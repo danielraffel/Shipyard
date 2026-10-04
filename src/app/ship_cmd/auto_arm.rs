@@ -54,11 +54,16 @@ pub(super) type RunGh<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
 /// `environment_opt_in` is the repository's
 /// [`crate::environment_requeue::CONFIG_KEY`]: when set, a head ejected once
 /// for an environment failure is armed without a new push.
+///
+/// `override_by` is set when the operator passed `--arm`: the head-approval
+/// gate ([`crate::head_approval`]) is skipped and the result names who
+/// overrode it. Every other refusal still applies.
 pub(super) fn arm_native_auto_merge(
     run_gh: RunGh<'_>,
     repo: &str,
     pr: u64,
     environment_opt_in: bool,
+    override_by: Option<&str>,
 ) -> ArmOutcome {
     let facts = match read_pr_facts(run_gh, repo, pr) {
         Ok(facts) => facts,
@@ -69,8 +74,8 @@ pub(super) fn arm_native_auto_merge(
             ));
         }
     };
-    let report = match read_queue_state(run_gh, repo, pr) {
-        Ok(value) => explain_pr_queue_state(&value),
+    let queue = match read_queue_state(run_gh, repo, pr) {
+        Ok(value) => value,
         Err(detail) => {
             return skipped(format!(
                 "⚠︎ Auto-merge not armed on #{pr}: its merge-queue state could not be read \
@@ -78,10 +83,17 @@ pub(super) fn arm_native_auto_merge(
             ));
         }
     };
+    let report = explain_pr_queue_state(&queue);
 
     let environment = crate::environment_requeue::assess(run_gh, repo, &report, environment_opt_in);
-    match decide_from_queue_state_with_environment(&report.state, facts.draft, environment.as_ref())
+    let verdict =
+        decide_from_queue_state_with_environment(&report.state, facts.draft, environment.as_ref());
+    let override_note = match approval_note(run_gh, repo, pr, &verdict, &queue, &facts, override_by)
     {
+        Ok(note) => note,
+        Err(refusal) => return refusal,
+    };
+    match verdict {
         ArmVerdict::Skip(skip) => skipped(format!(
             "▸ Auto-merge left as it is on #{pr}: {}{}",
             skip.explain(),
@@ -99,7 +111,7 @@ pub(super) fn arm_native_auto_merge(
                     armed: true,
                     line: format!(
                         "▸ Auto-merge armed on #{pr} (merge method MERGE) without a new head: \
-                         its one environment re-enqueue ({}).",
+                         its one environment re-enqueue ({}).{override_note}",
                         environment
                             .as_ref()
                             .map_or("", |verdict| verdict.reason.as_str())
@@ -122,7 +134,7 @@ pub(super) fn arm_native_auto_merge(
                 armed: true,
                 line: format!(
                     "▸ Auto-merge armed on #{pr} (merge method MERGE); GitHub enqueues it once \
-                     its required checks pass."
+                     its required checks pass.{override_note}"
                 ),
             },
             Ok(raw) => skipped(format!(
@@ -148,6 +160,102 @@ pub(super) fn arm_native_auto_merge(
     }
 }
 
+/// The note an arm result carries about head approval, or the refusal that
+/// replaces it. Only an [`ArmVerdict::Arm`] consults the gate.
+fn approval_note(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    verdict: &ArmVerdict,
+    queue: &Value,
+    facts: &PrFacts,
+    override_by: Option<&str>,
+) -> Result<String, ArmOutcome> {
+    match (verdict, override_by) {
+        (ArmVerdict::Skip(_), _) => Ok(String::new()),
+        (ArmVerdict::Arm, Some(by)) => Ok(format!(
+            " Armed by an explicit `--arm` from {by}, without checking for an approval of the \
+             head."
+        )),
+        (ArmVerdict::Arm, None) => match head_gate(run_gh, repo, pr, queue, facts) {
+            Ok(gate) if gate.allows() => Ok(String::new()),
+            Ok(gate) => Err(skipped(format!(
+                "▸ Auto-merge not armed on #{pr}: {}.",
+                gate.explain()
+            ))),
+            Err(detail) => Err(skipped(format!(
+                "⚠︎ Auto-merge not armed on #{pr}: whether its head is approved could not \
+                 be read ({detail}); refusing to arm blind."
+            ))),
+        },
+    }
+}
+
+/// The head-approval verdict for the head the queue state names.
+fn head_gate(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    queue: &Value,
+    facts: &PrFacts,
+) -> Result<crate::head_approval::HeadGate, String> {
+    let head = queue
+        .pointer("/data/repository/pullRequest/headRefOid")
+        .and_then(Value::as_str)
+        .filter(|head| !head.is_empty())
+        .ok_or_else(|| "the merge-queue state carried no head".to_owned())?;
+    let base = facts
+        .base
+        .as_deref()
+        .ok_or_else(|| "the pull request carried no base branch".to_owned())?;
+    crate::head_approval::evaluate(run_gh, repo, pr, head, base, queue)
+}
+
+/// Act on what the invocation asked of auto-merge: nothing for `--no-arm`,
+/// an approval-gated arm by default, and an override for `--arm` that names
+/// [`operator_identity`] as who armed it.
+pub(super) fn arm_for_request(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    environment_opt_in: bool,
+    request: crate::app::cli::ArmRequest,
+) -> Option<ArmOutcome> {
+    use crate::app::cli::ArmRequest;
+    let override_by = match request {
+        ArmRequest::Off => return None,
+        ArmRequest::Default => None,
+        ArmRequest::Override => Some(operator_identity()),
+    };
+    Some(arm_native_auto_merge(
+        run_gh,
+        repo,
+        pr,
+        environment_opt_in,
+        override_by.as_deref(),
+    ))
+}
+
+/// Who is running this command, for the record an `--arm` override leaves.
+///
+/// The GitHub credential is shared by every agent on a host, so it names no
+/// one; the operating-system user and host name at least name the machine and
+/// account the override came from.
+pub(super) fn operator_identity() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "an unknown user".to_owned());
+    let host = std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "an unknown host".to_owned());
+    format!("{user}@{host}")
+}
+
 fn skipped(line: String) -> ArmOutcome {
     ArmOutcome { armed: false, line }
 }
@@ -160,6 +268,8 @@ fn skipped(line: String) -> ArmOutcome {
 struct PrFacts {
     node_id: String,
     draft: bool,
+    /// Base branch, where the head-approval policy is read from.
+    base: Option<String>,
 }
 
 fn read_pr_facts(run_gh: RunGh<'_>, repo: &str, pr: u64) -> Result<PrFacts, String> {
@@ -170,7 +280,7 @@ fn read_pr_facts(run_gh: RunGh<'_>, repo: &str, pr: u64) -> Result<PrFacts, Stri
         "--repo".to_owned(),
         repo.to_owned(),
         "--json".to_owned(),
-        "id,isDraft".to_owned(),
+        "id,isDraft,baseRefName".to_owned(),
     ])?;
     let value: Value =
         serde_json::from_str(&raw).map_err(|error| format!("malformed PR JSON: {error}"))?;
@@ -186,7 +296,16 @@ fn read_pr_facts(run_gh: RunGh<'_>, repo: &str, pr: u64) -> Result<PrFacts, Stri
         .get("isDraft")
         .and_then(Value::as_bool)
         .ok_or_else(|| "PR view response carried no isDraft".to_owned())?;
-    Ok(PrFacts { node_id, draft })
+    let base = value
+        .get("baseRefName")
+        .and_then(Value::as_str)
+        .filter(|base| !base.is_empty())
+        .map(str::to_owned);
+    Ok(PrFacts {
+        node_id,
+        draft,
+        base,
+    })
 }
 
 fn read_queue_state(run_gh: RunGh<'_>, repo: &str, pr: u64) -> Result<Value, String> {

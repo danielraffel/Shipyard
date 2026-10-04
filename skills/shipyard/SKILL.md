@@ -3122,7 +3122,10 @@ squash subject folds the `chore: bump versions` marker commit in and trips
 release automation) from `resolve_pr_context`, the one chokepoint every route
 into `ship` passes through — so `shipyard pr`, a bare `ship`, and
 `ship --pr <n>` all arm, and no later route can quietly skip it. `--no-arm`
-opts out. This matters because Shipyard's own admission path enqueues only
+opts out. A repository whose base sets `[auto_merge]
+arm_requires_head_approval = true` arms only an approved head on every arming
+path (`ship`, the validated arm, the steward backstop); `--arm` overrides it
+and names who did. See `crate::head_approval`. This matters because Shipyard's own admission path enqueues only
 after it has validated a head, which happens only while a Shipyard process is
 alive; native auto-merge is server-owned, so a pull request whose ship lost its
 merge phase still lands instead of sitting green, unqueued and unarmed. Arming

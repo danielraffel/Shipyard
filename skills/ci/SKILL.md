@@ -159,6 +159,21 @@ envelope.
 `--no-arm` opts out for one invocation; the `shipyard:no-auto-merge` label opts a
 pull request out permanently. Neither is something to reach for by default.
 
+**Head approval.** A repository whose base branch sets
+`[auto_merge] arm_requires_head_approval = true` arms only a head that carries an
+approval of that exact head: an `APPROVED` review on that commit from a non-bot
+account, or a `reviewed:<sha>` comment line from a login listed in
+`[auto_merge] reviewer_logins` (empty by default). Bot accounts never count,
+including the Shipyard App every agent posts through, because a marker it wrote
+would approve itself. Without an approval the line reads
+`▸ Auto-merge not armed on #N: head … carries no approval …`, and the same check
+holds for the validated arm after a ship passes and for
+`runner steward --arm-unqueued`. A head the queue removed twice also needs an
+approval newer than its last removal; the line lists each removal's reason.
+`--arm` arms past the check on purpose and the line names who armed it. Rebasing
+an approved pull request produces a new head with no approval, so it stays
+disarmed until it is approved again.
+
 Two things not to conclude from it:
 
 - **A refusal is usually the `ghapp` queue-arm guard agreeing there is nothing to

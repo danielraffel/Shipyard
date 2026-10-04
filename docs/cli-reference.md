@@ -156,6 +156,8 @@ shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --works
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-form handoff identifiers
 shipyard pr --no-arm                                # do NOT arm native auto-merge on the PR
+shipyard pr --arm                                   # arm even where [auto_merge] arm_requires_head_approval
+                                                    #   would refuse an unapproved head; the result names who armed
                                                     # title/body come from origin/<base>..HEAD non-merge commits (never empty);
                                                     #   [pr.body] attribution = "..." closes every composed body once
 shipyard pr --body-append "Proxy: ..."              # add text to the PR body once, after the attribution line and before the

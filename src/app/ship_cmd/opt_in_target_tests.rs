@@ -166,7 +166,7 @@ fn ship_args(pr: Option<u64>, gh: Option<std::path::PathBuf>) -> ShipCommandArgs
         steward_handoff: None,
         invocation: ShipInvocation::Direct,
         foreground: true,
-        arm_auto_merge: false,
+        arm_auto_merge: crate::app::cli::ArmRequest::Off,
         body_append: None,
     }
 }

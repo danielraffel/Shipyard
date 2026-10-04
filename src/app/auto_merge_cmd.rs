@@ -792,6 +792,13 @@ fn merge_pr(
                 return Ok(MergeDisposition::Enqueued);
             }
             QueueAdmission::Arm { pr_id } => {
+                require_head_approval(
+                    client
+                        .as_ref()
+                        .expect("built-in merge should have gh client"),
+                    cwd,
+                    state,
+                )?;
                 ensure_unstacked(
                     client
                         .as_ref()
@@ -1568,6 +1575,9 @@ pub(super) fn supervise_merge_queue(
                                 ),
                             };
                         }
+                        if let Err(error) = require_head_approval(&client, cwd, &state) {
+                            return AutoMergeOutcome::MergeFailed { error };
+                        }
                         if let Err(error) = ensure_unstacked(&client, cwd, &state, global_dir) {
                             return AutoMergeOutcome::MergeFailed { error };
                         }
@@ -1670,6 +1680,9 @@ pub(super) fn supervise_merge_queue(
                                     "PR #{pr} has an uncertain prior exact-head enqueue mutation; refusing to re-arm without queue observation"
                                 ),
                             };
+                        }
+                        if let Err(error) = require_head_approval(&client, cwd, &state) {
+                            return AutoMergeOutcome::MergeFailed { error };
                         }
                         if let Err(error) = ensure_unstacked(&client, cwd, &state, global_dir) {
                             return AutoMergeOutcome::MergeFailed { error };
@@ -2041,6 +2054,81 @@ enum QueueArmError {
         guard: Box<MergeQueueMutationGuard>,
     },
     Uncertain(String),
+}
+
+/// Refuse to arm a validated head the repository has not seen approved.
+///
+/// Validation proves the head builds; it does not prove anyone chose to land
+/// it. A repository that sets `[auto_merge] arm_requires_head_approval` arms
+/// only a head carrying an approval ([`crate::head_approval`]), and that holds
+/// here as on every other arming path. `--arm` at `ship` time arms before
+/// this point, so an operator override never reaches this check.
+fn require_head_approval(client: &GhClient, cwd: &Path, state: &ShipState) -> Result<(), String> {
+    let run_gh = |args: &[String]| -> Result<String, String> {
+        let output = gh(client, cwd)?
+            .args(args)
+            .output()
+            .map_err(|error| format!("gh failed to start: {error}"))?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        }
+    };
+    head_approval_verdict(&run_gh, state)
+}
+
+/// [`require_head_approval`] over any `gh` transport.
+fn head_approval_verdict(
+    run_gh: crate::head_approval::RunGh<'_>,
+    state: &ShipState,
+) -> Result<(), String> {
+    let policy = crate::head_approval::read_policy(run_gh, &state.repo, &state.base_branch)
+        .map_err(|detail| {
+            format!(
+                "PR #{}: the head-approval policy could not be read ({detail}); refusing to arm blind",
+                state.pr
+            )
+        })?;
+    if !policy.required {
+        return Ok(());
+    }
+    let (owner, name) = state
+        .repo
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository slug {:?}", state.repo))?;
+    let queue: Value = serde_json::from_str(&run_gh(&[
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={}", crate::pr_queue_state::PR_QUEUE_STATE_QUERY),
+        "-F".to_owned(),
+        format!("owner={owner}"),
+        "-F".to_owned(),
+        format!("name={name}"),
+        "-F".to_owned(),
+        format!("number={}", state.pr),
+    ])?)
+    .map_err(|error| format!("merge-queue timeline returned invalid JSON: {error}"))?;
+    let gate = crate::head_approval::evaluate_with_policy(
+        run_gh,
+        &state.repo,
+        state.pr,
+        &state.head_sha,
+        &policy,
+        &queue,
+    )
+    .map_err(|detail| {
+        format!(
+            "PR #{}: whether head {} is approved could not be read ({detail}); refusing to arm blind",
+            state.pr, state.head_sha
+        )
+    })?;
+    if gate.allows() {
+        Ok(())
+    } else {
+        Err(format!("PR #{}: {}", state.pr, gate.explain()))
+    }
 }
 
 fn arm_native_queue(
@@ -4497,6 +4585,112 @@ exit 91
         assert!(
             includes_merge_mutation("api -X PUT repos/owner/repo/pulls/533/merge\n"),
             "negative control must detect a REST merge mutation"
+        );
+    }
+
+    /// A scripted `gh` for the validated-arm approval check: answers the policy
+    /// read, the queue timeline, reviews and comments, and records every call.
+    fn approval_gh<'a>(
+        policy: Result<&'a str, &'a str>,
+        reviews: &'a str,
+        calls: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&[String]) -> Result<String, String> + 'a {
+        move |args: &[String]| {
+            let joined = args.join(" ");
+            calls.borrow_mut().push(joined.clone());
+            if joined.contains("contents/.shipyard/config.toml?ref=main") {
+                return policy.map(str::to_owned).map_err(str::to_owned);
+            }
+            if joined.contains("isInMergeQueue") {
+                return Ok(crate::head_approval::tests::pr_9438_queue(
+                    crate::head_approval::tests::PR_9438_HEADS[6],
+                )
+                .to_string());
+            }
+            if joined.contains("pulls/9438/reviews") {
+                return Ok(reviews.to_owned());
+            }
+            if joined.contains("issues/9438/comments") {
+                return Ok(String::new());
+            }
+            Err(format!("unscripted gh call: {joined}"))
+        }
+    }
+
+    fn validated_9438() -> ShipState {
+        ShipState::new(
+            9438,
+            "Generous-Corp/pulp",
+            "feat/lane-reuse-record",
+            "main",
+            crate::head_approval::tests::PR_9438_HEADS[6],
+            "policy",
+        )
+    }
+
+    const REQUIRES_APPROVAL: &str = "[auto_merge]\narm_requires_head_approval = true\n";
+
+    /// Validation proves a head builds, not that anyone chose to land it: with
+    /// the policy on, a validated but unapproved head is not armed.
+    #[test]
+    fn a_validated_head_without_approval_is_not_armed() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let gh = approval_gh(Ok(REQUIRES_APPROVAL), "", &calls);
+        let error = head_approval_verdict(&gh, &validated_9438()).expect_err("refused");
+        assert!(error.contains("carries no approval"), "{error}");
+    }
+
+    /// Control on the same instrument: an approving review of the validated
+    /// head lets the arm proceed.
+    #[test]
+    fn a_validated_head_with_an_approving_review_is_armed() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let review = format!(
+            r#"{{"login":"someone","type":"User","at":"2026-10-04T04:50:00Z","state":"APPROVED","commit_id":"{}"}}"#,
+            crate::head_approval::tests::PR_9438_HEADS[6]
+        );
+        let gh = approval_gh(Ok(REQUIRES_APPROVAL), &review, &calls);
+        assert_eq!(head_approval_verdict(&gh, &validated_9438()), Ok(()));
+    }
+
+    /// A repository without the policy pays one read and is never refused.
+    #[test]
+    fn a_repository_without_the_policy_reads_nothing_else() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let gh = approval_gh(Err("gh: Not Found (HTTP 404)"), "", &calls);
+        assert_eq!(head_approval_verdict(&gh, &validated_9438()), Ok(()));
+        assert_eq!(calls.borrow().len(), 1, "{:?}", calls.borrow());
+    }
+
+    #[test]
+    fn an_unreadable_policy_refuses_the_validated_arm() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let gh = approval_gh(Err("HTTP 502: Bad Gateway"), "", &calls);
+        let error = head_approval_verdict(&gh, &validated_9438()).expect_err("refused");
+        assert!(error.contains("refusing to arm blind"), "{error}");
+    }
+
+    /// Every validated arm goes through the approval check before the
+    /// mutation: the initial admission and both re-enqueue paths.
+    #[test]
+    fn every_validated_arm_checks_head_approval_first() {
+        let source = include_str!("auto_merge_cmd.rs");
+        let body = &source[..source.find("\n#[cfg(test)]").expect("tests marker")];
+        let checks = body.matches("require_head_approval(").count();
+        let arms = body.matches("arm_native_queue(").count();
+        // One definition of each; every remaining call site is paired.
+        assert_eq!(
+            arms - 1,
+            3,
+            "arm sites changed; pair each with an approval check"
+        );
+        assert_eq!(checks - 1, arms - 1);
+        let admission = &body[body
+            .find("QueueAdmission::Arm { pr_id } => {")
+            .expect("arm branch")..];
+        assert!(
+            admission.find("require_head_approval(").expect("check")
+                < admission.find("arm_native_queue(").expect("arm")
         );
     }
 }

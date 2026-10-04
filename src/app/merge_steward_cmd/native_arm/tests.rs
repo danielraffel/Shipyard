@@ -41,6 +41,8 @@ case "$*" in
     printf '%s' '{{"data":{{"enablePullRequestAutoMerge":{{"pullRequest":{{"number":42}}}}}}}}' ;;
   *isInMergeQueue*)
     printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *contents/.shipyard/config.toml*)
+    printf '%s\n' 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
   *) printf '%s' '{{}}' ;;
 esac"#
     )
@@ -54,6 +56,8 @@ fn ejected_same_head(log: &str) -> String {
 case "$*" in
   *isInMergeQueue*)
     printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[{{"__typename":"AddedToMergeQueueEvent","createdAt":"2026-09-01T00:00:00Z","actor":{{"login":"a"}}}},{{"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-09-02T00:00:00Z","reason":"failed_checks","actor":{{"login":"a"}}}}]}}}}}}}}}}' ;;
+  *contents/.shipyard/config.toml*)
+    printf '%s\n' 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
   *) printf '%s' '{{}}' ;;
 esac"#
     )
@@ -368,6 +372,8 @@ fn an_unreadable_queue_state_arms_nothing_and_is_reported_unhealthy() {
             r#"printf '%s\n' "$*" >> '{}'
 case "$*" in
   *isInMergeQueue*) echo 'HTTP 502' >&2; exit 1 ;;
+  *contents/.shipyard/config.toml*)
+    printf '%s\n' 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
   *) printf '%s' '{{}}' ;;
 esac"#,
             log.display()
@@ -410,6 +416,8 @@ case "$*" in
     echo 'queue-arm-guard: refusing: PR #42 is already in the merge queue' >&2; exit 1 ;;
   *isInMergeQueue*)
     printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *contents/.shipyard/config.toml*)
+    printf '%s\n' 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
   *) printf '%s' '{{}}' ;;
 esac"#,
             log.display()
@@ -440,4 +448,93 @@ esac"#,
         "{calls}"
     );
     assert!(!calls.contains("GHAPP_ALLOW_QUEUE_REARM"), "{calls}");
+}
+
+// ---------------------------------------------------------------------------
+// Head approval
+// ---------------------------------------------------------------------------
+
+/// Script for a never-armed PR on a repository whose base requires head
+/// approval, with `reviews` as the flattened review records `gh` would print.
+#[cfg(unix)]
+fn approval_required(log: &str, reviews: &str) -> String {
+    format!(
+        r#"printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *enablePullRequestAutoMerge*)
+    printf '%s' '{{"data":{{"enablePullRequestAutoMerge":{{"pullRequest":{{"number":42}}}}}}}}' ;;
+  *isInMergeQueue*)
+    printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *contents/.shipyard/config.toml*)
+    printf '[auto_merge]\narm_requires_head_approval = true\n' ;;
+  *pulls/42/reviews*)
+    printf '%s' '{reviews}' ;;
+  *issues/42/comments*)
+    printf '' ;;
+  *) printf '%s' '{{}}' ;;
+esac"#
+    )
+}
+
+/// The backstop arms green, unarmed pull requests nobody handed to the
+/// steward, so it is exactly where a rebased, unreviewed head would be
+/// re-armed. On a repository that arms only approved heads it must not.
+#[cfg(unix)]
+#[test]
+fn the_backstop_leaves_an_unapproved_head_disarmed() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(&temp, &approval_required(&log.display().to_string(), ""));
+    let observation = observation(pr_row(&serde_json::json!({})), true);
+    let (status, unhealthy) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &report(StewardDecision::Unmanaged),
+        "shipyard:no-auto-merge",
+        true,
+    );
+    assert!(!unhealthy, "{status:?}");
+    assert_eq!(status.results[0].outcome, "skipped");
+    assert!(
+        matches!(
+            status.results[0].skip,
+            Some(crate::auto_arm::ArmSkip::HeadNotApproved { .. })
+        ),
+        "{status:?}"
+    );
+    let calls = std::fs::read_to_string(&log).expect("log");
+    assert!(
+        calls.contains("contents/.shipyard/config.toml?ref=main"),
+        "{calls}"
+    );
+    assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+}
+
+/// Control on the same instrument: an approving review of this head arms it.
+#[cfg(unix)]
+#[test]
+fn the_backstop_arms_a_head_with_an_approving_review() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls.log");
+    let review = r#"{"login":"someone","type":"User","at":"2026-10-04T01:00:00Z","state":"APPROVED","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+    let actions = fake_gh(
+        &temp,
+        &approval_required(&log.display().to_string(), review),
+    );
+    let observation = observation(pr_row(&serde_json::json!({})), true);
+    let (status, unhealthy) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &report(StewardDecision::Unmanaged),
+        "shipyard:no-auto-merge",
+        true,
+    );
+    assert!(!unhealthy, "{status:?}");
+    assert_eq!(status.results[0].outcome, "armed", "{status:?}");
+    let calls = std::fs::read_to_string(&log).expect("log");
+    assert_eq!(
+        calls.matches("enablePullRequestAutoMerge").count(),
+        1,
+        "{calls}"
+    );
 }

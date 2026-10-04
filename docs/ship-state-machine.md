@@ -274,6 +274,13 @@ document:
   line; the ship proceeds to submission either way.
 * It is idempotent, so a resumed or re-run ship re-issues nothing: an
   already-armed or already-queued pull request is left alone.
+* A repository that sets `[auto_merge] arm_requires_head_approval = true` on
+  its base branch arms only a head carrying an approval of that exact head: an
+  `APPROVED` review whose commit is the head from a non-bot account, or a
+  `reviewed:<sha>` comment from a login in `[auto_merge] reviewer_logins`. A
+  head the queue removed twice needs an approval newer than its last removal.
+  The same check guards T5's validated arm and the steward's `--arm-unqueued`
+  backstop. `--arm` arms past it and names who did.
 
 The reason it exists is a gap this state machine cannot close by itself. T5
 (merge on PASS) is the only thing that enqueues a validated head, so a ship that

@@ -601,6 +601,12 @@ pub(super) enum Command {
         /// not merge anything a required check has not passed.
         #[arg(long = "no-arm")]
         no_arm: bool,
+        /// Arm native auto-merge even when the repository arms only heads a
+        /// reviewer approved (`[auto_merge] arm_requires_head_approval`). The
+        /// result names who armed it. Use it when you have read the approval
+        /// yourself, or have decided to land without one.
+        #[arg(long = "arm", conflicts_with = "no_arm")]
+        arm: bool,
         /// Execute in this terminal for debugging instead of daemon ownership.
         #[arg(long)]
         foreground: bool,
@@ -690,6 +696,12 @@ pub(super) enum Command {
         /// not merge anything a required check has not passed.
         #[arg(long = "no-arm")]
         no_arm: bool,
+        /// Arm native auto-merge even when the repository arms only heads a
+        /// reviewer approved (`[auto_merge] arm_requires_head_approval`). The
+        /// result names who armed it. Use it when you have read the approval
+        /// yourself, or have decided to land without one.
+        #[arg(long = "arm", conflicts_with = "no_arm")]
+        arm: bool,
         /// Before anything else, cherry-pick this sibling branch's own commits
         /// (over origin/<base>; merges, version bumps and patches already here
         /// are skipped) onto the current branch. Repeatable; all-or-nothing.
@@ -3065,12 +3077,30 @@ impl Command {
     ///
     /// `None` for commands that never open or adopt a pull request.
     #[must_use]
-    pub(crate) const fn arm_auto_merge(&self) -> Option<bool> {
+    pub(crate) const fn arm_auto_merge(&self) -> Option<ArmRequest> {
         match self {
-            Self::Ship { no_arm, .. } | Self::Pr { no_arm, .. } => Some(!*no_arm),
+            Self::Ship { no_arm, arm, .. } | Self::Pr { no_arm, arm, .. } => Some(if *arm {
+                ArmRequest::Override
+            } else if *no_arm {
+                ArmRequest::Off
+            } else {
+                ArmRequest::Default
+            }),
             _ => None,
         }
     }
+}
+
+/// What a `ship` or `pr` invocation asked of native auto-merge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArmRequest {
+    /// `--no-arm`: leave auto-merge alone.
+    Off,
+    /// Arm, subject to every refusal, including the repository's
+    /// head-approval policy.
+    Default,
+    /// `--arm`: arm without checking for an approval of the head.
+    Override,
 }
 
 impl MergeMethod {
@@ -3805,10 +3835,24 @@ mod tests {
     #[test]
     fn arming_is_on_by_default_and_only_no_arm_disables_it() {
         for (argv, expected) in [
-            (vec!["shipyard", "pr"], Some(true)),
-            (vec!["shipyard", "pr", "--no-arm"], Some(false)),
-            (vec!["shipyard", "ship"], Some(true)),
-            (vec!["shipyard", "ship", "--no-arm"], Some(false)),
+            (vec!["shipyard", "pr"], Some(super::ArmRequest::Default)),
+            (
+                vec!["shipyard", "pr", "--no-arm"],
+                Some(super::ArmRequest::Off),
+            ),
+            (
+                vec!["shipyard", "pr", "--arm"],
+                Some(super::ArmRequest::Override),
+            ),
+            (vec!["shipyard", "ship"], Some(super::ArmRequest::Default)),
+            (
+                vec!["shipyard", "ship", "--no-arm"],
+                Some(super::ArmRequest::Off),
+            ),
+            (
+                vec!["shipyard", "ship", "--arm"],
+                Some(super::ArmRequest::Override),
+            ),
         ] {
             let cli = Cli::try_parse_from(argv.clone()).expect("parses");
             assert_eq!(cli.command.arm_auto_merge(), expected, "{argv:?}");
