@@ -3882,7 +3882,11 @@ and falls back to a direct spawn (loudly) on any launchctl failure. Two traps
 met building it: std passes the parent's **signal mask** to children, so the
 supervisor must spawn the daemon before blocking SIGTERM for its forwarding
 thread; and a RunAtLoad probe plist must never be written into
-`~/Library/LaunchAgents`, where it would rerun at every login.
+`~/Library/LaunchAgents`, where it would rerun at every login. Both the probe
+and the daemon start kickstart right after `launchctl bootstrap`: a RunAtLoad
+launch is speculative, and a busy host can defer it indefinitely (`runs = 0`,
+`pended nondemand spawn = speculative`), which the probe wait would otherwise
+misreport as an unanswered privacy prompt.
 
 A launcher host changes the daemon's parent: it is the resident launcher, not
 launchd (1). Any check that the production daemon "is still launchd-owned"
