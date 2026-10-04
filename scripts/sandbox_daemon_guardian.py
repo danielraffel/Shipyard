@@ -1491,6 +1491,7 @@ class Guardian:
             "deferred": 0,
             "skipped": 0,
             "errors": [],
+            "warnings": [],
         }
 
     def request_stop(self, _signum: int, _frame: object) -> None:
@@ -1574,10 +1575,19 @@ class Guardian:
             "deferred": 0,
             "skipped": 0,
             "errors": [],
+            "warnings": [],
         }
         errors = recovery["errors"]
         assert isinstance(errors, list)
+        # Another run's registration that cannot be recovered (no or foreign
+        # receipt, a guardian that may still be running) is reported, not
+        # failed on: it says nothing about this run, and a concurrent canary or
+        # a crashed runner's leftover would otherwise fail every later run. A
+        # removal that was attempted and failed stays an error.
+        warnings = recovery["warnings"]
+        assert isinstance(warnings, list)
         for launchd_pid, label in sorted(loaded, key=lambda item: item[1]):
+            attempting = False
             if label == self.launchd_label:
                 recovery["skipped"] = int(recovery["skipped"]) + 1
                 continue
@@ -1643,6 +1653,7 @@ class Guardian:
                     continue
                 recovery["eligible"] = int(recovery["eligible"]) + 1
                 recovery["attempted"] = int(recovery["attempted"]) + 1
+                attempting = True
                 _run(
                     [
                         "/bin/launchctl",
@@ -1660,7 +1671,9 @@ class Guardian:
                     )
             except Exception as error:
                 recovery["skipped"] = int(recovery["skipped"]) + 1
-                errors.append(f"{label}: {type(error).__name__}: {error}")
+                (errors if attempting else warnings).append(
+                    f"{label}: {type(error).__name__}: {error}"
+                )
         return recovery
 
     def hold_fleet_install_guard(self) -> None:
@@ -3096,6 +3109,7 @@ class Guardian:
                 "deferred": 0,
                 "skipped": 0,
                 "errors": [f"{type(error).__name__}: {error}"],
+                "warnings": [],
             }
         reason = "completed"
         try:
