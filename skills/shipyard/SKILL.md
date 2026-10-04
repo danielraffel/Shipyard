@@ -92,6 +92,9 @@ A Sandbox E2E canary that never writes `guardian.log` was never spawned:
 launchd can defer a RunAtLoad (speculative) launch indefinitely on a busy host,
 so the workflow kickstarts the guardian after bootstrapping it and always boots
 out its label at the end. See the ci skill for the `launchctl print` signature.
+Another run's leftover canary registration, or a concurrent canary, lands in
+the guardian receipt's `launchd_recovery.warnings`, never in `errors`, so it
+cannot fail an unrelated run.
 
 A quiet `daemon.log` during a Sandbox E2E run is expected: the sandbox audit
 holds the writer-domain lock exclusively, so `write_stderr` waits up to 30s
