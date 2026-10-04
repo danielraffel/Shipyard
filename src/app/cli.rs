@@ -1209,6 +1209,12 @@ pub(crate) struct ReuseRecordsArgs {
     /// The base to bind against (a ref or commit in this checkout).
     #[arg(long, default_value = "origin/main")]
     pub(crate) base: String,
+    /// List only the records of this commit. The plan's own count is unchanged.
+    #[arg(long)]
+    pub(crate) sha: Option<String>,
+    /// Owner/repo the caller expects; refused when the base names another.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -3655,6 +3661,21 @@ mod tests {
         assert_eq!(
             (args.target.as_str(), args.base.as_str()),
             ("mac", "origin/main")
+        );
+        assert_eq!((args.sha.as_deref(), args.repo.as_deref()), (None, None));
+        let cli = Cli::try_parse_from([
+            "shipyard", "reuse", "records", "--target", "mac", "--sha", "abc", "--repo", "o/r",
+        ])
+        .expect("records with sha and repo");
+        let Command::Reuse { command } = cli.command else {
+            panic!("expected reuse");
+        };
+        let super::ReuseCommand::Records(args) = *command else {
+            panic!("expected records");
+        };
+        assert_eq!(
+            (args.sha.as_deref(), args.repo.as_deref()),
+            (Some("abc"), Some("o/r"))
         );
         assert!(Cli::try_parse_from(["shipyard", "reuse", "records"]).is_err());
     }

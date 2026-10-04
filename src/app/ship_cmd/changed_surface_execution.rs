@@ -56,6 +56,16 @@ struct MachinePolicy {
     accepted_shadow_policy_digests: BTreeMap<(String, String), String>,
 }
 
+/// This machine's trusted `changed_surface_execution.mode` (`off`,
+/// `shadow_compare` or `authoritative`), read as the ship path reads it.
+///
+/// # Errors
+///
+/// The trusted machine configuration cannot be read or is invalid.
+pub(crate) fn machine_mode(config: &LoadedConfig) -> Result<&'static str, CliFailure> {
+    MachinePolicy::from_global(config).map(|policy| policy.mode.as_str())
+}
+
 impl MachinePolicy {
     fn from_global(config: &LoadedConfig) -> Result<Self, CliFailure> {
         let trusted = LoadedConfig::load_machine_global_from_dir(config.global_dir.clone())

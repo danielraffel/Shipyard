@@ -106,10 +106,35 @@ pub(crate) struct BindableRecords {
     pub(crate) repository: String,
     pub(crate) target: String,
     pub(crate) base_sha: String,
+    /// This host's platform, as the base's probe states it.
+    pub(crate) platform: String,
+    /// How many records the plan would bind (at most its candidate cap).
     pub(crate) bindable: usize,
     pub(crate) candidates: Vec<crate::changed_surface::executable_reuse::BaseCandidate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) no_base: Option<String>,
+    /// Every filed record, newest first, each judged by the same rules.
+    pub(crate) records: Vec<RecordJudgment>,
+}
+
+/// One filed record and whether a keyed plan against the base may bind it.
+#[derive(Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct RecordJudgment {
+    /// The commit the record's run validated.
+    pub(crate) sha: String,
+    pub(crate) target: String,
+    /// The record's run directory name.
+    pub(crate) run_id: String,
+    pub(crate) path: String,
+    /// When the store filed it (RFC 3339, UTC).
+    pub(crate) filed_at: String,
+    /// It passes every rule the plan applies.
+    pub(crate) bindable: bool,
+    /// It is among the records the plan binds (bindable and within the cap).
+    pub(crate) candidate: bool,
+    /// Why it is not bindable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
 }
 
 /// List the records a keyed plan against `base` would bind on this host,
@@ -161,6 +186,7 @@ pub(crate) fn bindable_records(
     let derivation_root = state_dir.join("executable-reuse").join("derivation");
     let policy_digest = crate::changed_surface::policy_digest(&policy);
     let build_dir = cwd.join(&reuse.build_dir);
+    let probed = std::cell::RefCell::new(None);
     let bound = bind(
         reuse,
         &BindRequest {
@@ -171,21 +197,74 @@ pub(crate) fn bindable_records(
             build_dir: &reuse.build_dir,
         },
         |path| git_bytes(cwd, &["show", &format!("{base_sha}:{path}")]),
-        |code_dir| probe_platform(reuse, code_dir, &build_dir),
+        |code_dir| {
+            let platform = probe_platform(reuse, code_dir, &build_dir)?;
+            probed.replace(Some(platform.clone()));
+            Ok(platform)
+        },
         |commit| merged_into(cwd, commit, &base_sha),
     )?;
+    let platform = probed
+        .into_inner()
+        .ok_or_else(|| "binding finished without probing the platform".to_owned())?;
     let (candidates, no_base) = match bound {
         Binding::Bound(binding) => (binding.candidates, None),
         Binding::NoBase(why) => (Vec::new(), Some(why)),
     };
+    let criteria = crate::changed_surface::executable_reuse::ConfiguredCriteria {
+        rules: &reuse.base_record,
+        merged: |commit: &str| merged_into(cwd, commit, &base_sha),
+    };
+    let records = judge_records(&store, target, &platform, &criteria, &candidates);
     Ok(BindableRecords {
         repository,
         target: target.to_owned(),
         base_sha,
+        platform,
         bindable: candidates.len(),
         candidates,
         no_base,
+        records,
     })
+}
+
+/// Judge every filed record, readable or not, as the plan would.
+fn judge_records<C: crate::reuse_record_store::BaseCriteria>(
+    store: &Path,
+    target: &str,
+    platform: &str,
+    criteria: &C,
+    candidates: &[crate::changed_surface::executable_reuse::BaseCandidate],
+) -> Vec<RecordJudgment> {
+    crate::reuse_record_store::survey(store)
+        .into_iter()
+        .map(|filed| {
+            let path = filed.path.to_string_lossy().into_owned();
+            let reason = match &filed.record {
+                Err(why) => Some(why.clone()),
+                Ok(record) => crate::reuse_record_store::judge(record, platform, criteria)
+                    .err()
+                    .map(|refusal| refusal.to_string()),
+            };
+            RecordJudgment {
+                sha: filed.commit,
+                target: target.to_owned(),
+                run_id: filed
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                filed_at: chrono::DateTime::<chrono::Utc>::from(filed.filed_at)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                bindable: reason.is_none(),
+                candidate: candidates
+                    .iter()
+                    .any(|candidate| candidate.record_path == path),
+                reason,
+                path,
+            }
+        })
+        .collect()
 }
 
 /// Whether a record's commit is in the planned base's history.
@@ -454,5 +533,63 @@ supported_build_types = ["debug"]
         assert_eq!(one.candidates[0].commit, base);
         assert_eq!(one.base_sha, base);
         assert_eq!(one.repository, "Owner/Repo");
+        assert_eq!(one.platform, "darwin-arm64");
+
+        // Every filed record is listed and judged by the plan's own rules,
+        // so the per-record view and the count can never disagree.
+        let judged: Vec<(&str, bool, bool, Option<&str>)> = one
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.sha.as_str(),
+                    record.bindable,
+                    record.candidate,
+                    record.reason.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(judged.len(), 3, "{judged:?}");
+        assert_eq!(
+            judged
+                .iter()
+                .filter(|(_, bindable, _, _)| *bindable)
+                .count(),
+            one.bindable
+        );
+        assert!(judged.contains(&(base.as_str(), true, true, None)));
+        assert!(judged.iter().any(|(sha, bindable, _, why)| *sha == base
+            && !bindable
+            && why.is_some_and(|why| why.starts_with("unusable: "))));
+        let nine = "9".repeat(40);
+        assert!(judged.contains(&(
+            nine.as_str(),
+            false,
+            false,
+            Some("its commit is not merged into the base")
+        )));
+        assert!(one.records.iter().all(|record| record.target == "mac"
+            && record.filed_at.ends_with('Z')
+            && !record.run_id.is_empty()));
+
+        // A run directory whose job.json is gone is reported, never dropped.
+        let unmerged_dir = one
+            .records
+            .iter()
+            .find(|record| record.sha == nine)
+            .map(|record| std::path::PathBuf::from(&record.path))
+            .expect("unmerged record");
+        std::fs::remove_file(unmerged_dir.join("job.json")).expect("remove job");
+        let broken = bindable_records(&repo, &state, "main", "mac").expect("measure");
+        assert_eq!(broken.records.len(), 3);
+        assert!(broken.records.iter().any(|record| {
+            record.sha == nine
+                && !record.bindable
+                && record
+                    .reason
+                    .as_deref()
+                    .is_some_and(|why| why.starts_with("no readable job.json"))
+        }));
+        assert_eq!(broken.bindable, 1);
     }
 }

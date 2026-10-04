@@ -141,9 +141,33 @@ pub struct StoredRecord {
 /// Every filed record, newest first. Unreadable entries are skipped.
 #[must_use]
 pub fn list(store: &Path) -> Vec<StoredRecord> {
-    let mut records = Vec::new();
+    survey(store)
+        .into_iter()
+        .filter_map(|filed| filed.record.ok())
+        .collect()
+}
+
+/// One run directory filed in the store, read or not.
+#[derive(Debug)]
+pub struct FiledRun {
+    /// The commit directory it sits under.
+    pub commit: String,
+    /// The run directory.
+    pub path: PathBuf,
+    /// When it was filed (directory modification time).
+    pub filed_at: std::time::SystemTime,
+    /// The record, or why its `job.json` cannot be read.
+    pub record: Result<StoredRecord, String>,
+}
+
+/// Every run directory in the store, newest first, including those whose
+/// `job.json` is missing or does not parse, so a reader can report them
+/// instead of silently dropping them. [`list`] is its readable subset.
+#[must_use]
+pub fn survey(store: &Path) -> Vec<FiledRun> {
+    let mut filed = Vec::new();
     let Ok(commits) = fs::read_dir(store.join("records")) else {
-        return records;
+        return filed;
     };
     for commit in commits.flatten() {
         let commit_name = commit.file_name().to_string_lossy().into_owned();
@@ -152,29 +176,35 @@ pub fn list(store: &Path) -> Vec<StoredRecord> {
         };
         for run in runs.flatten() {
             let path = run.path();
-            let Ok(bytes) = fs::read(path.join(JOB_FILE)) else {
-                continue;
-            };
-            let Ok(job) = serde_json::from_slice::<Value>(&bytes) else {
-                continue;
-            };
             let Ok(filed_at) = run.metadata().and_then(|meta| meta.modified()) else {
                 continue;
             };
-            records.push(StoredRecord {
+            let record = fs::read(path.join(JOB_FILE))
+                .map_err(|error| format!("no readable {JOB_FILE}: {error}"))
+                .and_then(|bytes| {
+                    serde_json::from_slice::<Value>(&bytes)
+                        .map_err(|error| format!("{JOB_FILE} is not JSON: {error}"))
+                })
+                .map(|job| StoredRecord {
+                    commit: commit_name.clone(),
+                    path: path.clone(),
+                    job,
+                    filed_at,
+                });
+            filed.push(FiledRun {
                 commit: commit_name.clone(),
                 path,
-                job,
                 filed_at,
+                record,
             });
         }
     }
-    records.sort_by(|a, b| {
+    filed.sort_by(|a, b| {
         b.filed_at
             .cmp(&a.filed_at)
             .then_with(|| b.path.cmp(&a.path))
     });
-    records
+    filed
 }
 
 /// Keep the newest `keep` records; remove the rest and any emptied commit dir.
@@ -239,6 +269,58 @@ fn stated(value: Option<String>) -> Option<String> {
     })
 }
 
+/// Why one record cannot be keyed against.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Refusal {
+    /// The record does not state its platform.
+    UnknownPlatform,
+    /// Its platform differs from the plan's.
+    OtherPlatform(String),
+    /// It does not state its toolchain, or states it as unknown.
+    UnknownToolchain,
+    /// It fails the record format's own usability rules.
+    Unusable(String),
+    /// Its commit is not an ancestor of the protected base.
+    NotMerged,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPlatform => f.write_str("the record states no platform"),
+            Self::OtherPlatform(platform) => write!(f, "the record is for platform {platform}"),
+            Self::UnknownToolchain => f.write_str("the record states no toolchain"),
+            Self::Unusable(why) => write!(f, "unusable: {why}"),
+            Self::NotMerged => f.write_str("its commit is not merged into the base"),
+        }
+    }
+}
+
+/// Whether one record may be keyed against, in the order
+/// [`select_candidates`] checks: platform, toolchain, usability, merged.
+///
+/// # Errors
+///
+/// The first [`Refusal`] that applies.
+pub fn judge<C: BaseCriteria>(
+    record: &StoredRecord,
+    want_platform: &str,
+    criteria: &C,
+) -> Result<(), Refusal> {
+    match stated(criteria.platform(&record.job)) {
+        None => Err(Refusal::UnknownPlatform),
+        Some(platform) if platform != want_platform => Err(Refusal::OtherPlatform(platform)),
+        Some(_) if stated(criteria.toolchain(&record.job)).is_none() => {
+            Err(Refusal::UnknownToolchain)
+        }
+        Some(_) => match criteria.unusable(record) {
+            Some(why) => Err(Refusal::Unusable(why)),
+            None if !criteria.merged(&record.commit) => Err(Refusal::NotMerged),
+            None => Ok(()),
+        },
+    }
+}
+
 /// The records a plan may key against, newest first and at most `cap`: each
 /// states `want_platform` and some toolchain, passes the format's usability
 /// rules, and has a merged commit. Platform is checked first, since a record
@@ -265,15 +347,13 @@ pub fn select_candidates<C: BaseCriteria>(
         if candidates.len() == cap {
             break;
         }
-        match stated(criteria.platform(&record.job)) {
-            None => refused.unknown_platform += 1,
-            Some(platform) if platform != want_platform => refused.other_platform += 1,
-            Some(_) if stated(criteria.toolchain(&record.job)).is_none() => {
-                refused.unknown_toolchain += 1;
-            }
-            Some(_) if criteria.unusable(&record).is_some() => refused.unusable += 1,
-            Some(_) if !criteria.merged(&record.commit) => refused.not_merged += 1,
-            Some(_) => candidates.push(record),
+        match judge(&record, want_platform, criteria) {
+            Err(Refusal::UnknownPlatform) => refused.unknown_platform += 1,
+            Err(Refusal::OtherPlatform(_)) => refused.other_platform += 1,
+            Err(Refusal::UnknownToolchain) => refused.unknown_toolchain += 1,
+            Err(Refusal::Unusable(_)) => refused.unusable += 1,
+            Err(Refusal::NotMerged) => refused.not_merged += 1,
+            Ok(()) => candidates.push(record),
         }
     }
     if candidates.is_empty() {

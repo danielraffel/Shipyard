@@ -116,7 +116,7 @@ pub(super) struct ShipStewardHandoff {
     pub(super) context_url: Option<String>,
 }
 
-mod changed_surface_execution;
+pub(super) mod changed_surface_execution;
 pub(super) mod executable_reuse_plan;
 mod fast_forward;
 mod metadata_authority;

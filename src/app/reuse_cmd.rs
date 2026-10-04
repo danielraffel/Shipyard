@@ -45,7 +45,7 @@ pub(super) fn reuse_command<W: Write>(
             json,
             stdout,
         ),
-        ReuseCommand::Records(args) => records(&args, cwd, state_dir, json, stdout),
+        ReuseCommand::Records(args) => records(&args, config, cwd, state_dir, json, stdout),
         ReuseCommand::RederiveSweep(args) => rederive_sweep(
             &|_: &Path, args: &[String]| gh(args),
             &args,
@@ -58,44 +58,94 @@ pub(super) fn reuse_command<W: Write>(
 
 fn records<W: Write>(
     args: &ReuseRecordsArgs,
+    config: &LoadedConfig,
     cwd: &Path,
     state_dir: &Path,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let found = super::ship_cmd::executable_reuse_plan::bindable_records(
+    let mode = super::ship_cmd::changed_surface_execution::machine_mode(config)?;
+    let mut found = super::ship_cmd::executable_reuse_plan::bindable_records(
         cwd,
         state_dir,
         &args.base,
         &args.target,
     )
     .map_err(|error| CliFailure::new(1, error))?;
-    let human = match &found.no_base {
-        Some(why) => format!(
-            "{} {} at {}: 0 bindable records ({why})",
-            found.repository, found.target, found.base_sha
-        ),
-        None => format!(
-            "{} {} at {}: {} bindable record(s): {}",
-            found.repository,
-            found.target,
-            found.base_sha,
-            found.bindable,
-            found
-                .candidates
-                .iter()
-                .map(|candidate| candidate.run_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+    narrow(&mut found, args.repo.as_deref(), args.sha.as_deref())?;
+    let human = records_line(&found, mode);
+    let Value::Object(fields) =
+        serde_json::to_value(&found).map_err(|error| CliFailure::new(1, error.to_string()))?
+    else {
+        return Err(CliFailure::new(
+            1,
+            "the records did not serialize as an object",
+        ));
     };
-    let mut data = BTreeMap::new();
+    let mut data: BTreeMap<String, Value> = fields.into_iter().collect();
     data.insert(
-        "records".to_owned(),
-        serde_json::to_value(&found).map_err(|error| CliFailure::new(1, error.to_string()))?,
+        "changed_surface_execution_mode".to_owned(),
+        Value::from(mode),
     );
     emit(stdout, json, "reuse.records", data, &human)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Refuse a caller expecting another repository; keep only `sha`'s records.
+fn narrow(
+    found: &mut super::ship_cmd::executable_reuse_plan::BindableRecords,
+    repo: Option<&str>,
+    sha: Option<&str>,
+) -> Result<(), CliFailure> {
+    if let Some(expected) = repo
+        && !expected.eq_ignore_ascii_case(&found.repository)
+    {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "the base names repository {}, not {expected}",
+                found.repository
+            ),
+        ));
+    }
+    if let Some(sha) = sha {
+        found.records.retain(|record| record.sha == sha);
+    }
+    Ok(())
+}
+
+fn records_line(
+    found: &super::ship_cmd::executable_reuse_plan::BindableRecords,
+    mode: &str,
+) -> String {
+    let head = format!(
+        "{} {} at {} on {} (mode {mode})",
+        found.repository, found.target, found.base_sha, found.platform
+    );
+    let mut lines = vec![match &found.no_base {
+        Some(why) => format!("{head}: 0 bindable records ({why})"),
+        None => format!("{head}: {} bindable record(s)", found.bindable),
+    }];
+    for record in &found.records {
+        lines.push(format!(
+            "  {} {} {}{}",
+            record.sha,
+            record.run_id,
+            if record.candidate {
+                "candidate"
+            } else if record.bindable {
+                "bindable"
+            } else {
+                "refused"
+            },
+            record
+                .reason
+                .as_deref()
+                .map(|why| format!(": {why}"))
+                .unwrap_or_default()
+        ));
+    }
+    lines.join("\n")
 }
 
 fn rederive<F, W>(
@@ -273,4 +323,64 @@ where
         &format!("{repo}: {}; {}{dry}", outcome.variable, outcome.issue),
     )?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::ship_cmd::executable_reuse_plan::{BindableRecords, RecordJudgment};
+
+    fn found() -> BindableRecords {
+        let record = |sha: &str, bindable: bool| RecordJudgment {
+            sha: sha.to_owned(),
+            target: "mac".to_owned(),
+            run_id: format!("{sha}-run"),
+            path: format!("/store/{sha}/{sha}-run"),
+            filed_at: "2026-10-04T00:00:00Z".to_owned(),
+            bindable,
+            candidate: bindable,
+            reason: (!bindable).then(|| "unusable: dirty".to_owned()),
+        };
+        BindableRecords {
+            repository: "Owner/Repo".to_owned(),
+            target: "mac".to_owned(),
+            base_sha: "b".to_owned(),
+            platform: "darwin-arm64".to_owned(),
+            bindable: 1,
+            candidates: Vec::new(),
+            no_base: None,
+            records: vec![record("a", true), record("c", false)],
+        }
+    }
+
+    #[test]
+    fn records_narrow_to_one_commit_and_refuse_another_repository() {
+        let mut all = found();
+        narrow(&mut all, Some("owner/repo"), None).expect("same repository, any case");
+        assert_eq!(all.records.len(), 2);
+
+        let mut one = found();
+        narrow(&mut one, None, Some("c")).expect("narrow");
+        assert_eq!(one.records.len(), 1);
+        assert_eq!(one.records[0].sha, "c");
+        assert_eq!(one.bindable, 1, "the plan's own count is not narrowed");
+
+        let mut none = found();
+        narrow(&mut none, None, Some("d")).expect("narrow");
+        assert!(none.records.is_empty(), "an absent commit lists nothing");
+
+        let refused = narrow(&mut found(), Some("Other/Repo"), None).expect_err("other repo");
+        assert_eq!(refused.code, 2);
+    }
+
+    #[test]
+    fn the_listing_names_each_record_and_why_it_is_refused() {
+        let line = records_line(&found(), "shadow_compare");
+        assert!(
+            line.contains("(mode shadow_compare): 1 bindable record(s)"),
+            "{line}"
+        );
+        assert!(line.contains("a a-run candidate"), "{line}");
+        assert!(line.contains("c c-run refused: unusable: dirty"), "{line}");
+    }
 }
