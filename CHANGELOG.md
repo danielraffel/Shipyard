@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02700"></a>
+## [0.270.0] - 2026-10-04
+
+- feat/reuse trip hooks ([#709](https://github.com/danielraffel/Shipyard/pull/709))
+
 <a id="v02693"></a>
 ## [0.269.3] - 2026-10-04
 
@@ -1924,6 +1929,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.270.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.270.0
 [0.269.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.269.3
 [0.269.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.269.2
 [0.269.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.269.1
