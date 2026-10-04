@@ -42,6 +42,7 @@ fn policy() -> ChangedSurfacePolicy {
         }],
         execution: None,
         secondary_contract_digests: std::collections::BTreeMap::default(),
+        executable_reuse: None,
     }
 }
 

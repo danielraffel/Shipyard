@@ -117,6 +117,7 @@ pub(super) struct ShipStewardHandoff {
 }
 
 mod changed_surface_execution;
+mod executable_reuse_plan;
 mod fast_forward;
 mod metadata_authority;
 mod prepush_changed_surface;
@@ -507,6 +508,8 @@ pub(super) fn ship_command<W: Write>(
     )
     .map_err(|error| CliFailure::new(1, error.to_string()))?;
 
+    // Before merge readiness, so a later live run's merge can wait on it.
+    rederive_keyed_runs(&request, config, cwd, &runtime_paths.state_dir);
     let render_state = post_run_merge_state(
         pr_context.number,
         cwd,
@@ -1229,6 +1232,8 @@ pub(super) fn finish_background_ship(
     // fallback.
     let terminal_state = ship_state.get_scoped(&request.repo, request.pr);
     let validated_state = crate::ship::validation_proof_state(request, job, terminal_state.clone());
+    // Before merge readiness, so a later live run's merge can wait on it.
+    rederive_keyed_runs(request, &config, &envelope.cwd, state_dir);
     let state = post_run_merge_state(
         request.pr,
         &envelope.cwd,
@@ -1247,6 +1252,39 @@ pub(super) fn finish_background_ship(
         terminal_state,
         state.queued_disposition(),
     ))
+}
+
+/// Re-derive every keyed shadow run this ship produced. Shadow verdicts
+/// never change the ship's outcome; a failure to look is reported on stderr
+/// and left for `shipyard reuse rederive-sweep`.
+fn rederive_keyed_runs(
+    request: &ShipExecutionRequest,
+    config: &LoadedConfig,
+    cwd: &Path,
+    state_dir: &Path,
+) {
+    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
+    let gh = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
+    for target in &request.targets {
+        let identity = crate::changed_surface::trial::TrialIdentity {
+            repository: request.repo.clone(),
+            pull_request: request.pr,
+            target: target.name.clone(),
+            head_sha: request.sha.clone(),
+        };
+        if let Err(error) = super::reuse_rederive::rederive_trial(
+            state_dir,
+            &identity,
+            super::reuse_rederive::ProducedBy::Completion,
+            &|_: &Path, args: &[String]| gh(args),
+        ) {
+            eprintln!(
+                "shipyard: host re-derivation for {} at {} was not recorded ({error}); \
+                 `shipyard reuse rederive-sweep` retries it",
+                target.name, request.sha
+            );
+        }
+    }
 }
 
 mod render;

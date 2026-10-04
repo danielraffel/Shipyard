@@ -12,6 +12,7 @@ use super::super::CliFailure;
 use super::super::changed_surface_cmd::{
     ChangedSurfacePlanArgs, observe_changed_surface_plan, observe_stale_base_shadow,
 };
+use super::executable_reuse_plan::{KeyRequest, Keyed, plan_keyed};
 use crate::changed_surface::trial::{TrialIdentity, result_directory};
 use crate::changed_surface::{
     ExecutionCommandTransport, ExecutionDisposition, FallbackReason, StaleBaseShadowReceipt,
@@ -478,8 +479,47 @@ pub(super) fn apply_changed_surface_execution(
                 continue;
             }
         };
+        let keyed = keyed_shadow_plan(
+            machine.mode,
+            &observation,
+            policy,
+            &disposition,
+            validation.reuse_record_repository.as_deref(),
+            cwd,
+            state_dir,
+            &contract_digest,
+        );
+        if let Some(Keyed::Closeout {
+            category,
+            diagnostic,
+        }) = &keyed
+        {
+            persist_fallback_diagnostic(
+                &result_dir(
+                    state_dir,
+                    repo,
+                    pr,
+                    &observation.receipt.head_sha,
+                    &target.name,
+                ),
+                &FallbackDiagnostic {
+                    schema_version: 1,
+                    repository: repo,
+                    pull_request: pr,
+                    target: &target.name,
+                    machine_mode: machine.mode,
+                    category,
+                    diagnostic: bounded_diagnostic(diagnostic),
+                },
+            )?;
+        }
+        let keyed = match keyed {
+            Some(Keyed::Planned(plan)) => Some(plan),
+            _ => None,
+        };
         let mut stale_execution = None;
-        if machine.mode == MachineMode::ShadowCompare
+        if keyed.is_none()
+            && machine.mode == MachineMode::ShadowCompare
             && observation.receipt.fallback_reason == Some(FallbackReason::StaleBase)
             && matches!(disposition, ExecutionDisposition::Full { .. })
         {
@@ -594,6 +634,8 @@ pub(super) fn apply_changed_surface_execution(
                 Some((receipt, receipt_digest, evidence_dir)),
                 Some(checkout),
             )
+        } else if let Some(plan) = keyed {
+            (plan, None, None)
         } else {
             let plan = match disposition {
                 ExecutionDisposition::Bounded(plan) => plan,
@@ -761,6 +803,21 @@ pub(super) fn apply_changed_surface_execution(
             )?;
         } else {
             persist_activation(&result_dir, &activation)?;
+            if plan.disposition != crate::changed_surface::BOUNDED {
+                persist_named_receipt(
+                    &result_dir,
+                    crate::changed_surface::executable_reuse::KEYED_CONTEXT_RECEIPT,
+                    &crate::changed_surface::executable_reuse::KeyedRunContext {
+                        schema_version: 1,
+                        repository: repo.to_owned(),
+                        checkout: cwd.to_string_lossy().into_owned(),
+                        execution_payload_b64: base64::Engine::encode(
+                            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                            &plan.execution_payload,
+                        ),
+                    },
+                )?;
+            }
         }
         if let Some(checkout) = stale_checkout {
             let ResolvedBackend::Local(local) = &mut target.backend else {
@@ -786,6 +843,52 @@ pub(super) fn apply_changed_surface_execution(
         }
     }
     Ok(())
+}
+
+/// A keyed shadow plan replaces the configured stages only on a shadow host,
+/// for a full or bounded plan that is not a stale-base comparison, and only
+/// when the protected base declares executable reuse. `None` leaves the
+/// existing behaviour untouched.
+#[allow(clippy::too_many_arguments)]
+fn keyed_shadow_plan(
+    mode: MachineMode,
+    observation: &super::super::changed_surface_cmd::ChangedSurfaceObservation,
+    policy: &crate::changed_surface::ChangedSurfacePolicy,
+    disposition: &ExecutionDisposition,
+    record_repository: Option<&str>,
+    cwd: &Path,
+    state_dir: &Path,
+    contract_digest: &str,
+) -> Option<Keyed> {
+    let reuse = policy.executable_reuse.as_ref()?;
+    if !keys_this_plan(
+        mode,
+        observation.receipt.fallback_reason.as_ref(),
+        disposition,
+    ) {
+        return None;
+    }
+    Some(plan_keyed(&KeyRequest {
+        observation,
+        policy,
+        reuse,
+        record_repository,
+        cwd,
+        state_dir,
+        contract_digest,
+    }))
+}
+
+/// Keyed runs are shadow measurement: never on an authoritative host, never
+/// for a blocked plan, and never in place of a stale-base comparison.
+fn keys_this_plan(
+    mode: MachineMode,
+    fallback_reason: Option<&FallbackReason>,
+    disposition: &ExecutionDisposition,
+) -> bool {
+    mode == MachineMode::ShadowCompare
+        && fallback_reason != Some(&FallbackReason::StaleBase)
+        && !matches!(disposition, ExecutionDisposition::Blocked { .. })
 }
 
 fn read_current_stale_generation(path: &Path) -> Result<Option<Vec<u8>>, CliFailure> {
@@ -1719,5 +1822,31 @@ mod tests {
             selected_resume_block_reason("build_and_test", Some("test"), false),
             None
         );
+    }
+
+    #[test]
+    fn only_a_shadow_host_keys_a_full_or_bounded_non_stale_plan() {
+        use super::keys_this_plan;
+        use crate::changed_surface::{ExecutionDisposition, FallbackReason, FullExecutionReason};
+        let full = ExecutionDisposition::Full {
+            reason: FullExecutionReason::PlannerSelectedFull,
+        };
+        let blocked = ExecutionDisposition::Blocked {
+            reason: "waiting".to_owned(),
+        };
+        assert!(keys_this_plan(MachineMode::ShadowCompare, None, &full));
+        assert!(keys_this_plan(
+            MachineMode::ShadowCompare,
+            Some(&FallbackReason::BaseRefNotProtected),
+            &full
+        ));
+        assert!(!keys_this_plan(MachineMode::Authoritative, None, &full));
+        assert!(!keys_this_plan(MachineMode::Off, None, &full));
+        assert!(!keys_this_plan(MachineMode::ShadowCompare, None, &blocked));
+        assert!(!keys_this_plan(
+            MachineMode::ShadowCompare,
+            Some(&FallbackReason::StaleBase),
+            &full
+        ));
     }
 }

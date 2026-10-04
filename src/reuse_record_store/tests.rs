@@ -128,7 +128,7 @@ fn the_store_keeps_only_the_newest_records() {
 }
 
 #[test]
-fn the_base_must_have_a_stated_equal_identity_a_usable_record_and_a_merged_commit() {
+fn a_candidate_states_the_platform_and_a_toolchain_is_usable_and_merged() {
     let store = tempfile::tempdir().expect("store");
     let (platform, toolchain) = ("macos-arm64", "clang-1 sdk-27");
     let job = |p: Option<&str>, t: Option<&str>| {
@@ -184,27 +184,45 @@ fn the_base_must_have_a_stated_equal_identity_a_usable_record_and_a_merged_commi
         70,
     );
 
-    let chosen = select_base(store.path(), platform, toolchain, &Criteria).expect("a base");
-    assert_eq!(chosen.commit, "good-new", "the newest qualifying record");
+    let commits = |cap| -> Vec<String> {
+        select_candidates(store.path(), platform, &Criteria, cap)
+            .expect("candidates")
+            .into_iter()
+            .map(|record| record.commit)
+            .collect()
+    };
+    assert_eq!(
+        commits(8),
+        ["good-d", "good-new", "good-old"],
+        "newest first; another stated toolchain is still a candidate"
+    );
+    assert_eq!(commits(2), ["good-d", "good-new"], "capped");
 
-    let none = select_base(store.path(), platform, "clang-9", &Criteria).expect_err("none match");
+    let none = select_candidates(store.path(), "windows-x86_64", &Criteria, 8)
+        .expect_err("no platform matches");
     assert_eq!(
         none,
         NoBase::NoneQualify(Refusals {
             unknown_platform: 1,
-            other_platform: 1,
-            unknown_toolchain: 1,
-            other_toolchain: 5,
+            other_platform: 7,
+            unknown_toolchain: 0,
             unusable: 0,
             not_merged: 0,
         })
     );
     let NoBase::NoneQualify(refused) =
-        select_base(store.path(), platform, toolchain, &NoneMerged).expect_err("none merged")
+        select_candidates(store.path(), platform, &NoneMerged, 8).expect_err("none merged")
     else {
         panic!("expected refusals");
     };
-    assert_eq!((refused.unusable, refused.not_merged), (1, 3));
+    assert_eq!(
+        (
+            refused.unknown_toolchain,
+            refused.unusable,
+            refused.not_merged
+        ),
+        (1, 1, 4)
+    );
 }
 
 struct NoneMerged;
@@ -228,7 +246,7 @@ impl BaseCriteria for NoneMerged {
 fn an_empty_store_says_so() {
     let store = tempfile::tempdir().expect("store");
     assert_eq!(
-        select_base(store.path(), "p", "t", &Criteria),
+        select_candidates(store.path(), "p", &Criteria, 8),
         Err(NoBase::Empty)
     );
 }

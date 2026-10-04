@@ -490,6 +490,7 @@ mod tests {
             ],
             execution: None,
             secondary_contract_digests: BTreeMap::new(),
+            executable_reuse: None,
         }
     }
 

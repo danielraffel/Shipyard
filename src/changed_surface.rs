@@ -12,15 +12,16 @@ use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod executable_reuse;
 mod execution;
 pub(crate) mod integration_checkout;
 pub mod live_switch;
 mod stale_base;
 pub mod trial;
 pub use execution::{
-    AuthoritativeExecutionPlan, ChangedSurfaceExecutionPolicy, ExecutionCommandTransport,
+    AuthoritativeExecutionPlan, BOUNDED, ChangedSurfaceExecutionPolicy, ExecutionCommandTransport,
     ExecutionDisposition, ExecutionMode, ExecutionPlanError, FullExecutionReason,
-    plan_authoritative_execution,
+    KEYED_BOUNDED_SHADOW, KEYED_FULL_SHADOW, plan_authoritative_execution, plan_keyed_execution,
 };
 pub use stale_base::{
     MergeAuthority, StaleBaseCandidate, StaleBaseShadowDisposition, StaleBaseShadowInput,
@@ -135,9 +136,30 @@ pub struct ChangedSurfacePolicy {
     /// Optional protected-base promotion policy. Absence remains shadow-only.
     #[serde(default)]
     pub execution: Option<ChangedSurfaceExecutionPolicy>,
+    /// Optional executable-keyed reuse declaration; absence plans no keyed reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_reuse: Option<executable_reuse::ExecutableReusePolicy>,
     /// Expected target-validation digests computed from the authenticated base.
     #[serde(skip)]
     pub secondary_contract_digests: BTreeMap<String, String>,
+}
+
+impl ChangedSurfacePolicy {
+    /// Paths whose head-side change means the selector itself may have
+    /// changed: the declared `policy_paths` and, when keyed reuse is
+    /// declared, its `derivation_paths`. Both come from the protected base.
+    #[must_use]
+    pub fn selector_policy_paths(&self) -> Vec<String> {
+        self.policy_paths
+            .iter()
+            .chain(
+                self.executable_reuse
+                    .iter()
+                    .flat_map(|reuse| reuse.derivation_paths.iter()),
+            )
+            .cloned()
+            .collect()
+    }
 }
 
 /// Authenticated GitHub provenance plus independently observed local git facts.
@@ -784,7 +806,7 @@ fn plan_with_policy(
     }
 
     let policy_patterns = std::iter::once(".shipyard/config.toml".to_owned())
-        .chain(policy.policy_paths.iter().cloned())
+        .chain(policy.selector_policy_paths())
         .collect::<Vec<_>>();
     let forced_fallback = if paths_match_any(changed_paths, &policy_patterns)? {
         Some((FallbackReason::SelectorPolicyChanged, None))
@@ -943,7 +965,7 @@ fn forced_full_paths(
     changed_paths: &[String],
 ) -> Result<BTreeSet<String>, IdentityError> {
     let patterns = std::iter::once(".shipyard/config.toml".to_owned())
-        .chain(policy.policy_paths.iter().cloned())
+        .chain(policy.selector_policy_paths())
         .chain(policy.test_topology_paths.iter().cloned())
         .chain(policy.full_required_paths.iter().cloned())
         .collect::<Vec<_>>();
@@ -1320,6 +1342,9 @@ fn validate_policy(policy: &ChangedSurfacePolicy) -> Result<(), String> {
     validate_patterns(&policy.baseline_only_paths)?;
     validate_patterns(&policy.ios_compile_skip_safe_paths)?;
     validate_patterns(&policy.policy_paths)?;
+    if let Some(reuse) = &policy.executable_reuse {
+        reuse.validate()?;
+    }
     validate_patterns(&policy.test_topology_paths)?;
     if policy.baseline_only_paths.iter().any(|pattern| {
         pattern.split('/').next().is_none_or(|first| {
@@ -1609,6 +1634,7 @@ mod tests {
             ],
             execution: None,
             secondary_contract_digests: BTreeMap::new(),
+            executable_reuse: None,
         }
     }
 
@@ -1883,6 +1909,143 @@ mod tests {
         tests = ["audio alpha"]
         supported_build_types = ["debug"]
     "#;
+
+    /// A protected base that declares keyed reuse over two derivation files.
+    const REUSE_BASE_CONFIG: &str = r#"
+        [targets.mac]
+        validation_build_type = "debug"
+
+        [targets.mac.changed_surface_selection]
+        schema_version = 1
+        full_test_count = 100
+        build_type = "debug"
+        baseline_tests = ["smoke boots"]
+        test_topology_paths = ["tests/**"]
+
+        [targets.mac.changed_surface_selection.executable_reuse]
+        switch_variable = "PULP_REUSE_LIVE"
+        derivation_paths = ["tools/ci/executable_keys.py", "tools/ci/link_members.py"]
+        build_dir = "build"
+        platform_probe = ["python3", "-I", "tools/ci/executable_keys.py", "--print-toolchain", "--build-dir", "{build_dir}"]
+        rederive = [["python3", "-I", "tools/ci/executable_keys.py", "--out", "{out_dir}/executable-keys.json"]]
+
+        [targets.mac.changed_surface_selection.executable_reuse.base_record]
+        platform = "/platform"
+        toolchain = "/toolchain/digest"
+        require = [
+            { pointer = "/dirty", equals = false },
+            { pointer = "/suites/full", present = true },
+        ]
+
+        [[targets.mac.changed_surface_selection.families]]
+        name = "keys"
+        paths = ["tools/ci/**"]
+        tests = ["keys selftest"]
+        supported_build_types = ["debug"]
+    "#;
+
+    #[test]
+    fn a_derivation_path_is_selector_policy_whatever_the_head_config_says() {
+        // The pull request's own config drops link_members.py from the list
+        // and edits it. Only the protected base's declaration is ever read, so
+        // the edit still sends the plan to the full suite, with or without the
+        // config change beside it.
+        let head_config = REUSE_BASE_CONFIG.replace(r#", "tools/ci/link_members.py""#, "");
+        let head = policy_from_toml(&head_config, "mac").expect("head parses");
+        assert_eq!(
+            head.executable_reuse
+                .as_ref()
+                .map(|r| r.derivation_paths.len()),
+            Some(1),
+            "the head really did drop it"
+        );
+        let base = policy_from_toml(REUSE_BASE_CONFIG, "mac").expect("base parses");
+        assert!(
+            base.selector_policy_paths()
+                .contains(&"tools/ci/link_members.py".to_owned())
+        );
+        for changed in [
+            &["tools/ci/link_members.py"][..],
+            &[".shipyard/config.toml", "tools/ci/link_members.py"][..],
+        ] {
+            let receipt =
+                plan_selection(&input(changed), Ok(base.clone())).expect("fallback receipt");
+            assert_eq!(
+                (receipt.fallback_reason, receipt.planned_suite),
+                (
+                    Some(FallbackReason::SelectorPolicyChanged),
+                    PlannedSuite::Full
+                ),
+                "{changed:?}"
+            );
+        }
+        // The same edit planned against the head's shrunken list would have
+        // been an ordinary bounded family: what the base read prevents.
+        let laundered =
+            plan_selection(&input(&["tools/ci/link_members.py"]), Ok(head)).expect("receipt");
+        assert_ne!(
+            laundered.fallback_reason,
+            Some(FallbackReason::SelectorPolicyChanged)
+        );
+    }
+
+    #[test]
+    fn the_base_record_rules_choose_a_clean_full_record_from_the_store() {
+        use crate::reuse_record_store::{create_pending, file, select_candidates};
+        let policy = policy_from_toml(REUSE_BASE_CONFIG, "mac").expect("base parses");
+        let rules = &policy
+            .executable_reuse
+            .as_ref()
+            .expect("declared")
+            .base_record;
+        assert_eq!(
+            rules.require[0].equals,
+            Some(serde_json::Value::Bool(false))
+        );
+        let store = tempfile::tempdir().expect("store");
+        let now = chrono::Utc::now();
+        let put = |commit: &str, job: serde_json::Value| {
+            let pending = create_pending(store.path(), commit, now).expect("pending");
+            std::fs::write(pending.join("job.json"), job.to_string()).expect("job");
+            file(store.path(), &pending, commit).expect("file");
+            // Filing order is newest-last; space them so mtimes differ.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let base = |dirty: serde_json::Value, suites: serde_json::Value| {
+            serde_json::json!({"platform": "darwin-arm64", "toolchain": {"digest": "tc1"},
+                               "dirty": dirty, "suites": suites})
+        };
+        put(
+            "clean-full",
+            base(false.into(), serde_json::json!({"full": 10})),
+        );
+        put(
+            "partial",
+            base(false.into(), serde_json::json!({"pr-affected": 2})),
+        );
+        put("dirty", base(true.into(), serde_json::json!({"full": 10})));
+        let criteria = executable_reuse::ConfiguredCriteria {
+            rules,
+            merged: |_: &str| true,
+        };
+        let chosen = select_candidates(store.path(), "darwin-arm64", &criteria, 8).expect("a base");
+        let commits: Vec<&str> = chosen.iter().map(|record| record.commit.as_str()).collect();
+        assert_eq!(
+            commits,
+            ["clean-full"],
+            "newer partial and dirty records are refused"
+        );
+    }
+
+    #[test]
+    fn an_invalid_reuse_declaration_is_an_invalid_policy() {
+        let globbed = REUSE_BASE_CONFIG.replace("tools/ci/link_members.py", "tools/ci/*.py");
+        let error = policy_from_toml(&globbed, "mac").expect_err("refused");
+        assert!(
+            error.contains("plain repository-relative file path"),
+            "{error}"
+        );
+    }
 
     const FAMILIES_FILE: &str = r#"
         [[families]]
