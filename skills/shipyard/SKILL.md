@@ -803,11 +803,29 @@ not evidence of anything.
 `<state>/reuse-records/OWNER__REPO/` only if a parsing `job.json` was written;
 the run log's last `=== reuse-record: ... ===` line says kept or why not. A
 recorder failure never changes the run's verdict, so read that line rather than
-the exit code to know whether a record exists. `select_base` checks platform
-before toolchain (a record from another OS can carry a plausible toolchain
-string), refuses an unmerged commit, a record the format marks unusable, and
-one that states its platform or toolchain as empty or `unknown`: unknown is a
-refusal, never a match.
+the exit code to know whether a record exists. `select_candidates` checks
+platform before anything else (a record from another OS can carry a plausible
+toolchain string), refuses an unmerged commit, a record the format marks
+unusable, and one that states its platform or toolchain as empty or `unknown`:
+unknown is a refusal, never a match. It does not compare toolchains: the lane
+picks among the candidates after its configure.
+
+### Keyed shadow runs measure reuse; they never skip
+
+When the protected base declares `executable_reuse`, a `shadow_compare` host
+turns a build-and-test plan into `keyed_full_shadow` or `keyed_bounded_shadow`.
+The configured build and full tests still run with their own verdict; the
+trial reports `keyed_shadow_recorded` with `would_skip_count` and
+`false_skips`, never `ready`. A result claiming `graduation_eligible` is
+rejected. The key code comes only from the base, byte for byte (never through a
+trimming git helper: its digest is over the exact bytes). When no record
+qualifies, read the `executable_reuse_*` diagnostic in the trial directory
+rather than assuming the run was keyed. A keyed result stays `collecting`
+until its `rederivation-<result sha256>.json` exists; both ship completion
+paths write it before merge readiness, the daemon sweeps missed ones at start,
+and `shipyard reuse rederive --pr N --target T --head SHA` (or
+`rederive-sweep`) does it by hand. Never delete `refusals.json` to "reset" a
+host: the second refusal there is what turns live reuse off.
 The command is evidence inspection only: it never changes machine mode,
 accepted policy digests, queue state, or merge readiness.
 

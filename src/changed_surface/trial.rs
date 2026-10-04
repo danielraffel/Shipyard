@@ -50,6 +50,10 @@ pub enum TrialState {
     Terminal,
     /// Observed evidence is malformed, contradictory, or non-passing.
     Rejected,
+    /// An exact-bound keyed shadow run recorded what executable reuse would
+    /// have skipped against its configured full run. It is measurement, never
+    /// graduation evidence.
+    KeyedShadowRecorded,
 }
 
 /// Stable read-only status returned by `changed-surface-trial-status`.
@@ -82,8 +86,32 @@ pub struct TrialStatus {
     /// Typed stale-base result when planning terminated before activation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shadow_disposition: Option<super::StaleBaseShadowDisposition>,
+    /// What a keyed shadow run measured, when one was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyed: Option<KeyedShadowSummary>,
     /// Stable bounded reason for the current state.
     pub reason: String,
+}
+
+impl TrialStatus {
+    /// A status for `identity` with no receipts observed yet.
+    fn new(identity: &TrialIdentity, state: TrialState, reason: &str) -> Self {
+        Self {
+            schema_version: TRIAL_STATUS_SCHEMA_VERSION,
+            state,
+            repository: identity.repository.clone(),
+            pull_request: identity.pull_request,
+            target: identity.target.clone(),
+            head_sha: identity.head_sha.clone(),
+            activation_receipt: None,
+            result_receipt_count: 0,
+            result_receipt: None,
+            timing: None,
+            shadow_disposition: None,
+            keyed: None,
+            reason: reason.to_owned(),
+        }
+    }
 }
 
 /// Validated timing and estimated savings for one matched shadow comparison.
@@ -110,6 +138,42 @@ pub struct TrialTiming {
     /// Full-path time divided by selected-path time, when selected time is nonzero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_speedup_ratio: Option<f64>,
+}
+
+/// Validated measurement from one keyed shadow run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct KeyedShadowSummary {
+    /// `keyed_full_shadow` or `keyed_bounded_shadow`.
+    pub disposition: String,
+    /// Tests executable reuse would have skipped; `None` when nothing was
+    /// derived.
+    pub would_skip_count: Option<usize>,
+    /// Would-skip tests that failed in the authoritative full run.
+    pub false_skip_count: Option<usize>,
+    /// Their names, in the adapter's order.
+    pub false_skips: Option<Vec<String>>,
+    /// The configured full test run's own verdict; `None` when the build
+    /// failed and no test ran.
+    pub full_returncode: Option<i32>,
+    /// The configured full build's own verdict.
+    pub full_build_returncode: i32,
+    /// The host re-derivation's verdict on this result.
+    pub rederivation: String,
+}
+
+/// File-name prefix of a host re-derivation receipt in a trial directory.
+pub const REDERIVATION_RECEIPT_PREFIX: &str = "rederivation-";
+
+/// The verdicts a host re-derivation receipt may state; only `refuse`
+/// rejects the run.
+pub const REDERIVATION_VERDICTS: [&str; 4] =
+    ["match", "match_with_diagnostics", "not_derived", "refuse"];
+
+#[derive(Debug, Deserialize)]
+struct RederivationReceipt {
+    schema_version: u32,
+    result_receipt_sha256: String,
+    verdict: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +223,8 @@ struct ActivationPlan {
     selected_build_target_count: usize,
     selection_tier: super::SelectionTier,
     stage: String,
+    #[serde(default)]
+    disposition: Option<String>,
 }
 
 pub(crate) fn validate_stale_activation_for_cleanup(
@@ -270,6 +336,22 @@ struct ResultReceipt {
     /// When the adapter wrote the receipt; an allowlist expiry is judged then.
     #[serde(default)]
     recorded_at_unix_ns: Option<u64>,
+    /// The disposition the adapter ran (keyed runs only).
+    #[serde(default)]
+    selected_execution_disposition: Option<String>,
+    /// What executable reuse would have done (keyed runs only).
+    #[serde(default)]
+    executable_reuse: Option<KeyedReuseResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyedReuseResult {
+    #[serde(default)]
+    would_skip_tests: Option<Vec<String>>,
+    #[serde(default)]
+    false_skip_count: Option<usize>,
+    #[serde(default)]
+    false_skips: Option<Vec<String>>,
 }
 
 /// The failure-set verdict: both legs failed, the selected leg failed nothing
@@ -298,20 +380,16 @@ pub fn evaluate_trial(
     identity: &TrialIdentity,
     activation: Option<ReceiptFile<'_>>,
     results: &[ReceiptFile<'_>],
+    rederivations: &[ReceiptFile<'_>],
 ) -> TrialStatus {
     let mut status = TrialStatus {
-        schema_version: TRIAL_STATUS_SCHEMA_VERSION,
-        state: TrialState::Collecting,
-        repository: identity.repository.clone(),
-        pull_request: identity.pull_request,
-        target: identity.target.clone(),
-        head_sha: identity.head_sha.clone(),
         activation_receipt: activation.map(|receipt| receipt.name.to_owned()),
         result_receipt_count: results.len(),
-        result_receipt: None,
-        timing: None,
-        shadow_disposition: None,
-        reason: "waiting_for_shadow_activation".to_owned(),
+        ..TrialStatus::new(
+            identity,
+            TrialState::Collecting,
+            "waiting_for_shadow_activation",
+        )
     };
 
     if let Err(reason) = validate_identity(identity) {
@@ -327,7 +405,18 @@ pub fn evaluate_trial(
     let Ok(activation) = serde_json::from_slice::<ActivationReceipt>(activation_file.bytes) else {
         return reject(status, None, "malformed_shadow_activation");
     };
-    if let Err(reason) = validate_activation(identity, &activation) {
+    let keyed = match activation.plan.disposition.as_deref() {
+        None | Some(super::BOUNDED) => None,
+        Some(disposition @ (super::KEYED_FULL_SHADOW | super::KEYED_BOUNDED_SHADOW)) => {
+            Some(disposition.to_owned())
+        }
+        Some(_) => return reject(status, None, "unknown_shadow_activation_disposition"),
+    };
+    let checked = match keyed.as_deref() {
+        Some(disposition) => validate_keyed_activation(identity, &activation, disposition),
+        None => validate_activation(identity, &activation),
+    };
+    if let Err(reason) = checked {
         return reject(status, None, reason);
     }
     if results.is_empty() {
@@ -336,6 +425,15 @@ pub fn evaluate_trial(
     }
     if results.len() != 1 {
         return reject(status, None, "ambiguous_shadow_results");
+    }
+    if let Some(disposition) = keyed {
+        return record_keyed(
+            status,
+            &activation.plan,
+            disposition,
+            &results[0],
+            rederivations,
+        );
     }
 
     let mut verdict = String::new();
@@ -362,18 +460,13 @@ pub fn evaluate_stale_base_terminal(
     receipt_file: ReceiptFile<'_>,
 ) -> TrialStatus {
     let mut status = TrialStatus {
-        schema_version: TRIAL_STATUS_SCHEMA_VERSION,
-        state: TrialState::Terminal,
-        repository: identity.repository.clone(),
-        pull_request: identity.pull_request,
-        target: identity.target.clone(),
-        head_sha: identity.head_sha.clone(),
-        activation_receipt: None,
-        result_receipt_count: 0,
         result_receipt: Some(receipt_file.name.to_owned()),
-        timing: None,
         shadow_disposition: Some(super::StaleBaseShadowDisposition::Invalidated),
-        reason: "malformed_stale_base_shadow_receipt".to_owned(),
+        ..TrialStatus::new(
+            identity,
+            TrialState::Terminal,
+            "malformed_stale_base_shadow_receipt",
+        )
     };
     if let Err(reason) = validate_identity(identity) {
         reason.clone_into(&mut status.reason);
@@ -655,6 +748,7 @@ pub(crate) fn rejected_trial(
         result_receipt,
         timing: None,
         shadow_disposition: None,
+        keyed: None,
         reason: reason.to_owned(),
     }
 }
@@ -680,7 +774,7 @@ fn validate_identity(identity: &TrialIdentity) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn validate_activation(
+fn validate_activation_identity(
     identity: &TrialIdentity,
     activation: &ActivationReceipt,
 ) -> Result<(), &'static str> {
@@ -705,9 +799,21 @@ fn validate_activation(
         || !valid_digest(&plan.validation_contract_digest)
         || !valid_digest(&plan.workflow_digest)
         || !valid_digest(&plan.selection_receipt_digest)
-        || !valid_digest(&plan.selected_tests_digest)
-        || !valid_optional_digest(plan.selected_build_targets_digest.as_deref())
         || !valid_digest(&plan.execution_payload_digest)
+    {
+        return Err("invalid_shadow_activation_identity_or_digest");
+    }
+    Ok(())
+}
+
+fn validate_activation(
+    identity: &TrialIdentity,
+    activation: &ActivationReceipt,
+) -> Result<(), &'static str> {
+    validate_activation_identity(identity, activation)?;
+    let plan = &activation.plan;
+    if !valid_digest(&plan.selected_tests_digest)
+        || !valid_optional_digest(plan.selected_build_targets_digest.as_deref())
         || plan.selected_count == 0
     {
         return Err("invalid_shadow_activation_identity_or_digest");
@@ -727,6 +833,177 @@ fn validate_activation(
         return Err("invalid_shadow_activation_build_target_contract");
     }
     Ok(())
+}
+
+/// The status for a keyed shadow run's single result.
+fn record_keyed(
+    mut status: TrialStatus,
+    plan: &ActivationPlan,
+    disposition: String,
+    file: &ReceiptFile<'_>,
+    rederivations: &[ReceiptFile<'_>],
+) -> TrialStatus {
+    let Ok(result) = serde_json::from_slice::<ResultReceipt>(file.bytes) else {
+        return reject(status, Some(file.name), "malformed_shadow_result");
+    };
+    let mut summary = match validate_keyed_result(plan, &disposition, &result) {
+        Ok(summary) => summary,
+        Err(reason) => return reject(status, Some(file.name), reason),
+    };
+    let bounded = disposition == super::KEYED_BOUNDED_SHADOW;
+    if bounded && let Err(reason) = validate_result(plan, &result) {
+        return reject(status, Some(file.name), reason);
+    }
+    status.result_receipt = Some(file.name.to_owned());
+    let rederivation = match rederivation_verdict(file.bytes, rederivations) {
+        Ok(Some(verdict)) => verdict,
+        Ok(None) => {
+            "waiting_for_host_rederivation".clone_into(&mut status.reason);
+            return status;
+        }
+        Err(reason) => return reject(status, Some(file.name), reason),
+    };
+    summary.rederivation = rederivation;
+    if bounded {
+        status.state = TrialState::Ready;
+        status.timing = timing(plan, &result);
+        status.reason = result.comparison_verdict;
+    } else {
+        status.state = TrialState::KeyedShadowRecorded;
+        status.reason = disposition;
+    }
+    status.keyed = Some(summary);
+    status
+}
+
+/// The host re-derivation's verdict on exactly this result, `None` while it
+/// has not run.
+fn rederivation_verdict(
+    result_bytes: &[u8],
+    receipts: &[ReceiptFile<'_>],
+) -> Result<Option<String>, &'static str> {
+    let [receipt] = receipts else {
+        return if receipts.is_empty() {
+            Ok(None)
+        } else {
+            Err("ambiguous_host_rederivation")
+        };
+    };
+    let Ok(parsed) = serde_json::from_slice::<RederivationReceipt>(receipt.bytes) else {
+        return Err("malformed_host_rederivation");
+    };
+    if parsed.schema_version != 1 || !REDERIVATION_VERDICTS.contains(&parsed.verdict.as_str()) {
+        return Err("malformed_host_rederivation");
+    }
+    if parsed.result_receipt_sha256 != sha256(result_bytes) {
+        return Err("host_rederivation_for_another_result");
+    }
+    if parsed.verdict == "refuse" {
+        return Err("host_rederivation_mismatch");
+    }
+    Ok(Some(parsed.verdict))
+}
+
+/// A keyed full run selects nothing and replaces the whole build-and-test
+/// stage; a keyed bounded run keeps the bounded plan's selection exactly.
+fn validate_keyed_activation(
+    identity: &TrialIdentity,
+    activation: &ActivationReceipt,
+    disposition: &str,
+) -> Result<(), &'static str> {
+    validate_activation_identity(identity, activation)?;
+    let plan = &activation.plan;
+    if plan.schema_version != 2 || plan.stage != "build_and_test" {
+        return Err("invalid_keyed_activation_contract");
+    }
+    let full_shape = plan.selected_count == 0
+        && plan.selected_tests_digest.is_empty()
+        && plan.selected_build_targets_digest.is_none()
+        && plan.selected_build_target_count == 0;
+    let bounded_shape = plan.selected_count != 0
+        && valid_digest(&plan.selected_tests_digest)
+        && plan
+            .selected_build_targets_digest
+            .as_deref()
+            .is_some_and(valid_digest)
+        && plan.selected_build_target_count != 0;
+    let shaped = if disposition == super::KEYED_FULL_SHADOW {
+        full_shape
+    } else {
+        bounded_shape
+    };
+    if !shaped {
+        return Err("invalid_keyed_activation_selection");
+    }
+    Ok(())
+}
+
+/// Validate a keyed shadow result against its plan. The full run is the
+/// authority: its own verdicts are recorded, never judged here, and a false
+/// skip must be a test the reuse would have skipped.
+fn validate_keyed_result(
+    plan: &ActivationPlan,
+    disposition: &str,
+    result: &ResultReceipt,
+) -> Result<KeyedShadowSummary, &'static str> {
+    validate_result_binding(plan, result)?;
+    if !result.full_authoritative {
+        return Err("full_suite_not_authoritative");
+    }
+    if result.selected_execution_disposition.as_deref() != Some(disposition) {
+        return Err("keyed_result_disposition_mismatch");
+    }
+    if disposition == super::KEYED_FULL_SHADOW {
+        if result.comparison_verdict != disposition {
+            return Err("keyed_result_disposition_mismatch");
+        }
+        if result.graduation_eligible {
+            return Err("keyed_result_claims_graduation");
+        }
+    }
+    let Some(full_build_returncode) = result.full_build_returncode else {
+        return Err("keyed_result_without_full_run");
+    };
+    // A failed build runs no tests; a passing one always reports them.
+    if result.full_returncode.is_some() != (full_build_returncode == 0) {
+        return Err("keyed_result_without_full_run");
+    }
+    let Some(reuse) = result.executable_reuse.as_ref() else {
+        return Err("keyed_result_without_executable_reuse");
+    };
+    let (would_skip_count, false_skip_count, false_skips) = match (
+        reuse.would_skip_tests.as_ref(),
+        reuse.false_skip_count,
+        reuse.false_skips.as_ref(),
+    ) {
+        (None, None, None) => (None, None, None),
+        (Some(would), Some(count), Some(false_skips)) => {
+            let would_set: std::collections::BTreeSet<&str> =
+                would.iter().map(String::as_str).collect();
+            let false_set: std::collections::BTreeSet<&str> =
+                false_skips.iter().map(String::as_str).collect();
+            if would_set.len() != would.len()
+                || false_set.len() != false_skips.len()
+                || count != false_skips.len()
+            {
+                return Err("keyed_result_counts_inconsistent");
+            }
+            if !false_set.is_subset(&would_set) {
+                return Err("keyed_result_false_skip_not_skippable");
+            }
+            (Some(would.len()), Some(count), Some(false_skips.clone()))
+        }
+        _ => return Err("keyed_result_counts_inconsistent"),
+    };
+    Ok(KeyedShadowSummary {
+        disposition: disposition.to_owned(),
+        would_skip_count,
+        false_skip_count,
+        false_skips,
+        full_returncode: result.full_returncode,
+        full_build_returncode,
+        rederivation: String::new(),
+    })
 }
 
 fn validate_result(plan: &ActivationPlan, result: &ResultReceipt) -> Result<(), &'static str> {
@@ -1055,6 +1332,14 @@ mod tests {
     }
 
     fn evaluate(activation: Option<&Value>, results: &[Value]) -> TrialStatus {
+        evaluate_with(activation, results, &[])
+    }
+
+    fn evaluate_with(
+        activation: Option<&Value>,
+        results: &[Value],
+        rederivations: &[Value],
+    ) -> TrialStatus {
         let activation_bytes = activation.map(|value| serde_json::to_vec(value).unwrap());
         let result_bytes = results
             .iter()
@@ -1072,7 +1357,41 @@ mod tests {
             .zip(&names)
             .map(|(bytes, name)| ReceiptFile { name, bytes })
             .collect::<Vec<_>>();
-        evaluate_trial(&identity(), activation_file, &result_files)
+        let rederivation_bytes = rederivations
+            .iter()
+            .map(|value| serde_json::to_vec(value).unwrap())
+            .collect::<Vec<_>>();
+        let rederivation_files = rederivation_bytes
+            .iter()
+            .map(|bytes| ReceiptFile {
+                name: "rederivation-x.json",
+                bytes,
+            })
+            .collect::<Vec<_>>();
+        evaluate_trial(
+            &identity(),
+            activation_file,
+            &result_files,
+            &rederivation_files,
+        )
+    }
+
+    /// A host re-derivation receipt for exactly `result`'s bytes.
+    fn rederived(result: &Value, verdict: &str) -> Value {
+        json!({
+            "schema_version": 1,
+            "result_receipt_sha256": sha256(&serde_json::to_vec(result).unwrap()),
+            "verdict": verdict
+        })
+    }
+
+    /// Evaluate a keyed run whose host re-derivation matched.
+    fn evaluate_keyed(activation: &Value, result: &Value) -> TrialStatus {
+        evaluate_with(
+            Some(activation),
+            std::slice::from_ref(result),
+            &[rederived(result, "match")],
+        )
     }
 
     #[test]
@@ -1353,5 +1672,258 @@ mod tests {
             result_directory(state, &first),
             result_directory(state, &second)
         );
+    }
+
+    fn keyed_full() -> (Value, Value) {
+        let mut activation = activation();
+        let plan = &mut activation["plan"];
+        plan["disposition"] = json!("keyed_full_shadow");
+        plan["selected_tests_digest"] = json!("");
+        plan["selected_build_targets_digest"] = Value::Null;
+        plan["selected_count"] = json!(0);
+        plan["selected_build_target_count"] = json!(0);
+        let mut result = result();
+        result["selected_tests_digest"] = json!("");
+        result["selected_build_targets_digest"] = Value::Null;
+        result["selected_logical_count"] = json!(0);
+        result["selected_build_target_count"] = json!(0);
+        result["comparison_verdict"] = json!("keyed_full_shadow");
+        result["selected_execution_disposition"] = json!("keyed_full_shadow");
+        result["graduation_eligible"] = json!(false);
+        result["executable_reuse"] = json!({
+            "mode": "shadow",
+            "bound": true,
+            "derived": true,
+            "would_skip_tests": ["alpha", "beta", "gamma"],
+            "false_skip_count": 1,
+            "false_skips": ["beta"]
+        });
+        (activation, result)
+    }
+
+    #[test]
+    fn a_keyed_full_run_is_recorded_as_measurement_not_readiness() {
+        let (activation, result) = keyed_full();
+        let status = evaluate_keyed(&activation, &result);
+        assert_eq!(
+            status.state,
+            TrialState::KeyedShadowRecorded,
+            "{}",
+            status.reason
+        );
+        assert_eq!(status.reason, "keyed_full_shadow");
+        let keyed = status.keyed.expect("summary");
+        assert_eq!(keyed.would_skip_count, Some(3));
+        assert_eq!(keyed.false_skip_count, Some(1));
+        assert_eq!(keyed.false_skips, Some(vec!["beta".to_owned()]));
+        assert_eq!(keyed.rederivation, "match");
+        assert_eq!(
+            serde_json::to_value(TrialState::KeyedShadowRecorded).unwrap(),
+            json!("keyed_shadow_recorded")
+        );
+    }
+
+    #[test]
+    fn a_keyed_run_waits_for_and_obeys_the_host_rederivation() {
+        let (activation, result) = keyed_full();
+        let waiting = evaluate(Some(&activation), std::slice::from_ref(&result));
+        assert_eq!(waiting.state, TrialState::Collecting);
+        assert_eq!(waiting.reason, "waiting_for_host_rederivation");
+
+        let refused = evaluate_with(
+            Some(&activation),
+            std::slice::from_ref(&result),
+            &[rederived(&result, "refuse")],
+        );
+        assert_eq!(refused.state, TrialState::Rejected);
+        assert_eq!(refused.reason, "host_rederivation_mismatch");
+
+        let mut other = result.clone();
+        other["full_duration_seconds"] = json!(21.0);
+        let elsewhere = evaluate_with(
+            Some(&activation),
+            std::slice::from_ref(&result),
+            &[rederived(&other, "match")],
+        );
+        assert_eq!(elsewhere.reason, "host_rederivation_for_another_result");
+
+        let twice = evaluate_with(
+            Some(&activation),
+            std::slice::from_ref(&result),
+            &[rederived(&result, "match"), rederived(&result, "match")],
+        );
+        assert_eq!(twice.reason, "ambiguous_host_rederivation");
+
+        let unknown = evaluate_with(
+            Some(&activation),
+            std::slice::from_ref(&result),
+            &[rederived(&result, "fine")],
+        );
+        assert_eq!(unknown.reason, "malformed_host_rederivation");
+    }
+
+    #[test]
+    fn a_keyed_run_records_a_failing_full_run_rather_than_judging_it() {
+        let (activation, mut result) = keyed_full();
+        result["full_returncode"] = json!(8);
+        let status = evaluate_keyed(&activation, &result);
+        assert_eq!(
+            status.state,
+            TrialState::KeyedShadowRecorded,
+            "{}",
+            status.reason
+        );
+        assert_eq!(status.keyed.expect("summary").full_returncode, Some(8));
+
+        let (activation, mut build_failed) = keyed_full();
+        build_failed["full_build_returncode"] = json!(2);
+        build_failed["full_returncode"] = Value::Null;
+        let status = evaluate_keyed(&activation, &build_failed);
+        assert_eq!(
+            status.state,
+            TrialState::KeyedShadowRecorded,
+            "{}",
+            status.reason
+        );
+        let keyed = status.keyed.expect("summary");
+        assert_eq!(
+            (keyed.full_build_returncode, keyed.full_returncode),
+            (2, None)
+        );
+    }
+
+    #[test]
+    fn a_keyed_run_that_derived_nothing_is_recorded_without_counts() {
+        let (activation, mut result) = keyed_full();
+        result["executable_reuse"] = json!({"mode": null, "bound": null, "derived": null,
+            "would_skip_tests": null, "false_skip_count": null, "false_skips": null});
+        let status = evaluate_keyed(&activation, &result);
+        assert_eq!(
+            status.state,
+            TrialState::KeyedShadowRecorded,
+            "{}",
+            status.reason
+        );
+        assert_eq!(status.keyed.expect("summary").would_skip_count, None);
+    }
+
+    #[test]
+    fn a_keyed_result_must_prove_its_measurement() {
+        type Mutation = fn(&mut Value);
+        let cases: [(&str, Mutation, &str); 9] = [
+            (
+                "graduation",
+                |r| r["graduation_eligible"] = json!(true),
+                "keyed_result_claims_graduation",
+            ),
+            (
+                "verdict",
+                |r| r["comparison_verdict"] = json!("matched_pass"),
+                "keyed_result_disposition_mismatch",
+            ),
+            (
+                "ran",
+                |r| r["selected_execution_disposition"] = json!("keyed_bounded_shadow"),
+                "keyed_result_disposition_mismatch",
+            ),
+            (
+                "no full",
+                |r| r["full_returncode"] = Value::Null,
+                "keyed_result_without_full_run",
+            ),
+            (
+                "tests after a failed build",
+                |r| r["full_build_returncode"] = json!(2),
+                "keyed_result_without_full_run",
+            ),
+            (
+                "no reuse",
+                |r| r["executable_reuse"] = Value::Null,
+                "keyed_result_without_executable_reuse",
+            ),
+            (
+                "count",
+                |r| r["executable_reuse"]["false_skip_count"] = json!(2),
+                "keyed_result_counts_inconsistent",
+            ),
+            (
+                "half null",
+                |r| r["executable_reuse"]["false_skips"] = Value::Null,
+                "keyed_result_counts_inconsistent",
+            ),
+            (
+                "outside",
+                |r| r["executable_reuse"]["false_skips"] = json!(["delta"]),
+                "keyed_result_false_skip_not_skippable",
+            ),
+        ];
+        for (name, mutate, reason) in cases {
+            let (activation, mut result) = keyed_full();
+            mutate(&mut result);
+            let status = evaluate_keyed(&activation, &result);
+            assert_eq!(status.state, TrialState::Rejected, "{name}");
+            assert_eq!(status.reason, reason, "{name}");
+        }
+    }
+
+    fn keyed_bounded() -> (Value, Value) {
+        let mut activation = activation();
+        activation["plan"]["disposition"] = json!("keyed_bounded_shadow");
+        let mut result = result();
+        result["selected_execution_disposition"] = json!("keyed_bounded_shadow");
+        result["executable_reuse"] =
+            json!({"would_skip_tests": ["a"], "false_skip_count": 0, "false_skips": []});
+        (activation, result)
+    }
+
+    #[test]
+    fn a_keyed_bounded_run_keeps_todays_verdict_rules_and_adds_the_keyed_block() {
+        let (activation, result) = keyed_bounded();
+        let status = evaluate_keyed(&activation, &result);
+        assert_eq!(status.state, TrialState::Ready, "{}", status.reason);
+        assert_eq!(status.reason, "matched_pass");
+        assert!(status.timing.is_some());
+        assert_eq!(status.keyed.expect("summary").would_skip_count, Some(1));
+
+        let (activation, mut failing) = keyed_bounded();
+        failing["selected_returncode"] = json!(1);
+        let status = evaluate_keyed(&activation, &failing);
+        assert_eq!(status.state, TrialState::Rejected);
+        assert_eq!(status.reason, "shadow_result_nonzero_returncode");
+
+        let (activation, mut unlabelled) = keyed_bounded();
+        unlabelled["selected_execution_disposition"] = Value::Null;
+        assert_eq!(
+            evaluate_keyed(&activation, &unlabelled).reason,
+            "keyed_result_disposition_mismatch"
+        );
+    }
+
+    #[test]
+    fn a_keyed_activation_must_have_its_dispositions_selection_shape() {
+        let (mut full_with_selection, keyed_result) = keyed_full();
+        full_with_selection["plan"]["selected_count"] = json!(6);
+        let status = evaluate_keyed(&full_with_selection, &keyed_result);
+        assert_eq!(status.reason, "invalid_keyed_activation_selection");
+
+        let (mut bounded_without_selection, _) = keyed_full();
+        bounded_without_selection["plan"]["disposition"] = json!("keyed_bounded_shadow");
+        let status = evaluate_keyed(&bounded_without_selection, &keyed_result);
+        assert_eq!(status.reason, "invalid_keyed_activation_selection");
+    }
+
+    #[test]
+    fn an_activation_disposition_is_read_from_a_closed_set() {
+        let mut bounded = activation();
+        bounded["plan"]["disposition"] = json!("bounded");
+        assert_eq!(
+            evaluate(Some(&bounded), &[result()]).state,
+            TrialState::Ready
+        );
+
+        let mut unknown = activation();
+        unknown["plan"]["disposition"] = json!("keyed_everything");
+        let status = evaluate(Some(&unknown), &[result()]);
+        assert_eq!(status.reason, "unknown_shadow_activation_disposition");
     }
 }

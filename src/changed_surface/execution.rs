@@ -184,6 +184,12 @@ pub struct AuthoritativeExecutionPlan {
     pub stage: String,
     /// Protected-base command with only the file path substituted.
     pub command: String,
+    /// `bounded`, `keyed_bounded_shadow` or `keyed_full_shadow`.
+    pub disposition: String,
+    /// The exact payload bytes `execution_payload_digest` covers, kept so a
+    /// keyed run's binding can be read back after the run.
+    #[serde(skip)]
+    pub execution_payload: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -199,13 +205,29 @@ struct AuthoritativeExecutionPayload<'a> {
     selection_receipt_digest: &'a str,
     validation_contract_digest: &'a str,
     workflow_digest: &'a str,
-    selected_tests_digest: &'a str,
-    selected_tests: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_tests_digest: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_tests: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selected_build_targets_digest: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selected_build_targets: Option<&'a [String]>,
+    /// `full` for a keyed-full plan; absent on every bounded payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disposition: Option<&'a str>,
+    /// The keyed binding the runner derives against and echoes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executable_reuse: Option<&'a super::executable_reuse::ExecutableReuseBinding>,
 }
+
+/// An ordinary bounded selection.
+pub const BOUNDED: &str = "bounded";
+/// A bounded selection that also derives executable keys (shadow).
+pub const KEYED_BOUNDED_SHADOW: &str = "keyed_bounded_shadow";
+/// The full suite, run by the adapter so it can derive executable keys
+/// first (shadow): the configured build and test, exactly, nothing skipped.
+pub const KEYED_FULL_SHADOW: &str = "keyed_full_shadow";
 
 /// Promotion error. Callers must fail closed to the full suite and retain the
 /// diagnostic; they must never treat this as bounded success.
@@ -309,7 +331,155 @@ pub fn plan_authoritative_execution(
         policy.schema_version,
         validation_contract_digest,
         workflow_digest,
+        None,
     )
+}
+
+/// Bind a keyed shadow plan: the adapter derives executable keys against
+/// `binding` before building, and every outcome still validates in full. A
+/// bounded receipt the policy may execute keeps its bounded selection
+/// (`keyed_bounded_shadow`); anything else becomes a keyed full run
+/// (`keyed_full_shadow`), whose payload carries `disposition: "full"` and no
+/// selected tests. `Ok(None)` means nothing is keyed here (a blocked plan, no
+/// execution template, another transport, or the machine kill switch), and
+/// the configured stages run as usual. Performs no I/O.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_keyed_execution(
+    receipt: &SelectionReceipt,
+    input: &ExactHeadInput,
+    policy: &ChangedSurfacePolicy,
+    binding: &super::executable_reuse::ExecutableReuseBinding,
+    machine_enabled: bool,
+    command_transport: ExecutionCommandTransport,
+    validation_contract_digest: &str,
+    workflow_digest: &str,
+) -> Result<Option<AuthoritativeExecutionPlan>, ExecutionPlanError> {
+    let derived = rederive_receipt(receipt, input, policy)?;
+    let receipt = &derived;
+    if !receipt.exact_head_verified || !receipt.shadow_only {
+        return Err(error(
+            "selection receipt is not an exact-head shadow planner receipt",
+        ));
+    }
+    let policy_digest_value = policy_digest(policy);
+    if receipt.policy_digest.as_deref() != Some(policy_digest_value.as_str()) {
+        return Err(error(
+            "selection receipt policy digest does not match protected-base policy",
+        ));
+    }
+    let Some(execution) = policy.execution.as_ref() else {
+        return Ok(None);
+    };
+    execution
+        .validate(policy.schema_version)
+        .map_err(ExecutionPlanError)?;
+    // A keyed run replaces the configured build as well as the tests, so
+    // only a build-and-test stage can carry one.
+    if execution.command.is_none()
+        || execution.stage != "build_and_test"
+        || receipt.planned_suite == PlannedSuite::Blocked
+        || !machine_enabled
+        || command_transport != ExecutionCommandTransport::PosixShell
+    {
+        return Ok(None);
+    }
+    validate_digest("validation contract", validation_contract_digest)?;
+    validate_digest("workflow", workflow_digest)?;
+    if receipt.planned_suite == PlannedSuite::Bounded && execution.mode != ExecutionMode::Shadow {
+        return match bounded_execution_plan(
+            receipt,
+            execution,
+            policy.schema_version,
+            validation_contract_digest,
+            workflow_digest,
+            Some(binding),
+        )? {
+            ExecutionDisposition::Bounded(plan) => Ok(Some(*plan)),
+            _ => Ok(None),
+        };
+    }
+    let selection_receipt = serde_json::to_vec(receipt)
+        .map_err(|failure| error(format!("serialize selection receipt: {failure}")))?;
+    let selection_receipt_digest = sha256_hex(&selection_receipt);
+    let execution_schema_version = AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION;
+    let execution_payload = serde_json::to_vec(&AuthoritativeExecutionPayload {
+        schema_version: execution_schema_version,
+        repository: &receipt.repository,
+        pull_request: receipt.pull_request,
+        target: &receipt.target,
+        base_sha: receipt.planned_base(),
+        head_sha: &receipt.head_sha,
+        tree_sha: &receipt.tree_sha,
+        policy_digest: &policy_digest_value,
+        selection_receipt_digest: &selection_receipt_digest,
+        validation_contract_digest,
+        workflow_digest,
+        selected_tests_digest: None,
+        selected_tests: None,
+        selected_build_targets_digest: None,
+        selected_build_targets: None,
+        disposition: Some("full"),
+        executable_reuse: Some(binding),
+    })
+    .map_err(|failure| error(format!("serialize keyed payload: {failure}")))?;
+    let execution_payload_digest = sha256_hex(&execution_payload);
+    let command = execution_command(
+        execution,
+        &execution_payload,
+        &execution_payload_digest,
+        "keyed",
+    )?;
+    Ok(Some(AuthoritativeExecutionPlan {
+        schema_version: execution_schema_version,
+        repository: receipt.repository.clone(),
+        pull_request: receipt.pull_request,
+        target: receipt.target.clone(),
+        base_sha: receipt.planned_base().to_owned(),
+        head_sha: receipt.head_sha.clone(),
+        tree_sha: receipt.tree_sha.clone(),
+        policy_digest: policy_digest_value,
+        changed_paths_digest: receipt.changed_paths_digest.clone(),
+        validation_contract_digest: validation_contract_digest.to_owned(),
+        workflow_digest: workflow_digest.to_owned(),
+        selection_receipt_digest,
+        selected_tests_digest: String::new(),
+        selected_build_targets_digest: None,
+        execution_payload_digest,
+        selection_tier: receipt.selection_tier,
+        selected_count: 0,
+        selected_build_target_count: 0,
+        stage: execution.stage.clone(),
+        command,
+        disposition: KEYED_FULL_SHADOW.to_owned(),
+        execution_payload,
+    }))
+}
+
+/// The protected-base command with the payload and its digest substituted,
+/// refused when it would exceed the smallest supported shell limit.
+fn execution_command(
+    execution: &ChangedSurfaceExecutionPolicy,
+    payload: &[u8],
+    payload_digest: &str,
+    kind: &str,
+) -> Result<String, ExecutionPlanError> {
+    let template = execution
+        .command
+        .as_deref()
+        .ok_or_else(|| error("authoritative command is missing"))?;
+    let command = template
+        .replacen(
+            SELECTED_TESTS_PAYLOAD_PLACEHOLDER,
+            &URL_SAFE_NO_PAD.encode(payload),
+            1,
+        )
+        .replacen(SELECTED_TESTS_DIGEST_PLACEHOLDER, payload_digest, 1);
+    if command.encode_utf16().count() > MAX_EXECUTION_COMMAND_UNITS {
+        return Err(error(format!(
+            "{kind} execution command exceeds the smallest supported shell limit"
+        )));
+    }
+    Ok(command)
 }
 
 fn rederive_receipt(
@@ -337,6 +507,7 @@ fn bounded_execution_plan(
     policy_schema_version: u32,
     validation_contract_digest: &str,
     workflow_digest: &str,
+    keyed: Option<&super::executable_reuse::ExecutableReuseBinding>,
 ) -> Result<ExecutionDisposition, ExecutionPlanError> {
     validate_digest("validation contract", validation_contract_digest)?;
     validate_digest("workflow", workflow_digest)?;
@@ -378,11 +549,13 @@ fn bounded_execution_plan(
         selection_receipt_digest: &selection_receipt_digest,
         validation_contract_digest,
         workflow_digest,
-        selected_tests_digest: &selected_tests_digest,
-        selected_tests: &receipt.selected_tests,
+        selected_tests_digest: Some(&selected_tests_digest),
+        selected_tests: Some(&receipt.selected_tests),
         selected_build_targets_digest: selected_build_targets_digest.as_deref(),
         selected_build_targets: (policy_schema_version >= 3)
             .then_some(receipt.selected_build_targets.as_slice()),
+        disposition: None,
+        executable_reuse: keyed,
     })
     .map_err(|failure| error(format!("serialize authoritative payload: {failure}")))?;
     if execution_payload.len() > MAX_SELECTED_TEST_BYTES {
@@ -391,26 +564,12 @@ fn bounded_execution_plan(
         ));
     }
     let execution_payload_digest = sha256_hex(&execution_payload);
-    let selected_tests_payload = URL_SAFE_NO_PAD.encode(&execution_payload);
-    let template = execution
-        .command
-        .as_deref()
-        .ok_or_else(|| error("authoritative command is missing"))?;
-    let command = template.replacen(
-        SELECTED_TESTS_PAYLOAD_PLACEHOLDER,
-        &selected_tests_payload,
-        1,
-    );
-    let command = command.replacen(
-        SELECTED_TESTS_DIGEST_PLACEHOLDER,
+    let command = execution_command(
+        execution,
+        &execution_payload,
         &execution_payload_digest,
-        1,
-    );
-    if command.encode_utf16().count() > MAX_EXECUTION_COMMAND_UNITS {
-        return Err(error(
-            "bounded execution command exceeds the smallest supported shell limit",
-        ));
-    }
+        "bounded",
+    )?;
     Ok(ExecutionDisposition::Bounded(Box::new(
         AuthoritativeExecutionPlan {
             schema_version: execution_schema_version,
@@ -436,6 +595,13 @@ fn bounded_execution_plan(
             selected_build_target_count: receipt.selected_build_targets.len(),
             stage: execution.stage.clone(),
             command,
+            disposition: if keyed.is_some() {
+                KEYED_BOUNDED_SHADOW
+            } else {
+                BOUNDED
+            }
+            .to_owned(),
+            execution_payload,
         },
     )))
 }
@@ -525,6 +691,7 @@ mod tests {
                     }),
             }),
             secondary_contract_digests: BTreeMap::new(),
+            executable_reuse: None,
         }
     }
 
@@ -968,6 +1135,155 @@ mod tests {
             ExecutionDisposition::Blocked {
                 reason: blocked_detail,
             }
+        );
+    }
+
+    fn binding() -> crate::changed_surface::executable_reuse::ExecutableReuseBinding {
+        crate::changed_surface::executable_reuse::ExecutableReuseBinding {
+            candidates: vec![crate::changed_surface::executable_reuse::BaseCandidate {
+                run_id: "c1-1-2".to_owned(),
+                record_sha256: DIGEST.to_owned(),
+                record_path: "/state/reuse-records/o__r/records/c1/c1-1-2".to_owned(),
+                commit: BASE.to_owned(),
+            }],
+            rules_digest: DIGEST.to_owned(),
+            derivation_code_dir: "/state/derivation/abc".to_owned(),
+            derivation_code_sha256: DIGEST.to_owned(),
+            sample_seed: DIGEST.to_owned(),
+            sample_percent: 5,
+            build_dir: "build".to_owned(),
+        }
+    }
+
+    fn build_and_test_policy(mode: ExecutionMode) -> ChangedSurfacePolicy {
+        let mut policy = fixture_policy(mode);
+        policy.schema_version = 3;
+        policy.baseline_build_targets = vec!["pulp-test-build-check".to_owned()];
+        policy.families[0].build_targets = vec!["pulp-cli".to_owned()];
+        policy.execution.as_mut().expect("execution").stage = "build_and_test".to_owned();
+        policy
+    }
+
+    fn keyed(
+        receipt: &SelectionReceipt,
+        input: &ExactHeadInput,
+        policy: &ChangedSurfacePolicy,
+        machine_enabled: bool,
+    ) -> Option<AuthoritativeExecutionPlan> {
+        plan_keyed_execution(
+            receipt,
+            input,
+            policy,
+            &binding(),
+            machine_enabled,
+            ExecutionCommandTransport::PosixShell,
+            DIGEST,
+            DIGEST,
+        )
+        .expect("keyed plan")
+    }
+
+    fn payload_of(plan: &AuthoritativeExecutionPlan) -> serde_json::Value {
+        let encoded = plan
+            .command
+            .split_whitespace()
+            .nth(2)
+            .expect("payload argument");
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).expect("base64")).expect("json")
+    }
+
+    #[test]
+    fn a_full_plan_becomes_a_keyed_full_run_with_no_selection() {
+        let policy = build_and_test_policy(ExecutionMode::Authoritative);
+        let input = fixture_input("CMakeLists.txt");
+        let receipt = fixture_receipt(&policy, &input);
+        assert_eq!(receipt.planned_suite, PlannedSuite::Full);
+        let plan = keyed(&receipt, &input, &policy, true).expect("keyed full");
+        assert_eq!(plan.disposition, KEYED_FULL_SHADOW);
+        assert_eq!(
+            (plan.selected_count, plan.selected_tests_digest.as_str()),
+            (0, "")
+        );
+        let payload = payload_of(&plan);
+        assert_eq!(payload["disposition"], "full");
+        assert_eq!(
+            payload["executable_reuse"],
+            serde_json::to_value(binding()).expect("json")
+        );
+        for absent in [
+            "selected_tests",
+            "selected_tests_digest",
+            "selected_build_targets",
+            "selected_build_targets_digest",
+        ] {
+            assert!(
+                payload.get(absent).is_none(),
+                "{absent} must not be in a full payload"
+            );
+        }
+        let raw = URL_SAFE_NO_PAD
+            .decode(
+                plan.command
+                    .split_whitespace()
+                    .nth(2)
+                    .expect("payload argument"),
+            )
+            .expect("base64");
+        assert_eq!(
+            sha256_hex(&raw),
+            plan.execution_payload_digest,
+            "the digest is over the exact bytes sent"
+        );
+    }
+
+    #[test]
+    fn a_bounded_plan_keeps_its_selection_and_binds_the_keys() {
+        let policy = build_and_test_policy(ExecutionMode::Authoritative);
+        let input = fixture_input("src/a.rs");
+        let receipt = fixture_receipt(&policy, &input);
+        let plan = keyed(&receipt, &input, &policy, true).expect("keyed bounded");
+        assert_eq!(plan.disposition, KEYED_BOUNDED_SHADOW);
+        let payload = payload_of(&plan);
+        assert!(
+            payload.get("disposition").is_none(),
+            "a bounded payload never says disposition"
+        );
+        assert!(payload.get("selected_tests").is_some());
+        assert_eq!(payload["executable_reuse"]["candidates"][0]["commit"], BASE);
+        let ExecutionDisposition::Bounded(unkeyed) =
+            fixture_execution(&receipt, &input, &policy, true).expect("bounded")
+        else {
+            panic!("expected bounded");
+        };
+        assert_eq!(unkeyed.disposition, BOUNDED);
+        assert_ne!(
+            unkeyed.execution_payload_digest, plan.execution_payload_digest,
+            "the binding is bound"
+        );
+    }
+
+    #[test]
+    fn nothing_is_keyed_when_the_plan_cannot_run_the_adapter() {
+        let policy = build_and_test_policy(ExecutionMode::Authoritative);
+        let input = fixture_input("CMakeLists.txt");
+        let receipt = fixture_receipt(&policy, &input);
+        assert!(keyed(&receipt, &input, &policy, true).is_some(), "control");
+        assert!(
+            keyed(&receipt, &input, &policy, false).is_none(),
+            "machine kill switch"
+        );
+        let tests_only = fixture_policy(ExecutionMode::Authoritative);
+        let receipt_tests_only = fixture_receipt(&tests_only, &input);
+        assert!(
+            keyed(&receipt_tests_only, &input, &tests_only, true).is_none(),
+            "a test-only stage cannot replace the build"
+        );
+        let mut shadow = build_and_test_policy(ExecutionMode::Shadow);
+        shadow.execution.as_mut().expect("execution").command = None;
+        let receipt = fixture_receipt(&shadow, &input);
+        assert!(
+            keyed(&receipt, &input, &shadow, true).is_none(),
+            "no command template"
         );
     }
 

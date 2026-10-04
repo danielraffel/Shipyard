@@ -1178,6 +1178,35 @@ pub(crate) enum ReuseCommand {
     /// Dry run unless `--apply`; a reason the issue already records is not
     /// added again.
     Trip(ReuseTripArgs),
+    /// Re-derive one keyed shadow run on this host and record the verdict in
+    /// its trial directory. A result already re-derived is left alone; the
+    /// second refusal on this host turns live reuse off.
+    Rederive(ReuseRederiveArgs),
+    /// Re-derive the newest keyed runs on this host that have no verdict yet.
+    RederiveSweep(ReuseRederiveSweepArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReuseRederiveArgs {
+    /// Owner/repo slug. Defaults to the current checkout's repository.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// Pull request number.
+    #[arg(long)]
+    pub(crate) pr: u64,
+    /// Target name.
+    #[arg(long)]
+    pub(crate) target: String,
+    /// Exact head SHA the run validated.
+    #[arg(long)]
+    pub(crate) head: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReuseRederiveSweepArgs {
+    /// Most runs to re-derive in this pass.
+    #[arg(long, default_value_t = 8)]
+    pub(crate) cap: usize,
 }
 
 #[derive(Debug, Args)]
@@ -3568,6 +3597,36 @@ mod tests {
             Cli::try_parse_from(["shipyard", "queue-observe", "--follow", "--max-polls", "1",])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn reuse_rederive_names_one_exact_run_and_the_sweep_is_capped() {
+        let cli = Cli::try_parse_from([
+            "shipyard", "reuse", "rederive", "--pr", "7", "--target", "mac", "--head", "abc",
+        ])
+        .expect("rederive");
+        let Command::Reuse { command } = cli.command else {
+            panic!("expected reuse");
+        };
+        let super::ReuseCommand::Rederive(args) = *command else {
+            panic!("expected rederive");
+        };
+        assert_eq!(
+            (args.pr, args.target.as_str(), args.head.as_str()),
+            (7, "mac", "abc")
+        );
+        assert!(
+            Cli::try_parse_from([
+                "shipyard", "reuse", "rederive", "--pr", "7", "--target", "mac"
+            ])
+            .is_err(),
+            "the exact head is required"
+        );
+        let cli = Cli::try_parse_from(["shipyard", "reuse", "rederive-sweep"]).expect("sweep");
+        let Command::Reuse { command } = cli.command else {
+            panic!("expected reuse");
+        };
+        assert!(matches!(*command, super::ReuseCommand::RederiveSweep(ref a) if a.cap == 8));
     }
 
     #[test]

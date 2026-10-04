@@ -82,7 +82,9 @@ pub(super) fn changed_surface_trial_status_command<W: Write>(
             Some(crate::changed_surface::StaleBaseShadowDisposition::Invalidated),
         )
         | (TrialState::Rejected, _) => ExitCode::from(1),
-        (TrialState::Ready | TrialState::Terminal, _) => ExitCode::SUCCESS,
+        (TrialState::Ready | TrialState::Terminal | TrialState::KeyedShadowRecorded, _) => {
+            ExitCode::SUCCESS
+        }
         (TrialState::Collecting, _) => ExitCode::from(3),
     })
 }
@@ -209,8 +211,30 @@ where
         .iter()
         .map(|(name, bytes)| ReceiptFile { name, bytes })
         .collect::<Vec<_>>();
-    let status = evaluate_trial(identity, activation, &result_files);
-    if status.state != TrialState::Ready {
+    let rederivations = match read_named_receipts(
+        result_dir,
+        crate::changed_surface::trial::REDERIVATION_RECEIPT_PREFIX,
+    ) {
+        Ok(receipts) => receipts,
+        Err(failure) => {
+            return rejected_trial(
+                identity,
+                Some(ACTIVATION_RECEIPT.to_owned()),
+                results.len(),
+                failure.receipt,
+                failure.reason,
+            );
+        }
+    };
+    let rederivation_files = rederivations
+        .iter()
+        .map(|(name, bytes)| ReceiptFile { name, bytes })
+        .collect::<Vec<_>>();
+    let status = evaluate_trial(identity, activation, &result_files, &rederivation_files);
+    if !matches!(
+        status.state,
+        TrialState::Ready | TrialState::KeyedShadowRecorded
+    ) {
         return status;
     }
 
@@ -239,7 +263,15 @@ where
             );
         }
     };
-    if final_activation != activation_bytes || final_results != results {
+    let final_rederivations = read_named_receipts(
+        result_dir,
+        crate::changed_surface::trial::REDERIVATION_RECEIPT_PREFIX,
+    )
+    .ok();
+    if final_activation != activation_bytes
+        || final_results != results
+        || final_rederivations.as_ref() != Some(&rederivations)
+    {
         return rejected_trial(
             identity,
             final_activation
@@ -636,6 +668,7 @@ fn emit_status<W: Write>(
                 TrialState::Ready => "ready",
                 TrialState::Terminal => "terminal",
                 TrialState::Rejected => "rejected",
+                TrialState::KeyedShadowRecorded => "keyed_shadow_recorded",
             },
             status.repository,
             status.pull_request,

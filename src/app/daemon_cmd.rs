@@ -735,6 +735,7 @@ fn daemon_run_with_repos(
     runtime_paths: &RuntimePaths,
     repos: Vec<String>,
 ) -> Result<ExitCode, CliFailure> {
+    spawn_rederive_sweep(mode, runtime_paths);
     match run_blocking(DaemonRunConfig {
         mode,
         global_dir: runtime_paths.global_dir.clone(),
@@ -747,6 +748,41 @@ fn daemon_run_with_repos(
         }
         Err(error) => Err(CliFailure::new(1, error.to_string())),
     }
+}
+
+/// Keyed runs left without a host re-derivation, at most this many, are
+/// picked up when the daemon starts.
+const STARTUP_REDERIVE_CAP: usize = 8;
+
+/// Re-derive, in the background, keyed runs whose completion path never
+/// recorded a verdict (a crash, a restart). Each trip, if any, runs `gh` with
+/// the configuration of the checkout that ran the keyed run.
+fn spawn_rederive_sweep(mode: RuntimeMode, runtime_paths: &RuntimePaths) {
+    let state_dir = runtime_paths.state_dir.clone();
+    let global_dir = runtime_paths.global_dir.clone();
+    std::thread::spawn(move || {
+        let gh = |checkout: &Path, args: &[String]| {
+            let config = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
+                mode,
+                checkout,
+                global_dir.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            crate::cloud::GitHubActions::from_loaded_config(checkout, &config)
+                .run_gh(args)
+                .map_err(|error| error.to_string())
+        };
+        for (identity, outcome) in
+            super::reuse_rederive::sweep(&state_dir, STARTUP_REDERIVE_CAP, &gh)
+        {
+            if let Err(error) = outcome {
+                eprintln!(
+                    "shipyard daemon: host re-derivation of {} PR #{} {} at {} failed: {error}",
+                    identity.repository, identity.pull_request, identity.target, identity.head_sha
+                );
+            }
+        }
+    });
 }
 
 fn render_daemon_start<W: Write>(

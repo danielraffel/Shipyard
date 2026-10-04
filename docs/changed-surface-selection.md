@@ -355,7 +355,14 @@ The command is read-only and reports one stable state under `trial.state`:
 - `rejected` (exit 1): evidence is malformed, unsafe to read, non-passing,
   identity/digest-inconsistent, or ambiguous. More than one append-only result
   for the exact identity is intentionally ambiguous even if the files are
-  byte-equivalent.
+  byte-equivalent;
+- `keyed_shadow_recorded` (exit 0): an executable-keyed full shadow run (see
+  [Executable-keyed shadow runs](#executable-keyed-shadow-runs)) recorded what
+  reuse would have skipped and its host re-derivation agreed. It is
+  measurement, never `ready` and never graduation evidence. A keyed run
+  without its re-derivation receipt stays `collecting`
+  (`waiting_for_host_rederivation`); a refused one is `rejected`
+  (`host_rederivation_mismatch`).
 
 `matched_fail` is the failure-set verdict for a lane whose full suite is not
 green. Both test legs failed and both builds succeeded, and Shipyard recomputes
@@ -497,18 +504,19 @@ when it holds a non-empty `job.json` that parses, and removed otherwise. The
 run log ends with one `=== reuse-record: ... ===` line saying which. The store
 keeps the newest 40 records.
 
-`reuse_record_store::select_base` chooses the record a plan compares against:
-the newest one whose platform (architecture and OS family), then toolchain, are
-stated and equal the plan's, that passes the record format's own usability
-rules, and whose commit is an ancestor of the plan's protected base. Platform
-is checked first because a record from another OS or architecture can carry a
-plausible-looking toolchain string. An empty or `unknown` value is unstated,
-and an unstated platform or toolchain is a refusal, never a match. A record
-from a commit that has not merged is never chosen, since the code that wrote
-it is unreviewed. "Merged" means the commit is an ancestor of the protected
-base, which holds for a pull request's own commits only when it lands with a
-merge commit; a squash or rebase landing rewrites them, so their records are
-never chosen. The project supplies how to read its records through the
+`reuse_record_store::select_candidates` lists the records a plan may compare
+against, newest first and capped: each states the plan's platform (architecture
+and OS family) and some toolchain, passes the record format's own usability
+rules, and has a commit that is an ancestor of the plan's protected base.
+Platform is checked first because a record from another OS or architecture can
+carry a plausible-looking toolchain string. An empty or `unknown` value is
+unstated, and an unstated platform or toolchain is a refusal, never a match.
+Which candidate's toolchain matches is left to the lane, which alone knows the
+toolchain it configured. A record from a commit that has not merged is never
+listed, since the code that wrote it is unreviewed. "Merged" means the commit
+is an ancestor of the protected base, which holds for a pull request's own
+commits only when it lands with a merge commit; a squash or rebase landing
+rewrites them, so their records are never listed. The project supplies how to read its records through the
 `BaseCriteria` trait; when nothing qualifies the caller gets a count per
 refusal reason. A pending directory left by a run that never reached filing (a
 cancelled run, or a killed process) is removed after a day.
@@ -518,3 +526,126 @@ also write into the store directly. The merged-commit rule limits which records
 a plan trusts, but a record's bytes are only as trustworthy as the lane; that is
 why live reuse runs only in a non-required lane, with a sampled re-run behind
 it.
+
+## Executable-keyed shadow runs
+
+A target's protected-base `changed_surface_selection` may declare
+`executable_reuse`, the inputs for keying each test executable against a base
+reuse record:
+
+```toml
+[targets.mac.changed_surface_selection.executable_reuse]
+switch_variable = "PULP_REUSE_LIVE"
+derivation_paths = ["tools/ci/executable_keys.py", "tools/ci/reuse_record.py"]
+build_dir = "build"
+platform_probe = ["python3", "-I", "tools/ci/executable_keys.py", "--print-toolchain", "--build-dir", "{build_dir}"]
+rederive = [
+    ["python3", "-I", "tools/ci/executable_keys.py", "--source-root", "{source_root}", "--out", "{out_dir}/executable-keys.json"],
+    ["python3", "-I", "tools/ci/executable_selection.py", "--manifest", "{out_dir}/executable-keys.json", "--out", "{out_dir}/selection.json"],
+]
+sample_percent = 5
+
+[targets.mac.changed_surface_selection.executable_reuse.base_record]
+platform = "/platform"
+toolchain = "/toolchain/digest"
+require = [
+    { pointer = "/toolchain/complete", equals = true },
+    { pointer = "/dirty", equals = false },
+    { pointer = "/suites/full", present = true },
+]
+```
+
+(The `rederive` lines are abbreviated; each passes the run's inputs through
+the placeholders listed below.)
+
+Every `derivation_paths` entry is a plain repository-relative file. Shipyard
+reads that list only from the protected base and treats each entry as selector
+policy, so a head that edits the key code, or drops a path from the list,
+still copies the base's file and forces the full suite. `base_record` names
+where a record's `job.json` states its platform, toolchain and other facts;
+`require` is checked in order and the first failure names the refusal.
+
+### Binding before any stage
+
+On a `shadow_compare` host, for a full or bounded plan that is neither blocked
+nor a stale-base comparison, and only for a `build_and_test` stage, the ship
+path:
+
+1. copies `derivation_paths` from the planned base, byte for byte, into a
+   content-addressed directory under `<state>/executable-reuse/derivation`,
+   re-verifying any directory it reuses;
+2. runs `platform_probe` from that directory, with `{build_dir}` replaced by
+   the lane's absolute build directory, and reads only the platform from it;
+3. binds a candidate set: up to eight records from the target's host-local
+   store, newest first, each stating that platform and some toolchain, passing
+   `require`, and from a commit that is an ancestor of the planned base, each
+   with its run id, content digest, path and commit;
+4. binds the rules digest, the derivation code's directory and digest, a sample
+   seed over head, policy and the candidates' digests (so the sample does not
+   depend on which candidate is picked), the sample percentage and the build
+   directory into the execution payload.
+
+The toolchain is not compared here. Only the lane, after it configures this
+head, knows the toolchain it builds with: it picks the first candidate whose
+toolchain equals its own and names its pick in the result. When none does,
+nothing is keyed and every test runs.
+
+A full plan becomes `keyed_full_shadow`: the adapter runs the configured build
+and full test commands exactly, with their own verdict, and reports which tests
+reuse would have skipped and which of those failed (`false_skips`). A bounded
+plan becomes `keyed_bounded_shadow`, keeps its selection exactly, and is judged
+by the ordinary `matched_pass` / `matched_fail` rules plus the keyed block.
+When no record qualifies, or binding or planning fails, the configured stages
+run unchanged and a categorized diagnostic (`executable_reuse_no_store`,
+`executable_reuse_no_base`, `executable_reuse_bind_error`,
+`executable_reuse_not_runnable`, `executable_reuse_plan_error`) is written to
+the trial directory. Nothing in this section skips any work; the switch
+variable governs only a future live mode.
+
+### Host re-derivation
+
+The runner leaves its inputs (`ctest-listing.json`, `toolchain.json`,
+`codemodel-digest.json`) and outputs (`executable-keys.json`,
+`selection.json`) in the trial directory, with each file's sha256 in the
+result's `executable_reuse.derived`. After the run, Shipyard:
+
+1. checks the activation's payload digest against the payload it kept, and the
+   base policy's digest against the plan's;
+2. refuses a pick that is not in the bound candidate set, or a picked record
+   whose content no longer has its bound digest;
+3. re-reads the key code from the base and requires the bound digest, then
+   re-verifies the materialized directory;
+4. copies the five files read-only into `<state>/executable-reuse/rederive/`,
+   each checked against its stated hash;
+5. runs each `rederive` command from the derivation directory under the
+   placeholders `{source_root}`, `{base_sha}` (the pick's commit), `{head_sha}`,
+   `{base_record_dir}`, `{base_record_run_id}`, `{result_dir}` (the read-only
+   copies), `{build_dir}`, `{out_dir}`, `{sample_seed}` and `{sample_percent}`;
+6. compares the host's manifest and selection with the runner's: the selection
+   must match byte for byte, and the manifests may differ only in run-specific
+   producer fields and `unknown:` nonces.
+
+It writes one `rederivation-<result sha256>.json` (`match`,
+`match_with_diagnostics`, `not_derived` or `refuse`, with the reason, the pick
+and who produced it) into the trial directory. Both ship completion paths run
+it just before merge readiness is decided; its verdict never changes a shadow
+run's merge. A result is re-derived at most once. Each refusal is counted per
+host and repository, once per (head, result), in
+`<state>/executable-reuse/refusals.json`; the second one turns live reuse off
+(the switch first, then the tracking issue). When a completion path does not
+record a verdict (a crash, a restart), the daemon re-derives the newest eight
+such runs when it starts, and an operator can run either step:
+
+```bash
+shipyard reuse rederive --pr 123 --target mac --head "$EXACT_PR_HEAD"
+shipyard reuse rederive-sweep --cap 8
+```
+
+`changed-surface-trial-status` accepts a keyed activation only from the closed
+set above. A keyed result must echo its disposition as
+`selected_execution_disposition` (and, for a full run, as
+`comparison_verdict`, with `graduation_eligible = false`), carry the full
+build's return code and, when the build passed, the full tests' return code,
+and either report nothing derived or list `false_skips` as a subset of
+`would_skip_tests` with a matching count. The full run's own return codes are
+recorded in `trial.keyed`, not judged.

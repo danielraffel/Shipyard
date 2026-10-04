@@ -58,6 +58,7 @@ mod release_bot_cmd;
 mod reroute_cmd;
 mod rescue_cmd;
 mod reuse_cmd;
+mod reuse_rederive;
 mod run_cmd;
 mod runner_cmd;
 mod runner_kill_cmd;
@@ -590,7 +591,14 @@ where
                 runtime_paths.global_dir.clone(),
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            return reuse_cmd::reuse_command(*command, &config, &cwd, cli.json, stdout);
+            return reuse_cmd::reuse_command(
+                *command,
+                &config,
+                &cwd,
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
         }
         Command::ChangedSurfacePlan {
             target,

@@ -11,11 +11,12 @@
 //! non-empty `job.json` that parses; otherwise it is removed and the reason
 //! returned for the run log. The store keeps the newest [`KEEP`] records.
 //!
-//! [`select_base`] picks the record a plan compares against: the newest one
-//! whose platform and toolchain are stated and equal the plan's, that passes
-//! the record format's own usability rules, and whose commit is an ancestor of
-//! the plan's protected base. A record from a commit that is not yet merged is
-//! never chosen: the code that wrote it is unreviewed. A pending directory a
+//! [`select_candidates`] lists the records a plan may compare against: newest
+//! first, each stating the plan's platform and some toolchain, passing the
+//! record format's own usability rules, and from a commit that is an ancestor
+//! of the plan's protected base. The toolchain match is left to the lane,
+//! which alone knows its configured toolchain. A record from a commit that is
+//! not yet merged is never listed: the code that wrote it is unreviewed. A pending directory a
 //! cancelled run left behind is swept after [`PENDING_MAX_AGE`].
 
 use std::fs;
@@ -200,8 +201,6 @@ pub struct Refusals {
     pub other_platform: usize,
     /// It does not state its toolchain, or states it as unknown.
     pub unknown_toolchain: usize,
-    /// Its toolchain differs from the plan's.
-    pub other_toolchain: usize,
     /// It fails the record format's own usability rules.
     pub unusable: usize,
     /// Its commit is not an ancestor of the protected base.
@@ -240,40 +239,47 @@ fn stated(value: Option<String>) -> Option<String> {
     })
 }
 
-/// Choose the plan's base record: the newest one whose platform, then
-/// toolchain, are stated and equal `want_platform` and `want_toolchain`, that
-/// passes the format's usability rules, and whose commit is merged. Platform
-/// is checked first, since a record from another OS or architecture can carry
-/// a plausible-looking toolchain.
+/// The records a plan may key against, newest first and at most `cap`: each
+/// states `want_platform` and some toolchain, passes the format's usability
+/// rules, and has a merged commit. Platform is checked first, since a record
+/// from another OS or architecture can carry a plausible-looking toolchain.
+/// Which candidate's toolchain matches is decided by the lane after its
+/// configure, the only point that knows the toolchain it built with.
 ///
 /// # Errors
 ///
 /// [`NoBase`] saying why nothing qualified.
-pub fn select_base<C: BaseCriteria>(
+pub fn select_candidates<C: BaseCriteria>(
     store: &Path,
     want_platform: &str,
-    want_toolchain: &str,
     criteria: &C,
-) -> Result<StoredRecord, NoBase> {
+    cap: usize,
+) -> Result<Vec<StoredRecord>, NoBase> {
     let records = list(store);
     if records.is_empty() {
         return Err(NoBase::Empty);
     }
     let mut refused = Refusals::default();
+    let mut candidates = Vec::new();
     for record in records {
+        if candidates.len() == cap {
+            break;
+        }
         match stated(criteria.platform(&record.job)) {
             None => refused.unknown_platform += 1,
             Some(platform) if platform != want_platform => refused.other_platform += 1,
-            Some(_) => match stated(criteria.toolchain(&record.job)) {
-                None => refused.unknown_toolchain += 1,
-                Some(toolchain) if toolchain != want_toolchain => refused.other_toolchain += 1,
-                Some(_) if criteria.unusable(&record).is_some() => refused.unusable += 1,
-                Some(_) if !criteria.merged(&record.commit) => refused.not_merged += 1,
-                Some(_) => return Ok(record),
-            },
+            Some(_) if stated(criteria.toolchain(&record.job)).is_none() => {
+                refused.unknown_toolchain += 1;
+            }
+            Some(_) if criteria.unusable(&record).is_some() => refused.unusable += 1,
+            Some(_) if !criteria.merged(&record.commit) => refused.not_merged += 1,
+            Some(_) => candidates.push(record),
         }
     }
-    Err(NoBase::NoneQualify(refused))
+    if candidates.is_empty() {
+        return Err(NoBase::NoneQualify(refused));
+    }
+    Ok(candidates)
 }
 
 #[cfg(test)]
