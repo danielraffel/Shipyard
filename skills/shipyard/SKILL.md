@@ -838,6 +838,11 @@ Separately, one sampled failure, one false skip or one would-skip executable
 rebuilt to different bytes trips the switch at once (`trip_reasons` and
 `key_blind_candidates` on the receipt); a null field is no information, not a
 pass and not a trip.
+A re-ship of a head whose stored activation differs from the keyed one it
+would write (the store gained a record, or the head first ran unkeyed) runs
+unkeyed with an `activation_conflict` diagnostic instead of failing; look for
+`activation_conflicts` in trial status before calling such a head's lane
+"unkeyed for no reason".
 `shipyard --json reuse records --target <t>` answers "could a keyed plan bind
 anything on this host right now?" with the same rules the ship path uses; read
 its `no_base` refusal counts before assuming the store is empty. `records[]`
