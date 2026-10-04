@@ -802,6 +802,39 @@ pub(super) fn apply_changed_surface_execution(
                 },
             )?;
         } else {
+            let planned = activation_bytes(&activation)?;
+            if let Ok(existing) =
+                fs::read(result_dir.join(activation_file_name(activation.machine_mode)))
+            {
+                let context = fs::read(
+                    result_dir
+                        .join(crate::changed_surface::executable_reuse::KEYED_CONTEXT_RECEIPT),
+                )
+                .ok();
+                if let Some(conflict) = activation_conflict(
+                    &existing,
+                    &planned,
+                    context.as_deref(),
+                    &plan.execution_payload,
+                ) {
+                    // A keyed shadow never breaks a ship: record why this head
+                    // runs its configured stages unkeyed, and move on.
+                    persist_fallback_diagnostic(
+                        &result_dir,
+                        &ActivationConflictDiagnostic {
+                            schema_version: 1,
+                            repository: repo,
+                            pull_request: pr,
+                            target: &target.name,
+                            machine_mode: machine.mode,
+                            category: "activation_conflict",
+                            status: "unkeyed: activation_conflict",
+                            conflict: &conflict,
+                        },
+                    )?;
+                    continue;
+                }
+            }
             persist_activation(&result_dir, &activation)?;
             if plan.disposition != crate::changed_surface::BOUNDED {
                 persist_named_receipt(
@@ -1103,15 +1136,132 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
+fn activation_file_name(mode: MachineMode) -> String {
+    format!("activation-{}.json", mode.as_str())
+}
+
+/// The exact bytes an activation receipt is stored as.
+fn activation_bytes(receipt: &ActivationReceipt<'_>) -> Result<Vec<u8>, CliFailure> {
+    let mut payload = serde_json::to_vec_pretty(receipt)
+        .map_err(|error| CliFailure::new(1, format!("serialize selector activation: {error}")))?;
+    payload.push(b'\n');
+    Ok(payload)
+}
+
+/// Why a head's stored activation differs from the one this ship would
+/// write, when either is keyed. A keyed plan binds the host's candidate
+/// records at ship time, so the same head re-shipped after the store changes,
+/// or first shipped before a base existed, plans differently.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct ActivationConflict {
+    existing_payload_sha256: Option<String>,
+    planned_payload_sha256: Option<String>,
+    differing_fields: Vec<String>,
+}
+
+/// Compare a stored activation with the one this ship would write. `None`
+/// when they are identical, or when neither is keyed (an unkeyed plan that
+/// changed is still refused, as before).
+fn activation_conflict(
+    existing_activation: &[u8],
+    planned_activation: &[u8],
+    existing_context: Option<&[u8]>,
+    planned_payload: &[u8],
+) -> Option<ActivationConflict> {
+    if existing_activation == planned_activation {
+        return None;
+    }
+    let parse = |bytes: &[u8]| serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    let existing = parse(existing_activation).unwrap_or_default();
+    let planned = parse(planned_activation).unwrap_or_default();
+    let plan_field =
+        |value: &serde_json::Value, key: &str| value.pointer(&format!("/plan/{key}")).cloned();
+    let keyed = |value: &serde_json::Value| {
+        plan_field(value, "disposition")
+            .and_then(|d| d.as_str().map(|d| d.starts_with("keyed_")))
+            .unwrap_or(false)
+    };
+    if !keyed(&existing) && !keyed(&planned) {
+        return None;
+    }
+    let mut differing = Vec::new();
+    for key in [
+        "disposition",
+        "base_sha",
+        "policy_digest",
+        "selection_receipt_digest",
+        "selected_tests_digest",
+        "execution_payload_digest",
+    ] {
+        if plan_field(&existing, key) != plan_field(&planned, key) {
+            differing.push(key.to_owned());
+        }
+    }
+    let existing_binding = existing_context
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(|context| {
+            context
+                .get("execution_payload_b64")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|b64| {
+                    base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b64)
+                        .ok()
+                })
+        })
+        .and_then(|payload| parse(&payload))
+        .and_then(|payload| payload.get("executable_reuse").cloned());
+    let planned_binding =
+        parse(planned_payload).and_then(|payload| payload.get("executable_reuse").cloned());
+    match (&existing_binding, &planned_binding) {
+        (Some(old), Some(new)) => {
+            for key in [
+                "candidates",
+                "sample_seed",
+                "rules_digest",
+                "derivation_code_sha256",
+            ] {
+                if old.get(key) != new.get(key) {
+                    differing.push(format!("executable_reuse.{key}"));
+                }
+            }
+        }
+        (None, None) => {}
+        _ => differing.push("executable_reuse".to_owned()),
+    }
+    if differing.is_empty() {
+        differing.push("activation".to_owned());
+    }
+    let digest = |value: &serde_json::Value| {
+        plan_field(value, "execution_payload_digest").and_then(|d| d.as_str().map(str::to_owned))
+    };
+    Some(ActivationConflict {
+        existing_payload_sha256: digest(&existing),
+        planned_payload_sha256: digest(&planned),
+        differing_fields: differing,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct ActivationConflictDiagnostic<'a> {
+    schema_version: u32,
+    repository: &'a str,
+    pull_request: u64,
+    target: &'a str,
+    machine_mode: MachineMode,
+    category: &'a str,
+    status: &'a str,
+    #[serde(flatten)]
+    conflict: &'a ActivationConflict,
+}
+
 fn persist_activation(path: &Path, receipt: &ActivationReceipt<'_>) -> Result<(), CliFailure> {
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::create_dir_all(path).map_err(|error| {
         CliFailure::new(1, format!("create selector evidence directory: {error}"))
     })?;
-    let payload = serde_json::to_vec_pretty(receipt)
-        .map_err(|error| CliFailure::new(1, format!("serialize selector activation: {error}")))?;
-    let destination = path.join(format!("activation-{}.json", receipt.machine_mode.as_str()));
+    let payload = activation_bytes(receipt)?;
+    let destination = path.join(activation_file_name(receipt.machine_mode));
     match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1119,7 +1269,6 @@ fn persist_activation(path: &Path, receipt: &ActivationReceipt<'_>) -> Result<()
     {
         Ok(mut file) => {
             file.write_all(&payload)
-                .and_then(|()| file.write_all(b"\n"))
                 .and_then(|()| file.sync_all())
                 .map_err(|error| {
                     CliFailure::new(1, format!("write selector activation: {error}"))
@@ -1129,9 +1278,7 @@ fn persist_activation(path: &Path, receipt: &ActivationReceipt<'_>) -> Result<()
             let existing = fs::read(&destination).map_err(|error| {
                 CliFailure::new(1, format!("read existing selector activation: {error}"))
             })?;
-            let mut expected = payload;
-            expected.push(b'\n');
-            if existing != expected {
+            if existing != payload {
                 return Err(CliFailure::new(
                     1,
                     "immutable selector activation receipt already exists with different bytes",
@@ -1185,9 +1332,9 @@ fn merge_base_promotion_refusal(
     }
 }
 
-fn persist_fallback_diagnostic(
+fn persist_fallback_diagnostic<T: Serialize>(
     path: &Path,
-    diagnostic: &FallbackDiagnostic<'_>,
+    diagnostic: &T,
 ) -> Result<(), CliFailure> {
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -1848,5 +1995,104 @@ mod tests {
             Some(&FallbackReason::StaleBase),
             &full
         ));
+    }
+
+    fn activation_json(disposition: &str, payload_digest: &str) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 2,
+            "machine_mode": "shadow_compare",
+            "plan": {
+                "disposition": disposition,
+                "base_sha": "b".repeat(40),
+                "policy_digest": "p".repeat(64),
+                "selection_receipt_digest": "s".repeat(64),
+                "selected_tests_digest": "",
+                "execution_payload_digest": payload_digest,
+            }
+        }))
+        .expect("activation");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn keyed_payload(candidates: &[&str], seed: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"executable_reuse": {
+            "candidates": candidates.iter().map(|run| serde_json::json!({"run_id": run})).collect::<Vec<_>>(),
+            "sample_seed": seed,
+            "rules_digest": "r",
+            "derivation_code_sha256": "d",
+        }}))
+        .expect("payload")
+    }
+
+    fn context_for(payload: &[u8]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "execution_payload_b64": base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                payload,
+            )
+        }))
+        .expect("context")
+    }
+
+    #[test]
+    fn a_head_reshipped_after_a_new_record_conflicts_on_its_candidates() {
+        use super::activation_conflict;
+        let first = keyed_payload(&["r1"], "seed1");
+        let second = keyed_payload(&["r2", "r1"], "seed2");
+        let conflict = activation_conflict(
+            &activation_json("keyed_full_shadow", "aaaa"),
+            &activation_json("keyed_full_shadow", "bbbb"),
+            Some(&context_for(&first)),
+            &second,
+        )
+        .expect("a conflict");
+        assert_eq!(conflict.existing_payload_sha256.as_deref(), Some("aaaa"));
+        assert_eq!(conflict.planned_payload_sha256.as_deref(), Some("bbbb"));
+        assert_eq!(
+            conflict.differing_fields,
+            [
+                "execution_payload_digest",
+                "executable_reuse.candidates",
+                "executable_reuse.sample_seed"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_head_first_shipped_unkeyed_conflicts_once_a_base_exists() {
+        use super::activation_conflict;
+        let conflict = activation_conflict(
+            &activation_json("bounded", "aaaa"),
+            &activation_json("keyed_bounded_shadow", "bbbb"),
+            None,
+            &keyed_payload(&["r1"], "seed"),
+        )
+        .expect("a conflict");
+        assert_eq!(
+            conflict.differing_fields,
+            [
+                "disposition",
+                "execution_payload_digest",
+                "executable_reuse"
+            ]
+        );
+    }
+
+    #[test]
+    fn identical_or_wholly_unkeyed_activations_are_not_a_keyed_conflict() {
+        use super::activation_conflict;
+        let same = activation_json("keyed_full_shadow", "aaaa");
+        assert!(activation_conflict(&same, &same, None, b"{}").is_none());
+        assert!(
+            activation_conflict(
+                &activation_json("bounded", "aaaa"),
+                &activation_json("bounded", "bbbb"),
+                None,
+                b"{}"
+            )
+            .is_none(),
+            "an unkeyed plan that changed is still refused"
+        );
     }
 }

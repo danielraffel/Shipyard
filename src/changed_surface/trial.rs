@@ -89,6 +89,11 @@ pub struct TrialStatus {
     /// What a keyed shadow run measured, when one was recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyed: Option<KeyedShadowSummary>,
+    /// Ships of this head that ran their configured stages unkeyed because
+    /// the stored activation differed from the keyed one they would have
+    /// written (`unkeyed: activation_conflict`), oldest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub activation_conflicts: Vec<serde_json::Value>,
     /// Stable bounded reason for the current state.
     pub reason: String,
 }
@@ -109,6 +114,7 @@ impl TrialStatus {
             timing: None,
             shadow_disposition: None,
             keyed: None,
+            activation_conflicts: Vec::new(),
             reason: reason.to_owned(),
         }
     }
@@ -754,6 +760,7 @@ pub(crate) fn rejected_trial(
         timing: None,
         shadow_disposition: None,
         keyed: None,
+        activation_conflicts: Vec::new(),
         reason: reason.to_owned(),
     }
 }

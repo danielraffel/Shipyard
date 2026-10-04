@@ -1761,4 +1761,50 @@ supported_build_types = ["debug"]
         assert_eq!(key_blind_candidates(&result, None), ["test/x"]);
         assert!(key_blind_candidates(&json!({}), None).is_empty());
     }
+
+    #[test]
+    fn an_activation_conflict_is_never_a_refusal() {
+        // A conflicting re-ship runs its configured stages unkeyed and writes
+        // no result, so the host has nothing to re-derive for it: the head
+        // reads as not keyed (an earlier unkeyed activation) or as no result
+        // yet (an earlier keyed one), and nothing is counted or tripped.
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let gh = |_: &Path, args: &[String]| {
+            calls.borrow_mut().push(args.to_vec());
+            Err("offline".to_owned())
+        };
+        for (head, disposition, expected) in [
+            ("h1", "bounded", Outcome::NotKeyed),
+            ("h2", "keyed_full_shadow", Outcome::NoResult),
+        ] {
+            let identity = keyed_run(&fixture, head, |_| {});
+            let dir = result_directory(&fixture.state, &identity);
+            fs::remove_file(dir.join("result-1.json")).expect("no result from the unkeyed re-ship");
+            let mut activation: Value = serde_json::from_slice(
+                &fs::read(dir.join(ACTIVATION_RECEIPT)).expect("activation"),
+            )
+            .expect("json");
+            activation["plan"]["disposition"] = json!(disposition);
+            fs::write(dir.join(ACTIVATION_RECEIPT), activation.to_string()).expect("write");
+            fs::write(
+                dir.join("fallback-1-2-0.json"),
+                json!({"category": "activation_conflict"}).to_string(),
+            )
+            .expect("diagnostic");
+            assert_eq!(
+                rederive_trial(&fixture.state, &identity, ProducedBy::Completion, &gh)
+                    .expect("rederive"),
+                expected,
+                "{head}"
+            );
+        }
+        assert!(calls.borrow().is_empty());
+        assert!(
+            !fixture
+                .state
+                .join("executable-reuse/refusals.json")
+                .exists()
+        );
+    }
 }

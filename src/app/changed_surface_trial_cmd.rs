@@ -230,7 +230,8 @@ where
         .iter()
         .map(|(name, bytes)| ReceiptFile { name, bytes })
         .collect::<Vec<_>>();
-    let status = evaluate_trial(identity, activation, &result_files, &rederivation_files);
+    let mut status = evaluate_trial(identity, activation, &result_files, &rederivation_files);
+    status.activation_conflicts = activation_conflicts(result_dir);
     if !matches!(
         status.state,
         TrialState::Ready | TrialState::KeyedShadowRecorded
@@ -507,6 +508,22 @@ struct ReceiptReadFailure {
     reason: &'static str,
     observed: usize,
     receipt: Option<String>,
+}
+
+/// The `activation_conflict` diagnostics a ship wrote into this trial
+/// directory, oldest first. Diagnostics are evidence of what ran, never of a
+/// result, so an unreadable one is skipped rather than failing the read.
+fn activation_conflicts(result_dir: &Path) -> Vec<Value> {
+    let Ok(files) = read_named_receipts(result_dir, "fallback-") else {
+        return Vec::new();
+    };
+    files
+        .iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice::<Value>(bytes).ok())
+        .filter(|value| {
+            value.get("category").and_then(Value::as_str) == Some("activation_conflict")
+        })
+        .collect()
 }
 
 fn read_result_receipts(result_dir: &Path) -> Result<Vec<(String, Vec<u8>)>, ReceiptReadFailure> {
@@ -787,6 +804,42 @@ mod tests {
             "integration_changed_paths_digest": DIGEST_C,
             "reason": "test_topology_drift"
         })
+    }
+
+    #[test]
+    fn an_activation_conflict_is_reported_in_the_trial_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = temp.path().join("state");
+        let identity = TrialIdentity {
+            repository: "owner/repo".to_owned(),
+            pull_request: 42,
+            target: "mac".to_owned(),
+            head_sha: "a".repeat(40),
+        };
+        let result_dir = result_directory(&state, &identity);
+        fs::create_dir_all(&result_dir).expect("result dir");
+        fs::write(
+            result_dir.join("fallback-1-2-0.json"),
+            json!({"category": "activation_conflict", "status": "unkeyed: activation_conflict",
+                   "existing_payload_sha256": "aaaa", "planned_payload_sha256": "bbbb",
+                   "differing_fields": ["executable_reuse.candidates"]})
+            .to_string(),
+        )
+        .expect("diagnostic");
+        fs::write(
+            result_dir.join("fallback-1-2-1.json"),
+            json!({"category": "full_fallback"}).to_string(),
+        )
+        .expect("other diagnostic");
+        let mut output = Vec::new();
+        changed_surface_trial_status_command(&args(), &state, true, &mut output).expect("status");
+        let output: Value = serde_json::from_slice(&output).expect("json");
+        let conflicts = output["trial"]["activation_conflicts"]
+            .as_array()
+            .expect("listed");
+        assert_eq!(conflicts.len(), 1, "only activation conflicts are listed");
+        assert_eq!(conflicts[0]["status"], "unkeyed: activation_conflict");
+        assert_eq!(conflicts[0]["planned_payload_sha256"], "bbbb");
     }
 
     #[test]
