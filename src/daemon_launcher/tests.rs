@@ -371,8 +371,9 @@ fn uninstall_removes_the_record_and_agent_but_keeps_the_launcher() {
     assert!(!uninstall(&state, &home).expect("second uninstall"));
 }
 
-/// A launchctl double that behaves like launchd for the probe: it parses the
-/// bootstrapped plist's `ProgramArguments` and runs the probe they describe.
+/// A launchctl double that behaves like launchd on a busy host for the probe:
+/// bootstrap only registers the plist, as a deferred `RunAtLoad` launch does,
+/// and the probe its `ProgramArguments` describe runs on kickstart.
 #[derive(Default)]
 struct ProbeRunningLaunchctl {
     arguments: Vec<String>,
@@ -396,6 +397,10 @@ impl Launchctl for ProbeRunningLaunchctl {
             .filter_map(|chunk| chunk.split("</string>").next())
             .map(str::to_owned)
             .collect();
+        Ok(())
+    }
+
+    fn kickstart(&mut self, _label: &str) -> Result<(), String> {
         let mut paths = Vec::new();
         let mut result = None;
         let mut iter = self.arguments.iter();
@@ -407,10 +412,6 @@ impl Launchctl for ProbeRunningLaunchctl {
             }
         }
         probe(&paths, &result.ok_or("no --result")?).map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    fn kickstart(&mut self, _label: &str) -> Result<(), String> {
         Ok(())
     }
 }

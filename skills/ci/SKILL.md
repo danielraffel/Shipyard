@@ -1172,6 +1172,8 @@ that volume, with someone at the desk:
 
 ```bash
 shipyard daemon launcher install        # approve the one-time prompt if shown
+                                        # (a timeout with no prompt on screen: check
+                                        #  `launchctl print` for runs = 0 / speculative)
 shipyard daemon launcher status
 shipyard daemon refresh                 # now started through launchd
 ```

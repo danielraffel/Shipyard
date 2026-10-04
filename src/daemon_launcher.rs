@@ -588,6 +588,11 @@ pub fn install(
         .map_err(|error| format!("failed to write {}: {error}", probe_plist.display()))?;
     plan.launchctl.bootout(&probe_label)?;
     plan.launchctl.bootstrap(&probe_plist)?;
+    // A RunAtLoad launch is speculative, and launchd can defer it indefinitely
+    // on a busy host (`runs = 0`, `pended nondemand spawn = speculative`), which
+    // this wait would misreport as an unanswered privacy prompt. Kickstart
+    // makes the probe an on-demand spawn now.
+    plan.launchctl.kickstart(&probe_label)?;
     let _ = writeln!(
         progress,
         "Probing {} from launchd as {}. If macOS shows a privacy prompt for that path, approve it; waiting up to {}s.",
