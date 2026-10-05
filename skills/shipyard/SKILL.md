@@ -857,7 +857,7 @@ receipt's `authoritative_execution: not_observed_by_shadow_planner` never
 changes after a run, so prove execution from the trial result receipt.
 An activation receipt's `schema_version` must equal its plan's: the trial
 reader rejects any mismatch as `invalid_shadow_activation_contract`. Shipyard
-0.274.0 through 0.276.0 wrote 2 for schema-3 `build_and_test` plans, so every
+0.274.0 and 0.275.0 wrote 2 for schema-3 `build_and_test` plans, so every
 trial those versions activated reads rejected. Re-run it on a fixed version
 rather than reading the old evidence.
 `shipyard --json reuse records --target <t>` answers "could a keyed plan bind
