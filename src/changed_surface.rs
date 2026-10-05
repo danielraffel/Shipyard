@@ -18,6 +18,8 @@ pub(crate) mod integration_checkout;
 pub mod live_switch;
 mod stale_base;
 pub mod trial;
+#[cfg(test)]
+pub use execution::schema_v3_build_and_test_plan_for_tests;
 pub use execution::{
     AuthoritativeExecutionPlan, BOUNDED, ChangedSurfaceExecutionPolicy,
     EXECUTABLE_REUSE_BINDING_FILE, ExecutionCommandTransport, ExecutionDisposition, ExecutionMode,
