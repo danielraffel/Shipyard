@@ -581,6 +581,87 @@ mod tests {
             status.shadow_disposition,
             Some(StaleBaseShadowDisposition::Recomputed)
         );
+        assert_eq!(
+            status.stale_base_reason.as_deref(),
+            Some("bounded_shadow_recomputed")
+        );
+    }
+
+    fn terminal_status(
+        receipt: &StaleBaseShadowReceipt,
+    ) -> crate::changed_surface::trial::TrialStatus {
+        let bytes = serde_json::to_vec(receipt).expect("receipt bytes");
+        evaluate_stale_base_terminal(
+            &TrialIdentity {
+                repository: "owner/repo".to_owned(),
+                pull_request: 42,
+                target: "mac".to_owned(),
+                head_sha: HEAD.to_owned(),
+            },
+            ReceiptFile {
+                name: "stale-base-shadow.json",
+                bytes: &bytes,
+            },
+        )
+    }
+
+    #[test]
+    fn trial_status_records_the_planner_stale_base_reason() {
+        let mut workflow_drift = context();
+        workflow_drift.live_workflow_digest = "0".repeat(64);
+        let receipt = plan_stale_base_shadow(&exact(), &workflow_drift).expect("assessment");
+        let status = terminal_status(&receipt);
+        assert_eq!(status.reason, "stale_base_full_required");
+        assert_eq!(
+            status.stale_base_reason.as_deref(),
+            Some("selector_policy_or_workflow_drift")
+        );
+        let json = serde_json::to_value(&status).expect("status json");
+        assert_eq!(
+            json["stale_base_reason"],
+            "selector_policy_or_workflow_drift"
+        );
+
+        let mut topology = context();
+        topology.protected_base_delta_paths = vec!["tests/CMakeLists.txt".to_owned()];
+        topology.integration_changed_paths = vec![
+            "src/audio/change.cpp".to_owned(),
+            "tests/CMakeLists.txt".to_owned(),
+        ];
+        let receipt = plan_stale_base_shadow(&exact(), &topology).expect("assessment");
+        assert_eq!(
+            terminal_status(&receipt).stale_base_reason.as_deref(),
+            Some(receipt.reason.as_str())
+        );
+    }
+
+    #[test]
+    fn stale_base_reason_is_bounded_and_absent_without_a_valid_receipt() {
+        let mut receipt = plan_stale_base_shadow(&exact(), &context()).expect("assessment");
+        receipt.disposition = StaleBaseShadowDisposition::FullRequired;
+        receipt.shadow_selection = None;
+        for odd in ["", "Has Upper", "path/like", &"x".repeat(65)] {
+            receipt.reason = odd.to_owned();
+            assert_eq!(
+                terminal_status(&receipt).stale_base_reason.as_deref(),
+                Some("unrecognized"),
+                "{odd:?}"
+            );
+        }
+        receipt.reason = "drift_v2".to_owned();
+        assert_eq!(
+            terminal_status(&receipt).stale_base_reason.as_deref(),
+            Some("drift_v2")
+        );
+
+        receipt.head_sha = "f".repeat(40);
+        let mismatched = terminal_status(&receipt);
+        assert_eq!(
+            mismatched.reason,
+            "stale_base_shadow_identity_or_contract_mismatch"
+        );
+        assert_eq!(mismatched.stale_base_reason, None);
+        assert!(serde_json::to_value(&mismatched).unwrap()["stale_base_reason"].is_null());
     }
 
     #[test]

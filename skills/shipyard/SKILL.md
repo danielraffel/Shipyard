@@ -877,6 +877,13 @@ observation, unmapped/full-required path, replay, or semantic disagreement
 invalidates or selects full. The result always remains
 `blocked_until_current_merge_tree`: it is comparison telemetry, never merge
 authority, an automatic rebase, or permission to mutate a runner or PR.
+To count why stale-base trials fell back, read `stale_base_reason` from
+`changed-surface-trial-status`, not `reason`. `reason` is the trial's
+own state token (`stale_base_full_required`). `stale_base_reason` is the
+planner's cause (`selector_policy_or_workflow_drift`, `test_topology_drift`,
+and so on). The field appears only once the receipt has passed identity
+validation, so a status without it is a rejected receipt, not a missing
+cause.
 
 Prospective pre-push selection is only a transport optimization and is also
 machine-global default-off. Shipyard permits one non-delete branch update and
