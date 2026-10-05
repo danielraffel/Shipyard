@@ -768,7 +768,11 @@ result's `executable_reuse.derived`. After the run, Shipyard:
    payload's digest, and records `not_derived` when the runner itself did not
    use the binding (`executable_reuse.bound` null and a `derived.status`
    starting `error: binding`, whatever reason word follows), since that run
-   was unkeyed;
+   was unkeyed. Any other `derived.status` starting `error:` means the
+   runner's own derivation failed. That is `not_derived` with reason
+   `runner_error: <first line>`, never a refusal: the run produced no
+   selection to judge and was full anyway. Trial status shows the line in
+   `keyed.runner_error`;
 2. takes the record the run keyed against: its named pick, which must be in
    the bound candidate set, or the first candidate when it names none; it
    records `not_derived` when nothing was derived or no candidate was bound,
@@ -780,7 +784,11 @@ result's `executable_reuse.derived`. After the run, Shipyard:
 5. runs each `rederive` command from the derivation directory under the
    placeholders `{source_root}`, `{base_sha}` (that record's commit), `{head_sha}`,
    `{base_record_dir}`, `{base_record_run_id}`, `{result_dir}` (the read-only
-   copies), `{build_dir}`, `{out_dir}`, `{sample_seed}` and `{sample_percent}`;
+   copies), `{build_dir}`, `{out_dir}`, `{sample_seed}` and `{sample_percent}`.
+   `{build_dir}` is the result's `derived.build_dir`, the absolute string the
+   runner's steps used, because the key code matches it as a string against
+   the ctest listing. Results without that field fall back to the binding's
+   `build_dir`;
 6. compares the host's manifest and selection with the runner's: the selection
    must match byte for byte, and the manifests may differ only in run-specific
    producer fields and `unknown:` nonces. A manifest that reports
@@ -795,7 +803,11 @@ it just before merge readiness is decided; its verdict never changes a shadow
 run's merge. A result is re-derived at most once. Each refusal is counted per
 host and repository, once per (head, result), in
 `<state>/executable-reuse/refusals.json`; the second one turns live reuse off
-(the switch first, then the tracking issue).
+(the switch first, then the tracking issue). A refusal that an earlier
+Shipyard recorded for a runner derivation error is withdrawn the next time the
+run is re-derived, whether by the sweep or by an operator. Its receipt is
+renamed `superseded-rederivation-<sha256>.json`, its ledger entry is removed,
+and the run is judged again.
 
 A result the host did not refuse is also read for what live reuse would have
 got wrong, and any one of these turns live reuse off at once, with the same

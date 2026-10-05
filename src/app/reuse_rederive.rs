@@ -34,6 +34,8 @@ const ACTIVATION_RECEIPT: &str = "activation-shadow_compare.json";
 const INVENTORY_UNMATCHED: &str = "inventory_unmatched";
 /// Refusals on one host that turn live reuse off.
 const TRIP_AFTER_REFUSALS: usize = 2;
+/// Prefix of a re-derivation receipt that a later reading withdrew.
+const SUPERSEDED_RECEIPT_PREFIX: &str = "superseded-";
 /// The runner's copied inputs, each with the `derived` field holding its
 /// sha256 in the result receipt.
 const RUNNER_INPUTS: [(&str, &str); 5] = [
@@ -257,7 +259,9 @@ where
     };
     let result_sha = sha256_hex(result_bytes);
     let receipt_name = format!("{REDERIVATION_RECEIPT_PREFIX}{result_sha}.json");
-    if trial_dir.join(&receipt_name).exists() {
+    let receipt_path = trial_dir.join(&receipt_name);
+    let withdrawn = refused_runner_error(&receipt_path, result_bytes)?;
+    if receipt_path.exists() && !withdrawn {
         return Ok(Outcome::AlreadyRecorded {
             receipt: receipt_name,
         });
@@ -266,6 +270,16 @@ where
         .ok_or_else(|| "the keyed run left no context receipt".to_owned())?;
     let context: KeyedRunContext = serde_json::from_slice(&context_bytes)
         .map_err(|error| format!("decode the keyed run context: {error}"))?;
+    if withdrawn {
+        // The superseded receipt is kept beside the new one under a name the
+        // trial reader does not take as a verdict.
+        fs::rename(
+            &receipt_path,
+            trial_dir.join(format!("{SUPERSEDED_RECEIPT_PREFIX}{receipt_name}")),
+        )
+        .map_err(|error| format!("set aside {}: {error}", receipt_path.display()))?;
+        forget_refusal(state_dir, &context.repository, &plan.head_sha, &result_sha)?;
+    }
     let work = state_dir
         .join("executable-reuse")
         .join("rederive")
@@ -490,6 +504,12 @@ fn judge(
             "the runner did not use the binding ({status})"
         )));
     }
+    // The runner tried to derive keys and failed. It produced no selection to
+    // judge and the run was full anyway, so this is never a refusal: counting
+    // it would trip the switch on an infrastructure failure.
+    if let Some(error) = runner_error(result_bytes) {
+        return Ok(Verdict::not_derived(error));
+    }
     let binding = match payload
         .get("executable_reuse_sha256")
         .and_then(Value::as_str)
@@ -643,7 +663,7 @@ fn judge_run(
         ("{base_record_dir}", pick.record_path.clone()),
         ("{base_record_run_id}", pick.run_id.clone()),
         ("{result_dir}", inputs.to_string_lossy().into_owned()),
-        ("{build_dir}", binding.build_dir.clone()),
+        ("{build_dir}", lane_build_dir(derived, binding)),
         ("{out_dir}", out.to_string_lossy().into_owned()),
         ("{sample_seed}", binding.sample_seed.clone()),
         ("{sample_percent}", binding.sample_percent.to_string()),
@@ -826,6 +846,88 @@ fn compare_outputs(inputs: &Path, out: &Path) -> Result<Verdict, String> {
 
 /// Count a refusal for this host, once per (head, result), and return the
 /// number of distinct refusals recorded for the repository.
+/// `runner_error: <first line>` when the runner's derivation failed: its
+/// `derived.status` starts with `error:`. A binding the runner could not use
+/// is reported separately, before this is asked.
+fn runner_error(result_bytes: &[u8]) -> Option<String> {
+    let result = serde_json::from_slice::<Value>(result_bytes).ok()?;
+    let status = result
+        .pointer("/executable_reuse/derived/status")
+        .and_then(Value::as_str)?;
+    let detail = status.strip_prefix("error:")?;
+    Some(format!(
+        "runner_error: {}",
+        detail.lines().next().unwrap_or_default().trim()
+    ))
+}
+
+/// The build directory string the runner's steps used: the absolute path it
+/// records in `derived.build_dir`, or the binding's string for results that
+/// predate the field. The key code matches it as a string against the ctest
+/// listing's command paths, so the host must pass the identical value.
+fn lane_build_dir(derived: &Value, binding: &ExecutableReuseBinding) -> String {
+    derived
+        .get("build_dir")
+        .and_then(Value::as_str)
+        .filter(|dir| !dir.is_empty())
+        .map_or_else(|| binding.build_dir.clone(), str::to_owned)
+}
+
+/// Whether an existing receipt is a refusal of a run whose runner derivation
+/// failed. Such a run is read as `not_derived` now, so the refusal is
+/// withdrawn and the run judged again.
+fn refused_runner_error(receipt: &Path, result_bytes: &[u8]) -> Result<bool, String> {
+    let Some(bytes) = read_optional(receipt)? else {
+        return Ok(false);
+    };
+    let refused = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("verdict")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|verdict| verdict == "refuse");
+    Ok(refused && runner_error(result_bytes).is_some())
+}
+
+/// Remove one counted refusal of `head_sha:result_sha`, returning how many
+/// remain for `repository`.
+fn forget_refusal(
+    state_dir: &Path,
+    repository: &str,
+    head_sha: &str,
+    result_sha: &str,
+) -> Result<usize, String> {
+    let dir = state_dir.join("executable-reuse");
+    fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(".refusals.lock"))
+        .map_err(|error| format!("open the refusal lock: {error}"))?;
+    FileExt::lock_exclusive(&lock).map_err(|error| format!("lock the refusals: {error}"))?;
+    let path = dir.join("refusals.json");
+    let Some(bytes) = read_optional(&path)? else {
+        return Ok(0);
+    };
+    let mut ledger: BTreeMap<String, BTreeMap<String, String>> = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("decode {}: {error}", path.display()))?;
+    let entries = ledger.entry(repository.to_owned()).or_default();
+    entries.remove(&format!("{head_sha}:{result_sha}"));
+    let count = entries.len();
+    let temporary = dir.join(format!(".refusals.{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(&ledger)
+        .map_err(|error| format!("encode the refusals: {error}"))?;
+    fs::write(&temporary, bytes)
+        .and_then(|()| fs::rename(&temporary, &path))
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    Ok(count)
+}
+
 fn record_refusal(
     state_dir: &Path,
     repository: &str,
@@ -1010,8 +1112,11 @@ where
         let [(_, bytes)] = results.as_slice() else {
             continue;
         };
-        let receipt = format!("{REDERIVATION_RECEIPT_PREFIX}{}.json", sha256_hex(bytes));
-        if evidence_dir.join(receipt).exists() {
+        let receipt = evidence_dir.join(format!(
+            "{REDERIVATION_RECEIPT_PREFIX}{}.json",
+            sha256_hex(bytes)
+        ));
+        if receipt.exists() && !refused_runner_error(&receipt, bytes).unwrap_or(false) {
             continue;
         }
         // The adapter's own record time, not a filesystem timestamp: two
@@ -1265,7 +1370,7 @@ switch_variable = "PULP_REUSE_LIVE"
 derivation_paths = ["rederive.py"]
 build_dir = "build"
 platform_probe = ["python3", "-I", "probe.py"]
-rederive = [["python3", "-I", "rederive.py", "{result_dir}", "{out_dir}", "{base_record_run_id}"]]
+rederive = [["python3", "-I", "rederive.py", "{result_dir}", "{out_dir}", "{base_record_run_id}", "--build-dir", "{build_dir}"]]
 
 [targets.mac.changed_surface_selection.executable_reuse.base_record]
 platform = "/platform"
@@ -1598,6 +1703,205 @@ supported_build_types = ["debug"]
         assert_eq!(
             verdict(&rederive(&fixture, &nothing, &calls)),
             "not_derived"
+        );
+    }
+
+    /// A runner whose derivation failed: its binding is present and its
+    /// `derived.status` is the step's error.
+    fn runner_failed(result: &mut Value) {
+        result["executable_reuse"]["bound"] = json!({"build_dir": "build"});
+        result["executable_reuse"]["derived"] = json!({"status":
+            "error: codemodel digest exited 1: no CMake file-API reply\nTraceback (most recent call last):"});
+    }
+
+    #[test]
+    fn a_runner_derive_error_is_not_derived_and_never_counted() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", runner_failed);
+        let outcome = rederive(&fixture, &identity, &calls);
+        let Outcome::Recorded {
+            verdict, reason, ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(
+            (verdict.as_str(), reason.as_str()),
+            (
+                "not_derived",
+                "runner_error: codemodel digest exited 1: no CMake file-API reply"
+            )
+        );
+        assert_eq!(
+            written_receipt(&fixture, &identity)["refusal_count"],
+            Value::Null
+        );
+        assert!(
+            !fixture
+                .state
+                .join("executable-reuse/refusals.json")
+                .exists(),
+            "a runner error is never a refusal"
+        );
+        assert!(calls.borrow().is_empty(), "nothing tripped");
+    }
+
+    #[test]
+    fn a_runner_error_in_the_exact_shape_the_pulp_adapter_wrote_is_not_derived() {
+        // The `executable_reuse` block of a real keyed run whose codemodel
+        // step ran against the derivation directory instead of the lane's
+        // build: binding bound and verified, derivation failed, nothing
+        // counted.
+        let observed: Value = serde_json::from_str(OBSERVED_RUNNER_ERROR).expect("json");
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", |result| {
+            result["executable_reuse"] = observed.clone();
+        });
+        let outcome = rederive(&fixture, &identity, &calls);
+        let Outcome::Recorded {
+            verdict, reason, ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(verdict, "not_derived");
+        assert!(
+            reason.starts_with("runner_error: codemodel digest exited 1:"),
+            "{reason}"
+        );
+        assert!(!reason.contains('\n'), "one line: {reason}");
+        assert!(
+            !fixture
+                .state
+                .join("executable-reuse/refusals.json")
+                .exists()
+        );
+    }
+
+    const OBSERVED_RUNNER_ERROR: &str = r#"{
+    "binding_sha256": "c43eaf76a1deeb24ef464b4ea6b1e5a9dca2b7838bc19915bd3a28e52cebb469",
+    "bound": {
+        "build_dir": "build",
+        "candidates": [
+            {
+                "commit": "64f3cadc36ed1f5e6fe316ee7bc7c19e4044b6d3",
+                "record_path": "/state/reuse-records/Generous-Corp__pulp/records/64f3cadc36ed1f5e6fe316ee7bc7c19e4044b6d3/64f3cadc36ed1f5e6fe316ee7bc7c19e4044b6d3-1791170114519872000-69131",
+                "record_sha256": "b2e2e7837cb8d115be84530c75fffd3b7dad2ff6ddd46651481a595dbffd7567",
+                "run_id": "64f3cadc36ed1f5e6fe316ee7bc7c19e4044b6d3-1791170114519872000-69131"
+            }
+        ],
+        "derivation_code_dir": "/state/executable-reuse/derivation/dc563d1d7aa7a8504a905aab0bc9fb7cad8b05b89aeda2e55bff97d174183f81",
+        "derivation_code_sha256": "dc563d1d7aa7a8504a905aab0bc9fb7cad8b05b89aeda2e55bff97d174183f81",
+        "rules_digest": "93798d7b8549ca07cb110333d99904075a2310498555a4821227df264069fee7",
+        "sample_percent": 5,
+        "sample_seed": "3b5124205532be796faa98e821c805309871e639195ed5d294094d955855f5fd"
+    },
+    "derived": {
+        "status": "error: codemodel digest exited 1: on Support/shipyard/executable-reuse/derivation/dc563d1d7aa7a8504a905aab0bc9fb7cad8b05b89aeda2e55bff97d174183f81/tools/ci/codemodel_digest.py\", line 100, in load_reply\n    raise CodemodelError(f\"no CMake file-API reply in {reply}\")\nCodemodelError: no CMake file-API reply in build/.cmake/api/v1/reply",
+        "unreached_changed": null,
+        "unreached_compared": 0,
+        "unreached_unchecked_modules": null
+    },
+    "false_skip_count": null,
+    "false_skips": null,
+    "mode": "keyed_bounded_shadow",
+    "sampled_failures": null,
+    "would_skip_tests": null
+}"#;
+
+    #[test]
+    fn an_earlier_refusal_of_a_runner_error_is_withdrawn_and_uncounted() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let failed = keyed_run(&fixture, "h1", runner_failed);
+        let refused = keyed_run(&fixture, "h2", |result| {
+            result["executable_reuse"]["derived"]["base_record_run_id"] = json!("elsewhere");
+        });
+        // What an earlier Shipyard left: the runner error judged a refusal
+        // and counted beside a genuine one.
+        let failed_dir = result_directory(&fixture.state, &failed);
+        let result_sha = sha256_hex(&fs::read(failed_dir.join("result-1.json")).expect("result"));
+        let receipt = format!("{REDERIVATION_RECEIPT_PREFIX}{result_sha}.json");
+        fs::write(
+            failed_dir.join(&receipt),
+            json!({"schema_version": 1, "verdict": "refuse",
+                   "reason": "the result states no ctest_listing_sha256"})
+            .to_string(),
+        )
+        .expect("old receipt");
+        record_refusal(&fixture.state, "owner/repo", "h1", &result_sha, "old").expect("count");
+        assert_eq!(verdict(&rederive(&fixture, &refused, &calls)), "refuse");
+        let count = |state: &Path| {
+            let ledger: Value = serde_json::from_slice(
+                &fs::read(state.join("executable-reuse/refusals.json")).expect("ledger"),
+            )
+            .expect("json");
+            ledger["owner/repo"].as_object().map(serde_json::Map::len)
+        };
+        assert_eq!(
+            count(&fixture.state),
+            Some(2),
+            "control: the phantom and the genuine refusal"
+        );
+
+        let outcome = rederive(&fixture, &failed, &calls);
+        assert_eq!(verdict(&outcome), "not_derived", "{outcome:?}");
+        assert_eq!(
+            count(&fixture.state),
+            Some(1),
+            "only the genuine refusal remains"
+        );
+        assert!(
+            failed_dir
+                .join(format!("{SUPERSEDED_RECEIPT_PREFIX}{receipt}"))
+                .exists(),
+            "the withdrawn receipt is kept"
+        );
+        let current = named_files(&failed_dir, REDERIVATION_RECEIPT_PREFIX).expect("receipts");
+        assert_eq!(current.len(), 1, "the trial reads exactly one verdict");
+        assert!(matches!(
+            rederive(&fixture, &failed, &calls),
+            Outcome::AlreadyRecorded { .. }
+        ));
+        assert!(
+            matches!(
+                rederive(&fixture, &refused, &calls),
+                Outcome::AlreadyRecorded { .. }
+            ),
+            "a genuine refusal is never revisited"
+        );
+        assert_eq!(count(&fixture.state), Some(1));
+    }
+
+    #[test]
+    fn the_host_passes_the_build_dir_the_runner_used() {
+        let fixture = fixture(
+            "import shutil, sys\n\
+             for name in ('executable-keys.json', 'selection.json'):\n\
+             \x20   shutil.copy(sys.argv[1] + '/' + name, sys.argv[2])\n\
+             open(sys.argv[2] + '/build-dir.txt', 'w').write(sys.argv[sys.argv.index('--build-dir') + 1])\n",
+        );
+        let calls = Calls::default();
+        let read_back = |identity: &TrialIdentity| {
+            let receipt = written_receipt(&fixture, identity);
+            let out = receipt["host_output_dir"]
+                .as_str()
+                .expect("host output dir");
+            fs::read_to_string(Path::new(out).join("build-dir.txt")).expect("build dir")
+        };
+        let absolute = keyed_run(&fixture, "h1", |result| {
+            result["executable_reuse"]["derived"]["build_dir"] = json!("/lane/checkout/build");
+        });
+        assert_eq!(verdict(&rederive(&fixture, &absolute, &calls)), "match");
+        assert_eq!(read_back(&absolute), "/lane/checkout/build");
+        let older = keyed_run(&fixture, "h2", |_| {});
+        assert_eq!(verdict(&rederive(&fixture, &older, &calls)), "match");
+        assert_eq!(
+            read_back(&older),
+            "build",
+            "results without the field use the binding's"
         );
     }
 

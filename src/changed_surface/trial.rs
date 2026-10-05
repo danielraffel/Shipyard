@@ -208,6 +208,11 @@ pub struct KeyedShadowSummary {
     /// staged report counts only when the run's result says the runner applied
     /// it and the key manifest it hashed says the key code found it clean.
     pub reuse_observation: bool,
+    /// The first line of the runner's `derived.status` when its derivation
+    /// failed. Such a run derived nothing, so it is counted here and never as
+    /// a reuse observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner_error: Option<String>,
 }
 
 /// Directory-name prefix of one keyed payload's evidence inside a trial
@@ -461,11 +466,29 @@ struct ResultReceipt {
 #[derive(Debug, Deserialize)]
 struct KeyedReuseResult {
     #[serde(default)]
+    derived: Option<serde_json::Value>,
+    #[serde(default)]
     would_skip_tests: Option<Vec<String>>,
     #[serde(default)]
     false_skip_count: Option<usize>,
     #[serde(default)]
     false_skips: Option<Vec<String>>,
+}
+
+impl ResultReceipt {
+    /// The first line of the runner's `derived.status` after `error:`, when
+    /// its derivation failed.
+    fn runner_error(&self) -> Option<String> {
+        let status = self
+            .executable_reuse
+            .as_ref()?
+            .derived
+            .as_ref()?
+            .get("status")?
+            .as_str()?;
+        let detail = status.strip_prefix("error:")?;
+        Some(detail.lines().next().unwrap_or_default().trim().to_owned())
+    }
 }
 
 /// The failure-set verdict: both legs failed, the selected leg failed nothing
@@ -989,6 +1012,7 @@ fn record_keyed(
         Err(reason) => return reject(status, Some(file.name), reason),
     };
     status.result_receipt = Some(file.name.to_owned());
+    summary.runner_error = result.runner_error();
     summary.rederivation = match rederivation_verdict(file.bytes, rederivations) {
         Ok(Some(verdict)) => verdict,
         Ok(None) => {
@@ -1030,8 +1054,10 @@ fn record_keyed_bounded(
             problem: Some(reason.to_owned()),
             audit: ABSENT_AUDIT.to_owned(),
             reuse_observation: false,
+            runner_error: None,
         }
     });
+    summary.runner_error = result.runner_error();
     summary.rederivation = match rederivation_verdict(file.bytes, rederivations) {
         Ok(Some(verdict)) => verdict,
         Ok(None) => "pending".to_owned(),
@@ -1175,6 +1201,7 @@ fn validate_keyed_result(
         problem: None,
         audit: ABSENT_AUDIT.to_owned(),
         reuse_observation: false,
+        runner_error: None,
     })
 }
 
@@ -2116,6 +2143,40 @@ mod tests {
         result["executable_reuse"] =
             json!({"would_skip_tests": ["a"], "false_skip_count": 0, "false_skips": []});
         (activation, result)
+    }
+
+    #[test]
+    fn a_runner_derive_error_is_its_own_column() {
+        let (activation, mut result) = keyed_bounded();
+        let clean = evaluate_keyed(&activation, &result).keyed.expect("summary");
+        assert_eq!(clean.runner_error, None, "control: a run that derived");
+        result["executable_reuse"] = json!({"derived": {"status":
+            "error: codemodel digest exited 1: no CMake file-API reply\nTraceback"}});
+        let failed = evaluate_with(
+            Some(&activation),
+            std::slice::from_ref(&result),
+            &[rederived(&result, "not_derived")],
+        )
+        .keyed
+        .expect("summary");
+        assert_eq!(
+            failed.runner_error.as_deref(),
+            Some("codemodel digest exited 1: no CMake file-API reply")
+        );
+        assert_eq!(failed.would_skip_count, None);
+        assert_eq!(failed.rederivation, "not_derived");
+
+        let (activation, mut result) = keyed_full();
+        result["executable_reuse"] =
+            json!({"derived": {"status": "error: toolchain probe failed"}});
+        let full = evaluate_with(
+            Some(&activation),
+            std::slice::from_ref(&result),
+            &[rederived(&result, "not_derived")],
+        )
+        .keyed
+        .expect("summary");
+        assert_eq!(full.runner_error.as_deref(), Some("toolchain probe failed"));
     }
 
     #[test]
