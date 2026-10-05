@@ -167,14 +167,20 @@ where
         target: args.target.clone(),
         head_sha: args.head.clone(),
     };
-    let outcome = rederive_trial(state_dir, &identity, ProducedBy::Operator, gh)
-        .map_err(|error| CliFailure::new(1, error))?;
+    let outcomes = rederive_trial(state_dir, &identity, ProducedBy::Operator, gh);
+    let errors: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|payload| payload.error.as_deref())
+        .collect();
+    if !errors.is_empty() {
+        return Err(CliFailure::new(1, errors.join("; ")));
+    }
     let mut data = BTreeMap::new();
     data.insert(
-        "outcome".to_owned(),
-        serde_json::to_value(&outcome).map_err(|error| CliFailure::new(1, error.to_string()))?,
+        "outcomes".to_owned(),
+        serde_json::to_value(&outcomes).map_err(|error| CliFailure::new(1, error.to_string()))?,
     );
-    let human = serde_json::to_string(&outcome).unwrap_or_default();
+    let human = serde_json::to_string(&outcomes).unwrap_or_default();
     emit(stdout, json, "reuse.rederive", data, &human)?;
     Ok(ExitCode::SUCCESS)
 }

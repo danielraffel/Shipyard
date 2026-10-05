@@ -1275,17 +1275,24 @@ fn rederive_keyed_runs(
             target: target.name.clone(),
             head_sha: request.sha.clone(),
         };
-        if let Err(error) = super::reuse_rederive::rederive_trial(
+        for payload in super::reuse_rederive::rederive_trial(
             state_dir,
             &identity,
             super::reuse_rederive::ProducedBy::Completion,
             &|_: &Path, args: &[String]| gh(args),
         ) {
-            eprintln!(
-                "shipyard: host re-derivation for {} at {} was not recorded ({error}); \
-                 `shipyard reuse rederive-sweep` retries it",
-                target.name, request.sha
-            );
+            if let Some(error) = payload.error {
+                eprintln!(
+                    "shipyard: host re-derivation for {} at {}{} was not recorded ({error}); \
+                     `shipyard reuse rederive-sweep` retries it",
+                    target.name,
+                    request.sha,
+                    payload
+                        .payload_sha256
+                        .map(|digest| format!(" (payload {digest})"))
+                        .unwrap_or_default()
+                );
+            }
         }
     }
 }

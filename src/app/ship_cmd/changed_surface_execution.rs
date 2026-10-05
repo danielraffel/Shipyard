@@ -759,10 +759,42 @@ pub(super) fn apply_changed_surface_execution(
         } else {
             None
         };
-        let result_dir = stale_receipt.as_ref().map_or_else(
+        let trial_dir = stale_receipt.as_ref().map_or_else(
             || result_dir(state_dir, repo, pr, &plan.head_sha, &target.name),
             |(_, _, evidence_dir)| evidence_dir.clone(),
         );
+        // A keyed plan keeps its whole evidence (activation, run context,
+        // runner artifacts, result, re-derivation) in its own payload
+        // directory, so re-shipping the head with a different candidate set
+        // runs keyed beside the earlier run instead of overwriting it.
+        let keyed_payload = (stale_receipt.is_none()
+            && matches!(
+                plan.disposition.as_str(),
+                crate::changed_surface::KEYED_FULL_SHADOW
+                    | crate::changed_surface::KEYED_BOUNDED_SHADOW
+            ))
+        .then(|| plan.execution_payload_digest.clone());
+        let Some(result_dir) = evidence_dir(&trial_dir, keyed_payload.as_deref()) else {
+            persist_fallback_diagnostic(
+                &trial_dir,
+                &ActivationConflictDiagnostic {
+                    schema_version: 1,
+                    repository: repo,
+                    pull_request: pr,
+                    target: &target.name,
+                    machine_mode: machine.mode,
+                    category: "activation_conflict",
+                    status: "unkeyed: activation_conflict",
+                    reason: Some("keyed_payload_cap"),
+                    conflict: &ActivationConflict {
+                        existing_payload_sha256: None,
+                        planned_payload_sha256: keyed_payload.clone(),
+                        differing_fields: vec!["executable_reuse".to_owned()],
+                    },
+                },
+            )?;
+            continue;
+        };
         let compare = if machine.mode == MachineMode::ShadowCompare {
             "1"
         } else {
@@ -830,7 +862,7 @@ pub(super) fn apply_changed_surface_execution(
                     // A keyed shadow never breaks a ship: record why this head
                     // runs its configured stages unkeyed, and move on.
                     persist_fallback_diagnostic(
-                        &result_dir,
+                        &trial_dir,
                         &ActivationConflictDiagnostic {
                             schema_version: 1,
                             repository: repo,
@@ -839,6 +871,7 @@ pub(super) fn apply_changed_surface_execution(
                             machine_mode: machine.mode,
                             category: "activation_conflict",
                             status: "unkeyed: activation_conflict",
+                            reason: None,
                             conflict: &conflict,
                         },
                     )?;
@@ -1142,6 +1175,21 @@ fn result_dir(state_dir: &Path, repo: &str, pr: u64, head: &str, target: &str) -
     )
 }
 
+/// Where a plan's evidence goes: the trial directory itself for an unkeyed
+/// plan, or the keyed payload's own directory. `None` when the payload is new
+/// and the head already holds the most keyed payloads it may, so the plan runs
+/// unkeyed instead and the head's evidence stays bounded.
+fn evidence_dir(trial_dir: &Path, keyed_payload: Option<&str>) -> Option<PathBuf> {
+    let Some(payload) = keyed_payload else {
+        return Some(trial_dir.to_path_buf());
+    };
+    let dir = crate::changed_surface::trial::payload_dir(trial_dir, payload);
+    (dir.is_dir()
+        || crate::changed_surface::trial::payload_dirs(trial_dir).len()
+            < crate::changed_surface::executable_reuse::MAX_CANDIDATES)
+        .then_some(dir)
+}
+
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
@@ -1260,6 +1308,10 @@ struct ActivationConflictDiagnostic<'a> {
     machine_mode: MachineMode,
     category: &'a str,
     status: &'a str,
+    /// Why, when it is not a difference between two stored activations:
+    /// `keyed_payload_cap` once a head holds the most keyed payloads it may.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
     #[serde(flatten)]
     conflict: &'a ActivationConflict,
 }
@@ -1485,10 +1537,10 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         CurrentStaleGeneration, FallbackDiagnostic, MAX_STALE_POINTER_BYTES, MachineMode,
-        MachinePolicy, bounded_diagnostic, full_fallback_diagnostic, persist_fallback_diagnostic,
-        publish_current_stale_generation, read_current_stale_generation, result_dir,
-        selected_resume_block_reason, shell_quote, stale_generation_has_execution_evidence,
-        target_declares_changed_surface_selection,
+        MachinePolicy, bounded_diagnostic, evidence_dir, full_fallback_diagnostic,
+        persist_fallback_diagnostic, publish_current_stale_generation,
+        read_current_stale_generation, result_dir, selected_resume_block_reason, shell_quote,
+        stale_generation_has_execution_evidence, target_declares_changed_surface_selection,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::collections::BTreeMap;
@@ -2103,6 +2155,35 @@ mod tests {
             )
             .is_none(),
             "an unkeyed plan that changed is still refused"
+        );
+    }
+
+    #[test]
+    fn keyed_payloads_get_their_own_directory_up_to_the_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let trial = temp.path().join("trial");
+        let digest = |n: usize| format!("{n:064x}");
+        assert_eq!(
+            evidence_dir(&trial, None),
+            Some(trial.clone()),
+            "an unkeyed plan keeps the top level"
+        );
+        let first = evidence_dir(&trial, Some(&digest(0))).expect("room");
+        assert_eq!(first, trial.join(format!("payload-{}", digest(0))));
+        let cap = crate::changed_surface::executable_reuse::MAX_CANDIDATES;
+        for n in 0..cap {
+            fs::create_dir_all(evidence_dir(&trial, Some(&digest(n))).expect("room"))
+                .expect("payload dir");
+        }
+        assert_eq!(
+            evidence_dir(&trial, Some(&digest(cap))),
+            None,
+            "a new payload past the cap runs unkeyed"
+        );
+        assert_eq!(
+            evidence_dir(&trial, Some(&digest(0))),
+            Some(first),
+            "an existing payload is reused at the cap"
         );
     }
 }

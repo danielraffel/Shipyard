@@ -609,16 +609,42 @@ the trial directory. Nothing in this section skips any work; the switch
 variable governs only a future live mode.
 
 A keyed plan binds the host's candidate records at ship time, so the same
-head re-shipped after a record is filed, or first shipped before any base
-existed, plans a different activation than the one already stored for it.
-That never fails the ship: Shipyard writes an `activation_conflict`
-diagnostic (both payload digests and the fields that differ: candidates,
-seed, disposition and the like, with `status: "unkeyed:
-activation_conflict"`), leaves the stored activation as it is, and runs the
-target's configured stages unkeyed. Trial status lists those diagnostics as
-`activation_conflicts`. The unkeyed run writes no result, so the host
-re-derivation has nothing to judge for it and never counts it as a refusal.
-An activation that changes when neither side is keyed is still refused.
+head re-shipped after a record is filed plans a different execution payload.
+Each keyed payload therefore keeps its whole evidence in its own directory,
+`<trial dir>/payload-<execution payload sha256>/`: Shipyard points
+`SHIPYARD_CHANGED_SURFACE_RESULT_DIR` there and writes the activation and
+`executable-reuse-context.json` there under their ordinary names, so the
+runner's fixed-name artifacts (`ctest-listing.json`, `toolchain.json`,
+`codemodel-digest.json`, `executable-keys.json`, `selection.json`), the
+result and its `rederivation-*.json` receipt all sit with the run that wrote
+them, and a second keyed run of the head never overwrites the first run's
+inputs. Unkeyed plans keep the top level of the trial directory, unchanged.
+
+A head holds at most 8 keyed payloads (the candidate cap). A ninth keyed plan,
+or a keyed plan whose payload directory already holds different activation
+bytes, never fails the ship: Shipyard writes an `activation_conflict`
+diagnostic to the trial directory (both payload digests and the fields that
+differ, `status: "unkeyed: activation_conflict"`, and `reason:
+"keyed_payload_cap"` for the cap), leaves the stored evidence as it is, and
+runs the target's configured stages unkeyed. Trial status lists those
+diagnostics as `activation_conflicts`; the unkeyed run writes no keyed
+result, so the host re-derivation never counts it as a refusal. A keyed
+activation left at the top level by an earlier Shipyard against an unkeyed
+re-ship still conflicts that way, and an unkeyed activation that changes is
+still refused.
+
+Trial status evaluates the top level and every payload directory exactly as
+it evaluates a single run. When a head holds payload directories, its
+verdict is the evaluation whose result the adapter recorded last
+(`recorded_at_unix_ns`, result name as tiebreak); `verdict_source` names it
+(`payload_sha256`, `disposition`, `result_receipt`), and `keyed_runs` lists
+every keyed run newest first. A result there without `recorded_at_unix_ns` is
+rejected (`result_without_recorded_at`) rather than ordered by file time, and
+a directory rejected before any result fails the head closed. Trial
+directories written before payload directories existed (a keyed activation
+and context at the top level) are read in place as one payload; nothing is
+moved or renamed. Nothing prunes `changed-surface-results/`; the cap bounds a
+head's evidence.
 
 To see what a keyed plan on this host would bind right now:
 

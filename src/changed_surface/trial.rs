@@ -94,11 +94,29 @@ pub struct TrialStatus {
     /// written (`unkeyed: activation_conflict`), oldest first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub activation_conflicts: Vec<serde_json::Value>,
+    /// Which run produced this verdict, when the head holds keyed payload
+    /// directories.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict_source: Option<VerdictSource>,
+    /// Every keyed run of this head, newest result first, when the head holds
+    /// keyed payload directories.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keyed_runs: Vec<KeyedRun>,
     /// Stable bounded reason for the current state.
     pub reason: String,
 }
 
 impl TrialStatus {
+    /// A status for `identity` still waiting for its shadow activation.
+    #[must_use]
+    pub fn new_collecting(identity: &TrialIdentity) -> Self {
+        Self::new(
+            identity,
+            TrialState::Collecting,
+            "waiting_for_shadow_activation",
+        )
+    }
+
     /// A status for `identity` with no receipts observed yet.
     fn new(identity: &TrialIdentity, state: TrialState, reason: &str) -> Self {
         Self {
@@ -115,6 +133,8 @@ impl TrialStatus {
             shadow_disposition: None,
             keyed: None,
             activation_conflicts: Vec::new(),
+            verdict_source: None,
+            keyed_runs: Vec::new(),
             reason: reason.to_owned(),
         }
     }
@@ -170,6 +190,71 @@ pub struct KeyedShadowSummary {
     /// changes the bounded verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
+}
+
+/// Directory-name prefix of one keyed payload's evidence inside a trial
+/// directory: `payload-<execution payload sha256>`. A keyed plan's activation,
+/// run context, runner artifacts, result and re-derivation receipt all live
+/// there under their ordinary names, so each payload keeps the single-run
+/// layout and a second keyed run of the same head never overwrites the first
+/// run's runner artifacts.
+pub const PAYLOAD_DIR_PREFIX: &str = "payload-";
+
+/// The evidence directory of one keyed payload in `trial_dir`.
+#[must_use]
+pub fn payload_dir(trial_dir: &Path, payload_sha256: &str) -> PathBuf {
+    trial_dir.join(format!("{PAYLOAD_DIR_PREFIX}{payload_sha256}"))
+}
+
+/// Every keyed payload directory in `trial_dir`, by payload digest: real
+/// directories (not symlinks) named `payload-<64 lowercase hex>`. Anything
+/// else under the prefix is ignored, never followed.
+#[must_use]
+pub fn payload_dirs(trial_dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(trial_dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_owned();
+            let digest = name.strip_prefix(PAYLOAD_DIR_PREFIX)?.to_owned();
+            let is_dir = std::fs::symlink_metadata(entry.path()).ok()?.is_dir();
+            (is_dir && valid_digest(&digest)).then(|| (digest, entry.path()))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Which evidence produced a head's verdict when it holds more than one run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct VerdictSource {
+    /// The keyed payload's digest; `None` for the top-level (unkeyed or
+    /// pre-payload-directory) evidence.
+    pub payload_sha256: Option<String>,
+    /// The plan disposition that run executed.
+    pub disposition: String,
+    /// The result receipt, relative to the trial directory.
+    pub result_receipt: String,
+}
+
+/// One keyed payload's evaluation, listed beside the head's verdict.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct KeyedRun {
+    /// The payload's digest; `None` for top-level keyed evidence written
+    /// before payload directories existed.
+    pub payload_sha256: Option<String>,
+    /// Its own state.
+    pub state: TrialState,
+    /// Its own reason.
+    pub reason: String,
+    /// Its result receipt, relative to the trial directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_receipt: Option<String>,
+    /// What it measured, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyed: Option<KeyedShadowSummary>,
 }
 
 /// File-name prefix of a host re-derivation receipt in a trial directory.
@@ -761,6 +846,8 @@ pub(crate) fn rejected_trial(
         shadow_disposition: None,
         keyed: None,
         activation_conflicts: Vec::new(),
+        verdict_source: None,
+        keyed_runs: Vec::new(),
         reason: reason.to_owned(),
     }
 }
