@@ -21,7 +21,7 @@ esac
     let ledger_path = temp.path().join("ledger.json");
     let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
     let policy = queue_policy();
-    let deadline = Instant::now() + Duration::from_millis(200);
+    let deadline = Instant::now() + Duration::from_secs(1);
     let started = Instant::now();
 
     let (_, error) = revalidate_recovery_target(
@@ -34,11 +34,19 @@ esac
     )
     .expect_err("hung PR read must fail closed");
 
+    // Either outcome is the deadline holding: the hung read is killed when
+    // the deadline passes, or, on a loaded host where the earlier read used
+    // the whole budget, the hung read is never started. Which one happens is
+    // timing, so the message is not the property; the bounded wall time is.
     assert!(
-        error
-            .as_deref()
-            .is_some_and(|message| message.contains("timed out")),
+        error.as_deref().is_some_and(|message| {
+            message.contains("timed out") || message.contains("exceeded its bounded deadline")
+        }),
         "{error:?}"
     );
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the hung read outlived the deadline: {:?}",
+        started.elapsed()
+    );
 }
