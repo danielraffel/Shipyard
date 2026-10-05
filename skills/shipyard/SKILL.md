@@ -852,7 +852,14 @@ could not use the binding file the payload named; its re-derivation is
 verified run echoes `binding_sha256`. A selection over the 5,632-byte payload
 cap falls back with `fallback_reason: "selection_payload_over_cap"` and
 `payload_bytes` in its fallback diagnostic; count those before redesigning
-the cap. The shadow planning
+the cap.
+A keyed plan stages the newest clean `read-audit.json` from the protected
+branch's `read-audit-nightly.yml` and binds it as `audit: {status: staged, ...}`;
+with none (`audit: {status: none, reason}`) it still runs keyed but keys
+nothing, and trial status marks it `reuse_observation: false`. Count only
+`reuse_observation: true` keyed runs as reuse evidence. `{audit_report}` in a
+base command is the staged path; add it to a project's commands only after
+every host runs a Shipyard that knows it. The shadow planning
 receipt's `authoritative_execution: not_observed_by_shadow_planner` never
 changes after a run, so prove execution from the trial result receipt.
 `shipyard --json reuse records --target <t>` answers "could a keyed plan bind

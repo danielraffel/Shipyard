@@ -46,7 +46,9 @@ pub struct ExecutableReusePolicy {
     /// code over the run's copied inputs. Placeholders: `{source_root}`,
     /// `{base_sha}`, `{head_sha}`, `{base_record_dir}`,
     /// `{base_record_run_id}`, `{result_dir}`, `{build_dir}`, `{out_dir}`,
-    /// `{sample_seed}`, `{sample_percent}`. They must leave
+    /// `{sample_seed}`, `{sample_percent}`, `{audit_report}` (the staged
+    /// read-audit report; when the plan bound none, the argument holding it
+    /// and the flag before it are dropped). They must leave
     /// `{out_dir}/executable-keys.json` and `{out_dir}/selection.json`.
     pub rederive: Vec<Vec<String>>,
     /// How to read a base reuse record's `job.json`, and what it must state
@@ -478,6 +480,38 @@ pub struct ExecutableReuseBinding {
     pub sample_percent: u32,
     /// The lane's build directory, as the identical string the runner uses.
     pub build_dir: String,
+    /// The read-audit report the key code is handed, or why there is none.
+    /// Absent in bindings written before the audit existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit: Option<AuditBinding>,
+}
+
+/// File a keyed plan's read-audit report is staged as in its evidence
+/// directory, beside [`crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE`].
+pub const AUDIT_REPORT_FILE: &str = "read-audit.json";
+
+/// The read-audit report a keyed plan bound. Without one the key code keys
+/// nothing (every executable is uncovered), so such a plan is not a reuse
+/// observation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuditBinding {
+    /// A clean report, staged as [`AUDIT_REPORT_FILE`].
+    Staged {
+        /// The read-audit workflow run that produced it.
+        run_id: String,
+        /// The commit that run audited.
+        audit_commit: String,
+        /// How many commits the plan's base is ahead of `audit_commit`.
+        commits_behind: u64,
+        /// sha256 of the staged file's bytes.
+        report_sha256: String,
+    },
+    /// No report: `no_clean_run`, `fetch_failed` or `no_credentials`.
+    None {
+        /// Why.
+        reason: String,
+    },
 }
 
 /// How the host's re-run of the base key code compares with the runner's.
@@ -560,7 +594,7 @@ pub fn compare_rederivation(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Binding {
     /// Every input bound; the runner derives and Shipyard re-derives against it.
-    Bound(ExecutableReuseBinding),
+    Bound(Box<ExecutableReuseBinding>),
     /// No base record qualified; nothing is keyed and the plan runs as usual.
     NoBase(String),
 }
@@ -644,7 +678,7 @@ where
     let seed = sample_seed(request.head_sha, request.policy_digest, &digests);
     let rules = serde_json::to_vec(&policy.base_record)
         .map_err(|error| format!("cannot serialize the base record rules: {error}"))?;
-    Ok(Binding::Bound(ExecutableReuseBinding {
+    Ok(Binding::Bound(Box::new(ExecutableReuseBinding {
         sample_seed: seed,
         candidates,
         rules_digest: sha256_hex(&rules),
@@ -652,7 +686,10 @@ where
         derivation_code_sha256: code.digest,
         sample_percent: policy.sample_percent,
         build_dir: request.build_dir.to_owned(),
-    }))
+        // The ship path fills this in before planning; bind() reads no
+        // network.
+        audit: None,
+    })))
 }
 
 /// One line saying why no record qualified.
@@ -1134,5 +1171,46 @@ mod tests {
             panic!("expected no base");
         };
         assert!(why.contains("3 other platform"), "{why}");
+    }
+
+    #[test]
+    fn the_audit_is_one_status_tagged_object_and_absent_when_unset() {
+        let mut bound = ExecutableReuseBinding {
+            candidates: Vec::new(),
+            rules_digest: "r".repeat(64),
+            derivation_code_dir: "/code".to_owned(),
+            derivation_code_sha256: "d".repeat(64),
+            sample_seed: "s".repeat(64),
+            sample_percent: 5,
+            build_dir: "build".to_owned(),
+            audit: None,
+        };
+        let plain = serde_json::to_value(&bound).expect("json");
+        assert!(
+            plain.get("audit").is_none(),
+            "older bindings stay byte-identical"
+        );
+        bound.audit = Some(AuditBinding::Staged {
+            run_id: "42".to_owned(),
+            audit_commit: "a".repeat(40),
+            commits_behind: 3,
+            report_sha256: "b".repeat(64),
+        });
+        assert_eq!(
+            serde_json::to_value(&bound).expect("json")["audit"],
+            serde_json::json!({"status": "staged", "run_id": "42", "audit_commit": "a".repeat(40),
+                               "commits_behind": 3, "report_sha256": "b".repeat(64)})
+        );
+        bound.audit = Some(AuditBinding::None {
+            reason: "no_clean_run".to_owned(),
+        });
+        assert_eq!(
+            serde_json::to_value(&bound).expect("json")["audit"],
+            serde_json::json!({"status": "none", "reason": "no_clean_run"})
+        );
+        let unknown: Result<AuditBinding, _> = serde_json::from_value(
+            serde_json::json!({"status": "none", "reason": "x", "extra": 1}),
+        );
+        assert!(unknown.is_err(), "the shape is exact");
     }
 }

@@ -190,6 +190,13 @@ pub struct KeyedShadowSummary {
     /// changes the bounded verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
+    /// The read-audit report the plan bound: `staged`, `none: <reason>`, or
+    /// `absent` for a binding written before the audit existed.
+    pub audit: String,
+    /// Whether this run counts as an observation of executable reuse. A plan
+    /// with no staged audit report keys nothing, so its zero would-skip count
+    /// is the missing report's, not the keying's, and it does not count.
+    pub reuse_observation: bool,
 }
 
 /// Directory-name prefix of one keyed payload's evidence inside a trial
@@ -992,6 +999,8 @@ fn record_keyed_bounded(
             full_build_returncode: result.full_build_returncode,
             rederivation: String::new(),
             problem: Some(reason.to_owned()),
+            audit: ABSENT_AUDIT.to_owned(),
+            reuse_observation: false,
         }
     });
     summary.rederivation = match rederivation_verdict(file.bytes, rederivations) {
@@ -1135,7 +1144,25 @@ fn validate_keyed_result(
         full_build_returncode: Some(full_build_returncode),
         rederivation: String::new(),
         problem: None,
+        audit: ABSENT_AUDIT.to_owned(),
+        reuse_observation: false,
     })
+}
+
+/// [`KeyedShadowSummary::audit`] before the binding is read.
+const ABSENT_AUDIT: &str = "absent";
+
+impl KeyedShadowSummary {
+    /// Record the binding's audit status: only a staged report makes the run
+    /// a reuse observation.
+    pub fn record_audit(&mut self, audit: Option<&super::executable_reuse::AuditBinding>) {
+        use super::executable_reuse::AuditBinding;
+        (self.audit, self.reuse_observation) = match audit {
+            Some(AuditBinding::Staged { .. }) => ("staged".to_owned(), true),
+            Some(AuditBinding::None { reason }) => (format!("none: {reason}"), false),
+            None => (ABSENT_AUDIT.to_owned(), false),
+        };
+    }
 }
 
 fn validate_result(plan: &ActivationPlan, result: &ResultReceipt) -> Result<(), &'static str> {
@@ -2083,5 +2110,33 @@ mod tests {
         unknown["plan"]["disposition"] = json!("keyed_everything");
         let status = evaluate(Some(&unknown), &[result()]);
         assert_eq!(status.reason, "unknown_shadow_activation_disposition");
+    }
+
+    #[test]
+    fn only_a_staged_audit_makes_a_keyed_run_a_reuse_observation() {
+        use crate::changed_surface::executable_reuse::AuditBinding;
+        let (activation, result) = keyed_bounded();
+        let mut keyed = evaluate_keyed(&activation, &result).keyed.expect("summary");
+        assert_eq!(
+            (keyed.audit.as_str(), keyed.reuse_observation),
+            ("absent", false)
+        );
+        keyed.record_audit(Some(&AuditBinding::None {
+            reason: "fetch_failed".to_owned(),
+        }));
+        assert_eq!(
+            (keyed.audit.as_str(), keyed.reuse_observation),
+            ("none: fetch_failed", false)
+        );
+        keyed.record_audit(Some(&AuditBinding::Staged {
+            run_id: "1".to_owned(),
+            audit_commit: "a".repeat(40),
+            commits_behind: 0,
+            report_sha256: "b".repeat(64),
+        }));
+        assert_eq!(
+            (keyed.audit.as_str(), keyed.reuse_observation),
+            ("staged", true)
+        );
     }
 }

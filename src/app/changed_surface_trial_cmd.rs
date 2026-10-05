@@ -405,6 +405,9 @@ where
         .map(|(name, bytes)| ReceiptFile { name, bytes })
         .collect::<Vec<_>>();
     let mut status = evaluate_trial(identity, activation, &result_files, &rederivation_files);
+    if let Some(keyed) = status.keyed.as_mut() {
+        keyed.record_audit(bound_audit(result_dir).as_ref());
+    }
     status.activation_conflicts = activation_conflicts(result_dir);
     if !matches!(
         status.state,
@@ -687,6 +690,22 @@ struct ReceiptReadFailure {
 /// The `activation_conflict` diagnostics a ship wrote into this trial
 /// directory, oldest first. Diagnostics are evidence of what ran, never of a
 /// result, so an unreadable one is skipped rather than failing the read.
+/// The audit status a keyed run's binding file records, if any.
+fn bound_audit(
+    result_dir: &Path,
+) -> Option<crate::changed_surface::executable_reuse::AuditBinding> {
+    let bytes = read_regular_receipt(
+        &result_dir.join(crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE),
+    )
+    .ok()
+    .flatten()?;
+    serde_json::from_slice::<crate::changed_surface::executable_reuse::ExecutableReuseBinding>(
+        &bytes,
+    )
+    .ok()?
+    .audit
+}
+
 fn activation_conflicts(result_dir: &Path) -> Vec<Value> {
     let Ok(files) = read_named_receipts(result_dir, "fallback-") else {
         return Vec::new();
