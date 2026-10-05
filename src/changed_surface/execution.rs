@@ -707,6 +707,14 @@ fn error(detail: impl Into<String>) -> ExecutionPlanError {
     ExecutionPlanError(detail.into())
 }
 
+/// A bounded schema-3 `build_and_test` plan, for tests elsewhere in the crate
+/// that need the shape the planner actually emits.
+#[cfg(test)]
+#[must_use]
+pub fn schema_v3_build_and_test_plan_for_tests() -> AuthoritativeExecutionPlan {
+    tests::schema_v3_build_and_test_plan()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -890,6 +898,23 @@ mod tests {
         assert!(!plan.command.contains(SELECTED_TESTS_PAYLOAD_PLACEHOLDER));
         assert!(!plan.command.contains(SELECTED_TESTS_DIGEST_PLACEHOLDER));
         assert!(plan.command.contains(&plan.execution_payload_digest));
+    }
+
+    pub(super) fn schema_v3_build_and_test_plan() -> AuthoritativeExecutionPlan {
+        let mut policy = fixture_policy(ExecutionMode::Authoritative);
+        policy.schema_version = 3;
+        policy.baseline_build_targets = vec!["pulp-test-build-check".to_owned()];
+        policy.families[0].build_targets = vec!["pulp-cli".to_owned()];
+        let execution = policy.execution.as_mut().expect("execution");
+        execution.stage = "build_and_test".to_owned();
+        let input = fixture_input("src/a.rs");
+        let receipt = fixture_receipt(&policy, &input);
+        let ExecutionDisposition::Bounded(plan) =
+            fixture_execution(&receipt, &input, &policy, true).expect("bounded")
+        else {
+            panic!("expected bounded plan");
+        };
+        *plan
     }
 
     #[test]

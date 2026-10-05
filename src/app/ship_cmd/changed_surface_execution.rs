@@ -839,25 +839,13 @@ pub(super) fn apply_changed_surface_execution(
             compare,
             plan.command
         );
-        let activation = ActivationReceipt {
-            schema_version: u32::from(plan.stage == "build_and_test") + 1,
-            machine_mode: machine.mode,
-            plan: &plan,
-            original_build_command_sha256: original_build
-                .as_ref()
-                .map(|command| sha256(command.as_bytes())),
-            original_test_command_sha256: sha256(original_test.as_bytes()),
-            substituted_build_command_sha256: (plan.stage == "build_and_test")
-                .then(|| sha256(substituted.as_bytes())),
-            substituted_test_command_sha256: sha256(
-                if plan.stage == "build_and_test" {
-                    ":"
-                } else {
-                    &substituted
-                }
-                .as_bytes(),
-            ),
-        };
+        let activation = activation_receipt(
+            &plan,
+            machine.mode,
+            original_build.as_deref(),
+            &original_test,
+            &substituted,
+        );
         if let Some((receipt, receipt_digest, _)) = stale_receipt.as_ref() {
             persist_stale_activation(
                 &result_dir,
@@ -1247,6 +1235,30 @@ fn activation_file_name(mode: MachineMode) -> String {
 }
 
 /// The exact bytes an activation receipt is stored as.
+/// The activation receipt for `plan`. Its schema version is the plan's, which
+/// the trial reader requires: test-stage plans are 1, `build_and_test` plans 2
+/// or 3.
+fn activation_receipt<'a>(
+    plan: &'a crate::changed_surface::AuthoritativeExecutionPlan,
+    machine_mode: MachineMode,
+    original_build: Option<&str>,
+    original_test: &str,
+    substituted: &str,
+) -> ActivationReceipt<'a> {
+    let build_and_test = plan.stage == "build_and_test";
+    ActivationReceipt {
+        schema_version: plan.schema_version,
+        machine_mode,
+        plan,
+        original_build_command_sha256: original_build.map(|command| sha256(command.as_bytes())),
+        original_test_command_sha256: sha256(original_test.as_bytes()),
+        substituted_build_command_sha256: build_and_test.then(|| sha256(substituted.as_bytes())),
+        substituted_test_command_sha256: sha256(
+            if build_and_test { ":" } else { substituted }.as_bytes(),
+        ),
+    }
+}
+
 fn activation_bytes(receipt: &ActivationReceipt<'_>) -> Result<Vec<u8>, CliFailure> {
     let mut payload = serde_json::to_vec_pretty(receipt)
         .map_err(|error| CliFailure::new(1, format!("serialize selector activation: {error}")))?;
@@ -1585,10 +1597,11 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         CurrentStaleGeneration, FallbackDiagnostic, MAX_STALE_POINTER_BYTES, MachineMode,
-        MachinePolicy, bounded_diagnostic, evidence_dir, full_fallback_diagnostic,
-        persist_exact_bytes, persist_fallback_diagnostic, publish_current_stale_generation,
-        read_current_stale_generation, result_dir, selected_resume_block_reason, shell_quote,
-        stale_generation_has_execution_evidence, target_declares_changed_surface_selection,
+        MachinePolicy, activation_bytes, activation_receipt, bounded_diagnostic, evidence_dir,
+        full_fallback_diagnostic, persist_exact_bytes, persist_fallback_diagnostic,
+        publish_current_stale_generation, read_current_stale_generation, result_dir,
+        selected_resume_block_reason, shell_quote, stale_generation_has_execution_evidence,
+        target_declares_changed_surface_selection,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::collections::BTreeMap;
@@ -1596,6 +1609,44 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    #[test]
+    fn a_build_and_test_activation_reads_as_its_plan_schema() {
+        use crate::changed_surface::trial::{
+            ReceiptFile, TrialIdentity, TrialState, evaluate_trial,
+        };
+        let plan = crate::changed_surface::schema_v3_build_and_test_plan_for_tests();
+        assert_eq!(plan.schema_version, 3);
+        let activation = activation_receipt(
+            &plan,
+            MachineMode::ShadowCompare,
+            Some("cmake --build build"),
+            "ctest --test-dir build",
+            "SHIPYARD_CHANGED_SURFACE_RESULT_DIR=/r adapter",
+        );
+        let bytes = activation_bytes(&activation).expect("activation bytes");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["schema_version"], json["plan"]["schema_version"]);
+        let status = evaluate_trial(
+            &TrialIdentity {
+                repository: plan.repository.clone(),
+                pull_request: plan.pull_request,
+                target: plan.target.clone(),
+                head_sha: plan.head_sha.clone(),
+            },
+            Some(ReceiptFile {
+                name: "activation-shadow_compare.json",
+                bytes: &bytes,
+            }),
+            &[],
+            &[],
+        );
+        assert_eq!(
+            (status.state, status.reason.as_str()),
+            (TrialState::Collecting, "waiting_for_shadow_result"),
+            "the trial reader accepts what the planner writes"
+        );
+    }
 
     #[test]
     fn full_fallback_diagnostic_names_the_planner_reason() {
