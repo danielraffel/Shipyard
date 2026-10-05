@@ -1683,6 +1683,70 @@ supported_build_types = ["debug"]
     }
 
     #[test]
+    fn a_runner_error_in_the_exact_shape_the_pulp_adapter_wrote_is_not_derived() {
+        // The `executable_reuse` block of a real keyed run whose codemodel
+        // step ran against the derivation directory instead of the lane's
+        // build: binding bound and verified, derivation failed, nothing
+        // counted.
+        let observed: Value = serde_json::from_str(OBSERVED_RUNNER_ERROR).expect("json");
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", |result| {
+            result["executable_reuse"] = observed.clone();
+        });
+        let outcome = rederive(&fixture, &identity, &calls);
+        let Outcome::Recorded {
+            verdict, reason, ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(verdict, "not_derived");
+        assert!(
+            reason.starts_with("runner_error: codemodel digest exited 1:"),
+            "{reason}"
+        );
+        assert!(!reason.contains('\n'), "one line: {reason}");
+        assert!(
+            !fixture
+                .state
+                .join("executable-reuse/refusals.json")
+                .exists()
+        );
+    }
+
+    const OBSERVED_RUNNER_ERROR: &str = r#"{
+    "binding_sha256": "c43eaf76a1deeb24ef464b4ea6b1e5a9dca2b7838bc19915bd3a28e52cebb469",
+    "bound": {
+        "build_dir": "build",
+        "candidates": [
+            {
+                "commit": "64f3cadc36ed1f5e6fe316ee7bc7c19e4044b6d3",
+                "record_path": "/state/reuse-records/Generous-Corp__pulp/records/64f3cadc36ed1f5e6fe316ee7bc7c19e4044b6d3/64f3cadc36ed1f5e6fe316ee7bc7c19e4044b6d3-1791170114519872000-69131",
+                "record_sha256": "b2e2e7837cb8d115be84530c75fffd3b7dad2ff6ddd46651481a595dbffd7567",
+                "run_id": "64f3cadc36ed1f5e6fe316ee7bc7c19e4044b6d3-1791170114519872000-69131"
+            }
+        ],
+        "derivation_code_dir": "/state/executable-reuse/derivation/dc563d1d7aa7a8504a905aab0bc9fb7cad8b05b89aeda2e55bff97d174183f81",
+        "derivation_code_sha256": "dc563d1d7aa7a8504a905aab0bc9fb7cad8b05b89aeda2e55bff97d174183f81",
+        "rules_digest": "93798d7b8549ca07cb110333d99904075a2310498555a4821227df264069fee7",
+        "sample_percent": 5,
+        "sample_seed": "3b5124205532be796faa98e821c805309871e639195ed5d294094d955855f5fd"
+    },
+    "derived": {
+        "status": "error: codemodel digest exited 1: on Support/shipyard/executable-reuse/derivation/dc563d1d7aa7a8504a905aab0bc9fb7cad8b05b89aeda2e55bff97d174183f81/tools/ci/codemodel_digest.py\", line 100, in load_reply\n    raise CodemodelError(f\"no CMake file-API reply in {reply}\")\nCodemodelError: no CMake file-API reply in build/.cmake/api/v1/reply",
+        "unreached_changed": null,
+        "unreached_compared": 0,
+        "unreached_unchecked_modules": null
+    },
+    "false_skip_count": null,
+    "false_skips": null,
+    "mode": "keyed_bounded_shadow",
+    "sampled_failures": null,
+    "would_skip_tests": null
+}"#;
+
+    #[test]
     fn an_earlier_refusal_of_a_runner_error_is_withdrawn_and_uncounted() {
         let fixture = fixture(FAITHFUL);
         let calls = Calls::default();
