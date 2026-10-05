@@ -190,12 +190,16 @@ pub struct KeyedShadowSummary {
     /// changes the bounded verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
-    /// The read-audit report the plan bound: `staged`, `none: <reason>`, or
-    /// `absent` for a binding written before the audit existed.
+    /// The read-audit report the plan bound: `staged`, `staged_unconfirmed:
+    /// <why>` when the run does not show the key code applying it,
+    /// `none: <reason>`, or `absent` for a binding written before the audit
+    /// existed.
     pub audit: String,
     /// Whether this run counts as an observation of executable reuse. A plan
     /// with no staged audit report keys nothing, so its zero would-skip count
-    /// is the missing report's, not the keying's, and it does not count.
+    /// is the missing report's, not the keying's, and it does not count. A
+    /// staged report counts only when the run's result says the runner applied
+    /// it and the key manifest it hashed says the key code found it clean.
     pub reuse_observation: bool,
 }
 
@@ -1149,16 +1153,70 @@ fn validate_keyed_result(
     })
 }
 
+/// Whether a keyed run shows its staged audit report in effect: the result's
+/// `executable_reuse.derived.audit.status` is `applied`, and the key manifest
+/// the run hashed (`derived.key_manifest_sha256`) records
+/// `producer.audit_status` `clean`. Either side drifting reads as unconfirmed.
+///
+/// # Errors
+///
+/// Why the run does not confirm it, as a short phrase.
+pub fn audit_applied(result: &serde_json::Value, manifest: Option<&[u8]>) -> Result<(), String> {
+    let derived = result
+        .pointer("/executable_reuse/derived")
+        .filter(|derived| !derived.is_null())
+        .ok_or("the result derived no keys")?;
+    let status = derived
+        .pointer("/audit/status")
+        .and_then(serde_json::Value::as_str);
+    if status != Some("applied") {
+        return Err(format!(
+            "runner audit status {}",
+            status.unwrap_or("missing")
+        ));
+    }
+    let manifest = manifest.ok_or("the run left no key manifest")?;
+    let want = derived
+        .get("key_manifest_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("the result states no key_manifest_sha256")?;
+    if format!("{:x}", Sha256::digest(manifest)) != want {
+        return Err("the key manifest is not the file the run hashed".to_owned());
+    }
+    let producer = serde_json::from_slice::<serde_json::Value>(manifest)
+        .ok()
+        .and_then(|manifest| {
+            manifest
+                .pointer("/producer/audit_status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    match producer.as_deref() {
+        Some("clean") => Ok(()),
+        other => Err(format!(
+            "key code audit status {}",
+            other.unwrap_or("missing")
+        )),
+    }
+}
+
 /// [`KeyedShadowSummary::audit`] before the binding is read.
 const ABSENT_AUDIT: &str = "absent";
 
 impl KeyedShadowSummary {
     /// Record the binding's audit status: only a staged report makes the run
     /// a reuse observation.
-    pub fn record_audit(&mut self, audit: Option<&super::executable_reuse::AuditBinding>) {
+    pub fn record_audit(
+        &mut self,
+        audit: Option<&super::executable_reuse::AuditBinding>,
+        applied: Result<(), String>,
+    ) {
         use super::executable_reuse::AuditBinding;
         (self.audit, self.reuse_observation) = match audit {
-            Some(AuditBinding::Staged { .. }) => ("staged".to_owned(), true),
+            Some(AuditBinding::Staged { .. }) => match applied {
+                Ok(()) => ("staged".to_owned(), true),
+                Err(why) => (format!("staged_unconfirmed: {why}"), false),
+            },
             Some(AuditBinding::None { reason }) => (format!("none: {reason}"), false),
             None => (ABSENT_AUDIT.to_owned(), false),
         };
@@ -2121,22 +2179,87 @@ mod tests {
             (keyed.audit.as_str(), keyed.reuse_observation),
             ("absent", false)
         );
-        keyed.record_audit(Some(&AuditBinding::None {
-            reason: "fetch_failed".to_owned(),
-        }));
+        keyed.record_audit(
+            Some(&AuditBinding::None {
+                reason: "fetch_failed".to_owned(),
+            }),
+            Ok(()),
+        );
         assert_eq!(
             (keyed.audit.as_str(), keyed.reuse_observation),
             ("none: fetch_failed", false)
         );
-        keyed.record_audit(Some(&AuditBinding::Staged {
+        let staged = AuditBinding::Staged {
             run_id: "1".to_owned(),
             audit_commit: "a".repeat(40),
             commits_behind: 0,
             report_sha256: "b".repeat(64),
-        }));
+        };
+        keyed.record_audit(Some(&staged), Ok(()));
         assert_eq!(
             (keyed.audit.as_str(), keyed.reuse_observation),
             ("staged", true)
         );
+        keyed.record_audit(Some(&staged), Err("runner audit status absent".to_owned()));
+        assert_eq!(
+            (keyed.audit.as_str(), keyed.reuse_observation),
+            ("staged_unconfirmed: runner audit status absent", false)
+        );
+    }
+
+    #[test]
+    fn a_staged_report_is_confirmed_only_by_the_runner_and_the_key_manifest() {
+        let manifest = |status: &str| {
+            serde_json::to_vec(&json!({"producer": {"audit_status": status}})).unwrap()
+        };
+        let result = |audit: Value, manifest: &[u8]| {
+            json!({"executable_reuse": {"derived": {
+                "audit": audit,
+                "key_manifest_sha256": format!("{:x}", sha2::Sha256::digest(manifest)),
+            }}})
+        };
+        let clean = manifest("clean");
+        assert_eq!(
+            audit_applied(&result(json!({"status": "applied"}), &clean), Some(&clean)),
+            Ok(())
+        );
+        let cases = [
+            (
+                result(json!({"status": "report_mismatch"}), &clean),
+                Some(clean.clone()),
+                "runner audit status report_mismatch",
+            ),
+            (
+                result(Value::Null, &clean),
+                Some(clean.clone()),
+                "runner audit status missing",
+            ),
+            (
+                result(json!({"status": "applied"}), &clean),
+                None,
+                "the run left no key manifest",
+            ),
+            (
+                result(json!({"status": "applied"}), &clean),
+                Some(manifest("not_clean")),
+                "the key manifest is not the file the run hashed",
+            ),
+            (
+                result(json!({"status": "applied"}), &manifest("not_clean")),
+                Some(manifest("not_clean")),
+                "key code audit status not_clean",
+            ),
+            (
+                json!({"executable_reuse": {"derived": null}}),
+                Some(clean.clone()),
+                "the result derived no keys",
+            ),
+        ];
+        for (result, manifest, why) in cases {
+            assert_eq!(
+                audit_applied(&result, manifest.as_deref()),
+                Err(why.to_owned())
+            );
+        }
     }
 }

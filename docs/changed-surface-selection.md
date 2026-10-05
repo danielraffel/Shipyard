@@ -702,8 +702,10 @@ A project's key code may key an executable only when a clean read audit of
 the protected branch covered it (Pulp's `executable_keys.py --audit-report`).
 At plan time Shipyard takes the newest run of the project's
 `read-audit-nightly.yml` on the protected branch that concluded `success` and
-whose `read-audit` artifact's `read-audit.json` states `stage0.verdict:
-clean`. It looks at the 20 newest successful runs, downloads at most three per
+whose `read-audit` artifact's `read-audit.json` is one the key code accepts:
+`schema: pulp-read-audit/v1`, `stage0.verdict: clean`, and a `stage0.covered`
+list. A clean verdict without the other two would bind `staged` while keying
+nothing, so it is cached as not clean. It looks at the 20 newest successful runs, downloads at most three per
 plan, and caches each run's verdict (the report itself only when clean) under
 `<state>/executable-reuse/read-audit/<repo>/<run id>/`, so later plans read
 the cache. The report is staged as `read-audit.json` in the plan's payload
@@ -721,7 +723,15 @@ code is handed none and keys nothing, the planner prints one line saying so,
 and trial status marks the keyed run `reuse_observation: false` with `audit:
 "none: <reason>"`. A binding written before the audit existed has no `audit`
 key and reads `audit: "absent"`, also not an observation. Only a staged
-report makes a keyed run an observation of executable reuse.
+report makes a keyed run an observation of executable reuse, and only when
+the run shows the report took effect on both sides. The result's
+`executable_reuse.derived.audit.status` must be `applied` (the runner handed
+it in), and the key manifest beside the result, whose bytes must hash to
+`derived.key_manifest_sha256`, must record `producer.audit_status: clean`
+(the key code accepted it). If either fails, the run reads `audit:
+"staged_unconfirmed: <why>"` with `reuse_observation: false`, so drift on
+either side can never pass as an observation. The runner's `derived.audit`
+key plays no part in re-derivation agreement.
 
 In the base's commands, `{audit_report}` is the staged report's path. When the
 plan bound none, an argument that is exactly `{audit_report}` is dropped

@@ -1442,6 +1442,12 @@ supported_build_types = ["debug"]
             "base_record_sha256".into(),
             json!(fixture.candidate.record_sha256),
         );
+        // The runner's audit outcome rides in `derived`; agreement must not
+        // depend on it.
+        derived.insert(
+            "audit".into(),
+            json!({"status": "applied", "run_id": "7", "commits_behind": 2}),
+        );
         for (name, key) in RUNNER_INPUTS {
             let bytes = format!("{{\"{name}\": \"{head}{tag}\"}}\n");
             fs::write(dir.join(name), &bytes).expect("input");

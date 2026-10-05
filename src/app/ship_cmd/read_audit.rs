@@ -3,9 +3,10 @@
 //! The key code treats an executable as keyable only when the last clean
 //! read audit of the protected branch covered it, so a keyed plan needs that
 //! report. The planner takes the newest successful run of the audit workflow
-//! on the protected branch whose report says `stage0.verdict` is `clean`,
-//! caches the report once per run under the state directory, and stages a
-//! copy beside the plan's binding. Without one the plan still runs keyed and
+//! on the protected branch whose report the key code would accept (its schema,
+//! a `clean` stage-0 verdict, and a published covered list), caches the
+//! report once per run under the state directory, and stages a copy beside
+//! the plan's binding. Without one the plan still runs keyed and
 //! the key code keys nothing; the binding says why.
 
 use std::fs;
@@ -124,6 +125,20 @@ fn cached_verdict(dir: &Path) -> Option<Option<Vec<u8>>> {
     fs::read(dir.join(AUDIT_FILE)).ok().map(Some)
 }
 
+/// The read-audit report schema the key code accepts.
+const READ_AUDIT_SCHEMA: &str = "pulp-read-audit/v1";
+
+/// Whether the key code would accept `report` as vouching for executables:
+/// the accepted schema, a `clean` stage-0 verdict, and a published covered
+/// list. Staging anything weaker would bind `staged` while keying nothing.
+fn vouches(report: &Value) -> bool {
+    report.get("schema").and_then(Value::as_str) == Some(READ_AUDIT_SCHEMA)
+        && report.pointer("/stage0/verdict").and_then(Value::as_str) == Some("clean")
+        && report
+            .pointer("/stage0/covered")
+            .is_some_and(Value::is_array)
+}
+
 /// Download one run's report and cache its verdict. `Ok(None)` when the
 /// report is not clean.
 fn download<G>(gh: &G, repository: &str, id: u64, dir: &Path) -> Result<Option<Vec<u8>>, String>
@@ -146,15 +161,7 @@ where
     ])?;
     let bytes = fs::read(staging.join(AUDIT_FILE))
         .map_err(|error| format!("the {AUDIT_ARTIFACT} artifact has no {AUDIT_FILE}: {error}"))?;
-    let clean = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|report| {
-            report
-                .pointer("/stage0/verdict")
-                .and_then(Value::as_str)
-                .map(|verdict| verdict == "clean")
-        })
-        .unwrap_or(false);
+    let clean = serde_json::from_slice::<Value>(&bytes).is_ok_and(|report| vouches(&report));
     fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     if clean {
         fs::write(dir.join(AUDIT_FILE), &bytes).map_err(|error| error.to_string())?;
@@ -211,6 +218,25 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    /// The report a fake run serves: `clean` and `findings` are well formed;
+    /// `old_schema` and `uncovered` are clean verdicts the key code rejects.
+    fn report(verdict: &str) -> Value {
+        match verdict {
+            "old_schema" => serde_json::json!({
+                "schema": "pulp-read-audit/v0",
+                "stage0": {"verdict": "clean", "covered": []},
+            }),
+            "uncovered" => serde_json::json!({
+                "schema": READ_AUDIT_SCHEMA,
+                "stage0": {"verdict": "clean"},
+            }),
+            verdict => serde_json::json!({
+                "schema": READ_AUDIT_SCHEMA,
+                "stage0": {"verdict": verdict, "covered": ["pulp-test-a"]},
+            }),
+        }
+    }
+
     /// A `gh` that lists `runs` and serves each run's report from `reports`.
     fn fake<'a>(
         runs: &'a [(u64, &'a str)],
@@ -230,11 +256,8 @@ mod tests {
                     let dir = std::path::PathBuf::from(&args[8]);
                     match reports.iter().find(|(run, _)| *run == id).and_then(|(_, r)| *r) {
                         Some(verdict) => {
-                            fs::write(
-                                dir.join(AUDIT_FILE),
-                                serde_json::json!({"stage0": {"verdict": verdict}}).to_string(),
-                            )
-                            .expect("write");
+                            fs::write(dir.join(AUDIT_FILE), report(verdict).to_string())
+                                .expect("write");
                             Ok(String::new())
                         }
                         None => Err("no artifact".to_owned()),
@@ -327,6 +350,38 @@ mod tests {
                 reason: "fetch_failed".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn a_clean_verdict_the_key_code_would_reject_is_not_staged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let calls = RefCell::new(Vec::new());
+        let shas: Vec<String> = (1..=3).map(|n| format!("{n:040}")).collect();
+        let runs: Vec<(u64, &str)> = vec![
+            (3, shas[2].as_str()),
+            (2, shas[1].as_str()),
+            (1, shas[0].as_str()),
+        ];
+        let gh = fake(
+            &runs,
+            &[
+                (3, Some("old_schema")),
+                (2, Some("uncovered")),
+                (1, Some("clean")),
+            ],
+            &calls,
+        );
+        let fetched = fetch_clean_report(&gh, "o/r", "main", &"f".repeat(40), temp.path());
+        let AuditBinding::Staged { run_id, .. } = &fetched.audit else {
+            panic!("expected run 1 staged: {:?}", fetched.audit);
+        };
+        assert_eq!(run_id, "1");
+        assert!(vouches(
+            &serde_json::from_slice(&fetched.report).expect("report")
+        ));
+        for rejected in ["old_schema", "uncovered", "findings"] {
+            assert!(!vouches(&report(rejected)), "{rejected}");
+        }
     }
 
     #[test]

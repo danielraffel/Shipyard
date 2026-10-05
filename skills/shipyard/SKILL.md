@@ -856,7 +856,10 @@ the cap.
 A keyed plan stages the newest clean `read-audit.json` from the protected
 branch's `read-audit-nightly.yml` and binds it as `audit: {status: staged, ...}`;
 with none (`audit: {status: none, reason}`) it still runs keyed but keys
-nothing, and trial status marks it `reuse_observation: false`. Count only
+nothing, and trial status marks it `reuse_observation: false`. A staged
+report counts only when the result's `derived.audit.status` is `applied` and
+the hashed key manifest says `producer.audit_status: clean`; otherwise the
+audit reads `staged_unconfirmed: <why>`. Count only
 `reuse_observation: true` keyed runs as reuse evidence. `{audit_report}` in a
 base command is the staged path; add it to a project's commands only after
 every host runs a Shipyard that knows it. The shadow planning
