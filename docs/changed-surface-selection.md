@@ -354,7 +354,13 @@ The command is read-only and reports one stable state under `trial.state`:
 - `terminal` (exit 0 for `blocked` or `full_required`, exit 1 for
   `invalidated`): stale-base planning safely ended with an immutable typed
   receipt instead of waiting indefinitely for an activation that should never
-  run;
+  run. Whenever that receipt passes identity validation, the status also
+  carries `stale_base_reason`, the planner's own reason token (for example
+  `selector_policy_or_workflow_drift`, `selector_policy_drift`,
+  `test_topology_drift`, or `bounded_shadow_recomputed`). It tells you how
+  much stale-base fallback each cause accounts for. Any token that is not
+  lowercase snake case of at most 64 bytes reads as `unrecognized`, and a
+  status that rejected the receipt carries no reason at all;
 - `rejected` (exit 1): evidence is malformed, unsafe to read, non-passing,
   identity/digest-inconsistent, or ambiguous. More than one append-only result
   for the exact identity is intentionally ambiguous even if the files are
