@@ -22,16 +22,16 @@ pub const SELECTED_TESTS_PAYLOAD_PLACEHOLDER: &str = "{selection_receipt_b64}";
 /// Stable payload-digest placeholder accepted in a protected-base command.
 pub const SELECTED_TESTS_DIGEST_PLACEHOLDER: &str = "{selection_receipt_digest}";
 /// Current bounded-execution planning receipt schema. Schema 3 names a keyed
-/// plan's executable-reuse binding by digest
-/// (`executable_reuse_binding_digest`); the binding is
-/// [`EXECUTABLE_REUSE_BINDING_FILE`] beside the activation.
+/// plan's executable-reuse binding by digest (`executable_reuse_sha256`); the
+/// binding is [`EXECUTABLE_REUSE_BINDING_FILE`] beside the activation.
 pub const AUTHORITATIVE_EXECUTION_PLAN_SCHEMA_VERSION: u32 = 3;
-/// The cap on the payload without its binding digest, which keeps the
-/// selected-test list small enough for the command once base64-expanded. A
-/// larger selection is not executed bounded: the configured stages run as
-/// usual (an unkeyed run, with a planning diagnostic). The command itself is
-/// held to [`MAX_EXECUTION_COMMAND_UNITS`].
-pub const MAX_SELECTED_TEST_BYTES: usize = 4 * 1024;
+/// The largest decoded execution payload, the same bytes and the same limit
+/// the repository adapter enforces. A payload of P bytes costs about 4P/3
+/// base64 units plus the fixed command parts, so 5,632 B stays under
+/// [`MAX_EXECUTION_COMMAND_UNITS`] with margin; that command check remains the
+/// authoritative shell bound. A larger selection is not executed bounded: the
+/// configured stages run as usual, with a planning diagnostic.
+pub const MAX_SELECTED_TEST_BYTES: usize = 5632;
 /// File a keyed plan's executable-reuse binding is written to, in the plan's
 /// evidence directory; the payload carries the sha256 of exactly its bytes.
 pub const EXECUTABLE_REUSE_BINDING_FILE: &str = "executable-reuse-binding.json";
@@ -231,30 +231,25 @@ struct AuthoritativeExecutionPayload<'a> {
     disposition: Option<&'a str>,
     /// sha256 of the keyed binding file the runner derives against.
     #[serde(skip_serializing_if = "Option::is_none")]
-    executable_reuse_binding_digest: Option<&'a str>,
+    executable_reuse_sha256: Option<&'a str>,
 }
 
-/// Serialize a bounded payload, naming `binding_digest` when keyed. The cap
-/// measures the selection, not the binding: a keyed plan adds only a
-/// fixed-size digest, and the command check holds the total.
+/// Serialize a bounded payload, naming `binding_digest` when keyed, and hold
+/// it to [`MAX_SELECTED_TEST_BYTES`] as sent: the binding itself is out of
+/// band, so a keyed payload is only the digest field larger.
 fn capped_payload<'a>(
     payload: &mut AuthoritativeExecutionPayload<'a>,
     binding_digest: Option<&'a str>,
 ) -> Result<Vec<u8>, ExecutionPlanError> {
-    payload.executable_reuse_binding_digest = None;
-    let unkeyed = serde_json::to_vec(&*payload)
+    payload.executable_reuse_sha256 = binding_digest;
+    let bytes = serde_json::to_vec(&*payload)
         .map_err(|failure| error(format!("serialize authoritative payload: {failure}")))?;
-    if unkeyed.len() > MAX_SELECTED_TEST_BYTES {
+    if bytes.len() > MAX_SELECTED_TEST_BYTES {
         return Err(error(
             "bounded selection payload exceeds the safe command limit",
         ));
     }
-    if binding_digest.is_none() {
-        return Ok(unkeyed);
-    }
-    payload.executable_reuse_binding_digest = binding_digest;
-    serde_json::to_vec(&*payload)
-        .map_err(|failure| error(format!("serialize authoritative payload: {failure}")))
+    Ok(bytes)
 }
 
 /// The canonical bytes of a keyed binding and their sha256.
@@ -466,7 +461,7 @@ pub fn plan_keyed_execution(
         selected_build_targets_digest: None,
         selected_build_targets: None,
         disposition: Some("full"),
-        executable_reuse_binding_digest: Some(&binding_digest),
+        executable_reuse_sha256: Some(&binding_digest),
     })
     .map_err(|failure| error(format!("serialize keyed payload: {failure}")))?;
     let execution_payload_digest = sha256_hex(&execution_payload);
@@ -604,7 +599,7 @@ fn bounded_execution_plan(
         selected_build_targets: (policy_schema_version >= 3)
             .then_some(receipt.selected_build_targets.as_slice()),
         disposition: None,
-        executable_reuse_binding_digest: None,
+        executable_reuse_sha256: None,
     };
     let execution_payload = capped_payload(
         &mut payload,
@@ -1263,7 +1258,7 @@ mod tests {
             serde_json::to_vec(&binding()).expect("json")
         );
         assert_eq!(
-            payload["executable_reuse_binding_digest"],
+            payload["executable_reuse_sha256"],
             sha256_hex(&plan.executable_reuse_binding),
             "the digest is over the exact file bytes"
         );
@@ -1311,7 +1306,7 @@ mod tests {
             serde_json::from_slice(&plan.executable_reuse_binding).expect("binding file");
         assert_eq!(bound["candidates"][0]["commit"], BASE);
         assert_eq!(
-            payload["executable_reuse_binding_digest"],
+            payload["executable_reuse_sha256"],
             sha256_hex(&plan.executable_reuse_binding)
         );
         let ExecutionDisposition::Bounded(unkeyed) =
@@ -1455,26 +1450,28 @@ mod tests {
         };
         assert_eq!(plan.disposition, KEYED_BOUNDED_SHADOW);
         // Control: the same payload with the binding inline, as schema 2 sent
-        // it, is over the 4 KiB cap; that is the refusal proof B hit.
+        // it, is over the pre-fix 4 KiB payload cap; that is the refusal
+        // proof B hit.
         let mut inline = payload_of(&plan);
         inline
             .as_object_mut()
             .expect("payload")
-            .remove("executable_reuse_binding_digest");
+            .remove("executable_reuse_sha256");
         inline["executable_reuse"] = serde_json::to_value(&bound).expect("binding");
         assert!(
-            serde_json::to_vec(&inline).expect("inline").len() > MAX_SELECTED_TEST_BYTES,
-            "the inline binding would not fit"
+            serde_json::to_vec(&inline).expect("inline").len() > 4 * 1024,
+            "the inline binding did not fit the old cap"
         );
     }
 
     #[test]
     fn the_command_does_not_grow_with_the_candidate_count() {
-        // A selection just under the 4 KiB cap, with the most candidates a
-        // plan binds, still makes a command under the shell bound, and the
-        // same command length as one candidate.
-        let (policy, receipt) = selection_of(96, 30);
-        let commands: Vec<usize> = [1, crate::changed_surface::executable_reuse::MAX_CANDIDATES]
+        // A selection near the payload cap, with the most candidates a plan
+        // binds, still makes a command under the shell bound, and the same
+        // command length as one candidate.
+        let (policy, receipt) = selection_of(140, 30);
+        let max = crate::changed_surface::executable_reuse::MAX_CANDIDATES;
+        let plans: Vec<AuthoritativeExecutionPlan> = [1, max]
             .iter()
             .map(|&n| {
                 let ExecutionDisposition::Bounded(plan) =
@@ -1482,17 +1479,38 @@ mod tests {
                 else {
                     panic!("expected a bounded plan");
                 };
-                plan.command.encode_utf16().count()
+                *plan
             })
+            .collect();
+        let commands: Vec<usize> = plans
+            .iter()
+            .map(|plan| plan.command.encode_utf16().count())
             .collect();
         assert!(commands[1] < MAX_EXECUTION_COMMAND_UNITS, "{commands:?}");
         assert_eq!(commands[0], commands[1], "{commands:?}");
+        // Control: the same eight candidates inline would push the command
+        // past the shell bound.
+        let mut inline = payload_of(&plans[1]);
+        inline
+            .as_object_mut()
+            .expect("payload")
+            .remove("executable_reuse_sha256");
+        inline["executable_reuse"] = serde_json::to_value(real_binding(max)).expect("binding");
+        let inline_units = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&inline).expect("inline"))
+            .len();
+        assert!(inline_units > MAX_EXECUTION_COMMAND_UNITS, "{inline_units}");
     }
 
     #[test]
     fn the_selection_cap_still_refuses_an_oversized_list() {
-        let (policy, receipt) = selection_of(140, 30);
-        assert!(keyed_bounded(&policy, &receipt, &real_binding(1)).is_err());
+        // Refused by the payload cap itself, before the command check.
+        let (policy, receipt) = selection_of(200, 30);
+        let Err(ExecutionPlanError(reason)) = keyed_bounded(&policy, &receipt, &real_binding(1))
+        else {
+            panic!("an oversized selection must not plan");
+        };
+        assert!(reason.contains("selection payload exceeds"), "{reason}");
     }
 
     #[test]
@@ -1505,7 +1523,7 @@ mod tests {
         };
         let payload = payload_of(&plan);
         assert_eq!(
-            payload["executable_reuse_binding_digest"],
+            payload["executable_reuse_sha256"],
             sha256_hex(&plan.executable_reuse_binding)
         );
         let parsed: crate::changed_surface::executable_reuse::ExecutableReuseBinding =

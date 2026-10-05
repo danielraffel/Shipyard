@@ -592,16 +592,18 @@ path:
 The binding does not travel in the command. Shipyard writes it, as the exact
 JSON bytes the plan produced, to `executable-reuse-binding.json` in the plan's
 payload directory before the activation, and the execution payload (schema 3)
-carries only `executable_reuse_binding_digest`, the sha256 of those bytes. So
-the command does not grow with the candidate count. The adapter reads the
-file and uses it only when its bytes hash to that digest; otherwise it runs
-the plan unkeyed and records `executable_reuse_binding` with
-`keyed_binding_mismatch` or `keyed_binding_unreadable` in its result, and a
-verified run records the digest it used. The 4 KiB `MAX_SELECTED_TEST_BYTES`
-cap measures the payload without that digest, that is the selection; the
-command itself is held to `MAX_EXECUTION_COMMAND_UNITS` (8,000). A selection
-over the cap is not executed bounded: the configured stages run, with a
-planning diagnostic. Schema-2 payloads, which carried the binding inline,
+carries only `executable_reuse_sha256`, the sha256 of those bytes. So the
+command does not grow with the candidate count. The adapter reads the file
+and uses it only when its bytes hash to that digest and it is a valid
+binding; a verified run echoes `binding_sha256` under `executable_reuse`.
+Otherwise it runs the plan unkeyed and records `executable_reuse.bound: null`
+with `derived.status` `error: binding <missing|unreadable|digest mismatch|invalid>`.
+Shipyard and the adapter apply one cap to the same bytes: the decoded payload
+may be at most 5,632 bytes (`MAX_SELECTED_TEST_BYTES`), which keeps the
+base64-expanded command under `MAX_EXECUTION_COMMAND_UNITS` (8,000), and that
+command check stays the authoritative shell bound. A selection over the cap
+is not executed bounded: the configured stages run, with a planning
+diagnostic. Schema-2 payloads, which carried the binding inline,
 are still read by re-derivation.
 
 The toolchain is not compared here. Only the lane, after it configures this
@@ -701,9 +703,9 @@ result's `executable_reuse.derived`. After the run, Shipyard:
 1. checks the activation's payload digest against the payload it kept, and the
    base policy's digest against the plan's; for a schema-3 payload it reads
    the binding file and refuses one whose bytes no longer hash to the
-   payload's digest, and records `not_derived` when the runner itself refused
-   the binding (`executable_reuse_binding.status` other than `verified`), since
-   that run was unkeyed;
+   payload's digest, and records `not_derived` when the runner itself did not
+   use the binding (`executable_reuse.bound` null and a `derived.status`
+   starting `error: binding`), since that run was unkeyed;
 2. takes the record the run keyed against: its named pick, which must be in
    the bound candidate set, or the first candidate when it names none; it
    records `not_derived` when nothing was derived or no candidate was bound,

@@ -467,24 +467,31 @@ fn judge(
         ));
     }
     let payload: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
-    // The runner refused a binding file that did not match the payload's
-    // digest and ran unkeyed: nothing was keyed, so there is nothing to judge.
+    // The runner could not use the binding the payload named (missing,
+    // unreadable, digest mismatch or invalid) and ran unkeyed: it records
+    // `bound: null` and a status starting `error: binding`. Nothing was keyed,
+    // so there is nothing to judge.
     if let Some(status) = serde_json::from_slice::<Value>(result_bytes)
         .ok()
+        .filter(|result| {
+            result
+                .pointer("/executable_reuse/bound")
+                .is_some_and(Value::is_null)
+        })
         .and_then(|result| {
             result
-                .pointer("/executable_reuse_binding/status")
+                .pointer("/executable_reuse/derived/status")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
-        .filter(|status| status != "verified")
+        .filter(|status| status.starts_with("error: binding"))
     {
         return Ok(Verdict::not_derived(format!(
-            "the runner refused the binding: {status}"
+            "the runner did not use the binding ({status})"
         )));
     }
     let binding = match payload
-        .get("executable_reuse_binding_digest")
+        .get("executable_reuse_sha256")
         .and_then(Value::as_str)
     {
         Some(digest) => read_binding_file(trial_dir, digest),
@@ -2065,7 +2072,7 @@ supported_build_types = ["debug"]
             &bytes,
         )
         .expect("binding file");
-        payload["executable_reuse_binding_digest"] = json!(sha256_hex(&bytes));
+        payload["executable_reuse_sha256"] = json!(sha256_hex(&bytes));
         let payload = serde_json::to_vec(&payload).expect("payload");
         context.execution_payload_b64 =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload);
@@ -2113,8 +2120,10 @@ supported_build_types = ["debug"]
         let fixture = fixture(FAITHFUL);
         let calls = Calls::default();
         let identity = keyed_run(&fixture, "h1", |result| {
-            result["executable_reuse_binding"] =
-                json!({"digest": "d", "status": "keyed_binding_mismatch"});
+            // The adapter's record of a binding it could not use.
+            result["executable_reuse"] = json!({
+                "mode": "keyed_bounded_shadow", "bound": null, "binding_sha256": "d",
+                "derived": {"status": "error: binding digest mismatch"}});
         });
         to_schema_3(&result_directory(&fixture.state, &identity));
         assert_eq!(
