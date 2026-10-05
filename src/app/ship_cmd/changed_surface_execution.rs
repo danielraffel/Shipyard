@@ -270,6 +270,36 @@ struct CurrentStaleGeneration<'a> {
     stale_receipt_sha256: &'a str,
 }
 
+/// A fallback caused by the execution payload cap: the reason and the byte
+/// count, so how often the cap bounds selection can be counted.
+#[derive(Debug, Serialize)]
+struct OverCapDiagnostic<'a> {
+    #[serde(flatten)]
+    base: FallbackDiagnostic<'a>,
+    fallback_reason: &'static str,
+    payload_bytes: usize,
+    payload_cap: usize,
+}
+
+impl FallbackDiagnostic<'_> {
+    /// Persist this diagnostic, carrying the over-cap reason when the
+    /// payload cap caused it.
+    fn persist(self, dir: &Path, payload_bytes: Option<usize>) -> Result<(), CliFailure> {
+        match payload_bytes {
+            Some(payload_bytes) => persist_fallback_diagnostic(
+                dir,
+                &OverCapDiagnostic {
+                    base: self,
+                    fallback_reason: crate::changed_surface::SELECTION_PAYLOAD_OVER_CAP,
+                    payload_bytes,
+                    payload_cap: crate::changed_surface::MAX_SELECTED_TEST_BYTES,
+                },
+            ),
+            None => persist_fallback_diagnostic(dir, &self),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct FallbackDiagnostic<'a> {
     schema_version: u32,
@@ -468,7 +498,16 @@ pub(super) fn apply_changed_surface_execution(
         ) {
             Ok(disposition) => disposition,
             Err(error) => {
-                persist_fallback_diagnostic(
+                FallbackDiagnostic {
+                    schema_version: 1,
+                    repository: repo,
+                    pull_request: pr,
+                    target: &target.name,
+                    machine_mode: machine.mode,
+                    category: "promotion_error",
+                    diagnostic: bounded_diagnostic(&error.to_string()),
+                }
+                .persist(
                     &result_dir(
                         state_dir,
                         repo,
@@ -476,15 +515,7 @@ pub(super) fn apply_changed_surface_execution(
                         &observation.receipt.head_sha,
                         &target.name,
                     ),
-                    &FallbackDiagnostic {
-                        schema_version: 1,
-                        repository: repo,
-                        pull_request: pr,
-                        target: &target.name,
-                        machine_mode: machine.mode,
-                        category: "promotion_error",
-                        diagnostic: bounded_diagnostic(&error.to_string()),
-                    },
+                    error.selection_payload_over_cap(),
                 )?;
                 continue;
             }
@@ -502,9 +533,19 @@ pub(super) fn apply_changed_surface_execution(
         if let Some(Keyed::Closeout {
             category,
             diagnostic,
+            payload_bytes,
         }) = &keyed
         {
-            persist_fallback_diagnostic(
+            FallbackDiagnostic {
+                schema_version: 1,
+                repository: repo,
+                pull_request: pr,
+                target: &target.name,
+                machine_mode: machine.mode,
+                category,
+                diagnostic: bounded_diagnostic(diagnostic),
+            }
+            .persist(
                 &result_dir(
                     state_dir,
                     repo,
@@ -512,15 +553,7 @@ pub(super) fn apply_changed_surface_execution(
                     &observation.receipt.head_sha,
                     &target.name,
                 ),
-                &FallbackDiagnostic {
-                    schema_version: 1,
-                    repository: repo,
-                    pull_request: pr,
-                    target: &target.name,
-                    machine_mode: machine.mode,
-                    category,
-                    diagnostic: bounded_diagnostic(diagnostic),
-                },
+                *payload_bytes,
             )?;
         }
         let keyed = match keyed {
@@ -878,6 +911,15 @@ pub(super) fn apply_changed_surface_execution(
                     continue;
                 }
             }
+            if !plan.executable_reuse_binding.is_empty() {
+                // Before the activation, so a stored keyed activation always
+                // has the binding file its payload names by digest.
+                persist_exact_bytes(
+                    &result_dir,
+                    crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE,
+                    &plan.executable_reuse_binding,
+                )?;
+            }
             persist_activation(&result_dir, &activation)?;
             if plan.disposition != crate::changed_surface::BOUNDED {
                 persist_named_receipt(
@@ -1122,14 +1164,20 @@ fn persist_named_receipt<T: Serialize>(
     name: &str,
     receipt: &T,
 ) -> Result<(), CliFailure> {
+    let mut payload = serde_json::to_vec_pretty(receipt)
+        .map_err(|error| CliFailure::new(1, format!("serialize selector receipt: {error}")))?;
+    payload.push(b'\n');
+    persist_exact_bytes(path, name, &payload)
+}
+
+/// Write `payload` to `path/name` once, byte for byte; an existing file must
+/// already hold exactly those bytes. Used where a digest covers the file.
+fn persist_exact_bytes(path: &Path, name: &str, payload: &[u8]) -> Result<(), CliFailure> {
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::create_dir_all(path).map_err(|error| {
         CliFailure::new(1, format!("create selector evidence directory: {error}"))
     })?;
-    let mut payload = serde_json::to_vec_pretty(receipt)
-        .map_err(|error| CliFailure::new(1, format!("serialize selector receipt: {error}")))?;
-    payload.push(b'\n');
     let destination = path.join(name);
     match OpenOptions::new()
         .write(true)
@@ -1137,7 +1185,7 @@ fn persist_named_receipt<T: Serialize>(
         .open(&destination)
     {
         Ok(mut file) => file
-            .write_all(&payload)
+            .write_all(payload)
             .and_then(|()| file.sync_all())
             .map_err(|error| CliFailure::new(1, format!("write selector receipt: {error}")))?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1538,7 +1586,7 @@ mod tests {
     use super::{
         CurrentStaleGeneration, FallbackDiagnostic, MAX_STALE_POINTER_BYTES, MachineMode,
         MachinePolicy, bounded_diagnostic, evidence_dir, full_fallback_diagnostic,
-        persist_fallback_diagnostic, publish_current_stale_generation,
+        persist_exact_bytes, persist_fallback_diagnostic, publish_current_stale_generation,
         read_current_stale_generation, result_dir, selected_resume_block_reason, shell_quote,
         stale_generation_has_execution_evidence, target_declares_changed_surface_selection,
     };
@@ -2185,5 +2233,64 @@ mod tests {
             Some(first),
             "an existing payload is reused at the cap"
         );
+    }
+
+    #[test]
+    fn the_binding_file_is_written_byte_exact_and_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("payload-x");
+        let name = crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE;
+        let bytes = br#"{"candidates":[],"sample_percent":5}"#;
+        persist_exact_bytes(&dir, name, bytes).expect("written");
+        let written = fs::read(dir.join(name)).expect("read");
+        assert_eq!(written, bytes, "no pretty-printing or trailing newline");
+        assert_eq!(
+            super::sha256(&written),
+            super::sha256(bytes),
+            "the digest the payload names is the file's"
+        );
+        persist_exact_bytes(&dir, name, bytes).expect("the same bytes again");
+        assert!(persist_exact_bytes(&dir, name, b"{}").is_err());
+    }
+
+    #[test]
+    fn a_payload_over_the_cap_is_recorded_as_such_with_its_size() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let diagnostic = |category| FallbackDiagnostic {
+            schema_version: 1,
+            repository: "o/r",
+            pull_request: 7,
+            target: "mac",
+            machine_mode: MachineMode::ShadowCompare,
+            category,
+            diagnostic: "refused".to_owned(),
+        };
+        let over = temp.path().join("over");
+        diagnostic("promotion_error")
+            .persist(&over, Some(6_100))
+            .expect("over-cap diagnostic");
+        let other = temp.path().join("other");
+        diagnostic("promotion_error")
+            .persist(&other, None)
+            .expect("other diagnostic");
+        let read = |dir: &std::path::Path| -> serde_json::Value {
+            let file = fs::read_dir(dir)
+                .expect("dir")
+                .flatten()
+                .find(|entry| entry.file_name().to_string_lossy().starts_with("fallback-"))
+                .expect("fallback file");
+            serde_json::from_slice(&fs::read(file.path()).expect("read")).expect("json")
+        };
+        let over = read(&over);
+        assert_eq!(over["fallback_reason"], "selection_payload_over_cap");
+        assert_eq!(over["payload_bytes"], 6_100);
+        assert_eq!(
+            over["payload_cap"],
+            crate::changed_surface::MAX_SELECTED_TEST_BYTES
+        );
+        assert_eq!(over["category"], "promotion_error");
+        let other = read(&other);
+        assert!(other.get("fallback_reason").is_none(), "{other}");
+        assert!(other.get("payload_bytes").is_none(), "{other}");
     }
 }

@@ -21,6 +21,8 @@ pub(super) enum Keyed {
     Closeout {
         category: &'static str,
         diagnostic: String,
+        /// The payload's size, when the plan was refused by the payload cap.
+        payload_bytes: Option<usize>,
     },
 }
 
@@ -28,6 +30,7 @@ fn closeout(category: &'static str, diagnostic: impl Into<String>) -> Keyed {
     Keyed::Closeout {
         category,
         diagnostic: diagnostic.into(),
+        payload_bytes: None,
     }
 }
 
@@ -95,7 +98,11 @@ pub(super) fn plan_keyed(request: &KeyRequest<'_>) -> Keyed {
             "executable_reuse_not_runnable",
             "the protected-base execution policy cannot carry a keyed build-and-test run",
         ),
-        Err(error) => closeout("executable_reuse_plan_error", error.to_string()),
+        Err(error) => Keyed::Closeout {
+            category: "executable_reuse_plan_error",
+            payload_bytes: error.selection_payload_over_cap(),
+            diagnostic: error.to_string(),
+        },
     }
 }
 
