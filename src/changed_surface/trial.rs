@@ -86,6 +86,12 @@ pub struct TrialStatus {
     /// Typed stale-base result when planning terminated before activation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shadow_disposition: Option<super::StaleBaseShadowDisposition>,
+    /// Why the planner's stale-base receipt ended where it did (for example
+    /// `selector_policy_drift`), copied from a receipt that passed identity
+    /// validation. A token outside the bounded vocabulary shape reads as
+    /// `unrecognized`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_base_reason: Option<String>,
     /// What a keyed shadow run measured, when one was recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyed: Option<KeyedShadowSummary>,
@@ -131,6 +137,7 @@ impl TrialStatus {
             result_receipt: None,
             timing: None,
             shadow_disposition: None,
+            stale_base_reason: None,
             keyed: None,
             activation_conflicts: Vec::new(),
             verdict_source: None,
@@ -560,6 +567,22 @@ pub fn evaluate_trial(
     status
 }
 
+/// A stale-base receipt reason as a ledger token: lowercase snake case (digits
+/// allowed) of at
+/// most 64 bytes, or `unrecognized`.
+fn bounded_stale_base_reason(reason: &str) -> String {
+    if !reason.is_empty()
+        && reason.len() <= 64
+        && reason
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        reason.to_owned()
+    } else {
+        "unrecognized".to_owned()
+    }
+}
+
 /// Validate a terminal stale-base receipt when no runnable activation exists.
 #[must_use]
 pub fn evaluate_stale_base_terminal(
@@ -604,6 +627,7 @@ pub fn evaluate_stale_base_terminal(
         return status;
     }
     status.shadow_disposition = Some(receipt.disposition);
+    status.stale_base_reason = Some(bounded_stale_base_reason(&receipt.reason));
     match receipt.disposition {
         super::StaleBaseShadowDisposition::Recomputed
         | super::StaleBaseShadowDisposition::Reused => {
@@ -855,6 +879,7 @@ pub(crate) fn rejected_trial(
         result_receipt,
         timing: None,
         shadow_disposition: None,
+        stale_base_reason: None,
         keyed: None,
         activation_conflicts: Vec::new(),
         verdict_source: None,

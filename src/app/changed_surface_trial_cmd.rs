@@ -1172,6 +1172,10 @@ mod tests {
             status.shadow_disposition,
             Some(crate::changed_surface::StaleBaseShadowDisposition::FullRequired)
         );
+        assert_eq!(
+            status.stale_base_reason.as_deref(),
+            Some("test_topology_drift")
+        );
 
         fs::write(
             result_dir.join(ACTIVATION_RECEIPT),
@@ -1188,6 +1192,7 @@ mod tests {
             status.reason,
             "ambiguous_stale_and_activated_trial_generations"
         );
+        assert_eq!(status.stale_base_reason, None);
     }
 
     #[test]
