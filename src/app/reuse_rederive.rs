@@ -2138,4 +2138,22 @@ supported_build_types = ["debug"]
             "an unkeyed run is never a refusal"
         );
     }
+
+    #[test]
+    fn an_unknown_binding_reason_is_still_not_derived() {
+        // The adapter's reason words may grow; only the prefix and the null
+        // binding decide, so a new word can never become a refusal.
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", |result| {
+            result["executable_reuse"] = json!({
+                "mode": "keyed_full_shadow", "bound": null, "binding_sha256": "d",
+                "derived": {"status": "error: binding quarantined by some future rule"}});
+        });
+        to_schema_3(&result_directory(&fixture.state, &identity));
+        assert_eq!(
+            verdict(&rederive(&fixture, &identity, &calls)),
+            "not_derived"
+        );
+    }
 }

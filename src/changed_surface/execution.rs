@@ -245,9 +245,7 @@ fn capped_payload<'a>(
     let bytes = serde_json::to_vec(&*payload)
         .map_err(|failure| error(format!("serialize authoritative payload: {failure}")))?;
     if bytes.len() > MAX_SELECTED_TEST_BYTES {
-        return Err(error(
-            "bounded selection payload exceeds the safe command limit",
-        ));
+        return Err(ExecutionPlanError::over_cap(bytes.len()));
     }
     Ok(bytes)
 }
@@ -274,6 +272,33 @@ pub const KEYED_FULL_SHADOW: &str = "keyed_full_shadow";
 /// diagnostic; they must never treat this as bounded success.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionPlanError(pub String);
+
+/// The reason a plan falls back when its payload is over
+/// [`MAX_SELECTED_TEST_BYTES`]; recorded with the byte count so the cap's
+/// effect can be counted from the fallback diagnostics.
+pub const SELECTION_PAYLOAD_OVER_CAP: &str = "selection_payload_over_cap";
+
+impl ExecutionPlanError {
+    fn over_cap(bytes: usize) -> Self {
+        error(format!(
+            "{SELECTION_PAYLOAD_OVER_CAP}: the bounded selection payload is {bytes} bytes, \
+             over the {MAX_SELECTED_TEST_BYTES}-byte cap"
+        ))
+    }
+
+    /// The payload's size when this plan was refused for exceeding
+    /// [`MAX_SELECTED_TEST_BYTES`], `None` for any other refusal.
+    #[must_use]
+    pub fn selection_payload_over_cap(&self) -> Option<usize> {
+        self.0
+            .strip_prefix(SELECTION_PAYLOAD_OVER_CAP)?
+            .strip_prefix(": the bounded selection payload is ")?
+            .split(' ')
+            .next()?
+            .parse()
+            .ok()
+    }
+}
 
 impl Display for ExecutionPlanError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
@@ -1506,11 +1531,16 @@ mod tests {
     fn the_selection_cap_still_refuses_an_oversized_list() {
         // Refused by the payload cap itself, before the command check.
         let (policy, receipt) = selection_of(200, 30);
-        let Err(ExecutionPlanError(reason)) = keyed_bounded(&policy, &receipt, &real_binding(1))
-        else {
+        let Err(refused) = keyed_bounded(&policy, &receipt, &real_binding(1)) else {
             panic!("an oversized selection must not plan");
         };
-        assert!(reason.contains("selection payload exceeds"), "{reason}");
+        let bytes = refused
+            .selection_payload_over_cap()
+            .unwrap_or_else(|| panic!("not the payload cap: {refused}"));
+        assert!(bytes > MAX_SELECTED_TEST_BYTES, "{bytes}");
+        assert!(refused.to_string().starts_with(SELECTION_PAYLOAD_OVER_CAP));
+        // Any other refusal names no byte count.
+        assert_eq!(error("other").selection_payload_over_cap(), None);
     }
 
     #[test]

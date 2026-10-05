@@ -602,8 +602,11 @@ Shipyard and the adapter apply one cap to the same bytes: the decoded payload
 may be at most 5,632 bytes (`MAX_SELECTED_TEST_BYTES`), which keeps the
 base64-expanded command under `MAX_EXECUTION_COMMAND_UNITS` (8,000), and that
 command check stays the authoritative shell bound. A selection over the cap
-is not executed bounded: the configured stages run, with a planning
-diagnostic. Schema-2 payloads, which carried the binding inline,
+is not executed bounded: the configured stages run, and the fallback
+diagnostic (`promotion_error`, or `executable_reuse_plan_error` for a keyed
+plan) carries `fallback_reason: "selection_payload_over_cap"` with
+`payload_bytes` and `payload_cap`, so how often the cap bounds selection can be
+counted from the trial directories. Schema-2 payloads, which carried the binding inline,
 are still read by re-derivation.
 
 The toolchain is not compared here. Only the lane, after it configures this
@@ -705,7 +708,8 @@ result's `executable_reuse.derived`. After the run, Shipyard:
    the binding file and refuses one whose bytes no longer hash to the
    payload's digest, and records `not_derived` when the runner itself did not
    use the binding (`executable_reuse.bound` null and a `derived.status`
-   starting `error: binding`), since that run was unkeyed;
+   starting `error: binding`, whatever reason word follows), since that run
+   was unkeyed;
 2. takes the record the run keyed against: its named pick, which must be in
    the bound candidate set, or the first candidate when it names none; it
    records `not_derived` when nothing was derived or no candidate was bound,
