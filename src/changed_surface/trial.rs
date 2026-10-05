@@ -768,7 +768,7 @@ fn validate_stale_plan_selection(
     let selected_tests = literal_file_bytes(&selection.selected_tests)?;
     let selected_build_targets = match plan.schema_version {
         1 => None,
-        2 => Some(literal_file_bytes(&selection.selected_build_targets)?),
+        2 | 3 => Some(literal_file_bytes(&selection.selected_build_targets)?),
         _ => return Err("unsupported_stale_activation_schema"),
     };
     let selected_build_targets_digest = selected_build_targets
@@ -879,7 +879,7 @@ fn validate_activation_identity(
 ) -> Result<(), &'static str> {
     let plan = &activation.plan;
     if activation.schema_version != plan.schema_version
-        || !matches!(plan.schema_version, 1 | 2)
+        || !matches!(plan.schema_version, 1..=3)
         || activation.machine_mode != "shadow_compare"
     {
         return Err("invalid_shadow_activation_contract");
@@ -924,7 +924,7 @@ fn validate_activation(
     {
         return Err("invalid_shadow_activation_build_target_contract");
     }
-    if plan.schema_version == 2
+    if plan.schema_version >= 2
         && (plan.stage != "build_and_test"
             || plan.selected_build_targets_digest.is_none()
             || plan.selected_build_target_count == 0)
@@ -1044,7 +1044,7 @@ fn validate_keyed_activation(
 ) -> Result<(), &'static str> {
     validate_activation_identity(identity, activation)?;
     let plan = &activation.plan;
-    if plan.schema_version != 2 || plan.stage != "build_and_test" {
+    if !matches!(plan.schema_version, 2 | 3) || plan.stage != "build_and_test" {
         return Err("invalid_keyed_activation_contract");
     }
     let full_shape = plan.selected_count == 0
@@ -1171,7 +1171,7 @@ fn validate_result(plan: &ActivationPlan, result: &ResultReceipt) -> Result<(), 
     } else if result.comparison_verdict != "matched_pass" {
         return Err("shadow_result_not_matched_pass");
     }
-    if plan.schema_version == 2 && timing(plan, result).is_none() {
+    if plan.schema_version >= 2 && timing(plan, result).is_none() {
         return Err("invalid_shadow_result_timing");
     }
     Ok(())
@@ -1274,7 +1274,7 @@ fn validate_result_binding(
 }
 
 fn timing(plan: &ActivationPlan, result: &ResultReceipt) -> Option<TrialTiming> {
-    if plan.schema_version != 2 {
+    if plan.schema_version < 2 {
         return None;
     }
     let verification = valid_duration(result.verification_duration_seconds?)?;

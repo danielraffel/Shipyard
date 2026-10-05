@@ -845,6 +845,11 @@ head, or a changed activation for the same payload, the ship runs unkeyed
 with an `activation_conflict` diagnostic instead of failing; look for
 `activation_conflicts` in trial status before calling such a head's lane
 "unkeyed for no reason".
+A keyed plan whose result names `executable_reuse_binding.status` other than
+`verified` ran unkeyed because the binding file did not match the payload's
+digest; its re-derivation is `not_derived`, not a refusal. The shadow planning
+receipt's `authoritative_execution: not_observed_by_shadow_planner` never
+changes after a run, so prove execution from the trial result receipt.
 `shipyard --json reuse records --target <t>` answers "could a keyed plan bind
 anything on this host right now?" with the same rules the ship path uses; read
 its `no_base` refusal counts before assuming the store is empty. `records[]`

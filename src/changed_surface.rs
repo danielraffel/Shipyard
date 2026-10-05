@@ -19,9 +19,10 @@ pub mod live_switch;
 mod stale_base;
 pub mod trial;
 pub use execution::{
-    AuthoritativeExecutionPlan, BOUNDED, ChangedSurfaceExecutionPolicy, ExecutionCommandTransport,
-    ExecutionDisposition, ExecutionMode, ExecutionPlanError, FullExecutionReason,
-    KEYED_BOUNDED_SHADOW, KEYED_FULL_SHADOW, plan_authoritative_execution, plan_keyed_execution,
+    AuthoritativeExecutionPlan, BOUNDED, ChangedSurfaceExecutionPolicy,
+    EXECUTABLE_REUSE_BINDING_FILE, ExecutionCommandTransport, ExecutionDisposition, ExecutionMode,
+    ExecutionPlanError, FullExecutionReason, KEYED_BOUNDED_SHADOW, KEYED_FULL_SHADOW,
+    plan_authoritative_execution, plan_keyed_execution,
 };
 pub use stale_base::{
     MergeAuthority, StaleBaseCandidate, StaleBaseShadowDisposition, StaleBaseShadowInput,

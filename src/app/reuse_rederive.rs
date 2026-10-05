@@ -466,14 +466,40 @@ fn judge(
             "the context's payload is not the one the activation bound",
         ));
     }
-    let Some(Ok(binding)) = serde_json::from_slice::<Value>(&payload)
+    let payload: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
+    // The runner refused a binding file that did not match the payload's
+    // digest and ran unkeyed: nothing was keyed, so there is nothing to judge.
+    if let Some(status) = serde_json::from_slice::<Value>(result_bytes)
         .ok()
-        .and_then(|value| value.get("executable_reuse").cloned())
-        .map(serde_json::from_value::<ExecutableReuseBinding>)
-    else {
-        return Ok(Verdict::refuse(
-            "the bound payload carries no reuse binding",
-        ));
+        .and_then(|result| {
+            result
+                .pointer("/executable_reuse_binding/status")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|status| status != "verified")
+    {
+        return Ok(Verdict::not_derived(format!(
+            "the runner refused the binding: {status}"
+        )));
+    }
+    let binding = match payload
+        .get("executable_reuse_binding_digest")
+        .and_then(Value::as_str)
+    {
+        Some(digest) => read_binding_file(trial_dir, digest),
+        None => payload
+            .get("executable_reuse")
+            .cloned()
+            .ok_or_else(|| "the bound payload carries no reuse binding".to_owned())
+            .and_then(|value| {
+                serde_json::from_value::<ExecutableReuseBinding>(value)
+                    .map_err(|_| "the bound payload carries no reuse binding".to_owned())
+            }),
+    };
+    let binding = match binding {
+        Ok(binding) => binding,
+        Err(reason) => return Ok(Verdict::refuse(reason)),
     };
     let checkout = Path::new(&context.checkout);
     let config = git_bytes(
@@ -510,6 +536,21 @@ fn judge(
         verdict.switch_variable = Some(reuse.switch_variable.clone());
         verdict
     })
+}
+
+/// A schema-3 plan's binding: the file beside the activation, accepted only
+/// when its bytes hash to the digest the payload names. The runner verified
+/// the same file before it ran, so a difference now means the evidence moved.
+fn read_binding_file(trial_dir: &Path, digest: &str) -> Result<ExecutableReuseBinding, String> {
+    let name = crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE;
+    let bytes = fs::read(trial_dir.join(name))
+        .map_err(|_| format!("the binding file {name} is missing"))?;
+    if sha256_hex(&bytes) != digest {
+        return Err(format!(
+            "the binding file {name} is not the one the payload named"
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| format!("the binding file {name} is not a binding"))
 }
 
 /// What a keyed run bound, read back and verified.
@@ -2000,6 +2041,92 @@ supported_build_types = ["debug"]
         assert!(
             sweep(&fixture.state, 8, &gh_recording(&calls)).is_empty(),
             "each once"
+        );
+    }
+
+    /// Rewrite a laid-out keyed run into schema 3: the binding moves from the
+    /// payload into its file, and the payload names it by digest.
+    fn to_schema_3(dir: &Path) -> Vec<u8> {
+        let context_path = dir.join(KEYED_CONTEXT_RECEIPT);
+        let mut context: KeyedRunContext =
+            serde_json::from_slice(&fs::read(&context_path).expect("context")).expect("json");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&context.execution_payload_b64)
+            .expect("payload");
+        let mut payload: Value = serde_json::from_slice(&payload).expect("json");
+        let binding = payload
+            .as_object_mut()
+            .expect("payload")
+            .remove("executable_reuse")
+            .expect("inline binding");
+        let bytes = serde_json::to_vec(&binding).expect("binding");
+        fs::write(
+            dir.join(crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE),
+            &bytes,
+        )
+        .expect("binding file");
+        payload["executable_reuse_binding_digest"] = json!(sha256_hex(&bytes));
+        let payload = serde_json::to_vec(&payload).expect("payload");
+        context.execution_payload_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload);
+        fs::write(&context_path, serde_json::to_vec(&context).expect("json")).expect("context");
+        let mut activation: Value =
+            serde_json::from_slice(&fs::read(dir.join(ACTIVATION_RECEIPT)).expect("activation"))
+                .expect("json");
+        activation["plan"]["execution_payload_digest"] = json!(sha256_hex(&payload));
+        fs::write(dir.join(ACTIVATION_RECEIPT), activation.to_string()).expect("activation");
+        bytes
+    }
+
+    #[test]
+    fn a_schema_3_run_is_judged_against_its_binding_file() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", |_| {});
+        to_schema_3(&result_directory(&fixture.state, &identity));
+        assert_eq!(verdict(&rederive(&fixture, &identity, &calls)), "match");
+    }
+
+    #[test]
+    fn a_binding_file_that_moved_after_the_run_is_refused() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", |_| {});
+        let dir = result_directory(&fixture.state, &identity);
+        let mut bytes = to_schema_3(&dir);
+        bytes.push(b' ');
+        fs::write(
+            dir.join(crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE),
+            &bytes,
+        )
+        .expect("tamper");
+        let outcome = rederive(&fixture, &identity, &calls);
+        assert_eq!(verdict(&outcome), "refuse");
+        let Outcome::Recorded { reason, .. } = outcome else {
+            unreachable!()
+        };
+        assert!(reason.contains("not the one the payload named"), "{reason}");
+    }
+
+    #[test]
+    fn a_run_whose_runner_refused_the_binding_is_not_derived() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let identity = keyed_run(&fixture, "h1", |result| {
+            result["executable_reuse_binding"] =
+                json!({"digest": "d", "status": "keyed_binding_mismatch"});
+        });
+        to_schema_3(&result_directory(&fixture.state, &identity));
+        assert_eq!(
+            verdict(&rederive(&fixture, &identity, &calls)),
+            "not_derived"
+        );
+        assert!(
+            !fixture
+                .state
+                .join("executable-reuse/refusals.json")
+                .exists(),
+            "an unkeyed run is never a refusal"
         );
     }
 }

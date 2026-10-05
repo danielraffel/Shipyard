@@ -168,7 +168,10 @@ families, complete selected tests, mandatory baseline, family/count telemetry,
 planner/full-suite outcomes, elapsed time, and any fallback reason. The receipt
 explicitly says `shadow_only: true`, `authoritative_suite: full`, and
 `authoritative_execution: not_observed_by_shadow_planner`; it is not target
-evidence and cannot satisfy a merge gate.
+evidence and cannot satisfy a merge gate. That field is written by the planner
+and never updated, so it reads the same whether or not the lane later ran;
+evidence that a run executed is its result receipt in the trial directory
+(`changed-surface-results/...`), never this planning receipt.
 
 When a release-only family is affected under Debug, the receipt either binds
 the required exact-head Release target evidence under `secondary_proofs`, or it
@@ -584,7 +587,22 @@ path:
 4. binds the rules digest, the derivation code's directory and digest, a sample
    seed over head, policy and the candidates' digests (so the sample does not
    depend on which candidate is picked), the sample percentage and the build
-   directory into the execution payload.
+   directory.
+
+The binding does not travel in the command. Shipyard writes it, as the exact
+JSON bytes the plan produced, to `executable-reuse-binding.json` in the plan's
+payload directory before the activation, and the execution payload (schema 3)
+carries only `executable_reuse_binding_digest`, the sha256 of those bytes. So
+the command does not grow with the candidate count. The adapter reads the
+file and uses it only when its bytes hash to that digest; otherwise it runs
+the plan unkeyed and records `executable_reuse_binding` with
+`keyed_binding_mismatch` or `keyed_binding_unreadable` in its result, and a
+verified run records the digest it used. The 4 KiB `MAX_SELECTED_TEST_BYTES`
+cap measures the payload without that digest, that is the selection; the
+command itself is held to `MAX_EXECUTION_COMMAND_UNITS` (8,000). A selection
+over the cap is not executed bounded: the configured stages run, with a
+planning diagnostic. Schema-2 payloads, which carried the binding inline,
+are still read by re-derivation.
 
 The toolchain is not compared here. Only the lane, after it configures this
 head, knows the toolchain it builds with: it picks the first candidate whose
@@ -681,7 +699,11 @@ The runner leaves its inputs (`ctest-listing.json`, `toolchain.json`,
 result's `executable_reuse.derived`. After the run, Shipyard:
 
 1. checks the activation's payload digest against the payload it kept, and the
-   base policy's digest against the plan's;
+   base policy's digest against the plan's; for a schema-3 payload it reads
+   the binding file and refuses one whose bytes no longer hash to the
+   payload's digest, and records `not_derived` when the runner itself refused
+   the binding (`executable_reuse_binding.status` other than `verified`), since
+   that run was unkeyed;
 2. takes the record the run keyed against: its named pick, which must be in
    the bound candidate set, or the first candidate when it names none; it
    records `not_derived` when nothing was derived or no candidate was bound,

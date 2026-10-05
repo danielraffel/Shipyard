@@ -878,6 +878,15 @@ pub(super) fn apply_changed_surface_execution(
                     continue;
                 }
             }
+            if !plan.executable_reuse_binding.is_empty() {
+                // Before the activation, so a stored keyed activation always
+                // has the binding file its payload names by digest.
+                persist_exact_bytes(
+                    &result_dir,
+                    crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE,
+                    &plan.executable_reuse_binding,
+                )?;
+            }
             persist_activation(&result_dir, &activation)?;
             if plan.disposition != crate::changed_surface::BOUNDED {
                 persist_named_receipt(
@@ -1122,14 +1131,20 @@ fn persist_named_receipt<T: Serialize>(
     name: &str,
     receipt: &T,
 ) -> Result<(), CliFailure> {
+    let mut payload = serde_json::to_vec_pretty(receipt)
+        .map_err(|error| CliFailure::new(1, format!("serialize selector receipt: {error}")))?;
+    payload.push(b'\n');
+    persist_exact_bytes(path, name, &payload)
+}
+
+/// Write `payload` to `path/name` once, byte for byte; an existing file must
+/// already hold exactly those bytes. Used where a digest covers the file.
+fn persist_exact_bytes(path: &Path, name: &str, payload: &[u8]) -> Result<(), CliFailure> {
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     fs::create_dir_all(path).map_err(|error| {
         CliFailure::new(1, format!("create selector evidence directory: {error}"))
     })?;
-    let mut payload = serde_json::to_vec_pretty(receipt)
-        .map_err(|error| CliFailure::new(1, format!("serialize selector receipt: {error}")))?;
-    payload.push(b'\n');
     let destination = path.join(name);
     match OpenOptions::new()
         .write(true)
@@ -1137,7 +1152,7 @@ fn persist_named_receipt<T: Serialize>(
         .open(&destination)
     {
         Ok(mut file) => file
-            .write_all(&payload)
+            .write_all(payload)
             .and_then(|()| file.sync_all())
             .map_err(|error| CliFailure::new(1, format!("write selector receipt: {error}")))?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1538,7 +1553,7 @@ mod tests {
     use super::{
         CurrentStaleGeneration, FallbackDiagnostic, MAX_STALE_POINTER_BYTES, MachineMode,
         MachinePolicy, bounded_diagnostic, evidence_dir, full_fallback_diagnostic,
-        persist_fallback_diagnostic, publish_current_stale_generation,
+        persist_exact_bytes, persist_fallback_diagnostic, publish_current_stale_generation,
         read_current_stale_generation, result_dir, selected_resume_block_reason, shell_quote,
         stale_generation_has_execution_evidence, target_declares_changed_surface_selection,
     };
@@ -2185,5 +2200,23 @@ mod tests {
             Some(first),
             "an existing payload is reused at the cap"
         );
+    }
+
+    #[test]
+    fn the_binding_file_is_written_byte_exact_and_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("payload-x");
+        let name = crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE;
+        let bytes = br#"{"candidates":[],"sample_percent":5}"#;
+        persist_exact_bytes(&dir, name, bytes).expect("written");
+        let written = fs::read(dir.join(name)).expect("read");
+        assert_eq!(written, bytes, "no pretty-printing or trailing newline");
+        assert_eq!(
+            super::sha256(&written),
+            super::sha256(bytes),
+            "the digest the payload names is the file's"
+        );
+        persist_exact_bytes(&dir, name, bytes).expect("the same bytes again");
+        assert!(persist_exact_bytes(&dir, name, b"{}").is_err());
     }
 }
