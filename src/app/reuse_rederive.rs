@@ -166,26 +166,75 @@ impl Verdict {
     }
 }
 
-/// Re-derive one trial's keyed run, at most once per result.
+/// One evidence directory's re-derivation outcome within a head.
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct PayloadOutcome {
+    /// The keyed payload directory's digest; `None` for the top-level
+    /// evidence of the head.
+    pub(crate) payload_sha256: Option<String>,
+    /// What happened, when it could be decided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) outcome: Option<Outcome>,
+    /// Why nothing was recorded for it; a later call can retry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+}
+
+/// Re-derive every keyed run of one head: its top-level evidence and each
+/// keyed payload directory, at most once per result. Each directory is judged
+/// on its own, so one that cannot be read never hides another's outcome, and
+/// refusals stay counted per (head, result).
 ///
 /// `gh` runs a `gh` command for the run's checkout (its first argument); it
 /// is used only to trip the switch after the second refusal.
-///
-/// # Errors
-///
-/// The trial directory or a receipt could not be read or written, or the
-/// checkout the run used is unreadable. Nothing is recorded and a later call
-/// (the sweep, an operator) can retry.
 pub(crate) fn rederive_trial<F>(
     state_dir: &Path,
     identity: &TrialIdentity,
+    produced_by: ProducedBy,
+    gh: &F,
+) -> Vec<PayloadOutcome>
+where
+    F: Fn(&Path, &[String]) -> Result<String, String> + ?Sized,
+{
+    let trial_dir = result_directory(state_dir, identity);
+    std::iter::once((None, trial_dir.clone()))
+        .chain(
+            crate::changed_surface::trial::payload_dirs(&trial_dir)
+                .into_iter()
+                .map(|(digest, dir)| (Some(digest), dir)),
+        )
+        .map(|(payload_sha256, dir)| {
+            let (outcome, error) = match rederive_dir(state_dir, &dir, produced_by, gh) {
+                Ok(outcome) => (Some(outcome), None),
+                Err(error) => (None, Some(error)),
+            };
+            PayloadOutcome {
+                payload_sha256,
+                outcome,
+                error,
+            }
+        })
+        .collect()
+}
+
+/// Re-derive the keyed run whose evidence is `trial_dir` (a head's top-level
+/// evidence or one keyed payload directory), at most once per result.
+///
+/// # Errors
+///
+/// The directory or a receipt could not be read or written, or the checkout
+/// the run used is unreadable. Nothing is recorded and a later call (the
+/// sweep, an operator) can retry.
+pub(crate) fn rederive_dir<F>(
+    state_dir: &Path,
+    trial_dir: &Path,
     produced_by: ProducedBy,
     gh: &F,
 ) -> Result<Outcome, String>
 where
     F: Fn(&Path, &[String]) -> Result<String, String> + ?Sized,
 {
-    let trial_dir = result_directory(state_dir, identity);
+    let trial_dir = trial_dir.to_path_buf();
     let Some(activation_bytes) = read_optional(&trial_dir.join(ACTIVATION_RECEIPT))? else {
         return Ok(Outcome::NotKeyed);
     };
@@ -827,8 +876,16 @@ where
 {
     let mut pending = Vec::new();
     let root = state_dir.join("changed-surface-results");
-    for trial_dir in trial_dirs(&root) {
-        let Ok(Some(bytes)) = read_optional(&trial_dir.join(ACTIVATION_RECEIPT)) else {
+    let evidence_dirs = trial_dirs(&root).into_iter().flat_map(|trial_dir| {
+        let payloads = crate::changed_surface::trial::payload_dirs(&trial_dir);
+        std::iter::once((trial_dir.clone(), trial_dir.clone())).chain(
+            payloads
+                .into_iter()
+                .map(move |(_, dir)| (dir, trial_dir.clone())),
+        )
+    });
+    for (evidence_dir, trial_dir) in evidence_dirs {
+        let Ok(Some(bytes)) = read_optional(&evidence_dir.join(ACTIVATION_RECEIPT)) else {
             continue;
         };
         let Ok(activation) = serde_json::from_slice::<SweepActivation>(&bytes) else {
@@ -841,14 +898,14 @@ where
         ) {
             continue;
         }
-        let Ok(results) = named_files(&trial_dir, "result-") else {
+        let Ok(results) = named_files(&evidence_dir, "result-") else {
             continue;
         };
         let [(_, bytes)] = results.as_slice() else {
             continue;
         };
         let receipt = format!("{REDERIVATION_RECEIPT_PREFIX}{}.json", sha256_hex(bytes));
-        if trial_dir.join(receipt).exists() {
+        if evidence_dir.join(receipt).exists() {
             continue;
         }
         // The adapter's own record time, not a filesystem timestamp: two
@@ -864,15 +921,15 @@ where
             head_sha: plan.head_sha,
         };
         if result_directory(state_dir, &identity) == trial_dir {
-            pending.push((recorded, trial_dir, identity));
+            pending.push((recorded, evidence_dir, identity));
         }
     }
     pending.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     pending
         .into_iter()
         .take(cap)
-        .map(|(_, _, identity)| {
-            let outcome = rederive_trial(state_dir, &identity, ProducedBy::Sweep, gh);
+        .map(|(_, evidence_dir, identity)| {
+            let outcome = rederive_dir(state_dir, &evidence_dir, ProducedBy::Sweep, gh);
             (identity, outcome)
         })
         .collect()
@@ -1211,24 +1268,44 @@ supported_build_types = ["debug"]
         candidates: &[BaseCandidate],
         edit: impl Fn(&mut Value),
     ) -> TrialIdentity {
+        keyed_run_into(fixture, head, candidates, None, edit).0
+    }
+
+    /// Lay out one keyed run; with `payload_tag` it goes into its own keyed
+    /// payload directory (the tag varies the sample seed, so each tag is a
+    /// distinct payload, and the runner artifacts, so each run's differ).
+    /// Returns the identity and the run's evidence directory.
+    fn keyed_run_into(
+        fixture: &Fixture,
+        head: &str,
+        candidates: &[BaseCandidate],
+        payload_tag: Option<&str>,
+        edit: impl Fn(&mut Value),
+    ) -> (TrialIdentity, PathBuf) {
         let identity = TrialIdentity {
             repository: "owner/repo".to_owned(),
             pull_request: 7,
             target: "mac".to_owned(),
             head_sha: head.to_owned(),
         };
-        let dir = result_directory(&fixture.state, &identity);
-        fs::create_dir_all(&dir).expect("trial dir");
+        let tag = payload_tag.unwrap_or("");
         let binding = ExecutableReuseBinding {
             candidates: candidates.to_vec(),
             rules_digest: "r".repeat(64),
             derivation_code_dir: "/unused".to_owned(),
             derivation_code_sha256: fixture.code.digest.clone(),
-            sample_seed: "s".repeat(64),
+            sample_seed: format!("{tag}{}", "s".repeat(64 - tag.len())),
             sample_percent: 5,
             build_dir: "build".to_owned(),
         };
         let payload = serde_json::to_vec(&json!({"executable_reuse": binding})).expect("payload");
+        let trial_dir = result_directory(&fixture.state, &identity);
+        let dir = if payload_tag.is_some() {
+            crate::changed_surface::trial::payload_dir(&trial_dir, &sha256_hex(&payload))
+        } else {
+            trial_dir
+        };
+        fs::create_dir_all(&dir).expect("trial dir");
         fs::write(
             dir.join(ACTIVATION_RECEIPT),
             json!({"plan": {
@@ -1259,7 +1336,7 @@ supported_build_types = ["debug"]
             json!(fixture.candidate.record_sha256),
         );
         for (name, key) in RUNNER_INPUTS {
-            let bytes = format!("{{\"{name}\": \"{head}\"}}\n");
+            let bytes = format!("{{\"{name}\": \"{head}{tag}\"}}\n");
             fs::write(dir.join(name), &bytes).expect("input");
             derived.insert(key.into(), json!(sha256_hex(bytes.as_bytes())));
         }
@@ -1269,7 +1346,7 @@ supported_build_types = ["debug"]
         });
         edit(&mut result);
         fs::write(dir.join("result-1.json"), result.to_string()).expect("result");
-        identity
+        (identity, dir)
     }
 
     /// A distinct adapter record time per fixture head (`h1` < `h2` < ...).
@@ -1284,7 +1361,21 @@ supported_build_types = ["debug"]
             calls.borrow_mut().push(args.to_vec());
             Err("offline".to_owned())
         };
-        rederive_trial(&fixture.state, identity, ProducedBy::Completion, &gh).expect("rederive")
+        top_level(rederive_trial(
+            &fixture.state,
+            identity,
+            ProducedBy::Completion,
+            &gh,
+        ))
+    }
+
+    /// The head's top-level evidence outcome, which these fixtures write.
+    fn top_level(outcomes: Vec<PayloadOutcome>) -> Outcome {
+        let mut outcomes = outcomes.into_iter();
+        let top = outcomes.next().expect("the top level is always judged");
+        assert_eq!(top.payload_sha256, None);
+        top.outcome
+            .unwrap_or_else(|| panic!("rederive: {:?}", top.error))
     }
 
     fn verdict(outcome: &Outcome) -> &str {
@@ -1793,8 +1884,12 @@ supported_build_types = ["debug"]
             )
             .expect("diagnostic");
             assert_eq!(
-                rederive_trial(&fixture.state, &identity, ProducedBy::Completion, &gh)
-                    .expect("rederive"),
+                top_level(rederive_trial(
+                    &fixture.state,
+                    &identity,
+                    ProducedBy::Completion,
+                    &gh
+                )),
                 expected,
                 "{head}"
             );
@@ -1805,6 +1900,106 @@ supported_build_types = ["debug"]
                 .state
                 .join("executable-reuse/refusals.json")
                 .exists()
+        );
+    }
+
+    const DISAGREEING: &str = "import shutil, sys\n\
+         open(sys.argv[2] + '/selection.json', 'w').write('{\"other\": 1}\\n')\n\
+         shutil.copy(sys.argv[1] + '/executable-keys.json', sys.argv[2])\n";
+
+    fn gh_recording(calls: &Calls) -> impl Fn(&Path, &[String]) -> Result<String, String> + '_ {
+        |_: &Path, args: &[String]| {
+            calls.borrow_mut().push(args.to_vec());
+            Err("offline".to_owned())
+        }
+    }
+
+    #[test]
+    fn a_second_payload_run_never_disturbs_the_first_runs_rederivation() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let candidates = std::slice::from_ref(&fixture.candidate);
+        let (identity, first) = keyed_run_into(&fixture, "h1", candidates, Some("a"), |_| {});
+        let (_, second) = keyed_run_into(&fixture, "h1", candidates, Some("b"), |_| {});
+        assert_ne!(
+            first, second,
+            "two candidate sets, two evidence directories"
+        );
+        let outcomes = rederive_trial(
+            &fixture.state,
+            &identity,
+            ProducedBy::Completion,
+            &gh_recording(&calls),
+        );
+        let verdicts: Vec<_> = outcomes
+            .iter()
+            .filter(|payload| payload.payload_sha256.is_some())
+            .map(|payload| verdict(payload.outcome.as_ref().expect("decided")).to_owned())
+            .collect();
+        assert_eq!(verdicts, ["match", "match"], "{outcomes:?}");
+        assert_eq!(
+            outcomes[0].outcome,
+            Some(Outcome::NotKeyed),
+            "the empty top level is not a run"
+        );
+        assert!(calls.borrow().is_empty(), "nothing tripped");
+    }
+
+    #[test]
+    fn two_refused_payloads_on_one_head_count_two_and_the_second_trips() {
+        let fixture = fixture(DISAGREEING);
+        let calls = Calls::default();
+        let candidates = std::slice::from_ref(&fixture.candidate);
+        let (identity, _) = keyed_run_into(&fixture, "h1", candidates, Some("a"), |_| {});
+        keyed_run_into(&fixture, "h1", candidates, Some("b"), |_| {});
+        let outcomes = rederive_trial(
+            &fixture.state,
+            &identity,
+            ProducedBy::Completion,
+            &gh_recording(&calls),
+        );
+        let refusals: Vec<_> = outcomes
+            .iter()
+            .filter_map(|payload| match &payload.outcome {
+                Some(Outcome::Recorded {
+                    verdict, tripped, ..
+                }) => Some((verdict.as_str(), tripped.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            refusals,
+            [("refuse", false), ("refuse", true)],
+            "{outcomes:?}"
+        );
+        let ledger: Value = serde_json::from_slice(
+            &fs::read(fixture.state.join("executable-reuse/refusals.json")).expect("ledger"),
+        )
+        .expect("json");
+        assert_eq!(
+            ledger["owner/repo"].as_object().map(serde_json::Map::len),
+            Some(2),
+            "one entry per (head, result)"
+        );
+        assert!(!calls.borrow().is_empty(), "the trip reached gh");
+    }
+
+    #[test]
+    fn the_sweep_reaches_keyed_payload_directories() {
+        let fixture = fixture(FAITHFUL);
+        let calls = Calls::default();
+        let candidates = std::slice::from_ref(&fixture.candidate);
+        keyed_run_into(&fixture, "h1", candidates, Some("a"), |_| {});
+        keyed_run_into(&fixture, "h1", candidates, Some("b"), |_| {});
+        let swept = sweep(&fixture.state, 8, &gh_recording(&calls));
+        let verdicts: Vec<_> = swept
+            .iter()
+            .map(|(_, outcome)| verdict(outcome.as_ref().expect("decided")).to_owned())
+            .collect();
+        assert_eq!(verdicts, ["match", "match"], "{swept:?}");
+        assert!(
+            sweep(&fixture.state, 8, &gh_recording(&calls)).is_empty(),
+            "each once"
         );
     }
 }

@@ -93,8 +93,182 @@ fn read_trial(identity: &TrialIdentity, result_dir: &Path) -> TrialStatus {
     read_trial_with_final_snapshot_hook(identity, result_dir, || {})
 }
 
-#[allow(clippy::too_many_lines)]
+/// Read a head's trial: its top-level evidence and, when the head holds
+/// keyed payload directories, every one of them. Each directory is evaluated
+/// exactly as a single run is, and the head's verdict is the one whose result
+/// the adapter recorded last.
 fn read_trial_with_final_snapshot_hook<F>(
+    identity: &TrialIdentity,
+    result_root: &Path,
+    mut before_final_snapshot: F,
+) -> TrialStatus
+where
+    F: FnMut(),
+{
+    let top = read_evidence_dir(identity, result_root, &mut before_final_snapshot);
+    let payloads = crate::changed_surface::trial::payload_dirs(result_root);
+    // A stale-base generation is its own evidence lane and never keyed.
+    if payloads.is_empty() || result_root.join(STALE_CURRENT_RECEIPT).exists() {
+        return top;
+    }
+    let mut candidates = vec![Candidate {
+        payload_sha256: None,
+        dir: result_root.to_path_buf(),
+        status: top,
+    }];
+    for (digest, dir) in payloads {
+        let mut status = read_evidence_dir(identity, &dir, &mut before_final_snapshot);
+        let prefix = format!(
+            "{}{digest}/",
+            crate::changed_surface::trial::PAYLOAD_DIR_PREFIX
+        );
+        status.activation_receipt = status
+            .activation_receipt
+            .map(|name| format!("{prefix}{name}"));
+        status.result_receipt = status.result_receipt.map(|name| format!("{prefix}{name}"));
+        status.activation_conflicts = Vec::new();
+        candidates.push(Candidate {
+            payload_sha256: Some(digest),
+            dir,
+            status,
+        });
+    }
+    merge_candidates(identity, candidates)
+}
+
+/// One evidence directory of a head and its own evaluation.
+struct Candidate {
+    payload_sha256: Option<String>,
+    dir: PathBuf,
+    status: TrialStatus,
+}
+
+impl Candidate {
+    /// Whether the directory holds any evidence at all; an empty top level
+    /// beside keyed payload directories is not a run.
+    fn has_evidence(&self) -> bool {
+        self.status.activation_receipt.is_some()
+            || self.status.result_receipt_count > 0
+            || self.status.state == TrialState::Rejected
+    }
+
+    fn disposition(&self) -> String {
+        if let Some(keyed) = &self.status.keyed {
+            return keyed.disposition.clone();
+        }
+        read_regular_receipt(&self.dir.join(ACTIVATION_RECEIPT))
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|activation| {
+                activation
+                    .pointer("/plan/disposition")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| crate::changed_surface::BOUNDED.to_owned())
+    }
+
+    /// The adapter's own record time for this directory's result.
+    fn recorded_at(&self) -> Option<u64> {
+        let name = self.status.result_receipt.as_deref()?;
+        let file = name.rsplit('/').next()?;
+        read_regular_receipt(&self.dir.join(file))
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|result| result.get("recorded_at_unix_ns").and_then(Value::as_u64))
+    }
+
+    fn keyed_run(&self) -> crate::changed_surface::trial::KeyedRun {
+        crate::changed_surface::trial::KeyedRun {
+            payload_sha256: self.payload_sha256.clone(),
+            state: self.status.state,
+            reason: self.status.reason.clone(),
+            result_receipt: self.status.result_receipt.clone(),
+            keyed: self.status.keyed.clone(),
+        }
+    }
+}
+
+/// The head's status from its evidence directories: the newest result by the
+/// adapter's `recorded_at_unix_ns` (result name breaks a tie) decides, and
+/// the status names it. A directory rejected before any result fails the
+/// head closed, and a result without a record time is rejected rather than
+/// ordered by file time.
+fn merge_candidates(identity: &TrialIdentity, candidates: Vec<Candidate>) -> TrialStatus {
+    let activation_conflicts = candidates[0].status.activation_conflicts.clone();
+    let result_receipt_count = candidates
+        .iter()
+        .map(|candidate| candidate.status.result_receipt_count)
+        .sum();
+    let candidates: Vec<Candidate> = candidates
+        .into_iter()
+        .filter(Candidate::has_evidence)
+        .collect();
+    let mut timed = Vec::new();
+    for candidate in &candidates {
+        if candidate.status.result_receipt.is_none() {
+            if candidate.status.state == TrialState::Rejected {
+                let mut status = candidate.status.clone();
+                status.activation_conflicts = activation_conflicts;
+                return status;
+            }
+            continue;
+        }
+        let Some(recorded_at) = candidate.recorded_at() else {
+            let mut status = rejected_trial(
+                identity,
+                candidate.status.activation_receipt.clone(),
+                result_receipt_count,
+                candidate.status.result_receipt.clone(),
+                "result_without_recorded_at",
+            );
+            status.activation_conflicts = activation_conflicts;
+            return status;
+        };
+        timed.push((recorded_at, candidate));
+    }
+    timed.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.status.result_receipt.cmp(&a.1.status.result_receipt))
+    });
+    let keyed_runs: Vec<_> = timed
+        .iter()
+        .map(|(_, candidate)| *candidate)
+        .chain(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.status.result_receipt.is_none()),
+        )
+        .filter(|candidate| candidate.payload_sha256.is_some() || candidate.status.keyed.is_some())
+        .map(Candidate::keyed_run)
+        .collect();
+    let decided = timed
+        .first()
+        .map(|(_, candidate)| *candidate)
+        .or_else(|| candidates.first());
+    let Some(decided) = decided else {
+        let mut status = TrialStatus::new_collecting(identity);
+        status.activation_conflicts = activation_conflicts;
+        return status;
+    };
+    let mut status = decided.status.clone();
+    if let Some(result_receipt) = decided.status.result_receipt.clone() {
+        status.verdict_source = Some(crate::changed_surface::trial::VerdictSource {
+            payload_sha256: decided.payload_sha256.clone(),
+            disposition: decided.disposition(),
+            result_receipt,
+        });
+    }
+    status.result_receipt_count = result_receipt_count;
+    status.activation_conflicts = activation_conflicts;
+    status.keyed_runs = keyed_runs;
+    status
+}
+
+#[allow(clippy::too_many_lines)]
+fn read_evidence_dir<F>(
     identity: &TrialIdentity,
     result_root: &Path,
     mut before_final_snapshot: F,
@@ -1140,5 +1314,173 @@ mod tests {
         assert_eq!(first.receipt, second.receipt);
         assert_eq!(first.reason, "unexpected_result_entry");
         assert_eq!(first.receipt.as_deref(), Some("result-a.tmp"));
+    }
+
+    fn identity() -> TrialIdentity {
+        TrialIdentity {
+            repository: "owner/repo".to_owned(),
+            pull_request: 42,
+            target: "mac".to_owned(),
+            head_sha: "a".repeat(40),
+        }
+    }
+
+    /// One run's evidence written into `dir`: a keyed bounded activation for
+    /// `payload` (or an unkeyed one when `keyed` is false) and its result,
+    /// recorded at `recorded_at` (omitted when `None`).
+    fn write_run(dir: &Path, payload: &str, keyed: bool, recorded_at: Option<u64>) {
+        fs::create_dir_all(dir).expect("evidence dir");
+        let mut activation = activation();
+        activation["plan"]["execution_payload_digest"] = json!(payload);
+        let mut result = result();
+        result["execution_payload_sha256"] = json!(payload);
+        if keyed {
+            activation["plan"]["disposition"] = json!("keyed_bounded_shadow");
+            result["selected_execution_disposition"] = json!("keyed_bounded_shadow");
+            result["executable_reuse"] =
+                json!({"would_skip_tests": ["a"], "false_skip_count": 0, "false_skips": []});
+        }
+        if let Some(recorded_at) = recorded_at {
+            result["recorded_at_unix_ns"] = json!(recorded_at);
+        }
+        fs::write(dir.join(ACTIVATION_RECEIPT), activation.to_string()).expect("activation");
+        fs::write(dir.join("result-1.json"), result.to_string()).expect("result");
+    }
+
+    const PAYLOAD_1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const PAYLOAD_2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    #[test]
+    fn a_reship_with_a_new_candidate_set_keeps_both_runs_and_the_newest_decides() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = result_directory(&temp.path().join("state"), &identity());
+        write_run(
+            &crate::changed_surface::trial::payload_dir(&root, PAYLOAD_1),
+            PAYLOAD_1,
+            true,
+            Some(10),
+        );
+        write_run(
+            &crate::changed_surface::trial::payload_dir(&root, PAYLOAD_2),
+            PAYLOAD_2,
+            true,
+            Some(20),
+        );
+        let status = read_trial(&identity(), &root);
+        assert_eq!(status.state, TrialState::Ready, "{}", status.reason);
+        let source = status.verdict_source.expect("named");
+        assert_eq!(source.payload_sha256.as_deref(), Some(PAYLOAD_2));
+        assert_eq!(source.disposition, "keyed_bounded_shadow");
+        assert_eq!(
+            source.result_receipt,
+            format!("payload-{PAYLOAD_2}/result-1.json")
+        );
+        assert_eq!(status.result_receipt_count, 2);
+        let listed: Vec<_> = status
+            .keyed_runs
+            .iter()
+            .map(|run| run.payload_sha256.as_deref())
+            .collect();
+        assert_eq!(listed, [Some(PAYLOAD_2), Some(PAYLOAD_1)], "newest first");
+    }
+
+    #[test]
+    fn an_unkeyed_top_level_run_and_a_keyed_payload_run_coexist() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = result_directory(&temp.path().join("state"), &identity());
+        write_run(&root, DIGEST_C, false, Some(30));
+        write_run(
+            &crate::changed_surface::trial::payload_dir(&root, PAYLOAD_1),
+            PAYLOAD_1,
+            true,
+            Some(10),
+        );
+        let status = read_trial(&identity(), &root);
+        assert_eq!(status.state, TrialState::Ready, "{}", status.reason);
+        let source = status.verdict_source.expect("named");
+        assert_eq!(source.payload_sha256, None, "the newer unkeyed run decides");
+        assert_eq!(source.disposition, "bounded");
+        assert_eq!(source.result_receipt, "result-1.json");
+        assert_eq!(status.keyed_runs.len(), 1);
+        assert_eq!(
+            status.keyed_runs[0].payload_sha256.as_deref(),
+            Some(PAYLOAD_1)
+        );
+    }
+
+    #[test]
+    fn a_payload_result_without_a_record_time_is_rejected_not_ordered_by_mtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = result_directory(&temp.path().join("state"), &identity());
+        write_run(
+            &crate::changed_surface::trial::payload_dir(&root, PAYLOAD_1),
+            PAYLOAD_1,
+            true,
+            Some(10),
+        );
+        write_run(
+            &crate::changed_surface::trial::payload_dir(&root, PAYLOAD_2),
+            PAYLOAD_2,
+            true,
+            None,
+        );
+        let status = read_trial(&identity(), &root);
+        assert_eq!(status.state, TrialState::Rejected);
+        assert_eq!(status.reason, "result_without_recorded_at");
+    }
+
+    #[test]
+    fn a_payload_result_naming_another_payload_is_still_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = result_directory(&temp.path().join("state"), &identity());
+        let dir = crate::changed_surface::trial::payload_dir(&root, PAYLOAD_1);
+        write_run(&dir, PAYLOAD_1, true, Some(10));
+        let mut result: Value =
+            serde_json::from_slice(&fs::read(dir.join("result-1.json")).expect("read"))
+                .expect("json");
+        result["execution_payload_sha256"] = json!(PAYLOAD_2);
+        fs::write(dir.join("result-1.json"), result.to_string()).expect("write");
+        let status = read_trial(&identity(), &root);
+        assert_eq!(status.state, TrialState::Rejected);
+        assert_eq!(status.reason, "shadow_result_digest_or_count_mismatch");
+        assert_eq!(
+            status.result_receipt.as_deref(),
+            Some(format!("payload-{PAYLOAD_1}/result-1.json").as_str())
+        );
+    }
+
+    #[test]
+    fn an_old_layout_keyed_trial_reads_in_place_and_is_never_moved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = result_directory(&temp.path().join("state"), &identity());
+        // The pre-payload-directory layout: keyed activation, context and
+        // result at the top level of the trial directory.
+        write_run(&root, PAYLOAD_1, true, None);
+        fs::write(
+            root.join(crate::changed_surface::executable_reuse::KEYED_CONTEXT_RECEIPT),
+            b"{}",
+        )
+        .expect("context");
+        let before: Vec<_> = {
+            let mut names: Vec<_> = fs::read_dir(&root)
+                .expect("dir")
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let status = read_trial(&identity(), &root);
+        assert_eq!(status.state, TrialState::Ready, "{}", status.reason);
+        assert_eq!(status.result_receipt.as_deref(), Some("result-1.json"));
+        assert_eq!(status.verdict_source, None, "a single run needs no source");
+        assert!(status.keyed.is_some());
+        let mut after: Vec<_> = fs::read_dir(&root)
+            .expect("dir")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        after.sort();
+        assert_eq!(before, after, "nothing is moved, renamed or added");
     }
 }
