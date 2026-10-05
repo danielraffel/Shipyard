@@ -848,8 +848,14 @@ with an `activation_conflict` diagnostic instead of failing; look for
 A keyed plan whose result has `executable_reuse.bound: null` and a
 `derived.status` starting `error: binding` ran unkeyed because the adapter
 could not use the binding file the payload named; its re-derivation is
-`not_derived`, not a refusal, whatever reason word follows the prefix. A
-verified run echoes `binding_sha256`. A selection over the 5,632-byte payload
+`not_derived`, not a refusal, whatever reason word follows the prefix. Any
+other `error:` status is the runner's own derivation failing. That is
+`not_derived: runner_error: <first line>`, shown in trial status as
+`keyed.runner_error`, and never counted toward the trip. A refusal an older
+Shipyard counted for such a run is withdrawn on the next re-derivation, by
+the sweep or by `shipyard reuse rederive`. The host substitutes `{build_dir}`
+from the result's `derived.build_dir`, the absolute string the runner used,
+falling back to the binding's. A verified run echoes `binding_sha256`. A selection over the 5,632-byte payload
 cap falls back with `fallback_reason: "selection_payload_over_cap"` and
 `payload_bytes` in its fallback diagnostic; count those before redesigning
 the cap. The shadow planning
