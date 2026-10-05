@@ -843,6 +843,12 @@ would write (the store gained a record, or the head first ran unkeyed) runs
 unkeyed with an `activation_conflict` diagnostic instead of failing; look for
 `activation_conflicts` in trial status before calling such a head's lane
 "unkeyed for no reason".
+`shipyard --json reuse records --target <t>` answers "could a keyed plan bind
+anything on this host right now?" with the same rules the ship path uses; read
+its `no_base` refusal counts before assuming the store is empty. `records[]`
+judges every filed record (`bindable`, `candidate`, `reason`) with the same
+rules, `--sha <commit>` narrows that list, and `changed_surface_execution_mode`
+reports the host's trusted mode.
 The command is evidence inspection only: it never changes machine mode,
 accepted policy digests, queue state, or merge readiness.
 

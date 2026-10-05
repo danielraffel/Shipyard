@@ -620,6 +620,33 @@ target's configured stages unkeyed. Trial status lists those diagnostics as
 re-derivation has nothing to judge for it and never counts it as a refusal.
 An activation that changes when neither side is keyed is still refused.
 
+To see what a keyed plan on this host would bind right now:
+
+```bash
+shipyard --json reuse records --target mac            # against origin/main
+shipyard --json reuse records --target mac --base <ref>
+shipyard --json reuse records --target mac --repo Generous-Corp/pulp --sha <commit>
+```
+
+It reads the base's policy, runs the base's platform probe and lists the
+candidate records exactly as the ship path binds them (`bindable`,
+`candidates`), or names why none qualifies (`no_base`, with the refusal
+counts). It also reports the host's `platform` and trusted
+`changed_surface_execution_mode`, and `records[]`: every filed run directory,
+newest first, each with `sha`, `target`, `run_id`, `path`, `filed_at`
+(RFC 3339 UTC, the store's filing time), `bindable`, `candidate` (bindable and
+within the plan's cap) and, when not bindable, `reason`. Each record is judged
+by the same function that selects candidates, so the listing and the count
+cannot disagree; a run directory whose `job.json` is missing or unreadable is
+listed with its reason, never dropped. `--sha` narrows `records[]` to one
+commit without changing `bindable`; `--repo` refuses (exit 2) when the base
+names another repository. A non-zero exit means the store, policy or machine
+mode could not be read, never "no records". A run whose `job.json` was never
+written is not filed at all, so a run that did not finish leaves its commit
+with no entry. Nothing is built or recorded. It is the daily measure of "hosts
+holding a bindable record for current main", and its own control: a host with
+no merged, clean, usable record reads 0.
+
 ### Host re-derivation
 
 The runner leaves its inputs (`ctest-listing.json`, `toolchain.json`,

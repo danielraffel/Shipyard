@@ -1196,6 +1196,25 @@ pub(crate) enum ReuseCommand {
     Rederive(ReuseRederiveArgs),
     /// Re-derive the newest keyed runs on this host that have no verdict yet.
     RederiveSweep(ReuseRederiveSweepArgs),
+    /// List the reuse records a keyed plan against the base would bind on
+    /// this host: the daily measure of hosts holding a bindable record.
+    Records(ReuseRecordsArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReuseRecordsArgs {
+    /// Target whose protected-base policy declares `executable_reuse`.
+    #[arg(long)]
+    pub(crate) target: String,
+    /// The base to bind against (a ref or commit in this checkout).
+    #[arg(long, default_value = "origin/main")]
+    pub(crate) base: String,
+    /// List only the records of this commit. The plan's own count is unchanged.
+    #[arg(long)]
+    pub(crate) sha: Option<String>,
+    /// Owner/repo the caller expects; refused when the base names another.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -3627,6 +3646,38 @@ mod tests {
             Cli::try_parse_from(["shipyard", "queue-observe", "--follow", "--max-polls", "1",])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn reuse_records_takes_a_target_and_defaults_the_base_to_origin_main() {
+        let cli = Cli::try_parse_from(["shipyard", "reuse", "records", "--target", "mac"])
+            .expect("records");
+        let Command::Reuse { command } = cli.command else {
+            panic!("expected reuse");
+        };
+        let super::ReuseCommand::Records(args) = *command else {
+            panic!("expected records");
+        };
+        assert_eq!(
+            (args.target.as_str(), args.base.as_str()),
+            ("mac", "origin/main")
+        );
+        assert_eq!((args.sha.as_deref(), args.repo.as_deref()), (None, None));
+        let cli = Cli::try_parse_from([
+            "shipyard", "reuse", "records", "--target", "mac", "--sha", "abc", "--repo", "o/r",
+        ])
+        .expect("records with sha and repo");
+        let Command::Reuse { command } = cli.command else {
+            panic!("expected reuse");
+        };
+        let super::ReuseCommand::Records(args) = *command else {
+            panic!("expected records");
+        };
+        assert_eq!(
+            (args.sha.as_deref(), args.repo.as_deref()),
+            (Some("abc"), Some("o/r"))
+        );
+        assert!(Cli::try_parse_from(["shipyard", "reuse", "records"]).is_err());
     }
 
     #[test]
