@@ -131,14 +131,18 @@ check a lease) routes jobs to the pool for as long as it is set, healthy or
 not.
 
 Every tick therefore also reads the lane's `github_variable` and reports it as
-`selector_state`: `unset`, `hosted`, `self_hosted` (it names `self-hosted` or
-the lease's required capability label, which only this pool's runners carry),
+`selector_state`: `unset`; `hosted`, only when every label is a GitHub-hosted
+image (`ubuntu-*`, `windows-*`, `macos-*`); `self_hosted` for any other label,
+since only a self-hosted runner can carry it,
 `malformed` (not JSON, so `fromJSON` fails and no job can start), or
 `unreadable`. `selector_alarm` is set, and the text output prints an `ALARM:`
 line, when:
 
 - the selector is `self_hosted` while the tick clears, so jobs reading it
-  queue for a pool that cannot take them;
+  queue for a pool that cannot take them. When its labels are neither
+  `self-hosted` nor this lane's, the alarm says it names labels this lane does
+  not carry: it routes to some other self-hosted pool, which still strands
+  the jobs if that pool is down;
 - the selector is `unreadable` while the tick clears;
 - the selector is `malformed`, whatever the pool's health.
 

@@ -2902,9 +2902,9 @@ the fence.
 ### Pulp disposable Linux health lease
 
 Each tick also reports the lane's `github_variable` as `selector_state`, and
-sets `selector_alarm` (an `ALARM:` line in text) when that selector routes to
-the pool (names `self-hosted` or the lease's required capability) while the
-tick clears, is unreadable while it clears, or is not JSON.
+sets `selector_alarm` (an `ALARM:` line in text) when that selector can only
+be served by a self-hosted runner (any label that is not a GitHub image such as
+`ubuntu-*`, `windows-*` or `macos-*`) while the tick clears, is unreadable while it clears, or is not JSON.
 That is the only protection for a selector read directly in `runs-on`, which
 no lease can gate. See docs/fleet-lease.md, "The selector alarm".
 Use `shipyard runner local-linux-lease --repo Generous-Corp/pulp` to inspect the

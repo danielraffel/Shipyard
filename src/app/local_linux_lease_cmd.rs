@@ -128,9 +128,10 @@ enum SelectorState {
     Unset,
     /// A selector naming no self-hosted label.
     Hosted,
-    /// A selector naming `self-hosted` or this pool's capability label: jobs
-    /// wait for this pool.
-    SelfHosted,
+    /// A selector naming any label that is not a GitHub-hosted image: jobs
+    /// wait for some self-hosted pool. `this_pool` is whether it names
+    /// `self-hosted` or one of this lane's labels.
+    SelfHosted { this_pool: bool },
     /// Not JSON: `fromJSON` fails and the job cannot start anywhere.
     Malformed,
     /// The variable could not be read.
@@ -142,34 +143,58 @@ impl SelectorState {
         match self {
             Self::Unset => "unset",
             Self::Hosted => "hosted",
-            Self::SelfHosted => "self_hosted",
+            Self::SelfHosted { .. } => "self_hosted",
             Self::Malformed => "malformed",
             Self::Unreadable => "unreadable",
         }
     }
 
-    /// Classify a selector value as read from the repository variable. A
-    /// selector routes to the pool when it names `self-hosted` or the pool's
-    /// capability label, which only that pool's runners carry.
-    fn classify(read: &Result<Option<String>, String>, pool_label: &str) -> Self {
+    /// Classify a selector value as read from the repository variable. It is
+    /// hosted only when every label is a GitHub-hosted image; any other label
+    /// can only be satisfied by a self-hosted runner, so the selector waits for
+    /// one. `lane_labels` are this lane's target labels.
+    fn classify(read: &Result<Option<String>, String>, lane_labels: &[String]) -> Self {
         let value = match read {
             Err(_) => return Self::Unreadable,
             Ok(None) => return Self::Unset,
             Ok(Some(value)) if value.trim().is_empty() => return Self::Unset,
             Ok(Some(value)) => value,
         };
-        let names_self_hosted = |label: &Value| {
-            label.as_str().is_some_and(|label| {
-                label.eq_ignore_ascii_case("self-hosted") || label.eq_ignore_ascii_case(pool_label)
-            })
+        let labels = match serde_json::from_str::<Value>(value) {
+            Ok(Value::String(label)) => vec![label],
+            Ok(Value::Array(items)) => {
+                let labels = items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>();
+                match labels {
+                    Some(labels) if !labels.is_empty() => labels,
+                    _ => return Self::Malformed,
+                }
+            }
+            _ => return Self::Malformed,
         };
-        match serde_json::from_str::<Value>(value) {
-            Ok(Value::Array(labels)) if labels.iter().any(names_self_hosted) => Self::SelfHosted,
-            Ok(label @ Value::String(_)) if names_self_hosted(&label) => Self::SelfHosted,
-            Ok(Value::Array(_) | Value::String(_)) => Self::Hosted,
-            _ => Self::Malformed,
+        if labels.iter().all(|label| is_github_hosted_label(label)) {
+            return Self::Hosted;
         }
+        let this_pool = labels.iter().any(|label| {
+            label.eq_ignore_ascii_case("self-hosted")
+                || lane_labels
+                    .iter()
+                    .any(|lane| lane.eq_ignore_ascii_case(label))
+        });
+        Self::SelfHosted { this_pool }
     }
+}
+
+/// Whether `label` names a GitHub-hosted runner image (`ubuntu-*`,
+/// `windows-*`, `macos-*`, including `-latest` and the larger and ARM
+/// variants).
+fn is_github_hosted_label(label: &str) -> bool {
+    let label = label.to_ascii_lowercase();
+    ["ubuntu-", "windows-", "macos-"]
+        .iter()
+        .any(|prefix| label.starts_with(prefix))
 }
 
 /// The finding for a selector that strands jobs: one that routes to this
@@ -185,9 +210,15 @@ fn selector_alarm(
         SelectorState::Malformed => Some(format!(
             "{variable} is not JSON, so every job reading it fails to start; fix or unset it"
         )),
-        SelectorState::SelfHosted if pool_down => Some(format!(
+        SelectorState::SelfHosted { this_pool: true } if pool_down => Some(format!(
             "{variable} is SET to this pool while it cannot take jobs ({}); jobs reading it \
              will queue until it is unset or the pool recovers",
+            decision.reason
+        )),
+        SelectorState::SelfHosted { this_pool: false } if pool_down => Some(format!(
+            "{variable} names labels not carried by this lane, so it routes to some other \
+             self-hosted pool, while this pool cannot take jobs ({}); check that pool or \
+             unset it",
             decision.reason
         )),
         SelectorState::Unreadable if pool_down => Some(format!(
@@ -289,7 +320,7 @@ pub(super) fn local_linux_lease_command<W: Write>(
         let selector = profile.selector_variable.as_deref().map(|variable| {
             let read =
                 trust_absence_only_if_readable(read_variable(&actions, &repo, variable), &decision);
-            let state = SelectorState::classify(&read, &profile.required_capability);
+            let state = SelectorState::classify(&read, &profile.required_labels);
             SelectorReport {
                 variable: variable.to_owned(),
                 state,
@@ -912,59 +943,64 @@ mod tests {
         }
     }
 
+    fn lane_labels() -> Vec<String> {
+        ["self-hosted", "Linux", "ARM64", "pulp-lint-linux-arm64"]
+            .map(str::to_owned)
+            .to_vec()
+    }
+
     #[test]
-    fn selector_values_classify_by_whether_jobs_wait_for_a_self_hosted_pool() {
+    fn a_selector_is_hosted_only_when_every_label_is_a_github_image() {
         let classify = |read: Result<Option<&str>, &str>| {
             SelectorState::classify(
                 &read
                     .map(|value| value.map(str::to_owned))
                     .map_err(str::to_owned),
-                "pulp-lint-linux-arm64",
+                &lane_labels(),
             )
         };
+        let this_pool = SelectorState::SelfHosted { this_pool: true };
+        let other_pool = SelectorState::SelfHosted { this_pool: false };
         assert_eq!(classify(Err("HTTP 502")), SelectorState::Unreadable);
         assert_eq!(classify(Ok(None)), SelectorState::Unset);
         assert_eq!(classify(Ok(Some("  "))), SelectorState::Unset);
-        assert_eq!(
-            classify(Ok(Some("\"ubuntu-latest\""))),
-            SelectorState::Hosted
-        );
-        assert_eq!(
-            classify(Ok(Some("[\"ubuntu-24.04\"]"))),
-            SelectorState::Hosted
-        );
-        assert_eq!(
-            classify(Ok(Some("[\"self-hosted\",\"Linux\",\"ARM64\"]"))),
-            SelectorState::SelfHosted
-        );
-        assert_eq!(
-            classify(Ok(Some("[\"Self-Hosted\",\"Linux\"]"))),
-            SelectorState::SelfHosted
-        );
-        assert_eq!(
-            classify(Ok(Some("\"self-hosted\""))),
-            SelectorState::SelfHosted
-        );
-        assert_eq!(
-            classify(Ok(Some("self-hosted,Linux"))),
-            SelectorState::Malformed
-        );
-        assert_eq!(classify(Ok(Some("{\"a\":1}"))), SelectorState::Malformed);
-        // The pool's capability label alone routes to the pool: GitHub
-        // matches every label, and only this pool's runners carry it.
+        // Provably hosted: every label is a GitHub image.
+        for hosted in [
+            "\"ubuntu-latest\"",
+            "[\"ubuntu-22.04\"]",
+            "[\"macos-15\"]",
+            "\"windows-2022\"",
+            "[\"ubuntu-24.04-arm\"]",
+            "\"macos-15-xlarge\"",
+        ] {
+            assert_eq!(
+                classify(Ok(Some(hosted))),
+                SelectorState::Hosted,
+                "{hosted}"
+            );
+        }
+        assert_eq!(classify(Ok(Some("[\"self-hosted\",\"Linux\"]"))), this_pool);
+        assert_eq!(classify(Ok(Some("\"Self-Hosted\""))), this_pool);
+        // No self-hosted label, but only a self-hosted runner can carry it.
         assert_eq!(
             classify(Ok(Some("[\"Linux\",\"ARM64\",\"pulp-lint-linux-arm64\"]"))),
-            SelectorState::SelfHosted
+            this_pool
         );
+        assert_eq!(classify(Ok(Some("[\"Linux\"]"))), this_pool);
+        // Another pool's labels still wait for a self-hosted pool.
+        assert_eq!(classify(Ok(Some("[\"pulp-build-linux-x64\"]"))), other_pool);
+        // A hosted label mixed with a self-hosted one is not provably hosted.
         assert_eq!(
-            classify(Ok(Some("\"PULP-LINT-LINUX-ARM64\""))),
-            SelectorState::SelfHosted
+            classify(Ok(Some("[\"ubuntu-latest\",\"gpu\"]"))),
+            other_pool
         );
-        // Control: another pool's label without self-hosted is not this pool.
-        assert_eq!(
-            classify(Ok(Some("[\"Linux\",\"pulp-build-linux\"]"))),
-            SelectorState::Hosted
-        );
+        for malformed in ["self-hosted,Linux", "{\"a\":1}", "[]", "[1]", "3"] {
+            assert_eq!(
+                classify(Ok(Some(malformed))),
+                SelectorState::Malformed,
+                "{malformed}"
+            );
+        }
     }
 
     #[test]
@@ -973,7 +1009,8 @@ mod tests {
         let up = decision(LeaseAction::Renew, "healthy_unreserved_idle_capacity");
         let alarm = |state, decision: &LeaseDecision| selector_alarm("SEL", state, decision);
 
-        let set_down = alarm(SelectorState::SelfHosted, &down).expect("set + down alarms");
+        let set_down =
+            alarm(SelectorState::SelfHosted { this_pool: true }, &down).expect("set + down alarms");
         assert!(set_down.contains("SEL is SET"), "{set_down}");
         assert!(
             set_down.contains("fleet_unreadable: HTTP 502"),
@@ -985,7 +1022,20 @@ mod tests {
             "malformed always alarms"
         );
         // Controls: a healthy pool, or a selector that does not route here.
-        assert_eq!(alarm(SelectorState::SelfHosted, &up), None);
+        let elsewhere = alarm(SelectorState::SelfHosted { this_pool: false }, &down)
+            .expect("a selector for another self-hosted pool still alarms");
+        assert!(
+            elsewhere.contains("names labels not carried by this lane"),
+            "{elsewhere}"
+        );
+        assert_eq!(
+            alarm(SelectorState::SelfHosted { this_pool: true }, &up),
+            None
+        );
+        assert_eq!(
+            alarm(SelectorState::SelfHosted { this_pool: false }, &up),
+            None
+        );
         assert_eq!(alarm(SelectorState::Unreadable, &up), None);
         assert_eq!(alarm(SelectorState::Unset, &down), None);
         assert_eq!(alarm(SelectorState::Hosted, &down), None);
@@ -1014,8 +1064,8 @@ esac"#,
         );
         let read = read_variable(&set, "owner/repo", "PULP_PREAMBLE_RUNS_ON_JSON");
         assert_eq!(
-            SelectorState::classify(&read, "pulp-lint-linux-arm64"),
-            SelectorState::SelfHosted
+            SelectorState::classify(&read, &lane_labels()),
+            SelectorState::SelfHosted { this_pool: true }
         );
 
         let absent_dir = tempfile::tempdir().expect("tempdir");
@@ -1026,7 +1076,7 @@ esac"#,
         let down = fake_gh_answering(&down_dir, "echo 'HTTP 502' >&2; exit 1");
         let read = read_variable(&down, "owner/repo", "X");
         assert_eq!(
-            SelectorState::classify(&read, "pulp-lint-linux-arm64"),
+            SelectorState::classify(&read, &lane_labels()),
             SelectorState::Unreadable
         );
     }
@@ -1037,7 +1087,7 @@ esac"#,
         let readable = decision(LeaseAction::Clear, "no_online_idle_matching_runner");
         let state = SelectorState::classify(
             &trust_absence_only_if_readable(Ok(None), &unreadable),
-            "pulp-lint-linux-arm64",
+            &lane_labels(),
         );
         assert_eq!(state, SelectorState::Unreadable);
         assert!(selector_alarm("SEL", state, &unreadable).is_some());
@@ -1057,10 +1107,10 @@ esac"#,
         let down = decision(LeaseAction::Clear, "no_online_idle_matching_runner");
         let report = SelectorReport {
             variable: "PULP_PREAMBLE_RUNS_ON_JSON".to_owned(),
-            state: SelectorState::SelfHosted,
+            state: SelectorState::SelfHosted { this_pool: true },
             alarm: selector_alarm(
                 "PULP_PREAMBLE_RUNS_ON_JSON",
-                SelectorState::SelfHosted,
+                SelectorState::SelfHosted { this_pool: true },
                 &down,
             ),
         };
