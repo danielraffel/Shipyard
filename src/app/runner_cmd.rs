@@ -277,6 +277,7 @@ fn runner_command_with_actions<W: Write>(
             soak_minutes,
             retry_hours,
             max_attempts,
+            lag_alert_hours,
             clear_host,
             apply,
         } => super::fleet_update_cmd::fleet_reconcile_command(
@@ -284,6 +285,7 @@ fn runner_command_with_actions<W: Write>(
                 soak_minutes,
                 retry_hours,
                 max_attempts,
+                lag_alert_hours,
                 clear_host,
                 apply,
             },

@@ -31,6 +31,7 @@ pub(in crate::app) struct FleetReconcileArgs {
     pub(in crate::app) soak_minutes: u64,
     pub(in crate::app) retry_hours: u64,
     pub(in crate::app) max_attempts: u32,
+    pub(in crate::app) lag_alert_hours: u64,
     pub(in crate::app) clear_host: Option<String>,
     pub(in crate::app) apply: bool,
 }
@@ -59,6 +60,13 @@ impl ReconcileEnv for LiveEnv<'_> {
 
     fn latest_release(&mut self) -> Result<PublishedRelease, String> {
         latest_release(self.config, self.cwd)
+    }
+
+    fn recent_releases(&mut self) -> Result<Vec<PublishedRelease>, String> {
+        let repository = release_authority::release_repository()?;
+        GitHubReleaseAuthorityVerifier::new(self.config, self.cwd)
+            .api_json(&format!("repos/{repository}/releases?per_page=30"))
+            .and_then(|value| reconcile::parse_recent_releases(&value))
     }
 
     fn probe_hosts(&mut self) -> Vec<HostVersion> {
@@ -168,6 +176,9 @@ pub(in crate::app) fn fleet_reconcile_command<W: Write>(
         soak: chrono::Duration::minutes(i64::try_from(args.soak_minutes).unwrap_or(i64::MAX / 120)),
         retry: chrono::Duration::hours(i64::try_from(args.retry_hours).unwrap_or(i64::MAX / 7200)),
         max_attempts: args.max_attempts.max(1),
+        lag_alert: chrono::Duration::hours(
+            i64::try_from(args.lag_alert_hours).unwrap_or(i64::MAX / 7200),
+        ),
     };
     let report = reconcile::run_reconcile(&mut env, &runtime_paths.state_dir, policy, args.apply);
     stdout
@@ -329,8 +340,8 @@ fn describe(decision: &ReconcileDecision, apply: bool) -> String {
             "AHEAD of the latest release: {}; nothing rolled out, never downgraded",
             hosts.join(", ")
         ),
-        ReconcileDecision::Rollout { lagging } => format!(
-            "{} lag; {}",
+        ReconcileDecision::Rollout { tag, lagging } => format!(
+            "{} lag {tag}; {}",
             lagging.join(", "),
             if apply {
                 "ran the verified fleet rollout to these host classes only"

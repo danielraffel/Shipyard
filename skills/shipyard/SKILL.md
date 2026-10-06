@@ -1036,9 +1036,15 @@ predates this (no `runner fleet-reconcile`), or when the Mac declares no
 `[host_class.*]`.
 
 For releases that reached GitHub another way, `shipyard runner fleet-reconcile`
-compares the latest published non-draft release (after `--soak-minutes`,
-default 30) with every host class's installed version. With `--apply` it rolls
-out to **only the lagging host classes**. It never downgrades: a host running
+compares the recent published non-draft releases with every host class's
+installed version and targets the **newest release that has itself soaked**
+(`--soak-minutes`, default 30). Each release still soaks its full window
+before any host gets it, but a newer release no longer restarts an older one's
+soak. Without that, steady merges starved the rollout (Shipyard #722). With
+`--apply` it rolls out to **only the host classes behind that tag**. A host
+that lags a published release for longer than `--lag-alert-hours` (default 2)
+is listed in `lagging_too_long` and raises one alert until it catches up,
+because a `soaking` decision exits 0. It never downgrades: a host running
 a newer version than the latest release stops the whole tick with an alert
 (exit 4). Each attempt is recorded before it starts. A tag is retried at most
 once per `--retry-hours` (default 6, exit 3), and after `--max-attempts`

@@ -2005,6 +2005,9 @@ pub(super) enum RunnerCommand {
         /// Attempts at one tag before it becomes terminal and raises an alert.
         #[arg(long = "max-attempts", default_value_t = 3)]
         max_attempts: u32,
+        /// Hours a host may lag a published release before it raises an alert.
+        #[arg(long = "lag-alert-hours", default_value_t = 2)]
+        lag_alert_hours: u64,
         /// Clear a host class quarantined after a failed rollback (fix the host
         /// first). A tag made terminal by that failure becomes eligible again.
         #[arg(long = "clear-host", value_name = "HOST_CLASS")]

@@ -138,7 +138,7 @@ pub(super) enum ReconcileDecision {
     /// is rolled out anywhere: "latest" is not what the fleet thinks it is.
     Ahead { hosts: Vec<String> },
     /// Hosts lag and a rollout is due, to exactly these host classes.
-    Rollout { lagging: Vec<String> },
+    Rollout { tag: String, lagging: Vec<String> },
     /// The release or at least one host version could not be read.
     Unknown { reason: String },
     /// Another rollout holds the controller lock; nothing was read or recorded.
@@ -181,6 +181,10 @@ pub(super) struct AttemptLedger {
     /// host's daemon reads healthy again.
     #[serde(default)]
     pub(super) daemon_alerted: BTreeSet<String>,
+    /// Host classes whose lag alert was already raised; cleared when the host
+    /// catches up with the latest release.
+    #[serde(default)]
+    pub(super) lag_alerted: BTreeSet<String>,
 }
 
 /// A host that was mutated, failed, and could not be restored.
@@ -450,11 +454,93 @@ pub(super) struct ReconcilePolicy {
     pub(super) soak: chrono::Duration,
     pub(super) retry: chrono::Duration,
     pub(super) max_attempts: u32,
+    /// How long a host may lag a published release before it alerts.
+    pub(super) lag_alert: chrono::Duration,
+}
+
+/// The newest release of `releases` (by version) that has itself soaked by
+/// `now`. A release published later never makes an older one wait longer, and
+/// an unsoaked release is never chosen, whatever soaked before it.
+pub(super) fn newest_soaked(
+    releases: &[PublishedRelease],
+    now: DateTime<Utc>,
+    soak: chrono::Duration,
+) -> Option<&PublishedRelease> {
+    releases
+        .iter()
+        .filter(|release| release.published_at + soak <= now)
+        .filter_map(|release| parse_version(&release.tag).map(|version| (version, release)))
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, release)| release)
+}
+
+/// When the earliest release newer than `version` that has not yet soaked
+/// will have soaked.
+fn next_soak_end(
+    releases: &[PublishedRelease],
+    newer_than: [u64; 3],
+    now: DateTime<Utc>,
+    soak: chrono::Duration,
+) -> Option<DateTime<Utc>> {
+    releases
+        .iter()
+        .filter(|release| parse_version(&release.tag).is_some_and(|version| version > newer_than))
+        .map(|release| release.published_at + soak)
+        .filter(|end| *end > now)
+        .min()
+}
+
+/// The newest release that has itself soaked and the host classes behind it,
+/// or the `Soaking` decision when no such release has a lagging host. The
+/// latest release is one of `releases`, so a fleet with only that one behaves
+/// as a single-release soak.
+fn soaked_target(
+    latest: &PublishedRelease,
+    releases: &[PublishedRelease],
+    reachable: &[&HostVersion],
+    lagging: Vec<String>,
+    ledger: &AttemptLedger,
+    now: DateTime<Utc>,
+    policy: ReconcilePolicy,
+) -> Result<(PublishedRelease, Vec<String>), ReconcileDecision> {
+    let mut candidates = releases.to_vec();
+    if !candidates.iter().any(|release| release.tag == latest.tag) {
+        candidates.push(latest.clone());
+    }
+    let soaking = |lagging: Vec<String>, newer_than: [u64; 3]| ReconcileDecision::Soaking {
+        soak_until: next_soak_end(&candidates, newer_than, now, policy.soak)
+            .unwrap_or(latest.published_at + policy.soak),
+        lagging,
+    };
+    let Some(release) = newest_soaked(&candidates, now, policy.soak) else {
+        return Err(soaking(lagging, [0, 0, 0]));
+    };
+    let Some(release_version) = parse_version(&release.tag) else {
+        return Err(soaking(lagging, [0, 0, 0]));
+    };
+    let behind_release = reachable
+        .iter()
+        .filter(|host| {
+            host.version
+                .as_deref()
+                .and_then(parse_version)
+                .is_some_and(|installed| installed < release_version)
+        })
+        .filter(|host| !ledger.quarantined.contains_key(&host.host_class))
+        .map(|host| host.host_class.clone())
+        .collect::<Vec<_>>();
+    if behind_release.is_empty() {
+        // Every host already runs the newest soaked release; the newer ones
+        // are still soaking.
+        return Err(soaking(lagging, release_version));
+    }
+    Ok((release.clone(), behind_release))
 }
 
 /// Decide what to do. Pure: every input is passed in.
 pub(super) fn decide(
     latest: Result<&PublishedRelease, &str>,
+    releases: &[PublishedRelease],
     hosts: &[HostVersion],
     ledger: &AttemptLedger,
     now: DateTime<Utc>,
@@ -532,20 +618,18 @@ pub(super) fn decide(
     if lagging.is_empty() {
         return ReconcileDecision::UpToDate;
     }
-    let attempts = ledger.tags.get(&latest.tag).cloned().unwrap_or_default();
+    let (release, lagging) =
+        match soaked_target(latest, releases, &reachable, lagging, ledger, now, policy) {
+            Ok(target) => target,
+            Err(decision) => return decision,
+        };
+    let attempts = ledger.tags.get(&release.tag).cloned().unwrap_or_default();
     if let Some(reason) = attempts.terminal {
         return ReconcileDecision::Terminal { reason, lagging };
     }
     if attempts.attempts >= policy.max_attempts {
         return ReconcileDecision::Terminal {
             reason: format!("gave up after {} attempts", attempts.attempts),
-            lagging,
-        };
-    }
-    let soak_until = latest.published_at + policy.soak;
-    if now < soak_until {
-        return ReconcileDecision::Soaking {
-            soak_until,
             lagging,
         };
     }
@@ -559,7 +643,10 @@ pub(super) fn decide(
             };
         }
     }
-    ReconcileDecision::Rollout { lagging }
+    ReconcileDecision::Rollout {
+        tag: release.tag,
+        lagging,
+    }
 }
 
 /// Result of one rollout the reconciler started.
@@ -592,6 +679,11 @@ pub(super) enum RolloutOutcome {
 pub(super) trait ReconcileEnv {
     fn now(&self) -> DateTime<Utc>;
     fn latest_release(&mut self) -> Result<PublishedRelease, String>;
+    /// Recently published releases, newest or not, for picking the newest one
+    /// that has itself soaked. Defaults to the latest release alone.
+    fn recent_releases(&mut self) -> Result<Vec<PublishedRelease>, String> {
+        self.latest_release().map(|latest| vec![latest])
+    }
     /// One entry per configured host class, in configuration order.
     fn probe_hosts(&mut self) -> Vec<HostVersion>;
     fn rollout(&mut self, tag: &str, host_classes: &[String]) -> RolloutOutcome;
@@ -624,11 +716,51 @@ pub(super) struct ReconcileReport {
     /// `<host class>: <problem and fix>` for each host whose daemon is not
     /// running or will not come back after a reboot.
     pub(super) daemon_problems: Vec<String>,
+    /// `<host class>: <hours> behind <tag>` for each host that has lagged a
+    /// published release for longer than the policy's `lag_alert`.
+    pub(super) lagging_too_long: Vec<String>,
     pub(super) exit_code: u8,
 }
 
 pub(super) fn alert_title(tag: &str) -> String {
     format!("fleet-reconcile: {tag} could not reach the fleet")
+}
+
+/// Put the probed hosts in the report with what they show: which could not be
+/// read, which are quarantined, and which declare themselves controllers.
+fn record_hosts(report: &mut ReconcileReport, hosts: Vec<HostVersion>, ledger: &AttemptLedger) {
+    report.unreachable = hosts
+        .iter()
+        .filter(|host| host.lagging.is_none())
+        .map(|host| host.host_class.clone())
+        .collect();
+    report.quarantined = ledger.quarantined.keys().cloned().collect();
+    report.other_controllers = hosts
+        .iter()
+        .filter(|host| host.declares_host_classes == Some(true))
+        .map(|host| host.host_class.clone())
+        .collect();
+    report.hosts = hosts;
+}
+
+/// The recent releases and the newest of them by version, or why none could
+/// be read.
+fn read_releases<E: ReconcileEnv>(
+    env: &mut E,
+) -> (Result<PublishedRelease, String>, Vec<PublishedRelease>) {
+    let releases = env.recent_releases();
+    let latest = releases
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|releases| {
+            releases
+                .iter()
+                .filter_map(|release| parse_version(&release.tag).map(|version| (version, release)))
+                .max_by_key(|(version, _)| *version)
+                .map(|(_, release)| release.clone())
+                .ok_or_else(|| "no published vMAJOR.MINOR.PATCH release".to_owned())
+        });
+    (latest, releases.unwrap_or_default())
 }
 
 /// One reconcile tick.
@@ -650,6 +782,7 @@ pub(super) fn run_reconcile<E: ReconcileEnv>(
         quarantined: Vec::new(),
         other_controllers: Vec::new(),
         daemon_problems: Vec::new(),
+        lagging_too_long: Vec::new(),
         exit_code: super::EXIT_CONTROLLER_BUSY,
     };
     let _lock = match super::controller_lock::try_acquire(state_dir) {
@@ -662,7 +795,7 @@ pub(super) fn run_reconcile<E: ReconcileEnv>(
         }
     };
     let now = env.now();
-    let latest = env.latest_release();
+    let (latest, releases) = read_releases(env);
     let mut hosts = env.probe_hosts();
     if let Ok(latest) = &latest {
         classify_hosts(latest, &mut hosts);
@@ -671,6 +804,7 @@ pub(super) fn run_reconcile<E: ReconcileEnv>(
     let decision = match read_ledger(state_dir) {
         Ok(ledger) => decide(
             latest.as_ref().map_err(String::as_str),
+            &releases,
             &hosts,
             &ledger,
             now,
@@ -679,21 +813,18 @@ pub(super) fn run_reconcile<E: ReconcileEnv>(
         Err(reason) => ReconcileDecision::Unknown { reason },
     };
     let ledger = read_ledger(state_dir).unwrap_or_default();
-    report.unreachable = hosts
-        .iter()
-        .filter(|host| host.lagging.is_none())
-        .map(|host| host.host_class.clone())
-        .collect();
-    report.quarantined = ledger.quarantined.keys().cloned().collect();
-    report.other_controllers = hosts
-        .iter()
-        .filter(|host| host.declares_host_classes == Some(true))
-        .map(|host| host.host_class.clone())
-        .collect();
-    report.hosts = hosts;
+    record_hosts(&mut report, hosts, &ledger);
     report.decision = decision.clone();
     track_unreachable(env, &mut report, state_dir, latest.is_ok());
     track_daemon_problems(env, &mut report, state_dir);
+    track_lag(
+        env,
+        &mut report,
+        state_dir,
+        &releases,
+        now,
+        policy.lag_alert,
+    );
     let tag = report
         .latest_release
         .as_ref()
@@ -726,8 +857,8 @@ pub(super) fn run_reconcile<E: ReconcileEnv>(
             EXIT_RECONCILE_AHEAD
         }
         ReconcileDecision::Rollout { .. } if !apply => 0,
-        ReconcileDecision::Rollout { lagging } => {
-            rollout(env, &mut report, state_dir, policy, &tag, lagging, now)
+        ReconcileDecision::Rollout { tag, lagging } => {
+            rollout(env, &mut report, state_dir, policy, tag, lagging, now)
         }
     };
     // A tick that could not read every host is not a clean pass.
@@ -838,6 +969,82 @@ fn track_daemon_problems<E: ReconcileEnv>(
             &format!(
                 "fleet-reconcile read {class}'s Shipyard daemon: {problem}. Until it is fixed the \
                  host can stop taking jobs after a reboot with nothing to say so."
+            ),
+        );
+    }
+}
+
+/// Record each host that has lagged a published release for longer than
+/// `threshold` in `lagging_too_long` and alert once per such class; a host
+/// that catches up clears its alert. The lag runs from the earliest known
+/// release newer than the host's version, so a soak that keeps restarting
+/// cannot hide it. Unreadable hosts are left as they were.
+fn track_lag<E: ReconcileEnv>(
+    env: &mut E,
+    report: &mut ReconcileReport,
+    state_dir: &Path,
+    releases: &[PublishedRelease],
+    now: DateTime<Utc>,
+    threshold: chrono::Duration,
+) {
+    let caught_up = report
+        .hosts
+        .iter()
+        .filter(|host| host.lagging == Some(false))
+        .map(|host| host.host_class.clone())
+        .collect::<Vec<_>>();
+    let mut overdue = Vec::new();
+    for host in report
+        .hosts
+        .iter()
+        .filter(|host| host.lagging == Some(true))
+    {
+        let Some(installed) = host.version.as_deref().and_then(parse_version) else {
+            continue;
+        };
+        let newer = releases.iter().filter(|release| {
+            parse_version(&release.tag).is_some_and(|version| version > installed)
+        });
+        let Some(since) = newer.clone().map(|release| release.published_at).min() else {
+            continue;
+        };
+        let latest_tag = newer
+            .filter_map(|release| parse_version(&release.tag).map(|version| (version, release)))
+            .max_by_key(|(version, _)| *version)
+            .map_or("?", |(_, release)| release.tag.as_str());
+        let lag = now - since;
+        if lag > threshold {
+            overdue.push((
+                host.host_class.clone(),
+                lag.num_hours(),
+                latest_tag.to_owned(),
+            ));
+        }
+    }
+    report.lagging_too_long = overdue
+        .iter()
+        .map(|(class, hours, tag)| format!("{class}: over {hours} h behind {tag}"))
+        .collect();
+    let mut to_alert = Vec::new();
+    let _ = update_ledger(state_dir, |ledger| {
+        for class in &caught_up {
+            ledger.lag_alerted.remove(class);
+        }
+        for (class, hours, tag) in &overdue {
+            if ledger.lag_alerted.insert(class.clone()) {
+                to_alert.push((class.clone(), *hours, tag.clone()));
+            }
+        }
+    });
+    for (class, hours, tag) in to_alert {
+        raise(
+            env,
+            report,
+            &format!("fleet-reconcile: {class} has lagged the latest release for over {hours} h"),
+            &format!(
+                "{class} has not received a published Shipyard release for over {hours} h \
+                 (newest available: {tag}). fleet-reconcile is still soaking or retrying; check \
+                 its decision, or roll a soaked tag with `shipyard runner fleet-update`."
             ),
         );
     }
@@ -1107,6 +1314,23 @@ pub(super) fn probe_version_at(
     result
 }
 
+/// Parse `GET repos/<repo>/releases`: the published, non-draft,
+/// non-prerelease releases with a `vMAJOR.MINOR.PATCH` tag. Anything else is
+/// skipped, never rolled.
+pub(super) fn parse_recent_releases(value: &Value) -> Result<Vec<PublishedRelease>, String> {
+    let releases = value
+        .as_array()
+        .ok_or_else(|| "the releases listing is not an array".to_owned())?
+        .iter()
+        .filter_map(|release| parse_latest_release(release).ok())
+        .filter(|release| parse_version(&release.tag).is_some())
+        .collect::<Vec<_>>();
+    if releases.is_empty() {
+        return Err("no published vMAJOR.MINOR.PATCH release in the listing".to_owned());
+    }
+    Ok(releases)
+}
+
 /// Parse `GET repos/<repo>/releases/latest`, which already excludes drafts and
 /// prereleases. A draft or prerelease that slipped through is refused anyway.
 pub(super) fn parse_latest_release(value: &Value) -> Result<PublishedRelease, String> {
@@ -1139,6 +1363,9 @@ mod tests {
             soak: chrono::Duration::minutes(30),
             retry: chrono::Duration::hours(6),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
+            // Long enough that only the lag tests, which set their own, see
+            // a lag alert among the alerts these tests count.
+            lag_alert: chrono::Duration::days(365),
         }
     }
 
@@ -1170,7 +1397,115 @@ mod tests {
         now: DateTime<Utc>,
     ) -> ReconcileDecision {
         classify_hosts(latest, &mut hosts);
-        decide(Ok(latest), &hosts, ledger, now, policy())
+        decide(
+            Ok(latest),
+            std::slice::from_ref(latest),
+            &hosts,
+            ledger,
+            now,
+            policy(),
+        )
+    }
+
+    #[test]
+    fn a_release_stream_rolls_the_newest_soaked_tag_never_an_unsoaked_one() {
+        // A release every 10 minutes for an hour, soaked for 30 minutes each.
+        let t0 = Utc::now();
+        let stream = (0..=6)
+            .map(|n| PublishedRelease {
+                tag: format!("v1.0.{n}"),
+                published_at: t0 + chrono::Duration::minutes(10 * n),
+            })
+            .collect::<Vec<_>>();
+        let mut rolled = Vec::new();
+        for tick in 0..=20 {
+            let now = t0 + chrono::Duration::minutes(5 * tick);
+            let published = stream
+                .iter()
+                .filter(|release| release.published_at <= now)
+                .cloned()
+                .collect::<Vec<_>>();
+            let latest = published.last().expect("v1.0.0 is published at t0").clone();
+            let mut hosts = vec![host("m1", Some("0.9.0"))];
+            classify_hosts(&latest, &mut hosts);
+            let decision = decide(
+                Ok(&latest),
+                &published,
+                &hosts,
+                &AttemptLedger::default(),
+                now,
+                policy(),
+            );
+            let soaked = published
+                .iter()
+                .rfind(|release| release.published_at + policy().soak <= now);
+            match (soaked, &decision) {
+                (None, ReconcileDecision::Soaking { soak_until, .. }) => {
+                    assert_eq!(*soak_until, t0 + policy().soak, "tick {tick}");
+                }
+                (Some(expected), ReconcileDecision::Rollout { tag, lagging }) => {
+                    assert_eq!(tag, &expected.tag, "tick {tick}: the newest soaked tag");
+                    assert_eq!(lagging, &["m1"]);
+                    rolled.push(tag.clone());
+                }
+                other => panic!("tick {tick}: {other:?}"),
+            }
+        }
+        // Control: the stream did outrun the soak. At every rolling tick a
+        // newer, unsoaked tag existed until publishing stopped, yet rollout
+        // never waited for it.
+        assert_eq!(rolled.first().map(String::as_str), Some("v1.0.0"));
+        assert_eq!(rolled.last().map(String::as_str), Some("v1.0.6"));
+        assert_eq!(rolled.len(), 15, "{rolled:?}");
+    }
+
+    #[test]
+    fn hosts_on_the_newest_soaked_tag_wait_for_the_next_to_soak() {
+        let now = Utc::now();
+        let releases = vec![release("v1.0.0", 60, now), release("v1.0.1", 10, now)];
+        let latest = releases[1].clone();
+        let mut hosts = vec![host("m1", Some("1.0.0"))];
+        classify_hosts(&latest, &mut hosts);
+        let decision = decide(
+            Ok(&latest),
+            &releases,
+            &hosts,
+            &AttemptLedger::default(),
+            now,
+            policy(),
+        );
+        assert_eq!(
+            decision,
+            ReconcileDecision::Soaking {
+                soak_until: releases[1].published_at + policy().soak,
+                lagging: vec!["m1".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn the_releases_listing_keeps_only_published_semver_tags() {
+        let release = |tag: &str, draft: bool, prerelease: bool| {
+            serde_json::json!({"tag_name": tag, "draft": draft, "prerelease": prerelease,
+                "published_at": "2026-10-06T03:59:22Z"})
+        };
+        let listing = serde_json::json!([
+            release("v0.278.1", false, false),
+            release("v0.279.0", true, false),
+            release("v0.280.0-rc1", false, true),
+            release("nightly", false, false),
+            release("v0.277.0", false, false),
+        ]);
+        let tags = parse_recent_releases(&listing)
+            .expect("two releases")
+            .into_iter()
+            .map(|release| release.tag)
+            .collect::<Vec<_>>();
+        assert_eq!(tags, ["v0.278.1", "v0.277.0"]);
+        assert!(
+            parse_recent_releases(&serde_json::json!([release("nightly", false, false)])).is_err()
+        );
+        assert!(parse_recent_releases(&serde_json::json!({})).is_err());
     }
 
     #[test]
@@ -1186,6 +1521,7 @@ mod tests {
         assert_eq!(
             decision,
             ReconcileDecision::Rollout {
+                tag: "v0.208.0".to_owned(),
                 lagging: vec!["m5".to_owned()]
             }
         );
@@ -1252,6 +1588,7 @@ mod tests {
         assert_eq!(
             decision,
             ReconcileDecision::Rollout {
+                tag: latest.tag.clone(),
                 lagging: vec!["m1".to_owned()]
             }
         );
@@ -1269,6 +1606,7 @@ mod tests {
         assert!(matches!(
             decide(
                 Err("HTTP 502"),
+                &[],
                 &[],
                 &AttemptLedger::default(),
                 now,
@@ -1894,6 +2232,88 @@ mod tests {
         ));
         let report = run_reconcile(&mut env, temp.path(), policy(), true);
         assert_eq!(report.other_controllers, ["m5"]);
+    }
+
+    #[test]
+    fn a_host_lagging_past_the_threshold_alerts_once_until_it_catches_up() {
+        struct Stream(FakeEnv, Vec<PublishedRelease>);
+        impl ReconcileEnv for Stream {
+            fn now(&self) -> DateTime<Utc> {
+                self.0.now()
+            }
+            fn latest_release(&mut self) -> Result<PublishedRelease, String> {
+                self.0.latest_release()
+            }
+            fn recent_releases(&mut self) -> Result<Vec<PublishedRelease>, String> {
+                Ok(self.1.clone())
+            }
+            fn probe_hosts(&mut self) -> Vec<HostVersion> {
+                self.0.probe_hosts()
+            }
+            fn rollout(&mut self, tag: &str, host_classes: &[String]) -> RolloutOutcome {
+                self.0.rollout(tag, host_classes)
+            }
+            fn alert(&mut self, title: &str, body: &str) -> Result<(), String> {
+                self.0.alert(title, body)
+            }
+        }
+        let temp = tempfile::tempdir().expect("temp");
+        let now = Utc::now();
+        let lag_policy = ReconcilePolicy {
+            lag_alert: chrono::Duration::hours(2),
+            ..policy()
+        };
+        // v0.209.0 has been out three hours; every newer release keeps
+        // restarting the soak, so m5 never received any of them.
+        let releases = vec![release("v0.209.0", 180, now), release("v0.210.0", 5, now)];
+        let mut env = Stream(
+            FakeEnv::new(
+                now,
+                &[("m1", "0.210.0"), ("m5", "0.208.0")],
+                RolloutOutcome::Verified,
+            ),
+            releases,
+        );
+        let report = run_reconcile(&mut env, temp.path(), lag_policy, false);
+        assert_eq!(report.lagging_too_long, ["m5: over 3 h behind v0.210.0"]);
+        assert_eq!(env.0.alerts.len(), 1, "{:?}", env.0.alerts);
+        assert!(env.0.alerts[0].0.contains("m5 has lagged"));
+
+        run_reconcile(&mut env, temp.path(), lag_policy, false);
+        assert_eq!(
+            env.0.alerts.len(),
+            1,
+            "one alert per host until it catches up"
+        );
+
+        env.0.hosts = vec![
+            ("m1".to_owned(), Some("0.210.0".to_owned())),
+            ("m5".to_owned(), Some("0.210.0".to_owned())),
+        ];
+        assert!(
+            run_reconcile(&mut env, temp.path(), lag_policy, false)
+                .lagging_too_long
+                .is_empty()
+        );
+        env.0.hosts[1].1 = Some("0.208.0".to_owned());
+        run_reconcile(&mut env, temp.path(), lag_policy, false);
+        assert_eq!(
+            env.0.alerts.len(),
+            2,
+            "lagging again after catching up alerts again"
+        );
+
+        // Control: under the threshold nothing is reported.
+        let quiet = tempfile::tempdir().expect("temp");
+        let mut recent = Stream(
+            FakeEnv::new(now, &[("m5", "0.208.0")], RolloutOutcome::Verified),
+            vec![release("v0.209.0", 60, now)],
+        );
+        assert!(
+            run_reconcile(&mut recent, quiet.path(), lag_policy, false)
+                .lagging_too_long
+                .is_empty()
+        );
     }
 
     fn daemon(installed: bool, active: bool, running: bool) -> HostDaemon {
