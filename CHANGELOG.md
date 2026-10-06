@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02781"></a>
+## [0.278.1] - 2026-10-05
+
+- fix/dmg smoke detach ([#720](https://github.com/danielraffel/Shipyard/pull/720))
+
 <a id="v02780"></a>
 ## [0.278.0] - 2026-10-05
 
@@ -1969,6 +1974,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.278.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.278.1
 [0.278.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.278.0
 [0.277.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.277.0
 [0.276.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.276.0

@@ -2292,6 +2292,7 @@ fn lagging_only_skips_current_and_ahead_hosts_and_fails_closed_on_unknown() {
             error: None,
             lagging: None,
             declares_host_classes: None,
+            daemon: None,
         }
     };
     let (lagging, current) =
@@ -2316,6 +2317,7 @@ fn lagging_only_skips_current_and_ahead_hosts_and_fails_closed_on_unknown() {
         error: Some("ssh: timed out".to_owned()),
         lagging: None,
         declares_host_classes: None,
+        daemon: None,
     };
     let error = partition_lagging(plans, "v0.137.0", unreadable).expect_err("unknown");
     assert!(
@@ -2523,6 +2525,7 @@ fn doctor_flags_a_host_only_once_it_lags_past_the_soak() {
         error: version.is_none().then(|| "ssh: timed out".to_owned()),
         lagging,
         declares_host_classes: None,
+        daemon: None,
     };
     let lagging =
         reconcile_cmd::fleet_version_row(&row(Some("0.205.0"), Some(true)), Some(&latest), now, 30);

@@ -62,6 +62,46 @@ pub(super) struct HostVersion {
     /// itself or when unread.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) declares_host_classes: Option<bool>,
+    /// The host's daemon and its launchd launcher, when the probe could read
+    /// them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) daemon: Option<HostDaemon>,
+}
+
+/// Whether a host's Shipyard daemon is running and will come back after a
+/// reboot. Each field is `None` when its probe printed nothing readable.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub(super) struct HostDaemon {
+    pub(super) launcher_installed: Option<bool>,
+    pub(super) launcher_active: Option<bool>,
+    pub(super) running: Option<bool>,
+}
+
+impl HostDaemon {
+    /// What is wrong with this host's daemon and the step that fixes it, or
+    /// `None` when nothing read shows a problem.
+    pub(super) fn problem(&self) -> Option<String> {
+        let launcher = match (self.launcher_installed, self.launcher_active) {
+            (Some(false), _) => Some(
+                "the daemon launcher is not installed, so nothing restarts the daemon after a \
+                 reboot; run `shipyard daemon launcher install` at the host's console (it needs \
+                 a one-time macOS approval)",
+            ),
+            (Some(true), Some(false)) => Some(
+                "the daemon launcher is installed but inactive; rerun `shipyard daemon launcher \
+                 install` at the host's console",
+            ),
+            _ => None,
+        };
+        let stopped = (self.running == Some(false))
+            .then_some("the daemon is not running; `shipyard daemon refresh` starts it");
+        match (stopped, launcher) {
+            (None, None) => None,
+            (Some(stopped), None) => Some(stopped.to_owned()),
+            (None, Some(launcher)) => Some(launcher.to_owned()),
+            (Some(stopped), Some(launcher)) => Some(format!("{stopped}; {launcher}")),
+        }
+    }
 }
 
 /// Exit code when a host runs a newer version than the latest release.
@@ -137,6 +177,10 @@ pub(super) struct AttemptLedger {
     /// Host classes whose "unreachable" alert was already raised.
     #[serde(default)]
     pub(super) unreachable_alerted: BTreeSet<String>,
+    /// Host classes whose daemon alert was already raised; cleared when the
+    /// host's daemon reads healthy again.
+    #[serde(default)]
+    pub(super) daemon_alerted: BTreeSet<String>,
 }
 
 /// A host that was mutated, failed, and could not be restored.
@@ -577,6 +621,9 @@ pub(super) struct ReconcileReport {
     /// Remote hosts whose own config declares `[host_class.*]`: there must be
     /// exactly one fleet controller.
     pub(super) other_controllers: Vec<String>,
+    /// `<host class>: <problem and fix>` for each host whose daemon is not
+    /// running or will not come back after a reboot.
+    pub(super) daemon_problems: Vec<String>,
     pub(super) exit_code: u8,
 }
 
@@ -602,6 +649,7 @@ pub(super) fn run_reconcile<E: ReconcileEnv>(
         unreachable: Vec::new(),
         quarantined: Vec::new(),
         other_controllers: Vec::new(),
+        daemon_problems: Vec::new(),
         exit_code: super::EXIT_CONTROLLER_BUSY,
     };
     let _lock = match super::controller_lock::try_acquire(state_dir) {
@@ -645,6 +693,7 @@ pub(super) fn run_reconcile<E: ReconcileEnv>(
     report.hosts = hosts;
     report.decision = decision.clone();
     track_unreachable(env, &mut report, state_dir, latest.is_ok());
+    track_daemon_problems(env, &mut report, state_dir);
     let tag = report
         .latest_release
         .as_ref()
@@ -737,6 +786,58 @@ fn track_unreachable<E: ReconcileEnv>(
             &format!(
                 "fleet-reconcile could not read {class}'s installed Shipyard for {ticks} \
                  consecutive ticks ({error}). It is left out of every rollout until it answers."
+            ),
+        );
+    }
+}
+
+/// Record each host class whose daemon is not running or will not come back
+/// after a reboot in `daemon_problems`, and alert once per such class. The
+/// alert is forgotten once the host reads healthy, so a recurrence alerts
+/// again. Hosts whose daemon could not be read are left as they were.
+fn track_daemon_problems<E: ReconcileEnv>(
+    env: &mut E,
+    report: &mut ReconcileReport,
+    state_dir: &Path,
+) {
+    let healthy = report
+        .hosts
+        .iter()
+        .filter(|host| {
+            host.daemon
+                .as_ref()
+                .is_some_and(|daemon| daemon.problem().is_none())
+        })
+        .map(|host| host.host_class.clone())
+        .collect::<Vec<_>>();
+    let failing = report
+        .hosts
+        .iter()
+        .filter_map(|host| Some((host.host_class.clone(), host.daemon.as_ref()?.problem()?)))
+        .collect::<Vec<_>>();
+    report.daemon_problems = failing
+        .iter()
+        .map(|(class, problem)| format!("{class}: {problem}"))
+        .collect();
+    let mut to_alert = Vec::new();
+    let _ = update_ledger(state_dir, |ledger| {
+        for class in &healthy {
+            ledger.daemon_alerted.remove(class);
+        }
+        for (class, problem) in &failing {
+            if ledger.daemon_alerted.insert(class.clone()) {
+                to_alert.push((class.clone(), problem.clone()));
+            }
+        }
+    });
+    for (class, problem) in to_alert {
+        raise(
+            env,
+            report,
+            &format!("fleet-reconcile: {class} daemon will not survive a reboot"),
+            &format!(
+                "fleet-reconcile read {class}'s Shipyard daemon: {problem}. Until it is fixed the \
+                 host can stop taking jobs after a reboot with nothing to say so."
             ),
         );
     }
@@ -879,6 +980,36 @@ fn rollout<E: ReconcileEnv>(
 }
 
 const PROBE_CONTROLLER_MARKER: &str = "SHIPYARD_PROBE_DECLARES_HOST_CLASSES=";
+const PROBE_LAUNCHER_MARKER: &str = "SHIPYARD_PROBE_DAEMON_LAUNCHER=";
+const PROBE_DAEMON_MARKER: &str = "SHIPYARD_PROBE_DAEMON_STATUS=";
+
+/// Read-only probe lines for the host's launcher and daemon, each one JSON
+/// document on a line after its marker. Their exit codes never fail the
+/// version probe.
+fn daemon_probe_script(binary: &str) -> String {
+    let binary = shlex_quote(binary);
+    let launcher = shlex_quote(PROBE_LAUNCHER_MARKER);
+    let daemon = shlex_quote(PROBE_DAEMON_MARKER);
+    format!(
+        "\nprintf '%s' {launcher}; {binary} --json daemon launcher status 2>/dev/null | /usr/bin/tr -d '\\n'; echo\nprintf '%s' {daemon}; {binary} --json daemon status 2>/dev/null | /usr/bin/tr -d '\\n'; echo"
+    )
+}
+
+/// The daemon state the probe printed, when it printed any marker.
+fn parse_daemon_probe(text: &str) -> Option<HostDaemon> {
+    let field = |marker: &str, key: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(marker))
+            .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            .and_then(|value| value.get(key).and_then(Value::as_bool))
+    };
+    let daemon = HostDaemon {
+        launcher_installed: field(PROBE_LAUNCHER_MARKER, "installed"),
+        launcher_active: field(PROBE_LAUNCHER_MARKER, "active"),
+        running: field(PROBE_DAEMON_MARKER, "running"),
+    };
+    (daemon != HostDaemon::default()).then_some(daemon)
+}
 
 /// Read one configured host's installed version. See [`probe_version_at`].
 pub(super) fn probe_host_version(class: &HostClassConfig) -> HostVersion {
@@ -906,6 +1037,7 @@ pub(super) fn probe_version_at(
         error: None,
         lagging: None,
         declares_host_classes: None,
+        daemon: None,
     };
     let Some(binary) = binary.filter(|path| path.starts_with('/')) else {
         result.error = Some("host_class has no absolute shipyard_bin".to_owned());
@@ -922,6 +1054,7 @@ pub(super) fn probe_version_at(
         );
         script.push_str(&probe);
     }
+    script.push_str(&daemon_probe_script(binary));
     let mut command = if let Some(host) = ssh {
         let mut command = Command::new(super::evidence::ssh_binary_path());
         command.args([
@@ -961,6 +1094,7 @@ pub(super) fn probe_version_at(
                 .lines()
                 .find_map(|line| line.strip_prefix(PROBE_CONTROLLER_MARKER))
                 .map(|value| value.trim() == "1");
+            result.daemon = parse_daemon_probe(&text);
         }
         Ok(output) => {
             result.error = Some(format!(
@@ -1025,6 +1159,7 @@ mod tests {
                 .then(|| "ssh: connect timed out".to_owned()),
             lagging: None,
             declares_host_classes: None,
+            daemon: None,
         }
     }
 
@@ -1759,5 +1894,140 @@ mod tests {
         ));
         let report = run_reconcile(&mut env, temp.path(), policy(), true);
         assert_eq!(report.other_controllers, ["m5"]);
+    }
+
+    fn daemon(installed: bool, active: bool, running: bool) -> HostDaemon {
+        HostDaemon {
+            launcher_installed: Some(installed),
+            launcher_active: Some(active),
+            running: Some(running),
+        }
+    }
+
+    #[test]
+    fn a_daemon_problem_names_the_step_that_fixes_it() {
+        assert_eq!(daemon(true, true, true).problem(), None);
+        assert_eq!(
+            HostDaemon::default().problem(),
+            None,
+            "nothing read, nothing claimed"
+        );
+        let missing = daemon(false, false, true).problem().expect("problem");
+        assert!(missing.contains("not installed"), "{missing}");
+        assert!(
+            missing.contains("`shipyard daemon launcher install`"),
+            "{missing}"
+        );
+        assert!(missing.contains("console"), "{missing}");
+        let inactive = daemon(true, false, true).problem().expect("problem");
+        assert!(inactive.contains("inactive"), "{inactive}");
+        let stopped = daemon(true, true, false).problem().expect("problem");
+        assert!(stopped.contains("not running"), "{stopped}");
+        assert!(stopped.contains("`shipyard daemon refresh`"), "{stopped}");
+        let both = daemon(false, false, false).problem().expect("problem");
+        assert!(
+            both.contains("not running") && both.contains("not installed"),
+            "{both}"
+        );
+    }
+
+    #[test]
+    fn the_probe_reads_the_launcher_and_daemon_status_lines() {
+        let text = format!(
+            "shipyard 0.276.0\n{PROBE_LAUNCHER_MARKER}{{\"active\": false, \"installed\": false, \"record\": null}}\n\
+             {PROBE_DAEMON_MARKER}{{\"running\": true, \"shipyard_version\": \"0.276.0\"}}\n"
+        );
+        assert_eq!(parse_daemon_probe(&text), Some(daemon(false, false, true)));
+        assert_eq!(
+            parse_daemon_probe("shipyard 0.276.0\n"),
+            None,
+            "an older host prints no markers"
+        );
+        let garbled = format!("{PROBE_LAUNCHER_MARKER}not json\n{PROBE_DAEMON_MARKER}\n");
+        assert_eq!(
+            parse_daemon_probe(&garbled),
+            None,
+            "unreadable output claims nothing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_host_probe_runs_the_daemon_status_commands() {
+        let temp = tempfile::tempdir().expect("temp");
+        let binary = temp.path().join("shipyard");
+        crate::test_support::write_executable_script(
+            &binary,
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+               --version) echo 'shipyard 0.276.0' ;;\n\
+               '--json daemon launcher status') printf '{\\n  \"active\": false,\\n  \"installed\": false\\n}\\n' ;;\n\
+               '--json daemon status') printf '{\\n  \"running\": false\\n}\\n' ;;\n\
+               *) echo \"unexpected: $*\" >&2; exit 2 ;;\n\
+             esac\n",
+        );
+        let host = probe_version_at("m5", None, binary.to_str(), None);
+        assert_eq!(host.version.as_deref(), Some("0.276.0"), "{:?}", host.error);
+        assert_eq!(host.daemon, Some(daemon(false, false, false)));
+    }
+
+    #[test]
+    fn a_daemon_problem_alerts_once_until_the_host_reads_healthy() {
+        struct Daemons(FakeEnv, HostDaemon);
+        impl ReconcileEnv for Daemons {
+            fn now(&self) -> DateTime<Utc> {
+                self.0.now()
+            }
+            fn latest_release(&mut self) -> Result<PublishedRelease, String> {
+                self.0.latest_release()
+            }
+            fn probe_hosts(&mut self) -> Vec<HostVersion> {
+                let mut hosts = self.0.probe_hosts();
+                hosts[0].daemon = Some(self.1.clone());
+                hosts
+            }
+            fn rollout(&mut self, tag: &str, host_classes: &[String]) -> RolloutOutcome {
+                self.0.rollout(tag, host_classes)
+            }
+            fn alert(&mut self, title: &str, body: &str) -> Result<(), String> {
+                self.0.alert(title, body)
+            }
+        }
+        let temp = tempfile::tempdir().expect("temp");
+        let mut env = Daemons(
+            FakeEnv::new(Utc::now(), &[("m5", "0.208.0")], RolloutOutcome::Verified),
+            daemon(false, false, false),
+        );
+        let report = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(report.daemon_problems.len(), 1);
+        assert!(
+            report.daemon_problems[0].starts_with("m5: "),
+            "{:?}",
+            report.daemon_problems
+        );
+        assert_eq!(
+            report.exit_code, 0,
+            "a daemon problem never blocks a rollout decision"
+        );
+        assert_eq!(env.0.alerts.len(), 1);
+        assert!(
+            env.0.alerts[0]
+                .1
+                .contains("shipyard daemon launcher install")
+        );
+
+        run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(env.0.alerts.len(), 1, "the same problem alerts once");
+
+        env.1 = daemon(true, true, true);
+        let healthy = run_reconcile(&mut env, temp.path(), policy(), true);
+        assert!(healthy.daemon_problems.is_empty());
+        env.1 = daemon(false, false, true);
+        run_reconcile(&mut env, temp.path(), policy(), true);
+        assert_eq!(
+            env.0.alerts.len(),
+            2,
+            "a recurrence after a healthy read alerts again"
+        );
     }
 }
