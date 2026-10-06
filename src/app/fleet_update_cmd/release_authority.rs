@@ -887,11 +887,16 @@ mod tests {
     fn release_asset_download_does_not_wait_for_escaped_pipe_holder() {
         let fixture = tempfile::tempdir().expect("fixture");
         let pid_file = fixture.path().join("escaped.pid");
+        let gate = fixture.path().join("gate");
+        std::fs::write(&gate, b"").expect("gate");
+        // The escaped holder keeps the asset pipe open until the test removes
+        // the gate, so it outlives any deadline: only a capture that stops
+        // without waiting for it can return early.
         let script = r#"
 use strict;
 use warnings;
 use POSIX qw(setsid);
-my $pid_file = shift @ARGV;
+my ($pid_file, $gate) = @ARGV;
 my $pid = fork();
 die "fork failed: $!" unless defined $pid;
 if ($pid == 0) {
@@ -899,7 +904,7 @@ if ($pid == 0) {
     open my $handle, '>', $pid_file or die "pid file: $!";
     print {$handle} "$$\n";
     close $handle;
-    sleep 30;
+    select undef, undef, undef, 0.02 while -e $gate;
     exit 0;
 }
 select undef, undef, undef, 0.05;
@@ -910,6 +915,7 @@ exit 0;
         command
             .args(["-MPOSIX=setsid", "-e", script])
             .arg(&pid_file)
+            .arg(&gate)
             .env_clear();
         let asset = ObservedAsset {
             id: 47,
@@ -917,20 +923,40 @@ exit 0;
             sha256: sha256(b"payload"),
             size: b"payload".len() as u64,
         };
+        // A capture that waits for the holder can only return at this
+        // deadline, so half of it separates the two outcomes by the mechanism
+        // rather than by how fast this host runs perl. The drain budget is
+        // unobservable on this Ok path: an empty read after `stop` returns
+        // first. release_asset_download_deadline_survives_escaped_pipe_flood
+        // bounds the writer that never pauses.
+        let timeout = Duration::from_secs(30);
         let started = Instant::now();
-        let result = download_asset_to_private_file(
-            &mut command,
-            &asset,
-            Duration::from_secs(2),
-            Some(fixture.path()),
-        );
-        if let Ok(pid) = std::fs::read_to_string(&pid_file).map(|value| value.trim().to_owned()) {
-            let _ = Command::new("/bin/kill").args(["-KILL", &pid]).status();
+        let result =
+            download_asset_to_private_file(&mut command, &asset, timeout, Some(fixture.path()));
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_file(&gate);
+        let holder = std::fs::read_to_string(&pid_file).map(|value| value.trim().to_owned());
+        if let Ok(pid) = &holder {
+            let _ = Command::new("/bin/kill").args(["-KILL", pid]).status();
         }
         result.expect("escaped pipe holder must not retain capture readers");
+        // The holder is gone: a leaked one would outlive this test.
+        let pid = holder.expect("the holder recorded its pid");
+        let gone = (0..100).any(|_| {
+            let alive = Command::new("/bin/kill")
+                .args(["-0", &pid])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if alive {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !alive
+        });
+        assert!(gone, "escaped holder {pid} is still running after teardown");
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "capture readers exceeded the bounded cleanup interval"
+            elapsed < timeout / 2,
+            "the capture waited for the escaped pipe holder: {elapsed:?}"
         );
     }
 
