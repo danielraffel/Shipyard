@@ -3120,8 +3120,11 @@ or removed from the queue with no new head since. "New head" is decided by SHA
 (`headRefOid` against the removed head, the second parent of the removal's
 `beforeCommit` merge-group commit), never by commit date or timeline position:
 GitHub sorts a fix committed before an ejection but pushed after it *before* the
-removal. Only a removal that names no head falls back to a push of the current
-head after it, and without one refuses. A same-head
+removal. Only a removal that names no head (`merge_conflict`) falls back to
+push time: a push of the current head after it in timeline order, or the
+head's earliest check suite created after the removal (`suite_after_removal`;
+`Commit.pushedDate` is null). Without either, including a head with no suite,
+it refuses. A same-head
 removal for `failed_checks`/`merge_conflict` is the ALLGREEN cascade (push a
 fix first); any other reason except `invalid_merge_commit` is refused with
 "confirm with whoever dequeued it". Shipyard's own enqueue is recognised

@@ -1,0 +1,90 @@
+{
+  "_provenance": {
+    "source_pr": "Generous-Corp/pulp#9653",
+    "captured": "2026-10-06T03:17:11Z",
+    "cut_event_created_at": "2026-10-05T23:59:14Z",
+    "note": "Live capture (PR_QUEUE_STATE_QUERY with PullRequestCommit.commit.checkSuites(first:1)) cut right after the RemovedFromMergeQueueEvent(merge_conflict) at 2026-10-05T23:59:14Z, with headRefOid set to 99403d83614a0e535a3d2a5bac391e5ab326b639: the head from its push at 2026-10-06T00:01:06Z (repository activity API: a1bf4ad7 -> 99403d83) until the next push at 02:45:26Z. 99403d83 was committed at 2026-10-05T22:23:28Z, so GitHub sorts its PullRequestCommit BEFORE the removal although it was pushed after it. A merge_conflict removal carries no beforeCommit, so the removed head is not named; the commit's earliest check suite (00:01:07Z, one second after the push) is the push-time evidence. autoMergeRequest is null: GitHub consumed it on enqueue and it was re-enabled only at 02:45:55Z. The live PR has since advanced to f18a1724, so this state is only reachable by cutting.",
+    "pushed_at_activity_api": "2026-10-06T00:01:06Z"
+  },
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "number": 9653,
+        "state": "OPEN",
+        "headRefOid": "99403d83614a0e535a3d2a5bac391e5ab326b639",
+        "isInMergeQueue": false,
+        "mergeQueueEntry": null,
+        "autoMergeRequest": null,
+        "timelineItems": {
+          "pageInfo": {
+            "hasPreviousPage": false
+          },
+          "nodes": [
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "6a955ff812750aee7d7a5eb821017111b85d516d",
+                "checkSuites": {
+                  "nodes": [
+                    {
+                      "createdAt": "2026-10-05T17:10:19Z"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "a1bf4ad7f725471371371e7c6a4c9a1a58698fd8",
+                "checkSuites": {
+                  "nodes": [
+                    {
+                      "createdAt": "2026-10-05T18:40:57Z"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "__typename": "AutoMergeEnabledEvent",
+              "createdAt": "2026-10-05T18:42:57Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "AddedToMergeQueueEvent",
+              "createdAt": "2026-10-05T19:00:39Z",
+              "actor": {
+                "login": "shipyard-local"
+              }
+            },
+            {
+              "__typename": "PullRequestCommit",
+              "commit": {
+                "oid": "99403d83614a0e535a3d2a5bac391e5ab326b639",
+                "checkSuites": {
+                  "nodes": [
+                    {
+                      "createdAt": "2026-10-06T00:01:07Z"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "__typename": "RemovedFromMergeQueueEvent",
+              "createdAt": "2026-10-05T23:59:14Z",
+              "reason": "merge_conflict",
+              "actor": {
+                "login": "github-merge-queue"
+              },
+              "beforeCommit": null
+            }
+          ]
+        }
+      }
+    }
+  }
+}
