@@ -25,6 +25,10 @@ pool, and capability namespace all come from the routing profile.
 > two Linux lanes. `docs/pulp-local-linux-lease.md` documents that deployment;
 > this page documents the general contract.
 
+Deployments: [Pulp local Linux lease](pulp-local-linux-lease.md) and
+[Pulp fleet Linux lint lane](pulp-fleet-lint-linux-lane.md), a report-only
+lane for the merge-queue preamble's selector.
+
 ## Declaring a lease
 
 A lease lives on a lane in the routing profile. All six core keys are
