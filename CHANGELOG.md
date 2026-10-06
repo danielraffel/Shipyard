@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02800"></a>
+## [0.280.0] - 2026-10-06
+
+- feat/reconcile newest soaked tag ([#723](https://github.com/danielraffel/Shipyard/pull/723))
+
 <a id="v02791"></a>
 ## [0.279.1] - 2026-10-05
 
@@ -1984,6 +1989,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.280.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.280.0
 [0.279.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.279.1
 [0.279.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.279.0
 [0.278.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.278.1
