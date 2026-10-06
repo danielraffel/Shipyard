@@ -2903,7 +2903,8 @@ the fence.
 
 Each tick also reports the lane's `github_variable` as `selector_state`, and
 sets `selector_alarm` (an `ALARM:` line in text) when that selector routes to
-the pool while the tick clears, is unreadable while it clears, or is not JSON.
+the pool (names `self-hosted` or the lease's required capability) while the
+tick clears, is unreadable while it clears, or is not JSON.
 That is the only protection for a selector read directly in `runs-on`, which
 no lease can gate. See docs/fleet-lease.md, "The selector alarm".
 Use `shipyard runner local-linux-lease --repo Generous-Corp/pulp` to inspect the

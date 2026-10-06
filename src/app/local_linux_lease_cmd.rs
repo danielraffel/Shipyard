@@ -128,7 +128,8 @@ enum SelectorState {
     Unset,
     /// A selector naming no self-hosted label.
     Hosted,
-    /// A selector naming `self-hosted`: jobs wait for this pool.
+    /// A selector naming `self-hosted` or this pool's capability label: jobs
+    /// wait for this pool.
     SelfHosted,
     /// Not JSON: `fromJSON` fails and the job cannot start anywhere.
     Malformed,
@@ -147,8 +148,10 @@ impl SelectorState {
         }
     }
 
-    /// Classify a selector value as read from the repository variable.
-    fn classify(read: &Result<Option<String>, String>) -> Self {
+    /// Classify a selector value as read from the repository variable. A
+    /// selector routes to the pool when it names `self-hosted` or the pool's
+    /// capability label, which only that pool's runners carry.
+    fn classify(read: &Result<Option<String>, String>, pool_label: &str) -> Self {
         let value = match read {
             Err(_) => return Self::Unreadable,
             Ok(None) => return Self::Unset,
@@ -156,9 +159,9 @@ impl SelectorState {
             Ok(Some(value)) => value,
         };
         let names_self_hosted = |label: &Value| {
-            label
-                .as_str()
-                .is_some_and(|label| label.eq_ignore_ascii_case("self-hosted"))
+            label.as_str().is_some_and(|label| {
+                label.eq_ignore_ascii_case("self-hosted") || label.eq_ignore_ascii_case(pool_label)
+            })
         };
         match serde_json::from_str::<Value>(value) {
             Ok(Value::Array(labels)) if labels.iter().any(names_self_hosted) => Self::SelfHosted,
@@ -286,7 +289,7 @@ pub(super) fn local_linux_lease_command<W: Write>(
         let selector = profile.selector_variable.as_deref().map(|variable| {
             let read =
                 trust_absence_only_if_readable(read_variable(&actions, &repo, variable), &decision);
-            let state = SelectorState::classify(&read);
+            let state = SelectorState::classify(&read, &profile.required_capability);
             SelectorReport {
                 variable: variable.to_owned(),
                 state,
@@ -916,6 +919,7 @@ mod tests {
                 &read
                     .map(|value| value.map(str::to_owned))
                     .map_err(str::to_owned),
+                "pulp-lint-linux-arm64",
             )
         };
         assert_eq!(classify(Err("HTTP 502")), SelectorState::Unreadable);
@@ -946,6 +950,21 @@ mod tests {
             SelectorState::Malformed
         );
         assert_eq!(classify(Ok(Some("{\"a\":1}"))), SelectorState::Malformed);
+        // The pool's capability label alone routes to the pool: GitHub
+        // matches every label, and only this pool's runners carry it.
+        assert_eq!(
+            classify(Ok(Some("[\"Linux\",\"ARM64\",\"pulp-lint-linux-arm64\"]"))),
+            SelectorState::SelfHosted
+        );
+        assert_eq!(
+            classify(Ok(Some("\"PULP-LINT-LINUX-ARM64\""))),
+            SelectorState::SelfHosted
+        );
+        // Control: another pool's label without self-hosted is not this pool.
+        assert_eq!(
+            classify(Ok(Some("[\"Linux\",\"pulp-build-linux\"]"))),
+            SelectorState::Hosted
+        );
     }
 
     #[test]
@@ -994,7 +1013,10 @@ mod tests {
 esac"#,
         );
         let read = read_variable(&set, "owner/repo", "PULP_PREAMBLE_RUNS_ON_JSON");
-        assert_eq!(SelectorState::classify(&read), SelectorState::SelfHosted);
+        assert_eq!(
+            SelectorState::classify(&read, "pulp-lint-linux-arm64"),
+            SelectorState::SelfHosted
+        );
 
         let absent_dir = tempfile::tempdir().expect("tempdir");
         let absent = fake_gh_answering(&absent_dir, "echo 'HTTP 404: Not Found' >&2; exit 1");
@@ -1003,14 +1025,20 @@ esac"#,
         let down_dir = tempfile::tempdir().expect("tempdir");
         let down = fake_gh_answering(&down_dir, "echo 'HTTP 502' >&2; exit 1");
         let read = read_variable(&down, "owner/repo", "X");
-        assert_eq!(SelectorState::classify(&read), SelectorState::Unreadable);
+        assert_eq!(
+            SelectorState::classify(&read, "pulp-lint-linux-arm64"),
+            SelectorState::Unreadable
+        );
     }
 
     #[test]
     fn an_absent_selector_is_trusted_only_when_the_repository_answered() {
         let unreadable = decision(LeaseAction::Clear, "fleet_unreadable: HTTP 404");
         let readable = decision(LeaseAction::Clear, "no_online_idle_matching_runner");
-        let state = SelectorState::classify(&trust_absence_only_if_readable(Ok(None), &unreadable));
+        let state = SelectorState::classify(
+            &trust_absence_only_if_readable(Ok(None), &unreadable),
+            "pulp-lint-linux-arm64",
+        );
         assert_eq!(state, SelectorState::Unreadable);
         assert!(selector_alarm("SEL", state, &unreadable).is_some());
         assert_eq!(
