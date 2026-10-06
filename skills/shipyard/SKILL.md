@@ -3653,6 +3653,16 @@ app-bundle CLI can otherwise attempt to start its GUI and emit non-JSON under a
 stripped LaunchAgent or SSH environment even while Tailscale is healthy. An
 interactive-shell success is not sufficient fleet proof.
 
+### A filtered `timelineItems` `totalCount` counts every timeline item
+
+`timelineItems(itemTypes:[...]){totalCount}` ignores `itemTypes`: GitHub
+returns the count of ALL timeline items, while `filteredCount` and `nodes`
+honour the filter. `adoption_audit.sh` read every merged PR as auto-merged this
+way, and the same shape made Pulp's version-at-land close never-queued bump PRs
+as "ejected". Select `nodes{__typename}` and count the matching type.
+`scripts/test_graphql_filtered_count.py` (Python helper CI lane) fails on the
+bad shape anywhere in the tree and also runs the adoption-audit shell suite.
+
 ## macOS GUI
 
 The GUI lives at `/Users/danielraffel/Code/shipyard-macos-gui`. Validate it
