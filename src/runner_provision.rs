@@ -755,6 +755,29 @@ mod tests {
     }
 
     #[test]
+    fn a_disposable_lint_runner_is_not_routing_drift() {
+        // A per-job JIT runner from tartci's tart-linux provider carries its
+        // lane's capability label, not the persistent `<repo>-build` labels.
+        // That is a missing-label note, never drift, so the audit's exit code
+        // stays clean for a fleet running these lanes.
+        let runners = vec![runner_with(
+            "pulp-lint-ephemeral-m1-4242-0",
+            &["self-hosted", "Linux", "ARM64", "pulp-lint-linux-arm64"],
+        )];
+        let findings = audit_runners("pulp", &runners);
+        assert_eq!(findings.len(), 1);
+        assert!(!findings[0].is_drift(), "{:?}", findings[0].issues);
+        assert_eq!(findings[0].label_class, None);
+        // Control: the same runner carrying a pin label for another class is
+        // drift, so the check above can see drift when it is there.
+        let pinned = vec![runner_with(
+            "pulp-lint-ephemeral-m1-4242-0",
+            &["self-hosted", "Linux", "pulp-build", "pulp-build-studio"],
+        )];
+        assert!(audit_runners("pulp", &pinned)[0].is_drift());
+    }
+
+    #[test]
     fn audit_flags_missing_host_class_label_for_local_mac_runner() {
         // The #325 Shipyard-studio-01: conforming name + local-mac, but missing
         // the shipyard-build / shipyard-build-studio labels.

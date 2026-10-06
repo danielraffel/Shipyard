@@ -467,6 +467,84 @@ runs_on_json = "macos-15"
         )
     }
 
+    /// Pulp's fleet Linux lint lane, as checked in: report-only, so apply must
+    /// never write its selector.
+    fn pulp_lint_preamble_lane() -> CiProfile {
+        CiProfile::parse(
+            r#"
+name = "normal-local-fast"
+
+[repo."Generous-Corp/pulp".merge_group.preamble]
+strategy = "ordered-fallback"
+targets = ["fleet.linux-arm64-lint-vm", "github.linux-x64"]
+github_variable = "PULP_PREAMBLE_RUNS_ON_JSON"
+health_lease_variable = "PULP_LINT_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["merge_group"]
+health_lease_runner_name_prefix = "pulp-lint-ephemeral-"
+health_lease_merge_queue_branch = "main"
+health_lease_admission_burst = 3
+health_lease_required_capability = "pulp-lint-linux-arm64"
+health_lease_forbidden_capability = "pulp-pr-safe-lint-linux-arm64"
+
+[targets."fleet.linux-arm64-lint-vm"]
+runs_on_json = ["self-hosted", "Linux", "ARM64", "pulp-lint-linux-arm64"]
+ephemeral = true
+
+[targets."github.linux-x64"]
+runs_on_json = "ubuntu-latest"
+"#,
+        )
+        .expect("profile")
+    }
+
+    #[test]
+    fn the_report_only_lint_lane_can_never_have_its_selector_written() {
+        // The preamble selector is an operator flip. Even when every live
+        // observation is favourable, the lane's own declaration keeps apply
+        // from writing it: its repository-scope runners have no runner group,
+        // and the target is neither proven nor tied to dispatch evidence.
+        let profile = pulp_lint_preamble_lane();
+        let lane = profile
+            .lane("Generous-Corp/pulp", "merge_group", "preamble")
+            .expect("lane");
+        let blocking = |observation: &LaneObservation| {
+            let verdict = evaluate_lane(
+                &profile,
+                "merge_group",
+                "preamble",
+                lane,
+                observation,
+                DEFAULT_EVIDENCE_MAX_AGE_DAYS,
+            );
+            assert!(!verdict.writable(), "{:?}", verdict.blocking());
+            verdict
+                .blocking()
+                .iter()
+                .map(|gate| gate.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let favourable = LaneObservation {
+            lease_age_seconds: Some(30),
+            ..healthy_observation()
+        };
+        let structural = blocking(&favourable);
+        for gate in ["target-proven", "runner-group-access", "dispatch-evidence"] {
+            assert!(
+                structural.iter().any(|name| name == gate),
+                "{gate}: {structural:?}"
+            );
+        }
+        // Today's observation: no lease has ever been published.
+        let today = blocking(&LaneObservation {
+            lease_age_seconds: None,
+            ..healthy_observation()
+        });
+        for gate in ["runner-group-access", "health-lease-live"] {
+            assert!(today.iter().any(|name| name == gate), "{gate}: {today:?}");
+        }
+    }
+
     #[test]
     fn control_a_fully_proved_lane_is_writable() {
         // Control for every rejection test below: proves a FAIL is the one
