@@ -64,7 +64,7 @@ shipyard landability --repo OWNER/REPO       # can this PR's required contexts b
 # Keep the fleet on the latest release (controller only)
 shipyard runner fleet-update --to vX.Y.Z --all-hosts          # plan
 shipyard runner fleet-update --to vX.Y.Z --all-hosts --apply  # roll out + verify every host
-shipyard runner fleet-reconcile                # latest release vs every host; --apply rolls out lagging fleets after the soak
+shipyard runner fleet-reconcile                # recent releases vs every host; --apply rolls the newest soaked tag to hosts behind it
 shipyard doctor --fleet                        # each host's version vs the latest release
 
 # Monitor
