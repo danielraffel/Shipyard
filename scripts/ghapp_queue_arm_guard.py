@@ -95,7 +95,8 @@ _TIMELINE = (
     "timelineItems(last:100,itemTypes:[PULL_REQUEST_COMMIT,HEAD_REF_FORCE_PUSHED_EVENT,"
     "ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT,AUTO_MERGE_ENABLED_EVENT,"
     "AUTO_MERGE_DISABLED_EVENT,MERGED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename "
-    "... on PullRequestCommit{commit{oid}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}} "
+    "... on PullRequestCommit{commit{oid checkSuites(first:1){nodes{createdAt}}}} "
+    "... on HeadRefForcePushedEvent{createdAt afterCommit{oid}} "
     "... on AddedToMergeQueueEvent{createdAt} "
     "... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid parents(first:3){nodes{oid}}}} "
     "... on AutoMergeEnabledEvent{createdAt} ... on AutoMergeDisabledEvent{createdAt} "
@@ -247,10 +248,13 @@ def _new_head_since(
     """Whether ``head`` differs from the head removed at ``index``, and on what basis.
 
     By SHA when the removal names its head. Otherwise a force-push or commit
-    after the removal (timeline order) whose oid is ``head``. With neither, no
-    new head is assumed, so a re-arm is refused. Commit dates are never
-    consulted: GitHub sorts a back-dated commit before a removal it was pushed
-    after.
+    after the removal (timeline order) whose oid is ``head``, or a commit of
+    ``head`` whose earliest check suite was created after the removal event,
+    wherever GitHub sorted it. With none of these, no new head is assumed, so a
+    re-arm is refused. Commit dates are never consulted: GitHub sorts a
+    back-dated commit before a removal it was pushed after. Mirrors
+    ``new_head_since`` in ``src/pr_queue_state.rs``, which documents why the
+    check suite stands in for the push time.
     """
     if head is None:
         return False, "no_evidence"
@@ -260,7 +264,37 @@ def _new_head_since(
         oid = _pushed_oid(node)
         if oid and oid.lower() == head.lower():
             return True, "push_after_removal"
+    removed_at = _timestamp(nodes[index].get("createdAt"))
+    if removed_at is not None:
+        for node in nodes:
+            if not isinstance(node, dict) or node.get("__typename") != "PullRequestCommit":
+                continue
+            oid = _pushed_oid(node)
+            suite = _earliest_suite(node)
+            if oid and oid.lower() == head.lower() and suite is not None and suite > removed_at:
+                return True, "suite_after_removal"
     return False, "no_evidence"
+
+
+def _timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _earliest_suite(node: dict[str, Any]) -> datetime | None:
+    """When the commit's earliest check suite was created: its push time to
+    within a second, since ``Commit.pushedDate`` is null."""
+    suites = (((node.get("commit") or {}).get("checkSuites") or {}).get("nodes")) or []
+    times = [
+        time
+        for time in (_timestamp(suite.get("createdAt")) for suite in suites if isinstance(suite, dict))
+        if time is not None
+    ]
+    return min(times) if times else None
 
 
 def _ejections_of_head(

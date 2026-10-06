@@ -342,8 +342,16 @@ the head the queue removed (the second parent of the removal's `beforeCommit`
 merge-group commit). Commit dates and timeline position are not consulted,
 because GitHub sorts a fix committed before an ejection but pushed after it
 *before* the removal. A removal that names no head (`merge_conflict`) falls back
-to a push of the current head after it; with none, both guards treat the head
-as unchanged.
+to push-time evidence. That is a push of the current head after it in timeline
+order, or the current head's earliest check suite created after the removal
+event, wherever GitHub sorted its commit (basis `suite_after_removal`). The
+suite stands in for the push time because `Commit.pushedDate` is null. A head
+with neither, including one with no check suite, is treated as unchanged by
+both guards. A commit that first reached GitHub on another branch before the
+removal carries that earlier suite and also reads as unchanged. If a live push
+is ever misread, the repository activity API
+(`repos/{owner}/{repo}/activity`, push events with timestamps) is the
+authoritative source.
 
 The two unreadable rows are asymmetric on purpose: arming blind can fail
 innocent batch-mates, while a blind refresh costs at most one gate run. Every

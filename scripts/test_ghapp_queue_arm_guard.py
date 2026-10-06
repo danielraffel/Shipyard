@@ -76,7 +76,7 @@ class ClassifierAgreesWithSharedCorpus(unittest.TestCase):
                 self.assertEqual("allow" if allowed else "refuse", want["guard"])
                 checked += 1
         # Control: the whole corpus, real and labelled-synthetic, was visited.
-        self.assertEqual(checked, 15)
+        self.assertEqual(checked, 16)
 
     def test_real_truncated_same_head_ejection_is_ejected_and_refused(self) -> None:
         response = fixture("pr_real_truncated_same_head_ejected.json")
@@ -138,6 +138,53 @@ FIX_8912 = "c246e05b54069e800a8d1e5f8f4c9d5e841818d7"
 
 def _removal_index(nodes: list[dict[str, Any]]) -> int:
     return max(i for i, n in enumerate(nodes) if n["__typename"] == "RemovedFromMergeQueueEvent")
+
+
+MERGE_CONFLICT_FIXTURE = "pr_real_9653_merge_conflict_backdated_push.json"
+# 9653's head after the ejection: committed before it, pushed after it.
+PUSHED_9653 = "99403d83614a0e535a3d2a5bac391e5ab326b639"
+
+
+class MergeConflictHeadIsDecidedByFirstSuite(unittest.TestCase):
+    """Twin of the Rust merge_conflict push-time tests."""
+
+    def setUp(self) -> None:
+        self.response = fixture(MERGE_CONFLICT_FIXTURE)
+        self.nodes = self.response["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+
+    def set_head_suites(self, suites: Any) -> None:
+        for node in self.nodes:
+            if node.get("commit", {}).get("oid") == PUSHED_9653:
+                node["commit"]["checkSuites"] = suites
+
+    def test_a_head_pushed_after_a_merge_conflict_ejection_is_new_by_its_first_suite(self) -> None:
+        self.assertEqual(self.response["_provenance"]["source_pr"], "Generous-Corp/pulp#9653")
+        # Control: the removal names no head and GitHub sorts the pushed
+        # commit BEFORE it, so neither the SHA nor the timeline can answer.
+        pushed = next(i for i, n in enumerate(self.nodes) if n.get("commit", {}).get("oid") == PUSHED_9653)
+        self.assertLess(pushed, _removal_index(self.nodes))
+        self.assertIsNone(self.nodes[_removal_index(self.nodes)].get("beforeCommit"))
+        got = guard.classify_pr_queue_state(self.response)
+        self.assertIs(got["new_head_since_removal"], True)
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "suite_after_removal")
+        allowed, message = guard.decide(got)
+        self.assertTrue(allowed, message)
+
+    def test_a_head_whose_first_suite_predates_the_ejection_is_not_new(self) -> None:
+        self.set_head_suites({"nodes": [{"createdAt": "2026-10-05T23:58:00Z"}]})
+        got = guard.classify_pr_queue_state(self.response)
+        self.assertIs(got["new_head_since_removal"], False)
+        self.assertEqual(got["last_ejection"]["new_head_basis"], "no_evidence")
+        self.assertFalse(guard.decide(got)[0])
+
+    def test_a_head_with_no_check_suite_keeps_the_timeline_rule(self) -> None:
+        for suites in ({"nodes": []}, None):
+            with self.subTest(suites=suites):
+                self.setUp()
+                self.set_head_suites(suites)
+                got = guard.classify_pr_queue_state(self.response)
+                self.assertIs(got["new_head_since_removal"], False)
+                self.assertFalse(guard.decide(got)[0])
 
 
 class NewHeadIsDecidedBySha(unittest.TestCase):

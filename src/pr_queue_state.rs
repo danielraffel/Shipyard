@@ -25,9 +25,22 @@
 //! `afterCommit`, or `headRefOid`). A removal GitHub never built a merge group
 //! for (`merge_conflict`) has no `beforeCommit`; there, and whenever the
 //! removed head cannot be established, the classifier falls back to push-time
-//! evidence in timeline order: a `HeadRefForcePushedEvent` or
-//! `PullRequestCommit` *after* the removal whose oid is the current head. With
-//! neither, the answer is "no new head", which refuses a re-arm (fail closed).
+//! evidence: a `HeadRefForcePushedEvent` or `PullRequestCommit` *after* the
+//! removal in timeline order whose oid is the current head, or, wherever its
+//! timeline item sits, a `PullRequestCommit` of the current head whose earliest
+//! check suite was created after the removal event. With neither, the answer is
+//! "no new head", which refuses a re-arm (fail closed).
+//!
+//! The check suite stands in for the push time because GitHub exposes none on
+//! the commit (`Commit.pushedDate` is null) and the suites are created when the
+//! push arrives: for Generous-Corp/pulp#9653 the earliest suite of each pushed
+//! head trailed the push the repository activity API recorded by one second.
+//! A commit that first reached GitHub on another branch before the removal
+//! carries that earlier suite and reads "no new head", the safe direction; a
+//! head with no check suite at all keeps the timeline-order rule. If this ever
+//! misreads a live push, the repository activity API
+//! (`repos/{owner}/{repo}/activity`, push events with timestamps) is the
+//! authoritative source to escalate to.
 //!
 //! ## Limits
 //!
@@ -51,7 +64,7 @@ use serde_json::Value;
 /// GraphQL document whose response [`classify_pr_queue_state`] consumes.
 ///
 /// Variables: `owner`, `name`, `number`.
-pub const PR_QUEUE_STATE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number state headRefOid isInMergeQueue mergeQueueEntry{state position} autoMergeRequest{enabledAt} timelineItems(last:100,itemTypes:[PULL_REQUEST_COMMIT,HEAD_REF_FORCE_PUSHED_EVENT,ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT,AUTO_MERGE_ENABLED_EVENT,AUTO_MERGE_DISABLED_EVENT,MERGED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename ... on PullRequestCommit{commit{oid}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}} ... on AddedToMergeQueueEvent{createdAt actor{login}} ... on RemovedFromMergeQueueEvent{createdAt reason actor{login} beforeCommit{oid parents(first:3){nodes{oid}}}} ... on AutoMergeEnabledEvent{createdAt actor{login}} ... on AutoMergeDisabledEvent{createdAt reason actor{login}} ... on MergedEvent{createdAt}}}}}}";
+pub const PR_QUEUE_STATE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number state headRefOid isInMergeQueue mergeQueueEntry{state position} autoMergeRequest{enabledAt} timelineItems(last:100,itemTypes:[PULL_REQUEST_COMMIT,HEAD_REF_FORCE_PUSHED_EVENT,ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT,AUTO_MERGE_ENABLED_EVENT,AUTO_MERGE_DISABLED_EVENT,MERGED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename ... on PullRequestCommit{commit{oid checkSuites(first:1){nodes{createdAt}}}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}} ... on AddedToMergeQueueEvent{createdAt actor{login}} ... on RemovedFromMergeQueueEvent{createdAt reason actor{login} beforeCommit{oid parents(first:3){nodes{oid}}}} ... on AutoMergeEnabledEvent{createdAt actor{login}} ... on AutoMergeDisabledEvent{createdAt reason actor{login}} ... on MergedEvent{createdAt}}}}}}";
 
 /// Fixed preface printed ahead of every classification a human or agent reads.
 pub const REST_AUTO_MERGE_PREFACE: &str = "REST pulls/<n>.auto_merge is null for every queued PR \
@@ -254,6 +267,10 @@ pub enum NewHeadBasis {
     /// The removal names no head; a force-push or commit after it in timeline
     /// order whose oid is `headRefOid`.
     PushAfterRemoval,
+    /// The removal names no head; a commit whose oid is `headRefOid` has its
+    /// earliest check suite created after the removal event, wherever GitHub
+    /// sorted it in the timeline.
+    SuiteAfterRemoval,
     /// Neither: no evidence of a new head, so none is assumed.
     NoEvidence,
 }
@@ -406,10 +423,41 @@ fn new_head_since(
         .filter_map(pushed_oid)
         .any(|oid| oid.eq_ignore_ascii_case(head))
     {
-        (true, NewHeadBasis::PushAfterRemoval)
+        return (true, NewHeadBasis::PushAfterRemoval);
+    }
+    let removed_at = nodes[index]
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .and_then(parse_timestamp);
+    let suite_after_removal = removed_at.is_some_and(|removed_at| {
+        nodes.iter().any(|node| {
+            node.get("__typename").and_then(Value::as_str) == Some("PullRequestCommit")
+                && pushed_oid(node).is_some_and(|oid| oid.eq_ignore_ascii_case(head))
+                && earliest_suite(node).is_some_and(|suite| suite > removed_at)
+        })
+    });
+    if suite_after_removal {
+        (true, NewHeadBasis::SuiteAfterRemoval)
     } else {
         (false, NewHeadBasis::NoEvidence)
     }
+}
+
+fn parse_timestamp(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|time| time.with_timezone(&chrono::Utc))
+}
+
+/// When the commit's earliest check suite was created: its push time to
+/// within a second, since `Commit.pushedDate` is null.
+fn earliest_suite(node: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    node.pointer("/commit/checkSuites/nodes")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|suite| suite.get("createdAt").and_then(Value::as_str))
+        .filter_map(parse_timestamp)
+        .min()
 }
 
 /// Classify and report every fact, with the field path it came from.
@@ -613,6 +661,9 @@ pub fn explain_pr_queue_state(response: &Value) -> PrQueueReport {
                     NewHeadBasis::PushAfterRemoval =>
                         "no removed head named; new head = a later PullRequestCommit or \
                          HeadRefForcePushedEvent whose oid is headRefOid",
+                    NewHeadBasis::SuiteAfterRemoval =>
+                        "no removed head named; new head = headRefOid's earliest check suite \
+                         was created after this removal",
                     NewHeadBasis::NoEvidence =>
                         "no removed head named and no later push of headRefOid; no new head \
                          assumed",
@@ -992,7 +1043,7 @@ mod tests {
         }
         // Control: the loop must actually have visited the whole corpus,
         // including the real ejected captures and the labelled synthetic ones.
-        assert_eq!(checked, 15);
+        assert_eq!(checked, 16);
     }
 
     #[test]
@@ -1136,6 +1187,82 @@ mod tests {
             .iter()
             .rposition(|node| node["__typename"] == "RemovedFromMergeQueueEvent")
             .expect("removal")
+    }
+
+    const MERGE_CONFLICT_FIXTURE: &str = "pr_real_9653_merge_conflict_backdated_push.json";
+    /// 9653's head after the ejection: committed before it, pushed after it.
+    const PUSHED_9653: &str = "99403d83614a0e535a3d2a5bac391e5ab326b639";
+
+    fn set_head_suites(value: &mut Value, suites: &Value) {
+        for node in nodes_mut(value) {
+            if node["commit"]["oid"] == PUSHED_9653 {
+                node["commit"]["checkSuites"] = suites.clone();
+            }
+        }
+    }
+
+    #[test]
+    fn a_merge_conflict_head_pushed_after_the_ejection_is_new_by_its_first_suite() {
+        let value = fixture(MERGE_CONFLICT_FIXTURE);
+        assert_eq!(value["_provenance"]["source_pr"], "Generous-Corp/pulp#9653");
+        // Control: the removal names no head and GitHub sorts the pushed
+        // commit BEFORE it, so neither the SHA nor the timeline can answer.
+        let nodes = value["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+            .as_array()
+            .expect("nodes");
+        let pushed = nodes
+            .iter()
+            .position(|node| node["commit"]["oid"] == PUSHED_9653)
+            .expect("pushed commit");
+        assert!(pushed < removal_index(&value));
+        assert!(nodes[removal_index(&value)]["beforeCommit"].is_null());
+        let report = explain_pr_queue_state(&value);
+        let ejection = report.last_ejection.expect("ejection");
+        assert_eq!(ejection.removed_head, None);
+        assert_eq!(ejection.new_head_basis, NewHeadBasis::SuiteAfterRemoval);
+        assert!(ejection.new_head_since);
+        assert_eq!(
+            report.state,
+            PrQueueState::Ejected {
+                reason: "merge_conflict".to_owned(),
+                at: Some("2026-10-05T23:59:14Z".to_owned()),
+                new_head_since_removal: true,
+                requeues_without_new_head: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_head_whose_first_suite_predates_the_ejection_is_not_new() {
+        let mut value = fixture(MERGE_CONFLICT_FIXTURE);
+        set_head_suites(
+            &mut value,
+            &serde_json::json!({"nodes": [{"createdAt": "2026-10-05T23:58:00Z"}]}),
+        );
+        let ejection = explain_pr_queue_state(&value)
+            .last_ejection
+            .expect("ejection");
+        assert!(
+            !ejection.new_head_since,
+            "the head reached GitHub before the removal"
+        );
+        assert_eq!(ejection.new_head_basis, NewHeadBasis::NoEvidence);
+    }
+
+    #[test]
+    fn a_head_with_no_check_suite_keeps_the_timeline_rule() {
+        for suites in [serde_json::json!({"nodes": []}), Value::Null] {
+            let mut value = fixture(MERGE_CONFLICT_FIXTURE);
+            set_head_suites(&mut value, &suites);
+            let ejection = explain_pr_queue_state(&value)
+                .last_ejection
+                .expect("ejection");
+            assert!(
+                !ejection.new_head_since,
+                "no push-time evidence: fail closed"
+            );
+            assert_eq!(ejection.new_head_basis, NewHeadBasis::NoEvidence);
+        }
     }
 
     #[test]
