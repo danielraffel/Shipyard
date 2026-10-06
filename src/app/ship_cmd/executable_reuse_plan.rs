@@ -45,6 +45,8 @@ pub(super) struct KeyRequest<'a> {
     pub(super) cwd: &'a Path,
     pub(super) state_dir: &'a Path,
     pub(super) contract_digest: &'a str,
+    /// Finds the read-audit report for a plan against the given base.
+    pub(super) audit: &'a dyn Fn(&str) -> super::read_audit::Fetched,
 }
 
 /// Bind the base record and plan the keyed run.
@@ -78,11 +80,21 @@ pub(super) fn plan_keyed(request: &KeyRequest<'_>) -> Keyed {
         |code_dir| probe_platform(request.reuse, code_dir, &build_dir),
         |commit| merged_into(cwd, commit, &base),
     );
-    let binding = match bound {
+    let mut binding = match bound {
         Ok(Binding::Bound(binding)) => binding,
         Ok(Binding::NoBase(why)) => return closeout("executable_reuse_no_base", why),
         Err(error) => return closeout("executable_reuse_bind_error", error),
     };
+    let fetched = (request.audit)(&base);
+    if let crate::changed_surface::executable_reuse::AuditBinding::None { reason } = &fetched.audit
+    {
+        eprintln!(
+            "shipyard: keyed plan at {} has no clean read-audit report ({reason}); the key code \
+             keys nothing, so this run is not a reuse observation",
+            receipt.head_sha
+        );
+    }
+    binding.audit = Some(fetched.audit);
     match plan_keyed_execution(
         receipt,
         &request.observation.input,
@@ -93,7 +105,10 @@ pub(super) fn plan_keyed(request: &KeyRequest<'_>) -> Keyed {
         request.contract_digest,
         &request.observation.workflow_digest,
     ) {
-        Ok(Some(plan)) => Keyed::Planned(Box::new(plan)),
+        Ok(Some(mut plan)) => {
+            plan.audit_report = fetched.report;
+            Keyed::Planned(Box::new(plan))
+        }
         Ok(None) => closeout(
             "executable_reuse_not_runnable",
             "the protected-base execution policy cannot carry a keyed build-and-test run",

@@ -652,6 +652,10 @@ fn judge_run(
     if let Some(refusal) = copy_runner_inputs(trial_dir, derived, &inputs)? {
         return Ok(Verdict::refuse(refusal));
     }
+    let audit_report = match stage_audit_report(trial_dir, binding, &inputs) {
+        Ok(path) => path,
+        Err(refusal) => return Ok(Verdict::refuse(refusal)),
+    };
     let substitutions = [
         ("{source_root}", context.checkout.clone()),
         ("{base_sha}", pick.commit.clone()),
@@ -665,14 +669,7 @@ fn judge_run(
         ("{sample_percent}", binding.sample_percent.to_string()),
     ];
     for command in &reuse.rederive {
-        let command = command
-            .iter()
-            .map(|arg| {
-                substitutions
-                    .iter()
-                    .fold(arg.clone(), |arg, (key, value)| arg.replace(key, value))
-            })
-            .collect::<Vec<_>>();
+        let command = substitute(command, &substitutions, audit_report.as_deref());
         if let Err(error) = run_base_command(&command, &code_dir, "the base key code") {
             return Ok(
                 Verdict::refuse(format!("the host re-derivation failed: {error}")).after(pick, out),
@@ -682,6 +679,67 @@ fn judge_run(
     let mut verdict = compare_outputs(&inputs, &out)?;
     verdict.toolchain_matched = Some(toolchain_matched);
     Ok(verdict.after(pick, out))
+}
+
+/// Placeholder for the staged read-audit report in a rederive command.
+const AUDIT_REPORT_PLACEHOLDER: &str = "{audit_report}";
+
+/// Substitute a base command's placeholders. `{audit_report}` becomes the
+/// staged report's path; when the plan bound none, the argument holding it
+/// and the `--flag` before it are dropped, so the key code runs as it would
+/// with no report and keys nothing.
+fn substitute(
+    command: &[String],
+    substitutions: &[(&str, String)],
+    audit_report: Option<&Path>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(command.len());
+    for arg in command {
+        if arg.contains(AUDIT_REPORT_PLACEHOLDER) {
+            if let Some(path) = audit_report {
+                out.push(arg.replace(AUDIT_REPORT_PLACEHOLDER, &path.to_string_lossy()));
+            } else if arg == AUDIT_REPORT_PLACEHOLDER
+                && out.last().is_some_and(|flag| flag.starts_with("--"))
+            {
+                out.pop();
+            }
+            continue;
+        }
+        out.push(
+            substitutions
+                .iter()
+                .fold(arg.clone(), |arg, (key, value)| arg.replace(key, value)),
+        );
+    }
+    out
+}
+
+/// Copy the read-audit report the binding names into the work inputs, after
+/// checking it is the bytes the binding pinned. `Ok(None)` when the binding
+/// names no report; `Err` is a refusal: the runner verified the same file
+/// before it ran, so a difference now means the evidence moved.
+fn stage_audit_report(
+    trial_dir: &Path,
+    binding: &ExecutableReuseBinding,
+    inputs: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let Some(crate::changed_surface::executable_reuse::AuditBinding::Staged {
+        report_sha256, ..
+    }) = &binding.audit
+    else {
+        return Ok(None);
+    };
+    let name = crate::changed_surface::executable_reuse::AUDIT_REPORT_FILE;
+    let bytes = fs::read(trial_dir.join(name))
+        .map_err(|_| format!("the staged read-audit report {name} is missing"))?;
+    if sha256_hex(&bytes) != *report_sha256 {
+        return Err(format!(
+            "the staged read-audit report {name} is not the one the binding named"
+        ));
+    }
+    let staged = inputs.join(name);
+    fs::write(&staged, &bytes).map_err(|error| format!("stage {name}: {error}"))?;
+    Ok(Some(staged))
 }
 
 /// The record the runner keyed against and whether it was the lane's
@@ -1450,6 +1508,7 @@ supported_build_types = ["debug"]
             sample_seed: format!("{tag}{}", "s".repeat(64 - tag.len())),
             sample_percent: 5,
             build_dir: "build".to_owned(),
+            audit: None,
         };
         let payload = serde_json::to_vec(&json!({"executable_reuse": binding})).expect("payload");
         let trial_dir = result_directory(&fixture.state, &identity);
@@ -1487,6 +1546,12 @@ supported_build_types = ["debug"]
         derived.insert(
             "base_record_sha256".into(),
             json!(fixture.candidate.record_sha256),
+        );
+        // The runner's audit outcome rides in `derived`; agreement must not
+        // depend on it.
+        derived.insert(
+            "audit".into(),
+            json!({"status": "applied", "run_id": "7", "commits_behind": 2}),
         );
         for (name, key) in RUNNER_INPUTS {
             let bytes = format!("{{\"{name}\": \"{head}{tag}\"}}\n");
@@ -2459,5 +2524,83 @@ supported_build_types = ["debug"]
             verdict(&rederive(&fixture, &identity, &calls)),
             "not_derived"
         );
+    }
+
+    #[test]
+    fn the_audit_placeholder_is_the_staged_path_or_dropped_with_its_flag() {
+        let command: Vec<String> = [
+            "k",
+            "--out",
+            "{out_dir}/x",
+            "--audit-report",
+            "{audit_report}",
+            "--z",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect();
+        let subs = [("{out_dir}", "/o".to_owned())];
+        assert_eq!(
+            substitute(&command, &subs, Some(Path::new("/i/read-audit.json"))),
+            [
+                "k",
+                "--out",
+                "/o/x",
+                "--audit-report",
+                "/i/read-audit.json",
+                "--z"
+            ]
+        );
+        assert_eq!(
+            substitute(&command, &subs, None),
+            ["k", "--out", "/o/x", "--z"],
+            "no report: the flag and its value go"
+        );
+        let inline: Vec<String> = ["k", "--verbose", "--audit-report={audit_report}"]
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect();
+        assert_eq!(substitute(&inline, &subs, None), ["k", "--verbose"]);
+    }
+
+    #[test]
+    fn a_staged_report_is_copied_only_when_it_is_the_one_bound() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let trial = temp.path().join("trial");
+        let inputs = temp.path().join("inputs");
+        fs::create_dir_all(&trial).expect("trial");
+        fs::create_dir_all(&inputs).expect("inputs");
+        let name = crate::changed_surface::executable_reuse::AUDIT_REPORT_FILE;
+        let bytes = br#"{"stage0":{"verdict":"clean"}}"#;
+        let mut bound: ExecutableReuseBinding = serde_json::from_value(json!({
+            "candidates": [], "rules_digest": "r", "derivation_code_dir": "/c",
+            "derivation_code_sha256": "d", "sample_seed": "s", "sample_percent": 5,
+            "build_dir": "build"}))
+        .expect("binding");
+        assert_eq!(stage_audit_report(&trial, &bound, &inputs), Ok(None));
+        bound.audit = Some(
+            crate::changed_surface::executable_reuse::AuditBinding::Staged {
+                run_id: "1".to_owned(),
+                audit_commit: "a".repeat(40),
+                commits_behind: 0,
+                report_sha256: sha256_hex(bytes),
+            },
+        );
+        assert!(
+            stage_audit_report(&trial, &bound, &inputs)
+                .expect_err("missing")
+                .contains("missing")
+        );
+        fs::write(trial.join(name), b"{}").expect("other bytes");
+        assert!(
+            stage_audit_report(&trial, &bound, &inputs)
+                .expect_err("moved")
+                .contains("not the one the binding named")
+        );
+        fs::write(trial.join(name), bytes).expect("the bound bytes");
+        let staged = stage_audit_report(&trial, &bound, &inputs)
+            .expect("staged")
+            .expect("a path");
+        assert_eq!(fs::read(staged).expect("read"), bytes);
     }
 }

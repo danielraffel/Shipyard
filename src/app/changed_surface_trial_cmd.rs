@@ -11,8 +11,9 @@ use sha2::{Digest, Sha256};
 
 use super::CliFailure;
 use crate::changed_surface::trial::{
-    ReceiptFile, TrialIdentity, TrialState, TrialStatus, evaluate_stale_base_execution,
-    evaluate_stale_base_terminal, evaluate_trial, rejected_trial, result_directory,
+    ReceiptFile, TrialIdentity, TrialState, TrialStatus, audit_applied,
+    evaluate_stale_base_execution, evaluate_stale_base_terminal, evaluate_trial, rejected_trial,
+    result_directory,
 };
 use crate::output::write_json_envelope;
 
@@ -405,6 +406,12 @@ where
         .map(|(name, bytes)| ReceiptFile { name, bytes })
         .collect::<Vec<_>>();
     let mut status = evaluate_trial(identity, activation, &result_files, &rederivation_files);
+    if let Some(keyed) = status.keyed.as_mut() {
+        keyed.record_audit(
+            bound_audit(result_dir).as_ref(),
+            run_applied_audit(result_dir, &results),
+        );
+    }
     status.activation_conflicts = activation_conflicts(result_dir);
     if !matches!(
         status.state,
@@ -682,6 +689,36 @@ struct ReceiptReadFailure {
     reason: &'static str,
     observed: usize,
     receipt: Option<String>,
+}
+
+/// The audit status a keyed run's binding file records, if any.
+fn bound_audit(
+    result_dir: &Path,
+) -> Option<crate::changed_surface::executable_reuse::AuditBinding> {
+    let bytes = read_regular_receipt(
+        &result_dir.join(crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE),
+    )
+    .ok()
+    .flatten()?;
+    serde_json::from_slice::<crate::changed_surface::executable_reuse::ExecutableReuseBinding>(
+        &bytes,
+    )
+    .ok()?
+    .audit
+}
+
+/// Whether the run's single result and the key manifest beside it show the
+/// staged audit report in effect; see [`audit_applied`].
+fn run_applied_audit(result_dir: &Path, results: &[(String, Vec<u8>)]) -> Result<(), String> {
+    let [(_, bytes)] = results else {
+        return Err("no single result".to_owned());
+    };
+    let result =
+        serde_json::from_slice::<Value>(bytes).map_err(|_| "unreadable result".to_owned())?;
+    let manifest = read_regular_receipt(&result_dir.join("executable-keys.json"))
+        .ok()
+        .flatten();
+    audit_applied(&result, manifest.as_deref())
 }
 
 /// The `activation_conflict` diagnostics a ship wrote into this trial
@@ -1451,6 +1488,63 @@ mod tests {
         assert_eq!(
             status.result_receipt.as_deref(),
             Some(format!("payload-{PAYLOAD_1}/result-1.json").as_str())
+        );
+    }
+
+    #[test]
+    fn a_staged_audit_counts_only_when_the_run_applied_it_cleanly() {
+        use crate::changed_surface::executable_reuse::{AuditBinding, ExecutableReuseBinding};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = result_directory(&temp.path().join("state"), &identity());
+        let binding = ExecutableReuseBinding {
+            candidates: Vec::new(),
+            rules_digest: DIGEST_C.to_owned(),
+            derivation_code_dir: "/derivation".to_owned(),
+            derivation_code_sha256: DIGEST_C.to_owned(),
+            sample_seed: DIGEST_C.to_owned(),
+            sample_percent: 5,
+            build_dir: "build".to_owned(),
+            audit: Some(AuditBinding::Staged {
+                run_id: "7".to_owned(),
+                audit_commit: "b".repeat(40),
+                commits_behind: 2,
+                report_sha256: DIGEST_C.to_owned(),
+            }),
+        };
+        let observe = |audit_status: &str, key_code_status: &str| {
+            write_run(&root, PAYLOAD_1, true, None);
+            fs::write(
+                root.join(crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE),
+                serde_json::to_vec(&binding).expect("binding"),
+            )
+            .expect("binding file");
+            let manifest = json!({"producer": {"audit_status": key_code_status}}).to_string();
+            fs::write(root.join("executable-keys.json"), &manifest).expect("manifest");
+            let path = root.join("result-1.json");
+            let mut result: Value =
+                serde_json::from_slice(&fs::read(&path).expect("result")).expect("json");
+            result["executable_reuse"]["derived"] = json!({
+                "audit": {"status": audit_status},
+                "key_manifest_sha256": format!("{:x}", Sha256::digest(manifest.as_bytes())),
+            });
+            fs::write(&path, result.to_string()).expect("result");
+            let keyed = read_trial(&identity(), &root).keyed.expect("keyed summary");
+            (keyed.audit, keyed.reuse_observation)
+        };
+        assert_eq!(observe("applied", "clean"), ("staged".to_owned(), true));
+        assert_eq!(
+            observe("applied", "not_clean"),
+            (
+                "staged_unconfirmed: key code audit status not_clean".to_owned(),
+                false
+            )
+        );
+        assert_eq!(
+            observe("base_key_code_predates_audit", "absent"),
+            (
+                "staged_unconfirmed: runner audit status base_key_code_predates_audit".to_owned(),
+                false
+            )
         );
     }
 

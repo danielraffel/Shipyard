@@ -203,6 +203,11 @@ pub struct AuthoritativeExecutionPlan {
     /// [`EXECUTABLE_REUSE_BINDING_FILE`]; empty when the plan is unkeyed.
     #[serde(skip)]
     pub executable_reuse_binding: Vec<u8>,
+    /// The read-audit report the binding names, as the exact bytes to stage
+    /// as [`super::executable_reuse::AUDIT_REPORT_FILE`]; empty when it names
+    /// none.
+    #[serde(skip)]
+    pub audit_report: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -520,6 +525,7 @@ pub fn plan_keyed_execution(
         disposition: KEYED_FULL_SHADOW.to_owned(),
         execution_payload,
         executable_reuse_binding: binding_bytes,
+        audit_report: Vec::new(),
     }))
 }
 
@@ -670,6 +676,7 @@ fn bounded_execution_plan(
             .to_owned(),
             execution_payload,
             executable_reuse_binding: binding.map(|(bytes, _)| bytes).unwrap_or_default(),
+            audit_report: Vec::new(),
         },
     )))
 }
@@ -1245,6 +1252,7 @@ mod tests {
             sample_seed: DIGEST.to_owned(),
             sample_percent: 5,
             build_dir: "build".to_owned(),
+            audit: None,
         }
     }
 
