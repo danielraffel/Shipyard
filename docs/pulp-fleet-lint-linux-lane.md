@@ -4,23 +4,30 @@ A self-hosted fallback for Pulp's merge-queue preamble (`resolve-provider`,
 `classify` and the jobs that share their runner) when GitHub cannot assign
 hosted Linux runners. Each job runs in its own disposable tart Linux VM on the
 Apple-silicon fleet, launched by tartci's `providers/tart-linux` provider, with
-egress limited to GitHub and no host mounts. The provider owns boot, isolation,
+egress limited to GitHub's published self-hosted-runner egress set (the meta
+ranges plus the documented runner hostnames, including the Azure ranges the
+runner uploads to) and no host mounts. The provider owns boot, isolation,
 teardown, the JIT runner and the host resource lease; see tartci's runbook.
 Shipyard owns the routing lane, the health report, and the alarm described
 here.
 
 ## What routes to it, and how
 
-The preamble reads `PULP_PREAMBLE_RUNS_ON_JSON` directly in `runs-on`:
+The preamble reads `PULP_PREAMBLE_RUNS_ON_JSON` directly in `runs-on`. The
+event scoping below is not on Pulp's `main` yet: it lands with Pulp's
+preamble-scoping change (branch `ci/preamble-merge-group-scope`). Until then all
+nine consumers on `main` route every event through the variable, so it must
+stay unset. Once the scoping change lands, every consumer reads:
 
 ```yaml
 runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.PULP_PREAMBLE_RUNS_ON_JSON || '"ubuntu-latest"') }}
 ```
 
-So the selector reaches the fleet for `merge_group` runs only; pull-request,
-push and dispatch runs stay GitHub-hosted whatever it holds. A `runs-on`
-expression cannot compare a lease expiry with the clock, and the preamble is
-the job that would read one, so **no health lease gates this selector**.
+With that change, the selector reaches the fleet for `merge_group` runs only;
+pull-request, push and dispatch runs stay GitHub-hosted whatever it holds. A
+`runs-on` expression cannot compare a lease expiry with the clock, and the
+preamble is the job that would read one, so **no health lease gates this
+selector**.
 Setting it is an operator flip for the duration of a hosted-runner outage, and
 unsetting it when hosted capacity returns is part of the same step.
 
