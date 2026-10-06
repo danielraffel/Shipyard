@@ -121,6 +121,123 @@ impl LeaseAction {
     }
 }
 
+/// What the lane's runs-on selector currently routes to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectorState {
+    /// Absent or empty: workflows fall back to their hosted label.
+    Unset,
+    /// A selector naming no self-hosted label.
+    Hosted,
+    /// A selector naming any label that is not a GitHub-hosted image: jobs
+    /// wait for some self-hosted pool. `this_pool` is whether it names
+    /// `self-hosted` or one of this lane's labels.
+    SelfHosted { this_pool: bool },
+    /// Not JSON: `fromJSON` fails and the job cannot start anywhere.
+    Malformed,
+    /// The variable could not be read.
+    Unreadable,
+}
+
+impl SelectorState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unset => "unset",
+            Self::Hosted => "hosted",
+            Self::SelfHosted { .. } => "self_hosted",
+            Self::Malformed => "malformed",
+            Self::Unreadable => "unreadable",
+        }
+    }
+
+    /// Classify a selector value as read from the repository variable. It is
+    /// hosted only when every label is a GitHub-hosted image; any other label
+    /// can only be satisfied by a self-hosted runner, so the selector waits for
+    /// one. `lane_labels` are this lane's target labels.
+    fn classify(read: &Result<Option<String>, String>, lane_labels: &[String]) -> Self {
+        let value = match read {
+            Err(_) => return Self::Unreadable,
+            Ok(None) => return Self::Unset,
+            Ok(Some(value)) if value.trim().is_empty() => return Self::Unset,
+            Ok(Some(value)) => value,
+        };
+        let labels = match serde_json::from_str::<Value>(value) {
+            Ok(Value::String(label)) => vec![label],
+            Ok(Value::Array(items)) => {
+                let labels = items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>();
+                match labels {
+                    Some(labels) if !labels.is_empty() => labels,
+                    _ => return Self::Malformed,
+                }
+            }
+            _ => return Self::Malformed,
+        };
+        if labels.iter().all(|label| is_github_hosted_label(label)) {
+            return Self::Hosted;
+        }
+        let this_pool = labels.iter().any(|label| {
+            label.eq_ignore_ascii_case("self-hosted")
+                || lane_labels
+                    .iter()
+                    .any(|lane| lane.eq_ignore_ascii_case(label))
+        });
+        Self::SelfHosted { this_pool }
+    }
+}
+
+/// Whether `label` names a GitHub-hosted runner image (`ubuntu-*`,
+/// `windows-*`, `macos-*`, including `-latest` and the larger and ARM
+/// variants).
+fn is_github_hosted_label(label: &str) -> bool {
+    let label = label.to_ascii_lowercase();
+    ["ubuntu-", "windows-", "macos-"]
+        .iter()
+        .any(|prefix| label.starts_with(prefix))
+}
+
+/// The finding for a selector that strands jobs: one that routes to this
+/// pool, or cannot be checked, while the pool cannot take jobs, or one that no
+/// job can start under at all.
+fn selector_alarm(
+    variable: &str,
+    state: SelectorState,
+    decision: &LeaseDecision,
+) -> Option<String> {
+    let pool_down = decision.action == LeaseAction::Clear;
+    match state {
+        SelectorState::Malformed => Some(format!(
+            "{variable} is not JSON, so every job reading it fails to start; fix or unset it"
+        )),
+        SelectorState::SelfHosted { this_pool: true } if pool_down => Some(format!(
+            "{variable} is SET to this pool while it cannot take jobs ({}); jobs reading it \
+             will queue until it is unset or the pool recovers",
+            decision.reason
+        )),
+        SelectorState::SelfHosted { this_pool: false } if pool_down => Some(format!(
+            "{variable} names labels not carried by this lane, so it routes to some other \
+             self-hosted pool, while this pool cannot take jobs ({}); check that pool or \
+             unset it",
+            decision.reason
+        )),
+        SelectorState::Unreadable if pool_down => Some(format!(
+            "{variable} could not be read while this pool cannot take jobs ({}); check it is \
+             unset",
+            decision.reason
+        )),
+        _ => None,
+    }
+}
+
+/// The selector line of one tick.
+#[derive(Debug)]
+struct SelectorReport {
+    variable: String,
+    state: SelectorState,
+    alarm: Option<String>,
+}
+
 #[derive(Debug)]
 struct LeaseDecision {
     action: LeaseAction,
@@ -200,6 +317,16 @@ pub(super) fn local_linux_lease_command<W: Write>(
             }
             Err(error) => unreadable_decision(&error),
         };
+        let selector = profile.selector_variable.as_deref().map(|variable| {
+            let read =
+                trust_absence_only_if_readable(read_variable(&actions, &repo, variable), &decision);
+            let state = SelectorState::classify(&read, &profile.required_labels);
+            SelectorReport {
+                variable: variable.to_owned(),
+                state,
+                alarm: selector_alarm(variable, state, &decision),
+            }
+        });
         let (mutation, mutation_failed) = if args.apply {
             mutation_for_tick(
                 apply_decision(&actions, &repo, &profile.variable, &decision),
@@ -216,6 +343,7 @@ pub(super) fn local_linux_lease_command<W: Write>(
             &profile.variable,
             &profile.events,
             &decision,
+            selector.as_ref(),
             &mutation,
             args.watch,
         )?;
@@ -243,6 +371,47 @@ fn unreadable_decision(error: &str) -> LeaseDecision {
         queued: 0,
         available: 0,
         reason: format!("fleet_unreadable: {error}"),
+    }
+}
+
+/// A 404 on the selector means absent only when the repository answered this
+/// tick; on a tick that could not read the fleet it may mean no access, so it
+/// reads as unreadable rather than unset.
+fn trust_absence_only_if_readable(
+    read: Result<Option<String>, String>,
+    decision: &LeaseDecision,
+) -> Result<Option<String>, String> {
+    match read {
+        Ok(None) if decision.reason.starts_with("fleet_unreadable") => {
+            Err("variable reported absent while the repository was unreadable".to_owned())
+        }
+        read => read,
+    }
+}
+
+/// Read a repository variable's value; `None` when it does not exist.
+fn read_variable(
+    actions: &GitHubActions,
+    repo: &str,
+    variable: &str,
+) -> Result<Option<String>, String> {
+    let budget = ObservationBudget::new(LEASE_MUTATION_TIMEOUT);
+    let args = vec![
+        "api".to_owned(),
+        format!("repos/{repo}/actions/variables/{variable}"),
+    ];
+    match budget.run_gh(actions, &args) {
+        Ok(raw) => serde_json::from_str::<Value>(&raw)
+            .map_err(|error| format!("unreadable variable payload: {error}"))
+            .and_then(|value| {
+                value
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .map(|value| Some(value.to_owned()))
+                    .ok_or_else(|| "variable payload has no value".to_owned())
+            }),
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -621,6 +790,7 @@ fn emit_decision<W: Write>(
     variable: &str,
     events: &[String],
     decision: &LeaseDecision,
+    selector: Option<&SelectorReport>,
     mutation: &str,
     watch: bool,
 ) -> Result<(), CliFailure> {
@@ -662,6 +832,20 @@ fn emit_decision<W: Write>(
             "expires_at".to_owned(),
             expiry.map_or(Value::Null, Value::from),
         );
+        if let Some(selector) = selector {
+            data.insert(
+                "selector_variable".to_owned(),
+                Value::from(selector.variable.clone()),
+            );
+            data.insert(
+                "selector_state".to_owned(),
+                Value::from(selector.state.as_str()),
+            );
+            data.insert(
+                "selector_alarm".to_owned(),
+                selector.alarm.clone().map_or(Value::Null, Value::from),
+            );
+        }
         if watch {
             let mut root = serde_json::Map::new();
             root.insert("schema_version".to_owned(), Value::from(SCHEMA_VERSION));
@@ -693,6 +877,20 @@ fn emit_decision<W: Write>(
             decision.reason
         )
         .map_err(|error| CliFailure::new(1, format!("failed to write output: {error}")))?;
+        if let Some(selector) = selector {
+            writeln!(
+                stdout,
+                "  selector {}={}",
+                selector.variable,
+                selector.state.as_str()
+            )
+            .map_err(|error| CliFailure::new(1, format!("failed to write output: {error}")))?;
+            if let Some(alarm) = &selector.alarm {
+                writeln!(stdout, "  ALARM: {alarm}").map_err(|error| {
+                    CliFailure::new(1, format!("failed to write output: {error}"))
+                })?;
+            }
+        }
     }
     Ok(())
 }
@@ -729,6 +927,228 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn decision(action: LeaseAction, reason: &str) -> LeaseDecision {
+        LeaseDecision {
+            action,
+            observed_at: Utc::now(),
+            expires_at: None,
+            matching: 0,
+            online: 0,
+            idle: 0,
+            queued: 0,
+            available: 0,
+            reason: reason.to_owned(),
+        }
+    }
+
+    fn lane_labels() -> Vec<String> {
+        ["self-hosted", "Linux", "ARM64", "pulp-lint-linux-arm64"]
+            .map(str::to_owned)
+            .to_vec()
+    }
+
+    #[test]
+    fn a_selector_is_hosted_only_when_every_label_is_a_github_image() {
+        let classify = |read: Result<Option<&str>, &str>| {
+            SelectorState::classify(
+                &read
+                    .map(|value| value.map(str::to_owned))
+                    .map_err(str::to_owned),
+                &lane_labels(),
+            )
+        };
+        let this_pool = SelectorState::SelfHosted { this_pool: true };
+        let other_pool = SelectorState::SelfHosted { this_pool: false };
+        assert_eq!(classify(Err("HTTP 502")), SelectorState::Unreadable);
+        assert_eq!(classify(Ok(None)), SelectorState::Unset);
+        assert_eq!(classify(Ok(Some("  "))), SelectorState::Unset);
+        // Provably hosted: every label is a GitHub image.
+        for hosted in [
+            "\"ubuntu-latest\"",
+            "[\"ubuntu-22.04\"]",
+            "[\"macos-15\"]",
+            "\"windows-2022\"",
+            "[\"ubuntu-24.04-arm\"]",
+            "\"macos-15-xlarge\"",
+        ] {
+            assert_eq!(
+                classify(Ok(Some(hosted))),
+                SelectorState::Hosted,
+                "{hosted}"
+            );
+        }
+        assert_eq!(classify(Ok(Some("[\"self-hosted\",\"Linux\"]"))), this_pool);
+        assert_eq!(classify(Ok(Some("\"Self-Hosted\""))), this_pool);
+        // No self-hosted label, but only a self-hosted runner can carry it.
+        assert_eq!(
+            classify(Ok(Some("[\"Linux\",\"ARM64\",\"pulp-lint-linux-arm64\"]"))),
+            this_pool
+        );
+        assert_eq!(classify(Ok(Some("[\"Linux\"]"))), this_pool);
+        // Another pool's labels still wait for a self-hosted pool.
+        assert_eq!(classify(Ok(Some("[\"pulp-build-linux-x64\"]"))), other_pool);
+        // A hosted label mixed with a self-hosted one is not provably hosted.
+        assert_eq!(
+            classify(Ok(Some("[\"ubuntu-latest\",\"gpu\"]"))),
+            other_pool
+        );
+        for malformed in ["self-hosted,Linux", "{\"a\":1}", "[]", "[1]", "3"] {
+            assert_eq!(
+                classify(Ok(Some(malformed))),
+                SelectorState::Malformed,
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selector_stranding_jobs_on_a_pool_that_cannot_take_them_alarms() {
+        let down = decision(LeaseAction::Clear, "fleet_unreadable: HTTP 502");
+        let up = decision(LeaseAction::Renew, "healthy_unreserved_idle_capacity");
+        let alarm = |state, decision: &LeaseDecision| selector_alarm("SEL", state, decision);
+
+        let set_down =
+            alarm(SelectorState::SelfHosted { this_pool: true }, &down).expect("set + down alarms");
+        assert!(set_down.contains("SEL is SET"), "{set_down}");
+        assert!(
+            set_down.contains("fleet_unreadable: HTTP 502"),
+            "{set_down}"
+        );
+        assert!(alarm(SelectorState::Unreadable, &down).is_some());
+        assert!(
+            alarm(SelectorState::Malformed, &up).is_some(),
+            "malformed always alarms"
+        );
+        // Controls: a healthy pool, or a selector that does not route here.
+        let elsewhere = alarm(SelectorState::SelfHosted { this_pool: false }, &down)
+            .expect("a selector for another self-hosted pool still alarms");
+        assert!(
+            elsewhere.contains("names labels not carried by this lane"),
+            "{elsewhere}"
+        );
+        assert_eq!(
+            alarm(SelectorState::SelfHosted { this_pool: true }, &up),
+            None
+        );
+        assert_eq!(
+            alarm(SelectorState::SelfHosted { this_pool: false }, &up),
+            None
+        );
+        assert_eq!(alarm(SelectorState::Unreadable, &up), None);
+        assert_eq!(alarm(SelectorState::Unset, &down), None);
+        assert_eq!(alarm(SelectorState::Hosted, &down), None);
+    }
+
+    #[cfg(unix)]
+    fn fake_gh_answering(temp: &tempfile::TempDir, script: &str) -> GitHubActions {
+        let gh = temp.path().join("gh");
+        fs::write(&gh, format!("#!/bin/sh\n{script}\n")).expect("write fake gh");
+        let mut permissions = fs::metadata(&gh).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&gh, permissions).expect("chmod fake gh");
+        GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_selector_is_read_from_the_variables_api() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let set = fake_gh_answering(
+            &temp,
+            r#"case "$*" in
+  *actions/variables/PULP_PREAMBLE_RUNS_ON_JSON*) printf '%s' '{"name":"PULP_PREAMBLE_RUNS_ON_JSON","value":"[\"self-hosted\",\"Linux\"]"}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac"#,
+        );
+        let read = read_variable(&set, "owner/repo", "PULP_PREAMBLE_RUNS_ON_JSON");
+        assert_eq!(
+            SelectorState::classify(&read, &lane_labels()),
+            SelectorState::SelfHosted { this_pool: true }
+        );
+
+        let absent_dir = tempfile::tempdir().expect("tempdir");
+        let absent = fake_gh_answering(&absent_dir, "echo 'HTTP 404: Not Found' >&2; exit 1");
+        assert_eq!(read_variable(&absent, "owner/repo", "X"), Ok(None));
+
+        let down_dir = tempfile::tempdir().expect("tempdir");
+        let down = fake_gh_answering(&down_dir, "echo 'HTTP 502' >&2; exit 1");
+        let read = read_variable(&down, "owner/repo", "X");
+        assert_eq!(
+            SelectorState::classify(&read, &lane_labels()),
+            SelectorState::Unreadable
+        );
+    }
+
+    #[test]
+    fn an_absent_selector_is_trusted_only_when_the_repository_answered() {
+        let unreadable = decision(LeaseAction::Clear, "fleet_unreadable: HTTP 404");
+        let readable = decision(LeaseAction::Clear, "no_online_idle_matching_runner");
+        let state = SelectorState::classify(
+            &trust_absence_only_if_readable(Ok(None), &unreadable),
+            &lane_labels(),
+        );
+        assert_eq!(state, SelectorState::Unreadable);
+        assert!(selector_alarm("SEL", state, &unreadable).is_some());
+        assert_eq!(
+            trust_absence_only_if_readable(Ok(None), &readable),
+            Ok(None),
+            "control: a readable repository's 404 is a real absence"
+        );
+        assert_eq!(
+            trust_absence_only_if_readable(Ok(Some("x".to_owned())), &unreadable),
+            Ok(Some("x".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_tick_reports_the_selector_and_its_alarm_in_json_and_text() {
+        let down = decision(LeaseAction::Clear, "no_online_idle_matching_runner");
+        let report = SelectorReport {
+            variable: "PULP_PREAMBLE_RUNS_ON_JSON".to_owned(),
+            state: SelectorState::SelfHosted { this_pool: true },
+            alarm: selector_alarm(
+                "PULP_PREAMBLE_RUNS_ON_JSON",
+                SelectorState::SelfHosted { this_pool: true },
+                &down,
+            ),
+        };
+        let emit = |json: bool| {
+            let mut output = Vec::new();
+            emit_decision(
+                &mut output,
+                json,
+                1,
+                "owner/repo",
+                "PULP_LINT_LINUX_LEASE_UNTIL",
+                &["merge_group".to_owned()],
+                &down,
+                Some(&report),
+                "dry_run",
+                false,
+            )
+            .expect("emit");
+            String::from_utf8(output).expect("utf-8")
+        };
+        let envelope: Value = serde_json::from_str(&emit(true)).expect("json");
+        assert_eq!(envelope["selector_variable"], "PULP_PREAMBLE_RUNS_ON_JSON");
+        assert_eq!(envelope["selector_state"], "self_hosted");
+        assert!(
+            envelope["selector_alarm"]
+                .as_str()
+                .is_some_and(|alarm| alarm.contains("is SET")),
+            "{envelope}"
+        );
+        let text = emit(false);
+        assert!(
+            text.contains("selector PULP_PREAMBLE_RUNS_ON_JSON=self_hosted"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ALARM: PULP_PREAMBLE_RUNS_ON_JSON is SET"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -781,6 +1201,7 @@ mod tests {
             "PULP_LOCAL_LINUX_LEASE_UNTIL",
             &["merge_group".to_owned()],
             &decision,
+            None,
             "dry_run",
             false,
         )
@@ -1204,6 +1625,7 @@ mod tests {
                 "PULP_LOCAL_LINUX_LEASE_UNTIL",
                 &["merge_group".to_owned()],
                 &decision,
+                None,
                 "renewed",
                 true,
             )

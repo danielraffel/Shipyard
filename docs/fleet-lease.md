@@ -125,6 +125,36 @@ not check" is never treated as "healthy".
 Lease time starts only after every read completes, so a slow observation can
 delay a renewal but can never publish an already-aged one.
 
+## The selector alarm
+
+A lease guards workflows that read the expiry in a step before choosing a
+runner. Some selectors cannot be guarded that way: a `runs-on` expression has
+no clock, so a selector read directly in `runs-on` (for example Pulp's
+`PULP_PREAMBLE_RUNS_ON_JSON`, read by the very preamble that would otherwise
+check a lease) routes jobs to the pool for as long as it is set, healthy or
+not.
+
+Every tick therefore also reads the lane's `github_variable` and reports it as
+`selector_state`: `unset`; `hosted`, only when every label is a GitHub-hosted
+image (`ubuntu-*`, `windows-*`, `macos-*`); `self_hosted` for any other label,
+since only a self-hosted runner can carry it,
+`malformed` (not JSON, so `fromJSON` fails and no job can start), or
+`unreadable`. `selector_alarm` is set, and the text output prints an `ALARM:`
+line, when:
+
+- the selector is `self_hosted` while the tick clears, so jobs reading it
+  queue for a pool that cannot take them. When its labels are neither
+  `self-hosted` nor this lane's, the alarm says it names labels this lane does
+  not carry: it routes to some other self-hosted pool, which still strands
+  the jobs if that pool is down;
+- the selector is `unreadable` while the tick clears;
+- the selector is `malformed`, whatever the pool's health.
+
+A 404 on the selector counts as `unset` only when the repository answered the
+same tick; on a tick whose fleet read failed it counts as `unreadable`, since
+the 404 may mean no access rather than no variable. The alarm only reports and
+never mutates the selector. Unsetting it is the operator's step.
+
 ## Operating notes
 
 - `--apply` is required to mutate anything. Without it every tick is a dry run.

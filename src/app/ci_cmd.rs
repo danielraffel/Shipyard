@@ -50,6 +50,9 @@ pub(super) struct LocalLinuxLeaseProfile {
     /// sibling pool cannot silently satisfy it.
     pub(super) forbidden_capability: String,
     pub(super) required_labels: Vec<String>,
+    /// The lane's `github_variable`: the runs-on selector workflows read. A
+    /// tick reports it so a selector left pointing at a dead pool is loud.
+    pub(super) selector_variable: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -431,6 +434,7 @@ pub(super) fn load_local_linux_lease_profile(
         min_idle: lease.min_idle,
         forbidden_capability,
         required_labels,
+        selector_variable: lane_body.github_variable.clone(),
     })
 }
 
@@ -896,6 +900,11 @@ runs_on_json = "macos-15"
                 .required_labels
                 .iter()
                 .any(|label| label == "vellum-pr-safe-macos-arm64")
+        );
+        assert_eq!(
+            lease.selector_variable.as_deref(),
+            Some("VELLUM_LOCAL_MACOS_RUNS_ON_JSON"),
+            "the lane's runs-on selector is carried for the stranded-selector alarm"
         );
     }
 
