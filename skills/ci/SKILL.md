@@ -280,6 +280,13 @@ v0.245.0 published with no attestation after one transient Sigstore TLS error,
 and every host's fleet-update refused it ("no acceptable build-provenance
 attestation"). If a release is stuck as a draft, rerun the failed
 `sign-and-upload-macos` job; do not publish it by hand without an attestation.
+A `sign-and-upload-macos` failure that ends in `OSError: [Errno 30] Read-only
+file system` after "The validate action worked!" is the DMG smoke's detach.
+The image was signed and notarized, but `hdiutil detach` was refused while the
+volume was busy. `detach_dmg` now retries, forces the last attempt, and names
+the refusal. A failed run can still leave the image mounted under
+`$TMPDIR/shipyard-dmg-*/mnt` on the runner host; `hdiutil detach` it there.
+Rerunning the failed job is safe.
 ## Leftover validation TMPDIRs: owner files, sweep, and `cleanup --validation-tmp`
 
 A killed validation run cannot run the Drop that removes its
