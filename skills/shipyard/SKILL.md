@@ -1057,7 +1057,16 @@ is held (a Sandbox canary on the controller), the tick defers before recording
 anything. The attempt ledger (`fleet-reconcile/attempts.json`) is production
 persistence in the protected state tree: a tick that changes nothing does not
 rewrite it, and every real write holds the shared sandbox writer-domain lease,
-so it waits for (and then defers to, exit 75) an exclusive Sandbox audit. Install its launchd agent on the controller only with
+so it waits for (and then defers to, exit 75) an exclusive Sandbox audit.
+Each tick also reads every host's daemon (`shipyard --json daemon status`) and
+launcher (`daemon launcher status`) and lists problems in `daemon_problems`. A
+host without the launcher has nothing to restart its daemon after a reboot.
+The fix is `shipyard daemon launcher install`, run at that host's console
+because it needs a one-time macOS approval, so never run it over SSH. A daemon
+that is not running gets `shipyard daemon refresh`. Each host raises one
+`fleet-reconcile: <class> daemon will not survive a reboot` issue until it
+reads healthy again. A daemon problem never changes the rollout decision or
+the exit code. Install its launchd agent on the controller only with
 `scripts/install_fleet_reconcile.sh`. That script is a dry run by default;
 `--install` first rehearses the reconcile under the agent's exact environment
 and refuses to load it on failure.
