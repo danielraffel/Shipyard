@@ -1807,7 +1807,9 @@ manual/unknown removal, head drift, and HTTP 403/rate-limit responses stop
 fail-closed. Admission reads the PR's queue timeline too: a head the queue
 removed for `failed_checks` / `merge_conflict` with no new head since is refused
 even by a fresh ship-state for the same SHA, so re-shipping from another host
-does not re-enqueue it. Push a fix.
+does not re-enqueue it. Push a fix. For a `merge_conflict` ejection, a fix that
+was committed before it but pushed after it counts as new, by its earliest
+check suite (`new_head_basis: suite_after_removal`), not by its commit date.
 
 ### "Validated green but not merged" — read the status before blaming the PR
 
