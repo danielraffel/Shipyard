@@ -1951,6 +1951,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_host_probe_runs_the_daemon_status_commands() {
         let temp = tempfile::tempdir().expect("temp");
