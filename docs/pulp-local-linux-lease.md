@@ -52,13 +52,12 @@ runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-hos
 ```
 
 Required runner labels come from the first target's `runs_on_json`; they are
-not duplicated in the lease declaration. Shipyard accepts only two complete
-namespaces: context `merge_group` with `PULP_LOCAL_LINUX_LEASE_UNTIL`,
-`pulp-ci-ephemeral-`, and `pulp-auto-linux-x64`; or PR-safe `pull_request` with
-profile context `pr`, `PULP_PR_SAFE_LINUX_LEASE_UNTIL`,
-`pulp-pr-safe-ephemeral-`, and
-`pulp-pr-safe-linux-x64`. Mixed control tuples or target selectors carrying both
-capability labels fail closed. TTLs must be 60–900 seconds, the branch must be
+not duplicated in the lease declaration. The namespace rules are generic (see
+[Fleet health leases](fleet-lease.md#namespace-safety)): each lease names its
+own variable, runner-name prefix, and required and forbidden capability
+labels, and one lease may name `merge_group` or `pull_request`, never both.
+Mixed control tuples or target selectors carrying both capability labels fail
+closed. TTLs must be 60–900 seconds, the branch must be
 `main`, and admission burst must be positive.
 
 ## Operation
