@@ -122,6 +122,7 @@ mod fast_forward;
 mod metadata_authority;
 mod prepush_changed_surface;
 mod provenance;
+mod read_audit;
 use changed_surface_execution::apply_changed_surface_execution;
 use provenance::{AppliedStewardHandoff, apply_requested_steward_handoff, run_pr_provenance_hook};
 

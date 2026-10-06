@@ -702,6 +702,59 @@ with no entry. Nothing is built or recorded. It is the daily measure of "hosts
 holding a bindable record for current main", and its own control: a host with
 no merged, clean, usable record reads 0.
 
+### The read-audit report
+
+A project's key code may key an executable only when a clean read audit of
+the protected branch covered it (Pulp's `executable_keys.py --audit-report`).
+At plan time Shipyard takes the newest run of the project's
+`read-audit-nightly.yml` on the protected branch that concluded `success` and
+whose `read-audit` artifact's `read-audit.json` is one the key code accepts:
+`schema: pulp-read-audit/v1`, `stage0.verdict: clean`, and a `stage0.covered`
+list. A clean verdict without the other two would bind `staged` while keying
+nothing, so it is cached as not clean. It looks at the 20 newest successful runs, downloads at most three per
+plan, and caches each run's verdict (the report itself only when clean) under
+`<state>/executable-reuse/read-audit/<repo>/<run id>/`, so later plans read
+the cache. The report is staged as `read-audit.json` in the plan's payload
+directory, before the binding, and the binding records it in one key:
+
+```json
+"audit": {"status": "staged", "run_id": "...", "audit_commit": "<the run's head_sha>",
+          "commits_behind": 7, "report_sha256": "<sha256 of read-audit.json>"}
+"audit": {"status": "none", "reason": "no_clean_run" | "fetch_failed" | "no_credentials"}
+```
+
+The binding's digest covers this object, so the report is pinned through the
+existing chain. When no report can be had the plan still runs keyed: the key
+code is handed none and keys nothing, the planner prints one line saying so,
+and trial status marks the keyed run `reuse_observation: false` with `audit:
+"none: <reason>"`. A binding written before the audit existed has no `audit`
+key and reads `audit: "absent"`, also not an observation. Only a staged
+report makes a keyed run an observation of executable reuse, and only when
+the run shows the report took effect on both sides. The result's
+`executable_reuse.derived.audit.status` must be `applied` (the runner handed
+it in), and the key manifest beside the result, whose bytes must hash to
+`derived.key_manifest_sha256`, must record `producer.audit_status: clean`
+(the key code accepted it). If either fails, the run reads `audit:
+"staged_unconfirmed: <why>"` with `reuse_observation: false`, so drift on
+either side can never pass as an observation. The runner's `derived.audit`
+key plays no part in re-derivation agreement.
+
+In the base's commands, `{audit_report}` is the staged report's path. When the
+plan bound none, an argument that is exactly `{audit_report}` is dropped
+together with the `--flag` before it, and an argument that merely contains it
+is dropped alone. Re-derivation copies the staged report into its work inputs
+and refuses one whose bytes no longer hash to `report_sha256`. A Shipyard
+older than this one passes the placeholder through literally, so a project
+adds `{audit_report}` to its commands only once every host it runs on has
+this release.
+
+Staleness is not limited yet; `audit_commit` and `commits_behind` are recorded
+so it can be measured. The exposure is bounded by construction: an executable
+new since the audit is uncovered (fail-closed), and one whose own inputs
+changed re-keys anyway; what a day-old report cannot see is a new unrecorded
+read added to an existing executable since the audit, which the nightly audit
+and the sampled re-run with its automatic trip exist to catch.
+
 ### Host re-derivation
 
 The runner leaves its inputs (`ctest-listing.json`, `toolchain.json`,

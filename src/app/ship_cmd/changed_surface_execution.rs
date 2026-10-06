@@ -520,6 +520,23 @@ pub(super) fn apply_changed_surface_execution(
                 continue;
             }
         };
+        let audit = |base: &str| -> super::read_audit::Fetched {
+            let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
+            let gh = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
+            super::read_audit::fetch_clean_report(
+                &gh,
+                repo,
+                observation
+                    .receipt
+                    .protected_ref
+                    .trim_start_matches("refs/heads/"),
+                base,
+                &state_dir
+                    .join("executable-reuse")
+                    .join("read-audit")
+                    .join(repo.replace('/', "__")),
+            )
+        };
         let keyed = keyed_shadow_plan(
             machine.mode,
             &observation,
@@ -529,6 +546,7 @@ pub(super) fn apply_changed_surface_execution(
             cwd,
             state_dir,
             &contract_digest,
+            &audit,
         );
         if let Some(Keyed::Closeout {
             category,
@@ -899,6 +917,14 @@ pub(super) fn apply_changed_surface_execution(
                     continue;
                 }
             }
+            if !plan.audit_report.is_empty() {
+                // Before the binding that names it by digest.
+                persist_exact_bytes(
+                    &result_dir,
+                    crate::changed_surface::executable_reuse::AUDIT_REPORT_FILE,
+                    &plan.audit_report,
+                )?;
+            }
             if !plan.executable_reuse_binding.is_empty() {
                 // Before the activation, so a stored keyed activation always
                 // has the binding file its payload names by digest.
@@ -965,6 +991,7 @@ fn keyed_shadow_plan(
     cwd: &Path,
     state_dir: &Path,
     contract_digest: &str,
+    audit: &dyn Fn(&str) -> super::read_audit::Fetched,
 ) -> Option<Keyed> {
     let reuse = policy.executable_reuse.as_ref()?;
     if !keys_this_plan(
@@ -982,6 +1009,7 @@ fn keyed_shadow_plan(
         cwd,
         state_dir,
         contract_digest,
+        audit,
     }))
 }
 
