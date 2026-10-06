@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -343,6 +344,90 @@ class PackageReleaseTests(unittest.TestCase):
                     ("shipyard", "shipyard-workstream-provider"),
                     ci_mode=False,
                 )
+
+    def test_detach_retries_a_busy_volume_until_it_unmounts(self) -> None:
+        calls: list[list[str]] = []
+        mounted = iter([True, True, False])
+        sleeps: list[float] = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 16, "", "hdiutil: couldn't unmount: Resource busy")
+
+        with mock.patch.object(package_release.subprocess, "run", side_effect=fake_run):
+            package_release.detach_dmg(
+                Path("/tmp/mnt"),
+                sleep=sleeps.append,
+                is_mounted=lambda _path: next(mounted),
+            )
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [1.0, 2.0])
+        self.assertNotIn("-force", calls[-1])
+
+    def test_detach_forces_the_last_attempt_and_names_the_refusal(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 16, "", "hdiutil: couldn't unmount: Resource busy")
+
+        with mock.patch.object(package_release.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(package_release.CommandFailed) as raised:
+                package_release.detach_dmg(
+                    Path("/tmp/mnt"),
+                    sleep=lambda _seconds: None,
+                    is_mounted=lambda _path: True,
+                )
+
+        self.assertEqual(len(calls), package_release.DETACH_ATTEMPTS)
+        self.assertEqual(calls[-1][-1], "-force")
+        self.assertIn("could not detach /tmp/mnt", str(raised.exception))
+        self.assertIn("Resource busy", str(raised.exception))
+
+    def _smoke_with_detach(self, detach_error, still_mounted: bool) -> tuple[object, list[Path]]:
+        created: list[Path] = []
+        real_mkdtemp = package_release.tempfile.mkdtemp
+
+        def fake_mkdtemp(**kwargs):
+            path = Path(real_mkdtemp(**kwargs))
+            created.append(path)
+            return str(path)
+
+        def fake_detach(_mount):
+            if detach_error is not None:
+                raise detach_error
+
+        outcome: object
+        with mock.patch.object(package_release, "require_commands"), \
+                mock.patch.object(package_release, "run", return_value=""), \
+                mock.patch.object(package_release.tempfile, "mkdtemp", side_effect=fake_mkdtemp), \
+                mock.patch.object(package_release, "smoke_binary_pair", return_value="smoke ok"), \
+                mock.patch.object(package_release, "detach_dmg", side_effect=fake_detach), \
+                mock.patch.object(package_release.os.path, "ismount", return_value=still_mounted):
+            try:
+                outcome = package_release.smoke_dmg(
+                    Path("fake.dmg"),
+                    ("shipyard", "shipyard-workstream-provider"),
+                    ci_mode=False,
+                )
+            except BaseException as error:  # noqa: BLE001 - the test inspects it
+                outcome = error
+        return outcome, created
+
+    def test_dmg_smoke_never_walks_into_a_volume_it_could_not_detach(self) -> None:
+        refused = package_release.CommandFailed("could not detach /x/mnt after 5 attempts: busy")
+        outcome, created = self._smoke_with_detach(refused, still_mounted=True)
+        try:
+            self.assertIs(outcome, refused, "the detach failure is the error, not EROFS")
+            self.assertTrue(created[0].exists(), "a still-mounted temp dir is left in place")
+        finally:
+            shutil.rmtree(created[0], ignore_errors=True)
+
+    def test_dmg_smoke_removes_its_temp_dir_once_detached(self) -> None:
+        outcome, created = self._smoke_with_detach(None, still_mounted=False)
+        self.assertEqual(outcome, "smoke ok")
+        self.assertFalse(created[0].exists())
 
     def test_notarize_uses_keychain_profile_for_long_running_submit(self) -> None:
         calls: list[list[str]] = []

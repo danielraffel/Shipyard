@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -567,9 +568,10 @@ def notarize_and_staple(path: Path) -> None:
 
 def smoke_dmg(path: Path, binary_names: tuple[str, ...], *, ci_mode: bool) -> str:
     require_commands(["hdiutil"])
-    with tempfile.TemporaryDirectory(prefix="shipyard-dmg-") as temp:
-        mount = Path(temp) / "mnt"
-        mount.mkdir()
+    temp = Path(tempfile.mkdtemp(prefix="shipyard-dmg-"))
+    mount = temp / "mnt"
+    mount.mkdir()
+    try:
         try:
             run(
                 [
@@ -594,13 +596,40 @@ def smoke_dmg(path: Path, binary_names: tuple[str, ...], *, ci_mode: bool) -> st
                 mount / binary_names[1],
             )
         finally:
-            subprocess.run(
-                ["hdiutil", "detach", str(mount)],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
+            detach_dmg(mount)
+    finally:
+        # Never walk into a volume that is still mounted: removing its
+        # read-only files fails and hides the real error.
+        if not os.path.ismount(mount):
+            shutil.rmtree(temp, ignore_errors=True)
+
+
+DETACH_ATTEMPTS = 5
+DETACH_BACKOFF_SECONDS = 1.0
+
+
+def detach_dmg(
+    mount: Path,
+    *,
+    attempts: int = DETACH_ATTEMPTS,
+    backoff: float = DETACH_BACKOFF_SECONDS,
+    sleep=time.sleep,
+    is_mounted=os.path.ismount,
+) -> None:
+    """Detach the image at ``mount``, retrying while the volume is busy and
+    forcing the last attempt. Raises when it is still mounted afterwards."""
+    stderr = ""
+    for attempt in range(1, attempts + 1):
+        args = ["hdiutil", "detach", str(mount)]
+        if attempt == attempts:
+            args.append("-force")
+        result = subprocess.run(args, check=False, capture_output=True, text=True)
+        if not is_mounted(mount):
+            return
+        stderr = (result.stderr or result.stdout or "").strip()
+        if attempt < attempts:
+            sleep(backoff * attempt)
+    raise CommandFailed(f"could not detach {mount} after {attempts} attempts: {stderr}")
 
 
 def sha256(path: Path) -> str:
