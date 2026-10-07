@@ -670,6 +670,8 @@ Owners not live for `unowned_after_hours` are marked unowned on the digest line.
 The label comes off when the flags are addressed and also when the PR merges or
 closes; for a terminal PR the DELETE is sent even if the scan's snapshot does not
 show the label yet (the snapshot can predate the add), and a 404 counts as gone.
+A label add re-reads the PR first and is refused if it is no longer open (or its
+state is unreadable), because the scan snapshot can predate a merge.
 Every delivering pass logs `wake.raised`/`sent`/`failed`/`resolved` events (with
 rung, channels, session, host) to the ledger's `events.jsonl`;
 `shipyard pr-watch wakes --since 24h` reports seen rate, p50/p90 latencies, and
