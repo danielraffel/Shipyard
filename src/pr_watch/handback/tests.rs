@@ -719,7 +719,8 @@ fn deliver_notifies_live_owners_once_per_episode() {
         .filter(|a| a.action == "add_label" && a.sent)
         .flat_map(|a| a.prs.clone())
         .collect();
-    assert_eq!(labelled, vec![1, 2, 5, 6]);
+    // PR 6 has no owner, so no label.
+    assert_eq!(labelled, vec![1, 2, 5]);
     assert!(
         out.writes.iter().all(|argv| is_label_write(argv)),
         "{:?}",
@@ -909,12 +910,13 @@ fn labels_are_only_added_when_defined_and_only_ours_are_removed() {
         .filter(|a| a.action == "add_label")
         .flat_map(|a| a.prs.clone())
         .collect();
-    assert_eq!(added, vec![1, 5, 6]);
-    for pr in [1, 5, 6] {
+    // PR 6 has no owner (no marker): it gets no label.
+    assert_eq!(added, vec![1, 5]);
+    for pr in [1, 5] {
         history.prs.get_mut(&pr).unwrap().labels = vec![NEEDS_AGENT_LABEL.to_owned()];
     }
 
-    // Every flag addressed: remove ours (1, 5, 6), never PR 2's.
+    // Every flag addressed: remove ours (1, 5), never PR 2's.
     for entry in ledger.entries.values_mut() {
         entry.addressed_at = Some(t(2));
     }
@@ -935,9 +937,90 @@ fn labels_are_only_added_when_defined_and_only_ours_are_removed() {
         .filter(|a| a.action == "remove_label" && a.sent)
         .flat_map(|a| a.prs.clone())
         .collect();
-    assert_eq!(removed, vec![1, 5, 6]);
+    assert_eq!(removed, vec![1, 5]);
     assert!(out.writes.iter().all(|argv| is_label_write(argv)));
     assert!(ledger.handback.labels.is_empty());
+}
+
+#[test]
+fn no_owner_means_no_label_and_an_unreadable_marker_keeps_ours() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, false);
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let posted = |writes: &[Vec<String>]| -> Vec<String> {
+        writes
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "POST"))
+            .map(|argv| argv[3].clone())
+            .collect()
+    };
+    // PR 6's body carries no whence marker and there is no steward record.
+    assert!(
+        !posted(&out.writes).contains(&"repos/o/r/issues/6/labels".to_owned()),
+        "{:?}",
+        out.writes
+    );
+    assert!(!ledger.handback.labels.contains_key(&6));
+    assert_eq!(ledger.handback.owners[&6].state, "none");
+
+    // PR 1 is labelled; next pass its body cannot be read. The label stays
+    // (no DELETE), and nothing new is added for it.
+    assert!(ledger.handback.labels.contains_key(&1));
+    let mut history = history;
+    history.prs.get_mut(&1).unwrap().labels = vec![NEEDS_AGENT_LABEL.to_owned()];
+    let gh = fake_gh(true);
+    let reader = |argv: &[String]| {
+        if argv.last().map(String::as_str) == Some("repos/o/r/pulls/1") {
+            return Err("gh: HTTP 502".to_owned());
+        }
+        gh(argv)
+    };
+    let sent = RefCell::new(Vec::new());
+    let writer = |argv: &[String]| {
+        sent.borrow_mut().push(argv.to_vec());
+        Ok("{}".to_owned())
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut runner = FakeRunner::default();
+    let mut deps = super::Deps {
+        runner: &mut runner,
+        state_dir: dir.path().to_path_buf(),
+        local_names: vec!["Daniels-M5-Studio".to_owned()],
+        local_machine: None,
+    };
+    let report = super::run(
+        &mut ledger,
+        &history,
+        t(2),
+        &cfg,
+        HandbackMode::Deliver,
+        &reader,
+        &writer,
+        &mut deps,
+    );
+    let sent = sent.into_inner();
+    assert!(
+        !sent
+            .iter()
+            .any(|argv| argv.iter().any(|a| a.contains("issues/1/"))),
+        "{sent:?}"
+    );
+    assert!(ledger.handback.labels.contains_key(&1));
+    assert!(
+        report
+            .gaps
+            .iter()
+            .any(|g| g.starts_with("#1: whence marker"))
+    );
 }
 
 #[test]
