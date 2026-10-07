@@ -118,6 +118,7 @@ fn check_fact(value: &Value) -> Option<CheckFact> {
         started_at: time(value, "started_at"),
         completed_at: time(value, "completed_at"),
         signatures: Vec::new(),
+        runner_name: None,
     })
 }
 
@@ -382,6 +383,7 @@ fn group_run(run: &ListedRun, required_jobs: Vec<CheckFact>) -> GroupRun {
         head_sha: run.head_sha.clone(),
         parent_sha: None,
         created_at: run.created_at,
+        completed_at: None,
         conclusion: run.conclusion.clone(),
         required_jobs,
         attribution: None,

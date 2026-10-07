@@ -35,6 +35,7 @@ fn done(id: u64, name: &str, conclusion: &str, at: DateTime<Utc>, sigs: &[&str])
         started_at: Some(at - Duration::minutes(20)),
         completed_at: Some(at),
         signatures: sigs.iter().map(|s| (*s).to_owned()).collect(),
+        runner_name: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn running(id: u64, name: &str, status: &str, at: DateTime<Utc>) -> CheckFact {
         started_at: Some(at),
         completed_at: None,
         signatures: Vec::new(),
+        runner_name: None,
     }
 }
 

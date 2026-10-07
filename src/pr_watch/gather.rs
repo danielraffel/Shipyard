@@ -313,6 +313,7 @@ struct ListedRun {
     head_branch: String,
     head_sha: String,
     created_at: DateTime<Utc>,
+    updated_at: Option<DateTime<Utc>>,
     status: String,
     conclusion: Option<String>,
     attempt: u64,
@@ -358,6 +359,7 @@ fn list_runs(
                     head_branch: text(&run, "head_branch").unwrap_or_default(),
                     head_sha: text(&run, "head_sha").unwrap_or_default(),
                     created_at,
+                    updated_at: time(&run, "updated_at"),
                     status: text(&run, "status").unwrap_or_default(),
                     conclusion: text(&run, "conclusion"),
                     attempt: run.get("run_attempt").and_then(Value::as_u64).unwrap_or(1),
@@ -460,6 +462,10 @@ fn check_fact(value: &Value, name: String) -> Option<CheckFact> {
         started_at: time(value, "started_at"),
         completed_at: time(value, "completed_at"),
         signatures: Vec::new(),
+        // Present (possibly null) only on an Actions job, never on a check run.
+        runner_name: value
+            .get("runner_name")
+            .map(|name| name.as_str().unwrap_or_default().to_owned()),
     })
 }
 
@@ -468,14 +474,18 @@ fn checks_to_value(checks: &[CheckFact]) -> Value {
         checks
             .iter()
             .map(|check| {
-                json!({
+                let mut value = json!({
                     "id": check.id,
                     "name": check.name,
                     "status": check.status,
                     "conclusion": check.conclusion,
                     "started_at": check.started_at.map(stamp),
                     "completed_at": check.completed_at.map(stamp),
-                })
+                });
+                if let Some(runner) = &check.runner_name {
+                    value["runner_name"] = json!(runner);
+                }
+                value
             })
             .collect(),
     )
@@ -572,6 +582,9 @@ fn read_group_runs(
                 .map(|(_, sha)| sha.to_owned())
                 .filter(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())),
             created_at: run.created_at,
+            completed_at: (run.status == "completed")
+                .then_some(run.updated_at)
+                .flatten(),
             conclusion: run.conclusion.clone(),
             required_jobs: Vec::new(),
             attribution: None,
@@ -581,7 +594,7 @@ fn read_group_runs(
             return Ok(group);
         }
         let key = format!(
-            "pr-watch:group-jobs:{}:{}:attempt-{}",
+            "pr-watch:group-jobs-v2:{}:{}:attempt-{}",
             query.repo, run.id, run.attempt
         );
         if let Some(value) = cache.get(&key) {
@@ -778,5 +791,36 @@ fn read_merge_bases(
                 head.merge_base = Some(merge_base.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_fact, checks_from_value, checks_to_value};
+    use serde_json::json;
+
+    #[test]
+    fn a_job_without_a_runner_stays_distinct_from_a_check_run_through_the_cache() {
+        let job = json!({"id": 1, "status": "completed", "conclusion": "failure",
+            "started_at": null, "completed_at": "2026-10-06T12:00:00Z", "runner_name": null});
+        let ran = json!({"id": 2, "status": "completed", "conclusion": "failure",
+            "started_at": "2026-10-06T11:40:00Z", "completed_at": "2026-10-06T12:00:00Z",
+            "runner_name": "pulp-gate-m3-1"});
+        let check_run = json!({"id": 3, "status": "completed", "conclusion": "failure",
+            "started_at": "2026-10-06T11:40:00Z", "completed_at": "2026-10-06T12:00:00Z"});
+        let facts = [
+            check_fact(&job, "macos".to_owned()).unwrap(),
+            check_fact(&ran, "macos".to_owned()).unwrap(),
+            check_fact(&check_run, "macos".to_owned()).unwrap(),
+        ];
+        assert_eq!(facts[0].runner_name.as_deref(), Some(""));
+        assert!(facts[0].never_ran());
+        assert_eq!(facts[1].runner_name.as_deref(), Some("pulp-gate-m3-1"));
+        assert!(!facts[1].never_ran());
+        assert_eq!(facts[2].runner_name, None);
+        assert!(!facts[2].never_ran());
+        // The cache round trip keeps all three apart: an unknown runner must
+        // not come back as "never ran", nor the reverse.
+        assert_eq!(checks_from_value(&checks_to_value(&facts)), facts);
     }
 }

@@ -167,6 +167,11 @@ pub struct CheckFact {
     /// Failing tests (or the first error line) read from the job log, for a
     /// failed check. Empty when the log was unreadable or held no signature.
     pub signatures: Vec<String>,
+    /// The Actions runner the job ran on: `Some("")` when the job was read
+    /// and never got a runner, `None` when the source does not say (a check
+    /// run, or a record cached before this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_name: Option<String>,
 }
 
 impl CheckFact {
@@ -177,6 +182,14 @@ impl CheckFact {
             self.conclusion.as_deref(),
             Some("failure" | "timed_out" | "startup_failure")
         )
+    }
+
+    /// Whether this attempt is known never to have started on a runner, so
+    /// its red conclusion says nothing about the code (a cancelled or
+    /// starved dependency, not a test run).
+    #[must_use]
+    pub fn never_ran(&self) -> bool {
+        self.runner_name.as_deref() == Some("")
     }
 
     /// Whether this attempt concluded green.
@@ -200,6 +213,9 @@ pub struct GroupRun {
     pub parent_sha: Option<String>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
+    /// When the run completed (its last update once completed), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
     /// Run conclusion.
     pub conclusion: Option<String>,
     /// Required jobs of the run. Read only for runs that did not succeed.
