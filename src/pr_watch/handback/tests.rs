@@ -971,6 +971,104 @@ fn a_label_someone_removed_is_not_put_back_this_episode() {
 }
 
 #[test]
+fn our_label_comes_off_a_merged_closed_or_unobserved_pull_request() {
+    let (mut ledger, mut history) = world(t(0));
+    let cfg = config(false, false);
+    let mut runner = FakeRunner::default();
+    pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert_eq!(
+        ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2, 5, 6]
+    );
+    for pr in [1, 2, 5, 6] {
+        history.prs.get_mut(&pr).unwrap().labels = vec![NEEDS_AGENT_LABEL.to_owned()];
+    }
+    // The flags still hold, but PR 1 merged, PR 5 closed, and PR 6 left the
+    // history window: none of them is open, so the label must come off. PR 2
+    // is still open and flagged, so it keeps its label.
+    history.prs.get_mut(&1).unwrap().merged_at = Some(t(2));
+    history.prs.get_mut(&5).unwrap().closed_at = Some(t(2));
+    history.prs.remove(&6);
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(3),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let deleted: Vec<String> = out
+        .writes
+        .iter()
+        .filter(|argv| argv.iter().any(|a| a == "DELETE"))
+        .map(|argv| argv.last().cloned().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        deleted,
+        vec![
+            "repos/o/r/issues/1/labels/shipyard%3Aneeds-agent".to_owned(),
+            "repos/o/r/issues/5/labels/shipyard%3Aneeds-agent".to_owned(),
+            "repos/o/r/issues/6/labels/shipyard%3Aneeds-agent".to_owned(),
+        ]
+    );
+    assert!(out.writes.iter().all(|argv| is_label_write(argv)));
+    assert_eq!(
+        ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
+        vec![2]
+    );
+
+    // A terminal pull request whose snapshot predates our add (no label
+    // shown) still gets the DELETE; one a person cleared does not.
+    let (mut ledger, mut history) = world(t(0));
+    let mut runner = FakeRunner::default();
+    pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    ledger.handback.labels.get_mut(&5).unwrap().removed_by_other = true;
+    for pr in [1, 5, 6] {
+        history.prs.get_mut(&pr).unwrap().closed_at = Some(t(2));
+    }
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(3),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let deleted: Vec<u64> = out
+        .report
+        .actions
+        .iter()
+        .filter(|a| a.action == "remove_label" && a.sent)
+        .flat_map(|a| a.prs.clone())
+        .collect();
+    assert_eq!(deleted, vec![1, 6]);
+    assert_eq!(
+        ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
+        vec![2]
+    );
+}
+
+#[test]
 fn a_dead_owner_turns_unowned_after_the_threshold_and_reaches_the_digest() {
     let (mut ledger, history) = world(t(0));
     let cfg = config(true, true);
