@@ -424,7 +424,10 @@ struct ResultReceipt {
     full_build_incremental_duration_seconds: Option<f64>,
     #[serde(default)]
     full_build_estimated_total_duration_seconds: Option<f64>,
-    selected_returncode: i32,
+    /// Absent for a keyed full shadow, which has no selected leg; required
+    /// wherever a selected leg ran.
+    #[serde(default)]
+    selected_returncode: Option<i32>,
     selected_build_returncode: Option<i32>,
     full_returncode: Option<i32>,
     full_build_returncode: Option<i32>,
@@ -490,6 +493,10 @@ impl ResultReceipt {
         Some(detail.lines().next().unwrap_or_default().trim().to_owned())
     }
 }
+
+/// A result whose selected execution was refused and the full suite ran
+/// alone (`selected_returncode` and `selected_build_returncode` are null).
+const REFUSED_FALLBACK_FULL: &str = "refused_fallback_full";
 
 /// The failure-set verdict: both legs failed, the selected leg failed nothing
 /// the full suite passed, saw every failure inside its selection, and every
@@ -1280,21 +1287,31 @@ fn validate_result(plan: &ActivationPlan, result: &ResultReceipt) -> Result<(), 
     if !result.full_authoritative {
         return Err("full_suite_not_authoritative");
     }
+    // A refused selection falls back to the full suite alone: no selected
+    // leg ran, so it has no selected return code or build to judge, and its
+    // verdict is the full run's and its non-graduating classification.
+    let refused_fallback =
+        result.selected_execution_disposition.as_deref() == Some(REFUSED_FALLBACK_FULL);
     let matched_fail = result.comparison_verdict == MATCHED_FAIL;
-    let tests_ok = if matched_fail {
-        result.selected_returncode != 0 && result.full_returncode.is_some_and(|code| code != 0)
+    let tests_ok = if refused_fallback {
+        result.full_returncode == Some(0)
     } else {
-        result.selected_returncode == 0 && result.full_returncode == Some(0)
+        let Some(selected_returncode) = result.selected_returncode else {
+            return Err("result_without_selected_returncode");
+        };
+        if matched_fail {
+            selected_returncode != 0 && result.full_returncode.is_some_and(|code| code != 0)
+        } else {
+            selected_returncode == 0 && result.full_returncode == Some(0)
+        }
     };
+    let selected_build_ok = refused_fallback || result.selected_build_returncode == Some(0);
     if !tests_ok
         || match plan.schema_version {
             1 => {
                 result.selected_build_returncode.is_some() || result.full_build_returncode.is_some()
             }
-            2 => {
-                result.selected_build_returncode != Some(0)
-                    || result.full_build_returncode != Some(0)
-            }
+            2 => !selected_build_ok || result.full_build_returncode != Some(0),
             _ => true,
         }
     {
@@ -1959,6 +1976,12 @@ mod tests {
         result["comparison_verdict"] = json!("keyed_full_shadow");
         result["selected_execution_disposition"] = json!("keyed_full_shadow");
         result["graduation_eligible"] = json!(false);
+        // A keyed full shadow has no selected leg, so the adapter writes no
+        // selected return code (Pulp's `run_changed_surface_tests.py` omits it).
+        result
+            .as_object_mut()
+            .expect("result object")
+            .remove("selected_returncode");
         result["executable_reuse"] = json!({
             "mode": "shadow",
             "bound": true,
@@ -1968,6 +1991,54 @@ mod tests {
             "false_skips": ["beta"]
         });
         (activation, result)
+    }
+
+    #[test]
+    fn a_bounded_result_must_still_carry_its_selected_return_code() {
+        let mut result = result();
+        result
+            .as_object_mut()
+            .expect("result object")
+            .remove("selected_returncode");
+        let status = evaluate(Some(&activation()), &[result]);
+        assert_eq!(status.state, TrialState::Rejected);
+        assert_eq!(status.reason, "result_without_selected_returncode");
+
+        // A keyed bounded shadow ran a selected leg too: still required.
+        let (activation, mut result) = keyed_bounded();
+        result
+            .as_object_mut()
+            .expect("result object")
+            .remove("selected_returncode");
+        let status = evaluate_keyed(&activation, &result);
+        assert_eq!(status.state, TrialState::Rejected);
+        assert_eq!(status.reason, "result_without_selected_returncode");
+    }
+
+    /// A refused-selection fallback as Pulp's adapter writes it: the full
+    /// suite ran alone, so the selected leg's fields are null.
+    fn refused_fallback(full_returncode: i32) -> Value {
+        let mut result = result();
+        result["selected_execution_disposition"] = json!("refused_fallback_full");
+        result["comparison_verdict"] = json!("fallback_full_non_graduation");
+        result["graduation_eligible"] = json!(false);
+        result["selected_returncode"] = Value::Null;
+        result["selected_build_returncode"] = Value::Null;
+        result["full_returncode"] = json!(full_returncode);
+        result
+    }
+
+    #[test]
+    fn a_refused_fallback_is_judged_on_its_full_run_not_a_selected_leg() {
+        // Green full run: not malformed and not missing a selected return
+        // code; it is a fallback, so it never graduates.
+        let status = evaluate(Some(&activation()), &[refused_fallback(0)]);
+        assert_eq!(status.state, TrialState::Rejected);
+        assert_eq!(status.reason, "shadow_result_not_matched_pass");
+        // Red full run: rejected on the return code.
+        let status = evaluate(Some(&activation()), &[refused_fallback(8)]);
+        assert_eq!(status.state, TrialState::Rejected);
+        assert_eq!(status.reason, "shadow_result_nonzero_returncode");
     }
 
     #[test]
