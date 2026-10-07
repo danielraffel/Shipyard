@@ -716,6 +716,9 @@ Every delivering pass logs `wake.raised`/`sent`/`failed`/`resolved` events (with
 rung, channels, session, host) to the ledger's `events.jsonl`;
 `shipyard pr-watch wakes --since 24h` reports seen rate, p50/p90 latencies, and
 open episodes sent but never seen. `sent` is not receipt; only `seen` is.
+`seen` is read back from `~/.local/state/shipyard/inbox/<session>.shown.jsonl`
+(stamped `shown_at` by the inbox hook, which also runs after every tool call via
+`hooks/handback-inbox-poll.sh`, starting nothing when the inbox is empty).
 `--deliver-handback` sends, and needs `[pr_watch.handback] enabled = true`; the
 daemon delivers when that is on. It never types into a session (no
 `cmux send`), never resumes or starts an agent, and never arms or dequeues.
