@@ -145,6 +145,24 @@ fn render_wakes(repo: &str, since: &str, summary: &wakes::WakeSummary) -> String
             episode.session.as_deref().unwrap_or("?")
         );
     }
+    for episode in &summary.unsent {
+        let _ = writeln!(
+            out,
+            "  UNSENT #{} {} raised {} owner {}{}",
+            episode.pr,
+            episode.id,
+            episode
+                .raised_at
+                .map(|at| at.format("%m-%d %H:%MZ").to_string())
+                .unwrap_or_default(),
+            episode.owner.as_deref().unwrap_or("?"),
+            episode
+                .unsent_reason
+                .as_deref()
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default()
+        );
+    }
     if summary.skipped_lines > 0 {
         let _ = writeln!(
             out,

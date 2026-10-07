@@ -186,6 +186,9 @@ pub struct WakeRecord {
     /// First successful delivery.
     #[serde(default)]
     pub sent_at: Option<DateTime<Utc>>,
+    /// Why nothing was attempted for it (`no_channel`), once logged.
+    #[serde(default)]
+    pub unsent: Option<String>,
 }
 
 /// One delivered episode.
@@ -306,6 +309,30 @@ pub struct HandbackReport {
     /// in plan mode.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<LedgerEvent>,
+}
+
+/// Log `wake.unsent` once per episode and reason.
+fn log_unsent(
+    state: &mut HandbackState,
+    report: &mut HandbackReport,
+    now: DateTime<Utc>,
+    id: &str,
+    reason: &str,
+    session: &str,
+) {
+    let Some(wake) = state.wakes.get_mut(id) else {
+        return;
+    };
+    if wake.unsent.as_deref() == Some(reason) {
+        return;
+    }
+    wake.unsent = Some(reason.to_owned());
+    report.events.push(wake_event(
+        now,
+        id,
+        "wake.unsent",
+        json!({"pr": wake.pr, "episode": wake.episode, "reason": reason, "session": session}),
+    ));
 }
 
 fn wake_event(at: DateTime<Utc>, id: &str, change: &str, detail: Value) -> LedgerEvent {
@@ -598,53 +625,6 @@ pub fn run(
         }
     }
     let actionable_prs: BTreeSet<u64> = by_pr.keys().copied().collect();
-    if deliver {
-        for ids in by_pr.values() {
-            for id in ids {
-                let Some(entry) = ledger.entries.get(id) else {
-                    continue;
-                };
-                if let Some(previous) = state.wakes.get(id) {
-                    if previous.episode == entry.first_seen_at {
-                        continue;
-                    }
-                    // The flag cleared and came back: close the old episode.
-                    report.events.push(wake_event(
-                        now,
-                        id,
-                        "wake.resolved",
-                        json!({
-                            "pr": previous.pr,
-                            "episode": previous.episode,
-                            "how": "new_episode",
-                            "raised_at": previous.raised_at,
-                            "sent_at": previous.sent_at,
-                        }),
-                    ));
-                }
-                state.wakes.insert(
-                    id.clone(),
-                    WakeRecord {
-                        pr: entry.pr,
-                        episode: entry.first_seen_at,
-                        raised_at: now,
-                        sent_at: None,
-                    },
-                );
-                report.events.push(wake_event(
-                    now,
-                    id,
-                    "wake.raised",
-                    json!({
-                        "pr": entry.pr,
-                        "kind": entry.kind.as_str(),
-                        "episode": entry.first_seen_at,
-                    }),
-                ));
-            }
-        }
-    }
-
     // Tier 0.
     if config.label {
         for (mut planned, is_add) in
@@ -735,6 +715,53 @@ pub fn run(
             unowned: state_name != "live" && now - since >= config.unowned_after,
         };
         state.owners.insert(pr, record.clone());
+        if deliver {
+            for id in ids {
+                let Some(entry) = ledger.entries.get(id) else {
+                    continue;
+                };
+                if let Some(previous) = state.wakes.get(id) {
+                    if previous.episode == entry.first_seen_at {
+                        continue;
+                    }
+                    // The flag cleared and came back: close the old episode.
+                    report.events.push(wake_event(
+                        now,
+                        id,
+                        "wake.resolved",
+                        json!({
+                            "pr": previous.pr,
+                            "episode": previous.episode,
+                            "how": "new_episode",
+                            "raised_at": previous.raised_at,
+                            "sent_at": previous.sent_at,
+                        }),
+                    ));
+                }
+                state.wakes.insert(
+                    id.clone(),
+                    WakeRecord {
+                        pr: entry.pr,
+                        episode: entry.first_seen_at,
+                        raised_at: now,
+                        sent_at: None,
+                        unsent: None,
+                    },
+                );
+                report.events.push(wake_event(
+                    now,
+                    id,
+                    "wake.raised",
+                    json!({
+                        "pr": entry.pr,
+                        "kind": entry.kind.as_str(),
+                        "episode": entry.first_seen_at,
+                        "owner": record.state,
+                        "session": record.owner.as_ref().map(|o| o.session.clone()),
+                    }),
+                ));
+            }
+        }
         let pending: Vec<String> = ids
             .iter()
             .filter(|id| {
@@ -769,6 +796,11 @@ pub fn run(
                 ));
             } else if !(notify_on || inbox_on) {
                 view.held = Some("notify and inbox are off".to_owned());
+                if deliver {
+                    for id in &pending {
+                        log_unsent(&mut state, &mut report, now, id, "no_channel", &o.session);
+                    }
+                }
             } else {
                 let batch = batches.entry(o.session.clone()).or_insert(SessionBatch {
                     route,
@@ -801,6 +833,7 @@ pub fn run(
             .into_iter()
             .collect();
         let mut channels = Vec::new();
+        let actions_before = report.actions.len();
         let mut run_host = |name: &str,
                             command: HostCommand,
                             stdin: Option<String>,
@@ -889,15 +922,15 @@ pub fn run(
                 }
             }
         }
+        let place = match &batch.route {
+            Route::Local => "local".to_owned(),
+            Route::Ssh(alias) => format!("ssh {alias}"),
+        };
         if inbox_on {
             let lines: String = entries
                 .iter()
                 .map(|(id, e)| inbox_line(&ledger.repo, id, e, now) + "\n")
                 .collect();
-            let place = match &batch.route {
-                Route::Local => "local".to_owned(),
-                Route::Ssh(alias) => format!("ssh {alias}"),
-            };
             if run_host(
                 "inbox",
                 HostCommand::InboxAppend {
@@ -914,11 +947,16 @@ pub fn run(
                 channels.push("inbox".to_owned());
             }
         }
-        let place = match &batch.route {
-            Route::Local => "local".to_owned(),
-            Route::Ssh(alias) => format!("ssh {alias}"),
-        };
-        if deliver {
+        // A wake with no channel attempted (notify on but no surface, inbox
+        // off) was never tried: it is unsent, not failed.
+        let attempted = report.actions[actions_before..]
+            .iter()
+            .any(|a| a.action == "notify" || a.action == "inbox");
+        if deliver && channels.is_empty() && !attempted {
+            for (id, _) in &entries {
+                log_unsent(&mut state, &mut report, now, id, "no_channel", &session);
+            }
+        } else if deliver {
             let change = if channels.is_empty() {
                 "wake.failed"
             } else {

@@ -1303,3 +1303,57 @@ fn a_delivery_whose_every_channel_failed_is_a_wake_failure() {
         out.report.events
     );
 }
+
+#[test]
+fn a_wake_with_no_channel_configured_is_unsent_not_failed() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, false);
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(
+        !out.report.events.iter().any(|e| e.change == "wake.failed"),
+        "{:?}",
+        out.report.events
+    );
+    let unsent: Vec<&str> = out
+        .report
+        .events
+        .iter()
+        .filter(|e| e.change == "wake.unsent")
+        .map(|e| e.id.as_str())
+        .collect();
+    // The live owners' episodes; a dead owner's is never attempted either,
+    // but it is the report's `unsent` list (by owner state), not an event.
+    assert_eq!(
+        unsent,
+        vec!["1:repeat_test_failure:k", "5:repeated_ejection:"]
+    );
+    let raised = out
+        .report
+        .events
+        .iter()
+        .find(|e| e.change == "wake.raised" && e.id == "2:red_while_armed:k")
+        .and_then(|e| e.detail.clone())
+        .unwrap();
+    assert_eq!(raised["owner"], json!("dead"));
+    // Logged once per episode, not every pass.
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(2),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(!out.report.events.iter().any(|e| e.change == "wake.unsent"));
+}

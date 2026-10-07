@@ -1418,6 +1418,80 @@ fn a_planned_handback_rides_the_scan_and_writes_nothing() {
     assert!(handback.actions.iter().all(|action| !action.sent));
 }
 
+#[test]
+fn a_delivering_scan_writes_its_wake_events_to_the_event_log() {
+    struct NoHost;
+    impl super::handback::host::HostRunner for NoHost {
+        fn run(
+            &mut self,
+            invocation: &super::handback::host::Invocation,
+        ) -> Result<String, super::handback::host::RunError> {
+            panic!("no owner, so no host command: {:?}", invocation.argv)
+        }
+        fn append_local_inbox(&mut self, _: &str, _: &str) -> Result<(), String> {
+            panic!("no owner, so no inbox")
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let reader = |argv: &[String]| fake_github(argv);
+    let writer = |argv: &[String]| -> Result<String, String> { panic!("wrote {argv:?}") };
+    let mut sender = |_: &str| -> Result<(), String> { panic!("no digest") };
+    let request = super::scan::ScanRequest {
+        repo: "o/r".to_owned(),
+        config: super::scan::WatchConfig {
+            lookback: Duration::days(2),
+            handback: super::handback::HandbackConfig {
+                enabled: true,
+                label: false,
+                ..super::handback::HandbackConfig::default()
+            },
+            ..super::scan::WatchConfig::default()
+        },
+        state_path: dir.path().join("ledger.json"),
+        post_comments: false,
+        post_digest: false,
+        plan_comments: false,
+        handback: super::handback::HandbackMode::Deliver,
+    };
+    let mut runner = NoHost;
+    let mut deps = super::handback::Deps {
+        runner: &mut runner,
+        state_dir: dir.path().to_path_buf(),
+        local_names: Vec::new(),
+        local_machine: None,
+    };
+    let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
+    let report = super::scan::scan(
+        &reader,
+        &writer,
+        &mut sender,
+        None,
+        &crate::gate_cost::ReadCache::disabled(),
+        &request,
+        now,
+        Some(&mut deps),
+    )
+    .unwrap();
+    let handback = report.handback.expect("hand-back report");
+    assert!(handback.events.iter().any(|e| e.change == "wake.raised"));
+    // The scan persisted them beside the ledger, where `pr-watch wakes` reads.
+    let (events, skipped) = super::ledger::read_events(&request.state_path).unwrap();
+    assert_eq!(skipped, 0);
+    let raised: Vec<&super::ledger::LedgerEvent> = events
+        .iter()
+        .filter(|e| e.change == "wake.raised")
+        .collect();
+    assert_eq!(raised.len(), 1, "{events:?}");
+    assert_eq!(
+        raised[0].detail.as_ref().unwrap()["pr"],
+        serde_json::json!(42)
+    );
+    assert_eq!(
+        raised[0].detail.as_ref().unwrap()["owner"],
+        serde_json::json!("none")
+    );
+}
+
 /// Load `body` as the only (machine-global) config layer, as the daemon does.
 fn watch_config_from_toml(body: &str) -> super::scan::WatchConfig {
     let global = tempfile::tempdir().unwrap();

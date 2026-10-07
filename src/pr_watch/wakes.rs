@@ -28,8 +28,13 @@ pub struct WakeEpisode {
     pub raised_at: Option<DateTime<Utc>>,
     /// First `wake.sent`.
     pub sent_at: Option<DateTime<Utc>>,
-    /// Session the first send went to.
+    /// Session the first send went to, else the owner session at raise.
     pub session: Option<String>,
+    /// Owner state when raised (`live`, `dead`, `unknown`, `unreachable`,
+    /// `none`).
+    pub owner: Option<String>,
+    /// Why nothing was attempted (`wake.unsent`), if logged.
+    pub unsent_reason: Option<String>,
     /// First `wake.seen`.
     pub seen_at: Option<DateTime<Utc>>,
     /// `wake.resolved`, and how.
@@ -86,6 +91,10 @@ pub struct WakeSummary {
     /// Open episodes sent but not seen for longer than the threshold, oldest
     /// first: the calls nobody has answered.
     pub unseen: Vec<WakeEpisode>,
+    /// Open episodes raised longer ago than the threshold and never sent (a
+    /// dead, unknown, or unresolved owner, or no channel), oldest first: the
+    /// calls nobody made.
+    pub unsent: Vec<WakeEpisode>,
     /// Event-log lines that did not parse.
     pub skipped_lines: usize,
 }
@@ -120,6 +129,26 @@ pub fn episodes(events: &[LedgerEvent]) -> Vec<WakeEpisode> {
         match kind {
             "raised" => {
                 episode.raised_at.get_or_insert(event.at);
+                let field = |key: &str| {
+                    detail
+                        .and_then(|d| d.get(key))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                };
+                if episode.owner.is_none() {
+                    episode.owner = field("owner");
+                }
+                if episode.session.is_none() {
+                    episode.session = field("session");
+                }
+            }
+            "unsent" => {
+                if episode.unsent_reason.is_none() {
+                    episode.unsent_reason = detail
+                        .and_then(|d| d.get("reason"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
             }
             "sent" => {
                 if episode.sent_at.is_none() {
@@ -212,10 +241,14 @@ pub fn summarize(
             *summary.resolved.entry(how.clone()).or_default() += 1;
         } else {
             summary.open += 1;
-            if episode.seen_at.is_none()
-                && episode.sent_at.is_some_and(|at| now - at > unseen_after)
-            {
-                summary.unseen.push(episode);
+            match episode.sent_at {
+                Some(sent) if episode.seen_at.is_none() && now - sent > unseen_after => {
+                    summary.unseen.push(episode);
+                }
+                None if episode.raised_at.is_some_and(|at| now - at > unseen_after) => {
+                    summary.unsent.push(episode);
+                }
+                _ => {}
             }
         }
     }
@@ -224,6 +257,7 @@ pub fn summarize(
     summary.time_to_seen = latency(to_seen);
     summary.time_to_resolve = latency(to_resolve);
     summary.unseen.sort_by_key(|episode| episode.sent_at);
+    summary.unsent.sort_by_key(|episode| episode.raised_at);
     summary
 }
 
@@ -265,6 +299,15 @@ mod tests {
             // answered (the shape of 10:24Z -> 14:20Z).
             wake(10, "b", "raised", 9, &none),
             wake(11, "b", "sent", 9, &json!({"session": "s2", "rung": "1"})),
+            // e: raised 5 for a dead owner, never sent, still open: the call
+            // nobody made (the shape of 02:42Z reported late).
+            wake(
+                5,
+                "e",
+                "raised",
+                4,
+                &json!({"owner": "dead", "session": "s9"}),
+            ),
             // c: raised 20, every channel failed, then closed.
             wake(20, "c", "raised", 19, &none),
             wake(20, "c", "failed", 19, &none),
@@ -281,12 +324,12 @@ mod tests {
             },
         ];
         let summary = summarize(&events, t(-10), t(60), Duration::minutes(30));
-        assert_eq!(summary.raised, 3);
+        assert_eq!(summary.raised, 4);
         assert_eq!(summary.sent, 2);
         assert_eq!(summary.seen, 1);
         assert_eq!(summary.seen_rate, Some(0.5));
         assert_eq!(summary.failed, 1);
-        assert_eq!(summary.open, 1);
+        assert_eq!(summary.open, 2);
         assert_eq!(summary.resolved.get("addressed"), Some(&1));
         assert_eq!(summary.resolved.get("closed"), Some(&1));
         assert_eq!(summary.time_to_seen.count, 1);
@@ -295,9 +338,15 @@ mod tests {
         let unseen: Vec<&str> = summary.unseen.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(unseen, vec!["b"]);
         assert_eq!(summary.unseen[0].session.as_deref(), Some("s2"));
-        // Within the threshold it is not yet unanswered.
+        // Never sent is not unseen: it is listed apart, with its owner state.
+        let unsent: Vec<&str> = summary.unsent.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(unsent, vec!["e"]);
+        assert_eq!(summary.unsent[0].owner.as_deref(), Some("dead"));
+        assert_eq!(summary.unsent[0].session.as_deref(), Some("s9"));
+        // Within the threshold neither list has it yet.
         let early = summarize(&events, t(-10), t(30), Duration::minutes(30));
         assert!(early.unseen.is_empty());
+        assert!(early.unsent.is_empty());
     }
 
     #[test]
