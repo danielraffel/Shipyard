@@ -1069,17 +1069,17 @@ fn our_label_comes_off_a_merged_closed_or_unobserved_pull_request() {
     );
     assert_eq!(
         ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
-        vec![1, 2, 5, 6]
+        vec![1, 2, 5]
     );
-    for pr in [1, 2, 5, 6] {
+    for pr in [1, 2, 5] {
         history.prs.get_mut(&pr).unwrap().labels = vec![NEEDS_AGENT_LABEL.to_owned()];
     }
-    // The flags still hold, but PR 1 merged, PR 5 closed, and PR 6 left the
-    // history window: none of them is open, so the label must come off. PR 2
-    // is still open and flagged, so it keeps its label.
+    // The flags still hold, but PR 1 merged and PR 2 left the history window:
+    // neither is open, so the label must come off. PR 5 is still open and
+    // flagged, so it keeps its label. (PR 6 has no owner, so it was never
+    // labelled.)
     history.prs.get_mut(&1).unwrap().merged_at = Some(t(2));
-    history.prs.get_mut(&5).unwrap().closed_at = Some(t(2));
-    history.prs.remove(&6);
+    history.prs.remove(&2);
     let mut runner = FakeRunner::default();
     let out = pass(
         &mut ledger,
@@ -1100,14 +1100,13 @@ fn our_label_comes_off_a_merged_closed_or_unobserved_pull_request() {
         deleted,
         vec![
             "repos/o/r/issues/1/labels/shipyard%3Aneeds-agent".to_owned(),
-            "repos/o/r/issues/5/labels/shipyard%3Aneeds-agent".to_owned(),
-            "repos/o/r/issues/6/labels/shipyard%3Aneeds-agent".to_owned(),
+            "repos/o/r/issues/2/labels/shipyard%3Aneeds-agent".to_owned(),
         ]
     );
     assert!(out.writes.iter().all(|argv| is_label_write(argv)));
     assert_eq!(
         ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
-        vec![2]
+        vec![5]
     );
 
     // A terminal pull request whose snapshot predates our add (no label
@@ -1124,7 +1123,7 @@ fn our_label_comes_off_a_merged_closed_or_unobserved_pull_request() {
         true,
     );
     ledger.handback.labels.get_mut(&5).unwrap().removed_by_other = true;
-    for pr in [1, 5, 6] {
+    for pr in [1, 2, 5] {
         history.prs.get_mut(&pr).unwrap().closed_at = Some(t(2));
     }
     let mut runner = FakeRunner::default();
@@ -1144,11 +1143,8 @@ fn our_label_comes_off_a_merged_closed_or_unobserved_pull_request() {
         .filter(|a| a.action == "remove_label" && a.sent)
         .flat_map(|a| a.prs.clone())
         .collect();
-    assert_eq!(deleted, vec![1, 6]);
-    assert_eq!(
-        ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
-        vec![2]
-    );
+    assert_eq!(deleted, vec![1, 2]);
+    assert!(ledger.handback.labels.is_empty());
 }
 
 #[test]
