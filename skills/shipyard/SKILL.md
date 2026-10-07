@@ -659,6 +659,9 @@ daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
 `enabled` stays off with a warning in the `pr_watch_pass` event). See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
+`repeated_ejection` counts only merge groups created since the PR's current head
+and clears on any passing named group that finishes after the last failure.
+
 `shipyard pr-watch scan --handback` plans the hand-back (dry run): for a PR
 with an owner-actionable flag it resolves the owner (steward handoff record,
 else the PR body's `whence` marker), probes the session read-only with
@@ -672,6 +675,15 @@ closes; for a terminal PR the DELETE is sent even if the scan's snapshot does no
 show the label yet (the snapshot can predate the add), and a 404 counts as gone.
 A label add re-reads the PR first and is refused if it is no longer open (or its
 state is unreadable), because the scan snapshot can predate a merge.
+`shipyard pr-watch sweep-labels` lists closed/merged PRs still carrying the
+label (plan by default); `--apply` removes it from those only, never from open PRs
+or issues, and does not check who added it, so read the plan before applying.
+A PR whose owner does not resolve (no steward record, no whence marker) gets no
+label; one whose marker is unreadable this pass keeps the label it has.
+Every delivering pass logs `wake.raised`/`sent`/`failed`/`resolved` events (with
+rung, channels, session, host) to the ledger's `events.jsonl`;
+`shipyard pr-watch wakes --since 24h` reports seen rate, p50/p90 latencies, and
+open episodes sent but never seen. `sent` is not receipt; only `seen` is.
 `--deliver-handback` sends, and needs `[pr_watch.handback] enabled = true`; the
 daemon delivers when that is on. It never types into a session (no
 `cmux send`), never resumes or starts an agent, and never arms or dequeues.

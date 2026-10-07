@@ -1278,6 +1278,43 @@ pub(crate) enum PrWatchCommand {
     /// Build the hourly digest from the ledger; `--post` delivers it through
     /// `[pr_watch.digest] command`.
     Digest(PrWatchDigestArgs),
+    /// List closed and merged pull requests still carrying
+    /// `shipyard:needs-agent`; `--apply` removes the label from them. Open
+    /// pull requests and issues are never touched.
+    SweepLabels(PrWatchSweepLabelsArgs),
+    /// How well the hand-back calls owners back: episodes raised, sent,
+    /// seen, resolved, the time each step took, and the calls nobody has
+    /// answered, from the ledger's `wake.*` events.
+    Wakes(PrWatchWakesArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PrWatchSweepLabelsArgs {
+    /// Owner/repo slug. Defaults to the current checkout's repository.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// Remove the label. Without this, only list.
+    #[arg(long)]
+    pub(crate) apply: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PrWatchWakesArgs {
+    /// Owner/repo slug. Defaults to the current checkout's repository.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// Base branch. Defaults to `[pr_watch] base`, else `main`.
+    #[arg(long)]
+    pub(crate) base: Option<String>,
+    /// Window: episodes raised in the last `24h`, `7d`, `90m`.
+    #[arg(long, default_value = "24h")]
+    pub(crate) since: String,
+    /// List open episodes sent this long ago and not yet seen.
+    #[arg(long = "unseen-after", default_value = "30m")]
+    pub(crate) unseen_after: String,
+    /// Override the ledger path.
+    #[arg(long = "state-file")]
+    pub(crate) state_file: Option<PathBuf>,
 }
 
 #[allow(clippy::struct_excessive_bools)] // Independent opt-in write switches.

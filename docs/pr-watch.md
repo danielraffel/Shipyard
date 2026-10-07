@@ -38,7 +38,7 @@ required job by name, never to "the first failed job".
 |---|---|---|---|
 | 1 | `repeat_test_failure` | the same required check failed with the same failing test on at least 2 runs of the PR (its heads and merge groups named for it), and the PR's latest pass-or-fail result for that check is still a failure | the check, the test, the runs. Verdict "code failure, not flake", or "failing on main/pre-existing" when the same test also failed on at least 2 *other* PRs in the last 24 h |
 | 2 | `red_while_armed` | auto-merge is armed (or the PR was ejected for `failed_checks` and not re-armed), it is not in the queue, and a required check on the current head has been red for more than 30 minutes with no push since | the check, head, and red-since time |
-| 3 | `repeated_ejection` | at least 2 merge groups named for the PR (`gh-readonly-queue/<base>/pr-<N>-<parent>`) failed a required job, with no passing named group since | each failed group with its parent group's status |
+| 3 | `repeated_ejection` | at least 2 merge groups named for the PR (`gh-readonly-queue/<base>/pr-<N>-<parent>`) and created since its current head was pushed failed a required job, with no passing named group finishing after the last failure | each failed group with its parent group's status |
 | 4 | `rebase_treadmill` | the head was replaced at least 3 times within 24 h, each time the previous head's gate run was cancelled and the merge base with the base branch advanced | the head chain; says "inferred" |
 | 5 | `split_candidate` | open more than 3 days, or more than 60 files or 30 commits | advisory only: raised only alongside another flag on the same PR, never alone, and never alone in a digest |
 
@@ -185,7 +185,7 @@ are not.
 
 | tier | when | what |
 |---|---|---|
-| 0 | an owner-actionable flag holds | the sticky comment, plus the `shipyard:needs-agent` label; the label is removed when every such flag is addressed or the pull request merges or closes |
+| 0 | an owner-actionable flag holds | the sticky comment, plus the `shipyard:needs-agent` label when an owner resolves (no owner: comment and digest only; an unreadable marker leaves the label as it is); the label is removed when every such flag is addressed or the pull request merges or closes, and ours also comes off a flagged pull request whose owner no longer resolves |
 | 1 | the owner's session is live | `cmux notify --surface <uuid>` (and, with `status = true`, a `shipyard-pr-<n>` sidebar pill, cleared later) plus an inbox line on the owner's host |
 | 2 | the owner is dead, unknown, or unreachable for `unowned_after_hours` | the pull request's digest line carries `owner.unowned = true` with the `whence` resume hint |
 
@@ -197,6 +197,13 @@ or no-longer-observed pull request has ours deleted even when its snapshot does
 not show it yet (a 404 means it is already gone), unless a person removed it. Before each add
 the pass re-reads the pull request and adds nothing if it is no longer open, or
 if its state cannot be read: the scan's snapshot can be minutes old.
+
+`shipyard pr-watch sweep-labels [--repo <owner/repo>] [--apply] [--json]` lists
+closed and merged pull requests still carrying `shipyard:needs-agent` and, with
+`--apply`, removes it from each. It never touches an open pull request or an
+issue, and it does not ask who added the label, so run the plan first and read
+the list. A 404 on removal counts as already gone; any other failure is reported
+and exits 1.
 
 **Owner.** The merge steward's exact-head handoff record (on this machine's
 state directory) wins; otherwise the `<!-- whence {...} -->` marker in the pull
@@ -262,6 +269,28 @@ timeout_seconds = 20
 m3 = "m3"
 Daniels-Mac-Studio-m3 = "m3"
 ```
+
+**Measuring it.** A delivering pass appends a `wake.*` event for every
+transition of an owner-actionable episode to the ledger's event log
+(`<ledger>.events.jsonl`, beside `opened`/`addressed:*`), with a structured
+`detail` (`pr`, `episode`, and per kind `rung`, `channels`, `session`, `host`,
+`how`):
+
+| event | when |
+|---|---|
+| `wake.raised` | a delivering pass first sees the episode owner-actionable on an open pull request |
+| `wake.sent` | a tier-1 channel accepted it (`rung`, `channels`, `session`, `host`) |
+| `wake.failed` | every tier-1 channel of a delivery failed |
+| `wake.seen` | the owner's session displayed it inside an agent turn |
+| `wake.escalated` | the next rung fired because the previous one was not seen |
+| `wake.resolved` | it stopped being actionable (`how`: `addressed`, `closed`, `gone`, `new_episode`, `not_actionable`) |
+
+Delivery is not receipt: `sent` is a channel's result, `seen` is the agent's.
+Plan mode writes no events. `shipyard pr-watch wakes [--since 24h]
+[--unseen-after 30m] [--json]` reports raised, sent, seen (and the seen rate),
+open, failed, escalated, resolved by how, p50/p90 of raised-to-sent,
+sent-to-seen and raised-to-resolved, and every open episode sent longer ago
+than `--unseen-after` and not seen: the calls nobody answered.
 
 ## Daemon job and config
 

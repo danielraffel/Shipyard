@@ -719,7 +719,8 @@ fn deliver_notifies_live_owners_once_per_episode() {
         .filter(|a| a.action == "add_label" && a.sent)
         .flat_map(|a| a.prs.clone())
         .collect();
-    assert_eq!(labelled, vec![1, 2, 5, 6]);
+    // PR 6 has no owner, so no label.
+    assert_eq!(labelled, vec![1, 2, 5]);
     assert!(
         out.writes.iter().all(|argv| is_label_write(argv)),
         "{:?}",
@@ -909,12 +910,13 @@ fn labels_are_only_added_when_defined_and_only_ours_are_removed() {
         .filter(|a| a.action == "add_label")
         .flat_map(|a| a.prs.clone())
         .collect();
-    assert_eq!(added, vec![1, 5, 6]);
-    for pr in [1, 5, 6] {
+    // PR 6 has no owner (no marker): it gets no label.
+    assert_eq!(added, vec![1, 5]);
+    for pr in [1, 5] {
         history.prs.get_mut(&pr).unwrap().labels = vec![NEEDS_AGENT_LABEL.to_owned()];
     }
 
-    // Every flag addressed: remove ours (1, 5, 6), never PR 2's.
+    // Every flag addressed: remove ours (1, 5), never PR 2's.
     for entry in ledger.entries.values_mut() {
         entry.addressed_at = Some(t(2));
     }
@@ -935,9 +937,90 @@ fn labels_are_only_added_when_defined_and_only_ours_are_removed() {
         .filter(|a| a.action == "remove_label" && a.sent)
         .flat_map(|a| a.prs.clone())
         .collect();
-    assert_eq!(removed, vec![1, 5, 6]);
+    assert_eq!(removed, vec![1, 5]);
     assert!(out.writes.iter().all(|argv| is_label_write(argv)));
     assert!(ledger.handback.labels.is_empty());
+}
+
+#[test]
+fn no_owner_means_no_label_and_an_unreadable_marker_keeps_ours() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, false);
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let posted = |writes: &[Vec<String>]| -> Vec<String> {
+        writes
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "POST"))
+            .map(|argv| argv[3].clone())
+            .collect()
+    };
+    // PR 6's body carries no whence marker and there is no steward record.
+    assert!(
+        !posted(&out.writes).contains(&"repos/o/r/issues/6/labels".to_owned()),
+        "{:?}",
+        out.writes
+    );
+    assert!(!ledger.handback.labels.contains_key(&6));
+    assert_eq!(ledger.handback.owners[&6].state, "none");
+
+    // PR 1 is labelled; next pass its body cannot be read. The label stays
+    // (no DELETE), and nothing new is added for it.
+    assert!(ledger.handback.labels.contains_key(&1));
+    let mut history = history;
+    history.prs.get_mut(&1).unwrap().labels = vec![NEEDS_AGENT_LABEL.to_owned()];
+    let gh = fake_gh(true);
+    let reader = |argv: &[String]| {
+        if argv.last().map(String::as_str) == Some("repos/o/r/pulls/1") {
+            return Err("gh: HTTP 502".to_owned());
+        }
+        gh(argv)
+    };
+    let sent = RefCell::new(Vec::new());
+    let writer = |argv: &[String]| {
+        sent.borrow_mut().push(argv.to_vec());
+        Ok("{}".to_owned())
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut runner = FakeRunner::default();
+    let mut deps = super::Deps {
+        runner: &mut runner,
+        state_dir: dir.path().to_path_buf(),
+        local_names: vec!["Daniels-M5-Studio".to_owned()],
+        local_machine: None,
+    };
+    let report = super::run(
+        &mut ledger,
+        &history,
+        t(2),
+        &cfg,
+        HandbackMode::Deliver,
+        &reader,
+        &writer,
+        &mut deps,
+    );
+    let sent = sent.into_inner();
+    assert!(
+        !sent
+            .iter()
+            .any(|argv| argv.iter().any(|a| a.contains("issues/1/"))),
+        "{sent:?}"
+    );
+    assert!(ledger.handback.labels.contains_key(&1));
+    assert!(
+        report
+            .gaps
+            .iter()
+            .any(|g| g.starts_with("#1: whence marker"))
+    );
 }
 
 #[test]
@@ -986,17 +1069,17 @@ fn our_label_comes_off_a_merged_closed_or_unobserved_pull_request() {
     );
     assert_eq!(
         ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
-        vec![1, 2, 5, 6]
+        vec![1, 2, 5]
     );
-    for pr in [1, 2, 5, 6] {
+    for pr in [1, 2, 5] {
         history.prs.get_mut(&pr).unwrap().labels = vec![NEEDS_AGENT_LABEL.to_owned()];
     }
-    // The flags still hold, but PR 1 merged, PR 5 closed, and PR 6 left the
-    // history window: none of them is open, so the label must come off. PR 2
-    // is still open and flagged, so it keeps its label.
+    // The flags still hold, but PR 1 merged and PR 2 left the history window:
+    // neither is open, so the label must come off. PR 5 is still open and
+    // flagged, so it keeps its label. (PR 6 has no owner, so it was never
+    // labelled.)
     history.prs.get_mut(&1).unwrap().merged_at = Some(t(2));
-    history.prs.get_mut(&5).unwrap().closed_at = Some(t(2));
-    history.prs.remove(&6);
+    history.prs.remove(&2);
     let mut runner = FakeRunner::default();
     let out = pass(
         &mut ledger,
@@ -1017,14 +1100,13 @@ fn our_label_comes_off_a_merged_closed_or_unobserved_pull_request() {
         deleted,
         vec![
             "repos/o/r/issues/1/labels/shipyard%3Aneeds-agent".to_owned(),
-            "repos/o/r/issues/5/labels/shipyard%3Aneeds-agent".to_owned(),
-            "repos/o/r/issues/6/labels/shipyard%3Aneeds-agent".to_owned(),
+            "repos/o/r/issues/2/labels/shipyard%3Aneeds-agent".to_owned(),
         ]
     );
     assert!(out.writes.iter().all(|argv| is_label_write(argv)));
     assert_eq!(
         ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
-        vec![2]
+        vec![5]
     );
 
     // A terminal pull request whose snapshot predates our add (no label
@@ -1041,7 +1123,7 @@ fn our_label_comes_off_a_merged_closed_or_unobserved_pull_request() {
         true,
     );
     ledger.handback.labels.get_mut(&5).unwrap().removed_by_other = true;
-    for pr in [1, 5, 6] {
+    for pr in [1, 2, 5] {
         history.prs.get_mut(&pr).unwrap().closed_at = Some(t(2));
     }
     let mut runner = FakeRunner::default();
@@ -1061,11 +1143,8 @@ fn our_label_comes_off_a_merged_closed_or_unobserved_pull_request() {
         .filter(|a| a.action == "remove_label" && a.sent)
         .flat_map(|a| a.prs.clone())
         .collect();
-    assert_eq!(deleted, vec![1, 6]);
-    assert_eq!(
-        ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
-        vec![2]
-    );
+    assert_eq!(deleted, vec![1, 2]);
+    assert!(ledger.handback.labels.is_empty());
 }
 
 #[test]
@@ -1075,6 +1154,9 @@ fn a_label_is_not_posted_on_a_pull_request_that_merged_after_the_snapshot() {
     let (mut ledger, history) = world(t(0));
     let cfg = config(false, false);
     let gh = fake_gh(true);
+    // Owners are resolved before tier 0, so PR 5's first read (its whence
+    // marker) succeeds and only the open-state re-read before the add fails.
+    let pr5_reads = std::sync::atomic::AtomicUsize::new(0);
     let reader = |argv: &[String]| {
         if argv.last().map(String::as_str) == Some("repos/o/r/pulls/1") {
             let open = gh(argv)?;
@@ -1083,7 +1165,9 @@ fn a_label_is_not_posted_on_a_pull_request_that_merged_after_the_snapshot() {
             value["merged_at"] = json!("2026-10-06T12:00:18Z");
             return Ok(value.to_string());
         }
-        if argv.last().map(String::as_str) == Some("repos/o/r/pulls/5") {
+        if argv.last().map(String::as_str) == Some("repos/o/r/pulls/5")
+            && pr5_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+        {
             return Err("gh: HTTP 502".to_owned());
         }
         gh(argv)
@@ -1118,13 +1202,8 @@ fn a_label_is_not_posted_on_a_pull_request_that_merged_after_the_snapshot() {
         .map(|argv| argv[3].clone())
         .collect();
     // PR 1 merged: refused. PR 5's state is unreadable: not posted blind.
-    assert_eq!(
-        posted,
-        vec![
-            "repos/o/r/issues/2/labels".to_owned(),
-            "repos/o/r/issues/6/labels".to_owned(),
-        ]
-    );
+    // PR 6 has no owner, so it is never a label candidate.
+    assert_eq!(posted, vec!["repos/o/r/issues/2/labels".to_owned()]);
     let refused = |pr: u64| {
         report
             .actions
@@ -1137,7 +1216,7 @@ fn a_label_is_not_posted_on_a_pull_request_that_merged_after_the_snapshot() {
     assert!(refused(5).contains("unreadable"), "{}", refused(5));
     assert_eq!(
         ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
-        vec![2, 6]
+        vec![2]
     );
 }
 
@@ -1310,4 +1389,296 @@ fn a_plan_shows_channels_the_config_leaves_off_and_delivery_skips_them() {
     );
     assert!(runner.local_inbox.is_empty());
     assert!(ledger.handback.delivered.is_empty());
+}
+
+#[test]
+fn the_label_sweep_touches_only_closed_pull_requests_carrying_the_label() {
+    let label = json!([{"name": NEEDS_AGENT_LABEL}]);
+    let other = json!([{"name": "bug"}]);
+    let page = json!([
+        {"number": 11, "state": "closed", "closed_at": "2026-10-06T12:00:18Z",
+         "labels": label, "pull_request": {"merged_at": "2026-10-06T12:00:00Z"}},
+        {"number": 12, "state": "closed", "closed_at": "2026-10-05T09:00:00Z",
+         "labels": label, "pull_request": {"merged_at": null}},
+        // An issue, not a pull request.
+        {"number": 13, "state": "closed", "labels": label},
+        // A pull request the listing returned without the label.
+        {"number": 14, "state": "closed", "labels": other,
+         "pull_request": {"merged_at": null}},
+        // Open: the regular pass judges it, the sweep never does.
+        {"number": 15, "state": "open", "labels": label,
+         "pull_request": {"merged_at": null}},
+        {"number": 16, "state": "closed", "closed_at": "2026-10-04T08:00:00Z",
+         "labels": label, "pull_request": {"merged_at": "2026-10-04T08:00:00Z"}}
+    ]);
+    let reads = std::sync::Mutex::new(Vec::new());
+    let gh = |argv: &[String]| {
+        reads.lock().unwrap().push(argv.to_vec());
+        if argv[1].ends_with("&page=1") {
+            Ok(page.to_string())
+        } else {
+            Ok("[]".to_owned())
+        }
+    };
+    // Plan: lists, never writes.
+    let planned = super::sweep_labels("o/r", &gh, None).unwrap();
+    let numbers: Vec<u64> = planned.iter().map(|s| s.pr).collect();
+    assert_eq!(numbers, vec![11, 12, 16]);
+    assert_eq!(planned[0].state, "merged");
+    assert_eq!(planned[1].state, "closed");
+    assert!(planned.iter().all(|s| !s.removed && s.error.is_none()));
+    assert!(
+        reads.lock().unwrap()[0][1]
+            .starts_with("repos/o/r/issues?labels=shipyard%3Aneeds-agent&state=closed"),
+        "{:?}",
+        reads.lock().unwrap()
+    );
+
+    // Apply: exactly one DELETE per stale pull request; a 404 counts as gone,
+    // any other failure is reported.
+    let sent = RefCell::new(Vec::new());
+    let write = |argv: &[String]| {
+        sent.borrow_mut().push(argv.to_vec());
+        match argv.last().map(String::as_str) {
+            Some("repos/o/r/issues/12/labels/shipyard%3Aneeds-agent") => {
+                Err("gh: Not Found (HTTP 404)".to_owned())
+            }
+            Some("repos/o/r/issues/16/labels/shipyard%3Aneeds-agent") => {
+                Err("gh: HTTP 502".to_owned())
+            }
+            _ => Ok("[]".to_owned()),
+        }
+    };
+    let applied = super::sweep_labels("o/r", &gh, Some(&write)).unwrap();
+    let sent = sent.into_inner();
+    assert_eq!(sent.len(), 3);
+    assert!(
+        sent.iter()
+            .all(|argv| is_label_write(argv) && argv.contains(&"DELETE".to_owned()))
+    );
+    assert!(applied[0].removed && applied[1].removed);
+    assert!(!applied[2].removed);
+    assert!(
+        applied[2]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("502"))
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One lifecycle, read top to bottom.
+fn wake_events_record_raise_send_failure_and_resolution_and_plan_records_none() {
+    let changes = |events: &[crate::pr_watch::ledger::LedgerEvent]| -> Vec<String> {
+        events
+            .iter()
+            .map(|e| format!("{} {}", e.change, e.id))
+            .collect()
+    };
+    // Plan mode: no events, no wake state.
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(true, true);
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Plan,
+        &mut runner,
+        true,
+    );
+    assert!(out.report.events.is_empty());
+    assert!(ledger.handback.wakes.is_empty());
+
+    // Deliver: every owner-actionable open episode is raised; live owners'
+    // episodes (1 on m3, 5 local) are sent with their session and route.
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let got = changes(&out.report.events);
+    for id in [
+        "1:repeat_test_failure:k",
+        "2:red_while_armed:k",
+        "5:repeated_ejection:",
+        "6:red_while_armed:k",
+    ] {
+        assert!(got.contains(&format!("wake.raised {id}")), "{got:?}");
+    }
+    assert!(
+        got.contains(&"wake.sent 1:repeat_test_failure:k".to_owned()),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&"wake.sent 5:repeated_ejection:".to_owned()),
+        "{got:?}"
+    );
+    // Not actionable (shared failure, neighbour ejection, treadmill): never raised.
+    assert!(
+        !got.iter().any(|c| c.contains(" 3:") || c.contains(" 4:")),
+        "{got:?}"
+    );
+    let sent = out
+        .report
+        .events
+        .iter()
+        .find(|e| e.change == "wake.sent" && e.id == "1:repeat_test_failure:k")
+        .and_then(|e| e.detail.clone())
+        .unwrap();
+    assert_eq!(sent["session"], json!(LIVE_SESSION));
+    assert_eq!(sent["host"], json!("ssh m3"));
+    assert_eq!(sent["rung"], json!("1"));
+    assert!(
+        ledger.handback.wakes["1:repeat_test_failure:k"]
+            .sent_at
+            .is_some()
+    );
+    assert!(
+        ledger.handback.wakes["2:red_while_armed:k"]
+            .sent_at
+            .is_none()
+    );
+
+    // An unchanged episode is not raised again.
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(2),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(
+        !changes(&out.report.events)
+            .iter()
+            .any(|c| c.starts_with("wake.raised")),
+        "{:?}",
+        out.report.events
+    );
+
+    // Addressed: resolved, with how; the record is gone.
+    ledger
+        .entries
+        .get_mut("1:repeat_test_failure:k")
+        .unwrap()
+        .addressed_at = Some(t(3));
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(3),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let resolved = out
+        .report
+        .events
+        .iter()
+        .find(|e| e.change == "wake.resolved")
+        .unwrap();
+    assert_eq!(resolved.id, "1:repeat_test_failure:k");
+    assert_eq!(resolved.detail.as_ref().unwrap()["how"], json!("addressed"));
+    assert!(
+        !ledger
+            .handback
+            .wakes
+            .contains_key("1:repeat_test_failure:k")
+    );
+}
+
+#[test]
+fn a_delivery_whose_every_channel_failed_is_a_wake_failure() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(true, false);
+    let mut runner = FakeRunner {
+        fail_notify: true,
+        ..FakeRunner::default()
+    };
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let failed: Vec<&str> = out
+        .report
+        .events
+        .iter()
+        .filter(|e| e.change == "wake.failed")
+        .map(|e| e.id.as_str())
+        .collect();
+    assert!(failed.contains(&"1:repeat_test_failure:k"), "{failed:?}");
+    assert!(
+        !out.report.events.iter().any(|e| e.change == "wake.sent"),
+        "{:?}",
+        out.report.events
+    );
+}
+
+#[test]
+fn a_wake_with_no_channel_configured_is_unsent_not_failed() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, false);
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(
+        !out.report.events.iter().any(|e| e.change == "wake.failed"),
+        "{:?}",
+        out.report.events
+    );
+    let unsent: Vec<&str> = out
+        .report
+        .events
+        .iter()
+        .filter(|e| e.change == "wake.unsent")
+        .map(|e| e.id.as_str())
+        .collect();
+    // The live owners' episodes; a dead owner's is never attempted either,
+    // but it is the report's `unsent` list (by owner state), not an event.
+    assert_eq!(
+        unsent,
+        vec!["1:repeat_test_failure:k", "5:repeated_ejection:"]
+    );
+    let raised = out
+        .report
+        .events
+        .iter()
+        .find(|e| e.change == "wake.raised" && e.id == "2:red_while_armed:k")
+        .and_then(|e| e.detail.clone())
+        .unwrap();
+    assert_eq!(raised["owner"], json!("dead"));
+    // Logged once per episode, not every pass.
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(2),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(!out.report.events.iter().any(|e| e.change == "wake.unsent"));
 }
