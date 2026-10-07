@@ -165,10 +165,14 @@ pub struct LedgerEvent {
     pub at: DateTime<Utc>,
     /// Entry id.
     pub id: String,
-    /// `opened` or `addressed:<reason>`.
+    /// `opened`, `addressed:<reason>`, or a hand-back `wake.*` transition.
     pub change: String,
     /// Evidence at the time.
     pub evidence: String,
+    /// Structured fields of a `wake.*` transition (rung, channels, session,
+    /// host, episode), so a report can be computed without parsing prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
 }
 
 /// Fold one scan's flags into the ledger.
@@ -286,6 +290,7 @@ pub fn reconcile(
 
 fn event(at: DateTime<Utc>, id: &str, change: &str, evidence: &str) -> LedgerEvent {
     LedgerEvent {
+        detail: None,
         at,
         id: id.to_owned(),
         change: change.to_owned(),
@@ -373,6 +378,36 @@ pub fn save(path: &Path, ledger: &Ledger) -> Result<(), String> {
     Ok(())
 }
 
+/// The event log beside a ledger.
+#[must_use]
+pub fn events_path(path: &Path) -> std::path::PathBuf {
+    path.with_extension("events.jsonl")
+}
+
+/// Read the event log beside a ledger: the events, and how many lines did
+/// not parse (a torn write, or a line from an incompatible version). A
+/// missing log is empty.
+///
+/// # Errors
+/// When the log exists but cannot be read.
+pub fn read_events(path: &Path) -> Result<(Vec<LedgerEvent>, usize), String> {
+    let log = events_path(path);
+    let text = match std::fs::read_to_string(&log) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(error) => return Err(format!("read {}: {error}", log.display())),
+    };
+    let mut events = Vec::new();
+    let mut skipped = 0;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        match serde_json::from_str(line) {
+            Ok(event) => events.push(event),
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((events, skipped))
+}
+
 /// Append audit events as NDJSON beside the ledger.
 ///
 /// # Errors
@@ -381,7 +416,7 @@ pub fn append_events(path: &Path, events: &[LedgerEvent]) -> Result<(), String> 
     if events.is_empty() {
         return Ok(());
     }
-    let log = path.with_extension("events.jsonl");
+    let log = events_path(path);
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)

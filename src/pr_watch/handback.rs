@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 use self::host::{HostCommand, HostRunner, Invocation, Liveness, RunError, STATUS_KEY_PREFIX};
 use self::owner::{Owner, Route};
 use super::flags::{DigestRoute, FlagKind};
-use super::ledger::{Ledger, LedgerEntry};
+use super::ledger::{Ledger, LedgerEntry, LedgerEvent};
 use super::{RepoHistory, open_at};
 use crate::config::LoadedConfig;
 use crate::gate_cost::SyncGhReader;
@@ -167,6 +167,25 @@ pub struct HandbackState {
     /// Latest owner observation per pull request.
     #[serde(default)]
     pub owners: BTreeMap<u64, OwnerRecord>,
+    /// Open wake episodes by ledger entry id: raised, maybe sent, not yet
+    /// resolved. Each transition is also a `wake.*` ledger event.
+    #[serde(default)]
+    pub wakes: BTreeMap<String, WakeRecord>,
+}
+
+/// One owner-actionable flag episode the hand-back is calling its owner back
+/// for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeRecord {
+    /// Pull request.
+    pub pr: u64,
+    /// The episode's start ([`LedgerEntry::first_seen_at`]).
+    pub episode: DateTime<Utc>,
+    /// When the episode was first seen by a delivering pass.
+    pub raised_at: DateTime<Utc>,
+    /// First successful delivery.
+    #[serde(default)]
+    pub sent_at: Option<DateTime<Utc>>,
 }
 
 /// One delivered episode.
@@ -283,6 +302,20 @@ pub struct HandbackReport {
     pub actions: Vec<HandbackAction>,
     /// Problems that stopped something (label missing, marker malformed).
     pub gaps: Vec<String>,
+    /// `wake.*` transitions of this pass, for the ledger's event log. Empty
+    /// in plan mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<LedgerEvent>,
+}
+
+fn wake_event(at: DateTime<Utc>, id: &str, change: &str, detail: Value) -> LedgerEvent {
+    LedgerEvent {
+        at,
+        id: id.to_owned(),
+        change: change.to_owned(),
+        evidence: String::new(),
+        detail: Some(detail),
+    }
 }
 
 /// This machine's short host name (`hostname -s`), for routing an owner
@@ -565,6 +598,52 @@ pub fn run(
         }
     }
     let actionable_prs: BTreeSet<u64> = by_pr.keys().copied().collect();
+    if deliver {
+        for ids in by_pr.values() {
+            for id in ids {
+                let Some(entry) = ledger.entries.get(id) else {
+                    continue;
+                };
+                if let Some(previous) = state.wakes.get(id) {
+                    if previous.episode == entry.first_seen_at {
+                        continue;
+                    }
+                    // The flag cleared and came back: close the old episode.
+                    report.events.push(wake_event(
+                        now,
+                        id,
+                        "wake.resolved",
+                        json!({
+                            "pr": previous.pr,
+                            "episode": previous.episode,
+                            "how": "new_episode",
+                            "raised_at": previous.raised_at,
+                            "sent_at": previous.sent_at,
+                        }),
+                    ));
+                }
+                state.wakes.insert(
+                    id.clone(),
+                    WakeRecord {
+                        pr: entry.pr,
+                        episode: entry.first_seen_at,
+                        raised_at: now,
+                        sent_at: None,
+                    },
+                );
+                report.events.push(wake_event(
+                    now,
+                    id,
+                    "wake.raised",
+                    json!({
+                        "pr": entry.pr,
+                        "kind": entry.kind.as_str(),
+                        "episode": entry.first_seen_at,
+                    }),
+                ));
+            }
+        }
+    }
 
     // Tier 0.
     if config.label {
@@ -835,6 +914,37 @@ pub fn run(
                 channels.push("inbox".to_owned());
             }
         }
+        let place = match &batch.route {
+            Route::Local => "local".to_owned(),
+            Route::Ssh(alias) => format!("ssh {alias}"),
+        };
+        if deliver {
+            let change = if channels.is_empty() {
+                "wake.failed"
+            } else {
+                "wake.sent"
+            };
+            for (id, entry) in &entries {
+                if !channels.is_empty()
+                    && let Some(wake) = state.wakes.get_mut(*id)
+                {
+                    wake.sent_at.get_or_insert(now);
+                }
+                report.events.push(wake_event(
+                    now,
+                    id,
+                    change,
+                    json!({
+                        "pr": entry.pr,
+                        "episode": entry.first_seen_at,
+                        "rung": "1",
+                        "channels": channels,
+                        "session": session,
+                        "host": place,
+                    }),
+                ));
+            }
+        }
         if deliver && !channels.is_empty() {
             for (id, entry) in &entries {
                 state.delivered.insert(
@@ -892,6 +1002,42 @@ pub fn run(
             }
         }
         report.actions.push(planned);
+    }
+
+    // An episode that is no longer owner-actionable on an open pull request
+    // is resolved: addressed, closed, or pruned from the ledger.
+    if deliver {
+        let open_ids: BTreeSet<&String> = by_pr.values().flatten().collect();
+        let resolved: Vec<String> = state
+            .wakes
+            .keys()
+            .filter(|id| !open_ids.contains(id))
+            .cloned()
+            .collect();
+        for id in resolved {
+            let Some(wake) = state.wakes.remove(&id) else {
+                continue;
+            };
+            let entry = ledger.entries.get(&id);
+            let how = match entry {
+                None => "gone",
+                Some(entry) if entry.addressed_at.is_some() => "addressed",
+                Some(_) if !open(wake.pr) => "closed",
+                Some(_) => "not_actionable",
+            };
+            report.events.push(wake_event(
+                now,
+                &id,
+                "wake.resolved",
+                json!({
+                    "pr": wake.pr,
+                    "episode": wake.episode,
+                    "how": how,
+                    "raised_at": wake.raised_at,
+                    "sent_at": wake.sent_at,
+                }),
+            ));
+        }
     }
 
     // Housekeeping.
