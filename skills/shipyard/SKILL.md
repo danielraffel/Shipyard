@@ -670,6 +670,8 @@ Owners not live for `unowned_after_hours` are marked unowned on the digest line.
 The label comes off when the flags are addressed and also when the PR merges or
 closes; for a terminal PR the DELETE is sent even if the scan's snapshot does not
 show the label yet (the snapshot can predate the add), and a 404 counts as gone.
+A label add re-reads the PR first and is refused if it is no longer open (or its
+state is unreadable), because the scan snapshot can predate a merge.
 A PR whose owner does not resolve (no steward record, no whence marker) gets no
 label; one whose marker is unreadable this pass keeps the label it has.
 `--deliver-handback` sends, and needs `[pr_watch.handback] enabled = true`; the
