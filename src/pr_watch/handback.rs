@@ -190,6 +190,13 @@ pub struct WakeRecord {
     /// Why nothing was attempted for it (`no_channel`), once logged.
     #[serde(default)]
     pub unsent: Option<String>,
+    /// The session and route of that delivery, where its acknowledgement is
+    /// read back.
+    #[serde(default)]
+    pub sent_to: Option<(String, Route)>,
+    /// When the session's hook displayed it inside an agent turn.
+    #[serde(default)]
+    pub seen_at: Option<DateTime<Utc>>,
 }
 
 /// One delivered episode.
@@ -606,6 +613,86 @@ fn still_open(gh: &SyncGhReader<'_>, repo: &str, pr: u64) -> Result<bool, String
     }
 }
 
+/// Record `wake.seen` for every sent, unseen episode whose inbox entry the
+/// owner session's hook has displayed.
+fn acknowledge(
+    state: &mut HandbackState,
+    config: &HandbackConfig,
+    deps: &mut Deps<'_>,
+    report: &mut HandbackReport,
+    now: DateTime<Utc>,
+) {
+    let mut by_session: BTreeMap<String, (Route, Vec<String>)> = BTreeMap::new();
+    for (id, wake) in &state.wakes {
+        if wake.seen_at.is_some() {
+            continue;
+        }
+        if let Some((session, route)) = &wake.sent_to {
+            by_session
+                .entry(session.clone())
+                .or_insert_with(|| (route.clone(), Vec::new()))
+                .1
+                .push(id.clone());
+        }
+    }
+    for (session, (route, ids)) in by_session {
+        let command = HostCommand::ShownRead {
+            session: session.clone(),
+        };
+        let read = match host::invocation(&route, &command, &config.cmux_path, None) {
+            Some(invocation) => deps.runner.run(&invocation).map_err(|e| e.to_string()),
+            None => deps.runner.read_local_shown(&session),
+        };
+        let text = match read {
+            Ok(text) => text,
+            Err(error) => {
+                report.gaps.push(format!(
+                    "session {session}: acknowledgements unreadable: {error}"
+                ));
+                continue;
+            }
+        };
+        let mut shown: BTreeMap<String, Option<DateTime<Utc>>> = BTreeMap::new();
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(id) = value.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let at = value
+                .get("shown_at")
+                .and_then(Value::as_str)
+                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                .map(|time| time.with_timezone(&Utc));
+            shown.entry(id.to_owned()).or_insert(at);
+        }
+        for id in ids {
+            let Some(wake) = state.wakes.get_mut(&id) else {
+                continue;
+            };
+            let key = format!("{id}@{}", wake.episode.format("%Y-%m-%dT%H:%M:%SZ"));
+            let Some(shown_at) = shown.get(&key) else {
+                continue;
+            };
+            // A hook too old to stamp `shown_at` still proves display by now.
+            let at = shown_at.unwrap_or(now);
+            wake.seen_at = Some(at);
+            report.events.push(wake_event(
+                at,
+                &id,
+                "wake.seen",
+                json!({
+                    "pr": wake.pr,
+                    "episode": wake.episode,
+                    "session": session,
+                    "shown_at": shown_at,
+                }),
+            ));
+        }
+    }
+}
+
 fn fetch_whence(gh: &SyncGhReader<'_>, repo: &str, pr: u64) -> Result<Option<Owner>, String> {
     let raw = gh(&["api".to_owned(), format!("repos/{repo}/pulls/{pr}")])?;
     let value: Value = serde_json::from_str(&raw).map_err(|e| format!("pull request JSON: {e}"))?;
@@ -892,6 +979,8 @@ pub fn run(
                         raised_at: now,
                         sent_at: None,
                         unsent: None,
+                        sent_to: None,
+                        seen_at: None,
                     },
                 );
                 report.events.push(wake_event(
@@ -1111,8 +1200,10 @@ pub fn run(
             for (id, entry) in &entries {
                 if !channels.is_empty()
                     && let Some(wake) = state.wakes.get_mut(*id)
+                    && wake.sent_at.is_none()
                 {
-                    wake.sent_at.get_or_insert(now);
+                    wake.sent_at = Some(now);
+                    wake.sent_to = Some((session.clone(), batch.route.clone()));
                 }
                 report.events.push(wake_event(
                     now,
@@ -1186,6 +1277,13 @@ pub fn run(
             }
         }
         report.actions.push(planned);
+    }
+
+    // Acknowledgement: a sent episode is seen once the owner session's hook
+    // has displayed it (moved it to `<session>.shown.jsonl` inside an agent
+    // turn). Read back over the delivery's own route, one read per session.
+    if deliver {
+        acknowledge(&mut state, config, deps, &mut report, now);
     }
 
     // An episode that is no longer owner-actionable on an open pull request

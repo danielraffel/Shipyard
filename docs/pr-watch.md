@@ -229,7 +229,8 @@ whose every channel failed is not recorded and is retried next pass.
 
 **Commands.** The only processes the hand-back can start are
 `cmux sessions list`, `cmux notify`, `cmux set-status`/`clear-status` (key
-`shipyard-pr-<n>`), and one fixed `sh -c` inbox append, run directly or as
+`shipyard-pr-<n>`), one fixed `sh -c` inbox append, and one fixed read-only
+`sh -c` that prints the tail of `<session>.shown.jsonl`, run directly or as
 `ssh -o BatchMode=yes -o ConnectTimeout=10 -- <alias> <single-quoted words>`.
 Every argv passes an allowlist before it runs, and tests assert `cmux send`,
 `send-key`, agent CLIs (`claude --resume`, `codex exec resume`), extra ssh
@@ -241,10 +242,16 @@ or starts an agent, or arms/dequeues a pull request.
 `first_seen_at`, `delivered_at`) appended to
 `~/.local/state/shipyard/inbox/<session-id>.jsonl` (`$SHIPYARD_INBOX_DIR`
 overrides locally). The Shipyard Claude plugin's `hooks/handback-inbox.py` runs
-at SessionStart and UserPromptSubmit: it is silent when the inbox is absent or
-empty; otherwise it claims the file (rename), prints at most five entries
-(2,000 characters, each line 300) as agent context, and moves them to
-`<session-id>.shown.jsonl` so they show once. Codex reads the same hook
+at SessionStart and UserPromptSubmit, and after every tool call through
+`hooks/handback-inbox-poll.sh`, which tests whether the session's inbox is
+non-empty and starts nothing otherwise, so a session working through a long
+turn sees an entry within one tool call. The reader is silent when the inbox is
+absent or empty; otherwise it claims the file (rename), prints at most five
+entries (2,000 characters, each line 300) as agent context, and moves them to
+`<session-id>.shown.jsonl`, stamped `shown_at`, so they show once. That move
+happens inside an agent turn, so it is the acknowledgement: each delivering
+pass reads the shown file back over the delivery's own route and records
+`wake.seen` (at `shown_at`) for every sent episode whose entry is there. Codex reads the same hook
 contract from `~/.codex/hooks.json`; add the script there to cover Codex
 sessions:
 
@@ -281,7 +288,7 @@ transition of an owner-actionable episode to the ledger's event log
 | `wake.raised` | a delivering pass first sees the episode owner-actionable on an open pull request |
 | `wake.sent` | a tier-1 channel accepted it (`rung`, `channels`, `session`, `host`) |
 | `wake.failed` | every tier-1 channel of a delivery failed |
-| `wake.seen` | the owner's session displayed it inside an agent turn |
+| `wake.seen` | the owner's session displayed it inside an agent turn (read back from `<session>.shown.jsonl`) |
 | `wake.escalated` | the next rung fired because the previous one was not seen |
 | `wake.resolved` | it stopped being actionable (`how`: `addressed`, `closed`, `gone`, `new_episode`, `not_actionable`) |
 

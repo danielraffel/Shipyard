@@ -9,7 +9,10 @@
 //! - `cmux set-status shipyard-pr-<n> <v> --workspace <uuid>` and the
 //!   matching `cmux clear-status`;
 //! - one fixed `sh -c` script that appends to
-//!   `~/.local/state/shipyard/inbox/<session>.jsonl` from stdin.
+//!   `~/.local/state/shipyard/inbox/<session>.jsonl` from stdin;
+//! - one fixed `sh -c` script that prints the tail of
+//!   `~/.local/state/shipyard/inbox/<session>.shown.jsonl` (read-only: the
+//!   entries the session's hook displayed, which acknowledge a wake).
 //!
 //! [`check_argv`] is the single gate: the production runner calls it before
 //! every spawn, and tests assert every planned argv passes it and that
@@ -35,6 +38,10 @@ pub const SSH_CONNECT_TIMEOUT: &str = "ConnectTimeout=10";
 /// the entry lines arrive on stdin.
 pub const INBOX_SCRIPT: &str =
     "umask 077; d=\"$HOME/.local/state/shipyard/inbox\"; mkdir -p \"$d\" && cat >> \"$d/$1.jsonl\"";
+
+/// The remote acknowledgement read, verbatim. `$1` is the (validated)
+/// session id; prints the last entries the session's hook displayed.
+pub const SHOWN_SCRIPT: &str = "f=\"$HOME/.local/state/shipyard/inbox/$1.shown.jsonl\"; [ -f \"$f\" ] || exit 0; tail -n 500 \"$f\"";
 
 /// One command on the owner's host.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -75,6 +82,11 @@ pub enum HostCommand {
         /// Session id.
         session: String,
     },
+    /// Print the tail of the session's displayed-entries file.
+    ShownRead {
+        /// Session id.
+        session: String,
+    },
 }
 
 impl HostCommand {
@@ -105,7 +117,7 @@ impl HostCommand {
             Self::ClearStatus { workspace, key } => {
                 own(&["clear-status", key, "--workspace", workspace])
             }
-            Self::InboxAppend { .. } => return None,
+            Self::InboxAppend { .. } | Self::ShownRead { .. } => return None,
         })
     }
 }
@@ -167,8 +179,8 @@ pub fn shell_unquote(line: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
-/// The invocation for `command` on `route`. `None` for a local inbox append,
-/// which is a file write, not a process.
+/// The invocation for `command` on `route`. `None` for a local inbox append
+/// or acknowledgement read, which is a file access, not a process.
 #[must_use]
 pub fn invocation(
     route: &Route,
@@ -179,15 +191,17 @@ pub fn invocation(
     let words: Vec<String> = if let Some(args) = command.cmux_args() {
         std::iter::once(cmux_path.to_owned()).chain(args).collect()
     } else {
-        let HostCommand::InboxAppend { session } = command else {
-            return None;
+        let (script, session) = match command {
+            HostCommand::InboxAppend { session } => (INBOX_SCRIPT, session),
+            HostCommand::ShownRead { session } => (SHOWN_SCRIPT, session),
+            _ => return None,
         };
         match route {
             Route::Local => return None,
             Route::Ssh(_) => vec![
                 "sh".to_owned(),
                 "-c".to_owned(),
-                INBOX_SCRIPT.to_owned(),
+                script.to_owned(),
                 "sh".to_owned(),
                 session.clone(),
             ],
@@ -280,7 +294,9 @@ pub fn check_argv(argv: &[String], cmux_path: &str) -> Result<(), String> {
     let words = shell_unquote(remote)?;
     let w: Vec<&str> = words.iter().map(String::as_str).collect();
     match w.as_slice() {
-        ["sh", "-c", script, "sh", session] if *script == INBOX_SCRIPT => {
+        ["sh", "-c", script, "sh", session]
+            if *script == INBOX_SCRIPT || *script == SHOWN_SCRIPT =>
+        {
             if safe_session_id(session) {
                 Ok(())
             } else {
@@ -410,6 +426,32 @@ pub trait HostRunner {
     /// # Errors
     /// When the file cannot be written.
     fn append_local_inbox(&mut self, session: &str, lines: &str) -> Result<(), String>;
+
+    /// The entries this machine's hook displayed for `session` (the tail of
+    /// `<session>.shown.jsonl`); empty when there are none.
+    ///
+    /// # Errors
+    /// When the file exists but cannot be read.
+    fn read_local_shown(&mut self, session: &str) -> Result<String, String>;
+}
+
+/// The last `limit` lines of `<dir>/<session>.shown.jsonl`; empty when absent.
+///
+/// # Errors
+/// When the session id is unsafe or the file cannot be read.
+pub fn read_shown_file(dir: &Path, session: &str, limit: usize) -> Result<String, String> {
+    if !safe_session_id(session) {
+        return Err("shown session id is not safe".to_owned());
+    }
+    let path = dir.join(format!("{session}.shown.jsonl"));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(limit);
+    Ok(lines[start..].join("\n"))
 }
 
 /// Default local inbox directory: `$SHIPYARD_INBOX_DIR`, else
@@ -520,5 +562,13 @@ impl HostRunner for ProcessHostRunner {
             .clone()
             .ok_or_else(|| "no inbox directory (HOME unset)".to_owned())?;
         append_inbox_file(&dir, session, lines)
+    }
+
+    fn read_local_shown(&mut self, session: &str) -> Result<String, String> {
+        let dir = self
+            .inbox_dir
+            .clone()
+            .ok_or_else(|| "no inbox directory (HOME unset)".to_owned())?;
+        read_shown_file(&dir, session, 500)
     }
 }

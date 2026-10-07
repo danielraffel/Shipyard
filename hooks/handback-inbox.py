@@ -8,6 +8,11 @@ UserPromptSubmit (Claude Code and Codex use the same hook contract): it
 claims the file, prints a short bounded summary as agent context, and moves
 the entries to ``<session-id>.shown.jsonl`` so they are shown once.
 
+Each entry moved to the shown file is stamped `shown_at`; Shipyard reads that
+file back as the wake's acknowledgement (`wake.seen`). PostToolUse runs reach
+this script only through `handback-inbox-poll.sh`, which costs one file test
+per tool call and starts nothing when the inbox is empty.
+
 It is a silent no-op when there is no session id, no inbox, or an empty one,
 and it never fails the agent's turn: any error exits 0 with no output.
 Nothing here writes to GitHub or to the session's input.
@@ -19,6 +24,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_ENTRIES = 5
@@ -72,9 +78,21 @@ def claim(directory: Path, session: str) -> list[str]:
     except OSError:
         return []
     shown = directory / f"{session}.shown.jsonl"
+    # `shown_at` is the acknowledgement Shipyard reads back: the entry reached
+    # this session inside an agent turn.
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with shown.open("a", encoding="utf-8") as handle:
         for line in lines:
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                entry = None
+            if isinstance(entry, dict):
+                entry.setdefault("shown_at", stamp)
+                handle.write(json.dumps(entry) + "\n")
+            else:
                 handle.write(line.rstrip("\n") + "\n")
     claimed.unlink(missing_ok=True)
     return lines

@@ -5,8 +5,8 @@ use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use serde_json::{Value, json};
 
 use super::host::{
-    self, HostCommand, HostRunner, INBOX_SCRIPT, Invocation, Liveness, RunError, check_argv,
-    parse_sessions, shell_quote, shell_unquote,
+    self, HostCommand, HostRunner, INBOX_SCRIPT, Invocation, Liveness, RunError, SHOWN_SCRIPT,
+    check_argv, parse_sessions, shell_quote, shell_unquote,
 };
 use super::owner::{self, Owner, OwnerSource, Route};
 use super::{HandbackConfig, HandbackMode, HandbackReport, NEEDS_AGENT_LABEL, actionable};
@@ -525,6 +525,9 @@ struct FakeRunner {
     runs: Vec<Invocation>,
     local_inbox: Vec<(String, String)>,
     fail_notify: bool,
+    /// What each session's `<session>.shown.jsonl` tail reads as.
+    shown: BTreeMap<String, String>,
+    local_shown_reads: Vec<String>,
 }
 
 impl HostRunner for FakeRunner {
@@ -543,6 +546,15 @@ impl HostRunner for FakeRunner {
         if self.fail_notify && joined.contains("notify") {
             return Err(RunError::Failed("socket".to_owned()));
         }
+        if joined.contains(".shown.jsonl") {
+            let session = self
+                .shown
+                .keys()
+                .find(|session| joined.contains(session.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            return Ok(self.shown.get(&session).cloned().unwrap_or_default());
+        }
         Ok(String::new())
     }
 
@@ -550,6 +562,11 @@ impl HostRunner for FakeRunner {
         self.local_inbox
             .push((session.to_owned(), lines.to_owned()));
         Ok(())
+    }
+
+    fn read_local_shown(&mut self, session: &str) -> Result<String, String> {
+        self.local_shown_reads.push(session.to_owned());
+        Ok(self.shown.get(session).cloned().unwrap_or_default())
     }
 }
 
@@ -773,12 +790,11 @@ fn deliver_notifies_live_owners_once_per_episode() {
             .iter()
             .all(|a| a.action != "notify" && a.action != "inbox")
     );
-    assert!(
-        again
-            .runs
-            .iter()
-            .all(|r| r.argv.join(" ").contains("sessions"))
-    );
+    // Only read-only probes: liveness, and the acknowledgement read-back.
+    assert!(again.runs.iter().all(|r| {
+        let joined = r.argv.join(" ");
+        joined.contains("sessions") || joined.contains(".shown.jsonl")
+    }));
     assert!(again.local_inbox.is_empty());
     assert!(out.writes.is_empty(), "labels re-added {:?}", out.writes);
 }
@@ -1681,4 +1697,170 @@ fn a_wake_with_no_channel_configured_is_unsent_not_failed() {
         true,
     );
     assert!(!out.report.events.iter().any(|e| e.change == "wake.unsent"));
+}
+
+#[test]
+fn a_wake_is_seen_only_when_the_owner_session_displayed_that_episode() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, true);
+    let mut runner = FakeRunner::default();
+    pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let id = "1:repeat_test_failure:k";
+    let episode = ledger.handback.wakes[id].episode;
+    let key = format!("{id}@{}", episode.format("%Y-%m-%dT%H:%M:%SZ"));
+    assert!(ledger.handback.wakes[id].sent_to.is_some());
+
+    // Delivered but not displayed: no `seen`, however much time passes.
+    let mut runner = FakeRunner::default();
+    runner.shown.insert(
+        LIVE_SESSION.to_owned(),
+        // Another episode of the same entry, and another entry: neither counts.
+        format!(
+            "{}\n{}\nnot json\n",
+            json!({"id": format!("{id}@2026-01-01T00:00:00Z"), "shown_at": "2026-10-07T00:10:00Z"}),
+            json!({"id": "2:red_while_armed:k@x", "shown_at": "2026-10-07T00:10:00Z"}),
+        ),
+    );
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(5),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(
+        !out.report.events.iter().any(|e| e.change == "wake.seen"),
+        "{:?}",
+        out.report.events
+    );
+    // The read went over the delivery's route and passed the allowlist.
+    assert!(
+        runner
+            .runs
+            .iter()
+            .any(|r| r.argv[0] == "ssh" && r.argv.last().is_some_and(|w| w.contains("shown.jsonl")))
+    );
+    // PR 5's owner is on this host: read as a file, not a process.
+    assert_eq!(runner.local_shown_reads, vec![LOCAL_SESSION.to_owned()]);
+
+    // Displayed: `seen` at the hook's own time, once.
+    let mut runner = FakeRunner::default();
+    runner.shown.insert(
+        LIVE_SESSION.to_owned(),
+        json!({"id": key, "shown_at": "2026-10-07T02:03:04Z"}).to_string(),
+    );
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(6),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let seen: Vec<_> = out
+        .report
+        .events
+        .iter()
+        .filter(|e| e.change == "wake.seen")
+        .collect();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].id, id);
+    assert_eq!(seen[0].at.to_rfc3339(), "2026-10-07T02:03:04+00:00");
+    assert_eq!(
+        seen[0].detail.as_ref().unwrap()["session"],
+        json!(LIVE_SESSION)
+    );
+    assert!(ledger.handback.wakes[id].seen_at.is_some());
+    let mut runner = FakeRunner::default();
+    runner.shown.insert(
+        LIVE_SESSION.to_owned(),
+        json!({"id": key, "shown_at": "2026-10-07T02:03:04Z"}).to_string(),
+    );
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(7),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(!out.report.events.iter().any(|e| e.change == "wake.seen"));
+}
+
+#[test]
+fn the_acknowledgement_read_is_one_fixed_script_and_nothing_else() {
+    let remote = |script: &str, session: &str| {
+        vec![
+            "ssh".to_owned(),
+            "-o".to_owned(),
+            "BatchMode=yes".to_owned(),
+            "-o".to_owned(),
+            host::SSH_CONNECT_TIMEOUT.to_owned(),
+            "--".to_owned(),
+            "m3".to_owned(),
+            ["sh", "-c", script, "sh", session]
+                .iter()
+                .map(|w| shell_quote(w))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ]
+    };
+    assert!(check_argv(&remote(SHOWN_SCRIPT, LIVE_SESSION), CMUX).is_ok());
+    assert!(check_argv(&remote(SHOWN_SCRIPT, "../../etc/passwd"), CMUX).is_err());
+    assert!(check_argv(&remote("cat ~/.ssh/id_ed25519", LIVE_SESSION), CMUX).is_err());
+    assert!(
+        check_argv(
+            &remote(&SHOWN_SCRIPT.replace("tail -n 500", "cat"), LIVE_SESSION),
+            CMUX
+        )
+        .is_err()
+    );
+    let planned = host::invocation(
+        &Route::Ssh("m3".to_owned()),
+        &HostCommand::ShownRead {
+            session: LIVE_SESSION.to_owned(),
+        },
+        CMUX,
+        None,
+    )
+    .unwrap();
+    assert_eq!(planned.argv, remote(SHOWN_SCRIPT, LIVE_SESSION));
+    assert!(
+        host::invocation(
+            &Route::Local,
+            &HostCommand::ShownRead {
+                session: LIVE_SESSION.to_owned(),
+            },
+            CMUX,
+            None,
+        )
+        .is_none()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        host::read_shown_file(dir.path(), LIVE_SESSION, 2).unwrap(),
+        ""
+    );
+    std::fs::write(
+        dir.path().join(format!("{LIVE_SESSION}.shown.jsonl")),
+        "a\nb\nc\n",
+    )
+    .unwrap();
+    assert_eq!(
+        host::read_shown_file(dir.path(), LIVE_SESSION, 2).unwrap(),
+        "b\nc"
+    );
+    assert!(host::read_shown_file(dir.path(), "../x", 2).is_err());
 }
