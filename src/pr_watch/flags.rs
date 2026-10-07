@@ -572,10 +572,18 @@ fn repeated_ejection(
     at: DateTime<Utc>,
     thresholds: &Thresholds,
 ) -> Option<Flag> {
+    // Only groups built from the current head speak to it: a push replaces
+    // the code an earlier ejection was about.
+    let head_since = pr
+        .heads
+        .iter()
+        .find(|known| known.sha == head)
+        .map(|known| known.first_seen_at);
     let mut named: Vec<&super::GroupRun> = history
         .group_runs
         .iter()
         .filter(|run| run.pr == Some(pr.number))
+        .filter(|run| head_since.is_none_or(|since| run.created_at >= since))
         .collect();
     named.sort_by_key(|run| (run.created_at, run.id));
     let failed: Vec<&super::GroupRun> = named
@@ -587,10 +595,12 @@ fn repeated_ejection(
         return None;
     }
     let last_failure = failed.iter().map(|run| run.settled_at()).max()?;
-    // A later passing group named for the pull request clears it.
-    let passed_since = named
-        .iter()
-        .any(|run| run.gate_passed() && run.created_at > last_failure && run.created_at <= at);
+    // A passing group named for the pull request that finished after the
+    // last failure clears it, even one created before that failure settled.
+    let passed_since = named.iter().any(|run| {
+        let done = run.completed_at.unwrap_or(run.created_at);
+        run.gate_passed() && done > last_failure && done <= at
+    });
     if passed_since {
         return None;
     }

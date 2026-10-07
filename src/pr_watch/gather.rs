@@ -313,6 +313,7 @@ struct ListedRun {
     head_branch: String,
     head_sha: String,
     created_at: DateTime<Utc>,
+    updated_at: Option<DateTime<Utc>>,
     status: String,
     conclusion: Option<String>,
     attempt: u64,
@@ -358,6 +359,7 @@ fn list_runs(
                     head_branch: text(&run, "head_branch").unwrap_or_default(),
                     head_sha: text(&run, "head_sha").unwrap_or_default(),
                     created_at,
+                    updated_at: time(&run, "updated_at"),
                     status: text(&run, "status").unwrap_or_default(),
                     conclusion: text(&run, "conclusion"),
                     attempt: run.get("run_attempt").and_then(Value::as_u64).unwrap_or(1),
@@ -572,6 +574,9 @@ fn read_group_runs(
                 .map(|(_, sha)| sha.to_owned())
                 .filter(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())),
             created_at: run.created_at,
+            completed_at: (run.status == "completed")
+                .then_some(run.updated_at)
+                .flatten(),
             conclusion: run.conclusion.clone(),
             required_jobs: Vec::new(),
             attribution: None,

@@ -106,6 +106,7 @@ fn group(id: u64, pr: u64, at: DateTime<Utc>, failed_jobs: &[&str]) -> GroupRun 
         head_sha: sha(&format!("g{id}")),
         parent_sha: Some(sha("base")),
         created_at: at - Duration::minutes(30),
+        completed_at: None,
         conclusion: Some(
             if failed_jobs.is_empty() {
                 "success"
@@ -407,6 +408,91 @@ fn flag3_needs_two_failed_named_groups_on_a_required_job() {
         ],
     );
     assert!(kinds(&evaluate(&recovered, t(5, 0), &thresholds), 400).is_empty());
+}
+
+#[test]
+fn flag3_counts_only_groups_on_the_current_head() {
+    let thresholds = Thresholds::default();
+    let checks = || vec![check(1, MACOS, "success", t(0, 30), &[])];
+    // Two failures on c1, then a push of c2 at 03:30.
+    let pushed = pr(
+        402,
+        vec![
+            head("c1", t(0, 0), "success", checks()),
+            head("c2", t(3, 30), "success", checks()),
+        ],
+        vec![],
+    );
+    let before = history(
+        vec![pushed.clone()],
+        vec![
+            group(1, 402, t(2, 0), &[MACOS]),
+            group(2, 402, t(3, 0), &[MACOS]),
+        ],
+    );
+    assert!(kinds(&evaluate(&before, t(5, 0), &thresholds), 402).is_empty());
+    // One failure on the new head is still not two.
+    let one_after = history(
+        vec![pushed.clone()],
+        vec![
+            group(1, 402, t(2, 0), &[MACOS]),
+            group(2, 402, t(3, 0), &[MACOS]),
+            group(3, 402, t(5, 0), &[MACOS]),
+        ],
+    );
+    assert!(kinds(&evaluate(&one_after, t(6, 0), &thresholds), 402).is_empty());
+    let two_after = history(
+        vec![pushed],
+        vec![
+            group(1, 402, t(2, 0), &[MACOS]),
+            group(2, 402, t(3, 0), &[MACOS]),
+            group(3, 402, t(5, 0), &[MACOS]),
+            group(4, 402, t(6, 0), &[MACOS]),
+        ],
+    );
+    assert_eq!(
+        kinds(&evaluate(&two_after, t(7, 0), &thresholds), 402),
+        vec![3]
+    );
+}
+
+#[test]
+fn flag3_clears_on_a_passing_group_that_finished_after_the_last_failure() {
+    let thresholds = Thresholds::default();
+    let base = pr(
+        403,
+        vec![head(
+            "c1",
+            t(0, 0),
+            "success",
+            vec![check(1, MACOS, "success", t(0, 30), &[])],
+        )],
+        vec![],
+    );
+    // Created at 02:40, before the second failure settled at 03:00, and
+    // finished green at 03:20, after it.
+    let mut passing = group(3, 403, t(3, 10), &[]);
+    passing.created_at = t(2, 40);
+    passing.completed_at = Some(t(3, 20));
+    let failures = vec![
+        group(1, 403, t(2, 0), &[MACOS]),
+        group(2, 403, t(3, 0), &[MACOS]),
+    ];
+    let mut groups = failures.clone();
+    groups.push(passing.clone());
+    let cleared = history(vec![base.clone()], groups);
+    assert!(kinds(&evaluate(&cleared, t(4, 0), &thresholds), 403).is_empty());
+    // Not yet finished at 03:10: the flag holds until it does.
+    assert_eq!(
+        kinds(&evaluate(&cleared, t(3, 10), &thresholds), 403),
+        vec![3]
+    );
+    // A passing group that finished before the last failure does not clear.
+    passing.completed_at = Some(t(2, 50));
+    let mut groups = failures;
+    groups.push(passing);
+    let early = history(vec![base], groups);
+    assert_eq!(kinds(&evaluate(&early, t(4, 0), &thresholds), 403), vec![3]);
 }
 
 // ---- flag 4 -------------------------------------------------------------------

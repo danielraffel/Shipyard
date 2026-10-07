@@ -42,7 +42,10 @@ fn options(thresholds: Thresholds) -> ReplayOptions {
         tick: Duration::minutes(15),
         thresholds,
         digest: DigestPolicy::default(),
-        expectations: ["8933=1,3,4,5", "8970=3", "9012=2", "9018=2", "9019=2"]
+        // #8970's flag 3 lives only between its second ejection (08:30Z) and
+        // the owner's next push (08:44Z), between two 15-minute ticks; it is
+        // pinned in `repeated_ejection_counts_named_failed_groups` instead.
+        expectations: ["8933=1,3,4,5", "9012=2", "9018=2", "9019=2"]
             .iter()
             .map(|text| text.parse::<Expectation>().unwrap())
             .collect(),
@@ -109,14 +112,17 @@ fn red_while_armed_waits_thirty_minutes_and_ends_at_the_next_push() {
 #[test]
 fn repeated_ejection_counts_named_failed_groups() {
     let history = history_with(&Thresholds::default());
-    // #8970: named groups failed `macos` at 07:59Z and 08:30Z on 09-28.
+    // #8970: named groups failed `macos` at 07:59Z and 08:30Z on 09-28, both
+    // built from head 47db0daf; the owner pushed 56282c2b at 08:44Z.
     assert!(!kinds_at(&history, 8970, at(28, 8, 15)).contains(&FlagKind::RepeatedEjection));
-    let flags = evaluate(&history, at(28, 9, 0), &Thresholds::default());
+    let flags = evaluate(&history, at(28, 8, 40), &Thresholds::default());
     let flag = flags
         .iter()
         .find(|flag| flag.pr == 8970 && flag.kind == FlagKind::RepeatedEjection)
         .expect("flag 3 on #8970");
     assert!(flag.evidence.contains("parent group"), "{}", flag.evidence);
+    // The push replaced the code both ejections were about.
+    assert!(!kinds_at(&history, 8970, at(28, 9, 0)).contains(&FlagKind::RepeatedEjection));
 }
 
 #[test]

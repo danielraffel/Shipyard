@@ -201,6 +201,9 @@ pub struct GroupRun {
     pub parent_sha: Option<String>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
+    /// When the run completed (its last update once completed), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
     /// Run conclusion.
     pub conclusion: Option<String>,
     /// Required jobs of the run. Read only for runs that did not succeed.
