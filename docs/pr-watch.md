@@ -185,14 +185,16 @@ are not.
 
 | tier | when | what |
 |---|---|---|
-| 0 | an owner-actionable flag holds | the sticky comment, plus the `shipyard:needs-agent` label when an owner resolves (no owner: comment and digest only; an unreadable marker leaves the label as it is); the label is removed when every such flag is addressed, and ours also comes off a flagged pull request whose owner no longer resolves |
+| 0 | an owner-actionable flag holds | the sticky comment, plus the `shipyard:needs-agent` label when an owner resolves (no owner: comment and digest only; an unreadable marker leaves the label as it is); the label is removed when every such flag is addressed or the pull request merges or closes, and ours also comes off a flagged pull request whose owner no longer resolves |
 | 1 | the owner's session is live | `cmux notify --surface <uuid>` (and, with `status = true`, a `shipyard-pr-<n>` sidebar pill, cleared later) plus an inbox line on the owner's host |
 | 2 | the owner is dead, unknown, or unreachable for `unowned_after_hours` | the pull request's digest line carries `owner.unowned = true` with the `whence` resume hint |
 
 **Label.** Only added or removed, never defined: if the repository has no
 `shipyard:needs-agent` label the pass reports it and adds nothing (GitHub would
 otherwise create it on add). A label the pass did not add is never removed, and
-one a person removed is not put back during the same episode.
+one a person removed is not put back during the same episode. A merged, closed,
+or no-longer-observed pull request has ours deleted even when its snapshot does
+not show it yet (a 404 means it is already gone), unless a person removed it.
 
 **Owner.** The merge steward's exact-head handoff record (on this machine's
 state directory) wins; otherwise the `<!-- whence {...} -->` marker in the pull
