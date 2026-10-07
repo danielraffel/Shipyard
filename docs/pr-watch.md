@@ -185,7 +185,7 @@ are not.
 
 | tier | when | what |
 |---|---|---|
-| 0 | an owner-actionable flag holds | the sticky comment, plus the `shipyard:needs-agent` label when an owner resolves (no owner: comment and digest only; an unreadable marker leaves the label as it is); the label is removed when every such flag is addressed |
+| 0 | an owner-actionable flag holds | the sticky comment, plus the `shipyard:needs-agent` label when an owner resolves (no owner: comment and digest only; an unreadable marker leaves the label as it is); the label is removed when every such flag is addressed, and ours also comes off a flagged pull request whose owner no longer resolves |
 | 1 | the owner's session is live | `cmux notify --surface <uuid>` (and, with `status = true`, a `shipyard-pr-<n>` sidebar pill, cleared later) plus an inbox line on the owner's host |
 | 2 | the owner is dead, unknown, or unreachable for `unowned_after_hours` | the pull request's digest line carries `owner.unowned = true` with the `whence` resume hint |
 
