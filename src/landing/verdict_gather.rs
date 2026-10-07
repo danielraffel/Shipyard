@@ -118,7 +118,6 @@ fn check_fact(value: &Value) -> Option<CheckFact> {
         started_at: time(value, "started_at"),
         completed_at: time(value, "completed_at"),
         signatures: Vec::new(),
-        runner_name: None,
     })
 }
 

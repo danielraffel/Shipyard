@@ -37,7 +37,6 @@ fn check(id: u64, name: &str, conclusion: &str, done: DateTime<Utc>, sigs: &[&st
         started_at: Some(done - Duration::minutes(20)),
         completed_at: Some(done),
         signatures: sigs.iter().map(|s| (*s).to_owned()).collect(),
-        runner_name: None,
     }
 }
 
@@ -409,42 +408,6 @@ fn flag3_needs_two_failed_named_groups_on_a_required_job() {
         ],
     );
     assert!(kinds(&evaluate(&recovered, t(5, 0), &thresholds), 400).is_empty());
-}
-
-#[test]
-fn flag3_ignores_ejections_whose_required_job_never_ran() {
-    let thresholds = Thresholds::default();
-    let base = pr(
-        401,
-        vec![head(
-            "c1",
-            t(0, 0),
-            "success",
-            vec![check(1, MACOS, "success", t(0, 30), &[])],
-        )],
-        vec![],
-    );
-    // The required job went red because its dependency was cancelled for
-    // want of a runner: it never got one, so no test ran.
-    let starved = |id: u64, at: DateTime<Utc>| {
-        let mut run = group(id, 401, at, &[MACOS]);
-        run.required_jobs[0].runner_name = Some(String::new());
-        run.required_jobs[0].started_at = None;
-        run
-    };
-    let infra = history(
-        vec![base.clone()],
-        vec![starved(1, t(2, 0)), starved(2, t(3, 0))],
-    );
-    assert!(kinds(&evaluate(&infra, t(5, 0), &thresholds), 401).is_empty());
-    // The same groups, with the job on a runner, still count.
-    let ran = |id: u64, at: DateTime<Utc>| {
-        let mut run = group(id, 401, at, &[MACOS]);
-        run.required_jobs[0].runner_name = Some("pulp-gate-m3-1".to_owned());
-        run
-    };
-    let real = history(vec![base], vec![ran(1, t(2, 0)), ran(2, t(3, 0))]);
-    assert_eq!(kinds(&evaluate(&real, t(5, 0), &thresholds), 401), vec![3]);
 }
 
 #[test]

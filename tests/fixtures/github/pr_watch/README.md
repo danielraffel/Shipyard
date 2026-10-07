@@ -12,7 +12,9 @@ were kept, and inside each answer only the items and fields the gatherer
 reads.
 
 - #8933: repeat test failure, repeated ejection, rebase treadmill, split.
-- #8970: two failed merge groups named for it (and a failed_checks ejection).
+- #8970: two failed merge groups named for it (and a failed_checks ejection),
+  both built from head 47db0daf; the owner pushed 56282c2b at 08:44Z, so flag 3
+  holds only from 08:30Z (second failure settled) to 08:44Z.
 - #9012, #9018, #9019: armed, out of the queue, `macos` red for over 30 min.
 - #9026, #9035: merged cleanly (the control: no flag may be raised).
 

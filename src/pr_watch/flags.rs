@@ -589,7 +589,7 @@ fn repeated_ejection(
     let failed: Vec<&super::GroupRun> = named
         .iter()
         .copied()
-        .filter(|run| group_ran_and_failed(history, run) && run.settled_at() <= at)
+        .filter(|run| group_failed(history, run) && run.settled_at() <= at)
         .collect();
     if failed.len() < thresholds.failed_groups {
         return None;
@@ -673,16 +673,6 @@ fn group_failed(history: &RepoHistory, run: &super::GroupRun) -> bool {
     run.required_jobs
         .iter()
         .any(|job| job.failed() && history.required_checks.contains(&job.name))
-}
-
-/// Whether a merge group failed a required job that actually ran. A required
-/// job that never got a runner (its dependency was cancelled for want of
-/// one) went red without running any test, which is infrastructure, not
-/// something the named pull request's owner can act on.
-fn group_ran_and_failed(history: &RepoHistory, run: &super::GroupRun) -> bool {
-    run.required_jobs
-        .iter()
-        .any(|job| job.failed() && !job.never_ran() && history.required_checks.contains(&job.name))
 }
 
 fn parent_status(history: &RepoHistory, run: &super::GroupRun) -> String {

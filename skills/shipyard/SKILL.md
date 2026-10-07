@@ -659,9 +659,8 @@ daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
 `enabled` stays off with a warning in the `pr_watch_pass` event). See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
-`repeated_ejection` counts only merge groups created since the PR's current head,
-ignores a failed required job that never got a runner (runner starvation), and
-clears on any passing named group that finishes after the last failure.
+`repeated_ejection` counts only merge groups created since the PR's current head
+and clears on any passing named group that finishes after the last failure.
 
 `shipyard pr-watch scan --handback` plans the hand-back (dry run): for a PR
 with an owner-actionable flag it resolves the owner (steward handoff record,
