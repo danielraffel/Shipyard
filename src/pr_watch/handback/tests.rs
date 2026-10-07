@@ -1154,6 +1154,9 @@ fn a_label_is_not_posted_on_a_pull_request_that_merged_after_the_snapshot() {
     let (mut ledger, history) = world(t(0));
     let cfg = config(false, false);
     let gh = fake_gh(true);
+    // Owners are resolved before tier 0, so PR 5's first read (its whence
+    // marker) succeeds and only the open-state re-read before the add fails.
+    let pr5_reads = std::sync::atomic::AtomicUsize::new(0);
     let reader = |argv: &[String]| {
         if argv.last().map(String::as_str) == Some("repos/o/r/pulls/1") {
             let open = gh(argv)?;
@@ -1162,7 +1165,9 @@ fn a_label_is_not_posted_on_a_pull_request_that_merged_after_the_snapshot() {
             value["merged_at"] = json!("2026-10-06T12:00:18Z");
             return Ok(value.to_string());
         }
-        if argv.last().map(String::as_str) == Some("repos/o/r/pulls/5") {
+        if argv.last().map(String::as_str) == Some("repos/o/r/pulls/5")
+            && pr5_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+        {
             return Err("gh: HTTP 502".to_owned());
         }
         gh(argv)
@@ -1197,13 +1202,8 @@ fn a_label_is_not_posted_on_a_pull_request_that_merged_after_the_snapshot() {
         .map(|argv| argv[3].clone())
         .collect();
     // PR 1 merged: refused. PR 5's state is unreadable: not posted blind.
-    assert_eq!(
-        posted,
-        vec![
-            "repos/o/r/issues/2/labels".to_owned(),
-            "repos/o/r/issues/6/labels".to_owned(),
-        ]
-    );
+    // PR 6 has no owner, so it is never a label candidate.
+    assert_eq!(posted, vec!["repos/o/r/issues/2/labels".to_owned()]);
     let refused = |pr: u64| {
         report
             .actions
@@ -1216,7 +1216,7 @@ fn a_label_is_not_posted_on_a_pull_request_that_merged_after_the_snapshot() {
     assert!(refused(5).contains("unreadable"), "{}", refused(5));
     assert_eq!(
         ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
-        vec![2, 6]
+        vec![2]
     );
 }
 
