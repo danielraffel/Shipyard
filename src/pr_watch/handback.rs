@@ -4,7 +4,8 @@
 //!
 //! - **Tier 0**: the sticky comment (see [`super::comment`]) plus the
 //!   [`NEEDS_AGENT_LABEL`] label on a pull request with an *owner-actionable*
-//!   flag ([`actionable`]), removed when every such flag is addressed. The
+//!   flag ([`actionable`]), removed when every such flag is addressed or the
+//!   pull request merges or closes. The
 //!   label is only ever added or removed, never defined: when the repository
 //!   lacks it, the pass reports that and adds nothing. A label someone else
 //!   put on (or took off) is never touched.
@@ -467,27 +468,30 @@ fn plan_labels(
             )),
         }
     }
-    for (&pr, _) in state
+    for (&pr, record) in state
         .labels
         .iter()
         .filter(|(pr, _)| !actionable_prs.contains(pr))
     {
-        let open = history
-            .prs
-            .get(&pr)
-            .is_some_and(|entry| entry.closed_at.is_none() && entry.merged_at.is_none());
         let mut remove = action(
             0,
             "remove_label",
             vec![pr],
             format!("remove {NEEDS_AGENT_LABEL}"),
         );
-        if open && has_label(pr) {
+        // A merged, closed, or unobserved pull request keeps a label nobody
+        // will act on, and its snapshot can predate our own add, so ours is
+        // deleted there whatever the snapshot shows (a 404 means it is gone).
+        // A label a person took off stays off.
+        let terminal = history
+            .prs
+            .get(&pr)
+            .is_none_or(|entry| entry.closed_at.is_some() || entry.merged_at.is_some());
+        if has_label(pr) || (terminal && !record.removed_by_other) {
             remove.argv = Some(label_remove_argv(&history.repo, pr));
             out.push((remove, false));
         } else {
-            // Gone already, or the pull request closed: just forget it.
-            "forget (label already absent or pull request closed)".clone_into(&mut remove.summary);
+            "forget (label already absent)".clone_into(&mut remove.summary);
             out.push((remove, false));
         }
     }

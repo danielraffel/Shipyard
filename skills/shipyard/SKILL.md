@@ -667,6 +667,9 @@ else the PR body's `whence` marker), probes the session read-only with
 to `~/.local/state/shipyard/inbox/<session>.jsonl` on the owner's host (the
 plugin's SessionStart/UserPromptSubmit hook shows that inbox to the agent once).
 Owners not live for `unowned_after_hours` are marked unowned on the digest line.
+The label comes off when the flags are addressed and also when the PR merges or
+closes; for a terminal PR the DELETE is sent even if the scan's snapshot does not
+show the label yet (the snapshot can predate the add), and a 404 counts as gone.
 Every delivering pass logs `wake.raised`/`sent`/`failed`/`resolved` events (with
 rung, channels, session, host) to the ledger's `events.jsonl`;
 `shipyard pr-watch wakes --since 24h` reports seen rate, p50/p90 latencies, and
