@@ -1465,3 +1465,220 @@ fn the_label_sweep_touches_only_closed_pull_requests_carrying_the_label() {
             .is_some_and(|e| e.contains("502"))
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // One lifecycle, read top to bottom.
+fn wake_events_record_raise_send_failure_and_resolution_and_plan_records_none() {
+    let changes = |events: &[crate::pr_watch::ledger::LedgerEvent]| -> Vec<String> {
+        events
+            .iter()
+            .map(|e| format!("{} {}", e.change, e.id))
+            .collect()
+    };
+    // Plan mode: no events, no wake state.
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(true, true);
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Plan,
+        &mut runner,
+        true,
+    );
+    assert!(out.report.events.is_empty());
+    assert!(ledger.handback.wakes.is_empty());
+
+    // Deliver: every owner-actionable open episode is raised; live owners'
+    // episodes (1 on m3, 5 local) are sent with their session and route.
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let got = changes(&out.report.events);
+    for id in [
+        "1:repeat_test_failure:k",
+        "2:red_while_armed:k",
+        "5:repeated_ejection:",
+        "6:red_while_armed:k",
+    ] {
+        assert!(got.contains(&format!("wake.raised {id}")), "{got:?}");
+    }
+    assert!(
+        got.contains(&"wake.sent 1:repeat_test_failure:k".to_owned()),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&"wake.sent 5:repeated_ejection:".to_owned()),
+        "{got:?}"
+    );
+    // Not actionable (shared failure, neighbour ejection, treadmill): never raised.
+    assert!(
+        !got.iter().any(|c| c.contains(" 3:") || c.contains(" 4:")),
+        "{got:?}"
+    );
+    let sent = out
+        .report
+        .events
+        .iter()
+        .find(|e| e.change == "wake.sent" && e.id == "1:repeat_test_failure:k")
+        .and_then(|e| e.detail.clone())
+        .unwrap();
+    assert_eq!(sent["session"], json!(LIVE_SESSION));
+    assert_eq!(sent["host"], json!("ssh m3"));
+    assert_eq!(sent["rung"], json!("1"));
+    assert!(
+        ledger.handback.wakes["1:repeat_test_failure:k"]
+            .sent_at
+            .is_some()
+    );
+    assert!(
+        ledger.handback.wakes["2:red_while_armed:k"]
+            .sent_at
+            .is_none()
+    );
+
+    // An unchanged episode is not raised again.
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(2),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(
+        !changes(&out.report.events)
+            .iter()
+            .any(|c| c.starts_with("wake.raised")),
+        "{:?}",
+        out.report.events
+    );
+
+    // Addressed: resolved, with how; the record is gone.
+    ledger
+        .entries
+        .get_mut("1:repeat_test_failure:k")
+        .unwrap()
+        .addressed_at = Some(t(3));
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(3),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let resolved = out
+        .report
+        .events
+        .iter()
+        .find(|e| e.change == "wake.resolved")
+        .unwrap();
+    assert_eq!(resolved.id, "1:repeat_test_failure:k");
+    assert_eq!(resolved.detail.as_ref().unwrap()["how"], json!("addressed"));
+    assert!(
+        !ledger
+            .handback
+            .wakes
+            .contains_key("1:repeat_test_failure:k")
+    );
+}
+
+#[test]
+fn a_delivery_whose_every_channel_failed_is_a_wake_failure() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(true, false);
+    let mut runner = FakeRunner {
+        fail_notify: true,
+        ..FakeRunner::default()
+    };
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let failed: Vec<&str> = out
+        .report
+        .events
+        .iter()
+        .filter(|e| e.change == "wake.failed")
+        .map(|e| e.id.as_str())
+        .collect();
+    assert!(failed.contains(&"1:repeat_test_failure:k"), "{failed:?}");
+    assert!(
+        !out.report.events.iter().any(|e| e.change == "wake.sent"),
+        "{:?}",
+        out.report.events
+    );
+}
+
+#[test]
+fn a_wake_with_no_channel_configured_is_unsent_not_failed() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, false);
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(
+        !out.report.events.iter().any(|e| e.change == "wake.failed"),
+        "{:?}",
+        out.report.events
+    );
+    let unsent: Vec<&str> = out
+        .report
+        .events
+        .iter()
+        .filter(|e| e.change == "wake.unsent")
+        .map(|e| e.id.as_str())
+        .collect();
+    // The live owners' episodes; a dead owner's is never attempted either,
+    // but it is the report's `unsent` list (by owner state), not an event.
+    assert_eq!(
+        unsent,
+        vec!["1:repeat_test_failure:k", "5:repeated_ejection:"]
+    );
+    let raised = out
+        .report
+        .events
+        .iter()
+        .find(|e| e.change == "wake.raised" && e.id == "2:red_while_armed:k")
+        .and_then(|e| e.detail.clone())
+        .unwrap();
+    assert_eq!(raised["owner"], json!("dead"));
+    // Logged once per episode, not every pass.
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(2),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(!out.report.events.iter().any(|e| e.change == "wake.unsent"));
+}

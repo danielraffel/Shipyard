@@ -75,6 +75,7 @@ shipyard pr-watch scan --repo Generous-Corp/pulp  # read-only flags for stuck op
 shipyard pr-watch replay --repo Generous-Corp/pulp --since 7d --expect 8933=1,3 --control merged-clean  # offline simulation
 shipyard pr-watch scan --repo Generous-Corp/pulp --handback  # plan the hand-back to owning sessions (dry run; --deliver-handback sends)
 shipyard pr-watch sweep-labels --repo Generous-Corp/pulp  # list closed/merged PRs still carrying shipyard:needs-agent (--apply removes it)
+shipyard pr-watch wakes --repo Generous-Corp/pulp --since 24h  # hand-back wake events: sent vs seen, latencies, unanswered calls
 shipyard watch                 # live-tail an in-flight ship
 shipyard watch local --target linux-vm --command '<cmd>' --milestone-regex '<re>' --terminal-regex '<re>'
 shipyard queue                 # show all jobs with priorities

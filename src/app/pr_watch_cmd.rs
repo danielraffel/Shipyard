@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 
 use crate::app::cli::{
     PrWatchCommand, PrWatchControl, PrWatchDigestArgs, PrWatchReplayArgs, PrWatchScanArgs,
-    PrWatchSweepLabelsArgs,
+    PrWatchSweepLabelsArgs, PrWatchWakesArgs,
 };
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::cloud::GitHubActions;
@@ -25,7 +25,7 @@ use crate::pr_watch::replay::{Expectation, ReplayOptions, ReplayReport, replay};
 use crate::pr_watch::scan::{
     AttributorCommand, ScanReport, ScanRequest, WatchConfig, run_digest_command, scan,
 };
-use crate::pr_watch::{WatchQuery, gather, ledger};
+use crate::pr_watch::{WatchQuery, gather, ledger, wakes};
 
 /// Per-request bound. Observation must never strand the invoking agent.
 const GITHUB_READ_TIMEOUT: StdDuration = StdDuration::from_secs(120);
@@ -54,6 +54,9 @@ pub(super) fn pr_watch_command<W: Write>(
             digest_command(args, &watch, cwd, runtime_paths, json, stdout)
         }
         PrWatchCommand::SweepLabels(args) => sweep_labels_command(args, config, cwd, json, stdout),
+        PrWatchCommand::Wakes(args) => {
+            wakes_command(args, &watch, cwd, runtime_paths, json, stdout)
+        }
     }
 }
 
@@ -122,6 +125,120 @@ fn sweep_labels_command<W: Write>(
     } else {
         ExitCode::from(1)
     })
+}
+
+fn wakes_command<W: Write>(
+    args: PrWatchWakesArgs,
+    watch: &WatchConfig,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let repo = super::runner_cmd::resolve_repo_slug(args.repo, cwd)?;
+    let base = args.base.unwrap_or_else(|| watch.base.clone());
+    let state_path = args
+        .state_file
+        .unwrap_or_else(|| ledger::default_path(&runtime_paths.state_dir, &repo, &base));
+    let window = crate::pr_watch::parse_duration(&args.since)
+        .map_err(|error| CliFailure::new(WAIT_EXIT_INVALID, format!("--since: {error}")))?;
+    let unseen_after = crate::pr_watch::parse_duration(&args.unseen_after)
+        .map_err(|error| CliFailure::new(WAIT_EXIT_INVALID, format!("--unseen-after: {error}")))?;
+    let (events, skipped) = ledger::read_events(&state_path).map_err(io_failure)?;
+    let now = Utc::now();
+    let mut summary = wakes::summarize(&events, now - window, now, unseen_after);
+    summary.skipped_lines = skipped;
+    if json {
+        write_pretty_json(
+            stdout,
+            &serde_json::json!({"repo": repo, "base": base, "summary": summary}),
+        )
+        .map_err(io_failure)?;
+    } else {
+        write!(stdout, "{}", render_wakes(&repo, &args.since, &summary)).map_err(io_failure)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn render_latency(latency: &wakes::Latency) -> String {
+    match (latency.p50_minutes, latency.p90_minutes) {
+        (Some(p50), Some(p90)) => format!("p50 {p50:.1}m, p90 {p90:.1}m (n={})", latency.count),
+        _ => "n=0".to_owned(),
+    }
+}
+
+fn render_wakes(repo: &str, since: &str, summary: &wakes::WakeSummary) -> String {
+    let mut out = String::new();
+    let rate = summary
+        .seen_rate
+        .map_or_else(|| "-".to_owned(), |rate| format!("{:.0}%", rate * 100.0));
+    let _ = writeln!(
+        out,
+        "wakes {repo} (last {since}): raised {}, sent {}, seen {} ({rate}), open {}, failed {}, escalated {}",
+        summary.raised, summary.sent, summary.seen, summary.open, summary.failed, summary.escalated
+    );
+    let _ = writeln!(
+        out,
+        "  raised -> sent:     {}",
+        render_latency(&summary.time_to_send)
+    );
+    let _ = writeln!(
+        out,
+        "  sent -> seen:       {}",
+        render_latency(&summary.time_to_seen)
+    );
+    let _ = writeln!(
+        out,
+        "  raised -> resolved: {}",
+        render_latency(&summary.time_to_resolve)
+    );
+    if !summary.resolved.is_empty() {
+        let parts: Vec<String> = summary
+            .resolved
+            .iter()
+            .map(|(how, count)| format!("{how} {count}"))
+            .collect();
+        let _ = writeln!(out, "  resolved: {}", parts.join(", "));
+    }
+    for episode in &summary.unseen {
+        let _ = writeln!(
+            out,
+            "  UNSEEN #{} {} sent {} to {}",
+            episode.pr,
+            episode.id,
+            episode
+                .sent_at
+                .map(|at| at.format("%m-%d %H:%MZ").to_string())
+                .unwrap_or_default(),
+            episode.session.as_deref().unwrap_or("?")
+        );
+    }
+    for episode in &summary.unsent {
+        let _ = writeln!(
+            out,
+            "  UNSENT #{} {} raised {} owner {}{}",
+            episode.pr,
+            episode.id,
+            episode
+                .raised_at
+                .map(|at| at.format("%m-%d %H:%MZ").to_string())
+                .unwrap_or_default(),
+            episode.owner.as_deref().unwrap_or("?"),
+            episode
+                .unsent_reason
+                .as_deref()
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default()
+        );
+    }
+    if summary.skipped_lines > 0 {
+        let _ = writeln!(
+            out,
+            "  ({} unparseable event line(s) skipped)",
+            summary.skipped_lines
+        );
+    }
+    out
 }
 
 fn io_failure(error: impl std::fmt::Display) -> CliFailure {

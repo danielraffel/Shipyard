@@ -510,6 +510,9 @@ pub fn scan(
         )),
         _ => None,
     };
+    if let Some(report) = &handback_report {
+        ledger::append_events(&request.state_path, &report.events)?;
+    }
     ledger::save(&request.state_path, &ledger)?;
     let mut persist = |ledger: &ledger::Ledger| ledger::save(&request.state_path, ledger);
     let (digest, digest_payload) = digest::run(

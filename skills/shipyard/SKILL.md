@@ -677,6 +677,10 @@ label (plan by default); `--apply` removes it from those only, never from open P
 or issues, and does not check who added it, so read the plan before applying.
 A PR whose owner does not resolve (no steward record, no whence marker) gets no
 label; one whose marker is unreadable this pass keeps the label it has.
+Every delivering pass logs `wake.raised`/`sent`/`failed`/`resolved` events (with
+rung, channels, session, host) to the ledger's `events.jsonl`;
+`shipyard pr-watch wakes --since 24h` reports seen rate, p50/p90 latencies, and
+open episodes sent but never seen. `sent` is not receipt; only `seen` is.
 `--deliver-handback` sends, and needs `[pr_watch.handback] enabled = true`; the
 daemon delivers when that is on. It never types into a session (no
 `cmux send`), never resumes or starts an agent, and never arms or dequeues.

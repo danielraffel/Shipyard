@@ -50,6 +50,7 @@ pub mod handback;
 pub mod ledger;
 pub mod replay;
 pub mod scan;
+pub mod wakes;
 
 pub use flags::{
     DigestRoute, Flag, FlagKind, RepeatFinding, Thresholds, evaluate, repeat_findings,

@@ -270,6 +270,28 @@ m3 = "m3"
 Daniels-Mac-Studio-m3 = "m3"
 ```
 
+**Measuring it.** A delivering pass appends a `wake.*` event for every
+transition of an owner-actionable episode to the ledger's event log
+(`<ledger>.events.jsonl`, beside `opened`/`addressed:*`), with a structured
+`detail` (`pr`, `episode`, and per kind `rung`, `channels`, `session`, `host`,
+`how`):
+
+| event | when |
+|---|---|
+| `wake.raised` | a delivering pass first sees the episode owner-actionable on an open pull request |
+| `wake.sent` | a tier-1 channel accepted it (`rung`, `channels`, `session`, `host`) |
+| `wake.failed` | every tier-1 channel of a delivery failed |
+| `wake.seen` | the owner's session displayed it inside an agent turn |
+| `wake.escalated` | the next rung fired because the previous one was not seen |
+| `wake.resolved` | it stopped being actionable (`how`: `addressed`, `closed`, `gone`, `new_episode`, `not_actionable`) |
+
+Delivery is not receipt: `sent` is a channel's result, `seen` is the agent's.
+Plan mode writes no events. `shipyard pr-watch wakes [--since 24h]
+[--unseen-after 30m] [--json]` reports raised, sent, seen (and the seen rate),
+open, failed, escalated, resolved by how, p50/p90 of raised-to-sent,
+sent-to-seen and raised-to-resolved, and every open episode sent longer ago
+than `--unseen-after` and not seen: the calls nobody answered.
+
 ## Daemon job and config
 
 The daemon runs one pass every 15 minutes, the first one interval after start.
