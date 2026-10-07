@@ -672,6 +672,9 @@ closes; for a terminal PR the DELETE is sent even if the scan's snapshot does no
 show the label yet (the snapshot can predate the add), and a 404 counts as gone.
 A label add re-reads the PR first and is refused if it is no longer open (or its
 state is unreadable), because the scan snapshot can predate a merge.
+`shipyard pr-watch sweep-labels` lists closed/merged PRs still carrying the
+label (plan by default); `--apply` removes it from those only, never from open PRs
+or issues, and does not check who added it, so read the plan before applying.
 `--deliver-handback` sends, and needs `[pr_watch.handback] enabled = true`; the
 daemon delivers when that is on. It never types into a session (no
 `cmux send`), never resumes or starts an agent, and never arms or dequeues.
