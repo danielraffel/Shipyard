@@ -194,7 +194,9 @@ are not.
 otherwise create it on add). A label the pass did not add is never removed, and
 one a person removed is not put back during the same episode. A merged, closed,
 or no-longer-observed pull request has ours deleted even when its snapshot does
-not show it yet (a 404 means it is already gone), unless a person removed it.
+not show it yet (a 404 means it is already gone), unless a person removed it. Before each add
+the pass re-reads the pull request and adds nothing if it is no longer open, or
+if its state cannot be read: the scan's snapshot can be minutes old.
 
 **Owner.** The merge steward's exact-head handoff record (on this machine's
 state directory) wins; otherwise the `<!-- whence {...} -->` marker in the pull
