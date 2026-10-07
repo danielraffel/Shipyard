@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 
 use crate::app::cli::{
     PrWatchCommand, PrWatchControl, PrWatchDigestArgs, PrWatchReplayArgs, PrWatchScanArgs,
+    PrWatchSweepLabelsArgs,
 };
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::cloud::GitHubActions;
@@ -52,7 +53,75 @@ pub(super) fn pr_watch_command<W: Write>(
         PrWatchCommand::Digest(args) => {
             digest_command(args, &watch, cwd, runtime_paths, json, stdout)
         }
+        PrWatchCommand::SweepLabels(args) => sweep_labels_command(args, config, cwd, json, stdout),
     }
+}
+
+fn sweep_labels_command<W: Write>(
+    args: PrWatchSweepLabelsArgs,
+    config: &LoadedConfig,
+    cwd: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let explicit = args.repo.is_some();
+    let repo = super::runner_cmd::resolve_repo_slug(args.repo, cwd)?;
+    let actions = actions_for(cwd, config, &repo, explicit);
+    let repo_binding = repo.clone();
+    let gh = |argv: &[String]| {
+        actions
+            .run_gh_with_timeout_env(
+                argv,
+                GITHUB_READ_TIMEOUT,
+                &[("GH_REPO", repo_binding.as_str())],
+            )
+            .map_err(|error| error.to_string())
+    };
+    let write: Option<handback::GhWriter<'_>> = if args.apply { Some(&gh) } else { None };
+    let found = handback::sweep_labels(&repo, &gh, write)
+        .map_err(|error| CliFailure::new(1, format!("pr-watch sweep-labels failed: {error}")))?;
+    let failed = found.iter().filter(|stale| stale.error.is_some()).count();
+    if json {
+        write_pretty_json(
+            stdout,
+            &serde_json::json!({"repo": repo, "apply": args.apply, "stale": found}),
+        )
+        .map_err(io_failure)?;
+    } else {
+        let verb = if args.apply {
+            "not removed"
+        } else {
+            "would remove"
+        };
+        let _ = writeln!(
+            stdout,
+            "{} {}: {} closed or merged pull request(s) carry {}",
+            if args.apply { "sweep" } else { "sweep (plan)" },
+            repo,
+            found.len(),
+            handback::NEEDS_AGENT_LABEL
+        );
+        for stale in &found {
+            let outcome = match (&stale.error, stale.removed) {
+                (Some(error), _) => format!("FAILED: {error}"),
+                (None, true) => "removed".to_owned(),
+                (None, false) => verb.to_owned(),
+            };
+            let _ = writeln!(
+                stdout,
+                "  #{} {} {} {}",
+                stale.pr,
+                stale.state,
+                stale.closed_at.as_deref().unwrap_or("-"),
+                outcome
+            );
+        }
+    }
+    Ok(if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 fn io_failure(error: impl std::fmt::Display) -> CliFailure {

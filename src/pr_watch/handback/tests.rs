@@ -1140,3 +1140,78 @@ fn a_plan_shows_channels_the_config_leaves_off_and_delivery_skips_them() {
     assert!(runner.local_inbox.is_empty());
     assert!(ledger.handback.delivered.is_empty());
 }
+
+#[test]
+fn the_label_sweep_touches_only_closed_pull_requests_carrying_the_label() {
+    let label = json!([{"name": NEEDS_AGENT_LABEL}]);
+    let other = json!([{"name": "bug"}]);
+    let page = json!([
+        {"number": 11, "state": "closed", "closed_at": "2026-10-06T12:00:18Z",
+         "labels": label, "pull_request": {"merged_at": "2026-10-06T12:00:00Z"}},
+        {"number": 12, "state": "closed", "closed_at": "2026-10-05T09:00:00Z",
+         "labels": label, "pull_request": {"merged_at": null}},
+        // An issue, not a pull request.
+        {"number": 13, "state": "closed", "labels": label},
+        // A pull request the listing returned without the label.
+        {"number": 14, "state": "closed", "labels": other,
+         "pull_request": {"merged_at": null}},
+        // Open: the regular pass judges it, the sweep never does.
+        {"number": 15, "state": "open", "labels": label,
+         "pull_request": {"merged_at": null}},
+        {"number": 16, "state": "closed", "closed_at": "2026-10-04T08:00:00Z",
+         "labels": label, "pull_request": {"merged_at": "2026-10-04T08:00:00Z"}}
+    ]);
+    let reads = std::sync::Mutex::new(Vec::new());
+    let gh = |argv: &[String]| {
+        reads.lock().unwrap().push(argv.to_vec());
+        if argv[1].ends_with("&page=1") {
+            Ok(page.to_string())
+        } else {
+            Ok("[]".to_owned())
+        }
+    };
+    // Plan: lists, never writes.
+    let planned = super::sweep_labels("o/r", &gh, None).unwrap();
+    let numbers: Vec<u64> = planned.iter().map(|s| s.pr).collect();
+    assert_eq!(numbers, vec![11, 12, 16]);
+    assert_eq!(planned[0].state, "merged");
+    assert_eq!(planned[1].state, "closed");
+    assert!(planned.iter().all(|s| !s.removed && s.error.is_none()));
+    assert!(
+        reads.lock().unwrap()[0][1]
+            .starts_with("repos/o/r/issues?labels=shipyard%3Aneeds-agent&state=closed"),
+        "{:?}",
+        reads.lock().unwrap()
+    );
+
+    // Apply: exactly one DELETE per stale pull request; a 404 counts as gone,
+    // any other failure is reported.
+    let sent = RefCell::new(Vec::new());
+    let write = |argv: &[String]| {
+        sent.borrow_mut().push(argv.to_vec());
+        match argv.last().map(String::as_str) {
+            Some("repos/o/r/issues/12/labels/shipyard%3Aneeds-agent") => {
+                Err("gh: Not Found (HTTP 404)".to_owned())
+            }
+            Some("repos/o/r/issues/16/labels/shipyard%3Aneeds-agent") => {
+                Err("gh: HTTP 502".to_owned())
+            }
+            _ => Ok("[]".to_owned()),
+        }
+    };
+    let applied = super::sweep_labels("o/r", &gh, Some(&write)).unwrap();
+    let sent = sent.into_inner();
+    assert_eq!(sent.len(), 3);
+    assert!(
+        sent.iter()
+            .all(|argv| is_label_write(argv) && argv.contains(&"DELETE".to_owned()))
+    );
+    assert!(applied[0].removed && applied[1].removed);
+    assert!(!applied[2].removed);
+    assert!(
+        applied[2]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("502"))
+    );
+}

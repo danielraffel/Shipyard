@@ -434,6 +434,98 @@ fn plan_labels(
     out
 }
 
+/// A request that changes GitHub state (`gh` argv in, stdout out).
+pub type GhWriter<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
+
+/// Pages the label sweep reads at most (100 items each).
+const SWEEP_MAX_PAGES: u32 = 10;
+
+/// A `shipyard:needs-agent` label on a pull request that is no longer open.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleLabel {
+    /// Pull request number.
+    pub pr: u64,
+    /// `merged` or `closed`.
+    pub state: String,
+    /// When it closed, as GitHub reports it.
+    pub closed_at: Option<String>,
+    /// Whether the DELETE succeeded (or the label was already gone).
+    pub removed: bool,
+    /// The DELETE's error, when it failed.
+    pub error: Option<String>,
+}
+
+/// Find every closed or merged pull request still carrying the
+/// [`NEEDS_AGENT_LABEL`] label, and with `write` remove it. Issues and open
+/// pull requests are never touched; an open one is the regular pass's to
+/// judge. Without `write` it only reads.
+///
+/// # Errors
+/// When the listing cannot be read or parsed.
+pub fn sweep_labels(
+    repo: &str,
+    gh: &SyncGhReader<'_>,
+    write: Option<GhWriter<'_>>,
+) -> Result<Vec<StaleLabel>, String> {
+    let mut found = Vec::new();
+    for page in 1..=SWEEP_MAX_PAGES {
+        let raw = gh(&[
+            "api".to_owned(),
+            format!(
+                "repos/{repo}/issues?labels=shipyard%3Aneeds-agent&state=closed&per_page=100&page={page}"
+            ),
+        ])?;
+        let items: Vec<Value> =
+            serde_json::from_str(&raw).map_err(|e| format!("issue listing JSON: {e}"))?;
+        let count = items.len();
+        for item in items {
+            let Some(pull) = item.get("pull_request") else {
+                continue;
+            };
+            let labelled = item
+                .get("labels")
+                .and_then(Value::as_array)
+                .is_some_and(|labels| {
+                    labels.iter().any(|label| {
+                        label.get("name").and_then(Value::as_str) == Some(NEEDS_AGENT_LABEL)
+                    })
+                });
+            let closed = item.get("state").and_then(Value::as_str) == Some("closed");
+            let Some(pr) = item.get("number").and_then(Value::as_u64) else {
+                continue;
+            };
+            if !labelled || !closed {
+                continue;
+            }
+            let merged = pull.get("merged_at").is_some_and(|at| !at.is_null());
+            found.push(StaleLabel {
+                pr,
+                state: if merged { "merged" } else { "closed" }.to_owned(),
+                closed_at: item
+                    .get("closed_at")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                removed: false,
+                error: None,
+            });
+        }
+        if count < 100 {
+            break;
+        }
+    }
+    found.sort_by_key(|stale| stale.pr);
+    if let Some(write) = write {
+        for stale in &mut found {
+            match write(&label_remove_argv(repo, stale.pr)) {
+                Ok(_) => stale.removed = true,
+                Err(error) if not_found(&error) => stale.removed = true,
+                Err(error) => stale.error = Some(error),
+            }
+        }
+    }
+    Ok(found)
+}
+
 fn fetch_whence(gh: &SyncGhReader<'_>, repo: &str, pr: u64) -> Result<Option<Owner>, String> {
     let raw = gh(&["api".to_owned(), format!("repos/{repo}/pulls/{pr}")])?;
     let value: Value = serde_json::from_str(&raw).map_err(|e| format!("pull request JSON: {e}"))?;

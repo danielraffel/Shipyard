@@ -1278,6 +1278,20 @@ pub(crate) enum PrWatchCommand {
     /// Build the hourly digest from the ledger; `--post` delivers it through
     /// `[pr_watch.digest] command`.
     Digest(PrWatchDigestArgs),
+    /// List closed and merged pull requests still carrying
+    /// `shipyard:needs-agent`; `--apply` removes the label from them. Open
+    /// pull requests and issues are never touched.
+    SweepLabels(PrWatchSweepLabelsArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PrWatchSweepLabelsArgs {
+    /// Owner/repo slug. Defaults to the current checkout's repository.
+    #[arg(long)]
+    pub(crate) repo: Option<String>,
+    /// Remove the label. Without this, only list.
+    #[arg(long)]
+    pub(crate) apply: bool,
 }
 
 #[allow(clippy::struct_excessive_bools)] // Independent opt-in write switches.

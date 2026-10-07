@@ -194,6 +194,13 @@ are not.
 otherwise create it on add). A label the pass did not add is never removed, and
 one a person removed is not put back during the same episode.
 
+`shipyard pr-watch sweep-labels [--repo <owner/repo>] [--apply] [--json]` lists
+closed and merged pull requests still carrying `shipyard:needs-agent` and, with
+`--apply`, removes it from each. It never touches an open pull request or an
+issue, and it does not ask who added the label, so run the plan first and read
+the list. A 404 on removal counts as already gone; any other failure is reported
+and exits 1.
+
 **Owner.** The merge steward's exact-head handoff record (on this machine's
 state directory) wins; otherwise the `<!-- whence {...} -->` marker in the pull
 request body (`prov.host`, `agent`, `session`, `terminal_address`, `resume`,

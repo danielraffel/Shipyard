@@ -74,6 +74,7 @@ shipyard --json queue-observe --follow  # adaptive delta-only NDJSON monitor
 shipyard pr-watch scan --repo Generous-Corp/pulp  # read-only flags for stuck open PRs (dry run; --post-comments / --digest opt in)
 shipyard pr-watch replay --repo Generous-Corp/pulp --since 7d --expect 8933=1,3 --control merged-clean  # offline simulation
 shipyard pr-watch scan --repo Generous-Corp/pulp --handback  # plan the hand-back to owning sessions (dry run; --deliver-handback sends)
+shipyard pr-watch sweep-labels --repo Generous-Corp/pulp  # list closed/merged PRs still carrying shipyard:needs-agent (--apply removes it)
 shipyard watch                 # live-tail an in-flight ship
 shipyard watch local --target linux-vm --command '<cmd>' --milestone-regex '<re>' --terminal-regex '<re>'
 shipyard queue                 # show all jobs with priorities
