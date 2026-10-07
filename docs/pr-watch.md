@@ -192,7 +192,9 @@ are not.
 **Label.** Only added or removed, never defined: if the repository has no
 `shipyard:needs-agent` label the pass reports it and adds nothing (GitHub would
 otherwise create it on add). A label the pass did not add is never removed, and
-one a person removed is not put back during the same episode.
+one a person removed is not put back during the same episode. Before each add
+the pass re-reads the pull request and adds nothing if it is no longer open, or
+if its state cannot be read: the scan's snapshot can be minutes old.
 
 **Owner.** The merge steward's exact-head handoff record (on this machine's
 state directory) wins; otherwise the `<!-- whence {...} -->` marker in the pull

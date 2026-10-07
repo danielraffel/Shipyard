@@ -667,6 +667,8 @@ else the PR body's `whence` marker), probes the session read-only with
 to `~/.local/state/shipyard/inbox/<session>.jsonl` on the owner's host (the
 plugin's SessionStart/UserPromptSubmit hook shows that inbox to the agent once).
 Owners not live for `unowned_after_hours` are marked unowned on the digest line.
+A label add re-reads the PR first and is refused if it is no longer open (or its
+state is unreadable), because the scan snapshot can predate a merge.
 `--deliver-handback` sends, and needs `[pr_watch.handback] enabled = true`; the
 daemon delivers when that is on. It never types into a session (no
 `cmux send`), never resumes or starts an agent, and never arms or dequeues.

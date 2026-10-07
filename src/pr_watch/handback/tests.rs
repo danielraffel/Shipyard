@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, TimeZone as _, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::host::{
     self, HostCommand, HostRunner, INBOX_SCRIPT, Invocation, Liveness, RunError, check_argv,
@@ -516,7 +516,7 @@ fn fake_gh(label_exists: bool) -> impl Fn(&[String]) -> Result<String, String> {
             "repos/o/r/pulls/6" => "no marker here".to_owned(),
             _ => return Err(format!("unexpected read {argv:?}")),
         };
-        Ok(json!({"body": body}).to_string())
+        Ok(json!({"body": body, "state": "open", "merged_at": null}).to_string())
     }
 }
 
@@ -968,6 +968,79 @@ fn a_label_someone_removed_is_not_put_back_this_episode() {
     );
     assert!(out.writes.is_empty(), "{:?}", out.writes);
     assert!(ledger.handback.labels[&1].removed_by_other);
+}
+
+#[test]
+fn a_label_is_not_posted_on_a_pull_request_that_merged_after_the_snapshot() {
+    // The snapshot (history) still shows PR 1 open and flagged, but GitHub
+    // now reports it merged, as with a pass that started minutes earlier.
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, false);
+    let gh = fake_gh(true);
+    let reader = |argv: &[String]| {
+        if argv.last().map(String::as_str) == Some("repos/o/r/pulls/1") {
+            let open = gh(argv)?;
+            let mut value: Value = serde_json::from_str(&open).unwrap();
+            value["state"] = json!("closed");
+            value["merged_at"] = json!("2026-10-06T12:00:18Z");
+            return Ok(value.to_string());
+        }
+        if argv.last().map(String::as_str) == Some("repos/o/r/pulls/5") {
+            return Err("gh: HTTP 502".to_owned());
+        }
+        gh(argv)
+    };
+    let sent = RefCell::new(Vec::new());
+    let writer = |argv: &[String]| {
+        sent.borrow_mut().push(argv.to_vec());
+        Ok("{}".to_owned())
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut runner = FakeRunner::default();
+    let mut deps = super::Deps {
+        runner: &mut runner,
+        state_dir: dir.path().to_path_buf(),
+        local_names: vec!["Daniels-M5-Studio".to_owned()],
+        local_machine: None,
+    };
+    let report = super::run(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &reader,
+        &writer,
+        &mut deps,
+    );
+    let posted: Vec<String> = sent
+        .into_inner()
+        .iter()
+        .filter(|argv| argv.iter().any(|a| a == "POST"))
+        .map(|argv| argv[3].clone())
+        .collect();
+    // PR 1 merged: refused. PR 5's state is unreadable: not posted blind.
+    assert_eq!(
+        posted,
+        vec![
+            "repos/o/r/issues/2/labels".to_owned(),
+            "repos/o/r/issues/6/labels".to_owned(),
+        ]
+    );
+    let refused = |pr: u64| {
+        report
+            .actions
+            .iter()
+            .find(|a| a.action == "add_label" && a.prs == vec![pr])
+            .and_then(|a| a.error.clone())
+            .unwrap_or_default()
+    };
+    assert!(refused(1).contains("no longer open"), "{}", refused(1));
+    assert!(refused(5).contains("unreadable"), "{}", refused(5));
+    assert_eq!(
+        ledger.handback.labels.keys().copied().collect::<Vec<_>>(),
+        vec![2, 6]
+    );
 }
 
 #[test]
