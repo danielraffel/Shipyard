@@ -675,6 +675,8 @@ state is unreadable), because the scan snapshot can predate a merge.
 `shipyard pr-watch sweep-labels` lists closed/merged PRs still carrying the
 label (plan by default); `--apply` removes it from those only, never from open PRs
 or issues, and does not check who added it, so read the plan before applying.
+A PR whose owner does not resolve (no steward record, no whence marker) gets no
+label; one whose marker is unreadable this pass keeps the label it has.
 `--deliver-handback` sends, and needs `[pr_watch.handback] enabled = true`; the
 daemon delivers when that is on. It never types into a session (no
 `cmux send`), never resumes or starts an agent, and never arms or dequeues.

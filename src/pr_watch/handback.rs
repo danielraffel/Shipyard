@@ -4,8 +4,8 @@
 //!
 //! - **Tier 0**: the sticky comment (see [`super::comment`]) plus the
 //!   [`NEEDS_AGENT_LABEL`] label on a pull request with an *owner-actionable*
-//!   flag ([`actionable`]), removed when every such flag is addressed or the
-//!   pull request merges or closes. The
+//!   flag ([`actionable`]) and an owner that resolves, removed when every such
+//!   flag is addressed or the pull request merges or closes. The
 //!   label is only ever added or removed, never defined: when the repository
 //!   lacks it, the pass reports that and adds nothing. A label someone else
 //!   put on (or took off) is never touched.
@@ -676,13 +676,47 @@ pub fn run(
             by_pr.entry(entry.pr).or_default().push(id.clone());
         }
     }
+    // Owners first: the label calls an owner back, so a pull request whose
+    // owner does not resolve gets none (it stays on the digest). One whose
+    // marker could not be read this pass keeps whatever label it has.
+    let mut owners: BTreeMap<u64, Option<Owner>> = BTreeMap::new();
+    let mut unreadable: BTreeSet<u64> = BTreeSet::new();
+    for &pr in by_pr.keys() {
+        let head = history
+            .prs
+            .get(&pr)
+            .map(|entry| entry.head_sha.clone())
+            .unwrap_or_default();
+        let steward = owner::steward_owner(
+            &deps.state_dir,
+            &history.repo,
+            pr,
+            &head,
+            deps.local_machine.as_deref(),
+        );
+        let whence = match fetch_whence(gh, &history.repo, pr) {
+            Ok(found) => found,
+            Err(error) => {
+                report.gaps.push(format!("#{pr}: whence marker: {error}"));
+                unreadable.insert(pr);
+                None
+            }
+        };
+        owners.insert(pr, owner::resolve(steward, whence));
+    }
     let actionable_prs: BTreeSet<u64> = by_pr.keys().copied().collect();
+    let label_prs: BTreeSet<u64> = by_pr
+        .keys()
+        .copied()
+        .filter(|pr| {
+            owners.get(pr).is_some_and(Option::is_some)
+                || (unreadable.contains(pr) && state.labels.contains_key(pr))
+        })
+        .collect();
 
     // Tier 0.
     if config.label {
-        for (mut planned, is_add) in
-            plan_labels(&mut state, history, &actionable_prs, gh, &mut report)
-        {
+        for (mut planned, is_add) in plan_labels(&mut state, history, &label_prs, gh, &mut report) {
             let pr = planned.prs[0];
             if deliver && is_add && planned.argv.is_some() {
                 match still_open(gh, &history.repo, pr) {
@@ -734,26 +768,7 @@ pub fn run(
     let mut probes: BTreeMap<String, (Option<Route>, Liveness)> = BTreeMap::new();
     let mut batches: BTreeMap<String, SessionBatch> = BTreeMap::new();
     for (&pr, ids) in &by_pr {
-        let head = history
-            .prs
-            .get(&pr)
-            .map(|entry| entry.head_sha.clone())
-            .unwrap_or_default();
-        let steward = owner::steward_owner(
-            &deps.state_dir,
-            &history.repo,
-            pr,
-            &head,
-            deps.local_machine.as_deref(),
-        );
-        let whence = match fetch_whence(gh, &history.repo, pr) {
-            Ok(found) => found,
-            Err(error) => {
-                report.gaps.push(format!("#{pr}: whence marker: {error}"));
-                None
-            }
-        };
-        let found = owner::resolve(steward, whence);
+        let found = owners.remove(&pr).flatten();
         let (route, liveness) = match &found {
             Some(o) => probes
                 .entry(o.session.clone())
