@@ -530,6 +530,22 @@ pub fn sweep_labels(
     Ok(found)
 }
 
+/// Whether the pull request is open right now, read just before a label add.
+/// The scan's snapshot can be minutes old, and a label posted on a pull
+/// request that merged since stays there forever.
+fn still_open(gh: &SyncGhReader<'_>, repo: &str, pr: u64) -> Result<bool, String> {
+    let raw = gh(&["api".to_owned(), format!("repos/{repo}/pulls/{pr}")])?;
+    let value: Value = serde_json::from_str(&raw).map_err(|e| format!("pull request JSON: {e}"))?;
+    let state = value.get("state").and_then(Value::as_str);
+    let merged = value
+        .get("merged_at")
+        .is_some_and(|merged| !merged.is_null());
+    match state {
+        Some(state) => Ok(state == "open" && !merged),
+        None => Err("pull request JSON has no state".to_owned()),
+    }
+}
+
 fn fetch_whence(gh: &SyncGhReader<'_>, repo: &str, pr: u64) -> Result<Option<Owner>, String> {
     let raw = gh(&["api".to_owned(), format!("repos/{repo}/pulls/{pr}")])?;
     let value: Value = serde_json::from_str(&raw).map_err(|e| format!("pull request JSON: {e}"))?;
@@ -668,6 +684,24 @@ pub fn run(
             plan_labels(&mut state, history, &actionable_prs, gh, &mut report)
         {
             let pr = planned.prs[0];
+            if deliver && is_add && planned.argv.is_some() {
+                match still_open(gh, &history.repo, pr) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        planned.argv = None;
+                        planned.error =
+                            Some("not added: the pull request is no longer open".to_owned());
+                        report.actions.push(planned);
+                        continue;
+                    }
+                    Err(error) => {
+                        planned.argv = None;
+                        planned.error = Some(format!("not added: open state unreadable: {error}"));
+                        report.actions.push(planned);
+                        continue;
+                    }
+                }
+            }
             if deliver {
                 let result = planned.argv.as_ref().map(|argv| write(argv));
                 match result {
