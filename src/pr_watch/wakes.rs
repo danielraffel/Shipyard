@@ -246,6 +246,12 @@ pub fn summarize(
                     summary.unseen.push(episode);
                 }
                 None if episode.raised_at.is_some_and(|at| now - at > unseen_after) => {
+                    let mut episode = episode;
+                    // Every channel failed: still nobody was reached, but say
+                    // why rather than leave it reasonless.
+                    if episode.failures > 0 && episode.unsent_reason.is_none() {
+                        episode.unsent_reason = Some("delivery_failed".to_owned());
+                    }
                     summary.unsent.push(episode);
                 }
                 _ => {}
@@ -308,6 +314,15 @@ mod tests {
                 4,
                 &json!({"owner": "dead", "session": "s9"}),
             ),
+            // f: raised 6, every channel failed, still open.
+            wake(
+                6,
+                "f",
+                "raised",
+                5,
+                &json!({"owner": "live", "session": "s3"}),
+            ),
+            wake(6, "f", "failed", 5, &none),
             // c: raised 20, every channel failed, then closed.
             wake(20, "c", "raised", 19, &none),
             wake(20, "c", "failed", 19, &none),
@@ -324,12 +339,12 @@ mod tests {
             },
         ];
         let summary = summarize(&events, t(-10), t(60), Duration::minutes(30));
-        assert_eq!(summary.raised, 4);
+        assert_eq!(summary.raised, 5);
         assert_eq!(summary.sent, 2);
         assert_eq!(summary.seen, 1);
         assert_eq!(summary.seen_rate, Some(0.5));
-        assert_eq!(summary.failed, 1);
-        assert_eq!(summary.open, 2);
+        assert_eq!(summary.failed, 2);
+        assert_eq!(summary.open, 3);
         assert_eq!(summary.resolved.get("addressed"), Some(&1));
         assert_eq!(summary.resolved.get("closed"), Some(&1));
         assert_eq!(summary.time_to_seen.count, 1);
@@ -340,9 +355,15 @@ mod tests {
         assert_eq!(summary.unseen[0].session.as_deref(), Some("s2"));
         // Never sent is not unseen: it is listed apart, with its owner state.
         let unsent: Vec<&str> = summary.unsent.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(unsent, vec!["e"]);
+        assert_eq!(unsent, vec!["e", "f"]);
         assert_eq!(summary.unsent[0].owner.as_deref(), Some("dead"));
         assert_eq!(summary.unsent[0].session.as_deref(), Some("s9"));
+        assert_eq!(summary.unsent[0].unsent_reason, None);
+        // Open with every channel failed: unsent, and it says why.
+        assert_eq!(
+            summary.unsent[1].unsent_reason.as_deref(),
+            Some("delivery_failed")
+        );
         // Within the threshold neither list has it yet.
         let early = summarize(&events, t(-10), t(30), Duration::minutes(30));
         assert!(early.unseen.is_empty());
