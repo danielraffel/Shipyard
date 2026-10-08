@@ -106,3 +106,28 @@ transition.
 The observer is intentionally a deterministic collector. A local or cloud LLM
 may summarize emitted transitions afterward, but it should not sit in this
 polling loop.
+
+## Cross-repository digest
+
+`shipyard queue-digest` is the read-only handback surface for a supervisor or
+agent that needs to answer “what is still open?” without trusting a stale
+conversation. It reads every `queue-observer/*.json` state under the selected
+runtime state root and preserves each repository/base pair, exact base SHA,
+observer state hash, owner, PR URL, and PR head SHA.
+
+```bash
+# Markdown for an operator or handoff note.
+shipyard queue-digest
+
+# Machine-readable output for Shipyard or an external scheduler.
+shipyard --json queue-digest --stale-after-seconds 900
+```
+
+Pull requests are grouped into `queued`, `armed`, `green_unarmed`, `red`,
+`dirty`, `behind`, `blocked`, `unstable`, or `unknown`. The digest is
+fail-closed: no state files, corrupt or hash-mismatched state, duplicate
+repository/base or PR census rows, stale observers, truncated snapshots, and
+ownership blockers all produce `complete=false` and a nonzero exit. Diagnostic
+JSON/Markdown is still emitted so a supervisor can hand the exact problem back
+to the responsible owner. Transition logs are deliberately not treated as
+current state and `.jsonl` files are ignored.

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "state_hash": "5dc0a22bbc0e82a47b0608d85240f7da23e015b29195423da4590a599bcbaeee",
+  "snapshot": {
+    "schema_version": 1,
+    "repo": "fixture/repo",
+    "base": "main",
+    "main_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "main_url": "https://github.test/fixture/repo/commit/base",
+    "truncated": false,
+    "required_contexts": [],
+    "required_checks": [],
+    "ownership": {
+      "machine": null,
+      "mutation_machine": null,
+      "authority_matches": false,
+      "hold_active": false,
+      "hold_reason": null,
+      "hold_machine": null,
+      "held_at": null,
+      "blocker": null
+    },
+    "queue": [],
+    "pull_requests": [
+      {
+        "number": 7,
+        "url": "https://github.test/fixture/repo/pull/7",
+        "head_sha": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+        "merge_state": "clean",
+        "auto_merge": false,
+        "owners": [
+          "fixture-owner"
+        ],
+        "blockers": [],
+        "checks": []
+      }
+    ]
+  },
+  "backoff_index": 0
+}
