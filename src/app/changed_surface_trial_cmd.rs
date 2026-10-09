@@ -22,6 +22,11 @@ const STALE_ACTIVATION_RECEIPT: &str = "stale-activation-shadow_compare.json";
 const STALE_CLEANUP_RECEIPT: &str = "stale-cleanup-shadow_compare.json";
 const STALE_CURRENT_RECEIPT: &str = "stale-current.json";
 const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
+/// A result receipt lists every selected test and the executable-reuse
+/// evidence of the run, and a key manifest lists every executable's key, so
+/// for a large suite both outgrow the small receipts' cap (Pulp's measured
+/// 1.4 MB and 1.8 MB at 23k tests).
+const MAX_LARGE_RECEIPT_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(super) struct ChangedSurfaceTrialStatusArgs {
     pub(super) repository: String,
@@ -171,14 +176,25 @@ impl Candidate {
     }
 
     /// The adapter's own record time for this directory's result.
-    fn recorded_at(&self) -> Option<u64> {
-        let name = self.status.result_receipt.as_deref()?;
-        let file = name.rsplit('/').next()?;
-        read_regular_receipt(&self.dir.join(file))
+    /// The adapter's record time. A receipt that cannot be read is its own
+    /// rejection reason, never mistaken for one without a record time.
+    fn recorded_at(&self) -> Result<Option<u64>, &'static str> {
+        let Some(file) = self
+            .status
+            .result_receipt
+            .as_deref()
+            .and_then(|name| name.rsplit('/').next())
+        else {
+            return Ok(None);
+        };
+        let Some(bytes) =
+            read_regular_receipt_capped(&self.dir.join(file), MAX_LARGE_RECEIPT_BYTES)?
+        else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_slice::<Value>(&bytes)
             .ok()
-            .flatten()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|result| result.get("recorded_at_unix_ns").and_then(Value::as_u64))
+            .and_then(|result| result.get("recorded_at_unix_ns").and_then(Value::as_u64)))
     }
 
     fn keyed_run(&self) -> crate::changed_surface::trial::KeyedRun {
@@ -217,16 +233,29 @@ fn merge_candidates(identity: &TrialIdentity, candidates: Vec<Candidate>) -> Tri
             }
             continue;
         }
-        let Some(recorded_at) = candidate.recorded_at() else {
-            let mut status = rejected_trial(
-                identity,
-                candidate.status.activation_receipt.clone(),
-                result_receipt_count,
-                candidate.status.result_receipt.clone(),
-                "result_without_recorded_at",
-            );
+        if candidate.status.state == TrialState::Rejected {
+            // Its own reason (an unreadable or oversized result) stands.
+            let mut status = candidate.status.clone();
             status.activation_conflicts = activation_conflicts;
             return status;
+        }
+        let recorded_at = match candidate.recorded_at() {
+            Ok(Some(recorded_at)) => recorded_at,
+            other => {
+                let reason = match other {
+                    Err(reason) => reason,
+                    _ => "result_without_recorded_at",
+                };
+                let mut status = rejected_trial(
+                    identity,
+                    candidate.status.activation_receipt.clone(),
+                    result_receipt_count,
+                    candidate.status.result_receipt.clone(),
+                    reason,
+                );
+                status.activation_conflicts = activation_conflicts;
+                return status;
+            }
         };
         timed.push((recorded_at, candidate));
     }
@@ -715,9 +744,11 @@ fn run_applied_audit(result_dir: &Path, results: &[(String, Vec<u8>)]) -> Result
     };
     let result =
         serde_json::from_slice::<Value>(bytes).map_err(|_| "unreadable result".to_owned())?;
-    let manifest = read_regular_receipt(&result_dir.join("executable-keys.json"))
-        .ok()
-        .flatten();
+    let manifest = read_regular_receipt_capped(
+        &result_dir.join("executable-keys.json"),
+        MAX_LARGE_RECEIPT_BYTES,
+    )
+    .map_err(|reason| format!("key manifest {reason}"))?;
     audit_applied(&result, manifest.as_deref())
 }
 
@@ -809,8 +840,13 @@ fn read_named_receipts(
     }
     paths.sort_by(|left, right| left.0.cmp(&right.0));
     let mut receipts = Vec::with_capacity(paths.len());
+    let max_bytes = if prefix == "result-" {
+        MAX_LARGE_RECEIPT_BYTES
+    } else {
+        MAX_RECEIPT_BYTES
+    };
     for (name, path) in paths {
-        match read_regular_receipt(&path) {
+        match read_regular_receipt_capped(&path, max_bytes) {
             Ok(Some(bytes)) => receipts.push((name, bytes)),
             Ok(None) | Err(_) => {
                 return Err(ReceiptReadFailure {
@@ -829,6 +865,13 @@ fn read_named_receipts(
 }
 
 fn read_regular_receipt(path: &Path) -> Result<Option<Vec<u8>>, &'static str> {
+    read_regular_receipt_capped(path, MAX_RECEIPT_BYTES)
+}
+
+fn read_regular_receipt_capped(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, &'static str> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -851,14 +894,14 @@ fn read_regular_receipt(path: &Path) -> Result<Option<Vec<u8>>, &'static str> {
     }
     let file = options.open(path).map_err(|_| "unreadable_receipt")?;
     let opened_metadata = file.metadata().map_err(|_| "unreadable_receipt")?;
-    if !opened_metadata.is_file() || opened_metadata.len() > MAX_RECEIPT_BYTES {
+    if !opened_metadata.is_file() || opened_metadata.len() > max_bytes {
         return Err("receipt_too_large");
     }
     let mut bytes = Vec::new();
-    file.take(MAX_RECEIPT_BYTES + 1)
+    file.take(max_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "unreadable_receipt")?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RECEIPT_BYTES {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
         return Err("receipt_too_large");
     }
     Ok(Some(bytes))
@@ -1450,6 +1493,154 @@ mod tests {
         );
     }
 
+    /// `write_run`, with the result padded to `bytes` so its size is known.
+    fn write_padded_run(dir: &Path, payload: &str, recorded_at: u64, bytes: usize) {
+        write_run(dir, payload, true, Some(recorded_at));
+        let path = dir.join("result-1.json");
+        let mut result: Value =
+            serde_json::from_slice(&fs::read(&path).expect("result")).expect("json");
+        result["padding"] = json!("");
+        let base = result.to_string().len();
+        result["padding"] = json!("x".repeat(bytes.saturating_sub(base)));
+        let text = result.to_string();
+        assert_eq!(text.len(), bytes.max(base));
+        fs::write(&path, text).expect("padded result");
+    }
+
+    #[test]
+    fn a_keyed_result_larger_than_a_small_receipt_is_still_read() {
+        // A keyed full shadow of a large suite lists every selected test:
+        // Pulp's measured 1,406,428 bytes, over the 1 MiB small-receipt cap.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = result_directory(&temp.path().join("state"), &identity());
+        write_padded_run(
+            &crate::changed_surface::trial::payload_dir(&root, PAYLOAD_1),
+            PAYLOAD_1,
+            10,
+            1_406_428,
+        );
+        let status = read_trial(&identity(), &root);
+        assert_eq!(status.state, TrialState::Ready, "{}", status.reason);
+        let source = status.verdict_source.expect("named");
+        assert_eq!(source.payload_sha256.as_deref(), Some(PAYLOAD_1));
+    }
+
+    #[test]
+    fn an_oversized_result_is_rejected_for_its_size_not_for_a_missing_record_time() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = result_directory(&temp.path().join("state"), &identity());
+        write_padded_run(
+            &crate::changed_surface::trial::payload_dir(&root, PAYLOAD_1),
+            PAYLOAD_1,
+            10,
+            usize::try_from(MAX_LARGE_RECEIPT_BYTES).expect("fits") + 1,
+        );
+        let status = read_trial(&identity(), &root);
+        assert_eq!(status.state, TrialState::Rejected);
+        assert_ne!(status.reason, "result_without_recorded_at");
+        assert_eq!(status.reason, "unsafe_or_unreadable_result_receipt");
+    }
+
+    /// The first real keyed run on Pulp (PR 9795, head 893acd73, lane
+    /// sy-20261007-60cce3): its payload's receipts as the adapter wrote them,
+    /// with the host's home directory rewritten and the two digests that bind
+    /// file contents recomputed.
+    fn unpack_pulp_canary(state: &Path, rename_recorded_at: bool) -> (TrialIdentity, PathBuf) {
+        let identity = TrialIdentity {
+            repository: "Generous-Corp/pulp".to_owned(),
+            pull_request: 9795,
+            target: "mac".to_owned(),
+            head_sha: "893acd73c685f930dca4eeceb3f7c88d8b4c7ecb".to_owned(),
+        };
+        let root = result_directory(state, &identity);
+        let payload = crate::changed_surface::trial::payload_dir(
+            &root,
+            "aa6d28f96d4074642ca6f54885459ef16633ce39793e481264d6916474af3421",
+        );
+        fs::create_dir_all(&payload).expect("payload dir");
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keyed-canary-pulp-9795");
+        for entry in fs::read_dir(&fixtures).expect("fixtures") {
+            let path = entry.expect("entry").path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("name");
+            let Some(name) = name.strip_suffix(".gz") else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(
+                &mut flate2::read::GzDecoder::new(fs::File::open(&path).expect("open")),
+                &mut bytes,
+            )
+            .expect("gunzip");
+            if rename_recorded_at && name.starts_with("result-") {
+                bytes = String::from_utf8(bytes)
+                    .expect("utf-8")
+                    .replace("\"recorded_at_unix_ns\"", "\"recorded_at\"")
+                    .into_bytes();
+            }
+            fs::write(payload.join(name), bytes).expect("write receipt");
+        }
+        if rename_recorded_at {
+            // Rebind the host's rederivation to the edited result, so the
+            // missing record time is the only thing wrong with the run.
+            let result =
+                fs::read(payload.join("result-1791385525057378000-13419-0.json")).expect("result");
+            let digest = format!("{:x}", Sha256::digest(&result));
+            let old = fs::read_dir(&payload)
+                .expect("payload")
+                .map(|entry| entry.expect("entry").path())
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("rederivation-"))
+                })
+                .expect("rederivation receipt");
+            let mut rederivation: Value =
+                serde_json::from_slice(&fs::read(&old).expect("read")).expect("json");
+            rederivation["result_receipt_sha256"] = json!(digest);
+            fs::remove_file(&old).expect("remove");
+            fs::write(
+                payload.join(format!("rederivation-{digest}.json")),
+                rederivation.to_string(),
+            )
+            .expect("rebound rederivation");
+        }
+        (identity, root)
+    }
+
+    #[test]
+    fn the_first_real_keyed_pulp_run_reads_as_a_recorded_keyed_shadow() {
+        // Its result (1,406,428 bytes) and key manifest (1,774,250 bytes) are
+        // over the small-receipt cap, and as a keyed full shadow it has no
+        // selected return code.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (identity, root) = unpack_pulp_canary(&temp.path().join("state"), false);
+        let status = read_trial(&identity, &root);
+        assert_eq!(
+            status.state,
+            TrialState::KeyedShadowRecorded,
+            "{}",
+            status.reason
+        );
+        assert_eq!(status.reason, "keyed_full_shadow");
+        let keyed = status.keyed.expect("keyed summary");
+        assert_eq!(keyed.audit, "staged");
+        assert!(keyed.reuse_observation);
+        assert_eq!(keyed.rederivation, "match");
+        assert_eq!(keyed.would_skip_count, Some(0));
+        assert_eq!(keyed.full_returncode, Some(8));
+
+        // Control: the same run without its record time is rejected for it.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (identity, root) = unpack_pulp_canary(&temp.path().join("state"), true);
+        let status = read_trial(&identity, &root);
+        assert_eq!(status.state, TrialState::Rejected);
+        assert_eq!(status.reason, "result_without_recorded_at");
+    }
+
     #[test]
     fn a_payload_result_without_a_record_time_is_rejected_not_ordered_by_mtime() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1511,14 +1702,20 @@ mod tests {
                 report_sha256: DIGEST_C.to_owned(),
             }),
         };
-        let observe = |audit_status: &str, key_code_status: &str| {
+        let observe_padded = |audit_status: &str, key_code_status: &str, pad: usize| {
             write_run(&root, PAYLOAD_1, true, None);
             fs::write(
                 root.join(crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE),
                 serde_json::to_vec(&binding).expect("binding"),
             )
             .expect("binding file");
-            let manifest = json!({"producer": {"audit_status": key_code_status}}).to_string();
+            // A real key manifest lists every executable; Pulp's measured
+            // 1,774,250 bytes, over the 1 MiB small-receipt cap.
+            let manifest = json!({
+                "producer": {"audit_status": key_code_status},
+                "padding": "x".repeat(pad),
+            })
+            .to_string();
             fs::write(root.join("executable-keys.json"), &manifest).expect("manifest");
             let path = root.join("result-1.json");
             let mut result: Value =
@@ -1531,7 +1728,15 @@ mod tests {
             let keyed = read_trial(&identity(), &root).keyed.expect("keyed summary");
             (keyed.audit, keyed.reuse_observation)
         };
+        let observe = |audit_status: &str, key_code_status: &str| {
+            observe_padded(audit_status, key_code_status, 0)
+        };
         assert_eq!(observe("applied", "clean"), ("staged".to_owned(), true));
+        assert_eq!(
+            observe_padded("applied", "clean", 1_774_250),
+            ("staged".to_owned(), true),
+            "a large key manifest is read, not mistaken for none"
+        );
         assert_eq!(
             observe("applied", "not_clean"),
             (

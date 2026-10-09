@@ -883,7 +883,13 @@ nothing, and trial status marks it `reuse_observation: false`. A staged
 report counts only when the result's `derived.audit.status` is `applied` and
 the hashed key manifest says `producer.audit_status: clean`; otherwise the
 audit reads `staged_unconfirmed: <why>`. Count only
-`reuse_observation: true` keyed runs as reuse evidence. `{audit_report}` in a
+`reuse_observation: true` keyed runs as reuse evidence. A keyed full shadow's
+result and key manifest list every test and executable (Pulp's: 1.4 MB and
+1.8 MB), so trial status reads both up to 16 MiB; small receipts keep 1 MiB.
+An unreadable or oversized receipt is reported by its own reason, never as a
+missing record time or "no key manifest". `selected_returncode` is optional
+only where no selected leg ran (keyed full shadow, `refused_fallback_full`).
+`{audit_report}` in a
 base command is the staged path; add it to a project's commands only after
 every host runs a Shipyard that knows it. The shadow planning
 receipt's `authoritative_execution: not_observed_by_shadow_planner` never
