@@ -8,6 +8,7 @@
 //! signal. `shipyard pr-watch liveness` and `shipyard doctor` read it here;
 //! `shipyard doctor --fleet` asks each configured host.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use chrono::{DateTime, Duration, Utc};
@@ -34,6 +35,9 @@ pub struct RepoLiveness {
     /// Why the ledger could not be read, if so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The last pass's coverage: handed pull requests no rule accounts for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<super::coverage::CoverageSummary>,
 }
 
 /// This host's pr-watch liveness.
@@ -70,17 +74,25 @@ pub fn read(
     if watch.enabled {
         if watch.repos.is_empty() {
             for ledger in ledgers_in(&state_dir.join("pr-watch"), &watch.base) {
-                repos.push(row(&ledger.repo, Ok(ledger.last_scan_at), now, stale_after));
+                let mut found = row(&ledger.repo, Ok(ledger.last_scan_at), now, stale_after);
+                found.coverage = ledger.coverage;
+                repos.push(found);
             }
         } else {
             for repo in &watch.repos {
                 let path = ledger::default_path(state_dir, repo, &watch.base);
-                let stamp = if path.exists() {
-                    ledger::load(&path, repo, &watch.base).map(|ledger| ledger.last_scan_at)
+                let loaded = if path.exists() {
+                    ledger::load(&path, repo, &watch.base).map(Some)
                 } else {
                     Ok(None)
                 };
-                repos.push(row(repo, stamp, now, stale_after));
+                let stamp = loaded
+                    .as_ref()
+                    .map(|ledger| ledger.as_ref().and_then(|l| l.last_scan_at))
+                    .map_err(Clone::clone);
+                let mut found = row(repo, stamp, now, stale_after);
+                found.coverage = loaded.ok().flatten().and_then(|ledger| ledger.coverage);
+                repos.push(found);
             }
         }
     }
@@ -104,6 +116,7 @@ fn row(
             age_minutes: last.map(|at| (now - at).num_minutes()),
             fresh: last.is_some_and(|at| now - at <= stale_after),
             error: None,
+            coverage: None,
         },
         Err(error) => RepoLiveness {
             repo: repo.to_owned(),
@@ -111,6 +124,7 @@ fn row(
             age_minutes: None,
             fresh: false,
             error: Some(error),
+            coverage: None,
         },
     }
 }
@@ -150,8 +164,31 @@ pub fn render(liveness: &Liveness) -> String {
     for repo in &liveness.repos {
         out.push_str(&line(repo, liveness.stale_after_minutes));
         out.push('\n');
+        if let Some((_, coverage)) = coverage_line(repo) {
+            out.push_str(&coverage);
+            out.push('\n');
+        }
     }
     out
+}
+
+/// The coverage line for one repository: counts, then each gap with its
+/// reason. `None` before a pass has recorded coverage.
+#[must_use]
+pub fn coverage_line(repo: &RepoLiveness) -> Option<(bool, String)> {
+    let coverage = repo.coverage.as_ref()?;
+    let mut text = format!(
+        "coverage {}: {} progressing, {} flagged, {} held, {} unaccounted",
+        repo.repo,
+        coverage.progressing,
+        coverage.flagged,
+        coverage.held,
+        coverage.gaps.len()
+    );
+    for gap in &coverage.gaps {
+        let _ = write!(text, "\n  #{}: {}", gap.pr, gap.reason);
+    }
+    Some((coverage.gaps.is_empty(), text))
 }
 
 /// The verdict for one repository, as `render` and `doctor` print it.

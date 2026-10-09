@@ -34,6 +34,12 @@ pub enum FlagKind {
     /// Flag 7: ejected once for `failed_checks`, the same head is green on
     /// every required check, and nothing re-armed it.
     EjectedGreen,
+    /// Flag 8: a pull request Shipyard was handed that nothing else accounts
+    /// for: not progressing, not held, and no other owner flag holds.
+    Unaccounted,
+    /// Flag 9: a required check red on a head nobody armed, for longer than
+    /// the flag-6 window: flag 2's unarmed twin.
+    RedUnarmed,
 }
 
 impl FlagKind {
@@ -48,7 +54,25 @@ impl FlagKind {
             Self::SplitCandidate => 5,
             Self::GreenUnarmed => 6,
             Self::EjectedGreen => 7,
+            Self::Unaccounted => 8,
+            Self::RedUnarmed => 9,
         }
+    }
+
+    /// Whether this kind calls the owner back (when routed per pull request).
+    /// A rebase treadmill (the base moving) and the split advisory do not.
+    #[must_use]
+    pub fn owner_actionable(self) -> bool {
+        matches!(
+            self,
+            Self::RepeatTestFailure
+                | Self::RedWhileArmed
+                | Self::RepeatedEjection
+                | Self::GreenUnarmed
+                | Self::EjectedGreen
+                | Self::Unaccounted
+                | Self::RedUnarmed
+        )
     }
 
     /// The kind for a spec flag number.
@@ -62,6 +86,8 @@ impl FlagKind {
             5 => Some(Self::SplitCandidate),
             6 => Some(Self::GreenUnarmed),
             7 => Some(Self::EjectedGreen),
+            8 => Some(Self::Unaccounted),
+            9 => Some(Self::RedUnarmed),
             _ => None,
         }
     }
@@ -78,10 +104,12 @@ impl FlagKind {
     #[must_use]
     pub fn severity(self) -> u8 {
         match self {
-            Self::RedWhileArmed => 7,
-            Self::RepeatedEjection => 6,
-            Self::EjectedGreen => 5,
-            Self::GreenUnarmed => 4,
+            Self::RedWhileArmed => 9,
+            Self::RedUnarmed => 8,
+            Self::RepeatedEjection => 7,
+            Self::EjectedGreen => 6,
+            Self::GreenUnarmed => 5,
+            Self::Unaccounted => 4,
             Self::RepeatTestFailure => 3,
             Self::RebaseTreadmill => 2,
             Self::SplitCandidate => 1,
@@ -99,6 +127,8 @@ impl FlagKind {
             Self::SplitCandidate => "split_candidate",
             Self::GreenUnarmed => "green_unarmed",
             Self::EjectedGreen => "ejected_green",
+            Self::Unaccounted => "unaccounted",
+            Self::RedUnarmed => "red_unarmed",
         }
     }
 }
@@ -180,6 +210,14 @@ pub struct Thresholds {
     /// Flag 6: minutes every required check must have been green.
     #[serde(default = "default_green_unarmed_minutes")]
     pub green_unarmed_minutes: i64,
+    /// Flag 8: authors whose pull requests Shipyard was handed (GraphQL
+    /// logins; a bot's is given without `[bot]`).
+    #[serde(default = "default_handed_authors")]
+    pub handed_authors: Vec<String>,
+}
+
+fn default_handed_authors() -> Vec<String> {
+    vec!["shipyard-local".to_owned()]
 }
 
 fn default_green_unarmed_minutes() -> i64 {
@@ -200,6 +238,7 @@ impl Default for Thresholds {
             split_files: 60,
             split_commits: 30,
             green_unarmed_minutes: default_green_unarmed_minutes(),
+            handed_authors: default_handed_authors(),
         }
     }
 }
@@ -224,6 +263,10 @@ pub fn evaluate(history: &RepoHistory, at: DateTime<Utc>, thresholds: &Threshold
         found.extend(rebase_treadmill(pr, &head, at, thresholds));
         found.extend(green_unarmed(pr, history, at, thresholds));
         found.extend(ejected_green(pr, history, at, thresholds));
+        found.extend(red_unarmed(pr, history, at, thresholds));
+        if let Some(gap) = super::coverage::unaccounted_flag(pr, history, at, thresholds, &found) {
+            found.push(gap);
+        }
         if !found.is_empty()
             && let Some(split) = split_candidate(pr, &head, at, thresholds)
         {
@@ -235,7 +278,7 @@ pub fn evaluate(history: &RepoHistory, at: DateTime<Utc>, thresholds: &Threshold
     flags
 }
 
-fn completed_by(check: &CheckFact, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+pub(super) fn completed_by(check: &CheckFact, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
     check.completed_at.filter(|completed| *completed <= at)
 }
 
@@ -480,7 +523,7 @@ fn listed(items: Vec<String>) -> String {
 
 /// Arming state reconstructed from the timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Arming {
+pub(super) enum Arming {
     Idle,
     Armed,
     Queued,
@@ -488,7 +531,7 @@ enum Arming {
     Done,
 }
 
-fn arming_at(pr: &PrHistory, at: DateTime<Utc>) -> Arming {
+pub(super) fn arming_at(pr: &PrHistory, at: DateTime<Utc>) -> Arming {
     let mut state = Arming::Idle;
     for event in pr.events.iter().filter(|event| event.at <= at) {
         state = match &event.kind {
@@ -520,7 +563,11 @@ fn arming_at(pr: &PrHistory, at: DateTime<Utc>) -> Arming {
 }
 
 /// The latest attempt of `name` on `head` that had started by `at`.
-fn latest_attempt<'a>(head: &'a HeadFact, name: &str, at: DateTime<Utc>) -> Option<&'a CheckFact> {
+pub(super) fn latest_attempt<'a>(
+    head: &'a HeadFact,
+    name: &str,
+    at: DateTime<Utc>,
+) -> Option<&'a CheckFact> {
     head.checks
         .iter()
         .filter(|check| check.name == name)
@@ -590,7 +637,7 @@ fn red_while_armed(
 /// When every required check's latest attempt on `head` had passed by `at`
 /// (`success`, or `skipped`/`neutral`, which branch protection accepts), the
 /// time the last of them did. `None` while any is missing, pending, or red.
-fn all_required_green_since(
+pub(super) fn all_required_green_since(
     history: &RepoHistory,
     head: &HeadFact,
     at: DateTime<Utc>,
@@ -718,6 +765,65 @@ fn ejected_green(
         shared_tests: Vec::new(),
         related_prs: Vec::new(),
     })
+}
+
+/// Flag 9: auto-merge was never armed (or was disarmed), the pull request
+/// is not queued or ejected, no hold label is set, and a required check on a
+/// head pushed longer ago than the flag-6 window has been red for that long.
+/// Flag 2 covers the armed case; without this, an unarmed red pull request
+/// waits on nobody.
+fn red_unarmed(
+    pr: &PrHistory,
+    history: &RepoHistory,
+    at: DateTime<Utc>,
+    thresholds: &Thresholds,
+) -> Vec<Flag> {
+    if arming_at(pr, at) != Arming::Idle
+        || pr.draft
+        || pr.labels.iter().any(|label| {
+            HOLD_LABELS
+                .iter()
+                .any(|hold| label.eq_ignore_ascii_case(hold))
+        })
+    {
+        return Vec::new();
+    }
+    let Some(head) = head_at(pr, at) else {
+        return Vec::new();
+    };
+    let window = Duration::minutes(thresholds.green_unarmed_minutes);
+    if at - head.first_seen_at <= window {
+        return Vec::new();
+    }
+    let mut flags = Vec::new();
+    for name in &history.required_checks {
+        let Some(check) = latest_attempt(head, name, at) else {
+            continue;
+        };
+        let Some(completed) = completed_by(check, at) else {
+            continue;
+        };
+        if !check.failed() || at - completed <= window {
+            continue;
+        }
+        flags.push(Flag {
+            pr: pr.number,
+            kind: FlagKind::RedUnarmed,
+            key: format!("{}|{name}", short(&head.sha)),
+            verdict: "red, and nobody armed it".to_owned(),
+            evidence: format!(
+                "required `{name}` on head {} red since {} (> {} min); not armed, not queued, no push since",
+                short(&head.sha),
+                completed.format("%Y-%m-%d %H:%MZ"),
+                thresholds.green_unarmed_minutes
+            ),
+            head_sha: head.sha.clone(),
+            route: DigestRoute::PerPr,
+            shared_tests: Vec::new(),
+            related_prs: Vec::new(),
+        });
+    }
+    flags
 }
 
 /// Flag 3.
