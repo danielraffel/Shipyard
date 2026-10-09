@@ -710,6 +710,7 @@ pub(crate) fn parse_snapshot_with_previous_at(
         repository,
         configured_required,
         branch_rule_denied.then_some(previous).flatten(),
+        branch_rule_denied,
     )?;
 
     let pull_requests_connection =
@@ -864,6 +865,7 @@ fn required_check_policy(
     repository: &Value,
     configured_required: &[String],
     previous: Option<&QueueStateSnapshot>,
+    branch_rule_denied: bool,
 ) -> Result<BTreeMap<String, Option<u64>>, String> {
     let mut required = configured_required
         .iter()
@@ -877,6 +879,9 @@ fn required_check_policy(
         for check in &previous.required_checks {
             required.insert(check.context.clone(), check.app_id);
         }
+        return Ok(required);
+    }
+    if branch_rule_denied {
         return Ok(required);
     }
     let rule = repository
@@ -1833,6 +1838,32 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["/incomplete_reasons", "/truncated"]
         );
+    }
+
+    #[test]
+    fn governance_permission_denial_without_previous_uses_configured_policy() {
+        let body = serde_json::json!({
+            "data":{"repository":{
+                "url":"https://github.test/o/r",
+                "baseRef":{"target":{"oid":"abc"},"branchProtectionRule":null},
+                "pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}},
+                "mergeQueue":null
+            }},
+            "errors":[
+                {"type":"FORBIDDEN","path":["repository","baseRef","branchProtectionRule"]},
+                {"type":"FORBIDDEN","path":["repository","mergeQueue"]}
+            ]
+        });
+        let snapshot = parse_snapshot(
+            &body,
+            "o/r",
+            "main",
+            &["configured-check".to_owned()],
+            OwnershipSnapshot::default(),
+        )
+        .expect("permission-denied optional fields are conservatively usable");
+        assert_eq!(snapshot.required_contexts, ["configured-check"]);
+        assert!(snapshot.truncated);
     }
 
     #[test]
