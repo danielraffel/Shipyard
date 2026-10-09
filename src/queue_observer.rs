@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// Persisted schema version for queue-observer state and transition records.
-pub const QUEUE_OBSERVER_SCHEMA_VERSION: u32 = 1;
+pub const QUEUE_OBSERVER_SCHEMA_VERSION: u32 = 2;
 
 /// Adaptive polling intervals, in seconds. A transition resets to the first
 /// value; every unchanged observation advances one step and then stays capped.

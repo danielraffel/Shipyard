@@ -23,7 +23,7 @@ use crate::queue_observer::{
 pub const DEFAULT_STALE_AFTER_SECONDS: u64 = 900;
 
 /// Stable output schema for queue digests.
-pub const QUEUE_DIGEST_SCHEMA_VERSION: u32 = 1;
+pub const QUEUE_DIGEST_SCHEMA_VERSION: u32 = 2;
 
 /// One observer's durable freshness and identity receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -321,22 +321,32 @@ fn read_observer(
         .as_deref()
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
         .map(|value| value.with_timezone(&Utc));
-    if snapshot.captured_at.is_some() && captured_at.is_none() {
+    if snapshot.captured_at.is_none() {
+        errors.push(format!(
+            "queue-observer state {} has no captured_at provenance value",
+            path.display()
+        ));
+    } else if captured_at.is_none() {
         errors.push(format!(
             "queue-observer state {} has an invalid captured_at provenance value",
             path.display()
         ));
     }
-    let freshness_time = captured_at.map_or(modified, SystemTime::from);
-    let (age_seconds, is_stale) = if let Ok(age) = now.duration_since(freshness_time) {
-        let seconds = age.as_secs();
-        (seconds, seconds > stale_after_seconds)
-    } else {
-        errors.push(format!(
-            "queue-observer state {} has a future modification time",
-            path.display()
-        ));
-        (0, true)
+    let (age_seconds, is_stale) = match captured_at {
+        Some(captured_at) => match now.duration_since(SystemTime::from(captured_at)) {
+            Ok(age) => {
+                let seconds = age.as_secs();
+                (seconds, seconds > stale_after_seconds)
+            }
+            Err(_) => {
+                errors.push(format!(
+                    "queue-observer state {} has a future captured_at value",
+                    path.display()
+                ));
+                (0, true)
+            }
+        },
+        None => (0, true),
     };
     if is_stale {
         errors.push(format!(
@@ -499,15 +509,32 @@ pub fn render_markdown(digest: &QueueDigest) -> String {
         format!("- observers: {}", digest.observers.len()),
     ];
     for observer in &digest.observers {
+        let incomplete_reasons = if observer.incomplete_reasons.is_empty() {
+            "none".to_owned()
+        } else {
+            observer
+                .incomplete_reasons
+                .iter()
+                .map(|reason| {
+                    serde_json::to_string(reason)
+                        .unwrap_or_else(|_| "unknown".to_owned())
+                        .trim_matches('"')
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         lines.push(format!(
-            "- `{}` `{}` base `{}`; state `{}`; age={}s; stale={}; truncated={}; file `{}`",
+            "- `{}` `{}` base `{}`; state `{}`; captured_at={}; age={}s; stale={}; truncated={}; incomplete_reasons={}; file `{}`",
             observer.repo,
             observer.base,
             observer.main_sha,
             observer.state_hash,
+            observer.captured_at.as_deref().unwrap_or("missing"),
             observer.age_seconds,
             observer.stale,
             observer.truncated,
+            incomplete_reasons,
             observer.state_file
         ));
     }
@@ -593,14 +620,14 @@ mod tests {
         observe(
             None,
             QueueStateSnapshot {
-                schema_version: 1,
+                schema_version: crate::queue_observer::QUEUE_OBSERVER_SCHEMA_VERSION,
                 repo: repo.to_owned(),
                 base: base.to_owned(),
                 main_sha: "b".repeat(40),
                 main_url: format!("https://github.test/{repo}/commit/base"),
                 truncated: false,
                 incomplete_reasons: vec![],
-                captured_at: None,
+                captured_at: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
                 required_contexts: vec![],
                 required_checks: vec![],
                 ownership: OwnershipSnapshot::default(),
