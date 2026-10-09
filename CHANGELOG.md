@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02862"></a>
+## [0.286.2] - 2026-10-09
+
+- fix(queue): authenticate observer snapshot integrity ([#749](https://github.com/danielraffel/Shipyard/pull/749))
+
 <a id="v02861"></a>
 ## [0.286.1] - 2026-10-09
 
@@ -2054,6 +2059,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.286.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.286.2
 [0.286.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.286.1
 [0.286.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.286.0
 [0.285.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.285.0
