@@ -135,4 +135,6 @@ and the observer rejects missing or malformed GraphQL connection `nodes` or
 `pageInfo` fields instead of treating them as empty. Diagnostic
 JSON/Markdown is still emitted so a supervisor can hand the exact problem back
 to the responsible owner. Transition logs are deliberately not treated as
-current state and `.jsonl` files are ignored.
+current state and `.jsonl` files are ignored. A schema-2 cursor is re-bootstrap
+eligible for `queue-observe` but remains fail-closed for `queue-digest` until a
+fresh schema-3 observation replaces it.

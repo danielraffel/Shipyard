@@ -192,6 +192,7 @@ pub struct ObserverState {
     /// SHA-256 of canonical snapshot JSON without capture provenance.
     pub state_hash: String,
     /// Integrity SHA-256 of canonical snapshot JSON, including capture time.
+    #[serde(default)]
     pub snapshot_integrity_hash: String,
     /// Last canonical snapshot.
     pub snapshot: QueueStateSnapshot,
@@ -339,6 +340,25 @@ pub fn load_state(path: &Path) -> Result<Option<ObserverState>, String> {
         Ok(raw) => {
             let state: ObserverState = serde_json::from_str(&raw)
                 .map_err(|error| format!("parse observer state {}: {error}", path.display()))?;
+            if state.schema_version == QUEUE_OBSERVER_SCHEMA_VERSION - 1
+                && state.snapshot_integrity_hash.is_empty()
+            {
+                let actual = snapshot_hash(&state.snapshot).map_err(|error| {
+                    format!("hash legacy observer state {}: {error}", path.display())
+                })?;
+                if actual != state.state_hash {
+                    return Err(format!(
+                        "legacy observer state {} hash mismatch: stored={} actual={actual}",
+                        path.display(),
+                        state.state_hash
+                    ));
+                }
+                // Legacy state cannot authenticate captured_at. Returning no
+                // previous cursor lets queue-observe fetch a fresh snapshot
+                // and atomically replace it with schema 3; queue-digest keeps
+                // the legacy file fail-closed instead of treating it as live.
+                return Ok(None);
+            }
             if state.schema_version != QUEUE_OBSERVER_SCHEMA_VERSION {
                 return Err(format!(
                     "observer state {} has unsupported schema version {}",
@@ -1302,6 +1322,19 @@ mod tests {
             second.state.snapshot_integrity_hash,
             first.state.snapshot_integrity_hash
         );
+    }
+
+    #[test]
+    fn legacy_state_reboots_without_trusting_unauthenticated_capture_time() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("observer.json");
+        let mut state = observe(None, minimal_snapshot("a")).expect("state").state;
+        state.schema_version = QUEUE_OBSERVER_SCHEMA_VERSION - 1;
+        state.snapshot.schema_version = QUEUE_OBSERVER_SCHEMA_VERSION - 1;
+        state.state_hash = snapshot_hash(&state.snapshot).expect("legacy hash");
+        state.snapshot_integrity_hash.clear();
+        save_state(&path, &state).expect("legacy state");
+        assert!(load_state(&path).expect("legacy read").is_none());
     }
 
     #[test]
