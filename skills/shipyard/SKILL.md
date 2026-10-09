@@ -665,7 +665,8 @@ and clears on any passing named group that finishes after the last failure.
 `shipyard pr-watch scan --handback` plans the hand-back (dry run): for a PR
 with an owner-actionable flag it resolves the owner (steward handoff record,
 else the PR body's `whence` marker), probes the session read-only with
-`cmux sessions list`, and prints the `shipyard:needs-agent` label change, the
+`cmux sessions list` (live = `running` or `idle` with its process alive, so an
+agent waiting for input still gets called back), and prints the `shipyard:needs-agent` label change, the
 `cmux notify` on the live session's surface, and the inbox line it would write
 to `~/.local/state/shipyard/inbox/<session>.jsonl` on the owner's host (the
 plugin's SessionStart/UserPromptSubmit hook shows that inbox to the agent once).
