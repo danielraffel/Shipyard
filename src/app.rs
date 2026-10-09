@@ -568,6 +568,16 @@ where
                 stdout,
             );
         }
+        Command::QueueDigest {
+            stale_after_seconds,
+        } => {
+            return queue_digest_command(
+                &runtime_paths.state_dir,
+                stale_after_seconds,
+                cli.json,
+                stdout,
+            );
+        }
         Command::PrWatch { command } => {
             let config = LoadedConfig::load_from_cwd_with_global_dir(
                 cli.mode.into(),
@@ -770,6 +780,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Queue
         | Command::QueueHold { .. }
         | Command::QueueObserve { .. }
+        | Command::QueueDigest { .. }
         | Command::PrWatch { .. }
         | Command::Reuse { .. }
         | Command::ChangedSurfacePlan { .. }
