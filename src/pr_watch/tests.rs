@@ -365,6 +365,113 @@ fn flag2_counts_an_ejection_for_failed_checks_as_armed() {
     assert!(kinds(&evaluate(&manual, t(2, 0), &thresholds), 300).is_empty());
 }
 
+// ---- flag 6 -------------------------------------------------------------------
+
+/// PR 600 whose head is green on both required checks, the last at 1:00.
+fn green_history(events: Vec<QueueEvent>, labels: &[&str], vellum: &str) -> RepoHistory {
+    let mut pr = pr(
+        600,
+        vec![head(
+            "g1",
+            t(0, 0),
+            "success",
+            vec![
+                check(61, MACOS, "success", t(1, 0), &[]),
+                check(62, "Vellum freeze", vellum, t(0, 30), &[]),
+            ],
+        )],
+        events,
+    );
+    pr.labels = labels.iter().map(|l| (*l).to_owned()).collect();
+    history(vec![pr], vec![])
+}
+
+#[test]
+fn flag6_fires_once_every_required_check_has_been_green_past_the_threshold() {
+    let thresholds = Thresholds::default();
+    let green = green_history(vec![], &[], "success");
+    assert!(kinds(&evaluate(&green, t(3, 0), &thresholds), 600).is_empty());
+    let flags = evaluate(&green, t(3, 1), &thresholds);
+    assert_eq!(kinds(&flags, 600), vec![6]);
+    assert_eq!(flags[0].verdict, "green but nobody armed it");
+    assert!(
+        flags[0].evidence.contains("since 2026-09-28 01:00Z"),
+        "{}",
+        flags[0].evidence
+    );
+    // A skipped required check passes, as branch protection treats it.
+    let skipped = green_history(vec![], &[], "skipped");
+    assert_eq!(
+        kinds(&evaluate(&skipped, t(4, 0), &thresholds), 600),
+        vec![6]
+    );
+    // The flag is owner-actionable, so the hand-back carries it.
+    let mut ledger = Ledger::new("o/r", "main");
+    ledger::reconcile(
+        &mut ledger,
+        &flags,
+        &now_map(600, &sha("g1"), true),
+        t(3, 1),
+    );
+    assert!(super::handback::actionable(&ledger.entries[&flags[0].id()]));
+}
+
+#[test]
+fn flag6_needs_every_required_check_green_and_nothing_armed_queued_or_held() {
+    let thresholds = Thresholds::default();
+    let at = t(6, 0);
+    for vellum in ["failure", "cancelled"] {
+        let red = green_history(vec![], &[], vellum);
+        assert!(
+            kinds(&evaluate(&red, at, &thresholds), 600).is_empty(),
+            "{vellum}"
+        );
+    }
+    // A required check that never ran on the head is not green.
+    let mut missing = green_history(vec![], &[], "success");
+    missing.required_checks.push("drift-fast".to_owned());
+    assert!(kinds(&evaluate(&missing, at, &thresholds), 600).is_empty());
+    for events in [
+        vec![ev(t(0, 1), QueueEventKind::Armed)],
+        vec![
+            ev(t(0, 1), QueueEventKind::Armed),
+            ev(t(1, 5), QueueEventKind::Enqueued),
+        ],
+        vec![
+            ev(t(1, 5), QueueEventKind::Enqueued),
+            ev(
+                t(1, 30),
+                QueueEventKind::Removed {
+                    reason: "failed_checks".to_owned(),
+                },
+            ),
+        ],
+    ] {
+        let busy = green_history(events.clone(), &[], "success");
+        assert!(
+            kinds(&evaluate(&busy, at, &thresholds), 600).is_empty(),
+            "{events:?}"
+        );
+    }
+    // Disarmed again is unarmed.
+    let disarmed = green_history(
+        vec![
+            ev(t(0, 1), QueueEventKind::Armed),
+            ev(t(0, 2), QueueEventKind::Disarmed { reason: None }),
+        ],
+        &[],
+        "success",
+    );
+    assert_eq!(kinds(&evaluate(&disarmed, at, &thresholds), 600), vec![6]);
+    for label in ["shipyard:no-auto-merge", "Shipyard:Hold"] {
+        let held = green_history(vec![], &[label], "success");
+        assert!(
+            kinds(&evaluate(&held, at, &thresholds), 600).is_empty(),
+            "{label}"
+        );
+    }
+}
+
 // ---- flag 3 -------------------------------------------------------------------
 
 #[test]

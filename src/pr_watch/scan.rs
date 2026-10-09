@@ -3,15 +3,17 @@
 //! `shipyard pr-watch scan` and the daemon's periodic job.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
+use serde_json::Value;
 
 use super::comment::{self, CommentAction};
 use super::digest::{self, DigestOutcome, DigestPayload, DigestPolicy};
-use super::flags::{Flag, Thresholds, evaluate};
+use super::flags::{Flag, FlagKind, Thresholds, evaluate};
 use super::gather::{WatchQuery, gather};
 use super::handback::{self, HandbackConfig, HandbackMode, HandbackReport};
 use super::ledger::{self, PrNow};
@@ -347,6 +349,7 @@ impl WatchConfig {
         span("red_minutes", &mut t.red_minutes);
         span("replacement_window_hours", &mut t.replacement_window_hours);
         span("split_days", &mut t.split_days);
+        span("green_unarmed_minutes", &mut t.green_unarmed_minutes);
         if let Some(value) = integer(config, "pr_watch.thresholds.split_files") {
             t.split_files = u64::try_from(value.max(1)).unwrap_or(1);
         }
@@ -464,7 +467,8 @@ pub fn scan(
     if let Some(attributor) = attributor {
         attribute(&mut history, attributor, cache, now, &config.thresholds);
     }
-    let flags = evaluate(&history, now, &config.thresholds);
+    let mut flags = evaluate(&history, now, &config.thresholds);
+    let screen_gaps = screen_green_unarmed(reader, &request.repo, &mut flags);
     let prs = pr_now(&history, now);
     let open_prs: Vec<u64> = prs
         .iter()
@@ -524,6 +528,7 @@ pub fn scan(
         sender,
     )?;
     gaps.extend(history.gaps.iter().cloned());
+    gaps.extend(screen_gaps);
     Ok(ScanReport {
         repo: request.repo.clone(),
         at: now,
@@ -539,6 +544,135 @@ pub fn scan(
         reads: cache.stats(),
         handback: handback_report,
     })
+}
+
+/// At most this many pull requests are screened per pass.
+const SCREEN_LIMIT: usize = 20;
+
+/// Screen flag-6 candidates against what the history does not carry: drop a
+/// draft, and a pull request whose body or comments hold a `shipyard:hold`
+/// line; name the latest comment that promised someone would arm it. A
+/// candidate that cannot be read keeps its flag, with a gap saying so.
+/// Replay does not screen, like the attributor.
+fn screen_green_unarmed(
+    reader: &SyncGhReader<'_>,
+    repo: &str,
+    flags: &mut Vec<Flag>,
+) -> Vec<String> {
+    let mut gaps = Vec::new();
+    let candidates: Vec<u64> = flags
+        .iter()
+        .filter(|flag| flag.kind == FlagKind::GreenUnarmed)
+        .map(|flag| flag.pr)
+        .collect();
+    let mut drop: Vec<u64> = Vec::new();
+    for (index, pr) in candidates.into_iter().enumerate() {
+        if index >= SCREEN_LIMIT {
+            gaps.push(format!(
+                "#{pr}: flag 6 not screened (more than {SCREEN_LIMIT} candidates this pass)"
+            ));
+            continue;
+        }
+        match read_screen(reader, repo, pr) {
+            Ok(screen) if screen.draft || screen.held => drop.push(pr),
+            Ok(screen) => {
+                if let (Some(note), Some(flag)) = (
+                    screen.arm_note,
+                    flags
+                        .iter_mut()
+                        .find(|flag| flag.pr == pr && flag.kind == FlagKind::GreenUnarmed),
+                ) {
+                    let _ = write!(flag.evidence, "; {note}");
+                }
+            }
+            Err(error) => gaps.push(format!("#{pr}: flag 6 screen: {error}")),
+        }
+    }
+    flags.retain(|flag| !(flag.kind == FlagKind::GreenUnarmed && drop.contains(&flag.pr)));
+    gaps
+}
+
+/// What a flag-6 screen read.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Screen {
+    draft: bool,
+    held: bool,
+    arm_note: Option<String>,
+}
+
+fn read_screen(reader: &SyncGhReader<'_>, repo: &str, pr: u64) -> Result<Screen, String> {
+    let raw = reader(&["api".to_owned(), format!("repos/{repo}/pulls/{pr}")])?;
+    let pull: Value = serde_json::from_str(&raw).map_err(|e| format!("pull request JSON: {e}"))?;
+    let raw = reader(&[
+        "api".to_owned(),
+        format!("repos/{repo}/issues/{pr}/comments?per_page=100"),
+    ])?;
+    let comments: Value = serde_json::from_str(&raw).map_err(|e| format!("comments JSON: {e}"))?;
+    Ok(screen_of(&pull, &comments))
+}
+
+/// A line that is exactly `shipyard:hold` (any case, optional trailing
+/// reason after whitespace or a colon) marks a deliberate hold.
+fn holds(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        line.strip_prefix("shipyard:hold")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', ':', '\t']))
+    })
+}
+
+/// The sentence of `text` that promises an arm (`... arms ...`, `... will
+/// arm ...`), clipped.
+fn arm_promise(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let at = [" arms ", " arms.", " arms,", " will arm ", " to arm "]
+        .iter()
+        .filter_map(|needle| lower.find(needle))
+        .min()?;
+    let start = text[..at].rfind(['.', '\n', '*']).map_or(0, |i| i + 1);
+    let end = text[at + 1..]
+        .find(['.', '\n'])
+        .map_or(text.len(), |i| at + 1 + i + 1);
+    let sentence: String = text[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let clipped: String = sentence.chars().take(140).collect();
+    (!clipped.is_empty()).then_some(clipped)
+}
+
+fn screen_of(pull: &Value, comments: &Value) -> Screen {
+    let body = pull.get("body").and_then(Value::as_str).unwrap_or_default();
+    let comments: Vec<&Value> = comments
+        .as_array()
+        .map(|c| c.iter().collect())
+        .unwrap_or_default();
+    let held = holds(body)
+        || comments
+            .iter()
+            .any(|c| holds(c.get("body").and_then(Value::as_str).unwrap_or_default()));
+    let arm_note = comments.iter().rev().find_map(|comment| {
+        let body = comment.get("body").and_then(Value::as_str)?;
+        // pr-watch's own sticky comment quotes the note; never re-quote it.
+        if body.contains(super::COMMENT_MARKER) {
+            return None;
+        }
+        let note = arm_promise(body)?;
+        let who = comment
+            .pointer("/user/login")
+            .and_then(Value::as_str)
+            .unwrap_or("someone");
+        let when = comment
+            .get("created_at")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Some(format!("waiting on \"{note}\" ({who}, {when})"))
+    });
+    Screen {
+        draft: pull.get("draft").and_then(Value::as_bool).unwrap_or(false),
+        held,
+        arm_note,
+    }
 }
 
 /// Deliver a digest by running `argv` with the payload on stdin. Exit 0 is
@@ -719,4 +853,110 @@ pub fn daemon_pass(
         }
     }
     pass
+}
+
+#[cfg(test)]
+mod screen_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::pr_watch::flags::DigestRoute;
+
+    fn flag(pr: u64, kind: FlagKind) -> Flag {
+        Flag {
+            pr,
+            kind,
+            key: "abc".to_owned(),
+            verdict: "v".to_owned(),
+            evidence: "green".to_owned(),
+            head_sha: "abc".to_owned(),
+            route: DigestRoute::PerPr,
+            shared_tests: Vec::new(),
+            related_prs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_hold_line_is_exact() {
+        assert!(holds("shipyard:hold"));
+        assert!(holds(
+            "Notes\n  Shipyard:Hold: waiting on the examples lane\n"
+        ));
+        assert!(holds("shipyard:hold until Friday"));
+        assert!(!holds("shipyard:holder"));
+        assert!(!holds("please do not shipyard:hold this"));
+    }
+
+    #[test]
+    fn an_arm_promise_quotes_its_sentence() {
+        assert_eq!(
+            arm_promise("Approved at 3e7ee2ca. Unarmed; team-lead arms. Read against the code.")
+                .as_deref(),
+            Some("Unarmed; team-lead arms.")
+        );
+        assert_eq!(
+            arm_promise(
+                "**Approved at this head; team-lead arms with MERGE once the required checks are green.**"
+            )
+            .as_deref(),
+            Some("Approved at this head; team-lead arms with MERGE once the required checks are green.")
+        );
+        assert_eq!(arm_promise("Unarmed and not queued."), None);
+    }
+
+    #[test]
+    fn the_screen_drops_drafts_and_holds_and_names_the_arm_promise() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let reader = |argv: &[String]| -> Result<String, String> {
+            calls.lock().unwrap().push(argv.join(" "));
+            let path = argv[1].as_str();
+            let comment = |body: &str| json!({"body": body, "user": {"login": "lead[bot]"}, "created_at": "2026-10-06T09:16:26Z"});
+            match path {
+                "repos/o/r/pulls/1" => Ok(json!({"draft": true, "body": ""}).to_string()),
+                "repos/o/r/pulls/2" => {
+                    Ok(json!({"draft": false, "body": "Fix.\n\nshipyard:hold"}).to_string())
+                }
+                "repos/o/r/pulls/3" | "repos/o/r/pulls/4" | "repos/o/r/pulls/5" => {
+                    Ok(json!({"draft": false, "body": "Fix."}).to_string())
+                }
+                "repos/o/r/issues/3/comments?per_page=100" => Ok(json!([
+                    comment("Approved at abc. Unarmed; team-lead arms."),
+                    comment(&format!(
+                        "{}\n- green but nobody armed it; waiting on \"x arms.\"",
+                        crate::pr_watch::COMMENT_MARKER
+                    )),
+                ])
+                .to_string()),
+                "repos/o/r/issues/4/comments?per_page=100" => Ok(json!([comment(
+                    "Holding.\nshipyard:hold: examples lane first"
+                )])
+                .to_string()),
+                p if p.ends_with("/comments?per_page=100") => Ok("[]".to_owned()),
+                _ => Err("boom".to_owned()),
+            }
+        };
+        let mut flags = vec![
+            flag(1, FlagKind::GreenUnarmed),
+            flag(2, FlagKind::GreenUnarmed),
+            flag(3, FlagKind::GreenUnarmed),
+            flag(4, FlagKind::GreenUnarmed),
+            flag(5, FlagKind::GreenUnarmed),
+            flag(6, FlagKind::GreenUnarmed),
+            flag(7, FlagKind::RedWhileArmed),
+        ];
+        let gaps = screen_green_unarmed(&reader, "o/r", &mut flags);
+        let left: Vec<u64> = flags.iter().map(|f| f.pr).collect();
+        // Draft (1), body hold (2), comment hold (4) are dropped; an
+        // unreadable candidate (6) keeps its flag with a gap; other kinds are
+        // never read.
+        assert_eq!(left, vec![3, 5, 6, 7]);
+        assert_eq!(
+            flags[0].evidence,
+            "green; waiting on \"Unarmed; team-lead arms.\" (lead[bot], 2026-10-06T09:16:26Z)"
+        );
+        assert_eq!(flags[1].evidence, "green");
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].starts_with("#6: flag 6 screen"), "{gaps:?}");
+        assert!(!calls.lock().unwrap().iter().any(|c| c.contains("/7")));
+    }
 }

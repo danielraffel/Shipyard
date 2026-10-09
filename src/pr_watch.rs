@@ -30,6 +30,11 @@
 //! 5. [`FlagKind::SplitCandidate`]: open longer than three days, or more than
 //!    60 files or 30 commits. Advisory only: it is raised only alongside
 //!    another flag on the same pull request, never alone.
+//! 6. [`FlagKind::GreenUnarmed`]: every required check on the current head has
+//!    been green for longer than the threshold, and nothing will merge it: not
+//!    armed, not queued, not ejected, not a draft, and not held (a
+//!    `shipyard:no-auto-merge` or `shipyard:hold` label, or a `shipyard:hold`
+//!    line in the body or a comment).
 //!
 //! Everything here is read-only on GitHub except two opt-in writes: the
 //! sticky pull-request comment in [`comment`] (comment endpoints only) and the
