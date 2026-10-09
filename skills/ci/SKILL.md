@@ -27,6 +27,13 @@ live in [references/adoption.md](references/adoption.md). Detect first: the
 costly failure is rebuilding something already wired, or adding a queue before
 the required checks it depends on.
 
+The auto-merge proof counts `AutoMergeEnabledEvent` nodes from an
+`itemTypes`-filtered timeline, never its `totalCount`: that count ignores
+`itemTypes` and covers every timeline item, so it once read every merged PR as
+auto-merged. A timeline answer without `nodes` is unreadable and leaves the row
+unmeasured. The offline suite (`skills/ci/scripts/test_adoption_audit.sh`) runs
+in the Python helper CI lane through `scripts/test_graphql_filtered_count.py`.
+
 ## Webhook repository identity
 
 Webhook registrar repository keys are canonical lowercase `owner/name` values
