@@ -3145,9 +3145,12 @@ Raw queue removal is not a queue-steward operation. Install
 chokepoint and run it against the wrapper argv before invoking the real `gh`.
 It refuses `pr merge --disable-auto`, `dequeuePullRequest`, and
 `disablePullRequestAutoMerge` unless the call comes from Shipyard's
-machine-authorized, exact-head, write-ahead-audited mutation path. A deliberate
-manual authority action requires the loud `GHAPP_ALLOW_QUEUE_REMOVAL=1`
-override. Long-running or pending advisory/self-hosted checks are never queue
+machine-authorized, exact-head, write-ahead-audited mutation path, and it
+honours Shipyard's internal marker only when the calling process is the
+Shipyard binary. A deliberate manual authority action uses the operator
+override in `docs/ghapp-guards.md`, which must state a reason: a rebase or a
+reorder is always refused (a queued PR does not need a rebase; the queue merges
+it on top of current main), and a defect fix is allowed and recorded. Long-running or pending advisory/self-hosted checks are never queue
 removal authority.
 
 The opposite mistake is guarded too. `scripts/ghapp_queue_arm_guard.py`
