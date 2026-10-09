@@ -301,7 +301,7 @@ pub fn check_argv(argv: &[String], cmux_path: &str) -> Result<(), String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
 pub enum Liveness {
-    /// A cmux record for the session is `running` with a live pid.
+    /// A cmux record for the session is `running` or `idle` with a live pid.
     Live {
         /// Surface holding it now.
         surface: Option<String>,
@@ -331,8 +331,11 @@ impl Liveness {
 
 /// Decide liveness from `cmux sessions list --json --session <id>` output.
 /// A row counts only when its `session_id` matches exactly; it is live only
-/// when `agent_lifecycle` is `running` and `stored_pid_exists` is `true`. A
-/// row on the expected surface is preferred.
+/// when `agent_lifecycle` is `running` or `idle` and `stored_pid_exists` is
+/// `true`. `idle` is an agent that finished its turn and waits for input with
+/// its process still alive: the usual state of an owner whose pull request
+/// went red after it stopped, and exactly the one a hand-back is for. A row
+/// on the expected surface is preferred.
 #[must_use]
 pub fn parse_sessions(stdout: &str, session: &str, expected_surface: Option<&str>) -> Liveness {
     let Ok(value) = serde_json::from_str::<Value>(stdout) else {
@@ -352,8 +355,10 @@ pub fn parse_sessions(stdout: &str, session: &str, expected_surface: Option<&str
     let live: Vec<&&Value> = rows
         .iter()
         .filter(|row| {
-            row.get("agent_lifecycle").and_then(Value::as_str) == Some("running")
-                && row.get("stored_pid_exists").and_then(Value::as_bool) == Some(true)
+            matches!(
+                row.get("agent_lifecycle").and_then(Value::as_str),
+                Some("running" | "idle")
+            ) && row.get("stored_pid_exists").and_then(Value::as_bool) == Some(true)
         })
         .collect();
     let chosen = live

@@ -216,8 +216,10 @@ and otherwise unreachable. Nothing about the fleet is hardcoded.
 
 **Liveness.** `cmux sessions list --json --session <id>` on the owner's host
 (read-only). Live means a record for exactly that session with
-`agent_lifecycle = running` and `stored_pid_exists = true`; the record's current
-surface is used. No record or a stopped one is dead; unreadable output is
+`agent_lifecycle` of `running` or `idle` and `stored_pid_exists = true` (an idle
+agent finished its turn and is waiting for input; it is the owner a hand-back is
+for); the record's current surface is used. No record, a stopped one, or one
+whose process is gone is dead; unreadable output is
 unknown; an ssh failure or an unmapped host is unreachable.
 
 **Once per episode.** A delivery is recorded in the ledger (`handback.delivered`)

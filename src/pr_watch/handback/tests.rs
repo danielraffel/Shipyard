@@ -194,7 +194,7 @@ fn sessions_json(rows: &[(&str, &str, bool, &str)]) -> String {
 }
 
 #[test]
-fn liveness_needs_a_running_record_with_a_live_pid() {
+fn liveness_needs_a_running_or_idle_record_with_a_live_pid() {
     let live = sessions_json(&[(LIVE_SESSION, "running", true, LIVE_SURFACE)]);
     assert_eq!(
         parse_sessions(&live, LIVE_SESSION, None),
@@ -203,8 +203,22 @@ fn liveness_needs_a_running_record_with_a_live_pid() {
             workspace: Some(LIVE_WORKSPACE.to_owned())
         }
     );
+    // An agent waiting for input is idle with its process alive: live.
+    let idle = sessions_json(&[(LIVE_SESSION, "idle", true, LIVE_SURFACE)]);
+    assert_eq!(
+        parse_sessions(&idle, LIVE_SESSION, None),
+        Liveness::Live {
+            surface: Some(LIVE_SURFACE.to_owned()),
+            workspace: Some(LIVE_WORKSPACE.to_owned())
+        }
+    );
     let gone_pid = sessions_json(&[(LIVE_SESSION, "running", false, LIVE_SURFACE)]);
     assert_eq!(parse_sessions(&gone_pid, LIVE_SESSION, None).name(), "dead");
+    let idle_gone_pid = sessions_json(&[(LIVE_SESSION, "idle", false, LIVE_SURFACE)]);
+    assert_eq!(
+        parse_sessions(&idle_gone_pid, LIVE_SESSION, None).name(),
+        "dead"
+    );
     let ended = sessions_json(&[(LIVE_SESSION, "ended", true, LIVE_SURFACE)]);
     assert_eq!(parse_sessions(&ended, LIVE_SESSION, None).name(), "dead");
     // Another session's live row does not count.
