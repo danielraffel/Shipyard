@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,9 +16,10 @@ HOOK = ROOT / "hooks" / "handback-inbox.py"
 SESSION = "cfc73f94-128a-4c3d-8e69-2f278ff4fd8b"
 
 
-def entry(pr: int, episode: str = "2026-09-29T01:00:00Z") -> str:
+def entry(pr: int, episode: str = "2026-09-29T01:00:00Z", **extra: object) -> str:
     return json.dumps(
         {
+            **extra,
             "schema": "shipyard.pr-watch.handback/v1",
             "id": f"{pr}:repeat_test_failure:macos|t@{episode}",
             "repo": "o/r",
@@ -95,6 +97,45 @@ class HandbackInboxHookTests(unittest.TestCase):
         self.assertIn("and 7 more", context)
         for line in context.splitlines():
             self.assertLessEqual(len(line), 300)
+
+    def test_each_note_names_its_head_and_age(self) -> None:
+        stamp = (datetime.now(timezone.utc) - timedelta(hours=3, minutes=5)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        (self.dir / f"{SESSION}.jsonl").write_text(
+            entry(9060, head_sha="0f6b0d273901aa", delivered_at=stamp) + "\n",
+            encoding="utf-8",
+        )
+        result = self.run_hook(self.payload())
+        context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("on head 0f6b0d2, 3h ago", context)
+        self.assertIn("if you pushed after that head", context)
+
+    def test_a_retraction_drops_the_unread_note_it_names(self) -> None:
+        stale = json.loads(entry(9060))["id"]
+        retraction = json.dumps(
+            {
+                "schema": "shipyard.pr-watch.handback/v1",
+                "retract": stale,
+                "pr": 9060,
+                "reason": "addressed",
+            }
+        )
+        inbox = self.dir / f"{SESSION}.jsonl"
+        inbox.write_text(entry(9060) + "\n" + retraction + "\n", encoding="utf-8")
+        self.assertEqual(self.run_hook(self.payload()).stdout, "")
+        self.assertFalse(inbox.exists())
+        # A note that was not retracted still shows alongside a retraction.
+        inbox.write_text(
+            entry(9060, episode="2026-09-30T01:00:00Z") + "\n" + entry(9055) + "\n"
+            + json.dumps({"retract": json.loads(entry(9055))["id"]}) + "\n",
+            encoding="utf-8",
+        )
+        context = json.loads(self.run_hook(self.payload()).stdout)["hookSpecificOutput"][
+            "additionalContext"
+        ]
+        self.assertIn("#9060", context)
+        self.assertNotIn("#9055", context)
 
     def test_bad_input_never_fails_the_turn(self) -> None:
         for raw in ["not json", "[]", json.dumps({"session_id": "../../etc/passwd"}), ""]:

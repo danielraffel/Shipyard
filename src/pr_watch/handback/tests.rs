@@ -1696,3 +1696,104 @@ fn a_wake_with_no_channel_configured_is_unsent_not_failed() {
     );
     assert!(!out.report.events.iter().any(|e| e.change == "wake.unsent"));
 }
+
+#[test]
+fn a_resolved_episode_retracts_its_unread_inbox_line_on_the_owners_host() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(true, true);
+    let mut runner = FakeRunner::default();
+    pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let line_of = |ledger: &Ledger, id: &str| {
+        ledger.handback.wakes[id]
+            .inbox
+            .as_ref()
+            .map(|target| target.line.clone())
+            .unwrap()
+    };
+    let remote = line_of(&ledger, "1:repeat_test_failure:k");
+    let local = line_of(&ledger, "5:repeated_ejection:");
+    assert!(remote.starts_with("1:repeat_test_failure:k@"), "{remote}");
+    // Still actionable: nothing is retracted.
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(2),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(
+        !out.report
+            .actions
+            .iter()
+            .any(|a| a.action == "retract_inbox"),
+        "{:?}",
+        out.report.actions
+    );
+
+    // The owner pushed a new head: both episodes are addressed.
+    for id in ["1:repeat_test_failure:k", "5:repeated_ejection:"] {
+        ledger.entries.get_mut(id).unwrap().addressed_at = Some(t(3));
+    }
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(3),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let retract = |stdin: &str| -> Value { serde_json::from_str(stdin.trim()).unwrap() };
+    let over_ssh = runner
+        .runs
+        .iter()
+        .filter_map(|i| i.stdin.as_deref())
+        .map(retract)
+        .find(|v| v.get("retract").is_some())
+        .expect("a retraction went over ssh");
+    assert_eq!(over_ssh["retract"], json!(remote));
+    assert_eq!(over_ssh["reason"], json!("addressed"));
+    assert_eq!(over_ssh["schema"], json!(super::INBOX_SCHEMA));
+    let (session, lines) = runner.local_inbox.first().expect("a local retraction");
+    assert_eq!(session, LOCAL_SESSION);
+    assert_eq!(retract(lines)["retract"], json!(local));
+    let sent = out
+        .report
+        .actions
+        .iter()
+        .filter(|a| a.action == "retract_inbox" && a.sent)
+        .count();
+    assert_eq!(sent, 2, "{:?}", out.report.actions);
+
+    // Retracted once: a later pass sends nothing more.
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(4),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(
+        !out.report
+            .actions
+            .iter()
+            .any(|a| a.action == "retract_inbox"),
+        "{:?}",
+        out.report.actions
+    );
+}

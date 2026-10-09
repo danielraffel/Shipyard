@@ -190,6 +190,28 @@ pub struct WakeRecord {
     /// Why nothing was attempted for it (`no_channel`), once logged.
     #[serde(default)]
     pub unsent: Option<String>,
+    /// Where its inbox line went, so the line can be retracted when the
+    /// episode resolves before the owner reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbox: Option<InboxTarget>,
+}
+
+/// The inbox an episode's line was appended to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxTarget {
+    /// Session whose inbox holds the line.
+    pub session: String,
+    /// Host route of that inbox.
+    pub route: Route,
+    /// The line's `id`.
+    pub line: String,
+}
+
+/// A retraction owed to an inbox: the episode its line describes resolved.
+struct Retraction {
+    pr: u64,
+    target: InboxTarget,
+    how: String,
 }
 
 /// One delivered episode.
@@ -645,10 +667,15 @@ fn detail(liveness: &Liveness) -> String {
     }
 }
 
+/// The `id` of an episode's inbox line.
+fn inbox_line_id(id: &str, episode: DateTime<Utc>) -> String {
+    format!("{id}@{}", episode.format("%Y-%m-%dT%H:%M:%SZ"))
+}
+
 fn inbox_line(repo: &str, id: &str, entry: &LedgerEntry, now: DateTime<Utc>) -> String {
     json!({
         "schema": INBOX_SCHEMA,
-        "id": format!("{id}@{}", entry.first_seen_at.format("%Y-%m-%dT%H:%M:%SZ")),
+        "id": inbox_line_id(id, entry.first_seen_at),
         "repo": repo,
         "pr": entry.pr,
         "url": entry.url,
@@ -696,6 +723,19 @@ struct SessionBatch {
     ids: Vec<String>,
 }
 
+/// A line that tells the inbox hook to drop an unread line: the episode it
+/// describes resolved (`how`) before the owner's next turn.
+fn retraction_line(line: &str, pr: u64, how: &str, now: DateTime<Utc>) -> String {
+    json!({
+        "schema": INBOX_SCHEMA,
+        "retract": line,
+        "pr": pr,
+        "reason": how,
+        "at": now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    })
+    .to_string()
+}
+
 /// Run the hand-back over a reconciled ledger. `gh` reads pull-request
 /// bodies and the label definition; `write` sends label requests (only in
 /// [`HandbackMode::Deliver`]).
@@ -730,6 +770,7 @@ pub fn run(
             .get(&pr)
             .is_some_and(|entry| open_at(entry, now))
     };
+    let mut retractions: Vec<Retraction> = Vec::new();
     let mut by_pr: BTreeMap<u64, Vec<String>> = BTreeMap::new();
     for (id, entry) in &ledger.entries {
         if actionable(entry) && open(entry.pr) {
@@ -871,6 +912,13 @@ pub fn run(
                         continue;
                     }
                     // The flag cleared and came back: close the old episode.
+                    if let Some(target) = previous.inbox.clone() {
+                        retractions.push(Retraction {
+                            pr: previous.pr,
+                            target,
+                            how: "new_episode".to_owned(),
+                        });
+                    }
                     report.events.push(wake_event(
                         now,
                         id,
@@ -892,6 +940,7 @@ pub fn run(
                         raised_at: now,
                         sent_at: None,
                         unsent: None,
+                        inbox: None,
                     },
                 );
                 report.events.push(wake_event(
@@ -1113,6 +1162,13 @@ pub fn run(
                     && let Some(wake) = state.wakes.get_mut(*id)
                 {
                     wake.sent_at.get_or_insert(now);
+                    if channels.iter().any(|c| c == "inbox") {
+                        wake.inbox = Some(InboxTarget {
+                            session: session.clone(),
+                            route: batch.route.clone(),
+                            line: inbox_line_id(id, entry.first_seen_at),
+                        });
+                    }
                 }
                 report.events.push(wake_event(
                     now,
@@ -1209,6 +1265,13 @@ pub fn run(
                 Some(_) if !open(wake.pr) => "closed",
                 Some(_) => "not_actionable",
             };
+            if let Some(target) = wake.inbox.clone() {
+                retractions.push(Retraction {
+                    pr: wake.pr,
+                    target,
+                    how: how.to_owned(),
+                });
+            }
             report.events.push(wake_event(
                 now,
                 &id,
@@ -1221,6 +1284,46 @@ pub fn run(
                     "sent_at": wake.sent_at,
                 }),
             ));
+        }
+    }
+
+    // Retract unread inbox lines whose episode resolved, so the owner's next
+    // turn is not told about a head it already replaced. A line the hook has
+    // already shown is unaffected: the retraction only drops unread lines.
+    if deliver && inbox_on {
+        for retraction in retractions {
+            let Retraction { pr, target, how } = retraction;
+            let line = retraction_line(&target.line, pr, &how, now) + "\n";
+            let command = HostCommand::InboxAppend {
+                session: target.session.clone(),
+            };
+            let invocation = host::invocation(
+                &target.route,
+                &command,
+                &config.cmux_path,
+                Some(line.clone()),
+            );
+            let mut planned = action(
+                1,
+                "retract_inbox",
+                vec![pr],
+                format!("retract unread note for #{pr} ({how})"),
+            );
+            planned.session = Some(target.session.clone());
+            planned.argv = invocation.as_ref().map(|i| i.argv.clone());
+            let result = match &invocation {
+                Some(invocation) => deps
+                    .runner
+                    .run(invocation)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                None => deps.runner.append_local_inbox(&target.session, &line),
+            };
+            match result {
+                Ok(()) => planned.sent = true,
+                Err(error) => planned.error = Some(error),
+            }
+            report.actions.push(planned);
         }
     }
 

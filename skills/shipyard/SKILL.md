@@ -669,7 +669,9 @@ else the PR body's `whence` marker), probes the session read-only with
 agent waiting for input still gets called back), and prints the `shipyard:needs-agent` label change, the
 `cmux notify` on the live session's surface, and the inbox line it would write
 to `~/.local/state/shipyard/inbox/<session>.jsonl` on the owner's host (the
-plugin's SessionStart/UserPromptSubmit hook shows that inbox to the agent once).
+plugin's SessionStart/UserPromptSubmit hook shows that inbox to the agent once,
+naming each note's head and age; an unread note whose episode resolved is
+retracted).
 Owners not live for `unowned_after_hours` are marked unowned on the digest line.
 The label comes off when the flags are addressed and also when the PR merges or
 closes; for a terminal PR the DELETE is sent even if the scan's snapshot does not
