@@ -3702,7 +3702,12 @@ mod tests {
         assert!(matches!(cli.command, Command::QueueDigest { stale_after_seconds: 900 }));
         let cli = Cli::try_parse_from(["shipyard", "queue-digest", "--stale-after-seconds", "30"])
             .expect("queue digest custom freshness");
-        assert!(matches!(cli.command, Command::QueueDigest { stale_after_seconds: 30 }));
+        assert!(matches!(
+            cli.command,
+            Command::QueueDigest {
+                stale_after_seconds: 30
+            }
+        ));
     }
 
     #[test]
