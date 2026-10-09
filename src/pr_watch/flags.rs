@@ -29,6 +29,8 @@ pub enum FlagKind {
     RebaseTreadmill,
     /// Flag 5 (advisory): long-lived or large.
     SplitCandidate,
+    /// Flag 6: every required check green, but not armed and not queued.
+    GreenUnarmed,
 }
 
 impl FlagKind {
@@ -41,6 +43,7 @@ impl FlagKind {
             Self::RepeatedEjection => 3,
             Self::RebaseTreadmill => 4,
             Self::SplitCandidate => 5,
+            Self::GreenUnarmed => 6,
         }
     }
 
@@ -53,6 +56,7 @@ impl FlagKind {
             3 => Some(Self::RepeatedEjection),
             4 => Some(Self::RebaseTreadmill),
             5 => Some(Self::SplitCandidate),
+            6 => Some(Self::GreenUnarmed),
             _ => None,
         }
     }
@@ -69,8 +73,9 @@ impl FlagKind {
     #[must_use]
     pub fn severity(self) -> u8 {
         match self {
-            Self::RedWhileArmed => 5,
-            Self::RepeatedEjection => 4,
+            Self::RedWhileArmed => 6,
+            Self::RepeatedEjection => 5,
+            Self::GreenUnarmed => 4,
             Self::RepeatTestFailure => 3,
             Self::RebaseTreadmill => 2,
             Self::SplitCandidate => 1,
@@ -86,6 +91,7 @@ impl FlagKind {
             Self::RepeatedEjection => "repeated_ejection",
             Self::RebaseTreadmill => "rebase_treadmill",
             Self::SplitCandidate => "split_candidate",
+            Self::GreenUnarmed => "green_unarmed",
         }
     }
 }
@@ -164,6 +170,13 @@ pub struct Thresholds {
     pub split_files: u64,
     /// Flag 5: commits.
     pub split_commits: u64,
+    /// Flag 6: minutes every required check must have been green.
+    #[serde(default = "default_green_unarmed_minutes")]
+    pub green_unarmed_minutes: i64,
+}
+
+fn default_green_unarmed_minutes() -> i64 {
+    120
 }
 
 impl Default for Thresholds {
@@ -179,6 +192,7 @@ impl Default for Thresholds {
             split_days: 3,
             split_files: 60,
             split_commits: 30,
+            green_unarmed_minutes: default_green_unarmed_minutes(),
         }
     }
 }
@@ -201,6 +215,7 @@ pub fn evaluate(history: &RepoHistory, at: DateTime<Utc>, thresholds: &Threshold
         found.extend(red_while_armed(pr, history, at, thresholds));
         found.extend(repeated_ejection(history, pr, &head, at, thresholds));
         found.extend(rebase_treadmill(pr, &head, at, thresholds));
+        found.extend(green_unarmed(pr, history, at, thresholds));
         if !found.is_empty()
             && let Some(split) = split_candidate(pr, &head, at, thresholds)
         {
@@ -562,6 +577,78 @@ fn red_while_armed(
         });
     }
     flags
+}
+
+/// When every required check's latest attempt on `head` had passed by `at`
+/// (`success`, or `skipped`/`neutral`, which branch protection accepts), the
+/// time the last of them did. `None` while any is missing, pending, or red.
+fn all_required_green_since(
+    history: &RepoHistory,
+    head: &HeadFact,
+    at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if history.required_checks.is_empty() {
+        return None;
+    }
+    let mut since = head.first_seen_at;
+    for name in &history.required_checks {
+        let check = latest_attempt(head, name, at)?;
+        let completed = completed_by(check, at)?;
+        let passed =
+            check.succeeded() || matches!(check.conclusion.as_deref(), Some("skipped" | "neutral"));
+        if !passed {
+            return None;
+        }
+        since = since.max(completed);
+    }
+    Some(since)
+}
+
+/// Labels that say a pull request is deliberately left unarmed.
+pub const HOLD_LABELS: [&str; 2] = ["shipyard:no-auto-merge", "shipyard:hold"];
+
+/// Flag 6: every required check on the current head has been green for longer
+/// than the threshold, and nothing will merge it: auto-merge is not armed, it
+/// is not queued, and it was not ejected (an ejected head is flag 2's). A pull
+/// request labelled with a [`HOLD_LABELS`] label is a deliberate hold. Drafts
+/// and holds written in the body or a comment are screened at scan time.
+fn green_unarmed(
+    pr: &PrHistory,
+    history: &RepoHistory,
+    at: DateTime<Utc>,
+    thresholds: &Thresholds,
+) -> Option<Flag> {
+    if arming_at(pr, at) != Arming::Idle {
+        return None;
+    }
+    if pr.labels.iter().any(|label| {
+        HOLD_LABELS
+            .iter()
+            .any(|hold| label.eq_ignore_ascii_case(hold))
+    }) {
+        return None;
+    }
+    let head = head_at(pr, at)?;
+    let since = all_required_green_since(history, head, at)?;
+    if at - since <= Duration::minutes(thresholds.green_unarmed_minutes) {
+        return None;
+    }
+    Some(Flag {
+        pr: pr.number,
+        kind: FlagKind::GreenUnarmed,
+        key: short(&head.sha).to_owned(),
+        verdict: "green but nobody armed it".to_owned(),
+        evidence: format!(
+            "every required check green on head {} since {} (> {} min); not armed and not queued, so nothing will merge it",
+            short(&head.sha),
+            since.format("%Y-%m-%d %H:%MZ"),
+            thresholds.green_unarmed_minutes
+        ),
+        head_sha: head.sha.clone(),
+        route: DigestRoute::PerPr,
+        shared_tests: Vec::new(),
+        related_prs: Vec::new(),
+    })
 }
 
 /// Flag 3.

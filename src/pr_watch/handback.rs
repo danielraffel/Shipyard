@@ -394,7 +394,10 @@ pub fn actionable(entry: &LedgerEntry) -> bool {
         && entry.route == DigestRoute::PerPr
         && matches!(
             entry.kind,
-            FlagKind::RepeatTestFailure | FlagKind::RedWhileArmed | FlagKind::RepeatedEjection
+            FlagKind::RepeatTestFailure
+                | FlagKind::RedWhileArmed
+                | FlagKind::RepeatedEjection
+                | FlagKind::GreenUnarmed
         )
 }
 

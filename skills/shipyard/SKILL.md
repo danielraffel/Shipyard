@@ -659,6 +659,11 @@ daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
 `enabled` stays off with a warning in the `pr_watch_pass` event). See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
+`green_unarmed` (flag 6) is a PR green on every required check for 2 h that
+nobody armed; it is owner-actionable, quotes any "team-lead arms" promise, and
+skips drafts and holds (label `shipyard:hold` or `shipyard:no-auto-merge`, or a
+`shipyard:hold` line in the body or a comment). Mark a deliberate hold that way.
+
 `repeated_ejection` counts only merge groups created since the PR's current head
 and clears on any passing named group that finishes after the last failure.
 

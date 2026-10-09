@@ -40,12 +40,20 @@ required job by name, never to "the first failed job".
 | 2 | `red_while_armed` | auto-merge is armed (or the PR was ejected for `failed_checks` and not re-armed), it is not in the queue, and a required check on the current head has been red for more than 30 minutes with no push since | the check, head, and red-since time |
 | 3 | `repeated_ejection` | at least 2 merge groups named for the PR (`gh-readonly-queue/<base>/pr-<N>-<parent>`) and created since its current head was pushed failed a required job, with no passing named group finishing after the last failure | each failed group with its parent group's status |
 | 4 | `rebase_treadmill` | the head was replaced at least 3 times within 24 h, each time the previous head's gate run was cancelled and the merge base with the base branch advanced | the head chain; says "inferred" |
+| 6 | `green_unarmed` | every required check on the current head passed (`success`, or `skipped`/`neutral`) more than 120 minutes ago, auto-merge is not armed, the PR is not queued and was not ejected; not raised for a PR labelled `shipyard:no-auto-merge` or `shipyard:hold`, a draft, or a PR whose body or a comment has a line `shipyard:hold` | the head and green-since time, plus the latest comment that promised someone would arm it (for example "team-lead arms"), quoted with its author and time |
 | 5 | `split_candidate` | open more than 3 days, or more than 60 files or 30 commits | advisory only: raised only alongside another flag on the same PR, never alone, and never alone in a digest |
 
 Signatures: CTest summary lines are normalised to the bare test name
 (`21516 - name (Failed)  labels` becomes `name`, because CTest renumbers tests
 between runs). A log with no CTest summary uses its first `##[error]` line that
 is not a bare "Process completed with exit code N".
+
+Flag 6 catches the pull request nothing will ever merge: green, but nobody
+armed it. The draft and `shipyard:hold` screens, and the quoted arm promise, are
+read at scan time (one pull-request and one comment-list read per candidate,
+at most 20 per pass); `replay` evaluates the rule without them, like the
+attributor. A deliberate hold should carry `shipyard:hold` or
+`shipyard:no-auto-merge` so it is neither flagged nor armed by a backstop.
 
 Flag 3 is "named for", not "proved culprit". GitHub names a merge group after
 its last entry, so a batch-mate's failure is attributed to it; the parent
@@ -179,8 +187,8 @@ plans it as a dry run whatever the config says, and `scan --deliver-handback`
 
 A flag is **owner-actionable** when its digest route is per-PR (not a
 "failing on main/pre-existing" shared failure, not an ejection the attributor
-pinned on a neighbour) and it is a repeated test failure, red while armed, or a
-repeated ejection. A rebase treadmill (the base moving) and the split advisory
+pinned on a neighbour) and it is a repeated test failure, red while armed, a
+repeated ejection, or green but unarmed. A rebase treadmill (the base moving) and the split advisory
 are not.
 
 | tier | when | what |
@@ -317,6 +325,7 @@ comment_author = "shipyard-local[bot]"
 
 [pr_watch.thresholds]    # spec defaults
 red_minutes = 30
+green_unarmed_minutes = 120
 failed_groups = 2
 replacements = 3
 
