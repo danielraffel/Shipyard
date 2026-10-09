@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// Persisted schema version for queue-observer state and transition records.
-pub const QUEUE_OBSERVER_SCHEMA_VERSION: u32 = 1;
+pub const QUEUE_OBSERVER_SCHEMA_VERSION: u32 = 2;
 
 /// Adaptive polling intervals, in seconds. A transition resets to the first
 /// value; every unchanged observation advances one step and then stays capped.
@@ -61,6 +61,10 @@ pub struct PullRequestSnapshot {
 /// One server-owned merge-queue entry.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QueueEntrySnapshot {
+    /// Base branch used for the queue query. Persisting this alongside the
+    /// entry lets consumers reject a row copied from another observer target.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base: String,
     /// Pull request number.
     pub pr: u64,
     /// Queue position as reported by GitHub.
@@ -109,6 +113,32 @@ pub struct OwnershipSnapshot {
     pub blocker: Option<String>,
 }
 
+/// Why an observer snapshot cannot prove a complete census.
+///
+/// These values are deliberately typed and stable so a supervisor can route a
+/// missing permission, pagination truncation, or incomplete nested connection
+/// to the right owner without parsing prose.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncompleteReason {
+    /// The token could not read the server-owned merge queue.
+    MergeQueueUnavailable,
+    /// The token could not read branch-protection governance.
+    BranchProtectionUnavailable,
+    /// The open pull-request connection has another page.
+    PullRequestsTruncated,
+    /// The merge-queue entry connection has another page.
+    QueueEntriesTruncated,
+    /// A merge-group check-context connection has another page.
+    QueueCheckContextsTruncated,
+    /// A pull-request check-context connection has another page.
+    PullRequestCheckContextsTruncated,
+    /// A pull-request assignee connection has another page.
+    PullRequestAssigneesTruncated,
+    /// A pull-request label connection has another page.
+    PullRequestLabelsTruncated,
+}
+
 /// Canonical repository queue state. Ordered fields and sorted collections make
 /// its serialized bytes and SHA-256 hash stable across equivalent API payloads.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -126,6 +156,13 @@ pub struct QueueStateSnapshot {
     /// Whether any bounded GraphQL connection or optional governance field was
     /// unavailable, so the snapshot is intentionally conservative.
     pub truncated: bool,
+    /// Typed reasons for the conservative `truncated` verdict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_reasons: Vec<IncompleteReason>,
+    /// UTC time at which this source response was captured. It is provenance,
+    /// not semantic state, so canonical hashes and diffs intentionally omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<String>,
     /// Required check names from repository/configured governance.
     pub required_contexts: Vec<String>,
     /// Required contexts and their optional GitHub App binding.
@@ -199,7 +236,9 @@ pub struct ObservationResult {
 
 /// Compute a stable SHA-256 over canonical snapshot JSON.
 pub fn snapshot_hash(snapshot: &QueueStateSnapshot) -> Result<String, serde_json::Error> {
-    serde_json::to_vec(snapshot).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+    let mut canonical = snapshot.clone();
+    canonical.captured_at = None;
+    serde_json::to_vec(&canonical).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
 }
 
 /// Apply one canonical snapshot to the previous observer cursor.
@@ -434,7 +473,15 @@ pub fn parse_snapshot(
     configured_required: &[String],
     ownership: OwnershipSnapshot,
 ) -> Result<QueueStateSnapshot, String> {
-    parse_snapshot_with_previous(body, repo, base, configured_required, ownership, None)
+    parse_snapshot_with_previous_at(
+        body,
+        repo,
+        base,
+        configured_required,
+        ownership,
+        None,
+        chrono::Utc::now(),
+    )
 }
 
 /// Parse a snapshot while conservatively retaining governance facts that a
@@ -444,8 +491,30 @@ pub(crate) fn parse_snapshot_with_previous(
     repo: &str,
     base: &str,
     configured_required: &[String],
+    ownership: OwnershipSnapshot,
+    previous: Option<&QueueStateSnapshot>,
+) -> Result<QueueStateSnapshot, String> {
+    parse_snapshot_with_previous_at(
+        body,
+        repo,
+        base,
+        configured_required,
+        ownership,
+        previous,
+        chrono::Utc::now(),
+    )
+}
+
+/// Deterministic variant used by replay and tests that need a fixed capture
+/// time without making it part of the semantic state hash.
+pub(crate) fn parse_snapshot_with_previous_at(
+    body: &Value,
+    repo: &str,
+    base: &str,
+    configured_required: &[String],
     mut ownership: OwnershipSnapshot,
     previous: Option<&QueueStateSnapshot>,
+    captured_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<QueueStateSnapshot, String> {
     let merge_queue_denied = governance_field_denied(body, &["repository", "mergeQueue"]);
     let branch_rule_denied =
@@ -511,27 +580,18 @@ pub(crate) fn parse_snapshot_with_previous(
             .map(|value| connection_nodes(value.get("entries")))
             .unwrap_or_default()
             .into_iter()
-            .map(|node| parse_queue_entry(node, &required))
+            .map(|node| parse_queue_entry(node, base, &required))
             .collect::<Result<Vec<_>, _>>()?
     };
     queue.sort_by_key(|entry| (entry.position, entry.pr));
 
-    let truncated = merge_queue_denied
-        || branch_rule_denied
-        || connection_has_next(repository.get("pullRequests"))
-        || queue_value.is_some_and(|value| connection_has_next(value.get("entries")))
-        || queue_value.is_some_and(|value| {
-            connection_nodes(value.get("entries")).iter().any(|entry| {
-                connection_has_next(entry.pointer("/headCommit/statusCheckRollup/contexts"))
-            })
-        })
-        || connection_nodes(repository.get("pullRequests"))
-            .iter()
-            .any(|pr| {
-                connection_has_next(pr.pointer("/statusCheckRollup/contexts"))
-                    || connection_has_next(pr.get("assignees"))
-                    || connection_has_next(pr.get("labels"))
-            });
+    let incomplete_reasons = snapshot_incomplete_reasons(
+        repository,
+        queue_value,
+        merge_queue_denied,
+        branch_rule_denied,
+    );
+    let truncated = !incomplete_reasons.is_empty();
 
     Ok(QueueStateSnapshot {
         schema_version: QUEUE_OBSERVER_SCHEMA_VERSION,
@@ -540,6 +600,8 @@ pub(crate) fn parse_snapshot_with_previous(
         main_url: format!("{repository_url}/commit/{main_sha}"),
         main_sha,
         truncated,
+        incomplete_reasons,
+        captured_at: Some(captured_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
         required_contexts: required.keys().cloned().collect(),
         required_checks: required
             .into_iter()
@@ -549,6 +611,54 @@ pub(crate) fn parse_snapshot_with_previous(
         queue,
         pull_requests,
     })
+}
+
+fn snapshot_incomplete_reasons(
+    repository: &Value,
+    queue_value: Option<&Value>,
+    merge_queue_denied: bool,
+    branch_rule_denied: bool,
+) -> Vec<IncompleteReason> {
+    let mut reasons = Vec::new();
+    if merge_queue_denied {
+        reasons.push(IncompleteReason::MergeQueueUnavailable);
+    }
+    if branch_rule_denied {
+        reasons.push(IncompleteReason::BranchProtectionUnavailable);
+    }
+    if connection_has_next(repository.get("pullRequests")) {
+        reasons.push(IncompleteReason::PullRequestsTruncated);
+    }
+    if queue_value.is_some_and(|value| connection_has_next(value.get("entries"))) {
+        reasons.push(IncompleteReason::QueueEntriesTruncated);
+    }
+    if queue_value.is_some_and(|value| {
+        connection_nodes(value.get("entries")).iter().any(|entry| {
+            connection_has_next(entry.pointer("/headCommit/statusCheckRollup/contexts"))
+        })
+    }) {
+        reasons.push(IncompleteReason::QueueCheckContextsTruncated);
+    }
+    let pull_request_nodes = connection_nodes(repository.get("pullRequests"));
+    if pull_request_nodes
+        .iter()
+        .any(|pr| connection_has_next(pr.pointer("/statusCheckRollup/contexts")))
+    {
+        reasons.push(IncompleteReason::PullRequestCheckContextsTruncated);
+    }
+    if pull_request_nodes
+        .iter()
+        .any(|pr| connection_has_next(pr.get("assignees")))
+    {
+        reasons.push(IncompleteReason::PullRequestAssigneesTruncated);
+    }
+    if pull_request_nodes
+        .iter()
+        .any(|pr| connection_has_next(pr.get("labels")))
+    {
+        reasons.push(IncompleteReason::PullRequestLabelsTruncated);
+    }
+    reasons
 }
 
 /// Whether a GraphQL response contains errors exclusively on optional
@@ -899,6 +1009,7 @@ fn parse_latest_checks(
 
 fn parse_queue_entry(
     node: &Value,
+    base: &str,
     required: &BTreeMap<String, Option<u64>>,
 ) -> Result<QueueEntrySnapshot, String> {
     let pr = node
@@ -909,6 +1020,7 @@ fn parse_queue_entry(
     let (receipt_decisions, test_tier) =
         crate::validation_signals::signals_from_graphql_contexts(contexts);
     Ok(QueueEntrySnapshot {
+        base: base.to_owned(),
         pr: required_u64(pr, "number", "queue pull request")?,
         position: required_u64(node, "position", "queue entry")?,
         url: required_string(pr, "url", "queue pull request")?,
@@ -944,8 +1056,16 @@ fn render_check(check: &CheckSnapshot) -> String {
 }
 
 fn diff_snapshots(before: &QueueStateSnapshot, after: &QueueStateSnapshot) -> Vec<StateChange> {
-    let before = serde_json::to_value(before).expect("snapshot serialization");
-    let after = serde_json::to_value(after).expect("snapshot serialization");
+    let mut before = serde_json::to_value(before).expect("snapshot serialization");
+    let mut after = serde_json::to_value(after).expect("snapshot serialization");
+    before
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("captured_at");
+    after
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("captured_at");
     let mut changes = Vec::new();
     diff_values("", &before, &after, &mut changes);
     changes
@@ -1309,6 +1429,8 @@ mod tests {
             main_sha: sha.to_owned(),
             main_url: format!("https://github.test/o/r/commit/{sha}"),
             truncated: false,
+            incomplete_reasons: Vec::new(),
+            captured_at: None,
             required_contexts: Vec::new(),
             required_checks: Vec::new(),
             ownership: OwnershipSnapshot::default(),
@@ -1449,7 +1571,7 @@ mod tests {
                 .iter()
                 .map(|change| change.path.as_str())
                 .collect::<Vec<_>>(),
-            ["/truncated"]
+            ["/incomplete_reasons", "/truncated"]
         );
     }
 
