@@ -319,6 +319,7 @@ enabled = false          # daemon job off by default
 repos = ["Generous-Corp/pulp"]   # else the daemon's --repo list
 base = "main"
 workflow = "build.yml"
+stale_after_minutes = 45  # pr-watch liveness / doctor: stale after this
 # required_checks = ["macos", ...]   # else branch protection
 lookback = "7d"
 post_comments = false
@@ -345,6 +346,19 @@ the command, so use the table form. A `[pr_watch.digest]` table without
 `enabled` keeps the digest off and every pass reports a warning (in the
 `pr_watch_pass` event's `warnings`, and on stderr for `shipyard pr-watch`).
 This block is parsed by a unit test, so it stays valid TOML.
+
+**Is it still running?** Hand-back, comments and the digest all run inside
+the pass, usually on one host, so if passes stop completing (daemon down, auth
+broken, rate limited) every channel goes quiet at once. A completed pass stamps
+`last_scan_at` in the ledger. `shipyard pr-watch liveness [--json]` reads it for
+each watched repository and exits 1 when a scanning host has not completed a
+pass within `[pr_watch] stale_after_minutes` (default 45, three missed passes);
+a host with `[pr_watch] enabled` off is never stale. `shipyard doctor` adds a
+`PR watch` section on a scanning host, and `shipyard doctor --fleet` asks every
+configured host class (`<shipyard_bin> --json pr-watch liveness` over ssh) and
+fails `pr-watch:fleet` when no host is completing passes. Do not enable a second
+scanning host to cover the first: deliveries are recorded in each host's own
+ledger, so two scanners would each deliver every hand-back.
 
 Each pass publishes a `pr_watch_pass` IPC event with per-repository flag
 counts, errors and config warnings. The digest needs the command's host (the Harbormaster token
