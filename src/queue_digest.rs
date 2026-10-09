@@ -183,20 +183,10 @@ pub fn read_digest(state_root: &Path, stale_after_seconds: u64) -> QueueDigest {
 #[must_use]
 pub fn read_digest_at(state_root: &Path, stale_after_seconds: u64, now: SystemTime) -> QueueDigest {
     let observer_root = state_root.join("queue-observer");
-    let mut paths = match fs::read_dir(&observer_root) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-            .collect::<Vec<_>>(),
-        Err(error) => {
-            return QueueDigest::empty(format!(
-                "cannot read queue-observer state directory {}: {error}",
-                observer_root.display()
-            ));
-        }
+    let paths = match observer_paths(&observer_root) {
+        Ok(paths) => paths,
+        Err(error) => return QueueDigest::empty(error),
     };
-    paths.sort();
     if paths.is_empty() {
         return QueueDigest::empty(format!(
             "no queue-observer state files found under {}",
@@ -280,6 +270,30 @@ pub fn read_digest_at(state_root: &Path, stale_after_seconds: u64, now: SystemTi
     digest.errors.dedup();
     digest.complete = digest.errors.is_empty() && !digest.observers.is_empty();
     digest
+}
+
+fn observer_paths(observer_root: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(observer_root).map_err(|error| {
+        format!(
+            "cannot read queue-observer state directory {}: {error}",
+            observer_root.display()
+        )
+    })?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "cannot enumerate queue-observer state directory {}: {error}",
+                observer_root.display()
+            )
+        })?;
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 fn sort_observers(observers: &mut [ObserverDigest]) {
@@ -442,14 +456,14 @@ fn classify_pull_request(pr: &PullRequestSnapshot, queued: bool) -> &'static str
     if queued {
         return "queued";
     }
+    if !pr.blockers.is_empty() || pr.merge_state == "blocked" {
+        return "blocked";
+    }
     if pr.auto_merge {
         return "armed";
     }
     if has_failed_check(&pr.checks) {
         return "red";
-    }
-    if !pr.blockers.is_empty() || pr.merge_state == "blocked" {
-        return "blocked";
     }
     match pr.merge_state.as_str() {
         "clean" => "green_unarmed",
@@ -669,6 +683,21 @@ mod tests {
         let markdown = render_markdown(&digest);
         assert!(markdown.contains("https://github.test/o/r2/pull/2"));
         assert!(markdown.contains(&"h".repeat(40)));
+    }
+
+    #[test]
+    fn explicit_blocker_takes_precedence_over_auto_merge() {
+        let pr = PullRequestSnapshot {
+            number: 1,
+            url: "https://github.test/o/r/pull/1".to_owned(),
+            head_sha: "h".repeat(40),
+            merge_state: "clean".to_owned(),
+            auto_merge: true,
+            owners: vec![],
+            blockers: vec!["review".to_owned()],
+            checks: vec![],
+        };
+        assert_eq!(classify_pull_request(&pr, false), "blocked");
     }
 
     #[test]

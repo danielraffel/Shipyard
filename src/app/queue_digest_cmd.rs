@@ -19,6 +19,10 @@ pub(super) fn queue_digest_command<W: Write>(
     let digest = read_digest(state_dir, stale_after_seconds);
     if json_mode {
         let mut data = serde_json::Map::new();
+        data.insert(
+            "digest_schema_version".to_owned(),
+            Value::from(digest.schema_version),
+        );
         data.insert("complete".to_owned(), Value::Bool(digest.complete));
         data.insert(
             "observers".to_owned(),
@@ -59,5 +63,29 @@ pub(super) fn queue_digest_command<W: Write>(
                 digest.errors.join("; ")
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_output_identifies_digest_schema() {
+        let temp = tempfile::tempdir().expect("temporary state root");
+        let observer_root = temp.path().join("queue-observer");
+        std::fs::create_dir_all(&observer_root).expect("observer root");
+        std::fs::write(
+            observer_root.join("fixture.json"),
+            include_str!("../../tests/fixtures/queue-digest/complete.json"),
+        )
+        .expect("fixture state");
+
+        let mut output = Vec::new();
+        let exit = queue_digest_command(temp.path(), u64::MAX, true, &mut output)
+            .expect("complete digest");
+        assert_eq!(exit, ExitCode::SUCCESS);
+        let payload: Value = serde_json::from_slice(&output).expect("JSON envelope");
+        assert_eq!(payload["digest_schema_version"], 2);
     }
 }
