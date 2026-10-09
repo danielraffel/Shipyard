@@ -872,16 +872,18 @@ fn required_check_policy(
         .cloned()
         .map(|context| (context, None))
         .collect::<BTreeMap<_, _>>();
-    if let Some(previous) = previous {
-        for context in &previous.required_contexts {
-            required.entry(context.clone()).or_insert(None);
-        }
-        for check in &previous.required_checks {
-            required.insert(check.context.clone(), check.app_id);
-        }
-        return Ok(required);
-    }
     if branch_rule_denied {
+        // A permission-denied field is explicitly unavailable. Reuse the
+        // last authenticated policy when one exists; otherwise retain only
+        // the configured baseline and mark the snapshot incomplete upstream.
+        if let Some(previous) = previous {
+            for context in &previous.required_contexts {
+                required.entry(context.clone()).or_insert(None);
+            }
+            for check in &previous.required_checks {
+                required.insert(check.context.clone(), check.app_id);
+            }
+        }
         return Ok(required);
     }
     let rule = repository
