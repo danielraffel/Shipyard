@@ -3293,3 +3293,12 @@ Two traps worth stating because both cost time:
   outright. The **whole-directory control** — `parsed + refused` compared
   against a listing of `.github/workflows/`, printed on every run — is what made
   that visible instead of silent. It reads 77 / 77 on Pulp.
+
+### Queue-digest inventory contract
+
+The read-only `queue-digest` command consumes durable `queue-observe` snapshots;
+it must validate captured freshness, repository/base/head identity, queue-to-PR
+joins, ownership blockers, truncation, corruption, and duplicate rows before
+rendering an inventory. An incomplete or stale snapshot is an explicit unknown,
+never an empty backlog or all-clear. The command does not contact GitHub or
+mutate queue state; merge and product decisions remain outside the digest.
