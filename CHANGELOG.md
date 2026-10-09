@@ -3,6 +3,16 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02833"></a>
+## [0.283.3] - 2026-10-08
+
+- fix/handback stale notes ([#742](https://github.com/danielraffel/Shipyard/pull/742))
+
+<a id="v02832"></a>
+## [0.283.2] - 2026-10-08
+
+- fix/handback idle is live ([#741](https://github.com/danielraffel/Shipyard/pull/741))
+
 <a id="v02831"></a>
 ## [0.283.1] - 2026-10-08
 
@@ -2024,6 +2034,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.283.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.283.3
+[0.283.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.283.2
 [0.283.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.283.1
 [0.283.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.283.0
 [0.282.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.282.3
