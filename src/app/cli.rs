@@ -3699,7 +3699,12 @@ mod tests {
     #[test]
     fn queue_digest_defaults_to_fifteen_minute_freshness() {
         let cli = Cli::try_parse_from(["shipyard", "queue-digest"]).expect("queue digest parses");
-        assert!(matches!(cli.command, Command::QueueDigest { stale_after_seconds: 900 }));
+        assert!(matches!(
+            cli.command,
+            Command::QueueDigest {
+                stale_after_seconds: 900
+            }
+        ));
         let cli = Cli::try_parse_from(["shipyard", "queue-digest", "--stale-after-seconds", "30"])
             .expect("queue digest custom freshness");
         assert!(matches!(
