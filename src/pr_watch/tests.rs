@@ -447,9 +447,10 @@ fn flag6_needs_every_required_check_green_and_nothing_armed_queued_or_held() {
             ),
         ],
     ] {
+        // An ejected head is flag 7's, never flag 6's.
         let busy = green_history(events.clone(), &[], "success");
         assert!(
-            kinds(&evaluate(&busy, at, &thresholds), 600).is_empty(),
+            !kinds(&evaluate(&busy, at, &thresholds), 600).contains(&6),
             "{events:?}"
         );
     }
@@ -470,6 +471,96 @@ fn flag6_needs_every_required_check_green_and_nothing_armed_queued_or_held() {
             "{label}"
         );
     }
+}
+
+// ---- flag 7 -------------------------------------------------------------------
+
+fn ejected_events() -> Vec<QueueEvent> {
+    vec![
+        ev(t(0, 1), QueueEventKind::Armed),
+        ev(t(1, 5), QueueEventKind::Enqueued),
+        ev(
+            t(1, 40),
+            QueueEventKind::Removed {
+                reason: "failed_checks".to_owned(),
+            },
+        ),
+    ]
+}
+
+#[test]
+fn flag7_fires_on_a_green_head_ejected_for_failed_checks_and_never_rearmed() {
+    let thresholds = Thresholds::default();
+    let ejected = green_history(ejected_events(), &[], "success");
+    // The clock starts at the ejection (later than green-since).
+    assert!(kinds(&evaluate(&ejected, t(3, 40), &thresholds), 600).is_empty());
+    let flags = evaluate(&ejected, t(3, 41), &thresholds);
+    assert_eq!(kinds(&flags, 600), vec![7]);
+    assert!(
+        flags[0]
+            .evidence
+            .contains("for failed_checks at 2026-09-28 01:40Z"),
+        "{}",
+        flags[0].evidence
+    );
+    let mut ledger = Ledger::new("o/r", "main");
+    ledger::reconcile(
+        &mut ledger,
+        &flags,
+        &now_map(600, &sha("g1"), true),
+        t(3, 41),
+    );
+    assert!(super::handback::actionable(&ledger.entries[&flags[0].id()]));
+}
+
+#[test]
+fn flag7_needs_the_same_green_head_still_out_of_the_queue() {
+    let thresholds = Thresholds::default();
+    let at = t(6, 0);
+    // Red: flag 2's, not 7's.
+    let red = green_history(ejected_events(), &[], "failure");
+    assert_eq!(kinds(&evaluate(&red, at, &thresholds), 600), vec![2]);
+    // Re-armed or queued again.
+    for again in [QueueEventKind::Armed, QueueEventKind::Enqueued] {
+        let mut events = ejected_events();
+        events.push(ev(t(2, 0), again.clone()));
+        let history = green_history(events, &[], "success");
+        assert!(
+            kinds(&evaluate(&history, at, &thresholds), 600).is_empty(),
+            "{again:?}"
+        );
+    }
+    // Ejected for another reason.
+    let mut manual = ejected_events();
+    manual[2] = ev(
+        t(1, 40),
+        QueueEventKind::Removed {
+            reason: "manual".to_owned(),
+        },
+    );
+    assert_eq!(
+        kinds(
+            &evaluate(&green_history(manual, &[], "success"), at, &thresholds),
+            600
+        ),
+        vec![6]
+    );
+    // A new head after the ejection is the owner's answer.
+    let mut pushed = green_history(ejected_events(), &[], "success");
+    let pr = pushed.prs.get_mut(&600).unwrap();
+    pr.heads.push(head(
+        "g2",
+        t(2, 0),
+        "success",
+        vec![
+            check(71, MACOS, "success", t(2, 30), &[]),
+            check(72, "Vellum freeze", "success", t(2, 30), &[]),
+        ],
+    ));
+    assert!(!kinds(&evaluate(&pushed, at, &thresholds), 600).contains(&7));
+    // A hold label suppresses it.
+    let held = green_history(ejected_events(), &["shipyard:hold"], "success");
+    assert!(kinds(&evaluate(&held, at, &thresholds), 600).is_empty());
 }
 
 // ---- flag 3 -------------------------------------------------------------------

@@ -398,6 +398,7 @@ pub fn actionable(entry: &LedgerEntry) -> bool {
                 | FlagKind::RedWhileArmed
                 | FlagKind::RepeatedEjection
                 | FlagKind::GreenUnarmed
+                | FlagKind::EjectedGreen
         )
 }
 

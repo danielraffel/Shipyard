@@ -41,6 +41,7 @@ required job by name, never to "the first failed job".
 | 3 | `repeated_ejection` | at least 2 merge groups named for the PR (`gh-readonly-queue/<base>/pr-<N>-<parent>`) and created since its current head was pushed failed a required job, with no passing named group finishing after the last failure | each failed group with its parent group's status |
 | 4 | `rebase_treadmill` | the head was replaced at least 3 times within 24 h, each time the previous head's gate run was cancelled and the merge base with the base branch advanced | the head chain; says "inferred" |
 | 6 | `green_unarmed` | every required check on the current head passed (`success`, or `skipped`/`neutral`) more than 120 minutes ago, auto-merge is not armed, the PR is not queued and was not ejected; not raised for a PR labelled `shipyard:no-auto-merge` or `shipyard:hold`, a draft, or a PR whose body or a comment has a line `shipyard:hold` | the head and green-since time, plus the latest comment that promised someone would arm it (for example "team-lead arms"), quoted with its author and time |
+| 7 | `ejected_green` | the queue ejected the PR for `failed_checks`, its head has not changed since, every required check on that head is green, and nothing re-armed or re-queued it for more than 120 minutes (`green_unarmed_minutes`, counted from the later of the ejection and green); a hold label suppresses it | the head and ejection time. The arm guard refuses a same-head re-arm after a check failure unless it is certified environmental, so the owner pushes a new head or says why the failure was not this head's |
 | 5 | `split_candidate` | open more than 3 days, or more than 60 files or 30 commits | advisory only: raised only alongside another flag on the same PR, never alone, and never alone in a digest |
 
 Signatures: CTest summary lines are normalised to the bare test name
@@ -188,7 +189,7 @@ plans it as a dry run whatever the config says, and `scan --deliver-handback`
 A flag is **owner-actionable** when its digest route is per-PR (not a
 "failing on main/pre-existing" shared failure, not an ejection the attributor
 pinned on a neighbour) and it is a repeated test failure, red while armed, a
-repeated ejection, or green but unarmed. A rebase treadmill (the base moving) and the split advisory
+repeated ejection, green but unarmed, or ejected and green. A rebase treadmill (the base moving) and the split advisory
 are not.
 
 | tier | when | what |

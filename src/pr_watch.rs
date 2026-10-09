@@ -35,6 +35,9 @@
 //!    armed, not queued, not ejected, not a draft, and not held (a
 //!    `shipyard:no-auto-merge` or `shipyard:hold` label, or a `shipyard:hold`
 //!    line in the body or a comment).
+//! 7. [`FlagKind::EjectedGreen`]: the queue ejected the pull request for
+//!    `failed_checks`, the same head is now green on every required check, and
+//!    nothing re-armed it. The red half of that state is flag 2.
 //!
 //! Everything here is read-only on GitHub except two opt-in writes: the
 //! sticky pull-request comment in [`comment`] (comment endpoints only) and the
