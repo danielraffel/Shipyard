@@ -585,45 +585,12 @@ pub(crate) fn parse_snapshot_with_previous_at(
     };
     queue.sort_by_key(|entry| (entry.position, entry.pr));
 
-    let mut incomplete_reasons = Vec::new();
-    if merge_queue_denied {
-        incomplete_reasons.push(IncompleteReason::MergeQueueUnavailable);
-    }
-    if branch_rule_denied {
-        incomplete_reasons.push(IncompleteReason::BranchProtectionUnavailable);
-    }
-    if connection_has_next(repository.get("pullRequests")) {
-        incomplete_reasons.push(IncompleteReason::PullRequestsTruncated);
-    }
-    if queue_value.is_some_and(|value| connection_has_next(value.get("entries"))) {
-        incomplete_reasons.push(IncompleteReason::QueueEntriesTruncated);
-    }
-    if queue_value.is_some_and(|value| {
-        connection_nodes(value.get("entries")).iter().any(|entry| {
-            connection_has_next(entry.pointer("/headCommit/statusCheckRollup/contexts"))
-        })
-    }) {
-        incomplete_reasons.push(IncompleteReason::QueueCheckContextsTruncated);
-    }
-    let pull_request_nodes = connection_nodes(repository.get("pullRequests"));
-    if pull_request_nodes
-        .iter()
-        .any(|pr| connection_has_next(pr.pointer("/statusCheckRollup/contexts")))
-    {
-        incomplete_reasons.push(IncompleteReason::PullRequestCheckContextsTruncated);
-    }
-    if pull_request_nodes
-        .iter()
-        .any(|pr| connection_has_next(pr.get("assignees")))
-    {
-        incomplete_reasons.push(IncompleteReason::PullRequestAssigneesTruncated);
-    }
-    if pull_request_nodes
-        .iter()
-        .any(|pr| connection_has_next(pr.get("labels")))
-    {
-        incomplete_reasons.push(IncompleteReason::PullRequestLabelsTruncated);
-    }
+    let incomplete_reasons = snapshot_incomplete_reasons(
+        repository,
+        queue_value,
+        merge_queue_denied,
+        branch_rule_denied,
+    );
     let truncated = !incomplete_reasons.is_empty();
 
     Ok(QueueStateSnapshot {
@@ -644,6 +611,54 @@ pub(crate) fn parse_snapshot_with_previous_at(
         queue,
         pull_requests,
     })
+}
+
+fn snapshot_incomplete_reasons(
+    repository: &Value,
+    queue_value: Option<&Value>,
+    merge_queue_denied: bool,
+    branch_rule_denied: bool,
+) -> Vec<IncompleteReason> {
+    let mut reasons = Vec::new();
+    if merge_queue_denied {
+        reasons.push(IncompleteReason::MergeQueueUnavailable);
+    }
+    if branch_rule_denied {
+        reasons.push(IncompleteReason::BranchProtectionUnavailable);
+    }
+    if connection_has_next(repository.get("pullRequests")) {
+        reasons.push(IncompleteReason::PullRequestsTruncated);
+    }
+    if queue_value.is_some_and(|value| connection_has_next(value.get("entries"))) {
+        reasons.push(IncompleteReason::QueueEntriesTruncated);
+    }
+    if queue_value.is_some_and(|value| {
+        connection_nodes(value.get("entries")).iter().any(|entry| {
+            connection_has_next(entry.pointer("/headCommit/statusCheckRollup/contexts"))
+        })
+    }) {
+        reasons.push(IncompleteReason::QueueCheckContextsTruncated);
+    }
+    let pull_request_nodes = connection_nodes(repository.get("pullRequests"));
+    if pull_request_nodes
+        .iter()
+        .any(|pr| connection_has_next(pr.pointer("/statusCheckRollup/contexts")))
+    {
+        reasons.push(IncompleteReason::PullRequestCheckContextsTruncated);
+    }
+    if pull_request_nodes
+        .iter()
+        .any(|pr| connection_has_next(pr.get("assignees")))
+    {
+        reasons.push(IncompleteReason::PullRequestAssigneesTruncated);
+    }
+    if pull_request_nodes
+        .iter()
+        .any(|pr| connection_has_next(pr.get("labels")))
+    {
+        reasons.push(IncompleteReason::PullRequestLabelsTruncated);
+    }
+    reasons
 }
 
 /// Whether a GraphQL response contains errors exclusively on optional

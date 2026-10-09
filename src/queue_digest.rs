@@ -332,21 +332,19 @@ fn read_observer(
             path.display()
         ));
     }
-    let (age_seconds, is_stale) = match captured_at {
-        Some(captured_at) => match now.duration_since(SystemTime::from(captured_at)) {
-            Ok(age) => {
-                let seconds = age.as_secs();
-                (seconds, seconds > stale_after_seconds)
-            }
-            Err(_) => {
-                errors.push(format!(
-                    "queue-observer state {} has a future captured_at value",
-                    path.display()
-                ));
-                (0, true)
-            }
-        },
-        None => (0, true),
+    let (age_seconds, is_stale) = if let Some(captured_at) = captured_at {
+        if let Ok(age) = now.duration_since(SystemTime::from(captured_at)) {
+            let seconds = age.as_secs();
+            (seconds, seconds > stale_after_seconds)
+        } else {
+            errors.push(format!(
+                "queue-observer state {} has a future captured_at value",
+                path.display()
+            ));
+            (0, true)
+        }
+    } else {
+        (0, true)
     };
     if is_stale {
         errors.push(format!(
