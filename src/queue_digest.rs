@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use crate::queue_observer::{
     CheckSnapshot, IncompleteReason, ObserverState, PullRequestSnapshot, QueueEntrySnapshot,
-    load_state,
+    load_state_for_digest,
 };
 
 /// Default observer freshness window. A digest should not silently report an
@@ -324,7 +324,7 @@ fn read_observer(
             path.display()
         )
     })?;
-    let Some(observer_state) = load_state(path)? else {
+    let Some(observer_state) = load_state_for_digest(path)? else {
         return Err(format!(
             "queue-observer state {} disappeared during digest",
             path.display()
@@ -471,7 +471,7 @@ fn validate_base_identity(
     errors: &mut Vec<String>,
 ) {
     let expected_path = format!("/{}/commit/{}", snapshot.repo, snapshot.main_sha);
-    if url_path(&snapshot.main_url) != Some(expected_path.as_str()) {
+    if !url_path(&snapshot.main_url).is_some_and(|path| path.eq_ignore_ascii_case(&expected_path)) {
         errors.push(format!(
             "observer {}/{} main URL does not identify its repository/base: `{}`",
             snapshot.repo, snapshot.base, snapshot.main_url
@@ -481,9 +481,11 @@ fn validate_base_identity(
 
 fn url_matches_repository(url: &str, main_url: &str, repo: &str, number: u64) -> bool {
     let expected_suffix = format!("/{repo}/pull/{number}");
-    url_path(url).is_some_and(|path| path == expected_suffix.as_str())
+    url_path(url).is_some_and(|path| path.eq_ignore_ascii_case(&expected_suffix))
         && url_origin(url).is_some()
-        && url_origin(url) == url_origin(main_url)
+        && url_origin(url).is_some_and(|origin| {
+            url_origin(main_url).is_some_and(|main_origin| origin.eq_ignore_ascii_case(main_origin))
+        })
 }
 
 fn url_origin(url: &str) -> Option<&str> {
@@ -742,6 +744,19 @@ mod tests {
     }
 
     #[test]
+    fn github_repository_identity_is_case_insensitive() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut value = state("o/r", "main", 1, "green_unarmed");
+        value.snapshot.main_url =
+            format!("https://GITHUB.TEST/O/R/commit/{}", value.snapshot.main_sha);
+        value.snapshot.pull_requests[0].url = "https://github.test/O/R/pull/1".to_owned();
+        refresh_hashes(&mut value);
+        write_state(temp.path(), "one.json", &value);
+        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+        assert!(digest.complete, "{digest:?}");
+    }
+
+    #[test]
     fn explicit_blocker_takes_precedence_over_auto_merge() {
         let pr = PullRequestSnapshot {
             number: 1,
@@ -810,6 +825,25 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("nested snapshot schema version")),
+            "{digest:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_observer_schema_reports_rebootstrap_requirement() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut value = state("o/r", "main", 1, "green_unarmed");
+        value.schema_version = 2;
+        value.snapshot.schema_version = 2;
+        value.snapshot_integrity_hash.clear();
+        value.state_hash = crate::queue_observer::snapshot_hash(&value.snapshot).expect("hash");
+        write_state(temp.path(), "one.json", &value);
+        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+        assert!(!digest.complete);
+        assert!(
+            digest.errors.iter().any(|error| {
+                error.contains("legacy schema version") && error.contains("re-bootstrap")
+            }),
             "{digest:?}"
         );
     }

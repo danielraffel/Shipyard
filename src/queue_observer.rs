@@ -336,6 +336,22 @@ pub fn adaptive_query_count(duration_seconds: u64) -> u64 {
 
 /// Load a prior cursor. A missing file is a clean first run.
 pub fn load_state(path: &Path) -> Result<Option<ObserverState>, String> {
+    load_state_with_legacy_policy(path, false)
+}
+
+/// Load a prior cursor for a digest, rejecting legacy state explicitly.
+///
+/// `queue-observe` uses [`load_state`] so a schema-2 cursor can be replaced by
+/// a fresh authenticated capture. A digest has no fetch/rebootstrap step, so
+/// it must report that legacy state as the reason it cannot prove a census.
+pub fn load_state_for_digest(path: &Path) -> Result<Option<ObserverState>, String> {
+    load_state_with_legacy_policy(path, true)
+}
+
+fn load_state_with_legacy_policy(
+    path: &Path,
+    reject_legacy: bool,
+) -> Result<Option<ObserverState>, String> {
     match fs::read_to_string(path) {
         Ok(raw) => {
             let state: ObserverState = serde_json::from_str(&raw)
@@ -353,10 +369,16 @@ pub fn load_state(path: &Path) -> Result<Option<ObserverState>, String> {
                         state.state_hash
                     ));
                 }
+                if reject_legacy {
+                    return Err(format!(
+                        "observer state {} uses legacy schema version {}; rerun queue-observe to re-bootstrap",
+                        path.display(),
+                        state.schema_version
+                    ));
+                }
                 // Legacy state cannot authenticate captured_at. Returning no
                 // previous cursor lets queue-observe fetch a fresh snapshot
-                // and atomically replace it with schema 3; queue-digest keeps
-                // the legacy file fail-closed instead of treating it as live.
+                // and atomically replace it with schema 3.
                 return Ok(None);
             }
             if state.schema_version != QUEUE_OBSERVER_SCHEMA_VERSION {
@@ -464,7 +486,9 @@ fn url_has_path(url: &str, expected: &str) -> bool {
     let path_end = url[path_start..]
         .find(['?', '#'])
         .map_or(url.len(), |offset| path_start + offset);
-    url[path_start..path_end].trim_end_matches('/') == expected
+    url[path_start..path_end]
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(expected)
 }
 
 /// Atomically persist the latest cursor.
@@ -1012,8 +1036,8 @@ fn parse_pull_request(
     let number = required_u64(node, "number", "pull request")?;
     let labels_connection = require_connection(node.get("labels"), "pull request.labels")?;
     let assignees_connection = require_connection(node.get("assignees"), "pull request.assignees")?;
-    let contexts_connection = require_connection(
-        node.pointer("/statusCheckRollup/contexts"),
+    let contexts_connection = nullable_status_contexts(
+        node.get("statusCheckRollup"),
         "pull request.statusCheckRollup.contexts",
     )?;
     let labels = connection_nodes(Some(labels_connection))
@@ -1043,7 +1067,7 @@ fn parse_pull_request(
     blockers.sort();
     blockers.dedup();
 
-    let checks = parse_latest_checks(Some(contexts_connection), required)?;
+    let checks = parse_latest_checks(contexts_connection, required)?;
     Ok(PullRequestSnapshot {
         number,
         url: required_string(node, "url", "pull request")?,
@@ -1182,13 +1206,13 @@ fn parse_queue_entry(
     let pr = node
         .get("pullRequest")
         .ok_or_else(|| "queue entry missing pull request".to_owned())?;
-    let contexts = node.pointer("/headCommit/statusCheckRollup/contexts");
-    if node.get("headCommit").is_some_and(|value| !value.is_null()) {
-        require_connection(
-            contexts,
+    let contexts = match node.get("headCommit") {
+        None | Some(Value::Null) => None,
+        Some(head_commit) => nullable_status_contexts(
+            head_commit.get("statusCheckRollup"),
             "merge-queue headCommit.statusCheckRollup.contexts",
-        )?;
-    }
+        )?,
+    };
     let checks = parse_latest_checks(contexts, required)?;
     let (receipt_decisions, test_tier) =
         crate::validation_signals::signals_from_graphql_contexts(contexts);
@@ -1301,6 +1325,19 @@ fn require_connection<'a>(value: Option<&'a Value>, path: &str) -> Result<&'a Va
         ));
     }
     Ok(connection)
+}
+
+fn nullable_status_contexts<'a>(
+    rollup: Option<&'a Value>,
+    path: &str,
+) -> Result<Option<&'a Value>, String> {
+    let Some(rollup) = rollup else {
+        return Err(format!("queue snapshot response missing {path}"));
+    };
+    if rollup.is_null() {
+        return Ok(None);
+    }
+    require_connection(rollup.get("contexts"), path).map(Some)
 }
 
 fn connection_has_next(value: Option<&Value>) -> bool {
@@ -1908,6 +1945,17 @@ mod tests {
         )
         .expect_err("repository URL with an empty authority must fail closed");
         assert!(error.contains("malformed repository.url"));
+
+        let mut repository = fixture_repo("abc");
+        repository["url"] = serde_json::json!("https://github.test/O/R");
+        parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect("GitHub repository URL casing is not identity-bearing");
     }
 
     #[test]
@@ -1930,6 +1978,42 @@ mod tests {
         )
         .expect_err("missing PR check pageInfo must fail closed");
         assert!(error.contains("incomplete connection pull request.statusCheckRollup.contexts"));
+    }
+
+    #[test]
+    fn nullable_status_check_rollups_are_treated_as_empty_connections() {
+        let mut repository = fixture_repo("abc");
+        repository["pullRequests"]["nodes"] = serde_json::json!([{
+            "number": 7,
+            "url": "https://github.test/o/r/pull/7",
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "labels": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "assignees": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "statusCheckRollup": null
+        }]);
+        repository["mergeQueue"]["entries"] = serde_json::json!({
+            "nodes": [{
+                "position": 1,
+                "enqueuedAt": "2026-08-08T00:00:00Z",
+                "headCommit": {"oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "statusCheckRollup": null},
+                "pullRequest": {
+                    "number": 7,
+                    "url": "https://github.test/o/r/pull/7",
+                    "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            }],
+            "pageInfo": {"hasNextPage": false}
+        });
+        let snapshot = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect("nullable status rollups are valid");
+        assert!(snapshot.pull_requests[0].checks.is_empty());
+        assert!(snapshot.queue[0].checks.is_empty());
     }
 
     #[test]
