@@ -3302,3 +3302,9 @@ joins, ownership blockers, truncation, corruption, and duplicate rows before
 rendering an inventory. An incomplete or stale snapshot is an explicit unknown,
 never an empty backlog or all-clear. The command does not contact GitHub or
 mutate queue state; merge and product decisions remain outside the digest.
+
+The JSON form is versioned: consumers must inspect `digest_schema_version`
+before decoding fields (the current value is `2`). Explicit PR blockers always
+override an otherwise green or auto-merge classification. If an observer
+directory entry cannot be enumerated, the digest fails closed as incomplete;
+readers must never silently drop an enumeration error and report a clean queue.
