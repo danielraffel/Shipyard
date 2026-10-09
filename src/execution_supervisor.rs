@@ -1341,17 +1341,7 @@ pub fn verify_worker_authority(state_dir: &Path, job_id: &str, generation: &str)
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("receipt path has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(&mut temp, value).map_err(io::Error::other)?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|error| error.error)?;
-    #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
-    Ok(())
+    crate::durable_file::replace_json(path, value, false)
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
