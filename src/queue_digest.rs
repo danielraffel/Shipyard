@@ -13,7 +13,10 @@ use std::time::SystemTime;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 
-use crate::queue_observer::{CheckSnapshot, ObserverState, PullRequestSnapshot, load_state};
+use crate::queue_observer::{
+    CheckSnapshot, IncompleteReason, ObserverState, PullRequestSnapshot, QueueEntrySnapshot,
+    load_state,
+};
 
 /// Default observer freshness window. A digest should not silently report an
 /// old observer as the current GitHub queue.
@@ -44,6 +47,10 @@ pub struct ObserverDigest {
     /// Whether the observer was conservative because a bounded source was
     /// unavailable.
     pub truncated: bool,
+    /// Typed reasons the source could not prove a complete census.
+    pub incomplete_reasons: Vec<IncompleteReason>,
+    /// Source capture time, independent of local file-copy/mtime behavior.
+    pub captured_at: Option<String>,
     /// Number of open pull requests represented by the snapshot.
     pub pull_request_count: usize,
     /// Number of merge-queue entries represented by the snapshot.
@@ -230,6 +237,7 @@ pub fn read_digest_at(state_root: &Path, stale_after_seconds: u64, now: SystemTi
                     key.0, key.1, key.2
                 ));
             }
+            validate_queue_entry_identity(snapshot, entry, &mut digest.errors);
         }
         for pr in &snapshot.pull_requests {
             let key = (snapshot.repo.clone(), snapshot.base.clone(), pr.number);
@@ -300,8 +308,27 @@ fn read_observer(
             path.display()
         )
     })?;
+    let Some(observer_state) = load_state(path)? else {
+        return Err(format!(
+            "queue-observer state {} disappeared during digest",
+            path.display()
+        ));
+    };
+    let snapshot = &observer_state.snapshot;
     let mut errors = Vec::new();
-    let (age_seconds, is_stale) = if let Ok(age) = now.duration_since(modified) {
+    let captured_at = snapshot
+        .captured_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    if snapshot.captured_at.is_some() && captured_at.is_none() {
+        errors.push(format!(
+            "queue-observer state {} has an invalid captured_at provenance value",
+            path.display()
+        ));
+    }
+    let freshness_time = captured_at.map_or(modified, SystemTime::from);
+    let (age_seconds, is_stale) = if let Ok(age) = now.duration_since(freshness_time) {
         let seconds = age.as_secs();
         (seconds, seconds > stale_after_seconds)
     } else {
@@ -311,13 +338,6 @@ fn read_observer(
         ));
         (0, true)
     };
-    let Some(observer_state) = load_state(path)? else {
-        return Err(format!(
-            "queue-observer state {} disappeared during digest",
-            path.display()
-        ));
-    };
-    let snapshot = &observer_state.snapshot;
     if is_stale {
         errors.push(format!(
             "queue-observer state {} is stale: age={}s threshold={}s",
@@ -331,6 +351,15 @@ fn read_observer(
             "queue-observer state {} is truncated and cannot prove a complete census",
             path.display()
         ));
+    }
+    if !snapshot.incomplete_reasons.is_empty() {
+        for reason in &snapshot.incomplete_reasons {
+            errors.push(format!(
+                "queue-observer state {} is incomplete: {}",
+                path.display(),
+                serde_json::to_string(reason).unwrap_or_else(|_| "unknown".to_owned())
+            ));
+        }
     }
     if let Some(blocker) = snapshot.ownership.blocker.as_deref() {
         errors.push(format!(
@@ -348,10 +377,57 @@ fn read_observer(
         age_seconds,
         stale: is_stale,
         truncated: snapshot.truncated,
+        incomplete_reasons: snapshot.incomplete_reasons.clone(),
+        captured_at: snapshot.captured_at.clone(),
         pull_request_count: snapshot.pull_requests.len(),
         queue_count: snapshot.queue.len(),
     };
     Ok((observer_state, observer, errors))
+}
+
+/// Validate the identity tuple that joins a queue row to the open-PR census.
+///
+/// GitHub can expose a queue entry and pull-request row from different source
+/// reads. A matching number alone is insufficient: a stale queue row can point
+/// at a refreshed head, URL, repository, or base target. Every mismatch is a
+/// fail-closed digest error.
+fn validate_queue_entry_identity(
+    snapshot: &crate::queue_observer::QueueStateSnapshot,
+    entry: &QueueEntrySnapshot,
+    errors: &mut Vec<String>,
+) {
+    let Some(pr) = snapshot
+        .pull_requests
+        .iter()
+        .find(|pr| pr.number == entry.pr)
+    else {
+        return;
+    };
+    if entry.base != snapshot.base {
+        errors.push(format!(
+            "queue entry {}/{} PR #{} base mismatch: entry `{}` snapshot `{}`",
+            snapshot.repo, snapshot.base, entry.pr, entry.base, snapshot.base
+        ));
+    }
+    if entry.url != pr.url {
+        errors.push(format!(
+            "queue entry {}/{} PR #{} URL mismatch: entry `{}` census `{}`",
+            snapshot.repo, snapshot.base, entry.pr, entry.url, pr.url
+        ));
+    }
+    if entry.pr_head_sha != pr.head_sha {
+        errors.push(format!(
+            "queue entry {}/{} PR #{} head mismatch: entry `{}` census `{}`",
+            snapshot.repo, snapshot.base, entry.pr, entry.pr_head_sha, pr.head_sha
+        ));
+    }
+    let expected_suffix = format!("/{}/pull/{}", snapshot.repo, entry.pr);
+    if !entry.url.trim_end_matches('/').ends_with(&expected_suffix) {
+        errors.push(format!(
+            "queue entry {}/{} PR #{} URL does not identify its repository: `{}`",
+            snapshot.repo, snapshot.base, entry.pr, entry.url
+        ));
+    }
 }
 
 fn classify_pull_request(pr: &PullRequestSnapshot, queued: bool) -> &'static str {
@@ -523,6 +599,8 @@ mod tests {
                 main_sha: "b".repeat(40),
                 main_url: format!("https://github.test/{repo}/commit/base"),
                 truncated: false,
+                incomplete_reasons: vec![],
+                captured_at: None,
                 required_contexts: vec![],
                 required_checks: vec![],
                 ownership: OwnershipSnapshot::default(),
@@ -628,6 +706,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let mut value = state("o/r", "main", 1, "green_unarmed");
         value.snapshot.queue.push(QueueEntrySnapshot {
+            base: "main".to_owned(),
             pr: 99,
             position: 1,
             url: "https://github.test/o/r/pull/99".to_owned(),
@@ -648,6 +727,50 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("no matching pull-request"))
         );
+    }
+
+    #[test]
+    fn queue_entry_identity_mismatches_fail_closed() {
+        for field in ["base", "url", "head"] {
+            let temp = tempfile::tempdir().expect("temp");
+            let mut value = state("o/r", "main", 1, "green_unarmed");
+            let mut entry = QueueEntrySnapshot {
+                base: "main".to_owned(),
+                pr: 1,
+                position: 1,
+                url: "https://github.test/o/r/pull/1".to_owned(),
+                pr_head_sha: "h".repeat(40),
+                merge_group_sha: None,
+                enqueued_at: "2026-10-08T00:00:00Z".to_owned(),
+                checks: vec![],
+                receipt_decisions: vec![],
+                test_tier: vec![],
+            };
+            match field {
+                "base" => entry.base = "release".to_owned(),
+                "url" => entry.url = "https://github.test/o/other/pull/1".to_owned(),
+                "head" => entry.pr_head_sha = "q".repeat(40),
+                _ => unreachable!(),
+            }
+            value.snapshot.queue.push(entry);
+            value.state_hash = crate::queue_observer::snapshot_hash(&value.snapshot).expect("hash");
+            write_state(temp.path(), "one.json", &value);
+            let digest = read_digest_at(
+                temp.path(),
+                DEFAULT_STALE_AFTER_SECONDS,
+                SystemTime::now() + Duration::from_secs(1),
+            );
+            assert!(!digest.complete, "{field} mismatch must fail closed");
+            let expected = if field == "url" { "URL" } else { field };
+            assert!(
+                digest
+                    .errors
+                    .iter()
+                    .any(|error| error.contains(&format!("{expected} mismatch"))),
+                "{field} mismatch missing from {:?}",
+                digest.errors
+            );
+        }
     }
 
     #[test]
