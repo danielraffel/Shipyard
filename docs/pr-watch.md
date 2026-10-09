@@ -246,7 +246,12 @@ overrides locally). The Shipyard Claude plugin's `hooks/handback-inbox.py` runs
 at SessionStart and UserPromptSubmit: it is silent when the inbox is absent or
 empty; otherwise it claims the file (rename), prints at most five entries
 (2,000 characters, each line 300) as agent context, and moves them to
-`<session-id>.shown.jsonl` so they show once. Codex reads the same hook
+`<session-id>.shown.jsonl` so they show once. Each note names the head it was raised on and how
+long ago it was delivered, because the agent may have pushed since. When an
+episode resolves (new head, merged, closed, cleared) before its note is read, the
+next delivering pass appends a retraction (`{"retract": "<id>", "reason": ...}`)
+through the same inbox append, and the hook drops the unread note it names. A
+note already shown is not affected. Codex reads the same hook
 contract from `~/.codex/hooks.json`; add the script there to cover Codex
 sessions:
 

@@ -8,6 +8,10 @@ UserPromptSubmit (Claude Code and Codex use the same hook contract): it
 claims the file, prints a short bounded summary as agent context, and moves
 the entries to ``<session-id>.shown.jsonl`` so they are shown once.
 
+Each note names the head it was raised on and how long ago it was delivered,
+because the agent may have pushed since. A ``retract`` line (written when the
+episode resolved before the note was read) drops the unread note it names.
+
 It is a silent no-op when there is no session id, no inbox, or an empty one,
 and it never fails the agent's turn: any error exits 0 with no output.
 Nothing here writes to GitHub or to the session's input.
@@ -19,6 +23,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_ENTRIES = 5
@@ -80,7 +85,31 @@ def claim(directory: Path, session: str) -> list[str]:
     return lines
 
 
-def render(entries: list[dict]) -> str:
+def age(stamp: object, now: datetime) -> str:
+    """``3h ago`` for an ISO-8601 UTC stamp, or ``""`` when unreadable."""
+    try:
+        then = datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return ""
+    minutes = max(0, int((now - then).total_seconds() // 60))
+    if minutes < 60:
+        return f"{minutes}m ago"
+    if minutes < 48 * 60:
+        return f"{minutes // 60}h ago"
+    return f"{minutes // (24 * 60)}d ago"
+
+
+def where(entry: dict, now: datetime) -> str:
+    """`` on head abc1234, 3h ago`` (either part omitted when unknown)."""
+    head = str(entry.get("head_sha") or "")[:7]
+    when = age(entry.get("delivered_at"), now)
+    parts = [f"on head {head}" if head else "", when]
+    text = ", ".join(part for part in parts if part)
+    return f" {text}" if text else ""
+
+
+def render(entries: list[dict], now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
     prs = sorted({entry.get("pr") for entry in entries if entry.get("pr") is not None})
     head = (
         f"Shipyard PR watch: {len(prs)} pull request(s) you opened need attention "
@@ -91,15 +120,17 @@ def render(entries: list[dict]) -> str:
         # The link and verdict survive; only the evidence is shortened.
         prefix = clip(
             f"- #{entry.get('pr')} {entry.get('url', '')} "
-            f"{entry.get('verdict', '')} ({entry.get('kind', '')}): ",
-            MAX_LINE // 2,
+            f"{entry.get('verdict', '')} ({entry.get('kind', '')}){where(entry, now)}: ",
+            MAX_LINE * 2 // 3,
         )
         out.append(prefix + " " + clip(entry.get("evidence", ""), MAX_LINE - len(prefix) - 2))
     if len(entries) > MAX_ENTRIES:
         out.append(f"- …and {len(entries) - MAX_ENTRIES} more; see each PR's pr-watch comment.")
     out.append(
-        "Look at the failing check before pushing again; if it is not yours "
-        "(pre-existing or a neighbour), say so on the PR."
+        "Each note is about the head it names: if you pushed after that head, "
+        "it is stale, so check the PR's current state first. Look at the failing "
+        "check before pushing again; if it is not yours (pre-existing or a "
+        "neighbour), say so on the PR."
     )
     text = "\n".join(out)
     return text if len(text) <= MAX_TOTAL else text[: MAX_TOTAL - 1] + "…"
@@ -118,8 +149,8 @@ def main() -> int:
     directory = inbox_dir()
     already = shown_ids(directory / f"{session}.shown.jsonl")
     lines = claim(directory, session)
-    entries = []
-    seen = set()
+    parsed = []
+    retracted = set()
     for line in lines:
         try:
             entry = json.loads(line)
@@ -127,7 +158,16 @@ def main() -> int:
             continue
         if not isinstance(entry, dict):
             continue
+        if "retract" in entry:
+            retracted.add(entry["retract"])
+            continue
+        parsed.append(entry)
+    entries = []
+    seen = set()
+    for entry in parsed:
         key = entry.get("id")
+        if key in retracted:
+            continue
         if key in already or key in seen:
             continue
         seen.add(key)
