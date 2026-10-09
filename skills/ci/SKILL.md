@@ -3308,3 +3308,9 @@ before decoding fields (the current value is `2`). Explicit PR blockers always
 override an otherwise green or auto-merge classification. If an observer
 directory entry cannot be enumerated, the digest fails closed as incomplete;
 readers must never silently drop an enumeration error and report a clean queue.
+
+Observer state schema `3` carries both the semantic `state_hash` and a
+`snapshot_integrity_hash` that covers `captured_at`; both hashes and the nested
+schema are checked before a state can contribute to an all-clear. The observer
+also rejects missing or malformed GraphQL connection `nodes`/`pageInfo`, and
+the digest rejects a PR URL whose repository path does not match its census.

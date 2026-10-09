@@ -230,6 +230,7 @@ pub fn read_digest_at(state_root: &Path, stale_after_seconds: u64, now: SystemTi
             validate_queue_entry_identity(snapshot, entry, &mut digest.errors);
         }
         for pr in &snapshot.pull_requests {
+            validate_pull_request_identity(snapshot, pr, &mut digest.errors);
             let key = (snapshot.repo.clone(), snapshot.base.clone(), pr.number);
             if let Some(previous) = pull_request_keys.insert(key.clone(), path.clone()) {
                 digest.errors.push(format!(
@@ -443,13 +444,40 @@ fn validate_queue_entry_identity(
             snapshot.repo, snapshot.base, entry.pr, entry.pr_head_sha, pr.head_sha
         ));
     }
-    let expected_suffix = format!("/{}/pull/{}", snapshot.repo, entry.pr);
-    if !entry.url.trim_end_matches('/').ends_with(&expected_suffix) {
+    if !url_matches_repository(&entry.url, &snapshot.main_url, &snapshot.repo, entry.pr) {
         errors.push(format!(
             "queue entry {}/{} PR #{} URL does not identify its repository: `{}`",
             snapshot.repo, snapshot.base, entry.pr, entry.url
         ));
     }
+}
+
+fn validate_pull_request_identity(
+    snapshot: &crate::queue_observer::QueueStateSnapshot,
+    pr: &PullRequestSnapshot,
+    errors: &mut Vec<String>,
+) {
+    if !url_matches_repository(&pr.url, &snapshot.main_url, &snapshot.repo, pr.number) {
+        errors.push(format!(
+            "pull-request census {}/{} PR #{} URL does not identify its repository: `{}`",
+            snapshot.repo, snapshot.base, pr.number, pr.url
+        ));
+    }
+}
+
+fn url_matches_repository(url: &str, main_url: &str, repo: &str, number: u64) -> bool {
+    let expected_suffix = format!("/{repo}/pull/{number}");
+    url.trim_end_matches('/').ends_with(&expected_suffix)
+        && url_origin(url).is_some()
+        && url_origin(url) == url_origin(main_url)
+}
+
+fn url_origin(url: &str) -> Option<&str> {
+    let authority_start = url.find("://")? + 3;
+    let authority_end = url[authority_start..]
+        .find('/')
+        .map_or(url.len(), |offset| authority_start + offset);
+    (authority_end > authority_start).then_some(&url[..authority_end])
 }
 
 fn classify_pull_request(pr: &PullRequestSnapshot, queued: bool) -> &'static str {
@@ -606,7 +634,7 @@ mod tests {
     use super::*;
     use crate::queue_observer::{
         ObserverState, OwnershipSnapshot, QueueEntrySnapshot, QueueStateSnapshot, observe,
-        save_state,
+        save_state, snapshot_integrity_hash,
     };
 
     fn state(repo: &str, base: &str, number: u64, bucket: &str) -> ObserverState {
@@ -660,6 +688,11 @@ mod tests {
         .state
     }
 
+    fn refresh_hashes(state: &mut ObserverState) {
+        state.state_hash = crate::queue_observer::snapshot_hash(&state.snapshot).expect("hash");
+        state.snapshot_integrity_hash = snapshot_integrity_hash(&state.snapshot).expect("hash");
+    }
+
     fn write_state(root: &Path, name: &str, state: &ObserverState) {
         let path = root.join("queue-observer").join(name);
         save_state(&path, state).expect("save state");
@@ -698,6 +731,59 @@ mod tests {
             checks: vec![],
         };
         assert_eq!(classify_pull_request(&pr, false), "blocked");
+    }
+
+    #[test]
+    fn captured_at_tampering_fails_closed_even_when_state_hash_is_unchanged() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut value = state("o/r", "main", 1, "green_unarmed");
+        value.snapshot.captured_at = Some("2026-10-09T00:00:00.000Z".to_owned());
+        write_state(temp.path(), "one.json", &value);
+        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+        assert!(!digest.complete);
+        assert!(
+            digest
+                .errors
+                .iter()
+                .any(|error| error.contains("integrity hash mismatch")),
+            "{digest:?}"
+        );
+    }
+
+    #[test]
+    fn pull_request_url_repository_mismatch_fails_closed() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut value = state("o/r", "main", 1, "green_unarmed");
+        value.snapshot.pull_requests[0].url = "https://evil.example/not-fixture/pull/1".to_owned();
+        refresh_hashes(&mut value);
+        write_state(temp.path(), "one.json", &value);
+        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+        assert!(!digest.complete);
+        assert!(
+            digest
+                .errors
+                .iter()
+                .any(|error| error.contains("pull-request census") && error.contains("URL")),
+            "{digest:?}"
+        );
+    }
+
+    #[test]
+    fn nested_snapshot_schema_mismatch_fails_closed() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut value = state("o/r", "main", 1, "green_unarmed");
+        value.snapshot.schema_version = 2;
+        refresh_hashes(&mut value);
+        write_state(temp.path(), "one.json", &value);
+        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+        assert!(!digest.complete);
+        assert!(
+            digest
+                .errors
+                .iter()
+                .any(|error| error.contains("nested snapshot schema version")),
+            "{digest:?}"
+        );
     }
 
     #[test]
@@ -771,7 +857,7 @@ mod tests {
             receipt_decisions: vec![],
             test_tier: vec![],
         });
-        value.state_hash = crate::queue_observer::snapshot_hash(&value.snapshot).expect("hash");
+        refresh_hashes(&mut value);
         write_state(temp.path(), "one.json", &value);
         let digest = read_digest_at(temp.path(), 900, SystemTime::now() + Duration::from_secs(1));
         assert!(!digest.complete);
@@ -807,7 +893,7 @@ mod tests {
                 _ => unreachable!(),
             }
             value.snapshot.queue.push(entry);
-            value.state_hash = crate::queue_observer::snapshot_hash(&value.snapshot).expect("hash");
+            refresh_hashes(&mut value);
             write_state(temp.path(), "one.json", &value);
             let digest = read_digest_at(
                 temp.path(),
@@ -852,7 +938,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let mut value = state("o/r", "main", 1, "green_unarmed");
         value.snapshot.truncated = true;
-        value.state_hash = crate::queue_observer::snapshot_hash(&value.snapshot).expect("hash");
+        refresh_hashes(&mut value);
         write_state(temp.path(), "one.json", &value);
         let digest = read_digest_at(temp.path(), 0, UNIX_EPOCH + Duration::from_secs(1));
         assert!(!digest.complete);

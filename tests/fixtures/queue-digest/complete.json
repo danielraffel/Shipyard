@@ -1,8 +1,8 @@
 {
-  "schema_version": 2,
-  "state_hash": "872928bef3e579c7773785fab4aab68aaf2f75bee07648afbedc5227dad78d51",
+  "schema_version": 3,
+  "state_hash": "c08808d028f490d5df13dacebabd1015d120c87c8a92a61fcaf1056f5dbbe181",
   "snapshot": {
-    "schema_version": 2,
+    "schema_version": 3,
     "repo": "fixture/repo",
     "base": "main",
     "main_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -37,5 +37,6 @@
       }
     ]
   },
-  "backoff_index": 0
+  "backoff_index": 0,
+  "snapshot_integrity_hash": "c8f371f7274dc96d8f1a31f6a3e259f807efca89de805e3ac7a28b6a09501bc9"
 }

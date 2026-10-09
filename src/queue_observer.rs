@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// Persisted schema version for queue-observer state and transition records.
-pub const QUEUE_OBSERVER_SCHEMA_VERSION: u32 = 2;
+pub const QUEUE_OBSERVER_SCHEMA_VERSION: u32 = 3;
 
 /// Adaptive polling intervals, in seconds. A transition resets to the first
 /// value; every unchanged observation advances one step and then stays capped.
@@ -189,8 +189,10 @@ pub struct RequiredCheckSnapshot {
 pub struct ObserverState {
     /// Schema version.
     pub schema_version: u32,
-    /// SHA-256 of canonical snapshot JSON.
+    /// SHA-256 of canonical snapshot JSON without capture provenance.
     pub state_hash: String,
+    /// Integrity SHA-256 of canonical snapshot JSON, including capture time.
+    pub snapshot_integrity_hash: String,
     /// Last canonical snapshot.
     pub snapshot: QueueStateSnapshot,
     /// Index into [`BACKOFF_SECONDS`] used for the next poll.
@@ -234,11 +236,22 @@ pub struct ObservationResult {
     pub transition: Option<Transition>,
 }
 
-/// Compute a stable SHA-256 over canonical snapshot JSON.
+/// Compute a stable SHA-256 over canonical snapshot JSON without capture time.
 pub fn snapshot_hash(snapshot: &QueueStateSnapshot) -> Result<String, serde_json::Error> {
+    semantic_snapshot_hash(snapshot)
+}
+
+fn semantic_snapshot_hash(snapshot: &QueueStateSnapshot) -> Result<String, serde_json::Error> {
     let mut canonical = snapshot.clone();
     canonical.captured_at = None;
     serde_json::to_vec(&canonical).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Compute an integrity SHA-256 over canonical snapshot JSON including capture
+/// provenance, so a persisted state cannot be made fresh by editing only
+/// `captured_at`.
+pub fn snapshot_integrity_hash(snapshot: &QueueStateSnapshot) -> Result<String, serde_json::Error> {
+    serde_json::to_vec(snapshot).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
 }
 
 /// Apply one canonical snapshot to the previous observer cursor.
@@ -247,6 +260,7 @@ pub fn observe(
     snapshot: QueueStateSnapshot,
 ) -> Result<ObservationResult, serde_json::Error> {
     let state_hash = snapshot_hash(&snapshot)?;
+    let snapshot_integrity_hash = snapshot_integrity_hash(&snapshot)?;
     if previous.is_some_and(|state| state.state_hash == state_hash) {
         let previous = previous.expect("checked above");
         let backoff_index = (previous.backoff_index + 1).min(BACKOFF_SECONDS.len() - 1);
@@ -254,6 +268,7 @@ pub fn observe(
             state: ObserverState {
                 schema_version: QUEUE_OBSERVER_SCHEMA_VERSION,
                 state_hash,
+                snapshot_integrity_hash,
                 snapshot,
                 backoff_index,
             },
@@ -274,6 +289,7 @@ pub fn observe(
     let state = ObserverState {
         schema_version: QUEUE_OBSERVER_SCHEMA_VERSION,
         state_hash: state_hash.clone(),
+        snapshot_integrity_hash: snapshot_integrity_hash.clone(),
         snapshot: snapshot.clone(),
         backoff_index: 0,
     };
@@ -330,6 +346,7 @@ pub fn load_state(path: &Path) -> Result<Option<ObserverState>, String> {
                     state.schema_version
                 ));
             }
+            validate_snapshot_shape(&state.snapshot, path)?;
             let actual = snapshot_hash(&state.snapshot)
                 .map_err(|error| format!("hash observer state {}: {error}", path.display()))?;
             if actual != state.state_hash {
@@ -339,11 +356,74 @@ pub fn load_state(path: &Path) -> Result<Option<ObserverState>, String> {
                     state.state_hash
                 ));
             }
+            let actual_integrity = snapshot_integrity_hash(&state.snapshot).map_err(|error| {
+                format!("integrity-hash observer state {}: {error}", path.display())
+            })?;
+            if actual_integrity != state.snapshot_integrity_hash {
+                return Err(format!(
+                    "observer state {} integrity hash mismatch: stored={} actual={actual_integrity}",
+                    path.display(),
+                    state.snapshot_integrity_hash
+                ));
+            }
             Ok(Some(state))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("read observer state {}: {error}", path.display())),
     }
+}
+
+fn validate_snapshot_shape(snapshot: &QueueStateSnapshot, path: &Path) -> Result<(), String> {
+    if snapshot.schema_version != QUEUE_OBSERVER_SCHEMA_VERSION {
+        return Err(format!(
+            "observer state {} has unsupported nested snapshot schema version {}",
+            path.display(),
+            snapshot.schema_version
+        ));
+    }
+    if snapshot.repo.is_empty()
+        || snapshot.base.is_empty()
+        || snapshot.main_sha.is_empty()
+        || snapshot.main_url.is_empty()
+    {
+        return Err(format!(
+            "observer state {} has incomplete snapshot identity",
+            path.display()
+        ));
+    }
+    if snapshot
+        .required_checks
+        .iter()
+        .any(|check| check.context.is_empty())
+    {
+        return Err(format!(
+            "observer state {} has an empty required-check context",
+            path.display()
+        ));
+    }
+    if snapshot
+        .pull_requests
+        .iter()
+        .any(|pr| pr.number == 0 || pr.url.is_empty() || pr.head_sha.is_empty())
+    {
+        return Err(format!(
+            "observer state {} has an incomplete pull-request row",
+            path.display()
+        ));
+    }
+    if snapshot.queue.iter().any(|entry| {
+        entry.pr == 0
+            || entry.base.is_empty()
+            || entry.url.is_empty()
+            || entry.pr_head_sha.is_empty()
+            || entry.enqueued_at.is_empty()
+    }) {
+        return Err(format!(
+            "observer state {} has an incomplete merge-queue row",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Atomically persist the latest cursor.
@@ -564,20 +644,26 @@ pub(crate) fn parse_snapshot_with_previous_at(
         branch_rule_denied.then_some(previous).flatten(),
     )?;
 
-    let mut pull_requests = connection_nodes(repository.get("pullRequests"))
+    let pull_requests_connection =
+        require_connection(repository.get("pullRequests"), "repository.pullRequests")?;
+    let mut pull_requests = connection_nodes(Some(pull_requests_connection))
         .into_iter()
         .map(|node| parse_pull_request(node, &required))
         .collect::<Result<Vec<_>, _>>()?;
     pull_requests.sort_by_key(|pr| pr.number);
 
-    let queue_value = repository
-        .get("mergeQueue")
-        .filter(|value| !value.is_null());
+    let queue_field = repository.get("mergeQueue");
+    if !merge_queue_denied && queue_field.is_none() {
+        return Err("queue snapshot response missing repository.mergeQueue".to_owned());
+    }
+    let queue_value = queue_field.filter(|value| !value.is_null());
     let mut queue = if merge_queue_denied {
         previous.map_or_else(Vec::new, |snapshot| snapshot.queue.clone())
     } else {
         queue_value
-            .map(|value| connection_nodes(value.get("entries")))
+            .map(|value| require_connection(value.get("entries"), "repository.mergeQueue.entries"))
+            .transpose()?
+            .map(|entries| connection_nodes(Some(entries)))
             .unwrap_or_default()
             .into_iter()
             .map(|node| parse_queue_entry(node, base, &required))
@@ -849,7 +935,13 @@ fn parse_pull_request(
     required: &BTreeMap<String, Option<u64>>,
 ) -> Result<PullRequestSnapshot, String> {
     let number = required_u64(node, "number", "pull request")?;
-    let labels = connection_nodes(node.get("labels"))
+    let labels_connection = require_connection(node.get("labels"), "pull request.labels")?;
+    let assignees_connection = require_connection(node.get("assignees"), "pull request.assignees")?;
+    let contexts_connection = require_connection(
+        node.pointer("/statusCheckRollup/contexts"),
+        "pull request.statusCheckRollup.contexts",
+    )?;
+    let labels = connection_nodes(Some(labels_connection))
         .into_iter()
         .filter_map(|label| label.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
@@ -860,7 +952,7 @@ fn parse_pull_request(
         .collect::<Vec<_>>();
     if owners.is_empty() {
         owners.extend(
-            connection_nodes(node.get("assignees"))
+            connection_nodes(Some(assignees_connection))
                 .into_iter()
                 .filter_map(|assignee| assignee.get("login").and_then(Value::as_str))
                 .map(str::to_owned),
@@ -876,7 +968,7 @@ fn parse_pull_request(
     blockers.sort();
     blockers.dedup();
 
-    let checks = parse_latest_checks(node.pointer("/statusCheckRollup/contexts"), required)?;
+    let checks = parse_latest_checks(Some(contexts_connection), required)?;
     Ok(PullRequestSnapshot {
         number,
         url: required_string(node, "url", "pull request")?,
@@ -1016,6 +1108,12 @@ fn parse_queue_entry(
         .get("pullRequest")
         .ok_or_else(|| "queue entry missing pull request".to_owned())?;
     let contexts = node.pointer("/headCommit/statusCheckRollup/contexts");
+    if node.get("headCommit").is_some_and(|value| !value.is_null()) {
+        require_connection(
+            contexts,
+            "merge-queue headCommit.statusCheckRollup.contexts",
+        )?;
+    }
     let checks = parse_latest_checks(contexts, required)?;
     let (receipt_decisions, test_tier) =
         crate::validation_signals::signals_from_graphql_contexts(contexts);
@@ -1110,6 +1208,26 @@ fn connection_nodes(value: Option<&Value>) -> Vec<&Value> {
         .unwrap_or_default()
 }
 
+fn require_connection<'a>(value: Option<&'a Value>, path: &str) -> Result<&'a Value, String> {
+    let connection = value.ok_or_else(|| format!("queue snapshot response missing {path}"))?;
+    let object = connection
+        .as_object()
+        .ok_or_else(|| format!("queue snapshot response has malformed {path}"))?;
+    if object.get("nodes").and_then(Value::as_array).is_none()
+        || object
+            .get("pageInfo")
+            .and_then(Value::as_object)
+            .and_then(|page| page.get("hasNextPage"))
+            .and_then(Value::as_bool)
+            .is_none()
+    {
+        return Err(format!(
+            "queue snapshot response has incomplete connection {path}"
+        ));
+    }
+    Ok(connection)
+}
+
 fn connection_has_next(value: Option<&Value>) -> bool {
     value
         .and_then(|value| value.pointer("/pageInfo/hasNextPage"))
@@ -1168,6 +1286,22 @@ mod tests {
         let changed = observe(Some(&same.state), minimal_snapshot("b")).expect("changed");
         assert!(changed.transition.is_some());
         assert_eq!(next_poll_seconds(&changed.state), 15);
+    }
+
+    #[test]
+    fn capture_time_changes_integrity_without_creating_transition() {
+        let mut first_snapshot = minimal_snapshot("a");
+        first_snapshot.captured_at = Some("2026-10-09T00:00:00.000Z".to_owned());
+        let first = observe(None, first_snapshot).expect("first");
+        let mut refreshed = first.state.snapshot.clone();
+        refreshed.captured_at = Some("2026-10-09T00:00:01.000Z".to_owned());
+        let second = observe(Some(&first.state), refreshed).expect("refreshed");
+        assert!(second.transition.is_none());
+        assert_eq!(second.state.state_hash, first.state.state_hash);
+        assert_ne!(
+            second.state.snapshot_integrity_hash,
+            first.state.snapshot_integrity_hash
+        );
     }
 
     #[test]
@@ -1589,6 +1723,55 @@ mod tests {
         let error = parse_snapshot(&body, "o/r", "main", &[], OwnershipSnapshot::default())
             .expect_err("PR errors must remain fatal");
         assert!(error.contains("pull requests unavailable"));
+    }
+
+    #[test]
+    fn malformed_required_connections_fail_closed() {
+        let mut repository = fixture_repo("abc");
+        repository["pullRequests"] = serde_json::json!({"nodes": []});
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("missing pageInfo must not look like an empty census");
+        assert!(error.contains("incomplete connection repository.pullRequests"));
+
+        let mut repository = fixture_repo("abc");
+        repository["mergeQueue"]["entries"] = serde_json::json!({"nodes": []});
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("missing queue pageInfo must not look like an empty queue");
+        assert!(error.contains("incomplete connection repository.mergeQueue.entries"));
+    }
+
+    #[test]
+    fn malformed_pull_request_connections_fail_closed() {
+        let mut repository = fixture_repo("abc");
+        repository["pullRequests"]["nodes"] = serde_json::json!([{
+            "number": 7,
+            "url": "https://github.test/o/r/pull/7",
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "labels": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "assignees": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "statusCheckRollup": {"contexts": {"nodes": []}}
+        }]);
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("missing PR check pageInfo must fail closed");
+        assert!(error.contains("incomplete connection pull request.statusCheckRollup.contexts"));
     }
 
     #[test]
