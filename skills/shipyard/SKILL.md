@@ -655,7 +655,9 @@ Observer state schema `3` authenticates capture provenance with a separate
 `snapshot_integrity_hash` in addition to the semantic `state_hash`; both hashes
 and the nested schema must validate before a snapshot is trusted. Missing or
 malformed GraphQL connection `nodes`/`pageInfo` fields fail closed, as does a
-pull-request URL whose repository path does not match its census.
+pull-request URL whose repository path does not match its census. Malformed
+top-level GraphQL errors, required policy values, and label/assignee nodes are
+fatal rather than silently filtered.
 
 Use `shipyard pr-watch scan --repo <owner/repo>` for read-only flags on stuck
 open PRs: the same required-check test failing on two runs (or

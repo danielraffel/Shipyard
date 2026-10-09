@@ -405,6 +405,10 @@ fn validate_snapshot_shape(snapshot: &QueueStateSnapshot, path: &Path) -> Result
         || snapshot.base.is_empty()
         || snapshot.main_sha.is_empty()
         || snapshot.main_url.is_empty()
+        || !url_has_path(
+            &snapshot.main_url,
+            &format!("/{}/commit/{}", snapshot.repo, snapshot.main_sha),
+        )
     {
         return Err(format!(
             "observer state {} has incomplete snapshot identity",
@@ -444,6 +448,20 @@ fn validate_snapshot_shape(snapshot: &QueueStateSnapshot, path: &Path) -> Result
         ));
     }
     Ok(())
+}
+
+fn url_has_path(url: &str, expected: &str) -> bool {
+    let Some(authority_start) = url.find("://").map(|offset| offset + 3) else {
+        return false;
+    };
+    let Some(relative_path) = url[authority_start..].find('/') else {
+        return false;
+    };
+    let path_start = authority_start + relative_path;
+    let path_end = url[path_start..]
+        .find(['?', '#'])
+        .map_or(url.len(), |offset| path_start + offset);
+    url[path_start..path_end].trim_end_matches('/') == expected
 }
 
 /// Atomically persist the latest cursor.
@@ -619,21 +637,24 @@ pub(crate) fn parse_snapshot_with_previous_at(
     let merge_queue_denied = governance_field_denied(body, &["repository", "mergeQueue"]);
     let branch_rule_denied =
         governance_field_denied(body, &["repository", "baseRef", "branchProtectionRule"]);
-    if let Some(errors) = body
-        .get("errors")
-        .and_then(Value::as_array)
-        .filter(|errors| !errors.is_empty())
-    {
-        let substantive = errors
-            .iter()
-            .filter(|error| !is_governance_graphql_error(error))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !substantive.is_empty() {
-            return Err(format!(
-                "queue snapshot GraphQL errors: {}",
-                Value::Array(substantive)
-            ));
+    if let Some(errors_value) = body.get("errors") {
+        let errors = errors_value
+            .as_array()
+            .ok_or_else(|| "queue snapshot response has malformed errors field".to_owned())?;
+        if errors.is_empty() {
+            // An explicitly empty GraphQL errors array is valid.
+        } else {
+            let substantive = errors
+                .iter()
+                .filter(|error| !is_governance_graphql_error(error))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !substantive.is_empty() {
+                return Err(format!(
+                    "queue snapshot GraphQL errors: {}",
+                    Value::Array(substantive)
+                ));
+            }
         }
     }
     let repository = body
@@ -646,10 +667,10 @@ pub(crate) fn parse_snapshot_with_previous_at(
         .filter(|sha| !sha.is_empty())
         .ok_or_else(|| format!("queue snapshot response missing refs/heads/{base}"))?
         .to_owned();
-    let repository_url = repository
-        .get("url")
-        .and_then(Value::as_str)
-        .unwrap_or("https://github.com");
+    let repository_url = required_string(repository, "url", "repository")?;
+    if !repository_url.contains("://") {
+        return Err("queue snapshot response has malformed repository.url".to_owned());
+    }
     if ownership.hold_reason.is_some()
         || ownership.hold_machine.is_some()
         || ownership.held_at.is_some()
@@ -703,7 +724,7 @@ pub(crate) fn parse_snapshot_with_previous_at(
         schema_version: QUEUE_OBSERVER_SCHEMA_VERSION,
         repo: repo.to_owned(),
         base: base.to_owned(),
-        main_url: format!("{repository_url}/commit/{main_sha}"),
+        main_url: format!("{}/commit/{main_sha}", repository_url.trim_end_matches('/')),
         main_sha,
         truncated,
         incomplete_reasons,
@@ -834,24 +855,45 @@ fn required_check_policy(
     let Some(rule) = repository.pointer("/baseRef/branchProtectionRule") else {
         return Ok(required);
     };
-    for context in rule
-        .get("requiredStatusCheckContexts")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
-        required.entry(context.to_owned()).or_insert(None);
+    if rule.is_null() {
+        return Ok(required);
     }
-    for check in rule
-        .get("requiredStatusChecks")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let context = required_string(check, "context", "required status check")?;
-        let app_id = check.pointer("/app/databaseId").and_then(Value::as_u64);
-        required.insert(context, app_id);
+    if !rule.is_object() {
+        return Err("queue snapshot response has malformed branchProtectionRule".to_owned());
+    }
+    if let Some(contexts) = rule.get("requiredStatusCheckContexts") {
+        let contexts = contexts.as_array().ok_or_else(|| {
+            "queue snapshot response has malformed requiredStatusCheckContexts".to_owned()
+        })?;
+        for context in contexts {
+            let context = context
+                .as_str()
+                .filter(|context| !context.is_empty())
+                .ok_or_else(|| {
+                    "queue snapshot response has malformed required status-check context".to_owned()
+                })?;
+            required.entry(context.to_owned()).or_insert(None);
+        }
+    }
+    if let Some(checks) = rule.get("requiredStatusChecks") {
+        let checks = checks.as_array().ok_or_else(|| {
+            "queue snapshot response has malformed requiredStatusChecks".to_owned()
+        })?;
+        for check in checks {
+            if !check.is_object() {
+                return Err(
+                    "queue snapshot response has malformed required status check".to_owned(),
+                );
+            }
+            let context = required_string(check, "context", "required status check")?;
+            let app_id = match check.pointer("/app/databaseId") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_u64().ok_or_else(|| {
+                    "queue snapshot response has malformed required status-check app id".to_owned()
+                })?),
+            };
+            required.insert(context, app_id);
+        }
     }
     Ok(required)
 }
@@ -963,8 +1005,8 @@ fn parse_pull_request(
     )?;
     let labels = connection_nodes(Some(labels_connection))
         .into_iter()
-        .filter_map(|label| label.get("name").and_then(Value::as_str))
-        .collect::<Vec<_>>();
+        .map(|label| required_string(label, "name", "pull request label"))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut owners = labels
         .iter()
         .filter_map(|label| label.strip_prefix("shipyard:owner/"))
@@ -974,8 +1016,8 @@ fn parse_pull_request(
         owners.extend(
             connection_nodes(Some(assignees_connection))
                 .into_iter()
-                .filter_map(|assignee| assignee.get("login").and_then(Value::as_str))
-                .map(str::to_owned),
+                .map(|assignee| required_string(assignee, "login", "pull request assignee"))
+                .collect::<Result<Vec<_>, _>>()?,
         );
     }
     owners.sort();
@@ -1375,10 +1417,10 @@ mod tests {
             .expect("read")
             .replace("commit/a", "commit/b");
         fs::write(&path, raw).expect("tamper");
+        let error = load_state(&path).expect_err("mismatch");
         assert!(
-            load_state(&path)
-                .expect_err("mismatch")
-                .contains("hash mismatch")
+            error.contains("mismatch") || error.contains("incomplete snapshot identity"),
+            "{error}"
         );
     }
 
@@ -1786,6 +1828,37 @@ mod tests {
     }
 
     #[test]
+    fn malformed_graphql_errors_and_repository_url_fail_closed() {
+        for errors in [
+            serde_json::json!({"message": "fatal"}),
+            serde_json::json!("fatal"),
+        ] {
+            let body = serde_json::json!({
+                "data": {"repository": fixture_repo("abc")},
+                "errors": errors
+            });
+            let error = parse_snapshot(&body, "o/r", "main", &[], OwnershipSnapshot::default())
+                .expect_err("malformed errors must fail closed");
+            assert!(error.contains("malformed errors field"));
+        }
+
+        let mut repository = fixture_repo("abc");
+        repository
+            .as_object_mut()
+            .expect("repository object")
+            .remove("url");
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("repository URL is required");
+        assert!(error.contains("repository missing url"));
+    }
+
+    #[test]
     fn malformed_pull_request_connections_fail_closed() {
         let mut repository = fixture_repo("abc");
         repository["pullRequests"]["nodes"] = serde_json::json!([{
@@ -1805,6 +1878,41 @@ mod tests {
         )
         .expect_err("missing PR check pageInfo must fail closed");
         assert!(error.contains("incomplete connection pull request.statusCheckRollup.contexts"));
+    }
+
+    #[test]
+    fn malformed_policy_and_label_nodes_fail_closed() {
+        let mut repository = fixture_repo("abc");
+        repository["baseRef"]["branchProtectionRule"]["requiredStatusCheckContexts"] =
+            serde_json::json!([{"context": "macos"}]);
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("malformed required context must fail closed");
+        assert!(error.contains("malformed required status-check context"));
+
+        let mut repository = fixture_repo("abc");
+        repository["pullRequests"]["nodes"] = serde_json::json!([{
+            "number": 7,
+            "url": "https://github.test/o/r/pull/7",
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "labels": {"nodes": [{"name": 7}], "pageInfo": {"hasNextPage": false}},
+            "assignees": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "statusCheckRollup": {"contexts": {"nodes": [], "pageInfo": {"hasNextPage": false}}}
+        }]);
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("malformed label node must fail closed");
+        assert!(error.contains("pull request label missing name"));
     }
 
     #[test]

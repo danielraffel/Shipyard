@@ -132,7 +132,9 @@ repository/base or PR census rows, stale observers, truncated snapshots, and
 ownership blockers all produce `complete=false` and a nonzero exit. It also
 rejects PR URLs whose repository path does not match the observed repository,
 and the observer rejects missing or malformed GraphQL connection `nodes` or
-`pageInfo` fields instead of treating them as empty. Diagnostic
+`pageInfo` fields instead of treating them as empty. Malformed top-level
+GraphQL `errors`, policy fields, or label/assignee nodes are rejected rather
+than filtered into an apparently healthy snapshot. Diagnostic
 JSON/Markdown is still emitted so a supervisor can hand the exact problem back
 to the responsible owner. Transition logs are deliberately not treated as
 current state and `.jsonl` files are ignored. A schema-2 cursor is re-bootstrap

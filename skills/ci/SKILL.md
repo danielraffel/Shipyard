@@ -3314,3 +3314,5 @@ Observer state schema `3` carries both the semantic `state_hash` and a
 schema are checked before a state can contribute to an all-clear. The observer
 also rejects missing or malformed GraphQL connection `nodes`/`pageInfo`, and
 the digest rejects a PR URL whose repository path does not match its census.
+Malformed top-level GraphQL errors, required policy values, or label/assignee
+nodes are also fatal; they must not be filtered into an empty result.

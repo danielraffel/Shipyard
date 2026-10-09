@@ -219,6 +219,7 @@ pub fn read_digest_at(state_root: &Path, stale_after_seconds: u64, now: SystemTi
         }
         digest.errors.append(&mut observer_errors);
         digest.observers.push(observer);
+        validate_base_identity(snapshot, &mut digest.errors);
         for entry in &snapshot.queue {
             let key = (snapshot.repo.clone(), snapshot.base.clone(), entry.pr);
             if !queued_keys.insert(key.clone()) {
@@ -465,9 +466,22 @@ fn validate_pull_request_identity(
     }
 }
 
+fn validate_base_identity(
+    snapshot: &crate::queue_observer::QueueStateSnapshot,
+    errors: &mut Vec<String>,
+) {
+    let expected_path = format!("/{}/commit/{}", snapshot.repo, snapshot.main_sha);
+    if url_path(&snapshot.main_url) != Some(expected_path.as_str()) {
+        errors.push(format!(
+            "observer {}/{} main URL does not identify its repository/base: `{}`",
+            snapshot.repo, snapshot.base, snapshot.main_url
+        ));
+    }
+}
+
 fn url_matches_repository(url: &str, main_url: &str, repo: &str, number: u64) -> bool {
     let expected_suffix = format!("/{repo}/pull/{number}");
-    url.trim_end_matches('/').ends_with(&expected_suffix)
+    url_path(url).is_some_and(|path| path == expected_suffix.as_str())
         && url_origin(url).is_some()
         && url_origin(url) == url_origin(main_url)
 }
@@ -478,6 +492,15 @@ fn url_origin(url: &str) -> Option<&str> {
         .find('/')
         .map_or(url.len(), |offset| authority_start + offset);
     (authority_end > authority_start).then_some(&url[..authority_end])
+}
+
+fn url_path(url: &str) -> Option<&str> {
+    let authority_start = url.find("://")? + 3;
+    let path_start = authority_start + url[authority_start..].find('/')?;
+    let path_end = url[path_start..]
+        .find(['?', '#'])
+        .map_or(url.len(), |offset| path_start + offset);
+    Some(url[path_start..path_end].trim_end_matches('/'))
 }
 
 fn classify_pull_request(pr: &PullRequestSnapshot, queued: bool) -> &'static str {
@@ -664,7 +687,7 @@ mod tests {
                 repo: repo.to_owned(),
                 base: base.to_owned(),
                 main_sha: "b".repeat(40),
-                main_url: format!("https://github.test/{repo}/commit/base"),
+                main_url: format!("https://github.test/{repo}/commit/{}", "b".repeat(40)),
                 truncated: false,
                 incomplete_reasons: vec![],
                 captured_at: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
@@ -752,20 +775,25 @@ mod tests {
 
     #[test]
     fn pull_request_url_repository_mismatch_fails_closed() {
-        let temp = tempfile::tempdir().expect("temp");
-        let mut value = state("o/r", "main", 1, "green_unarmed");
-        value.snapshot.pull_requests[0].url = "https://evil.example/not-fixture/pull/1".to_owned();
-        refresh_hashes(&mut value);
-        write_state(temp.path(), "one.json", &value);
-        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
-        assert!(!digest.complete);
-        assert!(
-            digest
-                .errors
-                .iter()
-                .any(|error| error.contains("pull-request census") && error.contains("URL")),
-            "{digest:?}"
-        );
+        for url in [
+            "https://evil.example/not-fixture/pull/1",
+            "https://github.test/evil/o/r/pull/1",
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let mut value = state("o/r", "main", 1, "green_unarmed");
+            value.snapshot.pull_requests[0].url = url.to_owned();
+            refresh_hashes(&mut value);
+            write_state(temp.path(), "one.json", &value);
+            let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+            assert!(!digest.complete);
+            assert!(
+                digest
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("pull-request census") && error.contains("URL")),
+                "{digest:?}"
+            );
+        }
     }
 
     #[test]
@@ -782,6 +810,26 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("nested snapshot schema version")),
+            "{digest:?}"
+        );
+    }
+
+    #[test]
+    fn base_url_path_mismatch_fails_closed() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut value = state("o/r", "main", 1, "green_unarmed");
+        value.snapshot.main_url =
+            "https://github.test/evil/o/r/commit/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned();
+        refresh_hashes(&mut value);
+        write_state(temp.path(), "one.json", &value);
+        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+        assert!(!digest.complete);
+        assert!(
+            digest.errors.iter().any(|error| {
+                error.contains("main URL does not identify")
+                    || error.contains("incomplete snapshot identity")
+            }),
             "{digest:?}"
         );
     }
