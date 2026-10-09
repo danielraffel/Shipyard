@@ -697,8 +697,8 @@ pub(crate) fn parse_snapshot_with_previous_at(
     pull_requests.sort_by_key(|pr| pr.number);
 
     let queue_field = repository.get("mergeQueue");
-    if !merge_queue_denied && queue_field.is_none() {
-        return Err("queue snapshot response missing repository.mergeQueue".to_owned());
+    if !merge_queue_denied && queue_field.is_none_or(Value::is_null) {
+        return Err("queue snapshot response missing repository.mergeQueue connection".to_owned());
     }
     let queue_value = queue_field.filter(|value| !value.is_null());
     let mut queue = if merge_queue_denied {
@@ -1795,6 +1795,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["/incomplete_reasons", "/truncated"]
         );
+    }
+
+    #[test]
+    fn null_merge_queue_without_permission_error_fails_closed() {
+        let mut repository = fixture_repo("abc");
+        repository["mergeQueue"] = serde_json::Value::Null;
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("null merge queue without a permission error must fail closed");
+        assert!(error.contains("missing repository.mergeQueue connection"));
     }
 
     #[test]
