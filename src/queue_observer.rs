@@ -879,9 +879,10 @@ fn required_check_policy(
         }
         return Ok(required);
     }
-    let Some(rule) = repository.pointer("/baseRef/branchProtectionRule") else {
-        return Ok(required);
-    };
+    let rule = repository
+        .get("baseRef")
+        .and_then(|base_ref| base_ref.get("branchProtectionRule"))
+        .ok_or_else(|| "queue snapshot response missing baseRef.branchProtectionRule".to_owned())?;
     if rule.is_null() {
         return Ok(required);
     }
@@ -2018,6 +2019,21 @@ mod tests {
 
     #[test]
     fn malformed_policy_and_label_nodes_fail_closed() {
+        let mut repository = fixture_repo("abc");
+        repository["baseRef"]
+            .as_object_mut()
+            .expect("fixture baseRef object")
+            .remove("branchProtectionRule");
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("omitted branch policy must fail closed");
+        assert!(error.contains("missing baseRef.branchProtectionRule"));
+
         let mut repository = fixture_repo("abc");
         repository["baseRef"]["branchProtectionRule"] = serde_json::json!({});
         let error = parse_snapshot(
