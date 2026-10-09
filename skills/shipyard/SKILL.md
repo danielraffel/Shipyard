@@ -663,6 +663,9 @@ daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
 nobody armed; it is owner-actionable, quotes any "team-lead arms" promise, and
 skips drafts and holds (label `shipyard:hold` or `shipyard:no-auto-merge`, or a
 `shipyard:hold` line in the body or a comment). Mark a deliberate hold that way.
+`ejected_green` (flag 7) is a PR ejected for `failed_checks` whose same head is
+now green and that nothing re-armed: the arm guard refuses that same-head re-arm,
+so the owner pushes a new head or explains the failure.
 
 `repeated_ejection` counts only merge groups created since the PR's current head
 and clears on any passing named group that finishes after the last failure.

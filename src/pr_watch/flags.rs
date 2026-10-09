@@ -31,6 +31,9 @@ pub enum FlagKind {
     SplitCandidate,
     /// Flag 6: every required check green, but not armed and not queued.
     GreenUnarmed,
+    /// Flag 7: ejected once for `failed_checks`, the same head is green on
+    /// every required check, and nothing re-armed it.
+    EjectedGreen,
 }
 
 impl FlagKind {
@@ -44,6 +47,7 @@ impl FlagKind {
             Self::RebaseTreadmill => 4,
             Self::SplitCandidate => 5,
             Self::GreenUnarmed => 6,
+            Self::EjectedGreen => 7,
         }
     }
 
@@ -57,6 +61,7 @@ impl FlagKind {
             4 => Some(Self::RebaseTreadmill),
             5 => Some(Self::SplitCandidate),
             6 => Some(Self::GreenUnarmed),
+            7 => Some(Self::EjectedGreen),
             _ => None,
         }
     }
@@ -73,8 +78,9 @@ impl FlagKind {
     #[must_use]
     pub fn severity(self) -> u8 {
         match self {
-            Self::RedWhileArmed => 6,
-            Self::RepeatedEjection => 5,
+            Self::RedWhileArmed => 7,
+            Self::RepeatedEjection => 6,
+            Self::EjectedGreen => 5,
             Self::GreenUnarmed => 4,
             Self::RepeatTestFailure => 3,
             Self::RebaseTreadmill => 2,
@@ -92,6 +98,7 @@ impl FlagKind {
             Self::RebaseTreadmill => "rebase_treadmill",
             Self::SplitCandidate => "split_candidate",
             Self::GreenUnarmed => "green_unarmed",
+            Self::EjectedGreen => "ejected_green",
         }
     }
 }
@@ -216,6 +223,7 @@ pub fn evaluate(history: &RepoHistory, at: DateTime<Utc>, thresholds: &Threshold
         found.extend(repeated_ejection(history, pr, &head, at, thresholds));
         found.extend(rebase_treadmill(pr, &head, at, thresholds));
         found.extend(green_unarmed(pr, history, at, thresholds));
+        found.extend(ejected_green(pr, history, at, thresholds));
         if !found.is_empty()
             && let Some(split) = split_candidate(pr, &head, at, thresholds)
         {
@@ -642,6 +650,67 @@ fn green_unarmed(
             "every required check green on head {} since {} (> {} min); not armed and not queued, so nothing will merge it",
             short(&head.sha),
             since.format("%Y-%m-%d %H:%MZ"),
+            thresholds.green_unarmed_minutes
+        ),
+        head_sha: head.sha.clone(),
+        route: DigestRoute::PerPr,
+        shared_tests: Vec::new(),
+        related_prs: Vec::new(),
+    })
+}
+
+/// Flag 7: the queue ejected the pull request for `failed_checks`, its head
+/// has not changed since, every required check on that head is green, and
+/// nothing has re-armed it for longer than the flag-6 threshold. The queue's
+/// arm guard refuses a same-head re-arm after a check failure unless the
+/// ejection is certified as environmental, so it waits for its owner: a new
+/// head, or a reason the failure was not this head's. Red heads in the same
+/// state are flag 2's.
+fn ejected_green(
+    pr: &PrHistory,
+    history: &RepoHistory,
+    at: DateTime<Utc>,
+    thresholds: &Thresholds,
+) -> Option<Flag> {
+    if arming_at(pr, at) != Arming::EjectedFailedChecks {
+        return None;
+    }
+    if pr.labels.iter().any(|label| {
+        HOLD_LABELS
+            .iter()
+            .any(|hold| label.eq_ignore_ascii_case(hold))
+    }) {
+        return None;
+    }
+    let ejected_at = pr
+        .events
+        .iter()
+        .filter(|event| event.at <= at)
+        .filter_map(|event| match &event.kind {
+            QueueEventKind::Removed { reason } if reason.eq_ignore_ascii_case("failed_checks") => {
+                Some(event.at)
+            }
+            _ => None,
+        })
+        .max()?;
+    let head = head_at(pr, at)?;
+    if head.first_seen_at > ejected_at {
+        return None;
+    }
+    let green_since = all_required_green_since(history, head, at)?;
+    let since = green_since.max(ejected_at);
+    if at - since <= Duration::minutes(thresholds.green_unarmed_minutes) {
+        return None;
+    }
+    Some(Flag {
+        pr: pr.number,
+        kind: FlagKind::EjectedGreen,
+        key: short(&head.sha).to_owned(),
+        verdict: "ejected, green, never re-armed".to_owned(),
+        evidence: format!(
+            "the queue ejected head {} for failed_checks at {}; every required check on it is green, and nothing re-armed it (> {} min). A same-head re-arm is refused unless the failure is certified environmental: push a new head, or say why the failure was not this head's",
+            short(&head.sha),
+            ejected_at.format("%Y-%m-%d %H:%MZ"),
             thresholds.green_unarmed_minutes
         ),
         head_sha: head.sha.clone(),
