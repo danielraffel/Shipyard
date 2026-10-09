@@ -651,6 +651,14 @@ green or auto-merge classification. Observer-directory enumeration errors are
 incomplete evidence and fail closed; they must not be discarded as if the
 entry were absent.
 
+Observer state schema `3` authenticates capture provenance with a separate
+`snapshot_integrity_hash` in addition to the semantic `state_hash`; both hashes
+and the nested schema must validate before a snapshot is trusted. Missing or
+malformed GraphQL connection `nodes`/`pageInfo` fields fail closed, as does a
+pull-request URL whose repository path does not match its census. Malformed
+top-level GraphQL errors, required policy values, and label/assignee nodes are
+fatal rather than silently filtered.
+
 Use `shipyard pr-watch scan --repo <owner/repo>` for read-only flags on stuck
 open PRs: the same required-check test failing on two runs (or
 "failing on main/pre-existing" when two other PRs fail it too), armed but red

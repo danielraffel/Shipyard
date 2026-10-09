@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use crate::queue_observer::{
     CheckSnapshot, IncompleteReason, ObserverState, PullRequestSnapshot, QueueEntrySnapshot,
-    load_state,
+    load_state_for_digest,
 };
 
 /// Default observer freshness window. A digest should not silently report an
@@ -219,6 +219,7 @@ pub fn read_digest_at(state_root: &Path, stale_after_seconds: u64, now: SystemTi
         }
         digest.errors.append(&mut observer_errors);
         digest.observers.push(observer);
+        validate_base_identity(snapshot, &mut digest.errors);
         for entry in &snapshot.queue {
             let key = (snapshot.repo.clone(), snapshot.base.clone(), entry.pr);
             if !queued_keys.insert(key.clone()) {
@@ -230,6 +231,7 @@ pub fn read_digest_at(state_root: &Path, stale_after_seconds: u64, now: SystemTi
             validate_queue_entry_identity(snapshot, entry, &mut digest.errors);
         }
         for pr in &snapshot.pull_requests {
+            validate_pull_request_identity(snapshot, pr, &mut digest.errors);
             let key = (snapshot.repo.clone(), snapshot.base.clone(), pr.number);
             if let Some(previous) = pull_request_keys.insert(key.clone(), path.clone()) {
                 digest.errors.push(format!(
@@ -322,7 +324,7 @@ fn read_observer(
             path.display()
         )
     })?;
-    let Some(observer_state) = load_state(path)? else {
+    let Some(observer_state) = load_state_for_digest(path)? else {
         return Err(format!(
             "queue-observer state {} disappeared during digest",
             path.display()
@@ -443,13 +445,64 @@ fn validate_queue_entry_identity(
             snapshot.repo, snapshot.base, entry.pr, entry.pr_head_sha, pr.head_sha
         ));
     }
-    let expected_suffix = format!("/{}/pull/{}", snapshot.repo, entry.pr);
-    if !entry.url.trim_end_matches('/').ends_with(&expected_suffix) {
+    if !url_matches_repository(&entry.url, &snapshot.main_url, &snapshot.repo, entry.pr) {
         errors.push(format!(
             "queue entry {}/{} PR #{} URL does not identify its repository: `{}`",
             snapshot.repo, snapshot.base, entry.pr, entry.url
         ));
     }
+}
+
+fn validate_pull_request_identity(
+    snapshot: &crate::queue_observer::QueueStateSnapshot,
+    pr: &PullRequestSnapshot,
+    errors: &mut Vec<String>,
+) {
+    if !url_matches_repository(&pr.url, &snapshot.main_url, &snapshot.repo, pr.number) {
+        errors.push(format!(
+            "pull-request census {}/{} PR #{} URL does not identify its repository: `{}`",
+            snapshot.repo, snapshot.base, pr.number, pr.url
+        ));
+    }
+}
+
+fn validate_base_identity(
+    snapshot: &crate::queue_observer::QueueStateSnapshot,
+    errors: &mut Vec<String>,
+) {
+    let expected_path = format!("/{}/commit/{}", snapshot.repo, snapshot.main_sha);
+    if !url_path(&snapshot.main_url).is_some_and(|path| path.eq_ignore_ascii_case(&expected_path)) {
+        errors.push(format!(
+            "observer {}/{} main URL does not identify its repository/base: `{}`",
+            snapshot.repo, snapshot.base, snapshot.main_url
+        ));
+    }
+}
+
+fn url_matches_repository(url: &str, main_url: &str, repo: &str, number: u64) -> bool {
+    let expected_suffix = format!("/{repo}/pull/{number}");
+    url_path(url).is_some_and(|path| path.eq_ignore_ascii_case(&expected_suffix))
+        && url_origin(url).is_some()
+        && url_origin(url).is_some_and(|origin| {
+            url_origin(main_url).is_some_and(|main_origin| origin.eq_ignore_ascii_case(main_origin))
+        })
+}
+
+fn url_origin(url: &str) -> Option<&str> {
+    let authority_start = url.find("://")? + 3;
+    let authority_end = url[authority_start..]
+        .find('/')
+        .map_or(url.len(), |offset| authority_start + offset);
+    (authority_end > authority_start).then_some(&url[..authority_end])
+}
+
+fn url_path(url: &str) -> Option<&str> {
+    let authority_start = url.find("://")? + 3;
+    let path_start = authority_start + url[authority_start..].find('/')?;
+    let path_end = url[path_start..]
+        .find(['?', '#'])
+        .map_or(url.len(), |offset| path_start + offset);
+    Some(url[path_start..path_end].trim_end_matches('/'))
 }
 
 fn classify_pull_request(pr: &PullRequestSnapshot, queued: bool) -> &'static str {
@@ -606,7 +659,7 @@ mod tests {
     use super::*;
     use crate::queue_observer::{
         ObserverState, OwnershipSnapshot, QueueEntrySnapshot, QueueStateSnapshot, observe,
-        save_state,
+        save_state, snapshot_integrity_hash,
     };
 
     fn state(repo: &str, base: &str, number: u64, bucket: &str) -> ObserverState {
@@ -636,7 +689,7 @@ mod tests {
                 repo: repo.to_owned(),
                 base: base.to_owned(),
                 main_sha: "b".repeat(40),
-                main_url: format!("https://github.test/{repo}/commit/base"),
+                main_url: format!("https://github.test/{repo}/commit/{}", "b".repeat(40)),
                 truncated: false,
                 incomplete_reasons: vec![],
                 captured_at: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
@@ -658,6 +711,11 @@ mod tests {
         )
         .expect("state")
         .state
+    }
+
+    fn refresh_hashes(state: &mut ObserverState) {
+        state.state_hash = crate::queue_observer::snapshot_hash(&state.snapshot).expect("hash");
+        state.snapshot_integrity_hash = snapshot_integrity_hash(&state.snapshot).expect("hash");
     }
 
     fn write_state(root: &Path, name: &str, state: &ObserverState) {
@@ -686,6 +744,19 @@ mod tests {
     }
 
     #[test]
+    fn github_repository_identity_is_case_insensitive() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut value = state("o/r", "main", 1, "green_unarmed");
+        value.snapshot.main_url =
+            format!("https://GITHUB.TEST/O/R/commit/{}", value.snapshot.main_sha);
+        value.snapshot.pull_requests[0].url = "https://github.test/O/R/pull/1".to_owned();
+        refresh_hashes(&mut value);
+        write_state(temp.path(), "one.json", &value);
+        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+        assert!(digest.complete, "{digest:?}");
+    }
+
+    #[test]
     fn explicit_blocker_takes_precedence_over_auto_merge() {
         let pr = PullRequestSnapshot {
             number: 1,
@@ -698,6 +769,103 @@ mod tests {
             checks: vec![],
         };
         assert_eq!(classify_pull_request(&pr, false), "blocked");
+    }
+
+    #[test]
+    fn captured_at_tampering_fails_closed_even_when_state_hash_is_unchanged() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut value = state("o/r", "main", 1, "green_unarmed");
+        value.snapshot.captured_at = Some("2026-10-09T00:00:00.000Z".to_owned());
+        write_state(temp.path(), "one.json", &value);
+        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+        assert!(!digest.complete);
+        assert!(
+            digest
+                .errors
+                .iter()
+                .any(|error| error.contains("integrity hash mismatch")),
+            "{digest:?}"
+        );
+    }
+
+    #[test]
+    fn pull_request_url_repository_mismatch_fails_closed() {
+        for url in [
+            "https://evil.example/not-fixture/pull/1",
+            "https://github.test/evil/o/r/pull/1",
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let mut value = state("o/r", "main", 1, "green_unarmed");
+            value.snapshot.pull_requests[0].url = url.to_owned();
+            refresh_hashes(&mut value);
+            write_state(temp.path(), "one.json", &value);
+            let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+            assert!(!digest.complete);
+            assert!(
+                digest
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("pull-request census") && error.contains("URL")),
+                "{digest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_snapshot_schema_mismatch_fails_closed() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut value = state("o/r", "main", 1, "green_unarmed");
+        value.snapshot.schema_version = 2;
+        refresh_hashes(&mut value);
+        write_state(temp.path(), "one.json", &value);
+        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+        assert!(!digest.complete);
+        assert!(
+            digest
+                .errors
+                .iter()
+                .any(|error| error.contains("nested snapshot schema version")),
+            "{digest:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_observer_schema_reports_rebootstrap_requirement() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut value = state("o/r", "main", 1, "green_unarmed");
+        value.schema_version = 2;
+        value.snapshot.schema_version = 2;
+        value.snapshot_integrity_hash.clear();
+        value.state_hash = crate::queue_observer::snapshot_hash(&value.snapshot).expect("hash");
+        write_state(temp.path(), "one.json", &value);
+        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+        assert!(!digest.complete);
+        assert!(
+            digest.errors.iter().any(|error| {
+                error.contains("legacy schema version") && error.contains("re-bootstrap")
+            }),
+            "{digest:?}"
+        );
+    }
+
+    #[test]
+    fn base_url_path_mismatch_fails_closed() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut value = state("o/r", "main", 1, "green_unarmed");
+        value.snapshot.main_url =
+            "https://github.test/evil/o/r/commit/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned();
+        refresh_hashes(&mut value);
+        write_state(temp.path(), "one.json", &value);
+        let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
+        assert!(!digest.complete);
+        assert!(
+            digest.errors.iter().any(|error| {
+                error.contains("main URL does not identify")
+                    || error.contains("incomplete snapshot identity")
+            }),
+            "{digest:?}"
+        );
     }
 
     #[test]
@@ -771,7 +939,7 @@ mod tests {
             receipt_decisions: vec![],
             test_tier: vec![],
         });
-        value.state_hash = crate::queue_observer::snapshot_hash(&value.snapshot).expect("hash");
+        refresh_hashes(&mut value);
         write_state(temp.path(), "one.json", &value);
         let digest = read_digest_at(temp.path(), 900, SystemTime::now() + Duration::from_secs(1));
         assert!(!digest.complete);
@@ -807,7 +975,7 @@ mod tests {
                 _ => unreachable!(),
             }
             value.snapshot.queue.push(entry);
-            value.state_hash = crate::queue_observer::snapshot_hash(&value.snapshot).expect("hash");
+            refresh_hashes(&mut value);
             write_state(temp.path(), "one.json", &value);
             let digest = read_digest_at(
                 temp.path(),
@@ -852,7 +1020,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let mut value = state("o/r", "main", 1, "green_unarmed");
         value.snapshot.truncated = true;
-        value.state_hash = crate::queue_observer::snapshot_hash(&value.snapshot).expect("hash");
+        refresh_hashes(&mut value);
         write_state(temp.path(), "one.json", &value);
         let digest = read_digest_at(temp.path(), 0, UNIX_EPOCH + Duration::from_secs(1));
         assert!(!digest.complete);

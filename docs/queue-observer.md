@@ -72,8 +72,10 @@ queue-observer/<repo-and-base-digest>.transitions.jsonl
 ```
 
 The first file is atomically replaced and contains the canonical snapshot,
-SHA-256 hash, and backoff cursor. Its hash is verified on load. The second is an
-append-only NDJSON transition log. Transition append precedes cursor advance,
+semantic SHA-256 hash, a separate `snapshot_integrity_hash` covering capture
+provenance, and the backoff cursor. Both hashes and the nested observer schema
+are verified on load, so editing only `captured_at` cannot make a stale state
+appear fresh. The second is an append-only NDJSON transition log. Transition append precedes cursor advance,
 giving crash recovery at-least-once delivery rather than silently losing a
 transition. Each record is encoded before append, serialized by a log-specific
 lock, and an incomplete crash tail is removed before the next append. Consumers
@@ -127,7 +129,14 @@ Pull requests are grouped into `queued`, `armed`, `green_unarmed`, `red`,
 `dirty`, `behind`, `blocked`, `unstable`, or `unknown`. The digest is
 fail-closed: no state files, corrupt or hash-mismatched state, duplicate
 repository/base or PR census rows, stale observers, truncated snapshots, and
-ownership blockers all produce `complete=false` and a nonzero exit. Diagnostic
+ownership blockers all produce `complete=false` and a nonzero exit. It also
+rejects PR URLs whose repository path does not match the observed repository,
+and the observer rejects missing or malformed GraphQL connection `nodes` or
+`pageInfo` fields instead of treating them as empty. Malformed top-level
+GraphQL `errors`, policy fields, or label/assignee nodes are rejected rather
+than filtered into an apparently healthy snapshot. Diagnostic
 JSON/Markdown is still emitted so a supervisor can hand the exact problem back
 to the responsible owner. Transition logs are deliberately not treated as
-current state and `.jsonl` files are ignored.
+current state and `.jsonl` files are ignored. A schema-2 cursor is re-bootstrap
+eligible for `queue-observe` but remains fail-closed for `queue-digest` until a
+fresh schema-3 observation replaces it.
