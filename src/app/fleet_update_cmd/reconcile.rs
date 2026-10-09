@@ -74,6 +74,10 @@ pub(super) struct HostVersion {
 pub(super) struct HostDaemon {
     pub(super) launcher_installed: Option<bool>,
     pub(super) launcher_active: Option<bool>,
+    /// What the agent plist launchd loads says: it starts at login and
+    /// restarts a daemon that exits non-zero. `None` when the host's Shipyard
+    /// predates the field, or the plist is absent or unreadable.
+    pub(super) survives_kill_and_reboot: Option<bool>,
     pub(super) running: Option<bool>,
 }
 
@@ -91,6 +95,21 @@ impl HostDaemon {
                 "the daemon launcher is installed but inactive; rerun `shipyard daemon launcher \
                  install` at the host's console",
             ),
+            // An active launcher is only reboot-safe when the plist launchd
+            // loads says so. An unread answer is not a yes.
+            (Some(true), Some(true)) => match self.survives_kill_and_reboot {
+                Some(true) => None,
+                Some(false) => Some(
+                    "the daemon's launchd agent neither starts at login nor restarts a daemon \
+                     that dies (its plist has RunAtLoad or KeepAlive off); run `shipyard daemon \
+                     refresh` on the host to rewrite it",
+                ),
+                None => Some(
+                    "the daemon's launchd agent plist could not be read, so nothing shows the \
+                     daemon comes back after a reboot or a kill; update the host's Shipyard and \
+                     run `shipyard daemon refresh` there",
+                ),
+            },
             _ => None,
         };
         let stopped = (self.running == Some(false))
@@ -1213,6 +1232,7 @@ fn parse_daemon_probe(text: &str) -> Option<HostDaemon> {
     let daemon = HostDaemon {
         launcher_installed: field(PROBE_LAUNCHER_MARKER, "installed"),
         launcher_active: field(PROBE_LAUNCHER_MARKER, "active"),
+        survives_kill_and_reboot: field(PROBE_LAUNCHER_MARKER, "survives_kill_and_reboot"),
         running: field(PROBE_DAEMON_MARKER, "running"),
     };
     (daemon != HostDaemon::default()).then_some(daemon)
@@ -2320,8 +2340,30 @@ mod tests {
         HostDaemon {
             launcher_installed: Some(installed),
             launcher_active: Some(active),
+            survives_kill_and_reboot: (installed && active).then_some(true),
             running: Some(running),
         }
+    }
+
+    #[test]
+    fn an_active_launcher_is_reboot_safe_only_when_its_plist_says_so() {
+        let with = |survives| HostDaemon {
+            survives_kill_and_reboot: survives,
+            ..daemon(true, true, true)
+        };
+        assert_eq!(with(Some(true)).problem(), None);
+        let off = with(Some(false))
+            .problem()
+            .expect("plist with KeepAlive off is a problem");
+        assert!(off.contains("RunAtLoad or KeepAlive off"), "{off}");
+        assert!(off.contains("`shipyard daemon refresh`"), "{off}");
+        let unread = with(None).problem().expect("an unread plist is not a yes");
+        assert!(unread.contains("could not be read"), "{unread}");
+        let text = format!(
+            "{PROBE_LAUNCHER_MARKER}{{\"active\": true, \"installed\": true, \"survives_kill_and_reboot\": false}}\n\
+             {PROBE_DAEMON_MARKER}{{\"running\": true}}\n"
+        );
+        assert_eq!(parse_daemon_probe(&text), Some(with(Some(false))));
     }
 
     #[test]

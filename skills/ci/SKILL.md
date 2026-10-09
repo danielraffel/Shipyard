@@ -1186,7 +1186,10 @@ shipyard daemon refresh                 # now started through launchd
 ```
 
 After that every refresh, including a fleet self-update's, starts the daemon
-through the stable launcher, whose consent survives updates. `daemon launcher
+through the stable launcher, whose consent survives updates. The agent starts
+at login and launchd restarts a daemon that exits non-zero; `daemon launcher
+status` prints whether the installed plist says so (`survives_kill_and_reboot`).
+A host whose plist predates that policy needs one `shipyard daemon refresh`. `daemon launcher
 uninstall` returns to direct spawns. Hosts on internal disks need nothing.
 
 ## `shipyard verdicts` — the verdict nobody consumed
