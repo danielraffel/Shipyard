@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::{
-    CliFailure, RuntimeMode, WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG,
-    WAIT_EXIT_TIMEOUT, WAIT_EXIT_UNSUPPORTED,
-    cli::{WaitCommand, WaitPrState, WaitPrUntil},
+    CliFailure, RuntimeMode, WAIT_EXIT_CLOSED, WAIT_EXIT_EJECTED, WAIT_EXIT_INVALID,
+    WAIT_EXIT_MERGED, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_QUEUED, WAIT_EXIT_RED,
+    WAIT_EXIT_TERMINAL_WRONG, WAIT_EXIT_TIMEOUT, WAIT_EXIT_UNSUPPORTED,
+    cli::{WaitCommand, WaitPrState},
 };
 use crate::config::LoadedConfig;
 use crate::log_retention::{TerminalLogManifest, read_terminal_manifest};
@@ -56,7 +57,6 @@ pub(super) fn wait_command<W: Write>(
         WaitCommand::Pr {
             pr_number,
             state,
-            until,
             timeout,
             poll_interval,
             no_fallback,
@@ -69,11 +69,7 @@ pub(super) fn wait_command<W: Write>(
             json,
             stdout,
             pr_number,
-            state.or_else(|| until.map(|until| match until {
-                WaitPrUntil::Green => WaitPrState::Green,
-                WaitPrUntil::Merged => WaitPrState::Merged,
-                WaitPrUntil::Closed => WaitPrState::Closed,
-            })).expect("clap requires --state or --until"),
+            state,
             timeout,
             poll_interval,
             no_fallback,
@@ -190,6 +186,9 @@ fn wait_pr<W: Write>(
     let result = wait_for_condition_with_timeout(
         |snapshot| match state {
             WaitPrState::Green => evaluate_pr_green_for_wait(snapshot, &mut terminal_wrong),
+            WaitPrState::Queued => evaluate_pr_queue_state(snapshot, "queued"),
+            WaitPrState::Red => evaluate_pr_queue_state(snapshot, "red"),
+            WaitPrState::Ejected => evaluate_pr_queue_state(snapshot, "ejected"),
             WaitPrState::Merged => wait_logic::evaluate_pr_state(snapshot, "merged")
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
             WaitPrState::Closed => wait_logic::evaluate_pr_state(snapshot, "closed")
@@ -201,7 +200,11 @@ fn wait_pr<W: Write>(
                 WaitPrState::Green => {
                     fetch_pr_green_snapshot_with_timeout(&repo, pr_number, cwd, remaining)
                 }
-                WaitPrState::Merged | WaitPrState::Closed => {
+                WaitPrState::Queued
+                | WaitPrState::Red
+                | WaitPrState::Ejected
+                | WaitPrState::Merged
+                | WaitPrState::Closed => {
                     fetch_pr_snapshot_with_timeout(&repo, pr_number, cwd, remaining)
                 }
             },
@@ -257,10 +260,88 @@ fn wait_pr<W: Write>(
             if terminal_wrong {
                 return Ok(ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
             }
-            Ok(wait_exit_code(&outcome))
+            Ok(if outcome.matched {
+                wait_pr_state_exit_code(state)
+            } else {
+                wait_exit_code(&outcome)
+            })
         }
         Err(error) => Err(wait_failure(error.as_ref())),
     }
+}
+
+fn wait_pr_state_exit_code(state: WaitPrState) -> ExitCode {
+    match state {
+        WaitPrState::Green => ExitCode::SUCCESS,
+        WaitPrState::Queued => ExitCode::from(WAIT_EXIT_QUEUED),
+        WaitPrState::Red => ExitCode::from(WAIT_EXIT_RED),
+        WaitPrState::Ejected => ExitCode::from(WAIT_EXIT_EJECTED),
+        WaitPrState::Merged => ExitCode::from(WAIT_EXIT_MERGED),
+        WaitPrState::Closed => ExitCode::from(WAIT_EXIT_CLOSED),
+    }
+}
+
+fn evaluate_pr_queue_state(
+    snapshot: Option<&Value>,
+    target: &str,
+) -> crate::wait_transport::WaitResult<crate::wait::TruthResult> {
+    let Some(snapshot) = snapshot else {
+        return Ok(crate::wait::TruthResult {
+            matched: false,
+            observed: BTreeMap::from([("state".to_owned(), Value::Null)]),
+        });
+    };
+    let state = snapshot
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let merge = snapshot
+        .get("mergeStateStatus")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let checks = snapshot
+        .get("statusCheckRollup")
+        .or_else(|| snapshot.get("checks"));
+    let red = checks.and_then(Value::as_array).is_some_and(|items| {
+        items.iter().any(|item| {
+            ["conclusion", "state"].iter().any(|key| {
+                item.get(*key).and_then(Value::as_str).is_some_and(|v| {
+                    crate::wait::TERMINAL_FAILURE_CONCLUSIONS
+                        .contains(&v.to_ascii_uppercase().as_str())
+                })
+            })
+        })
+    });
+    let ejected = snapshot
+        .get("ejected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || merge.contains("eject")
+        || merge.contains("unstable");
+    let matched = match target {
+        "queued" => {
+            merge == "merge_queued"
+                || merge == "queued"
+                || snapshot
+                    .get("in_merge_queue")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        }
+        "red" => red,
+        "ejected" => ejected,
+        _ => false,
+    };
+    Ok(crate::wait::TruthResult {
+        matched,
+        observed: BTreeMap::from([
+            ("state".to_owned(), Value::String(state)),
+            ("merge_state_status".to_owned(), Value::String(merge)),
+            ("red".to_owned(), Value::Bool(red)),
+            ("ejected".to_owned(), Value::Bool(ejected)),
+        ]),
+    })
 }
 
 fn render_pr_terminal_failure<W: Write>(

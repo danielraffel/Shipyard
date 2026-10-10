@@ -194,7 +194,7 @@ fn sessions_json(rows: &[(&str, &str, bool, &str)]) -> String {
 }
 
 #[test]
-fn liveness_needs_a_running_record_with_a_live_pid() {
+fn liveness_needs_a_running_or_idle_record_with_a_live_pid() {
     let live = sessions_json(&[(LIVE_SESSION, "running", true, LIVE_SURFACE)]);
     assert_eq!(
         parse_sessions(&live, LIVE_SESSION, None),
@@ -202,6 +202,19 @@ fn liveness_needs_a_running_record_with_a_live_pid() {
             surface: Some(LIVE_SURFACE.to_owned()),
             workspace: Some(LIVE_WORKSPACE.to_owned())
         }
+    );
+    let idle = sessions_json(&[(LIVE_SESSION, "idle", true, LIVE_SURFACE)]);
+    assert_eq!(
+        parse_sessions(&idle, LIVE_SESSION, None),
+        Liveness::Live {
+            surface: Some(LIVE_SURFACE.to_owned()),
+            workspace: Some(LIVE_WORKSPACE.to_owned())
+        }
+    );
+    let idle_gone_pid = sessions_json(&[(LIVE_SESSION, "idle", false, LIVE_SURFACE)]);
+    assert_eq!(
+        parse_sessions(&idle_gone_pid, LIVE_SESSION, None).name(),
+        "dead"
     );
     let gone_pid = sessions_json(&[(LIVE_SESSION, "running", false, LIVE_SURFACE)]);
     assert_eq!(parse_sessions(&gone_pid, LIVE_SESSION, None).name(), "dead");
@@ -215,6 +228,16 @@ fn liveness_needs_a_running_record_with_a_live_pid() {
         "unknown"
     );
     assert_eq!(parse_sessions("{}", LIVE_SESSION, None).name(), "unknown");
+    let corroborated = json!({
+        "sessions": [],
+        "process_alive": true,
+        "transcript_mtime": "2026-10-07T02:03:04Z"
+    })
+    .to_string();
+    assert_eq!(
+        parse_sessions(&corroborated, LIVE_SESSION, None).name(),
+        "live"
+    );
     // The expected surface wins among live rows.
     let second = "11111111-2222-3333-4444-555555555555";
     let two = sessions_json(&[
@@ -1797,6 +1820,38 @@ fn a_wake_is_seen_only_when_the_owner_session_displayed_that_episode() {
         true,
     );
     assert!(!out.report.events.iter().any(|e| e.change == "wake.seen"));
+}
+
+#[test]
+fn unanswered_wake_retries_until_budget_then_escalates_once() {
+    let (mut ledger, history) = world(t(0));
+    let mut cfg = config(false, true);
+    cfg.retry_after = chrono::Duration::hours(1);
+    cfg.max_unseen_sends = 3;
+    for (at, expected_sends, expected_escalations) in
+        [(1, 1, 0), (1, 1, 0), (2, 2, 0), (3, 3, 1), (4, 3, 0)]
+    {
+        let mut runner = FakeRunner::default();
+        let out = pass(
+            &mut ledger,
+            &history,
+            t(at),
+            &cfg,
+            HandbackMode::Deliver,
+            &mut runner,
+            true,
+        );
+        let id = "1:repeat_test_failure:k";
+        assert_eq!(ledger.handback.wakes[id].send_count, expected_sends);
+        assert_eq!(
+            out.report
+                .events
+                .iter()
+                .filter(|e| e.change == "wake.escalated" && e.id == id)
+                .count(),
+            expected_escalations
+        );
+    }
 }
 
 #[test]

@@ -36,7 +36,7 @@ asset uploads.
 shipyard wait release v0.23.0 --timeout 900 --json
 ```
 
-### `shipyard wait pr <N> --state {green|merged|closed}`
+### `shipyard wait pr <N> --state {green|queued|red|ejected|merged|closed}`
 
 Waits for PR `<N>` to reach the given state.
 
@@ -44,13 +44,17 @@ Waits for PR `<N>` to reach the given state.
 # All required checks on current HEAD pass.
 shipyard wait pr 151 --state green --timeout 1800 --json
 
+# PR is in the merge queue.
+shipyard wait pr 151 --state queued --timeout 3600 --json
+
 # PR is merged (branch protection passed + merge clicked).
 shipyard wait pr 151 --state merged --timeout 3600 --json
 ```
 
-The unattended handoff spelling is also accepted as
-`shipyard wait pr <N> --until {green|merged|closed}`. It is bounded by the
-same explicit `--timeout`; there is no second local ledger.
+The wait reads the single authoritative pr-watch ledger over the configured SSH
+handback route. If that host cannot be reached, it prints a visible slow,
+read-only GitHub fallback notice and polls GitHub without creating a local
+ledger. It is bounded by the explicit `--timeout`.
 
 ### `shipyard wait run <run-id> [--success]`
 
@@ -76,6 +80,11 @@ shipyard wait run 22345678 --success --timeout 1200 --json
 
 - `0` — condition matched.
 - `1` — `--timeout` elapsed.
+- `8` — queued.
+- `9` — red.
+- `10` — ejected.
+- `11` — merged.
+- `12` — closed.
 - `4` — `wait run --success` reached a terminal-but-wrong state.
 - `5` — invalid input (PR/run/release not found, bad tag).
 - `6` — daemon unreachable + snapshot missed + `--no-fallback` set.

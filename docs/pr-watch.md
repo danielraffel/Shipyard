@@ -40,12 +40,19 @@ required job by name, never to "the first failed job".
 | 2 | `red_while_armed` | auto-merge is armed (or the PR was ejected for `failed_checks` and not re-armed), it is not in the queue, and a required check on the current head has been red for more than 30 minutes with no push since | the check, head, and red-since time |
 | 3 | `repeated_ejection` | at least 2 merge groups named for the PR (`gh-readonly-queue/<base>/pr-<N>-<parent>`) and created since its current head was pushed failed a required job, with no passing named group finishing after the last failure | each failed group with its parent group's status |
 | 4 | `rebase_treadmill` | the head was replaced at least 3 times within 24 h, each time the previous head's gate run was cancelled and the merge base with the base branch advanced | the head chain; says "inferred" |
+| 6 | `green_unarmed` | every required check on the current head passed (`success`, or `skipped`/`neutral`) more than 120 minutes ago, auto-merge is not armed, the PR is not queued and was not ejected; not raised for a PR labelled `shipyard:no-auto-merge` or `shipyard:hold`, a draft, or a PR whose body or a comment has a line `shipyard:hold` | the head and green-since time, plus the latest comment that promised someone would arm it (for example "team-lead arms"), quoted with its author and time |
+| 7 | `ejected_green` | the queue ejected the PR for `failed_checks`, its head has not changed since, every required check on that head is green, and nothing re-armed or re-queued it for more than 120 minutes (`green_unarmed_minutes`, counted from the later of the ejection and green); a hold label suppresses it | the head and ejection time. The arm guard refuses a same-head re-arm after a check failure unless it is certified environmental, so the owner pushes a new head or says why the failure was not this head's |
 | 5 | `split_candidate` | open more than 3 days, or more than 60 files or 30 commits | advisory only: raised only alongside another flag on the same PR, never alone, and never alone in a digest |
 
 Signatures: CTest summary lines are normalised to the bare test name
 (`21516 - name (Failed)  labels` becomes `name`, because CTest renumbers tests
 between runs). A log with no CTest summary uses its first `##[error]` line that
 is not a bare "Process completed with exit code N".
+
+Flag 6 catches the pull request nothing will ever merge: green, but nobody
+armed it. The draft and `shipyard:hold` screens, and the quoted arm promise, are
+read at scan time. A deliberate hold should carry `shipyard:hold` or
+`shipyard:no-auto-merge` so it is neither flagged nor armed by a backstop.
 
 Flag 3 is "named for", not "proved culprit". GitHub names a merge group after
 its last entry, so a batch-mate's failure is attributed to it; the parent
@@ -179,8 +186,8 @@ plans it as a dry run whatever the config says, and `scan --deliver-handback`
 
 A flag is **owner-actionable** when its digest route is per-PR (not a
 "failing on main/pre-existing" shared failure, not an ejection the attributor
-pinned on a neighbour) and it is a repeated test failure, red while armed, or a
-repeated ejection. A rebase treadmill (the base moving) and the split advisory
+pinned on a neighbour) and it is a repeated test failure, red while armed, a
+repeated ejection, green but unarmed, or ejected and green. A rebase treadmill (the base moving) and the split advisory
 are not.
 
 | tier | when | what |
@@ -216,9 +223,11 @@ and otherwise unreachable. Nothing about the fleet is hardcoded.
 
 **Liveness.** `cmux sessions list --json --session <id>` on the owner's host
 (read-only). Live means a record for exactly that session with
-`agent_lifecycle = running` and `stored_pid_exists = true`; the record's current
-surface is used. No record or a stopped one is dead; unreadable output is
-unknown; an ssh failure or an unmapped host is unreachable.
+`agent_lifecycle` of `running` or `idle` and `stored_pid_exists = true` (an idle
+agent finished its turn and is waiting for input); the record's current surface
+is used. A missing row is cross-checked against transcript mtime and process
+liveness before it is classified, and every probe is timestamped. Unreadable
+output is unknown; an ssh failure or an unmapped host is unreachable.
 
 **Until seen.** A delivery is recorded in the ledger (`handback.delivered`). If
 the owner hook has not returned `wake.seen`, the pass re-sends after
@@ -251,7 +260,10 @@ turn sees an entry within one tool call. The reader is silent when the inbox is
 absent or empty; otherwise it claims the file (rename), prints at most five
 entries (2,000 characters, each line 300) as agent context, and moves them to
 `<session-id>.shown.jsonl`, stamped `shown_at`, so they show once. That move
-happens inside an agent turn, so it is the acknowledgement: each delivering
+happens inside an agent turn, so it is the acknowledgement. If an episode
+resolves before its note is read, the next delivering pass appends a retraction
+(`{"retract": "<id>", "reason": ...}`) through the same inbox route; the hook
+drops the unread note it names. A note already shown is not affected. Each delivering
 pass reads the shown file back over the delivery's own route and records
 `wake.seen` (at `shown_at`) for every sent episode whose entry is there. Codex reads the same hook
 contract from `~/.codex/hooks.json`; add the script there to cover Codex

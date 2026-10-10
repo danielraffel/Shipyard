@@ -201,8 +201,11 @@ pub struct WakeRecord {
     /// Why nothing was attempted for it (`no_channel`), once logged.
     #[serde(default)]
     pub unsent: Option<String>,
-    /// The session and route of that delivery, where its acknowledgement is
-    /// read back.
+    /// Where its inbox line went, so the line can be retracted when the
+    /// episode resolves before the owner reads it.
+    #[serde(default)]
+    pub inbox: Option<InboxTarget>,
+    /// The session and route of the most recent delivery.
     #[serde(default)]
     pub sent_to: Option<(String, Route)>,
     /// When the session's hook displayed it inside an agent turn.
@@ -217,6 +220,24 @@ pub struct WakeRecord {
     /// Whether the unanswered episode has been escalated.
     #[serde(default)]
     pub escalated: bool,
+}
+
+/// The inbox an episode's line was appended to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxTarget {
+    /// Session whose inbox holds the line.
+    pub session: String,
+    /// Host route of that inbox.
+    pub route: Route,
+    /// The line's `id`.
+    pub line: String,
+}
+
+/// A retraction owed to an inbox: the episode its line describes resolved.
+struct Retraction {
+    pr: u64,
+    target: InboxTarget,
+    how: String,
 }
 
 /// One delivered episode.
@@ -807,6 +828,17 @@ struct SessionBatch {
     ids: Vec<String>,
 }
 
+fn retraction_line(line: &str, pr: u64, how: &str, now: DateTime<Utc>) -> String {
+    json!({
+        "schema": INBOX_SCHEMA,
+        "retract": line,
+        "pr": pr,
+        "reason": how,
+        "at": now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    })
+    .to_string()
+}
+
 /// Run the hand-back over a reconciled ledger. `gh` reads pull-request
 /// bodies and the label definition; `write` sends label requests (only in
 /// [`HandbackMode::Deliver`]).
@@ -835,6 +867,7 @@ pub fn run(
     let inbox_on = config.inbox || !deliver;
     let off_note = |enabled: bool| if enabled { "" } else { " [off in config]" };
     let mut state = ledger.handback.clone();
+    let mut retractions: Vec<Retraction> = Vec::new();
     let open = |pr: u64| {
         history
             .prs
@@ -981,6 +1014,13 @@ pub fn run(
                     if previous.episode == entry.first_seen_at {
                         continue;
                     }
+                    if let Some(target) = previous.inbox.clone() {
+                        retractions.push(Retraction {
+                            pr: previous.pr,
+                            target,
+                            how: "new_episode".to_owned(),
+                        });
+                    }
                     // The flag cleared and came back: close the old episode.
                     report.events.push(wake_event(
                         now,
@@ -1003,6 +1043,7 @@ pub fn run(
                         raised_at: now,
                         sent_at: None,
                         unsent: None,
+                        inbox: None,
                         sent_to: None,
                         seen_at: None,
                         send_count: 0,
@@ -1028,12 +1069,20 @@ pub fn run(
             .iter()
             .filter(|id| {
                 let episode = ledger.entries.get(*id).map(|e| e.first_seen_at);
-                let Some(wake) = state.wakes.get(*id) else { return true; };
-                if Some(wake.episode) != episode { return true; }
-                if wake.sent_at.is_none() { return true; }
+                let Some(wake) = state.wakes.get(*id) else {
+                    return true;
+                };
+                if Some(wake.episode) != episode {
+                    return true;
+                }
+                if wake.sent_at.is_none() {
+                    return true;
+                }
                 wake.seen_at.is_none()
                     && wake.send_count < config.max_unseen_sends
-                    && wake.last_sent_at.is_some_and(|at| now - at >= config.retry_after)
+                    && wake
+                        .last_sent_at
+                        .is_some_and(|at| now - at >= config.retry_after)
             })
             .cloned()
             .collect();
@@ -1234,6 +1283,16 @@ pub fn run(
                     wake.last_sent_at = Some(now);
                     wake.send_count = wake.send_count.saturating_add(1);
                     wake.sent_to = Some((session.clone(), batch.route.clone()));
+                    if channels.iter().any(|c| c == "inbox") {
+                        wake.inbox = Some(InboxTarget {
+                            session: session.clone(),
+                            route: batch.route.clone(),
+                            line: format!(
+                                "{id}@{}",
+                                entry.first_seen_at.format("%Y-%m-%dT%H:%M:%SZ")
+                            ),
+                        });
+                    }
                 }
                 report.events.push(wake_event(
                     now,
@@ -1286,7 +1345,10 @@ pub fn run(
                     2,
                     "steward_escalation",
                     vec![wake.pr],
-                    format!("escalate unanswered wake for #{} to steward after {} sends", wake.pr, wake.send_count),
+                    format!(
+                        "escalate unanswered wake for #{} to steward after {} sends",
+                        wake.pr, wake.send_count
+                    ),
                 ));
             }
         }
@@ -1363,6 +1425,13 @@ pub fn run(
                 Some(_) if !open(wake.pr) => "closed",
                 Some(_) => "not_actionable",
             };
+            if let Some(target) = wake.inbox.clone() {
+                retractions.push(Retraction {
+                    pr: wake.pr,
+                    target,
+                    how: how.to_owned(),
+                });
+            }
             report.events.push(wake_event(
                 now,
                 &id,
@@ -1375,6 +1444,42 @@ pub fn run(
                     "sent_at": wake.sent_at,
                 }),
             ));
+        }
+    }
+
+    if deliver && inbox_on {
+        for Retraction { pr, target, how } in retractions {
+            let line = retraction_line(&target.line, pr, &how, now) + "\n";
+            let command = HostCommand::InboxAppend {
+                session: target.session.clone(),
+            };
+            let invocation = host::invocation(
+                &target.route,
+                &command,
+                &config.cmux_path,
+                Some(line.clone()),
+            );
+            let mut planned = action(
+                1,
+                "retract_inbox",
+                vec![pr],
+                format!("retract unread note for #{pr} ({how})"),
+            );
+            planned.session = Some(target.session.clone());
+            planned.argv = invocation.as_ref().map(|i| i.argv.clone());
+            let result = match invocation {
+                Some(invocation) => deps
+                    .runner
+                    .run(&invocation)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                None => deps.runner.append_local_inbox(&target.session, &line),
+            };
+            match result {
+                Ok(()) => planned.sent = true,
+                Err(error) => planned.error = Some(error),
+            }
+            report.actions.push(planned);
         }
     }
 

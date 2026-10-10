@@ -365,10 +365,23 @@ pub fn parse_sessions(stdout: &str, session: &str, expected_surface: Option<&str
         .filter(|row| row.get("session_id").and_then(Value::as_str) == Some(session))
         .collect();
     if rows.is_empty() {
-        // A missing cmux row is not proof of death. Hosts can lose the cmux
-        // index while the agent process and its transcript continue. The
-        // caller must cross-check those independent signals before declaring
-        // the owner dead.
+        // A missing cmux row is not proof of death. The host probe may include
+        // independent transcript and process evidence in the same response;
+        // require both before treating the owner as live.
+        let process_alive = value
+            .get("process_alive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let transcript_mtime = value
+            .get("transcript_mtime")
+            .and_then(Value::as_str)
+            .filter(|mtime| !mtime.is_empty());
+        if process_alive && transcript_mtime.is_some() {
+            return Liveness::Live {
+                surface: None,
+                workspace: None,
+            };
+        }
         return Liveness::Unknown("no cmux record for the session".to_owned());
     }
     let text = |row: &Value, key: &str| row.get(key).and_then(Value::as_str).map(str::to_owned);
