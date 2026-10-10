@@ -23,7 +23,6 @@ mod fold;
 #[allow(clippy::struct_excessive_bools)]
 pub(super) struct PrCommandArgs {
     pub(super) base: String,
-    pub(super) apply_bumps: bool,
     pub(super) allow_unreachable_targets: bool,
     /// Proceed even when this host has not converged to the declared fleet epoch.
     pub(super) allow_fleet_epoch_drift: bool,
@@ -294,17 +293,10 @@ pub(super) fn pr_command<W: Write>(
     warn_missing_release_bot_token(stdout, cwd, config);
     print_fold_suggestions(stdout, cwd, config, &args.base);
     run_skill_sync(stdout, &python, &gates, &repo_root, &args.base)?;
-    let bumped_files = run_version_bump(stdout, &python, &gates, &repo_root, &args)?;
-    if !bumped_files.is_empty() {
-        writeln!(
-            stdout,
-            "▸ Committing version bump(s) — {} file(s)",
-            bumped_files.len()
-        )
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        commit_bumped_files(&repo_root, &bumped_files)
-            .map_err(|error| CliFailure::new(1, error))?;
-    }
+    // Version numbers are assigned by the single writer after the merge.
+    // Keep the gate as a read-only check so this command can never create a
+    // competing version commit on an author branch.
+    run_version_bump(stdout, &python, &gates, &repo_root, &args)?;
 
     let steward_handoff =
         resolve_steward_handoff(&args, protected_base_auto_handoff(cwd, &args.base));
@@ -410,16 +402,15 @@ fn run_version_bump<W: Write>(
     gates: &PrGates,
     repo_root: &Path,
     args: &PrCommandArgs,
-) -> Result<Vec<String>, CliFailure> {
-    let bump_mode = if args.apply_bumps { "apply" } else { "report" };
-    writeln!(stdout, "▸ Version-bump {bump_mode}")
+) -> Result<(), CliFailure> {
+    writeln!(stdout, "▸ Version-bump report")
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     let version_output = Command::new(python)
         .arg(&gates.version_bump)
         .args(["--base", &format!("origin/{}", args.base)])
         .arg("--config")
         .arg(&gates.versioning_config)
-        .arg(format!("--mode={bump_mode}"))
+        .arg("--mode=report")
         .current_dir(repo_root)
         .output()
         .map_err(|error| CliFailure::new(1, format!("failed to run version-bump gate: {error}")))?;
@@ -437,9 +428,7 @@ fn run_version_bump<W: Write>(
             "version-bump gate failed; fix the bump and retry.",
         ));
     }
-    Ok(parse_edited_files(&String::from_utf8_lossy(
-        &version_output.stdout,
-    )))
+    Ok(())
 }
 
 fn status_code(code: Option<i32>) -> u8 {
@@ -463,25 +452,6 @@ fn shortcut_trailers(args: &PrCommandArgs) -> Vec<String> {
         }
     }
     trailers
-}
-
-fn parse_edited_files(output: &str) -> Vec<String> {
-    let mut in_block = false;
-    let mut files = Vec::new();
-    for line in output.lines() {
-        if line.starts_with("Edited files:") {
-            in_block = true;
-            continue;
-        }
-        if in_block {
-            if line.starts_with("  ") && !line.trim().is_empty() {
-                files.push(line.trim().to_owned());
-            } else {
-                break;
-            }
-        }
-    }
-    files
 }
 
 #[derive(Debug)]
@@ -650,33 +620,6 @@ fn interpret_trailer(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn commit_bumped_files(repo_root: &Path, bumped_files: &[String]) -> Result<(), String> {
-    let mut args = vec![
-        "-c".to_owned(),
-        "commit.gpgsign=false".to_owned(),
-        "commit".to_owned(),
-        "-m".to_owned(),
-        "chore: bump versions".to_owned(),
-        "--only".to_owned(),
-        "--".to_owned(),
-    ];
-    args.extend(bumped_files.iter().cloned());
-    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let output = crate::supervised::git_supervised()
-        .args(&refs)
-        .current_dir(repo_root)
-        .output()
-        .map_err(|error| format!("failed to commit version bump(s): {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "git commit for version bump(s) failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
 fn warn_missing_release_bot_token<W: Write>(stdout: &mut W, cwd: &Path, config: &LoadedConfig) {
     let Some(repo) = detect_repo_from_remote(cwd, None) else {
         return;
@@ -843,7 +786,6 @@ mod tests {
     fn pr_args() -> PrCommandArgs {
         PrCommandArgs {
             base: String::from("main"),
-            apply_bumps: true,
             allow_unreachable_targets: false,
             allow_fleet_epoch_drift: false,
             allow_unserved_lanes: Vec::new(),
@@ -867,6 +809,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn empty_config() -> LoadedConfig {
         LoadedConfig {
             data: toml::Table::new(),
@@ -899,21 +842,6 @@ mod tests {
             "git {} failed: {}",
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[test]
-    fn parses_edited_files_block_only() {
-        let files = parse_edited_files(
-            "checking\nEdited files:\n  pyproject.toml\n  crates/foo/Cargo.toml\n\n[next]\n",
-        );
-
-        assert_eq!(
-            files,
-            vec![
-                String::from("pyproject.toml"),
-                String::from("crates/foo/Cargo.toml")
-            ]
         );
     }
 
@@ -1262,64 +1190,6 @@ exit 0
 
     #[cfg(unix)]
     #[test]
-    fn run_version_bump_parses_apply_output_and_maps_failures() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let version_bump = temp.path().join("version_bump_check.py");
-        fs::write(
-            &version_bump,
-            r#"#!/bin/sh
-case "$*" in
-  *"--mode=apply"*)
-    printf '%s\n' 'Edited files:' '  Cargo.toml' '  crates/foo/Cargo.toml'
-    exit 0
-    ;;
-  *)
-    printf '%s\n' 'gate failed'
-    exit 7
-    ;;
-esac
-"#,
-        )
-        .expect("write version-bump script");
-        let gates = PrGates {
-            skill_sync: temp.path().join("skill_sync_check.py"),
-            version_bump,
-            versioning_config: temp.path().join("versioning.json"),
-        };
-        let mut stdout = Vec::new();
-
-        let bumped = run_version_bump(
-            &mut stdout,
-            Path::new("/bin/sh"),
-            &gates,
-            temp.path(),
-            &pr_args(),
-        )
-        .expect("bump");
-
-        assert_eq!(
-            bumped,
-            vec![
-                String::from("Cargo.toml"),
-                String::from("crates/foo/Cargo.toml")
-            ]
-        );
-        let mut report_args = pr_args();
-        report_args.apply_bumps = false;
-        let error = run_version_bump(
-            &mut Vec::new(),
-            Path::new("/bin/sh"),
-            &gates,
-            temp.path(),
-            &report_args,
-        )
-        .expect_err("report mode failure");
-        assert_eq!(error.code, 7);
-        assert!(error.message.contains("version-bump gate failed"));
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn append_trailers_refuses_staged_changes() {
         let temp = tempfile::tempdir().expect("tempdir");
         git(temp.path(), &["init"]);
@@ -1372,28 +1242,6 @@ esac
     }
 
     #[cfg(unix)]
-    #[test]
-    fn commit_bumped_files_commits_only_requested_files() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        git(temp.path(), &["init"]);
-        git(temp.path(), &["config", "user.name", "test"]);
-        git(temp.path(), &["config", "user.email", "test@example.com"]);
-        git(temp.path(), &["config", "commit.gpgsign", "false"]);
-        fs::write(temp.path().join("Cargo.toml"), "one\n").expect("cargo");
-        fs::write(temp.path().join("README.md"), "one\n").expect("readme");
-        git(temp.path(), &["add", "."]);
-        git(temp.path(), &["commit", "-m", "initial"]);
-        fs::write(temp.path().join("Cargo.toml"), "two\n").expect("cargo update");
-        fs::write(temp.path().join("README.md"), "two\n").expect("readme update");
-
-        commit_bumped_files(temp.path(), &[String::from("Cargo.toml")]).expect("commit bump");
-
-        let subject = git_output(temp.path(), &["log", "-1", "--format=%s"]).expect("subject");
-        assert_eq!(subject, "chore: bump versions");
-        let status = git_output(temp.path(), &["status", "--short"]).expect("status");
-        assert_eq!(status, "M README.md");
-    }
-
     #[test]
     fn missing_skip_reason_returns_exit_two() {
         let temp = tempfile::tempdir().expect("tempdir");

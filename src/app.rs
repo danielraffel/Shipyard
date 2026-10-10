@@ -1138,8 +1138,6 @@ fn handle_pr_variant<W: Write>(
     let arm_auto_merge = command.arm_auto_merge().unwrap_or(cli::ArmRequest::Default);
     let Command::Pr {
         base,
-        apply_bumps,
-        no_apply_bumps,
         allow_unreachable_targets,
         allow_fleet_epoch_drift,
         allow_unserved_lanes,
@@ -1174,7 +1172,6 @@ fn handle_pr_variant<W: Write>(
     pr_command(
         PrCommandArgs {
             base,
-            apply_bumps: apply_bumps && !no_apply_bumps,
             allow_unreachable_targets,
             allow_fleet_epoch_drift,
             allow_unserved_lanes,

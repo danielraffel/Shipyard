@@ -29,7 +29,7 @@ Enforcement runs in three layers, all calling the same two scripts.
 
 Scripts:
 
-- `scripts/version_bump_check.py` — detects which surfaces need a bump. Heuristic (public-API vs internal paths) + conventional-commit signals + explicit `Version-Bump:` trailer override. `--mode=apply` rewrites version files in place.
+- `scripts/version_bump_check.py` — detects which surfaces need a post-merge assignment. Pull requests may not edit version files; the gate has no apply mode.
 - `scripts/skill_sync_check.py` — hard-fails when a mapped path is touched without the corresponding `SKILL.md` update. The map is `scripts/skill_path_map.json`; every dir under `skills/` must appear in it.
 
 Full design: borrowed from `pulp` (upstream) — the schema and scripts are shared. See the pulp repo's `docs/guides/versioning.md` for the source of truth on the design.
@@ -48,7 +48,7 @@ for patterns and exit-code reference.
 When the user says "push a PR", "ship this", "ship it", "we're done", "merge this", or similar, invoke `shipyard pr` (or `shipyard ship` if that name is reserved for release today — check `skills/ci/SKILL.md`). It orchestrates:
 
 1. `skill_sync_check.py --mode=report` — hard-fails on missing SKILL.md updates.
-2. `version_bump_check.py --mode=apply` — applies the right bump per surface.
+2. `version_bump_check.py --mode=report` — validates the version-file prohibition.
 3. `git commit` + `gh pr create` + CI validate + merge on green.
 4. `.github/workflows/auto-release.yml` tags the moved CLI version on merge; the existing tag-triggered `release.yml` publishes binaries.
 

@@ -1,7 +1,7 @@
 {
   "$schema": "./versioning.schema.json",
   "schema_version": 1,
-  "_comment": "Shipyard versioning gate. The CLI is now a Shipyard binary versioned from Cargo.toml; plugin files remain git-delivered and independently versioned.",
+  "_comment": "Shipyard versioning gate. Pull requests never edit version files; version-at-land assigns them after merge. A release PR may opt in with Release: allow-version-files reason=\"...\".",
 
   "surfaces": {
     "cli": {
@@ -46,8 +46,7 @@
       "internal_only_paths": [
         "scripts/test_*.py",
         "tools/sandbox-e2e/**"
-      ],
-      "auto_apply_patch": true
+      ]
     },
 
     "plugin": {

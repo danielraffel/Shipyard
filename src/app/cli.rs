@@ -629,12 +629,6 @@ pub(super) enum Command {
         /// Base branch to ship into.
         #[arg(long, default_value = "main")]
         base: String,
-        /// Run `version_bump_check.py` in apply mode.
-        #[arg(long = "apply-bumps", default_value_t = true, action = ArgAction::SetTrue)]
-        apply_bumps: bool,
-        /// Run `version_bump_check.py` in report mode.
-        #[arg(long = "no-apply-bumps")]
-        no_apply_bumps: bool,
         /// Continue even when preflight cannot reach a backend.
         #[arg(long = "allow-unreachable-targets")]
         allow_unreachable_targets: bool,

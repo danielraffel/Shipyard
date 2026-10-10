@@ -35,18 +35,12 @@ Usage: shipyard pr [OPTIONS]
   triggers ("push a PR", "ship this"). Internally:
 
       1. scripts/skill_sync_check.py --mode=report
-      2. scripts/version_bump_check.py --mode=(apply|report)
-      3. git commit of any bumps
-      4. invokes `shipyard ship` for push + PR + validate + merge
+      2. scripts/version_bump_check.py --mode=report
+      3. invokes `shipyard ship` for push + PR + validate + merge
 
 Options:
   --base TEXT                     Base branch to ship into (default: main)
-  --apply-bumps / --no-apply-bumps
-                                  Run scripts/version_bump_check.py
-                                  --mode=apply to auto-rewrite version files
-                                  when a surface moved. On by default (mirrors
-                                  pulp's pulp pr). --no-apply-bumps switches
-                                  to --mode=report so missing bumps hard-fail.
+  Version files are assigned after merge; no apply flags exist.
 ```
 
 ## 3. pytest green
