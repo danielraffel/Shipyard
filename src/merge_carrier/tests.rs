@@ -531,3 +531,22 @@ fn an_arrival_the_window_cannot_show_proves_nothing() {
     );
     assert!(head_arm_time(&json!({}), HEAD).is_err());
 }
+
+#[test]
+fn another_head_s_force_push_is_never_this_head_s_arrival() {
+    // The current head has no check suite yet, so the timeline cannot say when
+    // it arrived. A force-push to a different oid before the arm must not
+    // stand in for it.
+    let pushed = json!({"__typename": "PullRequestCommit", "commit": {"oid": HEAD,
+        "checkSuites": {"nodes": []}}});
+    let other = json!({"__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-09T07:00:00Z",
+        "afterCommit": {"oid": GROUP}});
+    let armed = json!({"__typename": "AutoMergeEnabledEvent", "createdAt": "2026-10-09T08:00:00Z"});
+    let complete = timeline(
+        &json!([other.clone(), armed.clone(), pushed.clone()]),
+        false,
+    );
+    assert_eq!(head_arm_time(&complete, HEAD), Ok(None));
+    let truncated = timeline(&json!([other, armed, pushed]), true);
+    assert!(head_arm_time(&truncated, HEAD).is_err());
+}
