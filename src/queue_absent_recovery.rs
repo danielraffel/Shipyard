@@ -2014,6 +2014,7 @@ mod tests {
                 // it deterministically models a stale/PID-reused receipt.
                 pid: std::process::id(),
                 started_at: Utc::now(),
+                boot_id: None,
             })
             .expect("receipt json"),
         )
@@ -2077,6 +2078,7 @@ mod tests {
                     generation: generation.to_owned(),
                     pid,
                     started_at: Utc::now(),
+                    boot_id: None,
                 })
                 .map_err(|error| error.to_string())?,
             )
