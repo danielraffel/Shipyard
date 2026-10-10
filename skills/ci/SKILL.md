@@ -157,7 +157,7 @@ What the transcript line means:
 |------|---------|
 | `▸ Auto-merge armed on #N` | GitHub will enqueue it when its required checks pass |
 | `▸ Auto-merge left as it is on #N: …` | nothing to do (already armed, already queued, draft, ejected on this head, not yet green) — **not** a failure |
-| `▸ Auto-merge armed on #N … without a new head: its one environment re-enqueue (…)` | the repo opted in (`[queue.environment_requeue] enabled = true`) and the head's first ejection was a network failure; nothing to push. A second ejection of the same head is refused |
+| `▸ Auto-merge armed on #N … at exactly its current head, without a new push: a same-head re-enqueue (…)` | the repo opted in (`[queue.environment_requeue] enabled = true`) and the ejection was a network failure (first ejection only) or an interruption (a starved required job, or `Upload progress stalled` after green; first two ejections). The arm carries `expectedHeadOid`; nothing to push |
 | `⚠︎ Auto-merge not armed on #N: …` | the arm did not happen and the ship continued; re-check with `shipyard landing --pr <n>` |
 
 In `--json` mode that line goes to **stderr**, because stdout carries one
@@ -202,6 +202,39 @@ by another route, or ejected and left unarmed — is
 requests the steward itself declines to own, so it cannot contend with the
 enqueue path. See the shipyard skill's
 [merge-steward reference](../shipyard/references/merge-steward.md).
+
+## The unattended carrier: `runner carrier`
+
+`shipyard runner carrier --repo <owner/repo>` plans the mechanical steps an
+approved, armed PR needs when nobody is watching, from GitHub facts alone.
+It is the command the tartci carrier scheduler drives on its single controller
+host; agents read it, they do not run `--apply`.
+
+- **Classes.** `redispatch` reruns a cancelled required run on the current
+  head (at most two reruns per run, read from `run_attempt`, and two per PR
+  per hour). `rearm` re-arms the exact head the queue removed with
+  `expectedHeadOid` when every required merge-group job that did not pass
+  starved: cancelled with no runner after waiting at least ten minutes. A
+  no-runner cancel within seconds is a superseding push or a concurrency
+  cancel, not starvation. `update_branch` is planned for a green, armed,
+  `BEHIND` PR and refused for `--apply` until the own-lines invariant exists.
+- **Approval record.** The carrier acts only on a head GitHub's timeline
+  shows armed: an `AutoMergeEnabledEvent` at or after the head arrived (its
+  force-push, or its first check suite). Only the arming actor arms, after
+  reading the verdict, so the arm of this head is its approval; a pushed head
+  carries no arm, and a never-armed head goes to a steward. Reviewers also add
+  a line `reviewed:<full 40-hex head>` to every approval verdict; the carrier
+  records it as a cross-check but never trusts it alone, because every agent
+  posts as the same App and could write one.
+- **Holds.** Draft, conflicting, unarmed, queued, or unapproved PRs; a failed
+  required check; a removal for a real failure, a conflict, or a person's
+  decision; a head pushed after the removal; any unreadable fact.
+- **Apply.** `--apply` needs at least one `--class` and an `--intent FILE`
+  the controller wrote first; it re-plans and performs only intended actions a
+  fresh plan still proposes on the same head, through the merge-queue mutation
+  guard (authority, `HOLD`, audit).
+- **Replay.** `--replay facts.jsonl` plans recorded facts with no GitHub read;
+  every plan prints the facts it used, so any decision can be reproduced.
 
 ## Governance policy comes from the base, and `apply` needs `--yes`
 
@@ -368,7 +401,7 @@ PRs are gone.
 | Show all queued jobs | `shipyard queue --json` |
 | Experimental authority schema v5 | No operational command exists. Official builds are v4-only; an explicit source test build may validate the reserved request shape only to return `ExperimentalAuthorityRefused`, with no writer, queue mutation, outcome, backend, execution, or authority. |
 | Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
-| Flag stuck open PRs (repeat test failure, red while armed, repeated ejection on the current head, rebase treadmill, green but unarmed for 2 h (skips drafts and `shipyard:hold` / `shipyard:no-auto-merge` holds), ejected for failed_checks then green and never re-armed; split advisory) | `shipyard pr-watch scan --repo <owner/repo> [--post-comments] [--digest]` (read-only dry run by default; `replay --since 7d --expect PR=FLAGS --control merged-clean` simulates a past window; the daemon digest toggle is `[pr_watch.digest] enabled = true`; see `docs/pr-watch.md`) |
+| Flag stuck open PRs (repeat test failure, red while armed, repeated ejection on the current head, rebase treadmill, green but unarmed for 2 h (skips drafts and `shipyard:hold` / `shipyard:no-auto-merge` holds), red and unarmed for 2 h, and any Shipyard-handed PR no rule accounts for (`unaccounted`, with the reason; counts and gaps in `pr-watch liveness` and `doctor`), ejected for failed_checks then green and never re-armed; split advisory) | `shipyard pr-watch scan --repo <owner/repo> [--post-comments] [--digest]` (read-only dry run by default; `replay --since 7d --expect PR=FLAGS --control merged-clean` simulates a past window; the daemon digest toggle is `[pr_watch.digest] enabled = true`; see `docs/pr-watch.md`) |
 | Check pr-watch passes are still completing (the scanning host's silence otherwise mutes hand-back, comments and digest) | `shipyard pr-watch liveness [--json]` (exit 1 when stale past `[pr_watch] stale_after_minutes`, default 45); `shipyard doctor` shows a `PR watch` section on a scanning host; `shipyard doctor --fleet` asks every host class and fails `pr-watch:fleet` when none is completing passes |
 | Hand a red PR back to its owning session (label + `cmux notify` + inbox note, no input injection; the label is removed on merge/close too; never labels a PR that is no longer open; `pr-watch sweep-labels` lists, and with `--apply` removes, stale labels on closed PRs; no label when no owner resolves; an owner session is live when cmux reports it `running` or `idle` with its process alive; inbox notes name their head and age, and an unread note is retracted when its episode resolves; `pr-watch wakes` measures sent vs seen) | `shipyard pr-watch scan --repo <owner/repo> --handback` (dry run); `--deliver-handback` with `[pr_watch.handback] enabled = true` sends. See `docs/pr-watch.md#hand-back` |
 | Remove an exact queue entry | Do not use raw `ghapp pr merge --disable-auto` or `dequeuePullRequest`; use Shipyard's audited exact-head path. The ghapp queue-removal guard refuses unaudited removal, with `GHAPP_ALLOW_QUEUE_REMOVAL=1` reserved for an explicit authority action. |

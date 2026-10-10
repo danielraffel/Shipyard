@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 
 use self::host::{HostCommand, HostRunner, Invocation, Liveness, RunError, STATUS_KEY_PREFIX};
 use self::owner::{Owner, Route};
-use super::flags::{DigestRoute, FlagKind};
+use super::flags::DigestRoute;
 use super::ledger::{Ledger, LedgerEntry, LedgerEvent};
 use super::{RepoHistory, open_at};
 use crate::config::LoadedConfig;
@@ -392,14 +392,7 @@ pub fn local_host_names() -> Vec<String> {
 pub fn actionable(entry: &LedgerEntry) -> bool {
     entry.addressed_at.is_none()
         && entry.route == DigestRoute::PerPr
-        && matches!(
-            entry.kind,
-            FlagKind::RepeatTestFailure
-                | FlagKind::RedWhileArmed
-                | FlagKind::RepeatedEjection
-                | FlagKind::GreenUnarmed
-                | FlagKind::EjectedGreen
-        )
+        && entry.kind.owner_actionable()
 }
 
 fn label_add_argv(repo: &str, pr: u64) -> Vec<String> {
