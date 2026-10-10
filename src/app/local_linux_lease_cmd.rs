@@ -898,9 +898,9 @@ fn emit_decision<W: Write>(
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use chrono::TimeZone;
-    #[cfg(unix)]
     use std::fs;
+
+    use chrono::TimeZone;
 
     use super::*;
     use crate::runner_provision::ApiLabel;
