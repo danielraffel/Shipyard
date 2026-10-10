@@ -366,11 +366,61 @@ queue removal is refreshable.
 |---|---|---|
 | `SHIPYARD_INTERNAL_QUEUE_MUTATION=1` | Shipyard itself, on its own exact-head, audited queue commands (enqueue arm, classic merge, merge-steward enqueue, disable/dequeue revocation) | both queue guards step aside; Shipyard's admission rules already made the decision |
 | `GHAPP_ALLOW_QUEUE_REARM=1` | an operator, deliberately, for one command | the arm guard allows a refused arm and prints a `WARNING` naming what it overrode |
-| `GHAPP_ALLOW_QUEUE_REMOVAL=1` | an operator, deliberately | the removal guard allows a dequeue/disable and prints a `WARNING` |
+| `GHAPP_ALLOW_QUEUE_REMOVAL=1` | an operator, deliberately, with a stated reason | the removal guard allows the dequeue/disable, with a `WARNING` and an audit record, only for a `defect-fix` or the main-red fix PR itself (below) |
 | `GHAPP_ALLOW_BRANCH_REFRESH=1` | an operator, deliberately, for one command | the branch-refresh guard allows a refused refresh and prints a `WARNING` |
 
 Setting `SHIPYARD_INTERNAL_QUEUE_MUTATION` by hand claims Shipyard's authority
-for a command Shipyard did not audit. Do not.
+for a command Shipyard did not audit. Do not. The removal guard honours it only
+when the nearest deciding ancestor process is the Shipyard binary: it walks up
+from its own parent, skips shells, `env`, `timeout` and the `gh` shim (not Python),
+and requires the first other process to be named `shipyard`. An agent that
+exports the marker has its own runtime (`codex`, `node`, `claude`) there, even
+when a Shipyard process launched that agent, so the marker is ignored and the
+request is judged like any other. The deciding process must also run the
+installed binary: its executable path, read from the kernel
+(`proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux) rather than its name,
+must resolve to a file named `shipyard` under
+`~/.local/share/shipyard/auth-generations/`. A binary merely named
+`shipyard` elsewhere, or a dev build under `target/`, does not pass. This
+stops an agent that exports the marker by habit or names a binary to match;
+anyone who can write into the install root can still pass it.
+
+### Queue-removal override decisions
+
+`GHAPP_ALLOW_QUEUE_REMOVAL=1` alone is refused. The override must say why, in
+two more variables:
+
+| variable | meaning |
+|---|---|
+| `GHAPP_QUEUE_REMOVAL_REASON` | one reason class, below |
+| `GHAPP_QUEUE_REMOVAL_NOTE` | what is wrong, in words; required for the allowed classes |
+| `GHAPP_QUEUE_REMOVAL_FIX_PR` | for `reorder-main-red-fix`, the number of the PR that fixes `main` |
+
+| reason | decision |
+|---|---|
+| `rebase` | refuse: a queued PR does not need a rebase; the queue merges it on top of current main |
+| `reorder` | refuse: dequeuing other PRs discards their merge-group runs; enqueue the PR that must land first with the queue's jump option |
+| `defect-fix` | allow, with a `WARNING`, and append a record |
+| `reorder-main-red-fix` | allow only when every PR removed is the one `GHAPP_QUEUE_REMOVAL_FIX_PR` names (it leaves the queue to jump back in); never another PR |
+| missing or anything else | refuse |
+
+An allowed removal reads each target PR through the App token and appends one
+JSON line (time, reason, note, fix PR, each target's repository, number, head
+and queue state, and the argv) to `$GHAPP_QUEUE_REMOVAL_LOG`, default
+`~/.local/state/shipyard/queue-removals.jsonl`. The log is per host and nothing reads it yet; collecting it fleet-wide is a
+follow-up. A target that cannot be read, or a log that cannot be written,
+refuses the removal: an allowance nobody can
+audit later is not given. A request body read from stdin is refused too,
+because the guard cannot see which PR it removes.
+
+Why intent and not queue health: of 46 queue removals agents made on
+Generous-Corp/pulp between 10-03 and 10-09, 34 dequeued a healthy PR to rebase
+it because `main` moved and 2 dequeued other PRs to reorder the queue, each
+discarding the merge-group run it rode in. The 7 legitimate ones were defect
+fixes found locally before any required check went red, which a health rule
+would have blocked. `scripts/test_ghapp_queue_removal_guard.py` replays all 46
+(`scripts/fixtures/queue_removals_classified_2026-10.jsonl`): the 36 avoidable
+ones are refused and the 7 defect fixes allowed.
 
 ## Installing, and fleet-wide ordering
 
