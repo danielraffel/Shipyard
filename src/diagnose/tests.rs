@@ -607,5 +607,8 @@ fn superseded_annotation_uses_environment_requeue_phrase() {
         "Canceling since a {} for build-refs/pull/9957/merge exists",
         crate::environment_requeue::SUPERSEDED_ANNOTATIONS[0]
     );
-    assert_eq!(cancel_cause(&[message]).map(|(rule, _)| rule), Some("superseded"));
+    assert_eq!(
+        cancel_cause(&[message]).map(|(rule, _)| rule),
+        Some("superseded")
+    );
 }

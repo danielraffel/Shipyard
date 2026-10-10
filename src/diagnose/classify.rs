@@ -129,7 +129,10 @@ pub fn default_fail_closed() -> Vec<Regex> {
 /// they say nothing about the cause.
 #[must_use]
 pub fn cancel_cause(messages: &[String]) -> Option<(&'static str, String)> {
-    if let Some(hit) = messages.iter().find(|message| NOT_ACQUIRED.is_match(message)) {
+    if let Some(hit) = messages
+        .iter()
+        .find(|message| NOT_ACQUIRED.is_match(message))
+    {
         return Some(("no_runner", short(hit)));
     }
     if let Some(hit) = messages.iter().find(|message| {

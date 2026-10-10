@@ -250,8 +250,7 @@ fn ran(job: &GateJobSample) -> bool {
 /// diagnosis. Keep the empty-string runner case equivalent to no runner:
 /// GitHub emits both shapes for a job that never started.
 pub(crate) fn starved(conclusion: Option<&str>, runner_name: Option<&str>) -> bool {
-    conclusion == Some("cancelled")
-        && runner_name.is_none_or(|name| name.trim().is_empty())
+    conclusion == Some("cancelled") && runner_name.is_none_or(|name| name.trim().is_empty())
 }
 
 fn starved_job(job: &GateJobSample) -> bool {
