@@ -52,6 +52,7 @@ mod pr_watch_cmd;
 mod profile_apply_cmd;
 mod quarantine_cmd;
 mod queue_cmd;
+mod queue_digest_cmd;
 mod queue_hold_cmd;
 mod queue_observer_cmd;
 mod release_bot_cmd;
@@ -113,6 +114,7 @@ use self::queue_cmd::{
     bump_command, cancel_command, evidence_command, logs_command, queue_command,
     reconcile_orphan_command, status_command,
 };
+use self::queue_digest_cmd::queue_digest_command;
 use self::queue_hold_cmd::queue_hold_command;
 use self::queue_observer_cmd::{QueueObserverArgs, queue_observer_command};
 use self::release_bot_cmd::release_bot_command;
@@ -568,6 +570,16 @@ where
                 stdout,
             );
         }
+        Command::QueueDigest {
+            stale_after_seconds,
+        } => {
+            return queue_digest_command(
+                &runtime_paths.state_dir,
+                stale_after_seconds,
+                cli.json,
+                stdout,
+            );
+        }
         Command::PrWatch { command } => {
             let config = LoadedConfig::load_from_cwd_with_global_dir(
                 cli.mode.into(),
@@ -770,6 +782,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Queue
         | Command::QueueHold { .. }
         | Command::QueueObserve { .. }
+        | Command::QueueDigest { .. }
         | Command::PrWatch { .. }
         | Command::Reuse { .. }
         | Command::ChangedSurfacePlan { .. }

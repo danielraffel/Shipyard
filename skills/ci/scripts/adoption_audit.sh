@@ -221,12 +221,14 @@ else
   elif [ "$am" = true ] && [ "$mc" = true ]; then st=present
   elif [ "$am" = true ] || [ "$mc" = true ]; then st=partial
   else st=absent; fi
-  # Proxy: merged PRs whose timeline shows AutoMergeEnabledEvent.
+  # Proxy: merged PRs whose timeline shows AutoMergeEnabledEvent. Count the
+  # filtered nodes: the connection's totalCount ignores itemTypes and counts
+  # every timeline item, so it reads every merged PR as auto-merged.
   pv=unmeasured; n_ae=0; n_read=0
   owner="${REPO%%/*}"; name="${REPO#*/}"
   for n in $(printf '%s\n' "$merged" | sed '/^$/d' | head -n "$EFFECT_SAMPLE" | cut -d' ' -f1); do
-    c="$(api graphql -f query="query{repository(owner:\"$owner\",name:\"$name\"){pullRequest(number:$n){timelineItems(itemTypes:[AUTO_MERGE_ENABLED_EVENT],first:1){totalCount}}}}" \
-        --jq '.data.repository.pullRequest.timelineItems.totalCount')"
+    c="$(api graphql -f query="query{repository(owner:\"$owner\",name:\"$name\"){pullRequest(number:$n){timelineItems(itemTypes:[AUTO_MERGE_ENABLED_EVENT],first:1){nodes{__typename}}}}}" \
+        --jq '.data.repository.pullRequest.timelineItems.nodes | if type == "array" then map(select(.__typename == "AutoMergeEnabledEvent")) | length else empty end')"
     case "$c" in ''|*[!0-9]*) continue ;; esac
     n_read=$((n_read+1)); [ "$c" -gt 0 ] && n_ae=$((n_ae+1))
   done
