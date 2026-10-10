@@ -42,8 +42,9 @@ use serde::Serialize;
 
 use super::{GitHubActions, ObservedPr, PrReport, RepoObservation, StewardDecision};
 use crate::auto_arm::{
-    ArmSkip, ArmVerdict, arm_mutation_args, arm_response_accepted, decide_from_queue_state,
-    first_graphql_error, is_arm_guard_refusal, preselect_backstop_candidate,
+    ArmSkip, ArmVerdict, arm_mutation_args, arm_mutation_args_at_head, arm_response_accepted,
+    decide_from_queue_state_with_environment, first_graphql_error, is_arm_guard_refusal,
+    preselect_backstop_candidate,
 };
 use crate::pr_queue_state::{PR_QUEUE_STATE_QUERY, explain_pr_queue_state};
 
@@ -215,11 +216,29 @@ fn consider_candidate(
         }
     };
 
-    let state = explain_pr_queue_state(&queue).state;
-    let verdict = match decide_from_queue_state(&state, pr.fact.draft) {
+    let report = explain_pr_queue_state(&queue);
+    let run_gh = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
+    // A same-head `failed_checks` ejection is re-armed only on a classified
+    // interruption or environment failure, never a real red, and only at the
+    // exact head the classification read.
+    let environment =
+        match same_head_verdict(&run_gh, repo, base, &report, &queue, number, &head_sha) {
+            Ok(verdict) => verdict,
+            Err(result) => return *result,
+        };
+    let same_head = environment.as_ref().is_some_and(|verdict| verdict.allowed);
+    let excuse = environment
+        .as_ref()
+        .is_some_and(crate::environment_requeue::EnvironmentRequeue::is_allowed_interruption);
+    let verdict = match decide_from_queue_state_with_environment(
+        &report.state,
+        pr.fact.draft,
+        environment.as_ref(),
+    ) {
         ArmVerdict::Arm => {
-            let run_gh = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
-            match crate::head_approval::evaluate(&run_gh, repo, number, &head_sha, base, &queue) {
+            match crate::head_approval::evaluate_excusing(
+                &run_gh, repo, number, &head_sha, base, &queue, excuse,
+            ) {
                 Ok(gate) if gate.allows() => ArmVerdict::Arm,
                 Ok(gate) => ArmVerdict::Skip(ArmSkip::HeadNotApproved {
                     detail: gate.explain(),
@@ -252,16 +271,106 @@ fn consider_candidate(
         ArmVerdict::Arm if !apply => NativeArmResult {
             number,
             head_sha,
-            outcome: "would_arm".to_owned(),
+            outcome: if same_head {
+                "would_rearm_same_head"
+            } else {
+                "would_arm"
+            }
+            .to_owned(),
             skip: None,
             error: None,
         },
-        ArmVerdict::Arm => arm(actions, number, head_sha, &pr.node_id),
+        ArmVerdict::Arm => arm(actions, number, head_sha, &pr.node_id, same_head),
     }
 }
 
 /// Issue the arm mutation for one confirmed candidate.
-fn arm(actions: &GitHubActions, number: u64, head_sha: String, node_id: &str) -> NativeArmResult {
+/// For a same-head `failed_checks` ejection, the classifier's verdict on
+/// whether this exact head may re-enter the queue
+/// ([`crate::environment_requeue::assess`]); `None` for any other state. A
+/// moved head or an unreadable policy ends the candidate with its result.
+fn same_head_verdict(
+    run_gh: crate::environment_requeue::RunGh<'_>,
+    repo: &str,
+    base: &str,
+    report: &crate::pr_queue_state::PrQueueReport,
+    queue: &serde_json::Value,
+    number: u64,
+    head_sha: &str,
+) -> Result<Option<crate::environment_requeue::EnvironmentRequeue>, Box<NativeArmResult>> {
+    if !crate::environment_requeue::applies(report) {
+        return Ok(None);
+    }
+    let skipped = |detail: String, error: Option<String>| {
+        Box::new(NativeArmResult {
+            number,
+            head_sha: head_sha.to_owned(),
+            outcome: "skipped".to_owned(),
+            skip: Some(ArmSkip::Unknown { detail }),
+            error,
+        })
+    };
+    let queue_head = queue
+        .pointer("/data/repository/pullRequest/headRefOid")
+        .and_then(serde_json::Value::as_str);
+    if queue_head != Some(head_sha) {
+        return Err(skipped(
+            "the head moved between observation and the queue read".to_owned(),
+            None,
+        ));
+    }
+    match crate::environment_requeue::read_opt_in(run_gh, repo, base) {
+        Ok(opted_in) => Ok(
+            crate::environment_requeue::assess(run_gh, repo, report, opted_in)
+                .map(|verdict| armed_since_arrival(verdict, queue, head_sha)),
+        ),
+        Err(detail) => Err(skipped(
+            detail.clone(),
+            Some(format!(
+                "PR #{number} re-enqueue policy unreadable; refusing to arm blind: {detail}"
+            )),
+        )),
+    }
+}
+
+/// An allowed same-head verdict stands only when someone armed *this* head:
+/// an `AutoMergeEnabledEvent` at or after the head's own arrival (its own
+/// force-push, or its first check suite), read by the steward carrier's
+/// [`crate::merge_carrier::head_arm_time`]. Otherwise a head pushed after an
+/// earlier head was armed, auto-queued and then starved would be re-armed with
+/// nobody having armed it. A window that cannot place the arrival refuses.
+fn armed_since_arrival(
+    mut verdict: crate::environment_requeue::EnvironmentRequeue,
+    queue: &serde_json::Value,
+    head_sha: &str,
+) -> crate::environment_requeue::EnvironmentRequeue {
+    if !verdict.allowed {
+        return verdict;
+    }
+    let refusal = match crate::merge_carrier::head_arm_time(queue, head_sha) {
+        Ok(Some(_)) => return verdict,
+        Ok(None) => format!(
+            "nobody armed head {} after it arrived, so the backstop will not re-arm it",
+            head_sha.get(..12).unwrap_or(head_sha)
+        ),
+        Err(detail) => format!("whether this head was ever armed cannot be read: {detail}"),
+    };
+    verdict.allowed = false;
+    verdict.class = None;
+    verdict.reason = format!("{refusal} (the ejection itself was: {})", verdict.reason);
+    verdict
+}
+
+/// Arm one pull request. `same_head` is a classified same-head re-enqueue:
+/// the mutation is bound to `head_sha` with `expectedHeadOid`, so GitHub
+/// refuses it if the head moved since the classification.
+fn arm(
+    actions: &GitHubActions,
+    number: u64,
+    head_sha: String,
+    node_id: &str,
+    same_head: bool,
+) -> NativeArmResult {
     if node_id.is_empty() {
         return NativeArmResult {
             number,
@@ -278,11 +387,21 @@ fn arm(actions: &GitHubActions, number: u64, head_sha: String, node_id: &str) ->
     // this request is not bound to a validated head, so the guard's second
     // opinion is wanted. Its refusals are honoured, never overridden, and
     // Shipyard never sets `GHAPP_ALLOW_QUEUE_REARM`.
-    match actions.run_gh(&arm_mutation_args(node_id)) {
+    let args = if same_head {
+        arm_mutation_args_at_head(node_id, &head_sha)
+    } else {
+        arm_mutation_args(node_id)
+    };
+    match actions.run_gh(&args) {
         Ok(raw) if arm_response_accepted(&raw) => NativeArmResult {
             number,
+            outcome: if same_head {
+                "rearmed_same_head"
+            } else {
+                "armed"
+            }
+            .to_owned(),
             head_sha,
-            outcome: "armed".to_owned(),
             skip: None,
             error: None,
         },

@@ -157,7 +157,7 @@ What the transcript line means:
 |------|---------|
 | `▸ Auto-merge armed on #N` | GitHub will enqueue it when its required checks pass |
 | `▸ Auto-merge left as it is on #N: …` | nothing to do (already armed, already queued, draft, ejected on this head, not yet green) — **not** a failure |
-| `▸ Auto-merge armed on #N … without a new head: its one environment re-enqueue (…)` | the repo opted in (`[queue.environment_requeue] enabled = true`) and the head's first ejection was a network failure; nothing to push. A second ejection of the same head is refused |
+| `▸ Auto-merge armed on #N … at exactly its current head, without a new push: a same-head re-enqueue (…)` | the repo opted in (`[queue.environment_requeue] enabled = true`) and the ejection was a network failure (first ejection only) or an interruption (a starved required job, or `Upload progress stalled` after green; first two ejections). The arm carries `expectedHeadOid`; nothing to push |
 | `⚠︎ Auto-merge not armed on #N: …` | the arm did not happen and the ship continued; re-check with `shipyard landing --pr <n>` |
 
 In `--json` mode that line goes to **stderr**, because stdout carries one
@@ -202,6 +202,39 @@ by another route, or ejected and left unarmed — is
 requests the steward itself declines to own, so it cannot contend with the
 enqueue path. See the shipyard skill's
 [merge-steward reference](../shipyard/references/merge-steward.md).
+
+## The unattended carrier: `runner carrier`
+
+`shipyard runner carrier --repo <owner/repo>` plans the mechanical steps an
+approved, armed PR needs when nobody is watching, from GitHub facts alone.
+It is the command the tartci carrier scheduler drives on its single controller
+host; agents read it, they do not run `--apply`.
+
+- **Classes.** `redispatch` reruns a cancelled required run on the current
+  head (at most two reruns per run, read from `run_attempt`, and two per PR
+  per hour). `rearm` re-arms the exact head the queue removed with
+  `expectedHeadOid` when every required merge-group job that did not pass
+  starved: cancelled with no runner after waiting at least ten minutes. A
+  no-runner cancel within seconds is a superseding push or a concurrency
+  cancel, not starvation. `update_branch` is planned for a green, armed,
+  `BEHIND` PR and refused for `--apply` until the own-lines invariant exists.
+- **Approval record.** The carrier acts only on a head GitHub's timeline
+  shows armed: an `AutoMergeEnabledEvent` at or after the head arrived (its
+  force-push, or its first check suite). Only the arming actor arms, after
+  reading the verdict, so the arm of this head is its approval; a pushed head
+  carries no arm, and a never-armed head goes to a steward. Reviewers also add
+  a line `reviewed:<full 40-hex head>` to every approval verdict; the carrier
+  records it as a cross-check but never trusts it alone, because every agent
+  posts as the same App and could write one.
+- **Holds.** Draft, conflicting, unarmed, queued, or unapproved PRs; a failed
+  required check; a removal for a real failure, a conflict, or a person's
+  decision; a head pushed after the removal; any unreadable fact.
+- **Apply.** `--apply` needs at least one `--class` and an `--intent FILE`
+  the controller wrote first; it re-plans and performs only intended actions a
+  fresh plan still proposes on the same head, through the merge-queue mutation
+  guard (authority, `HOLD`, audit).
+- **Replay.** `--replay facts.jsonl` plans recorded facts with no GitHub read;
+  every plan prints the facts it used, so any decision can be reproduced.
 
 ## Governance policy comes from the base, and `apply` needs `--yes`
 
@@ -1194,7 +1227,10 @@ shipyard daemon refresh                 # now started through launchd
 ```
 
 After that every refresh, including a fleet self-update's, starts the daemon
-through the stable launcher, whose consent survives updates. `daemon launcher
+through the stable launcher, whose consent survives updates. The agent starts
+at login and launchd restarts a daemon that exits non-zero; `daemon launcher
+status` prints whether the installed plist says so (`survives_kill_and_reboot`).
+A host whose plist predates that policy needs one `shipyard daemon refresh`. `daemon launcher
 uninstall` returns to direct spawns. Hosts on internal disks need nothing.
 
 ## `shipyard verdicts` — the verdict nobody consumed

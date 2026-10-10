@@ -69,7 +69,7 @@ Then, for a same-head `failed_checks` ejection only, the guard (and
 | the timeline window is complete and shows exactly one `failed_checks`/`merge_conflict` removal of the current head | the allowance is one retry per head; a head ejected twice has had it, and a truncated window cannot prove it has not |
 | the removal names its merge-group commit (`beforeCommit`) | that commit's check runs are the ones that ejected it; no run-resolution heuristic |
 | the base's required checks (rulesets plus classic protection) can be read and are non-empty | only a **required** failure ejects; an advisory lane failing a real test is not what removed the head |
-| every failing required check on the merge-group commit is a GitHub Actions job concluded `failure`, and no required commit status failed | a `timed_out`/`cancelled` job or a status has no log that could prove anything |
+| every failing required check on the merge-group commit is a GitHub Actions job concluded `failure` (or `cancelled` and starved, below), and no required commit status failed | a `timed_out` job or a status has no log that could prove anything |
 | every failing step of each such job (jobs API `conclusion == failure`) printed an environment signature within 60 output lines of that step's first `##[error]` | positive evidence at the failure, not anywhere in a long log |
 
 The signatures are the network-transport spellings shared with Shipyard's infra
@@ -88,6 +88,31 @@ read as output. **The first `##[error]` in a log is not the failing step**: an
 `if: always()` / `continue-on-error` step after it prints its own. The failing
 step comes from the jobs API and its output from the first `Run` segment at or
 after the step's `started_at`, through that segment's first `##[error]`.
+
+### Interruptions: a starved job, or an upload that stalled after green
+
+Two more ejection causes say nothing against the head, and the same reader
+(Rust and the guard's Python twin) treats them as **interruptions**:
+
+| cause | evidence required |
+|---|---|
+| a required job **starved** of a runner | the required check concluded `cancelled`, its Actions job has an empty `runner_name` (`gate_cost/proxy.rs` `ejection_cause()` says `starved`), and it waited at least 10 minutes from `created_at` to `completed_at`. A shorter no-runner cancel is a superseding push or a concurrency-group cancel. A check run whose annotations say `Canceling since a higher priority waiting request` is a concurrency supersede at any wait (runs 37890997376 and 37891885987 waited 11.6 and 16.5 minutes), so it is never starvation. Missing times, or annotations that cannot be read, refuse. |
+| an **upload that stalled** after the work passed | the failing step's own `##[error]` line, or the line before it, reads `Upload progress stalled`. Any earlier failing step, such as a red test step, has no signature and refuses the whole verdict; a stall that recovered earlier in the step explains nothing. |
+
+An interruption allows a same-head re-enqueue on each of a head's first **two**
+ejections (a network failure allows the first only), and an allowed
+interruption does not count toward the head-approval `EJECTION_CAP`. Every
+same-head re-arm, from `ship`'s arm-on-open or from the steward's
+`--arm-unqueued` backstop, is sent with `expectedHeadOid` bound to the head the
+classifier read, so GitHub refuses it if the head moved. The steward's backstop
+reads the opt-in from the protected base's `.shipyard/config.toml`, never from
+the head, and re-arms only a head someone armed after it arrived: an
+`AutoMergeEnabledEvent` at or after the head's own force-push or its first
+check suite (`merge_carrier::head_arm_time`, the steward carrier's rule).
+Without that, a head pushed after an earlier head was armed, auto-queued and
+starved would be re-armed with nobody having armed it. A window that cannot
+place the arrival refuses. A real `failure` with a runner, `merge_conflict`, or a moved head is
+never re-armed.
 
 ### Why this is not the inference refused above
 
@@ -366,11 +391,61 @@ queue removal is refreshable.
 |---|---|---|
 | `SHIPYARD_INTERNAL_QUEUE_MUTATION=1` | Shipyard itself, on its own exact-head, audited queue commands (enqueue arm, classic merge, merge-steward enqueue, disable/dequeue revocation) | both queue guards step aside; Shipyard's admission rules already made the decision |
 | `GHAPP_ALLOW_QUEUE_REARM=1` | an operator, deliberately, for one command | the arm guard allows a refused arm and prints a `WARNING` naming what it overrode |
-| `GHAPP_ALLOW_QUEUE_REMOVAL=1` | an operator, deliberately | the removal guard allows a dequeue/disable and prints a `WARNING` |
+| `GHAPP_ALLOW_QUEUE_REMOVAL=1` | an operator, deliberately, with a stated reason | the removal guard allows the dequeue/disable, with a `WARNING` and an audit record, only for a `defect-fix` or the main-red fix PR itself (below) |
 | `GHAPP_ALLOW_BRANCH_REFRESH=1` | an operator, deliberately, for one command | the branch-refresh guard allows a refused refresh and prints a `WARNING` |
 
 Setting `SHIPYARD_INTERNAL_QUEUE_MUTATION` by hand claims Shipyard's authority
-for a command Shipyard did not audit. Do not.
+for a command Shipyard did not audit. Do not. The removal guard honours it only
+when the nearest deciding ancestor process is the Shipyard binary: it walks up
+from its own parent, skips shells, `env`, `timeout` and the `gh` shim (not Python),
+and requires the first other process to be named `shipyard`. An agent that
+exports the marker has its own runtime (`codex`, `node`, `claude`) there, even
+when a Shipyard process launched that agent, so the marker is ignored and the
+request is judged like any other. The deciding process must also run the
+installed binary: its executable path, read from the kernel
+(`proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux) rather than its name,
+must resolve to a file named `shipyard` under
+`~/.local/share/shipyard/auth-generations/`. A binary merely named
+`shipyard` elsewhere, or a dev build under `target/`, does not pass. This
+stops an agent that exports the marker by habit or names a binary to match;
+anyone who can write into the install root can still pass it.
+
+### Queue-removal override decisions
+
+`GHAPP_ALLOW_QUEUE_REMOVAL=1` alone is refused. The override must say why, in
+two more variables:
+
+| variable | meaning |
+|---|---|
+| `GHAPP_QUEUE_REMOVAL_REASON` | one reason class, below |
+| `GHAPP_QUEUE_REMOVAL_NOTE` | what is wrong, in words; required for the allowed classes |
+| `GHAPP_QUEUE_REMOVAL_FIX_PR` | for `reorder-main-red-fix`, the number of the PR that fixes `main` |
+
+| reason | decision |
+|---|---|
+| `rebase` | refuse: a queued PR does not need a rebase; the queue merges it on top of current main |
+| `reorder` | refuse: dequeuing other PRs discards their merge-group runs; enqueue the PR that must land first with the queue's jump option |
+| `defect-fix` | allow, with a `WARNING`, and append a record |
+| `reorder-main-red-fix` | allow only when every PR removed is the one `GHAPP_QUEUE_REMOVAL_FIX_PR` names (it leaves the queue to jump back in); never another PR |
+| missing or anything else | refuse |
+
+An allowed removal reads each target PR through the App token and appends one
+JSON line (time, reason, note, fix PR, each target's repository, number, head
+and queue state, and the argv) to `$GHAPP_QUEUE_REMOVAL_LOG`, default
+`~/.local/state/shipyard/queue-removals.jsonl`. The log is per host and nothing reads it yet; collecting it fleet-wide is a
+follow-up. A target that cannot be read, or a log that cannot be written,
+refuses the removal: an allowance nobody can
+audit later is not given. A request body read from stdin is refused too,
+because the guard cannot see which PR it removes.
+
+Why intent and not queue health: of 46 queue removals agents made on
+Generous-Corp/pulp between 10-03 and 10-09, 34 dequeued a healthy PR to rebase
+it because `main` moved and 2 dequeued other PRs to reorder the queue, each
+discarding the merge-group run it rode in. The 7 legitimate ones were defect
+fixes found locally before any required check went red, which a health rule
+would have blocked. `scripts/test_ghapp_queue_removal_guard.py` replays all 46
+(`scripts/fixtures/queue_removals_classified_2026-10.jsonl`): the 36 avoidable
+ones are refused and the 7 defect fixes allowed.
 
 ## Installing, and fleet-wide ordering
 

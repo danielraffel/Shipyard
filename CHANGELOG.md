@@ -3,6 +3,32 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02910"></a>
+## [0.291.0] - 2026-10-09
+
+- fix/starved eject rearm ([#757](https://github.com/danielraffel/Shipyard/pull/757))
+
+<a id="v02900"></a>
+## [0.290.0] - 2026-10-09
+
+- feat/steward carrier plan ([#756](https://github.com/danielraffel/Shipyard/pull/756))
+
+<a id="v02890"></a>
+## [0.289.0] - 2026-10-09
+
+- fix/queue removal guard exe path ([#758](https://github.com/danielraffel/Shipyard/pull/758))
+- fix/daemon keepalive ([#752](https://github.com/danielraffel/Shipyard/pull/752))
+
+<a id="v02880"></a>
+## [0.288.0] - 2026-10-09
+
+- fix/queue removal guard health ([#751](https://github.com/danielraffel/Shipyard/pull/751))
+
+<a id="v02870"></a>
+## [0.287.0] - 2026-10-09
+
+- fix/pr watch liveness ([#746](https://github.com/danielraffel/Shipyard/pull/746))
+
 <a id="v02863"></a>
 ## [0.286.3] - 2026-10-09
 
@@ -2064,6 +2090,11 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.291.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.291.0
+[0.290.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.290.0
+[0.289.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.289.0
+[0.288.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.288.0
+[0.287.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.287.0
 [0.286.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.286.3
 [0.286.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.286.2
 [0.286.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.286.1

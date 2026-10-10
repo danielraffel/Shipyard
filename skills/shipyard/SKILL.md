@@ -348,6 +348,19 @@ rejected, and none after 2026-09-15 once arm-on-open took over. The test
 returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
 `arm native auto-merge`; `merge-queue resolve` still accepts the old
 `enqueue pull request` entries.
+## The carrier re-arms with `expectedHeadOid`, through the internal path
+
+`runner carrier --apply --class rearm` arms native auto-merge with
+`expectedHeadOid` on a head the queue removed for `failed_checks`. The `ghapp`
+arm guard would refuse that as a same-head re-arm after a failed removal,
+because it cannot see the jobs, so the carrier uses
+`run_gh_internal_queue_mutation`: its plan is the head-scoped verdict, proven
+from the removal's merge-group jobs (every required job that did not pass was
+cancelled with no runner after waiting at least ten minutes). It still takes
+the merge-queue mutation guard, so `HOLD`, `mutation_machine` and the audit
+apply. Its starvation rule is `gate_cost::proxy::ejection_cause` plus the
+wait bound, shared with the gate-cost metric; do not add a third copy.
+
 ## fleet-reconcile ledger: every attempt says how it ended
 
 `fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
@@ -1128,7 +1141,12 @@ so it waits for (and then defers to, exit 75) an exclusive Sandbox audit.
 Each tick also reads every host's daemon (`shipyard --json daemon status`) and
 launcher (`daemon launcher status`) and lists problems in `daemon_problems`. A
 host without the launcher has nothing to restart its daemon after a reboot.
-The fix is `shipyard daemon launcher install`, run at that host's console
+An active launcher counts as reboot-safe only when `daemon launcher status`
+reads `survives_kill_and_reboot: true` from the agent plist launchd loads
+(`RunAtLoad` true and `KeepAlive {SuccessfulExit = false}`); `false` gets
+`shipyard daemon refresh`, which rewrites the plist, and an unread value is a
+problem too, never a yes.
+The fix for a missing launcher is `shipyard daemon launcher install`, run at that host's console
 because it needs a one-time macOS approval, so never run it over SSH. A daemon
 that is not running gets `shipyard daemon refresh`. Each host raises one
 `fleet-reconcile: <class> daemon will not survive a reboot` issue until it
@@ -3172,9 +3190,14 @@ Raw queue removal is not a queue-steward operation. Install
 chokepoint and run it against the wrapper argv before invoking the real `gh`.
 It refuses `pr merge --disable-auto`, `dequeuePullRequest`, and
 `disablePullRequestAutoMerge` unless the call comes from Shipyard's
-machine-authorized, exact-head, write-ahead-audited mutation path. A deliberate
-manual authority action requires the loud `GHAPP_ALLOW_QUEUE_REMOVAL=1`
-override. Long-running or pending advisory/self-hosted checks are never queue
+machine-authorized, exact-head, write-ahead-audited mutation path, and it
+honours Shipyard's internal marker only when the calling process is the
+installed Shipyard binary: its kernel-reported executable must resolve under
+`~/.local/share/shipyard/auth-generations/`, so a binary merely named
+`shipyard` (or a dev build) does not pass. A deliberate manual authority action uses the operator
+override in `docs/ghapp-guards.md`, which must state a reason: a rebase or a
+reorder is always refused (a queued PR does not need a rebase; the queue merges
+it on top of current main), and a defect fix is allowed and recorded. Long-running or pending advisory/self-hosted checks are never queue
 removal authority.
 
 The opposite mistake is guarded too. `scripts/ghapp_queue_arm_guard.py`
@@ -3236,6 +3259,16 @@ flake verdict is silently discarded. Read the API through `$GHAPP_REAL_GH` with
 the exported `GH_TOKEN`/`GH_REPO`, and reproduce under
 `env -i HOME=$HOME PATH=<trusted path>`, never in an interactive shell. The
 refusal quotes the attributor's stderr tail.
+
+**An INTERRUPTION ejection is re-armed at the same head, unattended.** A
+required job cancelled with no runner after 10+ minutes queued (starved; the
+`ejection_cause()` label in `gate_cost/proxy.rs`), or a failing step whose
+`##[error]` line is `Upload progress stalled` after the test step passed, is an
+interruption: `src/environment_requeue.rs` allows a same-head re-enqueue on the
+head's first two ejections and leaves it out of the head-approval ejection cap,
+and the steward's `--arm-unqueued` backstop re-arms it with `expectedHeadOid`
+(outcome `rearmed_same_head`), but only for a head somebody armed after it arrived (`merge_carrier::head_arm_time`). Under the same opt-in as below. Do not dequeue,
+rebase or push a no-op commit for these; read `shipyard landing --pr <n>`.
 
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
 when the repo sets `[queue.environment_requeue] enabled = true`: every failing
@@ -4026,6 +4059,15 @@ macOS, opt-in per host). Facts it rests on, all measured with
 So the launcher is a copy of the signed binary at
 `~/.local/libexec/shipyard/shipyard-daemon-launcher`, run by a per-state-root
 LaunchAgent as `daemon supervise --exec <binary>`, staying the daemon's parent.
+launchd is the only restart authority: the agent plist sets `RunAtLoad` (it
+starts at login, so after a reboot), `KeepAlive {SuccessfulExit = false}` and
+a 30 s `ThrottleInterval`. `supervise` is one-shot and exits with the daemon's
+code, so a killed daemon (128 + signal) or a dead launcher brings a new pid,
+while `shipyard daemon stop` (an IPC stop, exit 0) and `launchctl bootout`
+leave it down. A daemon beside another one that holds the state root exits 2
+and is retried every 30 s until it can take over. A plist written before this
+policy keeps both keys false until the next `shipyard daemon refresh`
+rewrites it.
 The launcher only spawns `<release> daemon supervise --in-place`, which runs
 the release's own daemon preparation and then `exec`s `daemon run` under the
 same pid. So the daemon runs the generation binary with the direct-spawn argv
