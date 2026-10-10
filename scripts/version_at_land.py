@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from version_bump_check import (
-    LEVELS,
     Config,
     assess_surfaces,
     bump_version,

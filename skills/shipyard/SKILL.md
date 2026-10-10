@@ -435,15 +435,12 @@ a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
 a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
 everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
 
-## A PR's version must be ahead of live main, not just its merge base
+## Version-at-land
 
-Shipyard main has no merge queue and no up-to-date rule, so two PRs cut from
-one main used to pass the bump gate with the same next version and both
-merge (#677 and #680 both landed as 0.245.0; #680 shipped untagged). The
-"Version ahead of live main" step in version-skill-check compares the PR head
-with a fresh `origin/main`, and `version-ahead-sweep.yml` re-judges every open
-PR on each push to main, posting `shipyard/version-ahead-of-main`. A red
-status there means: merge main and bump past it before merging.
+A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
+versions. The read-only version gate rejects those edits unless the PR carries
+the explicit release recovery trailer. After merge, `version-at-land.yml` is the
+single writer and assigns the next versions.
 
 ## Stale ship-state records: `discard --repo` and `prune`
 
@@ -3627,7 +3624,7 @@ cargo fmt --all --check \
 ```
 
 **`Cargo.lock` after a version bump — now automatic.**
-`version_bump_check.py --mode=apply` used to rewrite `Cargo.toml` and leave
+`version_bump_check.py` no longer rewrites version files; the post-merge writer updates
 `Cargo.lock` on the old version, so the `--locked` steps above failed with
 
 ```

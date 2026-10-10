@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,9 +33,11 @@ jobs:
 
       - name: Assign the next version
         env:
+          RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           GIT_AUTHOR_NAME: shipyard-release-bot
           GIT_AUTHOR_EMAIL: shipyard-release-bot@users.noreply.github.com
           GIT_COMMITTER_NAME: shipyard-release-bot
           GIT_COMMITTER_EMAIL: shipyard-release-bot@users.noreply.github.com
         run: |
+          test -n "$RELEASE_BOT_TOKEN" || { echo 'RELEASE_BOT_TOKEN is required; refusing to land an untagged version bump.' >&2; exit 1; }
           python3 scripts/version_at_land.py --push --json

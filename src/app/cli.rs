@@ -629,12 +629,6 @@ pub(super) enum Command {
         /// Base branch to ship into.
         #[arg(long, default_value = "main")]
         base: String,
-        /// Deprecated compatibility flag. Version-at-land keeps PRs version-file-free.
-        #[arg(long = "apply-bumps", default_value_t = false, action = ArgAction::SetTrue)]
-        apply_bumps: bool,
-        /// Run the versioning gate in report mode (the default).
-        #[arg(long = "no-apply-bumps")]
-        no_apply_bumps: bool,
         /// Continue even when preflight cannot reach a backend.
         #[arg(long = "allow-unreachable-targets")]
         allow_unreachable_targets: bool,

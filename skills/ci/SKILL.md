@@ -338,15 +338,12 @@ a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
 a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
 everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
 
-## A PR's version must be ahead of live main, not just its merge base
+## Version-at-land
 
-Shipyard main has no merge queue and no up-to-date rule, so two PRs cut from
-one main used to pass the bump gate with the same next version and both
-merge (#677 and #680 both landed as 0.245.0; #680 shipped untagged). The
-"Version ahead of live main" step in version-skill-check compares the PR head
-with a fresh `origin/main`, and `version-ahead-sweep.yml` re-judges every open
-PR on each push to main, posting `shipyard/version-ahead-of-main`. A red
-status there means: merge main and bump past it before merging.
+A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
+versions. The read-only version gate rejects those edits unless the PR carries
+the explicit release recovery trailer. After merge, `version-at-land.yml` is the
+single writer and assigns the next versions.
 
 ## Stale ship-state records: `discard --repo` and `prune`
 
@@ -2714,12 +2711,12 @@ over after 30s and is not by itself a wedge.
 
 ## Shipping a PR (the `shipyard pr` path)
 
-When the user says "push a PR", "ship this", "ship it", "we're done", "merge this", or "push it" — run `shipyard pr` (or the `/pr` slash command — see `commands/pr.md`). It wraps `shipyard ship` with the versioning gates: skill-sync check, version-bump apply, and a `chore: bump versions` commit before handing off to the push/PR/validate/merge flow.
+When the user says "push a PR", "ship this", "ship it", "we're done", "merge this", or "push it" — run `shipyard pr` (or the `/pr` slash command — see `commands/pr.md`). It wraps `shipyard ship` with the skill-sync and read-only version gates before handing off to the push/PR/validate/merge flow.
 
 The orchestration, in order:
 
 1. `skill_sync_check.py --mode=report` — hard-fails if a mapped path was touched without a `SKILL.md` update or a `Skill-Update:` trailer on the tip commit.
-2. `version_bump_check.py --mode=apply` — rewrites `Cargo.toml` for CLI-surface bumps and `.claude-plugin/plugin.json` for plugin-surface bumps. The two version streams are independent per `RELEASING.md`.
+2. `version_bump_check.py --mode=report` — rejects version-file edits; version-at-land assigns both surfaces after merge.
 3. `git commit` + `gh pr create` + `shipyard ship`.
 4. If `[pr.provenance]` is configured, run its exact argv with the submitting session's environment. A required hook must succeed before any durable handoff or validation dispatch.
 5. With `[merge_steward].auto_handoff = true` on the protected base branch or explicit `--workstream-id`, write the exact-head server receipt and managed label immediately after provenance, before validation begins. The PR branch cannot enable the project default. The fallback workstream is `OWNER/REPO#PR` and the fallback context is the PR URL; `--no-steward-handoff` is an explicit override.

@@ -34,11 +34,10 @@ class CheckCliHookTests(unittest.TestCase):
         diverged on main, and only on the next run of a check that does not
         block a merge. This asserts the arming instead: that the plugin
         surface lists marketplace.json among its version files, so
-        `version_bump_check.py --mode=apply` moves both in lockstep.
+        the post-merge writer moves both in lockstep.
 
         It was unregistered for long enough to ship a split-brain version,
-        while the apply logic that keeps multiple files in step already
-        existed and named this very file in its comments. A guard that is
+        while the post-merge writer keeps multiple files in step. A guard that is
         present but unwired is not a guard.
         """
         versioning = json.loads(

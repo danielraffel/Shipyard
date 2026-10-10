@@ -13,7 +13,7 @@ Run `shipyard pr` to orchestrate the full push-a-PR flow:
 
 On merge, `.github/workflows/auto-release.yml` detects the `Cargo.toml` package-version move and creates a `v<x.y.z>` tag. The existing tag-triggered `release.yml` then builds + publishes the binaries.
 
-Do NOT run `gh pr create` + `shipyard ship` separately. Do NOT run the skill-sync or version-bump scripts by hand — `shipyard pr` invokes them in the right order with the right flags.
+Do NOT run `gh pr create` + `shipyard ship` separately. Do NOT run the skill-sync or version-bump scripts by hand — `shipyard pr` invokes the read-only gates in the right order.
 
 If GitHub GraphQL quota is exhausted, Shipyard falls back from `gh pr list/create/view` to the REST Pulls API. That keeps the PR in Shipyard's tracker instead of forcing a manual `gh api` escape hatch that the GUI cannot see.
 
@@ -24,7 +24,6 @@ shipyard pr $ARGUMENTS
 ## Flags
 
 - `--base <ref>` — base branch to ship into (default `main`).
-- `--apply-bumps` / `--no-apply-bumps` — retained for compatibility; both leave version files untouched.
 - `--allow-unreachable-targets` — forwarded to `shipyard ship`.
 - `--workstream-id <id>` — opt into an atomic steward receipt and use this durable work item ID.
 - `--context-url <url>` — receipt link; defaults to the newly-created PR URL.
@@ -38,4 +37,4 @@ shipyard pr $ARGUMENTS
 | Skill update  | `Skill-Update: skip skill=<name> reason="..."`              |
 | Auto-release  | `Release: skip reason="..."`                                 |
 
-Run `shipyard doctor` first if the repo lacks a `RELEASE_BOT_TOKEN` secret — the release workflow chain won't fire on tag push until the secret is configured. `shipyard pr` prints a yellow heads-up when the secret is missing.
+The release workflow requires `RELEASE_BOT_TOKEN`; it refuses to run with the default `GITHUB_TOKEN`, which cannot trigger the downstream release workflow.

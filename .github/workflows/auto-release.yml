@@ -31,7 +31,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+
+      - name: Require release bot token
+        env:
+          RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+        run: |
+          test -n "$RELEASE_BOT_TOKEN" || { echo 'RELEASE_BOT_TOKEN is required; refusing to create an untriggering tag.' >&2; exit 1; }
 
       - name: Skip on trailer or revert
         id: guard
@@ -78,7 +84,7 @@ jobs:
         if: steps.guard.outputs.skip == '0'
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
           V_BEFORE: ${{ steps.versions.outputs.before }}
           V_AFTER: ${{ steps.versions.outputs.after }}
         run: |
