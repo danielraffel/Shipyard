@@ -623,12 +623,6 @@ pub(super) enum Command {
         /// the text from a file. Re-running with the same text changes nothing.
         #[arg(long = "body-append", value_name = "TEXT|@FILE")]
         body_append: Option<String>,
-        /// Terminal condition for `pr wait`.
-        #[arg(long = "until", value_enum, requires = "pr_action")]
-        wait_until: Option<WaitPrUntil>,
-        /// Timeout for `pr wait`.
-        #[arg(long = "timeout", default_value_t = 1800.0, requires = "pr_action")]
-        wait_timeout: f64,
     },
     /// One-shot push-a-PR: skill-sync, version-bump, then ship.
     Pr {
@@ -732,6 +726,12 @@ pub(super) enum Command {
         /// the text from a file. Re-running with the same text changes nothing.
         #[arg(long = "body-append", value_name = "TEXT|@FILE")]
         body_append: Option<String>,
+        /// Terminal condition for `pr wait`.
+        #[arg(long = "until", value_enum, requires = "pr_action")]
+        wait_until: Option<WaitPrUntil>,
+        /// Timeout for `pr wait`.
+        #[arg(long = "timeout", default_value_t = 1800.0, requires = "pr_action")]
+        wait_timeout: f64,
     },
     /// Cloud runner operations.
     Cloud {
