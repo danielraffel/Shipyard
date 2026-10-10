@@ -1228,6 +1228,55 @@ pub(super) fn probe_host_version(class: &HostClassConfig) -> HostVersion {
     )
 }
 
+/// Ask one configured host whether its pr-watch passes still complete
+/// (`shipyard --json pr-watch liveness`), read-only. The command exits 1 when
+/// the host is stale, so the JSON is read whatever the exit status. A host
+/// whose Shipyard predates the subcommand answers with an error.
+pub(super) fn probe_pr_watch_liveness(
+    class: &HostClassConfig,
+) -> Result<crate::pr_watch::liveness::Liveness, String> {
+    let Some(binary) = class
+        .shipyard_bin
+        .as_deref()
+        .filter(|path| path.starts_with('/'))
+    else {
+        return Err("host_class has no absolute shipyard_bin".to_owned());
+    };
+    let script = format!("{} --json pr-watch liveness", shlex_quote(binary));
+    let mut command = if let Some(host) = class.ssh.as_deref() {
+        let mut command = Command::new(super::evidence::ssh_binary_path());
+        command.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "-o",
+            "StrictHostKeyChecking=yes",
+        ]);
+        command.arg(host).arg(&script);
+        command
+    } else {
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(["-c", &script])
+            .env_clear()
+            .env("HOME", home_dir())
+            .env("PATH", unattended_tool_path());
+        command
+    };
+    let label = format!("pr-watch liveness probe for host class {}", class.class);
+    let output =
+        crate::process::run_output_until(&mut command, Instant::now() + HOST_PROBE_TIMEOUT, &label)
+            .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(text.trim()).map_err(|_| {
+        format!(
+            "no pr-watch liveness answer (exit {}); its Shipyard may predate `pr-watch liveness`",
+            output.status.code().unwrap_or(-1)
+        )
+    })
+}
+
 /// Read one host's installed `shipyard --version` without mutating anything.
 /// For a remote host with a known global dir, also report whether its own
 /// machine-global config declares host classes (a second fleet controller).

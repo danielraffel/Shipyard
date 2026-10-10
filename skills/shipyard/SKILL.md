@@ -686,6 +686,11 @@ daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
 `enabled` stays off with a warning in the `pr_watch_pass` event). See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
+`shipyard pr-watch liveness` exits 1 when this scanning host's last completed
+pass is older than `[pr_watch] stale_after_minutes` (45); `doctor --fleet` asks
+every host and fails `pr-watch:fleet` when none is scanning. Never add a second
+scanner as a backup: each host's ledger dedupes only its own deliveries.
+
 `green_unarmed` (flag 6) is a PR green on every required check for 2 h that
 nobody armed; it is owner-actionable, quotes any "team-lead arms" promise, and
 skips drafts and holds (label `shipyard:hold` or `shipyard:no-auto-merge`, or a

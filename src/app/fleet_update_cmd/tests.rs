@@ -2559,3 +2559,59 @@ fn doctor_flags_a_host_only_once_it_lags_past_the_soak() {
     let no_release = reconcile_cmd::fleet_version_row(&row(Some("0.205.0"), None), None, now, 30);
     assert!(!no_release.ok);
 }
+
+#[test]
+fn pr_watch_fleet_rows_fail_only_when_no_host_completes_passes() {
+    use crate::pr_watch::liveness::{Liveness, RepoLiveness};
+    let scanner = |fresh: bool| Liveness {
+        enabled: true,
+        stale_after_minutes: 45,
+        repos: vec![RepoLiveness {
+            repo: "o/r".to_owned(),
+            last_scan_at: Some(chrono::Utc::now()),
+            age_minutes: Some(if fresh { 5 } else { 90 }),
+            fresh,
+            error: None,
+        }],
+    };
+    let quiet = Liveness {
+        enabled: false,
+        stale_after_minutes: 45,
+        repos: Vec::new(),
+    };
+    let rows = reconcile_cmd::pr_watch_fleet_rows(&[
+        ("m3".to_owned(), Ok(quiet.clone())),
+        ("m5s".to_owned(), Ok(scanner(true))),
+        ("m1".to_owned(), Err("old Shipyard".to_owned())),
+    ]);
+    assert!(rows["pr-watch:fleet"].ok, "{rows:?}");
+    assert_eq!(
+        rows["pr-watch:fleet"].version.as_deref(),
+        Some("scanning on m5s")
+    );
+    assert!(rows["pr-watch:m5s"].ok);
+    assert!(!rows.contains_key("pr-watch:m3"), "a quiet host has no row");
+    assert!(
+        rows["pr-watch:m1"].ok,
+        "an unanswered host reports, never fails alone"
+    );
+
+    // The only scanner went stale: both its row and the fleet row fail.
+    let rows = reconcile_cmd::pr_watch_fleet_rows(&[
+        ("m3".to_owned(), Ok(quiet.clone())),
+        ("m5s".to_owned(), Ok(scanner(false))),
+    ]);
+    assert!(!rows["pr-watch:m5s"].ok);
+    assert!(!rows["pr-watch:fleet"].ok);
+    assert!(
+        rows["pr-watch:fleet"]
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("only stale scanners: m5s")),
+        "{rows:?}"
+    );
+
+    // Nobody scans at all.
+    let rows = reconcile_cmd::pr_watch_fleet_rows(&[("m3".to_owned(), Ok(quiet))]);
+    assert!(!rows["pr-watch:fleet"].ok);
+}
