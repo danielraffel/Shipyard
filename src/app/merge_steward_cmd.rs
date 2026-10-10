@@ -31,6 +31,7 @@ use crate::output::write_json_envelope;
 use crate::paths::RuntimePaths;
 use crate::ship_state::{ShipState, ShipStateStore};
 
+pub(super) mod carrier;
 pub(super) mod recovery_worker;
 
 #[derive(Clone)]

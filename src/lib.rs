@@ -147,6 +147,8 @@ pub mod log_retention;
 /// Merge-queue enqueue / poll / eviction supervision engine.
 /// Open issues a subsystem owns, found by a body marker.
 pub mod marked_issue;
+/// The unattended carrier's per-PR plan, from GitHub facts alone.
+pub mod merge_carrier;
 pub mod merge_queue;
 /// Fleet authority, serialization, hold, and audit controls for queue writes.
 pub mod merge_queue_control;

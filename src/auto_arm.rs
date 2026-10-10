@@ -35,6 +35,15 @@ use crate::pr_queue_state::{PrQueueState, same_head_requeue_allowed};
 pub const NATIVE_AUTO_MERGE_MUTATION: &str = "mutation($id:ID!){enablePullRequestAutoMerge(input:\
      {pullRequestId:$id,mergeMethod:MERGE}){pullRequest{number}}}";
 
+/// [`NATIVE_AUTO_MERGE_MUTATION`] bound to one exact head: GitHub refuses the
+/// arm if the pull request's head is no longer `$head`. Every same-head
+/// re-arm after an ejection uses it, so a push that lands between the
+/// classification and the mutation can never be armed on evidence about the
+/// old head.
+pub const NATIVE_AUTO_MERGE_EXACT_HEAD_MUTATION: &str = "mutation($id:ID!,$head:GitObjectID!)\
+     {enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:MERGE,\
+     expectedHeadOid:$head}){pullRequest{number}}}";
+
 /// `mergeStateStatus` values on which arming native auto-merge is appropriate.
 ///
 /// Read as "GitHub does not currently know of anything on this pull request
@@ -315,6 +324,21 @@ pub fn arm_mutation_args(node_id: &str) -> Vec<String> {
         format!("query={NATIVE_AUTO_MERGE_MUTATION}"),
         "-F".to_owned(),
         format!("id={node_id}"),
+    ]
+}
+
+/// `gh` arguments for [`NATIVE_AUTO_MERGE_EXACT_HEAD_MUTATION`].
+#[must_use]
+pub fn arm_mutation_args_at_head(node_id: &str, head: &str) -> Vec<String> {
+    vec![
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={NATIVE_AUTO_MERGE_EXACT_HEAD_MUTATION}"),
+        "-F".to_owned(),
+        format!("id={node_id}"),
+        "-f".to_owned(),
+        format!("head={head}"),
     ]
 }
 

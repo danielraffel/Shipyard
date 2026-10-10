@@ -38,6 +38,10 @@
 //! 7. [`FlagKind::EjectedGreen`]: the queue ejected the pull request for
 //!    `failed_checks`, the same head is now green on every required check, and
 //!    nothing re-armed it. The red half of that state is flag 2.
+//! 8. [`FlagKind::Unaccounted`]: a pull request Shipyard was handed that is not
+//!    progressing, not held, and no other owner flag holds (see [`coverage`]).
+//! 9. [`FlagKind::RedUnarmed`]: a required check red past the window on a head
+//!    nobody armed; flag 2's unarmed twin.
 //!
 //! Everything here is read-only on GitHub except two opt-in writes: the
 //! sticky pull-request comment in [`comment`] (comment endpoints only) and the
@@ -50,6 +54,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod comment;
+pub mod coverage;
 pub mod digest;
 pub mod fixtures;
 pub mod flags;
@@ -127,6 +132,15 @@ pub struct PrHistory {
     pub events: Vec<QueueEvent>,
     /// `false` when GitHub reported earlier timeline items than were read.
     pub timeline_complete: bool,
+    /// Author login as GraphQL reports it (`shipyard-local` for the bot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// Draft (current).
+    #[serde(default)]
+    pub draft: bool,
+    /// `mergeStateStatus` (current): `CLEAN`, `DIRTY`, `BEHIND`, `BLOCKED`...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_state: Option<String>,
 }
 
 /// One head the pull request had.
