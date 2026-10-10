@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 
 use super::evidence::clip;
 use super::{Context, Job, Step, seconds};
+use crate::environment_requeue::SUPERSEDED_ANNOTATIONS;
+use crate::gate_cost::proxy;
 
 /// The runner or a service failed.
 pub const INFRA: &str = "infra";
@@ -66,8 +68,6 @@ fn pattern(source: &str) -> Regex {
 }
 
 static NOT_ACQUIRED: LazyLock<Regex> = LazyLock::new(|| pattern(r"was not acquired by Runner"));
-static SUPERSEDED: LazyLock<Regex> =
-    LazyLock::new(|| pattern(r"Canceling since a higher priority waiting request"));
 static TIMEOUT: LazyLock<Regex> = LazyLock::new(|| pattern(r"exceeded the maximum execution time"));
 static CANCELED_BY: LazyLock<Regex> =
     LazyLock::new(|| pattern(r"The run was canceled by @?(\S+?)\.?$"));
@@ -129,14 +129,18 @@ pub fn default_fail_closed() -> Vec<Regex> {
 /// they say nothing about the cause.
 #[must_use]
 pub fn cancel_cause(messages: &[String]) -> Option<(&'static str, String)> {
-    for (rx, rule) in [
-        (&*NOT_ACQUIRED, "no_runner"),
-        (&*SUPERSEDED, "superseded"),
-        (&*TIMEOUT, "timeout"),
-    ] {
-        if let Some(hit) = messages.iter().find(|message| rx.is_match(message)) {
-            return Some((rule, short(hit)));
-        }
+    if let Some(hit) = messages.iter().find(|message| NOT_ACQUIRED.is_match(message)) {
+        return Some(("no_runner", short(hit)));
+    }
+    if let Some(hit) = messages.iter().find(|message| {
+        SUPERSEDED_ANNOTATIONS
+            .iter()
+            .any(|annotation| message.contains(annotation))
+    }) {
+        return Some(("superseded", short(hit)));
+    }
+    if let Some(hit) = messages.iter().find(|message| TIMEOUT.is_match(message)) {
+        return Some(("timeout", short(hit)));
     }
     messages
         .iter()
@@ -194,9 +198,18 @@ fn needs_starved(
         .filter(|sibling| {
             sibling.id != job.id
                 && sibling.run_id == job.run_id
-                && sibling.conclusion.as_deref() == Some("cancelled")
+                && proxy::starved(
+                    sibling.conclusion.as_deref(),
+                    sibling.runner_name.as_deref(),
+                )
         })
-        .filter(|sibling| matches!(cancel_cause(notes(sibling.id)), Some(("no_runner", _))))
+        .filter(|sibling| {
+            !notes(sibling.id).iter().any(|message| {
+                SUPERSEDED_ANNOTATIONS
+                    .iter()
+                    .any(|annotation| message.contains(annotation))
+            })
+        })
         .map(|sibling| sibling.name.as_str())
         .take(3)
         .collect();

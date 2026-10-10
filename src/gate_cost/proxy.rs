@@ -244,8 +244,18 @@ fn ran(job: &GateJobSample) -> bool {
     job.status == "completed" && job.conclusion.as_deref() != Some("skipped")
 }
 
-fn starved(job: &GateJobSample) -> bool {
-    job.conclusion.as_deref() == Some("cancelled") && !assigned(job)
+/// Whether a completed job was cancelled before a runner was assigned.
+///
+/// This is the single starvation rule used by gate-cost accounting and by
+/// diagnosis. Keep the empty-string runner case equivalent to no runner:
+/// GitHub emits both shapes for a job that never started.
+pub(crate) fn starved(conclusion: Option<&str>, runner_name: Option<&str>) -> bool {
+    conclusion == Some("cancelled")
+        && runner_name.is_none_or(|name| name.trim().is_empty())
+}
+
+fn starved_job(job: &GateJobSample) -> bool {
+    starved(job.conclusion.as_deref(), job.runner_name.as_deref())
 }
 
 /// Why one merge-group job did not pass, or `None` when it did.
@@ -495,11 +505,11 @@ pub fn compute(observation: &GateCostObservation, merged_prs: Option<u64>) -> Ga
         }
     }
     let mg_attempts = ran_jobs.iter().filter(|job| is_mg(job)).count();
-    let starved_count = ran_jobs.iter().filter(|job| starved(job)).count();
+    let starved_count = ran_jobs.iter().filter(|job| starved_job(job)).count();
     let (_, superseded) = superseded_runs(observation);
     let starved_by_push = ran_jobs
         .iter()
-        .filter(|job| starved(job) && superseded.contains(&job.run_id))
+        .filter(|job| starved_job(job) && superseded.contains(&job.run_id))
         .count();
 
     GateProxies {

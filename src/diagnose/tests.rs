@@ -566,3 +566,46 @@ fn a_starved_sibling_from_another_run_does_not_exonerate_the_failure() {
         ("real", "default")
     );
 }
+
+#[test]
+fn a_runnerless_same_run_sibling_is_starved_without_annotation() {
+    let mut target = job(1, "macos", "failure");
+    target.steps = Some(vec![Step {
+        number: Some(1),
+        name: "macOS merge-group bootstrap (required when native leg is absent)".to_owned(),
+        conclusion: Some("failure".to_owned()),
+        started_at: Some("2026-10-01T00:00:00Z".to_owned()),
+        completed_at: Some("2026-10-01T00:00:09Z".to_owned()),
+    }]);
+    let mut starved = job(2, "classify", "cancelled");
+    starved.runner_name = Some(String::new());
+    starved.steps = Some(Vec::new());
+    let mut context = Context::new();
+    context.fail_closed = default_fail_closed();
+    let logs = HashMap::from([(
+        target.id,
+        "2026-10-01T00:00:01.0000000Z provider resolution did not succeed — failing macos gate closed\n"
+            .to_owned(),
+    )]);
+    let doc = build(
+        &[target, starved],
+        &logs,
+        &["macos".to_owned()],
+        &context,
+        DEFAULT_MAX_BYTES,
+    );
+    let class = &doc.checks[0].classification;
+    assert_eq!(
+        (class.class.as_str(), class.rule.as_str()),
+        ("infra", "needs_starved")
+    );
+}
+
+#[test]
+fn superseded_annotation_uses_environment_requeue_phrase() {
+    let message = format!(
+        "Canceling since a {} for build-refs/pull/9957/merge exists",
+        crate::environment_requeue::SUPERSEDED_ANNOTATIONS[0]
+    );
+    assert_eq!(cancel_cause(&[message]).map(|(rule, _)| rule), Some("superseded"));
+}
