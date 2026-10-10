@@ -212,6 +212,7 @@ fn an_ejected_pr_on_the_same_head_is_not_re_armed() {
 fn environment_verdict(allowed: bool) -> crate::environment_requeue::EnvironmentRequeue {
     crate::environment_requeue::EnvironmentRequeue {
         allowed,
+        class: None,
         reason: "test".to_owned(),
         merge_group_commit: None,
         evidence: Vec::new(),

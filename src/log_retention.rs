@@ -271,13 +271,7 @@ fn rotate_before_open_unlocked(path: &Path, segments: usize) -> io::Result<bool>
 /// Make directory-entry changes durable on platforms where std exposes a
 /// directory handle suitable for syncing.
 pub fn sync_parent_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    crate::durable_file::sync_parent_directory(path)
 }
 
 fn prune_excess_segments(path: &Path, segments: usize) -> io::Result<()> {

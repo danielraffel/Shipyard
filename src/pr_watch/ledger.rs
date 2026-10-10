@@ -52,6 +52,9 @@ pub struct Ledger {
     /// Hand-back deliveries, labels and owner observations.
     #[serde(default)]
     pub handback: super::handback::HandbackState,
+    /// The last pass's coverage of handed pull requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<super::coverage::CoverageSummary>,
 }
 
 impl Ledger {
@@ -69,6 +72,7 @@ impl Ledger {
             digest_claim: None,
             shared_announced: BTreeMap::new(),
             handback: super::handback::HandbackState::default(),
+            coverage: None,
         }
     }
 

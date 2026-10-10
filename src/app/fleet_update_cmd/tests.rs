@@ -2547,6 +2547,7 @@ fn pr_watch_fleet_rows_fail_only_when_no_host_completes_passes() {
             age_minutes: Some(if fresh { 5 } else { 90 }),
             fresh,
             error: None,
+            coverage: None,
         }],
     };
     let quiet = Liveness {

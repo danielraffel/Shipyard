@@ -503,6 +503,7 @@ mod tests {
             generation: "generation-a".to_owned(),
             pid: 42,
             started_at: Utc::now(),
+            boot_id: None,
         };
         let transaction = TerminationTransaction {
             schema_version: TERMINATION_SCHEMA_VERSION,
@@ -532,6 +533,7 @@ mod tests {
             generation: generation.to_owned(),
             pid: child.id(),
             started_at: Utc::now(),
+            boot_id: None,
         }
     }
 

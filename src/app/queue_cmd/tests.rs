@@ -862,3 +862,36 @@ fn status_still_probes_a_default_target() {
     );
     assert_eq!(row.status, None);
 }
+
+#[test]
+fn a_pending_job_shows_why_it_was_returned_to_the_queue() {
+    let mut requeued = Job::create(
+        "c".repeat(40),
+        "feature/rebooted",
+        vec!["macos".to_owned()],
+        ValidationMode::Full,
+        Priority::Normal,
+    );
+    requeued.scheduler_defer_reason =
+        Some("interrupted: host reboot, requeued once at 2026-10-10T04:00:00Z".to_owned());
+    let plain = Job::create(
+        "d".repeat(40),
+        "feature/plain",
+        vec!["macos".to_owned()],
+        ValidationMode::Full,
+        Priority::Normal,
+    );
+    let mut out = Vec::new();
+    super::write_queue_human(&mut out, &[], &[requeued, plain], &[]).expect("render");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(
+        text.contains(
+            "feature/rebooted @ cccccccc [normal] (interrupted: host reboot, requeued once at 2026-10-10T04:00:00Z)"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("feature/plain @ dddddddd [normal]\n"),
+        "{text}"
+    );
+}
