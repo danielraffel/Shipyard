@@ -29,11 +29,11 @@ use super::{CliFailure, GitHubActions, ObservedPr, RepoObservation, write_json_e
 use crate::auto_arm::{arm_response_accepted, first_graphql_error};
 use crate::identity::RuntimeMode;
 use crate::merge_carrier::{
-    APPROVED_HEAD_CONTEXT, CarrierAction, CarrierClass, CarrierFacts, CarrierPlan,
-    CarrierQueueFact, JobFact, RequiredFact, RunFact, plan,
+    CarrierAction, CarrierClass, CarrierFacts, CarrierPlan, CarrierQueueFact, JobFact,
+    RequiredFact, RunFact, head_arm_time, plan,
 };
 use crate::merge_queue_control::MergeQueueMutationGuard;
-use crate::merge_steward::{has_successful_status, selected_required_check};
+use crate::merge_steward::selected_required_check;
 use crate::paths::RuntimePaths;
 use crate::pr_queue_state::{PrQueueState, explain_pr_queue_state};
 use crate::ship_state::{ShipState, ShipStateStore};
@@ -362,6 +362,7 @@ fn carrier_facts(
         },
         approved_head: false,
         approval_evidence: None,
+        review_marker: None,
         required,
         runs: Vec::new(),
         observed_at: Utc::now(),
@@ -369,15 +370,28 @@ fn carrier_facts(
     if matches!(facts.queue, CarrierQueueFact::Queued) {
         return Ok(facts);
     }
-    facts.queue = queue_fact(actions, &observation.repo, fact.number, &fact.head_sha);
+    let response;
+    (facts.queue, response) = queue_fact(actions, &observation.repo, fact.number, &fact.head_sha);
     if !matches!(
         facts.queue,
         CarrierQueueFact::ArmedNotQueued | CarrierQueueFact::Ejected { .. }
     ) {
         return Ok(facts);
     }
-    facts.approval_evidence = approval_evidence(actions, observation, pr)?;
-    facts.approved_head = facts.approval_evidence.is_some();
+    if let Some(response) = &response {
+        match head_arm_time(response, &fact.head_sha) {
+            Ok(Some(at)) => {
+                facts.approved_head = true;
+                facts.approval_evidence = Some(format!("arm_event:{}", at.to_rfc3339()));
+            }
+            Ok(None) => {}
+            Err(detail) => {
+                facts.queue = CarrierQueueFact::Unknown { detail };
+                return Ok(facts);
+            }
+        }
+    }
+    facts.review_marker = review_marker(actions, observation, pr)?;
     if !facts.approved_head {
         return Ok(facts);
     }
@@ -411,12 +425,21 @@ fn carrier_facts(
     Ok(facts)
 }
 
-fn queue_fact(actions: &GitHubActions, repo: &str, number: u64, head: &str) -> CarrierQueueFact {
+fn queue_fact(
+    actions: &GitHubActions,
+    repo: &str,
+    number: u64,
+    head: &str,
+) -> (CarrierQueueFact, Option<Value>) {
     let response = match read_queue_state(actions, repo, number) {
         Ok(response) => response,
-        Err(detail) => return CarrierQueueFact::Unknown { detail },
+        Err(detail) => return (CarrierQueueFact::Unknown { detail }, None),
     };
-    let report = explain_pr_queue_state(&response);
+    (queue_fact_from(&response, head), Some(response))
+}
+
+fn queue_fact_from(response: &Value, head: &str) -> CarrierQueueFact {
+    let report = explain_pr_queue_state(response);
     if !report
         .head_oid
         .as_deref()
@@ -446,20 +469,15 @@ fn queue_fact(actions: &GitHubActions, repo: &str, number: u64, head: &str) -> C
     }
 }
 
-/// The approval record for the current head, if any.
+/// The reviewer's `reviewed:<full sha>` cross-check for the current head.
 ///
-/// The status is read from the observation the steward already made. A
-/// `reviewed:<sha>` comment line naming the full current head is the
-/// fallback, so a reviewer's verdict comment records approval without a
-/// separate status write.
-fn approval_evidence(
+/// Recorded beside the arming event for the audit trail; never trusted on its
+/// own, because every agent posts through the same App identity.
+fn review_marker(
     actions: &GitHubActions,
     observation: &RepoObservation,
     pr: &ObservedPr,
 ) -> Result<Option<String>, String> {
-    if has_successful_status(&pr.fact, APPROVED_HEAD_CONTEXT) {
-        return Ok(Some(format!("status:{APPROVED_HEAD_CONTEXT}")));
-    }
     let marker = Regex::new(r"(?im)^\s*reviewed:([0-9a-f]{40})\s*$").map_err(|e| e.to_string())?;
     for page in 1..=10 {
         let value = gh_json(

@@ -218,11 +218,14 @@ host; agents read it, they do not run `--apply`.
   no-runner cancel within seconds is a superseding push or a concurrency
   cancel, not starvation. `update_branch` is planned for a green, armed,
   `BEHIND` PR and refused for `--apply` until the own-lines invariant exists.
-- **Approval record.** The carrier acts only on a head carrying a successful
-  `shipyard/approved-head` commit status, or a PR comment with a line
-  `reviewed:<full 40-hex head>`. A pushed head carries neither until someone
-  approves it, so a moved head is never carried. Every agent posts as the
-  same App, so the record proves which head was approved, not who approved it.
+- **Approval record.** The carrier acts only on a head GitHub's timeline
+  shows armed: an `AutoMergeEnabledEvent` at or after the head arrived (its
+  force-push, or its first check suite). Only the arming actor arms, after
+  reading the verdict, so the arm of this head is its approval; a pushed head
+  carries no arm, and a never-armed head goes to a steward. Reviewers also add
+  a line `reviewed:<full 40-hex head>` to every approval verdict; the carrier
+  records it as a cross-check but never trusts it alone, because every agent
+  posts as the same App and could write one.
 - **Holds.** Draft, conflicting, unarmed, queued, or unapproved PRs; a failed
   required check; a removal for a real failure, a conflict, or a person's
   decision; a head pushed after the removal; any unreadable fact.

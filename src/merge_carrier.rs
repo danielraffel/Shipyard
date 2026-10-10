@@ -31,16 +31,19 @@
 //!
 //! ## The approval record
 //!
-//! A pull request is carried only on a head someone approved. The approval is
-//! the commit status [`APPROVED_HEAD_CONTEXT`] in state `success` on that exact
-//! SHA, posted by the arming actor and linking the review comment that names
-//! the head. A status is bound to its SHA by GitHub, so a pushed head carries
-//! no approval until someone approves it, and "the head moved since approval"
-//! needs no comparison: the current head simply lacks the status. Every agent
-//! posts through the same App identity, so the status proves which head was
-//! approved, not who approved it. A reviewer's comment carrying a line
-//! `reviewed:<full sha>` for the current head is read as the same record, so
-//! a verdict comment needs no separate status write.
+//! A pull request is carried only on a head that was armed at that exact head.
+//! The record is GitHub's own timeline: an `AutoMergeEnabledEvent` created at
+//! or after the moment the current head reached the pull request (its
+//! force-push event, or the creation of its first check suite). Only the
+//! arming actor arms, and only after reading the approval verdict, so an arm
+//! of this head is the approval of this head. A head pushed after the last arm
+//! carries no arm, so "the head moved since approval" needs no comparison, and
+//! a head that was never armed goes to a steward. When the timeline window
+//! cannot show the head's arrival, nothing is assumed.
+//!
+//! The reviewer's `reviewed:<full sha>` comment line is recorded beside it as
+//! the human cross-check. It is not trusted on its own: every agent posts
+//! through the same App identity, so any agent could write one.
 //!
 //! ## What the planner never does
 //!
@@ -56,8 +59,6 @@ use serde::{Deserialize, Serialize};
 use crate::gate_cost::GateJobSample;
 use crate::gate_cost::proxy::ejection_cause;
 
-/// Commit-status context that records the approved head.
-pub const APPROVED_HEAD_CONTEXT: &str = "shipyard/approved-head";
 /// Reruns the carrier may cause on one workflow run, read from `run_attempt`.
 pub const MAX_REDISPATCHES_PER_RUN: u64 = 2;
 /// Reruns the carrier may cause on one pull request within
@@ -195,14 +196,17 @@ pub struct CarrierFacts {
     pub merge_state: String,
     /// Queue state.
     pub queue: CarrierQueueFact,
-    /// Whether the current head carries an approval record: a successful
-    /// [`APPROVED_HEAD_CONTEXT`] status, or a `reviewed:<sha>` comment line
-    /// naming the full current head.
+    /// Whether GitHub's timeline shows the current head armed: an
+    /// `AutoMergeEnabledEvent` at or after the head reached the pull request.
     pub approved_head: bool,
-    /// Which record proved the approval (`status:<context>` or
-    /// `comment:<id>`), for the audit trail.
+    /// The arming event that proved it (`arm_event:<createdAt>`).
     #[serde(default)]
     pub approval_evidence: Option<String>,
+    /// The reviewer's `reviewed:<full sha>` cross-check, when a comment
+    /// carries one for the current head (`comment:<id>`). Recorded, not
+    /// trusted on its own.
+    #[serde(default)]
+    pub review_marker: Option<String>,
     /// Required contexts on the current head, in policy order.
     pub required: Vec<RequiredFact>,
     /// Runs on the current head (any event), plus the merge-group runs of the
@@ -738,6 +742,82 @@ fn removal_causes(facts: &CarrierFacts, commit: &str) -> Result<Vec<String>, Str
     causes.sort();
     causes.dedup();
     Ok(causes)
+}
+
+/// When the current head was armed, read from a `pr_queue_state` timeline
+/// response (`PR_QUEUE_STATE_QUERY`).
+///
+/// The head's arrival is the latest of its force-push events and the creation
+/// of its first check suite; the answer is the newest `AutoMergeEnabledEvent`
+/// at or after that arrival. `Ok(None)` means the timeline shows no arm of
+/// this head. An arrival the visible window cannot show is an error when the
+/// window is truncated, because an arm cannot be proven newer than it.
+///
+/// # Errors
+///
+/// When the response has no timeline, or the head's arrival lies outside a
+/// truncated window.
+pub fn head_arm_time(
+    response: &serde_json::Value,
+    head: &str,
+) -> Result<Option<DateTime<Utc>>, String> {
+    let timeline = response
+        .pointer("/data/repository/pullRequest/timelineItems")
+        .ok_or("queue-state response has no timeline")?;
+    let nodes = timeline
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("queue-state timeline has no nodes")?;
+    let time = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&Utc))
+    };
+    let arrival = nodes
+        .iter()
+        .filter_map(
+            |node| match node.get("__typename").and_then(serde_json::Value::as_str) {
+                Some("HeadRefForcePushedEvent")
+                    if node
+                        .pointer("/afterCommit/oid")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|oid| oid.eq_ignore_ascii_case(head)) =>
+                {
+                    time(node.get("createdAt"))
+                }
+                Some("PullRequestCommit")
+                    if node
+                        .pointer("/commit/oid")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|oid| oid.eq_ignore_ascii_case(head)) =>
+                {
+                    time(node.pointer("/commit/checkSuites/nodes/0/createdAt"))
+                }
+                _ => None,
+            },
+        )
+        .max();
+    let Some(arrival) = arrival else {
+        let truncated = timeline
+            .pointer("/pageInfo/hasPreviousPage")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        return if truncated {
+            Err("the head's arrival is outside the visible timeline window".to_owned())
+        } else {
+            Ok(None)
+        };
+    };
+    Ok(nodes
+        .iter()
+        .filter(|node| {
+            node.get("__typename").and_then(serde_json::Value::as_str)
+                == Some("AutoMergeEnabledEvent")
+        })
+        .filter_map(|node| time(node.get("createdAt")))
+        .filter(|at| *at >= arrival)
+        .max())
 }
 
 #[cfg(test)]

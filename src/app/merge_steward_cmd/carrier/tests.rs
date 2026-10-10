@@ -130,8 +130,8 @@ fn authority(temp: &tempfile::TempDir, machine: &str) -> (ShipStateStore, PathBu
 }
 
 #[cfg(unix)]
-fn ejected_observation(comment_marker: bool) -> RepoObservation {
-    let mut checks = vec![StewardCheck {
+fn ejected_observation() -> RepoObservation {
+    let checks = vec![StewardCheck {
         name: "macos".to_owned(),
         source: StewardCheckSource::CheckRun,
         app_id: None,
@@ -140,17 +140,6 @@ fn ejected_observation(comment_marker: bool) -> RepoObservation {
         run_id: Some(100),
         observed_at: Some("2026-10-09T09:00:00Z".to_owned()),
     }];
-    if !comment_marker {
-        checks.push(StewardCheck {
-            name: APPROVED_HEAD_CONTEXT.to_owned(),
-            source: StewardCheckSource::StatusContext,
-            app_id: None,
-            status: "COMPLETED".to_owned(),
-            conclusion: Some("SUCCESS".to_owned()),
-            run_id: None,
-            observed_at: Some("2026-10-09T08:00:00Z".to_owned()),
-        });
-    }
     RepoObservation {
         repo: "owner/repo".to_owned(),
         base: "main".to_owned(),
@@ -186,14 +175,20 @@ fn ejected_observation(comment_marker: bool) -> RepoObservation {
 }
 
 /// A fake `gh` for a pull request the queue removed for `failed_checks` at
-/// the current head, whose merge-group `macos` job ended as `macos_job`.
+/// the current head, whose merge-group `macos` job ended as `macos_job`. The
+/// head's first check suite is 07:00; it was armed at 08:00.
 #[cfg(unix)]
 fn ejected_gh_body(macos_job: &str, arm_reply: &str) -> String {
+    ejected_gh_body_armed_at(macos_job, arm_reply, "2026-10-09T08:00:00Z")
+}
+
+#[cfg(unix)]
+fn ejected_gh_body_armed_at(macos_job: &str, arm_reply: &str, armed_at: &str) -> String {
     format!(
         r#"
 case "$*" in
   *enablePullRequestAutoMerge*) printf '%s' '{arm_reply}' ;;
-  *timelineItems*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{HEAD}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[{{"__typename":"PullRequestCommit","commit":{{"oid":"{HEAD}","checkSuites":{{"nodes":[{{"createdAt":"2026-10-09T07:00:00Z"}}]}}}}}},{{"__typename":"AutoMergeEnabledEvent","createdAt":"2026-10-09T08:00:00Z","actor":{{"login":"shipyard-local"}}}},{{"__typename":"AddedToMergeQueueEvent","createdAt":"2026-10-09T08:01:00Z","actor":{{"login":"shipyard-local"}}}},{{"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-09T08:30:00Z","reason":"failed_checks","actor":{{"login":"github-merge-queue"}},"beforeCommit":{{"oid":"{GROUP}","parents":{{"nodes":[{{"oid":"dddddddddddddddddddddddddddddddddddddddd"}},{{"oid":"{HEAD}"}}]}}}}}}]}}}}}}}}}}' ;;
+  *timelineItems*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{HEAD}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[{{"__typename":"PullRequestCommit","commit":{{"oid":"{HEAD}","checkSuites":{{"nodes":[{{"createdAt":"2026-10-09T07:00:00Z"}}]}}}}}},{{"__typename":"AutoMergeEnabledEvent","createdAt":"{armed_at}","actor":{{"login":"shipyard-local"}}}},{{"__typename":"AddedToMergeQueueEvent","createdAt":"2026-10-09T08:01:00Z","actor":{{"login":"shipyard-local"}}}},{{"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-09T08:30:00Z","reason":"failed_checks","actor":{{"login":"github-merge-queue"}},"beforeCommit":{{"oid":"{GROUP}","parents":{{"nodes":[{{"oid":"dddddddddddddddddddddddddddddddddddddddd"}},{{"oid":"{HEAD}"}}]}}}}}}]}}}}}}}}}}' ;;
   *issues/42/comments*) printf '%s' '[{{"id":77,"body":"Review of {HEAD}: approved.\nreviewed:{HEAD}"}}]' ;;
   *"actions/runs?head_sha={GROUP}&per_page=100&event=merge_group"*) printf '%s' '{{"total_count":1,"workflow_runs":[{{"id":500,"path":".github/workflows/build.yml","name":"Build","event":"merge_group","head_sha":"{GROUP}","status":"completed","conclusion":"failure","run_attempt":1,"run_started_at":"2026-10-09T08:02:00Z"}}]}}' ;;
   *"actions/runs/500/jobs"*) printf '%s' '{{"total_count":2,"jobs":[{{"name":"Linux (x64) [github-hosted]","status":"completed","conclusion":"failure","runner_name":"hosted-1"}},{macos_job}]}}' ;;
@@ -244,7 +239,7 @@ fn rearm_intent() -> CarrierIntent {
 fn a_starved_removal_is_planned_as_an_exact_head_rearm_from_github_facts() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(&temp, &ejected_gh_body(STARVED_MACOS, ARMED));
-    let observation = ejected_observation(false);
+    let observation = ejected_observation();
     let report = planned_report(&actions, &observation);
     let planned = &report.prs[0];
     assert_eq!(
@@ -255,24 +250,26 @@ fn a_starved_removal_is_planned_as_an_exact_head_rearm_from_github_facts() {
     );
     assert_eq!(
         planned.facts.approval_evidence.as_deref(),
-        Some("status:shipyard/approved-head")
+        Some("arm_event:2026-10-09T08:00:00+00:00")
     );
-    // The status already proved approval, so the comments were not read.
-    assert!(!gh_calls(&temp).contains("comments"), "{}", gh_calls(&temp));
+    assert_eq!(planned.facts.review_marker.as_deref(), Some("comment:77"));
 }
 
 #[cfg(unix)]
 #[test]
-fn a_reviewed_marker_comment_records_the_approval_when_no_status_does() {
+fn a_reviewed_marker_without_an_arm_of_this_head_is_not_an_approval() {
+    // Armed at 06:00, before this head's first check suite at 07:00: that arm
+    // belonged to an earlier head. Any agent can write the marker.
     let temp = tempfile::tempdir().expect("temp");
-    let actions = fake_gh(&temp, &ejected_gh_body(STARVED_MACOS, ARMED));
-    let observation = ejected_observation(true);
-    let report = planned_report(&actions, &observation);
-    assert_eq!(
-        report.prs[0].facts.approval_evidence.as_deref(),
-        Some("comment:77")
+    let actions = fake_gh(
+        &temp,
+        &ejected_gh_body_armed_at(STARVED_MACOS, ARMED, "2026-10-09T06:00:00Z"),
     );
-    assert!(report.prs[0].plan.action().is_some());
+    let report = planned_report(&actions, &ejected_observation());
+    let facts = &report.prs[0].facts;
+    assert!(!facts.approved_head);
+    assert_eq!(facts.review_marker.as_deref(), Some("comment:77"));
+    assert!(report.prs[0].plan.action().is_none());
 }
 
 #[cfg(unix)]
@@ -282,7 +279,7 @@ fn a_removal_whose_required_job_ran_and_failed_is_held() {
     let failed =
         r#"{"name":"macos","status":"completed","conclusion":"failure","runner_name":"m5-gate"}"#;
     let actions = fake_gh(&temp, &ejected_gh_body(failed, ARMED));
-    let report = planned_report(&actions, &ejected_observation(false));
+    let report = planned_report(&actions, &ejected_observation());
     assert!(report.prs[0].plan.action().is_none());
 }
 
@@ -291,7 +288,7 @@ fn a_removal_whose_required_job_ran_and_failed_is_held() {
 fn apply_rearms_only_the_intended_action_with_the_exact_head() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(&temp, &ejected_gh_body(STARVED_MACOS, ARMED));
-    let observation = ejected_observation(false);
+    let observation = ejected_observation();
     let mut report = planned_report(&actions, &observation);
     let (store, global_dir) = authority(&temp, "m5s");
     let classes = BTreeSet::from([CarrierClass::Rearm]);
@@ -321,7 +318,7 @@ fn apply_rearms_only_the_intended_action_with_the_exact_head() {
 fn apply_does_nothing_outside_the_intent_or_the_enabled_classes() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(&temp, &ejected_gh_body(STARVED_MACOS, ARMED));
-    let observation = ejected_observation(false);
+    let observation = ejected_observation();
     let (store, global_dir) = authority(&temp, "m5s");
 
     // Not in the intent: nothing happens.
@@ -371,7 +368,7 @@ fn apply_does_nothing_outside_the_intent_or_the_enabled_classes() {
 fn an_intent_naming_an_older_head_is_not_applied() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(&temp, &ejected_gh_body(STARVED_MACOS, ARMED));
-    let observation = ejected_observation(false);
+    let observation = ejected_observation();
     let mut report = planned_report(&actions, &observation);
     let (store, global_dir) = authority(&temp, "m5s");
     let stale = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
@@ -403,7 +400,7 @@ fn an_intent_naming_an_older_head_is_not_applied() {
 fn a_host_that_is_not_the_mutation_machine_cannot_apply() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(&temp, &ejected_gh_body(STARVED_MACOS, ARMED));
-    let observation = ejected_observation(false);
+    let observation = ejected_observation();
     let mut report = planned_report(&actions, &observation);
     let (store, global_dir) = authority(&temp, "m3");
     apply_intent(

@@ -65,7 +65,8 @@ fn armed() -> CarrierFacts {
         merge_state: "BLOCKED".to_owned(),
         queue: CarrierQueueFact::ArmedNotQueued,
         approved_head: true,
-        approval_evidence: Some("status:shipyard/approved-head".to_owned()),
+        approval_evidence: Some("arm_event:2026-10-09T08:00:00+00:00".to_owned()),
+        review_marker: None,
         required: vec![green("macos"), green("Enforce")],
         runs: Vec::new(),
         observed_at: at("2026-10-09T10:00:00Z"),
@@ -491,4 +492,42 @@ fn class_names_parse_both_spellings() {
         Some(CarrierClass::UpdateBranch)
     );
     assert_eq!(CarrierClass::parse("merge"), None);
+}
+
+fn timeline(nodes: &serde_json::Value, truncated: bool) -> serde_json::Value {
+    json!({"data": {"repository": {"pullRequest": {"timelineItems": {
+        "pageInfo": {"hasPreviousPage": truncated}, "nodes": nodes}}}}})
+}
+
+#[test]
+fn the_head_is_armed_only_by_an_arm_event_after_it_arrived() {
+    let pushed = json!({"__typename": "PullRequestCommit", "commit": {"oid": HEAD,
+        "checkSuites": {"nodes": [{"createdAt": "2026-10-09T07:00:00Z"}]}}});
+    let armed = |at: &str| json!({"__typename": "AutoMergeEnabledEvent", "createdAt": at});
+    let after = timeline(&json!([pushed, armed("2026-10-09T08:00:00Z")]), false);
+    assert_eq!(
+        head_arm_time(&after, HEAD),
+        Ok(Some(at("2026-10-09T08:00:00Z")))
+    );
+    let before = timeline(&json!([armed("2026-10-09T06:00:00Z"), pushed]), false);
+    assert_eq!(head_arm_time(&before, HEAD), Ok(None));
+    // A later force-push of the same head resets its arrival.
+    let force = json!({"__typename": "HeadRefForcePushedEvent", "createdAt": "2026-10-09T09:00:00Z",
+        "afterCommit": {"oid": HEAD}});
+    let repushed = timeline(
+        &json!([pushed, armed("2026-10-09T08:00:00Z"), force]),
+        false,
+    );
+    assert_eq!(head_arm_time(&repushed, HEAD), Ok(None));
+}
+
+#[test]
+fn an_arrival_the_window_cannot_show_proves_nothing() {
+    let armed = json!({"__typename": "AutoMergeEnabledEvent", "createdAt": "2026-10-09T08:00:00Z"});
+    assert!(head_arm_time(&timeline(&json!([armed.clone()]), true), HEAD).is_err());
+    assert_eq!(
+        head_arm_time(&timeline(&json!([armed]), false), HEAD),
+        Ok(None)
+    );
+    assert!(head_arm_time(&json!({}), HEAD).is_err());
 }
