@@ -1338,6 +1338,12 @@ class EnvironmentSignaturesAgreeWithSharedCorpus(unittest.TestCase):
         self.assertIn(
             f"FAILURE_PROXIMITY_LINES: usize = {guard.FAILURE_PROXIMITY_LINES};", rust
         )
+        for signature in guard.INTERRUPTION_SIGNATURES:
+            self.assertIn(f'"{signature}"', rust)
+        self.assertIn(
+            f"STARVATION_MIN_WAIT_MINUTES: i64 = {guard.STARVATION_MIN_WAIT_MINUTES};", rust
+        )
+        self.assertIn(f"INTERRUPTION_REARM_LIMIT: u32 = {guard.INTERRUPTION_REARM_LIMIT};", rust)
 
     def test_a_signature_in_the_script_echo_is_not_output(self) -> None:
         log = job_fixture("job_real_8933_test_failure.json")["log"].splitlines()
@@ -1397,6 +1403,115 @@ class EnvironmentSignaturesAgreeWithSharedCorpus(unittest.TestCase):
         )
 
 
+GROUP = "c0ffee0000000000000000000000000000000001"
+
+UPLOAD_STALL_LOG = (
+    "2026-10-09T23:10:00.0000000Z ##[group]Run cargo test\n"
+    "2026-10-09T23:10:00.0000000Z cargo test\n"
+    "2026-10-09T23:10:00.0000000Z ##[endgroup]\n"
+    "2026-10-09T23:30:00.0000000Z test result: ok. 22592 passed; 0 failed\n"
+    "2026-10-09T23:30:01.0000000Z ##[group]Run actions/upload-artifact@v4\n"
+    "2026-10-09T23:30:01.0000000Z with:\n"
+    "2026-10-09T23:30:01.0000000Z ##[endgroup]\n"
+    "2026-10-09T23:30:02.0000000Z Uploading 812 files\n"
+    "2026-10-09T23:37:00.0000000Z ##[error]Upload progress stalled.\n"
+)
+
+
+def assess_interrupted(conclusion: str, job: dict[str, Any], log: str, ejections: int) -> dict[str, Any]:
+    """The twin of the Rust ``interrupted_group``: one required macos check on job 7."""
+    api = FakeApi()
+    api.json[f"repos/{REPO}/branches/main/protection/required_status_checks"] = {"contexts": ["macos"]}
+    api.json[f"repos/{REPO}/commits/{GROUP}/check-runs?per_page=100"] = {
+        "total_count": 1,
+        "check_runs": [{"id": 7, "name": "macos", "status": "completed",
+                        "conclusion": conclusion, "app": {"slug": "github-actions"}}],
+    }
+    api.json[f"repos/{REPO}/commits/{GROUP}/status"] = {"statuses": []}
+    api.json[f"repos/{REPO}/actions/jobs/7"] = job
+    api.text[f"repos/{REPO}/actions/jobs/7/logs"] = log
+    classification = guard.classify_pr_queue_state(
+        fixture("pr_real_8678_first_environment_ejection.json")
+    )
+    classification["ejections_of_current_head"] = ejections
+    classification["last_ejection"] = {**classification["last_ejection"], "merge_group_commit": GROUP}
+    verdict = guard.assess_environment_requeue(
+        classification, REPO, True, api_json=api.api_json, api_text=api.api_text
+    )
+    assert verdict is not None
+    return verdict
+
+
+def queued_job(runner: str, completed: str | None) -> dict[str, Any]:
+    return {"id": 7, "status": "completed", "conclusion": "cancelled",
+            "created_at": "2026-10-08T10:00:00Z", "completed_at": completed,
+            "runner_name": runner, "steps": []}
+
+
+def upload_job(test_conclusion: str) -> dict[str, Any]:
+    return {"id": 7, "status": "completed", "conclusion": "failure",
+            "runner_name": "studio-pulp-gate-01",
+            "steps": [
+                {"name": "Test", "conclusion": test_conclusion, "started_at": "2026-10-09T23:10:00Z"},
+                {"name": "Upload test artifacts", "conclusion": "failure",
+                 "started_at": "2026-10-09T23:30:01Z"},
+            ]}
+
+
+class InterruptionRequeue(unittest.TestCase):
+    """Same cases as the Rust module's interruption tests; the two must agree."""
+
+    def test_a_starved_required_job_is_an_interruption_bounded_at_two(self) -> None:
+        job = queued_job("", "2026-10-08T10:16:00Z")
+        verdict = assess_interrupted("cancelled", job, "", 1)
+        self.assertTrue(verdict["allowed"], verdict["reason"])
+        self.assertEqual(verdict["class"], "interruption")
+        self.assertEqual(verdict["evidence"][0]["signature"], "starved")
+        self.assertTrue(assess_interrupted("cancelled", job, "", 2)["allowed"])
+        third = assess_interrupted("cancelled", job, "", 3)
+        self.assertFalse(third["allowed"])
+        self.assertIn("3 times", third["reason"])
+
+    def test_a_cancel_that_had_a_runner_or_never_waited_is_not_starvation(self) -> None:
+        for runner, completed, why in (
+            ("studio-pulp-gate-01", "2026-10-08T10:16:00Z", "a runner took it"),
+            ("", "2026-10-08T10:02:00Z", "superseded after 2 minutes"),
+            ("", None, "no completion time"),
+        ):
+            with self.subTest(why=why):
+                verdict = assess_interrupted("cancelled", queued_job(runner, completed), "", 1)
+                self.assertFalse(verdict["allowed"], verdict["reason"])
+                self.assertEqual(verdict["evidence"][0]["reading"], "no_signature")
+
+    def test_an_upload_stall_after_a_green_test_step_is_an_interruption(self) -> None:
+        verdict = assess_interrupted("failure", upload_job("success"), UPLOAD_STALL_LOG, 1)
+        self.assertTrue(verdict["allowed"], verdict["reason"])
+        self.assertEqual(verdict["class"], "interruption")
+        self.assertEqual([step["step"] for step in verdict["evidence"]], ["Upload test artifacts"])
+
+    def test_a_recovered_stall_earlier_in_the_step_does_not_explain_its_failure(self) -> None:
+        log = UPLOAD_STALL_LOG.replace(
+            "2026-10-09T23:37:00.0000000Z ##[error]Upload progress stalled.\n",
+            "2026-10-09T23:31:00.0000000Z Upload progress stalled.\n"
+            "2026-10-09T23:32:00.0000000Z Retrying upload\n"
+            "2026-10-09T23:36:00.0000000Z Finalizing artifact\n"
+            "2026-10-09T23:37:00.0000000Z ##[error]Artifact storage quota has been hit.\n",
+        )
+        verdict = assess_interrupted("failure", upload_job("success"), log, 1)
+        self.assertFalse(verdict["allowed"], verdict["reason"])
+        self.assertEqual(verdict["evidence"][0]["reading"], "no_signature")
+
+    def test_a_real_red_before_a_stalled_upload_stays_refused(self) -> None:
+        log = UPLOAD_STALL_LOG.replace(
+            "test result: ok. 22592 passed; 0 failed",
+            "test result: FAILED. 22591 passed; 1 failed\n"
+            "2026-10-09T23:30:00.5000000Z ##[error]Process completed with exit code 101.",
+        )
+        verdict = assess_interrupted("failure", upload_job("failure"), log, 1)
+        self.assertFalse(verdict["allowed"], verdict["reason"])
+        self.assertIn("Test", verdict["reason"])
+
+
 class EnvironmentRequeueWorkedExamples(unittest.TestCase):
     def test_pip_relay_ejection_of_8678_allows_one_re_enqueue(self) -> None:
         verdict = assess(FakeApi(), "pr_real_8678_first_environment_ejection.json")
@@ -1411,7 +1526,7 @@ class EnvironmentRequeueWorkedExamples(unittest.TestCase):
         )
         allowed, message = guard.decide(classification, None, verdict)
         self.assertTrue(allowed)
-        self.assertIn("one environment re-enqueue", message)
+        self.assertIn("this re-enqueue is allowed", message)
         self.assertIn("Tunnel connection failed", message)
         # Control: the same classification without the verdict is refused.
         self.assertFalse(guard.decide(classification)[0])
@@ -1437,8 +1552,21 @@ class EnvironmentRequeueWorkedExamples(unittest.TestCase):
     def test_a_second_ejection_of_the_same_head_is_refused(self) -> None:
         verdict = assess(FakeApi(), "pr_real_8678_second_ejection_same_head.json")
         assert verdict is not None
+        self.assertFalse(verdict["allowed"], verdict["reason"])
+
+    def test_a_network_failure_allows_only_the_first_ejection(self) -> None:
+        classification = guard.classify_pr_queue_state(
+            fixture("pr_real_8678_first_environment_ejection.json")
+        )
+        classification["ejections_of_current_head"] = 2
+        api = FakeApi()
+        verdict = guard.assess_environment_requeue(
+            classification, REPO, True, api_json=api.api_json, api_text=api.api_text
+        )
+        assert verdict is not None
         self.assertFalse(verdict["allowed"])
         self.assertIn("2 times", verdict["reason"])
+        self.assertEqual(verdict["evidence"][0]["reading"], "environment")
 
     def test_not_opted_in_is_refused_without_reading(self) -> None:
         verdict = assess(FakeApi(), "pr_real_8678_first_environment_ejection.json", False)

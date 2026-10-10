@@ -56,6 +56,10 @@ fn every_job_log_matches_the_shared_expectations() {
                     assert_eq!(want["reading"], "environment", "{name}/{step}");
                     assert_eq!(want["signature"], hit.signature.as_str(), "{name}/{step}");
                 }
+                StepReading::Interruption(hit) => {
+                    assert_eq!(want["reading"], "interruption", "{name}/{step}");
+                    assert_eq!(want["signature"], hit.signature.as_str(), "{name}/{step}");
+                }
                 StepReading::NoSignature => {
                     assert_eq!(want["reading"], "no_signature", "{name}/{step}");
                 }
@@ -327,17 +331,220 @@ fn test_failure_ejection_of_8933_stays_refused() {
 }
 
 #[test]
-fn a_second_ejection_of_the_same_head_is_refused_without_reading_logs() {
-    // The FakeGh has no answers for b82856ec, so any read would fail loudly
-    // rather than refuse for the reason asserted here.
+fn a_second_ejection_of_the_same_head_is_refused() {
+    // The real capture of 8678's second ejection: its merge-group commit has
+    // no answers here, so it refuses whether or not the logs are read.
     let verdict = assess_fixture(
         &FakeGh::new(),
         "pr_real_8678_second_ejection_same_head.json",
         true,
     )
     .expect("applies");
+    assert!(!verdict.allowed, "{}", verdict.reason);
+}
+
+#[test]
+fn a_network_failure_allows_only_the_first_ejection() {
+    let gh = FakeGh::new();
+    let mut report =
+        explain_pr_queue_state(&fixture("pr_real_8678_first_environment_ejection.json"));
+    report.ejections_of_current_head = 2;
+    let verdict = assess(&|args: &[String]| gh.call(args), REPO, &report, true).expect("applies");
     assert!(!verdict.allowed);
     assert!(verdict.reason.contains("2 times"), "{}", verdict.reason);
+    assert!(
+        matches!(&verdict.evidence[0].reading, StepReading::Environment(_)),
+        "the evidence was network, and network allows one"
+    );
+}
+
+const GROUP: &str = "c0ffee0000000000000000000000000000000001";
+
+/// A merge group whose required `macos` check ended `conclusion` on Actions
+/// job 7, with `job` as that job's API record and `log` as its log.
+fn interrupted_group(
+    conclusion: &str,
+    job: &Value,
+    log: &str,
+) -> HashMap<String, Result<String, String>> {
+    let checks = fixture("merge_group_required_checks_real.json");
+    let mut answers = HashMap::new();
+    answers.insert(
+        format!("repos/{REPO}/rules/branches/main"),
+        Ok(checks["rules_branches_main"].to_string()),
+    );
+    answers.insert(
+        format!("repos/{REPO}/branches/main/protection/required_status_checks"),
+        Ok(json!({"contexts": ["macos"]}).to_string()),
+    );
+    answers.insert(
+        format!("repos/{REPO}/pulls/8678"),
+        Ok(json!({"base": {"ref": "main"}}).to_string()),
+    );
+    answers.insert(
+        format!("repos/{REPO}/commits/{GROUP}/check-runs?per_page=100"),
+        Ok(json!({"total_count": 1, "check_runs": [{
+            "id": 7, "name": "macos", "status": "completed", "conclusion": conclusion,
+            "app": {"slug": "github-actions"}
+        }]})
+        .to_string()),
+    );
+    answers.insert(
+        format!("repos/{REPO}/commits/{GROUP}/status"),
+        Ok(json!({"statuses": []}).to_string()),
+    );
+    answers.insert(format!("repos/{REPO}/actions/jobs/7"), Ok(job.to_string()));
+    answers.insert(
+        format!("repos/{REPO}/actions/jobs/7/logs"),
+        Ok(log.to_owned()),
+    );
+    answers
+}
+
+fn assess_group(
+    answers: &HashMap<String, Result<String, String>>,
+    ejections: u32,
+) -> EnvironmentRequeue {
+    let mut report =
+        explain_pr_queue_state(&fixture("pr_real_8678_first_environment_ejection.json"));
+    report.ejections_of_current_head = ejections;
+    if let Some(ejection) = report.last_ejection.as_mut() {
+        ejection.merge_group_commit = Some(GROUP.to_owned());
+    }
+    let gh = |args: &[String]| {
+        answers
+            .get(&args[1])
+            .cloned()
+            .unwrap_or_else(|| Err(format!("unexpected call {}", args[1])))
+    };
+    assess(&gh, REPO, &report, true).expect("applies")
+}
+
+fn queued_job(runner: &str, created: &str, completed: &str) -> Value {
+    json!({
+        "id": 7, "status": "completed", "conclusion": "cancelled",
+        "created_at": created, "started_at": null, "completed_at": completed,
+        "runner_name": runner, "labels": ["pulp-gate"], "steps": []
+    })
+}
+
+#[test]
+fn a_required_job_starved_of_a_runner_is_an_interruption() {
+    // #9650/#9657/#9658's shape: cancelled 16 min after creation, no runner.
+    let job = queued_job("", "2026-10-08T10:00:00Z", "2026-10-08T10:16:00Z");
+    let verdict = assess_group(&interrupted_group("cancelled", &job, ""), 1);
+    assert!(verdict.allowed, "{}", verdict.reason);
+    assert!(verdict.is_allowed_interruption());
+    assert!(matches!(
+        &verdict.evidence[0].reading,
+        StepReading::Interruption(hit) if hit.signature == "starved"
+    ));
+    // The bound: a second interruption is allowed, a third is not.
+    assert!(assess_group(&interrupted_group("cancelled", &job, ""), 2).allowed);
+    let third = assess_group(&interrupted_group("cancelled", &job, ""), 3);
+    assert!(
+        !third.allowed && third.reason.contains("3 times"),
+        "{}",
+        third.reason
+    );
+}
+
+#[test]
+fn a_cancel_that_had_a_runner_or_never_waited_is_not_starvation() {
+    for (runner, completed, why) in [
+        (
+            "studio-pulp-gate-01",
+            "2026-10-08T10:16:00Z",
+            "a runner took it",
+        ),
+        (
+            "",
+            "2026-10-08T10:02:00Z",
+            "a 2-minute cancel is a superseding push",
+        ),
+        ("", "", "no completion time fails closed"),
+    ] {
+        let mut job = queued_job(runner, "2026-10-08T10:00:00Z", completed);
+        if completed.is_empty() {
+            job["completed_at"] = Value::Null;
+        }
+        let verdict = assess_group(&interrupted_group("cancelled", &job, ""), 1);
+        assert!(!verdict.allowed, "{why}: {}", verdict.reason);
+        assert_eq!(
+            verdict.evidence[0].reading,
+            StepReading::NoSignature,
+            "{why}"
+        );
+    }
+}
+
+const UPLOAD_STALL_LOG: &str = "\
+2026-10-09T23:10:00.0000000Z ##[group]Run cargo test
+2026-10-09T23:10:00.0000000Z cargo test
+2026-10-09T23:10:00.0000000Z ##[endgroup]
+2026-10-09T23:30:00.0000000Z test result: ok. 22592 passed; 0 failed
+2026-10-09T23:30:01.0000000Z ##[group]Run actions/upload-artifact@v4
+2026-10-09T23:30:01.0000000Z with:
+2026-10-09T23:30:01.0000000Z ##[endgroup]
+2026-10-09T23:30:02.0000000Z Uploading 812 files
+2026-10-09T23:37:00.0000000Z ##[error]Upload progress stalled.
+";
+
+fn upload_job(test_conclusion: &str) -> Value {
+    json!({
+        "id": 7, "status": "completed", "conclusion": "failure",
+        "created_at": "2026-10-09T23:00:00Z", "completed_at": "2026-10-09T23:37:00Z",
+        "runner_name": "studio-pulp-gate-01",
+        "steps": [
+            {"name": "Test", "conclusion": test_conclusion, "started_at": "2026-10-09T23:10:00Z"},
+            {"name": "Upload test artifacts", "conclusion": "failure", "started_at": "2026-10-09T23:30:01Z"}
+        ]
+    })
+}
+
+#[test]
+fn an_upload_that_stalls_after_a_green_test_step_is_an_interruption() {
+    // #9976, job 114059088753: 22592/22592 passed, then the upload stalled.
+    let verdict = assess_group(
+        &interrupted_group("failure", &upload_job("success"), UPLOAD_STALL_LOG),
+        1,
+    );
+    assert!(verdict.allowed, "{}", verdict.reason);
+    assert!(verdict.is_allowed_interruption());
+    assert_eq!(verdict.evidence.len(), 1);
+    assert_eq!(verdict.evidence[0].step, "Upload test artifacts");
+}
+
+#[test]
+fn a_recovered_stall_earlier_in_the_step_does_not_explain_its_failure() {
+    // The upload stalled, recovered, and later failed for another reason.
+    let log = UPLOAD_STALL_LOG.replace(
+        "2026-10-09T23:37:00.0000000Z ##[error]Upload progress stalled.\n",
+        "2026-10-09T23:31:00.0000000Z Upload progress stalled.\n\
+         2026-10-09T23:32:00.0000000Z Retrying upload\n\
+         2026-10-09T23:36:00.0000000Z Finalizing artifact\n\
+         2026-10-09T23:37:00.0000000Z ##[error]Artifact storage quota has been hit.\n",
+    );
+    let verdict = assess_group(
+        &interrupted_group("failure", &upload_job("success"), &log),
+        1,
+    );
+    assert!(!verdict.allowed, "{}", verdict.reason);
+    assert_eq!(verdict.evidence[0].reading, StepReading::NoSignature);
+}
+
+#[test]
+fn a_real_red_before_a_stalled_upload_stays_refused() {
+    let log = UPLOAD_STALL_LOG.replace(
+        "test result: ok. 22592 passed; 0 failed",
+        "test result: FAILED. 22591 passed; 1 failed\n2026-10-09T23:30:00.5000000Z ##[error]Process completed with exit code 101.",
+    );
+    let verdict = assess_group(
+        &interrupted_group("failure", &upload_job("failure"), &log),
+        1,
+    );
+    assert!(!verdict.allowed, "{}", verdict.reason);
+    assert!(verdict.reason.contains("Test"), "{}", verdict.reason);
 }
 
 #[test]

@@ -69,7 +69,7 @@ Then, for a same-head `failed_checks` ejection only, the guard (and
 | the timeline window is complete and shows exactly one `failed_checks`/`merge_conflict` removal of the current head | the allowance is one retry per head; a head ejected twice has had it, and a truncated window cannot prove it has not |
 | the removal names its merge-group commit (`beforeCommit`) | that commit's check runs are the ones that ejected it; no run-resolution heuristic |
 | the base's required checks (rulesets plus classic protection) can be read and are non-empty | only a **required** failure ejects; an advisory lane failing a real test is not what removed the head |
-| every failing required check on the merge-group commit is a GitHub Actions job concluded `failure`, and no required commit status failed | a `timed_out`/`cancelled` job or a status has no log that could prove anything |
+| every failing required check on the merge-group commit is a GitHub Actions job concluded `failure` (or `cancelled` and starved, below), and no required commit status failed | a `timed_out` job or a status has no log that could prove anything |
 | every failing step of each such job (jobs API `conclusion == failure`) printed an environment signature within 60 output lines of that step's first `##[error]` | positive evidence at the failure, not anywhere in a long log |
 
 The signatures are the network-transport spellings shared with Shipyard's infra
@@ -88,6 +88,26 @@ read as output. **The first `##[error]` in a log is not the failing step**: an
 `if: always()` / `continue-on-error` step after it prints its own. The failing
 step comes from the jobs API and its output from the first `Run` segment at or
 after the step's `started_at`, through that segment's first `##[error]`.
+
+### Interruptions: a starved job, or an upload that stalled after green
+
+Two more ejection causes say nothing against the head, and the same reader
+(Rust and the guard's Python twin) treats them as **interruptions**:
+
+| cause | evidence required |
+|---|---|
+| a required job **starved** of a runner | the required check concluded `cancelled`, its Actions job has an empty `runner_name` (`gate_cost/proxy.rs` `ejection_cause()` says `starved`), and it waited at least 10 minutes from `created_at` to `completed_at`. A shorter no-runner cancel is a superseding push or a concurrency-group cancel. Missing times refuse. |
+| an **upload that stalled** after the work passed | the failing step's own `##[error]` line, or the line before it, reads `Upload progress stalled`. Any earlier failing step, such as a red test step, has no signature and refuses the whole verdict; a stall that recovered earlier in the step explains nothing. |
+
+An interruption allows a same-head re-enqueue on each of a head's first **two**
+ejections (a network failure allows the first only), and an allowed
+interruption does not count toward the head-approval `EJECTION_CAP`. Every
+same-head re-arm, from `ship`'s arm-on-open or from the steward's
+`--arm-unqueued` backstop, is sent with `expectedHeadOid` bound to the head the
+classifier read, so GitHub refuses it if the head moved. The steward's backstop
+reads the opt-in from the protected base's `.shipyard/config.toml`, never from
+the head. A real `failure` with a runner, `merge_conflict`, or a moved head is
+never re-armed.
 
 ### Why this is not the inference refused above
 

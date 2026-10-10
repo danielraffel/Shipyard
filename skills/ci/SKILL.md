@@ -157,7 +157,7 @@ What the transcript line means:
 |------|---------|
 | `▸ Auto-merge armed on #N` | GitHub will enqueue it when its required checks pass |
 | `▸ Auto-merge left as it is on #N: …` | nothing to do (already armed, already queued, draft, ejected on this head, not yet green) — **not** a failure |
-| `▸ Auto-merge armed on #N … without a new head: its one environment re-enqueue (…)` | the repo opted in (`[queue.environment_requeue] enabled = true`) and the head's first ejection was a network failure; nothing to push. A second ejection of the same head is refused |
+| `▸ Auto-merge armed on #N … at exactly its current head, without a new push: a same-head re-enqueue (…)` | the repo opted in (`[queue.environment_requeue] enabled = true`) and the ejection was a network failure (first ejection only) or an interruption (a starved required job, or `Upload progress stalled` after green; first two ejections). The arm carries `expectedHeadOid`; nothing to push |
 | `⚠︎ Auto-merge not armed on #N: …` | the arm did not happen and the ship continued; re-check with `shipyard landing --pr <n>` |
 
 In `--json` mode that line goes to **stderr**, because stdout carries one

@@ -248,7 +248,11 @@ fn starved(job: &GateJobSample) -> bool {
     job.conclusion.as_deref() == Some("cancelled") && !assigned(job)
 }
 
-fn ejection_cause(job: &GateJobSample) -> Option<String> {
+/// Why a required job that did not pass ejected its batch: `gate_failed`
+/// (failure or timeout), `starved` (cancelled before any runner took it),
+/// `cancelled_after_start`, the raw conclusion otherwise, or `None` for a
+/// passing job. Reads only GitHub's job facts.
+pub(crate) fn ejection_cause(job: &GateJobSample) -> Option<String> {
     match job.conclusion.as_deref() {
         Some("success" | "skipped" | "neutral") => None,
         Some("failure" | "timed_out") => Some("gate_failed".to_owned()),

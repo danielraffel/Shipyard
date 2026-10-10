@@ -538,3 +538,120 @@ fn the_backstop_arms_a_head_with_an_approving_review() {
         "{calls}"
     );
 }
+
+/// A fake `gh` for #8678's real `failed_checks` ejection, whose merge group's
+/// required `macos` check concluded `cancelled` on Actions job 7 described by
+/// `job`. The repository opts in to same-head re-enqueues on its base.
+#[cfg(unix)]
+fn ejected_with_cancelled_macos(
+    temp: &tempfile::TempDir,
+    job: &serde_json::Value,
+) -> GitHubActions {
+    let dir = temp.path();
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/github/pr_real_8678_first_environment_ejection.json"
+    );
+    let group = "2410ca497342cfc0264bf5b72713de0b56099a0f";
+    let files = [
+        ("config", "[queue.environment_requeue]\nenabled = true\n".to_owned()),
+        ("rules", "[]".to_owned()),
+        ("classic", r#"{"contexts":["macos"]}"#.to_owned()),
+        ("pull", r#"{"base":{"ref":"main"}}"#.to_owned()),
+        (
+            "runs",
+            r#"{"total_count":1,"check_runs":[{"id":7,"name":"macos","status":"completed","conclusion":"cancelled","app":{"slug":"github-actions"}}]}"#
+                .to_owned(),
+        ),
+        ("status", r#"{"statuses":[]}"#.to_owned()),
+        ("job", job.to_string()),
+        (
+            "armed",
+            r#"{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":8678}}}}"#.to_owned(),
+        ),
+    ];
+    for (name, body) in &files {
+        std::fs::write(dir.join(name), body).expect("answer");
+    }
+    let log = dir.join("calls.log");
+    let d = dir.display();
+    fake_gh(
+        temp,
+        &format!(
+            r#"printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *enablePullRequestAutoMerge*) cat '{d}/armed' ;;
+  *isInMergeQueue*) cat '{fixture}' ;;
+  *contents/.shipyard/config.toml*) cat '{d}/config' ;;
+  *rules/branches/main*) cat '{d}/rules' ;;
+  *protection/required_status_checks*) cat '{d}/classic' ;;
+  *pulls/8678*) cat '{d}/pull' ;;
+  *commits/{group}/check-runs*) cat '{d}/runs' ;;
+  *commits/{group}/status*) cat '{d}/status' ;;
+  *actions/jobs/7*) cat '{d}/job' ;;
+  *) printf '%s' '{{}}' ;;
+esac"#,
+            log = log.display()
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn run_backstop_on_8678(actions: &GitHubActions) -> super::NativeArmResult {
+    let head = "f0fb2fb38ef5c900efad7ea0630906f081db53a9";
+    let observation = observation(pr_row(&serde_json::json!({"headRefOid": head})), true);
+    let (status, unhealthy) = apply_native_arm_backstop(
+        actions,
+        &observation,
+        &report(StewardDecision::Unmanaged),
+        "shipyard:no-auto-merge",
+        true,
+    );
+    assert!(!unhealthy, "{status:?}");
+    status.results[0].clone()
+}
+
+/// The unattended path for #9650/#9657/#9658: a required job cancelled after
+/// 16 minutes with no runner ejected the head. The backstop re-arms that exact
+/// head, bound to it with `expectedHeadOid`.
+#[cfg(unix)]
+#[test]
+fn the_backstop_rearms_a_head_ejected_by_a_starved_required_job_at_that_head() {
+    let temp = tempfile::tempdir().expect("temp");
+    let job = serde_json::json!({"id": 7, "status": "completed", "conclusion": "cancelled",
+        "created_at": "2026-09-23T03:30:00Z", "completed_at": "2026-09-23T03:46:00Z",
+        "runner_name": "", "steps": []});
+    let actions = ejected_with_cancelled_macos(&temp, &job);
+    let result = run_backstop_on_8678(&actions);
+    assert_eq!(result.outcome, "rearmed_same_head", "{result:?}");
+    let calls = std::fs::read_to_string(temp.path().join("calls.log")).expect("log");
+    let arm = calls
+        .lines()
+        .find(|call| call.contains("enablePullRequestAutoMerge"))
+        .expect("an arm mutation");
+    assert!(arm.contains("expectedHeadOid:$head"), "{arm}");
+    assert!(
+        arm.contains("head=f0fb2fb38ef5c900efad7ea0630906f081db53a9"),
+        "{arm}"
+    );
+}
+
+/// Negative control: the same ejection, but a runner took the job before it
+/// was cancelled. That is not starvation, so the head stays disarmed.
+#[cfg(unix)]
+#[test]
+fn the_backstop_leaves_a_head_disarmed_when_the_cancelled_job_had_a_runner() {
+    let temp = tempfile::tempdir().expect("temp");
+    let job = serde_json::json!({"id": 7, "status": "completed", "conclusion": "cancelled",
+        "created_at": "2026-09-23T03:30:00Z", "completed_at": "2026-09-23T03:46:00Z",
+        "runner_name": "studio-pulp-gate-01", "steps": []});
+    let actions = ejected_with_cancelled_macos(&temp, &job);
+    let result = run_backstop_on_8678(&actions);
+    assert_eq!(result.outcome, "skipped", "{result:?}");
+    let calls = std::fs::read_to_string(temp.path().join("calls.log")).expect("log");
+    assert!(
+        calls.contains("actions/jobs/7"),
+        "the job was read: {calls}"
+    );
+    assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+}

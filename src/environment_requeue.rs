@@ -106,6 +106,21 @@ pub const ENVIRONMENT_SIGNATURES: [&str; 13] = [
     "curl: (56)",
 ];
 
+/// Failing-step lines that say the job was interrupted after its work was
+/// done, not that the work failed. An artifact upload that stalls after a
+/// green test step reads red and ejects the batch; the head is as good as it
+/// was.
+pub const INTERRUPTION_SIGNATURES: [&str; 1] = ["Upload progress stalled"];
+
+/// A required job cancelled before any runner took it is starved only after
+/// it waited this long. A shorter no-runner cancel is a superseding push or a
+/// concurrency-group cancel, which says nothing about capacity.
+pub const STARVATION_MIN_WAIT_MINUTES: i64 = 10;
+
+/// Same-head re-enqueues an interruption allows, counting every ejection of
+/// the head. An environment (network) failure allows one.
+pub const INTERRUPTION_REARM_LIMIT: u32 = 2;
+
 /// Output lines before (and including) a failing step's first `##[error]`
 /// that may carry the signature.
 pub const FAILURE_PROXIMITY_LINES: usize = 60;
@@ -129,6 +144,9 @@ pub struct SignatureHit {
 pub enum StepReading {
     /// An environment signature near the step's failure.
     Environment(SignatureHit),
+    /// An interruption: an [`INTERRUPTION_SIGNATURES`] line at the step's
+    /// failure, or a required job starved of a runner.
+    Interruption(SignatureHit),
     /// The step's output was found and carries no signature near its failure.
     NoSignature,
     /// No `Run` segment with an `##[error]` starts at or after the step's
@@ -241,9 +259,49 @@ pub fn signature_near_failure(output: &[&str]) -> Option<SignatureHit> {
 pub fn read_failing_step(log: &str, started_at: &str) -> StepReading {
     match failing_step_output(log, started_at) {
         None => StepReading::NotLocated,
-        Some(output) => signature_near_failure(&output)
-            .map_or(StepReading::NoSignature, StepReading::Environment),
+        Some(output) => signature_near_failure(&output).map_or_else(
+            || {
+                interruption_at_failure(&output)
+                    .map_or(StepReading::NoSignature, StepReading::Interruption)
+            },
+            StepReading::Environment,
+        ),
     }
+}
+
+/// An [`INTERRUPTION_SIGNATURES`] line on the step's own `##[error]` line or
+/// the line just before it. Only the failure itself counts: an earlier,
+/// recovered stall says nothing about why the step failed.
+fn interruption_at_failure(output: &[&str]) -> Option<SignatureHit> {
+    output.iter().rev().take(2).find_map(|line| {
+        INTERRUPTION_SIGNATURES
+            .iter()
+            .find(|signature| line.contains(**signature))
+            .map(|signature| SignatureHit {
+                signature: (*signature).to_owned(),
+                line: line.trim().chars().take(240).collect(),
+            })
+    })
+}
+
+/// Whether a required job that concluded `cancelled` was starved: no runner
+/// ever took it ([`crate::gate_cost::proxy::ejection_cause`] says `starved`)
+/// and it waited at least [`STARVATION_MIN_WAIT_MINUTES`]. Missing times
+/// fail closed.
+#[must_use]
+pub fn starved_job(job: &Value) -> Option<SignatureHit> {
+    let sample = crate::gate_cost::GateJobSample::from_job(0, "merge_group", job);
+    if crate::gate_cost::proxy::ejection_cause(&sample).as_deref() != Some("starved") {
+        return None;
+    }
+    let waited = sample
+        .completed_at?
+        .signed_duration_since(sample.created_at?)
+        .num_minutes();
+    (waited >= STARVATION_MIN_WAIT_MINUTES).then(|| SignatureHit {
+        signature: "starved".to_owned(),
+        line: format!("cancelled with no runner after {waited} min queued"),
+    })
 }
 
 /// One failing step of one failing required check, and what its log says.
@@ -268,6 +326,9 @@ impl StepEvidence {
             StepReading::Environment(hit) => {
                 format!("environment ({}): {}", hit.signature, hit.line)
             }
+            StepReading::Interruption(hit) => {
+                format!("interruption ({}): {}", hit.signature, hit.line)
+            }
             StepReading::NoSignature => format!(
                 "no environment signature within {FAILURE_PROXIMITY_LINES} lines of its failure"
             ),
@@ -287,16 +348,41 @@ pub struct EnvironmentRequeue {
     pub allowed: bool,
     /// Why, in one sentence.
     pub reason: String,
+    /// Which allowance an allowed verdict spends: `network` (one per head)
+    /// or `interruption` ([`INTERRUPTION_REARM_LIMIT`] per head, and not
+    /// counted toward [`crate::head_approval::EJECTION_CAP`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<RequeueClass>,
     /// The merge-group commit whose required checks were read.
     pub merge_group_commit: Option<String>,
     /// Per failing step of each failing required check, what its log says.
     pub evidence: Vec<StepEvidence>,
 }
 
+/// What kind of ejection an allowed verdict answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequeueClass {
+    /// Every failing required step printed a network signature.
+    Network,
+    /// At least one failing required check was interrupted (starved of a
+    /// runner, or an upload that stalled after its work passed) and every
+    /// other one failed on the network.
+    Interruption,
+}
+
 impl EnvironmentRequeue {
+    /// Whether this is an allowed interruption re-enqueue, the one class
+    /// that is not counted toward the head-approval ejection cap.
+    #[must_use]
+    pub fn is_allowed_interruption(&self) -> bool {
+        self.allowed && self.class == Some(RequeueClass::Interruption)
+    }
+
     fn refuse(reason: impl Into<String>, merge_group_commit: Option<String>) -> Self {
         Self {
             allowed: false,
+            class: None,
             reason: reason.into(),
             merge_group_commit,
             evidence: Vec::new(),
@@ -314,6 +400,39 @@ fn api(run_gh: RunGh<'_>, path: String) -> Result<String, String> {
 fn api_json(run_gh: RunGh<'_>, path: &str) -> Result<Value, String> {
     let raw = api(run_gh, path.to_owned())?;
     serde_json::from_str(&raw).map_err(|error| format!("{path} was not JSON: {error}"))
+}
+
+/// Whether the repository opted in, read from `base`'s tracked
+/// `.shipyard/config.toml` through the GitHub API, never from a head: a
+/// branch must not be able to opt itself in. A missing file is `false`.
+///
+/// # Errors
+///
+/// When the file exists but cannot be read or parsed.
+pub fn read_opt_in(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<bool, String> {
+    let raw = match run_gh(&[
+        "api".to_owned(),
+        "-H".to_owned(),
+        "Accept: application/vnd.github.raw+json".to_owned(),
+        format!("repos/{repo}/contents/.shipyard/config.toml?ref={base}"),
+    ]) {
+        Ok(raw) => raw,
+        Err(detail) if detail.contains("404") || detail.contains("Not Found") => return Ok(false),
+        Err(detail) => {
+            return Err(format!(
+                ".shipyard/config.toml on {base} unreadable: {detail}"
+            ));
+        }
+    };
+    let table = raw
+        .parse::<toml::Table>()
+        .map_err(|error| format!(".shipyard/config.toml on {base} does not parse: {error}"))?;
+    Ok(table
+        .get("queue")
+        .and_then(|queue| queue.get("environment_requeue"))
+        .and_then(|section| section.get("enabled"))
+        .and_then(toml::Value::as_bool)
+        == Some(true))
 }
 
 /// Whether the report is the case this module speaks to: an open pull request
@@ -530,11 +649,13 @@ pub fn assess(
             commit,
         ));
     }
-    if report.ejections_of_current_head != 1 {
+    if report.ejections_of_current_head == 0
+        || report.ejections_of_current_head > INTERRUPTION_REARM_LIMIT
+    {
         return Some(EnvironmentRequeue::refuse(
             format!(
-                "the queue has ejected this head {} times; the one environment re-enqueue a \
-                 head is allowed has been spent",
+                "the queue has ejected this head {} times; the re-enqueues a head is allowed \
+                 have been spent",
                 report.ejections_of_current_head
             ),
             commit,
@@ -589,6 +710,17 @@ fn assess_merge_group(
                 check.name, check.conclusion
             ));
         };
+        if check.conclusion == "cancelled" {
+            let job = api_json(run_gh, &format!("repos/{repo}/actions/jobs/{job_id}"))?;
+            evidence.push(StepEvidence {
+                check: check.name.clone(),
+                job_id,
+                step: "(queued)".to_owned(),
+                reading: starved_job(&job)
+                    .map_or(StepReading::NoSignature, StepReading::Interruption),
+            });
+            continue;
+        }
         if check.conclusion != "failure" {
             return Err(format!(
                 "required check `{}` concluded `{}`, which is not an environment signature",
@@ -597,15 +729,66 @@ fn assess_merge_group(
         }
         evidence.extend(read_job(run_gh, repo, &check.name, job_id)?);
     }
+    Ok(verdict_from_evidence(
+        sha,
+        report.ejections_of_current_head,
+        evidence,
+    ))
+}
+
+/// The verdict once every failing required check's evidence is read: refused
+/// when any step is unexplained, else an interruption (bounded by the caller's
+/// ejection check) or a network failure (first ejection only).
+fn verdict_from_evidence(
+    sha: &str,
+    ejections: u32,
+    evidence: Vec<StepEvidence>,
+) -> EnvironmentRequeue {
     let unexplained = evidence
         .iter()
-        .filter(|step| !matches!(step.reading, StepReading::Environment(_)))
+        .filter(|step| {
+            !matches!(
+                step.reading,
+                StepReading::Environment(_) | StepReading::Interruption(_)
+            )
+        })
         .map(StepEvidence::render)
         .collect::<Vec<_>>();
     let commit = Some(sha.to_owned());
-    if unexplained.is_empty() {
-        Ok(EnvironmentRequeue {
+    if !unexplained.is_empty() {
+        return EnvironmentRequeue {
+            allowed: false,
+            class: None,
+            reason: format!(
+                "a required failure on merge-group commit {} is not an environment failure or \
+                 an interruption: {}",
+                short(sha),
+                unexplained.join("; ")
+            ),
+            merge_group_commit: commit,
+            evidence,
+        };
+    }
+    let interrupted = evidence
+        .iter()
+        .any(|step| matches!(step.reading, StepReading::Interruption(_)));
+    if interrupted {
+        EnvironmentRequeue {
             allowed: true,
+            class: Some(RequeueClass::Interruption),
+            reason: format!(
+                "every failing required check on merge-group commit {} was interrupted or \
+                 failed on the network, and this is ejection {ejections} of at most \
+                 {INTERRUPTION_REARM_LIMIT} for this head",
+                short(sha)
+            ),
+            merge_group_commit: commit,
+            evidence,
+        }
+    } else if ejections == 1 {
+        EnvironmentRequeue {
+            allowed: true,
+            class: Some(RequeueClass::Network),
             reason: format!(
                 "every failing required check on merge-group commit {} failed on the network, \
                  and this is the head's first ejection",
@@ -613,18 +796,18 @@ fn assess_merge_group(
             ),
             merge_group_commit: commit,
             evidence,
-        })
+        }
     } else {
-        Ok(EnvironmentRequeue {
+        EnvironmentRequeue {
             allowed: false,
+            class: None,
             reason: format!(
-                "a required failure on merge-group commit {} is not an environment failure: {}",
-                short(sha),
-                unexplained.join("; ")
+                "the queue has ejected this head {ejections} times; the one environment \
+                 re-enqueue a head is allowed has been spent"
             ),
             merge_group_commit: commit,
             evidence,
-        })
+        }
     }
 }
 
