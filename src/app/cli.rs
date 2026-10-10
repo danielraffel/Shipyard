@@ -623,9 +623,21 @@ pub(super) enum Command {
         /// the text from a file. Re-running with the same text changes nothing.
         #[arg(long = "body-append", value_name = "TEXT|@FILE")]
         body_append: Option<String>,
+        /// Terminal condition for `pr wait`.
+        #[arg(long = "until", value_enum, requires = "pr_action")]
+        wait_until: Option<WaitPrUntil>,
+        /// Timeout for `pr wait`.
+        #[arg(long = "timeout", default_value_t = 1800.0, requires = "pr_action")]
+        wait_timeout: f64,
     },
     /// One-shot push-a-PR: skill-sync, version-bump, then ship.
     Pr {
+        /// Optional nested spelling: `shipyard pr wait <PR> --until ...`.
+        #[arg(value_name = "PR_ACTION", hide = true)]
+        pr_action: Option<String>,
+        /// Pull request number for the nested wait spelling.
+        #[arg(value_name = "PR_NUMBER", hide = true)]
+        pr_number: Option<u64>,
         /// Base branch to ship into.
         #[arg(long, default_value = "main")]
         base: String,

@@ -1137,6 +1137,8 @@ fn handle_pr_variant<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     let arm_auto_merge = command.arm_auto_merge().unwrap_or(cli::ArmRequest::Default);
     let Command::Pr {
+        pr_action,
+        pr_number,
         base,
         apply_bumps,
         no_apply_bumps,
@@ -1160,10 +1162,43 @@ fn handle_pr_variant<W: Write>(
         arm: _,
         fold,
         body_append,
+        wait_until,
+        wait_timeout,
     } = command
     else {
         unreachable!("pr variant required")
     };
+    if pr_action.as_deref() == Some("wait") {
+        let Some(pr_number) = pr_number else {
+            return Err(CliFailure::new(2, "pr wait requires a pull request number"));
+        };
+        let Some(until) = wait_until else {
+            return Err(CliFailure::new(2, "pr wait requires --until merged|closed|green"));
+        };
+        let state = match until {
+            cli::WaitPrUntil::Green => Some(cli::WaitPrState::Green),
+            cli::WaitPrUntil::Merged => Some(cli::WaitPrState::Merged),
+            cli::WaitPrUntil::Closed => Some(cli::WaitPrState::Closed),
+        };
+        return wait_command(
+            cli::WaitCommand::Pr {
+                pr_number,
+                state,
+                until: None,
+                timeout: wait_timeout,
+                poll_interval: 30.0,
+                no_fallback: false,
+                repo: None,
+                snapshot_file: None,
+            },
+            mode,
+            &runtime_paths.daemon_socket,
+            &runtime_paths.state_dir,
+            cwd,
+            json,
+            stdout,
+        );
+    }
     // Read an `@file` before any side effect, so a bad path fails first.
     let body_append = body_append
         .map(|argument| crate::pr_text::resolve_body_append(&argument, cwd))
