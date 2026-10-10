@@ -53,9 +53,7 @@ is not a bare "Process completed with exit code N".
 
 Flag 6 catches the pull request nothing will ever merge: green, but nobody
 armed it. The draft and `shipyard:hold` screens, and the quoted arm promise, are
-read at scan time (one pull-request and one comment-list read per candidate,
-at most 20 per pass); `replay` evaluates the rule without them, like the
-attributor. A deliberate hold should carry `shipyard:hold` or
+read at scan time. A deliberate hold should carry `shipyard:hold` or
 `shipyard:no-auto-merge` so it is neither flagged nor armed by a backstop.
 
 Flag 3 is "named for", not "proved culprit". GitHub names a merge group after
@@ -248,21 +246,24 @@ and otherwise unreachable. Nothing about the fleet is hardcoded.
 **Liveness.** `cmux sessions list --json --session <id>` on the owner's host
 (read-only). Live means a record for exactly that session with
 `agent_lifecycle` of `running` or `idle` and `stored_pid_exists = true` (an idle
-agent finished its turn and is waiting for input; it is the owner a hand-back is
-for); the record's current surface is used. No record, a stopped one, or one
-whose process is gone is dead; unreadable output is
-unknown; an ssh failure or an unmapped host is unreachable.
+agent finished its turn and is waiting for input); the record's current surface
+is used. A missing row is cross-checked against transcript mtime and process
+liveness before it is classified, and every probe is timestamped. Unreadable
+output is unknown; an ssh failure or an unmapped host is unreachable.
 
-**Once per episode.** A delivery is recorded in the ledger (`handback.delivered`)
-against the flag episode's start, so an unchanged episode is never re-sent; a
-new episode (new head, or a flag that cleared and came back) is. A session gets
-at most one delivery per `session_interval_minutes` (pending episodes wait) and
-several pull requests for one session go out as one notification. A delivery
-whose every channel failed is not recorded and is retried next pass.
+**Until seen.** A delivery is recorded in the ledger (`handback.delivered`). If
+the owner hook has not returned `wake.seen`, the pass re-sends after
+`retry_after_minutes` while the head and episode stay unchanged. After
+`max_unseen_sends`, it records `wake.escalated` for the steward and stops
+retrying. A session gets at most one delivery per `session_interval_minutes`
+(pending episodes wait) and several pull requests for one session go out as one
+notification. A delivery whose every channel failed is not recorded and is
+retried next pass.
 
 **Commands.** The only processes the hand-back can start are
 `cmux sessions list`, `cmux notify`, `cmux set-status`/`clear-status` (key
-`shipyard-pr-<n>`), and one fixed `sh -c` inbox append, run directly or as
+`shipyard-pr-<n>`), one fixed `sh -c` inbox append, and one fixed read-only
+`sh -c` that prints the tail of `<session>.shown.jsonl`, run directly or as
 `ssh -o BatchMode=yes -o ConnectTimeout=10 -- <alias> <single-quoted words>`.
 Every argv passes an allowlist before it runs, and tests assert `cmux send`,
 `send-key`, agent CLIs (`claude --resume`, `codex exec resume`), extra ssh
@@ -274,15 +275,19 @@ or starts an agent, or arms/dequeues a pull request.
 `first_seen_at`, `delivered_at`) appended to
 `~/.local/state/shipyard/inbox/<session-id>.jsonl` (`$SHIPYARD_INBOX_DIR`
 overrides locally). The Shipyard Claude plugin's `hooks/handback-inbox.py` runs
-at SessionStart and UserPromptSubmit: it is silent when the inbox is absent or
-empty; otherwise it claims the file (rename), prints at most five entries
-(2,000 characters, each line 300) as agent context, and moves them to
-`<session-id>.shown.jsonl` so they show once. Each note names the head it was raised on and how
-long ago it was delivered, because the agent may have pushed since. When an
-episode resolves (new head, merged, closed, cleared) before its note is read, the
-next delivering pass appends a retraction (`{"retract": "<id>", "reason": ...}`)
-through the same inbox append, and the hook drops the unread note it names. A
-note already shown is not affected. Codex reads the same hook
+at SessionStart and UserPromptSubmit, and after every tool call through
+`hooks/handback-inbox-poll.sh`, which tests whether the session's inbox is
+non-empty and starts nothing otherwise, so a session working through a long
+turn sees an entry within one tool call. The reader is silent when the inbox is
+absent or empty; otherwise it claims the file (rename), prints at most five
+entries (2,000 characters, each line 300) as agent context, and moves them to
+`<session-id>.shown.jsonl`, stamped `shown_at`, so they show once. That move
+happens inside an agent turn, so it is the acknowledgement. If an episode
+resolves before its note is read, the next delivering pass appends a retraction
+(`{"retract": "<id>", "reason": ...}`) through the same inbox route; the hook
+drops the unread note it names. A note already shown is not affected. Each delivering
+pass reads the shown file back over the delivery's own route and records
+`wake.seen` (at `shown_at`) for every sent episode whose entry is there. Codex reads the same hook
 contract from `~/.codex/hooks.json`; add the script there to cover Codex
 sessions:
 
@@ -299,6 +304,8 @@ notify = false           # tier 1 cmux notify
 status = false           # tier 1 sidebar pill (with notify)
 inbox = false            # tier 1 inbox line
 session_interval_minutes = 30
+retry_after_minutes = 30
+max_unseen_sends = 3
 unowned_after_hours = 1
 timeout_seconds = 20
 # cmux_path = "/Applications/cmux.app/Contents/Resources/bin/cmux"
@@ -319,7 +326,7 @@ transition of an owner-actionable episode to the ledger's event log
 | `wake.raised` | a delivering pass first sees the episode owner-actionable on an open pull request |
 | `wake.sent` | a tier-1 channel accepted it (`rung`, `channels`, `session`, `host`) |
 | `wake.failed` | every tier-1 channel of a delivery failed |
-| `wake.seen` | the owner's session displayed it inside an agent turn |
+| `wake.seen` | the owner's session displayed it inside an agent turn (read back from `<session>.shown.jsonl`) |
 | `wake.escalated` | the next rung fired because the previous one was not seen |
 | `wake.resolved` | it stopped being actionable (`how`: `addressed`, `closed`, `gone`, `new_episode`, `not_actionable`) |
 
@@ -341,7 +348,6 @@ enabled = false          # daemon job off by default
 repos = ["Generous-Corp/pulp"]   # else the daemon's --repo list
 base = "main"
 workflow = "build.yml"
-stale_after_minutes = 45  # pr-watch liveness / doctor: stale after this
 # required_checks = ["macos", ...]   # else branch protection
 lookback = "7d"
 post_comments = false
@@ -349,7 +355,6 @@ comment_author = "shipyard-local[bot]"
 
 [pr_watch.thresholds]    # spec defaults
 red_minutes = 30
-green_unarmed_minutes = 120
 failed_groups = 2
 replacements = 3
 
@@ -368,19 +373,6 @@ the command, so use the table form. A `[pr_watch.digest]` table without
 `enabled` keeps the digest off and every pass reports a warning (in the
 `pr_watch_pass` event's `warnings`, and on stderr for `shipyard pr-watch`).
 This block is parsed by a unit test, so it stays valid TOML.
-
-**Is it still running?** Hand-back, comments and the digest all run inside
-the pass, usually on one host, so if passes stop completing (daemon down, auth
-broken, rate limited) every channel goes quiet at once. A completed pass stamps
-`last_scan_at` in the ledger. `shipyard pr-watch liveness [--json]` reads it for
-each watched repository and exits 1 when a scanning host has not completed a
-pass within `[pr_watch] stale_after_minutes` (default 45, three missed passes);
-a host with `[pr_watch] enabled` off is never stale. `shipyard doctor` adds a
-`PR watch` section on a scanning host, and `shipyard doctor --fleet` asks every
-configured host class (`<shipyard_bin> --json pr-watch liveness` over ssh) and
-fails `pr-watch:fleet` when no host is completing passes. Do not enable a second
-scanning host to cover the first: deliveries are recorded in each host's own
-ledger, so two scanners would each deliver every hand-back.
 
 Each pass publishes a `pr_watch_pass` IPC event with per-repository flag
 counts, errors and config warnings. The digest needs the command's host (the Harbormaster token

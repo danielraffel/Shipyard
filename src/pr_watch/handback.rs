@@ -72,6 +72,10 @@ pub struct HandbackConfig {
     pub unowned_after: Duration,
     /// Per host-command deadline.
     pub timeout_seconds: u64,
+    /// Re-send an unanswered wake after this interval.
+    pub retry_after: Duration,
+    /// Maximum number of sends before steward escalation.
+    pub max_unseen_sends: u32,
 }
 
 impl Default for HandbackConfig {
@@ -87,6 +91,8 @@ impl Default for HandbackConfig {
             session_interval: Duration::minutes(30),
             unowned_after: Duration::hours(1),
             timeout_seconds: 20,
+            retry_after: Duration::hours(4),
+            max_unseen_sends: 3,
         }
     }
 }
@@ -133,6 +139,11 @@ impl HandbackConfig {
             timeout_seconds: int("timeout_seconds")
                 .and_then(|s| u64::try_from(s.max(1)).ok())
                 .unwrap_or(defaults.timeout_seconds),
+            retry_after: int("retry_after_minutes")
+                .map_or(defaults.retry_after, |m| Duration::minutes(m.max(1))),
+            max_unseen_sends: int("max_unseen_sends")
+                .and_then(|n| u32::try_from(n.max(1)).ok())
+                .unwrap_or(defaults.max_unseen_sends),
         }
     }
 }
@@ -192,8 +203,23 @@ pub struct WakeRecord {
     pub unsent: Option<String>,
     /// Where its inbox line went, so the line can be retracted when the
     /// episode resolves before the owner reads it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub inbox: Option<InboxTarget>,
+    /// The session and route of the most recent delivery.
+    #[serde(default)]
+    pub sent_to: Option<(String, Route)>,
+    /// When the session's hook displayed it inside an agent turn.
+    #[serde(default)]
+    pub seen_at: Option<DateTime<Utc>>,
+    /// Number of successful sends for this episode.
+    #[serde(default)]
+    pub send_count: u32,
+    /// Most recent successful send.
+    #[serde(default)]
+    pub last_sent_at: Option<DateTime<Utc>>,
+    /// Whether the unanswered episode has been escalated.
+    #[serde(default)]
+    pub escalated: bool,
 }
 
 /// The inbox an episode's line was appended to.
@@ -625,6 +651,86 @@ fn still_open(gh: &SyncGhReader<'_>, repo: &str, pr: u64) -> Result<bool, String
     }
 }
 
+/// Record `wake.seen` for every sent, unseen episode whose inbox entry the
+/// owner session's hook has displayed.
+fn acknowledge(
+    state: &mut HandbackState,
+    config: &HandbackConfig,
+    deps: &mut Deps<'_>,
+    report: &mut HandbackReport,
+    now: DateTime<Utc>,
+) {
+    let mut by_session: BTreeMap<String, (Route, Vec<String>)> = BTreeMap::new();
+    for (id, wake) in &state.wakes {
+        if wake.seen_at.is_some() {
+            continue;
+        }
+        if let Some((session, route)) = &wake.sent_to {
+            by_session
+                .entry(session.clone())
+                .or_insert_with(|| (route.clone(), Vec::new()))
+                .1
+                .push(id.clone());
+        }
+    }
+    for (session, (route, ids)) in by_session {
+        let command = HostCommand::ShownRead {
+            session: session.clone(),
+        };
+        let read = match host::invocation(&route, &command, &config.cmux_path, None) {
+            Some(invocation) => deps.runner.run(&invocation).map_err(|e| e.to_string()),
+            None => deps.runner.read_local_shown(&session),
+        };
+        let text = match read {
+            Ok(text) => text,
+            Err(error) => {
+                report.gaps.push(format!(
+                    "session {session}: acknowledgements unreadable: {error}"
+                ));
+                continue;
+            }
+        };
+        let mut shown: BTreeMap<String, Option<DateTime<Utc>>> = BTreeMap::new();
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(id) = value.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let at = value
+                .get("shown_at")
+                .and_then(Value::as_str)
+                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                .map(|time| time.with_timezone(&Utc));
+            shown.entry(id.to_owned()).or_insert(at);
+        }
+        for id in ids {
+            let Some(wake) = state.wakes.get_mut(&id) else {
+                continue;
+            };
+            let key = format!("{id}@{}", wake.episode.format("%Y-%m-%dT%H:%M:%SZ"));
+            let Some(shown_at) = shown.get(&key) else {
+                continue;
+            };
+            // A hook too old to stamp `shown_at` still proves display by now.
+            let at = shown_at.unwrap_or(now);
+            wake.seen_at = Some(at);
+            report.events.push(wake_event(
+                at,
+                &id,
+                "wake.seen",
+                json!({
+                    "pr": wake.pr,
+                    "episode": wake.episode,
+                    "session": session,
+                    "shown_at": shown_at,
+                }),
+            ));
+        }
+    }
+}
+
 fn fetch_whence(gh: &SyncGhReader<'_>, repo: &str, pr: u64) -> Result<Option<Owner>, String> {
     let raw = gh(&["api".to_owned(), format!("repos/{repo}/pulls/{pr}")])?;
     let value: Value = serde_json::from_str(&raw).map_err(|e| format!("pull request JSON: {e}"))?;
@@ -646,11 +752,29 @@ fn probe(owner: &Owner, config: &HandbackConfig, deps: &mut Deps<'_>) -> (Option
     let Some(invocation) = host::invocation(&route, &command, &config.cmux_path, None) else {
         return (Some(route), Liveness::Unknown("no invocation".to_owned()));
     };
-    let liveness = match deps.runner.run(&invocation) {
+    let mut liveness = match deps.runner.run(&invocation) {
         Ok(stdout) => host::parse_sessions(&stdout, &owner.session, owner.surface.as_deref()),
         Err(RunError::Unreachable(e)) => Liveness::Unreachable(e),
         Err(RunError::Failed(e)) => Liveness::Unknown(e),
     };
+    if matches!(liveness, Liveness::Unknown(_))
+        && let Some(transcript) = owner.path.as_deref()
+        && let Some(evidence) = host::invocation(
+            &route,
+            &HostCommand::LivenessEvidence {
+                session: owner.session.clone(),
+                transcript: transcript.to_owned(),
+            },
+            &config.cmux_path,
+            None,
+        )
+    {
+        liveness = match deps.runner.run(&evidence) {
+            Ok(stdout) => host::parse_sessions(&stdout, &owner.session, owner.surface.as_deref()),
+            Err(RunError::Unreachable(e)) => Liveness::Unreachable(e),
+            Err(RunError::Failed(e)) => Liveness::Unknown(e),
+        };
+    }
     (Some(route), liveness)
 }
 
@@ -664,15 +788,10 @@ fn detail(liveness: &Liveness) -> String {
     }
 }
 
-/// The `id` of an episode's inbox line.
-fn inbox_line_id(id: &str, episode: DateTime<Utc>) -> String {
-    format!("{id}@{}", episode.format("%Y-%m-%dT%H:%M:%SZ"))
-}
-
 fn inbox_line(repo: &str, id: &str, entry: &LedgerEntry, now: DateTime<Utc>) -> String {
     json!({
         "schema": INBOX_SCHEMA,
-        "id": inbox_line_id(id, entry.first_seen_at),
+        "id": format!("{id}@{}", entry.first_seen_at.format("%Y-%m-%dT%H:%M:%SZ")),
         "repo": repo,
         "pr": entry.pr,
         "url": entry.url,
@@ -720,8 +839,6 @@ struct SessionBatch {
     ids: Vec<String>,
 }
 
-/// A line that tells the inbox hook to drop an unread line: the episode it
-/// describes resolved (`how`) before the owner's next turn.
 fn retraction_line(line: &str, pr: u64, how: &str, now: DateTime<Utc>) -> String {
     json!({
         "schema": INBOX_SCHEMA,
@@ -761,13 +878,13 @@ pub fn run(
     let inbox_on = config.inbox || !deliver;
     let off_note = |enabled: bool| if enabled { "" } else { " [off in config]" };
     let mut state = ledger.handback.clone();
+    let mut retractions: Vec<Retraction> = Vec::new();
     let open = |pr: u64| {
         history
             .prs
             .get(&pr)
             .is_some_and(|entry| open_at(entry, now))
     };
-    let mut retractions: Vec<Retraction> = Vec::new();
     let mut by_pr: BTreeMap<u64, Vec<String>> = BTreeMap::new();
     for (id, entry) in &ledger.entries {
         if actionable(entry) && open(entry.pr) {
@@ -908,7 +1025,6 @@ pub fn run(
                     if previous.episode == entry.first_seen_at {
                         continue;
                     }
-                    // The flag cleared and came back: close the old episode.
                     if let Some(target) = previous.inbox.clone() {
                         retractions.push(Retraction {
                             pr: previous.pr,
@@ -916,6 +1032,7 @@ pub fn run(
                             how: "new_episode".to_owned(),
                         });
                     }
+                    // The flag cleared and came back: close the old episode.
                     report.events.push(wake_event(
                         now,
                         id,
@@ -938,6 +1055,11 @@ pub fn run(
                         sent_at: None,
                         unsent: None,
                         inbox: None,
+                        sent_to: None,
+                        seen_at: None,
+                        send_count: 0,
+                        last_sent_at: None,
+                        escalated: false,
                     },
                 );
                 report.events.push(wake_event(
@@ -958,10 +1080,20 @@ pub fn run(
             .iter()
             .filter(|id| {
                 let episode = ledger.entries.get(*id).map(|e| e.first_seen_at);
-                state
-                    .delivered
-                    .get(*id)
-                    .is_none_or(|d| Some(d.episode) != episode)
+                let Some(wake) = state.wakes.get(*id) else {
+                    return true;
+                };
+                if Some(wake.episode) != episode {
+                    return true;
+                }
+                if wake.sent_at.is_none() {
+                    return true;
+                }
+                wake.seen_at.is_none()
+                    && wake.send_count < config.max_unseen_sends
+                    && wake
+                        .last_sent_at
+                        .is_some_and(|at| now - at >= config.retry_after)
             })
             .cloned()
             .collect();
@@ -973,7 +1105,7 @@ pub fn run(
             held: None,
         };
         if pending.is_empty() {
-            view.held = Some("already delivered for this episode".to_owned());
+            view.held = Some("delivered and awaiting the owner".to_owned());
             view.tier = 1;
         } else if let (Liveness::Live { surface, workspace }, Some(route), Some(o)) =
             (&liveness, route, found.as_ref())
@@ -1159,11 +1291,17 @@ pub fn run(
                     && let Some(wake) = state.wakes.get_mut(*id)
                 {
                     wake.sent_at.get_or_insert(now);
+                    wake.last_sent_at = Some(now);
+                    wake.send_count = wake.send_count.saturating_add(1);
+                    wake.sent_to = Some((session.clone(), batch.route.clone()));
                     if channels.iter().any(|c| c == "inbox") {
                         wake.inbox = Some(InboxTarget {
                             session: session.clone(),
                             route: batch.route.clone(),
-                            line: inbox_line_id(id, entry.first_seen_at),
+                            line: format!(
+                                "{id}@{}",
+                                entry.first_seen_at.format("%Y-%m-%dT%H:%M:%SZ")
+                            ),
                         });
                     }
                 }
@@ -1174,7 +1312,7 @@ pub fn run(
                     json!({
                         "pr": entry.pr,
                         "episode": entry.first_seen_at,
-                        "rung": "1",
+                        "rung": if state.wakes.get(*id).is_some_and(|wake| wake.send_count > 1) { "2" } else { "1" },
                         "channels": channels,
                         "session": session,
                         "host": place,
@@ -1195,6 +1333,35 @@ pub fn run(
                 );
             }
             state.sessions.insert(session.clone(), now);
+        }
+    }
+
+    // A live owner that has not acknowledged after the configured send budget
+    // is handed to the merge steward. This is a durable, read-only escalation
+    // signal; the steward decides whether and how to resume the work.
+    if deliver {
+        for (id, wake) in &mut state.wakes {
+            if wake.seen_at.is_none()
+                && wake.send_count >= config.max_unseen_sends
+                && !wake.escalated
+            {
+                wake.escalated = true;
+                report.events.push(wake_event(
+                    now,
+                    id,
+                    "wake.escalated",
+                    json!({"pr": wake.pr, "episode": wake.episode, "sends": wake.send_count, "to": "steward"}),
+                ));
+                report.actions.push(action(
+                    2,
+                    "steward_escalation",
+                    vec![wake.pr],
+                    format!(
+                        "escalate unanswered wake for #{} to steward after {} sends",
+                        wake.pr, wake.send_count
+                    ),
+                ));
+            }
         }
     }
 
@@ -1241,6 +1408,13 @@ pub fn run(
         report.actions.push(planned);
     }
 
+    // Acknowledgement: a sent episode is seen once the owner session's hook
+    // has displayed it (moved it to `<session>.shown.jsonl` inside an agent
+    // turn). Read back over the delivery's own route, one read per session.
+    if deliver {
+        acknowledge(&mut state, config, deps, &mut report, now);
+    }
+
     // An episode that is no longer owner-actionable on an open pull request
     // is resolved: addressed, closed, or pruned from the ledger.
     if deliver {
@@ -1284,12 +1458,8 @@ pub fn run(
         }
     }
 
-    // Retract unread inbox lines whose episode resolved, so the owner's next
-    // turn is not told about a head it already replaced. A line the hook has
-    // already shown is unaffected: the retraction only drops unread lines.
     if deliver && inbox_on {
-        for retraction in retractions {
-            let Retraction { pr, target, how } = retraction;
+        for Retraction { pr, target, how } in retractions {
             let line = retraction_line(&target.line, pr, &how, now) + "\n";
             let command = HostCommand::InboxAppend {
                 session: target.session.clone(),
@@ -1308,10 +1478,10 @@ pub fn run(
             );
             planned.session = Some(target.session.clone());
             planned.argv = invocation.as_ref().map(|i| i.argv.clone());
-            let result = match &invocation {
+            let result = match invocation {
                 Some(invocation) => deps
                     .runner
-                    .run(invocation)
+                    .run(&invocation)
                     .map(|_| ())
                     .map_err(|e| e.to_string()),
                 None => deps.runner.append_local_inbox(&target.session, &line),

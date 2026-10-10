@@ -3179,6 +3179,9 @@ pub(super) enum WaitCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(super) enum WaitPrState {
     Green,
+    Queued,
+    Red,
+    Ejected,
     Merged,
     Closed,
 }
@@ -3255,6 +3258,9 @@ impl WaitPrState {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Green => "green",
+            Self::Queued => "queued",
+            Self::Red => "red",
+            Self::Ejected => "ejected",
             Self::Merged => "merged",
             Self::Closed => "closed",
         }

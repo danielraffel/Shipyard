@@ -8,9 +8,10 @@ UserPromptSubmit (Claude Code and Codex use the same hook contract): it
 claims the file, prints a short bounded summary as agent context, and moves
 the entries to ``<session-id>.shown.jsonl`` so they are shown once.
 
-Each note names the head it was raised on and how long ago it was delivered,
-because the agent may have pushed since. A ``retract`` line (written when the
-episode resolved before the note was read) drops the unread note it names.
+Each entry moved to the shown file is stamped `shown_at`; Shipyard reads that
+file back as the wake's acknowledgement (`wake.seen`). PostToolUse runs reach
+this script only through `handback-inbox-poll.sh`, which costs one file test
+per tool call and starts nothing when the inbox is empty.
 
 It is a silent no-op when there is no session id, no inbox, or an empty one,
 and it never fails the agent's turn: any error exits 0 with no output.
@@ -77,16 +78,27 @@ def claim(directory: Path, session: str) -> list[str]:
     except OSError:
         return []
     shown = directory / f"{session}.shown.jsonl"
+    # `shown_at` is the acknowledgement Shipyard reads back: the entry reached
+    # this session inside an agent turn.
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with shown.open("a", encoding="utf-8") as handle:
         for line in lines:
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                entry = None
+            if isinstance(entry, dict):
+                entry.setdefault("shown_at", stamp)
+                handle.write(json.dumps(entry) + "\n")
+            else:
                 handle.write(line.rstrip("\n") + "\n")
     claimed.unlink(missing_ok=True)
     return lines
 
 
 def age(stamp: object, now: datetime) -> str:
-    """``3h ago`` for an ISO-8601 UTC stamp, or ``""`` when unreadable."""
     try:
         then = datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
@@ -100,11 +112,9 @@ def age(stamp: object, now: datetime) -> str:
 
 
 def where(entry: dict, now: datetime) -> str:
-    """`` on head abc1234, 3h ago`` (either part omitted when unknown)."""
     head = str(entry.get("head_sha") or "")[:7]
     when = age(entry.get("delivered_at"), now)
-    parts = [f"on head {head}" if head else "", when]
-    text = ", ".join(part for part in parts if part)
+    text = ", ".join(part for part in (f"on head {head}" if head else "", when) if part)
     return f" {text}" if text else ""
 
 
@@ -151,6 +161,7 @@ def main() -> int:
     lines = claim(directory, session)
     parsed = []
     retracted = set()
+    seen = set()
     for line in lines:
         try:
             entry = json.loads(line)
@@ -163,12 +174,9 @@ def main() -> int:
             continue
         parsed.append(entry)
     entries = []
-    seen = set()
     for entry in parsed:
         key = entry.get("id")
-        if key in retracted:
-            continue
-        if key in already or key in seen:
+        if key in retracted or key in already or key in seen:
             continue
         seen.add(key)
         entries.append(entry)

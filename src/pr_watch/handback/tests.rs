@@ -5,8 +5,8 @@ use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use serde_json::{Value, json};
 
 use super::host::{
-    self, HostCommand, HostRunner, INBOX_SCRIPT, Invocation, Liveness, RunError, check_argv,
-    parse_sessions, shell_quote, shell_unquote,
+    self, HostCommand, HostRunner, INBOX_SCRIPT, Invocation, Liveness, RunError, SHOWN_SCRIPT,
+    check_argv, parse_sessions, shell_quote, shell_unquote,
 };
 use super::owner::{self, Owner, OwnerSource, Route};
 use super::{HandbackConfig, HandbackMode, HandbackReport, NEEDS_AGENT_LABEL, actionable};
@@ -203,7 +203,6 @@ fn liveness_needs_a_running_or_idle_record_with_a_live_pid() {
             workspace: Some(LIVE_WORKSPACE.to_owned())
         }
     );
-    // An agent waiting for input is idle with its process alive: live.
     let idle = sessions_json(&[(LIVE_SESSION, "idle", true, LIVE_SURFACE)]);
     assert_eq!(
         parse_sessions(&idle, LIVE_SESSION, None),
@@ -212,23 +211,33 @@ fn liveness_needs_a_running_or_idle_record_with_a_live_pid() {
             workspace: Some(LIVE_WORKSPACE.to_owned())
         }
     );
-    let gone_pid = sessions_json(&[(LIVE_SESSION, "running", false, LIVE_SURFACE)]);
-    assert_eq!(parse_sessions(&gone_pid, LIVE_SESSION, None).name(), "dead");
     let idle_gone_pid = sessions_json(&[(LIVE_SESSION, "idle", false, LIVE_SURFACE)]);
     assert_eq!(
         parse_sessions(&idle_gone_pid, LIVE_SESSION, None).name(),
         "dead"
     );
+    let gone_pid = sessions_json(&[(LIVE_SESSION, "running", false, LIVE_SURFACE)]);
+    assert_eq!(parse_sessions(&gone_pid, LIVE_SESSION, None).name(), "dead");
     let ended = sessions_json(&[(LIVE_SESSION, "ended", true, LIVE_SURFACE)]);
     assert_eq!(parse_sessions(&ended, LIVE_SESSION, None).name(), "dead");
     // Another session's live row does not count.
     let other = sessions_json(&[(DEAD_SESSION, "running", true, LIVE_SURFACE)]);
-    assert_eq!(parse_sessions(&other, LIVE_SESSION, None).name(), "dead");
+    assert_eq!(parse_sessions(&other, LIVE_SESSION, None).name(), "unknown");
     assert_eq!(
         parse_sessions("not json", LIVE_SESSION, None).name(),
         "unknown"
     );
     assert_eq!(parse_sessions("{}", LIVE_SESSION, None).name(), "unknown");
+    let corroborated = json!({
+        "sessions": [],
+        "process_alive": true,
+        "transcript_mtime": "2026-10-07T02:03:04Z"
+    })
+    .to_string();
+    assert_eq!(
+        parse_sessions(&corroborated, LIVE_SESSION, None).name(),
+        "live"
+    );
     // The expected surface wins among live rows.
     let second = "11111111-2222-3333-4444-555555555555";
     let two = sessions_json(&[
@@ -266,6 +275,10 @@ fn every_command() -> Vec<HostCommand> {
         HostCommand::InboxAppend {
             session: LIVE_SESSION.to_owned(),
         },
+        HostCommand::LivenessEvidence {
+            session: LIVE_SESSION.to_owned(),
+            transcript: "/work/transcript.jsonl".to_owned(),
+        },
     ]
 }
 
@@ -276,7 +289,10 @@ fn every_command_the_builder_can_make_passes_the_allowlist() {
             let Some(invocation) = host::invocation(&route, &command, CMUX, None) else {
                 assert!(matches!(
                     (&route, &command),
-                    (Route::Local, HostCommand::InboxAppend { .. })
+                    (
+                        Route::Local,
+                        HostCommand::InboxAppend { .. } | HostCommand::LivenessEvidence { .. }
+                    )
                 ));
                 continue;
             };
@@ -284,6 +300,24 @@ fn every_command_the_builder_can_make_passes_the_allowlist() {
                 .unwrap_or_else(|e| panic!("{e}: {:?}", invocation.argv));
         }
     }
+}
+
+#[test]
+fn missing_cmux_row_has_a_real_remote_process_and_transcript_probe() {
+    let invocation = host::invocation(
+        &Route::Ssh("m3".to_owned()),
+        &HostCommand::LivenessEvidence {
+            session: LIVE_SESSION.to_owned(),
+            transcript: "/work/transcript.jsonl".to_owned(),
+        },
+        CMUX,
+        None,
+    )
+    .expect("ssh evidence probe");
+    let command = invocation.argv.join(" ");
+    assert!(command.contains("process_alive"));
+    assert!(command.contains("transcript.jsonl"));
+    check_argv(&invocation.argv, CMUX).expect("evidence probe allowlist");
 }
 
 #[test]
@@ -539,6 +573,10 @@ struct FakeRunner {
     runs: Vec<Invocation>,
     local_inbox: Vec<(String, String)>,
     fail_notify: bool,
+    /// What each session's `<session>.shown.jsonl` tail reads as.
+    shown: BTreeMap<String, String>,
+    local_shown_reads: Vec<String>,
+    omit_cmux_rows: bool,
 }
 
 impl HostRunner for FakeRunner {
@@ -546,16 +584,38 @@ impl HostRunner for FakeRunner {
         check_argv(&invocation.argv, CMUX).map_err(RunError::Failed)?;
         self.runs.push(invocation.clone());
         let joined = invocation.argv.join(" ");
+        if joined.contains("process_alive") {
+            let process_alive = !joined.contains(DEAD_SESSION);
+            return Ok(json!({
+                "sessions": [],
+                "process_alive": process_alive,
+                "transcript_mtime": "2026-10-07T02:03:04Z"
+            })
+            .to_string());
+        }
         if joined.contains("sessions") {
-            let rows = [
-                (LIVE_SESSION, "running", true, LIVE_SURFACE),
-                (LOCAL_SESSION, "running", true, LIVE_SURFACE),
-                (DEAD_SESSION, "running", false, LIVE_SURFACE),
-            ];
+            let rows = if self.omit_cmux_rows {
+                vec![]
+            } else {
+                vec![
+                    (LIVE_SESSION, "running", true, LIVE_SURFACE),
+                    (LOCAL_SESSION, "running", true, LIVE_SURFACE),
+                    (DEAD_SESSION, "running", false, LIVE_SURFACE),
+                ]
+            };
             return Ok(sessions_json(&rows));
         }
         if self.fail_notify && joined.contains("notify") {
             return Err(RunError::Failed("socket".to_owned()));
+        }
+        if joined.contains(".shown.jsonl") {
+            let session = self
+                .shown
+                .keys()
+                .find(|session| joined.contains(session.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            return Ok(self.shown.get(&session).cloned().unwrap_or_default());
         }
         Ok(String::new())
     }
@@ -564,6 +624,11 @@ impl HostRunner for FakeRunner {
         self.local_inbox
             .push((session.to_owned(), lines.to_owned()));
         Ok(())
+    }
+
+    fn read_local_shown(&mut self, session: &str) -> Result<String, String> {
+        self.local_shown_reads.push(session.to_owned());
+        Ok(self.shown.get(session).cloned().unwrap_or_default())
     }
 }
 
@@ -787,12 +852,11 @@ fn deliver_notifies_live_owners_once_per_episode() {
             .iter()
             .all(|a| a.action != "notify" && a.action != "inbox")
     );
-    assert!(
-        again
-            .runs
-            .iter()
-            .all(|r| r.argv.join(" ").contains("sessions"))
-    );
+    // Only read-only probes: liveness, and the acknowledgement read-back.
+    assert!(again.runs.iter().all(|r| {
+        let joined = r.argv.join(" ");
+        joined.contains("sessions") || joined.contains(".shown.jsonl")
+    }));
     assert!(again.local_inbox.is_empty());
     assert!(out.writes.is_empty(), "labels re-added {:?}", out.writes);
 }
@@ -1603,6 +1667,12 @@ fn wake_events_record_raise_send_failure_and_resolution_and_plan_records_none() 
         .unwrap();
     assert_eq!(resolved.id, "1:repeat_test_failure:k");
     assert_eq!(resolved.detail.as_ref().unwrap()["how"], json!("addressed"));
+    assert!(runner.runs.iter().any(|invocation| {
+        invocation
+            .stdin
+            .as_deref()
+            .is_some_and(|text| text.contains("\"retract\":\"1:repeat_test_failure:k@"))
+    }));
     assert!(
         !ledger
             .handback
@@ -1698,9 +1768,9 @@ fn a_wake_with_no_channel_configured_is_unsent_not_failed() {
 }
 
 #[test]
-fn a_resolved_episode_retracts_its_unread_inbox_line_on_the_owners_host() {
+fn a_wake_is_seen_only_when_the_owner_session_displayed_that_episode() {
     let (mut ledger, history) = world(t(0));
-    let cfg = config(true, true);
+    let cfg = config(false, true);
     let mut runner = FakeRunner::default();
     pass(
         &mut ledger,
@@ -1711,40 +1781,124 @@ fn a_resolved_episode_retracts_its_unread_inbox_line_on_the_owners_host() {
         &mut runner,
         true,
     );
-    let line_of = |ledger: &Ledger, id: &str| {
-        ledger.handback.wakes[id]
-            .inbox
-            .as_ref()
-            .map(|target| target.line.clone())
-            .unwrap()
-    };
-    let remote = line_of(&ledger, "1:repeat_test_failure:k");
-    let local = line_of(&ledger, "5:repeated_ejection:");
-    assert!(remote.starts_with("1:repeat_test_failure:k@"), "{remote}");
-    // Still actionable: nothing is retracted.
+    let id = "1:repeat_test_failure:k";
+    let episode = ledger.handback.wakes[id].episode;
+    let key = format!("{id}@{}", episode.format("%Y-%m-%dT%H:%M:%SZ"));
+    assert!(ledger.handback.wakes[id].sent_to.is_some());
+
+    // Delivered but not displayed: no `seen`, however much time passes.
     let mut runner = FakeRunner::default();
+    runner.shown.insert(
+        LIVE_SESSION.to_owned(),
+        // Another episode of the same entry, and another entry: neither counts.
+        format!(
+            "{}\n{}\nnot json\n",
+            json!({"id": format!("{id}@2026-01-01T00:00:00Z"), "shown_at": "2026-10-07T00:10:00Z"}),
+            json!({"id": "2:red_while_armed:k@x", "shown_at": "2026-10-07T00:10:00Z"}),
+        ),
+    );
     let out = pass(
         &mut ledger,
         &history,
-        t(2),
+        t(5),
         &cfg,
         HandbackMode::Deliver,
         &mut runner,
         true,
     );
     assert!(
-        !out.report
-            .actions
-            .iter()
-            .any(|a| a.action == "retract_inbox"),
+        !out.report.events.iter().any(|e| e.change == "wake.seen"),
         "{:?}",
-        out.report.actions
+        out.report.events
     );
+    // The read went over the delivery's route and passed the allowlist.
+    assert!(
+        runner
+            .runs
+            .iter()
+            .any(|r| r.argv[0] == "ssh" && r.argv.last().is_some_and(|w| w.contains("shown.jsonl")))
+    );
+    // PR 5's owner is on this host: read as a file, not a process.
+    assert_eq!(runner.local_shown_reads, vec![LOCAL_SESSION.to_owned()]);
 
-    // The owner pushed a new head: both episodes are addressed.
-    for id in ["1:repeat_test_failure:k", "5:repeated_ejection:"] {
-        ledger.entries.get_mut(id).unwrap().addressed_at = Some(t(3));
-    }
+    // Displayed: `seen` at the hook's own time, once.
+    let mut runner = FakeRunner::default();
+    runner.shown.insert(
+        LIVE_SESSION.to_owned(),
+        json!({"id": key, "shown_at": "2026-10-07T02:03:04Z"}).to_string(),
+    );
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(6),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    let seen: Vec<_> = out
+        .report
+        .events
+        .iter()
+        .filter(|e| e.change == "wake.seen")
+        .collect();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].id, id);
+    assert_eq!(seen[0].at.to_rfc3339(), "2026-10-07T02:03:04+00:00");
+    assert_eq!(
+        seen[0].detail.as_ref().unwrap()["session"],
+        json!(LIVE_SESSION)
+    );
+    assert!(ledger.handback.wakes[id].seen_at.is_some());
+    let mut runner = FakeRunner::default();
+    runner.shown.insert(
+        LIVE_SESSION.to_owned(),
+        json!({"id": key, "shown_at": "2026-10-07T02:03:04Z"}).to_string(),
+    );
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(7),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(!out.report.events.iter().any(|e| e.change == "wake.seen"));
+    assert!(
+        !out.report
+            .events
+            .iter()
+            .any(|e| { e.id == id && matches!(e.change.as_str(), "wake.sent" | "wake.escalated") })
+    );
+    assert!(!runner.runs.iter().any(|invocation| {
+        let joined = invocation.argv.join(" ");
+        joined.contains(" notify ") || joined.contains(INBOX_SCRIPT)
+    }));
+}
+
+#[test]
+fn seen_at_alone_blocks_an_due_retry() {
+    let (mut ledger, history) = world(t(0));
+    let mut cfg = config(false, true);
+    cfg.retry_after = chrono::Duration::hours(1);
+    let id = "1:repeat_test_failure:k";
+    ledger.handback.wakes.insert(
+        id.to_owned(),
+        super::WakeRecord {
+            pr: 1,
+            episode: t(0),
+            raised_at: t(0),
+            sent_at: Some(t(0)),
+            unsent: None,
+            inbox: None,
+            sent_to: Some((LIVE_SESSION.to_owned(), Route::Ssh("m3".to_owned()))),
+            seen_at: Some(t(0)),
+            send_count: 1,
+            last_sent_at: Some(t(0)),
+            escalated: false,
+        },
+    );
     let mut runner = FakeRunner::default();
     let out = pass(
         &mut ledger,
@@ -1755,45 +1909,168 @@ fn a_resolved_episode_retracts_its_unread_inbox_line_on_the_owners_host() {
         &mut runner,
         true,
     );
-    let retract = |stdin: &str| -> Value { serde_json::from_str(stdin.trim()).unwrap() };
-    let over_ssh = runner
-        .runs
-        .iter()
-        .filter_map(|i| i.stdin.as_deref())
-        .map(retract)
-        .find(|v| v.get("retract").is_some())
-        .expect("a retraction went over ssh");
-    assert_eq!(over_ssh["retract"], json!(remote));
-    assert_eq!(over_ssh["reason"], json!("addressed"));
-    assert_eq!(over_ssh["schema"], json!(super::INBOX_SCHEMA));
-    let (session, lines) = runner.local_inbox.first().expect("a local retraction");
-    assert_eq!(session, LOCAL_SESSION);
-    assert_eq!(retract(lines)["retract"], json!(local));
-    let sent = out
-        .report
-        .actions
-        .iter()
-        .filter(|a| a.action == "retract_inbox" && a.sent)
-        .count();
-    assert_eq!(sent, 2, "{:?}", out.report.actions);
+    assert!(!out.report.events.iter().any(|event| {
+        event.id == id && matches!(event.change.as_str(), "wake.sent" | "wake.escalated")
+    }));
+}
 
-    // Retracted once: a later pass sends nothing more.
-    let mut runner = FakeRunner::default();
-    let out = pass(
+#[test]
+fn dead_process_with_missing_cmux_row_is_not_live() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, false);
+    let mut runner = FakeRunner {
+        omit_cmux_rows: true,
+        ..FakeRunner::default()
+    };
+    pass(
         &mut ledger,
         &history,
-        t(4),
+        t(1),
         &cfg,
         HandbackMode::Deliver,
         &mut runner,
         true,
     );
-    assert!(
-        !out.report
-            .actions
-            .iter()
-            .any(|a| a.action == "retract_inbox"),
-        "{:?}",
-        out.report.actions
+    assert_eq!(ledger.handback.owners[&2].state, "unknown");
+    assert!(runner.runs.iter().any(|invocation| {
+        invocation.argv.join(" ").contains("process_alive")
+            && invocation.argv.join(" ").contains(DEAD_SESSION)
+    }));
+}
+
+#[test]
+fn missing_cmux_row_runs_evidence_probe_and_can_prove_live() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, false);
+    let mut runner = FakeRunner {
+        omit_cmux_rows: true,
+        ..FakeRunner::default()
+    };
+    pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
     );
+    assert_eq!(ledger.handback.owners[&1].state, "live");
+    assert!(runner.runs.iter().any(|invocation| {
+        invocation.argv.join(" ").contains("process_alive")
+            && invocation.argv.join(" ").contains(LIVE_SESSION)
+    }));
+}
+
+#[test]
+fn liveness_allowlist_rejects_transcript_path_traversal() {
+    let invocation = host::invocation(
+        &Route::Ssh("m3".to_owned()),
+        &HostCommand::LivenessEvidence {
+            session: LIVE_SESSION.to_owned(),
+            transcript: "/work/../etc/transcript.jsonl".to_owned(),
+        },
+        CMUX,
+        None,
+    )
+    .expect("ssh evidence probe");
+    assert!(check_argv(&invocation.argv, CMUX).is_err());
+}
+
+#[test]
+fn unanswered_wake_retries_until_budget_then_escalates_once() {
+    let (mut ledger, history) = world(t(0));
+    let mut cfg = config(false, true);
+    cfg.retry_after = chrono::Duration::hours(1);
+    cfg.max_unseen_sends = 3;
+    for (at, expected_sends, expected_escalations) in
+        [(1, 1, 0), (1, 1, 0), (2, 2, 0), (3, 3, 1), (4, 3, 0)]
+    {
+        let mut runner = FakeRunner::default();
+        let out = pass(
+            &mut ledger,
+            &history,
+            t(at),
+            &cfg,
+            HandbackMode::Deliver,
+            &mut runner,
+            true,
+        );
+        let id = "1:repeat_test_failure:k";
+        assert_eq!(ledger.handback.wakes[id].send_count, expected_sends);
+        assert_eq!(
+            out.report
+                .events
+                .iter()
+                .filter(|e| e.change == "wake.escalated" && e.id == id)
+                .count(),
+            expected_escalations
+        );
+    }
+}
+
+#[test]
+fn the_acknowledgement_read_is_one_fixed_script_and_nothing_else() {
+    let remote = |script: &str, session: &str| {
+        vec![
+            "ssh".to_owned(),
+            "-o".to_owned(),
+            "BatchMode=yes".to_owned(),
+            "-o".to_owned(),
+            host::SSH_CONNECT_TIMEOUT.to_owned(),
+            "--".to_owned(),
+            "m3".to_owned(),
+            ["sh", "-c", script, "sh", session]
+                .iter()
+                .map(|w| shell_quote(w))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ]
+    };
+    assert!(check_argv(&remote(SHOWN_SCRIPT, LIVE_SESSION), CMUX).is_ok());
+    assert!(check_argv(&remote(SHOWN_SCRIPT, "../../etc/passwd"), CMUX).is_err());
+    assert!(check_argv(&remote("cat ~/.ssh/id_ed25519", LIVE_SESSION), CMUX).is_err());
+    assert!(
+        check_argv(
+            &remote(&SHOWN_SCRIPT.replace("tail -n 500", "cat"), LIVE_SESSION),
+            CMUX
+        )
+        .is_err()
+    );
+    let planned = host::invocation(
+        &Route::Ssh("m3".to_owned()),
+        &HostCommand::ShownRead {
+            session: LIVE_SESSION.to_owned(),
+        },
+        CMUX,
+        None,
+    )
+    .unwrap();
+    assert_eq!(planned.argv, remote(SHOWN_SCRIPT, LIVE_SESSION));
+    assert!(
+        host::invocation(
+            &Route::Local,
+            &HostCommand::ShownRead {
+                session: LIVE_SESSION.to_owned(),
+            },
+            CMUX,
+            None,
+        )
+        .is_none()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        host::read_shown_file(dir.path(), LIVE_SESSION, 2).unwrap(),
+        ""
+    );
+    std::fs::write(
+        dir.path().join(format!("{LIVE_SESSION}.shown.jsonl")),
+        "a\nb\nc\n",
+    )
+    .unwrap();
+    assert_eq!(
+        host::read_shown_file(dir.path(), LIVE_SESSION, 2).unwrap(),
+        "b\nc"
+    );
+    assert!(host::read_shown_file(dir.path(), "../x", 2).is_err());
 }

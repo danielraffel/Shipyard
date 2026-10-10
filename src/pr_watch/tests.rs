@@ -1871,6 +1871,9 @@ fn a_planned_handback_rides_the_scan_and_writes_nothing() {
         fn append_local_inbox(&mut self, _: &str, _: &str) -> Result<(), String> {
             panic!("no inbox in a plan")
         }
+        fn read_local_shown(&mut self, _: &str) -> Result<String, String> {
+            panic!("no acknowledgement read in a plan")
+        }
     }
     let dir = tempfile::tempdir().unwrap();
     let reader = |argv: &[String]| fake_github(argv);
@@ -1926,6 +1929,9 @@ fn a_delivering_scan_writes_its_wake_events_to_the_event_log() {
         }
         fn append_local_inbox(&mut self, _: &str, _: &str) -> Result<(), String> {
             panic!("no owner, so no inbox")
+        }
+        fn read_local_shown(&mut self, _: &str) -> Result<String, String> {
+            panic!("nothing was sent, so nothing to acknowledge")
         }
     }
     let dir = tempfile::tempdir().unwrap();

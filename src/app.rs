@@ -185,6 +185,11 @@ pub(super) const WAIT_EXIT_TERMINAL_WRONG: u8 = 4;
 pub(super) const WAIT_EXIT_INVALID: u8 = 5;
 pub(super) const WAIT_EXIT_NO_FALLBACK: u8 = 6;
 pub(super) const WAIT_EXIT_UNSUPPORTED: u8 = 7;
+pub(super) const WAIT_EXIT_QUEUED: u8 = 8;
+pub(super) const WAIT_EXIT_RED: u8 = 9;
+pub(super) const WAIT_EXIT_EJECTED: u8 = 10;
+pub(super) const WAIT_EXIT_MERGED: u8 = 11;
+pub(super) const WAIT_EXIT_CLOSED: u8 = 12;
 
 /// Run the CLI.
 #[must_use]

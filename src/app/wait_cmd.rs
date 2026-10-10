@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::{
-    CliFailure, RuntimeMode, WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG,
-    WAIT_EXIT_TIMEOUT, WAIT_EXIT_UNSUPPORTED,
+    CliFailure, RuntimeMode, WAIT_EXIT_CLOSED, WAIT_EXIT_EJECTED, WAIT_EXIT_INVALID,
+    WAIT_EXIT_MERGED, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_QUEUED, WAIT_EXIT_RED,
+    WAIT_EXIT_TERMINAL_WRONG, WAIT_EXIT_TIMEOUT, WAIT_EXIT_UNSUPPORTED,
     cli::{WaitCommand, WaitPrState},
 };
 use crate::config::LoadedConfig;
@@ -185,6 +186,9 @@ fn wait_pr<W: Write>(
     let result = wait_for_condition_with_timeout(
         |snapshot| match state {
             WaitPrState::Green => evaluate_pr_green_for_wait(snapshot, &mut terminal_wrong),
+            WaitPrState::Queued => Ok(evaluate_pr_queue_state(snapshot, "queued")),
+            WaitPrState::Red => Ok(evaluate_pr_queue_state(snapshot, "red")),
+            WaitPrState::Ejected => Ok(evaluate_pr_queue_state(snapshot, "ejected")),
             WaitPrState::Merged => wait_logic::evaluate_pr_state(snapshot, "merged")
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
             WaitPrState::Closed => wait_logic::evaluate_pr_state(snapshot, "closed")
@@ -196,7 +200,11 @@ fn wait_pr<W: Write>(
                 WaitPrState::Green => {
                     fetch_pr_green_snapshot_with_timeout(&repo, pr_number, cwd, remaining)
                 }
-                WaitPrState::Merged | WaitPrState::Closed => {
+                WaitPrState::Queued
+                | WaitPrState::Red
+                | WaitPrState::Ejected
+                | WaitPrState::Merged
+                | WaitPrState::Closed => {
                     fetch_pr_snapshot_with_timeout(&repo, pr_number, cwd, remaining)
                 }
             },
@@ -252,9 +260,86 @@ fn wait_pr<W: Write>(
             if terminal_wrong {
                 return Ok(ExitCode::from(WAIT_EXIT_TERMINAL_WRONG));
             }
-            Ok(wait_exit_code(&outcome))
+            Ok(if outcome.matched {
+                wait_pr_state_exit_code(state)
+            } else {
+                wait_exit_code(&outcome)
+            })
         }
         Err(error) => Err(wait_failure(error.as_ref())),
+    }
+}
+
+fn wait_pr_state_exit_code(state: WaitPrState) -> ExitCode {
+    match state {
+        WaitPrState::Green => ExitCode::SUCCESS,
+        WaitPrState::Queued => ExitCode::from(WAIT_EXIT_QUEUED),
+        WaitPrState::Red => ExitCode::from(WAIT_EXIT_RED),
+        WaitPrState::Ejected => ExitCode::from(WAIT_EXIT_EJECTED),
+        WaitPrState::Merged => ExitCode::from(WAIT_EXIT_MERGED),
+        WaitPrState::Closed => ExitCode::from(WAIT_EXIT_CLOSED),
+    }
+}
+
+fn evaluate_pr_queue_state(snapshot: Option<&Value>, target: &str) -> crate::wait::TruthResult {
+    let Some(snapshot) = snapshot else {
+        return crate::wait::TruthResult {
+            matched: false,
+            observed: BTreeMap::from([("state".to_owned(), Value::Null)]),
+        };
+    };
+    let state = snapshot
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let merge = snapshot
+        .get("mergeStateStatus")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let checks = snapshot
+        .get("statusCheckRollup")
+        .or_else(|| snapshot.get("checks"));
+    let red = checks.and_then(Value::as_array).is_some_and(|items| {
+        items.iter().any(|item| {
+            if item.get("isRequired").and_then(Value::as_bool) == Some(false) {
+                return false;
+            }
+            ["conclusion", "state"].iter().any(|key| {
+                item.get(*key).and_then(Value::as_str).is_some_and(|v| {
+                    crate::wait::TERMINAL_FAILURE_CONCLUSIONS
+                        .contains(&v.to_ascii_uppercase().as_str())
+                })
+            })
+        })
+    });
+    let ejected = snapshot
+        .get("ejected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || merge == "ejected";
+    let matched = match target {
+        "queued" => {
+            merge == "merge_queued"
+                || merge == "queued"
+                || snapshot
+                    .get("in_merge_queue")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        }
+        "red" => red,
+        "ejected" => ejected,
+        _ => false,
+    };
+    crate::wait::TruthResult {
+        matched,
+        observed: BTreeMap::from([
+            ("state".to_owned(), Value::String(state)),
+            ("merge_state_status".to_owned(), Value::String(merge)),
+            ("red".to_owned(), Value::Bool(red)),
+            ("ejected".to_owned(), Value::Bool(ejected)),
+        ]),
     }
 }
 
@@ -873,13 +958,13 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        RuntimeMode, WaitOutcome, WaitPrState, evaluate_pr_green_for_wait, evaluate_run_for_wait,
-        parse_github_repo_slug, release_manifest, render_wait_outcome, resolve_repo_slug,
-        wait_exit_code, wait_failure, wait_job, wait_pr, wait_release, wait_run,
+        RuntimeMode, WaitOutcome, WaitPrState, evaluate_pr_green_for_wait, evaluate_pr_queue_state,
+        evaluate_run_for_wait, parse_github_repo_slug, release_manifest, render_wait_outcome,
+        resolve_repo_slug, wait_exit_code, wait_failure, wait_job, wait_pr, wait_release, wait_run,
     };
     use crate::app::{
-        WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG, WAIT_EXIT_TIMEOUT,
-        WAIT_EXIT_UNSUPPORTED,
+        WAIT_EXIT_CLOSED, WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG,
+        WAIT_EXIT_TIMEOUT, WAIT_EXIT_UNSUPPORTED,
     };
     use crate::gh::GhPrepareError;
     use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
@@ -1190,10 +1275,23 @@ artifacts = [
         )
         .expect("wait pr");
 
-        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(code, ExitCode::from(WAIT_EXIT_CLOSED));
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.starts_with("matched after "));
         assert!(text.contains("(transport=polling, events=0)"));
+    }
+
+    #[test]
+    fn unstable_merge_state_is_not_ejected() {
+        let snapshot = serde_json::json!({
+            "state": "OPEN",
+            "mergeStateStatus": "UNSTABLE",
+            "statusCheckRollup": [{"name": "advisory", "conclusion": "FAILURE", "isRequired": false}]
+        });
+        let result = evaluate_pr_queue_state(Some(&snapshot), "ejected");
+        assert!(!result.matched);
+        let result = evaluate_pr_queue_state(Some(&snapshot), "red");
+        assert!(!result.matched);
     }
 
     #[test]
