@@ -767,8 +767,10 @@ it started under (`boot_id`, from `kern.boottime` on macOS and
 `/proc/sys/kernel/random/boot_id` on Linux), and a process from another boot
 cannot be alive.
 
-The pass is **opt-in per host** (machine-global
-`.shipyard/config.toml`: `[queue.boot_requeue] enabled = true`, default off).
+The pass is **opt-in per host**: `[queue.boot_requeue] enabled = true` in
+the machine-global `config.toml` in Shipyard's global directory
+(`~/Library/Application Support/shipyard/config.toml` on macOS), default off.
+A repository's tracked config cannot turn it on.
 A pull request cannot yet show that its lane was requeued (Shipyard posts no
 lane verdict comment or check-run), so a host requeues only once its operator
 chooses to; making the requeue visible on the pull request is the follow-up
