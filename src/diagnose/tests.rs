@@ -7,7 +7,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use super::annotate::{self, Tree};
-use super::classify::default_fail_closed;
+use super::classify::{cancel_cause, default_fail_closed};
 use super::evidence::{self, split_lines};
 use super::*;
 
