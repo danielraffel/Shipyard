@@ -274,6 +274,14 @@ pub(super) enum Command {
         )]
         max_polls: Option<u64>,
     },
+    /// Summarize all durable queue-observer states without contacting GitHub.
+    #[command(name = "queue-digest")]
+    QueueDigest {
+        /// Mark an observer stale after this many seconds without a fresh
+        /// durable state write.
+        #[arg(long, default_value_t = 900)]
+        stale_after_seconds: u64,
+    },
     /// Read-only flags for stuck open pull requests: repeated test failures,
     /// red-while-armed, repeated merge-queue ejections, rebase treadmills.
     ///
@@ -3686,6 +3694,25 @@ mod tests {
             Cli::try_parse_from(["shipyard", "queue-observe", "--follow", "--max-polls", "1",])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn queue_digest_defaults_to_fifteen_minute_freshness() {
+        let cli = Cli::try_parse_from(["shipyard", "queue-digest"]).expect("queue digest parses");
+        assert!(matches!(
+            cli.command,
+            Command::QueueDigest {
+                stale_after_seconds: 900
+            }
+        ));
+        let cli = Cli::try_parse_from(["shipyard", "queue-digest", "--stale-after-seconds", "30"])
+            .expect("queue digest custom freshness");
+        assert!(matches!(
+            cli.command,
+            Command::QueueDigest {
+                stale_after_seconds: 30
+            }
+        ));
     }
 
     #[test]

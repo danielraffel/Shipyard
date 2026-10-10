@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// Persisted schema version for queue-observer state and transition records.
-pub const QUEUE_OBSERVER_SCHEMA_VERSION: u32 = 1;
+pub const QUEUE_OBSERVER_SCHEMA_VERSION: u32 = 3;
 
 /// Adaptive polling intervals, in seconds. A transition resets to the first
 /// value; every unchanged observation advances one step and then stays capped.
@@ -61,6 +61,10 @@ pub struct PullRequestSnapshot {
 /// One server-owned merge-queue entry.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QueueEntrySnapshot {
+    /// Base branch used for the queue query. Persisting this alongside the
+    /// entry lets consumers reject a row copied from another observer target.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base: String,
     /// Pull request number.
     pub pr: u64,
     /// Queue position as reported by GitHub.
@@ -109,6 +113,32 @@ pub struct OwnershipSnapshot {
     pub blocker: Option<String>,
 }
 
+/// Why an observer snapshot cannot prove a complete census.
+///
+/// These values are deliberately typed and stable so a supervisor can route a
+/// missing permission, pagination truncation, or incomplete nested connection
+/// to the right owner without parsing prose.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncompleteReason {
+    /// The token could not read the server-owned merge queue.
+    MergeQueueUnavailable,
+    /// The token could not read branch-protection governance.
+    BranchProtectionUnavailable,
+    /// The open pull-request connection has another page.
+    PullRequestsTruncated,
+    /// The merge-queue entry connection has another page.
+    QueueEntriesTruncated,
+    /// A merge-group check-context connection has another page.
+    QueueCheckContextsTruncated,
+    /// A pull-request check-context connection has another page.
+    PullRequestCheckContextsTruncated,
+    /// A pull-request assignee connection has another page.
+    PullRequestAssigneesTruncated,
+    /// A pull-request label connection has another page.
+    PullRequestLabelsTruncated,
+}
+
 /// Canonical repository queue state. Ordered fields and sorted collections make
 /// its serialized bytes and SHA-256 hash stable across equivalent API payloads.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -126,6 +156,13 @@ pub struct QueueStateSnapshot {
     /// Whether any bounded GraphQL connection or optional governance field was
     /// unavailable, so the snapshot is intentionally conservative.
     pub truncated: bool,
+    /// Typed reasons for the conservative `truncated` verdict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_reasons: Vec<IncompleteReason>,
+    /// UTC time at which this source response was captured. It is provenance,
+    /// not semantic state, so canonical hashes and diffs intentionally omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<String>,
     /// Required check names from repository/configured governance.
     pub required_contexts: Vec<String>,
     /// Required contexts and their optional GitHub App binding.
@@ -152,8 +189,11 @@ pub struct RequiredCheckSnapshot {
 pub struct ObserverState {
     /// Schema version.
     pub schema_version: u32,
-    /// SHA-256 of canonical snapshot JSON.
+    /// SHA-256 of canonical snapshot JSON without capture provenance.
     pub state_hash: String,
+    /// Integrity SHA-256 of canonical snapshot JSON, including capture time.
+    #[serde(default)]
+    pub snapshot_integrity_hash: String,
     /// Last canonical snapshot.
     pub snapshot: QueueStateSnapshot,
     /// Index into [`BACKOFF_SECONDS`] used for the next poll.
@@ -197,8 +237,21 @@ pub struct ObservationResult {
     pub transition: Option<Transition>,
 }
 
-/// Compute a stable SHA-256 over canonical snapshot JSON.
+/// Compute a stable SHA-256 over canonical snapshot JSON without capture time.
 pub fn snapshot_hash(snapshot: &QueueStateSnapshot) -> Result<String, serde_json::Error> {
+    semantic_snapshot_hash(snapshot)
+}
+
+fn semantic_snapshot_hash(snapshot: &QueueStateSnapshot) -> Result<String, serde_json::Error> {
+    let mut canonical = snapshot.clone();
+    canonical.captured_at = None;
+    serde_json::to_vec(&canonical).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Compute an integrity SHA-256 over canonical snapshot JSON including capture
+/// provenance, so a persisted state cannot be made fresh by editing only
+/// `captured_at`.
+pub fn snapshot_integrity_hash(snapshot: &QueueStateSnapshot) -> Result<String, serde_json::Error> {
     serde_json::to_vec(snapshot).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -208,6 +261,7 @@ pub fn observe(
     snapshot: QueueStateSnapshot,
 ) -> Result<ObservationResult, serde_json::Error> {
     let state_hash = snapshot_hash(&snapshot)?;
+    let snapshot_integrity_hash = snapshot_integrity_hash(&snapshot)?;
     if previous.is_some_and(|state| state.state_hash == state_hash) {
         let previous = previous.expect("checked above");
         let backoff_index = (previous.backoff_index + 1).min(BACKOFF_SECONDS.len() - 1);
@@ -215,6 +269,7 @@ pub fn observe(
             state: ObserverState {
                 schema_version: QUEUE_OBSERVER_SCHEMA_VERSION,
                 state_hash,
+                snapshot_integrity_hash,
                 snapshot,
                 backoff_index,
             },
@@ -235,6 +290,7 @@ pub fn observe(
     let state = ObserverState {
         schema_version: QUEUE_OBSERVER_SCHEMA_VERSION,
         state_hash: state_hash.clone(),
+        snapshot_integrity_hash: snapshot_integrity_hash.clone(),
         snapshot: snapshot.clone(),
         backoff_index: 0,
     };
@@ -280,10 +336,51 @@ pub fn adaptive_query_count(duration_seconds: u64) -> u64 {
 
 /// Load a prior cursor. A missing file is a clean first run.
 pub fn load_state(path: &Path) -> Result<Option<ObserverState>, String> {
+    load_state_with_legacy_policy(path, false)
+}
+
+/// Load a prior cursor for a digest, rejecting legacy state explicitly.
+///
+/// `queue-observe` uses [`load_state`] so a schema-2 cursor can be replaced by
+/// a fresh authenticated capture. A digest has no fetch/rebootstrap step, so
+/// it must report that legacy state as the reason it cannot prove a census.
+pub fn load_state_for_digest(path: &Path) -> Result<Option<ObserverState>, String> {
+    load_state_with_legacy_policy(path, true)
+}
+
+fn load_state_with_legacy_policy(
+    path: &Path,
+    reject_legacy: bool,
+) -> Result<Option<ObserverState>, String> {
     match fs::read_to_string(path) {
         Ok(raw) => {
             let state: ObserverState = serde_json::from_str(&raw)
                 .map_err(|error| format!("parse observer state {}: {error}", path.display()))?;
+            if state.schema_version == QUEUE_OBSERVER_SCHEMA_VERSION - 1
+                && state.snapshot_integrity_hash.is_empty()
+            {
+                let actual = snapshot_hash(&state.snapshot).map_err(|error| {
+                    format!("hash legacy observer state {}: {error}", path.display())
+                })?;
+                if actual != state.state_hash {
+                    return Err(format!(
+                        "legacy observer state {} hash mismatch: stored={} actual={actual}",
+                        path.display(),
+                        state.state_hash
+                    ));
+                }
+                if reject_legacy {
+                    return Err(format!(
+                        "observer state {} uses legacy schema version {}; rerun queue-observe to re-bootstrap",
+                        path.display(),
+                        state.schema_version
+                    ));
+                }
+                // Legacy state cannot authenticate captured_at. Returning no
+                // previous cursor lets queue-observe fetch a fresh snapshot
+                // and atomically replace it with schema 3.
+                return Ok(None);
+            }
             if state.schema_version != QUEUE_OBSERVER_SCHEMA_VERSION {
                 return Err(format!(
                     "observer state {} has unsupported schema version {}",
@@ -291,6 +388,7 @@ pub fn load_state(path: &Path) -> Result<Option<ObserverState>, String> {
                     state.schema_version
                 ));
             }
+            validate_snapshot_shape(&state.snapshot, path)?;
             let actual = snapshot_hash(&state.snapshot)
                 .map_err(|error| format!("hash observer state {}: {error}", path.display()))?;
             if actual != state.state_hash {
@@ -300,11 +398,97 @@ pub fn load_state(path: &Path) -> Result<Option<ObserverState>, String> {
                     state.state_hash
                 ));
             }
+            let actual_integrity = snapshot_integrity_hash(&state.snapshot).map_err(|error| {
+                format!("integrity-hash observer state {}: {error}", path.display())
+            })?;
+            if actual_integrity != state.snapshot_integrity_hash {
+                return Err(format!(
+                    "observer state {} integrity hash mismatch: stored={} actual={actual_integrity}",
+                    path.display(),
+                    state.snapshot_integrity_hash
+                ));
+            }
             Ok(Some(state))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("read observer state {}: {error}", path.display())),
     }
+}
+
+fn validate_snapshot_shape(snapshot: &QueueStateSnapshot, path: &Path) -> Result<(), String> {
+    if snapshot.schema_version != QUEUE_OBSERVER_SCHEMA_VERSION {
+        return Err(format!(
+            "observer state {} has unsupported nested snapshot schema version {}",
+            path.display(),
+            snapshot.schema_version
+        ));
+    }
+    if snapshot.repo.is_empty()
+        || snapshot.base.is_empty()
+        || snapshot.main_sha.is_empty()
+        || snapshot.main_url.is_empty()
+        || !url_has_path(
+            &snapshot.main_url,
+            &format!("/{}/commit/{}", snapshot.repo, snapshot.main_sha),
+        )
+    {
+        return Err(format!(
+            "observer state {} has incomplete snapshot identity",
+            path.display()
+        ));
+    }
+    if snapshot
+        .required_checks
+        .iter()
+        .any(|check| check.context.is_empty())
+    {
+        return Err(format!(
+            "observer state {} has an empty required-check context",
+            path.display()
+        ));
+    }
+    if snapshot
+        .pull_requests
+        .iter()
+        .any(|pr| pr.number == 0 || pr.url.is_empty() || pr.head_sha.is_empty())
+    {
+        return Err(format!(
+            "observer state {} has an incomplete pull-request row",
+            path.display()
+        ));
+    }
+    if snapshot.queue.iter().any(|entry| {
+        entry.pr == 0
+            || entry.base.is_empty()
+            || entry.url.is_empty()
+            || entry.pr_head_sha.is_empty()
+            || entry.enqueued_at.is_empty()
+    }) {
+        return Err(format!(
+            "observer state {} has an incomplete merge-queue row",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn url_has_path(url: &str, expected: &str) -> bool {
+    let Some(authority_start) = url.find("://").map(|offset| offset + 3) else {
+        return false;
+    };
+    let Some(relative_path) = url[authority_start..].find('/') else {
+        return false;
+    };
+    let path_start = authority_start + relative_path;
+    if path_start == authority_start {
+        return false;
+    }
+    let path_end = url[path_start..]
+        .find(['?', '#'])
+        .map_or(url.len(), |offset| path_start + offset);
+    url[path_start..path_end]
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(expected)
 }
 
 /// Atomically persist the latest cursor.
@@ -434,7 +618,15 @@ pub fn parse_snapshot(
     configured_required: &[String],
     ownership: OwnershipSnapshot,
 ) -> Result<QueueStateSnapshot, String> {
-    parse_snapshot_with_previous(body, repo, base, configured_required, ownership, None)
+    parse_snapshot_with_previous_at(
+        body,
+        repo,
+        base,
+        configured_required,
+        ownership,
+        None,
+        chrono::Utc::now(),
+    )
 }
 
 /// Parse a snapshot while conservatively retaining governance facts that a
@@ -444,27 +636,52 @@ pub(crate) fn parse_snapshot_with_previous(
     repo: &str,
     base: &str,
     configured_required: &[String],
+    ownership: OwnershipSnapshot,
+    previous: Option<&QueueStateSnapshot>,
+) -> Result<QueueStateSnapshot, String> {
+    parse_snapshot_with_previous_at(
+        body,
+        repo,
+        base,
+        configured_required,
+        ownership,
+        previous,
+        chrono::Utc::now(),
+    )
+}
+
+/// Deterministic variant used by replay and tests that need a fixed capture
+/// time without making it part of the semantic state hash.
+pub(crate) fn parse_snapshot_with_previous_at(
+    body: &Value,
+    repo: &str,
+    base: &str,
+    configured_required: &[String],
     mut ownership: OwnershipSnapshot,
     previous: Option<&QueueStateSnapshot>,
+    captured_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<QueueStateSnapshot, String> {
     let merge_queue_denied = governance_field_denied(body, &["repository", "mergeQueue"]);
     let branch_rule_denied =
         governance_field_denied(body, &["repository", "baseRef", "branchProtectionRule"]);
-    if let Some(errors) = body
-        .get("errors")
-        .and_then(Value::as_array)
-        .filter(|errors| !errors.is_empty())
-    {
-        let substantive = errors
-            .iter()
-            .filter(|error| !is_governance_graphql_error(error))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !substantive.is_empty() {
-            return Err(format!(
-                "queue snapshot GraphQL errors: {}",
-                Value::Array(substantive)
-            ));
+    if let Some(errors_value) = body.get("errors") {
+        let errors = errors_value
+            .as_array()
+            .ok_or_else(|| "queue snapshot response has malformed errors field".to_owned())?;
+        if errors.is_empty() {
+            // An explicitly empty GraphQL errors array is valid.
+        } else {
+            let substantive = errors
+                .iter()
+                .filter(|error| !is_governance_graphql_error(error))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !substantive.is_empty() {
+                return Err(format!(
+                    "queue snapshot GraphQL errors: {}",
+                    Value::Array(substantive)
+                ));
+            }
         }
     }
     let repository = body
@@ -477,10 +694,10 @@ pub(crate) fn parse_snapshot_with_previous(
         .filter(|sha| !sha.is_empty())
         .ok_or_else(|| format!("queue snapshot response missing refs/heads/{base}"))?
         .to_owned();
-    let repository_url = repository
-        .get("url")
-        .and_then(Value::as_str)
-        .unwrap_or("https://github.com");
+    let repository_url = required_string(repository, "url", "repository")?;
+    if !url_has_path(&repository_url, &format!("/{repo}")) {
+        return Err("queue snapshot response has malformed repository.url".to_owned());
+    }
     if ownership.hold_reason.is_some()
         || ownership.hold_machine.is_some()
         || ownership.held_at.is_some()
@@ -493,53 +710,53 @@ pub(crate) fn parse_snapshot_with_previous(
         repository,
         configured_required,
         branch_rule_denied.then_some(previous).flatten(),
+        branch_rule_denied,
     )?;
 
-    let mut pull_requests = connection_nodes(repository.get("pullRequests"))
+    let pull_requests_connection =
+        require_connection(repository.get("pullRequests"), "repository.pullRequests")?;
+    let mut pull_requests = connection_nodes(Some(pull_requests_connection))
         .into_iter()
         .map(|node| parse_pull_request(node, &required))
         .collect::<Result<Vec<_>, _>>()?;
     pull_requests.sort_by_key(|pr| pr.number);
 
-    let queue_value = repository
-        .get("mergeQueue")
-        .filter(|value| !value.is_null());
+    let queue_field = repository.get("mergeQueue");
+    if !merge_queue_denied && queue_field.is_none_or(Value::is_null) {
+        return Err("queue snapshot response missing repository.mergeQueue connection".to_owned());
+    }
+    let queue_value = queue_field.filter(|value| !value.is_null());
     let mut queue = if merge_queue_denied {
         previous.map_or_else(Vec::new, |snapshot| snapshot.queue.clone())
     } else {
         queue_value
-            .map(|value| connection_nodes(value.get("entries")))
+            .map(|value| require_connection(value.get("entries"), "repository.mergeQueue.entries"))
+            .transpose()?
+            .map(|entries| connection_nodes(Some(entries)))
             .unwrap_or_default()
             .into_iter()
-            .map(|node| parse_queue_entry(node, &required))
+            .map(|node| parse_queue_entry(node, base, &required))
             .collect::<Result<Vec<_>, _>>()?
     };
     queue.sort_by_key(|entry| (entry.position, entry.pr));
 
-    let truncated = merge_queue_denied
-        || branch_rule_denied
-        || connection_has_next(repository.get("pullRequests"))
-        || queue_value.is_some_and(|value| connection_has_next(value.get("entries")))
-        || queue_value.is_some_and(|value| {
-            connection_nodes(value.get("entries")).iter().any(|entry| {
-                connection_has_next(entry.pointer("/headCommit/statusCheckRollup/contexts"))
-            })
-        })
-        || connection_nodes(repository.get("pullRequests"))
-            .iter()
-            .any(|pr| {
-                connection_has_next(pr.pointer("/statusCheckRollup/contexts"))
-                    || connection_has_next(pr.get("assignees"))
-                    || connection_has_next(pr.get("labels"))
-            });
+    let incomplete_reasons = snapshot_incomplete_reasons(
+        repository,
+        queue_value,
+        merge_queue_denied,
+        branch_rule_denied,
+    );
+    let truncated = !incomplete_reasons.is_empty();
 
     Ok(QueueStateSnapshot {
         schema_version: QUEUE_OBSERVER_SCHEMA_VERSION,
         repo: repo.to_owned(),
         base: base.to_owned(),
-        main_url: format!("{repository_url}/commit/{main_sha}"),
+        main_url: format!("{}/commit/{main_sha}", repository_url.trim_end_matches('/')),
         main_sha,
         truncated,
+        incomplete_reasons,
+        captured_at: Some(captured_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
         required_contexts: required.keys().cloned().collect(),
         required_checks: required
             .into_iter()
@@ -549,6 +766,54 @@ pub(crate) fn parse_snapshot_with_previous(
         queue,
         pull_requests,
     })
+}
+
+fn snapshot_incomplete_reasons(
+    repository: &Value,
+    queue_value: Option<&Value>,
+    merge_queue_denied: bool,
+    branch_rule_denied: bool,
+) -> Vec<IncompleteReason> {
+    let mut reasons = Vec::new();
+    if merge_queue_denied {
+        reasons.push(IncompleteReason::MergeQueueUnavailable);
+    }
+    if branch_rule_denied {
+        reasons.push(IncompleteReason::BranchProtectionUnavailable);
+    }
+    if connection_has_next(repository.get("pullRequests")) {
+        reasons.push(IncompleteReason::PullRequestsTruncated);
+    }
+    if queue_value.is_some_and(|value| connection_has_next(value.get("entries"))) {
+        reasons.push(IncompleteReason::QueueEntriesTruncated);
+    }
+    if queue_value.is_some_and(|value| {
+        connection_nodes(value.get("entries")).iter().any(|entry| {
+            connection_has_next(entry.pointer("/headCommit/statusCheckRollup/contexts"))
+        })
+    }) {
+        reasons.push(IncompleteReason::QueueCheckContextsTruncated);
+    }
+    let pull_request_nodes = connection_nodes(repository.get("pullRequests"));
+    if pull_request_nodes
+        .iter()
+        .any(|pr| connection_has_next(pr.pointer("/statusCheckRollup/contexts")))
+    {
+        reasons.push(IncompleteReason::PullRequestCheckContextsTruncated);
+    }
+    if pull_request_nodes
+        .iter()
+        .any(|pr| connection_has_next(pr.get("assignees")))
+    {
+        reasons.push(IncompleteReason::PullRequestAssigneesTruncated);
+    }
+    if pull_request_nodes
+        .iter()
+        .any(|pr| connection_has_next(pr.get("labels")))
+    {
+        reasons.push(IncompleteReason::PullRequestLabelsTruncated);
+    }
+    reasons
 }
 
 /// Whether a GraphQL response contains errors exclusively on optional
@@ -600,41 +865,79 @@ fn required_check_policy(
     repository: &Value,
     configured_required: &[String],
     previous: Option<&QueueStateSnapshot>,
+    branch_rule_denied: bool,
 ) -> Result<BTreeMap<String, Option<u64>>, String> {
     let mut required = configured_required
         .iter()
         .cloned()
         .map(|context| (context, None))
         .collect::<BTreeMap<_, _>>();
-    if let Some(previous) = previous {
-        for context in &previous.required_contexts {
-            required.entry(context.clone()).or_insert(None);
-        }
-        for check in &previous.required_checks {
-            required.insert(check.context.clone(), check.app_id);
+    if branch_rule_denied {
+        // A permission-denied field is explicitly unavailable. Reuse the
+        // last authenticated policy when one exists; otherwise retain only
+        // the configured baseline and mark the snapshot incomplete upstream.
+        if let Some(previous) = previous {
+            for context in &previous.required_contexts {
+                required.entry(context.clone()).or_insert(None);
+            }
+            for check in &previous.required_checks {
+                required.insert(check.context.clone(), check.app_id);
+            }
         }
         return Ok(required);
     }
-    let Some(rule) = repository.pointer("/baseRef/branchProtectionRule") else {
+    let rule = repository
+        .get("baseRef")
+        .and_then(|base_ref| base_ref.get("branchProtectionRule"))
+        .ok_or_else(|| "queue snapshot response missing baseRef.branchProtectionRule".to_owned())?;
+    if rule.is_null() {
         return Ok(required);
-    };
-    for context in rule
+    }
+    if !rule.is_object() {
+        return Err("queue snapshot response has malformed branchProtectionRule".to_owned());
+    }
+    let contexts = rule
         .get("requiredStatusCheckContexts")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
+        .ok_or_else(|| "queue snapshot response missing requiredStatusCheckContexts".to_owned())?;
+    let contexts = contexts.as_array().ok_or_else(|| {
+        "queue snapshot response has malformed requiredStatusCheckContexts".to_owned()
+    })?;
+    for context in contexts {
+        let context = context
+            .as_str()
+            .filter(|context| !context.is_empty())
+            .ok_or_else(|| {
+                "queue snapshot response has malformed required status-check context".to_owned()
+            })?;
         required.entry(context.to_owned()).or_insert(None);
     }
-    for check in rule
+    let checks = rule
         .get("requiredStatusChecks")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+        .ok_or_else(|| "queue snapshot response missing requiredStatusChecks".to_owned())?;
+    let checks = checks
+        .as_array()
+        .ok_or_else(|| "queue snapshot response has malformed requiredStatusChecks".to_owned())?;
+    for check in checks {
+        if !check.is_object() {
+            return Err("queue snapshot response has malformed required status check".to_owned());
+        }
         let context = required_string(check, "context", "required status check")?;
-        let app_id = check.pointer("/app/databaseId").and_then(Value::as_u64);
+        let app_id = match check.get("app") {
+            None | Some(Value::Null) => None,
+            Some(app) => {
+                let app = app.as_object().ok_or_else(|| {
+                    "queue snapshot response has malformed required status-check app".to_owned()
+                })?;
+                Some(
+                    app.get("databaseId")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            "queue snapshot response has malformed required status-check app id"
+                                .to_owned()
+                        })?,
+                )
+            }
+        };
         required.insert(context, app_id);
     }
     Ok(required)
@@ -739,10 +1042,16 @@ fn parse_pull_request(
     required: &BTreeMap<String, Option<u64>>,
 ) -> Result<PullRequestSnapshot, String> {
     let number = required_u64(node, "number", "pull request")?;
-    let labels = connection_nodes(node.get("labels"))
+    let labels_connection = require_connection(node.get("labels"), "pull request.labels")?;
+    let assignees_connection = require_connection(node.get("assignees"), "pull request.assignees")?;
+    let contexts_connection = nullable_status_contexts(
+        node.get("statusCheckRollup"),
+        "pull request.statusCheckRollup.contexts",
+    )?;
+    let labels = connection_nodes(Some(labels_connection))
         .into_iter()
-        .filter_map(|label| label.get("name").and_then(Value::as_str))
-        .collect::<Vec<_>>();
+        .map(|label| required_string(label, "name", "pull request label"))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut owners = labels
         .iter()
         .filter_map(|label| label.strip_prefix("shipyard:owner/"))
@@ -750,10 +1059,10 @@ fn parse_pull_request(
         .collect::<Vec<_>>();
     if owners.is_empty() {
         owners.extend(
-            connection_nodes(node.get("assignees"))
+            connection_nodes(Some(assignees_connection))
                 .into_iter()
-                .filter_map(|assignee| assignee.get("login").and_then(Value::as_str))
-                .map(str::to_owned),
+                .map(|assignee| required_string(assignee, "login", "pull request assignee"))
+                .collect::<Result<Vec<_>, _>>()?,
         );
     }
     owners.sort();
@@ -766,7 +1075,7 @@ fn parse_pull_request(
     blockers.sort();
     blockers.dedup();
 
-    let checks = parse_latest_checks(node.pointer("/statusCheckRollup/contexts"), required)?;
+    let checks = parse_latest_checks(contexts_connection, required)?;
     Ok(PullRequestSnapshot {
         number,
         url: required_string(node, "url", "pull request")?,
@@ -899,16 +1208,24 @@ fn parse_latest_checks(
 
 fn parse_queue_entry(
     node: &Value,
+    base: &str,
     required: &BTreeMap<String, Option<u64>>,
 ) -> Result<QueueEntrySnapshot, String> {
     let pr = node
         .get("pullRequest")
         .ok_or_else(|| "queue entry missing pull request".to_owned())?;
-    let contexts = node.pointer("/headCommit/statusCheckRollup/contexts");
+    let contexts = match node.get("headCommit") {
+        None | Some(Value::Null) => None,
+        Some(head_commit) => nullable_status_contexts(
+            head_commit.get("statusCheckRollup"),
+            "merge-queue headCommit.statusCheckRollup.contexts",
+        )?,
+    };
     let checks = parse_latest_checks(contexts, required)?;
     let (receipt_decisions, test_tier) =
         crate::validation_signals::signals_from_graphql_contexts(contexts);
     Ok(QueueEntrySnapshot {
+        base: base.to_owned(),
         pr: required_u64(pr, "number", "queue pull request")?,
         position: required_u64(node, "position", "queue entry")?,
         url: required_string(pr, "url", "queue pull request")?,
@@ -944,8 +1261,16 @@ fn render_check(check: &CheckSnapshot) -> String {
 }
 
 fn diff_snapshots(before: &QueueStateSnapshot, after: &QueueStateSnapshot) -> Vec<StateChange> {
-    let before = serde_json::to_value(before).expect("snapshot serialization");
-    let after = serde_json::to_value(after).expect("snapshot serialization");
+    let mut before = serde_json::to_value(before).expect("snapshot serialization");
+    let mut after = serde_json::to_value(after).expect("snapshot serialization");
+    before
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("captured_at");
+    after
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("captured_at");
     let mut changes = Vec::new();
     diff_values("", &before, &after, &mut changes);
     changes
@@ -988,6 +1313,39 @@ fn connection_nodes(value: Option<&Value>) -> Vec<&Value> {
         .and_then(Value::as_array)
         .map(|nodes| nodes.iter().collect())
         .unwrap_or_default()
+}
+
+fn require_connection<'a>(value: Option<&'a Value>, path: &str) -> Result<&'a Value, String> {
+    let connection = value.ok_or_else(|| format!("queue snapshot response missing {path}"))?;
+    let object = connection
+        .as_object()
+        .ok_or_else(|| format!("queue snapshot response has malformed {path}"))?;
+    if object.get("nodes").and_then(Value::as_array).is_none()
+        || object
+            .get("pageInfo")
+            .and_then(Value::as_object)
+            .and_then(|page| page.get("hasNextPage"))
+            .and_then(Value::as_bool)
+            .is_none()
+    {
+        return Err(format!(
+            "queue snapshot response has incomplete connection {path}"
+        ));
+    }
+    Ok(connection)
+}
+
+fn nullable_status_contexts<'a>(
+    rollup: Option<&'a Value>,
+    path: &str,
+) -> Result<Option<&'a Value>, String> {
+    let Some(rollup) = rollup else {
+        return Err(format!("queue snapshot response missing {path}"));
+    };
+    if rollup.is_null() {
+        return Ok(None);
+    }
+    require_connection(rollup.get("contexts"), path).map(Some)
 }
 
 fn connection_has_next(value: Option<&Value>) -> bool {
@@ -1051,6 +1409,35 @@ mod tests {
     }
 
     #[test]
+    fn capture_time_changes_integrity_without_creating_transition() {
+        let mut first_snapshot = minimal_snapshot("a");
+        first_snapshot.captured_at = Some("2026-10-09T00:00:00.000Z".to_owned());
+        let first = observe(None, first_snapshot).expect("first");
+        let mut refreshed = first.state.snapshot.clone();
+        refreshed.captured_at = Some("2026-10-09T00:00:01.000Z".to_owned());
+        let second = observe(Some(&first.state), refreshed).expect("refreshed");
+        assert!(second.transition.is_none());
+        assert_eq!(second.state.state_hash, first.state.state_hash);
+        assert_ne!(
+            second.state.snapshot_integrity_hash,
+            first.state.snapshot_integrity_hash
+        );
+    }
+
+    #[test]
+    fn legacy_state_reboots_without_trusting_unauthenticated_capture_time() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("observer.json");
+        let mut state = observe(None, minimal_snapshot("a")).expect("state").state;
+        state.schema_version = QUEUE_OBSERVER_SCHEMA_VERSION - 1;
+        state.snapshot.schema_version = QUEUE_OBSERVER_SCHEMA_VERSION - 1;
+        state.state_hash = snapshot_hash(&state.snapshot).expect("legacy hash");
+        state.snapshot_integrity_hash.clear();
+        save_state(&path, &state).expect("legacy state");
+        assert!(load_state(&path).expect("legacy read").is_none());
+    }
+
+    #[test]
     fn state_hash_is_independent_of_source_object_order() {
         let left = serde_json::json!({"data":{"repository":fixture_repo("a")}});
         let right: Value =
@@ -1088,10 +1475,10 @@ mod tests {
             .expect("read")
             .replace("commit/a", "commit/b");
         fs::write(&path, raw).expect("tamper");
+        let error = load_state(&path).expect_err("mismatch");
         assert!(
-            load_state(&path)
-                .expect_err("mismatch")
-                .contains("hash mismatch")
+            error.contains("mismatch") || error.contains("incomplete snapshot identity"),
+            "{error}"
         );
     }
 
@@ -1309,6 +1696,8 @@ mod tests {
             main_sha: sha.to_owned(),
             main_url: format!("https://github.test/o/r/commit/{sha}"),
             truncated: false,
+            incomplete_reasons: Vec::new(),
+            captured_at: None,
             required_contexts: Vec::new(),
             required_checks: Vec::new(),
             ownership: OwnershipSnapshot::default(),
@@ -1320,7 +1709,7 @@ mod tests {
     fn fixture_repo(sha: &str) -> Value {
         serde_json::json!({
             "url":"https://github.test/o/r",
-            "baseRef":{"target":{"oid":sha},"branchProtectionRule":{"requiredStatusCheckContexts":["macos"]}},
+            "baseRef":{"target":{"oid":sha},"branchProtectionRule":{"requiredStatusCheckContexts":["macos"],"requiredStatusChecks":[]}},
             "pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}},
             "mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false}}}
         })
@@ -1449,8 +1838,49 @@ mod tests {
                 .iter()
                 .map(|change| change.path.as_str())
                 .collect::<Vec<_>>(),
-            ["/truncated"]
+            ["/incomplete_reasons", "/truncated"]
         );
+    }
+
+    #[test]
+    fn governance_permission_denial_without_previous_uses_configured_policy() {
+        let body = serde_json::json!({
+            "data":{"repository":{
+                "url":"https://github.test/o/r",
+                "baseRef":{"target":{"oid":"abc"},"branchProtectionRule":null},
+                "pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false}},
+                "mergeQueue":null
+            }},
+            "errors":[
+                {"type":"FORBIDDEN","path":["repository","baseRef","branchProtectionRule"]},
+                {"type":"FORBIDDEN","path":["repository","mergeQueue"]}
+            ]
+        });
+        let snapshot = parse_snapshot(
+            &body,
+            "o/r",
+            "main",
+            &["configured-check".to_owned()],
+            OwnershipSnapshot::default(),
+        )
+        .expect("permission-denied optional fields are conservatively usable");
+        assert_eq!(snapshot.required_contexts, ["configured-check"]);
+        assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn null_merge_queue_without_permission_error_fails_closed() {
+        let mut repository = fixture_repo("abc");
+        repository["mergeQueue"] = serde_json::Value::Null;
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("null merge queue without a permission error must fail closed");
+        assert!(error.contains("missing repository.mergeQueue connection"));
     }
 
     #[test]
@@ -1467,6 +1897,232 @@ mod tests {
         let error = parse_snapshot(&body, "o/r", "main", &[], OwnershipSnapshot::default())
             .expect_err("PR errors must remain fatal");
         assert!(error.contains("pull requests unavailable"));
+    }
+
+    #[test]
+    fn malformed_required_connections_fail_closed() {
+        let mut repository = fixture_repo("abc");
+        repository["pullRequests"] = serde_json::json!({"nodes": []});
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("missing pageInfo must not look like an empty census");
+        assert!(error.contains("incomplete connection repository.pullRequests"));
+
+        let mut repository = fixture_repo("abc");
+        repository["mergeQueue"]["entries"] = serde_json::json!({"nodes": []});
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("missing queue pageInfo must not look like an empty queue");
+        assert!(error.contains("incomplete connection repository.mergeQueue.entries"));
+    }
+
+    #[test]
+    fn malformed_graphql_errors_and_repository_url_fail_closed() {
+        for errors in [
+            serde_json::json!({"message": "fatal"}),
+            serde_json::json!("fatal"),
+        ] {
+            let body = serde_json::json!({
+                "data": {"repository": fixture_repo("abc")},
+                "errors": errors
+            });
+            let error = parse_snapshot(&body, "o/r", "main", &[], OwnershipSnapshot::default())
+                .expect_err("malformed errors must fail closed");
+            assert!(error.contains("malformed errors field"));
+        }
+
+        let mut repository = fixture_repo("abc");
+        repository
+            .as_object_mut()
+            .expect("repository object")
+            .remove("url");
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("repository URL is required");
+        assert!(error.contains("repository missing url"));
+
+        let mut repository = fixture_repo("abc");
+        repository["url"] = serde_json::json!("https://");
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("malformed repository URL must fail closed");
+        assert!(error.contains("malformed repository.url"));
+
+        let mut repository = fixture_repo("abc");
+        repository["url"] = serde_json::json!("https:///o/r");
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("repository URL with an empty authority must fail closed");
+        assert!(error.contains("malformed repository.url"));
+
+        let mut repository = fixture_repo("abc");
+        repository["url"] = serde_json::json!("https://github.test/O/R");
+        parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect("GitHub repository URL casing is not identity-bearing");
+    }
+
+    #[test]
+    fn malformed_pull_request_connections_fail_closed() {
+        let mut repository = fixture_repo("abc");
+        repository["pullRequests"]["nodes"] = serde_json::json!([{
+            "number": 7,
+            "url": "https://github.test/o/r/pull/7",
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "labels": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "assignees": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "statusCheckRollup": {"contexts": {"nodes": []}}
+        }]);
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("missing PR check pageInfo must fail closed");
+        assert!(error.contains("incomplete connection pull request.statusCheckRollup.contexts"));
+    }
+
+    #[test]
+    fn nullable_status_check_rollups_are_treated_as_empty_connections() {
+        let mut repository = fixture_repo("abc");
+        repository["pullRequests"]["nodes"] = serde_json::json!([{
+            "number": 7,
+            "url": "https://github.test/o/r/pull/7",
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "labels": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "assignees": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "statusCheckRollup": null
+        }]);
+        repository["mergeQueue"]["entries"] = serde_json::json!({
+            "nodes": [{
+                "position": 1,
+                "enqueuedAt": "2026-08-08T00:00:00Z",
+                "headCommit": {"oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "statusCheckRollup": null},
+                "pullRequest": {
+                    "number": 7,
+                    "url": "https://github.test/o/r/pull/7",
+                    "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            }],
+            "pageInfo": {"hasNextPage": false}
+        });
+        let snapshot = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect("nullable status rollups are valid");
+        assert!(snapshot.pull_requests[0].checks.is_empty());
+        assert!(snapshot.queue[0].checks.is_empty());
+    }
+
+    #[test]
+    fn malformed_policy_and_label_nodes_fail_closed() {
+        let mut repository = fixture_repo("abc");
+        repository["baseRef"]
+            .as_object_mut()
+            .expect("fixture baseRef object")
+            .remove("branchProtectionRule");
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("omitted branch policy must fail closed");
+        assert!(error.contains("missing baseRef.branchProtectionRule"));
+
+        let mut repository = fixture_repo("abc");
+        repository["baseRef"]["branchProtectionRule"] = serde_json::json!({});
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("missing policy arrays must fail closed");
+        assert!(error.contains("missing requiredStatusCheckContexts"));
+
+        let mut repository = fixture_repo("abc");
+        repository["baseRef"]["branchProtectionRule"]["requiredStatusCheckContexts"] =
+            serde_json::json!([{"context": "macos"}]);
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("malformed required context must fail closed");
+        assert!(error.contains("malformed required status-check context"));
+
+        let mut repository = fixture_repo("abc");
+        repository["pullRequests"]["nodes"] = serde_json::json!([{
+            "number": 7,
+            "url": "https://github.test/o/r/pull/7",
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "labels": {"nodes": [{"name": 7}], "pageInfo": {"hasNextPage": false}},
+            "assignees": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "statusCheckRollup": {"contexts": {"nodes": [], "pageInfo": {"hasNextPage": false}}}
+        }]);
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("malformed label node must fail closed");
+        assert!(error.contains("pull request label missing name"));
+
+        let mut repository = fixture_repo("abc");
+        repository["baseRef"]["branchProtectionRule"]["requiredStatusChecks"] =
+            serde_json::json!([{"context": "macos", "app": "not-an-object"}]);
+        let error = parse_snapshot(
+            &serde_json::json!({"data":{"repository":repository}}),
+            "o/r",
+            "main",
+            &[],
+            OwnershipSnapshot::default(),
+        )
+        .expect_err("malformed required check app must fail closed");
+        assert!(error.contains("malformed required status-check app"));
     }
 
     #[test]
