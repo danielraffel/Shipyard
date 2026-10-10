@@ -1294,6 +1294,12 @@ pub(crate) enum PrWatchCommand {
     /// seen, resolved, the time each step took, and the calls nobody has
     /// answered, from the ledger's `wake.*` events.
     Wakes(PrWatchWakesArgs),
+    /// Whether this host's pr-watch passes still complete: each watched
+    /// repository's last completed pass against `[pr_watch]
+    /// stale_after_minutes` (45). Exits 1 when a scanning host is stale; a
+    /// host with `[pr_watch] enabled` off is never stale. Reads machine-global
+    /// config and local state only.
+    Liveness,
 }
 
 #[derive(Debug, Args)]

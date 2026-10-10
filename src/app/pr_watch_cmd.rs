@@ -57,7 +57,81 @@ pub(super) fn pr_watch_command<W: Write>(
         PrWatchCommand::Wakes(args) => {
             wakes_command(args, &watch, cwd, runtime_paths, json, stdout)
         }
+        PrWatchCommand::Liveness => liveness_command(runtime_paths, json, stdout),
     }
+}
+
+/// Doctor section for a scanning host: one row per watched repository, failed
+/// when its last completed pass is older than `[pr_watch] stale_after_minutes`.
+/// `None` on a host that does not scan.
+pub(super) fn pr_watch_doctor_section(
+    runtime_paths: &RuntimePaths,
+) -> Option<std::collections::BTreeMap<String, crate::doctor::DoctorEntry>> {
+    let config =
+        LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone()).ok()?;
+    let watch = WatchConfig::from_config(&config).ok()?;
+    let report = crate::pr_watch::liveness::read(
+        &watch,
+        &runtime_paths.state_dir,
+        Utc::now(),
+        watch.stale_after,
+    );
+    if !report.enabled {
+        return None;
+    }
+    let mut rows = std::collections::BTreeMap::new();
+    if report.repos.is_empty() {
+        rows.insert(
+            "scan".to_owned(),
+            crate::doctor::DoctorEntry {
+                ok: false,
+                version: None,
+                detail: None,
+                error: Some("enabled, but no repository has a ledger yet".to_owned()),
+            },
+        );
+    }
+    for repo in &report.repos {
+        let line = crate::pr_watch::liveness::line(repo, report.stale_after_minutes);
+        rows.insert(
+            repo.repo.clone(),
+            crate::doctor::DoctorEntry {
+                ok: repo.fresh,
+                version: repo.fresh.then(|| line.clone()),
+                detail: Some(line.clone()),
+                error: (!repo.fresh).then_some(line),
+            },
+        );
+    }
+    Some(rows)
+}
+
+/// `pr-watch liveness`: machine-global config, like the daemon that scans.
+fn liveness_command<W: Write>(
+    runtime_paths: &RuntimePaths,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let config = LoadedConfig::load_machine_global_from_dir(runtime_paths.global_dir.clone())
+        .map_err(|error| CliFailure::new(WAIT_EXIT_INVALID, error.to_string()))?;
+    let watch = WatchConfig::from_config(&config)
+        .map_err(|error| CliFailure::new(WAIT_EXIT_INVALID, format!("[pr_watch]: {error}")))?;
+    let report = crate::pr_watch::liveness::read(
+        &watch,
+        &runtime_paths.state_dir,
+        Utc::now(),
+        watch.stale_after,
+    );
+    if json {
+        write_pretty_json(stdout, &report).map_err(io_failure)?;
+    } else {
+        write!(stdout, "{}", crate::pr_watch::liveness::render(&report)).map_err(io_failure)?;
+    }
+    Ok(if report.healthy() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 fn sweep_labels_command<W: Write>(

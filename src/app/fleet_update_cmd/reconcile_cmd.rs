@@ -475,6 +475,98 @@ pub(in crate::app) fn fleet_version_doctor_section(
         let row = fleet_version_row(&host, latest.as_ref().ok(), now, soak_minutes);
         rows.insert(format!("host:{}", host.host_class), row);
     }
+    let answers: Vec<(String, Result<crate::pr_watch::liveness::Liveness, String>)> = classes
+        .iter()
+        .map(|class| {
+            (
+                class.class.clone(),
+                reconcile::probe_pr_watch_liveness(class),
+            )
+        })
+        .collect();
+    rows.extend(pr_watch_fleet_rows(&answers));
+    rows
+}
+
+/// Fleet rows for pr-watch: one per scanning host, plus `pr-watch:fleet`,
+/// which fails when no host reports a pass completed within its threshold.
+/// pr-watch usually runs on one host, so its silence is otherwise invisible.
+/// A host that could not be asked is reported but does not fail on its own.
+pub(super) fn pr_watch_fleet_rows(
+    answers: &[(String, Result<crate::pr_watch::liveness::Liveness, String>)],
+) -> BTreeMap<String, DoctorEntry> {
+    let mut rows = BTreeMap::new();
+    let mut fresh_scanners = Vec::new();
+    let mut stale_scanners = Vec::new();
+    for (class, answer) in answers {
+        match answer {
+            Ok(liveness) if liveness.enabled => {
+                let detail = if liveness.repos.is_empty() {
+                    "enabled, but no repository has a ledger yet".to_owned()
+                } else {
+                    liveness
+                        .repos
+                        .iter()
+                        .map(|repo| {
+                            crate::pr_watch::liveness::line(repo, liveness.stale_after_minutes)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let healthy = liveness.healthy();
+                if healthy {
+                    fresh_scanners.push(class.clone());
+                } else {
+                    stale_scanners.push(class.clone());
+                }
+                rows.insert(
+                    format!("pr-watch:{class}"),
+                    DoctorEntry {
+                        ok: healthy,
+                        version: Some(if healthy { "scanning" } else { "STALE" }.to_owned()),
+                        detail: Some(detail),
+                        error: (!healthy).then(|| {
+                            "pr-watch passes stopped completing; hand-back, comments and digest are silent"
+                                .to_owned()
+                        }),
+                    },
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                rows.insert(
+                    format!("pr-watch:{class}"),
+                    DoctorEntry {
+                        ok: true,
+                        version: Some("unknown".to_owned()),
+                        detail: Some(error.clone()),
+                        error: None,
+                    },
+                );
+            }
+        }
+    }
+    let fleet = if fresh_scanners.is_empty() {
+        DoctorEntry {
+            ok: false,
+            version: None,
+            detail: Some(if stale_scanners.is_empty() {
+                "no configured host reports [pr_watch] enabled".to_owned()
+            } else {
+                format!("only stale scanners: {}", stale_scanners.join(", "))
+            }),
+            error: Some("no host is completing pr-watch passes".to_owned()),
+        }
+    } else {
+        DoctorEntry {
+            ok: stale_scanners.is_empty(),
+            version: Some(format!("scanning on {}", fresh_scanners.join(", "))),
+            detail: (!stale_scanners.is_empty())
+                .then(|| format!("stale: {}", stale_scanners.join(", "))),
+            error: None,
+        }
+    };
+    rows.insert("pr-watch:fleet".to_owned(), fleet);
     rows
 }
 
