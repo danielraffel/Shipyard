@@ -117,6 +117,13 @@ pub const INTERRUPTION_SIGNATURES: [&str; 1] = ["Upload progress stalled"];
 /// concurrency-group cancel, which says nothing about capacity.
 pub const STARVATION_MIN_WAIT_MINUTES: i64 = 10;
 
+/// Check-run annotation text that marks a cancelled job as superseded by a
+/// concurrency group, not starved: GitHub cancels a waiting job when a
+/// higher-priority run for the same group arrives, and that job also never
+/// had a runner. Seen on Generous-Corp/pulp runs 37890997376 and 37891885987,
+/// whose macos jobs waited 11.6 and 16.5 minutes before the supersede.
+pub const SUPERSEDED_ANNOTATIONS: [&str; 1] = ["higher priority waiting request"];
+
 /// Same-head re-enqueues an interruption allows, counting every ejection of
 /// the head. An environment (network) failure allows one.
 pub const INTERRUPTION_REARM_LIMIT: u32 = 2;
@@ -286,10 +293,27 @@ fn interruption_at_failure(output: &[&str]) -> Option<SignatureHit> {
 
 /// Whether a required job that concluded `cancelled` was starved: no runner
 /// ever took it ([`crate::gate_cost::proxy::ejection_cause`] says `starved`)
-/// and it waited at least [`STARVATION_MIN_WAIT_MINUTES`]. Missing times
-/// fail closed.
+/// it waited at least [`STARVATION_MIN_WAIT_MINUTES`], and its check run
+/// carries no [`SUPERSEDED_ANNOTATIONS`] text. Missing times fail closed.
 #[must_use]
-pub fn starved_job(job: &Value) -> Option<SignatureHit> {
+pub fn starved_job(job: &Value, annotations: &Value) -> Option<SignatureHit> {
+    let superseded = annotations
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|annotation| {
+            annotation
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| {
+                    SUPERSEDED_ANNOTATIONS
+                        .iter()
+                        .any(|text| message.contains(text))
+                })
+        });
+    if superseded {
+        return None;
+    }
     let sample = crate::gate_cost::GateJobSample::from_job(0, "merge_group", job);
     if crate::gate_cost::proxy::ejection_cause(&sample).as_deref() != Some("starved") {
         return None;
@@ -712,11 +736,16 @@ fn assess_merge_group(
         };
         if check.conclusion == "cancelled" {
             let job = api_json(run_gh, &format!("repos/{repo}/actions/jobs/{job_id}"))?;
+            // An unreadable annotation list cannot rule out a supersede.
+            let annotations = api_json(
+                run_gh,
+                &format!("repos/{repo}/check-runs/{job_id}/annotations"),
+            )?;
             evidence.push(StepEvidence {
                 check: check.name.clone(),
                 job_id,
                 step: "(queued)".to_owned(),
-                reading: starved_job(&job)
+                reading: starved_job(&job, &annotations)
                     .map_or(StepReading::NoSignature, StepReading::Interruption),
             });
             continue;

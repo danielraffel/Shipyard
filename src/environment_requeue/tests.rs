@@ -395,6 +395,10 @@ fn interrupted_group(
     );
     answers.insert(format!("repos/{REPO}/actions/jobs/7"), Ok(job.to_string()));
     answers.insert(
+        format!("repos/{REPO}/check-runs/7/annotations"),
+        Ok("[]".to_owned()),
+    );
+    answers.insert(
         format!("repos/{REPO}/actions/jobs/7/logs"),
         Ok(log.to_owned()),
     );
@@ -447,6 +451,32 @@ fn a_required_job_starved_of_a_runner_is_an_interruption() {
         "{}",
         third.reason
     );
+}
+
+#[test]
+fn a_concurrency_supersede_is_not_starvation() {
+    // Run 37891885987's macos job: no runner, 16.5 min queued, then GitHub
+    // cancelled it for a higher-priority run in its concurrency group.
+    let job = queued_job("", "2026-10-08T10:00:00Z", "2026-10-08T10:16:30Z");
+    let mut answers = interrupted_group("cancelled", &job, "");
+    answers.insert(
+        format!("repos/{REPO}/check-runs/7/annotations"),
+        Ok(json!([{"annotation_level": "failure", "message":
+            "Canceling since a higher priority waiting request for build-refs/pull/9957/merge exists"}])
+        .to_string()),
+    );
+    let verdict = assess_group(&answers, 1);
+    assert!(!verdict.allowed, "{}", verdict.reason);
+    assert_eq!(verdict.evidence[0].reading, StepReading::NoSignature);
+    // Control: the same job with no annotation is starved.
+    assert!(assess_group(&interrupted_group("cancelled", &job, ""), 1).allowed);
+    // Unreadable annotations cannot rule a supersede out.
+    let mut unreadable = interrupted_group("cancelled", &job, "");
+    unreadable.insert(
+        format!("repos/{REPO}/check-runs/7/annotations"),
+        Err("HTTP 502".to_owned()),
+    );
+    assert!(!assess_group(&unreadable, 1).allowed);
 }
 
 #[test]

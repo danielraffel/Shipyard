@@ -625,6 +625,7 @@ case "$*" in
   *pulls/8678*) cat '{d}/pull' ;;
   *commits/{group}/check-runs*) cat '{d}/runs' ;;
   *commits/{group}/status*) cat '{d}/status' ;;
+  *check-runs/7/annotations*) printf '%s' '[]' ;;
   *actions/jobs/7*) cat '{d}/job' ;;
   *) printf '%s' '{{}}' ;;
 esac"#,

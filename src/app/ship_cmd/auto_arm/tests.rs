@@ -559,6 +559,7 @@ fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
             Box::leak(format!("commits/{group}/status").into_boxed_str()),
             Ok(r#"{"statuses":[]}"#.to_owned()),
         ),
+        ("check-runs/7/annotations", Ok("[]".to_owned())),
         ("actions/jobs/7", Ok(job.to_owned())),
         ("enablePullRequestAutoMerge", Ok(arm_accepted())),
     ]);

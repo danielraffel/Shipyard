@@ -1011,6 +1011,7 @@ FAILURE_PROXIMITY_LINES = 60
 INTERRUPTION_SIGNATURES = ("Upload progress stalled",)
 STARVATION_MIN_WAIT_MINUTES = 10
 INTERRUPTION_REARM_LIMIT = 2
+SUPERSEDED_ANNOTATIONS = ("higher priority waiting request",)
 _RUN_GROUP = "##[group]Run "
 _END_GROUP = "##[endgroup]"
 _ERROR = "##[error]"
@@ -1098,10 +1099,15 @@ def read_failing_step(log: str, started_at: str) -> dict[str, Any]:
     return {"reading": "no_signature"}
 
 
-def starved_job(job: Any) -> dict[str, str] | None:
-    """A required job cancelled with no runner after at least the minimum wait."""
+def starved_job(job: Any, annotations: Any = ()) -> dict[str, str] | None:
+    """A required job cancelled with no runner after at least the minimum wait,
+    and not superseded by a concurrency group."""
     if not isinstance(job, dict) or job.get("conclusion") != "cancelled":
         return None
+    for annotation in annotations if isinstance(annotations, list) else []:
+        message = annotation.get("message") if isinstance(annotation, dict) else None
+        if isinstance(message, str) and any(text in message for text in SUPERSEDED_ANNOTATIONS):
+            return None
     if str(job.get("runner_name") or "").strip():
         return None
     created, completed = _timestamp(job.get("created_at")), _timestamp(job.get("completed_at"))
@@ -1278,7 +1284,10 @@ def assess_environment_requeue(
                 )
             job_id = check["id"]
             if check["conclusion"] == "cancelled":
-                starved = starved_job(api_json(["api", f"repos/{repo}/actions/jobs/{job_id}"]))
+                starved = starved_job(
+                    api_json(["api", f"repos/{repo}/actions/jobs/{job_id}"]),
+                    api_json(["api", f"repos/{repo}/check-runs/{job_id}/annotations"]),
+                )
                 evidence.append({"check": check["name"], "job_id": job_id, "step": "(queued)",
                                  **({"reading": "interruption", **starved} if starved
                                     else {"reading": "no_signature"})})

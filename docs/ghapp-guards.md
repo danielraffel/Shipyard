@@ -96,7 +96,7 @@ Two more ejection causes say nothing against the head, and the same reader
 
 | cause | evidence required |
 |---|---|
-| a required job **starved** of a runner | the required check concluded `cancelled`, its Actions job has an empty `runner_name` (`gate_cost/proxy.rs` `ejection_cause()` says `starved`), and it waited at least 10 minutes from `created_at` to `completed_at`. A shorter no-runner cancel is a superseding push or a concurrency-group cancel. Missing times refuse. |
+| a required job **starved** of a runner | the required check concluded `cancelled`, its Actions job has an empty `runner_name` (`gate_cost/proxy.rs` `ejection_cause()` says `starved`), and it waited at least 10 minutes from `created_at` to `completed_at`. A shorter no-runner cancel is a superseding push or a concurrency-group cancel. A check run whose annotations say `Canceling since a higher priority waiting request` is a concurrency supersede at any wait (runs 37890997376 and 37891885987 waited 11.6 and 16.5 minutes), so it is never starvation. Missing times, or annotations that cannot be read, refuse. |
 | an **upload that stalled** after the work passed | the failing step's own `##[error]` line, or the line before it, reads `Upload progress stalled`. Any earlier failing step, such as a red test step, has no signature and refuses the whole verdict; a stall that recovered earlier in the step explains nothing. |
 
 An interruption allows a same-head re-enqueue on each of a head's first **two**

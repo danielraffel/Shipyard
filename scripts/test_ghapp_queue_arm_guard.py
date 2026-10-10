@@ -1344,6 +1344,8 @@ class EnvironmentSignaturesAgreeWithSharedCorpus(unittest.TestCase):
             f"STARVATION_MIN_WAIT_MINUTES: i64 = {guard.STARVATION_MIN_WAIT_MINUTES};", rust
         )
         self.assertIn(f"INTERRUPTION_REARM_LIMIT: u32 = {guard.INTERRUPTION_REARM_LIMIT};", rust)
+        for text in guard.SUPERSEDED_ANNOTATIONS:
+            self.assertIn(f'"{text}"', rust)
 
     def test_a_signature_in_the_script_echo_is_not_output(self) -> None:
         log = job_fixture("job_real_8933_test_failure.json")["log"].splitlines()
@@ -1418,8 +1420,10 @@ UPLOAD_STALL_LOG = (
 )
 
 
-def assess_interrupted(conclusion: str, job: dict[str, Any], log: str, ejections: int) -> dict[str, Any]:
+def assess_interrupted(conclusion: str, job: dict[str, Any], log: str, ejections: int,
+                       annotations: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """The twin of the Rust ``interrupted_group``: one required macos check on job 7."""
+    annotations = annotations or []
     api = FakeApi()
     api.json[f"repos/{REPO}/branches/main/protection/required_status_checks"] = {"contexts": ["macos"]}
     api.json[f"repos/{REPO}/commits/{GROUP}/check-runs?per_page=100"] = {
@@ -1429,6 +1433,7 @@ def assess_interrupted(conclusion: str, job: dict[str, Any], log: str, ejections
     }
     api.json[f"repos/{REPO}/commits/{GROUP}/status"] = {"statuses": []}
     api.json[f"repos/{REPO}/actions/jobs/7"] = job
+    api.json[f"repos/{REPO}/check-runs/7/annotations"] = annotations
     api.text[f"repos/{REPO}/actions/jobs/7/logs"] = log
     classification = guard.classify_pr_queue_state(
         fixture("pr_real_8678_first_environment_ejection.json")
@@ -1482,6 +1487,18 @@ class InterruptionRequeue(unittest.TestCase):
                 verdict = assess_interrupted("cancelled", queued_job(runner, completed), "", 1)
                 self.assertFalse(verdict["allowed"], verdict["reason"])
                 self.assertEqual(verdict["evidence"][0]["reading"], "no_signature")
+
+    def test_a_concurrency_supersede_is_not_starvation(self) -> None:
+        # Run 37891885987's macos job: no runner, 16.5 min queued, superseded.
+        job = queued_job("", "2026-10-08T10:16:30Z")
+        annotations = [{"annotation_level": "failure", "message":
+                        "Canceling since a higher priority waiting request for "
+                        "build-refs/pull/9957/merge exists"}]
+        verdict = assess_interrupted("cancelled", job, "", 1, annotations)
+        self.assertFalse(verdict["allowed"], verdict["reason"])
+        self.assertEqual(verdict["evidence"][0]["reading"], "no_signature")
+        # Control: the same job without the annotation is starved.
+        self.assertTrue(assess_interrupted("cancelled", job, "", 1, [])["allowed"])
 
     def test_an_upload_stall_after_a_green_test_step_is_an_interruption(self) -> None:
         verdict = assess_interrupted("failure", upload_job("success"), UPLOAD_STALL_LOG, 1)
