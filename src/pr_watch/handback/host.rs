@@ -19,7 +19,7 @@
 //! `cmux send`, `send-key`, agent CLIs and arbitrary shell do not.
 
 use std::io::Write as _;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
 use serde::Serialize;
@@ -247,8 +247,8 @@ pub fn invocation(
 }
 
 fn cmux_args_allowed(args: &[String]) -> Result<(), String> {
-    let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    let ok = match a.as_slice() {
+    let cmux_words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let ok = match cmux_words.as_slice() {
         ["sessions", "list", "--json", "--session", session] => safe_session_id(session),
         [
             "notify",
@@ -272,7 +272,7 @@ fn cmux_args_allowed(args: &[String]) -> Result<(), String> {
     } else {
         Err(format!(
             "cmux {} is not an allowed hand-back command",
-            a.first().copied().unwrap_or("")
+            cmux_words.first().copied().unwrap_or("")
         ))
     }
 }
@@ -313,10 +313,10 @@ pub fn check_argv(argv: &[String], cmux_path: &str) -> Result<(), String> {
     let words = shell_unquote(remote)?;
     let w: Vec<&str> = words.iter().map(String::as_str).collect();
     match w.as_slice() {
-        ["sh", "-c", script, "sh", args @ ..]
+        ["sh", "-c", script, "sh", command_args @ ..]
             if *script == INBOX_SCRIPT || *script == SHOWN_SCRIPT =>
         {
-            if args.len() == 1 && safe_session_id(args[0]) {
+            if command_args.len() == 1 && safe_session_id(command_args[0]) {
                 Ok(())
             } else {
                 Err("inbox session id is not safe".to_owned())
@@ -340,13 +340,10 @@ pub fn check_argv(argv: &[String], cmux_path: &str) -> Result<(), String> {
 }
 
 fn safe_transcript_path(path: &str) -> bool {
-    let candidate = Path::new(path);
     !path.is_empty()
         && path.len() <= 512
-        && candidate.is_absolute()
-        && !candidate
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
+        && path.starts_with('/')
+        && !path.split('/').any(|segment| segment == "..")
         && path.bytes().all(|b| !b.is_ascii_control() && b != b'\'')
 }
 

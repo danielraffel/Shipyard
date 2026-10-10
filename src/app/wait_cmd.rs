@@ -186,9 +186,9 @@ fn wait_pr<W: Write>(
     let result = wait_for_condition_with_timeout(
         |snapshot| match state {
             WaitPrState::Green => evaluate_pr_green_for_wait(snapshot, &mut terminal_wrong),
-            WaitPrState::Queued => evaluate_pr_queue_state(snapshot, "queued"),
-            WaitPrState::Red => evaluate_pr_queue_state(snapshot, "red"),
-            WaitPrState::Ejected => evaluate_pr_queue_state(snapshot, "ejected"),
+            WaitPrState::Queued => Ok(evaluate_pr_queue_state(snapshot, "queued")),
+            WaitPrState::Red => Ok(evaluate_pr_queue_state(snapshot, "red")),
+            WaitPrState::Ejected => Ok(evaluate_pr_queue_state(snapshot, "ejected")),
             WaitPrState::Merged => wait_logic::evaluate_pr_state(snapshot, "merged")
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
             WaitPrState::Closed => wait_logic::evaluate_pr_state(snapshot, "closed")
@@ -281,15 +281,12 @@ fn wait_pr_state_exit_code(state: WaitPrState) -> ExitCode {
     }
 }
 
-fn evaluate_pr_queue_state(
-    snapshot: Option<&Value>,
-    target: &str,
-) -> crate::wait_transport::WaitResult<crate::wait::TruthResult> {
+fn evaluate_pr_queue_state(snapshot: Option<&Value>, target: &str) -> crate::wait::TruthResult {
     let Some(snapshot) = snapshot else {
-        return Ok(crate::wait::TruthResult {
+        return crate::wait::TruthResult {
             matched: false,
             observed: BTreeMap::from([("state".to_owned(), Value::Null)]),
-        });
+        };
     };
     let state = snapshot
         .get("state")
@@ -335,7 +332,7 @@ fn evaluate_pr_queue_state(
         "ejected" => ejected,
         _ => false,
     };
-    Ok(crate::wait::TruthResult {
+    crate::wait::TruthResult {
         matched,
         observed: BTreeMap::from([
             ("state".to_owned(), Value::String(state)),
@@ -343,7 +340,7 @@ fn evaluate_pr_queue_state(
             ("red".to_owned(), Value::Bool(red)),
             ("ejected".to_owned(), Value::Bool(ejected)),
         ]),
-    })
+    }
 }
 
 fn render_pr_terminal_failure<W: Write>(
@@ -1291,9 +1288,9 @@ artifacts = [
             "mergeStateStatus": "UNSTABLE",
             "statusCheckRollup": [{"name": "advisory", "conclusion": "FAILURE", "isRequired": false}]
         });
-        let result = evaluate_pr_queue_state(Some(&snapshot), "ejected").expect("state");
+        let result = evaluate_pr_queue_state(Some(&snapshot), "ejected");
         assert!(!result.matched);
-        let result = evaluate_pr_queue_state(Some(&snapshot), "red").expect("state");
+        let result = evaluate_pr_queue_state(Some(&snapshot), "red");
         assert!(!result.matched);
     }
 
