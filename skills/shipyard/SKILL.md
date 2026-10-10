@@ -1133,7 +1133,12 @@ so it waits for (and then defers to, exit 75) an exclusive Sandbox audit.
 Each tick also reads every host's daemon (`shipyard --json daemon status`) and
 launcher (`daemon launcher status`) and lists problems in `daemon_problems`. A
 host without the launcher has nothing to restart its daemon after a reboot.
-The fix is `shipyard daemon launcher install`, run at that host's console
+An active launcher counts as reboot-safe only when `daemon launcher status`
+reads `survives_kill_and_reboot: true` from the agent plist launchd loads
+(`RunAtLoad` true and `KeepAlive {SuccessfulExit = false}`); `false` gets
+`shipyard daemon refresh`, which rewrites the plist, and an unread value is a
+problem too, never a yes.
+The fix for a missing launcher is `shipyard daemon launcher install`, run at that host's console
 because it needs a one-time macOS approval, so never run it over SSH. A daemon
 that is not running gets `shipyard daemon refresh`. Each host raises one
 `fleet-reconcile: <class> daemon will not survive a reboot` issue until it
@@ -3177,9 +3182,12 @@ Raw queue removal is not a queue-steward operation. Install
 chokepoint and run it against the wrapper argv before invoking the real `gh`.
 It refuses `pr merge --disable-auto`, `dequeuePullRequest`, and
 `disablePullRequestAutoMerge` unless the call comes from Shipyard's
-machine-authorized, exact-head, write-ahead-audited mutation path. A deliberate
-manual authority action requires the loud `GHAPP_ALLOW_QUEUE_REMOVAL=1`
-override. Long-running or pending advisory/self-hosted checks are never queue
+machine-authorized, exact-head, write-ahead-audited mutation path, and it
+honours Shipyard's internal marker only when the calling process is the
+Shipyard binary. A deliberate manual authority action uses the operator
+override in `docs/ghapp-guards.md`, which must state a reason: a rebase or a
+reorder is always refused (a queued PR does not need a rebase; the queue merges
+it on top of current main), and a defect fix is allowed and recorded. Long-running or pending advisory/self-hosted checks are never queue
 removal authority.
 
 The opposite mistake is guarded too. `scripts/ghapp_queue_arm_guard.py`
@@ -4031,6 +4039,15 @@ macOS, opt-in per host). Facts it rests on, all measured with
 So the launcher is a copy of the signed binary at
 `~/.local/libexec/shipyard/shipyard-daemon-launcher`, run by a per-state-root
 LaunchAgent as `daemon supervise --exec <binary>`, staying the daemon's parent.
+launchd is the only restart authority: the agent plist sets `RunAtLoad` (it
+starts at login, so after a reboot), `KeepAlive {SuccessfulExit = false}` and
+a 30 s `ThrottleInterval`. `supervise` is one-shot and exits with the daemon's
+code, so a killed daemon (128 + signal) or a dead launcher brings a new pid,
+while `shipyard daemon stop` (an IPC stop, exit 0) and `launchctl bootout`
+leave it down. A daemon beside another one that holds the state root exits 2
+and is retried every 30 s until it can take over. A plist written before this
+policy keeps both keys false until the next `shipyard daemon refresh`
+rewrites it.
 The launcher only spawns `<release> daemon supervise --in-place`, which runs
 the release's own daemon preparation and then `exec`s `daemon run` under the
 same pid. So the daemon runs the generation binary with the direct-spawn argv

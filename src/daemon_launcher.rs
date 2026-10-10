@@ -172,8 +172,35 @@ pub fn launcher_arguments(launcher: &Path, request: &SpawnRequest) -> Vec<OsStri
     arguments
 }
 
-/// Render a launchd agent plist. `run_at_load` is only set for the one-shot
-/// consent probe; the daemon agent is started explicitly with `kickstart`.
+/// Which launchd agent a plist describes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentKind {
+    /// The one-shot consent probe: runs once when bootstrapped, never again.
+    /// Its plist lives in a scratch directory, never in `LaunchAgents`.
+    ConsentProbe,
+    /// The resident daemon agent. It starts when its plist is loaded (at login,
+    /// so after a reboot) and launchd restarts it whenever it exits non-zero.
+    Daemon,
+}
+
+/// Seconds launchd waits before restarting the daemon agent after it exits.
+///
+/// `daemon run` exits non-zero when another daemon already holds the state
+/// root, so an agent beside a manually started daemon restarts at this pace
+/// until that daemon is gone, then takes over.
+pub const DAEMON_THROTTLE_SECS: u32 = 30;
+
+/// Render a launchd agent plist.
+///
+/// The daemon agent is the restart authority. `supervise` stays one-shot and
+/// exits with the daemon's code, and `KeepAlive {SuccessfulExit = false}`
+/// makes launchd start it again after any non-zero exit: a daemon killed by a
+/// signal (`supervise` reports 128 + the signal) or a launcher that died. A
+/// daemon stopped through `shipyard daemon stop` exits 0 and stays down.
+/// `RunAtLoad` starts the agent whenever launchd loads the plist, which
+/// includes the user's login after a reboot. One restart loop, owned by
+/// launchd, rather than a second one inside `supervise` that launchd would
+/// still have to back up for the reboot and launcher-death cases.
 #[must_use]
 pub fn render_plist(
     label: &str,
@@ -181,7 +208,7 @@ pub fn render_plist(
     log_path: &Path,
     home: &Path,
     path_env: &OsStr,
-    run_at_load: bool,
+    kind: AgentKind,
 ) -> String {
     let mut out = String::from(concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
@@ -226,13 +253,86 @@ pub fn render_plist(
             if value { "true" } else { "false" }
         );
     };
-    boolean(&mut out, "RunAtLoad", run_at_load);
-    boolean(&mut out, "KeepAlive", false);
+    boolean(&mut out, "RunAtLoad", true);
+    match kind {
+        AgentKind::ConsentProbe => boolean(&mut out, "KeepAlive", false),
+        AgentKind::Daemon => {
+            out.push_str(
+                "\t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>\n",
+            );
+            let _ = write!(
+                out,
+                "\t<key>ThrottleInterval</key>\n\t<integer>{DAEMON_THROTTLE_SECS}</integer>\n"
+            );
+        }
+    }
     // The daemon leads its own process group. If the launcher ever dies
     // first, launchd must not reap the daemon along with it.
     boolean(&mut out, "AbandonProcessGroup", true);
     out.push_str("</dict>\n</plist>\n");
     out
+}
+
+/// What an installed agent plist says launchd will do with the daemon.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentRestartPolicy {
+    /// `RunAtLoad` is true: the agent starts at login, so after a reboot.
+    pub run_at_load: bool,
+    /// `KeepAlive` restarts a daemon that died: `true`, or a dictionary whose
+    /// `SuccessfulExit` is `false`.
+    pub restarts_dead_daemon: bool,
+}
+
+impl AgentRestartPolicy {
+    /// Both: the daemon comes back after a reboot and after it is killed.
+    #[must_use]
+    pub const fn survives_kill_and_reboot(self) -> bool {
+        self.run_at_load && self.restarts_dead_daemon
+    }
+
+    /// Read the policy from a plist already converted to JSON
+    /// (`plutil -convert json`). `None` when it is not a dictionary.
+    #[must_use]
+    pub fn from_json(plist: &serde_json::Value) -> Option<Self> {
+        let dict = plist.as_object()?;
+        let run_at_load = dict.get("RunAtLoad").and_then(serde_json::Value::as_bool) == Some(true);
+        let restarts_dead_daemon = match dict.get("KeepAlive") {
+            Some(serde_json::Value::Bool(value)) => *value,
+            Some(serde_json::Value::Object(conditions)) => {
+                conditions
+                    .get("SuccessfulExit")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+            }
+            _ => false,
+        };
+        Some(Self {
+            run_at_load,
+            restarts_dead_daemon,
+        })
+    }
+}
+
+/// Read the restart policy of the daemon agent plist installed for `label`,
+/// the file launchd actually loads. `None` when the plist is absent or
+/// unreadable.
+#[must_use]
+pub fn installed_restart_policy(home: &Path, label: &str) -> Option<AgentRestartPolicy> {
+    let path = plist_path(home, label);
+    if !path.is_file() {
+        return None;
+    }
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-"])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    AgentRestartPolicy::from_json(&value)
 }
 
 fn xml_escape(value: &str) -> String {
@@ -350,7 +450,7 @@ pub fn start_via_launchd_with(
         &launcher_log_path(home),
         home,
         &crate::paths::unattended_tool_path(),
-        false,
+        AgentKind::Daemon,
     );
     // Unload first: bootstrap refuses a label that is already loaded, and a
     // stale definition would restart the daemon with old arguments.
@@ -582,7 +682,7 @@ pub fn install(
         &launcher_log_path(&plan.home),
         &plan.home,
         &crate::paths::unattended_tool_path(),
-        true,
+        AgentKind::ConsentProbe,
     );
     write_file_atomically(&probe_plist, rendered.as_bytes(), 0o600)
         .map_err(|error| format!("failed to write {}: {error}", probe_plist.display()))?;
