@@ -68,8 +68,7 @@ fn pattern(source: &str) -> Regex {
 static NOT_ACQUIRED: LazyLock<Regex> = LazyLock::new(|| pattern(r"was not acquired by Runner"));
 static SUPERSEDED: LazyLock<Regex> =
     LazyLock::new(|| pattern(r"Canceling since a higher priority waiting request"));
-static TIMEOUT: LazyLock<Regex> =
-    LazyLock::new(|| pattern(r"exceeded the maximum execution time"));
+static TIMEOUT: LazyLock<Regex> = LazyLock::new(|| pattern(r"exceeded the maximum execution time"));
 static CANCELED_BY: LazyLock<Regex> =
     LazyLock::new(|| pattern(r"The run was canceled by @?(\S+?)\.?$"));
 
@@ -166,7 +165,11 @@ fn cancelled(job: &Job, step: Option<&Step>, messages: &[String]) -> Classificat
                 None if job.steps().is_empty() => "cancelled before any step".to_owned(),
                 None => "cancelled".to_owned(),
             };
-            Classification::new(INTERRUPTED, "unknown", format!("{place}; no cause recorded"))
+            Classification::new(
+                INTERRUPTED,
+                "unknown",
+                format!("{place}; no cause recorded"),
+            )
         }
     }
 }
@@ -215,7 +218,10 @@ fn needs_starved(
     Some(Classification::new(
         INFRA,
         "needs_starved",
-        format!("{} never got a runner; {cause} ({ran}s)", starved.join(", ")),
+        format!(
+            "{} never got a runner; {cause} ({ran}s)",
+            starved.join(", ")
+        ),
     ))
 }
 

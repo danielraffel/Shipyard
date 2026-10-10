@@ -383,14 +383,7 @@ pub fn build<S: std::hash::BuildHasher>(
     let checks: Vec<CheckDiagnosis> = gate
         .iter()
         .take(MAX_CHECKS)
-        .map(|job| {
-            diagnose_job(
-                job,
-                jobs,
-                logs.get(&job.id).map(String::as_str),
-                context,
-            )
-        })
+        .map(|job| diagnose_job(job, jobs, logs.get(&job.id).map(String::as_str), context))
         .collect();
     let pending = jobs
         .iter()
@@ -434,7 +427,12 @@ pub fn seconds(from: Option<&str>, to: Option<&str>) -> Option<i64> {
     Some((parse(to?)? - parse(from?)?).num_seconds())
 }
 
-fn diagnose_job(job: &Job, siblings: &[Job], log: Option<&str>, context: &Context) -> CheckDiagnosis {
+fn diagnose_job(
+    job: &Job,
+    siblings: &[Job],
+    log: Option<&str>,
+    context: &Context,
+) -> CheckDiagnosis {
     let step = job.failing_step();
     let log = log.filter(|text| !text.is_empty());
     let raw: Vec<&str> = log.map(evidence::split_lines).unwrap_or_default();
@@ -445,14 +443,8 @@ fn diagnose_job(job: &Job, siblings: &[Job], log: Option<&str>, context: &Contex
         evidence::step_window(&raw, step)
     };
     let found = evidence::extract(&lines, lo, hi);
-    let classification = classify::classify(
-        job,
-        siblings,
-        step,
-        &found.tests,
-        &lines[lo..hi],
-        context,
-    );
+    let classification =
+        classify::classify(job, siblings, step, &found.tests, &lines[lo..hi], context);
     let total = found.tests.len();
     let groups = found.groups;
     CheckDiagnosis {
@@ -520,7 +512,8 @@ fn diagnose_job(job: &Job, siblings: &[Job], log: Option<&str>, context: &Contex
             step_lines: (!raw.is_empty()).then_some([lo + 1, hi]),
             fetch: format!(
                 "gh run view {} --job {} --log",
-                job.run_id.map_or_else(|| "None".to_owned(), |id| id.to_string()),
+                job.run_id
+                    .map_or_else(|| "None".to_owned(), |id| id.to_string()),
                 job.id
             ),
             note: log

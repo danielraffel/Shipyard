@@ -7,6 +7,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use super::annotate::{self, Tree};
+use super::classify::default_fail_closed;
 use super::evidence::{self, split_lines};
 use super::*;
 
@@ -24,7 +25,11 @@ fn fixtures() -> Vec<PathBuf> {
         .filter(|path| path.is_dir())
         .collect();
     dirs.sort();
-    assert!(dirs.len() >= 16, "expected the 16 diagnose fixtures, found {}", dirs.len());
+    assert!(
+        dirs.len() >= 16,
+        "expected the 16 diagnose fixtures, found {}",
+        dirs.len()
+    );
     dirs
 }
 
@@ -74,7 +79,11 @@ fn load(dir: &Path) -> Fixture {
     }
     let tree_text = fs::read_to_string(dir.join("tree.txt")).unwrap_or_default();
     Fixture {
-        name: dir.file_name().expect("name").to_string_lossy().into_owned(),
+        name: dir
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned(),
         head_sha,
         job,
         class: case["class"].as_str().expect("class").to_owned(),
@@ -134,7 +143,10 @@ fn every_fixture_has_its_labelled_class_and_rule() {
             .find(|c| c.context == f.job)
             .unwrap_or_else(|| panic!("{}: no diagnosis for {}", f.name, f.job));
         assert_eq!(
-            (check.classification.class.as_str(), check.classification.rule.as_str()),
+            (
+                check.classification.class.as_str(),
+                check.classification.rule.as_str()
+            ),
             (f.class.as_str(), f.rule.as_str()),
             "{}: {}",
             f.name,
@@ -187,7 +199,9 @@ fn an_adversarial_run_still_fits_the_cap() {
         );
     }
     log.push_str("2026-10-01T00:00:01.0000000Z Errors while running CTest\n");
-    let jobs: Vec<Job> = (0..12).map(|k| job(k, &format!("req{k}"), "failure")).collect();
+    let jobs: Vec<Job> = (0..12)
+        .map(|k| job(k, &format!("req{k}"), "failure"))
+        .collect();
     let logs: HashMap<i64, String> = (0..12).map(|k| (k, log.clone())).collect();
     let required: Vec<String> = (0..12).map(|k| format!("req{k}")).collect();
     let doc = build(&jobs, &logs, &required, &Context::new(), DEFAULT_MAX_BYTES);
@@ -225,7 +239,10 @@ fn a_runnerless_cancel_without_a_recorded_cause_is_never_infra_or_real() {
         DEFAULT_MAX_BYTES,
     );
     let class = &doc.checks[0].classification;
-    assert_eq!((class.class.as_str(), class.rule.as_str()), ("interrupted", "unknown"));
+    assert_eq!(
+        (class.class.as_str(), class.rule.as_str()),
+        ("interrupted", "unknown")
+    );
 }
 
 #[test]
@@ -242,10 +259,26 @@ fn a_step_window_excludes_errors_printed_by_earlier_steps() {
         steps[0].completed_at = Some("2026-10-01T00:00:07Z".to_owned());
     }
     let logs = HashMap::from([(1, log.to_owned())]);
-    let doc = build(&[lint], &logs, &["lint".to_owned()], &Context::new(), DEFAULT_MAX_BYTES);
-    let text: Vec<&String> = doc.checks[0].evidence.iter().flat_map(|g| &g.lines).collect();
-    assert!(text.iter().any(|l| l.contains("lint: tools/x.py has a problem")));
-    assert!(!text.iter().any(|l| l.contains("unrelated failure")), "{text:?}");
+    let doc = build(
+        &[lint],
+        &logs,
+        &["lint".to_owned()],
+        &Context::new(),
+        DEFAULT_MAX_BYTES,
+    );
+    let text: Vec<&String> = doc.checks[0]
+        .evidence
+        .iter()
+        .flat_map(|g| &g.lines)
+        .collect();
+    assert!(
+        text.iter()
+            .any(|l| l.contains("lint: tools/x.py has a problem"))
+    );
+    assert!(
+        !text.iter().any(|l| l.contains("unrelated failure")),
+        "{text:?}"
+    );
     assert_eq!(doc.checks[0].more.step_lines, Some([2, 4]));
 }
 
@@ -261,7 +294,13 @@ fn an_interrupted_or_runner_cause_never_gets_a_position() {
         ("infra", "non_content_step"),
         ("real", "default"),
     ] {
-        let mut doc = build(&[], &HashMap::new(), &[], &Context::new(), DEFAULT_MAX_BYTES);
+        let mut doc = build(
+            &[],
+            &HashMap::new(),
+            &[],
+            &Context::new(),
+            DEFAULT_MAX_BYTES,
+        );
         doc.checks.push(CheckDiagnosis {
             context: "macos".to_owned(),
             conclusion: Some("failure".to_owned()),
@@ -320,11 +359,13 @@ fn paths_resolve_only_to_one_tree_file() {
         "b/util.py",
     ]);
     assert_eq!(
-        tree.resolve("/Users/admin/actions-runner/_work/pulp/pulp/test/test_ipc.cpp").as_deref(),
+        tree.resolve("/Users/admin/actions-runner/_work/pulp/pulp/test/test_ipc.cpp")
+            .as_deref(),
         Some("test/test_ipc.cpp")
     );
     assert_eq!(
-        tree.resolve("/home/runner/work/pulp/pulp/test/test_ipc.cpp").as_deref(),
+        tree.resolve("/home/runner/work/pulp/pulp/test/test_ipc.cpp")
+            .as_deref(),
         Some("test/test_ipc.cpp")
     );
     assert_eq!(
@@ -332,7 +373,10 @@ fn paths_resolve_only_to_one_tree_file() {
         Some("experimental/pulp-rs/tests/help_parity_test.rs")
     );
     assert_eq!(tree.resolve("util.py"), None, "ambiguous suffix");
-    assert_eq!(tree.resolve("/opt/hostedtoolcache/Python/3.12/lib/util.py"), None);
+    assert_eq!(
+        tree.resolve("/opt/hostedtoolcache/Python/3.12/lib/util.py"),
+        None
+    );
     assert_eq!(tree.resolve("missing.cpp"), None);
 }
 
@@ -355,8 +399,15 @@ fn positions_read_the_forms_ci_tools_print() {
         got(r#"  File "/usr/lib/python3.12/urllib/request.py", line 639, in x"#)[0],
         ("/usr/lib/python3.12/urllib/request.py".to_owned(), 639)
     );
-    assert!(got(" see foo.py:12abc").is_empty(), "a position must end at a delimiter");
-    assert_eq!(got(" see foo.py:12:5x")[0], ("foo.py".to_owned(), 12), "column dropped, line kept");
+    assert!(
+        got(" see foo.py:12abc").is_empty(),
+        "a position must end at a delimiter"
+    );
+    assert_eq!(
+        got(" see foo.py:12:5x")[0],
+        ("foo.py".to_owned(), 12),
+        "column dropped, line kept"
+    );
 }
 
 #[test]
@@ -402,21 +453,42 @@ const STALL_LOG: &str = "\
 
 #[test]
 fn an_upload_stall_after_a_green_test_step_is_infra() {
-    let green_log = STALL_LOG.replace("FAILED", "passed").replace("(Failed)", "");
+    let green_log = STALL_LOG
+        .replace("FAILED", "passed")
+        .replace("(Failed)", "");
     let logs = HashMap::from([(1, green_log)]);
     let jobs = [two_step_job("success", "failure")];
-    let doc = build(&jobs, &logs, &["macos".to_owned()], &Context::new(), DEFAULT_MAX_BYTES);
+    let doc = build(
+        &jobs,
+        &logs,
+        &["macos".to_owned()],
+        &Context::new(),
+        DEFAULT_MAX_BYTES,
+    );
     let class = &doc.checks[0].classification;
-    assert_eq!((class.class.as_str(), class.rule.as_str()), ("infra", "infra_marker"));
+    assert_eq!(
+        (class.class.as_str(), class.rule.as_str()),
+        ("infra", "infra_marker")
+    );
 }
 
 #[test]
 fn a_red_test_step_before_an_upload_stall_stays_real() {
     let logs = HashMap::from([(1, STALL_LOG.to_owned())]);
     let jobs = [two_step_job("failure", "failure")];
-    let doc = build(&jobs, &logs, &["macos".to_owned()], &Context::new(), DEFAULT_MAX_BYTES);
+    let doc = build(
+        &jobs,
+        &logs,
+        &["macos".to_owned()],
+        &Context::new(),
+        DEFAULT_MAX_BYTES,
+    );
     let check = &doc.checks[0];
-    assert_eq!(check.classification.class, "real", "{}", check.classification.why);
+    assert_eq!(
+        check.classification.class, "real",
+        "{}",
+        check.classification.why
+    );
     assert_eq!(check.failing_tests.names, vec!["parser_rejects_bad_input"]);
 }
 
@@ -432,12 +504,65 @@ fn every_failing_test_corroborated_elsewhere_reads_flake_candidate() {
     let jobs = [job(1, "macos", "failure")];
     let required = ["macos".to_owned()];
     let mut context = Context::new();
-    context.history.insert("racy_counter".to_owned(), vec![9547]);
+    context
+        .history
+        .insert("racy_counter".to_owned(), vec![9547]);
     let doc = build(&jobs, &logs, &required, &context, DEFAULT_MAX_BYTES);
-    assert_eq!(doc.checks[0].classification.class, "real", "one uncorroborated test keeps it real");
+    assert_eq!(
+        doc.checks[0].classification.class, "real",
+        "one uncorroborated test keeps it real"
+    );
     context.history.insert("other_test".to_owned(), vec![9540]);
     let doc = build(&jobs, &logs, &required, &context, DEFAULT_MAX_BYTES);
     let class = &doc.checks[0].classification;
-    assert_eq!((class.class.as_str(), class.rule.as_str()), ("flake_candidate", "failed_on_other_heads"));
-    assert!(class.why.contains("9540") && class.why.contains("9547"), "{}", class.why);
+    assert_eq!(
+        (class.class.as_str(), class.rule.as_str()),
+        ("flake_candidate", "failed_on_other_heads")
+    );
+    assert!(
+        class.why.contains("9540") && class.why.contains("9547"),
+        "{}",
+        class.why
+    );
+}
+
+#[test]
+fn a_starved_sibling_from_another_run_does_not_exonerate_the_failure() {
+    let mut target = job(1, "macos", "failure");
+    target.run_id = Some(1);
+    target.steps = Some(vec![Step {
+        number: Some(1),
+        name: "macOS merge-group bootstrap (required when native leg is absent)".to_owned(),
+        conclusion: Some("failure".to_owned()),
+        started_at: Some("2026-10-01T00:00:00Z".to_owned()),
+        completed_at: Some("2026-10-01T00:00:09Z".to_owned()),
+    }]);
+    let mut starved = job(2, "classify", "cancelled");
+    starved.run_id = Some(2);
+    starved.runner_name = Some(String::new());
+    starved.steps = Some(Vec::new());
+    let mut context = Context::new();
+    context.annotations.insert(
+        starved.id,
+        vec!["The job was not acquired by Runner".to_owned()],
+    );
+    context.fail_closed = default_fail_closed();
+    let mut logs = HashMap::new();
+    logs.insert(
+        target.id,
+        "2026-10-01T00:00:01.0000000Z provider resolution did not succeed — failing macos gate closed\n"
+            .to_owned(),
+    );
+    let doc = build(
+        &[target, starved],
+        &logs,
+        &["macos".to_owned()],
+        &context,
+        DEFAULT_MAX_BYTES,
+    );
+    let class = &doc.checks[0].classification;
+    assert_eq!(
+        (class.class.as_str(), class.rule.as_str()),
+        ("real", "default")
+    );
 }

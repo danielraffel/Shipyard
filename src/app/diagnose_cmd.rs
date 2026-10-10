@@ -66,7 +66,9 @@ impl AnnotateMode {
             "off" => Ok(Self::Off),
             "plan" => Ok(Self::Plan),
             "post" => Ok(Self::Post),
-            other => Err(format!("--annotate must be off, plan or post, not `{other}`")),
+            other => Err(format!(
+                "--annotate must be off, plan or post, not `{other}`"
+            )),
         }
     }
 }
@@ -134,7 +136,8 @@ pub(super) fn diagnose_command<W: Write>(
         &context,
         args.max_bytes,
     );
-    doc.unreadable_checks.extend(target.unreadable.iter().cloned());
+    doc.unreadable_checks
+        .extend(target.unreadable.iter().cloned());
     doc.api_calls = Some(calls.load(Ordering::Relaxed));
     diagnose::fit(&mut doc, args.max_bytes);
 
@@ -160,7 +163,10 @@ pub(super) fn diagnose_command<W: Write>(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-fn print_json<W: Write>(stdout: &mut W, value: &Value) -> Result<std::process::ExitCode, CliFailure> {
+fn print_json<W: Write>(
+    stdout: &mut W,
+    value: &Value,
+) -> Result<std::process::ExitCode, CliFailure> {
     writeln!(
         stdout,
         "{}",
@@ -183,8 +189,9 @@ fn config_patterns(config: &LoadedConfig, key: &str) -> Result<Vec<Regex>, CliFa
             let text = item
                 .as_str()
                 .ok_or_else(|| CliFailure::new(2, format!("{key} must hold strings")))?;
-            Regex::new(text)
-                .map_err(|error| CliFailure::new(2, format!("{key}: bad pattern `{text}`: {error}")))
+            Regex::new(text).map_err(|error| {
+                CliFailure::new(2, format!("{key}: bad pattern `{text}`: {error}"))
+            })
         })
         .collect()
 }
@@ -347,7 +354,10 @@ fn gather_pr(read: &Read<'_>, repo: &str, pr: u64) -> Result<Target, CliFailure>
         unreadable,
         ..Target::default()
     };
-    let runs: BTreeSet<u64> = failing.iter().filter_map(|context| context.run_id).collect();
+    let runs: BTreeSet<u64> = failing
+        .iter()
+        .filter_map(|context| context.run_id)
+        .collect();
     for run in runs {
         match read_jobs(read, repo, run) {
             Ok(jobs) => target.jobs.extend(jobs),
@@ -368,9 +378,15 @@ fn gather_pr(read: &Read<'_>, repo: &str, pr: u64) -> Result<Target, CliFailure>
 fn read_jobs(read: &Read<'_>, repo: &str, run: u64) -> Result<Vec<Job>, String> {
     let value = read_json(
         read,
-        &["api", &format!("repos/{repo}/actions/runs/{run}/jobs?per_page=100")],
+        &[
+            "api",
+            &format!("repos/{repo}/actions/runs/{run}/jobs?per_page=100"),
+        ],
     )?;
-    let jobs = value.get("jobs").cloned().unwrap_or(Value::Array(Vec::new()));
+    let jobs = value
+        .get("jobs")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
     serde_json::from_value(jobs).map_err(|error| format!("jobs of run {run}: {error}"))
 }
 
@@ -402,12 +418,20 @@ fn required_policy(read: &Read<'_>, repo: &str, base: &str) -> Result<Vec<String
     let base = encode_path_segment(base);
     let evaluated = read_json(
         read,
-        &["api", "--paginate", "--slurp", &format!("repos/{repo}/rules/branches/{base}")],
+        &[
+            "api",
+            "--paginate",
+            "--slurp",
+            &format!("repos/{repo}/rules/branches/{base}"),
+        ],
     )?;
     let mut checks = evaluated_required_checks(&evaluated)?;
     match read_json(
         read,
-        &["api", &format!("repos/{repo}/branches/{base}/protection/required_status_checks")],
+        &[
+            "api",
+            &format!("repos/{repo}/branches/{base}/protection/required_status_checks"),
+        ],
     ) {
         Ok(classic) => checks.extend(classic_required_checks(&classic)?),
         Err(error) if error.contains("404") => {}
@@ -450,7 +474,10 @@ fn read_annotations(read: &Read<'_>, repo: &str, target: &Target) -> Vec<(i64, V
         .filter_map(|id| {
             let value = read_json(
                 read,
-                &["api", &format!("repos/{repo}/check-runs/{id}/annotations?per_page=50")],
+                &[
+                    "api",
+                    &format!("repos/{repo}/check-runs/{id}/annotations?per_page=50"),
+                ],
             )
             .ok()?;
             let messages = value
@@ -470,12 +497,17 @@ fn read_logs(read: &Read<'_>, repo: &str, target: &Target) -> HashMap<i64, Strin
     target
         .jobs
         .iter()
-        .filter(|job| target.required.contains(&job.name) && job.is_bad() && !job.steps().is_empty())
+        .filter(|job| {
+            target.required.contains(&job.name) && job.is_bad() && !job.steps().is_empty()
+        })
         .take(diagnose::MAX_CHECKS)
         .filter_map(|job| {
-            read(&argv(&["api", &format!("repos/{repo}/actions/jobs/{}/logs", job.id)]))
-                .ok()
-                .map(|log| (job.id, log))
+            read(&argv(&[
+                "api",
+                &format!("repos/{repo}/actions/jobs/{}/logs", job.id),
+            ]))
+            .ok()
+            .map(|log| (job.id, log))
         })
         .collect()
 }
@@ -513,7 +545,9 @@ pub(super) fn history_from_ledger(
             continue;
         }
         for test in &entry.shared_tests {
-            out.entry(test.clone()).or_default().extend(prs.iter().copied());
+            out.entry(test.clone())
+                .or_default()
+                .extend(prs.iter().copied());
         }
     }
     out.into_iter()
@@ -598,7 +632,12 @@ fn post_check_run(
 }
 
 fn render_human<W: Write>(stdout: &mut W, doc: &Diagnosis) -> std::io::Result<()> {
-    writeln!(stdout, "diagnose: {}: {}", doc.verdict.to_uppercase(), doc.summary)?;
+    writeln!(
+        stdout,
+        "diagnose: {}: {}",
+        doc.verdict.to_uppercase(),
+        doc.summary
+    )?;
     for check in &doc.checks {
         let tests = &check.failing_tests;
         writeln!(
@@ -615,7 +654,12 @@ fn render_human<W: Write>(stdout: &mut W, doc: &Diagnosis) -> std::io::Result<()
         )?;
         writeln!(stdout, "  why: {}", check.classification.why)?;
         if tests.total > 0 {
-            writeln!(stdout, "  tests ({}): {}", tests.total, tests.names.join(", "))?;
+            writeln!(
+                stdout,
+                "  tests ({}): {}",
+                tests.total,
+                tests.names.join(", ")
+            )?;
         }
         if let Some(group) = check.evidence.first() {
             writeln!(stdout, "  evidence (line {}):", group.line)?;

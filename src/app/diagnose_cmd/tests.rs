@@ -32,7 +32,10 @@ fn the_rollup_names_red_required_actions_jobs_and_nothing_else() {
     ]);
     let parsed = parse_pr_rollup(&rollup(&nodes, false)).expect("parse");
     assert_eq!(parsed.head, "abc");
-    assert_eq!(parsed.required, vec!["drift-fast", "external", "legacy", "macos"]);
+    assert_eq!(
+        parsed.required,
+        vec!["drift-fast", "external", "legacy", "macos"]
+    );
     assert_eq!(
         parsed.failing,
         vec![RedContext {
@@ -41,7 +44,11 @@ fn the_rollup_names_red_required_actions_jobs_and_nothing_else() {
             state: "failure".to_owned()
         }]
     );
-    let names: Vec<&str> = parsed.unreadable.iter().map(|u| u.context.as_str()).collect();
+    let names: Vec<&str> = parsed
+        .unreadable
+        .iter()
+        .map(|u| u.context.as_str())
+        .collect();
     assert_eq!(names, vec!["external", "legacy"]);
 }
 
@@ -80,7 +87,11 @@ fn annotations_are_read_for_cancelled_required_jobs_and_starved_siblings_only() 
             job(4, "Linux", "cancelled", false),
             job(5, "version", "success", false),
         ],
-        required: vec!["macos".to_owned(), "drift-fast".to_owned(), "version".to_owned()],
+        required: vec![
+            "macos".to_owned(),
+            "drift-fast".to_owned(),
+            "version".to_owned(),
+        ],
         unreadable: Vec::new(),
     };
     assert_eq!(annotation_targets(&target), vec![2, 3]);
@@ -109,11 +120,19 @@ fn entry(pr: u64, kind: FlagKind, route: DigestRoute, seen: DateTime<Utc>) -> Le
 
 #[test]
 fn history_counts_recent_shared_failures_on_other_pull_requests() {
-    let now = Utc.with_ymd_and_hms(2026, 10, 5, 4, 0, 0).single().expect("time");
+    let now = Utc
+        .with_ymd_and_hms(2026, 10, 5, 4, 0, 0)
+        .single()
+        .expect("time");
     let mut ledger = Ledger::new("o/r", "main");
     ledger.entries.insert(
         "a".to_owned(),
-        entry(9525, FlagKind::RepeatTestFailure, DigestRoute::Shared, now - Duration::hours(1)),
+        entry(
+            9525,
+            FlagKind::RepeatTestFailure,
+            DigestRoute::Shared,
+            now - Duration::hours(1),
+        ),
     );
     let history = history_from_ledger(&ledger, Some(9540), now);
     assert_eq!(
@@ -123,7 +142,12 @@ fn history_counts_recent_shared_failures_on_other_pull_requests() {
 
     // stale, per-PR, or another rule: no corroboration
     for stale in [
-        entry(9525, FlagKind::RepeatTestFailure, DigestRoute::Shared, now - Duration::hours(30)),
+        entry(
+            9525,
+            FlagKind::RepeatTestFailure,
+            DigestRoute::Shared,
+            now - Duration::hours(30),
+        ),
         entry(9525, FlagKind::RepeatTestFailure, DigestRoute::PerPr, now),
         entry(9525, FlagKind::RepeatedEjection, DigestRoute::Shared, now),
     ] {
