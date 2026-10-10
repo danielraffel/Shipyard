@@ -348,6 +348,19 @@ rejected, and none after 2026-09-15 once arm-on-open took over. The test
 returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
 `arm native auto-merge`; `merge-queue resolve` still accepts the old
 `enqueue pull request` entries.
+## The carrier re-arms with `expectedHeadOid`, through the internal path
+
+`runner carrier --apply --class rearm` arms native auto-merge with
+`expectedHeadOid` on a head the queue removed for `failed_checks`. The `ghapp`
+arm guard would refuse that as a same-head re-arm after a failed removal,
+because it cannot see the jobs, so the carrier uses
+`run_gh_internal_queue_mutation`: its plan is the head-scoped verdict, proven
+from the removal's merge-group jobs (every required job that did not pass was
+cancelled with no runner after waiting at least ten minutes). It still takes
+the merge-queue mutation guard, so `HOLD`, `mutation_machine` and the audit
+apply. Its starvation rule is `gate_cost::proxy::ejection_cause` plus the
+wait bound, shared with the gate-cost metric; do not add a third copy.
+
 ## fleet-reconcile ledger: every attempt says how it ended
 
 `fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
