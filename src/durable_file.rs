@@ -106,10 +106,11 @@ mod tests {
         let before = syncs_on_this_thread();
         replace(&path, b"first").expect("create");
         assert_eq!(fs::read(&path).expect("read"), b"first");
-        #[cfg(unix)]
+        // The directory has no syncable handle off Unix.
+        let expected = if cfg!(unix) { 2 } else { 1 };
         assert_eq!(
             syncs_on_this_thread() - before,
-            2,
+            expected,
             "the file, then its directory"
         );
         replace(&path, b"second, longer").expect("replace");
