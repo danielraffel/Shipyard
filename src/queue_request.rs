@@ -2040,37 +2040,15 @@ fn ensure_request_directory(path: &Path) -> io::Result<()> {
     protect_request_directory(path)
 }
 
+/// Every queue-request write is durable: a request or result that reads back
+/// empty after a power loss strands the job it describes.
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> QueueRequestResult<()> {
-    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
-    let Some(parent) = path.parent() else {
-        return Err(QueueRequestError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "queue request path has no parent",
-        )));
-    };
-    fs::create_dir_all(parent)?;
-    let temp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(&temp, value)?;
-    temp.persist(path)
-        .map_err(|error| QueueRequestError::Io(error.error))?;
-    Ok(())
+    write_json_atomic_durable(path, value)
 }
 
 fn write_json_atomic_durable<T: Serialize>(path: &Path, value: &T) -> QueueRequestResult<()> {
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
-    let Some(parent) = path.parent() else {
-        return Err(QueueRequestError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "queue request path has no parent",
-        )));
-    };
-    fs::create_dir_all(parent)?;
-    let temp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(temp.as_file(), value)?;
-    temp.as_file().sync_all()?;
-    temp.persist(path)
-        .map_err(|error| QueueRequestError::Io(error.error))?;
-    crate::log_retention::sync_parent_directory(path)?;
+    crate::durable_file::replace_json(path, value, false)?;
     Ok(())
 }
 

@@ -612,6 +612,31 @@ impl Queue {
         })
     }
 
+    /// Return a Running job whose worker a host reboot ended to pending, with
+    /// `reason` recorded as its scheduler deferral. A job that is no longer
+    /// Running, or has a cancel requested, is left as it is. Only the
+    /// supervisor's boot pass calls this, after proving the reboot.
+    pub(crate) fn requeue_running_after_reboot(
+        &mut self,
+        job_id: &str,
+        reason: &str,
+    ) -> QueueResult<Option<Job>> {
+        self.with_jobs_locked(|jobs| {
+            let Some(job) = jobs.iter_mut().find(|job| {
+                job.id == job_id
+                    && job.status == JobStatus::Running
+                    && job.cancel_requested_at.is_none()
+            }) else {
+                return Ok(None);
+            };
+            job.scheduler_defer_reason = Some(reason.to_owned());
+            job.scheduler_defer_count = job.scheduler_defer_count.saturating_add(1);
+            job.scheduler_defer_until = None;
+            job.status = JobStatus::Pending;
+            Ok(Some(job.clone()))
+        })
+    }
+
     /// Release a daemon-deferred Running claim only after its supervisor has
     /// verified that the exact worker tree is dead.
     pub(crate) fn finalize_deferred_daemon_worker(

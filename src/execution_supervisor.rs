@@ -58,6 +58,36 @@ pub struct WorkerReceipt {
     pub pid: u32,
     /// Worker launch timestamp.
     pub started_at: chrono::DateTime<Utc>,
+    /// The host boot the worker started under ([`crate::boot_identity`]).
+    /// `None` on receipts written before this field existed, and when the
+    /// boot could not be read; such a receipt never proves a reboot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+}
+
+/// Recorded on a job a reboot interrupted, and in its boot-requeue marker.
+pub const BOOT_REQUEUE_REASON: &str = "interrupted: host reboot";
+
+/// Machine-global key that opts a host in to the boot requeue.
+pub const BOOT_REQUEUE_CONFIG_KEY: &str = "queue.boot_requeue.enabled";
+
+/// Write-ahead record of one boot requeue, keyed by job id and dead boot.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct BootRequeueMarker {
+    job_id: String,
+    dead_boot_id: String,
+    current_boot_id: String,
+    state: BootRequeueState,
+    recorded_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BootRequeueState {
+    /// Written before any step; the steps after it are idempotent.
+    Intent,
+    /// The job is back in the queue; nothing more to do.
+    Requeued,
 }
 
 /// Cross-process ownership transaction for worker receipt publication,
@@ -147,6 +177,15 @@ pub struct ExecutionSupervisor {
     merge_observers: BTreeMap<PathBuf, (AlreadyMergedObserver, String)>,
     next_queue_absent_recovery: std::time::Instant,
     queue_absent_recovery_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// This host's current boot ([`crate::boot_identity::current`]).
+    boot_id: Option<String>,
+    /// Whether the start-up boot pass has completed for this supervisor.
+    boot_pass_done: bool,
+    /// Test-only replacement for the machine-global opt-in.
+    boot_requeue_override: Option<bool>,
+    /// Test-only crash point: fail right after the intent marker is written.
+    #[cfg(test)]
+    crash_after_intent: bool,
 }
 
 struct QueueAbsentRecoveryFlight(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -177,12 +216,38 @@ impl ExecutionSupervisor {
             queue_absent_recovery_in_flight: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
+            boot_id: crate::boot_identity::current(),
+            boot_pass_done: false,
+            boot_requeue_override: None,
+            #[cfg(test)]
+            crash_after_intent: false,
         }
+    }
+
+    /// Replace the boot identity, for tests that simulate a reboot.
+    #[cfg(test)]
+    pub(crate) fn with_boot_id(mut self, boot_id: Option<&str>) -> Self {
+        self.boot_id = boot_id.map(str::to_owned);
+        self.boot_requeue_override = Some(true);
+        self
+    }
+
+    /// Replace the machine-global opt-in, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_boot_requeue(mut self, enabled: bool) -> Self {
+        self.boot_requeue_override = Some(enabled);
+        self
     }
 
     /// Reconcile worker ownership and admit safe pending jobs.
     pub fn tick(&mut self) -> Result<(), SupervisorError> {
         crate::writer_domain_lease::ensure_protected_dir_all(&self.worker_dir())?;
+        // First, before any sweep can retire a receipt: a receipt from an
+        // earlier boot is the only proof that its worker died in a reboot.
+        if !self.boot_pass_done {
+            self.requeue_jobs_interrupted_by_reboot()?;
+            self.boot_pass_done = true;
+        }
         // Local custody recovery must never wait behind repository-wide git
         // provenance scans or provider observation.  A cancellation already
         // present at tick entry is handled before any potentially expensive
@@ -882,6 +947,7 @@ impl ExecutionSupervisor {
             generation,
             pid: child.id(),
             started_at: Utc::now(),
+            boot_id: self.boot_id.clone(),
         };
         let receipt_path = self.receipt_path(&job.id);
         if let Err(error) = write_receipt(&receipt_path, &receipt) {
@@ -937,6 +1003,149 @@ impl ExecutionSupervisor {
             ProcessLiveness::Alive => WorkerObservation::Alive(receipt),
             ProcessLiveness::Dead | ProcessLiveness::Unknown => WorkerObservation::Unknown,
         })
+    }
+
+    /// Return each Running job whose worker started under an earlier boot to
+    /// pending, once.
+    ///
+    /// A worker receipt whose `boot_id` differs from this host's current boot
+    /// proves the worker is gone: a reboot ends every process. Such a job is
+    /// requeued under its own id and request envelope, so it runs again for
+    /// the same repository, pull request and exact head, with the reason
+    /// `interrupted: host reboot` recorded on it. Order, each step idempotent:
+    /// a write-ahead marker keyed by (job id, dead boot id), then the job's
+    /// host-pool leases are released, its receipt removed, the job returned to
+    /// pending, and the marker completed. A later start finds the marker and
+    /// repeats nothing.
+    ///
+    /// Everything else keeps the ordinary lost-worker path (`UNCERTAIN`, no
+    /// replay): a host that has not opted in ([`BOOT_REQUEUE_CONFIG_KEY`]), a
+    /// receipt with no boot id or the current one, an unreadable current boot,
+    /// a cancel already requested, a termination transaction in progress, and
+    /// a job already requeued once after an earlier reboot.
+    fn requeue_jobs_interrupted_by_reboot(&mut self) -> Result<(), SupervisorError> {
+        let Some(current_boot) = self.boot_id.clone() else {
+            return Ok(());
+        };
+        if !self.boot_requeue_enabled() {
+            return Ok(());
+        }
+        let mut queue = Queue::new(&self.state_dir)?;
+        let termination = TerminationStore::new(&self.state_dir);
+        for job in queue.get_running()? {
+            if job.cancel_requested_at.is_some() || termination.load(&job.id)?.is_some() {
+                continue;
+            }
+            // A started requeue is finished from its marker: a crash after the
+            // receipt was removed leaves no receipt to prove the reboot again.
+            let (marker_path, mut marker) = if let Some(started) = self.intent_marker(&job.id)? {
+                started
+            } else {
+                let Ok(Some(receipt)) = self.read_exact_receipt(&job.id) else {
+                    continue;
+                };
+                let Some(dead_boot) = receipt.boot_id.filter(|boot| *boot != current_boot) else {
+                    continue;
+                };
+                // Once per job: any earlier marker, for any boot, means this
+                // job already had its requeue.
+                if self.job_was_requeued_after_a_reboot(&job.id)? {
+                    continue;
+                }
+                let marker = BootRequeueMarker {
+                    job_id: job.id.clone(),
+                    dead_boot_id: dead_boot.clone(),
+                    current_boot_id: current_boot.clone(),
+                    state: BootRequeueState::Intent,
+                    recorded_at: Utc::now(),
+                };
+                let path = self.boot_requeue_marker_path(&job.id, &dead_boot);
+                write_json_atomic(&path, &marker)?;
+                #[cfg(test)]
+                if self.crash_after_intent {
+                    return Err(io::Error::other("injected crash after the intent marker").into());
+                }
+                (path, marker)
+            };
+            self.release_host_pool_leases(&job.id)?;
+            self.remove_receipt_if_present(&job.id)?;
+            let reason = format!(
+                "{BOOT_REQUEUE_REASON}, requeued once at {}",
+                marker.recorded_at.format("%Y-%m-%dT%H:%M:%SZ")
+            );
+            queue.requeue_running_after_reboot(&job.id, &reason)?;
+            marker.state = BootRequeueState::Requeued;
+            write_json_atomic(&marker_path, &marker)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this host opted in (machine-global `queue.boot_requeue.enabled =
+    /// true`). Off by default: until a requeue is visible on the pull request
+    /// itself, a host requeues only when its operator chose to.
+    fn boot_requeue_enabled(&self) -> bool {
+        if let Some(enabled) = self.boot_requeue_override {
+            return enabled;
+        }
+        crate::config::LoadedConfig::load_machine_global_from_dir(self.global_dir.clone())
+            .ok()
+            .and_then(|config| {
+                config
+                    .get(BOOT_REQUEUE_CONFIG_KEY)
+                    .and_then(toml::Value::as_bool)
+            })
+            .unwrap_or(false)
+    }
+
+    /// The marker of a requeue this job started and did not finish.
+    fn intent_marker(&self, job_id: &str) -> io::Result<Option<(PathBuf, BootRequeueMarker)>> {
+        let entries = match fs::read_dir(self.boot_requeue_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let prefix = format!("{job_id}@");
+        for entry in entries {
+            let path = entry?.path();
+            if !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            {
+                continue;
+            }
+            let marker = serde_json::from_slice::<BootRequeueMarker>(&fs::read(&path)?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if marker.state == BootRequeueState::Intent && marker.job_id == job_id {
+                return Ok(Some((path, marker)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn boot_requeue_dir(&self) -> PathBuf {
+        self.worker_dir().join("boot-requeue")
+    }
+
+    fn boot_requeue_marker_path(&self, job_id: &str, dead_boot: &str) -> PathBuf {
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(dead_boot.as_bytes()));
+        self.boot_requeue_dir()
+            .join(format!("{job_id}@{}.json", &digest[..16]))
+    }
+
+    /// Whether any marker records an earlier boot requeue of `job_id`.
+    fn job_was_requeued_after_a_reboot(&self, job_id: &str) -> io::Result<bool> {
+        let entries = match fs::read_dir(self.boot_requeue_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let prefix = format!("{job_id}@");
+        for entry in entries {
+            if entry?.file_name().to_string_lossy().starts_with(&prefix) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn read_exact_receipt(&self, job_id: &str) -> io::Result<Option<WorkerReceipt>> {
@@ -1341,17 +1550,7 @@ pub fn verify_worker_authority(state_dir: &Path, job_id: &str, generation: &str)
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("receipt path has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(&mut temp, value).map_err(io::Error::other)?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|error| error.error)?;
-    #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
-    Ok(())
+    crate::durable_file::replace_json(path, value, false)
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
@@ -1436,6 +1635,7 @@ mod tests {
             generation: "unique-generation".to_owned(),
             pid: std::process::id(),
             started_at: Utc::now(),
+            boot_id: None,
         };
         assert_eq!(process_liveness(&receipt), ProcessLiveness::Dead);
     }
@@ -1451,6 +1651,7 @@ mod tests {
             generation: "dead-generation".to_owned(),
             pid: std::process::id(),
             started_at: Utc::now(),
+            boot_id: None,
         };
         let replacement = WorkerReceipt {
             generation: "replacement-generation".to_owned(),
@@ -1503,6 +1704,7 @@ mod tests {
             generation: "generation".to_owned(),
             pid: std::process::id(),
             started_at: Utc::now(),
+            boot_id: None,
         };
         assert_eq!(process_liveness(&receipt), ProcessLiveness::Unknown);
     }
@@ -1867,6 +2069,7 @@ mod tests {
                 // PID-reuse input and must be proven dead for this receipt.
                 pid: std::process::id(),
                 started_at: Utc::now(),
+                boot_id: None,
             },
         )
         .expect("dead receipt");
@@ -1913,6 +2116,7 @@ mod tests {
                 // worker identity, so the normal receipt sweep proves it dead.
                 pid: std::process::id(),
                 started_at: Utc::now(),
+                boot_id: None,
             },
         )
         .expect("receipt");
@@ -2128,6 +2332,7 @@ mod tests {
             generation: "killed-before-drop".to_owned(),
             pid: dead_pid,
             started_at: Utc::now(),
+            boot_id: None,
         };
         let supervisor = ExecutionSupervisor::new(
             PathBuf::from("/does/not/exist"),
@@ -2251,6 +2456,7 @@ mod tests {
             generation: "replacement-generation".to_owned(),
             pid: std::process::id(),
             started_at: Utc::now(),
+            boot_id: None,
         };
         write_json_atomic(&supervisor.receipt_path(job_id), &replacement)
             .expect("publish replacement receipt");
@@ -2409,6 +2615,7 @@ mod tests {
             generation: "generation-b".to_owned(),
             pid: std::process::id(),
             started_at: Utc::now(),
+            boot_id: None,
         };
         if restart_cleanup {
             let transaction = supervisor
@@ -3158,6 +3365,366 @@ mod tests {
         );
     }
 
+    /// A Running job whose worker receipt names `boot` (or none).
+    fn running_job_with_receipt(state_dir: &Path, job_id: &str, boot: Option<&str>) {
+        queued_job(state_dir, job_id);
+        let mut queue = Queue::new(state_dir).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        let mut running = queue
+            .start_pending_jobs_for_drain(&lock, &[job_id.to_owned()])
+            .expect("start")
+            .remove(0);
+        running.started_at = Some(Utc::now() - Duration::minutes(4));
+        queue.update(&running).expect("persist running job");
+        drop(lock);
+        let receipt = WorkerReceipt {
+            job_id: job_id.to_owned(),
+            generation: "before-reboot".to_owned(),
+            // A pid this test process cannot own; the boot id is what decides.
+            pid: 999_999,
+            started_at: Utc::now() - Duration::minutes(4),
+            boot_id: boot.map(str::to_owned),
+        };
+        let path = state_dir
+            .join("queue-workers")
+            .join(format!("{job_id}.json"));
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        write_json_atomic(&path, &receipt).expect("receipt");
+    }
+
+    fn supervisor_on_boot(state_dir: &Path, boot: Option<&str>) -> ExecutionSupervisor {
+        ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            state_dir.into(),
+            state_dir.into(),
+        )
+        .with_boot_id(boot)
+    }
+
+    fn boot_markers(state_dir: &Path) -> Vec<BootRequeueMarker> {
+        let dir = state_dir.join("queue-workers/boot-requeue");
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .map(|entry| {
+                serde_json::from_slice(&fs::read(entry.expect("entry").path()).expect("read"))
+                    .expect("marker")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_job_whose_worker_started_before_this_boot_is_requeued_exactly_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        running_job_with_receipt(temp.path(), "rebooted", Some("boot-A"));
+
+        // First daemon start after the reboot.
+        let mut first = supervisor_on_boot(temp.path(), Some("boot-B"));
+        first
+            .requeue_jobs_interrupted_by_reboot()
+            .expect("boot pass");
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let job = queue.get("rebooted").expect("read").expect("job");
+        assert_eq!(job.status, JobStatus::Pending);
+        assert!(
+            job.scheduler_defer_reason
+                .as_deref()
+                .is_some_and(|reason| reason
+                    .starts_with(&format!("{BOOT_REQUEUE_REASON}, requeued once at "))),
+            "{:?}",
+            job.scheduler_defer_reason
+        );
+        assert_eq!(job.scheduler_defer_count, 1);
+        assert!(
+            !temp.path().join("queue-workers/rebooted.json").exists(),
+            "receipt retired"
+        );
+        let markers = boot_markers(temp.path());
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].dead_boot_id, "boot-A");
+        assert_eq!(markers[0].state, BootRequeueState::Requeued);
+        // The same request envelope stays the job's: same repo, PR, exact head.
+        assert!(
+            QueueRequestStore::new(temp.path())
+                .expect("store")
+                .load("rebooted")
+                .expect("load")
+                .is_some()
+        );
+
+        // A second daemon start (same boot) repeats nothing.
+        let mut second = supervisor_on_boot(temp.path(), Some("boot-B"));
+        second
+            .requeue_jobs_interrupted_by_reboot()
+            .expect("boot pass");
+        let job = queue.get("rebooted").expect("read").expect("job");
+        assert_eq!(job.scheduler_defer_count, 1, "requeued exactly once");
+        assert_eq!(boot_markers(temp.path()).len(), 1);
+    }
+
+    /// Through the daemon's own tick: the boot pass runs first, before the
+    /// receipt sweeps and the lost-worker path could turn it UNCERTAIN.
+    #[test]
+    fn the_first_tick_after_a_reboot_requeues_instead_of_going_uncertain() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        running_job_with_receipt(temp.path(), "ticked", Some("boot-A"));
+        let mut supervisor = supervisor_on_boot(temp.path(), Some("boot-B"));
+        let _ = supervisor.tick();
+        let job = Queue::new(temp.path())
+            .expect("queue")
+            .get("ticked")
+            .expect("read")
+            .expect("job");
+        assert!(
+            !job.results
+                .values()
+                .any(|result| result.failure_class.as_deref() == Some("UNCERTAIN")),
+            "{job:?}"
+        );
+        assert_eq!(boot_markers(temp.path()).len(), 1);
+        assert_eq!(
+            boot_markers(temp.path())[0].state,
+            BootRequeueState::Requeued
+        );
+    }
+
+    #[test]
+    fn a_crash_after_the_marker_finishes_the_requeue_once_on_the_next_start() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        running_job_with_receipt(temp.path(), "half-done", Some("boot-A"));
+        let supervisor = supervisor_on_boot(temp.path(), Some("boot-B"));
+        // The daemon died right after writing its intent.
+        let marker_path = supervisor.boot_requeue_marker_path("half-done", "boot-A");
+        write_json_atomic(
+            &marker_path,
+            &BootRequeueMarker {
+                job_id: "half-done".to_owned(),
+                dead_boot_id: "boot-A".to_owned(),
+                current_boot_id: "boot-B".to_owned(),
+                state: BootRequeueState::Intent,
+                recorded_at: Utc::now(),
+            },
+        )
+        .expect("intent");
+        let mut restarted = supervisor_on_boot(temp.path(), Some("boot-B"));
+        restarted
+            .requeue_jobs_interrupted_by_reboot()
+            .expect("boot pass");
+        let job = Queue::new(temp.path())
+            .expect("queue")
+            .get("half-done")
+            .expect("read")
+            .expect("job");
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.scheduler_defer_count, 1);
+        assert_eq!(
+            boot_markers(temp.path())[0].state,
+            BootRequeueState::Requeued
+        );
+    }
+
+    /// The write-ahead control: the daemon dies right after deciding to
+    /// requeue. The intent marker must already be on disk, with nothing else
+    /// done, and the next start finishes the requeue exactly once.
+    #[test]
+    fn the_intent_marker_is_written_before_any_requeue_step() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        running_job_with_receipt(temp.path(), "write-ahead", Some("boot-A"));
+        let mut crashing = supervisor_on_boot(temp.path(), Some("boot-B"));
+        crashing.crash_after_intent = true;
+        assert!(crashing.requeue_jobs_interrupted_by_reboot().is_err());
+        let markers = boot_markers(temp.path());
+        assert_eq!(markers.len(), 1, "the marker is written first");
+        assert_eq!(markers[0].state, BootRequeueState::Intent);
+        assert!(
+            temp.path().join("queue-workers/write-ahead.json").exists(),
+            "no step after the marker ran"
+        );
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        assert_eq!(
+            queue.get("write-ahead").expect("read").expect("job").status,
+            JobStatus::Running
+        );
+        for _ in 0..2 {
+            supervisor_on_boot(temp.path(), Some("boot-B"))
+                .requeue_jobs_interrupted_by_reboot()
+                .expect("next start");
+        }
+        let job = queue.get("write-ahead").expect("read").expect("job");
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.scheduler_defer_count, 1);
+        assert_eq!(
+            boot_markers(temp.path())[0].state,
+            BootRequeueState::Requeued
+        );
+    }
+
+    /// The ordering control: the daemon died after removing the receipt and
+    /// before returning the job to pending. Nothing on disk proves the reboot
+    /// again except the marker, which finishes the requeue exactly once.
+    #[test]
+    fn a_crash_after_the_receipt_is_removed_still_requeues_exactly_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        running_job_with_receipt(temp.path(), "mid-step", Some("boot-A"));
+        let supervisor = supervisor_on_boot(temp.path(), Some("boot-B"));
+        write_json_atomic(
+            &supervisor.boot_requeue_marker_path("mid-step", "boot-A"),
+            &BootRequeueMarker {
+                job_id: "mid-step".to_owned(),
+                dead_boot_id: "boot-A".to_owned(),
+                current_boot_id: "boot-B".to_owned(),
+                state: BootRequeueState::Intent,
+                recorded_at: Utc::now(),
+            },
+        )
+        .expect("intent");
+        fs::remove_file(temp.path().join("queue-workers/mid-step.json")).expect("step 3 done");
+        for _ in 0..2 {
+            supervisor_on_boot(temp.path(), Some("boot-B"))
+                .requeue_jobs_interrupted_by_reboot()
+                .expect("boot pass");
+        }
+        let job = Queue::new(temp.path())
+            .expect("queue")
+            .get("mid-step")
+            .expect("read")
+            .expect("job");
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.scheduler_defer_count, 1);
+        assert_eq!(
+            boot_markers(temp.path())[0].state,
+            BootRequeueState::Requeued
+        );
+    }
+
+    #[test]
+    fn a_host_that_has_not_opted_in_never_requeues() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        running_job_with_receipt(temp.path(), "opted-out", Some("boot-A"));
+        supervisor_on_boot(temp.path(), Some("boot-B"))
+            .with_boot_requeue(false)
+            .requeue_jobs_interrupted_by_reboot()
+            .expect("boot pass");
+        let job = Queue::new(temp.path())
+            .expect("queue")
+            .get("opted-out")
+            .expect("read")
+            .expect("job");
+        assert_eq!(job.status, JobStatus::Running);
+        assert!(boot_markers(temp.path()).is_empty());
+        // The default, with no machine-global key, is off.
+        let default = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        assert!(!default.boot_requeue_enabled());
+    }
+
+    #[test]
+    fn without_a_proven_reboot_a_lost_worker_is_not_requeued() {
+        for (name, receipt_boot, current_boot) in [
+            ("same-boot", Some("boot-B"), Some("boot-B")),
+            ("no-receipt-boot", None, Some("boot-B")),
+            ("unreadable-current-boot", Some("boot-A"), None),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            running_job_with_receipt(temp.path(), name, receipt_boot);
+            let mut supervisor = supervisor_on_boot(temp.path(), current_boot);
+            supervisor.tick().expect("tick");
+            let job = Queue::new(temp.path())
+                .expect("queue")
+                .get(name)
+                .expect("read")
+                .expect("job");
+            // Left to the ordinary lost-worker path (UNCERTAIN, no replay).
+            assert_ne!(job.status, JobStatus::Pending, "{name}");
+            assert_eq!(job.scheduler_defer_reason, None, "{name}");
+            assert!(boot_markers(temp.path()).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_second_reboot_does_not_requeue_the_same_job_again() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        running_job_with_receipt(temp.path(), "twice", Some("boot-A"));
+        supervisor_on_boot(temp.path(), Some("boot-B"))
+            .requeue_jobs_interrupted_by_reboot()
+            .expect("first reboot");
+        // It ran again under boot B, and the host rebooted again.
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, &["twice".to_owned()])
+            .expect("start");
+        drop(lock);
+        let receipt = WorkerReceipt {
+            job_id: "twice".to_owned(),
+            generation: "after-first-reboot".to_owned(),
+            pid: 999_999,
+            started_at: Utc::now(),
+            boot_id: Some("boot-B".to_owned()),
+        };
+        write_json_atomic(&temp.path().join("queue-workers/twice.json"), &receipt)
+            .expect("receipt");
+        supervisor_on_boot(temp.path(), Some("boot-C"))
+            .requeue_jobs_interrupted_by_reboot()
+            .expect("second reboot");
+        let job = queue.get("twice").expect("read").expect("job");
+        assert_eq!(
+            job.status,
+            JobStatus::Running,
+            "left to the ordinary lost-worker path"
+        );
+        assert_eq!(boot_markers(temp.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_job_with_a_cancel_requested_is_not_requeued_after_a_reboot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        running_job_with_receipt(temp.path(), "cancelled", Some("boot-A"));
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let mut job = queue.get("cancelled").expect("read").expect("job");
+        job.cancel_requested_at = Some(Utc::now());
+        queue.update(&job).expect("persist");
+        supervisor_on_boot(temp.path(), Some("boot-B"))
+            .requeue_jobs_interrupted_by_reboot()
+            .expect("boot pass");
+        assert_eq!(
+            queue.get("cancelled").expect("read").expect("job").status,
+            JobStatus::Running
+        );
+        assert!(boot_markers(temp.path()).is_empty());
+    }
+
+    /// Spawns `/bin/sleep`; the daemon's worker path is Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_worker_receipt_records_this_boot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_job(temp.path(), "fresh");
+        let mut supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/bin/sleep"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        )
+        .with_boot_id(Some("boot-now"));
+        let _ = supervisor.tick();
+        if let Ok(bytes) = fs::read(temp.path().join("queue-workers/fresh.json")) {
+            let receipt: WorkerReceipt = serde_json::from_slice(&bytes).expect("receipt");
+            assert_eq!(receipt.boot_id.as_deref(), Some("boot-now"));
+            for child in supervisor.children.values_mut() {
+                let _ = child.kill();
+            }
+        } else {
+            panic!("the worker was not spawned, so no receipt was written");
+        }
+    }
+
     #[test]
     fn daemon_restart_repairs_missing_terminal_outcome() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3456,6 +4023,7 @@ mod tests {
             generation: "generation".to_owned(),
             pid: u32::MAX,
             started_at: Utc::now(),
+            boot_id: None,
         };
         write_json_atomic(
             &temp.path().join("queue-workers/unknown-owner.json"),

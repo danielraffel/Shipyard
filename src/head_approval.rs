@@ -344,10 +344,31 @@ pub fn decide(
     comments: &[Value],
     queue: &Value,
 ) -> HeadGate {
+    decide_excusing(policy, head, reviews, comments, queue, false)
+}
+
+/// [`decide`], leaving the latest removal out of [`EJECTION_CAP`] when
+/// `latest_was_interruption`: a removal the classifier proved was an
+/// interruption ([`crate::environment_requeue::RequeueClass::Interruption`])
+/// says nothing against the head, so it must not cost the head its approval.
+/// The interruption allowance is bounded on its own
+/// ([`crate::environment_requeue::INTERRUPTION_REARM_LIMIT`]).
+#[must_use]
+pub fn decide_excusing(
+    policy: &ApprovalPolicy,
+    head: &str,
+    reviews: &[Value],
+    comments: &[Value],
+    queue: &Value,
+    latest_was_interruption: bool,
+) -> HeadGate {
     if !policy.required {
         return HeadGate::NotRequired;
     }
-    let ejections = head_ejections(queue, head);
+    let mut ejections = head_ejections(queue, head);
+    if latest_was_interruption {
+        ejections.pop();
+    }
     if ejections.len() >= EJECTION_CAP {
         // An unreadable removal time leaves no floor an approval can be
         // proven newer than, so nothing passes it.
@@ -427,8 +448,45 @@ pub fn evaluate(
     base: &str,
     queue: &Value,
 ) -> Result<HeadGate, String> {
+    evaluate_excusing(run_gh, repo, pr, head, base, queue, false)
+}
+
+/// [`evaluate`] through [`decide_excusing`].
+///
+/// # Errors
+///
+/// When a needed fact cannot be read. Callers must not arm on an error.
+pub fn evaluate_excusing(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    base: &str,
+    queue: &Value,
+    latest_was_interruption: bool,
+) -> Result<HeadGate, String> {
     let policy = read_policy(run_gh, repo, base)?;
-    evaluate_with_policy(run_gh, repo, pr, head, &policy, queue)
+    if !policy.required {
+        return Ok(HeadGate::NotRequired);
+    }
+    let reviews = read_records(
+        run_gh,
+        &format!("repos/{repo}/pulls/{pr}/reviews"),
+        ".[] | {login: .user.login, type: .user.type, at: .submitted_at, state: .state, commit_id: .commit_id}",
+    )?;
+    let comments = read_records(
+        run_gh,
+        &format!("repos/{repo}/issues/{pr}/comments"),
+        ".[] | {login: .user.login, type: .user.type, at: .created_at, body: .body}",
+    )?;
+    Ok(decide_excusing(
+        &policy,
+        head,
+        &reviews,
+        &comments,
+        queue,
+        latest_was_interruption,
+    ))
 }
 
 /// [`evaluate`] with the policy already read, for a caller that reads the

@@ -24,8 +24,10 @@ pub mod auto_arm;
 /// Classify a "Shipyard validated green but GitHub refused the merge" wedge and
 /// decide whether a red required check is a flaky leg the operator can recover.
 pub mod auto_rescue;
-/// Base-poison signal reading and fix-PR jump advice.
 pub mod base_health;
+/// Base-poison signal reading and fix-PR jump advice.
+/// Which boot of this host the current process belongs to.
+pub mod boot_identity;
 /// Remote branch creation and branch-protection application.
 pub mod branch;
 /// Bundle transfer command construction and path normalization.
@@ -70,6 +72,7 @@ pub mod diagnose;
 pub mod diagnostics;
 /// Doctor report generation for machine and environment checks.
 pub mod doctor;
+pub mod durable_file;
 /// One same-head re-enqueue after a merge-queue ejection the network caused.
 pub mod environment_requeue;
 /// Durable evidence records and cross-branch lookup helpers.
@@ -150,6 +153,8 @@ pub mod log_retention;
 /// Merge-queue enqueue / poll / eviction supervision engine.
 /// Open issues a subsystem owns, found by a body marker.
 pub mod marked_issue;
+/// The unattended carrier's per-PR plan, from GitHub facts alone.
+pub mod merge_carrier;
 pub mod merge_queue;
 /// Fleet authority, serialization, hold, and audit controls for queue writes.
 pub mod merge_queue_control;

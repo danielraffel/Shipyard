@@ -92,6 +92,20 @@ pub(super) fn pr_watch_doctor_section(
         );
     }
     for repo in &report.repos {
+        if let Some((ok, text)) = crate::pr_watch::liveness::coverage_line(repo) {
+            rows.insert(
+                format!("coverage {}", repo.repo),
+                crate::doctor::DoctorEntry {
+                    ok,
+                    version: ok.then(|| text.clone()),
+                    detail: Some(text.clone()),
+                    error: (!ok).then(|| {
+                        "handed pull requests no rule accounts for (flag 8 calls their owners)"
+                            .to_owned()
+                    }),
+                },
+            );
+        }
         let line = crate::pr_watch::liveness::line(repo, report.stale_after_minutes);
         rows.insert(
             repo.repo.clone(),
