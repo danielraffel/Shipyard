@@ -56,6 +56,7 @@ pub mod flags;
 pub mod gather;
 pub mod handback;
 pub mod ledger;
+pub mod liveness;
 pub mod replay;
 pub mod scan;
 pub mod wakes;

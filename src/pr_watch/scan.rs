@@ -203,6 +203,9 @@ pub struct WatchConfig {
     /// Config problems that do not stop a pass but must not pass silently,
     /// such as a `[pr_watch.digest]` table with no `enabled` key.
     pub warnings: Vec<String>,
+    /// How long a scanning host may go without a completed pass before
+    /// `pr-watch liveness` and `doctor` call it stale.
+    pub stale_after: Duration,
 }
 
 impl Default for WatchConfig {
@@ -222,6 +225,7 @@ impl Default for WatchConfig {
             thresholds: Thresholds::default(),
             handback: HandbackConfig::default(),
             warnings: Vec::new(),
+            stale_after: Duration::minutes(super::liveness::DEFAULT_STALE_AFTER_MINUTES),
         }
     }
 }
@@ -323,6 +327,9 @@ impl WatchConfig {
         out.digest_command = strings(config, "pr_watch.digest.command").unwrap_or_default();
         if let Some(minutes) = integer(config, "pr_watch.digest.interval_minutes") {
             out.digest_policy.interval = Duration::minutes(minutes.max(1));
+        }
+        if let Some(minutes) = integer(config, "pr_watch.stale_after_minutes") {
+            out.stale_after = Duration::minutes(minutes.max(1));
         }
         if let Some(minutes) = integer(config, "pr_watch.digest.min_age_minutes") {
             out.digest_policy.min_age = Duration::minutes(minutes.max(0));
