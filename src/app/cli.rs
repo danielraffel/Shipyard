@@ -2198,6 +2198,34 @@ pub(super) enum RunnerCommand {
         #[arg(long = "ledger", hide = true)]
         ledger: Option<PathBuf>,
     },
+    /// Plan, and optionally apply, the unattended carrier's mechanical
+    /// actions on armed, approved pull requests: rerun a cancelled required
+    /// run, re-arm a head the queue removed because its batch starved, and
+    /// propose a merge-only update of a BEHIND head. Reads only GitHub facts.
+    /// Plan-only unless `--apply`, which also needs `--intent` and at least
+    /// one `--class`.
+    Carrier {
+        /// Owner/repo slug. Repeatable; defaults to the current repository.
+        #[arg(long)]
+        repo: Vec<String>,
+        /// Target branch.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Action class enabled for `--apply`: redispatch or rearm.
+        /// `update_branch` is planned but refused for `--apply`.
+        #[arg(long = "class")]
+        class: Vec<String>,
+        /// JSON file naming the actions the controller intends to apply,
+        /// written before `--apply` runs.
+        #[arg(long)]
+        intent: Option<PathBuf>,
+        /// Plan recorded carrier facts (JSON lines) instead of reading GitHub.
+        #[arg(long)]
+        replay: Option<PathBuf>,
+        /// Perform the intended, still-valid mutations of the enabled classes.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Watch for cloud-queued macOS jobs and drain them to a local runner when
     /// a VM slot frees up. Observe-only unless `--apply`.
     RerouteWatch {

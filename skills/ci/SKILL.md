@@ -196,6 +196,36 @@ requests the steward itself declines to own, so it cannot contend with the
 enqueue path. See the shipyard skill's
 [merge-steward reference](../shipyard/references/merge-steward.md).
 
+## The unattended carrier: `runner carrier`
+
+`shipyard runner carrier --repo <owner/repo>` plans the mechanical steps an
+approved, armed PR needs when nobody is watching, from GitHub facts alone.
+It is the command the tartci carrier scheduler drives on its single controller
+host; agents read it, they do not run `--apply`.
+
+- **Classes.** `redispatch` reruns a cancelled required run on the current
+  head (at most two reruns per run, read from `run_attempt`, and two per PR
+  per hour). `rearm` re-arms the exact head the queue removed with
+  `expectedHeadOid` when every required merge-group job that did not pass
+  starved: cancelled with no runner after waiting at least ten minutes. A
+  no-runner cancel within seconds is a superseding push or a concurrency
+  cancel, not starvation. `update_branch` is planned for a green, armed,
+  `BEHIND` PR and refused for `--apply` until the own-lines invariant exists.
+- **Approval record.** The carrier acts only on a head carrying a successful
+  `shipyard/approved-head` commit status, or a PR comment with a line
+  `reviewed:<full 40-hex head>`. A pushed head carries neither until someone
+  approves it, so a moved head is never carried. Every agent posts as the
+  same App, so the record proves which head was approved, not who approved it.
+- **Holds.** Draft, conflicting, unarmed, queued, or unapproved PRs; a failed
+  required check; a removal for a real failure, a conflict, or a person's
+  decision; a head pushed after the removal; any unreadable fact.
+- **Apply.** `--apply` needs at least one `--class` and an `--intent FILE`
+  the controller wrote first; it re-plans and performs only intended actions a
+  fresh plan still proposes on the same head, through the merge-queue mutation
+  guard (authority, `HOLD`, audit).
+- **Replay.** `--replay facts.jsonl` plans recorded facts with no GitHub read;
+  every plan prints the facts it used, so any decision can be reproduced.
+
 ## Governance policy comes from the base, and `apply` needs `--yes`
 
 `shipyard governance status|diff|apply` and `shipyard landability` read
