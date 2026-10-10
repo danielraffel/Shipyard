@@ -809,6 +809,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn empty_config() -> LoadedConfig {
         LoadedConfig {
             data: toml::Table::new(),
