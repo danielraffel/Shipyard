@@ -941,8 +941,6 @@ mod tests {
 
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
-        use std::os::unix::fs::PermissionsExt;
-
         // Fixtures short-circuit on the probe argument. Without this the probe
         // would run the script for real, and a fixture with side effects would
         // record an invocation nobody made.
@@ -958,10 +956,7 @@ mod tests {
             guarded.contains(PROBE_ARG),
             "a fixture must begin with `#!/bin/sh` so the readiness probe cannot execute it: {contents}"
         );
-        std::fs::write(path, &guarded).expect("write executable");
-        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(path, permissions).expect("permissions");
+        crate::test_support::write_executable_script_with_mode(path, &guarded, 0o700);
         wait_until_executable(path);
     }
 

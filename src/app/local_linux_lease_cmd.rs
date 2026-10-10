@@ -898,21 +898,16 @@ fn emit_decision<W: Write>(
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     use chrono::TimeZone;
+    #[cfg(unix)]
+    use std::fs;
 
     use super::*;
     use crate::runner_provision::ApiLabel;
 
     #[cfg(unix)]
     fn write_executable(path: &Path, body: &str) {
-        fs::write(path, body).expect("write executable");
-        let mut permissions = fs::metadata(path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("chmod executable");
+        crate::test_support::write_executable_script(path, body);
     }
 
     fn runner(name: &str, status: &str, busy: bool, labels: &[&str]) -> LeaseRunner {
@@ -1044,10 +1039,7 @@ mod tests {
     #[cfg(unix)]
     fn fake_gh_answering(temp: &tempfile::TempDir, script: &str) -> GitHubActions {
         let gh = temp.path().join("gh");
-        fs::write(&gh, format!("#!/bin/sh\n{script}\n")).expect("write fake gh");
-        let mut permissions = fs::metadata(&gh).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&gh, permissions).expect("chmod fake gh");
+        crate::test_support::write_executable_script(&gh, &format!("#!/bin/sh\n{script}\n"));
         GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh)
     }
 
@@ -1647,17 +1639,13 @@ esac"#,
         let temp = tempfile::tempdir().expect("tempdir");
         let calls = temp.path().join("calls");
         let gh = temp.path().join("gh");
-        fs::write(
+        crate::test_support::write_executable_script(
             &gh,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho 'HTTP 404 Not Found' >&2\nexit 1\n",
                 calls.display()
             ),
-        )
-        .expect("write fake gh");
-        let mut permissions = fs::metadata(&gh).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&gh, permissions).expect("chmod fake gh");
+        );
         let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh);
         let decision = LeaseDecision {
             action: LeaseAction::Clear,

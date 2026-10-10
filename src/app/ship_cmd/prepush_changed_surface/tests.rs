@@ -3,8 +3,6 @@ use crate::changed_surface::{BuildType, RiskClass, TestFamily};
 #[cfg(unix)]
 use crate::pr::push_branch_with_env;
 use chrono::TimeZone as _;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt as _;
 
 fn loaded_config(global_dir: &Path, merged: toml::Table) -> LoadedConfig {
     LoadedConfig {
@@ -371,9 +369,10 @@ fn protected_base_hook_bytes_are_authenticated_before_and_after_push() {
         .args(["config", "core.hooksPath", ".githooks"]));
     fs::create_dir(checkout.join(".githooks")).expect("hooks");
     let hook = checkout.join(".githooks/pre-push");
-    fs::write(&hook, b"#!/bin/sh\nexit 0\n").expect("hook");
     #[cfg(unix)]
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");
+    crate::test_support::write_executable_script(&hook, "#!/bin/sh\nexit 0\n");
+    #[cfg(not(unix))]
+    fs::write(&hook, b"#!/bin/sh\nexit 0\n").expect("hook");
     run(Command::new("git")
         .current_dir(&checkout)
         .args(["add", ".githooks/pre-push"]));
@@ -428,9 +427,9 @@ fn push_hook_receipt_and_postpush_equivalence_create_one_verified_snapshot() {
         .arg(&remote));
     let hooks = checkout.join(".git/hooks");
     let hook = hooks.join("pre-push");
-    fs::write(
-            &hook,
-            r#"#!/bin/sh
+    crate::test_support::write_executable_script(
+        &hook,
+        r#"#!/bin/sh
 test "$SHIPYARD_PR_RUNNING" = 1 || exit 40
 python3 - <<'PY'
 import json, os
@@ -451,9 +450,7 @@ with open(os.path.join(os.environ['SHIPYARD_CHANGED_SURFACE_RESULT_DIR'], 'hook-
     json.dump(result, f, sort_keys=True, separators=(',', ':'))
 PY
 "#,
-        )
-        .expect("hook");
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     assert!(persist_verified_snapshot(&push, &state, "owner/repo", 42).is_err());
     push_branch_with_env(&checkout, "feature/prepush", push.environment())

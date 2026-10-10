@@ -63,13 +63,9 @@ struct Harness {
 /// `cancel_exit` / `cancel_stderr` script the cancel endpoint.
 #[cfg(unix)]
 fn harness(cancel_exit: u8, cancel_stderr: &str) -> Harness {
-    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().expect("tempdir");
     let write_exec = |path: &Path, body: &str| {
-        std::fs::write(path, body).expect("write script");
-        let mut perms = std::fs::metadata(path).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).expect("chmod");
+        crate::test_support::write_executable_script(path, body);
     };
     let helper = temp.path().join("token-helper");
     write_exec(

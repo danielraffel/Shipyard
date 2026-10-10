@@ -594,8 +594,6 @@ mod tests {
     use super::*;
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use chrono::TimeZone;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     fn config(root: &Path) -> LoadedConfig {
         LoadedConfig {
@@ -653,10 +651,7 @@ mod tests {
 
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
-        std::fs::write(path, contents).expect("write executable");
-        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("chmod executable");
+        crate::test_support::write_executable_script(path, contents);
     }
 
     #[cfg(unix)]
