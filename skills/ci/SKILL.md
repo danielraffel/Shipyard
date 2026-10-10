@@ -27,6 +27,13 @@ live in [references/adoption.md](references/adoption.md). Detect first: the
 costly failure is rebuilding something already wired, or adding a queue before
 the required checks it depends on.
 
+The auto-merge proof counts `AutoMergeEnabledEvent` nodes from an
+`itemTypes`-filtered timeline, never its `totalCount`: that count ignores
+`itemTypes` and covers every timeline item, so it once read every merged PR as
+auto-merged. A timeline answer without `nodes` is unreadable and leaves the row
+unmeasured. The offline suite (`skills/ci/scripts/test_adoption_audit.sh`) runs
+in the Python helper CI lane through `scripts/test_graphql_filtered_count.py`.
+
 ## Webhook repository identity
 
 Webhook registrar repository keys are canonical lowercase `owner/name` values
@@ -3294,3 +3301,26 @@ Two traps worth stating because both cost time:
   outright. The **whole-directory control** — `parsed + refused` compared
   against a listing of `.github/workflows/`, printed on every run — is what made
   that visible instead of silent. It reads 77 / 77 on Pulp.
+
+### Queue-digest inventory contract
+
+The read-only `queue-digest` command consumes durable `queue-observe` snapshots;
+it must validate captured freshness, repository/base/head identity, queue-to-PR
+joins, ownership blockers, truncation, corruption, and duplicate rows before
+rendering an inventory. An incomplete or stale snapshot is an explicit unknown,
+never an empty backlog or all-clear. The command does not contact GitHub or
+mutate queue state; merge and product decisions remain outside the digest.
+
+The JSON form is versioned: consumers must inspect `digest_schema_version`
+before decoding fields (the current value is `2`). Explicit PR blockers always
+override an otherwise green or auto-merge classification. If an observer
+directory entry cannot be enumerated, the digest fails closed as incomplete;
+readers must never silently drop an enumeration error and report a clean queue.
+
+Observer state schema `3` carries both the semantic `state_hash` and a
+`snapshot_integrity_hash` that covers `captured_at`; both hashes and the nested
+schema are checked before a state can contribute to an all-clear. The observer
+also rejects missing or malformed GraphQL connection `nodes`/`pageInfo`, and
+the digest rejects a PR URL whose repository path does not match its census.
+Malformed top-level GraphQL errors, required policy values, or label/assignee
+nodes are also fatal; they must not be filtered into an empty result.

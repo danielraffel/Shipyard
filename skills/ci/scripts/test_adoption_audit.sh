@@ -62,7 +62,11 @@ echo '[{"type":"merge_queue","parameters":{"merge_method":"MERGE"}}]' > "$T/fx/r
 echo '[{"id":1}]' > "$T/fx/rulesets.json"
 echo '{"total_count":2}' > "$T/fx/runners.json"
 echo '[{"number":7,"merged_at":"2026-09-30T00:00:00Z","user":{"login":"shipyard-local[bot]"}}]' > "$T/fx/pulls.json"
-echo '{"data":{"repository":{"pullRequest":{"timelineItems":{"totalCount":1}}}}}' > "$T/fx/graphql.json"
+# The real shape of an itemTypes-filtered timeline: totalCount counts EVERY
+# timeline item, while filteredCount and nodes honour the filter.
+echo '{"data":{"repository":{"pullRequest":{"timelineItems":{"totalCount":9,"filteredCount":1,"nodes":[{"__typename":"AutoMergeEnabledEvent"}]}}}}}' > "$T/fx/graphql.json"
+echo '{"data":{"repository":{"pullRequest":{"timelineItems":{"totalCount":9,"filteredCount":0,"nodes":[]}}}}}' > "$T/fx/graphql-noautomerge.json"
+echo '{"data":{"repository":{"pullRequest":{"timelineItems":{"totalCount":9}}}}}' > "$T/fx/graphql-unreadable.json"
 
 cat > "$T/bin/ghapp" <<'EOF'
 #!/usr/bin/env bash
@@ -88,7 +92,12 @@ case "$path" in
     [ "$mode" = noadmin ] && deny "Resource not accessible by integration" 403
     f=runners.json ;;
   repos/*/*/pulls*) f=pulls.json ;;
-  graphql) f=graphql.json ;;
+  graphql)
+    case "$mode" in
+      noautomerge) f=graphql-noautomerge.json ;;
+      unreadable) f=graphql-unreadable.json ;;
+      *) f=graphql.json ;;
+    esac ;;
   repos/*/*)
     if [ "$mode" = foreign ]; then echo '{"full_name":"someone/else"}' | jq -r "$jq_expr"; exit 0; fi
     if [ "$mode" = noadmin ]; then jq -r "del(.allow_auto_merge,.allow_merge_commit) | $jq_expr" "$fx/repo.json"; exit 0; fi
@@ -173,6 +182,14 @@ expect_proven healthy "$out" "version/skill-sync gates" unmeasured
 out="$(run "$T/work" "$T/bin" STUB_GH=unprotected)"
 expect unprotected "$out" "required checks" absent
 expect unprotected "$out" "merge queue" absent
+
+# Merged PRs that never had auto-merge enabled: the filtered timeline is empty
+# even though the PR has other timeline items (totalCount 9).
+out="$(run "$T/work" "$T/bin" STUB_GH=noautomerge)"
+expect_proven no-automerge "$out" "auto-merge (MERGE)" no
+# A timeline answer without nodes is unreadable, never a yes or a no.
+out="$(run "$T/work" "$T/bin" STUB_GH=unreadable)"
+expect_proven unreadable-timeline "$out" "auto-merge (MERGE)" unmeasured
 
 # 401 / no network: every API-fed row is UNKNOWN; git-only rows still answer.
 out="$(run "$T/work" "$T/bin" STUB_GH=down)"
