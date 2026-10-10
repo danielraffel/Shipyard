@@ -248,10 +248,15 @@ fn starved(job: &GateJobSample) -> bool {
     job.conclusion.as_deref() == Some("cancelled") && !assigned(job)
 }
 
-/// Why a required job that did not pass ejected its batch: `gate_failed`
-/// (failure or timeout), `starved` (cancelled before any runner took it),
-/// `cancelled_after_start`, the raw conclusion otherwise, or `None` for a
-/// passing job. Reads only GitHub's job facts.
+/// Why one merge-group job did not pass, or `None` when it did.
+///
+/// `starved` is a cancellation with no `runner_name`: the job never reached a
+/// runner, so it says nothing about the code. A cancellation after a runner
+/// took the job is `cancelled_after_start`, and a failure is `gate_failed`
+/// even when its runner name is empty, because that job ran somewhere. The
+/// steward carrier reads this same classification to decide whether a queue
+/// removal was an interruption, so both answers stay one rule.
+#[must_use]
 pub(crate) fn ejection_cause(job: &GateJobSample) -> Option<String> {
     match job.conclusion.as_deref() {
         Some("success" | "skipped" | "neutral") => None,
