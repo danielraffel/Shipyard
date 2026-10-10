@@ -1,4 +1,4 @@
-//! `shipyard diagnose` — a bounded diagnosis of a red pull request or run.
+//! `shipyard diagnose`: a bounded diagnosis of a red pull request or run.
 //!
 //! Reads, through the app-authenticated reader every other command uses:
 //!
@@ -225,10 +225,18 @@ pub(super) struct RedContext {
     pub(super) state: String,
 }
 
-/// `(head, required names, red required contexts, warnings)` from the PR query.
-pub(super) fn parse_pr_rollup(
-    value: &Value,
-) -> Result<(String, Vec<String>, Vec<RedContext>, Vec<Unreadable>), String> {
+/// What the PR query says about the head.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Rollup {
+    pub(super) head: String,
+    pub(super) required: Vec<String>,
+    pub(super) failing: Vec<RedContext>,
+    pub(super) unreadable: Vec<Unreadable>,
+}
+
+/// The head, the required context names, the required contexts that are not
+/// green, and what could not be read, from the PR query.
+pub(super) fn parse_pr_rollup(value: &Value) -> Result<Rollup, String> {
     let pull = value
         .pointer("/data/repository/pullRequest")
         .ok_or("pull request not found")?;
@@ -299,7 +307,12 @@ pub(super) fn parse_pr_rollup(
             state,
         });
     }
-    Ok((head, required.into_iter().collect(), red, unreadable))
+    Ok(Rollup {
+        head,
+        required: required.into_iter().collect(),
+        failing: red,
+        unreadable,
+    })
 }
 
 fn gather_pr(read: &Read<'_>, repo: &str, pr: u64) -> Result<Target, CliFailure> {
@@ -322,20 +335,25 @@ fn gather_pr(read: &Read<'_>, repo: &str, pr: u64) -> Result<Target, CliFailure>
         ],
     )
     .map_err(|error| CliFailure::new(1, error))?;
-    let (head_sha, required, red, unreadable) =
-        parse_pr_rollup(&rollup).map_err(|error| CliFailure::new(1, error))?;
+    let Rollup {
+        head,
+        required,
+        failing,
+        unreadable,
+    } = parse_pr_rollup(&rollup).map_err(|error| CliFailure::new(1, error))?;
     let mut target = Target {
-        head_sha,
+        head_sha: head,
         required,
         unreadable,
         ..Target::default()
     };
-    let runs: BTreeSet<u64> = red.iter().filter_map(|context| context.run_id).collect();
+    let runs: BTreeSet<u64> = failing.iter().filter_map(|context| context.run_id).collect();
     for run in runs {
         match read_jobs(read, repo, run) {
             Ok(jobs) => target.jobs.extend(jobs),
             Err(error) => target.unreadable.extend(
-                red.iter()
+                failing
+                    .iter()
                     .filter(|context| context.run_id == Some(run))
                     .map(|context| Unreadable {
                         context: context.name.clone(),

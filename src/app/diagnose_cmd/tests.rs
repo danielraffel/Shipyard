@@ -30,26 +30,26 @@ fn the_rollup_names_red_required_actions_jobs_and_nothing_else() {
          "conclusion": "FAILURE", "isRequired": true, "detailsUrl": "https://ci.example/1"},
         {"__typename": "StatusContext", "context": "legacy", "state": "ERROR", "isRequired": true}
     ]);
-    let (head, required, red, unreadable) = parse_pr_rollup(&rollup(&nodes, false)).expect("parse");
-    assert_eq!(head, "abc");
-    assert_eq!(required, vec!["drift-fast", "external", "legacy", "macos"]);
+    let parsed = parse_pr_rollup(&rollup(&nodes, false)).expect("parse");
+    assert_eq!(parsed.head, "abc");
+    assert_eq!(parsed.required, vec!["drift-fast", "external", "legacy", "macos"]);
     assert_eq!(
-        red,
+        parsed.failing,
         vec![RedContext {
             name: "macos".to_owned(),
             run_id: Some(500),
             state: "failure".to_owned()
         }]
     );
-    let names: Vec<&str> = unreadable.iter().map(|u| u.context.as_str()).collect();
+    let names: Vec<&str> = parsed.unreadable.iter().map(|u| u.context.as_str()).collect();
     assert_eq!(names, vec!["external", "legacy"]);
 }
 
 #[test]
 fn a_rollup_past_one_page_says_so() {
-    let (_, _, _, unreadable) = parse_pr_rollup(&rollup(&json!([]), true)).expect("parse");
-    assert_eq!(unreadable.len(), 1);
-    assert!(unreadable[0].reason.contains("more than 100"));
+    let parsed = parse_pr_rollup(&rollup(&json!([]), true)).expect("parse");
+    assert_eq!(parsed.unreadable.len(), 1);
+    assert!(parsed.unreadable[0].reason.contains("more than 100"));
 }
 
 fn job(id: i64, name: &str, conclusion: &str, runnerless: bool) -> Job {

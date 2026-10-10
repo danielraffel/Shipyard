@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -178,11 +179,12 @@ fn job(id: i64, name: &str, conclusion: &str) -> Job {
 fn an_adversarial_run_still_fits_the_cap() {
     let mut log = format!("2026-10-01T00:00:00.0000000Z {}\n", "x".repeat(5_000_000));
     log.push_str("2026-10-01T00:00:01.0000000Z The following tests FAILED:\n");
+    let padding = "y".repeat(300);
     for i in 0..3_000 {
-        log.push_str(&format!(
-            "2026-10-01T00:00:01.0000000Z \t{i} - test_{i}_{} (Failed)\n",
-            "y".repeat(300)
-        ));
+        let _ = writeln!(
+            log,
+            "2026-10-01T00:00:01.0000000Z \t{i} - test_{i}_{padding} (Failed)"
+        );
     }
     log.push_str("2026-10-01T00:00:01.0000000Z Errors while running CTest\n");
     let jobs: Vec<Job> = (0..12).map(|k| job(k, &format!("req{k}"), "failure")).collect();
@@ -416,4 +418,26 @@ fn a_red_test_step_before_an_upload_stall_stays_real() {
     let check = &doc.checks[0];
     assert_eq!(check.classification.class, "real", "{}", check.classification.why);
     assert_eq!(check.failing_tests.names, vec!["parser_rejects_bad_input"]);
+}
+
+#[test]
+fn every_failing_test_corroborated_elsewhere_reads_flake_candidate() {
+    let log = "\
+2026-10-01T00:00:01.0000000Z The following tests FAILED:
+2026-10-01T00:00:01.0000000Z \t7 - racy_counter (Failed)
+2026-10-01T00:00:01.0000000Z \t8 - other_test (Failed)
+2026-10-01T00:00:01.0000000Z Errors while running CTest
+";
+    let logs = HashMap::from([(1, log.to_owned())]);
+    let jobs = [job(1, "macos", "failure")];
+    let required = ["macos".to_owned()];
+    let mut context = Context::new();
+    context.history.insert("racy_counter".to_owned(), vec![9547]);
+    let doc = build(&jobs, &logs, &required, &context, DEFAULT_MAX_BYTES);
+    assert_eq!(doc.checks[0].classification.class, "real", "one uncorroborated test keeps it real");
+    context.history.insert("other_test".to_owned(), vec![9540]);
+    let doc = build(&jobs, &logs, &required, &context, DEFAULT_MAX_BYTES);
+    let class = &doc.checks[0].classification;
+    assert_eq!((class.class.as_str(), class.rule.as_str()), ("flake_candidate", "failed_on_other_heads"));
+    assert!(class.why.contains("9540") && class.why.contains("9547"), "{}", class.why);
 }

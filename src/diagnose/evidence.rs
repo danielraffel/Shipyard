@@ -243,9 +243,9 @@ pub fn ctest_failures(lines: &[String], lo: usize, hi: usize) -> Vec<CtestFailur
                 name: caps[2].trim().to_owned(),
                 result: caps[3].to_owned(),
             });
-        } else if line.trim().starts_with("Errors while running CTest") && !out.is_empty() {
-            break;
-        } else if !out.is_empty() && blank(line) {
+        } else if !out.is_empty()
+            && (blank(line) || line.trim().starts_with("Errors while running CTest"))
+        {
             break;
         }
     }

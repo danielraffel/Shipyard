@@ -17,6 +17,7 @@
 //! is a hint that never exonerates, `stale_base` says the head needs main.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -364,9 +365,9 @@ impl Diagnosis {
 /// Diagnose every failing required job in `jobs` (one or several runs), with
 /// its log from `logs` (keyed by job id), capped at `max_bytes`.
 #[must_use]
-pub fn build(
+pub fn build<S: std::hash::BuildHasher>(
     jobs: &[Job],
-    logs: &HashMap<i64, String>,
+    logs: &HashMap<i64, String, S>,
     required: &[String],
     context: &Context,
     max_bytes: usize,
@@ -541,10 +542,11 @@ pub fn summarize(checks: &[CheckDiagnosis]) -> String {
             let mut part = format!("{}: {}", check.context, check.classification.class);
             let total = check.failing_tests.total;
             if total > 0 {
-                part.push_str(&format!(", {total} test{}", if total == 1 { "" } else { "s" }));
+                let plural = if total == 1 { "" } else { "s" };
+                let _ = write!(part, ", {total} test{plural}");
             }
             if let Some(step) = &check.failing_step {
-                part.push_str(&format!(", step '{}'", step.name));
+                let _ = write!(part, ", step '{}'", step.name);
             }
             part
         })

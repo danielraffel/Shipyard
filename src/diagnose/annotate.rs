@@ -112,7 +112,8 @@ impl Tree {
             path = rx.replace(&path, "").into_owned();
         }
         if path.starts_with("./") {
-            path = path.trim_start_matches(['.', '/']).to_owned();
+            let cut = path.len() - path.trim_start_matches(['.', '/']).len();
+            path.drain(..cut);
         }
         if self.paths.contains(&path) {
             return Some(path);
