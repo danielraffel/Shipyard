@@ -76,27 +76,30 @@ pub(super) fn ensure_execution_daemon(
     spawn_execution_daemon(mode, runtime_paths, repos)
 }
 
-/// Replace every watched slug GitHub now reports under another name with that
-/// name, and say so on stderr (the daemon log, for a detached daemon). A slug
-/// that cannot be resolved is kept: an offline probe must never drop a
-/// repository from the watch list.
+/// Resolve the slugs the daemon is asked to watch ([`repo_slug::watch_list`]):
+/// a renamed slug is watched under its new name, a slug this host's
+/// credential answers 404 for is dropped, and both are said on stderr (the
+/// daemon log, for a detached daemon). A slug that cannot be resolved is kept.
 fn resolve_watch_list(mode: RuntimeMode, state_dir: &Path, repos: Vec<String>) -> Vec<String> {
     if repos.is_empty() {
         return repos;
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let registrar = Registrar::new_with_context(mode, state_dir, &cwd);
-    let (resolved, renames) = repo_slug::canonicalize(repos, |repo| {
-        let mut anonymous = repo_slug::anonymous_probe;
-        let mut authenticated = |slug: &str| registrar.probe_repo_name(slug);
-        repo_slug::resolve(repo, &mut [&mut anonymous, &mut authenticated])
+    let list = repo_slug::watch_list(repos, &mut repo_slug::anonymous_probe, &mut |slug| {
+        registrar.probe_repo_name(slug)
     });
-    for (from, to) in &renames {
+    for (from, to) in &list.renames {
         let _ = crate::writer_domain_lease::write_stderr(format_args!(
             "shipyard daemon: {from} now resolves to {to} on GitHub; watching {to}"
         ));
     }
-    resolved
+    for (repo, why) in &list.refused {
+        let _ = crate::writer_domain_lease::write_stderr(format_args!(
+            "shipyard daemon: refusing to watch {repo}: {why}"
+        ));
+    }
+    list.watched
 }
 
 fn configured_repositories_with_missing(

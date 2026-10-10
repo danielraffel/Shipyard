@@ -75,6 +75,9 @@ pub(super) struct HostDaemon {
     pub(super) launcher_installed: Option<bool>,
     pub(super) launcher_active: Option<bool>,
     pub(super) running: Option<bool>,
+    /// How many repositories the running daemon watches (`configured_repos`).
+    /// `None` when the status did not carry the list.
+    pub(super) watched_repos: Option<usize>,
 }
 
 impl HostDaemon {
@@ -93,8 +96,17 @@ impl HostDaemon {
             ),
             _ => None,
         };
-        let stopped = (self.running == Some(false))
-            .then_some("the daemon is not running; `shipyard daemon refresh` starts it");
+        let stopped = match (self.running, self.watched_repos) {
+            (Some(false), _) => {
+                Some("the daemon is not running; `shipyard daemon refresh` starts it")
+            }
+            (Some(true), Some(0)) => Some(
+                "the daemon watches no repositories, so it registers no webhook and takes no \
+                 work; run `shipyard daemon refresh --repo OWNER/REPO` on the host (its log \
+                 says why a repository was refused)",
+            ),
+            _ => None,
+        };
         match (stopped, launcher) {
             (None, None) => None,
             (Some(stopped), None) => Some(stopped.to_owned()),
@@ -1214,6 +1226,16 @@ fn parse_daemon_probe(text: &str) -> Option<HostDaemon> {
         launcher_installed: field(PROBE_LAUNCHER_MARKER, "installed"),
         launcher_active: field(PROBE_LAUNCHER_MARKER, "active"),
         running: field(PROBE_DAEMON_MARKER, "running"),
+        watched_repos: text
+            .lines()
+            .find_map(|line| line.strip_prefix(PROBE_DAEMON_MARKER))
+            .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            .and_then(|value| {
+                value
+                    .get("configured_repos")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+            }),
     };
     (daemon != HostDaemon::default()).then_some(daemon)
 }
@@ -2321,7 +2343,39 @@ mod tests {
             launcher_installed: Some(installed),
             launcher_active: Some(active),
             running: Some(running),
+            watched_repos: None,
         }
+    }
+
+    #[test]
+    fn a_running_daemon_that_watches_nothing_is_a_problem() {
+        let watching = |count| HostDaemon {
+            watched_repos: count,
+            ..daemon(true, true, true)
+        };
+        let empty = watching(Some(0))
+            .problem()
+            .expect("an empty watch list is a problem");
+        assert!(empty.contains("watches no repositories"), "{empty}");
+        assert!(
+            empty.contains("`shipyard daemon refresh --repo OWNER/REPO`"),
+            "{empty}"
+        );
+        assert_eq!(
+            watching(Some(1)).problem(),
+            None,
+            "control: one repository is fine"
+        );
+        assert_eq!(
+            watching(None).problem(),
+            None,
+            "an older status claims nothing"
+        );
+        let text = format!(
+            "{PROBE_LAUNCHER_MARKER}{{\"active\": true, \"installed\": true}}\n\
+             {PROBE_DAEMON_MARKER}{{\"running\": true, \"configured_repos\": []}}\n"
+        );
+        assert_eq!(parse_daemon_probe(&text), Some(watching(Some(0))));
     }
 
     #[test]

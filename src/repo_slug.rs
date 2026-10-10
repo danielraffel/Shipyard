@@ -184,6 +184,68 @@ pub fn canonicalize(
     (resolved, renames)
 }
 
+/// The daemon's watch list after resolving every requested slug.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WatchList {
+    /// Lowercased, deduplicated slugs the daemon watches.
+    pub watched: Vec<String>,
+    /// `(requested, now)` for each slug GitHub reports under another name.
+    pub renames: Vec<(String, String)>,
+    /// `(requested, why)` for each slug the daemon refuses to watch.
+    pub refused: Vec<(String, String)>,
+}
+
+/// Resolve the slugs a daemon is asked to watch.
+///
+/// The anonymous probe runs first and is the only way to learn a public
+/// repository's new name. The authenticated probe uses the credential the
+/// daemon itself registers webhooks with, so its verdict decides what the
+/// daemon can do: a name it reports is watched under that name, and an HTTP
+/// 404 from it refuses the slug. GitHub serves a renamed or transferred
+/// repository at its old name only to reads that follow redirects; an App
+/// installation lookup for the old name is a plain 404, so a daemon watching
+/// it retries registration forever. That holds whatever the anonymous probe
+/// said, including a rate-limited non-answer. A slug the authenticated probe
+/// could not answer for is kept: an offline probe must never drop a
+/// repository from the watch list.
+pub fn watch_list(
+    repos: Vec<String>,
+    anonymous: &mut dyn FnMut(&str) -> SlugProbe,
+    authenticated: &mut dyn FnMut(&str) -> SlugProbe,
+) -> WatchList {
+    let mut list = WatchList::default();
+    for repo in repos {
+        let renamed = |list: &mut WatchList, to: String| {
+            let to = to.to_ascii_lowercase();
+            list.renames.push((repo.clone(), to.clone()));
+            list.watched.push(to);
+        };
+        if let SlugProbe::Found(name) = anonymous(&repo) {
+            if name.eq_ignore_ascii_case(&repo) {
+                list.watched.push(repo.to_ascii_lowercase());
+            } else {
+                renamed(&mut list, name);
+            }
+            continue;
+        }
+        match authenticated(&repo) {
+            SlugProbe::Found(name) if !name.eq_ignore_ascii_case(&repo) => renamed(&mut list, name),
+            SlugProbe::NotFound => list.refused.push((
+                repo.clone(),
+                format!(
+                    "GitHub answers HTTP 404 for {repo} to this host's credential, so the daemon \
+                     can never register its webhook; if the repository was renamed or \
+                     transferred, configure its current name"
+                ),
+            )),
+            _ => list.watched.push(repo.to_ascii_lowercase()),
+        }
+    }
+    list.watched.sort();
+    list.watched.dedup();
+    list
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +361,66 @@ mod tests {
                 "generous-corp/pulp".to_owned()
             )]
         );
+    }
+
+    #[test]
+    fn the_watch_list_refuses_a_slug_the_daemon_credential_cannot_see() {
+        // m1, 10-09: an anonymous read was rate-limited and the App token
+        // helper answered HTTP 404 for the pre-transfer name.
+        let list = watch_list(
+            vec![
+                "danielraffel/pulp".to_owned(),
+                "owner/public-renamed".to_owned(),
+                "owner/private".to_owned(),
+                "owner/offline".to_owned(),
+                "Owner/Same".to_owned(),
+            ],
+            &mut |repo| match repo {
+                "owner/public-renamed" => SlugProbe::Found("owner/public-new".to_owned()),
+                "Owner/Same" => SlugProbe::Found("owner/same".to_owned()),
+                "owner/private" => SlugProbe::NotFound,
+                _ => SlugProbe::Unreadable("HTTP 403: API rate limit exceeded".to_owned()),
+            },
+            &mut |repo| match repo {
+                "danielraffel/pulp" => SlugProbe::NotFound,
+                "owner/private" => SlugProbe::Found("Owner/Private-New".to_owned()),
+                "owner/offline" => SlugProbe::Unreadable("timed out".to_owned()),
+                other => panic!("authenticated probe asked about {other}"),
+            },
+        );
+        assert_eq!(
+            list.watched,
+            [
+                "owner/offline",
+                "owner/private-new",
+                "owner/public-new",
+                "owner/same"
+            ]
+        );
+        assert_eq!(
+            list.renames,
+            [
+                (
+                    "owner/public-renamed".to_owned(),
+                    "owner/public-new".to_owned()
+                ),
+                ("owner/private".to_owned(), "owner/private-new".to_owned()),
+            ]
+        );
+        assert_eq!(list.refused.len(), 1);
+        assert_eq!(list.refused[0].0, "danielraffel/pulp");
+        assert!(list.refused[0].1.contains("HTTP 404"), "{:?}", list.refused);
+    }
+
+    #[test]
+    fn an_unanswered_authenticated_probe_keeps_the_slug() {
+        // Negative control: nothing answered, so nothing is refused.
+        let list = watch_list(
+            vec!["owner/repo".to_owned()],
+            &mut |_| SlugProbe::Unreadable("offline".to_owned()),
+            &mut |_| SlugProbe::Unreadable("offline".to_owned()),
+        );
+        assert_eq!(list.watched, ["owner/repo"]);
+        assert!(list.refused.is_empty() && list.renames.is_empty());
     }
 }
