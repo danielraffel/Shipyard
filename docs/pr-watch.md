@@ -220,12 +220,14 @@ and otherwise unreachable. Nothing about the fleet is hardcoded.
 surface is used. No record or a stopped one is dead; unreadable output is
 unknown; an ssh failure or an unmapped host is unreachable.
 
-**Once per episode.** A delivery is recorded in the ledger (`handback.delivered`)
-against the flag episode's start, so an unchanged episode is never re-sent; a
-new episode (new head, or a flag that cleared and came back) is. A session gets
-at most one delivery per `session_interval_minutes` (pending episodes wait) and
-several pull requests for one session go out as one notification. A delivery
-whose every channel failed is not recorded and is retried next pass.
+**Until seen.** A delivery is recorded in the ledger (`handback.delivered`). If
+the owner hook has not returned `wake.seen`, the pass re-sends after
+`retry_after_minutes` while the head and episode stay unchanged. After
+`max_unseen_sends`, it records `wake.escalated` for the steward and stops
+retrying. A session gets at most one delivery per `session_interval_minutes`
+(pending episodes wait) and several pull requests for one session go out as one
+notification. A delivery whose every channel failed is not recorded and is
+retried next pass.
 
 **Commands.** The only processes the hand-back can start are
 `cmux sessions list`, `cmux notify`, `cmux set-status`/`clear-status` (key
@@ -268,6 +270,8 @@ notify = false           # tier 1 cmux notify
 status = false           # tier 1 sidebar pill (with notify)
 inbox = false            # tier 1 inbox line
 session_interval_minutes = 30
+retry_after_minutes = 30
+max_unseen_sends = 3
 unowned_after_hours = 1
 timeout_seconds = 20
 # cmux_path = "/Applications/cmux.app/Contents/Resources/bin/cmux"

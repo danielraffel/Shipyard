@@ -209,7 +209,7 @@ fn liveness_needs_a_running_record_with_a_live_pid() {
     assert_eq!(parse_sessions(&ended, LIVE_SESSION, None).name(), "dead");
     // Another session's live row does not count.
     let other = sessions_json(&[(DEAD_SESSION, "running", true, LIVE_SURFACE)]);
-    assert_eq!(parse_sessions(&other, LIVE_SESSION, None).name(), "dead");
+    assert_eq!(parse_sessions(&other, LIVE_SESSION, None).name(), "unknown");
     assert_eq!(
         parse_sessions("not json", LIVE_SESSION, None).name(),
         "unknown"

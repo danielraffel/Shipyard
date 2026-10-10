@@ -3063,8 +3063,14 @@ pub(super) enum WaitCommand {
         /// Pull request number.
         pr_number: u64,
         /// What PR state to wait for.
-        #[arg(long, value_enum)]
-        state: WaitPrState,
+        #[arg(long, value_enum, required_unless_present = "until")]
+        state: Option<WaitPrState>,
+        /// Terminal condition used by the unattended PR handoff. `merged`
+        /// and `closed` retain the existing state semantics; `green` is the
+        /// required-check condition. The flag is accepted as an alias for
+        /// `--state` so scripts can use one vocabulary.
+        #[arg(long = "until", value_enum, conflicts_with = "state")]
+        until: Option<WaitPrUntil>,
         /// Give up after N seconds.
         #[arg(long, default_value_t = 1800.0)]
         timeout: f64,
@@ -3122,6 +3128,13 @@ pub(super) enum WaitCommand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(super) enum WaitPrState {
+    Green,
+    Merged,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(super) enum WaitPrUntil {
     Green,
     Merged,
     Closed,

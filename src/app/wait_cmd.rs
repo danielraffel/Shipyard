@@ -10,7 +10,7 @@ use serde_json::Value;
 use super::{
     CliFailure, RuntimeMode, WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG,
     WAIT_EXIT_TIMEOUT, WAIT_EXIT_UNSUPPORTED,
-    cli::{WaitCommand, WaitPrState},
+    cli::{WaitCommand, WaitPrState, WaitPrUntil},
 };
 use crate::config::LoadedConfig;
 use crate::log_retention::{TerminalLogManifest, read_terminal_manifest};
@@ -56,6 +56,7 @@ pub(super) fn wait_command<W: Write>(
         WaitCommand::Pr {
             pr_number,
             state,
+            until,
             timeout,
             poll_interval,
             no_fallback,
@@ -68,7 +69,11 @@ pub(super) fn wait_command<W: Write>(
             json,
             stdout,
             pr_number,
-            state,
+            state.or_else(|| until.map(|until| match until {
+                WaitPrUntil::Green => WaitPrState::Green,
+                WaitPrUntil::Merged => WaitPrState::Merged,
+                WaitPrUntil::Closed => WaitPrState::Closed,
+            })).expect("clap requires --state or --until"),
             timeout,
             poll_interval,
             no_fallback,

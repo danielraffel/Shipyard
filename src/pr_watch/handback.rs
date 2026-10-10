@@ -72,6 +72,10 @@ pub struct HandbackConfig {
     pub unowned_after: Duration,
     /// Per host-command deadline.
     pub timeout_seconds: u64,
+    /// Re-send an unanswered wake after this interval.
+    pub retry_after: Duration,
+    /// Maximum number of sends before steward escalation.
+    pub max_unseen_sends: u32,
 }
 
 impl Default for HandbackConfig {
@@ -87,6 +91,8 @@ impl Default for HandbackConfig {
             session_interval: Duration::minutes(30),
             unowned_after: Duration::hours(1),
             timeout_seconds: 20,
+            retry_after: Duration::hours(4),
+            max_unseen_sends: 3,
         }
     }
 }
@@ -133,6 +139,11 @@ impl HandbackConfig {
             timeout_seconds: int("timeout_seconds")
                 .and_then(|s| u64::try_from(s.max(1)).ok())
                 .unwrap_or(defaults.timeout_seconds),
+            retry_after: int("retry_after_minutes")
+                .map_or(defaults.retry_after, |m| Duration::minutes(m.max(1))),
+            max_unseen_sends: int("max_unseen_sends")
+                .and_then(|n| u32::try_from(n.max(1)).ok())
+                .unwrap_or(defaults.max_unseen_sends),
         }
     }
 }
@@ -197,6 +208,15 @@ pub struct WakeRecord {
     /// When the session's hook displayed it inside an agent turn.
     #[serde(default)]
     pub seen_at: Option<DateTime<Utc>>,
+    /// Number of successful sends for this episode.
+    #[serde(default)]
+    pub send_count: u32,
+    /// Most recent successful send.
+    #[serde(default)]
+    pub last_sent_at: Option<DateTime<Utc>>,
+    /// Whether the unanswered episode has been escalated.
+    #[serde(default)]
+    pub escalated: bool,
 }
 
 /// One delivered episode.
@@ -981,6 +1001,9 @@ pub fn run(
                         unsent: None,
                         sent_to: None,
                         seen_at: None,
+                        send_count: 0,
+                        last_sent_at: None,
+                        escalated: false,
                     },
                 );
                 report.events.push(wake_event(
@@ -1001,10 +1024,12 @@ pub fn run(
             .iter()
             .filter(|id| {
                 let episode = ledger.entries.get(*id).map(|e| e.first_seen_at);
-                state
-                    .delivered
-                    .get(*id)
-                    .is_none_or(|d| Some(d.episode) != episode)
+                let Some(wake) = state.wakes.get(*id) else { return true; };
+                if Some(wake.episode) != episode { return true; }
+                if wake.sent_at.is_none() { return true; }
+                wake.seen_at.is_none()
+                    && wake.send_count < config.max_unseen_sends
+                    && wake.last_sent_at.is_some_and(|at| now - at >= config.retry_after)
             })
             .cloned()
             .collect();
@@ -1016,7 +1041,7 @@ pub fn run(
             held: None,
         };
         if pending.is_empty() {
-            view.held = Some("already delivered for this episode".to_owned());
+            view.held = Some("delivered and awaiting the owner".to_owned());
             view.tier = 1;
         } else if let (Liveness::Live { surface, workspace }, Some(route), Some(o)) =
             (&liveness, route, found.as_ref())
@@ -1200,9 +1225,10 @@ pub fn run(
             for (id, entry) in &entries {
                 if !channels.is_empty()
                     && let Some(wake) = state.wakes.get_mut(*id)
-                    && wake.sent_at.is_none()
                 {
-                    wake.sent_at = Some(now);
+                    wake.sent_at.get_or_insert(now);
+                    wake.last_sent_at = Some(now);
+                    wake.send_count = wake.send_count.saturating_add(1);
                     wake.sent_to = Some((session.clone(), batch.route.clone()));
                 }
                 report.events.push(wake_event(
@@ -1212,7 +1238,7 @@ pub fn run(
                     json!({
                         "pr": entry.pr,
                         "episode": entry.first_seen_at,
-                        "rung": "1",
+                        "rung": if state.wakes.get(*id).is_some_and(|wake| wake.send_count > 1) { "2" } else { "1" },
                         "channels": channels,
                         "session": session,
                         "host": place,
@@ -1233,6 +1259,32 @@ pub fn run(
                 );
             }
             state.sessions.insert(session.clone(), now);
+        }
+    }
+
+    // A live owner that has not acknowledged after the configured send budget
+    // is handed to the merge steward. This is a durable, read-only escalation
+    // signal; the steward decides whether and how to resume the work.
+    if deliver {
+        for (id, wake) in &mut state.wakes {
+            if wake.seen_at.is_none()
+                && wake.send_count >= config.max_unseen_sends
+                && !wake.escalated
+            {
+                wake.escalated = true;
+                report.events.push(wake_event(
+                    now,
+                    id,
+                    "wake.escalated",
+                    json!({"pr": wake.pr, "episode": wake.episode, "sends": wake.send_count, "to": "steward"}),
+                ));
+                report.actions.push(action(
+                    2,
+                    "steward_escalation",
+                    vec![wake.pr],
+                    format!("escalate unanswered wake for #{} to steward after {} sends", wake.pr, wake.send_count),
+                ));
+            }
         }
     }
 

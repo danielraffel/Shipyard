@@ -48,6 +48,10 @@ shipyard wait pr 151 --state green --timeout 1800 --json
 shipyard wait pr 151 --state merged --timeout 3600 --json
 ```
 
+The unattended handoff spelling is also accepted as
+`shipyard wait pr <N> --until {green|merged|closed}`. It is bounded by the
+same explicit `--timeout`; there is no second local ledger.
+
 ### `shipyard wait run <run-id> [--success]`
 
 Waits for an Actions workflow run to reach a terminal status. With

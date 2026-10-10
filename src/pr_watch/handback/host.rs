@@ -365,7 +365,11 @@ pub fn parse_sessions(stdout: &str, session: &str, expected_surface: Option<&str
         .filter(|row| row.get("session_id").and_then(Value::as_str) == Some(session))
         .collect();
     if rows.is_empty() {
-        return Liveness::Dead("no cmux record for the session".to_owned());
+        // A missing cmux row is not proof of death. Hosts can lose the cmux
+        // index while the agent process and its transcript continue. The
+        // caller must cross-check those independent signals before declaring
+        // the owner dead.
+        return Liveness::Unknown("no cmux record for the session".to_owned());
     }
     let text = |row: &Value, key: &str| row.get(key).and_then(Value::as_str).map(str::to_owned);
     let live: Vec<&&Value> = rows
