@@ -21,6 +21,24 @@ Current ordering:
 2. Local Mac pool planning and later implementation.
 3. Adaptive queue routing only after local host-pool foundations exist.
 
+## Queue digest hardening wave (2026-10-09)
+
+The queue-observer and queue-digest work is an active hardening track alongside
+the older quota/auth and local Mac pool phases above.
+
+| Item | Status | Evidence / next action |
+|---|---|---|
+| Cross-repository queue digest foundation | Landed | Pull request [https://github.com/danielraffel/Shipyard/pull/745](https://github.com/danielraffel/Shipyard/pull/745) merged at [https://github.com/danielraffel/Shipyard/commit/d7c356944189c058a187c810d9896e463c69bcc7](https://github.com/danielraffel/Shipyard/commit/d7c356944189c058a187c810d9896e463c69bcc7). |
+| Digest output/classification hardening | Landed | Pull request [https://github.com/danielraffel/Shipyard/pull/748](https://github.com/danielraffel/Shipyard/pull/748) merged at [https://github.com/danielraffel/Shipyard/commit/1a5278188054d988235bc2b62494a626eefdbbc2](https://github.com/danielraffel/Shipyard/commit/1a5278188054d988235bc2b62494a626eefdbbc2); all hosted CI, Sandbox E2E, version/skill sync checks passed for head `c75dc0ad7258ee752a097eeedebd0e5153d14831`. |
+| Integrity follow-up | In progress | Fresh worktree `/Volumes/Workshop/Code/agent-worktrees/shipyard-queue-digest-integrity-20261009` adds observer schema 3 integrity hashing, nested shape validation, strict GraphQL connection validation, and PR URL identity checks with planted negatives. Run focused tests, gates, adversarial review, then open and land the follow-up PR. |
+
+Adversarial review found four inherited risks that remain open until the
+integrity follow-up lands: editing only `captured_at` could bypass the old
+semantic hash, PR URL repository identity was not checked, nested snapshot
+schema was not validated, and missing GraphQL connection fields defaulted to
+empty/false. The follow-up must close each risk and preserve the existing
+read-only/no-mutation boundary.
+
 ## Worktree
 
 | Field | Value |
