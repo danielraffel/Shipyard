@@ -69,7 +69,7 @@ Then, for a same-head `failed_checks` ejection only, the guard (and
 | the timeline window is complete and shows exactly one `failed_checks`/`merge_conflict` removal of the current head | the allowance is one retry per head; a head ejected twice has had it, and a truncated window cannot prove it has not |
 | the removal names its merge-group commit (`beforeCommit`) | that commit's check runs are the ones that ejected it; no run-resolution heuristic |
 | the base's required checks (rulesets plus classic protection) can be read and are non-empty | only a **required** failure ejects; an advisory lane failing a real test is not what removed the head |
-| every failing required check on the merge-group commit is a GitHub Actions job concluded `failure`, and no required commit status failed | a `timed_out`/`cancelled` job or a status has no log that could prove anything |
+| every failing required check on the merge-group commit is a GitHub Actions job concluded `failure` (or `cancelled` and starved, below), and no required commit status failed | a `timed_out` job or a status has no log that could prove anything |
 | every failing step of each such job (jobs API `conclusion == failure`) printed an environment signature within 60 output lines of that step's first `##[error]` | positive evidence at the failure, not anywhere in a long log |
 
 The signatures are the network-transport spellings shared with Shipyard's infra
@@ -88,6 +88,31 @@ read as output. **The first `##[error]` in a log is not the failing step**: an
 `if: always()` / `continue-on-error` step after it prints its own. The failing
 step comes from the jobs API and its output from the first `Run` segment at or
 after the step's `started_at`, through that segment's first `##[error]`.
+
+### Interruptions: a starved job, or an upload that stalled after green
+
+Two more ejection causes say nothing against the head, and the same reader
+(Rust and the guard's Python twin) treats them as **interruptions**:
+
+| cause | evidence required |
+|---|---|
+| a required job **starved** of a runner | the required check concluded `cancelled`, its Actions job has an empty `runner_name` (`gate_cost/proxy.rs` `ejection_cause()` says `starved`), and it waited at least 10 minutes from `created_at` to `completed_at`. A shorter no-runner cancel is a superseding push or a concurrency-group cancel. A check run whose annotations say `Canceling since a higher priority waiting request` is a concurrency supersede at any wait (runs 37890997376 and 37891885987 waited 11.6 and 16.5 minutes), so it is never starvation. Missing times, or annotations that cannot be read, refuse. |
+| an **upload that stalled** after the work passed | the failing step's own `##[error]` line, or the line before it, reads `Upload progress stalled`. Any earlier failing step, such as a red test step, has no signature and refuses the whole verdict; a stall that recovered earlier in the step explains nothing. |
+
+An interruption allows a same-head re-enqueue on each of a head's first **two**
+ejections (a network failure allows the first only), and an allowed
+interruption does not count toward the head-approval `EJECTION_CAP`. Every
+same-head re-arm, from `ship`'s arm-on-open or from the steward's
+`--arm-unqueued` backstop, is sent with `expectedHeadOid` bound to the head the
+classifier read, so GitHub refuses it if the head moved. The steward's backstop
+reads the opt-in from the protected base's `.shipyard/config.toml`, never from
+the head, and re-arms only a head someone armed after it arrived: an
+`AutoMergeEnabledEvent` at or after the head's own force-push or its first
+check suite (`merge_carrier::head_arm_time`, the steward carrier's rule).
+Without that, a head pushed after an earlier head was armed, auto-queued and
+starved would be re-armed with nobody having armed it. A window that cannot
+place the arrival refuses. A real `failure` with a runner, `merge_conflict`, or a moved head is
+never re-armed.
 
 ### Why this is not the inference refused above
 
@@ -376,10 +401,14 @@ from its own parent, skips shells, `env`, `timeout` and the `gh` shim (not Pytho
 and requires the first other process to be named `shipyard`. An agent that
 exports the marker has its own runtime (`codex`, `node`, `claude`) there, even
 when a Shipyard process launched that agent, so the marker is ignored and the
-request is judged like any other. Any process can be named `shipyard`, so this
-check stops an agent that exports the marker by habit; it is not a security
-boundary against one that sets out to defeat it. Resolving the ancestor's
-executable to the installed Shipyard binary is a planned follow-up.
+request is judged like any other. The deciding process must also run the
+installed binary: its executable path, read from the kernel
+(`proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux) rather than its name,
+must resolve to a file named `shipyard` under
+`~/.local/share/shipyard/auth-generations/`. A binary merely named
+`shipyard` elsewhere, or a dev build under `target/`, does not pass. This
+stops an agent that exports the marker by habit or names a binary to match;
+anyone who can write into the install root can still pass it.
 
 ### Queue-removal override decisions
 

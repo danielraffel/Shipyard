@@ -359,6 +359,19 @@ rejected, and none after 2026-09-15 once arm-on-open took over. The test
 returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
 `arm native auto-merge`; `merge-queue resolve` still accepts the old
 `enqueue pull request` entries.
+## The carrier re-arms with `expectedHeadOid`, through the internal path
+
+`runner carrier --apply --class rearm` arms native auto-merge with
+`expectedHeadOid` on a head the queue removed for `failed_checks`. The `ghapp`
+arm guard would refuse that as a same-head re-arm after a failed removal,
+because it cannot see the jobs, so the carrier uses
+`run_gh_internal_queue_mutation`: its plan is the head-scoped verdict, proven
+from the removal's merge-group jobs (every required job that did not pass was
+cancelled with no runner after waiting at least ten minutes). It still takes
+the merge-queue mutation guard, so `HOLD`, `mutation_machine` and the audit
+apply. Its starvation rule is `gate_cost::proxy::ejection_cause` plus the
+wait bound, shared with the gate-cost metric; do not add a third copy.
+
 ## fleet-reconcile ledger: every attempt says how it ended
 
 `fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
@@ -690,6 +703,12 @@ daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
 pass is older than `[pr_watch] stale_after_minutes` (45); `doctor --fleet` asks
 every host and fails `pr-watch:fleet` when none is scanning. Never add a second
 scanner as a backup: each host's ledger dedupes only its own deliveries.
+
+Coverage: every open PR authored by the Shipyard bot is, each pass,
+progressing, flagged, or held. Anything else is a gap: flag 8 (`unaccounted`)
+calls its owner with why it fell through, and `pr-watch liveness` / `doctor`
+name every gap. `red_unarmed` (flag 9) is a required check red for 2 h on a PR
+nobody armed.
 
 `green_unarmed` (flag 6) is a PR green on every required check for 2 h that
 nobody armed; it is owner-actionable, quotes any "team-lead arms" promise, and
@@ -3184,7 +3203,9 @@ It refuses `pr merge --disable-auto`, `dequeuePullRequest`, and
 `disablePullRequestAutoMerge` unless the call comes from Shipyard's
 machine-authorized, exact-head, write-ahead-audited mutation path, and it
 honours Shipyard's internal marker only when the calling process is the
-Shipyard binary. A deliberate manual authority action uses the operator
+installed Shipyard binary: its kernel-reported executable must resolve under
+`~/.local/share/shipyard/auth-generations/`, so a binary merely named
+`shipyard` (or a dev build) does not pass. A deliberate manual authority action uses the operator
 override in `docs/ghapp-guards.md`, which must state a reason: a rebase or a
 reorder is always refused (a queued PR does not need a rebase; the queue merges
 it on top of current main), and a defect fix is allowed and recorded. Long-running or pending advisory/self-hosted checks are never queue
@@ -3249,6 +3270,16 @@ flake verdict is silently discarded. Read the API through `$GHAPP_REAL_GH` with
 the exported `GH_TOKEN`/`GH_REPO`, and reproduce under
 `env -i HOME=$HOME PATH=<trusted path>`, never in an interactive shell. The
 refusal quotes the attributor's stderr tail.
+
+**An INTERRUPTION ejection is re-armed at the same head, unattended.** A
+required job cancelled with no runner after 10+ minutes queued (starved; the
+`ejection_cause()` label in `gate_cost/proxy.rs`), or a failing step whose
+`##[error]` line is `Upload progress stalled` after the test step passed, is an
+interruption: `src/environment_requeue.rs` allows a same-head re-enqueue on the
+head's first two ejections and leaves it out of the head-approval ejection cap,
+and the steward's `--arm-unqueued` backstop re-arms it with `expectedHeadOid`
+(outcome `rearmed_same_head`), but only for a head somebody armed after it arrived (`merge_carrier::head_arm_time`). Under the same opt-in as below. Do not dequeue,
+rebase or push a no-op commit for these; read `shipyard landing --pr <n>`.
 
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
 when the repo sets `[queue.environment_requeue] enabled = true`: every failing

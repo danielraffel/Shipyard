@@ -140,6 +140,26 @@ pub struct GateJobSample {
     pub labels: Vec<String>,
 }
 
+impl GateJobSample {
+    /// One job from the Actions jobs API (`actions/jobs/{id}` or a run's
+    /// `jobs[]` entry). A blank `runner_name` reads as no runner.
+    #[must_use]
+    pub fn from_job(run_id: u64, event: &str, job: &Value) -> Self {
+        Self {
+            run_id,
+            event: event.to_owned(),
+            attempt: job.get("run_attempt").and_then(Value::as_u64).unwrap_or(1),
+            status: text(job, "status").unwrap_or_default(),
+            conclusion: text(job, "conclusion"),
+            started_at: timestamp(job, "started_at"),
+            completed_at: timestamp(job, "completed_at"),
+            created_at: timestamp(job, "created_at"),
+            runner_name: text(job, "runner_name").filter(|name| !name.trim().is_empty()),
+            labels: job_labels(job),
+        }
+    }
+}
+
 /// One merge-queue push to the base branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchSample {
@@ -1152,7 +1172,7 @@ pub fn gather_cached(
                 let name = text(job, "name").unwrap_or_default();
                 placement_jobs.push(PlacementSample {
                     name: name.clone(),
-                    labels: labels.clone(),
+                    labels,
                     runner_assigned: runner_name.is_some(),
                     conclusion: text(job, "conclusion"),
                 });
@@ -1172,18 +1192,7 @@ pub fn gather_cached(
                         absence.resolved_names.push(name.clone());
                     }
                 }
-                gate_jobs.push(GateJobSample {
-                    run_id,
-                    event: event.clone(),
-                    attempt: job.get("run_attempt").and_then(Value::as_u64).unwrap_or(1),
-                    status: text(job, "status").unwrap_or_default(),
-                    conclusion: text(job, "conclusion"),
-                    started_at: timestamp(job, "started_at"),
-                    completed_at: timestamp(job, "completed_at"),
-                    created_at: timestamp(job, "created_at"),
-                    runner_name,
-                    labels,
-                });
+                gate_jobs.push(GateJobSample::from_job(run_id, event, job));
             }
             if !exact {
                 let ran = jobs.iter().any(|job| {

@@ -418,6 +418,8 @@ pub struct ScanReport {
     /// Hand-back plan or deliveries, when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handback: Option<HandbackReport>,
+    /// Where every open handed pull request stands.
+    pub coverage: super::coverage::CoverageSummary,
 }
 
 /// Current pull-request facts for the ledger.
@@ -475,7 +477,15 @@ pub fn scan(
         attribute(&mut history, attributor, cache, now, &config.thresholds);
     }
     let mut flags = evaluate(&history, now, &config.thresholds);
-    let screen_gaps = screen_green_unarmed(reader, &request.repo, &mut flags);
+    let (screen_gaps, screened_held) = screen_green_unarmed(reader, &request.repo, &mut flags);
+    let mut coverage_rows = super::coverage::coverage(&history, &flags, now, &config.thresholds);
+    for row in &mut coverage_rows {
+        if screened_held.contains(&row.pr) {
+            row.state = super::coverage::CoverageState::Held;
+            "draft, or a `shipyard:hold` line in the body or a comment".clone_into(&mut row.reason);
+        }
+    }
+    let coverage = super::coverage::summarize(&coverage_rows, now);
     let prs = pr_now(&history, now);
     let open_prs: Vec<u64> = prs
         .iter()
@@ -485,6 +495,7 @@ pub fn scan(
     let _lock = ledger::lock(&request.state_path)?;
     let mut ledger = ledger::load(&request.state_path, &request.repo, &config.base)?;
     let events = ledger::reconcile(&mut ledger, &flags, &prs, now);
+    ledger.coverage = Some(coverage.clone());
     ledger::append_events(&request.state_path, &events)?;
     // Acknowledged pull requests get no comment either.
     let commentable: Vec<Flag> = flags
@@ -550,6 +561,7 @@ pub fn scan(
         gaps,
         reads: cache.stats(),
         handback: handback_report,
+        coverage,
     })
 }
 
@@ -565,7 +577,7 @@ fn screen_green_unarmed(
     reader: &SyncGhReader<'_>,
     repo: &str,
     flags: &mut Vec<Flag>,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<u64>) {
     let mut gaps = Vec::new();
     let candidates: Vec<u64> = flags
         .iter()
@@ -596,7 +608,7 @@ fn screen_green_unarmed(
         }
     }
     flags.retain(|flag| !(flag.kind == FlagKind::GreenUnarmed && drop.contains(&flag.pr)));
-    gaps
+    (gaps, drop)
 }
 
 /// What a flag-6 screen read.
@@ -951,7 +963,8 @@ mod screen_tests {
             flag(6, FlagKind::GreenUnarmed),
             flag(7, FlagKind::RedWhileArmed),
         ];
-        let gaps = screen_green_unarmed(&reader, "o/r", &mut flags);
+        let (gaps, held) = screen_green_unarmed(&reader, "o/r", &mut flags);
+        assert_eq!(held, vec![1, 2, 4]);
         let left: Vec<u64> = flags.iter().map(|f| f.pr).collect();
         // Draft (1), body hold (2), comment hold (4) are dropped; an
         // unreadable candidate (6) keeps its flag with a gap; other kinds are

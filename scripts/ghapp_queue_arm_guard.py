@@ -529,8 +529,8 @@ def decide(
             and reason.lower() == "failed_checks"
         ):
             return True, (
-                f"{label} was ejected for {reason} at {at} by an environment failure, and this "
-                f"is its one environment re-enqueue: {environment.get('reason')}. "
+                f"{label} was ejected for {reason} at {at} by an environment failure or an "
+                f"interruption, and this re-enqueue is allowed: {environment.get('reason')}. "
                 + "; ".join(_describe_step(step) for step in environment.get("evidence") or [])
             )
         note = f" {attribution['detail']}" if attribution and attribution.get("detail") else ""
@@ -1006,6 +1006,12 @@ ENVIRONMENT_SIGNATURES = NETWORK_TRANSPORT_MARKERS + (
     "curl: (56)",
 )
 FAILURE_PROXIMITY_LINES = 60
+# Twins of INTERRUPTION_SIGNATURES, STARVATION_MIN_WAIT_MINUTES and
+# INTERRUPTION_REARM_LIMIT in src/environment_requeue.rs.
+INTERRUPTION_SIGNATURES = ("Upload progress stalled",)
+STARVATION_MIN_WAIT_MINUTES = 10
+INTERRUPTION_REARM_LIMIT = 2
+SUPERSEDED_ANNOTATIONS = ("higher priority waiting request",)
 _RUN_GROUP = "##[group]Run "
 _END_GROUP = "##[endgroup]"
 _ERROR = "##[error]"
@@ -1071,14 +1077,46 @@ def signature_near_failure(output: list[str]) -> dict[str, str] | None:
     return None
 
 
+def interruption_at_failure(output: list[str]) -> dict[str, str] | None:
+    """An interruption line on the step's ``##[error]`` line or the one before it."""
+    for line in reversed(output[-2:]):
+        for signature in INTERRUPTION_SIGNATURES:
+            if signature in line:
+                return {"signature": signature, "line": line.strip()[:240]}
+    return None
+
+
 def read_failing_step(log: str, started_at: str) -> dict[str, Any]:
     output = failing_step_output(log, started_at)
     if output is None:
         return {"reading": "not_located"}
     hit = signature_near_failure(output)
-    if hit is None:
-        return {"reading": "no_signature"}
-    return {"reading": "environment", **hit}
+    if hit is not None:
+        return {"reading": "environment", **hit}
+    interrupted = interruption_at_failure(output)
+    if interrupted is not None:
+        return {"reading": "interruption", **interrupted}
+    return {"reading": "no_signature"}
+
+
+def starved_job(job: Any, annotations: Any = ()) -> dict[str, str] | None:
+    """A required job cancelled with no runner after at least the minimum wait,
+    and not superseded by a concurrency group."""
+    if not isinstance(job, dict) or job.get("conclusion") != "cancelled":
+        return None
+    for annotation in annotations if isinstance(annotations, list) else []:
+        message = annotation.get("message") if isinstance(annotation, dict) else None
+        if isinstance(message, str) and any(text in message for text in SUPERSEDED_ANNOTATIONS):
+            return None
+    if str(job.get("runner_name") or "").strip():
+        return None
+    created, completed = _timestamp(job.get("created_at")), _timestamp(job.get("completed_at"))
+    if created is None or completed is None:
+        return None
+    waited = int((completed - created).total_seconds() // 60)
+    if waited < STARVATION_MIN_WAIT_MINUTES:
+        return None
+    return {"signature": "starved", "line": f"cancelled with no runner after {waited} min queued"}
 
 
 def environment_requeue_enabled(start: pathlib.Path | None = None) -> bool:
@@ -1120,6 +1158,8 @@ def _describe_step(step: dict[str, Any]) -> str:
     reading = step["reading"]
     if reading == "environment":
         what = f"environment ({step['signature']}): {step['line']}"
+    elif reading == "interruption":
+        what = f"interruption ({step['signature']}): {step['line']}"
     elif reading == "no_signature":
         what = f"no environment signature within {FAILURE_PROXIMITY_LINES} lines of its failure"
     else:
@@ -1179,10 +1219,10 @@ def assess_environment_requeue(
             "of this head cannot be ruled out"
         )
     count = classification.get("ejections_of_current_head")
-    if count != 1:
+    if not isinstance(count, int) or count < 1 or count > INTERRUPTION_REARM_LIMIT:
         return refuse(
-            f"the queue has ejected this head {count} times; the one environment re-enqueue a "
-            "head is allowed has been spent"
+            f"the queue has ejected this head {count} times; the re-enqueues a head is allowed "
+            "have been spent"
         )
     if not isinstance(sha, str) or not sha:
         return refuse(
@@ -1242,12 +1282,21 @@ def assess_environment_requeue(
                     f"required check `{check['name']}` ({check['conclusion']}) is not a GitHub "
                     "Actions job, so it has no log to read"
                 )
+            job_id = check["id"]
+            if check["conclusion"] == "cancelled":
+                starved = starved_job(
+                    api_json(["api", f"repos/{repo}/actions/jobs/{job_id}"]),
+                    api_json(["api", f"repos/{repo}/check-runs/{job_id}/annotations"]),
+                )
+                evidence.append({"check": check["name"], "job_id": job_id, "step": "(queued)",
+                                 **({"reading": "interruption", **starved} if starved
+                                    else {"reading": "no_signature"})})
+                continue
             if check["conclusion"] != "failure":
                 return refuse(
                     f"required check `{check['name']}` concluded `{check['conclusion']}`, which is "
                     "not an environment signature"
                 )
-            job_id = check["id"]
             job = api_json(["api", f"repos/{repo}/actions/jobs/{job_id}"])
             steps = job.get("steps") if isinstance(job, dict) else None
             failing = [step for step in steps or [] if isinstance(step, dict)
@@ -1271,15 +1320,35 @@ def assess_environment_requeue(
                                  "step": step.get("name") or "", **reading})
     except GuardError as error:
         return refuse(f"{error}")
-    unexplained = [_describe_step(step) for step in evidence if step["reading"] != "environment"]
+    unexplained = [_describe_step(step) for step in evidence
+                   if step["reading"] not in ("environment", "interruption")]
     if unexplained:
         return refuse(
-            f"a required failure on merge-group commit {short} is not an environment failure: "
-            + "; ".join(unexplained),
+            f"a required failure on merge-group commit {short} is not an environment failure or "
+            "an interruption: " + "; ".join(unexplained),
+            evidence,
+        )
+    if any(step["reading"] == "interruption" for step in evidence):
+        return {
+            "allowed": True,
+            "class": "interruption",
+            "reason": (
+                f"every failing required check on merge-group commit {short} was interrupted or "
+                f"failed on the network, and this is ejection {count} of at most "
+                f"{INTERRUPTION_REARM_LIMIT} for this head"
+            ),
+            "merge_group_commit": sha,
+            "evidence": evidence,
+        }
+    if count != 1:
+        return refuse(
+            f"the queue has ejected this head {count} times; the one environment re-enqueue a "
+            "head is allowed has been spent",
             evidence,
         )
     return {
         "allowed": True,
+        "class": "network",
         "reason": (
             f"every failing required check on merge-group commit {short} failed on the network, "
             "and this is the head's first ejection"
@@ -1491,7 +1560,7 @@ def main(args: list[str]) -> int:
         for allowed, message in verdicts:
             if allowed and (
                 "batch attributor certified" in message
-                or "one environment re-enqueue" in message
+                or "this re-enqueue is allowed" in message
             ):
                 print(f"queue-arm-guard: note: {message}", file=sys.stderr)
         return 0
