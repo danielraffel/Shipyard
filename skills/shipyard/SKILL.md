@@ -643,6 +643,22 @@ state root and takes an exclusive per-cursor lock. It exposes no mutation flag,
 does not acquire a mutation lease, and needs no write credential. See
 [`docs/queue-observer.md`](../../docs/queue-observer.md).
 
+The read-only `shipyard queue-digest` command renders an inventory from those
+durable snapshots without contacting GitHub or mutating queue state. Treat its
+JSON as a versioned contract: inspect `digest_schema_version` (currently `2`)
+before decoding fields. Explicit PR blockers take precedence over an otherwise
+green or auto-merge classification. Observer-directory enumeration errors are
+incomplete evidence and fail closed; they must not be discarded as if the
+entry were absent.
+
+Observer state schema `3` authenticates capture provenance with a separate
+`snapshot_integrity_hash` in addition to the semantic `state_hash`; both hashes
+and the nested schema must validate before a snapshot is trusted. Missing or
+malformed GraphQL connection `nodes`/`pageInfo` fields fail closed, as does a
+pull-request URL whose repository path does not match its census. Malformed
+top-level GraphQL errors, required policy values, and label/assignee nodes are
+fatal rather than silently filtered.
+
 Use `shipyard pr-watch scan --repo <owner/repo>` for read-only flags on stuck
 open PRs: the same required-check test failing on two runs (or
 "failing on main/pre-existing" when two other PRs fail it too), armed but red
@@ -3641,6 +3657,16 @@ Funnel command with `TERM=dumb`. Preserve that environment override: the macOS
 app-bundle CLI can otherwise attempt to start its GUI and emit non-JSON under a
 stripped LaunchAgent or SSH environment even while Tailscale is healthy. An
 interactive-shell success is not sufficient fleet proof.
+
+### A filtered `timelineItems` `totalCount` counts every timeline item
+
+`timelineItems(itemTypes:[...]){totalCount}` ignores `itemTypes`: GitHub
+returns the count of ALL timeline items, while `filteredCount` and `nodes`
+honour the filter. `adoption_audit.sh` read every merged PR as auto-merged this
+way, and the same shape made Pulp's version-at-land close never-queued bump PRs
+as "ejected". Select `nodes{__typename}` and count the matching type.
+`scripts/test_graphql_filtered_count.py` (Python helper CI lane) fails on the
+bad shape anywhere in the tree and also runs the adoption-audit shell suite.
 
 ## macOS GUI
 

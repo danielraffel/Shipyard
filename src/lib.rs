@@ -215,6 +215,8 @@ pub mod profile_apply;
 pub mod queue;
 /// Crash-safe, opt-in recovery of exact ship work missing from the queue.
 pub mod queue_absent_recovery;
+/// Read-only aggregation of durable queue-observer state across repositories.
+pub mod queue_digest;
 /// Stable read-only GitHub queue snapshots, state hashing, and delta tracking.
 pub mod queue_observer;
 /// Durable queued execution request and outcome stores.
