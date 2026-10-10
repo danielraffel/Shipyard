@@ -266,6 +266,20 @@ writer-domain lease before calling it; the helper only makes the write
 crash-safe. Off Unix only the file is synced, because std has no directory
 handle to sync there.
 
+## A lane job running at reboot is requeued once, not lost
+
+Worker receipts record the host boot (`boot_id`). On a host that opted in
+(machine-global `[queue.boot_requeue] enabled = true`; off by default until a
+requeue is visible on the pull request), the first supervisor tick after a
+reboot takes each `Running` job whose receipt names an earlier boot. It is
+returned to `Pending` under its own id and envelope (same PR and exact head),
+with `interrupted: host reboot, requeued once at <UTC>` as its deferral reason
+(printed by `shipyard queue`), after a write-ahead
+marker in `queue-workers/boot-requeue/`. It happens once per job; a receipt
+with no boot id, the same boot, or a second reboot keeps the ordinary
+`UNCERTAIN`, no-replay path. Do not hand-edit `queue.json` to rescue such a
+job; restart the daemon and read `shipyard queue`.
+
 ## Durable work handoff
 
 Do not spend an agent session polling a pull request, build, benchmark, release,
@@ -2372,9 +2386,17 @@ plain 404, so a daemon watching the old slug fails webhook registration on
 every retry while everything else looks healthy. Daemon start and `daemon
 refresh` resolve each watched slug (anonymous read, then the configured
 credential) and watch the name GitHub reports, logging the rename to the daemon
-log; an unresolvable slug is kept. `shipyard doctor` reports `daemon-repos`
-not ok for a watched repo that was renamed or returns 404 to both probes; the
-fix is `shipyard daemon refresh`.
+log. A private repository's new name is invisible to the anonymous read, and
+the configured credential only answers 404 for the old one, so a slug that
+credential answers HTTP 404 for is refused: dropped from the watch list with a
+`refusing to watch <slug>` line in the daemon log, whatever the anonymous read
+said (m1 watched the pre-transfer `danielraffel/pulp` for a day this way, with
+6494 registration failures, because a rate-limited anonymous read made the
+verdict "unknown"). A slug the credential could not answer for is kept.
+`shipyard doctor` reports `daemon-repos` not ok for a watched repo that was
+renamed or returns 404 to both probes; the fix is `shipyard daemon refresh
+--repo <current name>`. `runner fleet-reconcile` lists a running daemon that
+watches no repositories under `daemon_problems`.
 
 ## Legacy Queue Recovery: killed-worker stale-running reaping
 
