@@ -140,7 +140,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_auto_release_workflow_supports_doctor_release_chain(self) -> None:
         text = AUTO_RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("workflow_dispatch:", text)
-        self.assertIn("secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN", text)
+        self.assertIn("secrets.RELEASE_BOT_TOKEN", text)
+        self.assertIn("RELEASE_BOT_TOKEN is required", text)
+        self.assertNotIn("secrets.GITHUB_TOKEN", text)
         self.assertIn("actions/checkout@v5", text)
         self.assertIn("Cargo.toml", text)
         self.assertIn("version unchanged", text)

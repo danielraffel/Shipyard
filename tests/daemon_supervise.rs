@@ -3,8 +3,9 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -34,17 +35,15 @@ fn supervise_forwards_sigterm_to_the_daemon_and_exits_with_its_code() {
     let parent_file = temp.path().join("child.ppid");
     let marker = temp.path().join("terminated");
     let script = temp.path().join("fake-daemon");
-    fs::write(
+    common::write_executable(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\ntrap 'echo term > \"{marker}\"; exit 7' TERM\necho $PPID > \"{ppid}\"\necho $$ > \"{pid}\"\nwhile :; do sleep 0.05; done\n",
             marker = marker.display(),
             ppid = parent_file.display(),
             pid = pid_file.display()
         ),
-    )
-    .expect("script");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     let mut supervisor = Command::new(binary())
         .arg("--mode")
@@ -119,15 +118,13 @@ fn in_place_step_prepares_the_daemon_and_execs_it_under_the_same_pid() {
     let state = temp.path().join("state");
     let report = temp.path().join("report");
     let script = temp.path().join("fake-daemon");
-    fs::write(
+    common::write_executable(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\n{{ echo \"pid=$$\"; echo \"tmpdir=$TMPDIR\"; printf 'arg=%s\\n' \"$@\"; }} > \"{report}\"\necho from-daemon-stdout\n",
             report = report.display()
         ),
-    )
-    .expect("script");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
 
     let mut child = Command::new(binary())
         .arg("--mode")
@@ -191,16 +188,14 @@ fn in_place_step_prepares_the_daemon_and_execs_it_under_the_same_pid() {
 /// exits 0 once `stop` exists.
 fn write_counting_daemon(dir: &Path) -> std::path::PathBuf {
     let script = dir.join("fake-daemon");
-    fs::write(
+    common::write_executable(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\necho $$ >> \"{starts}\"\nwhile [ ! -e \"{stop}\" ]; do sleep 0.05; done\nexit 0\n",
             starts = dir.join("starts").display(),
             stop = dir.join("stop").display(),
         ),
-    )
-    .expect("script");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
     script
 }
 

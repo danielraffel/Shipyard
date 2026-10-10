@@ -111,9 +111,11 @@ impl Fixture {
         let close_guard_source = root.path().join("new-close-guard");
         std::fs::write(&helper_source, b"new helper\n").expect("helper source");
         std::fs::write(&wrapper_source, NEW_WRAPPER).expect("wrapper source");
-        std::fs::write(&close_guard_source, b"#!/bin/sh\nexit 0\n").expect("guard source");
-        std::fs::set_permissions(&close_guard_source, std::fs::Permissions::from_mode(0o700))
-            .expect("guard mode");
+        crate::test_support::write_executable_script_with_mode(
+            &close_guard_source,
+            "#!/bin/sh\nexit 0\n",
+            0o700,
+        );
         let mut authority = test_release_authority("v0.127.0");
         authority.auth_helper.sha256 = digest(b"new helper\n");
         authority.auth_wrapper.sha256 = digest(NEW_WRAPPER);
@@ -246,9 +248,11 @@ impl Fixture {
         let companion = self.companion();
         for path in [&binary, &companion] {
             if !path.exists() {
-                std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("binary fixture");
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-                    .expect("binary mode");
+                crate::test_support::write_executable_script_with_mode(
+                    path,
+                    "#!/bin/sh\nexit 0\n",
+                    0o700,
+                );
             }
         }
 

@@ -1769,15 +1769,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_version_probe_reads_the_installed_binary() {
-        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("temp");
         let binary = temp.path().join("shipyard");
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &binary,
             "#!/bin/sh\n[ \"$1\" = --version ] && echo 'shipyard 0.205.0'\n",
-        )
-        .expect("fake");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        );
         let mut class = crate::capacity::HostClassConfig {
             class: "studio".to_owned(),
             ssh: None,

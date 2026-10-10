@@ -221,14 +221,7 @@ fn config_with(body: &str) -> crate::config::LoadedConfig {
 
 #[cfg(unix)]
 fn write_test_executable(path: &Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(path, contents).expect("write executable");
-    let mut permissions = std::fs::metadata(path)
-        .expect("executable metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions).expect("chmod executable");
+    crate::test_support::write_executable_script(path, contents);
 }
 
 #[cfg(unix)]
@@ -386,14 +379,12 @@ fn reaper_thresholds_flags_win_over_config() {
 #[cfg(unix)]
 #[test]
 fn stale_run_reaper_continues_after_individual_cancellation_failure() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("temp");
     let calls = temp.path().join("calls");
     let gh = temp.path().join("gh");
-    std::fs::write(
+    crate::test_support::write_executable_script(
         &gh,
-        format!(
+        &format!(
             r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> '{calls}'
@@ -414,13 +405,7 @@ esac
 "#,
             calls = calls.display()
         ),
-    )
-    .expect("fake gh");
-    let mut permissions = std::fs::metadata(&gh)
-        .expect("fake gh metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&gh, permissions).expect("chmod fake gh");
+    );
     let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(gh);
     let settings = WatchdogSettings {
         repo_slug: "owner/repo".to_owned(),

@@ -1935,9 +1935,6 @@ mod service_supervision;
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     fn api_runner(name: &str, status: &str, busy: bool) -> ApiRunner {
         ApiRunner {
             name: name.to_owned(),
@@ -1952,16 +1949,10 @@ mod tests {
     fn runner_removal_uses_compound_service_uninstall() {
         let temp = tempfile::tempdir().expect("temp");
         let script = temp.path().join("svc.sh");
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &script,
             "#!/bin/sh\nprintf '%s\\n' \"$1\" > service-command\n",
-        )
-        .expect("write svc.sh");
-        let mut permissions = std::fs::metadata(&script)
-            .expect("svc.sh metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("make svc.sh executable");
+        );
 
         uninstall_runner_service(temp.path()).expect("service uninstall");
 
@@ -2179,14 +2170,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_readiness_probe_runs_inside_the_fixture_directory() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("temp");
         let script = temp.path().join("probe.sh");
-        std::fs::write(&script, "#!/bin/sh\npwd -P > probe-cwd\n").expect("script");
-        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("executable");
+        crate::test_support::write_executable_script(&script, "#!/bin/sh\npwd -P > probe-cwd\n");
         wait_until_executable(&script);
 
         let recorded = std::fs::read_to_string(temp.path().join("probe-cwd"))
@@ -2200,20 +2186,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn runner_configuration_receives_the_canonical_path() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("temp");
         let script = temp.path().join("config.sh");
         // The readiness probe short-circuits so only the real configuration
         // run writes `.path`.
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &script,
             "#!/bin/sh\n[ \"${1:-}\" = \"--probe\" ] && exit 0\nprintf '%s\\n' \"$PATH\" > .path\n",
-        )
-        .expect("script");
-        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).expect("executable");
+        );
         wait_until_executable(&script);
 
         let canonical = runner_path_file(temp.path());
@@ -2369,8 +2349,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failed_service_less_activation_uninstalls_then_restores_original() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("temp");
         let runner = temp.path().join("actions-runner-pulp-m5-01");
         let staged = temp
@@ -2381,16 +2359,11 @@ mod tests {
         std::fs::create_dir_all(staged.join("bin")).expect("staged bin");
         std::fs::write(staged.join("bin/Runner.Listener"), "new\n").expect("new listener");
         let staged_service = staged.join("svc.sh");
-        std::fs::write(
+        crate::test_support::write_executable_script_with_mode(
             &staged_service,
             "#!/bin/sh\nprintf '%s\\n' \"$1\" >> ../service-recovery\ncase \"$1\" in\n  start) touch ../replacement-running; exit 1 ;;\n  uninstall) rm -f ../replacement-running ;;\nesac\n",
-        )
-        .expect("staged service");
-        let mut permissions = std::fs::metadata(&staged_service)
-            .expect("metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&staged_service, permissions).expect("chmod");
+            0o700,
+        );
 
         let returned = activate_staged_service_install(&runner, &staged)
             .expect_err("failed start must restore original");
@@ -2415,30 +2388,29 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failed_staged_extraction_never_stops_or_changes_the_live_runner() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("temp");
         let runner = temp.path().join("actions-runner-pulp-m5-01");
         let package_root = temp.path().join("package-root");
         std::fs::create_dir_all(runner.join("bin")).expect("runner bin");
         std::fs::create_dir_all(package_root.join("bin")).expect("package bin");
         let listener = runner.join("bin/Runner.Listener");
-        std::fs::write(&listener, "#!/bin/sh\nprintf '2.334.0\\n'\n").expect("old listener");
+        crate::test_support::write_executable_script_with_mode(
+            &listener,
+            "#!/bin/sh\nprintf '2.334.0\\n'\n",
+            0o700,
+        );
         let service = runner.join("svc.sh");
-        std::fs::write(
+        crate::test_support::write_executable_script_with_mode(
             &service,
             "#!/bin/sh\nprintf '%s\\n' \"$1\" > ../service-invocation\n",
-        )
-        .expect("service");
+            0o700,
+        );
         let corrupt = package_root.join("bin/Runner.Listener");
-        std::fs::write(&corrupt, "#!/bin/sh\nprintf 'corrupt\\n'\n").expect("corrupt");
-        for executable in [&listener, &service, &corrupt] {
-            let mut permissions = std::fs::metadata(executable)
-                .expect("metadata")
-                .permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(executable, permissions).expect("chmod");
-        }
+        crate::test_support::write_executable_script_with_mode(
+            &corrupt,
+            "#!/bin/sh\nprintf 'corrupt\\n'\n",
+            0o700,
+        );
         let package = temp.path().join("runner.tar.gz");
         let status = Command::new("/usr/bin/tar")
             .args(["czf", package.to_str().expect("package path"), "-C"])

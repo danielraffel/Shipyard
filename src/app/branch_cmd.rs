@@ -137,7 +137,6 @@ fn render_result<W: Write>(
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     use clap::Parser;
     use serde_json::json;
@@ -307,10 +306,7 @@ exit 99
 
     fn write_script(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
         let path = dir.join(name);
-        fs::write(&path, contents).expect("write script");
-        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("chmod");
+        crate::test_support::write_executable_script(&path, contents);
         path
     }
 }

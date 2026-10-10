@@ -109,9 +109,11 @@ impl Fixture {
     }
 
     fn write_executable(path: &Path, contents: &[u8]) {
-        std::fs::write(path, contents).expect("write executable");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .expect("executable mode");
+        crate::test_support::write_executable_script_with_mode(
+            path,
+            std::str::from_utf8(contents).expect("script fixture is UTF-8"),
+            0o700,
+        );
     }
 
     fn state(&self) -> PathBuf {

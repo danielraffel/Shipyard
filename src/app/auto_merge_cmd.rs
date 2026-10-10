@@ -4308,19 +4308,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn custom_merge_hook_is_production_refused_and_isolated_only() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("tempdir");
         let hook = temp.path().join("merge-hook");
         let marker = temp.path().join("executed");
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &hook,
-            format!("#!/bin/sh\n/usr/bin/touch {}\n", marker.display()),
-        )
-        .expect("hook");
-        let mut permissions = std::fs::metadata(&hook).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&hook, permissions).expect("chmod");
+            &format!("#!/bin/sh\n/usr/bin/touch {}\n", marker.display()),
+        );
         let store = ShipStateStore::new(temp.path().join("state")).expect("store");
         let mut state = ShipState::new(534, "owner/repo", "feature/x", "main", "abc", "policy");
         store.save(&state).expect("state");
@@ -4439,8 +4433,6 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // The isolated child fixture proves the real command boundary.
     fn classic_merge_command_refuses_before_any_merge_mutation() {
-        use std::os::unix::fs::PermissionsExt;
-
         fn includes_merge_mutation(calls: &str) -> bool {
             calls
                 .lines()
@@ -4478,10 +4470,7 @@ exit 91
                 log = log.display(),
                 head = "a".repeat(40),
             );
-            std::fs::write(&fake, format!("#!/bin/sh\n{script}\n")).expect("fake gh");
-            let mut permissions = std::fs::metadata(&fake).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake, permissions).expect("chmod");
+            crate::test_support::write_executable_script(&fake, &format!("#!/bin/sh\n{script}\n"));
             let path = format!(
                 "{}:{}",
                 temp.path().display(),

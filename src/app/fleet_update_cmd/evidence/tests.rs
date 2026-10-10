@@ -574,8 +574,7 @@ fn local_generation_target_requires_private_owned_regular_member() {
     std::fs::set_permissions(&generation_dir, std::fs::Permissions::from_mode(0o700))
         .expect("private generation dir");
     let target = generation_dir.join("ghapp");
-    std::fs::write(&target, "#!/bin/sh\n").expect("target");
-    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).expect("target mode");
+    crate::test_support::write_executable_script_with_mode(&target, "#!/bin/sh\n", 0o700);
     symlink(&target, &plan.auth_wrapper).expect("canonical link");
 
     let observed = collect_local_support_file(&plan.auth_wrapper, Some("d"), true, &plan)
@@ -614,9 +613,7 @@ fn local_generation_target_requires_private_owned_regular_member() {
         .expect("restore share ancestor mode");
     std::fs::remove_file(&target).expect("remove regular target");
     let indirect_target = generation_dir.join("indirect-ghapp");
-    std::fs::write(&indirect_target, "#!/bin/sh\n").expect("indirect target");
-    std::fs::set_permissions(&indirect_target, std::fs::Permissions::from_mode(0o700))
-        .expect("indirect target mode");
+    crate::test_support::write_executable_script_with_mode(&indirect_target, "#!/bin/sh\n", 0o700);
     symlink(&indirect_target, &target).expect("nested target link");
     assert!(
         collect_local_support_file(&plan.auth_wrapper, Some("d"), true, &plan).is_err(),
@@ -737,16 +734,12 @@ fn remote_evidence_rejects_duplicate_or_incomplete_markers() {
 #[cfg(unix)]
 #[test]
 fn local_evidence_probes_share_the_host_attempt_deadline() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("temp dir");
     let binary = temp.path().join("shipyard");
-    std::fs::write(
+    crate::test_support::write_executable_script(
         &binary,
         "#!/bin/sh\ncase \"$*\" in *\"daemon status\"*) printf '%s\\n' '{\"command\":\"daemon:status\",\"running\":false}' ;; *\"--version\"*) sleep 60 ;; *) printf '%s\\n' '{\"command\":\"daemon:refresh\",\"new_pid\":42}' ;; esac\n",
-    )
-    .expect("fixture");
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    );
     let mut class = host(None);
     class.shipyard_bin = Some(binary.display().to_string());
     class.github_cli = Some(temp.path().join("ghapp").display().to_string());
