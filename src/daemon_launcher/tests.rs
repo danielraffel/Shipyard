@@ -107,20 +107,97 @@ fn label_is_stable_per_state_root_and_distinct_across_roots() {
 }
 
 #[test]
-fn plist_escapes_values_and_never_keeps_the_daemon_alive() {
+fn plist_escapes_values_and_the_daemon_agent_survives_kill_and_reboot() {
     let rendered = render_plist(
         "com.example.label",
         &["/a b/launcher".into(), "--repo".into(), "o/<&'\">".into()],
         Path::new("/tmp/launcher.log"),
         Path::new("/Users/ci"),
         OsStr::new("/usr/bin:/bin"),
-        false,
+        AgentKind::Daemon,
     );
     assert!(rendered.contains("<string>o/&lt;&amp;&apos;&quot;&gt;</string>"));
-    assert!(rendered.contains("<key>KeepAlive</key>\n\t<false/>"));
-    assert!(rendered.contains("<key>RunAtLoad</key>\n\t<false/>"));
+    assert!(rendered.contains("<key>RunAtLoad</key>\n\t<true/>"));
+    assert!(rendered.contains(
+        "<key>KeepAlive</key>\n\t<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>"
+    ));
+    assert!(rendered.contains(&format!(
+        "<key>ThrottleInterval</key>\n\t<integer>{DAEMON_THROTTLE_SECS}</integer>"
+    )));
     assert!(rendered.contains("<key>AbandonProcessGroup</key>\n\t<true/>"));
     assert!(!rendered.contains("o/<&"));
+}
+
+#[test]
+fn the_consent_probe_runs_once_and_is_never_kept_alive() {
+    let rendered = render_plist(
+        "com.example.probe",
+        &["/x/launcher".into()],
+        Path::new("/tmp/launcher.log"),
+        Path::new("/Users/ci"),
+        OsStr::new("/usr/bin:/bin"),
+        AgentKind::ConsentProbe,
+    );
+    assert!(rendered.contains("<key>RunAtLoad</key>\n\t<true/>"));
+    assert!(rendered.contains("<key>KeepAlive</key>\n\t<false/>"));
+    assert!(!rendered.contains("ThrottleInterval"));
+}
+
+#[test]
+fn restart_policy_reads_the_keys_launchd_reads() {
+    use serde_json::json;
+    let read = |value| AgentRestartPolicy::from_json(&value).expect("dict");
+    let rendered = read(json!({"RunAtLoad": true, "KeepAlive": {"SuccessfulExit": false}}));
+    assert!(rendered.survives_kill_and_reboot());
+    assert!(read(json!({"RunAtLoad": true, "KeepAlive": true})).survives_kill_and_reboot());
+    // The plist every host carried before: both keys false.
+    let before = read(json!({"RunAtLoad": false, "KeepAlive": false}));
+    assert!(!before.run_at_load && !before.restarts_dead_daemon);
+    assert!(!read(json!({"RunAtLoad": true, "KeepAlive": false})).survives_kill_and_reboot());
+    assert!(!read(json!({"RunAtLoad": false, "KeepAlive": true})).survives_kill_and_reboot());
+    // SuccessfulExit = true restarts only a daemon that exited cleanly.
+    assert!(
+        !read(json!({"RunAtLoad": true, "KeepAlive": {"SuccessfulExit": true}}))
+            .restarts_dead_daemon
+    );
+    assert!(!read(json!({"RunAtLoad": true})).survives_kill_and_reboot());
+    assert_eq!(AgentRestartPolicy::from_json(&json!([])), None);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn installed_restart_policy_reads_the_rendered_plist_through_plutil() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let label = "com.example.restart-policy";
+    assert_eq!(
+        installed_restart_policy(home.path(), label),
+        None,
+        "no plist, no answer"
+    );
+    let path = plist_path(home.path(), label);
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    for (kind, expected) in [(AgentKind::Daemon, true), (AgentKind::ConsentProbe, false)] {
+        fs::write(
+            &path,
+            render_plist(
+                label,
+                &["/x/launcher".into()],
+                Path::new("/tmp/launcher.log"),
+                home.path(),
+                OsStr::new("/usr/bin:/bin"),
+                kind,
+            ),
+        )
+        .expect("write plist");
+        let policy = installed_restart_policy(home.path(), label).expect("readable plist");
+        assert_eq!(policy.survives_kill_and_reboot(), expected, "{kind:?}");
+    }
+    fs::write(&path, "not a plist").expect("write");
+    assert_eq!(
+        installed_restart_policy(home.path(), label),
+        None,
+        "unreadable is unknown"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -134,7 +211,7 @@ fn rendered_plist_is_valid_for_launchd() {
         Path::new("/tmp/launcher.log"),
         Path::new("/Users/ci"),
         OsStr::new("/usr/bin:/bin"),
-        true,
+        AgentKind::Daemon,
     );
     fs::write(&path, rendered).expect("write plist");
     let status = Command::new("/usr/bin/plutil")
@@ -199,6 +276,10 @@ fn start_via_launchd_replaces_the_agent_then_kickstarts_it() {
     let written = fs::read_to_string(&plist).expect("plist written");
     assert!(written.contains("<string>supervise</string>"));
     assert!(written.contains(&format!("<string>{}</string>", launcher.path.display())));
+    assert!(
+        written.contains("<key>SuccessfulExit</key>"),
+        "the daemon agent is written with the keep-alive policy"
+    );
 }
 
 #[test]

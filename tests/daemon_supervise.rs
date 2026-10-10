@@ -186,3 +186,220 @@ fn in_place_step_prepares_the_daemon_and_execs_it_under_the_same_pid() {
         "stdout goes to daemon.log"
     );
 }
+
+/// A fake daemon that records each start's pid, then runs until killed, or
+/// exits 0 once `stop` exists.
+fn write_counting_daemon(dir: &Path) -> std::path::PathBuf {
+    let script = dir.join("fake-daemon");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ >> \"{starts}\"\nwhile [ ! -e \"{stop}\" ]; do sleep 0.05; done\nexit 0\n",
+            starts = dir.join("starts").display(),
+            stop = dir.join("stop").display(),
+        ),
+    )
+    .expect("script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    script
+}
+
+fn starts(dir: &Path) -> Vec<String> {
+    fs::read_to_string(dir.join("starts"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn supervise_command(temp: &Path, script: &Path) -> Command {
+    let mut command = Command::new(binary());
+    command
+        .arg("--mode")
+        .arg("shipyard")
+        .arg("--global-dir")
+        .arg(temp.join("global"))
+        .arg("--state-dir")
+        .arg(temp.join("state"))
+        .args(["daemon", "supervise", "--exec"])
+        .arg(script)
+        .args(["--repo", "owner/repo"])
+        .stdin(Stdio::null());
+    command
+}
+
+fn wait_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(exit) = child.try_wait().expect("try_wait") {
+            return exit;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("supervisor did not exit");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// launchd's `KeepAlive {SuccessfulExit = false}` restarts the agent on a
+/// non-zero exit, so `supervise` must report a killed daemon as non-zero and
+/// a cleanly stopped one as zero.
+#[test]
+fn supervise_reports_a_killed_daemon_as_failure_and_a_stopped_one_as_success() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script = write_counting_daemon(temp.path());
+
+    let mut killed = supervise_command(temp.path(), &script)
+        .spawn()
+        .expect("spawn supervisor");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while starts(temp.path()).is_empty() {
+        assert!(Instant::now() < deadline, "daemon never started");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let pid = starts(temp.path())[0].clone();
+    assert!(
+        Command::new("kill")
+            .args(["-KILL", &pid])
+            .status()
+            .expect("kill")
+            .success()
+    );
+    let exit = wait_exit(&mut killed);
+    assert_eq!(
+        exit.code(),
+        Some(128 + 9),
+        "SIGKILL reads as 137, a failure"
+    );
+
+    fs::write(temp.path().join("stop"), "").expect("stop marker");
+    let mut stopped = supervise_command(temp.path(), &script)
+        .spawn()
+        .expect("spawn supervisor");
+    assert_eq!(
+        wait_exit(&mut stopped).code(),
+        Some(0),
+        "a clean stop is a success"
+    );
+}
+
+/// Unloads a test launchd job when the test ends, pass or fail.
+#[cfg(target_os = "macos")]
+struct Bootout(String);
+
+#[cfg(target_os = "macos")]
+impl Drop for Bootout {
+    fn drop(&mut self) {
+        let _ = Command::new("/bin/launchctl")
+            .args(["bootout", &self.0])
+            .status();
+    }
+}
+
+/// The whole chain under the real launchd: a rendered daemon agent running
+/// `shipyard daemon supervise`. Killing the daemon brings up a new pid; a
+/// daemon that exits 0 stays down. Needs a logged-in GUI session (`gui/<uid>`)
+/// and takes about two throttle intervals, so it runs on demand:
+/// `cargo test --test daemon_supervise -- --ignored launchd`.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "drives the real launchd gui domain; run on a macOS host with --ignored"]
+fn launchd_restarts_a_killed_daemon_and_leaves_a_stopped_one_down() {
+    use shipyard::daemon_launcher::{AgentKind, DAEMON_THROTTLE_SECS, render_plist};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script = write_counting_daemon(temp.path());
+    let label = format!(
+        "com.danielraffel.shipyard.test.keepalive.{}",
+        std::process::id()
+    );
+    let plist = temp.path().join(format!("{label}.plist"));
+    let arguments: Vec<std::ffi::OsString> = vec![
+        binary().into(),
+        "--mode".into(),
+        "shipyard".into(),
+        "--global-dir".into(),
+        temp.path().join("global").into(),
+        "--state-dir".into(),
+        temp.path().join("state").into(),
+        "daemon".into(),
+        "supervise".into(),
+        "--exec".into(),
+        script.clone().into(),
+        "--repo".into(),
+        "owner/repo".into(),
+    ];
+    fs::write(
+        &plist,
+        render_plist(
+            &label,
+            &arguments,
+            &temp.path().join("launcher.log"),
+            temp.path(),
+            std::ffi::OsStr::new("/usr/bin:/bin"),
+            AgentKind::Daemon,
+        ),
+    )
+    .expect("plist");
+    let uid =
+        String::from_utf8(Command::new("id").arg("-u").output().expect("id").stdout).expect("utf8");
+    let domain = format!("gui/{}", uid.trim());
+    let target = format!("{domain}/{label}");
+    let _cleanup = Bootout(target.clone());
+    let status = Command::new("/bin/launchctl")
+        .args(["bootstrap", &domain])
+        .arg(&plist)
+        .status()
+        .expect("bootstrap");
+    assert!(status.success(), "launchctl bootstrap {domain} failed");
+    // RunAtLoad starts it; kickstart makes that start immediate, as
+    // `start_via_launchd` does.
+    let _ = Command::new("/bin/launchctl")
+        .args(["kickstart", &target])
+        .status();
+
+    let wait_for_starts = |count: usize, within: Duration| {
+        let deadline = Instant::now() + within;
+        while starts(temp.path()).len() < count {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        true
+    };
+    let throttle = Duration::from_secs(u64::from(DAEMON_THROTTLE_SECS));
+    assert!(
+        wait_for_starts(1, Duration::from_secs(30)),
+        "launchd never started the agent"
+    );
+    let first = starts(temp.path())[0].clone();
+    eprintln!("launchd started the daemon: pid {first}; sending SIGKILL");
+    assert!(
+        Command::new("kill")
+            .args(["-KILL", &first])
+            .status()
+            .expect("kill")
+            .success()
+    );
+    assert!(
+        wait_for_starts(2, throttle * 2 + Duration::from_secs(15)),
+        "launchd did not restart the agent after the daemon was killed"
+    );
+    let second = starts(temp.path())[1].clone();
+    assert_ne!(first, second, "a new daemon pid after the kill");
+    eprintln!("launchd restarted the daemon after SIGKILL: new pid {second}");
+
+    // Negative control: a clean exit is not restarted.
+    fs::write(temp.path().join("stop"), "").expect("stop marker");
+    assert!(
+        !wait_for_starts(3, throttle * 2 + Duration::from_secs(15)),
+        "launchd restarted a daemon that exited 0: {:?}",
+        starts(temp.path())
+    );
+    eprintln!(
+        "daemon exited 0 and launchd did not restart it; starts recorded: {:?}",
+        starts(temp.path())
+    );
+}
