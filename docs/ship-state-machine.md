@@ -757,6 +757,41 @@ continuously-active-writer Phase 2 boundary.
   termination, `merge-queue status` classifies an unmatched `started` row as
   uncertain. It is never silently converted into permission to retry.
 
+## Reboot recovery: a boot-id-proven interruption is requeued once
+
+A worker that a host reboot ended leaves its job `Running` in `queue.json`.
+Ordinarily a daemon-owned job with no live worker is completed `UNCERTAIN` and
+never replayed, because a lost worker may have had effects nobody can see. A
+reboot is the one case with proof: every worker receipt records the host boot
+it started under (`boot_id`, from `kern.boottime` on macOS and
+`/proc/sys/kernel/random/boot_id` on Linux), and a process from another boot
+cannot be alive.
+
+On its first tick, before any receipt sweep, the execution supervisor finds
+each `Running` job whose receipt names a different boot than the daemon's own.
+For each one, in this order, every step idempotent:
+
+1. it writes a write-ahead marker `queue-workers/boot-requeue/<job>@<boot>.json`
+   keyed by the job id and the dead boot;
+2. it releases the job's host-pool leases and worker-capacity claim;
+3. it removes the stale receipt;
+4. it returns the same job, with its own request envelope (so the same
+   repository, pull request and exact head), to `Pending`, recording
+   `interrupted: host reboot` as its deferral reason;
+5. it marks the marker `requeued`.
+
+A daemon killed between steps finds the `intent` marker on its next start and
+finishes the remaining steps once. Shipyard posts no GitHub check-run for lane
+jobs, so the interruption is recorded on the job and in the marker.
+
+Nothing else is requeued, and those jobs keep the ordinary lost-worker path:
+
+- a receipt with no `boot_id` (written by an older Shipyard) or with the current boot;
+- an unreadable current boot;
+- a job with a cancel requested;
+- a job with a termination transaction in progress;
+- a job already requeued once after an earlier reboot (one marker per job).
+
 ## Diagnostic: orphan reporting (no transition)
 
 `STATE_IN_FLIGHT` has no self-healing exit when the owning process dies

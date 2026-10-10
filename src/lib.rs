@@ -24,8 +24,10 @@ pub mod auto_arm;
 /// Classify a "Shipyard validated green but GitHub refused the merge" wedge and
 /// decide whether a red required check is a flaky leg the operator can recover.
 pub mod auto_rescue;
-/// Base-poison signal reading and fix-PR jump advice.
 pub mod base_health;
+/// Base-poison signal reading and fix-PR jump advice.
+/// Which boot of this host the current process belongs to.
+pub mod boot_identity;
 /// Remote branch creation and branch-protection application.
 pub mod branch;
 /// Bundle transfer command construction and path normalization.
