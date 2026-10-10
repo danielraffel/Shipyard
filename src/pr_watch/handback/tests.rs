@@ -5,8 +5,8 @@ use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use serde_json::{Value, json};
 
 use super::host::{
-    self, HostCommand, HostRunner, INBOX_SCRIPT, Invocation, Liveness, RunError, SHOWN_SCRIPT,
-    check_argv, parse_sessions, shell_quote, shell_unquote,
+    self, HostCommand, HostRunner, INBOX_SCRIPT, Invocation, LIVENESS_SCRIPT, Liveness, RunError,
+    SHOWN_SCRIPT, check_argv, parse_sessions, shell_quote, shell_unquote,
 };
 use super::owner::{self, Owner, OwnerSource, Route};
 use super::{HandbackConfig, HandbackMode, HandbackReport, NEEDS_AGENT_LABEL, actionable};
@@ -275,6 +275,10 @@ fn every_command() -> Vec<HostCommand> {
         HostCommand::InboxAppend {
             session: LIVE_SESSION.to_owned(),
         },
+        HostCommand::LivenessEvidence {
+            session: LIVE_SESSION.to_owned(),
+            transcript: "/work/transcript.jsonl".to_owned(),
+        },
     ]
 }
 
@@ -285,7 +289,10 @@ fn every_command_the_builder_can_make_passes_the_allowlist() {
             let Some(invocation) = host::invocation(&route, &command, CMUX, None) else {
                 assert!(matches!(
                     (&route, &command),
-                    (Route::Local, HostCommand::InboxAppend { .. })
+                    (
+                        Route::Local,
+                        HostCommand::InboxAppend { .. } | HostCommand::LivenessEvidence { .. }
+                    )
                 ));
                 continue;
             };
@@ -293,6 +300,24 @@ fn every_command_the_builder_can_make_passes_the_allowlist() {
                 .unwrap_or_else(|e| panic!("{e}: {:?}", invocation.argv));
         }
     }
+}
+
+#[test]
+fn missing_cmux_row_has_a_real_remote_process_and_transcript_probe() {
+    let invocation = host::invocation(
+        &Route::Ssh("m3".to_owned()),
+        &HostCommand::LivenessEvidence {
+            session: LIVE_SESSION.to_owned(),
+            transcript: "/work/transcript.jsonl".to_owned(),
+        },
+        CMUX,
+        None,
+    )
+    .expect("ssh evidence probe");
+    let command = invocation.argv.join(" ");
+    assert!(command.contains("process_alive"));
+    assert!(command.contains("transcript.jsonl"));
+    check_argv(&invocation.argv, CMUX).expect("evidence probe allowlist");
 }
 
 #[test]
@@ -558,6 +583,15 @@ impl HostRunner for FakeRunner {
         check_argv(&invocation.argv, CMUX).map_err(RunError::Failed)?;
         self.runs.push(invocation.clone());
         let joined = invocation.argv.join(" ");
+        if joined.contains(LIVENESS_SCRIPT) {
+            let process_alive = !joined.contains(DEAD_SESSION);
+            return Ok(json!({
+                "sessions": [],
+                "process_alive": process_alive,
+                "transcript_mtime": "2026-10-07T02:03:04Z"
+            })
+            .to_string());
+        }
         if joined.contains("sessions") {
             let rows = [
                 (LIVE_SESSION, "running", true, LIVE_SURFACE),
@@ -1628,6 +1662,12 @@ fn wake_events_record_raise_send_failure_and_resolution_and_plan_records_none() 
         .unwrap();
     assert_eq!(resolved.id, "1:repeat_test_failure:k");
     assert_eq!(resolved.detail.as_ref().unwrap()["how"], json!("addressed"));
+    assert!(runner.runs.iter().any(|invocation| {
+        invocation
+            .stdin
+            .as_deref()
+            .is_some_and(|text| text.contains("\"retract\":\"1:repeat_test_failure:k@"))
+    }));
     assert!(
         !ledger
             .handback
@@ -1820,6 +1860,16 @@ fn a_wake_is_seen_only_when_the_owner_session_displayed_that_episode() {
         true,
     );
     assert!(!out.report.events.iter().any(|e| e.change == "wake.seen"));
+    assert!(
+        !out.report
+            .events
+            .iter()
+            .any(|e| { e.id == id && matches!(e.change.as_str(), "wake.sent" | "wake.escalated") })
+    );
+    assert!(!runner.runs.iter().any(|invocation| {
+        let joined = invocation.argv.join(" ");
+        joined.contains(" notify ") || joined.contains(INBOX_SCRIPT)
+    }));
 }
 
 #[test]

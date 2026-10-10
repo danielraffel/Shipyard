@@ -51,10 +51,11 @@ shipyard wait pr 151 --state queued --timeout 3600 --json
 shipyard wait pr 151 --state merged --timeout 3600 --json
 ```
 
-The wait reads the single authoritative pr-watch ledger over the configured SSH
-handback route. If that host cannot be reached, it prints a visible slow,
-read-only GitHub fallback notice and polls GitHub without creating a local
-ledger. It is bounded by the explicit `--timeout`.
+The wait uses the existing Shipyard daemon event stream when available and
+reconciles against a read-only GitHub snapshot on each poll. If the daemon is
+unreachable it uses the same bounded, read-only GitHub polling path; it never
+creates a second local ledger. The wait is bounded by the explicit
+`--timeout`.
 
 ### `shipyard wait run <run-id> [--success]`
 

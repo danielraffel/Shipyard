@@ -759,11 +759,29 @@ fn probe(owner: &Owner, config: &HandbackConfig, deps: &mut Deps<'_>) -> (Option
     let Some(invocation) = host::invocation(&route, &command, &config.cmux_path, None) else {
         return (Some(route), Liveness::Unknown("no invocation".to_owned()));
     };
-    let liveness = match deps.runner.run(&invocation) {
+    let mut liveness = match deps.runner.run(&invocation) {
         Ok(stdout) => host::parse_sessions(&stdout, &owner.session, owner.surface.as_deref()),
         Err(RunError::Unreachable(e)) => Liveness::Unreachable(e),
         Err(RunError::Failed(e)) => Liveness::Unknown(e),
     };
+    if matches!(liveness, Liveness::Unknown(_))
+        && let Some(transcript) = owner.path.as_deref()
+        && let Some(evidence) = host::invocation(
+            &route,
+            &HostCommand::LivenessEvidence {
+                session: owner.session.clone(),
+                transcript: transcript.to_owned(),
+            },
+            &config.cmux_path,
+            None,
+        )
+    {
+        liveness = match deps.runner.run(&evidence) {
+            Ok(stdout) => host::parse_sessions(&stdout, &owner.session, owner.surface.as_deref()),
+            Err(RunError::Unreachable(e)) => Liveness::Unreachable(e),
+            Err(RunError::Failed(e)) => Liveness::Unknown(e),
+        };
+    }
     (Some(route), liveness)
 }
 

@@ -306,6 +306,9 @@ fn evaluate_pr_queue_state(
         .or_else(|| snapshot.get("checks"));
     let red = checks.and_then(Value::as_array).is_some_and(|items| {
         items.iter().any(|item| {
+            if item.get("isRequired").and_then(Value::as_bool) == Some(false) {
+                return false;
+            }
             ["conclusion", "state"].iter().any(|key| {
                 item.get(*key).and_then(Value::as_str).is_some_and(|v| {
                     crate::wait::TERMINAL_FAILURE_CONCLUSIONS
@@ -318,8 +321,7 @@ fn evaluate_pr_queue_state(
         .get("ejected")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        || merge.contains("eject")
-        || merge.contains("unstable");
+        || merge == "ejected";
     let matched = match target {
         "queued" => {
             merge == "merge_queued"
@@ -959,13 +961,14 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        RuntimeMode, WaitOutcome, WaitPrState, evaluate_pr_green_for_wait, evaluate_run_for_wait,
+        RuntimeMode, WaitOutcome, WaitPrState, evaluate_pr_green_for_wait,
+        evaluate_pr_queue_state, evaluate_run_for_wait,
         parse_github_repo_slug, release_manifest, render_wait_outcome, resolve_repo_slug,
         wait_exit_code, wait_failure, wait_job, wait_pr, wait_release, wait_run,
     };
     use crate::app::{
-        WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG, WAIT_EXIT_TIMEOUT,
-        WAIT_EXIT_UNSUPPORTED,
+        WAIT_EXIT_CLOSED, WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG,
+        WAIT_EXIT_TIMEOUT, WAIT_EXIT_UNSUPPORTED,
     };
     use crate::gh::GhPrepareError;
     use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
@@ -1276,10 +1279,23 @@ artifacts = [
         )
         .expect("wait pr");
 
-        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(code, ExitCode::from(WAIT_EXIT_CLOSED));
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.starts_with("matched after "));
         assert!(text.contains("(transport=polling, events=0)"));
+    }
+
+    #[test]
+    fn unstable_merge_state_is_not_ejected() {
+        let snapshot = serde_json::json!({
+            "state": "OPEN",
+            "mergeStateStatus": "UNSTABLE",
+            "statusCheckRollup": [{"name": "advisory", "conclusion": "FAILURE", "isRequired": false}]
+        });
+        let result = evaluate_pr_queue_state(Some(&snapshot), "ejected").expect("state");
+        assert!(!result.matched);
+        let result = evaluate_pr_queue_state(Some(&snapshot), "red").expect("state");
+        assert!(!result.matched);
     }
 
     #[test]

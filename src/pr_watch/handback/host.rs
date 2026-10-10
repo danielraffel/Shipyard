@@ -42,6 +42,9 @@ pub const INBOX_SCRIPT: &str =
 /// The remote acknowledgement read, verbatim. `$1` is the (validated)
 /// session id; prints the last entries the session's hook displayed.
 pub const SHOWN_SCRIPT: &str = "f=\"$HOME/.local/state/shipyard/inbox/$1.shown.jsonl\"; [ -f \"$f\" ] || exit 0; tail -n 500 \"$f\"";
+/// Read-only corroboration when cmux has lost a session row. `$1` is the
+/// session id and `$2` is the transcript path from the ownership marker.
+pub const LIVENESS_SCRIPT: &str = "p=false; pgrep -f -- \"$1\" >/dev/null 2>&1 && p=true; m=; [ -f \"$2\" ] && m=$(stat -f %m \"$2\" 2>/dev/null || stat -c %Y \"$2\" 2>/dev/null); printf '{\"sessions\":[],\"process_alive\":%s,\"transcript_mtime\":\"%s\"}\\n' \"$p\" \"$m\"";
 
 /// One command on the owner's host.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -87,6 +90,13 @@ pub enum HostCommand {
         /// Session id.
         session: String,
     },
+    /// Cross-check a missing cmux row against the owner process and transcript.
+    LivenessEvidence {
+        /// Session id to match in the process list.
+        session: String,
+        /// Transcript path whose mtime corroborates the process.
+        transcript: String,
+    },
 }
 
 impl HostCommand {
@@ -117,7 +127,9 @@ impl HostCommand {
             Self::ClearStatus { workspace, key } => {
                 own(&["clear-status", key, "--workspace", workspace])
             }
-            Self::InboxAppend { .. } | Self::ShownRead { .. } => return None,
+            Self::InboxAppend { .. }
+            | Self::ShownRead { .. }
+            | Self::LivenessEvidence { .. } => return None,
         })
     }
 }
@@ -191,20 +203,27 @@ pub fn invocation(
     let words: Vec<String> = if let Some(args) = command.cmux_args() {
         std::iter::once(cmux_path.to_owned()).chain(args).collect()
     } else {
-        let (script, session) = match command {
-            HostCommand::InboxAppend { session } => (INBOX_SCRIPT, session),
-            HostCommand::ShownRead { session } => (SHOWN_SCRIPT, session),
+        let (script, words): (&str, Vec<String>) = match command {
+            HostCommand::InboxAppend { session } => (INBOX_SCRIPT, vec![session.clone()]),
+            HostCommand::ShownRead { session } => (SHOWN_SCRIPT, vec![session.clone()]),
+            HostCommand::LivenessEvidence { session, transcript } => (
+                LIVENESS_SCRIPT,
+                vec![session.clone(), transcript.clone()],
+            ),
             _ => return None,
         };
         match route {
             Route::Local => return None,
-            Route::Ssh(_) => vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                script.to_owned(),
-                "sh".to_owned(),
-                session.clone(),
-            ],
+            Route::Ssh(_) => {
+                let mut command = vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    script.to_owned(),
+                    "sh".to_owned(),
+                ];
+                command.extend(words);
+                command
+            }
         }
     };
     let argv = match route {
@@ -294,14 +313,21 @@ pub fn check_argv(argv: &[String], cmux_path: &str) -> Result<(), String> {
     let words = shell_unquote(remote)?;
     let w: Vec<&str> = words.iter().map(String::as_str).collect();
     match w.as_slice() {
-        ["sh", "-c", script, "sh", session]
+        ["sh", "-c", script, "sh", args @ ..]
             if *script == INBOX_SCRIPT || *script == SHOWN_SCRIPT =>
         {
-            if safe_session_id(session) {
+            if args.len() == 1 && safe_session_id(args[0]) {
                 Ok(())
             } else {
                 Err("inbox session id is not safe".to_owned())
             }
+        }
+        ["sh", "-c", script, "sh", session, transcript]
+            if *script == LIVENESS_SCRIPT
+                && safe_session_id(session)
+                && safe_transcript_path(transcript) =>
+        {
+            Ok(())
         }
         [program, cmux_rest @ ..] if *program == cmux_path => cmux_args_allowed(
             &cmux_rest
@@ -311,6 +337,14 @@ pub fn check_argv(argv: &[String], cmux_path: &str) -> Result<(), String> {
         ),
         _ => Err("remote command is not an allowed hand-back command".to_owned()),
     }
+}
+
+fn safe_transcript_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 512
+        && path.starts_with('/')
+        && !path.contains("..")
+        && path.bytes().all(|b| !b.is_ascii_control() && b != b'\'')
 }
 
 /// Whether the owner session is running, from `cmux sessions list --json`.
