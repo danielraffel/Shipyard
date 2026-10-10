@@ -255,6 +255,17 @@ When asserting a gate "ran", check for `rc in (0, 1)` — not `rc == 0`. Zero is
 "ran and passed"; conflating it with "ran" is the same mistake one level up.
 `scripts/**` maps to this skill, so a change to either gate needs a note here.
 
+## Crash-safe state writes
+
+Write Shipyard state files (ship state, queue requests, receipts, holds) with
+`crate::durable_file::replace` / `replace_json`, never a bare `NamedTempFile`
+plus `persist`. A rename is atomic but not durable: without syncing the
+temporary file and then its directory, a power loss or reboot right after a
+save can read back an empty or old file and drop a PR's episode. Take the
+writer-domain lease before calling it; the helper only makes the write
+crash-safe. Off Unix only the file is synced, because std has no directory
+handle to sync there.
+
 ## Durable work handoff
 
 Do not spend an agent session polling a pull request, build, benchmark, release,
