@@ -3173,7 +3173,9 @@ It refuses `pr merge --disable-auto`, `dequeuePullRequest`, and
 `disablePullRequestAutoMerge` unless the call comes from Shipyard's
 machine-authorized, exact-head, write-ahead-audited mutation path, and it
 honours Shipyard's internal marker only when the calling process is the
-Shipyard binary. A deliberate manual authority action uses the operator
+installed Shipyard binary: its kernel-reported executable must resolve under
+`~/.local/share/shipyard/auth-generations/`, so a binary merely named
+`shipyard` (or a dev build) does not pass. A deliberate manual authority action uses the operator
 override in `docs/ghapp-guards.md`, which must state a reason: a rebase or a
 reorder is always refused (a queued PR does not need a rebase; the queue merges
 it on top of current main), and a defect fix is allowed and recorded. Long-running or pending advisory/self-hosted checks are never queue
