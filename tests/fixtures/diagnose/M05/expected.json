@@ -1,0 +1,90 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. macos: infra, step 'Post Run actions/checkout@v5'",
+ "checks": [
+  {
+   "context": "macos",
+   "conclusion": "failure",
+   "run_id": 37215232810,
+   "run_attempt": 1,
+   "job_id": 111474349410,
+   "runner": {
+    "name": "m5-pulp-gate-01-20350-18",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "pulp-build"
+    ]
+   },
+   "timing_s": {
+    "queued": 995,
+    "ran": 1769
+   },
+   "failing_step": {
+    "number": 116,
+    "name": "Post Run actions/checkout@v5",
+    "conclusion": "failure"
+   },
+   "classification": {
+    "class": "infra",
+    "rule": "non_content_step",
+    "why": "failing step 'Post Run actions/checkout@v5'"
+   },
+   "failing_tests": {
+    "names": [],
+    "total": 0,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "signal",
+     "line": 11,
+     "lines": [
+      "Artifact download URL: https://github.com/Generous-Corp/pulp/actions/runs/37215232810/artifacts/11308344296",
+      "Post job cleanup.",
+      "##[error]An error occurred trying to start process '/Users/admin/actions-runner/externals/node24/bin/node' with working directory '/Users/admin/actions-runner/_work/pulp/pulp'. Exec format error",
+      "Cleaning up orphan processes"
+     ]
+    },
+    {
+     "kind": "tail",
+     "line": 7,
+     "lines": [
+      "Artifact plugins-macos.zip successfully finalized. Artifact ID 11308344296",
+      "Artifact plugins-macos has been successfully uploaded! Final size is 109307427 bytes. Artifact ID is 11308344296",
+      "Artifact download URL: https://github.com/Generous-Corp/pulp/actions/runs/37215232810/artifacts/11308344296",
+      "Post job cleanup.",
+      "##[error]An error occurred trying to start process '/Users/admin/actions-runner/externals/node24/bin/node' with working directory '/Users/admin/actions-runner/_work/pulp/pulp'. Exec format error",
+      "Cleaning up orphan processes"
+     ]
+    }
+   ],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37215232810/job/111474349410",
+    "log_lines": 13,
+    "log_bytes": 1442,
+    "step_lines": [
+     7,
+     12
+    ],
+    "fetch": "gh run view 37215232810 --job 111474349410 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 1,
+  "names": [
+   "Linux (x64) [github-hosted]"
+  ]
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 2057
+ }
+}

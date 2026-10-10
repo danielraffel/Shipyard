@@ -1,0 +1,62 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. macos: interrupted",
+ "checks": [
+  {
+   "context": "macos",
+   "conclusion": "cancelled",
+   "run_id": 37890997376,
+   "run_attempt": 1,
+   "job_id": 113691792113,
+   "runner": {
+    "name": null,
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "pulp-build"
+    ]
+   },
+   "timing_s": {
+    "queued": 0,
+    "ran": 695
+   },
+   "failing_step": null,
+   "classification": {
+    "class": "interrupted",
+    "rule": "superseded",
+    "why": "Canceling since a higher priority waiting request for build-refs/pull/9959/merge exists"
+   },
+   "failing_tests": {
+    "names": [],
+    "total": 0,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37890997376/job/113691792113",
+    "log_lines": null,
+    "log_bytes": null,
+    "step_lines": null,
+    "fetch": "gh run view 37890997376 --job 113691792113 --log",
+    "note": "no job log in the run archive"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 2,
+  "names": [
+   "linux",
+   "windows"
+  ]
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 1023
+ }
+}

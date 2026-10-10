@@ -1,0 +1,109 @@
+﻿2026-10-05T10:50:57.4668070Z Current runner version: '2.336.0'
+2026-10-05T10:50:57.4671630Z Runner name: 'm5-pulp-gate-01-78761-1'
+2026-10-05T10:50:57.4672070Z Runner group name: 'Default'
+2026-10-05T11:31:12.4766520Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_browser_capture_ir.cpp:1258: FAILED:
+2026-10-05T11:31:12.4834910Z   CHECK_FALSE( result )
+2026-10-05T11:31:12.4835720Z with expansion:
+2026-10-05T11:31:12.4835950Z   !{?}
+2026-10-05T11:31:12.4836230Z 
+2026-10-05T11:31:12.4836460Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_browser_capture_ir.cpp:1260: FAILED:
+2026-10-05T11:31:12.4836840Z   CHECK( result.error.find("declared knob indicator for 'empty'") != std::string::npos )
+2026-10-05T11:31:12.4837110Z with expansion:
+2026-10-05T11:31:12.4837740Z   18446744073709551615 (0xffffffffffffffff)
+2026-10-05T11:31:12.4843710Z   !=
+2026-10-05T11:31:12.4843930Z   18446744073709551615 (0xffffffffffffffff)
+2026-10-05T11:31:12.4845250Z 
+2026-10-05T11:31:12.4846310Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_browser_capture_ir.cpp:1262: FAILED:
+2026-10-05T11:31:12.4851880Z   CHECK( result.error.find("no radial pointer geometry") != std::string::npos )
+2026-10-05T11:31:12.4859020Z with expansion:
+2026-10-05T11:31:12.4859150Z   18446744073709551615 (0xffffffffffffffff)
+2026-10-05T11:31:12.4859490Z   !=
+2026-10-05T11:31:12.4859670Z   18446744073709551615 (0xffffffffffffffff)
+2026-10-05T11:31:12.4859840Z 
+2026-10-05T11:31:12.4860460Z ===============================================================================
+2026-10-05T11:31:12.4862810Z test cases: 1 | 1 failed
+2026-10-05T11:31:12.4863250Z assertions: 3 | 3 failed
+2026-10-05T11:31:12.4931700Z 
+2026-10-05T11:31:12.4931970Z 
+2026-10-05T11:31:12.4932220Z             Start 18621: a pointer box with no extent at all fails lowering
+2026-10-05T11:31:12.4932780Z 18359/22343 Test #18622: a pointer aimed straight up projects to a hairline, not a slab ..............................................................................................   Passed    0.01 sec
+2026-10-05T11:32:29.4209610Z 21190/22343 Test #21590: harness-auto-discover-selftest ..............................................................................................................................   Passed    0.53 sec
+2026-10-05T11:32:29.4213740Z             Start 21595: harness-evidence-check-selftest
+2026-10-05T11:32:29.4865840Z 21191/22343 Test #21594: harness-differential-contract-selftest ......................................................................................................................   Passed    0.08 sec
+2026-10-05T11:32:29.4872640Z             Start 21596: harness-html-adapter-selftest
+2026-10-05T11:32:29.5206960Z 21192/22343 Test #21595: harness-evidence-check-selftest .............................................................................................................................   Passed    0.10 sec
+2026-10-05T11:32:29.5224280Z             Start 21597: harness-html-adapter-element-events-union-selftest
+2026-10-05T11:32:29.5422500Z ##[error]The operation was canceled.
+2026-10-05T11:32:29.5533610Z ##[group]Run python3 tools/ci/a2t_headroom_annotation.py "$RUNNER_TEMP/a2t-scope-headroom.json"
+2026-10-05T11:32:29.5533980Z [36;1mpython3 tools/ci/a2t_headroom_annotation.py "$RUNNER_TEMP/a2t-scope-headroom.json"[0m
+2026-10-05T11:32:29.5668170Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-05T11:32:29.5668350Z env:
+2026-10-05T11:32:29.5668460Z   PULP_BUILD_DIR: build-macos
+2026-10-05T11:32:29.5668590Z   CCACHE_COMPILERCHECK: content
+2026-10-05T11:32:29.5668810Z   CCACHE_NODEPEND: true
+2026-10-05T11:32:29.5668920Z   CCACHE_SLOPPINESS: time_macros
+2026-10-05T11:32:29.5669050Z   PULP_OFFLINE_BUILD: 1
+2026-10-05T11:32:29.5669150Z   REUSE_RECORD_JOB_START: 1791197461
+2026-10-05T11:32:29.5669540Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-05T11:32:29.5669930Z ##[endgroup]
+2026-10-05T11:32:29.6125600Z ##[notice]154 scope-touching revisions of a 512 limit (30%); the gate fails past 384.
+2026-10-05T11:32:55.5094360Z [36;1m  --leg "$PULP_CTEST_LEG" >> "$GITHUB_STEP_SUMMARY"[0m
+2026-10-05T11:32:55.5116940Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-05T11:32:55.5117110Z env:
+2026-10-05T11:32:55.5117240Z   PULP_BUILD_DIR: build-macos
+2026-10-05T11:32:55.5117400Z   CCACHE_COMPILERCHECK: content
+2026-10-05T11:32:55.5117540Z   CCACHE_NODEPEND: true
+2026-10-05T11:32:55.5117700Z   CCACHE_SLOPPINESS: time_macros
+2026-10-05T11:32:55.5117980Z   PULP_OFFLINE_BUILD: 1
+2026-10-05T11:32:55.5118110Z   REUSE_RECORD_JOB_START: 1791197461
+2026-10-05T11:32:55.5118570Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-05T11:32:55.5119060Z   PULP_CTEST_LEG: macOS (ARM64) [local]
+2026-10-05T11:32:55.5119210Z   CTEST_OUTCOME: cancelled
+2026-10-05T11:32:55.5119340Z ##[endgroup]
+2026-10-05T11:32:57.9644290Z ctest-nonruns: registered(ctest -N raw lines)=22740 registered(total)=22737
+2026-10-05T11:32:58.0035570Z ctest-nonruns: observation=unavailable declared=None testcases=None nonruns=0
+2026-10-05T11:32:58.0089030Z ##[error]Process completed with exit code 2.
+2026-10-05T11:32:58.0162740Z ##[group]Run actions/upload-artifact@v5
+2026-10-05T11:32:58.0162880Z with:
+2026-10-05T11:32:58.0162960Z   name: ctest-logs-macos
+2026-10-05T11:32:58.0163230Z   path: build-macos/Testing/Temporary/
+2026-10-05T11:32:58.0164100Z   PULP_BUILD_DIR: build-macos
+2026-10-05T11:32:58.0164280Z   CCACHE_COMPILERCHECK: content
+2026-10-05T11:32:58.0165040Z   CCACHE_NODEPEND: true
+2026-10-05T11:32:58.0165180Z   CCACHE_SLOPPINESS: time_macros
+2026-10-05T11:32:58.0165300Z   PULP_OFFLINE_BUILD: 1
+2026-10-05T11:32:58.0165400Z   REUSE_RECORD_JOB_START: 1791197461
+2026-10-05T11:32:58.0165800Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-05T11:32:58.0166280Z ##[endgroup]
+2026-10-05T11:32:58.1152680Z (node:91431) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-10-05T11:32:58.1161400Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-10-05T11:32:58.1201980Z Multiple search paths detected. Calculating the least common ancestor of all paths
+2026-10-05T11:32:58.1205560Z The least common ancestor is /Users/admin/actions-runner/_work/pulp/pulp/build-macos. This will be the root directory of the artifact
+2026-10-05T11:32:58.1206540Z With the provided path, there will be 4 files uploaded
+2026-10-05T11:32:58.1207400Z Artifact name is valid!
+2026-10-05T11:32:58.1207640Z Root directory input is valid!
+2026-10-05T11:32:58.6428520Z ##[error]Failed to CreateArtifact: Received non-retryable error: Failed request: (403) Forbidden: job is completed
+2026-10-05T11:32:58.6569300Z Post job cleanup.
+2026-10-05T11:32:58.7378140Z [command]/opt/homebrew/bin/git version
+2026-10-05T11:32:58.7457280Z git version 2.54.0
+2026-10-05T11:32:58.7473240Z Copying '/Users/admin/.gitconfig' to '/Users/admin/actions-runner/_work/_temp/8be6bcc1-6551-4cf5-b61e-deb04f7b9007/.gitconfig'
+2026-10-05T11:32:58.7477900Z Temporarily overriding HOME='/Users/admin/actions-runner/_work/_temp/8be6bcc1-6551-4cf5-b61e-deb04f7b9007' before making global git config changes
+2026-10-05T11:32:58.7478920Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-05T11:32:58.7483310Z [command]/opt/homebrew/bin/git config --global --add safe.directory /Users/admin/actions-runner/_work/pulp/pulp
+2026-10-05T11:32:58.7571340Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-05T11:32:58.7635910Z [command]/opt/homebrew/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-05T11:32:58.8711360Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-05T11:32:58.8781350Z http.https://github.com/.extraheader
+2026-10-05T11:32:58.8845960Z [command]/opt/homebrew/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-10-05T11:32:58.8947480Z [command]/opt/homebrew/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-05T11:32:58.9963120Z [command]/opt/homebrew/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-05T11:32:59.0064100Z [command]/opt/homebrew/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-05T11:32:59.1085530Z Cleaning up orphan processes
+2026-10-05T11:32:59.3909980Z Terminate orphan process: pid (92423) (bash)
+2026-10-05T11:32:59.5073420Z Terminate orphan process: pid (90827) (bash)
+2026-10-05T11:32:59.5413450Z Terminate orphan process: pid (90140) (bash)
+2026-10-05T11:32:59.5686070Z Terminate orphan process: pid (87191) (Python)
+2026-10-05T11:32:59.5919080Z Terminate orphan process: pid (83977) (Python)
+2026-10-05T11:32:59.6451820Z Terminate orphan process: pid (77738) (Python)
+2026-10-05T11:33:00.0829670Z Terminate orphan process: pid (31723) (ctest)
+2026-10-05T11:33:00.3868350Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/upload-artifact@v5. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/

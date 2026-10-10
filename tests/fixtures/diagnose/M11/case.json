@@ -1,0 +1,7 @@
+{
+ "id": "M11",
+ "job": "macos",
+ "class": "infra",
+ "rule": "lost_runner",
+ "resolution": "job recorded 0 steps; artifact upload refused because the job was already complete; PR closed"
+}

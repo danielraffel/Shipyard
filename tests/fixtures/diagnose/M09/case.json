@@ -1,0 +1,7 @@
+{
+ "id": "M09",
+ "job": "macos",
+ "class": "real",
+ "rule": "default",
+ "resolution": "PR pushed new commits"
+}

@@ -1,1 +1,2 @@
 tests/fixtures/reuse-record-digest/** -text
+tests/fixtures/diagnose/** -text

@@ -1,0 +1,86 @@
+2026-10-05T06:50:22.4649290Z     |     ^^^^^^^^^^^^^^^^^^^^^
+2026-10-05T06:50:22.4649540Z 
+2026-10-05T06:50:31.5000220Z warning: `pulp-rs` (lib) generated 8 warnings
+2026-10-05T06:50:47.5488490Z     Finished `release` profile [optimized] target(s) in 52.94s
+2026-10-05T06:50:47.5989300Z [4457/4466] Linking CXX executable tools/screenshot/pulp-screenshot
+2026-10-05T06:50:47.6089690Z ld: warning: ignoring duplicate libraries: 'core/state/libpulp-state.a'
+2026-10-05T06:58:30.7579860Z -------------------------------------------------------------------------------
+2026-10-05T06:58:30.7580320Z timeline agent tries later media locators after a stale existing hint
+2026-10-05T06:58:30.7580830Z -------------------------------------------------------------------------------
+2026-10-05T06:58:30.7581500Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_timeline_agent.cpp:789
+2026-10-05T06:58:30.7586130Z ...............................................................................
+2026-10-05T06:58:30.7586860Z 
+2026-10-05T06:58:30.7639710Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_timeline_agent.cpp:42: FAILED:
+2026-10-05T06:58:30.7652540Z   REQUIRE( std::filesystem::create_directories(path_) )
+2026-10-05T06:58:30.7652910Z with expansion:
+2026-10-05T06:58:30.7653090Z   false
+2026-10-05T06:58:30.7653180Z 
+2026-10-05T06:58:30.7653310Z ===============================================================================
+2026-10-05T06:58:30.7653610Z test cases: 1 | 1 failed
+2026-10-05T06:58:30.7653770Z assertions: 1 | 1 failed
+2026-10-05T06:58:30.7653990Z 
+2026-10-05T06:58:30.7653990Z 
+2026-10-05T06:58:30.7654280Z             Start  9941: timeline agent tries later media locators after a stale existing hint
+2026-10-05T06:58:30.7655010Z  9762/22334 Test  #9940: timeline agent rejects path-derived hashes as media identity ................................................................................................   Passed    0.01 sec
+2026-10-05T06:58:30.7655690Z             Start  9942: timeline agent decodes local file URI media locators
+2026-10-05T06:58:30.7656340Z  9763/22334 Test  #9939: timeline agent does not load offline media from non-root sequences ..........................................................................................   Passed    0.03 sec
+2026-10-05T07:03:10.3443440Z             Start 21534: unregistered-tests-check
+2026-10-05T07:03:12.4893300Z 21301/22334 Test #21534: unregistered-tests-check ....................................................................................................................................***Failed    2.14 sec
+2026-10-05T07:03:12.4894250Z test-registration: 554 invoked, 648 not invoked (647 baselined)
+2026-10-05T07:03:12.4939860Z test-registration: tools/validation/test_mlx_named_model_harness.py: no ctest, source-selftest, workflow or CMake invokes it; register it, or delete it if it is dead
+2026-10-05T07:03:12.4975370Z 
+2026-10-05T07:03:12.4977700Z             Start 21534: unregistered-tests-check
+2026-10-05T07:03:14.6105070Z           Test #21534: unregistered-tests-check ....................................................................................................................................***Failed    2.12 sec
+2026-10-05T07:03:14.6111080Z test-registration: 554 invoked, 648 not invoked (647 baselined)
+2026-10-05T07:03:14.6114650Z test-registration: tools/validation/test_mlx_named_model_harness.py: no ctest, source-selftest, workflow or CMake invokes it; register it, or delete it if it is dead
+2026-10-05T07:03:14.6115130Z 
+2026-10-05T07:03:15.0476310Z 21302/22334 Test #21508: gpu-probe-terminal-recorder-selftest ........................................................................................................................   Passed   20.24 sec
+2026-10-05T07:03:59.4751670Z 21303/22334 Test #21531: changed-surface-script-families-selftest ....................................................................................................................   Passed   56.11 sec
+2026-10-05T07:03:59.5010290Z 
+2026-10-05T07:03:59.5010610Z 99% tests passed, 1 tests failed out of 21303
+2026-10-05T07:03:59.5027790Z 
+2026-10-05T07:03:59.5027940Z Label Time Summary:
+2026-10-05T07:03:59.5028280Z admission               =   0.18 sec*proc (21 tests)
+2026-10-05T07:03:59.5028610Z aggregate               =   1.03 sec*proc (1 test)
+2026-10-05T07:03:59.5029340Z android                 =   0.00 sec*proc (0 test)
+2026-10-05T07:03:59.5029660Z app                     =   0.00 sec*proc (0 test)
+2026-10-05T07:03:59.5091480Z 	21126 - mac harness drives ELYSIUM imported knob body through hidden GPU host (Skipped)
+2026-10-05T07:03:59.5091750Z 
+2026-10-05T07:03:59.5091820Z The following tests FAILED:
+2026-10-05T07:03:59.5092020Z 	21534 - unregistered-tests-check (Failed)
+2026-10-05T07:03:59.6319670Z Errors while running CTest
+2026-10-05T07:04:02.0586640Z ##[notice]{"schema":"shipyard-test-tier/v1","tier":"full"}
+2026-10-05T07:04:02.0590650Z ##[error]Process completed with exit code 8.
+2026-10-05T07:04:02.0649770Z ##[group]Run python3 tools/ci/a2t_headroom_annotation.py "$RUNNER_TEMP/a2t-scope-headroom.json"
+2026-10-05T07:04:02.0650320Z [36;1mpython3 tools/ci/a2t_headroom_annotation.py "$RUNNER_TEMP/a2t-scope-headroom.json"[0m
+2026-10-05T07:04:02.0757670Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-05T07:04:02.0757920Z env:
+2026-10-05T07:04:02.0758070Z   PULP_BUILD_DIR: build-macos
+2026-10-05T07:04:02.0758260Z   CCACHE_COMPILERCHECK: content
+2026-10-05T07:04:02.0758440Z   CCACHE_NODEPEND: true
+2026-10-05T07:04:02.0758600Z   CCACHE_SLOPPINESS: time_macros
+2026-10-05T07:04:02.0758780Z   PULP_OFFLINE_BUILD: 1
+2026-10-05T07:04:02.0759060Z   REUSE_RECORD_JOB_START: 1791182674
+2026-10-05T07:04:02.0759670Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-05T07:04:02.0760270Z ##[endgroup]
+2026-10-05T07:04:02.1342090Z ##[notice]150 scope-touching revisions of a 512 limit (29%); the gate fails past 384.
+2026-10-05T07:04:02.1411800Z ##[group]Run python3 tools/ci/merge_group_shadows.py run \
+2026-10-05T07:04:02.1412160Z [36;1mpython3 tools/ci/merge_group_shadows.py run \[0m
+2026-10-05T07:04:02.1412520Z [36;1m  --build-dir "$PULP_BUILD_DIR" --source-root "$GITHUB_WORKSPACE" \[0m
+2026-10-05T07:04:02.1412950Z [36;1m  --repository "$GITHUB_REPOSITORY" --merge-sha "$GITHUB_SHA" --token "$GH_TOKEN" \[0m
+2026-10-05T07:04:02.1413390Z [36;1m  --junit "$GITHUB_WORKSPACE/$PULP_BUILD_DIR/ctest.junit.xml" \[0m
+2026-10-05T07:04:02.1413780Z [36;1m  --selected-json "$RUNNER_TEMP/ctest-evidence/selected.json" \[0m
+2026-10-05T07:04:02.1414120Z [36;1m  --ctest-outcome "failure" --hours 24 \[0m
+2026-10-05T07:04:02.1414430Z [36;1m  --work-dir "$RUNNER_TEMP/merge-group-shadows" || true[0m
+2026-10-05T07:04:02.1436150Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-05T07:04:02.1436440Z env:
+2026-10-05T07:04:02.1436610Z   PULP_BUILD_DIR: build-macos
+2026-10-05T07:04:02.1436840Z   CCACHE_COMPILERCHECK: content
+2026-10-05T07:04:02.1437050Z   CCACHE_NODEPEND: true
+2026-10-05T07:04:02.1437230Z   CCACHE_SLOPPINESS: time_macros
+2026-10-05T07:04:02.1437420Z   PULP_OFFLINE_BUILD: 1
+2026-10-05T07:04:02.1437600Z   REUSE_RECORD_JOB_START: 1791182674
+2026-10-05T07:04:02.1438210Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-05T07:04:02.1438810Z   PULP_GH_CLI: gh
+2026-10-05T07:04:02.1440840Z   GH_TOKEN: ***
+2026-10-05T07:04:02.1441010Z ##[endgroup]

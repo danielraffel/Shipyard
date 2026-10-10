@@ -1,0 +1,7 @@
+{
+ "id": "N12",
+ "job": "macos",
+ "class": "infra",
+ "rule": "needs_starved",
+ "resolution": "bootstrap failed closed in 11 s because classify/resolve-provider never got a runner"
+}

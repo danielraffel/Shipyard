@@ -1,0 +1,20 @@
+{
+ "name": "shipyard diagnose",
+ "head_sha": "38b2294aedbaccf89240db9ad3dae40aa52acfab",
+ "status": "completed",
+ "conclusion": "neutral",
+ "output": {
+  "title": "1 required check(s) failed. Enforce version & skill sync: real, 2 tests, step 'Gate-script fixture tests'",
+  "summary": "1 required check(s) failed. Enforce version & skill sync: real, 2 tests, step 'Gate-script fixture tests'",
+  "annotations": [
+   {
+    "path": "tools/ci/test_macos_merge_group_bootstrap.py",
+    "start_line": 34,
+    "end_line": 34,
+    "annotation_level": "failure",
+    "title": "Enforce version & skill sync: real",
+    "message": "    tools/b.py:8: subprocess.run(text=True) without encoding=\n    tools/b.py:9: subprocess.check_output(text=True) without encoding=\n    tools/b.py:10: open() in text mode without encoding=\nPass encoding=\"utf-8\" (or the encoding the data really uses).\ntext-encoding-lint: text I/O without encoding= (fails on Windows' cp1252)\n  tools/ci/test_macos_merge_group_bootstrap.py: 1 call(s) without encoding= (a new file)\n    tools/ci/test_macos_merge_group_bootstrap.py:34: subprocess.run(text=True) without encoding=\nPass encoding=\"utf-8\" (or the encoding the data really uses)."
+   }
+  ]
+ }
+}

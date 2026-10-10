@@ -1,0 +1,7 @@
+{
+ "id": "T01",
+ "job": "drift-fast",
+ "class": "interrupted",
+ "rule": "timeout",
+ "resolution": "'Install Linux dependencies' hung 19 min until the job timeout, named runner"
+}

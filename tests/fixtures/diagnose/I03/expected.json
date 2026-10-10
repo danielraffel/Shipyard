@@ -1,0 +1,89 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. Linux (x64) [github-hosted]: interrupted, step 'Test (non-Windows)'",
+ "checks": [
+  {
+   "context": "Linux (x64) [github-hosted]",
+   "conclusion": "cancelled",
+   "run_id": 37526068978,
+   "run_attempt": 1,
+   "job_id": 112483491552,
+   "runner": {
+    "name": "GitHub Actions 1000230102",
+    "labels": [
+     "ubuntu-latest"
+    ]
+   },
+   "timing_s": {
+    "queued": 4,
+    "ran": 3401
+   },
+   "failing_step": {
+    "number": 35,
+    "name": "Test (non-Windows)",
+    "conclusion": "cancelled"
+   },
+   "classification": {
+    "class": "interrupted",
+    "rule": "unknown",
+    "why": "The run was canceled by @shipyard-local[bot]."
+   },
+   "failing_tests": {
+    "names": [],
+    "total": 0,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "signal",
+     "line": 13,
+     "lines": [
+      "##[error]The operation was canceled.",
+      "set -uo pipefail"
+     ]
+    },
+    {
+     "kind": "tail",
+     "line": 38,
+     "lines": [
+      "  --leg \"$PULP_CTEST_LEG\" >> \"$GITHUB_STEP_SUMMARY\"",
+      "  PULP_BUILD_DIR: build-linux",
+      "  CCACHE_COMPILERCHECK: content",
+      "  CCACHE_NODEPEND: true",
+      "  CCACHE_SLOPPINESS: time_macros",
+      "  PULP_OFFLINE_BUILD: 1",
+      "  PULP_CTEST_LEG: Linux (x64) [github-hosted]",
+      "  CTEST_OUTCOME: cancelled"
+     ]
+    }
+   ],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37526068978/job/112483491552",
+    "log_lines": 51,
+    "log_bytes": 5261,
+    "step_lines": [
+     4,
+     48
+    ],
+    "fetch": "gh run view 37526068978 --job 112483491552 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 3,
+  "names": [
+   "macos",
+   "windows",
+   "linux"
+  ]
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 1496
+ }
+}

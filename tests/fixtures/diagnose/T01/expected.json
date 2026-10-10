@@ -1,0 +1,86 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. drift-fast: interrupted, step 'Install Linux dependencies'",
+ "checks": [
+  {
+   "context": "drift-fast",
+   "conclusion": "timed_out",
+   "run_id": 37670790334,
+   "run_attempt": 1,
+   "job_id": 112961721275,
+   "runner": {
+    "name": "GitHub Actions 1000241734",
+    "labels": [
+     "ubuntu-latest"
+    ]
+   },
+   "timing_s": {
+    "queued": 2,
+    "ran": 1219
+   },
+   "failing_step": {
+    "number": 5,
+    "name": "Install Linux dependencies",
+    "conclusion": "timed_out"
+   },
+   "classification": {
+    "class": "interrupted",
+    "rule": "timeout",
+    "why": "job reached its time limit"
+   },
+   "failing_tests": {
+    "names": [],
+    "total": 0,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "signal",
+     "line": 24,
+     "lines": [
+      "  PULP_LINUX_DEPS_EXTRAS:",
+      "##[error]The operation was canceled.",
+      "Post job cleanup."
+     ]
+    },
+    {
+     "kind": "tail",
+     "line": 24,
+     "lines": [
+      "##[error]The operation was canceled.",
+      "Post job cleanup.",
+      "git version 2.55.0",
+      "Temporarily overriding HOME='/home/runner/work/_temp/da0fc117-c869-41d8-84ba-d634bb8bb445' before making global git config changes",
+      "Adding repository directory to the temporary git global config as a safe directory",
+      "http.https://github.com/.extraheader",
+      "Cleaning up orphan processes",
+      "Terminate orphan process: pid (2545) (python3)"
+     ]
+    }
+   ],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37670790334/job/112961721275",
+    "log_lines": 41,
+    "log_bytes": 3422,
+    "step_lines": [
+     4,
+     41
+    ],
+    "fetch": "gh run view 37670790334 --job 112961721275 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 0,
+  "names": []
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 0
+ }
+}

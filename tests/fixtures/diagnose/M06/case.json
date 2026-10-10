@@ -1,0 +1,9 @@
+{
+ "id": "M06",
+ "job": "macos",
+ "class": "real",
+ "rule": "default",
+ "resolution": "same test failed on 9525, 9547, 9540 within 3.5 h; racy precompile-wait counter",
+ "label": "flake_candidate",
+ "note": "Labelled a flake: the same test later failed on two other PRs. This was the first occurrence, so no other head had failed it yet and the conservative rule correctly says real (the known recall limit)."
+}

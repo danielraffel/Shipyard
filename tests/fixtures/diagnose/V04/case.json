@@ -1,0 +1,7 @@
+{
+ "id": "V04",
+ "job": "Enforce version & skill sync",
+ "class": "real",
+ "rule": "default",
+ "resolution": "PR added 'fix: name the encoding in the read-audit cadence test'"
+}

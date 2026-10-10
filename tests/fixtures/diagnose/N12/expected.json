@@ -1,0 +1,80 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. macos: infra, step 'macOS merge-group bootstrap (required when native leg is absent)'",
+ "checks": [
+  {
+   "context": "macos",
+   "conclusion": "failure",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "job_id": 111964304273,
+   "runner": {
+    "name": "GitHub Actions 1000218514",
+    "labels": [
+     "ubuntu-latest"
+    ]
+   },
+   "timing_s": {
+    "queued": 34,
+    "ran": 11
+   },
+   "failing_step": {
+    "number": 2,
+    "name": "macOS merge-group bootstrap (required when native leg is absent)",
+    "conclusion": "failure"
+   },
+   "classification": {
+    "class": "infra",
+    "rule": "needs_starved",
+    "why": "resolve-provider, classify never got a runner; provider resolution did not succeed — failing macos gate closed (11s)"
+   },
+   "failing_tests": {
+    "names": [],
+    "total": 0,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "tail",
+     "line": 13,
+     "lines": [
+      "} >> \"${GITHUB_STEP_SUMMARY:-/dev/null}\"",
+      "echo \"::notice title=macos gate did not run the suite::$REASON\"",
+      "if [ \"\" = \"true\" ]; then",
+      "  echo '::notice title=shipyard-test-tier::{\"schema\":\"shipyard-test-tier/v1\",\"tier\":\"receipt-reused\"}'",
+      "else",
+      "  echo '::notice title=shipyard-test-tier::{\"schema\":\"shipyard-test-tier/v1\",\"tier\":\"not-required\"}'",
+      "fi",
+      "provider resolution did not succeed — failing macos gate closed"
+     ]
+    }
+   ],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111964304273",
+    "log_lines": 66,
+    "log_bytes": 5760,
+    "step_lines": [
+     4,
+     66
+    ],
+    "fetch": "gh run view 37367776813 --job 111964304273 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 2,
+  "names": [
+   "resolve-provider",
+   "classify"
+  ]
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 1673
+ }
+}

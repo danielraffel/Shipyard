@@ -1,0 +1,66 @@
+2026-10-05T20:28:56.7031708Z Prepare workflow directory
+2026-10-05T20:28:56.7302457Z Prepare all required actions
+2026-10-05T20:28:56.7357342Z Getting action download info
+2026-10-05T20:28:57.0652303Z Download action repository 'actions/checkout@v5' (SHA:fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09)
+2026-10-05T20:28:57.1694428Z Download action repository 'actions/upload-artifact@v5' (SHA:330a01c490aca151604b8cf639adc76d48f6c5d4)
+2026-10-05T20:28:57.4473704Z Complete job name: macos
+2026-10-05T20:28:57.5030575Z [36;1m  echo "passes on this tree."[0m
+2026-10-05T20:28:57.5030991Z [36;1m  echo[0m
+2026-10-05T20:28:57.5031604Z [36;1m  echo "To find a run where the suite actually executed:"[0m
+2026-10-05T20:28:57.5032123Z [36;1m  echo '```'[0m
+2026-10-05T20:28:57.5032652Z [36;1m  echo "python3 tools/scripts/gate_suite_executed.py --run-id <run-id>"[0m
+2026-10-05T20:28:57.5033247Z [36;1m  echo '```'[0m
+2026-10-05T20:28:57.5033644Z [36;1m} >> "${GITHUB_STEP_SUMMARY:-/dev/null}"[0m
+2026-10-05T20:28:57.5034224Z [36;1mecho "::notice title=macos gate did not run the suite::$REASON"[0m
+2026-10-05T20:28:57.5034784Z [36;1mif [ "" = "true" ]; then[0m
+2026-10-05T20:28:57.5035467Z [36;1m  echo '::notice title=shipyard-test-tier::{"schema":"shipyard-test-tier/v1","tier":"receipt-reused"}'[0m
+2026-10-05T20:28:57.5036160Z [36;1melse[0m
+2026-10-05T20:28:57.5036790Z [36;1m  echo '::notice title=shipyard-test-tier::{"schema":"shipyard-test-tier/v1","tier":"not-required"}'[0m
+2026-10-05T20:28:57.5037470Z [36;1mfi[0m
+2026-10-05T20:28:57.5260374Z shell: /usr/bin/bash -e {0}
+2026-10-05T20:28:57.5261054Z ##[endgroup]
+2026-10-05T20:28:57.5392016Z provider resolution did not succeed — failing macos gate closed
+2026-10-05T20:28:57.5402141Z ##[error]Process completed with exit code 1.
+2026-10-05T20:28:57.5578051Z ##[group]Run actions/checkout@v5
+2026-10-05T20:28:57.5578532Z with:
+2026-10-05T20:28:57.5578859Z   fetch-depth: 1
+2026-10-05T20:28:57.6356786Z Working directory is '/home/runner/work/pulp/pulp'
+2026-10-05T20:28:57.6357934Z [command]/usr/bin/git version
+2026-10-05T20:28:57.6414697Z git version 2.55.0
+2026-10-05T20:28:57.6430820Z ##[endgroup]
+2026-10-05T20:28:57.6442890Z Temporarily overriding HOME='/home/runner/work/_temp/167f5370-4ee2-4eab-aca1-773756f3de5e' before making global git config changes
+2026-10-05T20:28:57.6444604Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-05T20:28:57.6446558Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/pulp/pulp
+2026-10-05T20:28:57.6491852Z Deleting the contents of '/home/runner/work/pulp/pulp'
+2026-10-05T20:28:57.6495139Z ##[group]Initializing the repository
+2026-10-05T20:28:57.6498291Z [command]/usr/bin/git init /home/runner/work/pulp/pulp
+2026-10-05T20:28:57.6593277Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-10-05T20:28:57.6594572Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-10-05T20:28:57.6595719Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-10-05T20:28:57.6596664Z hint: call:
+2026-10-05T20:28:57.6597147Z hint:
+2026-10-05T20:28:57.6598031Z hint: 	git config --global init.defaultBranch <name>
+2026-10-05T20:28:57.6598790Z hint:
+2026-10-05T20:28:57.6599491Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-10-05T20:28:57.6600679Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-10-05T20:28:57.6601750Z hint:
+2026-10-05T20:28:57.6602254Z hint: 	git branch -m <name>
+2026-10-05T20:28:57.6602829Z hint:
+2026-10-05T20:28:57.6603616Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-10-05T20:28:57.6605267Z Initialized empty Git repository in /home/runner/work/pulp/pulp/.git/
+2026-10-05T20:28:57.6607892Z [command]/usr/bin/git remote add origin https://github.com/Generous-Corp/pulp
+2026-10-05T20:28:57.6650133Z ##[endgroup]
+2026-10-05T20:28:57.6651037Z ##[group]Disabling automatic garbage collection
+2026-10-05T20:28:57.6654558Z [command]/usr/bin/git config --local gc.auto 0
+2026-10-05T20:28:57.6682176Z ##[endgroup]
+2026-10-05T20:28:57.6683303Z ##[group]Setting up auth
+2026-10-05T20:28:57.6688012Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-05T20:28:57.6724119Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-05T20:28:57.7061055Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-05T20:28:57.7095701Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-05T20:28:57.7287697Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-05T20:28:57.7316832Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-05T20:28:57.7512195Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-10-05T20:28:57.7549198Z ##[endgroup]
+2026-10-05T20:28:57.7550231Z ##[group]Fetching the repository
+2026-10-05T20:28:57.7557909Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --filter=blob:none --depth=1 origin +4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b:refs/remotes/origin/gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342

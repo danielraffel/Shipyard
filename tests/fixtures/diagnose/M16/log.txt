@@ -1,0 +1,196 @@
+2026-10-06T18:08:09.6591880Z Root directory input is valid!
+2026-10-06T18:08:10.0900930Z Beginning upload of artifact content to blob storage
+2026-10-06T18:08:10.1027850Z (node:31552) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-10-06T18:08:11.2911460Z Uploaded bytes 299
+2026-10-06T18:08:11.3823150Z Finished uploading artifact content to blob storage!
+2026-10-06T18:08:11.3823620Z SHA256 digest of uploaded artifact zip is ef21a7bc2f28e0f9aa1ad12a56cdbe50fc08b9592ecddbc48730a6116c2ebd49
+2026-10-06T18:14:53.5933210Z             Start 22793: pulp-rust-cli-cargo-tests
+2026-10-06T18:15:07.9660500Z 22486/22487 Test #22793: pulp-rust-cli-cargo-tests ...................................................................................................................................***Failed   14.37 sec
+2026-10-06T18:15:07.9660870Z warning: missing documentation for a function
+2026-10-06T18:15:08.0045650Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2026-10-06T18:15:08.0045650Z 
+2026-10-06T18:15:08.0045690Z error: 1 target failed:
+2026-10-06T18:15:08.0045740Z     `--test help_parity_test`
+2026-10-06T18:15:08.0045740Z 
+2026-10-06T18:15:08.0045800Z             Start 22793: pulp-rust-cli-cargo-tests
+2026-10-06T18:15:22.3228140Z           Test #22793: pulp-rust-cli-cargo-tests ...................................................................................................................................***Failed   14.36 sec
+2026-10-06T18:15:22.3228540Z warning: missing documentation for a function
+2026-10-06T18:15:22.3228700Z    --> src/cmd/orchestrate.rs:155:1
+2026-10-06T18:15:22.3228820Z     |
+2026-10-06T18:15:22.3228950Z 155 | pub fn parse_build_args(args: &[String]) -> BuildArgs {
+2026-10-06T18:15:22.3229120Z     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-06T18:15:22.3229250Z     |
+2026-10-06T18:15:22.3229340Z note: the lint level is defined here
+2026-10-06T18:15:22.3229460Z    --> src/lib.rs:67:9
+2026-10-06T18:15:22.3229550Z     |
+2026-10-06T18:15:22.3229640Z  67 | #![warn(missing_docs)]
+2026-10-06T18:15:22.3229760Z     |         ^^^^^^^^^^^^
+2026-10-06T18:15:22.3229840Z 
+2026-10-06T18:15:22.3229910Z warning: missing documentation for a struct field
+2026-10-06T18:15:22.3444560Z test diag::tests::it_reports_standalone_project_when_pulp_toml_present ... ok
+2026-10-06T18:15:22.3444760Z test diag::tests::it_warns_when_cli_min_ahead_of_cli ... ok
+2026-10-06T18:15:22.3444930Z test error::tests::it_renders_io_with_path_and_cause ... ok
+2026-10-06T18:15:22.3445140Z test error::tests::it_stringifies_unknown_subcommand_for_c_plus_plus_parity ... ok
+2026-10-06T18:15:22.3445360Z test fallthrough::tests::custom_binary_env_takes_precedence ... ok
+2026-10-06T18:15:22.3445570Z test fallthrough::tests::delegates_with_resolved_binary_and_full_argv ... ok
+2026-10-06T18:15:22.3491400Z test cmd::trace_gpu_analysis::tests::hanging_processor_hits_deadline_and_terminates_descendants ... ok
+2026-10-06T18:15:22.3491400Z 
+2026-10-06T18:15:22.3491520Z test result: ok. 1024 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.87s
+2026-10-06T18:15:22.3491520Z 
+2026-10-06T18:15:22.3491620Z      Running unittests src/main.rs (cargo-test/target/debug/deps/pulp-034819691616352a)
+2026-10-06T18:15:22.3492040Z test control_broker_startup_tests::installer_reconcile_arguments_remain_strict_and_private ... ok
+2026-10-06T18:15:22.3492040Z 
+2026-10-06T18:15:22.3492140Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2026-10-06T18:15:22.3492150Z 
+2026-10-06T18:15:22.3492320Z      Running tests/chrome_for_testing_tool_test.rs (cargo-test/target/debug/deps/chrome_for_testing_tool_test-e9da5db1e3a6f73c)
+2026-10-06T18:15:22.3492740Z test chrome_specific_uninstall_works_outside_a_checkout ... ok
+2026-10-06T18:15:22.3492740Z 
+2026-10-06T18:15:22.3492850Z test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+2026-10-06T18:15:22.3492850Z 
+2026-10-06T18:15:22.3492980Z      Running tests/config_parity_test.rs (cargo-test/target/debug/deps/config_parity_test-ab0e1511457c277f)
+2026-10-06T18:15:22.3493370Z test set_rejects_bad_value_with_exit_two ... ok
+2026-10-06T18:15:22.3493370Z 
+2026-10-06T18:15:22.3493470Z test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2026-10-06T18:15:22.3493480Z 
+2026-10-06T18:15:22.3493640Z      Running tests/gpu_doctor_delegation_test.rs (cargo-test/target/debug/deps/gpu_doctor_delegation_test-68ce24dbfc79aa10)
+2026-10-06T18:15:22.3493870Z test gpu_doctor_delegates_exact_argv_and_preserves_exit_contract ... ok
+2026-10-06T18:15:22.3493870Z 
+2026-10-06T18:15:22.3493980Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2026-10-06T18:15:22.3493980Z 
+2026-10-06T18:15:22.3494100Z      Running tests/help_parity_test.rs (cargo-test/target/debug/deps/help_parity_test-ffe1e73c4adfce0d)
+2026-10-06T18:15:22.3494340Z test help_banner_exit_code_is_zero ... ok
+2026-10-06T18:15:22.3494400Z test disabled_delegation_names_the_opt_out_env_var ... ok
+2026-10-06T18:15:22.3494450Z test help_banner_matches_cpp_output ... FAILED
+2026-10-06T18:15:22.3494550Z test unknown_command_still_suggests_without_a_delegate ... ok
+2026-10-06T18:15:22.3494610Z test unknown_command_falls_back_when_no_close_match ... ok
+2026-10-06T18:15:22.3495010Z ---- help_banner_matches_cpp_output stdout ----
+2026-10-06T18:15:22.3495010Z 
+2026-10-06T18:15:22.3495120Z thread 'help_banner_matches_cpp_output' (281284) panicked at tests/help_parity_test.rs:67:5:
+2026-10-06T18:15:22.3495170Z help banner diverged from C++ reference
+2026-10-06T18:15:22.3495200Z --- expected (C++) ---
+2026-10-06T18:15:22.3503850Z     help_banner_matches_cpp_output
+2026-10-06T18:15:22.3503850Z 
+2026-10-06T18:15:22.3503960Z test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2026-10-06T18:15:22.3503960Z 
+2026-10-06T18:15:22.3504030Z error: test failed, to rerun pass `--test help_parity_test`
+2026-10-06T18:15:22.3504180Z      Running tests/identity_smoke_test.rs (cargo-test/target/debug/deps/identity_smoke_test-057caffa1d2ec39c)
+2026-10-06T18:15:22.3504180Z 
+2026-10-06T18:15:22.3504430Z test identity_check_fails_on_drifted_au_code ... ok
+2026-10-06T18:15:22.3504430Z 
+2026-10-06T18:15:22.3504530Z test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+2026-10-06T18:15:22.3504530Z 
+2026-10-06T18:15:22.3504680Z      Running tests/orchestrate_parity_test.rs (cargo-test/target/debug/deps/orchestrate_parity_test-7f627f0331d54552)
+2026-10-06T18:15:22.3505790Z test installed_status_does_not_run_lazy_broker_activation ... ok
+2026-10-06T18:15:22.3505790Z 
+2026-10-06T18:15:22.3505900Z test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+2026-10-06T18:15:22.3505900Z 
+2026-10-06T18:15:22.3506020Z      Running tests/parity_test.rs (cargo-test/target/debug/deps/parity_test-18c8a65b4d0757ca)
+2026-10-06T18:15:22.3507140Z test fixtures_match_cpp_expected_json ... ok
+2026-10-06T18:15:22.3507150Z 
+2026-10-06T18:15:22.3507290Z test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2026-10-06T18:15:22.3507340Z 
+2026-10-06T18:15:22.3507480Z      Running tests/phase6d_parity_test.rs (cargo-test/target/debug/deps/phase6d_parity_test-52b86ecb1cb05aee)
+2026-10-06T18:15:22.3508380Z test unknown_create_flag_still_scaffolds_fall_through ... ok
+2026-10-06T18:15:22.3508380Z 
+2026-10-06T18:15:22.3508490Z test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2026-10-06T18:15:22.3508490Z 
+2026-10-06T18:15:22.3508610Z      Running tests/pkg_parity_test.rs (cargo-test/target/debug/deps/pkg_parity_test-06f236809b8ed68e)
+2026-10-06T18:15:22.3513370Z test update_reports_but_does_not_write_without_apply ... ok
+2026-10-06T18:15:22.3513370Z 
+2026-10-06T18:15:22.3513480Z test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2026-10-06T18:15:22.3513480Z 
+2026-10-06T18:15:22.3513620Z      Running tests/project_parity_test.rs (cargo-test/target/debug/deps/project_parity_test-b384f8bab1e85c57)
+2026-10-06T18:15:22.3514680Z test unpin_switches_standalone_project_to_latest ... ok
+2026-10-06T18:15:22.3514680Z 
+2026-10-06T18:15:22.3514790Z test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2026-10-06T18:15:22.3514790Z 
+2026-10-06T18:15:22.3514960Z      Running tests/projects_parity_test.rs (cargo-test/target/debug/deps/projects_parity_test-7f3e7c8cded45ceb)
+2026-10-06T18:15:22.3515250Z test projects_list_json_matches_expected_on_all_fixtures ... ok
+2026-10-06T18:15:22.3515250Z 
+2026-10-06T18:15:22.3515350Z test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2026-10-06T18:15:22.3515360Z 
+2026-10-06T18:15:22.3515470Z      Running tests/rollback_test.rs (cargo-test/target/debug/deps/rollback_test-69ef1a1d29e1c0e8)
+2026-10-06T18:15:22.3515930Z test kit_and_content_help_flags_fall_through_to_pulp_cpp ... ok
+2026-10-06T18:15:22.3515930Z 
+2026-10-06T18:15:22.3516030Z test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2026-10-06T18:15:22.3516030Z 
+2026-10-06T18:15:22.3516200Z      Running tests/scan_parity_test.rs (cargo-test/target/debug/deps/scan_parity_test-319c90c7e7056dc1)
+2026-10-06T18:15:22.3516740Z test scan_cli_empty_roots_on_isolated_home_prints_fallback ... ok
+2026-10-06T18:15:22.3516740Z 
+2026-10-06T18:15:22.3516850Z test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2026-10-06T18:15:22.3516850Z 
+2026-10-06T18:15:22.3516950Z      Running tests/smoke_test.rs (cargo-test/target/debug/deps/smoke_test-7f1a3dedbc4c6c58)
+2026-10-06T18:15:22.3517100Z test doctor_versions_json_has_required_shape ... ok
+2026-10-06T18:15:22.3517100Z 
+2026-10-06T18:15:22.3517200Z test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2026-10-06T18:15:22.3517200Z 
+2026-10-06T18:15:22.3517320Z      Running tests/snapshot_test.rs (cargo-test/target/debug/deps/snapshot_test-31a11f65c6863d03)
+2026-10-06T18:15:22.3517620Z test projects_list_json_snapshot_single_project ... ok
+2026-10-06T18:15:22.3517620Z 
+2026-10-06T18:15:22.3517720Z test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2026-10-06T18:15:22.3517720Z 
+2026-10-06T18:15:22.3517850Z      Running tests/stale_cli_test.rs (cargo-test/target/debug/deps/stale_cli_test-37ac97d6e9c2ddd9)
+2026-10-06T18:15:22.3518310Z test stale_cli_builds_a_missing_checkout_cli_through_the_governor_then_reruns ... ok
+2026-10-06T18:15:22.3518310Z 
+2026-10-06T18:15:22.3518410Z test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2026-10-06T18:15:22.3518420Z 
+2026-10-06T18:15:22.3518570Z      Running tests/trace_processor_tool_test.rs (cargo-test/target/debug/deps/trace_processor_tool_test-2d32b2eea4e4d4ed)
+2026-10-06T18:15:22.3518780Z test registry_entry_parses_with_expected_shape ... ok
+2026-10-06T18:15:22.3518780Z 
+2026-10-06T18:15:22.3518880Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2026-10-06T18:15:22.3518880Z 
+2026-10-06T18:15:22.3519020Z      Running tests/upgrade_parity_test.rs (cargo-test/target/debug/deps/upgrade_parity_test-9e2292f35163d572)
+2026-10-06T18:15:22.3519440Z test upgrade_check_only_json_matches_expected ... ok
+2026-10-06T18:15:22.3519440Z 
+2026-10-06T18:15:22.3519540Z test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2026-10-06T18:15:22.3519540Z 
+2026-10-06T18:15:22.3519710Z      Running tests/version_parity_test.rs (cargo-test/target/debug/deps/version_parity_test-245e039aee594b52)
+2026-10-06T18:15:22.3519900Z test version_json_matches_expected ... ok
+2026-10-06T18:15:22.3519910Z 
+2026-10-06T18:15:22.3520010Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2026-10-06T18:15:22.3520010Z 
+2026-10-06T18:15:22.3520040Z error: 1 target failed:
+2026-10-06T18:15:22.3520080Z     `--test help_parity_test`
+2026-10-06T18:15:22.3520080Z 
+2026-10-06T18:15:22.3520120Z 
+2026-10-06T18:15:22.3520170Z 99% tests passed, 1 tests failed out of 22486
+2026-10-06T18:15:22.3534680Z 	22790 - pulp-rust-gpu-trace-analysis-integration (Skipped)
+2026-10-06T18:15:22.3534680Z 
+2026-10-06T18:15:22.3534730Z The following tests FAILED:
+2026-10-06T18:15:22.3534840Z 	22793 - pulp-rust-cli-cargo-tests (Failed)                cli rust
+2026-10-06T18:15:22.4299400Z Errors while running CTest
+2026-10-06T18:15:23.6141530Z ##[notice]{"schema":"shipyard-test-tier/v1","tier":"full"}
+2026-10-06T18:15:23.6145670Z ##[error]Process completed with exit code 8.
+2026-10-06T18:15:23.6209120Z ##[group]Run python3 tools/ci/a2t_headroom_annotation.py "$RUNNER_TEMP/a2t-scope-headroom.json"
+2026-10-06T18:15:23.6209450Z [36;1mpython3 tools/ci/a2t_headroom_annotation.py "$RUNNER_TEMP/a2t-scope-headroom.json"[0m
+2026-10-06T18:15:23.6249920Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-06T18:15:23.6250080Z env:
+2026-10-06T18:15:23.6250180Z   PULP_BUILD_DIR: build-macos
+2026-10-06T18:15:23.6250290Z   CCACHE_COMPILERCHECK: content
+2026-10-06T18:15:23.6250410Z   CCACHE_NODEPEND: true
+2026-10-06T18:15:23.6250510Z   CCACHE_SLOPPINESS: time_macros
+2026-10-06T18:15:23.6250620Z   PULP_OFFLINE_BUILD: 1
+2026-10-06T18:15:23.6250720Z   REUSE_RECORD_JOB_START: 1791309791
+2026-10-06T18:15:23.6251080Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-06T18:15:23.6251430Z ##[endgroup]
+2026-10-06T18:15:23.6719380Z ##[notice]173 scope-touching revisions of a 512 limit (34%); the gate fails past 384.
+2026-10-06T18:15:23.6778580Z ##[group]Run python3 tools/ci/merge_group_shadows.py run \
+2026-10-06T18:15:23.6778800Z [36;1mpython3 tools/ci/merge_group_shadows.py run \[0m
+2026-10-06T18:15:23.6779000Z [36;1m  --build-dir "$PULP_BUILD_DIR" --source-root "$GITHUB_WORKSPACE" \[0m
+2026-10-06T18:15:23.6779250Z [36;1m  --repository "$GITHUB_REPOSITORY" --merge-sha "$GITHUB_SHA" --token "$GH_TOKEN" \[0m
+2026-10-06T18:15:23.6779500Z [36;1m  --junit "$GITHUB_WORKSPACE/$PULP_BUILD_DIR/ctest.junit.xml" \[0m
+2026-10-06T18:15:23.6779700Z [36;1m  --selected-json "$RUNNER_TEMP/ctest-evidence/selected.json" \[0m
+2026-10-06T18:15:23.6779880Z [36;1m  --ctest-outcome "failure" --hours 24 \[0m
+2026-10-06T18:15:23.6780080Z [36;1m  --work-dir "$RUNNER_TEMP/merge-group-shadows" || true[0m
+2026-10-06T18:15:23.6796370Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-06T18:15:23.6796510Z env:
+2026-10-06T18:15:23.6796600Z   PULP_BUILD_DIR: build-macos
+2026-10-06T18:15:23.6796740Z   CCACHE_COMPILERCHECK: content
+2026-10-06T18:15:23.6796870Z   CCACHE_NODEPEND: true
+2026-10-06T18:15:23.6796980Z   CCACHE_SLOPPINESS: time_macros
+2026-10-06T18:15:23.6797110Z   PULP_OFFLINE_BUILD: 1
+2026-10-06T18:15:23.6797240Z   REUSE_RECORD_JOB_START: 1791309791
+2026-10-06T18:15:23.6797620Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-06T18:15:23.6798000Z   PULP_GH_CLI: gh
+2026-10-06T18:15:23.6799480Z   GH_TOKEN: ***
+2026-10-06T18:15:23.6799580Z ##[endgroup]

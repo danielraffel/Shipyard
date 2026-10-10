@@ -1,0 +1,255 @@
+2026-10-07T11:47:29.6396174Z  * [new branch]            --help                  -> origin/--help
+2026-10-07T11:47:29.6397230Z  * [new branch]            agent-c/rn-parser       -> origin/agent-c/rn-parser
+2026-10-07T11:47:29.6398685Z  * [new branch]            agent-c/source-contracts-ci -> origin/agent-c/source-contracts-ci
+2026-10-07T11:47:29.6399858Z  * [new branch]            agent-c/source-contracts-pr1 -> origin/agent-c/source-contracts-pr1
+2026-10-07T11:47:29.6401136Z  * [new branch]            agent-c/source-contracts-pr2 -> origin/agent-c/source-contracts-pr2
+2026-10-07T11:47:29.6402255Z  * [new branch]            agent-c/v0-dev-parser   -> origin/agent-c/v0-dev-parser
+2026-10-07T11:47:29.6403707Z  * [new branch]            agent/bootstrap-pr-safe-linux-main -> origin/agent/bootstrap-pr-safe-linux-main
+2026-10-07T11:47:29.6405521Z  * [new branch]            agent/codex-quota-diagnostic-20260814 -> origin/agent/codex-quota-diagnostic-20260814
+2026-10-07T11:47:29.6407312Z  * [new branch]            agentB/1576-resolveCSSLength-fresh -> origin/agentB/1576-resolveCSSLength-fresh
+2026-10-07T11:47:29.6408801Z  * [new branch]            agentB/cov-1739-canvas2d-drawImage -> origin/agentB/cov-1739-canvas2d-drawImage
+2026-10-07T11:47:29.6410192Z  * [new branch]            agentB/listStyleType-roman-alpha -> origin/agentB/listStyleType-roman-alpha
+2026-10-07T11:47:29.6411975Z  * [new branch]            agentB/rn-cursor-mac-partial -> origin/agentB/rn-cursor-mac-partial
+2026-10-07T11:47:29.6413472Z  * [new branch]            agentB/scanner-clap-dlerror-asan -> origin/agentB/scanner-clap-dlerror-asan
+2026-10-07T11:47:29.6414858Z  * [new branch]            agentB/textAlign-match-parent -> origin/agentB/textAlign-match-parent
+2026-10-07T11:47:29.6416271Z  * [new branch]            agentB/tier2-trivial-honest-reclass -> origin/agentB/tier2-trivial-honest-reclass
+2026-10-07T11:47:29.6417718Z  * [new branch]            agentB/tier4-oos-3d-content-reclass -> origin/agentB/tier4-oos-3d-content-reclass
+2026-10-07T11:47:29.6419052Z  * [new branch]            agentB/tier4-perf-misc-reclass -> origin/agentB/tier4-perf-misc-reclass
+2026-10-07T11:47:29.6420497Z  * [new branch]            agentB/tier4-selector-class-intentional -> origin/agentB/tier4-selector-class-intentional
+2026-10-07T11:47:29.6421925Z  * [new branch]            agentB/tier4-yoga-arch-reclass -> origin/agentB/tier4-yoga-arch-reclass
+2026-10-07T11:47:29.6423960Z  * [new branch]            archive/p0a-real-gpu-receipt-20260919-preforce -> origin/archive/p0a-real-gpu-receipt-20260919-preforce
+2026-10-07T11:47:29.6425671Z  * [new branch]            audit/audio-model-activate-docs -> origin/audit/audio-model-activate-docs
+2026-10-07T11:47:29.6426502Z  * [new branch]            audit/compat-refresh-2026-05-03 -> origin/audit/compat-refresh-2026-05-03
+2026-10-07T11:47:29.6427202Z  * [new branch]            audit/compat-refresh-2026-05-04 -> origin/audit/compat-refresh-2026-05-04
+2026-10-07T11:47:29.6427922Z  * [new branch]            audit/compat-triage-2026-05-03 -> origin/audit/compat-triage-2026-05-03
+2026-10-07T11:47:29.6428975Z  * [new branch]            audit/coverage-filters-silent-noop-1052 -> origin/audit/coverage-filters-silent-noop-1052
+2026-10-07T11:47:29.6430171Z  * [new branch]            audit/gpu-wavenet-shared-provider-boundary-20260925 -> origin/audit/gpu-wavenet-shared-provider-boundary-20260925
+2026-10-07T11:47:29.6431134Z  * [new branch]            audit/metal4-comparator-20260925 -> origin/audit/metal4-comparator-20260925
+2026-10-07T11:47:29.6431934Z  * [new branch]            audit/package-search-refresh-fallthrough -> origin/audit/package-search-refresh-fallthrough
+2026-10-07T11:47:29.6432803Z  * [new branch]            audit/physmod-completion-20260718 -> origin/audit/physmod-completion-20260718
+2026-10-07T11:47:29.6434304Z  * [new branch]            audit/pulpsampler-docs  -> origin/audit/pulpsampler-docs
+2026-10-07T11:47:29.6435326Z  * [new branch]            audit/pulpsampler-screenshot-gain -> origin/audit/pulpsampler-screenshot-gain
+2026-10-07T11:47:29.6436143Z  * [new branch]            audit/ship-check-platform-codesign -> origin/audit/ship-check-platform-codesign
+2026-10-07T11:47:29.6436859Z  * [new branch]            backfill/v0.395.0-release-cli -> origin/backfill/v0.395.0-release-cli
+2026-10-07T11:47:29.6437601Z  * [new branch]            batch/core-view-runtime-20260912 -> origin/batch/core-view-runtime-20260912
+2026-10-07T11:47:29.6438358Z  * [new branch]            batch/lv2-adapter-and-skill-20260920 -> origin/batch/lv2-adapter-and-skill-20260920
+2026-10-07T11:47:29.6439134Z  * [new branch]            batch/midi-message-coverage-20260920 -> origin/batch/midi-message-coverage-20260920
+2026-10-07T11:47:29.6439886Z  * [new branch]            batch/tooling-ship-ci-20260912 -> origin/batch/tooling-ship-ci-20260912
+2026-10-07T11:47:29.6440796Z  * [new branch]            build/gate-materialized-runtime-conformance-on-esbuild -> origin/build/gate-materialized-runtime-conformance-on-esbuild
+2026-10-07T11:47:29.6441650Z  * [new branch]            build/header-fanout     -> origin/build/header-fanout
+2026-10-07T11:47:29.6442261Z  * [new branch]            build/proxmox-host-drift-state -> origin/build/proxmox-host-drift-state
+2026-10-07T11:47:29.6442952Z  * [new branch]            build/proxmox-host-json-out -> origin/build/proxmox-host-json-out
+2026-10-07T11:47:29.6444140Z  * [new branch]            build/setup-cache-lock-windows-registration -> origin/build/setup-cache-lock-windows-registration
+2026-10-07T11:47:29.6445071Z  * [new branch]            chore/a3-retire-workstream-handoff-guidance -> origin/chore/a3-retire-workstream-handoff-guidance
+2026-10-07T11:47:29.6445865Z  * [new branch]            chore/batched-stack-v0.77.0 -> origin/chore/batched-stack-v0.77.0
+2026-10-07T11:47:29.6446541Z  * [new branch]            chore/batched-stack-version-bump -> origin/chore/batched-stack-version-bump
+2026-10-07T11:47:29.6447395Z  * [new branch]            chore/bump-0.68.2       -> origin/chore/bump-0.68.2
+2026-10-07T11:47:29.6448529Z  * [new branch]            chore/bump-0.72.4-1348-catchup -> origin/chore/bump-0.72.4-1348-catchup
+2026-10-07T11:47:29.6449176Z  * [new branch]            chore/bump-after-1008   -> origin/chore/bump-after-1008
+2026-10-07T11:47:29.6449783Z  * [new branch]            chore/bump-after-1295   -> origin/chore/bump-after-1295
+2026-10-07T11:47:29.6450420Z  * [new branch]            chore/bump-after-329a103a-imp153 -> origin/chore/bump-after-329a103a-imp153
+2026-10-07T11:47:29.6451098Z  * [new branch]            chore/bump-after-67f4c98f -> origin/chore/bump-after-67f4c98f
+2026-10-07T11:47:29.6451693Z  * [new branch]            chore/bump-after-8355aef1 -> origin/chore/bump-after-8355aef1
+2026-10-07T11:47:29.6452268Z  * [new branch]            chore/bump-after-ee159335 -> origin/chore/bump-after-ee159335
+2026-10-07T11:47:29.6452867Z  * [new branch]            chore/bump-sdk-066-catchup -> origin/chore/bump-sdk-066-catchup
+2026-10-07T11:47:29.6453638Z  * [new branch]            chore/bump-shipyard-0.21.1 -> origin/chore/bump-shipyard-0.21.1
+2026-10-07T11:47:29.6454244Z  * [new branch]            chore/bump-shipyard-0.3.0 -> origin/chore/bump-shipyard-0.3.0
+2026-10-07T11:47:29.6454831Z  * [new branch]            chore/bump-shipyard-0.67.0 -> origin/chore/bump-shipyard-0.67.0
+2026-10-07T11:47:29.6456071Z  * [new branch]            chore/bump-shipyard-0.8.0 -> origin/chore/bump-shipyard-0.8.0
+2026-10-07T11:47:29.6457706Z  * [new branch]            chore/bump-shipyard-pin-to-v0.143.0 -> origin/chore/bump-shipyard-pin-to-v0.143.0
+2026-10-07T11:47:29.6459283Z  * [new branch]            chore/bump-shipyard-pin-to-v0.46.0 -> origin/chore/bump-shipyard-pin-to-v0.46.0
+2026-10-07T11:47:29.6460982Z  * [new branch]            chore/bump-shipyard-pin-to-v0.78.0 -> origin/chore/bump-shipyard-pin-to-v0.78.0
+2026-10-07T11:47:29.6462633Z  * [new branch]            chore/bump-shipyard-pin-to-v0.80.3 -> origin/chore/bump-shipyard-pin-to-v0.80.3
+2026-10-07T11:47:29.6464298Z  * [new branch]            chore/bump-shipyard-pin-to-v0.83.0 -> origin/chore/bump-shipyard-pin-to-v0.83.0
+2026-10-07T11:47:29.6465727Z  * [new branch]            chore/bump-shipyard-pin-to-v0.91.2 -> origin/chore/bump-shipyard-pin-to-v0.91.2
+2026-10-07T11:47:29.6466743Z  * [new branch]            chore/bump-shipyard-v0.21.0 -> origin/chore/bump-shipyard-v0.21.0
+2026-10-07T11:47:29.6467371Z  * [new branch]            chore/bump-v0.101.2     -> origin/chore/bump-v0.101.2
+2026-10-07T11:47:29.6467904Z  * [new branch]            chore/bump-v0.24.0      -> origin/chore/bump-v0.24.0
+2026-10-07T11:47:29.6468729Z  * [new branch]            chore/ci-nscloud-cache  -> origin/chore/ci-nscloud-cache
+2026-10-07T11:47:29.6469876Z  * [new branch]            chore/ci-skill-rebase-hygiene -> origin/chore/ci-skill-rebase-hygiene
+2026-10-07T11:47:29.6471054Z  * [new branch]            chore/codex-review-sweep-2 -> origin/chore/codex-review-sweep-2
+2026-10-07T11:47:29.6472253Z  * [new branch]            chore/codex-review-sweep-batch -> origin/chore/codex-review-sweep-batch
+2026-10-07T11:47:29.6473833Z  * [new branch]            chore/control-digest-single-source -> origin/chore/control-digest-single-source
+2026-10-07T11:47:29.6475268Z  * [new branch]            chore/coverage-phase1-rebaseline-docs -> origin/chore/coverage-phase1-rebaseline-docs
+2026-10-07T11:47:29.6476648Z  * [new branch]            chore/css-noop-wontfix-reclassify -> origin/chore/css-noop-wontfix-reclassify
+2026-10-07T11:47:29.6477996Z  * [new branch]            chore/cut-v0.396.0      -> origin/chore/cut-v0.396.0
+2026-10-07T11:47:29.6478992Z  * [new branch]            chore/delete-merge-steward -> origin/chore/delete-merge-steward
+2026-10-07T11:47:29.6480250Z  * [new branch]            chore/demo-source-links-generous-corp -> origin/chore/demo-source-links-generous-corp
+2026-10-07T11:47:29.6481604Z  * [new branch]            chore/deps-low-risk-bumps-20260830 -> origin/chore/deps-low-risk-bumps-20260830
+2026-10-07T11:47:29.6482794Z  * [new branch]            chore/drop-us-english-guard -> origin/chore/drop-us-english-guard
+2026-10-07T11:47:29.6484241Z  * [new branch]            chore/enable-refresh-branch-policy -> origin/chore/enable-refresh-branch-policy
+2026-10-07T11:47:29.6485543Z  * [new branch]            chore/figma-plugin-published-id -> origin/chore/figma-plugin-published-id
+2026-10-07T11:47:29.6486712Z  * [new branch]            chore/fleet-expected-hosts -> origin/chore/fleet-expected-hosts
+2026-10-07T11:47:29.6488126Z  * [new branch]            chore/format-changed-gotcha-and-path-map -> origin/chore/format-changed-gotcha-and-path-map
+2026-10-07T11:47:29.6489666Z  * [new branch]            chore/gitignore-skia-build-diffcover-doc -> origin/chore/gitignore-skia-build-diffcover-doc
+2026-10-07T11:47:29.6491123Z  * [new branch]            chore/jsx-contract-reverify-20260820 -> origin/chore/jsx-contract-reverify-20260820
+2026-10-07T11:47:29.6492271Z  * [new branch]            chore/land-ci-batch     -> origin/chore/land-ci-batch
+2026-10-07T11:47:29.6493520Z  * [new branch]            chore/ledger-reconcile-exposure -> origin/chore/ledger-reconcile-exposure
+2026-10-07T11:47:29.6494667Z  * [new branch]            chore/lineage-list-perf -> origin/chore/lineage-list-perf
+2026-10-07T11:47:29.6495773Z  * [new branch]            chore/namespace-recommissioned -> origin/chore/namespace-recommissioned
+2026-10-07T11:47:29.6497026Z  * [new branch]            chore/org-ref-sweep     -> origin/chore/org-ref-sweep
+2026-10-07T11:47:29.6498110Z  * [new branch]            chore/org-residual-pulp-sweep -> origin/chore/org-residual-pulp-sweep
+2026-10-07T11:47:29.6499363Z  * [new branch]            chore/paced-probe-long-run-20260926 -> origin/chore/paced-probe-long-run-20260926
+2026-10-07T11:47:29.6500688Z  * [new branch]            chore/planning-pointer-viewbridge -> origin/chore/planning-pointer-viewbridge
+2026-10-07T11:47:29.6502236Z  * [new branch]            chore/reanchor-version-at-land-20260727 -> origin/chore/reanchor-version-at-land-20260727
+2026-10-07T11:47:29.6504114Z  * [new branch]            chore/refresh-consumption-census -> origin/chore/refresh-consumption-census
+2026-10-07T11:47:29.6505889Z  * [new branch]            chore/release-0634-linux-glibc234 -> origin/chore/release-0634-linux-glibc234
+2026-10-07T11:47:29.6507379Z  * [new branch]            chore/release-backlog-v0.459.2 -> origin/chore/release-backlog-v0.459.2
+2026-10-07T11:47:29.6508793Z  * [new branch]            chore/release-desk-clean-bump -> origin/chore/release-desk-clean-bump
+2026-10-07T11:47:29.6510161Z  * [new branch]            chore/release-min-os-sdk -> origin/chore/release-min-os-sdk
+2026-10-07T11:47:29.6511841Z  * [new branch]            chore/remove-bitches-brew-example -> origin/chore/remove-bitches-brew-example
+2026-10-07T11:47:29.6513468Z  * [new branch]            chore/scrub-private-importer-consumers -> origin/chore/scrub-private-importer-consumers
+2026-10-07T11:47:29.6515568Z  * [new branch]            chore/sequencer-followon-code-health-20260919 -> origin/chore/sequencer-followon-code-health-20260919
+2026-10-07T11:47:29.6517252Z  * [new branch]            chore/ship-docs-drift-20260902 -> origin/chore/ship-docs-drift-20260902
+2026-10-07T11:47:29.6519340Z  * [new branch]            chore/shipyard-0.58.0   -> origin/chore/shipyard-0.58.0
+2026-10-07T11:47:29.6520983Z  * [new branch]            chore/shipyard-0.59.0   -> origin/chore/shipyard-0.59.0
+2026-10-07T11:47:29.6523346Z  * [new branch]            chore/shipyard-controller-schedule-current-20260815 -> origin/chore/shipyard-controller-schedule-current-20260815
+2026-10-07T11:47:29.6525446Z  * [new branch]            chore/shipyard-mac-timeout-bump -> origin/chore/shipyard-mac-timeout-bump
+2026-10-07T11:47:29.6526666Z  * [new branch]            chore/shipyard-pin-0.269.0 -> origin/chore/shipyard-pin-0.269.0
+2026-10-07T11:47:29.6527835Z  * [new branch]            chore/shipyard-pin-0802-20260730 -> origin/chore/shipyard-pin-0802-20260730
+2026-10-07T11:47:29.6529004Z  * [new branch]            chore/shipyard-pin-v0.262.0 -> origin/chore/shipyard-pin-v0.262.0
+2026-10-07T11:47:29.6530085Z  * [new branch]            chore/shipyard-pin-v0.29.0 -> origin/chore/shipyard-pin-v0.29.0
+2026-10-07T11:47:29.6531154Z  * [new branch]            chore/shipyard-pin-v0.35.0 -> origin/chore/shipyard-pin-v0.35.0
+2026-10-07T11:47:29.6532271Z  * [new branch]            chore/shipyard-pin-v0.46.0-clean -> origin/chore/shipyard-pin-v0.46.0-clean
+2026-10-07T11:47:29.6533194Z  * [new branch]            chore/shipyard-pin-v0.68.0 -> origin/chore/shipyard-pin-v0.68.0
+2026-10-07T11:47:29.6534806Z  * [new branch]            chore/shipyard-upstream-fixes-retire-workarounds -> origin/chore/shipyard-upstream-fixes-retire-workarounds
+2026-10-07T11:47:29.6536642Z  * [new branch]            chore/shipyard-v0.38.0-revert-chcp -> origin/chore/shipyard-v0.38.0-revert-chcp
+2026-10-07T11:47:29.6537827Z  * [new branch]            chore/shipyard-v0.40.0  -> origin/chore/shipyard-v0.40.0
+2026-10-07T11:47:29.6538567Z  * [new branch]            chore/software-gpu-proof-lane-20260926 -> origin/chore/software-gpu-proof-lane-20260926
+2026-10-07T11:47:29.6539799Z  * [new branch]            chore/source-contract-recheck-20260820 -> origin/chore/source-contract-recheck-20260820
+2026-10-07T11:47:29.6541394Z  * [new branch]            chore/source-neutral-corpus-identifiers -> origin/chore/source-neutral-corpus-identifiers
+2026-10-07T11:47:29.6543515Z  * [new branch]            chore/spectr-format-validation-20260809 -> origin/chore/spectr-format-validation-20260809
+2026-10-07T11:47:29.6545089Z  * [new branch]            chore/trigger-release-0.159.0 -> origin/chore/trigger-release-0.159.0
+2026-10-07T11:47:29.6546334Z  * [new branch]            chore/web-player-0.2.0  -> origin/chore/web-player-0.2.0
+2026-10-07T11:47:29.6547460Z  * [new branch]            chore/web-player-0.2.1  -> origin/chore/web-player-0.2.1
+2026-10-07T11:47:29.6548740Z  * [new branch]            chore/web-player-publish-script -> origin/chore/web-player-publish-script
+2026-10-07T11:47:29.6550034Z  * [new branch]            chore/web-player-rename -> origin/chore/web-player-rename
+2026-10-07T11:47:29.6551372Z  * [new branch]            chore/web-player-unattended-publish -> origin/chore/web-player-unattended-publish
+2026-10-07T11:47:29.6552733Z  * [new branch]            chore/web-player-unprivate -> origin/chore/web-player-unprivate
+2026-10-07T11:47:29.6554316Z  * [new branch]            chore/worktree-reaper-20260902 -> origin/chore/worktree-reaper-20260902
+2026-10-07T11:47:29.6555642Z  * [new branch]            ci/8324-label-exclusion-lint -> origin/ci/8324-label-exclusion-lint
+2026-10-07T11:47:29.6556932Z  * [new branch]            ci/a2t-headroom-early-warning -> origin/ci/a2t-headroom-early-warning
+2026-10-07T11:47:29.6558188Z  * [new branch]            ci/advisory-lane-signal -> origin/ci/advisory-lane-signal
+2026-10-07T11:47:29.6559263Z  * [new branch]            ci/agent-pokayoke       -> origin/ci/agent-pokayoke
+2026-10-07T11:47:29.6560490Z  * [new branch]            ci/android-emulator-redisable-hvf -> origin/ci/android-emulator-redisable-hvf
+2026-10-07T11:47:29.6561785Z  * [new branch]            ci/android-emulator-smoke -> origin/ci/android-emulator-smoke
+2026-10-07T11:47:29.6563285Z  * [new branch]            ci/backstop-read-audit-nightly -> origin/ci/backstop-read-audit-nightly
+2026-10-07T11:47:29.6564601Z  * [new branch]            ci/bootstrap-step-timeout -> origin/ci/bootstrap-step-timeout
+2026-10-07T11:47:29.6565969Z  * [new branch]            ci/bound-slow-selftests -> origin/ci/bound-slow-selftests
+2026-10-07T11:47:29.6567124Z  * [new branch]            ci/branch-protection-alias-jobs -> origin/ci/branch-protection-alias-jobs
+2026-10-07T11:47:29.6568277Z  * [new branch]            ci/build-dir-lock-cpp   -> origin/ci/build-dir-lock-cpp
+2026-10-07T11:47:29.6569306Z  * [new branch]            ci/build-perf-tier1     -> origin/ci/build-perf-tier1
+2026-10-07T11:47:29.6570328Z  * [new branch]            ci/build-poka-yokes     -> origin/ci/build-poka-yokes
+2026-10-07T11:47:29.6571492Z  * [new branch]            ci/bump-fastpath-pr-merge-ref -> origin/ci/bump-fastpath-pr-merge-ref
+2026-10-07T11:47:29.6572773Z  * [new branch]            ci/classify-wide-non-native -> origin/ci/classify-wide-non-native
+2026-10-07T11:47:29.6574346Z  * [new branch]            ci/claude-md-sync-user-install -> origin/ci/claude-md-sync-user-install
+2026-10-07T11:47:29.6575696Z  * [new branch]            ci/codemodel-generated-content -> origin/ci/codemodel-generated-content
+2026-10-07T11:47:29.6576969Z  * [new branch]            ci/codeql-pr-concurrency -> origin/ci/codeql-pr-concurrency
+2026-10-07T11:47:29.6578324Z  * [new branch]            ci/codex-p1-coverage-crossplatform -> origin/ci/codex-p1-coverage-crossplatform
+2026-10-07T11:47:29.6579603Z  * [new branch]            ci/compat-sync-hook-1029 -> origin/ci/compat-sync-hook-1029
+2026-10-07T11:47:29.6582068Z  * [new branch]            ci/coordinate-cli-constants-fixtures -> origin/ci/coordinate-cli-constants-fixtures
+2026-10-07T11:48:07.6464427Z   Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.15/x64
+2026-10-07T11:48:07.6474934Z   LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.12.15/x64/lib
+2026-10-07T11:48:07.6475858Z ##[endgroup]
+2026-10-07T11:48:31.8217404Z framework-neutrality: clean (core, inspect, ship, packages, experimental, test, apple, tools, docs/reports)
+2026-10-07T11:48:31.8314717Z ##[group]Run python3 tools/scripts/test_gates.py
+2026-10-07T11:48:31.8315134Z [36;1mpython3 tools/scripts/test_gates.py[0m
+2026-10-07T11:49:22.9688719Z [config-doc] ✗ doc NOT updated
+2026-10-07T11:49:22.9689168Z     changed: .shipyard/config.toml
+2026-10-07T11:49:22.9689836Z     expected a change in one of: docs/guides/versioning.md, docs/guides/local-ci.md
+2026-10-07T11:49:22.9691711Z     why: Shipyard validation config (targets, gates, routing) is documented in the versioning + local-ci guides; a change here without a doc edit silently drifts the operator-facing description of how CI validates and merges.
+2026-10-07T11:49:22.9693442Z 
+2026-10-07T11:49:22.9693611Z Config-doc check FAILED.
+2026-10-07T11:49:22.9694142Z For each entry above marked ✗, either:
+2026-10-07T11:49:22.9694836Z   1. Update the relevant guide doc in this branch so it stays in sync, OR
+2026-10-07T11:49:22.9695696Z   2. Add a commit trailer on any commit in this branch with the form:
+2026-10-07T11:49:22.9696371Z      Config-Doc: skip reason="..."
+2026-10-07T11:49:22.9696879Z [config-doc] ✗ doc NOT updated
+2026-10-07T11:49:22.9697353Z     changed: .github/workflows/auto-release.yml
+2026-10-07T11:49:22.9698014Z     expected a change in one of: docs/guides/release-watchdog.md
+2026-10-07T11:49:22.9699494Z     why: The auto-release + watchdog + cadence-check trio is the release-watchdog design; changing any of them without a doc edit drifts the documented three-layer release-failure protection.
+2026-10-07T11:49:22.9700539Z 
+2026-10-07T11:49:22.9700691Z Config-doc check FAILED.
+2026-10-07T11:49:22.9701173Z For each entry above marked ✗, either:
+2026-10-07T11:49:22.9701869Z   1. Update the relevant guide doc in this branch so it stays in sync, OR
+2026-10-07T11:49:22.9702695Z   2. Add a commit trailer on any commit in this branch with the form:
+2026-10-07T11:49:22.9703581Z      Config-Doc: skip reason="..."
+2026-10-07T11:49:23.1793133Z Ran 15 tests in 0.014s
+2026-10-07T11:49:23.1793683Z 
+2026-10-07T11:49:23.1793877Z OK
+2026-10-07T11:49:23.1795026Z test_build_creates_new_aggregate_with_trailing_newline (__main__.CliRoundTripTests.test_build_creates_new_aggregate_with_trailing_newline) ... ok
+2026-10-07T11:49:23.2586275Z test_build_missing_parts_dir_and_check_missing_aggregate (__main__.CliRoundTripTests.test_build_missing_parts_dir_and_check_missing_aggregate) ... ok
+2026-10-07T11:49:23.3395268Z test_check_detects_drift (__main__.CliRoundTripTests.test_check_detects_drift) ... ok
+2026-10-07T11:49:23.3787671Z test_check_missing_parts_dir (__main__.CliRoundTripTests.test_check_missing_parts_dir) ... ok
+2026-10-07T11:49:23.4587036Z test_check_reports_structural_part_errors (__main__.CliRoundTripTests.test_check_reports_structural_part_errors) ... ok
+2026-10-07T11:49:23.5784252Z test_split_build_check_on_sample (__main__.CliRoundTripTests.test_split_build_check_on_sample) ... ok
+2026-10-07T11:49:29.8248379Z safe-path-lint: ok (2590 source(s) scanned)
+2026-10-07T11:49:29.8973593Z .........text-encoding-lint: no Python sources found under /tmp/tmpplux3dhg
+2026-10-07T11:49:29.8989078Z ..text-encoding-lint: --write refuses to raise the baseline:
+2026-10-07T11:49:29.8989808Z   tools/a.py: 8 > 2
+2026-10-07T11:49:37.7777864Z ..F.
+2026-10-07T11:49:37.7778384Z ======================================================================
+2026-10-07T11:49:37.7779247Z FAIL: test_the_committed_baseline_matches_the_tree (__main__.RepositoryTests.test_the_committed_baseline_matches_the_tree)
+2026-10-07T11:49:37.7780034Z ----------------------------------------------------------------------
+2026-10-07T11:49:37.7780500Z Traceback (most recent call last):
+2026-10-07T11:49:37.7790143Z   File "/home/runner/work/pulp/pulp/tools/scripts/test_text_encoding_lint.py", line 124, in test_the_committed_baseline_matches_the_tree
+2026-10-07T11:49:37.7790978Z     self.assertEqual(lint.main(["--root", str(ROOT)]), 0)
+2026-10-07T11:49:37.7791366Z AssertionError: 1 != 0
+2026-10-07T11:49:37.7791527Z 
+2026-10-07T11:49:37.7791699Z ----------------------------------------------------------------------
+2026-10-07T11:49:37.7792075Z Ran 15 tests in 7.889s
+2026-10-07T11:49:37.7792229Z 
+2026-10-07T11:49:37.7792344Z FAILED (failures=1)
+2026-10-07T11:49:37.7792489Z 
+2026-10-07T11:49:37.7792819Z text-encoding-lint: the baseline is higher than the tree; record the lower counts with --write:
+2026-10-07T11:49:37.7793683Z   tools/a.py: baseline 3, now 0
+2026-10-07T11:49:37.7794107Z text-encoding-lint: ok (8 baselined call(s) in 1 file(s); 1 source(s) scanned)
+2026-10-07T11:49:37.7794688Z text-encoding-lint: text I/O without encoding= (fails on Windows' cp1252)
+2026-10-07T11:49:37.7795035Z 
+2026-10-07T11:49:37.7795190Z   tools/a.py: 8 call(s) without encoding= (baseline 7)
+2026-10-07T11:49:37.7795574Z     tools/a.py:3: .read_text() without encoding=
+2026-10-07T11:49:37.7795931Z     tools/a.py:4: .write_text() without encoding=
+2026-10-07T11:49:37.7796313Z     tools/a.py:5: open() in text mode without encoding=
+2026-10-07T11:49:37.7796698Z     tools/a.py:6: open() in text mode without encoding=
+2026-10-07T11:49:37.7797084Z     tools/a.py:7: .open() in text mode without encoding=
+2026-10-07T11:49:37.7797455Z     tools/a.py:8: subprocess.run(text=True) without encoding=
+2026-10-07T11:49:37.7799511Z text-encoding-lint: text I/O without encoding= (fails on Windows' cp1252)
+2026-10-07T11:49:37.7799807Z 
+2026-10-07T11:49:37.7799942Z   tools/b.py: 8 call(s) without encoding= (a new file)
+2026-10-07T11:49:37.7800269Z     tools/b.py:3: .read_text() without encoding=
+2026-10-07T11:49:37.7800585Z     tools/b.py:4: .write_text() without encoding=
+2026-10-07T11:49:37.7800913Z     tools/b.py:5: open() in text mode without encoding=
+2026-10-07T11:49:37.7801250Z     tools/b.py:6: open() in text mode without encoding=
+2026-10-07T11:49:37.7801591Z     tools/b.py:7: .open() in text mode without encoding=
+2026-10-07T11:49:37.7801949Z     tools/b.py:8: subprocess.run(text=True) without encoding=
+2026-10-07T11:49:37.7802360Z     tools/b.py:9: subprocess.check_output(text=True) without encoding=
+2026-10-07T11:49:37.7802759Z     tools/b.py:10: open() in text mode without encoding=
+2026-10-07T11:49:37.7802973Z 
+2026-10-07T11:49:37.7803368Z Pass encoding="utf-8" (or the encoding the data really uses).
+2026-10-07T11:49:37.7803823Z text-encoding-lint: text I/O without encoding= (fails on Windows' cp1252)
+2026-10-07T11:49:37.7804124Z 
+2026-10-07T11:49:37.7804334Z   tools/ci/test_read_audit_cadence.py: 7 call(s) without encoding= (a new file)
+2026-10-07T11:49:37.7804839Z     tools/ci/test_read_audit_cadence.py:167: .write_text() without encoding=
+2026-10-07T11:49:37.7805324Z     tools/ci/test_read_audit_cadence.py:169: .write_text() without encoding=
+2026-10-07T11:49:37.7805837Z     tools/ci/test_read_audit_cadence.py:170: subprocess.run(text=True) without encoding=
+2026-10-07T11:49:37.7806352Z     tools/ci/test_read_audit_cadence.py:175: .read_text() without encoding=
+2026-10-07T11:49:37.7806861Z     tools/ci/test_read_audit_cadence.py:176: .read_text() without encoding=
+2026-10-07T11:49:37.7807326Z     tools/ci/test_read_audit_cadence.py:186: .read_text() without encoding=
+2026-10-07T11:49:37.7807780Z     tools/ci/test_read_audit_cadence.py:190: .read_text() without encoding=
+2026-10-07T11:49:37.7808060Z 
+2026-10-07T11:49:37.7808221Z Pass encoding="utf-8" (or the encoding the data really uses).
+2026-10-07T11:49:37.7923879Z ##[error]Process completed with exit code 1.
+2026-10-07T11:49:37.8065857Z Post job cleanup.
+2026-10-07T11:49:37.8919442Z [command]/usr/bin/git version
+2026-10-07T11:49:37.8961784Z git version 2.55.0
+2026-10-07T11:49:37.9001503Z Temporarily overriding HOME='/home/runner/work/_temp/54c04874-3ee1-456b-903e-1f76f999722e' before making global git config changes
+2026-10-07T11:49:37.9003238Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-07T11:49:37.9007090Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/pulp/pulp
+2026-10-07T11:49:37.9046133Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-07T11:49:37.9082124Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-07T11:49:37.9350581Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-07T11:49:37.9379099Z http.https://github.com/.extraheader
+2026-10-07T11:49:37.9394725Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-10-07T11:49:37.9431745Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-07T11:49:37.9719524Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-07T11:49:37.9770216Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url

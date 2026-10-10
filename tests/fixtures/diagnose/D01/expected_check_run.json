@@ -1,0 +1,20 @@
+{
+ "name": "shipyard diagnose",
+ "head_sha": "e56b3f47261a118d96aabe987ded3828c0bde6da",
+ "status": "completed",
+ "conclusion": "neutral",
+ "output": {
+  "title": "1 required check(s) failed. drift-fast: infra, step 'Configure (no build)'",
+  "summary": "1 required check(s) failed. drift-fast: infra, step 'Configure (no build)'",
+  "annotations": [
+   {
+    "path": "tools/cmake/PulpDependencies.cmake",
+    "start_line": 303,
+    "end_line": 303,
+    "annotation_level": "notice",
+    "title": "drift-fast: infra",
+    "message": "  File \"/usr/lib/python3.12/urllib/request.py\", line 639, in http_error_default\n    raise HTTPError(req.full_url, code, msg, hdrs, fp)\nurllib.error.HTTPError: HTTP Error 500: Internal Server Error\nCMake Error at tools/cmake/PulpDependencies.cmake:303 (message):\n  Skia: pinned cache generation validation/provisioning failed; refusing\n  unvalidated external/skia-build fallback"
+   }
+  ]
+ }
+}

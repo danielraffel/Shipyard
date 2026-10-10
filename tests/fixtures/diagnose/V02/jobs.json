@@ -1,0 +1,227 @@
+{
+ "jobs": [
+  {
+   "id": 111618927886,
+   "head_sha": "e45b445c8f98b2d063096fb89ebbd29ac6bd0ba4",
+   "name": "Enforce version & skill sync",
+   "conclusion": "failure",
+   "status": "completed",
+   "runner_name": "GitHub Actions 1000204511",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T04:42:41Z",
+   "started_at": "2026-10-05T04:42:43Z",
+   "completed_at": "2026-10-05T04:43:15Z",
+   "run_id": 37264702227,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37264702227/job/111618927886",
+   "head_branch": "gh-readonly-queue/main/pr-9568-bf7a25335161ed3ac81e40105a23d05983dc8a9d",
+   "steps": [
+    {
+     "number": 1,
+     "name": "Set up job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T04:42:43Z",
+     "completed_at": "2026-10-05T04:42:44Z"
+    },
+    {
+     "number": 2,
+     "name": "Checkout PR head with full history",
+     "conclusion": "success",
+     "started_at": "2026-10-05T04:42:44Z",
+     "completed_at": "2026-10-05T04:43:12Z"
+    },
+    {
+     "number": 3,
+     "name": "Set up Python",
+     "conclusion": "success",
+     "started_at": "2026-10-05T04:43:12Z",
+     "completed_at": "2026-10-05T04:43:12Z"
+    },
+    {
+     "number": 4,
+     "name": "Resolve diff base",
+     "conclusion": "success",
+     "started_at": "2026-10-05T04:43:12Z",
+     "completed_at": "2026-10-05T04:43:12Z"
+    },
+    {
+     "number": 5,
+     "name": "Skill-sync check",
+     "conclusion": "success",
+     "started_at": "2026-10-05T04:43:12Z",
+     "completed_at": "2026-10-05T04:43:12Z"
+    },
+    {
+     "number": 6,
+     "name": "Skill-path-map lint",
+     "conclusion": "success",
+     "started_at": "2026-10-05T04:43:12Z",
+     "completed_at": "2026-10-05T04:43:13Z"
+    },
+    {
+     "number": 7,
+     "name": "Screenshot-sync check",
+     "conclusion": "success",
+     "started_at": "2026-10-05T04:43:13Z",
+     "completed_at": "2026-10-05T04:43:13Z"
+    },
+    {
+     "number": 8,
+     "name": "Docs-sync check (#566 Phase 4 /",
+     "conclusion": "success",
+     "started_at": "2026-10-05T04:43:13Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 9,
+     "name": "Version-bump check",
+     "conclusion": "failure",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 10,
+     "name": "Report expected release tags",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 11,
+     "name": "Compat-sync check (issue",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 12,
+     "name": "Config-doc drift check",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 13,
+     "name": "Compat aggregate check",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 14,
+     "name": "Node ABI virtual-order check",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 15,
+     "name": "Hotspot size guard",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 16,
+     "name": "Header fan-out guard",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 17,
+     "name": "Planning-gitlink guard",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 18,
+     "name": "Source-contract registry check",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 19,
+     "name": "CLI \u2194 MCP parity check (issue",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 20,
+     "name": "Sequencer exposure ledger",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 21,
+     "name": "SignalGraph single-backend governance (issue-keyed I1/I10/I11/I12)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 22,
+     "name": "Conflict-marker guard",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 23,
+     "name": "Framework-neutrality guard",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 24,
+     "name": "Gate-script fixture tests",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 25,
+     "name": "Source-only selftests (moved off the macOS gate)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 26,
+     "name": "Wide non-native tier (tooling checks for a skipped macOS gate)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 51,
+     "name": "Post Set up Python",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 52,
+     "name": "Post Checkout PR head with full history",
+     "conclusion": "success",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    },
+    {
+     "number": 53,
+     "name": "Complete job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T04:43:14Z",
+     "completed_at": "2026-10-05T04:43:14Z"
+    }
+   ]
+  }
+ ]
+}

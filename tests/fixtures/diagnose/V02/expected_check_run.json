@@ -1,0 +1,11 @@
+{
+ "name": "shipyard diagnose",
+ "head_sha": "e45b445c8f98b2d063096fb89ebbd29ac6bd0ba4",
+ "status": "completed",
+ "conclusion": "neutral",
+ "output": {
+  "title": "1 required check(s) failed. Enforce version & skill sync: real, step 'Version-bump check'",
+  "summary": "1 required check(s) failed. Enforce version & skill sync: real, step 'Version-bump check'",
+  "annotations": []
+ }
+}

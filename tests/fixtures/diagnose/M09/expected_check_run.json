@@ -1,0 +1,11 @@
+{
+ "name": "shipyard diagnose",
+ "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+ "status": "completed",
+ "conclusion": "neutral",
+ "output": {
+  "title": "1 required check(s) failed. macos: real, 1 test, step 'Test (non-Windows)'",
+  "summary": "1 required check(s) failed. macos: real, 1 test, step 'Test (non-Windows)'",
+  "annotations": []
+ }
+}

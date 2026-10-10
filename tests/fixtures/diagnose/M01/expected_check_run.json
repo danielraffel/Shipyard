@@ -1,0 +1,20 @@
+{
+ "name": "shipyard diagnose",
+ "head_sha": "e5ae025a80a9e680f0ae2431a3484b8285759f18",
+ "status": "completed",
+ "conclusion": "neutral",
+ "output": {
+  "title": "1 required check(s) failed. macos: real, 1 test, step 'Test (non-Windows)'",
+  "summary": "1 required check(s) failed. macos: real, 1 test, step 'Test (non-Windows)'",
+  "annotations": [
+   {
+    "path": "test/cmake/test_control_sdk_consumer.cmake",
+    "start_line": 790,
+    "end_line": 790,
+    "annotation_level": "failure",
+    "title": "macos: cmake-control-sdk-consumer",
+    "message": "Test #21390: cmake-control-sdk-consumer ..................................................................................................................................***Failed  253.16 sec\nCMake Error at /Users/admin/actions-runner/_work/pulp/pulp/test/cmake/test_control_sdk_consumer.cmake:790 (message):\n  Installed production broker did not launch/register the author host (42)\n  FAILED:\n    REQUIRE( connection )\n  with expansion:\n    itself failed.\n    itself failed.\n    Undefined error: 0\n    waited for the enrolled broker to accept a client connection at /private/tmp/\n    Undefined error: 0\n    waited for the enrolled broker to accept a client connection at /private/tmp/"
+   }
+  ]
+ }
+}

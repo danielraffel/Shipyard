@@ -1,0 +1,2 @@
+tools/ci/test_read_audit_cadence.py
+tools/scripts/test_text_encoding_lint.py

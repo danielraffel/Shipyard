@@ -1,0 +1,99 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. macos: real, 1 test, step 'Test (non-Windows)'",
+ "checks": [
+  {
+   "context": "macos",
+   "conclusion": "failure",
+   "run_id": 37063419759,
+   "run_attempt": 1,
+   "job_id": 111025433614,
+   "runner": {
+    "name": "m5-pulp-gate-01-12158-31",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "pulp-build"
+    ]
+   },
+   "timing_s": {
+    "queued": 190,
+    "ran": 1205
+   },
+   "failing_step": {
+    "number": 33,
+    "name": "Test (non-Windows)",
+    "conclusion": "failure"
+   },
+   "classification": {
+    "class": "real",
+    "rule": "default",
+    "why": "no infra, stale-base, interruption or flake evidence"
+   },
+   "failing_tests": {
+    "names": [
+     "cmake-control-sdk-consumer"
+    ],
+    "total": 1,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "test",
+     "line": 16,
+     "test": "cmake-control-sdk-consumer",
+     "repeats": 2,
+     "lines": [
+      "Test #21390: cmake-control-sdk-consumer ..................................................................................................................................***Failed  253.16 sec",
+      "CMake Error at /Users/admin/actions-runner/_work/pulp/pulp/test/cmake/test_control_sdk_consumer.cmake:790 (message):",
+      "  Installed production broker did not launch/register the author host (42)",
+      "  FAILED:",
+      "    REQUIRE( connection )",
+      "  with expansion:",
+      "    itself failed.",
+      "    itself failed.",
+      "    Undefined error: 0",
+      "    waited for the enrolled broker to accept a client connection at /private/tmp/",
+      "    Undefined error: 0",
+      "    waited for the enrolled broker to accept a client connection at /private/tmp/"
+     ]
+    },
+    {
+     "kind": "signal",
+     "line": 75,
+     "lines": [
+      "...............................................................................",
+      "/Users/admin/actions-runner/_work/pulp/pulp/test/test_gpu_spectral_freeze.cpp:174: FAILED:",
+      "  REQUIRE( fz.render(fo.data(), JIT) )",
+      "with expansion:",
+      "  false"
+     ]
+    }
+   ],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37063419759/job/111025433614",
+    "log_lines": 128,
+    "log_bytes": 11149,
+    "step_lines": [
+     4,
+     128
+    ],
+    "fetch": "gh run view 37063419759 --job 111025433614 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 0,
+  "names": []
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 2139
+ }
+}

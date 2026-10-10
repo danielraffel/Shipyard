@@ -1,0 +1,20 @@
+{
+ "name": "shipyard diagnose",
+ "head_sha": "4fd9c0cf314565969c87d289181fc5fd109fe714",
+ "status": "completed",
+ "conclusion": "neutral",
+ "output": {
+  "title": "1 required check(s) failed. macos: real, 1 test, step 'Test (non-Windows)'",
+  "summary": "1 required check(s) failed. macos: real, 1 test, step 'Test (non-Windows)'",
+  "annotations": [
+   {
+    "path": "experimental/pulp-rs/tests/help_parity_test.rs",
+    "start_line": 67,
+    "end_line": 67,
+    "annotation_level": "failure",
+    "title": "macos: pulp-rust-cli-cargo-tests",
+    "message": "Test #22793: pulp-rust-cli-cargo-tests ...................................................................................................................................***Failed   14.36 sec\ntest error::tests::it_renders_io_with_path_and_cause ... ok\ntest error::tests::it_stringifies_unknown_subcommand_for_c_plus_plus_parity ... ok\ntest help_banner_matches_cpp_output ... FAILED\ntest unknown_command_still_suggests_without_a_delegate ... ok\nthread 'help_banner_matches_cpp_output' (281284) panicked at tests/help_parity_test.rs:67:5:\nhelp banner diverged from C++ reference\ntest result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\nerror: test failed, to rerun pass `--test help_parity_test`\n     Running tests/identity_smoke_test.rs (cargo-test/target/debug/deps/identity_smoke_test-057caffa1d2ec39c)\nerror: 1 target failed:\n    `--test help_parity_test`"
+   }
+  ]
+ }
+}

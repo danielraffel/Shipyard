@@ -1,0 +1,7 @@
+{
+ "id": "M01",
+ "job": "macos",
+ "class": "real",
+ "rule": "default",
+ "resolution": "PR added 'ci: rerun tests whose spawned executables the replay rebuilds' then merged"
+}

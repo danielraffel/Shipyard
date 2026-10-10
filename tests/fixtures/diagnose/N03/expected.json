@@ -1,0 +1,59 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. macos: infra",
+ "checks": [
+  {
+   "context": "macos",
+   "conclusion": "cancelled",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "job_id": 111958533314,
+   "runner": {
+    "name": null,
+    "labels": [
+     "ubuntu-latest"
+    ]
+   },
+   "timing_s": {
+    "queued": 0,
+    "ran": 1174
+   },
+   "failing_step": null,
+   "classification": {
+    "class": "infra",
+    "rule": "no_runner",
+    "why": "The job was not acquired by Runner of type hosted even after multiple attempts"
+   },
+   "failing_tests": {
+    "names": [],
+    "total": 0,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111958533314",
+    "log_lines": null,
+    "log_bytes": null,
+    "step_lines": null,
+    "fetch": "gh run view 37366122740 --job 111958533314 --log",
+    "note": "no job log in the run archive"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 2,
+  "names": [
+   "resolve-provider",
+   "classify"
+  ]
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 986
+ }
+}

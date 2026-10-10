@@ -447,6 +447,40 @@ pub(super) enum Command {
         #[arg(long, value_name = "NUMBER")]
         pr: Option<u64>,
     },
+    /// Bounded diagnosis of a red pull request or workflow run.
+    ///
+    /// For each failing REQUIRED check: the failing step, the failing tests,
+    /// up to five groups of evidence lines, the runner, a classification
+    /// (`infra`, `interrupted`, `stale_base`, `flake_candidate`, `real`) and
+    /// a pointer to the full log, in a `shipyard.diagnose/v1` document never
+    /// larger than `--max-bytes`. Read-only unless `--annotate post`.
+    Diagnose {
+        /// Pull request whose head to diagnose.
+        #[arg(value_name = "PR", conflicts_with = "run")]
+        pr: Option<u64>,
+        /// Workflow run to diagnose instead of a pull request head.
+        #[arg(long, value_name = "ID")]
+        run: Option<u64>,
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Base branch whose required checks gate a `--run` (and whose
+        /// pr-watch ledger supplies flake history).
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Required check name for `--run`, instead of reading the base
+        /// branch's policy. Repeatable.
+        #[arg(long = "required", value_name = "NAME")]
+        required: Vec<String>,
+        /// Cap on the serialized document, in bytes.
+        #[arg(long, default_value_t = crate::diagnose::DEFAULT_MAX_BYTES)]
+        max_bytes: usize,
+        /// Check-run annotations: `off` (default), `plan` (print the check-run
+        /// body), or `post` (create the neutral "shipyard diagnose" check run
+        /// on the head).
+        #[arg(long, default_value = "off", value_name = "off|plan|post")]
+        annotate: String,
+    },
     /// Read the repository's base-poison signal and, for a poisoned base with
     /// a named fix pull request, print the commands that jump it to the front
     /// of the merge queue.

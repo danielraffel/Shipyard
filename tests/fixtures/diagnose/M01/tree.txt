@@ -1,0 +1,2 @@
+test/cmake/test_control_sdk_consumer.cmake
+test/test_gpu_spectral_freeze.cpp

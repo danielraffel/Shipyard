@@ -1,0 +1,41 @@
+2026-10-07T18:57:38.1419050Z env:
+2026-10-07T18:57:38.1419339Z   PULP_BUILD_DIR: build-linux
+2026-10-07T18:57:38.1419689Z ##[endgroup]
+2026-10-07T18:58:10.2791602Z gpu-provenance-hydration: PASS total=65 fetched=65 cap=128
+2026-10-07T18:58:10.3052694Z Prepare all required actions
+2026-10-07T18:58:10.3104319Z ##[group]Run ./.github/actions/install-linux-build-deps
+2026-10-07T18:58:10.3104664Z with:
+2026-10-07T18:58:10.3104870Z   profile: native
+2026-10-07T18:58:10.3105068Z env:
+2026-10-07T18:58:10.3105269Z   PULP_BUILD_DIR: build-linux
+2026-10-07T18:58:10.3105508Z ##[endgroup]
+2026-10-07T18:58:10.3167577Z ##[start-action display=Resolve and install apt packages;id=__self.__run]
+2026-10-07T18:58:10.3197778Z ##[group]Run set -euo pipefail
+2026-10-07T18:58:10.3198097Z [36;1mset -euo pipefail[0m
+2026-10-07T18:58:10.3198415Z [36;1mpython3 tools/ci/install_linux_build_deps.py \[0m
+2026-10-07T18:58:10.3198800Z [36;1m  --profile "${PULP_LINUX_DEPS_PROFILE}" \[0m
+2026-10-07T18:58:10.3199156Z [36;1m  --extra-packages "${PULP_LINUX_DEPS_EXTRAS}"[0m
+2026-10-07T18:58:10.3264564Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-07T18:58:10.3264944Z env:
+2026-10-07T18:58:10.3265153Z   PULP_BUILD_DIR: build-linux
+2026-10-07T18:58:10.3265464Z   PULP_LINUX_DEPS_PROFILE: native
+2026-10-07T18:58:10.3265732Z   PULP_LINUX_DEPS_EXTRAS: 
+2026-10-07T18:58:10.3266121Z ##[endgroup]
+2026-10-07T19:17:44.1172686Z ##[error]The operation was canceled.
+2026-10-07T19:17:44.1180471Z ##[end-action id=__self.__run;outcome=cancelled;conclusion=cancelled;duration_ms=1173801]
+2026-10-07T19:17:44.1332792Z Post job cleanup.
+2026-10-07T19:17:44.2239275Z [command]/usr/bin/git version
+2026-10-07T19:17:44.2282387Z git version 2.55.0
+2026-10-07T19:17:44.2323634Z Temporarily overriding HOME='/home/runner/work/_temp/da0fc117-c869-41d8-84ba-d634bb8bb445' before making global git config changes
+2026-10-07T19:17:44.2353121Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-07T19:17:44.2354603Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/pulp/pulp
+2026-10-07T19:17:44.2373267Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-07T19:17:44.2407948Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-07T19:17:44.3610523Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-07T19:17:44.3611274Z http.https://github.com/.extraheader
+2026-10-07T19:17:44.3612127Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-10-07T19:17:44.3613617Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-07T19:17:44.3615306Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-07T19:17:44.3617127Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-07T19:17:44.3675186Z Cleaning up orphan processes
+2026-10-07T19:17:44.3978429Z Terminate orphan process: pid (2545) (python3)

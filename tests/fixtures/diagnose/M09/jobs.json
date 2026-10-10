@@ -1,0 +1,1230 @@
+{
+ "jobs": [
+  {
+   "id": 111642054529,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "resolve-provider",
+   "conclusion": "success",
+   "status": "completed",
+   "runner_name": "GitHub Actions 1000206682",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T06:26:24Z",
+   "started_at": "2026-10-05T06:26:27Z",
+   "completed_at": "2026-10-05T06:26:41Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642054529",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": [
+    {
+     "number": 1,
+     "name": "Set up job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:29Z",
+     "completed_at": "2026-10-05T06:26:29Z"
+    },
+    {
+     "number": 2,
+     "name": "Run actions/checkout@v5",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:29Z",
+     "completed_at": "2026-10-05T06:26:38Z"
+    },
+    {
+     "number": 3,
+     "name": "Run set -euo pipefail",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:38Z",
+     "completed_at": "2026-10-05T06:26:38Z"
+    },
+    {
+     "number": 6,
+     "name": "Post Run actions/checkout@v5",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:38Z",
+     "completed_at": "2026-10-05T06:26:38Z"
+    },
+    {
+     "number": 7,
+     "name": "Complete job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:38Z",
+     "completed_at": "2026-10-05T06:26:38Z"
+    }
+   ]
+  },
+  {
+   "id": 111642054791,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "classify",
+   "conclusion": "success",
+   "status": "completed",
+   "runner_name": "GitHub Actions 1000206683",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T06:26:24Z",
+   "started_at": "2026-10-05T06:26:26Z",
+   "completed_at": "2026-10-05T06:26:38Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642054791",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": [
+    {
+     "number": 1,
+     "name": "Set up job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:27Z",
+     "completed_at": "2026-10-05T06:26:28Z"
+    },
+    {
+     "number": 2,
+     "name": "Run actions/checkout@v5",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:28Z",
+     "completed_at": "2026-10-05T06:26:36Z"
+    },
+    {
+     "number": 3,
+     "name": "Run set -euo pipefail",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:36Z",
+     "completed_at": "2026-10-05T06:26:37Z"
+    },
+    {
+     "number": 6,
+     "name": "Post Run actions/checkout@v5",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:37Z",
+     "completed_at": "2026-10-05T06:26:37Z"
+    },
+    {
+     "number": 7,
+     "name": "Complete job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:37Z",
+     "completed_at": "2026-10-05T06:26:37Z"
+    }
+   ]
+  },
+  {
+   "id": 111642055666,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "Pulp repository-isolation local proof",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "created_at": "2026-10-05T06:26:25Z",
+   "started_at": "2026-10-05T06:26:25Z",
+   "completed_at": "2026-10-05T06:26:24Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642055666",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": []
+  },
+  {
+   "id": 111642116495,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "Windows BLE compile-gate (advisory)",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "windows-latest"
+   ],
+   "created_at": "2026-10-05T06:26:39Z",
+   "started_at": "2026-10-05T06:26:39Z",
+   "completed_at": "2026-10-05T06:26:39Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642116495",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": []
+  },
+  {
+   "id": 111642116632,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "Windows MSVC release-path gate",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "windows-latest"
+   ],
+   "created_at": "2026-10-05T06:26:39Z",
+   "started_at": "2026-10-05T06:26:39Z",
+   "completed_at": "2026-10-05T06:26:39Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642116632",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": []
+  },
+  {
+   "id": 111642116649,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "Windows MIDI Services SDK compile-gate (advisory)",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "windows-latest"
+   ],
+   "created_at": "2026-10-05T06:26:39Z",
+   "started_at": "2026-10-05T06:26:39Z",
+   "completed_at": "2026-10-05T06:26:39Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642116649",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": []
+  },
+  {
+   "id": 111642125697,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "protected-receipt-reuse",
+   "conclusion": "success",
+   "status": "completed",
+   "runner_name": "GitHub Actions 1000206702",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T06:26:41Z",
+   "started_at": "2026-10-05T06:26:43Z",
+   "completed_at": "2026-10-05T06:26:54Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642125697",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": [
+    {
+     "number": 1,
+     "name": "Set up job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:43Z",
+     "completed_at": "2026-10-05T06:26:44Z"
+    },
+    {
+     "number": 2,
+     "name": "Run actions/checkout@v5",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:44Z",
+     "completed_at": "2026-10-05T06:26:52Z"
+    },
+    {
+     "number": 3,
+     "name": "Run set -u",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:52Z",
+     "completed_at": "2026-10-05T06:26:53Z"
+    },
+    {
+     "number": 6,
+     "name": "Post Run actions/checkout@v5",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:53Z",
+     "completed_at": "2026-10-05T06:26:53Z"
+    },
+    {
+     "number": 7,
+     "name": "Complete job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:53Z",
+     "completed_at": "2026-10-05T06:26:53Z"
+    }
+   ]
+  },
+  {
+   "id": 111642127475,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "a2t-protected-event",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "macos-15"
+   ],
+   "created_at": "2026-10-05T06:26:41Z",
+   "started_at": "2026-10-05T06:26:41Z",
+   "completed_at": "2026-10-05T06:26:41Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642127475",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": []
+  },
+  {
+   "id": 111642127627,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true') && 'macos' || 'macos-pr-unused'",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T06:26:41Z",
+   "started_at": "2026-10-05T06:26:41Z",
+   "completed_at": "2026-10-05T06:26:41Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642127627",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": []
+  },
+  {
+   "id": 111642185537,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "macos",
+   "conclusion": "failure",
+   "status": "completed",
+   "runner_name": "m1-pulp-gate-slot2-02-75625-12",
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "created_at": "2026-10-05T06:26:55Z",
+   "started_at": "2026-10-05T06:44:29Z",
+   "completed_at": "2026-10-05T07:13:48Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642185537",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": [
+    {
+     "number": 1,
+     "name": "Set up job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:44:30Z",
+     "completed_at": "2026-10-05T06:44:33Z"
+    },
+    {
+     "number": 2,
+     "name": "Mark job start for the reuse replay record",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:44:33Z",
+     "completed_at": "2026-10-05T06:44:34Z"
+    },
+    {
+     "number": 3,
+     "name": "Seed the checkout from the host git mirror (tartci macOS)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:44:34Z",
+     "completed_at": "2026-10-05T06:44:34Z"
+    },
+    {
+     "number": 4,
+     "name": "Run actions/checkout@v5",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:44:34Z",
+     "completed_at": "2026-10-05T06:44:38Z"
+    },
+    {
+     "number": 5,
+     "name": "Fetch protected capability base",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:44:38Z",
+     "completed_at": "2026-10-05T06:44:38Z"
+    },
+    {
+     "number": 6,
+     "name": "Hydrate bounded GPU provenance commits",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:44:38Z",
+     "completed_at": "2026-10-05T06:45:21Z"
+    },
+    {
+     "number": 7,
+     "name": "Set up Namespace macOS cache",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:45:21Z",
+     "completed_at": "2026-10-05T06:45:21Z"
+    },
+    {
+     "number": 8,
+     "name": "Install Linux dependencies",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:45:21Z",
+     "completed_at": "2026-10-05T06:45:21Z"
+    },
+    {
+     "number": 9,
+     "name": "Namespace cache (brew + ccache + Pulp FetchContent)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:45:21Z",
+     "completed_at": "2026-10-05T06:45:21Z"
+    },
+    {
+     "number": 10,
+     "name": "brew update (macOS)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:45:21Z",
+     "completed_at": "2026-10-05T06:45:21Z"
+    },
+    {
+     "number": 11,
+     "name": "Install ccache (macOS)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:45:21Z",
+     "completed_at": "2026-10-05T06:45:21Z"
+    },
+    {
+     "number": 12,
+     "name": "Install ccache (Windows)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:45:21Z",
+     "completed_at": "2026-10-05T06:45:21Z"
+    },
+    {
+     "number": 13,
+     "name": "Restore FetchContent sources (GitHub-hosted)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:45:21Z",
+     "completed_at": "2026-10-05T06:45:21Z"
+    },
+    {
+     "number": 14,
+     "name": "Restore ccache (GitHub-hosted)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:45:21Z",
+     "completed_at": "2026-10-05T06:45:21Z"
+    },
+    {
+     "number": 15,
+     "name": "Bootstrap repository dependencies",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:45:21Z",
+     "completed_at": "2026-10-05T06:45:42Z"
+    },
+    {
+     "number": 16,
+     "name": "Install pinned Chrome for browser-source fidelity (macOS ARM64)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:45:42Z",
+     "completed_at": "2026-10-05T06:45:46Z"
+    },
+    {
+     "number": 17,
+     "name": "Fetch pulp-rs crates",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:45:46Z",
+     "completed_at": "2026-10-05T06:45:50Z"
+    },
+    {
+     "number": 18,
+     "name": "Save FetchContent sources (main push, GitHub-hosted Linux/Windows)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:45:50Z",
+     "completed_at": "2026-10-05T06:45:50Z"
+    },
+    {
+     "number": 19,
+     "name": "Fetch prebuilt Skia (macOS)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:45:50Z",
+     "completed_at": "2026-10-05T06:45:51Z"
+    },
+    {
+     "number": 20,
+     "name": "Intel canary \u2014 lint + x86_64 GPU-off compile",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:45:51Z",
+     "completed_at": "2026-10-05T06:45:51Z"
+    },
+    {
+     "number": 21,
+     "name": "Ccache effective config (proof of override)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:45:51Z",
+     "completed_at": "2026-10-05T06:45:51Z"
+    },
+    {
+     "number": 22,
+     "name": "Install materialized runtime Node test dependencies (Linux)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:45:51Z",
+     "completed_at": "2026-10-05T06:45:51Z"
+    },
+    {
+     "number": 23,
+     "name": "Configure",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:45:51Z",
+     "completed_at": "2026-10-05T06:46:12Z"
+    },
+    {
+     "number": 24,
+     "name": "Install visual-analysis Python dependencies",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:46:12Z",
+     "completed_at": "2026-10-05T06:46:20Z"
+    },
+    {
+     "number": 25,
+     "name": "Install build-time Node dependencies",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:46:20Z",
+     "completed_at": "2026-10-05T06:46:21Z"
+    },
+    {
+     "number": 26,
+     "name": "Build",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:46:21Z",
+     "completed_at": "2026-10-05T06:50:47Z"
+    },
+    {
+     "number": 27,
+     "name": "Record iOS gate digest",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:50:47Z",
+     "completed_at": "2026-10-05T06:50:47Z"
+    },
+    {
+     "number": 28,
+     "name": "Ccache stats",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:50:47Z",
+     "completed_at": "2026-10-05T06:50:47Z"
+    },
+    {
+     "number": 29,
+     "name": "Save ccache (main push, GitHub-hosted Linux/Windows)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:50:47Z",
+     "completed_at": "2026-10-05T06:50:47Z"
+    },
+    {
+     "number": 30,
+     "name": "Decide pull-request test suite",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:50:47Z",
+     "completed_at": "2026-10-05T06:50:47Z"
+    },
+    {
+     "number": 31,
+     "name": "Test fast deterministic tier (pull request head)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:50:47Z",
+     "completed_at": "2026-10-05T06:50:47Z"
+    },
+    {
+     "number": 32,
+     "name": "Test what this pull request reaches (pull request head)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:50:47Z",
+     "completed_at": "2026-10-05T06:50:47Z"
+    },
+    {
+     "number": 33,
+     "name": "Test (non-Windows)",
+     "conclusion": "failure",
+     "started_at": "2026-10-05T06:50:47Z",
+     "completed_at": "2026-10-05T07:04:02Z"
+    },
+    {
+     "number": 34,
+     "name": "Announce A2T scope-history headroom",
+     "conclusion": "success",
+     "started_at": "2026-10-05T07:04:02Z",
+     "completed_at": "2026-10-05T07:04:02Z"
+    },
+    {
+     "number": 35,
+     "name": "Merge-group shadow instruments",
+     "conclusion": "success",
+     "started_at": "2026-10-05T07:04:02Z",
+     "completed_at": "2026-10-05T07:11:35Z"
+    },
+    {
+     "number": 36,
+     "name": "Record per-test receipts (shadow)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T07:11:35Z",
+     "completed_at": "2026-10-05T07:11:38Z"
+    },
+    {
+     "number": 37,
+     "name": "Announce a failed PR-head full suite (non-gating)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:11:38Z",
+     "completed_at": "2026-10-05T07:11:38Z"
+    },
+    {
+     "number": 38,
+     "name": "Observe ctest non-runs (non-Windows)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T07:11:38Z",
+     "completed_at": "2026-10-05T07:11:41Z"
+    },
+    {
+     "number": 39,
+     "name": "Observe GPU adapter contract (self-hosted macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:11:41Z",
+     "completed_at": "2026-10-05T07:11:41Z"
+    },
+    {
+     "number": 40,
+     "name": "Test installed SDK capability contract (affected changes)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:11:41Z",
+     "completed_at": "2026-10-05T07:11:41Z"
+    },
+    {
+     "number": 41,
+     "name": "Install and publish exact GPU-audio SDK (macOS ARM64)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:11:41Z",
+     "completed_at": "2026-10-05T07:11:41Z"
+    },
+    {
+     "number": 42,
+     "name": "Upload exact GPU-audio SDK (macOS ARM64)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:11:41Z",
+     "completed_at": "2026-10-05T07:11:41Z"
+    },
+    {
+     "number": 43,
+     "name": "Wait before retrying the GPU-audio SDK upload",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:11:41Z",
+     "completed_at": "2026-10-05T07:11:41Z"
+    },
+    {
+     "number": 44,
+     "name": "Upload exact GPU-audio SDK (macOS ARM64, retry)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:11:41Z",
+     "completed_at": "2026-10-05T07:11:41Z"
+    },
+    {
+     "number": 45,
+     "name": "Test A2T structural receipt issuer",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:11:41Z",
+     "completed_at": "2026-10-05T07:11:41Z"
+    },
+    {
+     "number": 46,
+     "name": "Verify A2T structural receipt",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:11:41Z",
+     "completed_at": "2026-10-05T07:11:41Z"
+    },
+    {
+     "number": 47,
+     "name": "Publish A2T structural verification",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:11:41Z",
+     "completed_at": "2026-10-05T07:11:41Z"
+    },
+    {
+     "number": 48,
+     "name": "Surface ctest failures (non-Windows)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T07:11:41Z",
+     "completed_at": "2026-10-05T07:11:42Z"
+    },
+    {
+     "number": 49,
+     "name": "Upload ctest logs and JUnit report",
+     "conclusion": "success",
+     "started_at": "2026-10-05T07:11:42Z",
+     "completed_at": "2026-10-05T07:11:44Z"
+    },
+    {
+     "number": 50,
+     "name": "Record per-test results for reuse replay (macOS)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T07:11:44Z",
+     "completed_at": "2026-10-05T07:13:34Z"
+    },
+    {
+     "number": 51,
+     "name": "Upload reuse replay record (macOS)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T07:13:34Z",
+     "completed_at": "2026-10-05T07:13:40Z"
+    },
+    {
+     "number": 52,
+     "name": "Announce a missing reuse replay record (macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:13:40Z",
+     "completed_at": "2026-10-05T07:13:40Z"
+    },
+    {
+     "number": 53,
+     "name": "Test (Windows \u2014 UTF-8 code page wrapped)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:13:40Z",
+     "completed_at": "2026-10-05T07:13:40Z"
+    },
+    {
+     "number": 54,
+     "name": "Issue exact protected-validation receipt",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:13:40Z",
+     "completed_at": "2026-10-05T07:13:40Z"
+    },
+    {
+     "number": 55,
+     "name": "Publish exact protected-validation receipt",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:13:40Z",
+     "completed_at": "2026-10-05T07:13:40Z"
+    },
+    {
+     "number": 56,
+     "name": "Upload plugin bundles (macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:13:40Z",
+     "completed_at": "2026-10-05T07:13:40Z"
+    },
+    {
+     "number": 57,
+     "name": "Upload plugin bundles (Windows)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:13:40Z",
+     "completed_at": "2026-10-05T07:13:40Z"
+    },
+    {
+     "number": 58,
+     "name": "Upload plugin bundles (Linux)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T07:13:40Z",
+     "completed_at": "2026-10-05T07:13:40Z"
+    },
+    {
+     "number": 116,
+     "name": "Post Run actions/checkout@v5",
+     "conclusion": "success",
+     "started_at": "2026-10-05T07:13:40Z",
+     "completed_at": "2026-10-05T07:13:41Z"
+    },
+    {
+     "number": 117,
+     "name": "Complete job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T07:13:41Z",
+     "completed_at": "2026-10-05T07:13:41Z"
+    }
+   ]
+  },
+  {
+   "id": 111642185550,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "Linux (x64) [github-hosted]",
+   "conclusion": "failure",
+   "status": "completed",
+   "runner_name": "GitHub Actions 1000206708",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T06:26:55Z",
+   "started_at": "2026-10-05T06:26:57Z",
+   "completed_at": "2026-10-05T06:48:21Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642185550",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": [
+    {
+     "number": 1,
+     "name": "Set up job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:57Z",
+     "completed_at": "2026-10-05T06:26:59Z"
+    },
+    {
+     "number": 2,
+     "name": "Mark job start for the reuse replay record",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:26:59Z",
+     "completed_at": "2026-10-05T06:26:59Z"
+    },
+    {
+     "number": 3,
+     "name": "Seed the checkout from the host git mirror (tartci macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:26:59Z",
+     "completed_at": "2026-10-05T06:26:59Z"
+    },
+    {
+     "number": 4,
+     "name": "Run actions/checkout@v5",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:26:59Z",
+     "completed_at": "2026-10-05T06:27:07Z"
+    },
+    {
+     "number": 5,
+     "name": "Fetch protected capability base",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:27:07Z",
+     "completed_at": "2026-10-05T06:27:07Z"
+    },
+    {
+     "number": 6,
+     "name": "Hydrate bounded GPU provenance commits",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:27:07Z",
+     "completed_at": "2026-10-05T06:27:36Z"
+    },
+    {
+     "number": 7,
+     "name": "Set up Namespace macOS cache",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:27:36Z",
+     "completed_at": "2026-10-05T06:27:36Z"
+    },
+    {
+     "number": 8,
+     "name": "Install Linux dependencies",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:27:36Z",
+     "completed_at": "2026-10-05T06:27:56Z"
+    },
+    {
+     "number": 9,
+     "name": "Namespace cache (brew + ccache + Pulp FetchContent)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:27:56Z",
+     "completed_at": "2026-10-05T06:27:56Z"
+    },
+    {
+     "number": 10,
+     "name": "brew update (macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:27:56Z",
+     "completed_at": "2026-10-05T06:27:56Z"
+    },
+    {
+     "number": 11,
+     "name": "Install ccache (macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:27:56Z",
+     "completed_at": "2026-10-05T06:27:56Z"
+    },
+    {
+     "number": 12,
+     "name": "Install ccache (Windows)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:27:56Z",
+     "completed_at": "2026-10-05T06:27:56Z"
+    },
+    {
+     "number": 13,
+     "name": "Restore FetchContent sources (GitHub-hosted)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:27:56Z",
+     "completed_at": "2026-10-05T06:27:57Z"
+    },
+    {
+     "number": 14,
+     "name": "Restore ccache (GitHub-hosted)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:27:57Z",
+     "completed_at": "2026-10-05T06:28:02Z"
+    },
+    {
+     "number": 15,
+     "name": "Bootstrap repository dependencies",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:28:02Z",
+     "completed_at": "2026-10-05T06:29:15Z"
+    },
+    {
+     "number": 16,
+     "name": "Install pinned Chrome for browser-source fidelity (macOS ARM64)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:29:15Z",
+     "completed_at": "2026-10-05T06:29:15Z"
+    },
+    {
+     "number": 17,
+     "name": "Fetch pulp-rs crates",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:29:15Z",
+     "completed_at": "2026-10-05T06:29:20Z"
+    },
+    {
+     "number": 18,
+     "name": "Save FetchContent sources (main push, GitHub-hosted Linux/Windows)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:29:20Z",
+     "completed_at": "2026-10-05T06:29:20Z"
+    },
+    {
+     "number": 19,
+     "name": "Fetch prebuilt Skia (macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:29:20Z",
+     "completed_at": "2026-10-05T06:29:20Z"
+    },
+    {
+     "number": 20,
+     "name": "Intel canary \u2014 lint + x86_64 GPU-off compile",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:29:20Z",
+     "completed_at": "2026-10-05T06:29:20Z"
+    },
+    {
+     "number": 21,
+     "name": "Ccache effective config (proof of override)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:29:20Z",
+     "completed_at": "2026-10-05T06:29:20Z"
+    },
+    {
+     "number": 22,
+     "name": "Install materialized runtime Node test dependencies (Linux)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:29:20Z",
+     "completed_at": "2026-10-05T06:29:22Z"
+    },
+    {
+     "number": 23,
+     "name": "Configure",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:29:22Z",
+     "completed_at": "2026-10-05T06:30:43Z"
+    },
+    {
+     "number": 24,
+     "name": "Install visual-analysis Python dependencies",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:30:43Z",
+     "completed_at": "2026-10-05T06:30:56Z"
+    },
+    {
+     "number": 25,
+     "name": "Install build-time Node dependencies",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:30:56Z",
+     "completed_at": "2026-10-05T06:30:57Z"
+    },
+    {
+     "number": 26,
+     "name": "Build",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:30:57Z",
+     "completed_at": "2026-10-05T06:42:52Z"
+    },
+    {
+     "number": 27,
+     "name": "Record iOS gate digest",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:42:52Z",
+     "completed_at": "2026-10-05T06:42:52Z"
+    },
+    {
+     "number": 28,
+     "name": "Ccache stats",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:42:52Z",
+     "completed_at": "2026-10-05T06:42:52Z"
+    },
+    {
+     "number": 29,
+     "name": "Save ccache (main push, GitHub-hosted Linux/Windows)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:42:52Z",
+     "completed_at": "2026-10-05T06:42:52Z"
+    },
+    {
+     "number": 30,
+     "name": "Decide pull-request test suite",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:42:52Z",
+     "completed_at": "2026-10-05T06:42:52Z"
+    },
+    {
+     "number": 31,
+     "name": "Test fast deterministic tier (pull request head)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:42:52Z",
+     "completed_at": "2026-10-05T06:42:52Z"
+    },
+    {
+     "number": 32,
+     "name": "Test what this pull request reaches (pull request head)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:42:52Z",
+     "completed_at": "2026-10-05T06:42:52Z"
+    },
+    {
+     "number": 33,
+     "name": "Test (non-Windows)",
+     "conclusion": "failure",
+     "started_at": "2026-10-05T06:42:52Z",
+     "completed_at": "2026-10-05T06:48:16Z"
+    },
+    {
+     "number": 34,
+     "name": "Announce A2T scope-history headroom",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:16Z",
+     "completed_at": "2026-10-05T06:48:16Z"
+    },
+    {
+     "number": 35,
+     "name": "Merge-group shadow instruments",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:16Z",
+     "completed_at": "2026-10-05T06:48:16Z"
+    },
+    {
+     "number": 36,
+     "name": "Record per-test receipts (shadow)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:16Z",
+     "completed_at": "2026-10-05T06:48:16Z"
+    },
+    {
+     "number": 37,
+     "name": "Announce a failed PR-head full suite (non-gating)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:16Z",
+     "completed_at": "2026-10-05T06:48:16Z"
+    },
+    {
+     "number": 38,
+     "name": "Observe ctest non-runs (non-Windows)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:48:16Z",
+     "completed_at": "2026-10-05T06:48:19Z"
+    },
+    {
+     "number": 39,
+     "name": "Observe GPU adapter contract (self-hosted macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:19Z",
+     "completed_at": "2026-10-05T06:48:19Z"
+    },
+    {
+     "number": 40,
+     "name": "Test installed SDK capability contract (affected changes)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:19Z",
+     "completed_at": "2026-10-05T06:48:19Z"
+    },
+    {
+     "number": 41,
+     "name": "Install and publish exact GPU-audio SDK (macOS ARM64)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:19Z",
+     "completed_at": "2026-10-05T06:48:19Z"
+    },
+    {
+     "number": 42,
+     "name": "Upload exact GPU-audio SDK (macOS ARM64)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:19Z",
+     "completed_at": "2026-10-05T06:48:19Z"
+    },
+    {
+     "number": 43,
+     "name": "Wait before retrying the GPU-audio SDK upload",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:19Z",
+     "completed_at": "2026-10-05T06:48:19Z"
+    },
+    {
+     "number": 44,
+     "name": "Upload exact GPU-audio SDK (macOS ARM64, retry)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:19Z",
+     "completed_at": "2026-10-05T06:48:19Z"
+    },
+    {
+     "number": 45,
+     "name": "Test A2T structural receipt issuer",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:19Z",
+     "completed_at": "2026-10-05T06:48:19Z"
+    },
+    {
+     "number": 46,
+     "name": "Verify A2T structural receipt",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:19Z",
+     "completed_at": "2026-10-05T06:48:19Z"
+    },
+    {
+     "number": 47,
+     "name": "Publish A2T structural verification",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:19Z",
+     "completed_at": "2026-10-05T06:48:19Z"
+    },
+    {
+     "number": 48,
+     "name": "Surface ctest failures (non-Windows)",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:48:19Z",
+     "completed_at": "2026-10-05T06:48:19Z"
+    },
+    {
+     "number": 49,
+     "name": "Upload ctest logs and JUnit report",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:48:19Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    },
+    {
+     "number": 50,
+     "name": "Record per-test results for reuse replay (macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:20Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    },
+    {
+     "number": 51,
+     "name": "Upload reuse replay record (macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:20Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    },
+    {
+     "number": 52,
+     "name": "Announce a missing reuse replay record (macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:20Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    },
+    {
+     "number": 53,
+     "name": "Test (Windows \u2014 UTF-8 code page wrapped)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:20Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    },
+    {
+     "number": 54,
+     "name": "Issue exact protected-validation receipt",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:20Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    },
+    {
+     "number": 55,
+     "name": "Publish exact protected-validation receipt",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:20Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    },
+    {
+     "number": 56,
+     "name": "Upload plugin bundles (macOS)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:20Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    },
+    {
+     "number": 57,
+     "name": "Upload plugin bundles (Windows)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:20Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    },
+    {
+     "number": 58,
+     "name": "Upload plugin bundles (Linux)",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T06:48:20Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    },
+    {
+     "number": 116,
+     "name": "Post Run actions/checkout@v5",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:48:20Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    },
+    {
+     "number": 117,
+     "name": "Complete job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T06:48:20Z",
+     "completed_at": "2026-10-05T06:48:20Z"
+    }
+   ]
+  },
+  {
+   "id": 111642186721,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "github.event_name == 'merge_group' && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true' || needs.protected-receipt-reuse.outputs.macos_reused == 'true') && 'macos' || 'macos-merge-unused'",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T06:26:55Z",
+   "started_at": "2026-10-05T06:26:55Z",
+   "completed_at": "2026-10-05T06:26:54Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642186721",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": []
+  },
+  {
+   "id": 111654778237,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "windows",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T07:13:48Z",
+   "started_at": "2026-10-05T07:13:48Z",
+   "completed_at": "2026-10-05T07:13:48Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111654778237",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": []
+  },
+  {
+   "id": 111654778385,
+   "head_sha": "d764bba2ff836594aaadbbee05eb7b36748bec71",
+   "name": "linux",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T07:13:48Z",
+   "started_at": "2026-10-05T07:13:48Z",
+   "completed_at": "2026-10-05T07:13:48Z",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111654778385",
+   "head_branch": "gh-readonly-queue/main/pr-9577-f85a50352a46b7e2a6a302f1b4208fdc4f8ee0fa",
+   "steps": []
+  }
+ ]
+}

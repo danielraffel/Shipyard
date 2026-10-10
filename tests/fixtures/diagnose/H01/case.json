@@ -1,0 +1,7 @@
+{
+ "id": "H01",
+ "job": "macos",
+ "class": "infra",
+ "rule": "non_content_step",
+ "resolution": "same-run cancelled sibling had a runner, so it is excluded from starvation"
+}

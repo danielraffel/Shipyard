@@ -1,0 +1,115 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. drift-fast: infra, step 'Configure (no build)'",
+ "checks": [
+  {
+   "context": "drift-fast",
+   "conclusion": "failure",
+   "run_id": 37476264297,
+   "run_attempt": 1,
+   "job_id": 112312344864,
+   "runner": {
+    "name": "GitHub Actions 1000228300",
+    "labels": [
+     "ubuntu-latest"
+    ]
+   },
+   "timing_s": {
+    "queued": 3,
+    "ran": 253
+   },
+   "failing_step": {
+    "number": 8,
+    "name": "Configure (no build)",
+    "conclusion": "failure"
+   },
+   "classification": {
+    "class": "infra",
+    "rule": "infra_marker",
+    "why": "transient download failure (HTTP Error 500: Internal Server Error); retrying in 2s [attempt 2 of 4]"
+   },
+   "failing_tests": {
+    "names": [],
+    "total": 0,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "signal",
+     "line": 60,
+     "lines": [
+      "  File \"/usr/lib/python3.12/urllib/request.py\", line 639, in http_error_default",
+      "    raise HTTPError(req.full_url, code, msg, hdrs, fp)",
+      "urllib.error.HTTPError: HTTP Error 500: Internal Server Error",
+      "CMake Error at tools/cmake/PulpDependencies.cmake:303 (message):",
+      "  Skia: pinned cache generation validation/provisioning failed; refusing",
+      "  unvalidated external/skia-build fallback"
+     ]
+    },
+    {
+     "kind": "tail",
+     "line": 59,
+     "lines": [
+      "    raise HTTPError(req.full_url, code, msg, hdrs, fp)",
+      "urllib.error.HTTPError: HTTP Error 500: Internal Server Error",
+      "CMake Error at tools/cmake/PulpDependencies.cmake:303 (message):",
+      "  Skia: pinned cache generation validation/provisioning failed; refusing",
+      "  unvalidated external/skia-build fallback",
+      "Call Stack (most recent call first):",
+      "  CMakeLists.txt:368 (include)",
+      "-- Configuring incomplete, errors occurred!"
+     ]
+    },
+    {
+     "kind": "signal",
+     "line": 32,
+     "lines": [
+      "  expected lib: /home/runner/.cache/pulp/skia/.linux-x64-b132db47979f116a2b35720c6e4e8c7128505499e52b218cc64546f87b0bb363-receipt-v3.staging-piz9eylo/build/linux-gpu/lib/Release/libskia.a",
+      "Downloading -> /home/runner/work/pulp/pulp/.skia-release-asset-y789lp7w.zip",
+      "  transient download failure (HTTP Error 500: Internal Server Error); retrying in 2s [attempt 2 of 4]",
+      "  transient download failure (HTTP Error 500: Internal Server Error); retrying in 4s [attempt 3 of 4]",
+      "  transient download failure (HTTP Error 500: Internal Server Error); retrying in 8s [attempt 4 of 4]",
+      "  download failed after 4 attempts: HTTP Error 500: Internal Server Error",
+      "Traceback (most recent call last):",
+      "  File \"/home/runner/work/pulp/pulp/tools/scripts/fetch_skia_for_release.py\", line 1058, in <module>",
+      "    sys.exit(main(sys.argv))"
+     ]
+    },
+    {
+     "kind": "signal",
+     "line": 13,
+     "lines": [
+      "-- Detecting C compile features - done",
+      "-- Pulp 0.920.1 — platform: linux",
+      "-- Pulp: ccache not found on PATH — using compiler directly",
+      "-- Pulp: AAX support disabled",
+      "-- Pulp: VCV Rack support disabled"
+     ]
+    }
+   ],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37476264297/job/112312344864",
+    "log_lines": 85,
+    "log_bytes": 8509,
+    "step_lines": [
+     4,
+     85
+    ],
+    "fetch": "gh run view 37476264297 --job 112312344864 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 0,
+  "names": []
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 3071
+ }
+}

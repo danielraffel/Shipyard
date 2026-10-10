@@ -1,0 +1,129 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. Enforce version & skill sync: real, 2 tests, step 'Gate-script fixture tests'",
+ "checks": [
+  {
+   "context": "Enforce version & skill sync",
+   "conclusion": "failure",
+   "run_id": 37616420557,
+   "run_attempt": 1,
+   "job_id": 112775724433,
+   "runner": {
+    "name": "GitHub Actions 1000236996",
+    "labels": [
+     "ubuntu-latest"
+    ]
+   },
+   "timing_s": {
+    "queued": 2,
+    "ran": 160
+   },
+   "failing_step": {
+    "number": 24,
+    "name": "Gate-script fixture tests",
+    "conclusion": "failure"
+   },
+   "classification": {
+    "class": "real",
+    "rule": "default",
+    "why": "no infra, stale-base, interruption or flake evidence"
+   },
+   "failing_tests": {
+    "names": [
+     "test_the_committed_baseline_matches_the_tree",
+     "(failures=1)"
+    ],
+    "total": 2,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "signal",
+     "line": 202,
+     "lines": [
+      "Ran 15 tests in 7.889s",
+      "FAILED (failures=1)",
+      "text-encoding-lint: the baseline is higher than the tree; record the lower counts with --write:"
+     ]
+    },
+    {
+     "kind": "tail",
+     "line": 232,
+     "lines": [
+      "    tools/ci/test_read_audit_cadence.py:167: .write_text() without encoding=",
+      "    tools/ci/test_read_audit_cadence.py:169: .write_text() without encoding=",
+      "    tools/ci/test_read_audit_cadence.py:170: subprocess.run(text=True) without encoding=",
+      "    tools/ci/test_read_audit_cadence.py:175: .read_text() without encoding=",
+      "    tools/ci/test_read_audit_cadence.py:176: .read_text() without encoding=",
+      "    tools/ci/test_read_audit_cadence.py:186: .read_text() without encoding=",
+      "    tools/ci/test_read_audit_cadence.py:190: .read_text() without encoding=",
+      "Pass encoding=\"utf-8\" (or the encoding the data really uses)."
+     ]
+    },
+    {
+     "kind": "signal",
+     "line": 192,
+     "lines": [
+      "..F.",
+      "======================================================================",
+      "FAIL: test_the_committed_baseline_matches_the_tree (__main__.RepositoryTests.test_the_committed_baseline_matches_the_tree)",
+      "----------------------------------------------------------------------",
+      "Traceback (most recent call last):",
+      "  File \"/home/runner/work/pulp/pulp/tools/scripts/test_text_encoding_lint.py\", line 124, in test_the_committed_baseline_matches_the_tree",
+      "    self.assertEqual(lint.main([\"--root\", str(ROOT)]), 0)",
+      "AssertionError: 1 != 0",
+      "----------------------------------------------------------------------"
+     ]
+    },
+    {
+     "kind": "signal",
+     "line": 172,
+     "lines": [
+      "    why: The auto-release + watchdog + cadence-check trio is the release-watchdog design; changing any of them without a doc edit drifts the documented three-layer release-failure protection.",
+      "Config-doc check FAILED.",
+      "For each entry above marked ✗, either:",
+      "  1. Update the relevant guide doc in this branch so it stays in sync, OR",
+      "  2. Add a commit trailer on any commit in this branch with the form:"
+     ]
+    },
+    {
+     "kind": "signal",
+     "line": 163,
+     "lines": [
+      "Config-doc check FAILED.",
+      "For each entry above marked ✗, either:",
+      "  1. Update the relevant guide doc in this branch so it stays in sync, OR",
+      "  2. Add a commit trailer on any commit in this branch with the form:",
+      "     Config-Doc: skip reason=\"...\"",
+      "[config-doc] ✗ doc NOT updated",
+      "    changed: .github/workflows/auto-release.yml",
+      "    expected a change in one of: docs/guides/release-watchdog.md"
+     ]
+    }
+   ],
+   "evidence_truncated": true,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37616420557/job/112775724433",
+    "log_lines": 255,
+    "log_bytes": 28875,
+    "step_lines": [
+     154,
+     255
+    ],
+    "fetch": "gh run view 37616420557 --job 112775724433 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 0,
+  "names": []
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 3531
+ }
+}

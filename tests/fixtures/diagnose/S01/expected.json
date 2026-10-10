@@ -1,0 +1,89 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. Enforce version & skill sync: real, step 'Version-bump check'",
+ "checks": [
+  {
+   "context": "Enforce version & skill sync",
+   "conclusion": "failure",
+   "run_id": 37264702227,
+   "run_attempt": 1,
+   "job_id": 111618927886,
+   "runner": {
+    "name": "GitHub Actions 1000204511",
+    "labels": [
+     "ubuntu-latest"
+    ]
+   },
+   "timing_s": {
+    "queued": 2,
+    "ran": 32
+   },
+   "failing_step": {
+    "number": 9,
+    "name": "Version-bump check",
+    "conclusion": "failure"
+   },
+   "classification": {
+    "class": "real",
+    "rule": "default",
+    "why": "no infra, stale-base, interruption or flake evidence"
+   },
+   "failing_tests": {
+    "names": [],
+    "total": 0,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "signal",
+     "line": 177,
+     "lines": [
+      "── fix/feat-touches-a-surface check (post-merge assignment) ──",
+      "✗ this fix/feat touches NO versioned surface, so the version-at-land bot would assign nothing and the change would never ship. Resolve one of:",
+      "  • re-title to `chore:` / `docs:` / `refactor:` / `build:` if it is genuinely not user-facing, OR",
+      "  • declare intent on a commit: `Version-Bump: <surface>=<patch|minor|major>`, OR"
+     ]
+    },
+    {
+     "kind": "tail",
+     "line": 171,
+     "lines": [
+      "  GITHUB_PR_TITLE:",
+      "[sdk] Pulp SDK / CLI: no bump needed",
+      "[plugin] Claude Code plugin: no bump needed",
+      "── fix/feat-touches-a-surface check (post-merge assignment) ──",
+      "✗ this fix/feat touches NO versioned surface, so the version-at-land bot would assign nothing and the change would never ship. Resolve one of:",
+      "  • re-title to `chore:` / `docs:` / `refactor:` / `build:` if it is genuinely not user-facing, OR",
+      "  • declare intent on a commit: `Version-Bump: <surface>=<patch|minor|major>`, OR",
+      "  • opt out: `Version-Bump: skip reason=\"...\"`."
+     ]
+    }
+   ],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37264702227/job/111618927886",
+    "log_lines": 196,
+    "log_bytes": 23504,
+    "step_lines": [
+     154,
+     196
+    ],
+    "fetch": "gh run view 37264702227 --job 111618927886 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 1,
+  "names": [
+   "classify"
+  ]
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 2108
+ }
+}
