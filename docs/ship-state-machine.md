@@ -767,6 +767,13 @@ it started under (`boot_id`, from `kern.boottime` on macOS and
 `/proc/sys/kernel/random/boot_id` on Linux), and a process from another boot
 cannot be alive.
 
+The pass is **opt-in per host** (machine-global
+`.shipyard/config.toml`: `[queue.boot_requeue] enabled = true`, default off).
+A pull request cannot yet show that its lane was requeued (Shipyard posts no
+lane verdict comment or check-run), so a host requeues only once its operator
+chooses to; making the requeue visible on the pull request is the follow-up
+that comes before enabling it fleet-wide.
+
 On its first tick, before any receipt sweep, the execution supervisor finds
 each `Running` job whose receipt names a different boot than the daemon's own.
 For each one, in this order, every step idempotent:
@@ -777,15 +784,18 @@ For each one, in this order, every step idempotent:
 3. it removes the stale receipt;
 4. it returns the same job, with its own request envelope (so the same
    repository, pull request and exact head), to `Pending`, recording
-   `interrupted: host reboot` as its deferral reason;
+   `interrupted: host reboot, requeued once at <UTC>` as its deferral reason,
+   which `shipyard queue` prints on the pending line;
 5. it marks the marker `requeued`.
 
 A daemon killed between steps finds the `intent` marker on its next start and
-finishes the remaining steps once. Shipyard posts no GitHub check-run for lane
+finishes the remaining steps once, from the marker rather than the receipt:
+after step 3 the receipt is gone, and only the marker still proves the reboot. Shipyard posts no GitHub check-run for lane
 jobs, so the interruption is recorded on the job and in the marker.
 
 Nothing else is requeued, and those jobs keep the ordinary lost-worker path:
 
+- a host that has not opted in;
 - a receipt with no `boot_id` (written by an older Shipyard) or with the current boot;
 - an unreadable current boot;
 - a job with a cancel requested;

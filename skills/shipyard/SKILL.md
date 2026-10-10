@@ -257,10 +257,13 @@ When asserting a gate "ran", check for `rc in (0, 1)` — not `rc == 0`. Zero is
 
 ## A lane job running at reboot is requeued once, not lost
 
-Worker receipts record the host boot (`boot_id`). On the first supervisor
-tick after a reboot, a `Running` job whose receipt names an earlier boot is
+Worker receipts record the host boot (`boot_id`). On a host that opted in
+(machine-global `[queue.boot_requeue] enabled = true`; off by default until a
+requeue is visible on the pull request), the first supervisor tick after a
+reboot takes each `Running` job whose receipt names an earlier boot. It is
 returned to `Pending` under its own id and envelope (same PR and exact head),
-with `interrupted: host reboot` as its deferral reason, after a write-ahead
+with `interrupted: host reboot, requeued once at <UTC>` as its deferral reason
+(printed by `shipyard queue`), after a write-ahead
 marker in `queue-workers/boot-requeue/`. It happens once per job; a receipt
 with no boot id, the same boot, or a second reboot keeps the ordinary
 `UNCERTAIN`, no-replay path. Do not hand-edit `queue.json` to rescue such a

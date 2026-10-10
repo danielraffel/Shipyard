@@ -68,6 +68,9 @@ pub struct WorkerReceipt {
 /// Recorded on a job a reboot interrupted, and in its boot-requeue marker.
 pub const BOOT_REQUEUE_REASON: &str = "interrupted: host reboot";
 
+/// Machine-global key that opts a host in to the boot requeue.
+pub const BOOT_REQUEUE_CONFIG_KEY: &str = "queue.boot_requeue.enabled";
+
 /// Write-ahead record of one boot requeue, keyed by job id and dead boot.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct BootRequeueMarker {
@@ -178,6 +181,8 @@ pub struct ExecutionSupervisor {
     boot_id: Option<String>,
     /// Whether the start-up boot pass has completed for this supervisor.
     boot_pass_done: bool,
+    /// Test-only replacement for the machine-global opt-in.
+    boot_requeue_override: Option<bool>,
 }
 
 struct QueueAbsentRecoveryFlight(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -210,6 +215,7 @@ impl ExecutionSupervisor {
             ),
             boot_id: crate::boot_identity::current(),
             boot_pass_done: false,
+            boot_requeue_override: None,
         }
     }
 
@@ -217,6 +223,14 @@ impl ExecutionSupervisor {
     #[cfg(test)]
     pub(crate) fn with_boot_id(mut self, boot_id: Option<&str>) -> Self {
         self.boot_id = boot_id.map(str::to_owned);
+        self.boot_requeue_override = Some(true);
+        self
+    }
+
+    /// Replace the machine-global opt-in, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_boot_requeue(mut self, enabled: bool) -> Self {
+        self.boot_requeue_override = Some(enabled);
         self
     }
 
@@ -1000,57 +1014,103 @@ impl ExecutionSupervisor {
     /// repeats nothing.
     ///
     /// Everything else keeps the ordinary lost-worker path (`UNCERTAIN`, no
-    /// replay): a receipt with no boot id or the current one, an unreadable
-    /// current boot, a cancel already requested, a termination transaction in
-    /// progress, and a job this pass already requeued once after an earlier
-    /// reboot.
+    /// replay): a host that has not opted in ([`BOOT_REQUEUE_CONFIG_KEY`]), a
+    /// receipt with no boot id or the current one, an unreadable current boot,
+    /// a cancel already requested, a termination transaction in progress, and
+    /// a job already requeued once after an earlier reboot.
     fn requeue_jobs_interrupted_by_reboot(&mut self) -> Result<(), SupervisorError> {
         let Some(current_boot) = self.boot_id.clone() else {
             return Ok(());
         };
+        if !self.boot_requeue_enabled() {
+            return Ok(());
+        }
         let mut queue = Queue::new(&self.state_dir)?;
         let termination = TerminationStore::new(&self.state_dir);
         for job in queue.get_running()? {
             if job.cancel_requested_at.is_some() || termination.load(&job.id)?.is_some() {
                 continue;
             }
-            let Ok(Some(receipt)) = self.read_exact_receipt(&job.id) else {
-                continue;
+            // A started requeue is finished from its marker: a crash after the
+            // receipt was removed leaves no receipt to prove the reboot again.
+            let (marker_path, mut marker) = if let Some(started) = self.intent_marker(&job.id)? {
+                started
+            } else {
+                let Ok(Some(receipt)) = self.read_exact_receipt(&job.id) else {
+                    continue;
+                };
+                let Some(dead_boot) = receipt.boot_id.filter(|boot| *boot != current_boot) else {
+                    continue;
+                };
+                // Once per job: any earlier marker, for any boot, means this
+                // job already had its requeue.
+                if self.job_was_requeued_after_a_reboot(&job.id)? {
+                    continue;
+                }
+                let marker = BootRequeueMarker {
+                    job_id: job.id.clone(),
+                    dead_boot_id: dead_boot.clone(),
+                    current_boot_id: current_boot.clone(),
+                    state: BootRequeueState::Intent,
+                    recorded_at: Utc::now(),
+                };
+                let path = self.boot_requeue_marker_path(&job.id, &dead_boot);
+                write_json_atomic(&path, &marker)?;
+                (path, marker)
             };
-            let Some(dead_boot) = receipt.boot_id.clone().filter(|boot| *boot != current_boot)
-            else {
-                continue;
-            };
-            let marker_path = self.boot_requeue_marker_path(&job.id, &dead_boot);
-            let marker = match fs::read(&marker_path) {
-                Ok(bytes) => serde_json::from_slice::<BootRequeueMarker>(&bytes).ok(),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            };
-            if marker
-                .as_ref()
-                .is_some_and(|marker| marker.state == BootRequeueState::Requeued)
-            {
-                continue;
-            }
-            if marker.is_none() && self.job_was_requeued_after_a_reboot(&job.id)? {
-                continue;
-            }
-            let mut marker = marker.unwrap_or_else(|| BootRequeueMarker {
-                job_id: job.id.clone(),
-                dead_boot_id: dead_boot.clone(),
-                current_boot_id: current_boot.clone(),
-                state: BootRequeueState::Intent,
-                recorded_at: Utc::now(),
-            });
-            write_json_atomic(&marker_path, &marker)?;
             self.release_host_pool_leases(&job.id)?;
             self.remove_receipt_if_present(&job.id)?;
-            queue.requeue_running_after_reboot(&job.id, BOOT_REQUEUE_REASON)?;
+            let reason = format!(
+                "{BOOT_REQUEUE_REASON}, requeued once at {}",
+                marker.recorded_at.format("%Y-%m-%dT%H:%M:%SZ")
+            );
+            queue.requeue_running_after_reboot(&job.id, &reason)?;
             marker.state = BootRequeueState::Requeued;
             write_json_atomic(&marker_path, &marker)?;
         }
         Ok(())
+    }
+
+    /// Whether this host opted in (machine-global `queue.boot_requeue.enabled =
+    /// true`). Off by default: until a requeue is visible on the pull request
+    /// itself, a host requeues only when its operator chose to.
+    fn boot_requeue_enabled(&self) -> bool {
+        if let Some(enabled) = self.boot_requeue_override {
+            return enabled;
+        }
+        crate::config::LoadedConfig::load_machine_global_from_dir(self.global_dir.clone())
+            .ok()
+            .and_then(|config| {
+                config
+                    .get(BOOT_REQUEUE_CONFIG_KEY)
+                    .and_then(toml::Value::as_bool)
+            })
+            .unwrap_or(false)
+    }
+
+    /// The marker of a requeue this job started and did not finish.
+    fn intent_marker(&self, job_id: &str) -> io::Result<Option<(PathBuf, BootRequeueMarker)>> {
+        let entries = match fs::read_dir(self.boot_requeue_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let prefix = format!("{job_id}@");
+        for entry in entries {
+            let path = entry?.path();
+            if !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            {
+                continue;
+            }
+            let marker = serde_json::from_slice::<BootRequeueMarker>(&fs::read(&path)?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if marker.state == BootRequeueState::Intent && marker.job_id == job_id {
+                return Ok(Some((path, marker)));
+            }
+        }
+        Ok(None)
     }
 
     fn boot_requeue_dir(&self) -> PathBuf {
@@ -3369,9 +3429,13 @@ mod tests {
         let mut queue = Queue::new(temp.path()).expect("queue");
         let job = queue.get("rebooted").expect("read").expect("job");
         assert_eq!(job.status, JobStatus::Pending);
-        assert_eq!(
-            job.scheduler_defer_reason.as_deref(),
-            Some(BOOT_REQUEUE_REASON)
+        assert!(
+            job.scheduler_defer_reason
+                .as_deref()
+                .is_some_and(|reason| reason
+                    .starts_with(&format!("{BOOT_REQUEUE_REASON}, requeued once at "))),
+            "{:?}",
+            job.scheduler_defer_reason
         );
         assert_eq!(job.scheduler_defer_count, 1);
         assert!(
@@ -3460,6 +3524,69 @@ mod tests {
             boot_markers(temp.path())[0].state,
             BootRequeueState::Requeued
         );
+    }
+
+    /// The ordering control: the daemon died after removing the receipt and
+    /// before returning the job to pending. Nothing on disk proves the reboot
+    /// again except the marker, which finishes the requeue exactly once.
+    #[test]
+    fn a_crash_after_the_receipt_is_removed_still_requeues_exactly_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        running_job_with_receipt(temp.path(), "mid-step", Some("boot-A"));
+        let supervisor = supervisor_on_boot(temp.path(), Some("boot-B"));
+        write_json_atomic(
+            &supervisor.boot_requeue_marker_path("mid-step", "boot-A"),
+            &BootRequeueMarker {
+                job_id: "mid-step".to_owned(),
+                dead_boot_id: "boot-A".to_owned(),
+                current_boot_id: "boot-B".to_owned(),
+                state: BootRequeueState::Intent,
+                recorded_at: Utc::now(),
+            },
+        )
+        .expect("intent");
+        fs::remove_file(temp.path().join("queue-workers/mid-step.json")).expect("step 3 done");
+        for _ in 0..2 {
+            supervisor_on_boot(temp.path(), Some("boot-B"))
+                .requeue_jobs_interrupted_by_reboot()
+                .expect("boot pass");
+        }
+        let job = Queue::new(temp.path())
+            .expect("queue")
+            .get("mid-step")
+            .expect("read")
+            .expect("job");
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.scheduler_defer_count, 1);
+        assert_eq!(
+            boot_markers(temp.path())[0].state,
+            BootRequeueState::Requeued
+        );
+    }
+
+    #[test]
+    fn a_host_that_has_not_opted_in_never_requeues() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        running_job_with_receipt(temp.path(), "opted-out", Some("boot-A"));
+        supervisor_on_boot(temp.path(), Some("boot-B"))
+            .with_boot_requeue(false)
+            .requeue_jobs_interrupted_by_reboot()
+            .expect("boot pass");
+        let job = Queue::new(temp.path())
+            .expect("queue")
+            .get("opted-out")
+            .expect("read")
+            .expect("job");
+        assert_eq!(job.status, JobStatus::Running);
+        assert!(boot_markers(temp.path()).is_empty());
+        // The default, with no machine-global key, is off.
+        let default = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        assert!(!default.boot_requeue_enabled());
     }
 
     #[test]
