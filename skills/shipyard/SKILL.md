@@ -3254,6 +3254,16 @@ the exported `GH_TOKEN`/`GH_REPO`, and reproduce under
 `env -i HOME=$HOME PATH=<trusted path>`, never in an interactive shell. The
 refusal quotes the attributor's stderr tail.
 
+**An INTERRUPTION ejection is re-armed at the same head, unattended.** A
+required job cancelled with no runner after 10+ minutes queued (starved; the
+`ejection_cause()` label in `gate_cost/proxy.rs`), or a failing step whose
+`##[error]` line is `Upload progress stalled` after the test step passed, is an
+interruption: `src/environment_requeue.rs` allows a same-head re-enqueue on the
+head's first two ejections and leaves it out of the head-approval ejection cap,
+and the steward's `--arm-unqueued` backstop re-arms it with `expectedHeadOid`
+(outcome `rearmed_same_head`), but only for a head somebody armed after it arrived (`merge_carrier::head_arm_time`). Under the same opt-in as below. Do not dequeue,
+rebase or push a no-op commit for these; read `shipyard landing --pr <n>`.
+
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
 when the repo sets `[queue.environment_requeue] enabled = true`: every failing
 required check on the removal's merge-group commit must be an Actions job whose

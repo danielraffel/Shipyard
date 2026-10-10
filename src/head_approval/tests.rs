@@ -1,8 +1,8 @@
 use serde_json::{Value, json};
 
 use super::{
-    Approval, ApprovalPolicy, EJECTION_CAP, HeadGate, decide, ejection_cause, find_approval,
-    head_ejections, read_policy,
+    Approval, ApprovalPolicy, EJECTION_CAP, HeadGate, decide, decide_excusing, ejection_cause,
+    find_approval, head_ejections, read_policy,
 };
 
 /// The heads Generous-Corp/pulp#9438 was force-pushed to on 2026-10-04, in
@@ -357,6 +357,26 @@ fn a_head_ejected_twice_needs_an_approval_newer_than_the_last_ejection() {
         &format!("reviewed:{HEAD}"),
     )];
     assert!(decide(&policy, HEAD, &old, &fresh, &ejected_twice(HEAD)).allows());
+}
+
+#[test]
+fn an_interruption_ejection_does_not_count_toward_the_cap() {
+    let policy = required(&["reviewer"]);
+    let old = [review(
+        "someone",
+        "User",
+        "APPROVED",
+        HEAD,
+        "2026-10-04T01:30:00Z",
+    )];
+    // The second removal was classified an interruption: one counted
+    // ejection remains, under the cap, so the earlier approval still holds.
+    assert!(decide_excusing(&policy, HEAD, &old, &[], &ejected_twice(HEAD), true).allows());
+    // Control: unexcused, the same facts hit the cap.
+    assert!(matches!(
+        decide_excusing(&policy, HEAD, &old, &[], &ejected_twice(HEAD), false),
+        HeadGate::EjectionCap { .. }
+    ));
 }
 
 #[test]
