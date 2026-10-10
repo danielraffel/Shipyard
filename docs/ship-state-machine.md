@@ -61,6 +61,15 @@ Failed verdicts (`STATE_VERDICT_FAIL`), refused merges, and merge
 attempts that hit a GhError all leave the active file in place for
 inspection. `shipyard cleanup --ship-state` ages these out (see T12).
 
+### Durable saves
+
+Every ship-state save, including the legacy `<pr>.json` mirror, goes through
+`src/durable_file.rs`: the temporary file is synced before it is renamed over
+the state file, and the directory is synced after. A rename alone is atomic
+but not durable, so a host that loses power or reboots right after a save
+could read back an empty or old state file and drop the PR's episode. Queue
+requests, execution receipts and queue-hold records use the same helper.
+
 ### Writer-domain audit boundary
 
 The per-PR `ShipStatePrLock` remains the semantic concurrency boundary for

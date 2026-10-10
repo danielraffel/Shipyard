@@ -463,10 +463,7 @@ impl ShipStateStore {
         _lock: &ShipStatePrLock,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
-        let payload = serde_json::to_string_pretty(state)?;
-        let temp = tempfile::NamedTempFile::new_in(&self.path)?;
-        fs::write(temp.path(), format!("{payload}\n"))?;
-        temp.persist(self.state_path(state.pr))?;
+        crate::durable_file::replace_json(&self.state_path(state.pr), state, true)?;
         Ok(())
     }
 
@@ -762,14 +759,7 @@ impl ShipStateStore {
 
     fn persist_state_at(state: &ShipState, path: &Path) -> io::Result<()> {
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
-        let parent = path.parent().expect("ship-state path has parent");
-        fs::create_dir_all(parent)?;
-        let payload = serde_json::to_string_pretty(state)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let temp = tempfile::NamedTempFile::new_in(parent)?;
-        fs::write(temp.path(), format!("{payload}\n"))?;
-        temp.persist(path).map_err(|error| error.error)?;
-        Ok(())
+        crate::durable_file::replace_json(path, state, true)
     }
 
     fn legacy_is_preserved(&self, legacy: &ShipState) -> bool {
@@ -839,11 +829,7 @@ impl ShipStateStore {
         let collision_marker = self.collision_marker_path(pr);
         match scoped.as_slice() {
             [state] => {
-                let payload = serde_json::to_string_pretty(state)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                let temp = tempfile::NamedTempFile::new_in(&self.path)?;
-                fs::write(temp.path(), format!("{payload}\n"))?;
-                temp.persist(&legacy_path).map_err(|error| error.error)?;
+                crate::durable_file::replace_json(&legacy_path, state, true)?;
                 if collision_marker.exists() {
                     fs::remove_file(collision_marker)?;
                 }
@@ -1134,6 +1120,31 @@ mod tests {
             phase: None,
             required: true,
         }
+    }
+
+    /// A ship-state save must survive a power loss: a state file that reads
+    /// back empty after a reboot drops the PR's episode. Every file a save
+    /// writes (the scoped state and the legacy mirror) is synced along with
+    /// its directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_syncs_every_file_it_writes_and_its_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let before = crate::durable_file::syncs_on_this_thread();
+        store.save(&sample_state(4343, "abc1234")).expect("save");
+        let syncs = crate::durable_file::syncs_on_this_thread() - before;
+        assert_eq!(
+            syncs, 4,
+            "scoped state + directory, legacy mirror + directory"
+        );
+        let lock = store.lock_pr(4343).expect("lock");
+        let before = crate::durable_file::syncs_on_this_thread();
+        store
+            .save_locked(&sample_state(4343, "def5678"), &lock)
+            .expect("save_locked");
+        assert_eq!(crate::durable_file::syncs_on_this_thread() - before, 2);
+        assert_eq!(store.get(4343).expect("state").head_sha, "def5678");
     }
 
     /// Contention must be distinguishable from absence, or a hung worker is
