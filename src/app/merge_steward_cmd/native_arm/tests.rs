@@ -547,11 +547,48 @@ fn ejected_with_cancelled_macos(
     temp: &tempfile::TempDir,
     job: &serde_json::Value,
 ) -> GitHubActions {
-    let dir = temp.path();
-    let fixture = concat!(
+    ejected_with_timeline(temp, job, &timeline_8678(Some("2026-09-22T23:20:00Z"), &[]))
+}
+
+/// #8678's real queue-state response, with the current head's first check
+/// suite at `arrived` (the capture carries none) and `extra` timeline nodes
+/// appended.
+#[cfg(unix)]
+fn timeline_8678(arrived: Option<&str>, extra: &[serde_json::Value]) -> serde_json::Value {
+    let raw = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/github/pr_real_8678_first_environment_ejection.json"
-    );
+    ))
+    .expect("fixture");
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("fixture JSON");
+    let nodes = value
+        .pointer_mut("/data/repository/pullRequest/timelineItems/nodes")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("nodes");
+    for node in nodes.iter_mut() {
+        if let Some(at) = arrived
+            && node
+                .pointer("/commit/oid")
+                .and_then(serde_json::Value::as_str)
+                == Some("f0fb2fb38ef5c900efad7ea0630906f081db53a9")
+        {
+            node["commit"]["checkSuites"] = serde_json::json!({"nodes": [{"createdAt": at}]});
+        }
+    }
+    nodes.extend(extra.iter().cloned());
+    value
+}
+
+#[cfg(unix)]
+fn ejected_with_timeline(
+    temp: &tempfile::TempDir,
+    job: &serde_json::Value,
+    timeline: &serde_json::Value,
+) -> GitHubActions {
+    let dir = temp.path();
+    let fixture_path = dir.join("queue_state.json");
+    std::fs::write(&fixture_path, timeline.to_string()).expect("timeline");
+    let fixture = fixture_path.display().to_string();
     let group = "2410ca497342cfc0264bf5b72713de0b56099a0f";
     let files = [
         ("config", "[queue.environment_requeue]\nenabled = true\n".to_owned()),
@@ -654,4 +691,97 @@ fn the_backstop_leaves_a_head_disarmed_when_the_cancelled_job_had_a_runner() {
         "the job was read: {calls}"
     );
     assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+}
+
+#[cfg(unix)]
+fn starved_job() -> serde_json::Value {
+    serde_json::json!({"id": 7, "status": "completed", "conclusion": "cancelled",
+        "created_at": "2026-09-23T03:30:00Z", "completed_at": "2026-09-23T03:46:00Z",
+        "runner_name": "", "steps": []})
+}
+
+/// The same starved ejection is re-armed only when someone armed the current
+/// head after it arrived. Each control removes that one fact.
+#[cfg(unix)]
+#[test]
+fn the_backstop_rearms_only_a_head_someone_armed_after_it_arrived() {
+    let without_arms = {
+        let mut value = timeline_8678(Some("2026-09-22T23:20:00Z"), &[]);
+        value["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+            .as_array_mut()
+            .expect("nodes")
+            .retain(|node| node["__typename"] != "AutoMergeEnabledEvent");
+        value
+    };
+    let mut truncated = timeline_8678(None, &[]);
+    truncated["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"]["hasPreviousPage"] =
+        serde_json::json!(true);
+    let controls = [
+        (
+            "the arms were for earlier heads; the current head was force-pushed after them",
+            timeline_8678(
+                None,
+                &[serde_json::json!({"__typename": "HeadRefForcePushedEvent",
+                    "createdAt": "2026-09-23T00:00:00Z",
+                    "afterCommit": {"oid": "f0fb2fb38ef5c900efad7ea0630906f081db53a9"}})],
+            ),
+        ),
+        ("no arm event at all", without_arms),
+        (
+            "the head's first check suite came after the last arm",
+            timeline_8678(Some("2026-09-23T00:00:00Z"), &[]),
+        ),
+        (
+            "a truncated window: refused by the classifier before the arrival check",
+            truncated,
+        ),
+    ];
+    for (why, timeline) in controls {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = ejected_with_timeline(&temp, &starved_job(), &timeline);
+        let result = run_backstop_on_8678(&actions);
+        assert_eq!(result.outcome, "skipped", "{why}: {result:?}");
+        let calls = std::fs::read_to_string(temp.path().join("calls.log")).expect("log");
+        assert!(
+            !calls.contains("enablePullRequestAutoMerge"),
+            "{why}: {calls}"
+        );
+    }
+    // Positive control on the same instrument: arrival at 23:20, armed 23:42.
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = ejected_with_timeline(
+        &temp,
+        &starved_job(),
+        &timeline_8678(Some("2026-09-22T23:20:00Z"), &[]),
+    );
+    assert_eq!(run_backstop_on_8678(&actions).outcome, "rearmed_same_head");
+}
+
+/// The arrival check fails closed on its own. Through the backstop a
+/// truncated window is refused earlier, by the classifier's complete-timeline
+/// rule, so this branch is exercised directly.
+#[cfg(unix)]
+#[test]
+fn an_arrival_the_window_cannot_place_refuses_the_rearm() {
+    let allowed = crate::environment_requeue::EnvironmentRequeue {
+        allowed: true,
+        class: Some(crate::environment_requeue::RequeueClass::Interruption),
+        reason: "starved".to_owned(),
+        merge_group_commit: None,
+        evidence: Vec::new(),
+    };
+    let head = "f0fb2fb38ef5c900efad7ea0630906f081db53a9";
+    let mut truncated = timeline_8678(None, &[]);
+    truncated["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"]["hasPreviousPage"] =
+        serde_json::json!(true);
+    let refused = super::armed_since_arrival(allowed.clone(), &truncated, head);
+    assert!(!refused.allowed);
+    assert!(
+        refused.reason.contains("cannot be read"),
+        "{}",
+        refused.reason
+    );
+    // Control: the same verdict with the arrival placed before the last arm.
+    let placed = timeline_8678(Some("2026-09-22T23:20:00Z"), &[]);
+    assert!(super::armed_since_arrival(allowed, &placed, head).allowed);
 }

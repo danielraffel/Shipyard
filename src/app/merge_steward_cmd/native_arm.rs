@@ -320,9 +320,10 @@ fn same_head_verdict(
         ));
     }
     match crate::environment_requeue::read_opt_in(run_gh, repo, base) {
-        Ok(opted_in) => Ok(crate::environment_requeue::assess(
-            run_gh, repo, report, opted_in,
-        )),
+        Ok(opted_in) => Ok(
+            crate::environment_requeue::assess(run_gh, repo, report, opted_in)
+                .map(|verdict| armed_since_arrival(verdict, queue, head_sha)),
+        ),
         Err(detail) => Err(skipped(
             detail.clone(),
             Some(format!(
@@ -330,6 +331,34 @@ fn same_head_verdict(
             )),
         )),
     }
+}
+
+/// An allowed same-head verdict stands only when someone armed *this* head:
+/// an `AutoMergeEnabledEvent` at or after the head's own arrival (its own
+/// force-push, or its first check suite), read by the steward carrier's
+/// [`crate::merge_carrier::head_arm_time`]. Otherwise a head pushed after an
+/// earlier head was armed, auto-queued and then starved would be re-armed with
+/// nobody having armed it. A window that cannot place the arrival refuses.
+fn armed_since_arrival(
+    mut verdict: crate::environment_requeue::EnvironmentRequeue,
+    queue: &serde_json::Value,
+    head_sha: &str,
+) -> crate::environment_requeue::EnvironmentRequeue {
+    if !verdict.allowed {
+        return verdict;
+    }
+    let refusal = match crate::merge_carrier::head_arm_time(queue, head_sha) {
+        Ok(Some(_)) => return verdict,
+        Ok(None) => format!(
+            "nobody armed head {} after it arrived, so the backstop will not re-arm it",
+            head_sha.get(..12).unwrap_or(head_sha)
+        ),
+        Err(detail) => format!("whether this head was ever armed cannot be read: {detail}"),
+    };
+    verdict.allowed = false;
+    verdict.class = None;
+    verdict.reason = format!("{refusal} (the ejection itself was: {})", verdict.reason);
+    verdict
 }
 
 /// Arm one pull request. `same_head` is a classified same-head re-enqueue:

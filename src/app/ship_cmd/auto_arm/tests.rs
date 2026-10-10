@@ -529,3 +529,55 @@ fn each_arm_request_reaches_the_arm_as_asked() {
     );
     assert!(outcome.line.contains('@'), "{}", outcome.line);
 }
+
+/// `ship`'s arm-on-open re-enqueues a starved head of #8678 at exactly that
+/// head: the mutation carries `expectedHeadOid`, never the plain arm.
+#[test]
+fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
+    let state = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/github/pr_real_8678_first_environment_ejection.json"
+    ))
+    .expect("fixture");
+    let group = "2410ca497342cfc0264bf5b72713de0b56099a0f";
+    let runs = r#"{"total_count":1,"check_runs":[{"id":7,"name":"macos","status":"completed","conclusion":"cancelled","app":{"slug":"github-actions"}}]}"#;
+    let job = r#"{"id":7,"status":"completed","conclusion":"cancelled","created_at":"2026-09-23T03:30:00Z","completed_at":"2026-09-23T03:46:00Z","runner_name":"","steps":[]}"#;
+    let gh = FakeGh::new(vec![
+        ("pr view", Ok(pr_view("PR_node8678", false))),
+        ("isInMergeQueue", Ok(state)),
+        ("rules/branches/main", Ok("[]".to_owned())),
+        (
+            "protection/required_status_checks",
+            Ok(r#"{"contexts":["macos"]}"#.to_owned()),
+        ),
+        ("pulls/8678", Ok(r#"{"base":{"ref":"main"}}"#.to_owned())),
+        (
+            Box::leak(format!("commits/{group}/check-runs").into_boxed_str()),
+            Ok(runs.to_owned()),
+        ),
+        (
+            Box::leak(format!("commits/{group}/status").into_boxed_str()),
+            Ok(r#"{"statuses":[]}"#.to_owned()),
+        ),
+        ("actions/jobs/7", Ok(job.to_owned())),
+        ("enablePullRequestAutoMerge", Ok(arm_accepted())),
+    ]);
+    let outcome =
+        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None);
+    assert!(outcome.armed, "{}", outcome.line);
+    assert!(
+        outcome.line.contains("at exactly its current head"),
+        "{}",
+        outcome.line
+    );
+    let calls = gh.calls.borrow();
+    let arm = calls
+        .iter()
+        .find(|call| call.contains("enablePullRequestAutoMerge"))
+        .expect("an arm mutation");
+    assert!(arm.contains("expectedHeadOid:$head"), "{arm}");
+    assert!(
+        arm.contains("head=f0fb2fb38ef5c900efad7ea0630906f081db53a9"),
+        "{arm}"
+    );
+}

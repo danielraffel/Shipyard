@@ -106,7 +106,12 @@ same-head re-arm, from `ship`'s arm-on-open or from the steward's
 `--arm-unqueued` backstop, is sent with `expectedHeadOid` bound to the head the
 classifier read, so GitHub refuses it if the head moved. The steward's backstop
 reads the opt-in from the protected base's `.shipyard/config.toml`, never from
-the head. A real `failure` with a runner, `merge_conflict`, or a moved head is
+the head, and re-arms only a head someone armed after it arrived: an
+`AutoMergeEnabledEvent` at or after the head's own force-push or its first
+check suite (`merge_carrier::head_arm_time`, the steward carrier's rule).
+Without that, a head pushed after an earlier head was armed, auto-queued and
+starved would be re-armed with nobody having armed it. A window that cannot
+place the arrival refuses. A real `failure` with a runner, `merge_conflict`, or a moved head is
 never re-armed.
 
 ### Why this is not the inference refused above

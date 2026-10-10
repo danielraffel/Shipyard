@@ -3251,7 +3251,7 @@ required job cancelled with no runner after 10+ minutes queued (starved; the
 interruption: `src/environment_requeue.rs` allows a same-head re-enqueue on the
 head's first two ejections and leaves it out of the head-approval ejection cap,
 and the steward's `--arm-unqueued` backstop re-arms it with `expectedHeadOid`
-(outcome `rearmed_same_head`). Under the same opt-in as below. Do not dequeue,
+(outcome `rearmed_same_head`), but only for a head somebody armed after it arrived (`merge_carrier::head_arm_time`). Under the same opt-in as below. Do not dequeue,
 rebase or push a no-op commit for these; read `shipyard landing --pr <n>`.
 
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
