@@ -126,6 +126,31 @@ mod tests {
         );
     }
 
+    /// The new contents arrive by rename, never by rewriting the live file: a
+    /// reader that opened the old file keeps reading complete old contents,
+    /// and the path names a different inode afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn replace_renames_a_new_file_over_the_old_one() {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("state.json");
+        replace(&path, b"old contents").expect("create");
+        let before = fs::metadata(&path).expect("stat").ino();
+        let mut reader = File::open(&path).expect("open old");
+        replace(&path, b"new").expect("replace");
+        assert_ne!(
+            fs::metadata(&path).expect("stat").ino(),
+            before,
+            "a new inode"
+        );
+        let mut seen = String::new();
+        reader.read_to_string(&mut seen).expect("read old");
+        assert_eq!(seen, "old contents", "an open reader is never torn");
+        assert_eq!(fs::read(&path).expect("read"), b"new");
+    }
+
     #[test]
     fn replace_json_matches_serde_pretty_bytes() {
         let temp = tempfile::tempdir().expect("tempdir");
