@@ -508,27 +508,50 @@ pub(super) fn pr_watch_fleet_rows(
                         .repos
                         .iter()
                         .map(|repo| {
-                            crate::pr_watch::liveness::line(repo, liveness.stale_after_minutes)
+                            let mut text =
+                                crate::pr_watch::liveness::line(repo, liveness.stale_after_minutes);
+                            if let Some((_, coverage)) =
+                                crate::pr_watch::liveness::coverage_line(repo)
+                            {
+                                text.push('\n');
+                                text.push_str(&coverage);
+                            }
+                            text
                         })
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
+                let gaps: usize = liveness
+                    .repos
+                    .iter()
+                    .filter_map(|repo| repo.coverage.as_ref())
+                    .map(|coverage| coverage.gaps.len())
+                    .sum();
                 let healthy = liveness.healthy();
                 if healthy {
                     fresh_scanners.push(class.clone());
                 } else {
                     stale_scanners.push(class.clone());
                 }
+                let error = if !healthy {
+                    Some(
+                        "pr-watch passes stopped completing; hand-back, comments and digest are silent"
+                            .to_owned(),
+                    )
+                } else if gaps > 0 {
+                    Some(format!(
+                        "{gaps} handed pull request(s) no rule accounts for (flag 8 calls their owners)"
+                    ))
+                } else {
+                    None
+                };
                 rows.insert(
                     format!("pr-watch:{class}"),
                     DoctorEntry {
-                        ok: healthy,
+                        ok: error.is_none(),
                         version: Some(if healthy { "scanning" } else { "STALE" }.to_owned()),
                         detail: Some(detail),
-                        error: (!healthy).then(|| {
-                            "pr-watch passes stopped completing; hand-back, comments and digest are silent"
-                                .to_owned()
-                        }),
+                        error,
                     },
                 );
             }
