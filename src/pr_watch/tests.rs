@@ -71,6 +71,7 @@ fn pr(number: u64, heads: Vec<HeadFact>, events: Vec<QueueEvent>) -> PrHistory {
         heads,
         events,
         timeline_complete: true,
+        ..PrHistory::default()
     }
 }
 
@@ -423,7 +424,7 @@ fn flag6_needs_every_required_check_green_and_nothing_armed_queued_or_held() {
     for vellum in ["failure", "cancelled"] {
         let red = green_history(vec![], &[], vellum);
         assert!(
-            kinds(&evaluate(&red, at, &thresholds), 600).is_empty(),
+            !kinds(&evaluate(&red, at, &thresholds), 600).contains(&6),
             "{vellum}"
         );
     }
@@ -561,6 +562,217 @@ fn flag7_needs_the_same_green_head_still_out_of_the_queue() {
     // A hold label suppresses it.
     let held = green_history(ejected_events(), &["shipyard:hold"], "success");
     assert!(kinds(&evaluate(&held, at, &thresholds), 600).is_empty());
+}
+
+// ---- coverage and flag 8 ------------------------------------------------------
+
+/// PR 800, handed to Shipyard, one head seen at 0:00 with `macos` and
+/// `Vellum freeze` settled at 0:30 as given (`None`: never ran, `Some("")`:
+/// still running).
+fn handed_history(
+    macos: Option<&str>,
+    vellum: Option<&str>,
+    events: Vec<QueueEvent>,
+) -> RepoHistory {
+    let mut checks = Vec::new();
+    for (id, name, outcome) in [(81, MACOS, macos), (82, "Vellum freeze", vellum)] {
+        match outcome {
+            None => {}
+            Some("") => {
+                let mut running = check(id, name, "success", t(0, 30), &[]);
+                running.status = "in_progress".to_owned();
+                running.conclusion = None;
+                running.completed_at = None;
+                checks.push(running);
+            }
+            Some(conclusion) => checks.push(check(id, name, conclusion, t(0, 30), &[])),
+        }
+    }
+    let mut pr = pr(800, vec![head("h8", t(0, 0), "completed", checks)], events);
+    pr.author = Some("shipyard-local".to_owned());
+    history(vec![pr], vec![])
+}
+
+fn state_at(history: &RepoHistory, at: DateTime<Utc>) -> (coverage::CoverageState, String) {
+    let thresholds = Thresholds::default();
+    let flags = evaluate(history, at, &thresholds);
+    let rows = coverage::coverage(history, &flags, at, &thresholds);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    (rows[0].state, rows[0].reason.clone())
+}
+
+#[test]
+fn coverage_puts_every_handed_pull_request_in_exactly_one_state() {
+    use coverage::CoverageState::{Flagged, Gap, Held, Progressing};
+    let late = t(5, 0);
+    // Progressing: a recent push, a running required check, a recent
+    // settle, the queue.
+    let red_unarmed = handed_history(Some("failure"), Some("success"), vec![]);
+    assert_eq!(state_at(&red_unarmed, t(1, 0)).0, Progressing);
+    let running = handed_history(Some(""), Some("success"), vec![]);
+    assert_eq!(
+        state_at(&running, late),
+        (Progressing, "required `macos` running".to_owned())
+    );
+    assert_eq!(state_at(&red_unarmed, t(2, 10)).0, Progressing);
+    let queued = handed_history(
+        Some("success"),
+        Some("success"),
+        vec![
+            ev(t(0, 40), QueueEventKind::Armed),
+            ev(t(0, 41), QueueEventKind::Enqueued),
+        ],
+    );
+    assert_eq!(state_at(&queued, late), (Progressing, "queued".to_owned()));
+    // Flagged: a specific owner flag holds.
+    let armed_red = handed_history(
+        Some("failure"),
+        Some("success"),
+        vec![ev(t(0, 1), QueueEventKind::Armed)],
+    );
+    assert_eq!(
+        state_at(&armed_red, late),
+        (Flagged, "red_while_armed".to_owned())
+    );
+    let green = handed_history(Some("success"), Some("success"), vec![]);
+    assert_eq!(
+        state_at(&green, late),
+        (Flagged, "green_unarmed".to_owned())
+    );
+    // Held: a draft or a hold label.
+    let mut draft = red_unarmed.clone();
+    draft.prs.get_mut(&800).unwrap().draft = true;
+    assert_eq!(state_at(&draft, late), (Held, "draft".to_owned()));
+    let mut labelled = red_unarmed.clone();
+    labelled.prs.get_mut(&800).unwrap().labels = vec!["shipyard:no-auto-merge".to_owned()];
+    assert_eq!(state_at(&labelled, late).0, Held);
+    assert_eq!(
+        state_at(&red_unarmed, late),
+        (Flagged, "red_unarmed".to_owned())
+    );
+    // Gaps, each with why it fell through.
+    let cancelled = handed_history(Some("cancelled"), Some("success"), vec![]);
+    let (state, reason) = state_at(&cancelled, late);
+    assert_eq!(state, Gap);
+    assert!(reason.contains("`macos` cancelled on head"), "{reason}");
+    let missing = handed_history(Some("success"), None, vec![]);
+    let (state, reason) = state_at(&missing, late);
+    assert_eq!(state, Gap);
+    assert!(reason.contains("`Vellum freeze` never ran"), "{reason}");
+    let mut dirty = cancelled.clone();
+    dirty.prs.get_mut(&800).unwrap().merge_state = Some("DIRTY".to_owned());
+    assert!(
+        state_at(&dirty, late)
+            .1
+            .starts_with("merge conflicts with the base (DIRTY)")
+    );
+    let armed_green = handed_history(
+        Some("success"),
+        Some("success"),
+        vec![ev(t(0, 40), QueueEventKind::Armed)],
+    );
+    let (state, reason) = state_at(&armed_green, late);
+    assert_eq!(state, Gap);
+    assert!(reason.contains("GitHub never queued it"), "{reason}");
+    let removed = handed_history(
+        Some("cancelled"),
+        Some("success"),
+        vec![
+            ev(t(0, 40), QueueEventKind::Armed),
+            ev(t(0, 41), QueueEventKind::Enqueued),
+            ev(
+                t(0, 50),
+                QueueEventKind::Removed {
+                    reason: "manual".to_owned(),
+                },
+            ),
+        ],
+    );
+    assert!(
+        state_at(&removed, late)
+            .1
+            .contains("removed from the queue (manual)")
+    );
+}
+
+#[test]
+fn flag8_calls_the_owner_for_every_gap_and_only_for_handed_pull_requests() {
+    let thresholds = Thresholds::default();
+    let late = t(5, 0);
+    let red_unarmed = handed_history(Some("cancelled"), Some("success"), vec![]);
+    let flags = evaluate(&red_unarmed, late, &thresholds);
+    assert_eq!(kinds(&flags, 800), vec![8]);
+    assert!(
+        flags[0].evidence.contains("cancelled on head"),
+        "{}",
+        flags[0].evidence
+    );
+    let mut ledger = Ledger::new("o/r", "main");
+    ledger::reconcile(&mut ledger, &flags, &now_map(800, &sha("h8"), true), late);
+    assert!(super::handback::actionable(&ledger.entries[&flags[0].id()]));
+    // Flag 8 makes the pull request flagged-by-gap, never double-counted.
+    let summary = coverage::summarize(
+        &coverage::coverage(&red_unarmed, &flags, late, &thresholds),
+        late,
+    );
+    assert_eq!(
+        (summary.progressing, summary.flagged, summary.held),
+        (0, 0, 0)
+    );
+    assert_eq!(summary.gaps.len(), 1);
+    // Not handed (another author, or none): no flag 8, no coverage row.
+    for author in [None, Some("danielraffel")] {
+        let mut other = red_unarmed.clone();
+        other.prs.get_mut(&800).unwrap().author = author.map(str::to_owned);
+        assert!(kinds(&evaluate(&other, late, &thresholds), 800).is_empty());
+        assert!(coverage::coverage(&other, &[], late, &thresholds).is_empty());
+    }
+    // A bot login written with `[bot]` still counts.
+    let mut bot = red_unarmed.clone();
+    bot.prs.get_mut(&800).unwrap().author = Some("shipyard-local[bot]".to_owned());
+    assert_eq!(kinds(&evaluate(&bot, late, &thresholds), 800), vec![8]);
+    // Accounted states raise no flag 8.
+    let queued = handed_history(
+        Some("failure"),
+        Some("success"),
+        vec![
+            ev(t(0, 40), QueueEventKind::Armed),
+            ev(t(0, 41), QueueEventKind::Enqueued),
+        ],
+    );
+    assert!(!kinds(&evaluate(&queued, late, &thresholds), 800).contains(&8));
+}
+
+#[test]
+fn flag9_is_red_on_a_head_nobody_armed_past_the_window() {
+    let thresholds = Thresholds::default();
+    let red = handed_history(Some("failure"), Some("success"), vec![]);
+    // Red since 0:30: quiet until the window has passed since the red.
+    assert!(kinds(&evaluate(&red, t(2, 30), &thresholds), 800).is_empty());
+    let flags = evaluate(&red, t(2, 31), &thresholds);
+    assert_eq!(kinds(&flags, 800), vec![9]);
+    assert!(
+        flags[0].evidence.contains("required `macos` on head"),
+        "{}",
+        flags[0].evidence
+    );
+    // Not a handed-only rule: any author.
+    let mut other = red.clone();
+    other.prs.get_mut(&800).unwrap().author = None;
+    assert_eq!(kinds(&evaluate(&other, t(5, 0), &thresholds), 800), vec![9]);
+    // Armed is flag 2's; held, drafts and queued raise nothing.
+    let armed = handed_history(
+        Some("failure"),
+        Some("success"),
+        vec![ev(t(0, 1), QueueEventKind::Armed)],
+    );
+    assert_eq!(kinds(&evaluate(&armed, t(5, 0), &thresholds), 800), vec![2]);
+    let mut held = red.clone();
+    held.prs.get_mut(&800).unwrap().labels = vec!["shipyard:hold".to_owned()];
+    assert!(kinds(&evaluate(&held, t(5, 0), &thresholds), 800).is_empty());
+    let mut draft = red.clone();
+    draft.prs.get_mut(&800).unwrap().draft = true;
+    assert!(kinds(&evaluate(&draft, t(5, 0), &thresholds), 800).is_empty());
 }
 
 // ---- flag 3 -------------------------------------------------------------------
@@ -1352,7 +1564,7 @@ fn expectations_parse_and_reject_nonsense() {
     assert_eq!(parsed.pr, 8933);
     assert_eq!(parsed.kinds.len(), 4);
     assert!("8933".parse::<Expectation>().is_err());
-    assert!("8933=9".parse::<Expectation>().is_err());
+    assert!("8933=10".parse::<Expectation>().is_err());
 }
 
 #[test]

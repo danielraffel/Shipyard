@@ -353,16 +353,10 @@ fn ambient_only_rejects_a_script_binary_override() {
     let wrapper = temp
         .path()
         .join(if cfg!(windows) { "gh.exe" } else { "gh" });
-    std::fs::write(&wrapper, b"#!/bin/sh\nexit 91\n").expect("wrapper fixture");
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&wrapper)
-            .expect("wrapper metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&wrapper, permissions).expect("executable wrapper");
-    }
+    crate::test_support::write_executable_script(&wrapper, "#!/bin/sh\nexit 91\n");
+    #[cfg(not(unix))]
+    std::fs::write(&wrapper, b"#!/bin/sh\nexit 91\n").expect("wrapper fixture");
 
     let error = GhClient::ambient()
         .prepare_command(

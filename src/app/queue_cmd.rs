@@ -746,11 +746,14 @@ fn write_queue_human<W: Write>(
         for job in pending {
             writeln!(
                 stdout,
-                "    {} {} @ {} [{}]",
+                "    {} {} @ {} [{}]{}",
                 job.id,
                 job.branch,
                 short_sha(&job.sha),
-                priority_name(job.priority)
+                priority_name(job.priority),
+                job.scheduler_defer_reason
+                    .as_deref()
+                    .map_or_else(String::new, |reason| format!(" ({reason})"))
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }

@@ -3,6 +3,41 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v02960"></a>
+## [0.296.0] - 2026-10-10
+
+- fix/shared script writer ([#763](https://github.com/danielraffel/Shipyard/pull/763))
+
+<a id="v02950"></a>
+## [0.295.0] - 2026-10-10
+
+- fix/durable state writes ([#753](https://github.com/danielraffel/Shipyard/pull/753))
+
+<a id="v02940"></a>
+## [0.294.0] - 2026-10-10
+
+- fix/daemon repo drift ([#754](https://github.com/danielraffel/Shipyard/pull/754))
+
+<a id="v02930"></a>
+## [0.293.0] - 2026-10-10
+
+- fix/boot pass requeue ([#759](https://github.com/danielraffel/Shipyard/pull/759))
+
+<a id="v02920"></a>
+## [0.292.0] - 2026-10-10
+
+- feat/pr watch coverage ([#755](https://github.com/danielraffel/Shipyard/pull/755))
+
+<a id="v02910"></a>
+## [0.291.0] - 2026-10-09
+
+- fix/starved eject rearm ([#757](https://github.com/danielraffel/Shipyard/pull/757))
+
+<a id="v02900"></a>
+## [0.290.0] - 2026-10-09
+
+- feat/steward carrier plan ([#756](https://github.com/danielraffel/Shipyard/pull/756))
+
 <a id="v02890"></a>
 ## [0.289.0] - 2026-10-09
 
@@ -2080,6 +2115,13 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.296.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.296.0
+[0.295.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.295.0
+[0.294.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.294.0
+[0.293.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.293.0
+[0.292.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.292.0
+[0.291.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.291.0
+[0.290.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.290.0
 [0.289.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.289.0
 [0.288.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.288.0
 [0.287.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.287.0

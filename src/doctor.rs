@@ -1929,15 +1929,17 @@ mod tests {
         std::fs::create_dir_all(&second_dir).expect("dir");
         let first = first_dir.join("shipyard");
         let second = second_dir.join("shipyard");
-        std::fs::write(&first, "#!/bin/sh\nprintf '%s\\n' 'shipyard 0.21.1'\n").expect("write");
-        std::fs::write(&second, "#!/bin/sh\nprintf '%s\\n' 'shipyard 0.11.0'\n").expect("write");
+        let first_script = "#!/bin/sh\nprintf '%s\\n' 'shipyard 0.21.1'\n";
+        let second_script = "#!/bin/sh\nprintf '%s\\n' 'shipyard 0.11.0'\n";
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-            std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            crate::test_support::write_executable_script(&first, first_script);
+            crate::test_support::write_executable_script(&second, second_script);
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&first, first_script).expect("write");
+            std::fs::write(&second, second_script).expect("write");
         }
 
         let entry = check_shipyard_path_shadows_with(

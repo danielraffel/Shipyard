@@ -237,6 +237,17 @@ pub fn next_action_with_environment(
     environment: Option<&EnvironmentRequeue>,
 ) -> String {
     match (state, environment) {
+        (PrQueueState::Ejected { reason, at, .. }, Some(verdict))
+            if verdict.is_allowed_interruption() =>
+        {
+            format!(
+                "Ejected for {reason} at {} by an INTERRUPTION ({}): the head did not fail. \
+                 Re-enqueue this exact head with `shipyard ship --pr {pr}` (no new push \
+                 needed); the steward's backstop does this on its own when it runs.",
+                at.as_deref().unwrap_or("an unknown time"),
+                verdict.reason
+            )
+        }
         (PrQueueState::Ejected { reason, at, .. }, Some(verdict)) if verdict.allowed => {
             format!(
                 "Ejected for {reason} at {} by an ENVIRONMENT failure, and this is the head's \
@@ -471,6 +482,7 @@ mod tests {
         };
         let verdict = |allowed| EnvironmentRequeue {
             allowed,
+            class: None,
             reason: "because".to_owned(),
             merge_group_commit: Some("2410ca497342".to_owned()),
             evidence: Vec::new(),

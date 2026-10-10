@@ -595,8 +595,6 @@ fn dependency_branch_push_uses_an_absence_lease() {
 #[cfg(unix)]
 #[test]
 fn dependency_commit_disables_repository_hooks_and_keeps_an_exact_diff() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let temp = tempfile::tempdir().expect("tempdir");
     let git = |args: &[&str]| {
         let output = crate::supervised::git_supervised()
@@ -617,16 +615,10 @@ fn dependency_commit_disables_repository_hooks_and_keeps_an_exact_diff() {
     let hooks = temp.path().join(".githooks");
     std::fs::create_dir(&hooks).expect("hooks directory");
     let hook = hooks.join("pre-commit");
-    std::fs::write(
+    crate::test_support::write_executable_script(
         &hook,
         "#!/bin/sh\nprintf 'ran\\n' > hook-ran\ngit add hook-ran\n",
-    )
-    .expect("hook");
-    let mut permissions = std::fs::metadata(&hook)
-        .expect("hook metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&hook, permissions).expect("hook permissions");
+    );
     git(&["add", "README.md", ".githooks/pre-commit"]);
     git(&[
         "-c",

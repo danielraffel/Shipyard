@@ -42,6 +42,8 @@ required job by name, never to "the first failed job".
 | 4 | `rebase_treadmill` | the head was replaced at least 3 times within 24 h, each time the previous head's gate run was cancelled and the merge base with the base branch advanced | the head chain; says "inferred" |
 | 6 | `green_unarmed` | every required check on the current head passed (`success`, or `skipped`/`neutral`) more than 120 minutes ago, auto-merge is not armed, the PR is not queued and was not ejected; not raised for a PR labelled `shipyard:no-auto-merge` or `shipyard:hold`, a draft, or a PR whose body or a comment has a line `shipyard:hold` | the head and green-since time, plus the latest comment that promised someone would arm it (for example "team-lead arms"), quoted with its author and time |
 | 7 | `ejected_green` | the queue ejected the PR for `failed_checks`, its head has not changed since, every required check on that head is green, and nothing re-armed or re-queued it for more than 120 minutes (`green_unarmed_minutes`, counted from the later of the ejection and green); a hold label suppresses it | the head and ejection time. The arm guard refuses a same-head re-arm after a check failure unless it is certified environmental, so the owner pushes a new head or says why the failure was not this head's |
+| 8 | `unaccounted` | a pull request Shipyard was handed (author in `[pr_watch.thresholds] handed_authors`, default the `shipyard-local` bot) is open, not progressing, not held, and no other owner flag holds; see [Coverage](#coverage) | why it fell through: merge conflicts (DIRTY), a cancelled or never-run required check, an armed green head GitHub never queued, a removal from the queue, only non-owner flags |
+| 9 | `red_unarmed` | auto-merge is not armed (and the PR is not queued, ejected, a draft or held), the head is older than 120 minutes, and a required check on it has been red for more than 120 minutes (`green_unarmed_minutes`); flag 2 is the armed case | the check, head and red-since time |
 | 5 | `split_candidate` | open more than 3 days, or more than 60 files or 30 commits | advisory only: raised only alongside another flag on the same PR, never alone, and never alone in a digest |
 
 Signatures: CTest summary lines are normalised to the bare test name
@@ -69,6 +71,25 @@ exactly `false` with verdict `other_pull_request` naming another PR, or
 runs outside any checkout; `replay` does not call it) flag 3 keeps the
 named-failed-groups rule. Flag 4's "main moved" is inferred from the merge base
 (`compare/<base>...<head>`), which is why its evidence says so.
+
+## Coverage
+
+Every open pull request Shipyard was handed must be, at every pass, in exactly
+one accounted state: **progressing** (queued, a required check running, a push
+or a settled check within 120 minutes), **flagged** (an owner-actionable flag
+holds, so the hand-back is calling its owner), or **held** (a draft, a
+`shipyard:hold` / `shipyard:no-auto-merge` label, or a `shipyard:hold` line).
+Merged and closed pull requests are out of scope. Anything else is a **gap**:
+a stuck state no specific rule names. Flag 8 calls its owner anyway, with the
+reason it fell through, so a gap is never silent, and a recurring reason is a
+rule to add (flag 9 is the first one found this way).
+
+Each pass records the counts and every gap in the ledger and the scan report
+(`coverage`). `shipyard pr-watch liveness` prints them, `shipyard doctor` fails
+a `coverage <repo>` row while any gap exists, and `doctor --fleet` fails the
+scanning host's row. Draft state, `mergeStateStatus` and the author are read in
+the same search as everything else; like the labels they are current values,
+so `replay` applies them to the whole window.
 
 ## Sources
 
@@ -187,7 +208,8 @@ plans it as a dry run whatever the config says, and `scan --deliver-handback`
 A flag is **owner-actionable** when its digest route is per-PR (not a
 "failing on main/pre-existing" shared failure, not an ejection the attributor
 pinned on a neighbour) and it is a repeated test failure, red while armed, a
-repeated ejection, green but unarmed, or ejected and green. A rebase treadmill (the base moving) and the split advisory
+repeated ejection, green but unarmed, ejected and green, red and unarmed, or
+unaccounted. A rebase treadmill (the base moving) and the split advisory
 are not.
 
 | tier | when | what |

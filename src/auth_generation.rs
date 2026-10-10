@@ -101,7 +101,7 @@ mod tests {
 
     #[cfg(unix)]
     fn home_with_generation(version: &str) -> tempfile::TempDir {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::symlink;
 
         let home = tempfile::tempdir().expect("home");
         let generation = home
@@ -110,8 +110,11 @@ mod tests {
             .join(ID);
         std::fs::create_dir_all(&generation).expect("generation");
         let binary = generation.join("shipyard");
-        std::fs::write(&binary, format!("#!/bin/sh\necho 'shipyard {version}'\n")).expect("binary");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        crate::test_support::write_executable_script_with_mode(
+            &binary,
+            &format!("#!/bin/sh\necho 'shipyard {version}'\n"),
+            0o700,
+        );
         std::fs::create_dir_all(home.path().join(".local/bin")).expect("bin");
         symlink(
             generation.join("ghapp"),

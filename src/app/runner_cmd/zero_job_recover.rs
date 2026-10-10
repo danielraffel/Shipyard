@@ -1261,8 +1261,6 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn apply_spends_remote_receipt_then_dispatches_once_without_cancellation() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = temp.path().join("gh");
         let log = temp.path().join("calls.log");
@@ -1321,10 +1319,7 @@ esac
 "#,
             log = log.display(),
         );
-        std::fs::write(&gh, script).expect("fake gh");
-        let mut permissions = std::fs::metadata(&gh).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&gh, permissions).expect("chmod");
+        crate::test_support::write_executable_script(&gh, &script);
         let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh);
         let mut output = Vec::new();
         let args = ZeroJobRecoverArgs {

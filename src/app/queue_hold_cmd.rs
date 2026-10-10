@@ -676,16 +676,8 @@ fn process_start_digest(_pid: u32) -> Result<String, CliFailure> {
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("queue-hold path has no parent"))?;
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(&mut temp, value)?;
-    temp.write_all(b"\n")?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|error| error.error)?;
-    File::open(parent)?.sync_all()
+    crate::durable_file::replace_json(path, value, true)
 }
 
 fn canonical_set(

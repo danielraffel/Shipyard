@@ -38,7 +38,7 @@ const SEARCH_PAGE: u32 = 50;
 const MAX_SEARCH_PAGES: u32 = 40;
 
 /// GraphQL search over pull requests with their queue timelines.
-pub const SEARCH_QUERY: &str = "query($q:String!,$cursor:String){search(query:$q,type:ISSUE,first:50,after:$cursor){issueCount pageInfo{hasNextPage endCursor} nodes{... on PullRequest{number title url state createdAt mergedAt closedAt headRefName headRefOid changedFiles commits{totalCount} labels(first:20){nodes{name}} timelineItems(last:100,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT,AUTO_MERGE_ENABLED_EVENT,AUTO_MERGE_DISABLED_EVENT,MERGED_EVENT,CLOSED_EVENT,REOPENED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}} ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason} ... on AutoMergeEnabledEvent{createdAt} ... on AutoMergeDisabledEvent{createdAt reason} ... on MergedEvent{createdAt} ... on ClosedEvent{createdAt} ... on ReopenedEvent{createdAt}}}}}}}";
+pub const SEARCH_QUERY: &str = "query($q:String!,$cursor:String){search(query:$q,type:ISSUE,first:50,after:$cursor){issueCount pageInfo{hasNextPage endCursor} nodes{... on PullRequest{number title url state createdAt mergedAt closedAt headRefName headRefOid isDraft mergeStateStatus author{login} changedFiles commits{totalCount} labels(first:20){nodes{name}} timelineItems(last:100,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT,AUTO_MERGE_ENABLED_EVENT,AUTO_MERGE_DISABLED_EVENT,MERGED_EVENT,CLOSED_EVENT,REOPENED_EVENT]){pageInfo{hasPreviousPage} nodes{__typename ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}} ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason} ... on AutoMergeEnabledEvent{createdAt} ... on AutoMergeDisabledEvent{createdAt reason} ... on MergedEvent{createdAt} ... on ClosedEvent{createdAt} ... on ReopenedEvent{createdAt}}}}}}}";
 
 /// What to read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,6 +303,15 @@ pub fn parse_pr(node: &Value) -> Option<PrHistory> {
         heads: Vec::new(),
         events,
         timeline_complete,
+        author: node
+            .pointer("/author/login")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        draft: node
+            .get("isDraft")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        merge_state: text(node, "mergeStateStatus"),
     })
 }
 

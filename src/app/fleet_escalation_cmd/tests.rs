@@ -12,7 +12,6 @@ use super::*;
 use crate::fleet_escalation::EscalationAction;
 
 fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
-    use std::os::unix::fs::PermissionsExt;
     let path = temp.path().join("gh");
     // Write to a staging name and rename into place. Writing the script and
     // exec'ing it directly races: with tests running in parallel, another
@@ -25,16 +24,12 @@ fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     let staging = temp.path().join("gh.staging");
     // The probe short-circuits before the body so it cannot append to a
     // recording script's call log and corrupt the assertions that read it.
-    std::fs::write(
+    crate::test_support::write_executable_script(
         &staging,
-        format!("#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--probe\" ]; then exit 0; fi\n{body}\n"),
-    )
-    .expect("write fake gh");
-    let mut permissions = std::fs::metadata(&staging)
-        .expect("fake gh metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&staging, permissions).expect("chmod fake gh");
+        &format!(
+            "#!/bin/sh\nset -eu\nif [ \"${{1:-}}\" = \"--probe\" ]; then exit 0; fi\n{body}\n"
+        ),
+    );
     std::fs::rename(&staging, &path).expect("publish fake gh");
     wait_until_executable(&path);
     // An empty config keeps the fake off the ambient auth path, which

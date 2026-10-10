@@ -489,7 +489,6 @@ fn exact_worker_is_stopped(
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -504,6 +503,7 @@ mod tests {
             generation: "generation-a".to_owned(),
             pid: 42,
             started_at: Utc::now(),
+            boot_id: None,
         };
         let transaction = TerminationTransaction {
             schema_version: TERMINATION_SCHEMA_VERSION,
@@ -523,10 +523,7 @@ mod tests {
 
     fn executable_script(temp: &Path, body: &str) -> PathBuf {
         let path = temp.join("execution-worker-fixture.sh");
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("fixture script");
-        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("permissions");
+        crate::test_support::write_executable_script(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
 
@@ -536,6 +533,7 @@ mod tests {
             generation: generation.to_owned(),
             pid: child.id(),
             started_at: Utc::now(),
+            boot_id: None,
         }
     }
 

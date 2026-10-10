@@ -255,6 +255,31 @@ When asserting a gate "ran", check for `rc in (0, 1)` — not `rc == 0`. Zero is
 "ran and passed"; conflating it with "ran" is the same mistake one level up.
 `scripts/**` maps to this skill, so a change to either gate needs a note here.
 
+## Crash-safe state writes
+
+Write Shipyard state files (ship state, queue requests, receipts, holds) with
+`crate::durable_file::replace` / `replace_json`, never a bare `NamedTempFile`
+plus `persist`. A rename is atomic but not durable: without syncing the
+temporary file and then its directory, a power loss or reboot right after a
+save can read back an empty or old file and drop a PR's episode. Take the
+writer-domain lease before calling it; the helper only makes the write
+crash-safe. Off Unix only the file is synced, because std has no directory
+handle to sync there.
+
+## A lane job running at reboot is requeued once, not lost
+
+Worker receipts record the host boot (`boot_id`). On a host that opted in
+(machine-global `[queue.boot_requeue] enabled = true`; off by default until a
+requeue is visible on the pull request), the first supervisor tick after a
+reboot takes each `Running` job whose receipt names an earlier boot. It is
+returned to `Pending` under its own id and envelope (same PR and exact head),
+with `interrupted: host reboot, requeued once at <UTC>` as its deferral reason
+(printed by `shipyard queue`), after a write-ahead
+marker in `queue-workers/boot-requeue/`. It happens once per job; a receipt
+with no boot id, the same boot, or a second reboot keeps the ordinary
+`UNCERTAIN`, no-replay path. Do not hand-edit `queue.json` to rescue such a
+job; restart the daemon and read `shipyard queue`.
+
 ## Durable work handoff
 
 Do not spend an agent session polling a pull request, build, benchmark, release,
@@ -348,6 +373,19 @@ rejected, and none after 2026-09-15 once arm-on-open took over. The test
 returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
 `arm native auto-merge`; `merge-queue resolve` still accepts the old
 `enqueue pull request` entries.
+## The carrier re-arms with `expectedHeadOid`, through the internal path
+
+`runner carrier --apply --class rearm` arms native auto-merge with
+`expectedHeadOid` on a head the queue removed for `failed_checks`. The `ghapp`
+arm guard would refuse that as a same-head re-arm after a failed removal,
+because it cannot see the jobs, so the carrier uses
+`run_gh_internal_queue_mutation`: its plan is the head-scoped verdict, proven
+from the removal's merge-group jobs (every required job that did not pass was
+cancelled with no runner after waiting at least ten minutes). It still takes
+the merge-queue mutation guard, so `HOLD`, `mutation_machine` and the audit
+apply. Its starvation rule is `gate_cost::proxy::ejection_cause` plus the
+wait bound, shared with the gate-cost metric; do not add a third copy.
+
 ## fleet-reconcile ledger: every attempt says how it ended
 
 `fleet-reconcile/attempts.json` records `last_outcome` (`verified` or
@@ -422,15 +460,12 @@ a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
 a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
 everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
 
-## A PR's version must be ahead of live main, not just its merge base
+## Version-at-land
 
-Shipyard main has no merge queue and no up-to-date rule, so two PRs cut from
-one main used to pass the bump gate with the same next version and both
-merge (#677 and #680 both landed as 0.245.0; #680 shipped untagged). The
-"Version ahead of live main" step in version-skill-check compares the PR head
-with a fresh `origin/main`, and `version-ahead-sweep.yml` re-judges every open
-PR on each push to main, posting `shipyard/version-ahead-of-main`. A red
-status there means: merge main and bump past it before merging.
+A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
+versions. The read-only version gate rejects those edits unless the PR carries
+the explicit release recovery trailer. After merge, `version-at-land.yml` is the
+single writer and assigns the next versions.
 
 ## Stale ship-state records: `discard --repo` and `prune`
 
@@ -679,6 +714,12 @@ daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
 pass is older than `[pr_watch] stale_after_minutes` (45); `doctor --fleet` asks
 every host and fails `pr-watch:fleet` when none is scanning. Never add a second
 scanner as a backup: each host's ledger dedupes only its own deliveries.
+
+Coverage: every open PR authored by the Shipyard bot is, each pass,
+progressing, flagged, or held. Anything else is a gap: flag 8 (`unaccounted`)
+calls its owner with why it fell through, and `pr-watch liveness` / `doctor`
+name every gap. `red_unarmed` (flag 9) is a required check red for 2 h on a PR
+nobody armed.
 
 `green_unarmed` (flag 6) is a PR green on every required check for 2 h that
 nobody armed; it is owner-actionable, quotes any "team-lead arms" promise, and
@@ -2345,9 +2386,17 @@ plain 404, so a daemon watching the old slug fails webhook registration on
 every retry while everything else looks healthy. Daemon start and `daemon
 refresh` resolve each watched slug (anonymous read, then the configured
 credential) and watch the name GitHub reports, logging the rename to the daemon
-log; an unresolvable slug is kept. `shipyard doctor` reports `daemon-repos`
-not ok for a watched repo that was renamed or returns 404 to both probes; the
-fix is `shipyard daemon refresh`.
+log. A private repository's new name is invisible to the anonymous read, and
+the configured credential only answers 404 for the old one, so a slug that
+credential answers HTTP 404 for is refused: dropped from the watch list with a
+`refusing to watch <slug>` line in the daemon log, whatever the anonymous read
+said (m1 watched the pre-transfer `danielraffel/pulp` for a day this way, with
+6494 registration failures, because a rate-limited anonymous read made the
+verdict "unknown"). A slug the credential could not answer for is kept.
+`shipyard doctor` reports `daemon-repos` not ok for a watched repo that was
+renamed or returns 404 to both probes; the fix is `shipyard daemon refresh
+--repo <current name>`. `runner fleet-reconcile` lists a running daemon that
+watches no repositories under `daemon_problems`.
 
 ## Legacy Queue Recovery: killed-worker stale-running reaping
 
@@ -3244,6 +3293,16 @@ the exported `GH_TOKEN`/`GH_REPO`, and reproduce under
 `env -i HOME=$HOME PATH=<trusted path>`, never in an interactive shell. The
 refusal quotes the attributor's stderr tail.
 
+**An INTERRUPTION ejection is re-armed at the same head, unattended.** A
+required job cancelled with no runner after 10+ minutes queued (starved; the
+`ejection_cause()` label in `gate_cost/proxy.rs`), or a failing step whose
+`##[error]` line is `Upload progress stalled` after the test step passed, is an
+interruption: `src/environment_requeue.rs` allows a same-head re-enqueue on the
+head's first two ejections and leaves it out of the head-approval ejection cap,
+and the steward's `--arm-unqueued` backstop re-arms it with `expectedHeadOid`
+(outcome `rearmed_same_head`), but only for a head somebody armed after it arrived (`merge_carrier::head_arm_time`). Under the same opt-in as below. Do not dequeue,
+rebase or push a no-op commit for these; read `shipyard landing --pr <n>`.
+
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
 when the repo sets `[queue.environment_requeue] enabled = true`: every failing
 required check on the removal's merge-group commit must be an Actions job whose
@@ -3601,7 +3660,7 @@ cargo fmt --all --check \
 ```
 
 **`Cargo.lock` after a version bump — now automatic.**
-`version_bump_check.py --mode=apply` used to rewrite `Cargo.toml` and leave
+`version_bump_check.py` no longer rewrites version files; the post-merge writer updates
 `Cargo.lock` on the old version, so the `--locked` steps above failed with
 
 ```

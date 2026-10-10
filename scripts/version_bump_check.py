@@ -2,13 +2,10 @@
 """Version-bump gate.
 
 Given a diff range (base..head), decide whether each configured surface
-needs a version bump (patch/minor/major). Three modes:
+needs a version bump (patch/minor/major). Two modes:
 
     report  exit 0 if every surface that moved has a bumped version,
             exit 1 otherwise. Authoritative gate for CI.
-    apply   same as report, but for every surface missing a bump, rewrite
-            the version file(s) in place and stage them for commit.
-            Used by `pulp pr` to make bumps automatic.
     hint    advisory text only; always exits 0. Used by agent hooks.
 
 Heuristics (per surface, deliberately conservative):
@@ -65,12 +62,6 @@ class Surface:
     public_api_paths: list[str] = field(default_factory=list)
     internal_only_paths: list[str] = field(default_factory=list)
     changelog: str | None = None
-    # When True, `apply_bumps()` auto-applies patch-level verdicts
-    # in addition to minor/major. Default False preserves the
-    # advisory-patch behavior for projects that want manual control
-    # over when a patch release is cut. See issue #70 for the
-    # rollup-gap discussion this flag addresses.
-    auto_apply_patch: bool = False
 
 
 @dataclass
@@ -259,7 +250,6 @@ def load_config(path: Path) -> Config:
             public_api_paths=entry.get("public_api_paths", []),
             internal_only_paths=entry.get("internal_only_paths", []),
             changelog=entry.get("changelog"),
-            auto_apply_patch=bool(entry.get("auto_apply_patch", False)),
         ))
     trailers = data.get("trailers") or {}
     return Config(
@@ -267,6 +257,30 @@ def load_config(path: Path) -> Config:
         generated_globs=data.get("generated_globs", []) or [],
         trailer_version_bump=trailers.get("version_bump", "Version-Bump"),
     )
+
+
+def version_file_paths(cfg: Config) -> set[str]:
+    """Return every path that a post-merge writer owns."""
+    paths = {vf.path for surface in cfg.surfaces for vf in surface.version_files}
+    # Cargo's lockfile is generated from the package version and must move with
+    # Cargo.toml. Keep it in the PR prohibition even though it has no scalar
+    # version field in the config.
+    if "Cargo.toml" in paths:
+        paths.add("Cargo.lock")
+    return paths
+
+
+def release_version_file_exception(base: str, head: str) -> bool:
+    """Allow a deliberate release PR to carry version files.
+
+    The trailer is intentionally explicit and reason-bearing. A generic
+    ``Release: skip`` does not authorize a PR to edit the single-writer files.
+    """
+    trailers = git_range_trailers(base, head)
+    for value in trailers.get("release", []):
+        if re.search(r"^allow-version-files\b.*\breason\s*=\s*\"[^\"]+\"", value, re.I):
+            return True
+    return False
 
 
 # ── Version-file I/O ────────────────────────────────────────────────────
@@ -536,7 +550,7 @@ def bump_version(current: str, level: str) -> str:
     return current
 
 
-# ── Reporting / apply ───────────────────────────────────────────────────
+# ── Reporting ───────────────────────────────────────────────────
 
 
 def _extract_version_from_text(text: str, vf: VersionFile) -> str | None:
@@ -673,10 +687,20 @@ def render_report(
     mode: str,
     base: str,
     repo: Path,
+    *,
+    forbidden_version_files: list[str] | None = None,
 ) -> tuple[str, int]:
     lines: list[str] = []
     failures = 0
-    warnings = 0
+    if forbidden_version_files:
+        lines.append(
+            "Version files are owned by version-at-land and must not be edited in a PR: "
+            + ", ".join(forbidden_version_files)
+        )
+        lines.append(
+            'Release PRs must carry `Release: allow-version-files reason="..."`.'
+        )
+        failures += 1
     for v in verdicts:
         if v.final_level == "none":
             lines.append(f"[{v.surface.name}] {v.surface.label}: no bump needed")
@@ -693,11 +717,8 @@ def render_report(
         elif any_bumped:
             unbumped = [vf.path for vf, b in per_file if not b]
             tag = f"✗ partial bump — not moved: {', '.join(unbumped)}"
-        elif v.final_level == "patch":
-            # Advisory only — not a hard fail.
-            tag = "? bump suggested (patch)"
         else:
-            tag = "✗ bump required"
+            tag = "✓ assigned post-merge"
         lines.append(
             f"[{v.surface.name}] {v.surface.label}: "
             f"heuristic={v.heuristic}"
@@ -712,10 +733,7 @@ def render_report(
             # nothing has been bumped at all.
             if any_bumped:
                 failures += 1
-            elif v.final_level == "patch":
-                warnings += 1
-            else:
-                failures += 1
+            # A clean PR is assigned by the post-merge writer.
 
     if mode == "hint":
         return "\n".join(lines), 0
@@ -723,78 +741,12 @@ def render_report(
     if failures:
         lines.append("")
         lines.append("Version-bump check FAILED.")
-        lines.append("Apply the required bump with:")
-        lines.append("  python3 tools/scripts/version_bump_check.py --mode=apply")
-        lines.append("Or record an explicit override on the tip commit:")
-        lines.append('  Version-Bump: <surface>=<patch|minor|major|skip> reason="..."')
+        if not forbidden_version_files:
+            lines.append("Remove version-file edits; the post-merge writer assigns the next version.")
         return "\n".join(lines), 1
 
     return "\n".join(lines), 0
 
-
-def apply_bumps(
-    verdicts: list[Verdict],
-    base: str,
-    repo: Path,
-) -> list[str]:
-    """Write new versions for surfaces that need a bump and aren't already bumped.
-
-    By default skips "patch" verdicts (advisory only). When a
-    surface sets `auto_apply_patch: true` in versioning.json, patch
-    verdicts are also written — closes the rollup gap where fix-
-    only PRs accumulated on main without triggering a release.
-    See issue #70.
-    """
-    edited: list[str] = []
-    for v in verdicts:
-        if v.final_level == "none":
-            continue
-        if v.final_level == "patch" and not v.surface.auto_apply_patch:
-            continue
-        # Skip if ALL version files are already at the target; otherwise
-        # apply to every file (keeps plugin.json and marketplace.json in
-        # lockstep after a partial-bump from a prior run).
-        all_bumped = all(already_bumped(base, vf, repo) for vf in v.surface.version_files)
-        if all_bumped or not v.current_version:
-            continue
-        # Compute the target from the BASE version, not v.current_version.
-        # v.current_version reflects the first readable file at HEAD, which
-        # may already have been bumped by a prior partial run — bumping it
-        # again would double-bump (e.g. 0.1.0 -> 0.2.0 -> 0.3.0). Reading
-        # the base keeps a partial-apply idempotent.
-        base_ver: str | None = None
-        for vf in v.surface.version_files:
-            base_ver = version_at_base(base, vf)
-            if base_ver:
-                break
-        source_ver = base_ver or v.current_version
-        new_ver = bump_version(source_ver, v.final_level)
-        for vf in v.surface.version_files:
-            if write_version(repo, vf, new_ver):
-                edited.append(vf.path)
-                # A Cargo.toml bump must carry its lockfile or `--locked`
-                # validation fails on the stale version.
-                if Path(vf.path).name == "Cargo.toml":
-                    lock_rel = refresh_cargo_lock(repo, vf.path, new_ver)
-                    if lock_rel:
-                        edited.append(lock_rel)
-        # Changelog stub.
-        if v.surface.changelog:
-            cl_path = repo / v.surface.changelog
-            if cl_path.exists():
-                header = f"## [{new_ver}]\n\n"
-                cl_text = cl_path.read_text()
-                pos = cl_text.find("## [")
-                if pos != -1:
-                    cl_text = cl_text[:pos] + header + cl_text[pos:]
-                else:
-                    cl_text = header + cl_text
-                cl_path.write_text(cl_text)
-                edited.append(str(cl_path.relative_to(repo)))
-    # Stage for commit so callers see them in `git status`.
-    if edited:
-        subprocess.run(["git", "-C", str(repo), "add", "--"] + edited, check=False)
-    return edited
 
 
 # ── Main ────────────────────────────────────────────────────────────────
@@ -805,7 +757,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--base", default="origin/main")
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--config", default=None)
-    parser.add_argument("--mode", choices=("report", "hint", "apply"), default="report")
+    parser.add_argument("--mode", choices=("report", "hint"), default="report")
     parser.add_argument("--repo-root", default=None)
     args = parser.parse_args(argv)
 
@@ -826,20 +778,14 @@ def main(argv: list[str]) -> int:
 
     verdicts = assess_surfaces(cfg, changed, args.base, args.head, root)
 
-    if args.mode == "apply":
-        edited = apply_bumps(verdicts, args.base, root)
-        # Re-assess after editing: re-read current versions and re-check.
-        verdicts_after = assess_surfaces(cfg, changed, args.base, args.head, root)
-        text, code = render_report(verdicts_after, mode="report", base=args.base, repo=root)
-        if edited:
-            print("Edited files:")
-            for e in edited:
-                print(f"  {e}")
-        if text:
-            print(text)
-        return code
+    forbidden: list[str] = []
+    if not release_version_file_exception(args.base, args.head):
+        forbidden = sorted(set(changed) & version_file_paths(cfg))
 
-    text, code = render_report(verdicts, args.mode, args.base, root)
+    text, code = render_report(
+        verdicts, args.mode, args.base, root,
+        forbidden_version_files=forbidden,
+    )
     if text:
         print(text)
     return code

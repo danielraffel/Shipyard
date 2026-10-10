@@ -847,16 +847,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn github_metrics_observation_times_out_escaped_helper() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().expect("tempdir");
         let helper = temp.path().join("gh");
-        std::fs::write(&helper, "#!/bin/sh\nsleep 2\n").expect("write helper");
-        let mut permissions = std::fs::metadata(&helper)
-            .expect("helper metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&helper, permissions).expect("helper permissions");
+        crate::test_support::write_executable_script_with_mode(
+            &helper,
+            "#!/bin/sh\nsleep 2\n",
+            0o700,
+        );
 
         let error = gh_json_with_timeout(&helper, &[], Duration::from_millis(50))
             .expect_err("hung helper must time out");

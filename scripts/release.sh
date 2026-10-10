@@ -24,10 +24,15 @@ set -euo pipefail
 #   2. Commit the bump
 #   3. Tag and push — triggers release.yml binary build
 
+DRY_RUN=0
+if [ "${1:-}" = "--dry-run" ]; then
+  DRY_RUN=1
+  shift
+fi
 BUMP="${1:-}"
 
 if [ -z "$BUMP" ]; then
-  echo "Usage: ./scripts/release.sh <patch|minor|major|X.Y.Z>"
+  echo "Usage: ./scripts/release.sh [--dry-run] <patch|minor|major|X.Y.Z>"
   exit 1
 fi
 
@@ -76,6 +81,12 @@ esac
 
 echo "New version: $NEW"
 echo ""
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "Dry run: would update Cargo.toml, Cargo.lock, .claude-plugin/plugin.json, and .claude-plugin/marketplace.json"
+  echo "Dry run: would create tag v${NEW} and let release.yml publish it."
+  exit 0
+fi
 
 # Confirm
 read -p "Release v${NEW}? [y/N] " -n 1 -r
