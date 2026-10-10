@@ -206,34 +206,77 @@ def _process_name_and_parent(pid: int) -> tuple[str, int] | None:
         return None
 
 
-def process_ancestry(limit: int = 8) -> list[str]:
-    """Executable basenames from this guard's parent upward, nearest first."""
-    names: list[str] = []
+def executable_path(pid: int) -> str | None:
+    """The real executable of ``pid``, from the kernel rather than its name."""
+    if sys.platform.startswith("linux"):
+        try:
+            return os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return None
+    if sys.platform == "darwin":
+        try:
+            import ctypes
+
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+            buffer = ctypes.create_string_buffer(4096)
+            length = libproc.proc_pidpath(ctypes.c_int(pid), buffer, ctypes.c_uint32(4096))
+        except (OSError, AttributeError):
+            return None
+        return buffer.value.decode("utf-8", "replace") if length > 0 else None
+    return None
+
+
+def process_ancestry(limit: int = 8) -> list[tuple[str, str | None]]:
+    """``(basename, executable path)`` from this guard's parent upward, nearest first."""
+    entries: list[tuple[str, str | None]] = []
     pid = os.getppid()
-    while pid > 1 and len(names) < limit:
+    while pid > 1 and len(entries) < limit:
         found = _process_name_and_parent(pid)
         if found is None:
             break
         command, parent = found
-        names.append(posixpath.basename(command).lstrip("-"))
+        entries.append((posixpath.basename(command).lstrip("-"), executable_path(pid)))
         pid = parent
-    return names
+    return entries
 
 
-def shipyard_parent(ancestry: list[str] | None = None) -> bool:
-    """True when the nearest deciding ancestor is the Shipyard binary.
+def install_roots() -> list[pathlib.Path]:
+    """Where an installed Shipyard binary lives: one auth generation per release."""
+    return [pathlib.Path.home() / ".local" / "share" / "shipyard" / "auth-generations"]
+
+
+def is_installed_shipyard(path: str | None, roots: list[pathlib.Path]) -> bool:
+    """Whether ``path`` resolves to a ``shipyard`` binary under an install root."""
+    if not path:
+        return False
+    real = pathlib.Path(os.path.realpath(path))
+    if real.name != "shipyard":
+        return False
+    for root in roots:
+        resolved = pathlib.Path(os.path.realpath(root))
+        if resolved == real.parent or resolved in real.parents:
+            return True
+    return False
+
+
+def shipyard_parent(
+    ancestry: list[tuple[str, str | None]] | None = None,
+    roots: list[pathlib.Path] | None = None,
+) -> bool:
+    """True when the nearest deciding ancestor is the installed Shipyard binary.
 
     Shells and the ghapp wrapper are skipped; the first other process decides.
     An agent that exports the marker from its own shell has that agent
     (codex, node, claude, python) as the nearest deciding ancestor, even when
-    the agent itself was launched by a Shipyard process. Any process can be
-    named ``shipyard``, so this stops an agent exporting the marker by habit,
-    not a determined one.
+    the agent itself was launched by a Shipyard process. The deciding process
+    must also run an executable that resolves under a Shipyard install root,
+    read from the kernel, so a binary merely named ``shipyard`` does not pass.
     """
-    for name in process_ancestry() if ancestry is None else ancestry:
+    roots = install_roots() if roots is None else roots
+    for name, path in process_ancestry() if ancestry is None else ancestry:
         if name in WRAPPER_PROCESSES:
             continue
-        return name == "shipyard"
+        return name == "shipyard" and is_installed_shipyard(path, roots)
     return False
 
 
