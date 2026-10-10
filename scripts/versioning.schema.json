@@ -11,6 +11,7 @@
       "type": "integer",
       "const": 1
     },
+    "post_merge_assignment": { "type": "boolean" },
     "surfaces": {
       "type": "object",
       "minProperties": 1,

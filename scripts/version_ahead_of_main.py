@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require a pull request's CLI version to be strictly ahead of live main.
+"""Compatibility checker for the retired per-PR version treadmill.
 
 The version-bump gate checks that a PR moved `Cargo.toml`'s version relative
 to its own merge base. Two PRs cut from the same main both pass that check
@@ -49,12 +49,9 @@ def verdict(pr_version: str | None, main_version: str | None) -> tuple[bool, str
     main = parse_semver(main_version or "")
     if pr is None or main is None:
         return False, f"unreadable version (PR {pr_version!r}, main {main_version!r})"
-    if pr > main:
-        return True, f"{pr_version} is ahead of main {main_version}"
-    return False, (
-        f"{pr_version} is not ahead of main {main_version}: merge main and bump "
-        "past it, or this PR would ship a duplicate, untagged version"
-    )
+    if pr >= main:
+        return True, f"{pr_version} is compatible with main {main_version}; version-at-land assigns the next release"
+    return False, f"{pr_version} regresses main {main_version}"
 
 
 def _git_show(ref: str, path: str = "Cargo.toml") -> str:

@@ -294,17 +294,11 @@ pub(super) fn pr_command<W: Write>(
     warn_missing_release_bot_token(stdout, cwd, config);
     print_fold_suggestions(stdout, cwd, config, &args.base);
     run_skill_sync(stdout, &python, &gates, &repo_root, &args.base)?;
-    let bumped_files = run_version_bump(stdout, &python, &gates, &repo_root, &args)?;
-    if !bumped_files.is_empty() {
-        writeln!(
-            stdout,
-            "▸ Committing version bump(s) — {} file(s)",
-            bumped_files.len()
-        )
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        commit_bumped_files(&repo_root, &bumped_files)
-            .map_err(|error| CliFailure::new(1, error))?;
-    }
+    // Version numbers are assigned by the single writer after the merge.
+    // Keep the gate as a read-only check so this command can never create a
+    // competing version commit on an author branch.
+    args.apply_bumps = false;
+    let _ = run_version_bump(stdout, &python, &gates, &repo_root, &args)?;
 
     let steward_handoff =
         resolve_steward_handoff(&args, protected_base_auto_handoff(cwd, &args.base));

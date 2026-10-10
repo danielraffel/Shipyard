@@ -24,15 +24,15 @@ class VerdictTests(unittest.TestCase):
     def test_reads_the_package_version_not_a_dependency(self) -> None:
         self.assertEqual(gate.cargo_version(cargo("0.245.0")), "0.245.0")
 
-    def test_only_a_strictly_higher_version_passes(self) -> None:
+    def test_equal_or_higher_version_passes_under_version_at_land(self) -> None:
         self.assertTrue(gate.verdict("0.246.0", "0.245.0")[0])
-        self.assertFalse(gate.verdict("0.245.0", "0.245.0")[0])
+        self.assertTrue(gate.verdict("0.245.0", "0.245.0")[0])
         self.assertFalse(gate.verdict("0.244.9", "0.245.0")[0])
         self.assertFalse(gate.verdict(None, "0.245.0")[0])
 
-    def test_two_prs_at_the_same_version_the_second_fails_once_the_first_lands(self) -> None:
-        # Both PRs were cut from main at 0.244.0 and bumped to 0.245.0. The
-        # first merged; the sweep run on that push must turn the second red.
+    def test_two_prs_at_the_same_version_remain_compatible(self) -> None:
+        # Both PRs may retain main's version. The post-merge writer assigns
+        # versions after each merge, so neither branch needs a shared counter.
         heads = {"aaa": cargo("0.245.0"), "bbb": cargo("0.246.0")}
         posted: list[tuple[str, str]] = []
         results = gate.sweep(
@@ -44,8 +44,8 @@ class VerdictTests(unittest.TestCase):
             heads.get,
             lambda sha, state, _description: posted.append((sha, state)),
         )
-        self.assertEqual(posted, [("aaa", "failure"), ("bbb", "success")])
-        self.assertEqual([(number, ok) for number, ok, _ in results], [(680, False), (681, True)])
+        self.assertEqual(posted, [("aaa", "success"), ("bbb", "success")])
+        self.assertEqual([(number, ok) for number, ok, _ in results], [(680, True), (681, True)])
 
     def test_an_unreadable_head_is_posted_as_a_failure(self) -> None:
         posted: list[str] = []
@@ -87,13 +87,13 @@ class CheckCommandTests(unittest.TestCase):
         finally:
             os.chdir(cwd)
 
-    def test_the_second_pr_at_the_same_version_fails_against_live_main(self) -> None:
+    def test_the_second_pr_at_the_same_version_is_accepted(self) -> None:
         self.git("checkout", "-q", "-b", "pr")
         self.commit("0.245.0")
         self.git("checkout", "-q", "main")
         self.assertEqual(self.run_check(), 0, "control: ahead of main passes")
         self.commit("0.245.0")  # the other PR landed first
-        self.assertEqual(self.run_check(), 1)
+        self.assertEqual(self.run_check(), 0)
 
 
 if __name__ == "__main__":

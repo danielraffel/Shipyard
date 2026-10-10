@@ -357,3 +357,17 @@ The binary and plugin versions live in 3 places (all updated by `release.sh`):
 
 The `--json` output schema has its own version (`schema_version` field) that
 increments independently when the output format changes.
+
+## Version-at-land release flow
+
+Pull requests do not edit `Cargo.toml`, `Cargo.lock`, or the plugin manifest
+versions. The `version-at-land.yml` workflow is the single writer after a
+merge: it computes the next version, commits the files with a
+`Version-Bump-Applied:` marker, and `auto-release.yml` tags that commit. The
+tagged `release.yml` workflow and `shipyard update` path remain unchanged.
+
+Inspect the break-glass release path without changing files or creating a tag:
+
+```bash
+./scripts/release.sh --dry-run patch
+```

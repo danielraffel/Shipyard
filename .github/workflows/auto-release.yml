@@ -1,7 +1,8 @@
 name: Auto-Release on CLI Version Bump
 
 # On every push to main, diff Cargo.toml's package.version against the
-# previous push range. If it moved, create the matching v<x.y.z> tag;
+# previous push range. The version-at-land writer creates that movement;
+# if it moved, create the matching v<x.y.z> tag;
 # release.yml then builds draft release assets from the tag.
 #
 # The workflow also supports workflow_dispatch so `shipyard doctor

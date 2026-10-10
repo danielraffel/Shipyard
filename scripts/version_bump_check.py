@@ -78,6 +78,7 @@ class Config:
     surfaces: list[Surface]
     generated_globs: list[str]
     trailer_version_bump: str
+    post_merge_assignment: bool = False
 
 
 @dataclass
@@ -266,7 +267,32 @@ def load_config(path: Path) -> Config:
         surfaces=surfaces,
         generated_globs=data.get("generated_globs", []) or [],
         trailer_version_bump=trailers.get("version_bump", "Version-Bump"),
+        post_merge_assignment=bool(data.get("post_merge_assignment", False)),
     )
+
+
+def version_file_paths(cfg: Config) -> set[str]:
+    """Return every path that a post-merge writer owns."""
+    paths = {vf.path for surface in cfg.surfaces for vf in surface.version_files}
+    # Cargo's lockfile is generated from the package version and must move with
+    # Cargo.toml. Keep it in the PR prohibition even though it has no scalar
+    # version field in the config.
+    if "Cargo.toml" in paths:
+        paths.add("Cargo.lock")
+    return paths
+
+
+def release_version_file_exception(base: str, head: str) -> bool:
+    """Allow a deliberate release PR to carry version files.
+
+    The trailer is intentionally explicit and reason-bearing. A generic
+    ``Release: skip`` does not authorize a PR to edit the single-writer files.
+    """
+    trailers = git_range_trailers(base, head)
+    for value in trailers.get("release", []):
+        if re.search(r"^allow-version-files\b.*\breason\s*=\s*\"[^\"]+\"", value, re.I):
+            return True
+    return False
 
 
 # ── Version-file I/O ────────────────────────────────────────────────────
@@ -673,10 +699,22 @@ def render_report(
     mode: str,
     base: str,
     repo: Path,
+    *,
+    forbidden_version_files: list[str] | None = None,
+    post_merge_assignment: bool = False,
 ) -> tuple[str, int]:
     lines: list[str] = []
     failures = 0
     warnings = 0
+    if forbidden_version_files:
+        lines.append(
+            "Version files are owned by version-at-land and must not be edited in a PR: "
+            + ", ".join(forbidden_version_files)
+        )
+        lines.append(
+            'Release PRs must carry `Release: allow-version-files reason="..."`.'
+        )
+        failures += 1
     for v in verdicts:
         if v.final_level == "none":
             lines.append(f"[{v.surface.name}] {v.surface.label}: no bump needed")
@@ -693,6 +731,8 @@ def render_report(
         elif any_bumped:
             unbumped = [vf.path for vf, b in per_file if not b]
             tag = f"✗ partial bump — not moved: {', '.join(unbumped)}"
+        elif post_merge_assignment:
+            tag = "✓ assigned post-merge"
         elif v.final_level == "patch":
             # Advisory only — not a hard fail.
             tag = "? bump suggested (patch)"
@@ -710,7 +750,9 @@ def render_report(
             # Partial-bump is always a hard fail — split-brain versions are
             # never acceptable. Patch-suggested stays advisory only when
             # nothing has been bumped at all.
-            if any_bumped:
+            if post_merge_assignment and not any_bumped:
+                pass
+            elif any_bumped:
                 failures += 1
             elif v.final_level == "patch":
                 warnings += 1
@@ -723,10 +765,11 @@ def render_report(
     if failures:
         lines.append("")
         lines.append("Version-bump check FAILED.")
-        lines.append("Apply the required bump with:")
-        lines.append("  python3 tools/scripts/version_bump_check.py --mode=apply")
-        lines.append("Or record an explicit override on the tip commit:")
-        lines.append('  Version-Bump: <surface>=<patch|minor|major|skip> reason="..."')
+        if not forbidden_version_files:
+            lines.append("Apply the required bump with:")
+            lines.append("  python3 tools/version_bump_check.py --mode=apply")
+            lines.append("Or record an explicit override on the tip commit:")
+            lines.append('  Version-Bump: <surface>=<patch|minor|major|skip> reason="..."')
         return "\n".join(lines), 1
 
     return "\n".join(lines), 0
@@ -826,7 +869,11 @@ def main(argv: list[str]) -> int:
 
     verdicts = assess_surfaces(cfg, changed, args.base, args.head, root)
 
-    if args.mode == "apply":
+    forbidden: list[str] = []
+    if cfg.post_merge_assignment and not release_version_file_exception(args.base, args.head):
+        forbidden = sorted(set(changed) & version_file_paths(cfg))
+
+    if args.mode == "apply" and not cfg.post_merge_assignment:
         edited = apply_bumps(verdicts, args.base, root)
         # Re-assess after editing: re-read current versions and re-check.
         verdicts_after = assess_surfaces(cfg, changed, args.base, args.head, root)
@@ -839,7 +886,11 @@ def main(argv: list[str]) -> int:
             print(text)
         return code
 
-    text, code = render_report(verdicts, args.mode, args.base, root)
+    text, code = render_report(
+        verdicts, args.mode, args.base, root,
+        forbidden_version_files=forbidden,
+        post_merge_assignment=cfg.post_merge_assignment,
+    )
     if text:
         print(text)
     return code

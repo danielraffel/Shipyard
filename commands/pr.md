@@ -1,13 +1,13 @@
 ---
 name: pr
-description: One-shot push-a-PR — skill-sync gate, version-bump apply, commit, then hand off to `shipyard ship`. The canonical way to ship a branch when you want the versioning gates to run.
+description: One-shot push-a-PR — skill-sync and read-only version gate, then hand off to `shipyard ship`. Version files are assigned after merge.
 ---
 
 Run `shipyard pr` to orchestrate the full push-a-PR flow:
 
 1. `scripts/skill_sync_check.py --mode=report` — hard-fails if a mapped path was touched without updating the corresponding `SKILL.md` (or without a `Skill-Update: skip skill=<name> reason="..."` trailer on a commit in the PR range).
-2. `scripts/version_bump_check.py --mode=apply` — rewrites `Cargo.toml` and `.claude-plugin/plugin.json` for any surface whose code moved. `--no-apply-bumps` switches to report mode so missing bumps hard-fail instead of auto-applying.
-3. `git commit` — single `chore: bump versions` commit using `--only` to pick up exactly the files the bump script touched (pre-staged files the user had in progress for other reasons stay in the index).
+2. `scripts/version_bump_check.py --mode=report` — confirms the branch does not edit the single-writer version files.
+3. The post-merge `version-at-land` workflow assigns versions and triggers the release tag.
 4. Hands off to `shipyard ship` for push + `gh pr create` + cross-platform validate + merge on green.
 5. When the protected base branch has `[merge_steward].auto_handoff = true` (or `--workstream-id` is supplied), writes the exact-head `shipyard/steward-handoff` receipt and managed label immediately after PR creation. The PR branch cannot enable this project default for itself.
 
@@ -24,7 +24,7 @@ shipyard pr $ARGUMENTS
 ## Flags
 
 - `--base <ref>` — base branch to ship into (default `main`).
-- `--apply-bumps` / `--no-apply-bumps` — default is apply. `--no-apply-bumps` switches to report mode so the command refuses rather than auto-rewriting.
+- `--apply-bumps` / `--no-apply-bumps` — retained for compatibility; both leave version files untouched.
 - `--allow-unreachable-targets` — forwarded to `shipyard ship`.
 - `--workstream-id <id>` — opt into an atomic steward receipt and use this durable work item ID.
 - `--context-url <url>` — receipt link; defaults to the newly-created PR URL.

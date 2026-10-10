@@ -1,7 +1,8 @@
 {
   "$schema": "./versioning.schema.json",
   "schema_version": 1,
-  "_comment": "Shipyard versioning gate. The CLI is now a Shipyard binary versioned from Cargo.toml; plugin files remain git-delivered and independently versioned.",
+  "post_merge_assignment": true,
+  "_comment": "Shipyard versioning gate. Pull requests never edit version files; version-at-land assigns them after merge. A release PR may opt in with Release: allow-version-files reason=\"...\".",
 
   "surfaces": {
     "cli": {
