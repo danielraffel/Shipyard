@@ -376,10 +376,14 @@ from its own parent, skips shells, `env`, `timeout` and the `gh` shim (not Pytho
 and requires the first other process to be named `shipyard`. An agent that
 exports the marker has its own runtime (`codex`, `node`, `claude`) there, even
 when a Shipyard process launched that agent, so the marker is ignored and the
-request is judged like any other. Any process can be named `shipyard`, so this
-check stops an agent that exports the marker by habit; it is not a security
-boundary against one that sets out to defeat it. Resolving the ancestor's
-executable to the installed Shipyard binary is a planned follow-up.
+request is judged like any other. The deciding process must also run the
+installed binary: its executable path, read from the kernel
+(`proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux) rather than its name,
+must resolve to a file named `shipyard` under
+`~/.local/share/shipyard/auth-generations/`. A binary merely named
+`shipyard` elsewhere, or a dev build under `target/`, does not pass. This
+stops an agent that exports the marker by habit or names a binary to match;
+anyone who can write into the install root can still pass it.
 
 ### Queue-removal override decisions
 

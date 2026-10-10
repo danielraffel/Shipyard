@@ -173,15 +173,21 @@ class QueueRemovalGuardTests(unittest.TestCase):
 
     def test_internal_marker_is_honoured_only_from_a_shipyard_parent(self) -> None:
         args = ["api", "graphql", "-f", "query=mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }"]
-        with mock.patch.object(guard, "process_ancestry", return_value=["bash", "shipyard"]):
+        installed = str(pathlib.Path.home() / ".local/share/shipyard/auth-generations/abc/shipyard")
+        with mock.patch.object(
+            guard, "process_ancestry", return_value=[("bash", "/bin/bash"), ("shipyard", installed)]
+        ):
             self.assertEqual(self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1")[0], 0)
         for ancestry in (
-            ["bash", "zsh", "codex"],
-            ["bash", "node", "shipyard"],
+            [("bash", "/bin/bash"), ("zsh", "/bin/zsh"), ("codex", "/opt/codex")],
+            [("bash", "/bin/bash"), ("node", "/usr/bin/node"), ("shipyard", installed)],
             # A Python-driven agent launched by Shipyard decides; its python
             # is not skipped to reach the shipyard above it.
-            ["bash", "python3", "shipyard"],
-            ["bash", "Python", "shipyard"],
+            [("bash", "/bin/bash"), ("python3", "/usr/bin/python3"), ("shipyard", installed)],
+            [("bash", "/bin/bash"), ("Python", "/usr/bin/python3"), ("shipyard", installed)],
+            # Named shipyard, but not the installed binary.
+            [("bash", "/bin/bash"), ("shipyard", "/tmp/x/shipyard")],
+            [("bash", "/bin/bash"), ("shipyard", None)],
             [],
         ):
             with self.subTest(ancestry=ancestry), mock.patch.object(
@@ -190,6 +196,28 @@ class QueueRemovalGuardTests(unittest.TestCase):
                 code, message = self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
                 self.assertEqual(code, 1)
                 self.assertIn("not the Shipyard binary", message)
+
+    def test_an_install_root_check_resolves_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "auth-generations"
+            binary = root / "abc" / "shipyard"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("")
+            link = pathlib.Path(directory) / "bin" / "shipyard"
+            link.parent.mkdir()
+            link.symlink_to(binary)
+            self.assertTrue(guard.is_installed_shipyard(str(link), [root]))
+            elsewhere = pathlib.Path(directory) / "elsewhere" / "shipyard"
+            elsewhere.parent.mkdir()
+            elsewhere.write_text("")
+            self.assertFalse(guard.is_installed_shipyard(str(elsewhere), [root]))
+            # A link named shipyard that resolves to another binary in the root.
+            other = root / "abc" / "ghapp"
+            other.write_text("")
+            renamed = pathlib.Path(directory) / "bin2" / "shipyard"
+            renamed.parent.mkdir()
+            renamed.symlink_to(other)
+            self.assertFalse(guard.is_installed_shipyard(str(renamed), [root]))
 
 
 def pr_answer(number: int = 9706, queued: bool = True) -> dict:
@@ -375,7 +403,8 @@ class ReplayClassifiedRemovals(unittest.TestCase):
                 refused_avoidable += 1
             if row["guard_bypass"].startswith("SHIPYARD_INTERNAL"):
                 # The same request as it was actually made: the spoofed marker alone.
-                with mock.patch.object(guard, "process_ancestry", return_value=["bash", "codex"]):
+                with mock.patch.object(guard, "process_ancestry",
+                                       return_value=[("bash", "/bin/bash"), ("codex", "/opt/codex")]):
                     with mock.patch.dict(os.environ, {"SHIPYARD_INTERNAL_QUEUE_MUTATION": "1"}, clear=True), \
                             contextlib.redirect_stderr(io.StringIO()):
                         self.assertEqual(guard.main(dequeue(f"PR_{row['pr']}")), 1, row)
@@ -404,10 +433,11 @@ class RealProcessAncestry(unittest.TestCase):
                 self.skipTest(f"cannot build a launcher: {built.stderr.strip()}")
             probe = pathlib.Path(directory) / "probe.py"
             probe.write_text(
-                "import importlib.util, sys\n"
+                "import importlib.util, pathlib, sys\n"
                 f"spec = importlib.util.spec_from_file_location('g', {str(SCRIPT)!r})\n"
                 "g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)\n"
-                "print(g.shipyard_parent(), g.process_ancestry())\n"
+                f"root = pathlib.Path({directory!r})\n"
+                "print(g.shipyard_parent(roots=[root]), g.shipyard_parent(), g.process_ancestry())\n"
             )
             # launcher -> system()'s /bin/sh -> bash -> python: the same shape
             # as shipyard -> ghapp (bash) -> guard (python).
@@ -417,15 +447,19 @@ class RealProcessAncestry(unittest.TestCase):
                 text=True,
             )
 
-    def test_a_process_named_shipyard_is_recognised(self) -> None:
+    def test_the_kernel_path_decides_not_the_name(self) -> None:
+        # A launcher named shipyard, run from a temporary directory: it passes
+        # only when that directory is declared an install root, never under
+        # the real install roots.
         result = self.run_under("shipyard")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.startswith("True"), result.stdout + result.stderr)
+        self.assertTrue(result.stdout.startswith("True False"), result.stdout + result.stderr)
 
     def test_any_other_launcher_is_not(self) -> None:
         result = self.run_under("codex")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.startswith("False"), result.stdout + result.stderr)
+        self.assertTrue(result.stdout.startswith("False False"), result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
