@@ -961,10 +961,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        RuntimeMode, WaitOutcome, WaitPrState, evaluate_pr_green_for_wait,
-        evaluate_pr_queue_state, evaluate_run_for_wait,
-        parse_github_repo_slug, release_manifest, render_wait_outcome, resolve_repo_slug,
-        wait_exit_code, wait_failure, wait_job, wait_pr, wait_release, wait_run,
+        RuntimeMode, WaitOutcome, WaitPrState, evaluate_pr_green_for_wait, evaluate_pr_queue_state,
+        evaluate_run_for_wait, parse_github_repo_slug, release_manifest, render_wait_outcome,
+        resolve_repo_slug, wait_exit_code, wait_failure, wait_job, wait_pr, wait_release, wait_run,
     };
     use crate::app::{
         WAIT_EXIT_CLOSED, WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG,
