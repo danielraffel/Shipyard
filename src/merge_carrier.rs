@@ -716,14 +716,16 @@ fn removal_causes(facts: &CarrierFacts, commit: &str) -> Result<Vec<String>, Str
                 runner_name: job.runner_name.clone(),
                 labels: Vec::new(),
             };
-            let Some(mut cause) = ejection_cause(&sample) else {
+            let Some(cause) = ejection_cause(&sample) else {
                 continue;
             };
-            if cause == "starved" && !waited_for_a_runner(job) {
-                // No runner name, but cancelled too soon to be starvation:
-                // a superseding push or a concurrency-group cancel.
-                cause = "cancelled_before_wait".to_owned();
-            }
+            // No runner name, but cancelled too soon to be starvation: a
+            // superseding push or a concurrency-group cancel.
+            let cause = if cause == "starved" && !waited_for_a_runner(job) {
+                "cancelled_before_wait".to_owned()
+            } else {
+                cause
+            };
             let is_required = required.contains(&job.name.to_ascii_lowercase());
             if is_required || cause == "starved" {
                 causes.push(cause);
