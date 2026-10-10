@@ -1,6 +1,8 @@
 //! Production-shaped installed auth-generation acceptance controls.
 #![cfg(target_os = "macos")]
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -24,8 +26,7 @@ fn public_trampoline() -> Vec<u8> {
 }
 
 fn write_private(path: &Path, contents: &[u8], mode: u32) {
-    fs::write(path, contents).expect("write fixture");
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("fixture mode");
+    common::write_executable_with_mode(path, contents, mode);
 }
 
 fn sha256_file(path: &Path) -> String {

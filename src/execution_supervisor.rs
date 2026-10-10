@@ -1892,31 +1892,22 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_worker(temp: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = temp.join("fake-worker.sh");
-        fs::write(&path, "#!/bin/sh\n/bin/sleep 30\n").expect("script");
-        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("permissions");
+        crate::test_support::write_executable_script(&path, "#!/bin/sh\n/bin/sleep 30\n");
         path
     }
 
     #[cfg(unix)]
     fn fake_worker_tree(temp: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = temp.join("fake-worker-tree.sh");
         let pid_path = temp.join("descendant.pid");
-        fs::write(
+        crate::test_support::write_executable_script(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\n/bin/sleep 300 & echo $! > '{}'\nwait\n",
                 pid_path.display()
             ),
-        )
-        .expect("script");
-        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("permissions");
+        );
         path
     }
 

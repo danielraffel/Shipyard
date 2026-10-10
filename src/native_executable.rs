@@ -87,17 +87,13 @@ fn is_native_executable_magic(magic: [u8; 4]) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
 
     use tempfile::TempDir;
 
     use super::*;
 
     fn write_executable(path: &Path, contents: &str) {
-        std::fs::write(path, contents).expect("write script");
-        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("chmod script");
+        crate::test_support::write_executable_script(path, contents);
     }
 
     #[test]

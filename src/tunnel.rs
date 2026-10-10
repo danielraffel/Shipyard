@@ -821,12 +821,8 @@ fn tailscale_command(binary: &Path, args: &[&str]) -> Command {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::fs;
     use std::path::Path;
     use std::time::Duration;
-
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     use super::{
         TAILSCALE_PROBE_BACKOFFS, TailscaleStatus, TunnelBackend, TunnelError, TunnelErrorKind,
@@ -1377,13 +1373,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let missing = tmp.path().join("missing");
         let executable = tmp.path().join("tailscale");
-        fs::write(&executable, "#!/bin/sh\n").expect("write executable");
         #[cfg(unix)]
-        {
-            let mut permissions = fs::metadata(&executable).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&executable, permissions).expect("chmod");
-        }
+        crate::test_support::write_executable_script(&executable, "#!/bin/sh\n");
+        #[cfg(not(unix))]
+        std::fs::write(&executable, "#!/bin/sh\n").expect("write executable");
 
         assert_eq!(
             resolve_tailscale_binary_from(&[missing, executable.clone()]),

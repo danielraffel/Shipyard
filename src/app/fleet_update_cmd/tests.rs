@@ -363,11 +363,9 @@ fn fleet_resolver_probe_uses_exact_global_dir_before_commit() {
 #[cfg(unix)]
 #[test]
 fn auth_token_command_binds_verified_repo_in_a_scrubbed_non_checkout() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("tempdir");
     let wrapper = temp.path().join("auth wrapper");
-    std::fs::write(
+    crate::test_support::write_executable_script_with_mode(
         &wrapper,
         "#!/bin/sh\n\
          test \"$#\" -eq 2\n\
@@ -376,10 +374,8 @@ fn auth_token_command_binds_verified_repo_in_a_scrubbed_non_checkout() {
          test \"$GH_REPO\" = danielraffel/Shipyard\n\
          test -z \"${SHIPYARD_GHAPP_REPO:-}${SHIPYARD_GH_APP_REPO:-}\"\n\
          printf '%s\\n' exact-token\n",
-    )
-    .expect("wrapper fixture");
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
-        .expect("wrapper executable");
+        0o700,
+    );
 
     let token_command = auth_token_command("danielraffel/Shipyard", &wrapper);
     let probe = format!(
@@ -733,18 +729,14 @@ fn resolver_auth_token_command_uses_typed_machine_credentials_in_a_scrubbed_envi
 #[cfg(target_os = "macos")]
 #[test]
 fn remote_pair_probe_rejects_mixed_or_malformed_preinstall_state() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("temp dir");
     let primary = temp.path().join("shipyard");
     let companion = temp.path().join(COMPANION_BINARY_NAME);
     let write_binary = |path: &Path, label: &str, version: &str| {
-        std::fs::write(
+        crate::test_support::write_executable_script(
             path,
-            format!("#!/bin/sh\nprintf '%s\\n' '{label} {version}'\n"),
-        )
-        .expect("fixture");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("executable");
+            &format!("#!/bin/sh\nprintf '%s\\n' '{label} {version}'\n"),
+        );
     };
     write_binary(&primary, "shipyard", "0.126.2");
     let legacy_probe = remote_pair_probe(&primary, &companion, "before", None, false);
@@ -1075,18 +1067,14 @@ fn local_rollout_rejects_a_filename_the_installer_cannot_replace() {
 #[cfg(unix)]
 #[test]
 fn a_stalled_local_pre_probe_is_classified_before_mutation() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("temp dir");
     let binary = temp.path().join("shipyard");
-    std::fs::write(
+    crate::test_support::write_executable_script(
         &binary,
         "#!/bin/sh
 sleep 60
 ",
-    )
-    .expect("fixture");
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    );
     let plan = host_update_plan(&host(None, binary.to_str()), "v0.137.0").expect("plan");
     assert!(matches!(
         evidence::execute_plan_phased_with_timeout(&plan, Duration::from_millis(50)),
@@ -1099,16 +1087,12 @@ sleep 60
 #[cfg(unix)]
 #[test]
 fn one_stalled_host_is_terminated_at_its_bound() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("temp dir");
     let binary = temp.path().join("shipyard");
-    std::fs::write(
+    crate::test_support::write_executable_script(
         &binary,
         "#!/bin/sh\ncase \"$*\" in *\"daemon status\"*) printf '%s\\n' '{\"command\":\"daemon:status\",\"running\":false}' ;; *) sleep 60 ;; esac\n",
-    )
-    .expect("fixture");
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    );
     let plan = host_update_plan(&host(None, binary.to_str()), "v0.137.0").expect("plan");
     assert!(matches!(
         execute_plan_with_timeout(&plan, Duration::from_millis(50)),
@@ -1119,19 +1103,13 @@ fn one_stalled_host_is_terminated_at_its_bound() {
 #[cfg(unix)]
 #[test]
 fn configured_absolute_tool_survives_a_stripped_non_login_path() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().expect("temp dir");
     let homebrew_bin = temp.path().join("opt/homebrew/bin");
     std::fs::create_dir_all(&homebrew_bin).expect("homebrew bin");
     let tart = homebrew_bin.join("tart");
-    std::fs::write(&tart, "#!/bin/sh\nexit 0\n").expect("tool fixture");
-    std::fs::set_permissions(&tart, std::fs::Permissions::from_mode(0o755))
-        .expect("executable fixture");
+    crate::test_support::write_executable_script(&tart, "#!/bin/sh\nexit 0\n");
     let shipyard = homebrew_bin.join("shipyard");
-    std::fs::write(&shipyard, "#!/bin/sh\nexit 0\n").expect("Shipyard fixture");
-    std::fs::set_permissions(&shipyard, std::fs::Permissions::from_mode(0o755))
-        .expect("executable Shipyard fixture");
+    crate::test_support::write_executable_script(&shipyard, "#!/bin/sh\nexit 0\n");
 
     let hidden = Command::new("/usr/bin/env")
         .args([
@@ -1228,8 +1206,6 @@ fn fleet_plan_refuses_pre_atomic_generation_targets_before_rendering() {
 #[cfg(target_os = "macos")]
 #[test]
 fn real_auth_transaction_publishes_the_atomic_generation_contract() {
-    use std::os::unix::fs::PermissionsExt;
-
     use sha2::{Digest, Sha256};
 
     let temp = tempfile::tempdir().expect("transaction home");
@@ -1249,9 +1225,11 @@ fn real_auth_transaction_publishes_the_atomic_generation_contract() {
     let close_guard_source = temp.path().join("release-close-guard");
     let binary_source = temp.path().join("release-shipyard");
     let executable = |path: &Path, bytes: &[u8]| {
-        std::fs::write(path, bytes).expect("write executable");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .expect("executable mode");
+        crate::test_support::write_executable_script_with_mode(
+            path,
+            std::str::from_utf8(bytes).expect("script fixture is UTF-8"),
+            0o700,
+        );
     };
     executable(
         &helper_source,
@@ -2464,7 +2442,6 @@ fn a_fully_verified_rollout_ends_with_a_verified_summary() {
 #[cfg(unix)]
 #[test]
 fn verification_script_installs_guards_and_reads_every_fact_on_the_host() {
-    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().expect("temp");
     let bin = temp.path().join("shipyard");
     let log = temp.path().join("calls");
@@ -2472,9 +2449,9 @@ fn verification_script_installs_guards_and_reads_every_fact_on_the_host() {
     std::fs::create_dir_all(state_dir.join("daemon")).expect("daemon dir");
     let live_pid = std::process::id();
     std::fs::write(state_dir.join("daemon/daemon.pid"), format!("{live_pid}\n")).expect("pid");
-    std::fs::write(
+    crate::test_support::write_executable_script(
         &bin,
-        format!(
+        &format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> '{log}'\n\
              case \"$*\" in\n\
@@ -2488,9 +2465,7 @@ fn verification_script_installs_guards_and_reads_every_fact_on_the_host() {
             log = log.display(),
             marker = temp.path().join("status-read").display()
         ),
-    )
-    .expect("fake binary");
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    );
     let mut plan = host_update_plan(&named_host("studio"), "v0.137.0").expect("plan");
     plan.ssh = None;
     plan.binary = bin;

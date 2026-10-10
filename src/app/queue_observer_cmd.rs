@@ -496,12 +496,7 @@ mod tests {
 
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::write(path, contents).expect("write script");
-        let mut permissions = fs::metadata(path).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("chmod script");
+        crate::test_support::write_executable_script(path, contents);
     }
 
     #[test]
