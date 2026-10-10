@@ -5,8 +5,8 @@ use chrono::{DateTime, Duration, TimeZone as _, Utc};
 use serde_json::{Value, json};
 
 use super::host::{
-    self, HostCommand, HostRunner, INBOX_SCRIPT, Invocation, LIVENESS_SCRIPT, Liveness, RunError,
-    SHOWN_SCRIPT, check_argv, parse_sessions, shell_quote, shell_unquote,
+    self, HostCommand, HostRunner, INBOX_SCRIPT, Invocation, Liveness, RunError, SHOWN_SCRIPT,
+    check_argv, parse_sessions, shell_quote, shell_unquote,
 };
 use super::owner::{self, Owner, OwnerSource, Route};
 use super::{HandbackConfig, HandbackMode, HandbackReport, NEEDS_AGENT_LABEL, actionable};
@@ -576,6 +576,7 @@ struct FakeRunner {
     /// What each session's `<session>.shown.jsonl` tail reads as.
     shown: BTreeMap<String, String>,
     local_shown_reads: Vec<String>,
+    omit_cmux_rows: bool,
 }
 
 impl HostRunner for FakeRunner {
@@ -583,7 +584,7 @@ impl HostRunner for FakeRunner {
         check_argv(&invocation.argv, CMUX).map_err(RunError::Failed)?;
         self.runs.push(invocation.clone());
         let joined = invocation.argv.join(" ");
-        if joined.contains(LIVENESS_SCRIPT) {
+        if joined.contains("process_alive") {
             let process_alive = !joined.contains(DEAD_SESSION);
             return Ok(json!({
                 "sessions": [],
@@ -593,11 +594,15 @@ impl HostRunner for FakeRunner {
             .to_string());
         }
         if joined.contains("sessions") {
-            let rows = [
-                (LIVE_SESSION, "running", true, LIVE_SURFACE),
-                (LOCAL_SESSION, "running", true, LIVE_SURFACE),
-                (DEAD_SESSION, "running", false, LIVE_SURFACE),
-            ];
+            let rows = if self.omit_cmux_rows {
+                vec![]
+            } else {
+                vec![
+                    (LIVE_SESSION, "running", true, LIVE_SURFACE),
+                    (LOCAL_SESSION, "running", true, LIVE_SURFACE),
+                    (DEAD_SESSION, "running", false, LIVE_SURFACE),
+                ]
+            };
             return Ok(sessions_json(&rows));
         }
         if self.fail_notify && joined.contains("notify") {
@@ -1870,6 +1875,106 @@ fn a_wake_is_seen_only_when_the_owner_session_displayed_that_episode() {
         let joined = invocation.argv.join(" ");
         joined.contains(" notify ") || joined.contains(INBOX_SCRIPT)
     }));
+}
+
+#[test]
+fn seen_at_alone_blocks_an_due_retry() {
+    let (mut ledger, history) = world(t(0));
+    let mut cfg = config(false, true);
+    cfg.retry_after = chrono::Duration::hours(1);
+    let id = "1:repeat_test_failure:k";
+    ledger.handback.wakes.insert(
+        id.to_owned(),
+        super::WakeRecord {
+            pr: 1,
+            episode: t(0),
+            raised_at: t(0),
+            sent_at: Some(t(0)),
+            unsent: None,
+            inbox: None,
+            sent_to: Some((LIVE_SESSION.to_owned(), Route::Ssh("m3".to_owned()))),
+            seen_at: Some(t(0)),
+            send_count: 1,
+            last_sent_at: Some(t(0)),
+            escalated: false,
+        },
+    );
+    let mut runner = FakeRunner::default();
+    let out = pass(
+        &mut ledger,
+        &history,
+        t(3),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert!(!out.report.events.iter().any(|event| {
+        event.id == id && matches!(event.change.as_str(), "wake.sent" | "wake.escalated")
+    }));
+}
+
+#[test]
+fn dead_process_with_missing_cmux_row_is_not_live() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, false);
+    let mut runner = FakeRunner {
+        omit_cmux_rows: true,
+        ..FakeRunner::default()
+    };
+    pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert_eq!(ledger.handback.owners[&2].state, "unknown");
+    assert!(runner.runs.iter().any(|invocation| {
+        invocation.argv.join(" ").contains("process_alive")
+            && invocation.argv.join(" ").contains(DEAD_SESSION)
+    }));
+}
+
+#[test]
+fn missing_cmux_row_runs_evidence_probe_and_can_prove_live() {
+    let (mut ledger, history) = world(t(0));
+    let cfg = config(false, false);
+    let mut runner = FakeRunner {
+        omit_cmux_rows: true,
+        ..FakeRunner::default()
+    };
+    pass(
+        &mut ledger,
+        &history,
+        t(1),
+        &cfg,
+        HandbackMode::Deliver,
+        &mut runner,
+        true,
+    );
+    assert_eq!(ledger.handback.owners[&1].state, "live");
+    assert!(runner.runs.iter().any(|invocation| {
+        invocation.argv.join(" ").contains("process_alive")
+            && invocation.argv.join(" ").contains(LIVE_SESSION)
+    }));
+}
+
+#[test]
+fn liveness_allowlist_rejects_transcript_path_traversal() {
+    let invocation = host::invocation(
+        &Route::Ssh("m3".to_owned()),
+        &HostCommand::LivenessEvidence {
+            session: LIVE_SESSION.to_owned(),
+            transcript: "/work/../etc/transcript.jsonl".to_owned(),
+        },
+        CMUX,
+        None,
+    )
+    .expect("ssh evidence probe");
+    assert!(check_argv(&invocation.argv, CMUX).is_err());
 }
 
 #[test]

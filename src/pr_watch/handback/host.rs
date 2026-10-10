@@ -19,7 +19,7 @@
 //! `cmux send`, `send-key`, agent CLIs and arbitrary shell do not.
 
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
 
 use serde::Serialize;
@@ -127,9 +127,9 @@ impl HostCommand {
             Self::ClearStatus { workspace, key } => {
                 own(&["clear-status", key, "--workspace", workspace])
             }
-            Self::InboxAppend { .. }
-            | Self::ShownRead { .. }
-            | Self::LivenessEvidence { .. } => return None,
+            Self::InboxAppend { .. } | Self::ShownRead { .. } | Self::LivenessEvidence { .. } => {
+                return None;
+            }
         })
     }
 }
@@ -206,10 +206,10 @@ pub fn invocation(
         let (script, words): (&str, Vec<String>) = match command {
             HostCommand::InboxAppend { session } => (INBOX_SCRIPT, vec![session.clone()]),
             HostCommand::ShownRead { session } => (SHOWN_SCRIPT, vec![session.clone()]),
-            HostCommand::LivenessEvidence { session, transcript } => (
-                LIVENESS_SCRIPT,
-                vec![session.clone(), transcript.clone()],
-            ),
+            HostCommand::LivenessEvidence {
+                session,
+                transcript,
+            } => (LIVENESS_SCRIPT, vec![session.clone(), transcript.clone()]),
             _ => return None,
         };
         match route {
@@ -340,10 +340,13 @@ pub fn check_argv(argv: &[String], cmux_path: &str) -> Result<(), String> {
 }
 
 fn safe_transcript_path(path: &str) -> bool {
+    let candidate = Path::new(path);
     !path.is_empty()
         && path.len() <= 512
-        && path.starts_with('/')
-        && !path.contains("..")
+        && candidate.is_absolute()
+        && !candidate
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
         && path.bytes().all(|b| !b.is_ascii_control() && b != b'\'')
 }
 
