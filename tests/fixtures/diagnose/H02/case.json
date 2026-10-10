@@ -1,0 +1,7 @@
+{
+ "id": "H02",
+ "job": "macos",
+ "class": "infra",
+ "rule": "needs_starved",
+ "resolution": "superseded sibling is excluded from starvation evidence"
+}

@@ -1,0 +1,11 @@
+{
+ "name": "shipyard diagnose",
+ "head_sha": "d44b38bbc9409861217b919bcfa41672cbb8b352",
+ "status": "completed",
+ "conclusion": "neutral",
+ "output": {
+  "title": "1 required check(s) failed. macos: infra, step 'Post Run actions/checkout@v5'",
+  "summary": "1 required check(s) failed. macos: infra, step 'Post Run actions/checkout@v5'",
+  "annotations": []
+ }
+}
