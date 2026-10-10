@@ -725,7 +725,8 @@ continuously-active-writer Phase 2 boundary.
   disable/dequeue revocations, and the merge steward's enqueue) sets
   `SHIPYARD_INTERNAL_QUEUE_MUTATION=1`. When `gh` resolves to the `ghapp`
   wrapper, its queue-removal and queue-arm guards honour that marker instead of
-  re-judging a call Shipyard's own admission rules above already made; reads
+  re-judging a call Shipyard's own admission rules above already made (the
+  removal guard only when its calling process is the Shipyard binary); reads
   never carry it. An ad-hoc arm without it is classified live and refused for a
   queued, armed, merged/closed, unreadable, or same-head-ejected PR.
 - **Revocation authority:** an active ship-state owns native auto-merge and

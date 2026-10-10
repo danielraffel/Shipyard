@@ -74,6 +74,10 @@ pub(super) struct HostVersion {
 pub(super) struct HostDaemon {
     pub(super) launcher_installed: Option<bool>,
     pub(super) launcher_active: Option<bool>,
+    /// What the agent plist launchd loads says: it starts at login and
+    /// restarts a daemon that exits non-zero. `None` when the host's Shipyard
+    /// predates the field, or the plist is absent or unreadable.
+    pub(super) survives_kill_and_reboot: Option<bool>,
     pub(super) running: Option<bool>,
     /// How many repositories the running daemon watches (`configured_repos`).
     /// `None` when the status did not carry the list.
@@ -94,6 +98,21 @@ impl HostDaemon {
                 "the daemon launcher is installed but inactive; rerun `shipyard daemon launcher \
                  install` at the host's console",
             ),
+            // An active launcher is only reboot-safe when the plist launchd
+            // loads says so. An unread answer is not a yes.
+            (Some(true), Some(true)) => match self.survives_kill_and_reboot {
+                Some(true) => None,
+                Some(false) => Some(
+                    "the daemon's launchd agent neither starts at login nor restarts a daemon \
+                     that dies (its plist has RunAtLoad or KeepAlive off); run `shipyard daemon \
+                     refresh` on the host to rewrite it",
+                ),
+                None => Some(
+                    "the daemon's launchd agent plist could not be read, so nothing shows the \
+                     daemon comes back after a reboot or a kill; update the host's Shipyard and \
+                     run `shipyard daemon refresh` there",
+                ),
+            },
             _ => None,
         };
         let stopped = match (self.running, self.watched_repos) {
@@ -1225,6 +1244,7 @@ fn parse_daemon_probe(text: &str) -> Option<HostDaemon> {
     let daemon = HostDaemon {
         launcher_installed: field(PROBE_LAUNCHER_MARKER, "installed"),
         launcher_active: field(PROBE_LAUNCHER_MARKER, "active"),
+        survives_kill_and_reboot: field(PROBE_LAUNCHER_MARKER, "survives_kill_and_reboot"),
         running: field(PROBE_DAEMON_MARKER, "running"),
         watched_repos: text
             .lines()
@@ -1248,6 +1268,55 @@ pub(super) fn probe_host_version(class: &HostClassConfig) -> HostVersion {
         class.shipyard_bin.as_deref(),
         class.shipyard_global_dir.as_deref(),
     )
+}
+
+/// Ask one configured host whether its pr-watch passes still complete
+/// (`shipyard --json pr-watch liveness`), read-only. The command exits 1 when
+/// the host is stale, so the JSON is read whatever the exit status. A host
+/// whose Shipyard predates the subcommand answers with an error.
+pub(super) fn probe_pr_watch_liveness(
+    class: &HostClassConfig,
+) -> Result<crate::pr_watch::liveness::Liveness, String> {
+    let Some(binary) = class
+        .shipyard_bin
+        .as_deref()
+        .filter(|path| path.starts_with('/'))
+    else {
+        return Err("host_class has no absolute shipyard_bin".to_owned());
+    };
+    let script = format!("{} --json pr-watch liveness", shlex_quote(binary));
+    let mut command = if let Some(host) = class.ssh.as_deref() {
+        let mut command = Command::new(super::evidence::ssh_binary_path());
+        command.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "-o",
+            "StrictHostKeyChecking=yes",
+        ]);
+        command.arg(host).arg(&script);
+        command
+    } else {
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(["-c", &script])
+            .env_clear()
+            .env("HOME", home_dir())
+            .env("PATH", unattended_tool_path());
+        command
+    };
+    let label = format!("pr-watch liveness probe for host class {}", class.class);
+    let output =
+        crate::process::run_output_until(&mut command, Instant::now() + HOST_PROBE_TIMEOUT, &label)
+            .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(text.trim()).map_err(|_| {
+        format!(
+            "no pr-watch liveness answer (exit {}); its Shipyard may predate `pr-watch liveness`",
+            output.status.code().unwrap_or(-1)
+        )
+    })
 }
 
 /// Read one host's installed `shipyard --version` without mutating anything.
@@ -2342,6 +2411,7 @@ mod tests {
         HostDaemon {
             launcher_installed: Some(installed),
             launcher_active: Some(active),
+            survives_kill_and_reboot: (installed && active).then_some(true),
             running: Some(running),
             watched_repos: None,
         }
@@ -2372,10 +2442,31 @@ mod tests {
             "an older status claims nothing"
         );
         let text = format!(
-            "{PROBE_LAUNCHER_MARKER}{{\"active\": true, \"installed\": true}}\n\
+            "{PROBE_LAUNCHER_MARKER}{{\"active\": true, \"installed\": true, \"survives_kill_and_reboot\": true}}\n\
              {PROBE_DAEMON_MARKER}{{\"running\": true, \"configured_repos\": []}}\n"
         );
         assert_eq!(parse_daemon_probe(&text), Some(watching(Some(0))));
+    }
+
+    #[test]
+    fn an_active_launcher_is_reboot_safe_only_when_its_plist_says_so() {
+        let with = |survives| HostDaemon {
+            survives_kill_and_reboot: survives,
+            ..daemon(true, true, true)
+        };
+        assert_eq!(with(Some(true)).problem(), None);
+        let off = with(Some(false))
+            .problem()
+            .expect("plist with KeepAlive off is a problem");
+        assert!(off.contains("RunAtLoad or KeepAlive off"), "{off}");
+        assert!(off.contains("`shipyard daemon refresh`"), "{off}");
+        let unread = with(None).problem().expect("an unread plist is not a yes");
+        assert!(unread.contains("could not be read"), "{unread}");
+        let text = format!(
+            "{PROBE_LAUNCHER_MARKER}{{\"active\": true, \"installed\": true, \"survives_kill_and_reboot\": false}}\n\
+             {PROBE_DAEMON_MARKER}{{\"running\": true}}\n"
+        );
+        assert_eq!(parse_daemon_probe(&text), Some(with(Some(false))));
     }
 
     #[test]
