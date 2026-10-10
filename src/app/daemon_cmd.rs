@@ -348,13 +348,10 @@ fn daemon_launcher_command<W: Write>(
         DaemonLauncherCommand::Status => {
             let record = launcher::read_record(state_dir);
             let active = launcher::active_launcher(state_dir).is_some();
-            render_launcher_record(
-                stdout,
-                json,
-                "daemon:launcher:status",
-                record.as_ref(),
-                active,
-            )
+            let restart = record
+                .as_ref()
+                .and_then(|record| launcher::installed_restart_policy(&home, &record.label));
+            render_launcher_status(stdout, json, record.as_ref(), active, restart)
         }
         DaemonLauncherCommand::Uninstall => {
             let existed =
@@ -394,6 +391,62 @@ fn daemon_launcher_command<W: Write>(
         2,
         "the daemon launcher manages a macOS privacy identity and is only available on macOS",
     ))
+}
+
+/// `daemon launcher status`: the record, plus what the plist launchd loads
+/// will do with the daemon. `survives_kill_and_reboot` is `null` when no
+/// agent plist is installed or it cannot be read, never a guess.
+#[cfg(target_os = "macos")]
+fn render_launcher_status<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    record: Option<&crate::daemon_launcher::LauncherRecord>,
+    active: bool,
+    restart: Option<crate::daemon_launcher::AgentRestartPolicy>,
+) -> Result<ExitCode, CliFailure> {
+    let failure = |error: &dyn std::fmt::Display| CliFailure::new(1, error.to_string());
+    if json {
+        let mut data = BTreeMap::new();
+        data.insert("installed".to_owned(), Value::Bool(record.is_some()));
+        data.insert("active".to_owned(), Value::Bool(active));
+        data.insert(
+            "record".to_owned(),
+            serde_json::to_value(record).map_err(|error| failure(&error))?,
+        );
+        let optional = |value: Option<bool>| value.map_or(Value::Null, Value::Bool);
+        data.insert(
+            "run_at_load".to_owned(),
+            optional(restart.map(|policy| policy.run_at_load)),
+        );
+        data.insert(
+            "restarts_dead_daemon".to_owned(),
+            optional(restart.map(|policy| policy.restarts_dead_daemon)),
+        );
+        data.insert(
+            "survives_kill_and_reboot".to_owned(),
+            optional(
+                restart.map(crate::daemon_launcher::AgentRestartPolicy::survives_kill_and_reboot),
+            ),
+        );
+        write_json_envelope(stdout, "daemon:launcher:status", data)
+            .map_err(|error| failure(&error))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    render_launcher_record(stdout, false, "daemon:launcher:status", record, active)?;
+    if record.is_some() {
+        let line = match restart {
+            Some(policy) if policy.survives_kill_and_reboot() => {
+                "  launchd agent: starts at login and restarts a daemon that exits non-zero"
+            }
+            Some(_) => {
+                "  launchd agent: does NOT start at login or restart a dead daemon; run \
+                 `shipyard daemon refresh` to rewrite it"
+            }
+            None => "  launchd agent: no plist installed yet; `shipyard daemon refresh` writes it",
+        };
+        writeln!(stdout, "{line}").map_err(|error| failure(&error))?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(target_os = "macos")]
