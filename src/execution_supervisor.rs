@@ -183,6 +183,9 @@ pub struct ExecutionSupervisor {
     boot_pass_done: bool,
     /// Test-only replacement for the machine-global opt-in.
     boot_requeue_override: Option<bool>,
+    /// Test-only crash point: fail right after the intent marker is written.
+    #[cfg(test)]
+    crash_after_intent: bool,
 }
 
 struct QueueAbsentRecoveryFlight(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -216,6 +219,8 @@ impl ExecutionSupervisor {
             boot_id: crate::boot_identity::current(),
             boot_pass_done: false,
             boot_requeue_override: None,
+            #[cfg(test)]
+            crash_after_intent: false,
         }
     }
 
@@ -1056,6 +1061,10 @@ impl ExecutionSupervisor {
                 };
                 let path = self.boot_requeue_marker_path(&job.id, &dead_boot);
                 write_json_atomic(&path, &marker)?;
+                #[cfg(test)]
+                if self.crash_after_intent {
+                    return Err(io::Error::other("injected crash after the intent marker").into());
+                }
                 (path, marker)
             };
             self.release_host_pool_leases(&job.id)?;
@@ -3526,6 +3535,42 @@ mod tests {
         );
     }
 
+    /// The write-ahead control: the daemon dies right after deciding to
+    /// requeue. The intent marker must already be on disk, with nothing else
+    /// done, and the next start finishes the requeue exactly once.
+    #[test]
+    fn the_intent_marker_is_written_before_any_requeue_step() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        running_job_with_receipt(temp.path(), "write-ahead", Some("boot-A"));
+        let mut crashing = supervisor_on_boot(temp.path(), Some("boot-B"));
+        crashing.crash_after_intent = true;
+        assert!(crashing.requeue_jobs_interrupted_by_reboot().is_err());
+        let markers = boot_markers(temp.path());
+        assert_eq!(markers.len(), 1, "the marker is written first");
+        assert_eq!(markers[0].state, BootRequeueState::Intent);
+        assert!(
+            temp.path().join("queue-workers/write-ahead.json").exists(),
+            "no step after the marker ran"
+        );
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        assert_eq!(
+            queue.get("write-ahead").expect("read").expect("job").status,
+            JobStatus::Running
+        );
+        for _ in 0..2 {
+            supervisor_on_boot(temp.path(), Some("boot-B"))
+                .requeue_jobs_interrupted_by_reboot()
+                .expect("next start");
+        }
+        let job = queue.get("write-ahead").expect("read").expect("job");
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.scheduler_defer_count, 1);
+        assert_eq!(
+            boot_markers(temp.path())[0].state,
+            BootRequeueState::Requeued
+        );
+    }
+
     /// The ordering control: the daemon died after removing the receipt and
     /// before returning the job to pending. Nothing on disk proves the reboot
     /// again except the marker, which finishes the requeue exactly once.
@@ -3665,6 +3710,8 @@ mod tests {
         assert!(boot_markers(temp.path()).is_empty());
     }
 
+    /// Spawns `/bin/sleep`; the daemon's worker path is Unix-only.
+    #[cfg(unix)]
     #[test]
     fn a_new_worker_receipt_records_this_boot() {
         let temp = tempfile::tempdir().expect("tempdir");

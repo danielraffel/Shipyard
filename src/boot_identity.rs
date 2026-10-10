@@ -36,6 +36,14 @@ pub fn current() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Elsewhere there is no boot identity, so no receipt ever proves a
+    /// reboot and the boot requeue never runs: lost workers stay UNCERTAIN.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn other_platforms_have_no_boot_identity() {
+        assert_eq!(super::current(), None);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_boot_identity_is_readable_and_stable_within_one_boot() {
