@@ -284,6 +284,19 @@ fn supervise_reports_a_killed_daemon_as_failure_and_a_stopped_one_as_success() {
     );
 }
 
+/// Unloads a test launchd job when the test ends, pass or fail.
+#[cfg(target_os = "macos")]
+struct Bootout(String);
+
+#[cfg(target_os = "macos")]
+impl Drop for Bootout {
+    fn drop(&mut self) {
+        let _ = Command::new("/bin/launchctl")
+            .args(["bootout", &self.0])
+            .status();
+    }
+}
+
 /// The whole chain under the real launchd: a rendered daemon agent running
 /// `shipyard daemon supervise`. Killing the daemon brings up a new pid; a
 /// daemon that exits 0 stays down. Needs a logged-in GUI session (`gui/<uid>`)
@@ -333,14 +346,6 @@ fn launchd_restarts_a_killed_daemon_and_leaves_a_stopped_one_down() {
         String::from_utf8(Command::new("id").arg("-u").output().expect("id").stdout).expect("utf8");
     let domain = format!("gui/{}", uid.trim());
     let target = format!("{domain}/{label}");
-    struct Bootout(String);
-    impl Drop for Bootout {
-        fn drop(&mut self) {
-            let _ = Command::new("/bin/launchctl")
-                .args(["bootout", &self.0])
-                .status();
-        }
-    }
     let _cleanup = Bootout(target.clone());
     let status = Command::new("/bin/launchctl")
         .args(["bootstrap", &domain])
@@ -370,6 +375,7 @@ fn launchd_restarts_a_killed_daemon_and_leaves_a_stopped_one_down() {
         "launchd never started the agent"
     );
     let first = starts(temp.path())[0].clone();
+    eprintln!("launchd started the daemon: pid {first}; sending SIGKILL");
     assert!(
         Command::new("kill")
             .args(["-KILL", &first])
@@ -383,12 +389,17 @@ fn launchd_restarts_a_killed_daemon_and_leaves_a_stopped_one_down() {
     );
     let second = starts(temp.path())[1].clone();
     assert_ne!(first, second, "a new daemon pid after the kill");
+    eprintln!("launchd restarted the daemon after SIGKILL: new pid {second}");
 
     // Negative control: a clean exit is not restarted.
     fs::write(temp.path().join("stop"), "").expect("stop marker");
     assert!(
         !wait_for_starts(3, throttle * 2 + Duration::from_secs(15)),
         "launchd restarted a daemon that exited 0: {:?}",
+        starts(temp.path())
+    );
+    eprintln!(
+        "daemon exited 0 and launchd did not restart it; starts recorded: {:?}",
         starts(temp.path())
     );
 }
