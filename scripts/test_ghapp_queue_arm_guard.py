@@ -1499,6 +1499,13 @@ class InterruptionRequeue(unittest.TestCase):
         self.assertEqual(verdict["evidence"][0]["reading"], "no_signature")
         # Control: the same job without the annotation is starved.
         self.assertTrue(assess_interrupted("cancelled", job, "", 1, [])["allowed"])
+        # Positive control: annotations present, none of them a supersede.
+        not_acquired = [{"annotation_level": "failure", "message":
+                         "The job was not acquired by Runner of type self-hosted even after "
+                         "multiple attempts"}]
+        verdict = assess_interrupted("cancelled", job, "", 1, not_acquired)
+        self.assertTrue(verdict["allowed"], verdict["reason"])
+        self.assertEqual(verdict["evidence"][0]["signature"], "starved")
 
     def test_an_upload_stall_after_a_green_test_step_is_an_interruption(self) -> None:
         verdict = assess_interrupted("failure", upload_job("success"), UPLOAD_STALL_LOG, 1)

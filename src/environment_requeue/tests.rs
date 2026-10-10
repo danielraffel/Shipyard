@@ -470,6 +470,21 @@ fn a_concurrency_supersede_is_not_starvation() {
     assert_eq!(verdict.evidence[0].reading, StepReading::NoSignature);
     // Control: the same job with no annotation is starved.
     assert!(assess_group(&interrupted_group("cancelled", &job, ""), 1).allowed);
+    // Positive control for the new branch: annotations present, none of them
+    // a supersede (the not-acquired text GitHub writes on a starved job).
+    let mut annotated = interrupted_group("cancelled", &job, "");
+    annotated.insert(
+        format!("repos/{REPO}/check-runs/7/annotations"),
+        Ok(json!([{"annotation_level": "failure", "message":
+            "The job was not acquired by Runner of type self-hosted even after multiple attempts"}])
+        .to_string()),
+    );
+    let starved = assess_group(&annotated, 1);
+    assert!(starved.allowed, "{}", starved.reason);
+    assert!(matches!(
+        &starved.evidence[0].reading,
+        StepReading::Interruption(hit) if hit.signature == "starved"
+    ));
     // Unreadable annotations cannot rule a supersede out.
     let mut unreadable = interrupted_group("cancelled", &job, "");
     unreadable.insert(
