@@ -372,11 +372,14 @@ queue removal is refreshable.
 Setting `SHIPYARD_INTERNAL_QUEUE_MUTATION` by hand claims Shipyard's authority
 for a command Shipyard did not audit. Do not. The removal guard honours it only
 when the nearest deciding ancestor process is the Shipyard binary: it walks up
-from its own parent, skips shells, `env`, `timeout`, the `gh` shim and Python,
+from its own parent, skips shells, `env`, `timeout` and the `gh` shim (not Python),
 and requires the first other process to be named `shipyard`. An agent that
 exports the marker has its own runtime (`codex`, `node`, `claude`) there, even
 when a Shipyard process launched that agent, so the marker is ignored and the
-request is judged like any other.
+request is judged like any other. Any process can be named `shipyard`, so this
+check stops an agent that exports the marker by habit; it is not a security
+boundary against one that sets out to defeat it. Resolving the ancestor's
+executable to the installed Shipyard binary is a planned follow-up.
 
 ### Queue-removal override decisions
 
@@ -400,8 +403,9 @@ two more variables:
 An allowed removal reads each target PR through the App token and appends one
 JSON line (time, reason, note, fix PR, each target's repository, number, head
 and queue state, and the argv) to `$GHAPP_QUEUE_REMOVAL_LOG`, default
-`~/.local/state/shipyard/queue-removals.jsonl`. A target that cannot be read,
-or a log that cannot be written, refuses the removal: an allowance nobody can
+`~/.local/state/shipyard/queue-removals.jsonl`. The log is per host and nothing reads it yet; collecting it fleet-wide is a
+follow-up. A target that cannot be read, or a log that cannot be written,
+refuses the removal: an allowance nobody can
 audit later is not given. A request body read from stdin is refused too,
 because the guard cannot see which PR it removes.
 

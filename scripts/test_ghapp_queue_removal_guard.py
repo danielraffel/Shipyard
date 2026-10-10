@@ -175,7 +175,15 @@ class QueueRemovalGuardTests(unittest.TestCase):
         args = ["api", "graphql", "-f", "query=mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }"]
         with mock.patch.object(guard, "process_ancestry", return_value=["bash", "shipyard"]):
             self.assertEqual(self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1")[0], 0)
-        for ancestry in (["bash", "zsh", "codex"], ["bash", "node", "shipyard"], ["python3"], []):
+        for ancestry in (
+            ["bash", "zsh", "codex"],
+            ["bash", "node", "shipyard"],
+            # A Python-driven agent launched by Shipyard decides; its python
+            # is not skipped to reach the shipyard above it.
+            ["bash", "python3", "shipyard"],
+            ["bash", "Python", "shipyard"],
+            [],
+        ):
             with self.subTest(ancestry=ancestry), mock.patch.object(
                 guard, "process_ancestry", return_value=ancestry
             ):
@@ -270,6 +278,22 @@ class OverrideReasonThroughFakeGh(unittest.TestCase):
         self.assertEqual(code, 0, message)
         self.assertTrue(any("number=9834" in call and "owner=Generous-Corp" in call for call in calls), calls)
         self.assertEqual(records[0]["targets"][0]["pr"], 9834)
+
+    def test_disable_auto_by_url_reads_the_pr_the_url_names(self) -> None:
+        answer = {"data": {"repository": {"nameWithOwner": "Generous-Corp/pulp",
+                                          "pullRequest": pr_answer(9827)["data"]["node"]}}}
+        code, message, calls, records = self.run_with_answer(
+            ["pr", "merge", "https://github.com/Generous-Corp/pulp/pull/9827", "--disable-auto"],
+            answer, **OVERRIDE, GH_REPO="someone/else",
+            GHAPP_QUEUE_REMOVAL_REASON="defect-fix", GHAPP_QUEUE_REMOVAL_NOTE="bug")
+        self.assertEqual(code, 0, message)
+        self.assertFalse(any(call.startswith("pr view") for call in calls), calls)
+        self.assertTrue(
+            any("owner=Generous-Corp" in call and "name=pulp" in call and "number=9827" in call
+                for call in calls),
+            calls,
+        )
+        self.assertEqual(records[0]["targets"][0]["pr"], 9827)
 
     def test_main_red_fix_may_remove_only_the_fix_pr(self) -> None:
         env = {**OVERRIDE, "GHAPP_QUEUE_REMOVAL_REASON": "reorder-main-red-fix",

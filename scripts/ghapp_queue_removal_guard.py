@@ -182,6 +182,8 @@ def is_queue_removal(args: list[str]) -> bool:
 
 # Processes that sit between Shipyard and this guard without deciding anything:
 # the ghapp wrapper's shell, a `gh` shim that execs it, `env`, `timeout`.
+# Python is not among them: no Shipyard path reaches ghapp through a Python
+# helper, and a Python-driven agent is a deciding process like any other.
 WRAPPER_PROCESSES = {"bash", "sh", "zsh", "dash", "env", "timeout", "gh", "ghapp"}
 
 
@@ -224,10 +226,12 @@ def shipyard_parent(ancestry: list[str] | None = None) -> bool:
     Shells and the ghapp wrapper are skipped; the first other process decides.
     An agent that exports the marker from its own shell has that agent
     (codex, node, claude, python) as the nearest deciding ancestor, even when
-    the agent itself was launched by a Shipyard process.
+    the agent itself was launched by a Shipyard process. Any process can be
+    named ``shipyard``, so this stops an agent exporting the marker by habit,
+    not a determined one.
     """
     for name in process_ancestry() if ancestry is None else ancestry:
-        if name in WRAPPER_PROCESSES or name.startswith("python"):
+        if name in WRAPPER_PROCESSES:
             continue
         return name == "shipyard"
     return False
