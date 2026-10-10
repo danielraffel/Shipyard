@@ -1,0 +1,85 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. macos: real, 1 test, step 'Test (non-Windows)'",
+ "checks": [
+  {
+   "context": "macos",
+   "conclusion": "failure",
+   "run_id": 37243122816,
+   "run_attempt": 1,
+   "job_id": 111555720674,
+   "runner": {
+    "name": "m5studio-pulp-gate-01-58112-3",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "pulp-build"
+    ]
+   },
+   "timing_s": {
+    "queued": 169,
+    "ran": 936
+   },
+   "failing_step": {
+    "number": 33,
+    "name": "Test (non-Windows)",
+    "conclusion": "failure"
+   },
+   "classification": {
+    "class": "real",
+    "rule": "default",
+    "why": "no infra, stale-base, interruption or flake evidence"
+   },
+   "failing_tests": {
+    "names": [
+     "QuickJS evaluate_script waits for an in-flight precompile of the same source"
+    ],
+    "total": 1,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "test",
+     "line": 16,
+     "test": "QuickJS evaluate_script waits for an in-flight precompile of the same source",
+     "repeats": 2,
+     "lines": [
+      "Test #13159: QuickJS evaluate_script waits for an in-flight precompile of the same source ................................................................................***Failed    0.04 sec",
+      "/Users/admin/actions-runner/_work/pulp/pulp/test/test_js_engine.cpp:1004: FAILED:",
+      "  CHECK( stats.waits == 1 )",
+      "with expansion:",
+      "  0 == 1",
+      "test cases: 1 | 1 failed",
+      "assertions: 5 | 4 passed | 1 failed"
+     ]
+    }
+   ],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37243122816/job/111555720674",
+    "log_lines": 80,
+    "log_bytes": 7225,
+    "step_lines": [
+     4,
+     80
+    ],
+    "fetch": "gh run view 37243122816 --job 111555720674 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 1,
+  "names": [
+   "Linux (x64) [github-hosted]"
+  ]
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 1679
+ }
+}

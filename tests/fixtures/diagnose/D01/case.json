@@ -1,0 +1,7 @@
+{
+ "id": "D01",
+ "job": "drift-fast",
+ "class": "infra",
+ "rule": "infra_marker",
+ "resolution": "Skia cache download 500; PR re-queued"
+}

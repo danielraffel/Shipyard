@@ -1,0 +1,7 @@
+{
+ "id": "M05",
+ "job": "macos",
+ "class": "infra",
+ "rule": "non_content_step",
+ "resolution": "failed in 'Post Run actions/checkout'; PR only merged main"
+}

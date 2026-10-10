@@ -1,0 +1,7 @@
+{
+ "id": "N03",
+ "job": "macos",
+ "class": "infra",
+ "rule": "no_runner",
+ "resolution": "cancelled, no runner"
+}

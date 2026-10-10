@@ -1,0 +1,7 @@
+{
+ "id": "M16",
+ "job": "macos",
+ "class": "real",
+ "rule": "default",
+ "resolution": "PR later added 'test: restore rust cli help parity'"
+}

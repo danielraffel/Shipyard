@@ -61,6 +61,9 @@ pub mod daemon_version;
 pub(crate) mod daemon_worker_capacity;
 /// Typed dependency-channel policy and immutable consumer locks.
 pub mod dependency;
+/// Bounded CI failure diagnosis (`shipyard diagnose`): failing step, tests,
+/// capped evidence, classification and check-run annotations.
+pub mod diagnose;
 /// Phase 1 failure diagnostics for cloud (GitHub Actions) targets.
 /// Fetches failing-job metadata + parses a bounded log tail so
 /// `Validation failed.` becomes an actionable, structured block.

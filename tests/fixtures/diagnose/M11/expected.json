@@ -1,0 +1,119 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. macos: infra",
+ "checks": [
+  {
+   "context": "macos",
+   "conclusion": "failure",
+   "run_id": 37298838244,
+   "run_attempt": 1,
+   "job_id": 111726630712,
+   "runner": {
+    "name": "m5-pulp-gate-01-78761-1",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "pulp-build"
+    ]
+   },
+   "timing_s": {
+    "queued": 159,
+    "ran": 3246
+   },
+   "failing_step": null,
+   "classification": {
+    "class": "infra",
+    "rule": "lost_runner",
+    "why": "job ended with no recorded steps on a named runner"
+   },
+   "failing_tests": {
+    "names": [],
+    "total": 0,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "signal",
+     "line": 85,
+     "lines": [
+      "Artifact name is valid!",
+      "Root directory input is valid!",
+      "##[error]Failed to CreateArtifact: Received non-retryable error: Failed request: (403) Forbidden: job is completed",
+      "Post job cleanup."
+     ]
+    },
+    {
+     "kind": "tail",
+     "line": 56,
+     "lines": [
+      "  CCACHE_SLOPPINESS: time_macros",
+      "  PULP_OFFLINE_BUILD: 1",
+      "  REUSE_RECORD_JOB_START: 1791197461",
+      "  PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+      "  PULP_CTEST_LEG: macOS (ARM64) [local]",
+      "  CTEST_OUTCOME: cancelled",
+      "ctest-nonruns: registered(ctest -N raw lines)=22740 registered(total)=22737",
+      "ctest-nonruns: observation=unavailable declared=None testcases=None nonruns=0"
+     ]
+    },
+    {
+     "kind": "signal",
+     "line": 36,
+     "lines": [
+      "##[error]The operation was canceled.",
+      "python3 tools/ci/a2t_headroom_annotation.py \"$RUNNER_TEMP/a2t-scope-headroom.json\""
+     ]
+    },
+    {
+     "kind": "signal",
+     "line": 16,
+     "lines": [
+      "  18446744073709551615 (0xffffffffffffffff)",
+      "/Users/admin/actions-runner/_work/pulp/pulp/test/test_browser_capture_ir.cpp:1262: FAILED:",
+      "  CHECK( result.error.find(\"no radial pointer geometry\") != std::string::npos )",
+      "with expansion:",
+      "  18446744073709551615 (0xffffffffffffffff)",
+      "  !="
+     ]
+    },
+    {
+     "kind": "signal",
+     "line": 10,
+     "lines": [
+      "/Users/admin/actions-runner/_work/pulp/pulp/test/test_browser_capture_ir.cpp:1260: FAILED:",
+      "  CHECK( result.error.find(\"declared knob indicator for 'empty'\") != std::string::npos )",
+      "with expansion:",
+      "  18446744073709551615 (0xffffffffffffffff)",
+      "  !="
+     ]
+    }
+   ],
+   "evidence_truncated": true,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37298838244/job/111726630712",
+    "log_lines": 109,
+    "log_bytes": 9996,
+    "step_lines": [
+     1,
+     109
+    ],
+    "fetch": "gh run view 37298838244 --job 111726630712 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 1,
+  "names": [
+   "Linux (x64) [github-hosted]"
+  ]
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 2551
+ }
+}

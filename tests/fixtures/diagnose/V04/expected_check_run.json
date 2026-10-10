@@ -1,0 +1,20 @@
+{
+ "name": "shipyard diagnose",
+ "head_sha": "2d675f8cb755dfc021cef3b1708ba2250c168d89",
+ "status": "completed",
+ "conclusion": "neutral",
+ "output": {
+  "title": "1 required check(s) failed. Enforce version & skill sync: real, 2 tests, step 'Gate-script fixture tests'",
+  "summary": "1 required check(s) failed. Enforce version & skill sync: real, 2 tests, step 'Gate-script fixture tests'",
+  "annotations": [
+   {
+    "path": "tools/ci/test_read_audit_cadence.py",
+    "start_line": 167,
+    "end_line": 167,
+    "annotation_level": "failure",
+    "title": "Enforce version & skill sync: real",
+    "message": "    tools/ci/test_read_audit_cadence.py:167: .write_text() without encoding=\n    tools/ci/test_read_audit_cadence.py:169: .write_text() without encoding=\n    tools/ci/test_read_audit_cadence.py:170: subprocess.run(text=True) without encoding=\n    tools/ci/test_read_audit_cadence.py:175: .read_text() without encoding=\n    tools/ci/test_read_audit_cadence.py:176: .read_text() without encoding=\n    tools/ci/test_read_audit_cadence.py:186: .read_text() without encoding=\n    tools/ci/test_read_audit_cadence.py:190: .read_text() without encoding=\nPass encoding=\"utf-8\" (or the encoding the data really uses)."
+   }
+  ]
+ }
+}

@@ -1,0 +1,13 @@
+2026-10-04T16:47:58.8585440Z Uploaded bytes 100663296
+2026-10-04T16:48:03.0428500Z Uploaded bytes 109051904
+2026-10-04T16:48:04.0382640Z Uploaded bytes 109307427
+2026-10-04T16:48:04.7141380Z Finished uploading artifact content to blob storage!
+2026-10-04T16:48:04.7145820Z SHA256 digest of uploaded artifact zip is c49f6399fdd203f054407faf43d9e72f7fb8de2483b85276b54b0dd169ebaed7
+2026-10-04T16:48:04.7151140Z Finalizing artifact upload
+2026-10-04T16:48:05.4595670Z Artifact plugins-macos.zip successfully finalized. Artifact ID 11308344296
+2026-10-04T16:48:05.4596780Z Artifact plugins-macos has been successfully uploaded! Final size is 109307427 bytes. Artifact ID is 11308344296
+2026-10-04T16:48:05.4621460Z Artifact download URL: https://github.com/Generous-Corp/pulp/actions/runs/37215232810/artifacts/11308344296
+2026-10-04T16:48:05.4918890Z Post job cleanup.
+2026-10-04T16:48:05.5846140Z ##[error]An error occurred trying to start process '/Users/admin/actions-runner/externals/node24/bin/node' with working directory '/Users/admin/actions-runner/_work/pulp/pulp'. Exec format error
+2026-10-04T16:48:05.5948670Z Cleaning up orphan processes
+2026-10-04T16:48:06.4457680Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/upload-artifact@v5. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/

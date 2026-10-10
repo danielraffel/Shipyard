@@ -1,0 +1,11 @@
+{
+ "name": "shipyard diagnose",
+ "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+ "status": "completed",
+ "conclusion": "neutral",
+ "output": {
+  "title": "1 required check(s) failed. macos: infra",
+  "summary": "1 required check(s) failed. macos: infra",
+  "annotations": []
+ }
+}

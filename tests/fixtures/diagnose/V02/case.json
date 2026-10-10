@@ -1,0 +1,7 @@
+{
+ "id": "V02",
+ "job": "Enforce version & skill sync",
+ "class": "real",
+ "rule": "default",
+ "resolution": "PR force-pushed a fix"
+}

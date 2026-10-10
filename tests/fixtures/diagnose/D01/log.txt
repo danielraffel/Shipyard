@@ -1,0 +1,85 @@
+2026-10-06T14:10:46.5130950Z Cloning into '/home/runner/.cache/pulp/fetchcontent-src/vst3sdk-v3.8.0_build_66/vstgui4'...
+2026-10-06T14:10:48.7012838Z Submodule path 'base': checked out '3d2e82f8e6bff59c1d8b7a27491a29c2286b5206'
+2026-10-06T14:10:48.7145761Z Submodule path 'cmake': checked out 'de6e54eeaaab35b7145f5c32c279b5e892146e04'
+2026-10-06T14:10:49.3319991Z Submodule path 'doc': checked out '6d4737c9e70750056e731d88d49aa06eefc8a1a4'
+2026-10-06T14:10:49.3465278Z Submodule path 'pluginterfaces': checked out '31d6eeba6daaa3e2a8bfbe3e7a90ca0b7fbfbc1c'
+2026-10-06T14:10:49.4595229Z Submodule path 'public.sdk': checked out 'a3911a4615dabbfdfd9d181ee26b05c70c289a95'
+2026-10-06T14:10:57.0155089Z -- Detecting C compiler ABI info
+2026-10-06T14:10:57.1334943Z -- Detecting C compiler ABI info - done
+2026-10-06T14:10:57.1502484Z -- Check for working C compiler: /usr/bin/cc - skipped
+2026-10-06T14:10:57.1506285Z -- Detecting C compile features
+2026-10-06T14:10:57.1510715Z -- Detecting C compile features - done
+2026-10-06T14:10:57.1959696Z -- Pulp 0.920.1 — platform: linux
+2026-10-06T14:10:57.1964102Z -- Pulp: ccache not found on PATH — using compiler directly
+2026-10-06T14:10:57.1968656Z -- Pulp: AAX support disabled
+2026-10-06T14:10:57.1972484Z -- Pulp: VCV Rack support disabled
+2026-10-06T14:10:57.1974320Z -- Pulp: Ableton Link support disabled
+2026-10-06T14:10:57.2800631Z -- Pulp: using shared cache for choc: /home/runner/.cache/pulp/fetchcontent-src/choc-df148a41a6bc9cbd67727532c4d5c9d8aa6d5d60
+2026-10-06T14:10:57.3341390Z -- Pulp: using build-local mutable copy for choc: /home/runner/work/pulp/pulp/build-linux/_deps/pulp-mutable-choc-src
+2026-10-06T14:10:57.3564861Z -- Pulp: applied CHOC V8 compatibility patch
+2026-10-06T14:10:57.3567584Z -- Pulp: applied CHOC JSON positive-exponent patch
+2026-10-06T14:10:57.3570719Z -- Pulp: using shared cache for webgpu: /home/runner/.cache/pulp/fetchcontent-src/webgpu-17dcd42a7683355e7a40ac4e97e77f36dff5b5ab
+2026-10-06T14:10:57.3572734Z -- Pulp: using shared cache for wgpu-linux-x86_64-release: /home/runner/.cache/pulp/fetchcontent-src/wgpu-linux-x86_64-release-v24.0.3.1
+2026-10-06T14:10:57.3644820Z -- Fetching WebGPU implementation from 'https://github.com/gfx-rs/wgpu-native/releases/download/v24.0.3.1/wgpu-linux-x86_64-release.zip'
+2026-10-06T14:10:57.3650815Z -- Using WebGPU runtime from '/home/runner/.cache/pulp/fetchcontent-src/wgpu-linux-x86_64-release-v24.0.3.1/lib/libwgpu_native.so'
+2026-10-06T14:10:57.3654211Z -- Pulp: WebGPU (Dawn) enabled
+2026-10-06T14:10:57.4519770Z -- Skia: validating/provisioning linux-x64 → /home/runner/.cache/pulp/skia/linux-x64-b132db47979f116a2b35720c6e4e8c7128505499e52b218cc64546f87b0bb363-receipt-v3 (PULP_SKIA_AUTOFETCH; shared)
+2026-10-06T14:10:57.7777299Z Skia fetch: matrix=linux-x64, manifest=linux-x64
+2026-10-06T14:10:57.7778362Z   url: https://github.com/danielraffel/skia-builder/releases/download/chrome/m153/skia-build-linux-x64-gpu-release.zip
+2026-10-06T14:10:57.7779116Z   sha256: b132db47979f116a2b35720c6e4e8c7128505499e52b218cc64546f87b0bb363
+2026-10-06T14:10:57.7780078Z   expected lib: /home/runner/.cache/pulp/skia/.linux-x64-b132db47979f116a2b35720c6e4e8c7128505499e52b218cc64546f87b0bb363-receipt-v3.staging-piz9eylo/build/linux-gpu/lib/Release/libskia.a
+2026-10-06T14:10:57.7780999Z Downloading -> /home/runner/work/pulp/pulp/.skia-release-asset-y789lp7w.zip
+2026-10-06T14:10:57.7781641Z   transient download failure (HTTP Error 500: Internal Server Error); retrying in 2s [attempt 2 of 4]
+2026-10-06T14:10:59.8766453Z   transient download failure (HTTP Error 500: Internal Server Error); retrying in 4s [attempt 3 of 4]
+2026-10-06T14:11:03.9643003Z   transient download failure (HTTP Error 500: Internal Server Error); retrying in 8s [attempt 4 of 4]
+2026-10-06T14:11:12.0644997Z   download failed after 4 attempts: HTTP Error 500: Internal Server Error
+2026-10-06T14:11:12.2007639Z Traceback (most recent call last):
+2026-10-06T14:11:12.2008617Z   File "/home/runner/work/pulp/pulp/tools/scripts/fetch_skia_for_release.py", line 1058, in <module>
+2026-10-06T14:11:12.2009805Z     sys.exit(main(sys.argv))
+2026-10-06T14:11:12.2010277Z              ^^^^^^^^^^^^^^
+2026-10-06T14:11:12.2011078Z   File "/home/runner/work/pulp/pulp/tools/scripts/fetch_skia_for_release.py", line 1050, in main
+2026-10-06T14:11:12.2012073Z     return _main(argv)
+2026-10-06T14:11:12.2012581Z            ^^^^^^^^^^^
+2026-10-06T14:11:12.2013626Z   File "/home/runner/work/pulp/pulp/tools/scripts/fetch_skia_for_release.py", line 754, in _main
+2026-10-06T14:11:12.2014526Z     return publish_keyed_cache(
+2026-10-06T14:11:12.2015102Z            ^^^^^^^^^^^^^^^^^^^^
+2026-10-06T14:11:12.2219566Z   File "/usr/lib/python3.12/urllib/request.py", line 521, in open
+2026-10-06T14:11:12.2220330Z     response = meth(req, response)
+2026-10-06T14:11:12.2220854Z                ^^^^^^^^^^^^^^^^^^^
+2026-10-06T14:11:12.2221512Z   File "/usr/lib/python3.12/urllib/request.py", line 630, in http_response
+2026-10-06T14:11:12.2224334Z     response = self.parent.error(
+2026-10-06T14:11:12.2225139Z                ^^^^^^^^^^^^^^^^^^
+2026-10-06T14:11:12.2225977Z   File "/usr/lib/python3.12/urllib/request.py", line 559, in error
+2026-10-06T14:11:12.2226881Z     return self._call_chain(*args)
+2026-10-06T14:11:12.2227525Z            ^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-06T14:11:12.2228332Z   File "/usr/lib/python3.12/urllib/request.py", line 492, in _call_chain
+2026-10-06T14:11:12.2229291Z     result = func(*args)
+2026-10-06T14:11:12.2229904Z              ^^^^^^^^^^^
+2026-10-06T14:11:12.2230749Z   File "/usr/lib/python3.12/urllib/request.py", line 639, in http_error_default
+2026-10-06T14:11:12.2231828Z     raise HTTPError(req.full_url, code, msg, hdrs, fp)
+2026-10-06T14:11:12.2232819Z urllib.error.HTTPError: HTTP Error 500: Internal Server Error
+2026-10-06T14:11:12.2422344Z CMake Error at tools/cmake/PulpDependencies.cmake:303 (message):
+2026-10-06T14:11:12.2423323Z   Skia: pinned cache generation validation/provisioning failed; refusing
+2026-10-06T14:11:12.2424081Z   unvalidated external/skia-build fallback
+2026-10-06T14:11:12.2424499Z Call Stack (most recent call first):
+2026-10-06T14:11:12.2424972Z   CMakeLists.txt:368 (include)
+2026-10-06T14:11:12.2425315Z 
+2026-10-06T14:11:12.2425320Z 
+2026-10-06T14:11:12.2425627Z -- Configuring incomplete, errors occurred!
+2026-10-06T14:11:12.2500278Z ##[error]Process completed with exit code 1.
+2026-10-06T14:11:12.2747371Z Post job cleanup.
+2026-10-06T14:11:12.3593544Z [command]/usr/bin/git version
+2026-10-06T14:11:12.3639020Z git version 2.55.0
+2026-10-06T14:11:12.3681039Z Temporarily overriding HOME='/home/runner/work/_temp/e0d0d26a-f8ba-45a0-bfdd-a1b40ad51d67' before making global git config changes
+2026-10-06T14:11:12.3681941Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-06T14:11:12.3688111Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/pulp/pulp
+2026-10-06T14:11:12.3729651Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-06T14:11:12.3765222Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-06T14:11:12.4008731Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-06T14:11:12.4032269Z http.https://github.com/.extraheader
+2026-10-06T14:11:12.4043395Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-10-06T14:11:12.4078353Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-06T14:11:12.4325168Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-06T14:11:12.4374172Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-06T14:11:12.4760455Z Cleaning up orphan processes
+2026-10-06T14:11:12.5030010Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/cache/restore@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/

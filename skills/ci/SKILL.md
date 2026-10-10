@@ -3085,6 +3085,27 @@ conclusion, which an advisory Linux failure turns red). `HEALTHY`, `RED` (the
 failing required job and, when parseable, its tests), `PENDING`, or `UNPROVEN`
 (no merge-group run built the tip: a direct push), each with the tip SHA.
 
+### Diagnosing a red check: `shipyard diagnose`
+
+Before reading a job log, run `shipyard diagnose <PR>` (or `--run <ID>`). It
+reads about four GitHub calls and prints, per failing required check, the
+failing step and tests, at most five evidence groups (the root-cause line is
+in the first group in every replayed case), the runner, and a class:
+
+- `infra` (`no_runner` only on GitHub's own "not acquired by Runner" record,
+  `needs_starved`, `lost_runner`, `non_content_step`, `infra_marker`);
+- `interrupted` (`superseded`, `timeout`, `unknown`): a cancel is never `real`
+  and never `infra` without that record;
+- `stale_base` (a configured marker such as Vellum's "not current protected
+  main");
+- `flake_candidate`: every failing test also failed on another PR in the last
+  day (pr-watch shared flags). A hint only; it never exonerates;
+- `real`: everything else.
+
+The document never exceeds `--max-bytes` (16 KB). The step window removes
+checkout noise such as fetch output. `--annotate post` puts each failing test's
+evidence on its file and line in a neutral check run; it is off by default.
+
 **A red base overrides "wait for the queue".** `shipyard landing` also reads
 the repository's own `base-poison-signal/v1` annotation (Pulp publishes it from
 `main-health-detector.yml`). When it says `poisoned` and names a fix pull

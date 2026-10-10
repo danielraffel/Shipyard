@@ -1,0 +1,7 @@
+{
+ "id": "I03",
+ "job": "Linux (x64) [github-hosted]",
+ "class": "interrupted",
+ "rule": "unknown",
+ "resolution": "named runner, cancelled mid Test step; annotation 'The run was canceled by @shipyard-local[bot]'"
+}

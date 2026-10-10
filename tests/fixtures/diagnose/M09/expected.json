@@ -1,0 +1,92 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. macos: real, 1 test, step 'Test (non-Windows)'",
+ "checks": [
+  {
+   "context": "macos",
+   "conclusion": "failure",
+   "run_id": 37272420180,
+   "run_attempt": 1,
+   "job_id": 111642185537,
+   "runner": {
+    "name": "m1-pulp-gate-slot2-02-75625-12",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "pulp-build"
+    ]
+   },
+   "timing_s": {
+    "queued": 1054,
+    "ran": 1759
+   },
+   "failing_step": {
+    "number": 33,
+    "name": "Test (non-Windows)",
+    "conclusion": "failure"
+   },
+   "classification": {
+    "class": "real",
+    "rule": "default",
+    "why": "no infra, stale-base, interruption or flake evidence"
+   },
+   "failing_tests": {
+    "names": [
+     "unregistered-tests-check"
+    ],
+    "total": 1,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "test",
+     "line": 33,
+     "test": "unregistered-tests-check",
+     "repeats": 2,
+     "lines": [
+      "Test #21534: unregistered-tests-check ....................................................................................................................................***Failed    2.12 sec",
+      "test-registration: 554 invoked, 648 not invoked (647 baselined)",
+      "test-registration: tools/validation/test_mlx_named_model_harness.py: no ctest, source-selftest, workflow or CMake invokes it; register it, or delete it if it is dead"
+     ]
+    },
+    {
+     "kind": "signal",
+     "line": 13,
+     "lines": [
+      "...............................................................................",
+      "/Users/admin/actions-runner/_work/pulp/pulp/test/test_timeline_agent.cpp:42: FAILED:",
+      "  REQUIRE( std::filesystem::create_directories(path_) )",
+      "with expansion:",
+      "  false"
+     ]
+    }
+   ],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37272420180/job/111642185537",
+    "log_lines": 86,
+    "log_bytes": 7738,
+    "step_lines": [
+     4,
+     86
+    ],
+    "fetch": "gh run view 37272420180 --job 111642185537 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 1,
+  "names": [
+   "Linux (x64) [github-hosted]"
+  ]
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 1897
+ }
+}

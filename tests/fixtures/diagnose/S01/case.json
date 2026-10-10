@@ -1,0 +1,7 @@
+{
+ "id": "S01",
+ "job": "Enforce version & skill sync",
+ "class": "real",
+ "rule": "default",
+ "resolution": "negative control: V02's fast real version-gate failure with a planted provably-starved sibling must stay real"
+}

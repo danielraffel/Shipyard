@@ -1,0 +1,51 @@
+2026-10-06T21:16:37.0563286Z [100%] Building CXX object test/CMakeFiles/pulp-test-cli-project-command.dir/__/tools/cli/migration_runtime.cpp.o
+2026-10-06T21:16:37.1433243Z [100%] Building CXX object test/CMakeFiles/pulp-test-cli-project-command.dir/__/tools/cli/update_check.cpp.o
+2026-10-06T21:16:37.2103539Z [100%] Building CXX object test/CMakeFiles/pulp-test-cli-project-command.dir/__/tools/cli/version_diag.cpp.o
+2026-10-06T21:16:38.2383624Z /home/runner/work/pulp/pulp/tools/cli/cli_sdk.cpp: In lambda function:
+2026-10-06T21:16:38.2385095Z /home/runner/work/pulp/pulp/tools/cli/cli_sdk.cpp:485:9: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+2026-10-06T21:16:38.2385900Z   485 |         if (i >= s.size() || s[i] != '.') return false; ++i;
+2026-10-06T21:20:13.0187899Z 17763/21910 Test #18028: generate_pulp_swift maps image assets to Image / AsyncImage (B5) ............................................................................................   Passed    0.00 sec
+2026-10-06T21:20:13.0189083Z             Start 18029: generated SwiftUI with full B2 style + text-runs type-checks
+2026-10-06T21:20:13.0751056Z 17764/21910 Test #17984: Faithful specimens load + render ............................................................................................................................   Passed    0.42 sec
+2026-10-06T21:20:13.0762810Z             Start 18030: generate_pulp_swift binds meter/xy_pad/waveform/spectrum + emits text buttons
+2026-10-06T21:20:13.0813180Z 17765/21910 Test #18030: generate_pulp_swift binds meter/xy_pad/waveform/spectrum + emits text buttons ...............................................................................   Passed    0.01 sec
+2026-10-06T21:20:13.0814568Z             Start 18031: generate_pulp_swift renders a text button's label/icon children
+2026-10-06T21:20:33.9321770Z ##[error]The operation was canceled.
+2026-10-06T21:20:33.9397577Z ##[group]Run set -uo pipefail
+2026-10-06T21:20:33.9397962Z [36;1mset -uo pipefail[0m
+2026-10-06T21:20:33.9398345Z [36;1mjunit="$GITHUB_WORKSPACE/$PULP_BUILD_DIR/ctest.junit.xml"[0m
+2026-10-06T21:20:33.9398889Z [36;1m# When the full suite did not run (a pull-request head that took the[0m
+2026-10-06T21:20:33.9399459Z [36;1m# fast tier, or a build that stopped first) there is no full report[0m
+2026-10-06T21:20:33.9400026Z [36;1m# by design: observe the fast tier's own report if it exists, and[0m
+2026-10-06T21:20:33.9400608Z [36;1m# otherwise record a named "not run" instead of an unavailable error.[0m
+2026-10-06T21:20:33.9401136Z [36;1m# A suite that DID run and left no report stays an error.[0m
+2026-10-06T21:20:33.9401528Z [36;1mabsent=()[0m
+2026-10-06T21:20:33.9401970Z [36;1mif [ "$CTEST_OUTCOME" = skipped ]; then[0m
+2026-10-06T21:20:33.9402512Z [36;1m  absent=(--fallback "$GITHUB_WORKSPACE/$PULP_BUILD_DIR/ctest-pr-fast.junit.xml"[0m
+2026-10-06T21:20:33.9403384Z [36;1m          --not-run-reason "the full suite did not run on this leg (fast tier only, or the build stopped before ctest)")[0m
+2026-10-06T21:20:33.9403997Z [36;1mfi[0m
+2026-10-06T21:20:33.9404394Z [36;1mlisting="$(ctest --test-dir "$PULP_BUILD_DIR" -N 2>/dev/null)" || listing=""[0m
+2026-10-06T21:20:33.9404975Z [36;1mraw_lines="$(printf '%s\n' "$listing" | wc -l | tr -d ' ')"[0m
+2026-10-06T21:20:33.9405561Z [36;1mregistered="$(printf '%s\n' "$listing" | sed -n 's/^Total Tests: //p' | tail -1)"[0m
+2026-10-06T21:20:33.9406171Z [36;1m# Also echo the control to the job log. $GITHUB_STEP_SUMMARY has no[0m
+2026-10-06T21:20:33.9406723Z [36;1m# REST API, so a summary-only number cannot be read back from a[0m
+2026-10-06T21:20:33.9407294Z [36;1m# finished run; the log can. Same reason the ctest-failure step below[0m
+2026-10-06T21:20:33.9407768Z [36;1m# echoes its names twice.[0m
+2026-10-06T21:20:33.9408510Z [36;1mecho "ctest-nonruns: registered(ctest -N raw lines)=$raw_lines registered(total)=${registered:-unknown}"[0m
+2026-10-06T21:20:33.9409378Z [36;1mpython3 tools/scripts/ctest_nonruns.py "$junit" ${absent[@]+"${absent[@]}"} \[0m
+2026-10-06T21:20:33.9410008Z [36;1m  --registered "${registered:-unknown}" --raw-lines "$raw_lines" \[0m
+2026-10-06T21:20:33.9410560Z [36;1m  --json-output "$PULP_BUILD_DIR/ctest.nonruns.json" \[0m
+2026-10-06T21:20:33.9411030Z [36;1m  --leg "$PULP_CTEST_LEG" >> "$GITHUB_STEP_SUMMARY"[0m
+2026-10-06T21:20:33.9486487Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-06T21:20:33.9486883Z env:
+2026-10-06T21:20:33.9487121Z   PULP_BUILD_DIR: build-linux
+2026-10-06T21:20:33.9487434Z   CCACHE_COMPILERCHECK: content
+2026-10-06T21:20:33.9487729Z   CCACHE_NODEPEND: true
+2026-10-06T21:20:33.9488010Z   CCACHE_SLOPPINESS: time_macros
+2026-10-06T21:20:33.9488314Z   PULP_OFFLINE_BUILD: 1
+2026-10-06T21:20:33.9488611Z   PULP_CTEST_LEG: Linux (x64) [github-hosted]
+2026-10-06T21:20:33.9488962Z   CTEST_OUTCOME: cancelled
+2026-10-06T21:20:33.9489238Z ##[endgroup]
+2026-10-06T21:20:36.6822559Z ctest-nonruns: registered(ctest -N raw lines)=22295 registered(total)=22291
+2026-10-06T21:20:36.7348197Z ctest-nonruns: observation=unavailable declared=None testcases=None nonruns=0
+2026-10-06T21:20:36.7424351Z ##[error]Process completed with exit code 2.

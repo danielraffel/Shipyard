@@ -1,0 +1,7 @@
+{
+ "id": "M06",
+ "job": "macos",
+ "class": "flake_candidate",
+ "rule": "default",
+ "resolution": "same test failed on 9525, 9547, 9540 within 3.5 h; racy precompile-wait counter"
+}

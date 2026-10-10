@@ -14,6 +14,7 @@ use clap::Parser;
 mod auth_cmd;
 mod auto_merge_cmd;
 mod base_health_cmd;
+mod diagnose_cmd;
 mod branch_cmd;
 mod capacity_cmd;
 pub(crate) mod changed_surface_cmd;
@@ -447,6 +448,34 @@ where
                 stdout,
             );
         }
+        Command::Diagnose {
+            pr,
+            run,
+            repo,
+            base,
+            required,
+            max_bytes,
+            annotate,
+        } => {
+            let annotate = diagnose_cmd::AnnotateMode::parse(&annotate)
+                .map_err(|error| CliFailure::new(2, error))?;
+            return diagnose_cmd::diagnose_command(
+                diagnose_cmd::DiagnoseArgs {
+                    pr,
+                    run,
+                    repo,
+                    base,
+                    required,
+                    max_bytes,
+                    annotate,
+                    json: cli.json,
+                },
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                stdout,
+            );
+        }
         Command::BaseHealth {
             repo,
             workflow,
@@ -802,6 +831,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Landability { .. }
         | Command::Landing { .. }
         | Command::BaseHealth { .. }
+        | Command::Diagnose { .. }
         | Command::Doctor { .. }
         | Command::Daemon { .. }
         | Command::MergeQueue { .. }

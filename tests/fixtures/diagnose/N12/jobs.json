@@ -1,0 +1,311 @@
+{
+ "jobs": [
+  {
+   "id": 111957017826,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "resolve-provider",
+   "conclusion": "cancelled",
+   "status": "completed",
+   "runner_name": "",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:07:29Z",
+   "started_at": "2026-10-05T20:07:29Z",
+   "completed_at": "2026-10-05T20:27:16Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111957017826",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  },
+  {
+   "id": 111957018144,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "classify",
+   "conclusion": "cancelled",
+   "status": "completed",
+   "runner_name": "",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:07:29Z",
+   "started_at": "2026-10-05T20:07:29Z",
+   "completed_at": "2026-10-05T20:28:20Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111957018144",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  },
+  {
+   "id": 111957019612,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "Pulp repository-isolation local proof",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "created_at": "2026-10-05T20:07:29Z",
+   "started_at": "2026-10-05T20:07:29Z",
+   "completed_at": "2026-10-05T20:07:29Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111957019612",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  },
+  {
+   "id": 111964304273,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "macos",
+   "conclusion": "failure",
+   "status": "completed",
+   "runner_name": "GitHub Actions 1000218514",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:28:21Z",
+   "started_at": "2026-10-05T20:28:55Z",
+   "completed_at": "2026-10-05T20:29:06Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111964304273",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": [
+    {
+     "number": 1,
+     "name": "Set up job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T20:28:56Z",
+     "completed_at": "2026-10-05T20:28:57Z"
+    },
+    {
+     "number": 2,
+     "name": "macOS merge-group bootstrap (required when native leg is absent)",
+     "conclusion": "failure",
+     "started_at": "2026-10-05T20:28:57Z",
+     "completed_at": "2026-10-05T20:28:57Z"
+    },
+    {
+     "number": 3,
+     "name": "Check out the reuse record writer",
+     "conclusion": "success",
+     "started_at": "2026-10-05T20:28:57Z",
+     "completed_at": "2026-10-05T20:28:59Z"
+    },
+    {
+     "number": 4,
+     "name": "Record that no suite ran, for reuse replay",
+     "conclusion": "success",
+     "started_at": "2026-10-05T20:28:59Z",
+     "completed_at": "2026-10-05T20:29:03Z"
+    },
+    {
+     "number": 5,
+     "name": "Upload reuse replay record",
+     "conclusion": "success",
+     "started_at": "2026-10-05T20:29:03Z",
+     "completed_at": "2026-10-05T20:29:04Z"
+    },
+    {
+     "number": 6,
+     "name": "Announce a missing reuse replay record",
+     "conclusion": "skipped",
+     "started_at": "2026-10-05T20:29:04Z",
+     "completed_at": "2026-10-05T20:29:04Z"
+    },
+    {
+     "number": 12,
+     "name": "Post Check out the reuse record writer",
+     "conclusion": "success",
+     "started_at": "2026-10-05T20:29:04Z",
+     "completed_at": "2026-10-05T20:29:05Z"
+    },
+    {
+     "number": 13,
+     "name": "Complete job",
+     "conclusion": "success",
+     "started_at": "2026-10-05T20:29:05Z",
+     "completed_at": "2026-10-05T20:29:05Z"
+    }
+   ]
+  },
+  {
+   "id": 111964304771,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "Windows BLE compile-gate (advisory)",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "windows-latest"
+   ],
+   "created_at": "2026-10-05T20:28:21Z",
+   "started_at": "2026-10-05T20:28:21Z",
+   "completed_at": "2026-10-05T20:28:21Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111964304771",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  },
+  {
+   "id": 111964304865,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "a2t-protected-event",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "macos-15"
+   ],
+   "created_at": "2026-10-05T20:28:21Z",
+   "started_at": "2026-10-05T20:28:21Z",
+   "completed_at": "2026-10-05T20:28:21Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111964304865",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  },
+  {
+   "id": 111964304881,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "protected-receipt-reuse",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:28:21Z",
+   "started_at": "2026-10-05T20:28:21Z",
+   "completed_at": "2026-10-05T20:28:21Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111964304881",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  },
+  {
+   "id": 111964305048,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "Windows MSVC release-path gate",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "windows-latest"
+   ],
+   "created_at": "2026-10-05T20:28:21Z",
+   "started_at": "2026-10-05T20:28:21Z",
+   "completed_at": "2026-10-05T20:28:21Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111964305048",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  },
+  {
+   "id": 111964305069,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true') && 'macos' || 'macos-pr-unused'",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:28:21Z",
+   "started_at": "2026-10-05T20:28:21Z",
+   "completed_at": "2026-10-05T20:28:21Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111964305069",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  },
+  {
+   "id": 111964305300,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "Windows MIDI Services SDK compile-gate (advisory)",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "windows-latest"
+   ],
+   "created_at": "2026-10-05T20:28:21Z",
+   "started_at": "2026-10-05T20:28:21Z",
+   "completed_at": "2026-10-05T20:28:21Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111964305300",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  },
+  {
+   "id": 111964306546,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && matrix.key == 'macos' && 'macos' || format('{0} [{1}]', matrix.name, matrix.provider)",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [],
+   "created_at": "2026-10-05T20:28:21Z",
+   "started_at": "2026-10-05T20:28:21Z",
+   "completed_at": "2026-10-05T20:28:21Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111964306546",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  },
+  {
+   "id": 111964307081,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "windows",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:28:21Z",
+   "started_at": "2026-10-05T20:28:21Z",
+   "completed_at": "2026-10-05T20:28:21Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111964307081",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  },
+  {
+   "id": 111964307260,
+   "head_sha": "4aaf6bd97671e23c76586ff1c0c2c4bb2a8a011b",
+   "name": "linux",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:28:21Z",
+   "started_at": "2026-10-05T20:28:21Z",
+   "completed_at": "2026-10-05T20:28:21Z",
+   "run_id": 37367776813,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37367776813/job/111964307260",
+   "head_branch": "gh-readonly-queue/main/pr-9658-120ea94f6dcf5b353f4a0f2b97ae51acd0a86342",
+   "steps": []
+  }
+ ]
+}

@@ -1,0 +1,128 @@
+2026-10-02T21:02:36.8915720Z   REUSE_RECORD_JOB_START: 1790974620
+2026-10-02T21:02:36.8916390Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-02T21:02:36.8917050Z ##[endgroup]
+2026-10-02T21:02:37.1140340Z Cacheable calls:   75973 / 75973 (100.0%)
+2026-10-02T21:02:37.1141100Z   Hits:            74845 / 75973 (98.52%)
+2026-10-02T21:02:37.1141350Z     Direct:        74611 / 74845 (99.69%)
+2026-10-02T21:06:12.5712370Z             Start     3: broker cancellation and revocation fence prepared topology with live audio
+2026-10-02T21:07:17.0963150Z     6/22067 Test #21390: cmake-control-sdk-consumer ..................................................................................................................................***Failed  168.98 sec
+2026-10-02T21:07:17.1016200Z CMake Error at /Users/admin/actions-runner/_work/pulp/pulp/test/cmake/test_control_sdk_consumer.cmake:790 (message):
+2026-10-02T21:11:30.2490200Z 10626/22067 Test #10822: WorkerPool transition waits for every delayed worker before retirement ......................................................................................   Passed    0.03 sec
+2026-10-02T21:11:30.2491540Z             Start 10823: WorkerPool clears a gate-collision reheat only when no worker parked
+2026-10-02T21:11:30.2496680Z 10627/22067 Test #10820: WorkerPool cold workgroup preparation transitions every worker ..............................................................................................   Passed    0.15 sec
+2026-10-02T21:11:30.2505360Z             Start 10824: WorkerPool started on one thread, run() driven from another, is race-free
+2026-10-02T21:11:30.2530590Z 10628/22067 Test #10821: WorkerPool AU borrowed contexts transition synchronously before retirement ..................................................................................   Passed    0.05 sec
+2026-10-02T21:11:30.2642280Z             Start 10825: WorkerPool rapid back-to-back batches from a separate thread are race-free
+2026-10-02T21:11:30.2674370Z           Test #21390: cmake-control-sdk-consumer ..................................................................................................................................***Failed  253.16 sec
+2026-10-02T21:11:30.2676290Z CMake Error at /Users/admin/actions-runner/_work/pulp/pulp/test/cmake/test_control_sdk_consumer.cmake:790 (message):
+2026-10-02T21:11:30.2678780Z   Installed production broker did not launch/register the author host (42)
+2026-10-02T21:11:30.2679240Z 
+2026-10-02T21:11:30.2679450Z   Filters: [author-catalog-process]
+2026-10-02T21:11:30.2679740Z 
+2026-10-02T21:11:30.2679930Z   Randomness seeded to: 839800458
+2026-10-02T21:11:30.2680200Z 
+2026-10-02T21:11:30.2680300Z 
+2026-10-02T21:11:30.2680390Z 
+2026-10-02T21:11:30.2680560Z   
+2026-10-02T21:11:30.2680900Z   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+2026-10-02T21:11:30.2681230Z 
+2026-10-02T21:11:30.2681510Z   pulp-test-control-broker-daemon is a Catch2 v3.7.1 host application.
+2026-10-02T21:11:30.2687370Z   
+2026-10-02T21:11:30.2687780Z   /Users/admin/actions-runner/_work/pulp/pulp/test/test_control_broker_daemon.cpp:1080:
+2026-10-02T21:11:30.2688270Z   FAILED:
+2026-10-02T21:11:30.2688460Z 
+2026-10-02T21:11:30.2688630Z     REQUIRE( connection )
+2026-10-02T21:11:30.2688860Z 
+2026-10-02T21:11:30.2689070Z   with expansion:
+2026-10-02T21:11:30.2689290Z 
+2026-10-02T21:11:30.2689440Z     0
+2026-10-02T21:11:30.2694870Z     60000ms, spent 43051ms; last observed: connected. The budget was NOT
+2026-10-02T21:11:30.2695410Z     exhausted, so raising PULP_TEST_BROKER_WAIT_MS will not help; the launch
+2026-10-02T21:11:30.2704600Z     itself failed.
+2026-10-02T21:11:30.2705150Z 
+2026-10-02T21:11:30.2705160Z 
+2026-10-02T21:11:30.2741040Z     "session_id": "session-59b2b083273a87876bc3464980defc3c"}]. The budget was
+2026-10-02T21:11:30.2741500Z     NOT exhausted, so raising PULP_TEST_BROKER_WAIT_MS will not help; the launch
+2026-10-02T21:11:30.2741850Z     itself failed.
+2026-10-02T21:11:30.2742030Z     Undefined error: 0
+2026-10-02T21:11:30.2742350Z     waited for the enrolled broker to accept a client connection at /private/tmp/
+2026-10-02T21:11:30.2742840Z     pcd-22a552a41489ca69/runtime/pulp-control-501/broker.sock; budget 60000ms,
+2026-10-02T21:11:30.2743300Z     spent 51589ms; last observed: connected. The budget was NOT exhausted, so
+2026-10-02T21:11:30.2743750Z     raising PULP_TEST_BROKER_WAIT_MS will not help; the launch itself failed.
+2026-10-02T21:11:30.2744090Z     Undefined error: 0
+2026-10-02T21:11:30.2744460Z     waited for the enrolled broker to accept a client connection at /private/tmp/
+2026-10-02T21:11:30.2744940Z     pcd-22a552a41489ca69/runtime/pulp-control-501/broker.sock; budget 60000ms,
+2026-10-02T21:11:30.2745400Z     spent 60000ms; last observed: never connected. The budget was exhausted, so
+2026-10-02T21:11:30.2745870Z     this host may simply be slow -- re-run with a larger PULP_TEST_BROKER_WAIT_MS
+2026-10-02T21:11:30.2746250Z     to tell a starved launch from a failed one.
+2026-10-02T21:11:30.2746440Z 
+2026-10-02T21:11:30.2746450Z 
+2026-10-02T21:11:30.2746720Z   ===============================================================================
+2026-10-02T21:11:30.2746930Z 
+2026-10-02T21:11:30.2747020Z   test cases: 1 | 0 passed | 1 failed
+2026-10-02T21:11:30.2747180Z 
+2026-10-02T21:11:30.2747260Z   assertions: 68 | 67 passed | 1 failed
+2026-10-02T21:11:30.2747430Z 
+2026-10-02T21:11:30.2747430Z 
+2026-10-02T21:11:30.2747450Z 
+2026-10-02T21:11:33.0533820Z 10630/22067 Test #10823: WorkerPool clears a gate-collision reheat only when no worker parked ........................................................................................   Passed    2.72 sec
+2026-10-02T21:11:34.6555570Z -------------------------------------------------------------------------------
+2026-10-02T21:11:34.6556190Z GpuSpectralFreeze matches CpuSpectralStack under the unified jitter
+2026-10-02T21:11:34.6556800Z -------------------------------------------------------------------------------
+2026-10-02T21:11:34.6557470Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_gpu_spectral_freeze.cpp:142
+2026-10-02T21:11:34.6558090Z ...............................................................................
+2026-10-02T21:11:34.6558510Z 
+2026-10-02T21:11:34.6558940Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_gpu_spectral_freeze.cpp:174: FAILED:
+2026-10-02T21:11:34.6559550Z   REQUIRE( fz.render(fo.data(), JIT) )
+2026-10-02T21:11:34.6559970Z with expansion:
+2026-10-02T21:11:34.6560340Z   false
+2026-10-02T21:11:34.6560610Z 
+2026-10-02T21:11:34.6662350Z ===============================================================================
+2026-10-02T21:11:34.6662950Z test cases:  1 |  0 passed | 1 failed
+2026-10-02T21:11:34.6663530Z assertions: 12 | 11 passed | 1 failed
+2026-10-02T21:11:34.6663890Z 
+2026-10-02T21:11:34.6664060Z 
+2026-10-02T21:11:34.6664530Z             Start  8150: GpuSpectralFreeze matches CpuSpectralStack under the unified jitter
+2026-10-02T21:11:34.6665870Z 10631/22067 Test #10825: WorkerPool rapid back-to-back batches from a separate thread are race-free ..................................................................................   Passed    4.38 sec
+2026-10-02T21:11:34.6702320Z 10632/22067 Test #10824: WorkerPool started on one thread, run() driven from another, is race-free ...................................................................................   Passed    4.42 sec
+2026-10-02T21:11:36.0076350Z           Test  #8150: GpuSpectralFreeze matches CpuSpectralStack under the unified jitter .........................................................................................   Passed    1.37 sec
+2026-10-02T21:11:36.3547110Z 	10327 - Project package crash proof catches a production reference-admission mutation (Skipped)
+2026-10-02T21:11:36.3547490Z 
+2026-10-02T21:11:36.3547580Z The following tests FAILED:
+2026-10-02T21:11:36.3547950Z 	21390 - cmake-control-sdk-consumer (Failed)               cmake control headless inspect sdk
+2026-10-02T21:11:36.4639050Z Errors while running CTest
+2026-10-02T21:11:46.1271260Z ##[notice]{"schema":"shipyard-test-tier/v1","tier":"full"}
+2026-10-02T21:11:46.1398570Z ##[error]Process completed with exit code 8.
+2026-10-02T21:11:46.1601180Z ##[group]Run python3 tools/ci/a2t_headroom_annotation.py "$RUNNER_TEMP/a2t-scope-headroom.json"
+2026-10-02T21:11:46.1606880Z [36;1mpython3 tools/ci/a2t_headroom_annotation.py "$RUNNER_TEMP/a2t-scope-headroom.json"[0m
+2026-10-02T21:11:46.2027050Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-02T21:11:46.2027390Z env:
+2026-10-02T21:11:46.2027600Z   PULP_BUILD_DIR: build-macos
+2026-10-02T21:11:46.2027840Z   CCACHE_COMPILERCHECK: content
+2026-10-02T21:11:46.2028320Z   CCACHE_NODEPEND: true
+2026-10-02T21:11:46.2028530Z   CCACHE_SLOPPINESS: time_macros
+2026-10-02T21:11:46.2028920Z   PULP_OFFLINE_BUILD: 1
+2026-10-02T21:11:46.2029140Z   REUSE_RECORD_JOB_START: 1790974620
+2026-10-02T21:11:46.2029870Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-02T21:11:46.2030620Z ##[endgroup]
+2026-10-02T21:11:46.5600590Z ##[notice]279 scope-touching revisions of a 512 limit (54%); the gate fails past 384.
+2026-10-02T21:11:46.5753560Z ##[group]Run python3 tools/ci/merge_group_shadows.py run \
+2026-10-02T21:11:46.5760380Z [36;1mpython3 tools/ci/merge_group_shadows.py run \[0m
+2026-10-02T21:11:46.5761920Z [36;1m  --build-dir "$PULP_BUILD_DIR" --source-root "$GITHUB_WORKSPACE" \[0m
+2026-10-02T21:11:46.5767280Z [36;1m  --repository "$GITHUB_REPOSITORY" --merge-sha "$GITHUB_SHA" --token "$GH_TOKEN" \[0m
+2026-10-02T21:11:46.5767900Z [36;1m  --junit "$GITHUB_WORKSPACE/$PULP_BUILD_DIR/ctest.junit.xml" \[0m
+2026-10-02T21:11:46.5768470Z [36;1m  --selected-json "$RUNNER_TEMP/ctest-evidence/selected.json" \[0m
+2026-10-02T21:11:46.5770120Z [36;1m  --ctest-outcome "failure" --hours 24 \[0m
+2026-10-02T21:11:46.5771570Z [36;1m  --work-dir "$RUNNER_TEMP/merge-group-shadows" || true[0m
+2026-10-02T21:11:46.5853020Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-02T21:11:46.5853380Z env:
+2026-10-02T21:11:46.5853600Z   PULP_BUILD_DIR: build-macos
+2026-10-02T21:11:46.5854270Z   CCACHE_COMPILERCHECK: content
+2026-10-02T21:11:46.5854530Z   CCACHE_NODEPEND: true
+2026-10-02T21:11:46.5854780Z   CCACHE_SLOPPINESS: time_macros
+2026-10-02T21:11:46.5875480Z   PULP_OFFLINE_BUILD: 1
+2026-10-02T21:11:46.5875930Z   REUSE_RECORD_JOB_START: 1790974620
+2026-10-02T21:11:46.5876740Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-02T21:11:46.5877560Z   PULP_GH_CLI: gh
+2026-10-02T21:11:46.5900550Z   GH_TOKEN: ***
+2026-10-02T21:11:46.5900950Z ##[endgroup]

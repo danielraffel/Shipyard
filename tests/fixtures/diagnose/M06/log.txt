@@ -1,0 +1,80 @@
+2026-10-04T23:24:09.7468290Z     |     ^^^^^^^^^^^^^^^^^^^^^
+2026-10-04T23:24:09.7468350Z 
+2026-10-04T23:24:16.5894800Z warning: `pulp-rs` (lib) generated 8 warnings
+2026-10-04T23:24:24.7795010Z     Finished `release` profile [optimized] target(s) in 24.88s
+2026-10-04T23:24:24.8040000Z [4445/4460] Linking CXX executable tools/cli/pulp-test-cli-bake
+2026-10-04T23:24:24.8040500Z ld: warning: ignoring duplicate libraries: 'core/runtime/libpulp-runtime.a'
+2026-10-04T23:27:39.2222760Z             Start 13181: Interrupt cancels a queued request instead of arming the next eval
+2026-10-04T23:27:39.2242470Z 12856/22290 Test #13159: QuickJS evaluate_script waits for an in-flight precompile of the same source ................................................................................***Failed    0.05 sec
+2026-10-04T23:27:39.2242920Z Filters: "QuickJS evaluate_script waits for an in-flight precompile of the same source"
+2026-10-04T23:27:39.2557800Z 12860/22290 Test #13184: Color from hex ..............................................................................................................................................   Passed    0.01 sec
+2026-10-04T23:27:39.2559040Z             Start 13186: Theme light has required tokens
+2026-10-04T23:27:39.2600450Z 12861/22290 Test #13185: Theme dark has required tokens ..............................................................................................................................   Passed    0.01 sec
+2026-10-04T23:27:39.2601710Z             Start 13187: Theme pro_audio has required tokens
+2026-10-04T23:27:39.2636270Z 12862/22290 Test #13186: Theme light has required tokens .............................................................................................................................   Passed    0.01 sec
+2026-10-04T23:27:39.2637140Z             Start 13188: Theme apply_overrides
+2026-10-04T23:27:39.2665540Z           Test #13159: QuickJS evaluate_script waits for an in-flight precompile of the same source ................................................................................***Failed    0.04 sec
+2026-10-04T23:27:39.2665940Z Filters: "QuickJS evaluate_script waits for an in-flight precompile of the same source"
+2026-10-04T23:27:39.2666150Z Randomness seeded to: 2222321153
+2026-10-04T23:27:39.2666220Z 
+2026-10-04T23:27:39.2666300Z ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+2026-10-04T23:27:39.2666490Z pulp-test-group-script-view is a Catch2 v3.7.1 host application.
+2026-10-04T23:27:39.2666660Z Run with -? for options
+2026-10-04T23:27:39.2666730Z 
+2026-10-04T23:27:39.2666800Z -------------------------------------------------------------------------------
+2026-10-04T23:27:39.2667010Z QuickJS evaluate_script waits for an in-flight precompile of the same source
+2026-10-04T23:27:39.2667230Z -------------------------------------------------------------------------------
+2026-10-04T23:27:39.2667450Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_js_engine.cpp:978
+2026-10-04T23:27:39.2667650Z ...............................................................................
+2026-10-04T23:27:39.2667760Z 
+2026-10-04T23:27:39.2667860Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_js_engine.cpp:1004: FAILED:
+2026-10-04T23:27:39.2668040Z   CHECK( stats.waits == 1 )
+2026-10-04T23:27:39.2668160Z with expansion:
+2026-10-04T23:27:39.2668240Z   0 == 1
+2026-10-04T23:27:39.2668290Z 
+2026-10-04T23:27:39.2668340Z ===============================================================================
+2026-10-04T23:27:39.2668480Z test cases: 1 | 1 failed
+2026-10-04T23:27:39.2668580Z assertions: 5 | 4 passed | 1 failed
+2026-10-04T23:27:39.2668660Z 
+2026-10-04T23:27:39.2668660Z 
+2026-10-04T23:27:39.2687810Z 12864/22290 Test #12582: HeadlessSurface renders a deterministic clear-only frame ....................................................................................................   Passed    0.09 sec
+2026-10-04T23:27:39.3404680Z 	13137 - V8 engine reports a non-empty runtime version and provider identity (Skipped)
+2026-10-04T23:27:39.3404830Z 
+2026-10-04T23:27:39.3404870Z The following tests FAILED:
+2026-10-04T23:27:39.3405040Z 	13159 - QuickJS evaluate_script waits for an in-flight precompile of the same source (Failed)
+2026-10-04T23:27:39.3896010Z Errors while running CTest
+2026-10-04T23:27:41.2763730Z ##[notice]{"schema":"shipyard-test-tier/v1","tier":"full"}
+2026-10-04T23:27:41.2767620Z ##[error]Process completed with exit code 8.
+2026-10-04T23:27:41.2829850Z ##[group]Run python3 tools/ci/a2t_headroom_annotation.py "$RUNNER_TEMP/a2t-scope-headroom.json"
+2026-10-04T23:27:41.2830200Z [36;1mpython3 tools/ci/a2t_headroom_annotation.py "$RUNNER_TEMP/a2t-scope-headroom.json"[0m
+2026-10-04T23:27:41.2851970Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-04T23:27:41.2852110Z env:
+2026-10-04T23:27:41.2852220Z   PULP_BUILD_DIR: build-macos
+2026-10-04T23:27:41.2852330Z   CCACHE_COMPILERCHECK: content
+2026-10-04T23:27:41.2852440Z   CCACHE_NODEPEND: true
+2026-10-04T23:27:41.2852530Z   CCACHE_SLOPPINESS: time_macros
+2026-10-04T23:27:41.2852640Z   PULP_OFFLINE_BUILD: 1
+2026-10-04T23:27:41.2852740Z   REUSE_RECORD_JOB_START: 1791155958
+2026-10-04T23:27:41.2853090Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-04T23:27:41.2853440Z ##[endgroup]
+2026-10-04T23:27:41.3411590Z ##[notice]142 scope-touching revisions of a 512 limit (28%); the gate fails past 384.
+2026-10-04T23:27:41.3474120Z ##[group]Run python3 tools/ci/merge_group_shadows.py run \
+2026-10-04T23:27:41.3474370Z [36;1mpython3 tools/ci/merge_group_shadows.py run \[0m
+2026-10-04T23:27:41.3474590Z [36;1m  --build-dir "$PULP_BUILD_DIR" --source-root "$GITHUB_WORKSPACE" \[0m
+2026-10-04T23:27:41.3474840Z [36;1m  --repository "$GITHUB_REPOSITORY" --merge-sha "$GITHUB_SHA" --token "$GH_TOKEN" \[0m
+2026-10-04T23:27:41.3475120Z [36;1m  --junit "$GITHUB_WORKSPACE/$PULP_BUILD_DIR/ctest.junit.xml" \[0m
+2026-10-04T23:27:41.3475340Z [36;1m  --selected-json "$RUNNER_TEMP/ctest-evidence/selected.json" \[0m
+2026-10-04T23:27:41.3475530Z [36;1m  --ctest-outcome "failure" --hours 24 \[0m
+2026-10-04T23:27:41.3475740Z [36;1m  --work-dir "$RUNNER_TEMP/merge-group-shadows" || true[0m
+2026-10-04T23:27:41.3491480Z shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-04T23:27:41.3491670Z env:
+2026-10-04T23:27:41.3491770Z   PULP_BUILD_DIR: build-macos
+2026-10-04T23:27:41.3491950Z   CCACHE_COMPILERCHECK: content
+2026-10-04T23:27:41.3492090Z   CCACHE_NODEPEND: true
+2026-10-04T23:27:41.3492210Z   CCACHE_SLOPPINESS: time_macros
+2026-10-04T23:27:41.3492460Z   PULP_OFFLINE_BUILD: 1
+2026-10-04T23:27:41.3492600Z   REUSE_RECORD_JOB_START: 1791155958
+2026-10-04T23:27:41.3492990Z   PULP_DESIGN_BROWSER: /Users/admin/actions-runner/_work/_temp/pulp-chrome-for-testing-151.0.7922.47/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+2026-10-04T23:27:41.3493420Z   PULP_GH_CLI: gh
+2026-10-04T23:27:41.3494990Z   GH_TOKEN: ***
+2026-10-04T23:27:41.3495110Z ##[endgroup]

@@ -1,0 +1,2 @@
+tools/ci/test_macos_merge_group_bootstrap.py
+tools/scripts/test_text_encoding_lint.py

@@ -1,0 +1,90 @@
+{
+ "schema": "shipyard.diagnose/v1",
+ "verdict": "red",
+ "summary": "1 required check(s) failed. macos: real, 1 test, step 'Test (non-Windows)'",
+ "checks": [
+  {
+   "context": "macos",
+   "conclusion": "failure",
+   "run_id": 37507910762,
+   "run_attempt": 1,
+   "job_id": 112421427124,
+   "runner": {
+    "name": "m5studio-pulp-gate-01-53577-98",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "pulp-build"
+    ]
+   },
+   "timing_s": {
+    "queued": 141,
+    "ran": 1037
+   },
+   "failing_step": {
+    "number": 35,
+    "name": "Test (non-Windows)",
+    "conclusion": "failure"
+   },
+   "classification": {
+    "class": "real",
+    "rule": "default",
+    "why": "no infra, stale-base, interruption or flake evidence"
+   },
+   "failing_tests": {
+    "names": [
+     "pulp-rust-cli-cargo-tests"
+    ],
+    "total": 1,
+    "truncated": false
+   },
+   "passed_on_retry": null,
+   "evidence": [
+    {
+     "kind": "test",
+     "line": 16,
+     "test": "pulp-rust-cli-cargo-tests",
+     "repeats": 2,
+     "lines": [
+      "Test #22793: pulp-rust-cli-cargo-tests ...................................................................................................................................***Failed   14.36 sec",
+      "test error::tests::it_renders_io_with_path_and_cause ... ok",
+      "test error::tests::it_stringifies_unknown_subcommand_for_c_plus_plus_parity ... ok",
+      "test help_banner_matches_cpp_output ... FAILED",
+      "test unknown_command_still_suggests_without_a_delegate ... ok",
+      "thread 'help_banner_matches_cpp_output' (281284) panicked at tests/help_parity_test.rs:67:5:",
+      "help banner diverged from C++ reference",
+      "test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+      "error: test failed, to rerun pass `--test help_parity_test`",
+      "     Running tests/identity_smoke_test.rs (cargo-test/target/debug/deps/identity_smoke_test-057caffa1d2ec39c)",
+      "error: 1 target failed:",
+      "    `--test help_parity_test`"
+     ]
+    }
+   ],
+   "evidence_truncated": false,
+   "more": {
+    "job_url": "https://github.com/Generous-Corp/pulp/actions/runs/37507910762/job/112421427124",
+    "log_lines": 196,
+    "log_bytes": 15831,
+    "step_lines": [
+     4,
+     196
+    ],
+    "fetch": "gh run view 37507910762 --job 112421427124 --log"
+   }
+  }
+ ],
+ "omitted_checks": [],
+ "advisory_failures": {
+  "count": 1,
+  "names": [
+   "Linux (x64) [github-hosted]"
+  ]
+ },
+ "bounds": {
+  "max_bytes": 16384,
+  "truncated": false,
+  "bytes": 2103
+ }
+}

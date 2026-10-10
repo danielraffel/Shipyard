@@ -56,6 +56,15 @@ shipyard base-health --workflow FILE         # detector workflow (default base_h
 shipyard base-health --act                   # apply base_health.auto_jump: off (default; reads nothing) | dry-run (records "would jump PR #n"
                                              #   once per episode in <state>/base-health/jump-decisions.jsonl) | on (dequeue + enqueue jump:true)
 
+# Why is it red? Bounded diagnosis instead of reading a 10 MB job log (shipyard.diagnose/v1)
+shipyard diagnose 123                        # PR head: per failing REQUIRED check the step, tests, <=5 evidence groups,
+                                             #   runner, class (infra | interrupted | stale_base | flake_candidate | real),
+                                             #   rule, and the command for the full log; never over --max-bytes (16384)
+shipyard diagnose --run ID [--required NAME] # one workflow run (required checks from the base policy unless named)
+shipyard --json diagnose 123                 # the JSON document
+shipyard diagnose 123 --annotate plan|post   # check-run annotations on the failing file:line (neutral "shipyard diagnose" check run)
+                                             # config: [diagnose] stale_base_markers / fail_closed_markers = ["regex", ...]
+
 # ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard)
 shipyard guards status                       # missing/stale/current vs this build's copies; exit 1 unless all current
 shipyard guards install [--dir DIR] [--dry-run]  # install this build's copies atomically

@@ -1,0 +1,196 @@
+2026-10-05T04:43:11.1688953Z  * [new branch]            --help                  -> origin/--help
+2026-10-05T04:43:11.1690004Z  * [new branch]            agent-c/rn-parser       -> origin/agent-c/rn-parser
+2026-10-05T04:43:11.1691135Z  * [new branch]            agent-c/source-contracts-ci -> origin/agent-c/source-contracts-ci
+2026-10-05T04:43:11.1692131Z  * [new branch]            agent-c/source-contracts-pr1 -> origin/agent-c/source-contracts-pr1
+2026-10-05T04:43:11.1693263Z  * [new branch]            agent-c/source-contracts-pr2 -> origin/agent-c/source-contracts-pr2
+2026-10-05T04:43:11.1694284Z  * [new branch]            agent-c/v0-dev-parser   -> origin/agent-c/v0-dev-parser
+2026-10-05T04:43:11.1695226Z  * [new branch]            agent/bootstrap-pr-safe-linux-main -> origin/agent/bootstrap-pr-safe-linux-main
+2026-10-05T04:43:11.1696569Z  * [new branch]            agent/codex-quota-diagnostic-20260814 -> origin/agent/codex-quota-diagnostic-20260814
+2026-10-05T04:43:11.1697935Z  * [new branch]            agentB/1576-resolveCSSLength-fresh -> origin/agentB/1576-resolveCSSLength-fresh
+2026-10-05T04:43:11.1699355Z  * [new branch]            agentB/cov-1739-canvas2d-drawImage -> origin/agentB/cov-1739-canvas2d-drawImage
+2026-10-05T04:43:11.1700613Z  * [new branch]            agentB/listStyleType-roman-alpha -> origin/agentB/listStyleType-roman-alpha
+2026-10-05T04:43:11.1702218Z  * [new branch]            agentB/rn-cursor-mac-partial -> origin/agentB/rn-cursor-mac-partial
+2026-10-05T04:43:11.1703411Z  * [new branch]            agentB/scanner-clap-dlerror-asan -> origin/agentB/scanner-clap-dlerror-asan
+2026-10-05T04:43:11.1704725Z  * [new branch]            agentB/textAlign-match-parent -> origin/agentB/textAlign-match-parent
+2026-10-05T04:43:11.1706056Z  * [new branch]            agentB/tier2-trivial-honest-reclass -> origin/agentB/tier2-trivial-honest-reclass
+2026-10-05T04:43:11.1707385Z  * [new branch]            agentB/tier4-oos-3d-content-reclass -> origin/agentB/tier4-oos-3d-content-reclass
+2026-10-05T04:43:11.1708834Z  * [new branch]            agentB/tier4-perf-misc-reclass -> origin/agentB/tier4-perf-misc-reclass
+2026-10-05T04:43:11.1710142Z  * [new branch]            agentB/tier4-selector-class-intentional -> origin/agentB/tier4-selector-class-intentional
+2026-10-05T04:43:11.1711445Z  * [new branch]            agentB/tier4-yoga-arch-reclass -> origin/agentB/tier4-yoga-arch-reclass
+2026-10-05T04:43:11.1712817Z  * [new branch]            archive/p0a-real-gpu-receipt-20260919-preforce -> origin/archive/p0a-real-gpu-receipt-20260919-preforce
+2026-10-05T04:43:11.1714207Z  * [new branch]            audit/audio-model-activate-docs -> origin/audit/audio-model-activate-docs
+2026-10-05T04:43:11.1715384Z  * [new branch]            audit/compat-refresh-2026-05-03 -> origin/audit/compat-refresh-2026-05-03
+2026-10-05T04:43:11.1716585Z  * [new branch]            audit/compat-refresh-2026-05-04 -> origin/audit/compat-refresh-2026-05-04
+2026-10-05T04:43:11.1717742Z  * [new branch]            audit/compat-triage-2026-05-03 -> origin/audit/compat-triage-2026-05-03
+2026-10-05T04:43:11.1719199Z  * [new branch]            audit/coverage-filters-silent-noop-1052 -> origin/audit/coverage-filters-silent-noop-1052
+2026-10-05T04:43:11.1721023Z  * [new branch]            audit/gpu-wavenet-shared-provider-boundary-20260925 -> origin/audit/gpu-wavenet-shared-provider-boundary-20260925
+2026-10-05T04:43:11.1722465Z  * [new branch]            audit/metal4-comparator-20260925 -> origin/audit/metal4-comparator-20260925
+2026-10-05T04:43:11.1723752Z  * [new branch]            audit/package-search-refresh-fallthrough -> origin/audit/package-search-refresh-fallthrough
+2026-10-05T04:43:11.1725176Z  * [new branch]            audit/physmod-completion-20260718 -> origin/audit/physmod-completion-20260718
+2026-10-05T04:43:11.1726676Z  * [new branch]            audit/pulpsampler-docs  -> origin/audit/pulpsampler-docs
+2026-10-05T04:43:11.1727928Z  * [new branch]            audit/pulpsampler-screenshot-gain -> origin/audit/pulpsampler-screenshot-gain
+2026-10-05T04:43:11.1729231Z  * [new branch]            audit/ship-check-platform-codesign -> origin/audit/ship-check-platform-codesign
+2026-10-05T04:43:11.1730213Z  * [new branch]            backfill/v0.395.0-release-cli -> origin/backfill/v0.395.0-release-cli
+2026-10-05T04:43:11.1731243Z  * [new branch]            batch/core-view-runtime-20260912 -> origin/batch/core-view-runtime-20260912
+2026-10-05T04:43:11.1732362Z  * [new branch]            batch/lv2-adapter-and-skill-20260920 -> origin/batch/lv2-adapter-and-skill-20260920
+2026-10-05T04:43:11.1733581Z  * [new branch]            batch/midi-message-coverage-20260920 -> origin/batch/midi-message-coverage-20260920
+2026-10-05T04:43:11.1734697Z  * [new branch]            batch/tooling-ship-ci-20260912 -> origin/batch/tooling-ship-ci-20260912
+2026-10-05T04:43:11.1735653Z  * [new branch]            build/header-fanout     -> origin/build/header-fanout
+2026-10-05T04:43:11.1736765Z  * [new branch]            chore/a3-retire-workstream-handoff-guidance -> origin/chore/a3-retire-workstream-handoff-guidance
+2026-10-05T04:43:11.1738270Z  * [new branch]            chore/batched-stack-v0.77.0 -> origin/chore/batched-stack-v0.77.0
+2026-10-05T04:43:11.1739286Z  * [new branch]            chore/batched-stack-version-bump -> origin/chore/batched-stack-version-bump
+2026-10-05T04:43:11.1740291Z  * [new branch]            chore/bump-0.68.2       -> origin/chore/bump-0.68.2
+2026-10-05T04:43:11.1741548Z  * [new branch]            chore/bump-0.72.4-1348-catchup -> origin/chore/bump-0.72.4-1348-catchup
+2026-10-05T04:43:11.1742552Z  * [new branch]            chore/bump-after-1008   -> origin/chore/bump-after-1008
+2026-10-05T04:43:11.1743492Z  * [new branch]            chore/bump-after-1295   -> origin/chore/bump-after-1295
+2026-10-05T04:43:11.1744481Z  * [new branch]            chore/bump-after-329a103a-imp153 -> origin/chore/bump-after-329a103a-imp153
+2026-10-05T04:43:11.1745481Z  * [new branch]            chore/bump-after-67f4c98f -> origin/chore/bump-after-67f4c98f
+2026-10-05T04:43:11.1746424Z  * [new branch]            chore/bump-after-8355aef1 -> origin/chore/bump-after-8355aef1
+2026-10-05T04:43:11.1747361Z  * [new branch]            chore/bump-after-ee159335 -> origin/chore/bump-after-ee159335
+2026-10-05T04:43:11.1748464Z  * [new branch]            chore/bump-sdk-066-catchup -> origin/chore/bump-sdk-066-catchup
+2026-10-05T04:43:11.1749517Z  * [new branch]            chore/bump-shipyard-0.21.1 -> origin/chore/bump-shipyard-0.21.1
+2026-10-05T04:43:11.1750509Z  * [new branch]            chore/bump-shipyard-0.3.0 -> origin/chore/bump-shipyard-0.3.0
+2026-10-05T04:43:11.1751464Z  * [new branch]            chore/bump-shipyard-0.67.0 -> origin/chore/bump-shipyard-0.67.0
+2026-10-05T04:43:11.1752476Z  * [new branch]            chore/bump-shipyard-0.8.0 -> origin/chore/bump-shipyard-0.8.0
+2026-10-05T04:43:11.1753715Z  * [new branch]            chore/bump-shipyard-pin-to-v0.143.0 -> origin/chore/bump-shipyard-pin-to-v0.143.0
+2026-10-05T04:43:11.1754922Z  * [new branch]            chore/bump-shipyard-pin-to-v0.46.0 -> origin/chore/bump-shipyard-pin-to-v0.46.0
+2026-10-05T04:43:11.1756079Z  * [new branch]            chore/bump-shipyard-pin-to-v0.78.0 -> origin/chore/bump-shipyard-pin-to-v0.78.0
+2026-10-05T04:43:11.1757539Z  * [new branch]            chore/bump-shipyard-pin-to-v0.80.3 -> origin/chore/bump-shipyard-pin-to-v0.80.3
+2026-10-05T04:43:11.1758876Z  * [new branch]            chore/bump-shipyard-pin-to-v0.83.0 -> origin/chore/bump-shipyard-pin-to-v0.83.0
+2026-10-05T04:43:11.1759989Z  * [new branch]            chore/bump-shipyard-pin-to-v0.91.2 -> origin/chore/bump-shipyard-pin-to-v0.91.2
+2026-10-05T04:43:11.1761043Z  * [new branch]            chore/bump-shipyard-v0.21.0 -> origin/chore/bump-shipyard-v0.21.0
+2026-10-05T04:43:11.1761963Z  * [new branch]            chore/bump-v0.101.2     -> origin/chore/bump-v0.101.2
+2026-10-05T04:43:11.1762801Z  * [new branch]            chore/bump-v0.24.0      -> origin/chore/bump-v0.24.0
+2026-10-05T04:43:11.1763665Z  * [new branch]            chore/ci-nscloud-cache  -> origin/chore/ci-nscloud-cache
+2026-10-05T04:43:11.1764746Z  * [new branch]            chore/ci-skill-rebase-hygiene -> origin/chore/ci-skill-rebase-hygiene
+2026-10-05T04:43:11.1765749Z  * [new branch]            chore/codex-review-sweep-2 -> origin/chore/codex-review-sweep-2
+2026-10-05T04:43:11.1766785Z  * [new branch]            chore/codex-review-sweep-batch -> origin/chore/codex-review-sweep-batch
+2026-10-05T04:43:11.1767968Z  * [new branch]            chore/control-digest-single-source -> origin/chore/control-digest-single-source
+2026-10-05T04:43:11.1769333Z  * [new branch]            chore/coverage-phase1-rebaseline-docs -> origin/chore/coverage-phase1-rebaseline-docs
+2026-10-05T04:43:11.1770519Z  * [new branch]            chore/css-noop-wontfix-reclassify -> origin/chore/css-noop-wontfix-reclassify
+2026-10-05T04:43:11.1771663Z  * [new branch]            chore/cut-v0.396.0      -> origin/chore/cut-v0.396.0
+2026-10-05T04:43:11.1772701Z  * [new branch]            chore/delete-merge-steward -> origin/chore/delete-merge-steward
+2026-10-05T04:43:11.1773838Z  * [new branch]            chore/demo-source-links-generous-corp -> origin/chore/demo-source-links-generous-corp
+2026-10-05T04:43:11.1775065Z  * [new branch]            chore/deps-low-risk-bumps-20260830 -> origin/chore/deps-low-risk-bumps-20260830
+2026-10-05T04:43:11.1776163Z  * [new branch]            chore/drop-us-english-guard -> origin/chore/drop-us-english-guard
+2026-10-05T04:43:11.1777478Z  * [new branch]            chore/enable-refresh-branch-policy -> origin/chore/enable-refresh-branch-policy
+2026-10-05T04:43:11.1778838Z  * [new branch]            chore/figma-plugin-published-id -> origin/chore/figma-plugin-published-id
+2026-10-05T04:43:11.1779900Z  * [new branch]            chore/fleet-expected-hosts -> origin/chore/fleet-expected-hosts
+2026-10-05T04:43:11.1781024Z  * [new branch]            chore/format-changed-gotcha-and-path-map -> origin/chore/format-changed-gotcha-and-path-map
+2026-10-05T04:43:11.1782287Z  * [new branch]            chore/gitignore-skia-build-diffcover-doc -> origin/chore/gitignore-skia-build-diffcover-doc
+2026-10-05T04:43:11.1783526Z  * [new branch]            chore/jsx-contract-reverify-20260820 -> origin/chore/jsx-contract-reverify-20260820
+2026-10-05T04:43:11.1784733Z  * [new branch]            chore/land-ci-batch     -> origin/chore/land-ci-batch
+2026-10-05T04:43:11.1785743Z  * [new branch]            chore/ledger-reconcile-exposure -> origin/chore/ledger-reconcile-exposure
+2026-10-05T04:43:11.1786727Z  * [new branch]            chore/lineage-list-perf -> origin/chore/lineage-list-perf
+2026-10-05T04:43:11.1787707Z  * [new branch]            chore/namespace-recommissioned -> origin/chore/namespace-recommissioned
+2026-10-05T04:43:11.1788861Z  * [new branch]            chore/org-ref-sweep     -> origin/chore/org-ref-sweep
+2026-10-05T04:43:11.1789816Z  * [new branch]            chore/org-residual-pulp-sweep -> origin/chore/org-residual-pulp-sweep
+2026-10-05T04:43:11.1790895Z  * [new branch]            chore/paced-probe-long-run-20260926 -> origin/chore/paced-probe-long-run-20260926
+2026-10-05T04:43:11.1792035Z  * [new branch]            chore/planning-pointer-viewbridge -> origin/chore/planning-pointer-viewbridge
+2026-10-05T04:43:11.1793410Z  * [new branch]            chore/reanchor-version-at-land-20260727 -> origin/chore/reanchor-version-at-land-20260727
+2026-10-05T04:43:11.1794638Z  * [new branch]            chore/refresh-consumption-census -> origin/chore/refresh-consumption-census
+2026-10-05T04:43:11.1795726Z  * [new branch]            chore/release-0634-linux-glibc234 -> origin/chore/release-0634-linux-glibc234
+2026-10-05T04:43:11.1796849Z  * [new branch]            chore/release-backlog-v0.459.2 -> origin/chore/release-backlog-v0.459.2
+2026-10-05T04:43:11.1797930Z  * [new branch]            chore/release-desk-clean-bump -> origin/chore/release-desk-clean-bump
+2026-10-05T04:43:11.1799120Z  * [new branch]            chore/release-min-os-sdk -> origin/chore/release-min-os-sdk
+2026-10-05T04:43:11.1800200Z  * [new branch]            chore/remove-bitches-brew-example -> origin/chore/remove-bitches-brew-example
+2026-10-05T04:43:11.1801409Z  * [new branch]            chore/scrub-private-importer-consumers -> origin/chore/scrub-private-importer-consumers
+2026-10-05T04:43:11.1802753Z  * [new branch]            chore/sequencer-followon-code-health-20260919 -> origin/chore/sequencer-followon-code-health-20260919
+2026-10-05T04:43:11.1804042Z  * [new branch]            chore/ship-docs-drift-20260902 -> origin/chore/ship-docs-drift-20260902
+2026-10-05T04:43:11.1805006Z  * [new branch]            chore/shipyard-0.58.0   -> origin/chore/shipyard-0.58.0
+2026-10-05T04:43:11.1805875Z  * [new branch]            chore/shipyard-0.59.0   -> origin/chore/shipyard-0.59.0
+2026-10-05T04:43:11.1807071Z  * [new branch]            chore/shipyard-controller-schedule-current-20260815 -> origin/chore/shipyard-controller-schedule-current-20260815
+2026-10-05T04:43:11.1808512Z  * [new branch]            chore/shipyard-mac-timeout-bump -> origin/chore/shipyard-mac-timeout-bump
+2026-10-05T04:43:11.1809570Z  * [new branch]            chore/shipyard-pin-0.269.0 -> origin/chore/shipyard-pin-0.269.0
+2026-10-05T04:43:11.1810575Z  * [new branch]            chore/shipyard-pin-0802-20260730 -> origin/chore/shipyard-pin-0802-20260730
+2026-10-05T04:43:11.1811667Z  * [new branch]            chore/shipyard-pin-v0.262.0 -> origin/chore/shipyard-pin-v0.262.0
+2026-10-05T04:43:11.1812897Z  * [new branch]            chore/shipyard-pin-v0.29.0 -> origin/chore/shipyard-pin-v0.29.0
+2026-10-05T04:43:11.1813862Z  * [new branch]            chore/shipyard-pin-v0.35.0 -> origin/chore/shipyard-pin-v0.35.0
+2026-10-05T04:43:11.1814921Z  * [new branch]            chore/shipyard-pin-v0.46.0-clean -> origin/chore/shipyard-pin-v0.46.0-clean
+2026-10-05T04:43:11.1815986Z  * [new branch]            chore/shipyard-pin-v0.68.0 -> origin/chore/shipyard-pin-v0.68.0
+2026-10-05T04:43:11.1817227Z  * [new branch]            chore/shipyard-upstream-fixes-retire-workarounds -> origin/chore/shipyard-upstream-fixes-retire-workarounds
+2026-10-05T04:43:11.1818624Z  * [new branch]            chore/shipyard-v0.38.0-revert-chcp -> origin/chore/shipyard-v0.38.0-revert-chcp
+2026-10-05T04:43:11.1819662Z  * [new branch]            chore/shipyard-v0.40.0  -> origin/chore/shipyard-v0.40.0
+2026-10-05T04:43:11.1820971Z  * [new branch]            chore/software-gpu-proof-lane-20260926 -> origin/chore/software-gpu-proof-lane-20260926
+2026-10-05T04:43:11.1822325Z  * [new branch]            chore/source-contract-recheck-20260820 -> origin/chore/source-contract-recheck-20260820
+2026-10-05T04:43:11.1823560Z  * [new branch]            chore/source-neutral-corpus-identifiers -> origin/chore/source-neutral-corpus-identifiers
+2026-10-05T04:43:11.1824826Z  * [new branch]            chore/spectr-format-validation-20260809 -> origin/chore/spectr-format-validation-20260809
+2026-10-05T04:43:11.1825955Z  * [new branch]            chore/trigger-release-0.159.0 -> origin/chore/trigger-release-0.159.0
+2026-10-05T04:43:11.1826954Z  * [new branch]            chore/web-player-0.2.0  -> origin/chore/web-player-0.2.0
+2026-10-05T04:43:11.1827836Z  * [new branch]            chore/web-player-0.2.1  -> origin/chore/web-player-0.2.1
+2026-10-05T04:43:11.1829225Z  * [new branch]            chore/web-player-publish-script -> origin/chore/web-player-publish-script
+2026-10-05T04:43:11.1830271Z  * [new branch]            chore/web-player-rename -> origin/chore/web-player-rename
+2026-10-05T04:43:11.1831501Z  * [new branch]            chore/web-player-unattended-publish -> origin/chore/web-player-unattended-publish
+2026-10-05T04:43:11.1832604Z  * [new branch]            chore/web-player-unprivate -> origin/chore/web-player-unprivate
+2026-10-05T04:43:11.1833614Z  * [new branch]            chore/worktree-reaper-20260902 -> origin/chore/worktree-reaper-20260902
+2026-10-05T04:43:11.1834654Z  * [new branch]            ci/8324-label-exclusion-lint -> origin/ci/8324-label-exclusion-lint
+2026-10-05T04:43:11.1835691Z  * [new branch]            ci/a2t-headroom-early-warning -> origin/ci/a2t-headroom-early-warning
+2026-10-05T04:43:11.1836722Z  * [new branch]            ci/advisory-lane-signal -> origin/ci/advisory-lane-signal
+2026-10-05T04:43:11.1837630Z  * [new branch]            ci/agent-pokayoke       -> origin/ci/agent-pokayoke
+2026-10-05T04:43:11.1838781Z  * [new branch]            ci/android-emulator-redisable-hvf -> origin/ci/android-emulator-redisable-hvf
+2026-10-05T04:43:11.1839843Z  * [new branch]            ci/android-emulator-smoke -> origin/ci/android-emulator-smoke
+2026-10-05T04:43:11.1840707Z  * [new branch]            ci/bootstrap-step-timeout -> origin/ci/bootstrap-step-timeout
+2026-10-05T04:43:11.1841344Z  * [new branch]            ci/bound-slow-selftests -> origin/ci/bound-slow-selftests
+2026-10-05T04:43:11.1841961Z  * [new branch]            ci/branch-protection-alias-jobs -> origin/ci/branch-protection-alias-jobs
+2026-10-05T04:43:11.1842579Z  * [new branch]            ci/build-dir-lock-cpp   -> origin/ci/build-dir-lock-cpp
+2026-10-05T04:43:11.1843375Z  * [new branch]            ci/build-perf-tier1     -> origin/ci/build-perf-tier1
+2026-10-05T04:43:11.1844272Z  * [new branch]            ci/build-poka-yokes     -> origin/ci/build-poka-yokes
+2026-10-05T04:43:11.1845093Z  * [new branch]            ci/bump-fastpath-pr-merge-ref -> origin/ci/bump-fastpath-pr-merge-ref
+2026-10-05T04:43:11.1845928Z  * [new branch]            ci/classify-wide-non-native -> origin/ci/classify-wide-non-native
+2026-10-05T04:43:11.1846898Z  * [new branch]            ci/claude-md-sync-user-install -> origin/ci/claude-md-sync-user-install
+2026-10-05T04:43:11.1847744Z  * [new branch]            ci/codemodel-generated-content -> origin/ci/codemodel-generated-content
+2026-10-05T04:43:11.1848854Z  * [new branch]            ci/codex-p1-coverage-crossplatform -> origin/ci/codex-p1-coverage-crossplatform
+2026-10-05T04:43:11.1852833Z  * [new branch]            ci/compat-sync-hook-1029 -> origin/ci/compat-sync-hook-1029
+2026-10-05T04:43:11.1853764Z  * [new branch]            ci/coordinate-cli-constants-fixtures -> origin/ci/coordinate-cli-constants-fixtures
+2026-10-05T04:43:11.1854581Z  * [new branch]            ci/coordinate-derisk    -> origin/ci/coordinate-derisk
+2026-10-05T04:43:11.1855419Z  * [new branch]            ci/coordinate-reattach-shipyard-release -> origin/ci/coordinate-reattach-shipyard-release
+2026-10-05T04:43:11.1856424Z  * [new branch]            ci/coverage-budget-kill-unconditional -> origin/ci/coverage-budget-kill-unconditional
+2026-10-05T04:43:11.1857291Z  * [new branch]            ci/coverage-diff-gate-hang -> origin/ci/coverage-diff-gate-hang
+2026-10-05T04:43:11.1858029Z  * [new branch]            ci/coverage-p1-followups -> origin/ci/coverage-p1-followups
+2026-10-05T04:43:11.1858887Z  * [new branch]            ci/ctest-nonrun-visibility -> origin/ci/ctest-nonrun-visibility
+2026-10-05T04:43:13.9488375Z   Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.14/x64
+2026-10-05T04:43:13.9488713Z   LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.12.14/x64/lib
+2026-10-05T04:43:13.9488971Z ##[endgroup]
+2026-10-05T04:43:14.0046940Z docs-sync: no mapped paths touched — nothing to verify.
+2026-10-05T04:43:14.0140439Z ##[group]Run # Intent-trailer model is LIVE (version-at-land runs --push): a
+2026-10-05T04:43:14.0140890Z [36;1m# Intent-trailer model is LIVE (version-at-land runs --push): a[0m
+2026-10-05T04:43:14.0145928Z [36;1mpython3 tools/scripts/version_bump_check.py \[0m
+2026-10-05T04:43:14.0146236Z [36;1m    --base "ff83c0e9fd147dc143af7228eac0e3298e84b35f" \[0m
+2026-10-05T04:43:14.0146526Z [36;1m    --config tools/scripts/versioning.json \[0m
+2026-10-05T04:43:14.0146771Z [36;1m    --mode=report \[0m
+2026-10-05T04:43:14.0146960Z [36;1m    $extra[0m
+2026-10-05T04:43:14.0205508Z shell: /usr/bin/bash -e {0}
+2026-10-05T04:43:14.0205707Z env:
+2026-10-05T04:43:14.0205883Z   PULP_ENFORCE_PREPUSH: 1
+2026-10-05T04:43:14.0206139Z   pythonLocation: /opt/hostedtoolcache/Python/3.12.14/x64
+2026-10-05T04:43:14.0206487Z   PKG_CONFIG_PATH: /opt/hostedtoolcache/Python/3.12.14/x64/lib/pkgconfig
+2026-10-05T04:43:14.0206821Z   Python_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.14/x64
+2026-10-05T04:43:14.0207114Z   Python2_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.14/x64
+2026-10-05T04:43:14.0207408Z   Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.12.14/x64
+2026-10-05T04:43:14.0207703Z   LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.12.14/x64/lib
+2026-10-05T04:43:14.0207957Z   GITHUB_PR_TITLE: 
+2026-10-05T04:43:14.0208123Z ##[endgroup]
+2026-10-05T04:43:14.2000189Z [sdk] Pulp SDK / CLI: no bump needed
+2026-10-05T04:43:14.2000598Z [plugin] Claude Code plugin: no bump needed
+2026-10-05T04:43:14.2000860Z 
+2026-10-05T04:43:14.2001361Z ── fix/feat-touches-a-surface check (post-merge assignment) ──
+2026-10-05T04:43:14.2002485Z ✗ this fix/feat touches NO versioned surface, so the version-at-land bot would assign nothing and the change would never ship. Resolve one of:
+2026-10-05T04:43:14.2003586Z   • re-title to `chore:` / `docs:` / `refactor:` / `build:` if it is genuinely not user-facing, OR
+2026-10-05T04:43:14.2004360Z   • declare intent on a commit: `Version-Bump: <surface>=<patch|minor|major>`, OR
+2026-10-05T04:43:14.2004957Z   • opt out: `Version-Bump: skip reason="..."`.
+2026-10-05T04:43:14.2092145Z ##[error]Process completed with exit code 1.
+2026-10-05T04:43:14.2255960Z Post job cleanup.
+2026-10-05T04:43:14.2950249Z [command]/usr/bin/git version
+2026-10-05T04:43:14.2972996Z git version 2.55.0
+2026-10-05T04:43:14.3005851Z Temporarily overriding HOME='/home/runner/work/_temp/f1f7a379-bdd5-4b5c-b3ef-0530c96b5e79' before making global git config changes
+2026-10-05T04:43:14.3006578Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-05T04:43:14.3010896Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/pulp/pulp
+2026-10-05T04:43:14.3043097Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-05T04:43:14.3083031Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-05T04:43:14.3301421Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-05T04:43:14.3324811Z http.https://github.com/.extraheader
+2026-10-05T04:43:14.3334035Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-10-05T04:43:14.3363276Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-05T04:43:14.3597371Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-05T04:43:14.3629532Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-05T04:43:14.3986178Z Cleaning up orphan processes

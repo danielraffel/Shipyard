@@ -1,0 +1,254 @@
+{
+ "jobs": [
+  {
+   "id": 111951613758,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "resolve-provider",
+   "conclusion": "cancelled",
+   "status": "completed",
+   "runner_name": "",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T19:51:49Z",
+   "started_at": "2026-10-05T19:51:49Z",
+   "completed_at": "2026-10-05T20:07:26Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111951613758",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111951614075,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "classify",
+   "conclusion": "cancelled",
+   "status": "completed",
+   "runner_name": "",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T19:51:49Z",
+   "started_at": "2026-10-05T19:51:49Z",
+   "completed_at": "2026-10-05T20:11:51Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111951614075",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111951615457,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "Pulp repository-isolation local proof",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "created_at": "2026-10-05T19:51:49Z",
+   "started_at": "2026-10-05T19:51:49Z",
+   "completed_at": "2026-10-05T19:51:49Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111951615457",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111958533314,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "macos",
+   "conclusion": "cancelled",
+   "status": "completed",
+   "runner_name": "",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:11:51Z",
+   "started_at": "2026-10-05T20:11:51Z",
+   "completed_at": "2026-10-05T20:31:25Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111958533314",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111958534089,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "protected-receipt-reuse",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:11:51Z",
+   "started_at": "2026-10-05T20:11:51Z",
+   "completed_at": "2026-10-05T20:11:51Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111958534089",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111958534094,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "Windows MSVC release-path gate",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "windows-latest"
+   ],
+   "created_at": "2026-10-05T20:11:51Z",
+   "started_at": "2026-10-05T20:11:51Z",
+   "completed_at": "2026-10-05T20:11:51Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111958534094",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111958534291,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "Windows MIDI Services SDK compile-gate (advisory)",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "windows-latest"
+   ],
+   "created_at": "2026-10-05T20:11:52Z",
+   "started_at": "2026-10-05T20:11:52Z",
+   "completed_at": "2026-10-05T20:11:51Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111958534291",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111958534475,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "Windows BLE compile-gate (advisory)",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "windows-latest"
+   ],
+   "created_at": "2026-10-05T20:11:52Z",
+   "started_at": "2026-10-05T20:11:52Z",
+   "completed_at": "2026-10-05T20:11:51Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111958534475",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111958534534,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true') && 'macos' || 'macos-pr-unused'",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:11:52Z",
+   "started_at": "2026-10-05T20:11:52Z",
+   "completed_at": "2026-10-05T20:11:51Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111958534534",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111958534768,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "a2t-protected-event",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "macos-15"
+   ],
+   "created_at": "2026-10-05T20:11:52Z",
+   "started_at": "2026-10-05T20:11:52Z",
+   "completed_at": "2026-10-05T20:11:51Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111958534768",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111958535187,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && matrix.key == 'macos' && 'macos' || format('{0} [{1}]', matrix.name, matrix.provider)",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [],
+   "created_at": "2026-10-05T20:11:52Z",
+   "started_at": "2026-10-05T20:11:52Z",
+   "completed_at": "2026-10-05T20:11:51Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111958535187",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111958536265,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "linux",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:11:52Z",
+   "started_at": "2026-10-05T20:11:52Z",
+   "completed_at": "2026-10-05T20:11:51Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111958536265",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  },
+  {
+   "id": 111958536578,
+   "head_sha": "10a350c08d23f61ee3d116560cff17f97e69593a",
+   "name": "windows",
+   "conclusion": "skipped",
+   "status": "completed",
+   "runner_name": null,
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "created_at": "2026-10-05T20:11:52Z",
+   "started_at": "2026-10-05T20:11:52Z",
+   "completed_at": "2026-10-05T20:11:51Z",
+   "run_id": 37366122740,
+   "run_attempt": 1,
+   "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/37366122740/job/111958536578",
+   "head_branch": "gh-readonly-queue/main/pr-9657-11e4602989ca37cd4137c71ab97be34013fab6a1",
+   "steps": []
+  }
+ ]
+}
