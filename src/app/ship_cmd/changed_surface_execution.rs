@@ -142,7 +142,6 @@ fn parse_scoped_policy_digests(
     let Some(value) = trusted.get(ACCEPTED_POLICY_DIGESTS_KEY) else {
         return Ok(BTreeMap::new());
     };
-    use crate::changed_surface::same_base_canary::{FullShadowRecord, selected_returncode_matches};
     let repositories = value.as_table().ok_or_else(|| {
         CliFailure::new(
             2,
@@ -1945,6 +1944,7 @@ mod tests {
         selected_resume_block_reason, shell_quote, stale_generation_has_execution_evidence,
         target_declares_changed_surface_selection,
     };
+    use crate::changed_surface::same_base_canary::{FullShadowRecord, selected_returncode_matches};
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::collections::BTreeMap;
     use std::fs;
