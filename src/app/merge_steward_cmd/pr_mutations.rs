@@ -94,7 +94,6 @@ pub(super) fn enqueue_pull_request(
     enqueue_pull_request_with_recovery(context, pr, policy, ledger, false)
 }
 
-#[allow(clippy::too_many_lines)]
 fn enqueue_pull_request_with_recovery(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
@@ -102,102 +101,6 @@ fn enqueue_pull_request_with_recovery(
     ledger: &mut StewardLedger,
     recover_hosted_setup_eviction_priority: bool,
 ) -> (Option<String>, Option<String>) {
-    // B1: when the protected base requires head approval, re-read the
-    // reviewer policy and the live review/comment records immediately before
-    // the enqueue mutation. A stale local ship state or LGTM text is never
-    // sufficient evidence.
-    let run_gh = |argv: &[String]| {
-        context
-            .actions
-            .run_gh(argv)
-            .map_err(|error| error.to_string())
-    };
-    let approval_policy = match crate::head_approval::read_policy(
-        &run_gh,
-        &context.observation.repo,
-        &context.observation.base,
-    ) {
-        Ok(policy) => policy,
-        Err(error) => {
-            return (
-                None,
-                Some(format!("head approval policy unreadable: {error}")),
-            );
-        }
-    };
-    let mut approval_comment_id = None;
-    if approval_policy.required {
-        let Some((owner, name)) = context.observation.repo.split_once('/') else {
-            return (None, Some("invalid repository slug".to_owned()));
-        };
-        let queue = match run_gh(&[
-            "api".to_owned(),
-            "graphql".to_owned(),
-            "-f".to_owned(),
-            format!("query={}", crate::pr_queue_state::PR_QUEUE_STATE_QUERY),
-            "-F".to_owned(),
-            format!("owner={owner}"),
-            "-F".to_owned(),
-            format!("name={name}"),
-            "-F".to_owned(),
-            format!("number={}", pr.fact.number),
-        ]) {
-            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
-                Ok(queue) => queue,
-                Err(error) => {
-                    return (
-                        None,
-                        Some(format!("merge-queue observation unreadable: {error}")),
-                    );
-                }
-            },
-            Err(error) => {
-                return (
-                    None,
-                    Some(format!("merge-queue observation unreadable: {error}")),
-                );
-            }
-        };
-        match crate::head_approval::evaluate_with_policy(
-            &run_gh,
-            &context.observation.repo,
-            pr.fact.number,
-            &pr.fact.head_sha,
-            &approval_policy,
-            &queue,
-        ) {
-            Ok(crate::head_approval::HeadGate::Approved { approval }) => {
-                if pr
-                    .fact
-                    .author
-                    .as_deref()
-                    .is_some_and(|author| match &approval {
-                        crate::head_approval::Approval::Marker { login, .. }
-                        | crate::head_approval::Approval::Review { login } => {
-                            author.eq_ignore_ascii_case(login)
-                        }
-                    })
-                {
-                    return (
-                        Some("waiting_head_approval".to_owned()),
-                        Some("PR author cannot approve its own head".to_owned()),
-                    );
-                }
-                approval_comment_id = match approval {
-                    crate::head_approval::Approval::Marker { comment_id, .. } => comment_id,
-                    crate::head_approval::Approval::Review { .. } => None,
-                };
-            }
-            Ok(gate) if gate.allows() => {}
-            Ok(gate) => {
-                return (
-                    Some("waiting_head_approval".to_owned()),
-                    Some(gate.explain()),
-                );
-            }
-            Err(error) => return (None, Some(format!("head approval unreadable: {error}"))),
-        }
-    }
     let recovery = if recover_hosted_setup_eviction_priority {
         recovery_evidence(context.actions, context.observation, pr, ledger).unwrap_or_else(|_| {
             record_audit(
@@ -243,7 +146,6 @@ fn enqueue_pull_request_with_recovery(
                     ledger,
                     guard,
                     recovery.as_ref(),
-                    approval_comment_id,
                 );
             };
             let audit_error = guard.finish("rejected_stacked_pull_request").err();
@@ -274,13 +176,7 @@ fn enqueue_unstacked_pull_request(
     ledger: &mut StewardLedger,
     guard: crate::merge_queue_control::MergeQueueMutationGuard,
     recovery: Option<&QueueRecoveryEvidence>,
-    approval_comment_id: Option<u64>,
 ) -> (Option<String>, Option<String>) {
-    let mut guard = guard;
-    if let Err(error) = guard.record_approval_comment_id(approval_comment_id) {
-        let _ = guard.finish("approval_evidence_persistence_failed");
-        return (None, Some(error));
-    }
     let pr = match final_enqueue_revalidation(context, pr, policy, ledger) {
         Ok(Some(pr)) => pr,
         Ok(None) => {
@@ -424,7 +320,6 @@ fn enqueue_unstacked_pull_request(
                 job_id: recovery.job_id,
                 attempted_at: chrono::Utc::now().to_rfc3339(),
                 phase: super::QueueRecoveryPhase::Intent,
-                approval_comment_id,
             },
         );
         if let Err(error) = save_ledger(context.ledger_path, ledger) {
