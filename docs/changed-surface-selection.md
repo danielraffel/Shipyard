@@ -284,6 +284,10 @@ reserved for a separately reviewed graduation after comparison evidence. It
 also requires an exact repository-and-target entry in trusted machine-global
 config:
 
+`same_base_canary` is a shadow-only one-lane comparison posture. It pins one
+base and tree for the invocation, requires the keyed pass to bind to the
+full-shadow pass record from that invocation, and reports a missing or
+mismatched pass-1 record as inconclusive. It never changes merge authority.
 ```toml
 [changed_surface_execution]
 mode = "authoritative"

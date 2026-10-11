@@ -354,7 +354,10 @@ pub(crate) fn validate_stale_activation_for_cleanup(
     let activation: StaleActivationReceipt = serde_json::from_slice(activation_bytes)
         .map_err(|error| format!("decode stale integration activation: {error}"))?;
     if activation.schema_version != activation.plan.schema_version
-        || activation.machine_mode != "shadow_compare"
+        || !matches!(
+            activation.machine_mode.as_str(),
+            "shadow_compare" | "same_base_canary"
+        )
         || activation.merge_authority != super::MergeAuthority::BlockedUntilCurrentMergeTree
         || activation.stale_context_digest != super::stale_base_context_digest(stale)
         || sha256(stale_bytes) != activation.stale_receipt_sha256
@@ -946,7 +949,10 @@ fn validate_activation_identity(
     let plan = &activation.plan;
     if activation.schema_version != plan.schema_version
         || !matches!(plan.schema_version, 1..=3)
-        || activation.machine_mode != "shadow_compare"
+        || !matches!(
+            activation.machine_mode.as_str(),
+            "shadow_compare" | "same_base_canary"
+        )
     {
         return Err("invalid_shadow_activation_contract");
     }
