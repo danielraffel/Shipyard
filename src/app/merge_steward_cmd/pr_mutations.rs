@@ -106,18 +106,27 @@ fn enqueue_pull_request_with_recovery(
     // the enqueue mutation. A stale local ship state or LGTM text is never
     // sufficient evidence.
     let run_gh = |argv: &[String]| context.actions.run_gh(argv).map_err(|error| error.to_string());
-    match crate::head_approval::evaluate_excusing(
+    if let Ok(mut approval_policy) = crate::head_approval::read_policy(
         &run_gh,
         &context.observation.repo,
-        pr.fact.number,
-        &pr.fact.head_sha,
         &context.observation.base,
-        &Value::Null,
-        false,
-    ) {
-        Ok(gate) if gate.allows() => {}
-        Ok(gate) => return (Some("waiting_head_approval".to_owned()), Some(gate.explain())),
-        Err(error) => return (None, Some(format!("head approval unreadable: {error}"))),
+    ) && approval_policy.required
+    {
+        approval_policy.required = true;
+        match crate::head_approval::evaluate_with_policy(
+            &run_gh,
+            &context.observation.repo,
+            pr.fact.number,
+            &pr.fact.head_sha,
+            &approval_policy,
+            &Value::Null,
+        ) {
+            Ok(gate) if gate.allows() => {}
+            Ok(gate) => {
+                return (Some("waiting_head_approval".to_owned()), Some(gate.explain()));
+            }
+            Err(error) => return (None, Some(format!("head approval unreadable: {error}"))),
+        }
     }
     let recovery = if recover_hosted_setup_eviction_priority {
         recovery_evidence(context.actions, context.observation, pr, ledger).unwrap_or_else(|_| {
