@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -14,7 +15,7 @@ use super::super::changed_surface_cmd::{
 };
 use super::executable_reuse_plan::{KeyRequest, Keyed, plan_keyed};
 use crate::changed_surface::same_base_canary::{
-    FullShadowRecord, KeyedPassBinding, bind_keyed_pass, canary_command,
+    FullShadowRecord, KeyedPassBinding, bind_keyed_pass,
 };
 use crate::changed_surface::trial::{TrialIdentity, result_directory};
 use crate::changed_surface::{
@@ -543,17 +544,158 @@ pub(super) fn apply_changed_surface_execution(
                     .join(repo.replace('/', "__")),
             )
         };
-        let keyed = keyed_shadow_plan(
-            machine.mode,
-            &observation,
-            policy,
-            &disposition,
-            validation.reuse_record_repository.as_deref(),
-            cwd,
-            state_dir,
-            &contract_digest,
-            &audit,
-        );
+        let keyed = if machine.mode == MachineMode::SameBaseCanary {
+            // The canary deliberately executes pass 1 here, before asking the
+            // planner for a keyed choice.  This is the only point where the
+            // planner can see the record that pass 1 just filed.
+            let full_command = validation
+                .stages
+                .get("test")
+                .cloned()
+                .unwrap_or_else(|| ":".to_owned());
+            let pass1_dir = result_dir(
+                state_dir,
+                repo,
+                pr,
+                &observation.receipt.head_sha,
+                &target.name,
+            )
+            .join("same-base-pass1");
+            fs::create_dir_all(&pass1_dir).map_err(|error| {
+                CliFailure::new(1, format!("create same-base pass-1 evidence: {error}"))
+            })?;
+            let store = validation
+                .reuse_record_repository
+                .as_deref()
+                .map(|repository| crate::reuse_record_store::store_dir(state_dir, repository));
+            let pending = store
+                .as_ref()
+                .map(|store| {
+                    crate::reuse_record_store::create_pending(
+                        store,
+                        &observation.receipt.head_sha,
+                        chrono::Utc::now(),
+                    )
+                })
+                .transpose()
+                .map_err(|error| CliFailure::new(1, format!("create pass-1 record: {error}")))?;
+            let mut command = Command::new("/bin/sh");
+            command.arg("-c").arg(&full_command).current_dir(cwd);
+            command.env("SHIPYARD_CHANGED_SURFACE_RESULT_DIR", &pass1_dir);
+            command.env("SHIPYARD_CHANGED_SURFACE_COMPARE_FULL", "1");
+            if let Some(pending) = &pending {
+                command.env(crate::reuse_record_store::RECORD_DIR_ENV, pending);
+            }
+            let pass1_status = command
+                .status()
+                .map_err(|error| CliFailure::new(1, format!("run same-base pass 1: {error}")))?;
+            if let (Some(store), Some(pending)) = (&store, pending) {
+                let _ =
+                    crate::reuse_record_store::file(store, &pending, &observation.receipt.head_sha);
+            }
+            let replanned = observe_changed_surface_plan(
+                &ChangedSurfacePlanArgs {
+                    target: target.name.clone(),
+                    pr,
+                    repo: (!repo.is_empty()).then(|| repo.to_owned()),
+                },
+                config,
+                cwd,
+                state_dir,
+            )?;
+            let re_policy = replanned
+                .policy
+                .as_ref()
+                .map_err(|error| CliFailure::new(1, format!("same-base pass-2 policy: {error}")))?;
+            let re_disposition = plan_authoritative_execution(
+                &replanned.receipt,
+                &replanned.input,
+                re_policy,
+                true,
+                ExecutionCommandTransport::PosixShell,
+                &contract_digest,
+                &replanned.workflow_digest,
+            )?;
+            let replanned_keyed = keyed_shadow_plan(
+                machine.mode,
+                &replanned,
+                re_policy,
+                &re_disposition,
+                validation.reuse_record_repository.as_deref(),
+                cwd,
+                state_dir,
+                &contract_digest,
+                &audit,
+            );
+            if let Some(Keyed::Planned(plan)) = replanned_keyed {
+                let pass1_record_id = crate::reuse_record_store::list(
+                    &store.unwrap_or_else(|| state_dir.join("missing-reuse-store")),
+                )
+                .into_iter()
+                .next()
+                .and_then(|record| {
+                    record
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "missing-pass1-record".to_owned());
+                let planner_record_id =
+                    serde_json::from_slice::<serde_json::Value>(&plan.executable_reuse_binding)
+                        .ok()
+                        .and_then(|binding| {
+                            binding
+                                .pointer("/candidates/0/run_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToOwned::to_owned)
+                        });
+                let pass1 = FullShadowRecord {
+                    base_sha: observation.receipt.protected_ref_sha.clone(),
+                    tree_sha: observation.receipt.tree_sha.clone(),
+                    lane_config_sha256: contract_digest.to_owned(),
+                    record_id: pass1_record_id,
+                };
+                let candidate = planner_record_id.map(|record_id| FullShadowRecord {
+                    record_id,
+                    ..pass1.clone()
+                });
+                match bind_keyed_pass(Some(&pass1), candidate.as_ref()) {
+                    KeyedPassBinding::Bound(_) if pass1_status.success() => {
+                        Some(Keyed::Planned(plan))
+                    }
+                    KeyedPassBinding::Inconclusive { reason } => {
+                        persist_fallback_diagnostic(
+                            &pass1_dir,
+                            &FallbackDiagnostic {
+                                schema_version: 1,
+                                repository: repo,
+                                pull_request: pr,
+                                target: &target.name,
+                                machine_mode: machine.mode,
+                                category: "same_base_binding",
+                                diagnostic: reason,
+                            },
+                        )?;
+                        None
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            keyed_shadow_plan(
+                machine.mode,
+                &observation,
+                policy,
+                &disposition,
+                validation.reuse_record_repository.as_deref(),
+                cwd,
+                state_dir,
+                &contract_digest,
+                &audit,
+            )
+        };
         if let Some(Keyed::Closeout {
             category,
             diagnostic,
@@ -864,52 +1006,7 @@ pub(super) fn apply_changed_surface_execution(
             },
             plan.command
         );
-        let substituted = if machine.mode == MachineMode::SameBaseCanary {
-            let pass1_dir = trial_dir.join("same-base-pass1");
-            let record_path = pass1_dir.join("full-shadow-record.json");
-            let canary_receipt = trial_dir.join("same-base-canary-receipt.json");
-            let record = FullShadowRecord {
-                base_sha: plan.base_sha.clone(),
-                tree_sha: plan.tree_sha.clone(),
-                lane_config_sha256: plan.execution_payload_digest.clone(),
-                record_id: format!("{}-full-shadow", plan.execution_payload_digest),
-            };
-            let candidate = record.clone();
-            if !matches!(
-                bind_keyed_pass(Some(&record), Some(&candidate)),
-                KeyedPassBinding::Bound(_)
-            ) {
-                persist_fallback_diagnostic(
-                    &trial_dir,
-                    &FallbackDiagnostic {
-                        schema_version: 1,
-                        repository: repo,
-                        pull_request: pr,
-                        target: &target.name,
-                        machine_mode: machine.mode,
-                        category: "same_base_binding",
-                        diagnostic: "pass 2 refused the pass-1 record".to_owned(),
-                    },
-                )?;
-                continue;
-            }
-            persist_exact_bytes(
-                &pass1_dir,
-                "full-shadow-record.json.template",
-                &serde_json::to_vec_pretty(&record).map_err(|error| {
-                    CliFailure::new(1, format!("serialize full-shadow record: {error}"))
-                })?,
-            )?;
-            canary_command(
-                &plan.command,
-                &pass1_dir,
-                &result_dir,
-                &record_path,
-                &canary_receipt,
-            )
-        } else {
-            ordinary_substituted
-        };
+        let substituted = ordinary_substituted;
         let activation = activation_receipt(
             &plan,
             machine.mode,
