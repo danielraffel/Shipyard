@@ -68,7 +68,7 @@ pub type RunGh<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
 pub struct ApprovalPolicy {
     /// Whether arming requires an approval of the exact head.
     pub required: bool,
-    /// Logins whose `reviewed:<sha>` comments count, lower-cased.
+    /// Identities whose exact-head approvals count, lower-cased.
     pub reviewer_logins: Vec<String>,
 }
 
@@ -106,7 +106,7 @@ impl ApprovalPolicy {
         if self
             .reviewer_logins
             .iter()
-            .any(|login| login.eq_ignore_ascii_case("shipyard-local[bot]"))
+            .any(|login| is_fleet_author(login))
         {
             return Err("reviewer_identities must not include shipyard-local[bot]".to_owned());
         }
@@ -133,6 +133,9 @@ pub enum Approval {
         /// GitHub comment id used as durable approval evidence.
         #[serde(default)]
         comment_id: Option<u64>,
+        /// GitHub App database id that authored the comment, when present.
+        #[serde(default)]
+        performed_via_github_app_id: Option<u64>,
     },
 }
 
@@ -262,12 +265,13 @@ fn is_fleet_author(login: &str) -> bool {
 }
 
 fn reviewer_allowed(login: &str, policy: &ApprovalPolicy, author: Option<&str>) -> bool {
+    let reviewer = normalized_login(login);
     !is_fleet_author(login)
         && policy
             .reviewer_logins
             .iter()
-            .any(|reviewer| reviewer.eq_ignore_ascii_case(login))
-        && author.is_none_or(|author| !author.eq_ignore_ascii_case(login))
+            .any(|identity| normalized_login(identity) == reviewer)
+        && author.is_none_or(|author| normalized_login(author) != reviewer)
 }
 
 /// The newest approval of `head`, given reviews and comments flattened to
@@ -331,6 +335,9 @@ fn find_approval_for_author(
             Some(Approval::Marker {
                 login: login(comment)?.to_owned(),
                 comment_id: comment.get("id").and_then(Value::as_u64),
+                performed_via_github_app_id: comment
+                    .get("performed_via_github_app_id")
+                    .and_then(Value::as_u64),
             })
         })
 }
@@ -639,7 +646,7 @@ pub fn evaluate_excusing(
     let comments = read_records(
         run_gh,
         &format!("repos/{repo}/issues/{pr}/comments"),
-        ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body}",
+        ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}",
     )?;
     Ok(decide_excusing(
         &policy,
@@ -689,7 +696,7 @@ pub fn evaluate_with_policy_for_author(
     let comments = read_records(
         run_gh,
         &format!("repos/{repo}/issues/{pr}/comments"),
-        ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body}",
+        ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}",
     )?;
     Ok(decide_for_author(
         policy, head, &reviews, &comments, queue, false, author,

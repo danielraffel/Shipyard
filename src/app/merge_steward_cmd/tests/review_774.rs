@@ -34,7 +34,7 @@ const POLICY_ERR: &str = r"echo 'HTTP 500 server error' >&2; exit 1";
 
 fn comment(login: &str, body: &str) -> String {
     format!(
-        r#"{{"id":12345,"login":"{login}","type":"User","at":"2026-10-11T12:00:00Z","body":"{body}"}}"#
+        r#"{{"id":12345,"login":"{login}","type":"User","at":"2026-10-11T12:00:00Z","body":"{body}","performed_via_github_app_id":99}}"#
     )
 }
 
@@ -134,6 +134,10 @@ fn r774_enqueue_persists_marker_id_in_intent_and_receipt() {
     let audit = fs::read_to_string(temp.path().join("state/merge_queue/mutations.jsonl"))
         .expect("mutation audit");
     assert!(audit.contains("\"approval_comment_id\":12345"), "{audit}");
+    assert!(
+        audit.contains("\"performed_via_github_app_id\":99"),
+        "{audit}"
+    );
 }
 
 #[cfg(unix)]
@@ -212,9 +216,7 @@ fn r774_r1_later_hold_by_a_recognized_reviewer_does_not_arm() {
         "{}
 {}",
         comment("shipyard-review[bot]", &format!("LGTM\\nreviewed:{HEAD}")),
-        format!(
-            r#"{{"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-11T13:00:00Z","body":"verdict: HOLD head:{HEAD}"}}"#
-        )
+        r#"{{"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-11T13:00:00Z","body":"verdict: HOLD head:{HEAD}"}}"#
     );
     let body = script(&log, POLICY_OK, &comments);
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));

@@ -125,9 +125,18 @@ fn enqueue_pull_request_with_recovery(
             );
         }
     };
+    if !approval_policy.required {
+        return (
+            Some("waiting_head_approval".to_owned()),
+            Some(
+                "head approval policy does not require approval; refusing steward enqueue"
+                    .to_owned(),
+            ),
+        );
+    }
     let mut approval_comment_id = None;
     let mut approval_app_id = None;
-    if approval_policy.required {
+    {
         let Some((owner, name)) = context.observation.repo.split_once('/') else {
             return (None, Some("invalid repository slug".to_owned()));
         };
@@ -177,8 +186,11 @@ fn enqueue_pull_request_with_recovery(
                     crate::head_approval::Approval::Review {
                         performed_via_github_app_id,
                         ..
+                    }
+                    | crate::head_approval::Approval::Marker {
+                        performed_via_github_app_id,
+                        ..
                     } => *performed_via_github_app_id,
-                    crate::head_approval::Approval::Marker { .. } => None,
                 };
                 approval_app_id = found_app_id;
             }

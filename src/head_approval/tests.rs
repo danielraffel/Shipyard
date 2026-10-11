@@ -231,6 +231,7 @@ fn a_marker_from_a_listed_reviewer_counts() {
         Some(Approval::Marker {
             login: "reviewer".to_owned(),
             comment_id: None,
+            performed_via_github_app_id: None,
         })
     );
 }
@@ -332,7 +333,7 @@ fn short_markers_and_older_head_holds_never_gate() {
     let approve = [
         json!({"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-04T02:00:00Z","body":format!("reviewed: {HEAD}")}),
     ];
-    assert!(decide(&policy, HEAD, &[], &older_hold, &empty_queue(HEAD)).allows() == false);
+    assert!(!decide(&policy, HEAD, &[], &older_hold, &empty_queue(HEAD)).allows());
     assert!(decide(&policy, HEAD, &[], &approve, &empty_queue(HEAD)).allows());
 }
 
