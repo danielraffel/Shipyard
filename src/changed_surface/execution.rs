@@ -722,6 +722,35 @@ pub fn schema_v3_build_and_test_plan_for_tests() -> AuthoritativeExecutionPlan {
     tests::schema_v3_build_and_test_plan()
 }
 
+/// A shadow-mode observation (receipt, exact-head input, policy) whose
+/// receipt re-derives exactly, for tests elsewhere in the crate that drive the
+/// ship path without observing a real repository.
+#[cfg(test)]
+#[must_use]
+pub fn shadow_observation_parts_for_tests()
+-> (SelectionReceipt, ExactHeadInput, ChangedSurfacePolicy) {
+    let policy = tests::fixture_policy(ExecutionMode::Shadow);
+    let input = tests::fixture_input("src/a.rs");
+    let receipt = tests::fixture_receipt(&policy, &input);
+    (receipt, input, policy)
+}
+
+/// A bounded test-stage plan, for tests elsewhere in the crate that need a
+/// plan to substitute without running the keyed planner.
+#[cfg(test)]
+#[must_use]
+pub fn test_stage_plan_for_tests() -> AuthoritativeExecutionPlan {
+    let policy = tests::fixture_policy(ExecutionMode::Authoritative);
+    let input = tests::fixture_input("src/a.rs");
+    let receipt = tests::fixture_receipt(&policy, &input);
+    let ExecutionDisposition::Bounded(plan) =
+        tests::fixture_execution(&receipt, &input, &policy, true).expect("bounded")
+    else {
+        panic!("expected bounded plan");
+    };
+    *plan
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -740,7 +769,7 @@ mod tests {
     const DIGEST: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const DIGEST_TWO: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
-    fn fixture_policy(mode: ExecutionMode) -> ChangedSurfacePolicy {
+    pub(super) fn fixture_policy(mode: ExecutionMode) -> ChangedSurfacePolicy {
         ChangedSurfacePolicy {
             schema_version: 2,
             full_test_count: 10,
@@ -778,7 +807,7 @@ mod tests {
         }
     }
 
-    fn fixture_input(path: &str) -> ExactHeadInput {
+    pub(super) fn fixture_input(path: &str) -> ExactHeadInput {
         ExactHeadInput {
             repository: "owner/repo".to_owned(),
             pull_request: 42,
@@ -812,11 +841,14 @@ mod tests {
         }
     }
 
-    fn fixture_receipt(policy: &ChangedSurfacePolicy, input: &ExactHeadInput) -> SelectionReceipt {
+    pub(super) fn fixture_receipt(
+        policy: &ChangedSurfacePolicy,
+        input: &ExactHeadInput,
+    ) -> SelectionReceipt {
         plan_selection(input, Ok(policy.clone())).expect("fixture plan")
     }
 
-    fn fixture_execution(
+    pub(super) fn fixture_execution(
         receipt: &SelectionReceipt,
         input: &ExactHeadInput,
         policy: &ChangedSurfacePolicy,

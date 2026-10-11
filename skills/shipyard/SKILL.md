@@ -838,7 +838,11 @@ Bounded execution remains machine-global default-off. For a controlled canary,
 use `changed_surface_execution.mode = "shadow_compare"` in trusted global
 config; the repository cannot enable it, the queued command is exact-bound,
 and the repository adapter must keep the full result authoritative while
-writing selected-vs-full receipts. Do not use `authoritative` without reviewed
+writing selected-vs-full receipts. A same-base keyed canary may instead use
+`changed_surface_execution.mode = "same_base_canary"`; it is shadow-only and
+requires the keyed pass to bind to the full-shadow record from the same
+invocation and pinned base. Missing or mismatched pass-1 evidence is
+inconclusive. Do not use `authoritative` without reviewed
 graduation evidence and a machine-global
 `changed_surface_execution.accepted_shadow_policy_digests."<owner/repo>".<target>`
 entry that exactly matches the protected plan. Repository and target scope are
