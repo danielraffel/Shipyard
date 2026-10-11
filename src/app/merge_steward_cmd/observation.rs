@@ -443,7 +443,7 @@ pub(super) fn pull_requests(
         // when admission is needed most. Checks are reconstructed per head in
         // `hydrate_required_check_identities`, for the only pull requests that
         // can have them consulted.
-        "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author".to_owned(),
+        "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,body,commits".to_owned(),
     ];
     let value = gh_json(actions, &args, "open PR list")?;
     let rows = value
@@ -496,6 +496,7 @@ pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<Ob
         .collect();
     Ok(ObservedPr {
         node_id,
+        owner: crate::app::pr_status_cmd::owner_for(row),
         fact: StewardPullRequest {
             number,
             head_sha: row

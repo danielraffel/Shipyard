@@ -327,7 +327,7 @@ pub(super) fn apply_pr_plans(
                     && super::recovery::should_wake_owner(pr, &decision)
                 {
                     if let Some(context) = mutation_context.as_ref() {
-                        match super::recovery::wake_owner_comment(context, pr, &decision) {
+                        match super::recovery::wake_owner_comment(context, pr, &decision, ledger) {
                             Ok(action) => {
                                 mutation =
                                     Some(mutation.map_or(action.clone(), |prior| {

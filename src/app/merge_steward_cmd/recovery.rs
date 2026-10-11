@@ -746,6 +746,7 @@ pub(super) fn wake_owner_comment(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
     decision: &StewardDecision,
+    ledger: &mut StewardLedger,
 ) -> Result<String, String> {
     let reason = match decision {
         StewardDecision::NeedsUpdate { merge_state } => {
@@ -757,6 +758,21 @@ pub(super) fn wake_owner_comment(
         _ => return Err("owner wake requested for a non-actionable decision".to_owned()),
     };
     let body = owner_wake_body(pr, reason.as_str());
+    let wake_key = format!(
+        "{}:{}:{}",
+        context.observation.repo, pr.fact.number, pr.fact.head_sha
+    );
+    if ledger
+        .wake_records
+        .get(&wake_key)
+        .is_some_and(|state| state == "posted")
+    {
+        return Ok("owner_wake_already_posted".to_owned());
+    }
+    ledger
+        .wake_records
+        .insert(wake_key.clone(), "intent".to_owned());
+    super::save_ledger(context.ledger_path, ledger).map_err(|error| error.message().to_owned())?;
     super::handoff::verify_exact_open_pr(
         context.actions,
         &context.observation.repo,
@@ -779,11 +795,13 @@ pub(super) fn wake_owner_comment(
         ],
     )
     .map_err(|error| format!("could not post owner wake: {error}"))?;
+    ledger.wake_records.insert(wake_key, "posted".to_owned());
+    super::save_ledger(context.ledger_path, ledger).map_err(|error| error.message().to_owned())?;
     Ok("owner_wake_posted".to_owned())
 }
 
 fn owner_wake_body(pr: &ObservedPr, reason: &str) -> String {
-    let owner = pr.fact.author.as_deref().unwrap_or("team-lead");
+    let owner = &pr.owner;
     format!(
         "Shipyard owner wake for {owner}: PR #{} at exact head {} requires action: {reason}",
         pr.fact.number, pr.fact.head_sha
@@ -897,6 +915,7 @@ mod tests {
     fn pr(labels: Vec<&str>, recovery_states: Vec<(&str, &str)>) -> ObservedPr {
         ObservedPr {
             node_id: "PR_node".to_owned(),
+            owner: "team-lead".to_owned(),
             fact: StewardPullRequest {
                 number: 7,
                 head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -1135,7 +1154,7 @@ mod tests {
     #[test]
     fn owner_wake_body_names_the_owner() {
         let mut observed = pr(vec![], vec![]);
-        observed.fact.author = Some("alice".to_owned());
+        observed.owner = "alice".to_owned();
         assert!(owner_wake_body(&observed, "required checks failed").contains("for alice:"));
     }
 }
