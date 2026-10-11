@@ -2210,6 +2210,156 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
 
 #[cfg(unix)]
 #[test]
+fn apply_wakes_owner_only_when_enabled_and_deduplicates_exact_head() {
+    let temp = tempfile::tempdir().expect("temp");
+    let comments = temp.path().join("wake-comments");
+    let drift = temp.path().join("head-drift");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+case "$*" in
+  *"query=query("*"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*) printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"DIRTY","autoMergeRequest":null,"labels":[{{"name":"shipyard:managed"}}],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-08-27T00:00:00Z"}},{{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-27T00:00:01Z"}}]}}' ;;
+  *"repos/owner/repo/pulls/42"*) if test -f '{drift}'; then sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; else sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; fi; printf '{{"state":"open","head":{{"sha":"%s"}}}}' "$sha" ;;
+  *"issues/42/comments"*) printf '%s\\n' "$*" >> '{comments}'; printf '%s' '{{}}' ;;
+  *) printf '%s' '{{}}' ;;
+esac
+"#,
+            comments = comments.display(),
+            drift = drift.display(),
+        ),
+    );
+    let mut pr = ready_pr();
+    pr.owner = "alice".to_owned();
+    pr.fact.labels.push(MANAGED_LABEL.to_owned());
+    pr.fact.merge_state = "DIRTY".to_owned();
+    pr.fact.checks[0].conclusion = Some("FAILURE".to_owned());
+    pr.fact.checks.push(StewardCheck {
+        name: HANDOFF_CONTEXT.to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SUCCESS".to_owned()),
+        run_id: None,
+        observed_at: Some("2026-08-27T00:00:01Z".to_owned()),
+    });
+    let observation = observation_for(pr, true);
+    let mut args = StewardCommandArgs {
+        repos: vec!["owner/repo".to_owned()],
+        base: "main".to_owned(),
+        opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
+        managed_label: MANAGED_LABEL.to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
+        coalesce: true,
+        preempt_capacity: false,
+        max_preemptions_per_head: 1,
+        arm_unqueued: false,
+        wake_owner: true,
+        apply: true,
+        ledger: None,
+    };
+    let control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger::default();
+    let (reports, failed) = apply_pr_plans(
+        &actions,
+        &args,
+        &observation,
+        &queue_policy(),
+        &ledger_path,
+        &mut ledger,
+        Some(&control),
+    );
+    assert!(!failed, "{reports:?}");
+    assert!(
+        reports[0]
+            .mutation
+            .as_deref()
+            .unwrap_or_default()
+            .contains("owner_wake_posted")
+    );
+    let body = fs::read_to_string(&comments).expect("wake comment");
+    assert!(body.contains("for alice:"), "{body}");
+
+    let (reports, failed) = apply_pr_plans(
+        &actions,
+        &args,
+        &observation,
+        &queue_policy(),
+        &ledger_path,
+        &mut ledger,
+        Some(&control),
+    );
+    assert!(!failed, "{reports:?}");
+    assert_eq!(
+        fs::read_to_string(&comments)
+            .expect("wake comment")
+            .lines()
+            .count(),
+        1
+    );
+
+    args.wake_owner = false;
+    ledger.wake_records.clear();
+    let (reports, failed) = apply_pr_plans(
+        &actions,
+        &args,
+        &observation,
+        &queue_policy(),
+        &ledger_path,
+        &mut ledger,
+        Some(&control),
+    );
+    assert!(!failed, "{reports:?}");
+    assert!(
+        reports[0]
+            .mutation
+            .as_deref()
+            .unwrap_or_default()
+            .contains("needs_agent_signaled")
+    );
+    assert_eq!(
+        fs::read_to_string(&comments)
+            .expect("wake comment")
+            .lines()
+            .count(),
+        1
+    );
+
+    fs::write(&drift, "1").expect("head drift marker");
+    ledger.wake_records.clear();
+    args.wake_owner = true;
+    let (reports, failed) = apply_pr_plans(
+        &actions,
+        &args,
+        &observation,
+        &queue_policy(),
+        &ledger_path,
+        &mut ledger,
+        Some(&control),
+    );
+    assert!(failed);
+    assert!(
+        reports[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("head drift"))
+    );
+    assert_eq!(
+        fs::read_to_string(&comments)
+            .expect("wake comment")
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "the exact read-only GitHub transcript is intentionally kept beside its scenario"
