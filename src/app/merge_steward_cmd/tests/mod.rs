@@ -75,6 +75,33 @@ fn ready_pr() -> ObservedPr {
     .expect("ready PR")
 }
 
+#[cfg(unix)]
+fn ready_pr_with_wire_owner() -> ObservedPr {
+    parse_pr(
+        &serde_json::json!({
+            "id": "PR_kw",
+            "number": 42,
+            "state": "OPEN",
+            "isDraft": false,
+            "baseRefName": "main",
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "headRefName": "feature",
+            "mergeStateStatus": "DIRTY",
+            "autoMergeRequest": null,
+            "author": {"login": "app/shipyard-local", "is_bot": true},
+            "body": "<!-- whence {\"prov\": {\"session\": \"session-owner\"}} -->",
+            "commits": [{"authors": [{"login": "last-committer"}], "committedDate": "2026-08-27T00:00:00Z"}],
+            "labels": [{"name": "shipyard:managed"}],
+            "statusCheckRollup": [
+                {"__typename": "CheckRun", "name": "macos", "status": "COMPLETED", "conclusion": "FAILURE", "completedAt": "2026-08-27T00:00:00Z"},
+                {"__typename": "StatusContext", "context": "shipyard/steward-handoff", "state": "SUCCESS", "createdAt": "2026-08-27T00:00:01Z"}
+            ]
+        }),
+        &BTreeMap::new(),
+    )
+    .expect("wire-shaped PR")
+}
+
 fn observation_for(pr: ObservedPr, merge_queue: bool) -> RepoObservation {
     RepoObservation {
         repo: "owner/repo".to_owned(),

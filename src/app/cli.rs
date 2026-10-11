@@ -2242,6 +2242,10 @@ pub(super) enum RunnerCommand {
         /// Perform the planned mutations. Without this flag, only audit.
         #[arg(long)]
         apply: bool,
+        /// Post one exact-head owner wake comment for each actionable PR.
+        /// This is the B4 write; it never arms or merges.
+        #[arg(long = "wake-owner")]
+        wake_owner: bool,
         /// Override the durable retry/audit ledger path. Test hook.
         #[arg(long = "ledger", hide = true)]
         ledger: Option<PathBuf>,

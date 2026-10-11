@@ -245,6 +245,7 @@ pub(super) fn apply_repo_plan(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn apply_pr_plans(
     actions: &GitHubActions,
     args: &StewardCommandArgs,
@@ -289,56 +290,76 @@ pub(super) fn apply_pr_plans(
                 }
             }
             if args.apply && error.is_none() {
-                let (management_mutation, management_error) = reconcile_management_label(
-                    mutation_context
-                        .as_ref()
-                        .expect("apply mode requires mutation control"),
-                    pr,
-                    policy,
-                    &decision,
-                    ledger,
-                );
-                if let Some(management_mutation) = management_mutation {
-                    mutation = Some(mutation.map_or(management_mutation.clone(), |prior| {
-                        format!("{prior},{management_mutation}")
-                    }));
+                if let Some(context) = mutation_context.as_ref() {
+                    let (management_mutation, management_error) =
+                        reconcile_management_label(context, pr, policy, &decision, ledger);
+                    if let Some(management_mutation) = management_mutation {
+                        mutation = Some(mutation.map_or(management_mutation.clone(), |prior| {
+                            format!("{prior},{management_mutation}")
+                        }));
+                    }
+                    error = management_error;
+                } else {
+                    error = Some("management mutation requires mutation control".to_owned());
                 }
-                error = management_error;
             }
             if args.apply && error.is_none() {
-                let (recovery_mutation, recovery_error) = reconcile_recovery_signal(
-                    mutation_context
-                        .as_ref()
-                        .expect("apply mode requires mutation control"),
-                    pr,
-                    policy,
-                    &decision,
-                    ledger,
-                );
-                if let Some(recovery_mutation) = recovery_mutation {
-                    mutation = Some(mutation.map_or(recovery_mutation.clone(), |prior| {
-                        format!("{prior},{recovery_mutation}")
-                    }));
+                if let Some(context) = mutation_context.as_ref() {
+                    let (recovery_mutation, recovery_error) =
+                        reconcile_recovery_signal(context, pr, policy, &decision, ledger);
+                    if let Some(recovery_mutation) = recovery_mutation {
+                        mutation = Some(mutation.map_or(recovery_mutation.clone(), |prior| {
+                            format!("{prior},{recovery_mutation}")
+                        }));
+                    }
+                    error = recovery_error;
+                } else {
+                    error = Some("recovery mutation requires mutation control".to_owned());
                 }
-                error = recovery_error;
+                if args.wake_owner
+                    && error.is_none()
+                    && super::recovery::should_wake_owner(
+                        &observation.repo,
+                        pr,
+                        &decision,
+                        ledger,
+                        chrono::Utc::now(),
+                    )
+                {
+                    if let Some(context) = mutation_context.as_ref() {
+                        match super::recovery::wake_owner_comment(context, pr, &decision, ledger) {
+                            Ok(action) => {
+                                mutation =
+                                    Some(mutation.map_or(action.clone(), |prior| {
+                                        format!("{prior},{action}")
+                                    }));
+                            }
+                            Err(wake_error) => error = Some(wake_error),
+                        }
+                    } else {
+                        error = Some("owner wake requires mutation control".to_owned());
+                    }
+                }
             }
             if args.apply && error.is_none() {
-                let (pr_mutation, pr_error) = mutate_pr_with_recovery(
-                    mutation_context
-                        .as_ref()
-                        .expect("apply mode requires mutation control"),
-                    pr,
-                    policy,
-                    &decision,
-                    ledger,
-                    args.recover_hosted_setup_eviction_priority,
-                );
-                if let Some(pr_mutation) = pr_mutation {
-                    mutation = Some(mutation.map_or(pr_mutation.clone(), |prior| {
-                        format!("{prior},{pr_mutation}")
-                    }));
+                if let Some(context) = mutation_context.as_ref() {
+                    let (pr_mutation, pr_error) = mutate_pr_with_recovery(
+                        context,
+                        pr,
+                        policy,
+                        &decision,
+                        ledger,
+                        args.recover_hosted_setup_eviction_priority,
+                    );
+                    if let Some(pr_mutation) = pr_mutation {
+                        mutation = Some(mutation.map_or(pr_mutation.clone(), |prior| {
+                            format!("{prior},{pr_mutation}")
+                        }));
+                    }
+                    error = pr_error;
+                } else {
+                    error = Some("PR mutation requires mutation control".to_owned());
                 }
-                error = pr_error;
             }
             unhealthy |= error.is_some();
             PrReport {

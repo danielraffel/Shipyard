@@ -249,7 +249,7 @@ fn latest_movement(item: &serde_json::Value) -> String {
     times.into_iter().max().unwrap_or_default().to_owned()
 }
 
-fn owner_for(item: &serde_json::Value) -> String {
+pub(crate) fn owner_for(item: &serde_json::Value) -> String {
     if let Some(body) = item.get("body").and_then(serde_json::Value::as_str)
         && let Some(session) = crate::pr_fold::whence_session(body)
     {

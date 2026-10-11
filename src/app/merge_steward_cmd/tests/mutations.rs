@@ -105,6 +105,7 @@ esac
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
+        wake_owner: false,
         apply: true,
         ledger: None,
     };
@@ -2183,6 +2184,7 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
+        wake_owner: false,
         apply: false,
         ledger: None,
     };
@@ -2204,6 +2206,298 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
     assert!(reports[0].mutation.is_none());
     assert!(reports[0].error.is_none());
     assert!(!temp.path().join("state/ship").exists());
+}
+
+/// A fake GitHub for the owner-wake scenarios. It records every comment POST
+/// in `wake-comments`, serves `thread.json` (or no comments) for the
+/// escalation's comment read, answers the exact-head read with head B once
+/// `head-drift` exists, and, once `converged` exists, serves the PR with the
+/// needs-agent label and a FAILURE recovery status already in place.
+#[cfg(unix)]
+struct WakeHarness {
+    temp: tempfile::TempDir,
+    actions: GitHubActions,
+    control: MutationControl,
+    ledger: StewardLedger,
+}
+
+#[cfg(unix)]
+impl WakeHarness {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().display().to_string();
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+labels='{{"name":"shipyard:managed"}}'
+recovery=''
+if test -f '{root}/converged'; then
+  labels='{{"name":"shipyard:managed"}},{{"name":"shipyard:needs-agent"}}'
+  recovery=',{{"__typename":"StatusContext","context":"shipyard/steward-recovery","state":"FAILURE","createdAt":"2026-08-27T00:00:02Z"}}'
+fi
+case "$*" in
+  *"query=query("*"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*) printf '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"DIRTY","autoMergeRequest":null,"labels":[%s],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-08-27T00:00:00Z"}},{{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-27T00:00:01Z"}}%s]}}' "$labels" "$recovery" ;;
+  *"repos/owner/repo/pulls/42"*) if test -f '{root}/head-drift'; then sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; else sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; fi; printf '{{"state":"open","head":{{"sha":"%s"}}}}' "$sha" ;;
+  *"-X POST"*"issues/42/comments"*) printf '%s\n' "$*" >> '{root}/wake-comments'; printf '%s' '{{}}' ;;
+  *"issues/42/comments?since="*) if test -f '{root}/thread.json'; then cat '{root}/thread.json'; else printf '%s' '[]'; fi ;;
+  *) printf '%s' '{{}}' ;;
+esac
+"#
+            ),
+        );
+        let control = mutation_control(&temp, "studio", "studio");
+        Self {
+            temp,
+            actions,
+            control,
+            ledger: StewardLedger::default(),
+        }
+    }
+
+    fn args(wake_owner: bool) -> StewardCommandArgs {
+        StewardCommandArgs {
+            repos: vec!["owner/repo".to_owned()],
+            base: "main".to_owned(),
+            opt_out_label: "steward:skip".to_owned(),
+            provenance_blocking_labels: default_provenance_blocking_labels(),
+            managed_label: MANAGED_LABEL.to_owned(),
+            handoff_context: HANDOFF_CONTEXT.to_owned(),
+            max_transient_reruns: 1,
+            recover_hosted_setup_eviction_priority: false,
+            coalesce: true,
+            preempt_capacity: false,
+            max_preemptions_per_head: 1,
+            arm_unqueued: false,
+            wake_owner,
+            apply: true,
+            ledger: None,
+        }
+    }
+
+    /// The needs-agent signal already in place, as every pass after the
+    /// first observes it.
+    fn converge(&self) -> ObservedPr {
+        fs::write(self.temp.path().join("converged"), "1").expect("converged marker");
+        let mut pr = ready_pr_with_wire_owner();
+        pr.fact.labels.push(NEEDS_AGENT_LABEL.to_owned());
+        pr.fact.checks.push(crate::merge_steward::StewardCheck {
+            name: RECOVERY_CONTEXT.to_owned(),
+            source: StewardCheckSource::StatusContext,
+            app_id: None,
+            status: "COMPLETED".to_owned(),
+            conclusion: Some("FAILURE".to_owned()),
+            run_id: None,
+            observed_at: Some("2026-08-27T00:00:02Z".to_owned()),
+        });
+        pr
+    }
+
+    /// One `apply_pr_plans` pass; the PR's single report.
+    fn pass(&mut self, pr: ObservedPr, wake_owner: bool) -> PrReport {
+        let observation = observation_for(pr, true);
+        let (mut reports, failed) = apply_pr_plans(
+            &self.actions,
+            &Self::args(wake_owner),
+            &observation,
+            &queue_policy(),
+            &self.temp.path().join("ledger.json"),
+            &mut self.ledger,
+            Some(&self.control),
+        );
+        assert_eq!(reports.len(), 1);
+        let report = reports.remove(0);
+        assert_eq!(failed, report.error.is_some(), "{report:?}");
+        report
+    }
+
+    fn comments(&self) -> Vec<String> {
+        fs::read_to_string(self.temp.path().join("wake-comments"))
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// Serve these PR comments to the escalation's comment read.
+    fn thread(&self, comments: &serde_json::Value) {
+        fs::write(self.temp.path().join("thread.json"), comments.to_string()).expect("thread");
+    }
+
+    /// Record an owner wake for the exact head, posted `hours` ago.
+    fn posted_hours_ago(&mut self, hours: i64) {
+        self.ledger.wake_records.insert(
+            "owner/repo:42:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:needs_update".to_owned(),
+            format!(
+                "posted|session-owner|{}",
+                (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339()
+            ),
+        );
+    }
+}
+
+#[cfg(unix)]
+fn hours_ago(hours: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339()
+}
+
+#[cfg(unix)]
+fn minutes_ago(minutes: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339()
+}
+
+#[cfg(unix)]
+fn mutation_of(report: &PrReport) -> &str {
+    report.mutation.as_deref().unwrap_or_default()
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_wake_posts_once_per_exact_head_and_names_the_owner() {
+    let mut harness = WakeHarness::new();
+    let first = harness.pass(ready_pr_with_wire_owner(), true);
+    assert!(
+        mutation_of(&first).contains("owner_wake_posted"),
+        "{first:?}"
+    );
+    let comments = harness.comments();
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(comments[0].contains("for session-owner:"), "{comments:?}");
+    assert!(!comments[0].contains("app/shipyard-local"), "{comments:?}");
+
+    // The same transition observed again reaches the wake and is deduplicated
+    // by the exact-head record rather than posting a second comment.
+    let again = harness.pass(ready_pr_with_wire_owner(), true);
+    assert!(
+        mutation_of(&again).contains("owner_wake_already_posted"),
+        "{again:?}"
+    );
+    assert_eq!(harness.comments().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_wake_needs_the_wake_owner_switch() {
+    let mut harness = WakeHarness::new();
+    let report = harness.pass(ready_pr_with_wire_owner(), false);
+    assert!(
+        mutation_of(&report).contains("needs_agent_signaled"),
+        "the pass reached the recovery signal: {report:?}"
+    );
+    assert!(!mutation_of(&report).contains("owner_wake"), "{report:?}");
+    assert!(harness.comments().is_empty(), "{:?}", harness.comments());
+    assert!(harness.ledger.wake_records.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_wake_escalates_to_team_lead_once_the_signal_has_converged() {
+    let mut harness = WakeHarness::new();
+    harness.posted_hours_ago(3);
+    // Neither comment is movement: one predates the wake, and the other is
+    // the steward's own wake comment, even when it was edited recently.
+    harness.thread(&serde_json::json!([
+        {"created_at": hours_ago(4), "updated_at": hours_ago(4), "body": "earlier discussion"},
+        {"created_at": minutes_ago(170), "updated_at": minutes_ago(30),
+         "body": "Shipyard owner wake for session-owner: PR #42 at exact head aaaa requires action"},
+    ]));
+    let pr = harness.converge();
+    let report = harness.pass(pr.clone(), true);
+    assert!(
+        mutation_of(&report).contains("owner_wake_posted"),
+        "{report:?}"
+    );
+    let comments = harness.comments();
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("Escalation: Shipyard owner wake for team-lead:"),
+        "{comments:?}"
+    );
+    assert!(
+        harness
+            .ledger
+            .wake_records
+            .values()
+            .any(|record| record.starts_with("escalated|team-lead|")),
+        "{:?}",
+        harness.ledger.wake_records
+    );
+
+    // Escalation happens once.
+    let again = harness.pass(pr, true);
+    assert!(
+        !mutation_of(&again).contains("owner_wake_posted"),
+        "{again:?}"
+    );
+    assert_eq!(harness.comments().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_wake_does_not_escalate_after_a_reply_on_the_thread() {
+    let mut harness = WakeHarness::new();
+    harness.posted_hours_ago(3);
+    harness.thread(&serde_json::json!([
+        {"created_at": hours_ago(1), "updated_at": hours_ago(1), "body": "on it"},
+    ]));
+    let pr = harness.converge();
+    let report = harness.pass(pr, true);
+    assert!(report.error.is_none(), "{report:?}");
+    assert!(
+        !mutation_of(&report).contains("owner_wake_posted"),
+        "{report:?}"
+    );
+    assert!(harness.comments().is_empty(), "{:?}", harness.comments());
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_wake_does_not_escalate_after_a_check_state_change() {
+    let mut harness = WakeHarness::new();
+    harness.posted_hours_ago(3);
+    let mut pr = harness.converge();
+    pr.fact.checks.push(crate::merge_steward::StewardCheck {
+        name: "linux".to_owned(),
+        source: StewardCheckSource::CheckRun,
+        app_id: None,
+        status: "IN_PROGRESS".to_owned(),
+        conclusion: None,
+        run_id: None,
+        observed_at: Some(hours_ago(1)),
+    });
+    let report = harness.pass(pr, true);
+    assert!(report.error.is_none(), "{report:?}");
+    assert!(!mutation_of(&report).contains("owner_wake"), "{report:?}");
+    assert!(harness.comments().is_empty(), "{:?}", harness.comments());
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_wake_does_not_escalate_before_two_hours() {
+    let mut harness = WakeHarness::new();
+    harness.posted_hours_ago(1);
+    let pr = harness.converge();
+    let report = harness.pass(pr, true);
+    assert!(report.error.is_none(), "{report:?}");
+    assert!(!mutation_of(&report).contains("owner_wake"), "{report:?}");
+    assert!(harness.comments().is_empty(), "{:?}", harness.comments());
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_wake_escalation_refuses_a_moved_head() {
+    let mut harness = WakeHarness::new();
+    harness.posted_hours_ago(3);
+    let pr = harness.converge();
+    fs::write(harness.temp.path().join("head-drift"), "1").expect("drift marker");
+    let report = harness.pass(pr, true);
+    assert!(
+        report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("owner wake target changed")),
+        "{report:?}"
+    );
+    assert!(harness.comments().is_empty(), "{:?}", harness.comments());
 }
 
 #[cfg(unix)]
@@ -2293,6 +2587,7 @@ fi
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
+        wake_owner: false,
         apply: true,
         ledger: None,
     };
@@ -2352,6 +2647,7 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
+        wake_owner: false,
         apply: false,
         ledger: None,
     };
@@ -2394,6 +2690,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         preempt_capacity: false,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
+        wake_owner: false,
         apply: false,
         ledger: None,
     };
