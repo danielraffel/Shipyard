@@ -58,7 +58,7 @@ fi
 changed_files="$(git diff --name-only "$BASE" 2>/dev/null || true)"
 if [ -n "$changed_files" ]; then
     # Fast source guard: only changed Rust files are inspected.
-    "$PYTHON" "$ROOT/scripts/check_test_include_str.py" $changed_files || blocking_fail=1
+    "$PYTHON" "$ROOT/scripts/check_test_include_str.py" --base "$BASE" $changed_files || blocking_fail=1
 fi
 is_m3() { [[ "${SHIPYARD_HOST:-}" == "m3" || "$(uname -n 2>/dev/null)" == *m3* ]]; }
 m1_cmd="ssh m1 'cd $ROOT && cargo"
