@@ -460,14 +460,28 @@ fn execute_same_base_canary_passes(
         )?;
         return Err(CliFailure::new(1, reason));
     }
-    fs::create_dir_all(pass2_dir)
-        .map_err(|error| CliFailure::new(1, format!("create pass-2 evidence: {error}")))?;
-    persist_exact_bytes(
+    if let Err(error) = fs::create_dir_all(pass2_dir) {
+        let reason = format!("create pass-2 evidence: {error}");
+        persist_same_base_canary_receipt(receipt_dir, receipt_dir, Some(pass1), None, Some(&reason))?;
+        return Err(CliFailure::new(1, reason));
+    }
+    if let Err(error) = persist_exact_bytes(
         pass2_dir,
         crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE,
         binding,
-    )?;
-    let pass2_rc = run_pass(pass2_command, pass2_dir, true)?;
+    ) {
+        let reason = error.message.clone();
+        persist_same_base_canary_receipt(receipt_dir, receipt_dir, Some(pass1), None, Some(&reason))?;
+        return Err(error);
+    }
+    let pass2_rc = match run_pass(pass2_command, pass2_dir, true) {
+        Ok(rc) => rc,
+        Err(error) => {
+            let reason = error.message.clone();
+            persist_same_base_canary_receipt(receipt_dir, receipt_dir, Some(pass1), None, Some(&reason))?;
+            return Err(error);
+        }
+    };
     persist_same_base_canary_receipt(
         receipt_dir,
         pass2_dir,
@@ -492,10 +506,6 @@ pub(super) fn apply_changed_surface_execution(
     resume_from: Option<&str>,
     targets: &mut [ResolvedTarget],
 ) -> Result<(), CliFailure> {
-    #[cfg(test)]
-    if TEST_APPLY_HOOK.with(|hook| hook.borrow().is_some()) {
-        return TEST_APPLY_HOOK.with(|hook| hook.borrow_mut().as_mut().expect("test apply hook")());
-    }
     let machine = MachinePolicy::from_global(config)?;
     if machine.mode == MachineMode::Off || !cfg!(unix) {
         return Ok(());
@@ -503,6 +513,10 @@ pub(super) fn apply_changed_surface_execution(
     let Some(pr) = pr.filter(|number| *number != 0) else {
         return Ok(());
     };
+    #[cfg(test)]
+    if TEST_APPLY_HOOK.with(|hook| hook.borrow().is_some()) {
+        return TEST_APPLY_HOOK.with(|hook| hook.borrow_mut().as_mut().expect("test apply hook")());
+    }
 
     if resume_from == Some("test") {
         // This pass is deliberately read-only. A later schema-v3 target must
@@ -2900,6 +2914,33 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&fs::read(receipt.join("same-base-canary-receipt.json")).unwrap()).unwrap();
         assert_eq!(payload["verdict"], "INCONCLUSIVE");
         assert_eq!(payload["reason"], "selected_returncode_eq_lane_rc");
+    }
+
+    #[test]
+    fn apply_changed_surface_execution_pass2_spawn_error_writes_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let pass2 = temp.path().join("pass2");
+        let receipt = temp.path().join("receipt");
+        let record = canary_record("R");
+        let receipt_for_test = receipt.clone();
+        let error = apply_with_fake_stage(move || execute_same_base_canary_passes(
+            true,
+            Some(&record),
+            Some(&record),
+            &binding_json("R"),
+            &pass2,
+            &receipt_for_test,
+            "fake",
+            |_, _, _| Err(CliFailure::new(1, "fake spawn error")),
+        ))
+        .unwrap_err();
+        assert_eq!(error.message, "fake spawn error");
+        let payload: serde_json::Value = serde_json::from_slice(
+            &fs::read(receipt.join("same-base-canary-receipt.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["verdict"], "INCONCLUSIVE");
+        assert_eq!(payload["reason"], "fake spawn error");
     }
 
     #[test]
