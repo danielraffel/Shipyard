@@ -858,7 +858,7 @@ pub(super) fn apply_changed_surface_execution(
             "SHIPYARD_CHANGED_SURFACE_RESULT_DIR={} SHIPYARD_CHANGED_SURFACE_COMPARE_FULL={} SHIPYARD_CHANGED_SURFACE_CANARY_MODE={} {}",
             shell_quote(&result_dir),
             compare,
-            shell_quote(if machine.mode == MachineMode::SameBaseCanary { "same_base" } else { "off" }),
+            if machine.mode == MachineMode::SameBaseCanary { "same_base" } else { "off" },
             plan.command
         );
         let activation = activation_receipt(
