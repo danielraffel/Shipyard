@@ -393,6 +393,20 @@ fn persist_same_base_canary_receipt(
     persist_named_receipt(dir, "same-base-canary-receipt.json", &payload)
 }
 
+fn canary_binding_decision(
+    pass1_succeeded: bool,
+    pass1: Option<&FullShadowRecord>,
+    candidate: Option<&FullShadowRecord>,
+) -> Result<(), String> {
+    if !pass1_succeeded {
+        return Err("pass 1 failed".to_owned());
+    }
+    match bind_keyed_pass(pass1, candidate) {
+        KeyedPassBinding::Bound(_) => Ok(()),
+        KeyedPassBinding::Inconclusive { reason } => Err(reason),
+    }
+}
+
 // Keep the fail-open-to-full branches adjacent to their exact diagnostics and
 // mutation point; splitting them risks one error path accidentally substituting
 // a command or losing its durable reason.
@@ -739,8 +753,12 @@ pub(super) fn apply_changed_surface_execution(
                     record_id,
                     ..pass1.clone()
                 });
-                match bind_keyed_pass(Some(&pass1), candidate.as_ref()) {
-                    KeyedPassBinding::Bound(_) if pass1_status.success() => {
+                match canary_binding_decision(
+                    pass1_status.success(),
+                    Some(&pass1),
+                    candidate.as_ref(),
+                ) {
+                    Ok(()) => {
                         persist_same_base_canary_receipt(
                             canary_root,
                             &pass1_dir,
@@ -751,7 +769,7 @@ pub(super) fn apply_changed_surface_execution(
                         )?;
                         Some(Keyed::Planned(plan))
                     }
-                    KeyedPassBinding::Inconclusive { reason } => {
+                    Err(reason) if pass1_status.success() => {
                         persist_fallback_diagnostic(
                             &pass1_dir,
                             &FallbackDiagnostic {
@@ -774,7 +792,7 @@ pub(super) fn apply_changed_surface_execution(
                         )?;
                         None
                     }
-                    KeyedPassBinding::Bound(_) => {
+                    Err(_) => {
                         persist_same_base_canary_receipt(
                             canary_root,
                             &pass1_dir,
@@ -2665,5 +2683,53 @@ mod tests {
         let other = read(&other);
         assert!(other.get("fallback_reason").is_none(), "{other}");
         assert!(other.get("payload_bytes").is_none(), "{other}");
+    }
+
+    fn canary_record(id: &str) -> FullShadowRecord {
+        FullShadowRecord {
+            base_sha: "a".repeat(40),
+            tree_sha: "b".repeat(40),
+            lane_config_sha256: "c".repeat(64),
+            record_id: id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn apply_changed_surface_execution_t1_bound_pass_is_reachable() {
+        let record = canary_record("R");
+        assert!(canary_binding_decision(true, Some(&record), Some(&record)).is_ok());
+    }
+
+    #[test]
+    fn apply_changed_surface_execution_t2_different_id_is_inconclusive() {
+        let record = canary_record("R");
+        let candidate = canary_record("R2");
+        let error = canary_binding_decision(true, Some(&record), Some(&candidate)).unwrap_err();
+        assert!(error.contains("pass2_record_does_not_match"));
+    }
+
+    #[test]
+    fn apply_changed_surface_execution_t3_no_record_writes_inconclusive_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let receipt_dir = temp.path().join("receipt");
+        let pass1 = temp.path().join("pass1");
+        let pass2 = temp.path().join("pass2");
+        fs::create_dir_all(&pass1).unwrap();
+        fs::create_dir_all(&pass2).unwrap();
+        let error = canary_binding_decision(true, None, None).unwrap_err();
+        assert_eq!(error, "missing_pass1_record");
+        persist_same_base_canary_receipt(&receipt_dir, &pass1, &pass2, None, Some(1), Some(&error))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(
+            &fs::read(receipt_dir.join("same-base-canary-receipt.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["verdict"], "INCONCLUSIVE");
+        assert_eq!(payload["reason"], "missing_pass1_record");
+    }
+
+    #[test]
+    fn apply_changed_surface_execution_t4_absent_selected_returncode_is_inconclusive() {
+        assert_eq!(selected_returncode_matches(0, None), None);
     }
 }
