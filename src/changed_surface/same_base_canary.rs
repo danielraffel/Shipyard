@@ -155,6 +155,7 @@ mod tests {
         let pass2 = temp.path().join("pass2");
         let record_path = pass1.join("full-shadow-record.json");
         let receipt = temp.path().join("canary.json");
+        let passes = temp.path().join("passes.txt");
         fs::create_dir_all(&pass1).unwrap();
         fs::write(
             pass1.join("full-shadow-record.json.template"),
@@ -162,7 +163,10 @@ mod tests {
         )
         .unwrap();
         let command = canary_command(
-            "mkdir -p \"$SHIPYARD_CHANGED_SURFACE_RESULT_DIR\"; printf '{\"full_returncode\":0}' > \"$SHIPYARD_CHANGED_SURFACE_RESULT_DIR/result-1.json\"",
+            &format!(
+                "mkdir -p \"$SHIPYARD_CHANGED_SURFACE_RESULT_DIR\"; printf '%s\\n' \"$SHIPYARD_CHANGED_SURFACE_CANARY_PASS\" >> '{}'; printf '{{\"full_returncode\":0}}' > \"$SHIPYARD_CHANGED_SURFACE_RESULT_DIR/result-1.json\"",
+                passes.display()
+            ),
             &pass1,
             &pass2,
             &record_path,
@@ -181,5 +185,6 @@ mod tests {
             output["binding_record_and_tree_sha"]["record_id"],
             "full-run-1"
         );
+        assert_eq!(fs::read_to_string(passes).unwrap(), "full\nkeyed\n");
     }
 }
