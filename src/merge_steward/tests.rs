@@ -114,6 +114,7 @@ fn fleet_branch_is_managed_by_default_and_opt_out_still_wins() {
     policy.managed_label = Some("shipyard:managed".to_owned());
     let mut pr = green_pr();
     pr.head_branch = "codex/fleet-close".to_owned();
+    pr.author = Some("app/shipyard-local".to_owned());
     assert_eq!(
         classify_pr(&pr, &policy, &BTreeMap::new()),
         StewardDecision::ArmMergeQueue
