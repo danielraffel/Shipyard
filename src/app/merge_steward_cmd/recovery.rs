@@ -756,7 +756,22 @@ pub(super) fn wake_owner_comment(
         }
         _ => return Err("owner wake requested for a non-actionable decision".to_owned()),
     };
-    let body = owner_wake_body(pr, reason.as_str());
+    let owner = context
+        .actions
+        .run_gh(&[
+            "pr".to_owned(),
+            "view".to_owned(),
+            pr.fact.number.to_string(),
+            "--repo".to_owned(),
+            context.observation.repo.clone(),
+            "--json".to_owned(),
+            "body,commits".to_owned(),
+        ])
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .map(|item| crate::app::pr_status_cmd::owner_for(&item))
+        .unwrap_or_else(|| "team-lead".to_owned());
+    let body = owner_wake_body(pr, &owner, reason.as_str());
     super::handoff::verify_exact_open_pr(
         context.actions,
         &context.observation.repo,
@@ -782,8 +797,7 @@ pub(super) fn wake_owner_comment(
     Ok("owner_wake_posted".to_owned())
 }
 
-fn owner_wake_body(pr: &ObservedPr, reason: &str) -> String {
-    let owner = pr.fact.author.as_deref().unwrap_or("team-lead");
+fn owner_wake_body(pr: &ObservedPr, owner: &str, reason: &str) -> String {
     format!(
         "Shipyard owner wake for {owner}: PR #{} at exact head {} requires action: {reason}",
         pr.fact.number, pr.fact.head_sha
@@ -1136,6 +1150,8 @@ mod tests {
     fn owner_wake_body_names_the_owner() {
         let mut observed = pr(vec![], vec![]);
         observed.fact.author = Some("alice".to_owned());
-        assert!(owner_wake_body(&observed, "required checks failed").contains("for alice:"));
+        assert!(
+            owner_wake_body(&observed, "alice", "required checks failed").contains("for alice:")
+        );
     }
 }
