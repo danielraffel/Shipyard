@@ -419,6 +419,7 @@ fn canary_binding_decision(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_same_base_canary_passes(
     pass1_succeeded: bool,
     pass1: Option<&FullShadowRecord>,
