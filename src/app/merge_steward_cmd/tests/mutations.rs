@@ -2210,6 +2210,10 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
 
 #[cfg(unix)]
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exact wake transition transcript is intentionally kept beside its scenario"
+)]
 fn apply_wakes_owner_only_when_enabled_and_deduplicates_exact_head() {
     let temp = tempfile::tempdir().expect("temp");
     let comments = temp.path().join("wake-comments");
