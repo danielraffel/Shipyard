@@ -3027,10 +3027,17 @@ mod tests {
             pass1_writes_record: bool,
             pass2_result: Option<&'static [u8]>,
             pass2_spawn_fails: bool,
-            pass2_writes_fallback: bool,
-            /// Pass 1 leaves a fallback file in the canary root, where no
-            /// pass-2 fact may be read from.
-            pass1_plants_stray_fallback: bool,
+            fallback: Option<FallbackPlant>,
+        }
+
+        /// Where a fake stage leaves a fallback file.
+        #[derive(Clone, Copy, PartialEq)]
+        enum FallbackPlant {
+            /// Pass 2 writes one into its own result directory.
+            Pass2Dir,
+            /// Pass 1 leaves one in the canary root, where no pass-2 fact
+            /// may be read from.
+            CanaryRoot,
         }
 
         const BOUND: Script = Script {
@@ -3038,8 +3045,7 @@ mod tests {
             pass1_writes_record: true,
             pass2_result: Some(PASS2_ALL_FACTS),
             pass2_spawn_fails: false,
-            pass2_writes_fallback: false,
-            pass1_plants_stray_fallback: false,
+            fallback: None,
         };
 
         struct CanaryRun {
@@ -3133,7 +3139,7 @@ mod tests {
                         .map(Path::to_path_buf);
                     runs.push(run);
                     if first {
-                        if script.pass1_plants_stray_fallback {
+                        if script.fallback == Some(FallbackPlant::CanaryRoot) {
                             let canary_root = result_dir.parent().unwrap();
                             fs::write(canary_root.join("fallback-0-0-0.json"), b"{}").unwrap();
                         }
@@ -3153,7 +3159,7 @@ mod tests {
                     if let Some(result) = script.pass2_result {
                         fs::write(result_dir.join("result-2.json"), result).unwrap();
                     }
-                    if script.pass2_writes_fallback {
+                    if script.fallback == Some(FallbackPlant::Pass2Dir) {
                         fs::write(result_dir.join("fallback-1-1-0.json"), b"{}").unwrap();
                     }
                     Ok(0)
@@ -3237,7 +3243,7 @@ mod tests {
             let run = run_canary(
                 Choice::Other("an-older-record"),
                 Script {
-                    pass1_plants_stray_fallback: true,
+                    fallback: Some(FallbackPlant::CanaryRoot),
                     ..BOUND
                 },
             );
@@ -3376,7 +3382,7 @@ mod tests {
         fn same_base_canary_fails_on_a_fallback_file() {
             assert_fails(
                 Script {
-                    pass2_writes_fallback: true,
+                    fallback: Some(FallbackPlant::Pass2Dir),
                     ..BOUND
                 },
                 "fallback file in pass 2 evidence",
