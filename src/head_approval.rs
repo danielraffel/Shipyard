@@ -698,6 +698,29 @@ pub fn evaluate_with_policy_for_author(
         &format!("repos/{repo}/issues/{pr}/comments"),
         ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}",
     )?;
+    let comments = if comments.iter().any(|comment| {
+        comment
+            .get("body")
+            .and_then(Value::as_str)
+            .and_then(marker_verdict)
+            .is_some_and(|(_, marker_head)| marker_head.eq_ignore_ascii_case(head))
+    }) {
+        let created_at = run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repo}/commits/{head}"),
+            "--jq".to_owned(),
+            ".commit.committer.date".to_owned(),
+        ])?
+        .trim()
+        .parse::<DateTime<Utc>>()
+        .map_err(|error| format!("head commit timestamp unreadable: {error}"))?;
+        comments
+            .into_iter()
+            .filter(|comment| at(comment).is_some_and(|comment_at| comment_at > created_at))
+            .collect()
+    } else {
+        comments
+    };
     Ok(decide_for_author(
         policy, head, &reviews, &comments, queue, false, author,
     ))

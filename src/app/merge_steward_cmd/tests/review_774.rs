@@ -16,6 +16,7 @@ case "$*" in
   *"contents/.shipyard/config.toml"*) {config_case} ;;
   *"pulls/42/reviews"*) printf '' ;;
   *"issues/42/comments"*) printf '%s\n' '{comments}' ;;
+  *"commits/{head}"*) printf '%s' '2026-10-11T00:00:00Z' ;;
   *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"headRefOid":"{head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *"stackEntry"*) echo "GATE_PASSED_REACHED_STACK" >&2; exit 90 ;;
   *"enqueuePullRequest"*) echo "mutation must not run" >&2; exit 91 ;;
@@ -212,11 +213,12 @@ fn r774_policy_read_error_fails_closed() {
 fn r774_r1_later_hold_by_a_recognized_reviewer_does_not_arm() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
-    let comments = format!(
-        "{}
-{}",
-        comment("shipyard-review[bot]", &format!("LGTM\\nreviewed:{HEAD}")),
+    let hold = format!(
         r#"{{"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-11T13:00:00Z","body":"verdict: HOLD head:{HEAD}"}}"#
+    );
+    let comments = format!(
+        "{}\n{hold}",
+        comment("shipyard-review[bot]", &format!("LGTM\\nreviewed:{HEAD}")),
     );
     let body = script(&log, POLICY_OK, &comments);
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
