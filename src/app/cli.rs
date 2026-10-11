@@ -660,6 +660,12 @@ pub(super) enum Command {
     },
     /// One-shot push-a-PR: skill-sync, version-bump, then ship.
     Pr {
+        /// Read-only PR ledger action. `status --all` prints every open PR.
+        #[arg(value_name = "ACTION")]
+        action: Option<String>,
+        /// Include every configured repository in the read-only status ledger.
+        #[arg(long = "all")]
+        all: bool,
         /// Base branch to ship into.
         #[arg(long, default_value = "main")]
         base: String,

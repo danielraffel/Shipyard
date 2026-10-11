@@ -11,6 +11,7 @@ fn open_pr() -> StewardPullRequest {
     StewardPullRequest {
         number: 7,
         head_sha: "a".repeat(40),
+        author: None,
         head_branch: "feature/x".to_owned(),
         draft: false,
         merge_state: "CLEAN".to_owned(),
