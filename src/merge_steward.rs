@@ -451,6 +451,15 @@ fn classify_management(pr: &StewardPullRequest, policy: &StewardPolicy) -> Optio
         .labels
         .iter()
         .any(|label| label.eq_ignore_ascii_case(managed_label));
+    // Fleet-authored branches are managed by default. The opt-out label is
+    // checked by `classify_pr` before this function, so a fleet PR cannot sit
+    // unmanaged merely because a handoff label was not copied yet.
+    let fleet_branch = ["codex/", "feature/", "fix/"]
+        .iter()
+        .any(|prefix| pr.head_branch.starts_with(prefix));
+    if fleet_branch && !labelled {
+        return None;
+    }
     if !labelled {
         return Some(StewardDecision::Unmanaged);
     }

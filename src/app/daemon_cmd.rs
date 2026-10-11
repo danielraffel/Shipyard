@@ -714,10 +714,19 @@ fn daemon_start<W: Write>(
     repos: &[String],
     no_detach: bool,
 ) -> Result<ExitCode, CliFailure> {
+    let repos = if repos.is_empty() {
+        &[
+            "Generous-Corp/pulp".to_owned(),
+            "danielraffel/tartci".to_owned(),
+            "Generous-Corp/vellum".to_owned(),
+        ]
+    } else {
+        repos.to_vec()
+    };
     let resolved_repos = resolve_watch_list(
         mode,
         &runtime_paths.state_dir,
-        resolve_repos(&runtime_paths.state_dir, repos),
+        resolve_repos(&runtime_paths.state_dir, &repos),
     );
     if no_detach {
         return daemon_run_with_repos(mode, runtime_paths, resolved_repos);
@@ -782,7 +791,13 @@ fn daemon_run(
     runtime_paths: &RuntimePaths,
     repos: &[String],
 ) -> Result<ExitCode, CliFailure> {
-    let resolved_repos = resolve_repos(&runtime_paths.state_dir, repos);
+    let defaults = [
+        "Generous-Corp/pulp".to_owned(),
+        "danielraffel/tartci".to_owned(),
+        "Generous-Corp/vellum".to_owned(),
+    ];
+    let requested = if repos.is_empty() { &defaults } else { repos };
+    let resolved_repos = resolve_repos(&runtime_paths.state_dir, requested);
     daemon_run_with_repos(mode, runtime_paths, resolved_repos)
 }
 

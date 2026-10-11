@@ -74,6 +74,23 @@ fn explicit_management_requires_label_and_current_head_receipt() {
 }
 
 #[test]
+fn fleet_branch_is_managed_by_default_and_opt_out_still_wins() {
+    let mut policy = queue_policy();
+    policy.managed_label = Some("shipyard:managed".to_owned());
+    let mut pr = green_pr();
+    pr.head_branch = "codex/fleet-close".to_owned();
+    assert_eq!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::ArmMergeQueue
+    );
+    pr.labels.push("shipyard:no-auto-merge".to_owned());
+    assert_eq!(
+        classify_pr(&pr, &policy, &BTreeMap::new()),
+        StewardDecision::OptedOut
+    );
+}
+
+#[test]
 fn check_run_cannot_impersonate_handoff_status_context() {
     let mut policy = queue_policy();
     policy.managed_label = Some("shipyard:managed".to_owned());
