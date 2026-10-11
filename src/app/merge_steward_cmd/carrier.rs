@@ -16,12 +16,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Digest;
 
 use super::native_arm::read_queue_state;
 use super::observation::{gh_json, observe_repo, resolve_repos};
@@ -108,13 +109,6 @@ fn parse_classes(raw: &[String], apply: bool) -> Result<BTreeSet<CarrierClass>, 
             "--apply requires at least one --class: classes graduate to live one at a time",
         ));
     }
-    if apply && classes.contains(&CarrierClass::UpdateBranch) {
-        return Err(CliFailure::new(
-            2,
-            "update_branch is planned only: applying it needs the own-lines invariant, which \
-             extends the approval to the merge commit it creates",
-        ));
-    }
     Ok(classes)
 }
 
@@ -186,6 +180,7 @@ pub(crate) fn carrier_command<W: Write>(
                     apply_intent(
                         actions,
                         &observation,
+                        cwd,
                         intent,
                         &classes,
                         store,
@@ -628,6 +623,7 @@ fn latest_jobs(actions: &GitHubActions, repo: &str, run_id: u64) -> Result<Vec<J
 fn apply_intent(
     actions: &GitHubActions,
     observation: &RepoObservation,
+    cwd: &Path,
     intent: &CarrierIntent,
     classes: &BTreeSet<CarrierClass>,
     store: &ShipStateStore,
@@ -674,7 +670,18 @@ fn apply_intent(
             CarrierAction::Rearm { head } => {
                 rearm(actions, store, mode, global_dir, &state, &pr.node_id, head)
             }
-            CarrierAction::UpdateBranch { .. } => Err("update_branch is planned only".to_owned()),
+            CarrierAction::UpdateBranch { head } => update_branch(
+                actions,
+                store,
+                mode,
+                global_dir,
+                cwd,
+                &state,
+                &observation.base,
+                &pr.node_id,
+                head,
+                planned,
+            ),
         };
         match outcome {
             Ok(mutation) => planned.mutation = Some(mutation),
@@ -767,6 +774,212 @@ fn rearm(
             Err(format!("arm failed: {error}"))
         }
     }
+}
+
+const MAX_CARRIES_PER_DAY: usize = 2;
+
+fn required_check_passed(required: &RequiredFact) -> bool {
+    required.status.eq_ignore_ascii_case("COMPLETED")
+        && required.conclusion.as_deref().is_some_and(|conclusion| {
+            matches!(
+                conclusion.to_ascii_uppercase().as_str(),
+                "SUCCESS" | "NEUTRAL" | "SKIPPED"
+            )
+        })
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .map_err(|error| format!("git {} failed to start: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn carry_evidence(cwd: &Path, base: &str, head: &str) -> Result<(String, String), String> {
+    let tree = git_output(cwd, &["merge-tree", "--write-tree", base, head])?;
+    let tree = tree
+        .split_whitespace()
+        .next()
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "merge-tree did not produce a carry tree".to_owned())?
+        .to_owned();
+    let range = format!("{base}...{head}");
+    let own_lines = git_output(cwd, &["diff", "--binary", &range])?;
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(own_lines.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    Ok((digest, tree))
+}
+
+fn carries_today(store: &ShipStateStore, repo: &str, pr: u64) -> usize {
+    let path = store
+        .path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("merge_queue/mutations.jsonl");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let cutoff = Utc::now() - chrono::Duration::hours(24);
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| {
+            row.get("action").and_then(Value::as_str) == Some("runner carrier update branch")
+                && row.get("repo").and_then(Value::as_str) == Some(repo)
+                && row.get("pr").and_then(Value::as_u64) == Some(pr)
+                && row
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(|stamp| DateTime::parse_from_rfc3339(stamp).ok())
+                    .is_some_and(|stamp| stamp.with_timezone(&Utc) >= cutoff)
+                && row.get("phase").and_then(Value::as_str) == Some("finished")
+        })
+        .count()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_branch(
+    actions: &GitHubActions,
+    store: &ShipStateStore,
+    mode: RuntimeMode,
+    global_dir: &Path,
+    cwd: &Path,
+    state: &ShipState,
+    base: &str,
+    node_id: &str,
+    head: &str,
+    planned: &PlannedPr,
+) -> Result<String, String> {
+    if !head.eq_ignore_ascii_case(&state.head_sha) {
+        return Err("carry head differs from the observed exact head".to_owned());
+    }
+    if !planned.facts.approved_head {
+        return Err("carry requires approval of the current head".to_owned());
+    }
+    if planned.facts.merge_state.eq_ignore_ascii_case("DIRTY")
+        || planned
+            .facts
+            .merge_state
+            .eq_ignore_ascii_case("CONFLICTING")
+    {
+        return Err("carry refuses a dirty or conflicting pull request".to_owned());
+    }
+    if planned
+        .facts
+        .required
+        .iter()
+        .any(|required| !required_check_passed(required))
+    {
+        return Err("carry requires every required check to be terminal and green".to_owned());
+    }
+    let count = carries_today(store, &state.repo, state.pr);
+    if count >= MAX_CARRIES_PER_DAY {
+        return Err("carry budget exhausted for this pull request today".to_owned());
+    }
+    let (own_lines_digest, carry_tree) = carry_evidence(cwd, base, head)?;
+    let mut guard = MergeQueueMutationGuard::acquire_in_mode(
+        store,
+        Path::new("."),
+        mode,
+        global_dir,
+        state,
+        "runner carrier update branch",
+    )?;
+    guard.record_verdict_audit_events(vec![
+        format!("own_lines_sha256:{own_lines_digest}"),
+        format!("merge_tree:{carry_tree}"),
+        "update_method:merge".to_owned(),
+    ])?;
+    let args = vec![
+        "api".to_owned(),
+        "--method".to_owned(),
+        "PUT".to_owned(),
+        format!("repos/{}/pulls/{}/update-branch", state.repo, state.pr),
+        "-f".to_owned(),
+        format!("expected_head_sha={head}"),
+        "-f".to_owned(),
+        "update_method=merge".to_owned(),
+    ];
+    match actions.run_gh_internal_queue_mutation(&args) {
+        Ok(raw) => {
+            let new_head =
+                match verify_carry_result(cwd, base, &raw, &carry_tree, &own_lines_digest) {
+                    Ok(head) => head,
+                    Err(error) => {
+                        guard.finish("carry_rejected")?;
+                        return Err(error);
+                    }
+                };
+            guard.finish("carried")?;
+            let carried_state = ShipState::new(
+                state.pr,
+                &state.repo,
+                &state.branch,
+                &state.base_branch,
+                new_head.clone(),
+                "runner-carrier",
+            );
+            let arm = rearm(
+                actions,
+                store,
+                mode,
+                global_dir,
+                &carried_state,
+                node_id,
+                &new_head,
+            )?;
+            Ok(format!(
+                "carried {head} with merge tree {carry_tree}; {arm}; response {raw}"
+            ))
+        }
+        Err(error) => {
+            guard.finish("carry_failed")?;
+            Err(format!("update branch failed: {error}"))
+        }
+    }
+}
+
+fn verify_carry_result(
+    cwd: &Path,
+    base: &str,
+    raw: &str,
+    carry_tree: &str,
+    own_lines_digest: &str,
+) -> Result<String, String> {
+    let value = serde_json::from_str::<Value>(raw)
+        .map_err(|error| format!("update branch returned invalid JSON: {error}"))?;
+    let new_head = value
+        .pointer("/head/sha")
+        .or_else(|| value.pointer("/data/updatePullRequestBranch/pullRequest/headRefOid"))
+        .and_then(Value::as_str)
+        .filter(|sha| sha.len() == 40)
+        .ok_or_else(|| "update branch returned no new head".to_owned())?;
+    git_output(cwd, &["fetch", "--no-tags", "origin", base])?;
+    git_output(cwd, &["fetch", "--no-tags", "origin", new_head])?;
+    let new_tree = git_output(cwd, &["rev-parse", &format!("{new_head}^{{tree}}")])?;
+    let new_range = format!("{base}...{new_head}");
+    let new_own_lines = git_output(cwd, &["diff", "--binary", &new_range])?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(new_own_lines.as_bytes());
+    let new_digest = format!("{:x}", hasher.finalize());
+    if new_tree != carry_tree || new_digest != own_lines_digest {
+        return Err(format!(
+            "carry result changed the approved tree or own lines (tree {new_tree}, own_lines {new_digest})"
+        ));
+    }
+    Ok(new_head.to_owned())
 }
 
 #[cfg(test)]

@@ -1,6 +1,9 @@
 use super::*;
 
 #[cfg(unix)]
+use std::process::Command;
+
+#[cfg(unix)]
 use crate::merge_steward::{RequiredCheck, StewardCheck, StewardCheckSource, StewardPullRequest};
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -23,15 +26,83 @@ fn apply_without_a_class_is_refused() {
 fn update_branch_can_be_planned_but_never_applied() {
     let classes = parse_classes(&["update_branch".to_owned()], false).expect("plan");
     assert!(classes.contains(&CarrierClass::UpdateBranch));
-    let error = parse_classes(&["redispatch".to_owned(), "update-branch".to_owned()], true)
-        .expect_err("refused");
-    assert!(error.message.contains("own-lines"), "{}", error.message);
+    assert!(
+        parse_classes(&["redispatch".to_owned(), "update-branch".to_owned()], true)
+            .expect("carry can be applied when its runtime predicates pass")
+            .contains(&CarrierClass::UpdateBranch)
+    );
 }
 
 #[test]
 fn unknown_classes_are_refused() {
     let error = parse_classes(&["merge".to_owned()], false).expect_err("refused");
     assert!(error.message.contains("unknown carrier class"));
+}
+
+#[cfg(unix)]
+fn git_test(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(output.status.success(), "git failed: {output:?}");
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn carry_evidence_captures_the_merge_tree_and_own_lines() {
+    let temp = tempfile::tempdir().expect("temp");
+    git_test(temp.path(), &["init", "-q"]);
+    git_test(
+        temp.path(),
+        &["config", "user.email", "test@example.invalid"],
+    );
+    git_test(temp.path(), &["config", "user.name", "test"]);
+    fs::write(temp.path().join("base.txt"), "base\n").expect("base");
+    git_test(temp.path(), &["add", "."]);
+    git_test(temp.path(), &["commit", "-qm", "base"]);
+    let base = git_test(temp.path(), &["rev-parse", "HEAD"]);
+    git_test(temp.path(), &["checkout", "-qb", "feature"]);
+    fs::write(temp.path().join("feature.txt"), "feature\n").expect("feature");
+    git_test(temp.path(), &["add", "."]);
+    git_test(temp.path(), &["commit", "-qm", "feature"]);
+    let head = git_test(temp.path(), &["rev-parse", "HEAD"]);
+    let (digest, tree) = carry_evidence(temp.path(), &base, &head).expect("evidence");
+    assert_eq!(
+        tree,
+        git_test(temp.path(), &["rev-parse", &format!("{head}^{{tree}}")])
+    );
+    assert_eq!(digest.len(), 64);
+}
+
+#[cfg(unix)]
+#[test]
+fn carry_evidence_rejects_a_non_automatic_merge() {
+    let temp = tempfile::tempdir().expect("temp");
+    git_test(temp.path(), &["init", "-q"]);
+    git_test(
+        temp.path(),
+        &["config", "user.email", "test@example.invalid"],
+    );
+    git_test(temp.path(), &["config", "user.name", "test"]);
+    fs::write(temp.path().join("same.txt"), "base\n").expect("base");
+    git_test(temp.path(), &["add", "."]);
+    git_test(temp.path(), &["commit", "-qm", "base"]);
+    let base = git_test(temp.path(), &["rev-parse", "HEAD"]);
+    git_test(temp.path(), &["checkout", "-qb", "feature"]);
+    fs::write(temp.path().join("same.txt"), "feature\n").expect("feature");
+    git_test(temp.path(), &["commit", "-qam", "feature"]);
+    let head = git_test(temp.path(), &["rev-parse", "HEAD"]);
+    git_test(temp.path(), &["checkout", "-q", &base]);
+    fs::write(temp.path().join("same.txt"), "main\n").expect("main");
+    git_test(temp.path(), &["commit", "-qam", "main"]);
+    let current_base = git_test(temp.path(), &["rev-parse", "HEAD"]);
+    assert!(carry_evidence(temp.path(), &current_base, &head).is_err());
 }
 
 #[test]
@@ -297,6 +368,7 @@ fn apply_rearms_only_the_intended_action_with_the_exact_head() {
     apply_intent(
         &actions,
         &observation,
+        temp.path(),
         &rearm_intent(),
         &classes,
         &store,
@@ -333,6 +405,7 @@ fn apply_does_nothing_outside_the_intent_or_the_enabled_classes() {
     apply_intent(
         &actions,
         &observation,
+        temp.path(),
         &empty,
         &classes,
         &store,
@@ -347,6 +420,7 @@ fn apply_does_nothing_outside_the_intent_or_the_enabled_classes() {
     apply_intent(
         &actions,
         &observation,
+        temp.path(),
         &rearm_intent(),
         &classes,
         &store,
@@ -386,6 +460,7 @@ fn an_intent_naming_an_older_head_is_not_applied() {
     apply_intent(
         &actions,
         &observation,
+        temp.path(),
         &intent,
         &BTreeSet::from([CarrierClass::Rearm]),
         &store,
@@ -408,6 +483,7 @@ fn a_host_that_is_not_the_mutation_machine_cannot_apply() {
     apply_intent(
         &actions,
         &observation,
+        temp.path(),
         &rearm_intent(),
         &BTreeSet::from([CarrierClass::Rearm]),
         &store,

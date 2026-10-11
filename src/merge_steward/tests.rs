@@ -410,7 +410,10 @@ fn bounded_rerun_requires_a_classified_transient_run_and_one_budgeted_attempt() 
     for conclusion in ["CANCELLED", "STARTUP_FAILURE", "STALE"] {
         pr.checks[0].conclusion = Some(conclusion.to_owned());
         let decision = classify_pr(&pr, &queue_policy(), &BTreeMap::new());
-        assert_eq!(decision, StewardDecision::RerunTransient { run_ids: vec![10] });
+        assert_eq!(
+            decision,
+            StewardDecision::RerunTransient { run_ids: vec![10] }
+        );
     }
     pr.checks[0].run_id = None;
     assert!(matches!(
