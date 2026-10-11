@@ -60,22 +60,32 @@ if [ -n "$changed_files" ]; then
     # Fast source guard: only changed Rust files are inspected.
     "$PYTHON" "$ROOT/scripts/check_test_include_str.py" $changed_files || blocking_fail=1
 fi
+assert_rustup_proxy() {
+    local rustc_path target
+    rustc_path="$(command -v rustc 2>/dev/null || true)"
+    case "$rustc_path" in
+        "$HOME/.cargo/bin/rustc")
+            target="$(readlink "$rustc_path" 2>/dev/null || true)"
+            case "$target" in rustup|*/rustup) return 0 ;; esac
+            ;;
+    esac
+    echo "[pre-push] PATH rustc must be the rustup proxy; got ${rustc_path:-missing}." >&2
+    return 1
+}
 is_m3() { [[ "${SHIPYARD_HOST:-}" == "m3" || "$(uname -n 2>/dev/null)" == *m3* ]]; }
 m1_cmd="ssh m1 'cd $ROOT && cargo"
+assert_rustup_proxy || blocking_fail=1
 if is_m3; then
     echo "[pre-push] Rust gates require m1; Cargo is forbidden on m3." >&2
     echo "[pre-push] Run on m1: $m1_cmd fmt --all --check'" >&2
     if echo "$changed_files" | grep -Eq '^(src|tests)/'; then
-      echo "[pre-push] Run on m1 (advisory clippy): $m1_cmd clippy --all-targets --locked -- -D warnings'" >&2
+      echo "[pre-push] Run on m1: $m1_cmd clippy --all-targets --locked -- -D warnings'" >&2
     fi
     blocking_fail=1
 else
     cargo fmt --all --check || blocking_fail=1
     if echo "$changed_files" | grep -Eq '^(src|tests)/'; then
-      cargo clippy --all-targets --locked -- -D warnings || {
-        echo "[pre-push] clippy advisory failed; continuing (toolchain is not pinned yet)." >&2
-        advisory_fail=1
-      }
+      cargo clippy --all-targets --locked -- -D warnings || blocking_fail=1
     fi
 fi
 if [ "$blocking_fail" = "0" ] && [ "$fail" = "0" ]; then

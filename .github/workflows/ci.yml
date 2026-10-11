@@ -71,10 +71,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Read Rust toolchain
+        id: rust-toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           components: rustfmt, clippy
+
+      - name: Assert Rust toolchain
+        run: |
+          expected=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          actual=$(rustc --version | awk '{print $2}')
+          test "$actual" = "$expected"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -113,10 +124,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Read Rust toolchain
+        id: rust-toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           components: rustfmt
+
+      - name: Assert Rust toolchain
+        run: |
+          expected=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          actual=$(rustc --version | awk '{print $2}')
+          test "$actual" = "$expected"
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

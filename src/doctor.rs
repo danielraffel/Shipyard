@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -163,6 +164,7 @@ fn collect_report_with_github_auth(
     core.insert("ssh".to_owned(), check_command(probe, "ssh", &["-V"]));
     core.insert("rich-bundle".to_owned(), check_rich_bundle_health());
     core.insert("shipyard-on-path".to_owned(), check_shipyard_path_shadows());
+    core.insert("rustc-rustup-proxy".to_owned(), check_rustc_rustup_proxy());
     if let Some(entry) = check_macos_gatekeeper_health() {
         core.insert("macos-gatekeeper".to_owned(), entry);
     }
@@ -389,6 +391,35 @@ fn check_rich_bundle_health() -> DoctorEntry {
             "Shipyard no longer embeds Python rich/_unicode_data; this row is retained so doctor JSON keeps the upstream diagnostic surface.".to_owned(),
         ),
         error: None,
+    }
+}
+
+fn check_rustc_rustup_proxy() -> DoctorEntry {
+    let Some(path) = std::env::var_os("PATH").and_then(|value| {
+        std::env::split_paths(&value)
+            .map(|dir| dir.join("rustc"))
+            .find(|candidate| candidate.exists())
+    }) else {
+        return DoctorEntry {
+            ok: false,
+            version: None,
+            detail: None,
+            error: Some("rustc is not on PATH".to_owned()),
+        };
+    };
+    let is_cargo_proxy = path.ends_with(".cargo/bin/rustc")
+        && fs::read_link(&path).ok().is_some_and(|target| {
+            target.file_name() == Some(std::ffi::OsStr::new("rustup"))
+        });
+    if is_cargo_proxy {
+        DoctorEntry::ok(format!("{} (rustup proxy)", path.display()))
+    } else {
+        DoctorEntry {
+            ok: false,
+            version: None,
+            detail: Some(format!("PATH rustc resolves to {}", path.display())),
+            error: Some("rustc is not the rustup proxy".to_owned()),
+        }
     }
 }
 

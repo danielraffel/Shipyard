@@ -27,7 +27,7 @@ def main() -> int:
             assert proc.returncode != 0, proc.stderr
             assert "Cargo is forbidden on m3" in proc.stderr, proc.stderr
             assert "cargo fmt --all --check" in proc.stderr, proc.stderr
-            assert "advisory clippy" in proc.stderr and "cargo clippy --all-targets --locked" in proc.stderr, proc.stderr
+            assert "cargo clippy --all-targets --locked" in proc.stderr, proc.stderr
         finally:
             target.write_bytes(original)
     checker = ROOT / "scripts/check_test_include_str.py"
