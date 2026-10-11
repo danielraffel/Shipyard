@@ -714,8 +714,8 @@ fn daemon_start<W: Write>(
     repos: &[String],
     no_detach: bool,
 ) -> Result<ExitCode, CliFailure> {
-    let repos = if repos.is_empty() {
-        &[
+    let requested_repos: Vec<String> = if repos.is_empty() {
+        vec![
             "Generous-Corp/pulp".to_owned(),
             "danielraffel/tartci".to_owned(),
             "Generous-Corp/vellum".to_owned(),
@@ -726,7 +726,7 @@ fn daemon_start<W: Write>(
     let resolved_repos = resolve_watch_list(
         mode,
         &runtime_paths.state_dir,
-        resolve_repos(&runtime_paths.state_dir, &repos),
+        resolve_repos(&runtime_paths.state_dir, &requested_repos),
     );
     if no_detach {
         return daemon_run_with_repos(mode, runtime_paths, resolved_repos);
