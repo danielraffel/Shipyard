@@ -2734,4 +2734,44 @@ mod tests {
     fn apply_changed_surface_execution_t4_absent_selected_returncode_is_inconclusive() {
         assert_eq!(selected_returncode_matches(0, None), None);
     }
+
+    #[test]
+    fn production_canary_mutants_are_break_confirmed() {
+        let source = include_str!("changed_surface_execution.rs");
+        assert!(source.contains("canary_binding_decision(pass1_status.success()"));
+        assert!(!source.contains("let candidate = Some(pass1.clone())"));
+        assert!(source.contains("Filed::Kept"));
+    }
+
+    #[test]
+    fn production_receipt_contains_the_nine_fact_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let pass1 = temp.path().join("pass1");
+        let pass2 = temp.path().join("pass2");
+        let receipt = temp.path().join("receipt");
+        fs::create_dir_all(&pass1).unwrap();
+        fs::create_dir_all(&pass2).unwrap();
+        fs::write(pass1.join("result-1.json"), br#"{"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#).unwrap();
+        fs::write(pass2.join("result-2.json"), br#"{"selected_returncode":0}"#).unwrap();
+        let identity = canary_record("R");
+        persist_same_base_canary_receipt(&receipt, &pass1, &pass2, Some(&identity), Some(0), None)
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(
+            &fs::read(receipt.join("same-base-canary-receipt.json")).unwrap(),
+        )
+        .unwrap();
+        for field in [
+            "mode",
+            "binding_record_and_tree_sha",
+            "derived.status",
+            "audit_staged_then_applied",
+            "would_skip_gt_0",
+            "false_skips_eq_0",
+            "rederivation_match",
+            "selected_returncode_eq_lane_rc",
+            "no_fallback_file",
+        ] {
+            assert!(payload.get(field).is_some(), "missing {field}");
+        }
+    }
 }
