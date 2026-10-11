@@ -125,15 +125,6 @@ fn enqueue_pull_request_with_recovery(
             );
         }
     };
-    if !approval_policy.required {
-        return (
-            Some("waiting_head_approval".to_owned()),
-            Some(
-                "head approval policy does not require approval; refusing steward enqueue"
-                    .to_owned(),
-            ),
-        );
-    }
     let mut approval_comment_id = None;
     let mut approval_app_id = None;
     {
