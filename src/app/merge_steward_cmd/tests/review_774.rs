@@ -222,7 +222,10 @@ fn r774_r1_short_prefix_marker_does_not_arm() {
 fn r774_r1_absent_policy_file_does_not_arm_unapproved_head() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
-    let body = script(&log, r"echo '404 Not Found' >&2; exit 1", "");
+    let body = format!(
+        "# CONFIG_ERROR\n{}",
+        script(&log, r"echo '404 Not Found' >&2; exit 1", "",)
+    );
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
     assert!(!calls.contains("stackEntry") && !calls.contains("enqueuePullRequest"));
     assert!(mutation.is_none());

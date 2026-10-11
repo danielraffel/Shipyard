@@ -6,7 +6,7 @@ fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     let absent_policy = if body.contains("CONFIG_ERROR") {
         String::new()
     } else {
-        "case \"$*\" in *contents/.shipyard/config.toml*) echo '404 Not Found' >&2; exit 1 ;; esac\n".to_owned()
+        "case \"$*\" in *contents/.shipyard/config.toml*) printf '%s\\n' '[auto_merge]' 'arm_requires_head_approval = false' ;; esac\n".to_owned()
     };
     crate::test_support::write_executable_script(
         &path,
