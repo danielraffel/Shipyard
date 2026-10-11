@@ -28,7 +28,7 @@ use crate::pr_watch::scan::{
 use crate::pr_watch::{WatchQuery, gather, ledger, wakes};
 
 /// Per-request bound. Observation must never strand the invoking agent.
-const GITHUB_READ_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+const GITHUB_READ_TIMEOUT: StdDuration = StdDuration::from_mins(2);
 
 pub(super) fn pr_watch_command<W: Write>(
     command: PrWatchCommand,

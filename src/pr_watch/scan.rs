@@ -89,7 +89,7 @@ impl AttributorCommand {
                     &run_id.to_string(),
                 ])
                 .current_dir(&self.root);
-            let deadline = Instant::now() + StdDuration::from_secs(180);
+            let deadline = Instant::now() + StdDuration::from_mins(3);
             let output =
                 crate::process::run_output_until(&mut command, deadline, "queue attribution")
                     .ok()?;
@@ -707,7 +707,7 @@ pub fn run_digest_command(command_argv: &[String], payload: &str) -> Result<(), 
     {
         let mut command = std::process::Command::new(program);
         command.args(program_args);
-        let deadline = Instant::now() + StdDuration::from_secs(120);
+        let deadline = Instant::now() + StdDuration::from_mins(2);
         let output = crate::process::run_output_with_input_until(
             &mut command,
             payload.as_bytes(),
@@ -798,7 +798,7 @@ pub fn daemon_pass(
     for repo in repos {
         let actions = crate::cloud::GitHubActions::from_loaded_config(&cwd, &config)
             .with_repo_override(&repo);
-        let timeout = StdDuration::from_secs(120);
+        let timeout = StdDuration::from_mins(2);
         let reader = |argv: &[String]| {
             actions
                 .run_gh_with_timeout_env(argv, timeout, &[("GH_REPO", repo.as_str())])

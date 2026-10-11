@@ -253,15 +253,18 @@ fn marker_approval_preserves_comment_id_for_the_enqueue_receipt() {
 
 #[test]
 fn real_reviewer_comment_accepts_spaced_final_marker() {
-    let body = r#"## fable-graph review of 57802dbb66a6c963300cd0dd0177a9143ac4c63d: APPROVED
+    let body = r"## fable-graph review of 57802dbb66a6c963300cd0dd0177a9143ac4c63d: APPROVED
 
 - Required checks on the exact head: `macos` success, `linux`, `windows`, `Enforce version & skill sync` all success.
 
-reviewed: 57802dbb66a6c963300cd0dd0177a9143ac4c63d"#;
-    assert!(marker_names_head(
-        body,
-        "57802dbb66a6c963300cd0dd0177a9143ac4c63d"
-    ));
+reviewed: 57802dbb66a6c963300cd0dd0177a9143ac4c63d";
+    assert!(find_approval(
+        "57802dbb66a6c963300cd0dd0177a9143ac4c63d",
+        &[],
+        &[serde_json::json!({"login": "fable-graph", "type": "User", "at": "2026-10-11T12:00:00Z", "body": body})],
+        &required(&["fable-graph"]),
+        None,
+    ).is_some());
 }
 
 #[test]

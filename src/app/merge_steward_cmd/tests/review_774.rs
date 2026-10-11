@@ -29,7 +29,7 @@ esac
 }
 
 const POLICY_OK: &str = r#"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_logins = ["reviewer"]'"#;
-const POLICY_ERR: &str = r#"echo 'HTTP 500 server error' >&2; exit 1"#;
+const POLICY_ERR: &str = r"echo 'HTTP 500 server error' >&2; exit 1";
 
 fn comment(login: &str, body: &str) -> String {
     format!(
@@ -59,12 +59,12 @@ fn run(
     (mutation, error, calls)
 }
 
-fn assert_held(mutation: &Option<String>, error: &Option<String>, calls: &str) {
+fn assert_held(mutation: Option<&String>, error: Option<&String>, calls: &str) {
     assert!(
         !calls.contains("stackEntry")
             && !calls.contains("stackConfig")
             && !calls.contains("enqueuePullRequest")
-            && mutation.as_deref() != None,
+            && mutation.is_some(),
         "gate let the enqueue path continue: mutation={mutation:?} error={error:?}\n{calls}"
     );
 }
@@ -77,7 +77,7 @@ fn r774_positive_exact_head_marker_passes_the_gate() {
     let body = script(
         &log,
         POLICY_OK,
-        &comment("reviewer", &format!("LGTM\\nreviewed:{HEAD}")),
+        &comment("reviewer", &format!("LGTM\\nreviewed: {HEAD}")),
     );
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
     assert!(
@@ -103,7 +103,7 @@ fn r774_r8_marker_naming_an_earlier_head_does_not_arm() {
         &comment("reviewer", &format!("LGTM\\nreviewed:{EARLIER}")),
     );
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
-    assert_held(&mutation, &error, &calls);
+    assert_held(mutation.as_ref(), error.as_ref(), &calls);
     assert_eq!(
         mutation.as_deref(),
         Some("waiting_head_approval"),
@@ -124,7 +124,7 @@ fn r774_missing_approval_does_not_arm() {
     let log = temp.path().join("calls");
     let body = script(&log, POLICY_OK, "");
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
-    assert_held(&mutation, &error, &calls);
+    assert_held(mutation.as_ref(), error.as_ref(), &calls);
     assert_eq!(
         mutation.as_deref(),
         Some("waiting_head_approval"),
@@ -169,7 +169,7 @@ fn r774_r1_later_hold_by_a_recognized_reviewer_does_not_arm() {
     );
     let body = script(&log, POLICY_OK, &comments);
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
-    assert_held(&mutation, &error, &calls);
+    assert_held(mutation.as_ref(), error.as_ref(), &calls);
 }
 
 #[cfg(unix)]
@@ -186,7 +186,7 @@ fn r774_r1_hold_comment_carrying_a_marker_line_does_not_arm() {
         ),
     );
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
-    assert_held(&mutation, &error, &calls);
+    assert_held(mutation.as_ref(), error.as_ref(), &calls);
 }
 
 #[cfg(unix)]
@@ -200,7 +200,7 @@ fn r774_r1_author_cannot_approve_own_head() {
         &comment("reviewer", &format!("reviewed:{HEAD}")),
     );
     let (mutation, error, calls) = run(&temp, &body, Some("reviewer"));
-    assert_held(&mutation, &error, &calls);
+    assert_held(mutation.as_ref(), error.as_ref(), &calls);
 }
 
 #[cfg(unix)]
@@ -214,7 +214,7 @@ fn r774_r1_short_prefix_marker_does_not_arm() {
         &comment("reviewer", &format!("reviewed:{}", &HEAD[..7])),
     );
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
-    assert_held(&mutation, &error, &calls);
+    assert_held(mutation.as_ref(), error.as_ref(), &calls);
 }
 
 #[cfg(unix)]
@@ -222,7 +222,7 @@ fn r774_r1_short_prefix_marker_does_not_arm() {
 fn r774_r1_absent_policy_file_does_not_arm_unapproved_head() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
-    let body = script(&log, r#"echo '404 Not Found' >&2; exit 1"#, "");
+    let body = script(&log, r"echo '404 Not Found' >&2; exit 1", "");
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
     assert!(!calls.contains("stackEntry") && !calls.contains("enqueuePullRequest"));
     assert!(mutation.is_none());

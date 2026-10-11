@@ -457,7 +457,7 @@ fn assert_all_readers_valid(results: &[Result<String, String>]) {
 /// file" errors were a consequence, not the cause. The ceiling below is only a
 /// hang guard for a producer that is alive but wedged.
 fn wait_for_path(path: &Path, description: &str, mut producer_running: impl FnMut() -> bool) {
-    let hang_guard = Instant::now() + Duration::from_secs(300);
+    let hang_guard = Instant::now() + Duration::from_mins(5);
     while !path.exists() {
         if !producer_running() {
             assert!(

@@ -1365,8 +1365,7 @@ fn storage_probe_from_output(output: &Output, fallback_path: &str) -> StoragePro
 /// attempt is affordable where a longer ladder would starve the reads that
 /// follow. Retries stop early on their own once the shared budget is spent, and
 /// a denial is never retried at all.
-const RUNNER_CENSUS_BACKOFF: [Duration; 2] =
-    [Duration::from_millis(250), Duration::from_millis(1000)];
+const RUNNER_CENSUS_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
 
 fn fetch_repository_runners(actions: &GitHubActions, repo: &str) -> RunnerInventory {
     fetch_repository_runners_with_backoff(actions, repo, &RUNNER_CENSUS_BACKOFF)

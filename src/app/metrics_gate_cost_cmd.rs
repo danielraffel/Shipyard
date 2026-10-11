@@ -14,7 +14,7 @@ use crate::identity::RuntimeMode;
 use crate::output::write_pretty_json;
 
 /// Per-request bound. Observation must never strand the invoking agent.
-const GITHUB_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const GITHUB_READ_TIMEOUT: Duration = Duration::from_mins(1);
 const CONFIG_SECTION: &str = "metrics.gate_cost";
 
 pub(super) fn gate_cost_command<W: Write>(
