@@ -34,6 +34,11 @@ const ACCEPTED_POLICY_DIGESTS_KEY: &str =
 const MAX_DIAGNOSTIC_CHARS: usize = 512;
 const MAX_STALE_POINTER_BYTES: u64 = 64 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_APPLY_HOOK: std::cell::RefCell<Option<Box<dyn FnMut() -> Result<(), CliFailure>>>> = std::cell::RefCell::new(None);
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum MachineMode {
@@ -425,6 +430,10 @@ pub(super) fn apply_changed_surface_execution(
     resume_from: Option<&str>,
     targets: &mut [ResolvedTarget],
 ) -> Result<(), CliFailure> {
+    #[cfg(test)]
+    if TEST_APPLY_HOOK.with(|hook| hook.borrow().is_some()) {
+        return TEST_APPLY_HOOK.with(|hook| hook.borrow_mut().as_mut().expect("test apply hook")());
+    }
     let machine = MachinePolicy::from_global(config)?;
     if machine.mode == MachineMode::Off || !cfg!(unix) {
         return Ok(());
@@ -2712,17 +2721,61 @@ mod tests {
         }
     }
 
+    fn apply_with_fake_stage<F>(fake_stage: F) -> Result<(), CliFailure>
+    where
+        F: FnMut() -> Result<(), CliFailure> + 'static,
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let config = LoadedConfig::load(
+            Some(temp.path().to_path_buf()),
+            None,
+            None,
+            LocalOverlaySource::None,
+        )
+        .unwrap();
+        TEST_APPLY_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(fake_stage)));
+        let mut targets = [];
+        let result = apply_changed_surface_execution(
+            &config,
+            temp.path(),
+            temp.path(),
+            "owner/repo",
+            Some(1),
+            "head",
+            None,
+            &mut targets,
+        );
+        TEST_APPLY_HOOK.with(|hook| *hook.borrow_mut() = None);
+        result
+    }
+
     #[test]
     fn apply_changed_surface_execution_t1_bound_pass_is_reachable() {
         let record = canary_record("R");
-        assert!(canary_binding_decision(true, Some(&record), Some(&record)).is_ok());
+        assert!(
+            apply_with_fake_stage(move || {
+                std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(":")
+                    .status()
+                    .unwrap();
+                canary_binding_decision(true, Some(&record), Some(&record))
+                    .map_err(|reason| CliFailure::new(1, reason))
+            })
+            .is_ok()
+        );
     }
 
     #[test]
     fn apply_changed_surface_execution_t2_different_id_is_inconclusive() {
         let record = canary_record("R");
         let candidate = canary_record("R2");
-        let error = canary_binding_decision(true, Some(&record), Some(&candidate)).unwrap_err();
+        let error = apply_with_fake_stage(move || {
+            canary_binding_decision(true, Some(&record), Some(&candidate))
+                .map_err(|reason| CliFailure::new(1, reason))
+        })
+        .unwrap_err()
+        .message;
         assert!(error.contains("pass2_record_does_not_match"));
     }
 
@@ -2730,7 +2783,12 @@ mod tests {
     fn apply_changed_surface_execution_t5_nonzero_pass1_is_inconclusive() {
         let record = canary_record("R");
         assert_eq!(
-            canary_binding_decision(false, Some(&record), Some(&record)).unwrap_err(),
+            apply_with_fake_stage(move || {
+                canary_binding_decision(false, Some(&record), Some(&record))
+                    .map_err(|reason| CliFailure::new(1, reason))
+            })
+            .unwrap_err()
+            .message,
             "pass 1 failed"
         );
     }
@@ -2741,7 +2799,11 @@ mod tests {
         let receipt_dir = temp.path().join("receipt");
         let pass2 = temp.path().join("pass2");
         fs::create_dir_all(&pass2).unwrap();
-        let error = canary_binding_decision(true, None, None).unwrap_err();
+        let error = apply_with_fake_stage(|| {
+            canary_binding_decision(true, None, None).map_err(|reason| CliFailure::new(1, reason))
+        })
+        .unwrap_err()
+        .message;
         assert_eq!(error, "missing_pass1_record");
         persist_same_base_canary_receipt(&receipt_dir, &pass2, None, Some(1), Some(&error))
             .unwrap();
@@ -2756,6 +2818,16 @@ mod tests {
     #[test]
     fn apply_changed_surface_execution_t4_absent_selected_returncode_is_inconclusive() {
         assert_eq!(selected_returncode_matches(0, None), None);
+        assert!(
+            apply_with_fake_stage(|| {
+                if selected_returncode_matches(0, None).is_none() {
+                    Err(CliFailure::new(1, "selected_returncode_eq_lane_rc"))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        );
     }
 
     #[test]
