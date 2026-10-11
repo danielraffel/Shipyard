@@ -75,6 +75,7 @@ fn ready_pr() -> ObservedPr {
     .expect("ready PR")
 }
 
+#[cfg(unix)]
 fn ready_pr_with_wire_owner() -> ObservedPr {
     parse_pr(
         &serde_json::json!({
