@@ -87,7 +87,10 @@ impl CanaryFacts {
 /// The injected runner is only a command seam: production supplies the lane
 /// command, while tests supply a fake shell command that writes its receipts.
 #[must_use]
-pub fn execute_canary_with_runner<F>(mut run: F, receipt_path: &Path) -> CanaryFacts
+pub fn apply_changed_surface_execution_with_runner<F>(
+    mut run: F,
+    receipt_path: &Path,
+) -> CanaryFacts
 where
     F: FnMut(bool, Option<&str>) -> FakeLanePass,
 {
@@ -327,7 +330,7 @@ mod tests {
     fn apply_changed_surface_execution_t1_bound_pass_is_reachable() {
         let temp = tempfile::tempdir().unwrap();
         let receipt = temp.path().join("receipt.json");
-        let facts = execute_canary_with_runner(
+        let facts = apply_changed_surface_execution_with_runner(
             |full, bound| {
                 if full {
                     fs::write(
@@ -370,7 +373,7 @@ mod tests {
     fn apply_changed_surface_execution_t2_different_id_is_inconclusive() {
         let temp = tempfile::tempdir().unwrap();
         let receipt = temp.path().join("receipt.json");
-        let facts = execute_canary_with_runner(
+        let facts = apply_changed_surface_execution_with_runner(
             |full, _| FakeLanePass {
                 record_id: Some(if full { "R" } else { "R2" }.into()),
                 selected_returncode: Some(0),
@@ -389,7 +392,7 @@ mod tests {
     fn apply_changed_surface_execution_t3_no_record_writes_inconclusive_receipt() {
         let temp = tempfile::tempdir().unwrap();
         let receipt = temp.path().join("receipt.json");
-        let facts = execute_canary_with_runner(
+        let facts = apply_changed_surface_execution_with_runner(
             |_, _| FakeLanePass {
                 record_id: None,
                 selected_returncode: None,
@@ -408,7 +411,7 @@ mod tests {
     fn apply_changed_surface_execution_t4_absent_selected_returncode_is_inconclusive() {
         let temp = tempfile::tempdir().unwrap();
         let receipt = temp.path().join("receipt.json");
-        let facts = execute_canary_with_runner(
+        let facts = apply_changed_surface_execution_with_runner(
             |full, _| FakeLanePass {
                 record_id: Some("R".into()),
                 selected_returncode: if full { Some(0) } else { None },
