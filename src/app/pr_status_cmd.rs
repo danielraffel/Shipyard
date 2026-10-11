@@ -96,7 +96,7 @@ pub(crate) fn status_command<W: Write>(
                 next_action: if queue_ready { "observe" } else { "owner-wake" }.to_owned(),
                 age_seconds,
                 last_movement: movement,
-                stalled: !queue_ready && age_seconds >= 2 * 60 * 60,
+                stalled: is_stalled(age_seconds, queue_ready),
             });
         }
     }
@@ -128,6 +128,10 @@ pub(crate) fn status_command<W: Write>(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+fn is_stalled(age_seconds: u64, queue_ready: bool) -> bool {
+    !queue_ready && age_seconds >= 2 * 60 * 60
+}
+
 fn parse_age(updated: &str) -> u64 {
     let Ok(time) = chrono::DateTime::parse_from_rfc3339(updated) else {
         return 0;
@@ -144,21 +148,41 @@ fn latest_movement(item: &serde_json::Value) -> String {
     if let Some(value) = item.get("updatedAt").and_then(serde_json::Value::as_str) {
         times.push(value);
     }
-    if let Some(commits) = item.get("commits").and_then(|v| v.get("nodes")).and_then(serde_json::Value::as_array) {
+    if let Some(commits) = item
+        .get("commits")
+        .and_then(|v| v.get("nodes"))
+        .and_then(serde_json::Value::as_array)
+    {
         for commit in commits {
-            if let Some(value) = commit.pointer("/commit/committedDate").and_then(serde_json::Value::as_str) { times.push(value); }
-        }
-    }
-    if let Some(comments) = item.get("comments").and_then(|v| v.get("nodes")).and_then(serde_json::Value::as_array) {
-        for comment in comments {
-            for key in ["createdAt", "updatedAt"] {
-                if let Some(value) = comment.get(key).and_then(serde_json::Value::as_str) { times.push(value); }
+            if let Some(value) = commit
+                .pointer("/commit/committedDate")
+                .and_then(serde_json::Value::as_str)
+            {
+                times.push(value);
             }
         }
     }
-    if let Some(checks) = item.get("statusCheckRollup").and_then(serde_json::Value::as_array) {
+    if let Some(comments) = item
+        .get("comments")
+        .and_then(|v| v.get("nodes"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for comment in comments {
+            for key in ["createdAt", "updatedAt"] {
+                if let Some(value) = comment.get(key).and_then(serde_json::Value::as_str) {
+                    times.push(value);
+                }
+            }
+        }
+    }
+    if let Some(checks) = item
+        .get("statusCheckRollup")
+        .and_then(serde_json::Value::as_array)
+    {
         for check in checks {
-            if let Some(value) = check.get("completedAt").and_then(serde_json::Value::as_str) { times.push(value); }
+            if let Some(value) = check.get("completedAt").and_then(serde_json::Value::as_str) {
+                times.push(value);
+            }
         }
     }
     times.into_iter().max().unwrap_or_default().to_owned()
@@ -170,35 +194,14 @@ fn owner_for(item: &serde_json::Value) -> String {
     {
         return session;
     }
-    item.pointer("/commits/nodes/0/commit/author/login")
+    item.get("commits")
+        .and_then(|commits| commits.get("nodes"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|nodes| nodes.last())
+        .and_then(|node| node.pointer("/commit/author/login"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("team-lead")
         .to_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stalled_uses_latest_of_head_comment_and_check_movement() {
-        let item = serde_json::json!({
-            "updatedAt": "2026-10-11T00:00:00Z",
-            "commits": {"nodes": [{"commit": {"committedDate": "2026-10-11T01:00:00Z"}}]},
-            "comments": {"nodes": [{"createdAt": "2026-10-11T02:00:00Z", "updatedAt": "2026-10-11T02:00:00Z"}]},
-            "statusCheckRollup": [{"completedAt": "2026-10-11T03:00:00Z"}]
-        });
-        assert_eq!(latest_movement(&item), "2026-10-11T03:00:00Z");
-    }
-
-    #[test]
-    fn owner_prefers_whence_then_last_committer_then_team_lead() {
-        let whence = serde_json::json!({"body": "<!-- whence {\"prov\": {\"session\": \"sess-1\"}} -->", "commits": {"nodes": [{"commit": {"author": {"login": "alice"}}}]}});
-        assert_eq!(owner_for(&whence), "sess-1");
-        let committer = serde_json::json!({"body": "plain", "commits": {"nodes": [{"commit": {"author": {"login": "alice"}}}]}});
-        assert_eq!(owner_for(&committer), "alice");
-        assert_eq!(owner_for(&serde_json::json!({"body": "plain"})), "team-lead");
-    }
 }
 
 fn current_repository(cwd: &Path) -> Result<String, CliFailure> {
@@ -231,4 +234,54 @@ fn configured_repositories(cwd: &Path) -> Vec<String> {
         repos.push(current);
     }
     repos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stalled_uses_latest_of_head_comment_and_check_movement() {
+        let item = serde_json::json!({
+            "updatedAt": "2026-10-11T00:00:00Z",
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-10-11T01:00:00Z"}}]},
+            "comments": {"nodes": [{"createdAt": "2026-10-11T02:00:00Z", "updatedAt": "2026-10-11T02:00:00Z"}]},
+            "statusCheckRollup": [{"completedAt": "2026-10-11T03:00:00Z"}]
+        });
+        assert_eq!(latest_movement(&item), "2026-10-11T03:00:00Z");
+    }
+
+    #[test]
+    fn owner_prefers_whence_then_last_committer_then_team_lead() {
+        let whence = serde_json::json!({"body": "<!-- whence {\"prov\": {\"session\": \"sess-1\"}} -->", "commits": {"nodes": [{"commit": {"author": {"login": "alice"}}}]}});
+        assert_eq!(owner_for(&whence), "sess-1");
+        let committers = serde_json::json!({"body": "plain", "commits": {"nodes": [
+            {"commit": {"author": {"login": "first"}}},
+            {"commit": {"author": {"login": "last"}}}
+        ]}});
+        assert_eq!(owner_for(&committers), "last");
+        assert_eq!(
+            owner_for(&serde_json::json!({"body": "plain"})),
+            "team-lead"
+        );
+    }
+
+    #[test]
+    fn stalled_threshold_is_exact_and_queue_ready_never_stalls() {
+        assert!(!is_stalled(7_199, false));
+        assert!(is_stalled(7_200, false));
+        assert!(!is_stalled(99_999, true));
+    }
+
+    #[test]
+    fn fleet_repository_defaults_include_all_configured_repositories() {
+        assert_eq!(
+            FLEET_REPOSITORIES,
+            &[
+                "Generous-Corp/pulp",
+                "danielraffel/tartci",
+                "Generous-Corp/vellum"
+            ]
+        );
+    }
 }

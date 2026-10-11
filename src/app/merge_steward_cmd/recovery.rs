@@ -775,9 +775,7 @@ pub(super) fn wake_owner_comment(
                 context.observation.repo, pr.fact.number
             ),
             "-f".to_owned(),
-            format!(
-                "body={body}",
-            ),
+            format!("body={body}"),
         ],
     )
     .map_err(|error| format!("could not post owner wake: {error}"))?;
@@ -903,7 +901,7 @@ mod tests {
                 number: 7,
                 head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 author: None,
-        head_branch: "feature".to_owned(),
+                head_branch: "feature".to_owned(),
                 draft: false,
                 merge_state: "CLEAN".to_owned(),
                 auto_merge_active: false,
@@ -1126,7 +1124,10 @@ mod tests {
         };
         assert!(should_wake_owner(&pr(vec![], vec![]), &decision));
         assert!(!should_wake_owner(
-            &pr(vec![NEEDS_AGENT_LABEL], vec![("FAILURE", "2026-08-27T00:00:00Z")]),
+            &pr(
+                vec![NEEDS_AGENT_LABEL],
+                vec![("FAILURE", "2026-08-27T00:00:00Z")]
+            ),
             &decision
         ));
     }
