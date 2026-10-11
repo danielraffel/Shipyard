@@ -42,20 +42,32 @@ pub fn selected_returncode_matches(lane_rc: i32, selected_rc: Option<i32>) -> Op
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Test command result used to drive the real two-pass decision seam.
 pub struct FakeLanePass {
+    /// Record selected by the planner.
     pub record_id: Option<String>,
+    /// Selected return code from the keyed result.
     pub selected_returncode: Option<i32>,
+    /// Return code from the lane command.
     pub lane_returncode: i32,
+    /// Number of pass-1 candidates that would be skipped.
     pub would_skip: Option<usize>,
+    /// Number of false skips reported by pass 1.
     pub false_skips: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Facts emitted by the canary receipt.
 pub struct CanaryFacts {
+    /// Overall verdict.
     pub verdict: &'static str,
+    /// Bounded reason for the verdict.
     pub reason: String,
+    /// Whether pass 1 reported at least one skip.
     pub would_skip_gt_0: Option<bool>,
+    /// Whether pass 1 reported no false skips.
     pub false_skips_eq_0: Option<bool>,
+    /// Whether the selected return code matched the lane return code.
     pub selected_returncode_eq_lane_rc: Option<bool>,
 }
 
