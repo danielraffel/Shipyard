@@ -168,11 +168,29 @@ pull request out permanently. Neither is something to reach for by default.
 
 **Head approval.** A repository whose base branch sets
 `[auto_merge] arm_requires_head_approval = true` arms only a head that carries an
-approval of that exact head: an `APPROVED` review on that commit from a non-bot
-account, or a `reviewed:<sha>` comment line from a login listed in
-`[auto_merge] reviewer_logins` (empty by default). Bot accounts never count,
-including the Shipyard App every agent posts through, because a marker it wrote
-would approve itself. Without an approval the line reads
+approval of that exact head from an identity listed in
+`[auto_merge] reviewer_identities` (empty by default; the older spelling
+`reviewer_logins` is still read), for example
+`reviewer_identities = ["shipyard-review[bot]", "danielraffel"]`. A listed bot
+counts, which is how the review App approves. The fleet author App
+`shipyard-local[bot]`, which opens every fleet PR, never counts and is refused
+in the list, and no identity can approve a PR it authored.
+
+To give a verdict as a reviewer, prefer a PR Review from the review App: state
+`APPROVE`, or `REQUEST_CHANGES` to hold. GitHub binds the review to the head it
+was submitted on. A comment works too, but only its last non-empty line is read,
+and it must name the full current head:
+
+```
+verdict: APPROVE head:<40-hex sha>
+verdict: HOLD head:<40-hex sha>
+reviewed:<40-hex sha>
+```
+
+`reviewed:` is an alias for APPROVE. The latest verdict on the current head
+decides. A HOLD on an older head, a quoted (`>`) line, a line above the last,
+and prose that mentions "hold" or "changes requested" never gate. A marker
+posted before the head commit existed does not count. Without an approval the line reads
 `▸ Auto-merge not armed on #N: head … carries no approval …`, and the same check
 holds for the validated arm after a ship passes and for
 `runner steward --arm-unqueued`. A head the queue removed twice also needs an
