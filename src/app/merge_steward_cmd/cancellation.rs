@@ -321,6 +321,26 @@ pub(super) fn apply_pr_plans(
                     }));
                 }
                 error = recovery_error;
+                if args.wake_owner
+                    && error.is_none()
+                    && matches!(
+                        decision,
+                        StewardDecision::NeedsUpdate { .. }
+                            | StewardDecision::RequiredFailed { .. }
+                    )
+                {
+                    let context = mutation_context
+                        .as_ref()
+                        .expect("apply mode requires mutation control");
+                    match super::recovery::wake_owner_comment(context, pr, &decision) {
+                        Ok(action) => {
+                            mutation = Some(mutation.map_or(action.clone(), |prior| {
+                                format!("{prior},{action}")
+                            }));
+                        }
+                        Err(wake_error) => error = Some(wake_error),
+                    }
+                }
             }
             if args.apply && error.is_none() {
                 let (pr_mutation, pr_error) = mutate_pr_with_recovery(

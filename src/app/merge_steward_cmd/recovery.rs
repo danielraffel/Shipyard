@@ -739,6 +739,51 @@ fn signal_needs_agent(
     Ok("needs_agent_signaled".to_owned())
 }
 
+/// B4 owner wake: one exact-head comment naming the actionable reason.
+/// Callers gate this behind a state transition and the explicit `--wake-owner`
+/// switch, so the steward never emits a comment on every polling pass.
+pub(super) fn wake_owner_comment(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    decision: &StewardDecision,
+) -> Result<String, String> {
+    let reason = match decision {
+        StewardDecision::NeedsUpdate { merge_state } => {
+            format!("merge state is {merge_state}")
+        }
+        StewardDecision::RequiredFailed { contexts } => {
+            format!("required checks failed: {}", contexts.join(", "))
+        }
+        _ => return Err("owner wake requested for a non-actionable decision".to_owned()),
+    };
+    super::handoff::verify_exact_open_pr(
+        context.actions,
+        &context.observation.repo,
+        pr.fact.number,
+        &pr.fact.head_sha,
+    )
+    .map_err(|error| format!("owner wake target changed: {}", error.message()))?;
+    run_steward_write(
+        context.actions,
+        &[
+            "api".to_owned(),
+            "-X".to_owned(),
+            "POST".to_owned(),
+            format!(
+                "repos/{}/issues/{}/comments",
+                context.observation.repo, pr.fact.number
+            ),
+            "-f".to_owned(),
+            format!(
+                "body=Shipyard owner wake: PR #{} at exact head {} requires action: {}",
+                pr.fact.number, pr.fact.head_sha, reason
+            ),
+        ],
+    )
+    .map_err(|error| format!("could not post owner wake: {error}"))?;
+    Ok("owner_wake_posted".to_owned())
+}
+
 fn clear_needs_agent(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,

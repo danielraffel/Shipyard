@@ -51,6 +51,7 @@ pub(super) struct StewardCommandArgs {
     /// Also arm GitHub-native auto-merge on green, unqueued, unarmed pull
     /// requests the steward declines to own. See `native_arm`.
     pub(super) arm_unqueued: bool,
+    pub(super) wake_owner: bool,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
 }
