@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 
 use super::super::CliFailure;
 use super::super::changed_surface_cmd::{
-    ChangedSurfacePlanArgs, observe_changed_surface_plan, observe_stale_base_shadow,
+    ChangedSurfaceObservation, ChangedSurfacePlanArgs, observe_changed_surface_plan,
+    observe_stale_base_shadow,
 };
 use super::executable_reuse_plan::{KeyRequest, Keyed, plan_keyed};
 use crate::changed_surface::same_base_canary::{
@@ -34,6 +35,30 @@ const MAX_DIAGNOSTIC_CHARS: usize = 512;
 const MAX_STALE_POINTER_BYTES: u64 = 64 * 1024;
 
 type StageRunner<'a> = dyn FnMut(&str, &Path, bool, Option<&Path>) -> Result<i32, CliFailure> + 'a;
+
+pub(super) trait CanaryEnvironment {
+    fn observe(
+        &mut self,
+        args: &ChangedSurfacePlanArgs,
+        config: &LoadedConfig,
+        cwd: &Path,
+        state_dir: &Path,
+    ) -> Result<ChangedSurfaceObservation, CliFailure>;
+}
+
+pub(super) struct ProductionCanaryEnvironment;
+
+impl CanaryEnvironment for ProductionCanaryEnvironment {
+    fn observe(
+        &mut self,
+        args: &ChangedSurfacePlanArgs,
+        config: &LoadedConfig,
+        cwd: &Path,
+        state_dir: &Path,
+    ) -> Result<ChangedSurfaceObservation, CliFailure> {
+        observe_changed_surface_plan(args, config, cwd, state_dir)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -517,6 +542,7 @@ pub(super) fn apply_changed_surface_execution(
     resume_from: Option<&str>,
     targets: &mut [ResolvedTarget],
     runner: &mut StageRunner<'_>,
+    environment: &mut dyn CanaryEnvironment,
 ) -> Result<(), CliFailure> {
     let machine = MachinePolicy::from_global(config)?;
     if machine.mode == MachineMode::Off || !cfg!(unix) {
@@ -545,7 +571,7 @@ pub(super) fn apply_changed_surface_execution(
             let Some(contract_digest) = validation_contract_digest(target) else {
                 continue;
             };
-            let Ok(observation) = observe_changed_surface_plan(
+            let Ok(observation) = environment.observe(
                 &ChangedSurfacePlanArgs {
                     target: target.name.clone(),
                     pr,
@@ -627,7 +653,7 @@ pub(super) fn apply_changed_surface_execution(
         } else {
             None
         };
-        let observation = match observe_changed_surface_plan(
+        let observation = match environment.observe(
             &ChangedSurfacePlanArgs {
                 target: target.name.clone(),
                 pr,
@@ -782,7 +808,7 @@ pub(super) fn apply_changed_surface_execution(
                     .map(|name| name.to_string_lossy().into_owned()),
                 crate::reuse_record_store::Filed::Discarded(_) => None,
             });
-            let replanned = observe_changed_surface_plan(
+            let replanned = environment.observe(
                 &ChangedSurfacePlanArgs {
                     target: target.name.clone(),
                     pr,
@@ -2787,6 +2813,7 @@ mod tests {
         let mut targets = [];
         let mut runner =
             |_command: &str, _dir: &Path, _compare_full: bool, _record_dir: Option<&Path>| Ok(0);
+        let mut environment = ProductionCanaryEnvironment;
         let result = apply_changed_surface_execution(
             &config,
             temp.path(),
@@ -2797,6 +2824,7 @@ mod tests {
             None,
             &mut targets,
             &mut runner,
+            &mut environment,
         );
         result.and_then(|()| fake_stage())
     }

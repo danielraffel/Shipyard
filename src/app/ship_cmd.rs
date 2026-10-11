@@ -123,7 +123,7 @@ mod metadata_authority;
 mod prepush_changed_surface;
 mod provenance;
 mod read_audit;
-use changed_surface_execution::apply_changed_surface_execution;
+use changed_surface_execution::{ProductionCanaryEnvironment, apply_changed_surface_execution};
 use provenance::{AppliedStewardHandoff, apply_requested_steward_handoff, run_pr_provenance_hook};
 
 #[allow(clippy::too_many_lines)]
@@ -396,6 +396,7 @@ pub(super) fn ship_command<W: Write>(
                         CliFailure::new(1, format!("run changed-surface stage: {error}"))
                     })
             };
+        let mut canary_environment = ProductionCanaryEnvironment;
         apply_changed_surface_execution(
             config,
             cwd,
@@ -406,6 +407,7 @@ pub(super) fn ship_command<W: Write>(
             args.resume_from.as_deref(),
             &mut targets,
             &mut stage_runner,
+            &mut canary_environment,
         )?;
     }
 
