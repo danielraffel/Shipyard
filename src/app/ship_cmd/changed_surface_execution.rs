@@ -438,15 +438,49 @@ fn latest_result(dir: &Path) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
+/// Whether `dir` holds a fallback diagnostic: `fallback.json`, or one of the
+/// append-only `fallback-*.json` files a shadow plan writes.
+fn has_fallback_file(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("fallback") && name.ends_with(".json")
+        })
+    })
+}
+
+/// The canary verdict and its reason. FAIL is any observed defect: a false
+/// skip, a re-derivation mismatch, or a fallback file in pass 2's evidence.
+/// PASS needs every fact present and true. Anything else is INCONCLUSIVE,
+/// naming the first absent fact.
+fn same_base_canary_verdict(
+    facts: &[(&'static str, Option<bool>)],
+    defects: &[(Option<bool>, String)],
+) -> (&'static str, Option<String>) {
+    if let Some((_, reason)) = defects.iter().find(|(held, _)| *held == Some(false)) {
+        return ("FAIL", Some(reason.clone()));
+    }
+    if let Some((name, _)) = facts.iter().find(|(_, value)| value.is_none()) {
+        return ("INCONCLUSIVE", Some((*name).to_owned()));
+    }
+    if let Some((name, _)) = facts.iter().find(|(_, value)| *value == Some(false)) {
+        return ("INCONCLUSIVE", Some(format!("{name} is false")));
+    }
+    ("PASS", None)
+}
+
+/// Write the canary receipt. `pass2_dir` is `None` when pass 2 never ran, so
+/// none of its facts can be read and the verdict cannot be PASS or FAIL.
 fn persist_same_base_canary_receipt(
     dir: &Path,
-    pass2_dir: &Path,
+    pass2_dir: Option<&Path>,
     identity: Option<&FullShadowRecord>,
     lane_rc: Option<i32>,
     reason: Option<&str>,
     stale_base: Option<bool>,
 ) -> Result<(), CliFailure> {
-    let pass2 = latest_result(pass2_dir);
+    let pass2 = pass2_dir.map_or(serde_json::Value::Null, latest_result);
     let reuse = pass2.get("executable_reuse");
     let derived = reuse.and_then(|value| value.get("derived"));
     let derived_status = derived
@@ -461,40 +495,54 @@ fn persist_same_base_canary_receipt(
         .and_then(|value| value.get("would_skip_count"))
         .and_then(serde_json::Value::as_u64)
         .map(|count| count > 0);
-    let false_skips = reuse
+    let false_skip_count = reuse
         .and_then(|value| value.get("false_skip_count"))
-        .and_then(serde_json::Value::as_u64)
-        .map(|count| count == 0);
+        .and_then(serde_json::Value::as_u64);
+    let false_skips = false_skip_count.map(|count| count == 0);
     let rederivation = derived_status.map(|status| status == "derived");
     let selected_rc = pass2
         .get("selected_returncode")
         .and_then(serde_json::Value::as_i64)
         .and_then(|value| i32::try_from(value).ok());
     let selected_matches = lane_rc.and_then(|rc| selected_returncode_matches(rc, selected_rc));
-    let no_fallback = !pass2_dir.join("fallback.json").exists();
-    let missing = if audit.is_none() {
-        Some("audit_staged_then_applied")
-    } else if would_skip.is_none() {
-        Some("would_skip_gt_0")
-    } else if false_skips.is_none() {
-        Some("false_skips_eq_0")
-    } else if rederivation.is_none() {
-        Some("rederivation_match")
-    } else if selected_matches.is_none() {
-        Some("selected_returncode_eq_lane_rc")
+    let no_fallback = pass2_dir.map(|pass2_dir| !has_fallback_file(pass2_dir));
+    let (verdict, judged) = same_base_canary_verdict(
+        &[
+            ("audit_staged_then_applied", audit),
+            ("would_skip_gt_0", would_skip),
+            ("false_skips_eq_0", false_skips),
+            ("rederivation_match", rederivation),
+            ("selected_returncode_eq_lane_rc", selected_matches),
+            ("no_fallback_file", no_fallback),
+        ],
+        &[
+            (
+                false_skips,
+                format!(
+                    "false skips: false_skip_count = {}",
+                    false_skip_count.unwrap_or_default()
+                ),
+            ),
+            (
+                rederivation,
+                format!(
+                    "rederivation mismatch: derived.status = {}",
+                    derived_status.unwrap_or_default()
+                ),
+            ),
+            (no_fallback, "fallback file in pass 2 evidence".to_owned()),
+        ],
+    );
+    // A defect pass 2 showed outranks why the run stopped; otherwise the
+    // caller's reason (a refusal, a failed pass) is the more specific one.
+    let reason = if verdict == "FAIL" {
+        judged
     } else {
-        None
+        reason.map(ToOwned::to_owned).or(judged)
     };
-    let complete = missing.is_none()
-        && audit == Some(true)
-        && would_skip == Some(true)
-        && false_skips == Some(true)
-        && rederivation == Some(true)
-        && selected_matches == Some(true)
-        && no_fallback;
     let payload = serde_json::json!({
-        "schema_version": 1, "mode": "same_base_canary", "verdict": if complete { "PASS" } else { "INCONCLUSIVE" },
-        "reason": reason.or(missing), "binding_record_and_tree_sha": identity,
+        "schema_version": 1, "mode": "same_base_canary", "verdict": verdict,
+        "reason": reason, "binding_record_and_tree_sha": identity,
         "derived.status": derived_status, "audit_staged_then_applied": audit, "would_skip_gt_0": would_skip,
         "false_skips_eq_0": false_skips, "rederivation_match": rederivation, "selected_returncode_eq_lane_rc": selected_matches,
         "no_fallback_file": no_fallback, "lane_returncode": lane_rc, "selected_returncode": selected_rc,
@@ -542,7 +590,7 @@ fn execute_same_base_canary_passes(
     let refuse = |identity: Option<&FullShadowRecord>, error: CliFailure| {
         persist_same_base_canary_receipt(
             receipt_dir,
-            receipt_dir,
+            None,
             identity,
             None,
             Some(&error.message),
@@ -578,7 +626,7 @@ fn execute_same_base_canary_passes(
     };
     persist_same_base_canary_receipt(
         receipt_dir,
-        pass2_dir,
+        Some(pass2_dir),
         Some(pass1),
         Some(pass2_rc),
         (pass2_rc != 0).then_some("pass 2 failed"),
@@ -855,7 +903,7 @@ pub(super) fn apply_changed_surface_execution(
                     let canary_root = pass1_dir.parent().unwrap_or(&pass1_dir);
                     persist_same_base_canary_receipt(
                         canary_root,
-                        canary_root,
+                        None,
                         None,
                         None,
                         Some(&error.message),
@@ -952,7 +1000,7 @@ pub(super) fn apply_changed_surface_execution(
                 Err(reason) => {
                     persist_same_base_canary_receipt(
                         canary_root,
-                        canary_root,
+                        None,
                         pass1.as_ref(),
                         Some(pass1_rc),
                         Some(&reason),
@@ -2852,6 +2900,8 @@ mod tests {
         use std::path::Path;
 
         const PASS2_ALL_FACTS: &[u8] = br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
+        const PASS2_ONE_FALSE_SKIP: &[u8] = br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":1,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
+        const PASS2_REDERIVATION_MISMATCH: &[u8] = br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":0,"derived":{"status":"error: binding digest mismatch","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
         const PASS2_NO_SELECTED_RC: &[u8] = br#"{"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
         const RESULT_DIR_ENV: &str = "SHIPYARD_CHANGED_SURFACE_RESULT_DIR";
         const COMPARE_FULL_ENV: &str = "SHIPYARD_CHANGED_SURFACE_COMPARE_FULL";
@@ -2957,6 +3007,7 @@ mod tests {
             pass1_writes_record: bool,
             pass2_result: Option<&'static [u8]>,
             pass2_spawn_fails: bool,
+            pass2_writes_fallback: bool,
         }
 
         const BOUND: Script = Script {
@@ -2964,6 +3015,7 @@ mod tests {
             pass1_writes_record: true,
             pass2_result: Some(PASS2_ALL_FACTS),
             pass2_spawn_fails: false,
+            pass2_writes_fallback: false,
         };
 
         struct CanaryRun {
@@ -3072,6 +3124,9 @@ mod tests {
                     }
                     if let Some(result) = script.pass2_result {
                         fs::write(result_dir.join("result-2.json"), result).unwrap();
+                    }
+                    if script.pass2_writes_fallback {
+                        fs::write(result_dir.join("fallback-1-1-0.json"), b"{}").unwrap();
                     }
                     Ok(0)
                 };
@@ -3215,6 +3270,47 @@ mod tests {
             );
         }
 
+        fn assert_fails(script: Script, reason: &str) {
+            let run = run_canary(Choice::Pass1Record, script);
+            run.result.unwrap();
+            assert_eq!(run.runs.len(), 2, "{:?}", run.runs);
+            assert_eq!(run.receipt["verdict"], "FAIL", "{}", run.receipt);
+            assert_eq!(run.receipt["reason"], reason, "{}", run.receipt);
+        }
+
+        #[test]
+        fn same_base_canary_fails_on_a_false_skip() {
+            assert_fails(
+                Script {
+                    pass2_result: Some(PASS2_ONE_FALSE_SKIP),
+                    ..BOUND
+                },
+                "false skips: false_skip_count = 1",
+            );
+        }
+
+        #[test]
+        fn same_base_canary_fails_on_a_rederivation_mismatch() {
+            assert_fails(
+                Script {
+                    pass2_result: Some(PASS2_REDERIVATION_MISMATCH),
+                    ..BOUND
+                },
+                "rederivation mismatch: derived.status = error: binding digest mismatch",
+            );
+        }
+
+        #[test]
+        fn same_base_canary_fails_on_a_fallback_file() {
+            assert_fails(
+                Script {
+                    pass2_writes_fallback: true,
+                    ..BOUND
+                },
+                "fallback file in pass 2 evidence",
+            );
+        }
+
         #[test]
         fn same_base_canary_pass_two_spawn_error_writes_a_receipt() {
             let run = run_canary(
@@ -3268,8 +3364,15 @@ mod tests {
         fs::create_dir_all(&pass2).unwrap();
         fs::write(pass2.join("result-2.json"), br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#).unwrap();
         let identity = canary_record("R");
-        persist_same_base_canary_receipt(&receipt, &pass2, Some(&identity), Some(0), None, None)
-            .unwrap();
+        persist_same_base_canary_receipt(
+            &receipt,
+            Some(&pass2),
+            Some(&identity),
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(
             &fs::read(receipt.join("same-base-canary-receipt.json")).unwrap(),
         )
@@ -3297,8 +3400,15 @@ mod tests {
         fs::create_dir_all(&pass2).unwrap();
         fs::write(pass2.join("result-2.json"), br#"{"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#).unwrap();
         let identity = canary_record("R");
-        persist_same_base_canary_receipt(&receipt, &pass2, Some(&identity), Some(0), None, None)
-            .unwrap();
+        persist_same_base_canary_receipt(
+            &receipt,
+            Some(&pass2),
+            Some(&identity),
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(
             &fs::read(receipt.join("same-base-canary-receipt.json")).unwrap(),
         )
