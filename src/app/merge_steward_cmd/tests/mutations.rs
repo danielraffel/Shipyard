@@ -2394,10 +2394,10 @@ fn owner_wake_escalates_to_team_lead_once_the_signal_has_converged() {
     let mut harness = WakeHarness::new();
     harness.posted_hours_ago(3);
     // Neither comment is movement: one predates the wake, and the other is
-    // the steward's own wake comment.
+    // the steward's own wake comment, even when it was edited recently.
     harness.thread(&serde_json::json!([
         {"created_at": hours_ago(4), "updated_at": hours_ago(4), "body": "earlier discussion"},
-        {"created_at": minutes_ago(170), "updated_at": minutes_ago(170),
+        {"created_at": minutes_ago(170), "updated_at": minutes_ago(30),
          "body": "Shipyard owner wake for session-owner: PR #42 at exact head aaaa requires action"},
     ]));
     let pr = harness.converge();

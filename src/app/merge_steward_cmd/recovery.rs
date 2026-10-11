@@ -826,8 +826,10 @@ pub(super) fn wake_owner_comment(
     Ok("owner_wake_posted".to_owned())
 }
 
-/// The newest comment on the PR created or edited after `since`, other than
-/// the steward's own wake comments.
+/// The newest time a comment on the PR was created or edited, among the
+/// comments GitHub reports as updated since `since`, other than the
+/// steward's own wake comments. An older time can only be further from now
+/// than the wake itself, so it never defers an escalation.
 fn latest_comment_after(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
@@ -862,7 +864,6 @@ fn latest_comment_after(
                 .filter_map(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc))
         })
-        .filter(|at| *at > since)
         .max())
 }
 
