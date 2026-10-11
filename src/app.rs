@@ -49,6 +49,7 @@ mod parallel_proof_canary_cmd;
 mod paths_cmd;
 mod pin_cmd;
 mod pr_cmd;
+mod pr_status_cmd;
 mod pr_watch_cmd;
 mod profile_apply_cmd;
 mod quarantine_cmd;
@@ -1172,6 +1173,8 @@ fn handle_pr_variant<W: Write>(
 ) -> Result<ExitCode, CliFailure> {
     let arm_auto_merge = command.arm_auto_merge().unwrap_or(cli::ArmRequest::Default);
     let Command::Pr {
+        action,
+        all,
         base,
         allow_unreachable_targets,
         allow_fleet_epoch_drift,
@@ -1197,6 +1200,9 @@ fn handle_pr_variant<W: Write>(
     else {
         unreachable!("pr variant required")
     };
+    if action.as_deref() == Some("status") {
+        return pr_status_cmd::status_command(cwd, all, json, stdout);
+    }
     // Read an `@file` before any side effect, so a bad path fails first.
     let body_append = body_append
         .map(|argument| crate::pr_text::resolve_body_append(&argument, cwd))
