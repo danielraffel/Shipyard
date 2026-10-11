@@ -44,6 +44,36 @@ pub(super) trait CanaryEnvironment {
         cwd: &Path,
         state_dir: &Path,
     ) -> Result<ChangedSurfaceObservation, CliFailure>;
+
+    /// Ask the keyed planner which record pass 2 would bind, once pass 1 has
+    /// filed its record. The request is pinned to pass 1's observation, so
+    /// the plan is made against the same base and tree pass 1 ran on.
+    fn plan_keyed_pass(&mut self, request: &CanaryPlanRequest<'_>) -> CanaryPlan;
+}
+
+/// Everything the keyed planner needs for the canary's pass 2, taken from the
+/// observation pass 1 ran under.
+pub(super) struct CanaryPlanRequest<'a> {
+    pub(super) mode: MachineMode,
+    pub(super) observation: &'a ChangedSurfaceObservation,
+    pub(super) policy: &'a crate::changed_surface::ChangedSurfacePolicy,
+    pub(super) disposition: &'a ExecutionDisposition,
+    pub(super) record_repository: Option<&'a str>,
+    pub(super) cwd: &'a Path,
+    pub(super) state_dir: &'a Path,
+    pub(super) contract_digest: &'a str,
+    pub(super) audit: &'a dyn Fn(&str) -> super::read_audit::Fetched,
+}
+
+/// The planner's decision as the canary consumes it.
+pub(super) struct CanaryPlan {
+    /// The keyed plan pass 2 runs, or why the planner produced none.
+    pub(super) plan: Result<Box<crate::changed_surface::AuthoritativeExecutionPlan>, String>,
+    /// The record the planner chose to bind, when it chose one.
+    pub(super) chosen_record_id: Option<String>,
+    /// Whether the observation was planned against a stale protected base.
+    /// Recorded as a fact; it does not stop the canary.
+    pub(super) stale_base: bool,
 }
 
 pub(super) struct ProductionCanaryEnvironment;
@@ -58,11 +88,59 @@ impl CanaryEnvironment for ProductionCanaryEnvironment {
     ) -> Result<ChangedSurfaceObservation, CliFailure> {
         observe_changed_surface_plan(args, config, cwd, state_dir)
     }
+
+    fn plan_keyed_pass(&mut self, request: &CanaryPlanRequest<'_>) -> CanaryPlan {
+        let stale_base =
+            request.observation.receipt.fallback_reason == Some(FallbackReason::StaleBase);
+        let keyed = keyed_shadow_plan(
+            request.mode,
+            request.observation,
+            request.policy,
+            request.disposition,
+            request.record_repository,
+            request.cwd,
+            request.state_dir,
+            request.contract_digest,
+            request.audit,
+        );
+        match keyed {
+            Some(Keyed::Planned(plan)) => CanaryPlan {
+                chosen_record_id: planner_record_id(&plan.executable_reuse_binding),
+                plan: Ok(plan),
+                stale_base,
+            },
+            Some(Keyed::Closeout {
+                category,
+                diagnostic,
+                ..
+            }) => CanaryPlan {
+                plan: Err(format!(
+                    "planner produced no keyed plan: {category}: {diagnostic}"
+                )),
+                chosen_record_id: None,
+                stale_base,
+            },
+            None => CanaryPlan {
+                plan: Err("planner produced no keyed plan".to_owned()),
+                chosen_record_id: None,
+                stale_base,
+            },
+        }
+    }
+}
+
+/// The record a keyed binding names first: the one pass 2 compares against.
+fn planner_record_id(binding: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(binding)
+        .ok()?
+        .pointer("/candidates/0/run_id")?
+        .as_str()
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum MachineMode {
+pub(super) enum MachineMode {
     #[default]
     Off,
     ShadowCompare,
@@ -366,6 +444,7 @@ fn persist_same_base_canary_receipt(
     identity: Option<&FullShadowRecord>,
     lane_rc: Option<i32>,
     reason: Option<&str>,
+    stale_base: Option<bool>,
 ) -> Result<(), CliFailure> {
     let pass2 = latest_result(pass2_dir);
     let reuse = pass2.get("executable_reuse");
@@ -419,104 +498,83 @@ fn persist_same_base_canary_receipt(
         "derived.status": derived_status, "audit_staged_then_applied": audit, "would_skip_gt_0": would_skip,
         "false_skips_eq_0": false_skips, "rederivation_match": rederivation, "selected_returncode_eq_lane_rc": selected_matches,
         "no_fallback_file": no_fallback, "lane_returncode": lane_rc, "selected_returncode": selected_rc,
+        "stale_base": stale_base,
     });
     persist_named_receipt(dir, "same-base-canary-receipt.json", &payload)
 }
 
+/// Bind pass 2 to pass 1's record. A refusal names both record ids, so the
+/// receipt says which record the planner chose instead.
 fn canary_binding_decision(
-    pass1_succeeded: bool,
-    pass1: Option<&FullShadowRecord>,
+    pass1: &FullShadowRecord,
     candidate: Option<&FullShadowRecord>,
 ) -> Result<(), String> {
-    if !pass1_succeeded {
-        return Err("pass 1 failed".to_owned());
-    }
-    match bind_keyed_pass(pass1, candidate) {
+    match bind_keyed_pass(Some(pass1), candidate) {
         KeyedPassBinding::Bound(_) => Ok(()),
-        KeyedPassBinding::Inconclusive { reason } => Err(reason),
+        KeyedPassBinding::Inconclusive { reason } => Err(format!(
+            "{reason}: pass 1 filed {}, planner chose {}",
+            pass1.record_id,
+            candidate.map_or("none", |candidate| candidate.record_id.as_str())
+        )),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_same_base_canary_passes(
+/// What pass 1 and the planner left for the canary to judge.
+struct CanaryPassInputs<'a> {
     pass1_succeeded: bool,
-    pass1: Option<&FullShadowRecord>,
-    candidate: Option<&FullShadowRecord>,
-    binding: &[u8],
+    pass1: Option<&'a FullShadowRecord>,
+    candidate: Option<&'a FullShadowRecord>,
+    binding: &'a [u8],
+    stale_base: bool,
+}
+
+/// Run pass 2 bound to pass 1's record, and write the canary receipt on every
+/// path. The binding file is written into pass 2's result directory before
+/// pass 2 runs; pass 2 always compares against a full run.
+fn execute_same_base_canary_passes(
+    inputs: &CanaryPassInputs<'_>,
     pass2_dir: &Path,
     receipt_dir: &Path,
     pass2_command: &str,
     mut run_pass: impl FnMut(&str, &Path, bool) -> Result<i32, CliFailure>,
 ) -> Result<(), CliFailure> {
-    let Some(pass1) = pass1 else {
+    let stale_base = Some(inputs.stale_base);
+    let refuse = |identity: Option<&FullShadowRecord>, error: CliFailure| {
         persist_same_base_canary_receipt(
             receipt_dir,
             receipt_dir,
+            identity,
             None,
-            None,
-            Some("missing_pass1_record"),
+            Some(&error.message),
+            stale_base,
         )?;
-        return Err(CliFailure::new(1, "missing_pass1_record"));
+        Err(error)
     };
-    if !pass1_succeeded {
-        persist_same_base_canary_receipt(
-            receipt_dir,
-            receipt_dir,
-            Some(pass1),
-            None,
-            Some("pass 1 failed"),
-        )?;
-        return Err(CliFailure::new(1, "pass 1 failed"));
+    let Some(pass1) = inputs.pass1 else {
+        return refuse(None, CliFailure::new(1, "missing_pass1_record"));
+    };
+    if !inputs.pass1_succeeded {
+        return refuse(Some(pass1), CliFailure::new(1, "pass 1 failed"));
     }
-    if let Err(reason) = canary_binding_decision(true, Some(pass1), candidate) {
-        persist_same_base_canary_receipt(
-            receipt_dir,
-            receipt_dir,
-            Some(pass1),
-            None,
-            Some(&reason),
-        )?;
-        return Err(CliFailure::new(1, reason));
+    if let Err(reason) = canary_binding_decision(pass1, inputs.candidate) {
+        return refuse(Some(pass1), CliFailure::new(1, reason));
     }
     if let Err(error) = fs::create_dir_all(pass2_dir) {
-        let reason = format!("create pass-2 evidence: {error}");
-        persist_same_base_canary_receipt(
-            receipt_dir,
-            receipt_dir,
+        return refuse(
             Some(pass1),
-            None,
-            Some(&reason),
-        )?;
-        return Err(CliFailure::new(1, reason));
+            CliFailure::new(1, format!("create pass-2 evidence: {error}")),
+        );
     }
     if let Err(error) = persist_exact_bytes(
         pass2_dir,
         crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE,
-        binding,
+        inputs.binding,
     ) {
-        let reason = error.message.clone();
-        persist_same_base_canary_receipt(
-            receipt_dir,
-            receipt_dir,
-            Some(pass1),
-            None,
-            Some(&reason),
-        )?;
-        return Err(error);
+        return refuse(Some(pass1), error);
     }
     let pass2_rc = match run_pass(pass2_command, pass2_dir, true) {
         Ok(rc) => rc,
-        Err(error) => {
-            let reason = error.message.clone();
-            persist_same_base_canary_receipt(
-                receipt_dir,
-                receipt_dir,
-                Some(pass1),
-                None,
-                Some(&reason),
-            )?;
-            return Err(error);
-        }
+        Err(error) => return refuse(Some(pass1), error),
     };
     persist_same_base_canary_receipt(
         receipt_dir,
@@ -524,8 +582,8 @@ fn execute_same_base_canary_passes(
         Some(pass1),
         Some(pass2_rc),
         (pass2_rc != 0).then_some("pass 2 failed"),
-    )?;
-    Ok(())
+        stale_base,
+    )
 }
 
 // Keep the fail-open-to-full branches adjacent to their exact diagnostics and
@@ -791,7 +849,21 @@ pub(super) fn apply_changed_surface_execution(
                 })
                 .transpose()
                 .map_err(|error| CliFailure::new(1, format!("create pass-1 record: {error}")))?;
-            let pass1_rc = runner(&full_command, &pass1_dir, false, pending.as_deref())?;
+            let pass1_rc = match runner(&full_command, &pass1_dir, false, pending.as_deref()) {
+                Ok(rc) => rc,
+                Err(error) => {
+                    let canary_root = pass1_dir.parent().unwrap_or(&pass1_dir);
+                    persist_same_base_canary_receipt(
+                        canary_root,
+                        canary_root,
+                        None,
+                        None,
+                        Some(&error.message),
+                        None,
+                    )?;
+                    return Err(error);
+                }
+            };
             let filed = if let (Some(store), Some(pending)) = (&store, pending) {
                 Some(
                     crate::reuse_record_store::file(store, &pending, &observation.receipt.head_sha)
@@ -808,114 +880,86 @@ pub(super) fn apply_changed_surface_execution(
                     .map(|name| name.to_string_lossy().into_owned()),
                 crate::reuse_record_store::Filed::Discarded(_) => None,
             });
-            let replanned = environment.observe(
-                &ChangedSurfacePlanArgs {
-                    target: target.name.clone(),
-                    pr,
-                    repo: (!repo.is_empty()).then(|| repo.to_owned()),
-                },
-                config,
+            let decision = environment.plan_keyed_pass(&CanaryPlanRequest {
+                mode: machine.mode,
+                observation: &observation,
+                policy,
+                disposition: &disposition,
+                record_repository: validation.reuse_record_repository.as_deref(),
                 cwd,
                 state_dir,
-            )?;
-            let re_policy = replanned
-                .policy
-                .as_ref()
-                .map_err(|error| CliFailure::new(1, format!("same-base pass-2 policy: {error}")))?;
-            let re_disposition = plan_authoritative_execution(
-                &replanned.receipt,
-                &replanned.input,
-                re_policy,
-                true,
-                ExecutionCommandTransport::PosixShell,
-                &contract_digest,
-                &replanned.workflow_digest,
-            )
-            .map_err(|error| CliFailure::new(1, format!("same-base pass-2 planning: {error}")))?;
-            let replanned_keyed = keyed_shadow_plan(
-                machine.mode,
-                &replanned,
-                re_policy,
-                &re_disposition,
-                validation.reuse_record_repository.as_deref(),
-                cwd,
-                state_dir,
-                &contract_digest,
-                &audit,
-            );
+                contract_digest: &contract_digest,
+                audit: &audit,
+            });
             let canary_root = pass1_dir.parent().unwrap_or(&pass1_dir);
-            if let Some(Keyed::Planned(mut plan)) = replanned_keyed {
-                let planner_record_id =
-                    serde_json::from_slice::<serde_json::Value>(&plan.executable_reuse_binding)
-                        .ok()
-                        .and_then(|binding| {
-                            binding
-                                .pointer("/candidates/0/run_id")
-                                .and_then(serde_json::Value::as_str)
-                                .map(ToOwned::to_owned)
-                        });
-                let pass1 = filed_record_id.as_ref().map(|record_id| FullShadowRecord {
-                    base_sha: observation.receipt.protected_ref_sha.clone(),
-                    tree_sha: observation.receipt.tree_sha.clone(),
-                    lane_config_sha256: contract_digest.clone(),
-                    record_id: record_id.clone(),
-                });
-                let candidate = planner_record_id
-                    .zip(pass1.as_ref())
-                    .map(|(record_id, record)| FullShadowRecord {
-                        record_id,
-                        ..record.clone()
-                    });
-                let pass2_dir = canary_root.join("same-base-pass2");
-                let mut run_pass2 = |command: &str, dir: &Path, compare_full: bool| {
-                    runner(command, dir, compare_full, None)
-                };
-                match execute_same_base_canary_passes(
-                    pass1_rc == 0,
-                    pass1.as_ref(),
-                    candidate.as_ref(),
-                    &plan.executable_reuse_binding,
-                    &pass2_dir,
-                    canary_root,
-                    &plan.command,
-                    &mut run_pass2,
-                ) {
-                    Ok(()) => {
-                        ":".clone_into(&mut plan.command);
-                        Some(Keyed::Planned(plan))
+            let pass1 = filed_record_id.map(|record_id| FullShadowRecord {
+                base_sha: observation.receipt.protected_ref_sha.clone(),
+                tree_sha: observation.receipt.tree_sha.clone(),
+                lane_config_sha256: contract_digest.clone(),
+                record_id,
+            });
+            match decision.plan {
+                Ok(mut plan) => {
+                    let candidate =
+                        decision
+                            .chosen_record_id
+                            .zip(pass1.as_ref())
+                            .map(|(record_id, record)| FullShadowRecord {
+                                record_id,
+                                ..record.clone()
+                            });
+                    let pass2_dir = canary_root.join("same-base-pass2");
+                    let run_pass2 = |command: &str, dir: &Path, compare_full: bool| {
+                        runner(command, dir, compare_full, None)
+                    };
+                    match execute_same_base_canary_passes(
+                        &CanaryPassInputs {
+                            pass1_succeeded: pass1_rc == 0,
+                            pass1: pass1.as_ref(),
+                            candidate: candidate.as_ref(),
+                            binding: &plan.executable_reuse_binding,
+                            stale_base: decision.stale_base,
+                        },
+                        &pass2_dir,
+                        canary_root,
+                        &plan.command,
+                        run_pass2,
+                    ) {
+                        Ok(()) => {
+                            // Pass 2 was the keyed run; the lane must not run
+                            // it a second time.
+                            ":".clone_into(&mut plan.command);
+                            Some(Keyed::Planned(plan))
+                        }
+                        Err(error) if pass1_rc == 0 => {
+                            persist_fallback_diagnostic(
+                                &pass1_dir,
+                                &FallbackDiagnostic {
+                                    schema_version: 1,
+                                    repository: repo,
+                                    pull_request: pr,
+                                    target: &target.name,
+                                    machine_mode: machine.mode,
+                                    category: "same_base_binding",
+                                    diagnostic: bounded_diagnostic(&error.message),
+                                },
+                            )?;
+                            None
+                        }
+                        Err(_) => None,
                     }
-                    Err(error) if pass1_rc == 0 => {
-                        persist_fallback_diagnostic(
-                            &pass1_dir,
-                            &FallbackDiagnostic {
-                                schema_version: 1,
-                                repository: repo,
-                                pull_request: pr,
-                                target: &target.name,
-                                machine_mode: machine.mode,
-                                category: "same_base_binding",
-                                diagnostic: error.message,
-                            },
-                        )?;
-                        None
-                    }
-                    Err(_) => None,
                 }
-            } else {
-                let identity = filed_record_id.as_ref().map(|record_id| FullShadowRecord {
-                    base_sha: observation.receipt.protected_ref_sha.clone(),
-                    tree_sha: observation.receipt.tree_sha.clone(),
-                    lane_config_sha256: contract_digest.clone(),
-                    record_id: record_id.clone(),
-                });
-                persist_same_base_canary_receipt(
-                    canary_root,
-                    canary_root,
-                    identity.as_ref(),
-                    Some(pass1_rc),
-                    Some("planner produced no keyed plan"),
-                )?;
-                None
+                Err(reason) => {
+                    persist_same_base_canary_receipt(
+                        canary_root,
+                        canary_root,
+                        pass1.as_ref(),
+                        Some(pass1_rc),
+                        Some(&reason),
+                        Some(decision.stale_base),
+                    )?;
+                    None
+                }
             }
         } else {
             keyed_shadow_plan(
@@ -2032,15 +2076,14 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CurrentStaleGeneration, FallbackDiagnostic, MAX_STALE_POINTER_BYTES, MachineMode,
-        MachinePolicy, activation_bytes, activation_receipt, apply_changed_surface_execution,
-        bounded_diagnostic, evidence_dir, execute_same_base_canary_passes,
-        full_fallback_diagnostic, persist_exact_bytes, persist_fallback_diagnostic,
-        persist_same_base_canary_receipt, publish_current_stale_generation,
-        read_current_stale_generation, result_dir, selected_resume_block_reason, shell_quote,
-        stale_generation_has_execution_evidence, target_declares_changed_surface_selection,
+        CanaryPassInputs, CurrentStaleGeneration, FallbackDiagnostic, MAX_STALE_POINTER_BYTES,
+        MachineMode, MachinePolicy, activation_bytes, activation_receipt, bounded_diagnostic,
+        evidence_dir, execute_same_base_canary_passes, full_fallback_diagnostic,
+        persist_exact_bytes, persist_fallback_diagnostic, persist_same_base_canary_receipt,
+        publish_current_stale_generation, read_current_stale_generation, result_dir,
+        selected_resume_block_reason, shell_quote, stale_generation_has_execution_evidence,
+        target_declares_changed_surface_selection,
     };
-    use crate::app::CliFailure;
     use crate::changed_surface::same_base_canary::FullShadowRecord;
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use std::collections::BTreeMap;
@@ -2793,227 +2836,410 @@ mod tests {
         }
     }
 
-    fn apply_with_fake_stage<F>(mut fake_stage: F) -> Result<(), CliFailure>
-    where
-        F: FnMut() -> Result<(), CliFailure> + 'static,
-    {
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(
-            temp.path().join("config.toml"),
-            "[changed_surface_execution]\nmode = 'same_base_canary'\n",
-        )
-        .unwrap();
-        let config = LoadedConfig::load(
-            Some(temp.path().to_path_buf()),
-            None,
-            None,
-            LocalOverlaySource::None,
-        )
-        .unwrap();
-        let mut targets = [];
-        let mut runner =
-            |_command: &str, _dir: &Path, _compare_full: bool, _record_dir: Option<&Path>| Ok(0);
-        let mut environment = ProductionCanaryEnvironment;
-        let result = apply_changed_surface_execution(
-            &config,
-            temp.path(),
-            temp.path(),
-            "owner/repo",
-            Some(1),
-            "head",
-            None,
-            &mut targets,
-            &mut runner,
-            &mut environment,
-        );
-        result.and_then(|()| fake_stage())
-    }
+    /// The same-base canary driven through `apply_changed_surface_execution`
+    /// for one real target. Unix only: the entry point is a no-op elsewhere.
+    #[cfg(unix)]
+    mod same_base_canary_apply {
+        use super::super::{
+            CanaryEnvironment, CanaryPlan, CanaryPlanRequest, ChangedSurfaceObservation,
+            ChangedSurfacePlanArgs, ResolvedBackend, ResolvedTarget, ResolvedValidation,
+            apply_changed_surface_execution, result_dir,
+        };
+        use crate::app::CliFailure;
+        use crate::config::{LoadedConfig, LocalOverlaySource};
+        use std::collections::BTreeMap;
+        use std::fs;
+        use std::path::Path;
 
-    fn binding_json(id: &str) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({"candidates":[{"run_id":id}]})).unwrap()
-    }
+        const PASS2_ALL_FACTS: &[u8] = br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
+        const PASS2_NO_SELECTED_RC: &[u8] = br#"{"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
+        const RESULT_DIR_ENV: &str = "SHIPYARD_CHANGED_SURFACE_RESULT_DIR";
+        const COMPARE_FULL_ENV: &str = "SHIPYARD_CHANGED_SURFACE_COMPARE_FULL";
 
-    #[test]
-    fn apply_changed_surface_execution_t1_bound_pass_is_reachable() {
-        let record = canary_record("R");
-        let candidate = record.clone();
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let seen = events.clone();
-        let temp = tempfile::tempdir().unwrap();
-        let pass2 = temp.path().join("pass2");
-        let receipt = temp.path().join("receipt");
-        let receipt_for_test = receipt.clone();
-        let binding = binding_json("R");
-        assert!(
-            apply_with_fake_stage(move || {
-                execute_same_base_canary_passes(
-                    true,
-                    Some(&record),
-                    Some(&candidate),
-                    &binding,
-                    &pass2,
-                    &receipt_for_test,
-                    "fake-pass-2",
-                    |command, dir, compare_full| {
-                        let binding_exists = dir.join(crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE).exists();
-                        seen.lock().unwrap().push(format!("{command}:{compare_full}:{binding_exists}"));
-                        fs::write(dir.join("result-2.json"), br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#).unwrap();
-                        Ok(0)
+        /// The planner's canned choice for the canary's pass 2.
+        #[derive(Clone)]
+        enum Choice {
+            /// The record pass 1 filed in this invocation.
+            Pass1Record,
+            /// A different record.
+            Other(&'static str),
+        }
+
+        /// Observes a fixed shadow plan and answers the keyed planner with a
+        /// canned choice. Runs no command.
+        struct FakeCanaryEnvironment {
+            choice: Choice,
+            pass1_record: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+        }
+
+        impl CanaryEnvironment for FakeCanaryEnvironment {
+            fn observe(
+                &mut self,
+                _args: &ChangedSurfacePlanArgs,
+                _config: &LoadedConfig,
+                _cwd: &Path,
+                _state_dir: &Path,
+            ) -> Result<ChangedSurfaceObservation, CliFailure> {
+                let (receipt, input, policy) =
+                    crate::changed_surface::shadow_observation_parts_for_tests();
+                Ok(ChangedSurfaceObservation {
+                    receipt,
+                    input,
+                    policy: Ok(policy),
+                    workflow_digest: "d".repeat(64),
+                })
+            }
+
+            fn plan_keyed_pass(&mut self, _request: &CanaryPlanRequest<'_>) -> CanaryPlan {
+                let chosen = match &self.choice {
+                    Choice::Pass1Record => self.pass1_record.borrow().clone(),
+                    Choice::Other(id) => Some((*id).to_owned()),
+                };
+                let mut plan = crate::changed_surface::test_stage_plan_for_tests();
+                "keyed-pass-2".clone_into(&mut plan.command);
+                crate::changed_surface::KEYED_FULL_SHADOW.clone_into(&mut plan.disposition);
+                plan.executable_reuse_binding = serde_json::to_vec(
+                    &serde_json::json!({"candidates": [{"run_id": chosen.clone().unwrap_or_default()}]}),
+                )
+                .unwrap();
+                CanaryPlan {
+                    plan: Ok(Box::new(plan)),
+                    chosen_record_id: chosen,
+                    stale_base: false,
+                }
+            }
+        }
+
+        /// One stage run as the production command builder would have spawned it.
+        #[derive(Debug)]
+        struct StageRun {
+            command: String,
+            envs: BTreeMap<String, Option<String>>,
+            binding_present: bool,
+        }
+
+        impl StageRun {
+            fn env(&self, name: &str) -> Option<&str> {
+                self.envs.get(name).and_then(Option::as_deref)
+            }
+        }
+
+        /// What each fake stage run does.
+        #[derive(Clone, Copy)]
+        struct Script {
+            pass1_rc: i32,
+            pass1_writes_record: bool,
+            pass2_result: Option<&'static [u8]>,
+            pass2_spawn_fails: bool,
+        }
+
+        const BOUND: Script = Script {
+            pass1_rc: 0,
+            pass1_writes_record: true,
+            pass2_result: Some(PASS2_ALL_FACTS),
+            pass2_spawn_fails: false,
+        };
+
+        struct CanaryRun {
+            result: Result<(), CliFailure>,
+            runs: Vec<StageRun>,
+            receipt: serde_json::Value,
+            test_stage: String,
+            pass1_record: Option<String>,
+        }
+
+        fn canary_target() -> ResolvedTarget {
+            ResolvedTarget {
+                name: "mac".to_owned(),
+                validation_build_type: Some("debug".to_owned()),
+                platform: "macos".to_owned(),
+                backend_name: "local".to_owned(),
+                warm_keepalive_seconds: 60,
+                host: None,
+                backend: ResolvedBackend::Local(crate::executor::local::LocalTargetConfig {
+                    name: "mac".to_owned(),
+                    platform: "macos".to_owned(),
+                    cwd: None,
+                    timeout_secs: 300,
+                }),
+                validation: ResolvedValidation::Local(
+                    crate::executor::local::LocalValidationConfig {
+                        stages: BTreeMap::from([("test".to_owned(), "pass-1-command".to_owned())]),
+                        reuse_record_repository: Some("owner/repo".to_owned()),
+                        ..Default::default()
                     },
-                )
-            })
-            .is_ok()
-        );
-        assert_eq!(events.lock().unwrap().as_slice(), ["fake-pass-2:true:true"]);
-        let receipt_json: serde_json::Value = serde_json::from_slice(
-            &fs::read(receipt.join("same-base-canary-receipt.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(receipt_json["verdict"], "PASS");
-    }
+                ),
+                failure_parser: None,
+            }
+        }
 
-    #[test]
-    fn apply_changed_surface_execution_t2_different_id_is_inconclusive() {
-        let record = canary_record("R");
-        let candidate = canary_record("R2");
-        let temp = tempfile::tempdir().unwrap();
-        let pass2 = temp.path().join("pass2");
-        let receipt = temp.path().join("receipt");
-        let binding = binding_json("R2");
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
-        let calls_seen = calls.clone();
-        let error = apply_with_fake_stage(move || {
-            execute_same_base_canary_passes(
-                true,
-                Some(&record),
-                Some(&candidate),
-                &binding,
-                &pass2,
-                &receipt,
-                "fake-pass-2",
-                |_, _, _| {
-                    *calls_seen.lock().unwrap() += 1;
+        /// Drive `apply_changed_surface_execution` for one real target in
+        /// `same_base_canary` mode. Every stage run goes through the production
+        /// command builder; the fake only reads the environment it was given.
+        fn run_canary(choice: Choice, script: Script) -> CanaryRun {
+            let temp = tempfile::tempdir().unwrap();
+            let global = temp.path().join("global");
+            fs::create_dir_all(&global).unwrap();
+            fs::write(
+                global.join("config.toml"),
+                "[changed_surface_execution]\nmode = 'same_base_canary'\n",
+            )
+            .unwrap();
+            let mut config =
+                LoadedConfig::load(Some(global), None, None, LocalOverlaySource::None).unwrap();
+            config.data.insert(
+                "targets".to_owned(),
+                toml::toml! { [mac.changed_surface_selection] enabled = true }.into(),
+            );
+            let state = temp.path().join("state");
+            let cwd = temp.path().join("checkout");
+            fs::create_dir_all(&cwd).unwrap();
+            let mut targets = [canary_target()];
+            let pass1_record = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+            let filed = pass1_record.clone();
+            let mut runs = Vec::new();
+            let result = {
+                let mut runner = |command: &str,
+                                  dir: &Path,
+                                  compare_full: bool,
+                                  record_dir: Option<&Path>|
+                 -> Result<i32, CliFailure> {
+                    let built = crate::app::ship_cmd::changed_surface_stage_command(
+                        command,
+                        &cwd,
+                        dir,
+                        compare_full,
+                        record_dir,
+                    );
+                    let envs: BTreeMap<String, Option<String>> = built
+                        .get_envs()
+                        .map(|(key, value)| {
+                            (
+                                key.to_string_lossy().into_owned(),
+                                value.map(|value| value.to_string_lossy().into_owned()),
+                            )
+                        })
+                        .collect();
+                    let result_dir = Path::new(
+                        envs.get(RESULT_DIR_ENV)
+                            .and_then(Option::as_deref)
+                            .expect("every stage run is told its result directory"),
+                    )
+                    .to_path_buf();
+                    let run = StageRun {
+                        command: command.to_owned(),
+                        binding_present: result_dir
+                            .join(crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE)
+                            .exists(),
+                        envs,
+                    };
+                    let first = runs.is_empty();
+                    let record = run
+                        .env(crate::reuse_record_store::RECORD_DIR_ENV)
+                        .map(Path::new)
+                        .map(Path::to_path_buf);
+                    runs.push(run);
+                    if first {
+                        if script.pass1_writes_record
+                            && let Some(record) = record
+                        {
+                            fs::write(record.join("job.json"), b"{}").unwrap();
+                            *filed.borrow_mut() = record
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned());
+                        }
+                        return Ok(script.pass1_rc);
+                    }
+                    if script.pass2_spawn_fails {
+                        return Err(CliFailure::new(1, "fake pass-2 spawn error"));
+                    }
+                    if let Some(result) = script.pass2_result {
+                        fs::write(result_dir.join("result-2.json"), result).unwrap();
+                    }
                     Ok(0)
-                },
-            )
-        })
-        .unwrap_err()
-        .message;
-        assert!(error.contains("pass2_record_does_not_match"));
-        assert_eq!(*calls.lock().unwrap(), 0);
-    }
-
-    #[test]
-    fn apply_changed_surface_execution_t5_nonzero_pass1_is_inconclusive() {
-        let record = canary_record("R");
-        assert_eq!(
-            apply_with_fake_stage(move || {
-                let temp = tempfile::tempdir().unwrap();
-                execute_same_base_canary_passes(
-                    false,
-                    Some(&record),
-                    Some(&record),
-                    &binding_json("R"),
-                    &temp.path().join("pass2"),
-                    &temp.path().join("receipt"),
-                    "fake",
-                    |_, _, _| Ok(0),
+                };
+                let mut environment = FakeCanaryEnvironment {
+                    choice,
+                    pass1_record: pass1_record.clone(),
+                };
+                apply_changed_surface_execution(
+                    &config,
+                    &cwd,
+                    &state,
+                    "owner/repo",
+                    Some(42),
+                    "head",
+                    None,
+                    &mut targets,
+                    &mut runner,
+                    &mut environment,
                 )
-            })
-            .unwrap_err()
-            .message,
-            "pass 1 failed"
-        );
-    }
+            };
+            let (receipt, _, _) = crate::changed_surface::shadow_observation_parts_for_tests();
+            let canary_root = result_dir(&state, "owner/repo", 42, &receipt.head_sha, "mac");
+            let receipt = fs::read(canary_root.join("same-base-canary-receipt.json"))
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                .unwrap_or(serde_json::Value::Null);
+            let ResolvedValidation::Local(validation) = &targets[0].validation else {
+                unreachable!();
+            };
+            CanaryRun {
+                result,
+                runs,
+                receipt,
+                test_stage: validation.stages["test"].clone(),
+                pass1_record: pass1_record.borrow().clone(),
+            }
+        }
 
-    #[test]
-    fn apply_changed_surface_execution_t3_no_record_writes_inconclusive_receipt() {
-        let temp = tempfile::tempdir().unwrap();
-        let receipt_dir = temp.path().join("receipt");
-        let pass2 = temp.path().join("pass2");
-        fs::create_dir_all(&pass2).unwrap();
-        let receipt_for_test = receipt_dir.clone();
-        let error = apply_with_fake_stage(move || {
-            execute_same_base_canary_passes(
-                true,
+        #[test]
+        fn same_base_canary_binds_pass_two_to_the_record_pass_one_filed() {
+            let run = run_canary(Choice::Pass1Record, BOUND);
+            run.result.unwrap();
+            assert_eq!(run.runs.len(), 2, "{:?}", run.runs);
+            let (pass1, pass2) = (&run.runs[0], &run.runs[1]);
+            assert_eq!(pass1.command, "pass-1-command");
+            assert!(
+                pass1
+                    .env(crate::reuse_record_store::RECORD_DIR_ENV)
+                    .is_some(),
+                "pass 1 must be told where to file its record: {pass1:?}"
+            );
+            assert_eq!(
+                pass1.env(COMPARE_FULL_ENV),
                 None,
-                None,
-                &binding_json("R"),
-                &pass2,
-                &receipt_for_test,
-                "fake",
-                |_, _, _| Ok(0),
-            )
-        })
-        .unwrap_err()
-        .message;
-        assert_eq!(error, "missing_pass1_record");
-        let payload: serde_json::Value = serde_json::from_slice(
-            &fs::read(receipt_dir.join("same-base-canary-receipt.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(payload["verdict"], "INCONCLUSIVE");
-        assert_eq!(payload["reason"], "missing_pass1_record");
-    }
+                "pass 1 is not a comparison"
+            );
+            assert!(!pass1.binding_present, "pass 1 runs with no binding");
+            assert_eq!(pass2.command, "keyed-pass-2");
+            assert_eq!(pass2.env(COMPARE_FULL_ENV), Some("1"));
+            assert!(
+                pass2.binding_present,
+                "the binding is written before pass 2 runs"
+            );
+            assert_eq!(run.receipt["verdict"], "PASS", "{}", run.receipt);
+            assert_eq!(
+                run.receipt["binding_record_and_tree_sha"]["record_id"],
+                run.pass1_record.expect("pass 1 filed a record").as_str()
+            );
+            assert_eq!(run.receipt["stale_base"], false);
+            assert!(
+                run.test_stage.ends_with(" :"),
+                "the lane must not run the keyed pass again: {}",
+                run.test_stage
+            );
+        }
 
-    #[test]
-    fn apply_changed_surface_execution_t4_absent_selected_returncode_is_inconclusive() {
-        let temp = tempfile::tempdir().unwrap();
-        let pass2 = temp.path().join("pass2");
-        let receipt = temp.path().join("receipt");
-        let receipt_for_test = receipt.clone();
-        let record = canary_record("R");
-        let result = apply_with_fake_stage(move || {
-            execute_same_base_canary_passes(
-                true,
-                Some(&record),
-                Some(&record),
-                &binding_json("R"),
-                &pass2,
-                &receipt_for_test,
-                "fake",
-                |_, dir, _| {
-                    fs::write(dir.join("result-2.json"), br#"{"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#).unwrap();
-                    Ok(0)
+        #[test]
+        fn same_base_canary_refuses_a_record_the_planner_chose_instead() {
+            let run = run_canary(Choice::Other("an-older-record"), BOUND);
+            run.result.unwrap();
+            assert_eq!(run.runs.len(), 1, "pass 2 never runs: {:?}", run.runs);
+            assert_eq!(run.receipt["verdict"], "INCONCLUSIVE", "{}", run.receipt);
+            let reason = run.receipt["reason"].as_str().unwrap();
+            let filed = run.pass1_record.expect("pass 1 filed a record");
+            assert!(reason.contains("an-older-record"), "{reason}");
+            assert!(reason.contains(&filed), "{reason}");
+            assert_eq!(run.test_stage, "pass-1-command");
+        }
+
+        #[test]
+        fn same_base_canary_without_a_pass_one_record_is_inconclusive() {
+            let run = run_canary(
+                Choice::Other("an-older-record"),
+                Script {
+                    pass1_writes_record: false,
+                    ..BOUND
                 },
-            )
-        });
-        assert!(result.is_ok());
-        let payload: serde_json::Value = serde_json::from_slice(
-            &fs::read(receipt.join("same-base-canary-receipt.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(payload["verdict"], "INCONCLUSIVE");
-        assert_eq!(payload["reason"], "selected_returncode_eq_lane_rc");
+            );
+            run.result.unwrap();
+            assert_eq!(run.runs.len(), 1, "pass 2 never runs: {:?}", run.runs);
+            assert_eq!(run.receipt["verdict"], "INCONCLUSIVE", "{}", run.receipt);
+            assert_eq!(run.receipt["reason"], "missing_pass1_record");
+            assert_eq!(run.test_stage, "pass-1-command");
+        }
+
+        #[test]
+        fn same_base_canary_with_a_failed_pass_one_never_runs_pass_two() {
+            let run = run_canary(
+                Choice::Pass1Record,
+                Script {
+                    pass1_rc: 1,
+                    ..BOUND
+                },
+            );
+            run.result.unwrap();
+            assert!(run.pass1_record.is_some(), "pass 1 filed a record");
+            assert_eq!(run.runs.len(), 1, "pass 2 never runs: {:?}", run.runs);
+            assert_eq!(run.receipt["verdict"], "INCONCLUSIVE", "{}", run.receipt);
+            assert_eq!(run.receipt["reason"], "pass 1 failed");
+            assert_eq!(run.test_stage, "pass-1-command");
+        }
+
+        #[test]
+        fn same_base_canary_names_a_missing_pass_two_field() {
+            let run = run_canary(
+                Choice::Pass1Record,
+                Script {
+                    pass2_result: Some(PASS2_NO_SELECTED_RC),
+                    ..BOUND
+                },
+            );
+            run.result.unwrap();
+            assert_eq!(run.runs.len(), 2, "{:?}", run.runs);
+            assert_eq!(run.receipt["verdict"], "INCONCLUSIVE", "{}", run.receipt);
+            assert_eq!(run.receipt["reason"], "selected_returncode_eq_lane_rc");
+            assert_eq!(
+                run.receipt["selected_returncode"],
+                serde_json::Value::Null,
+                "{}",
+                run.receipt
+            );
+        }
+
+        #[test]
+        fn same_base_canary_pass_two_spawn_error_writes_a_receipt() {
+            let run = run_canary(
+                Choice::Pass1Record,
+                Script {
+                    pass2_spawn_fails: true,
+                    ..BOUND
+                },
+            );
+            run.result.unwrap();
+            assert_eq!(run.runs.len(), 2, "{:?}", run.runs);
+            assert_eq!(run.receipt["verdict"], "INCONCLUSIVE", "{}", run.receipt);
+            assert_eq!(run.receipt["reason"], "fake pass-2 spawn error");
+            assert_eq!(run.test_stage, "pass-1-command");
+        }
     }
 
     #[test]
-    fn apply_changed_surface_execution_pass2_spawn_error_writes_receipt() {
-        let temp = tempfile::tempdir().unwrap();
-        let pass2 = temp.path().join("pass2");
-        let receipt = temp.path().join("receipt");
-        let record = canary_record("R");
-        let receipt_for_test = receipt.clone();
-        let error = apply_with_fake_stage(move || {
-            execute_same_base_canary_passes(
-                true,
-                Some(&record),
-                Some(&record),
-                &binding_json("R"),
-                &pass2,
-                &receipt_for_test,
-                "fake",
-                |_, _, _| Err(CliFailure::new(1, "fake spawn error")),
-            )
-        })
+    fn a_refused_binding_names_both_records() {
+        let error = execute_same_base_canary_passes(
+            &CanaryPassInputs {
+                pass1_succeeded: true,
+                pass1: Some(&canary_record("R")),
+                candidate: Some(&canary_record("R2")),
+                binding: b"{}",
+                stale_base: true,
+            },
+            &tempfile::tempdir().unwrap().path().join("pass2"),
+            tempfile::tempdir().unwrap().path(),
+            "unused",
+            |_, _, _| panic!("pass 2 must not run"),
+        )
         .unwrap_err();
-        assert_eq!(error.message, "fake spawn error");
-        let payload: serde_json::Value = serde_json::from_slice(
-            &fs::read(receipt.join("same-base-canary-receipt.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(payload["verdict"], "INCONCLUSIVE");
-        assert_eq!(payload["reason"], "fake spawn error");
+        assert!(
+            error.message.contains("pass 1 filed R,"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("planner chose R2"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
@@ -3024,7 +3250,8 @@ mod tests {
         fs::create_dir_all(&pass2).unwrap();
         fs::write(pass2.join("result-2.json"), br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#).unwrap();
         let identity = canary_record("R");
-        persist_same_base_canary_receipt(&receipt, &pass2, Some(&identity), Some(0), None).unwrap();
+        persist_same_base_canary_receipt(&receipt, &pass2, Some(&identity), Some(0), None, None)
+            .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(
             &fs::read(receipt.join("same-base-canary-receipt.json")).unwrap(),
         )
@@ -3052,7 +3279,8 @@ mod tests {
         fs::create_dir_all(&pass2).unwrap();
         fs::write(pass2.join("result-2.json"), br#"{"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#).unwrap();
         let identity = canary_record("R");
-        persist_same_base_canary_receipt(&receipt, &pass2, Some(&identity), Some(0), None).unwrap();
+        persist_same_base_canary_receipt(&receipt, &pass2, Some(&identity), Some(0), None, None)
+            .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(
             &fs::read(receipt.join("same-base-canary-receipt.json")).unwrap(),
         )

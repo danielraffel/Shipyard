@@ -126,6 +126,33 @@ mod read_audit;
 use changed_surface_execution::{ProductionCanaryEnvironment, apply_changed_surface_execution};
 use provenance::{AppliedStewardHandoff, apply_requested_steward_handoff, run_pr_provenance_hook};
 
+/// The command one same-base canary pass runs: the configured stage under
+/// `/bin/sh`, told where to write its result, whether to compare the keyed
+/// selection against a full run, and, for the full pass, where to write its
+/// reuse record. A pass that is not comparing carries no comparison flag at
+/// all, so an inherited value cannot turn it into a comparison.
+fn changed_surface_stage_command(
+    command: &str,
+    cwd: &Path,
+    result_dir: &Path,
+    compare_full: bool,
+    record_dir: Option<&Path>,
+) -> std::process::Command {
+    let mut child = std::process::Command::new("/bin/sh");
+    child.arg("-c").arg(command).current_dir(cwd);
+    child.env("SHIPYARD_CHANGED_SURFACE_RESULT_DIR", result_dir);
+    if compare_full {
+        child.env("SHIPYARD_CHANGED_SURFACE_COMPARE_FULL", "1");
+    } else {
+        child.env_remove("SHIPYARD_CHANGED_SURFACE_COMPARE_FULL");
+    }
+    match record_dir {
+        Some(record_dir) => child.env(crate::reuse_record_store::RECORD_DIR_ENV, record_dir),
+        None => child.env_remove(crate::reuse_record_store::RECORD_DIR_ENV),
+    };
+    child
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn ship_command<W: Write>(
     args: ShipCommandArgs,
@@ -379,17 +406,7 @@ pub(super) fn ship_command<W: Write>(
              dir: &std::path::Path,
              compare_full: bool,
              record_dir: Option<&std::path::Path>| {
-                let mut child = std::process::Command::new("/bin/sh");
-                child.arg("-c").arg(command).current_dir(cwd);
-                child.env("SHIPYARD_CHANGED_SURFACE_RESULT_DIR", dir);
-                child.env(
-                    "SHIPYARD_CHANGED_SURFACE_COMPARE_FULL",
-                    if compare_full { "1" } else { "0" },
-                );
-                if let Some(record_dir) = record_dir {
-                    child.env(crate::reuse_record_store::RECORD_DIR_ENV, record_dir);
-                }
-                child
+                changed_surface_stage_command(command, cwd, dir, compare_full, record_dir)
                     .status()
                     .map(|status| status.code().unwrap_or(1))
                     .map_err(|error| {
