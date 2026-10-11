@@ -2230,20 +2230,7 @@ esac
             drift = drift.display(),
         ),
     );
-    let mut pr = ready_pr();
-    pr.owner = "alice".to_owned();
-    pr.fact.labels.push(MANAGED_LABEL.to_owned());
-    pr.fact.merge_state = "DIRTY".to_owned();
-    pr.fact.checks[0].conclusion = Some("FAILURE".to_owned());
-    pr.fact.checks.push(StewardCheck {
-        name: HANDOFF_CONTEXT.to_owned(),
-        source: StewardCheckSource::StatusContext,
-        app_id: None,
-        status: "COMPLETED".to_owned(),
-        conclusion: Some("SUCCESS".to_owned()),
-        run_id: None,
-        observed_at: Some("2026-08-27T00:00:01Z".to_owned()),
-    });
+    let pr = ready_pr_with_wire_owner();
     let observation = observation_for(pr, true);
     let mut args = StewardCommandArgs {
         repos: vec!["owner/repo".to_owned()],
@@ -2283,7 +2270,8 @@ esac
             .contains("owner_wake_posted")
     );
     let body = fs::read_to_string(&comments).expect("wake comment");
-    assert!(body.contains("for alice:"), "{body}");
+    assert!(body.contains("for session-owner:"), "{body}");
+    assert!(!body.contains("app/shipyard-local"), "{body}");
 
     let (reports, failed) = apply_pr_plans(
         &actions,
