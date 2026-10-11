@@ -355,7 +355,7 @@ where
             Some(activation_name.to_owned()),
             0,
             None,
-            "shadow activation is missing".to_owned(),
+            "shadow activation is missing",
         );
     }
     let stale_activation_bytes =
@@ -474,12 +474,13 @@ where
     }
 
     before_final_snapshot();
+    let activation_path = result_dir.join(activation_name);
     let final_activation = match read_regular_receipt(&activation_path) {
         Ok(bytes) => bytes,
         Err(reason) => {
             return rejected_trial(
                 identity,
-                Some(ACTIVATION_RECEIPT.to_owned()),
+                Some(activation_name.to_owned()),
                 results.len(),
                 status.result_receipt,
                 reason,
