@@ -125,6 +125,7 @@ fn enqueue_pull_request_with_recovery(
             );
         }
     };
+    let mut approval_comment_id = None;
     if approval_policy.required {
         let Some((owner, name)) = context.observation.repo.split_once('/') else {
             return (None, Some("invalid repository slug".to_owned()));
@@ -165,7 +166,28 @@ fn enqueue_pull_request_with_recovery(
             &approval_policy,
             &queue,
         ) {
-            Ok(crate::head_approval::HeadGate::Approved { .. }) => {}
+            Ok(crate::head_approval::HeadGate::Approved { approval }) => {
+                if pr
+                    .fact
+                    .author
+                    .as_deref()
+                    .is_some_and(|author| match &approval {
+                        crate::head_approval::Approval::Marker { login, .. }
+                        | crate::head_approval::Approval::Review { login } => {
+                            author.eq_ignore_ascii_case(login)
+                        }
+                    })
+                {
+                    return (
+                        Some("waiting_head_approval".to_owned()),
+                        Some("PR author cannot approve its own head".to_owned()),
+                    );
+                }
+                approval_comment_id = match approval {
+                    crate::head_approval::Approval::Marker { comment_id, .. } => comment_id,
+                    crate::head_approval::Approval::Review { .. } => None,
+                };
+            }
             Ok(gate) if gate.allows() => {}
             Ok(gate) => {
                 return (
@@ -221,6 +243,7 @@ fn enqueue_pull_request_with_recovery(
                     ledger,
                     guard,
                     recovery.as_ref(),
+                    approval_comment_id,
                 );
             };
             let audit_error = guard.finish("rejected_stacked_pull_request").err();
@@ -251,7 +274,13 @@ fn enqueue_unstacked_pull_request(
     ledger: &mut StewardLedger,
     guard: crate::merge_queue_control::MergeQueueMutationGuard,
     recovery: Option<&QueueRecoveryEvidence>,
+    approval_comment_id: Option<u64>,
 ) -> (Option<String>, Option<String>) {
+    let mut guard = guard;
+    if let Err(error) = guard.record_approval_comment_id(approval_comment_id) {
+        let _ = guard.finish("approval_evidence_persistence_failed");
+        return (None, Some(error));
+    }
     let pr = match final_enqueue_revalidation(context, pr, policy, ledger) {
         Ok(Some(pr)) => pr,
         Ok(None) => {
@@ -395,6 +424,7 @@ fn enqueue_unstacked_pull_request(
                 job_id: recovery.job_id,
                 attempted_at: chrono::Utc::now().to_rfc3339(),
                 phase: super::QueueRecoveryPhase::Intent,
+                approval_comment_id,
             },
         );
         if let Err(error) = save_ledger(context.ledger_path, ledger) {
