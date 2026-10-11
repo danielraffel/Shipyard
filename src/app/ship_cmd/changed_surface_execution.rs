@@ -419,8 +419,6 @@ fn canary_binding_decision(
     }
 }
 
-type CanaryPassRunner<'a> = dyn FnMut(&str, &Path, bool) -> Result<i32, CliFailure> + 'a;
-
 fn execute_same_base_canary_passes(
     pass1_succeeded: bool,
     pass1: Option<&FullShadowRecord>,
