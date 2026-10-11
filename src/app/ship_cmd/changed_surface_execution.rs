@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -2768,7 +2767,7 @@ mod tests {
         }
     }
 
-    fn apply_with_fake_stage<F>(fake_stage: F) -> Result<(), CliFailure>
+    fn apply_with_fake_stage<F>(mut fake_stage: F) -> Result<(), CliFailure>
     where
         F: FnMut() -> Result<(), CliFailure> + 'static,
     {
