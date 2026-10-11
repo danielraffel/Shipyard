@@ -37,28 +37,33 @@ pub(crate) fn status_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<std::process::ExitCode, CliFailure> {
-    let read = |repository: &str| {
-        let output = Command::new("ghapp")
-            .args([
-                "pr", "list", "--repo", repository, "--state", "open", "--limit", "100",
-                "--json", "number,headRefOid,updatedAt,body,author,mergeStateStatus,statusCheckRollup,comments,commits",
-            ])
-            .current_dir(cwd)
-            .output()
-            .map_err(|error| CliFailure::new(1, format!("ghapp pr list failed: {error}")))?;
-        if !output.status.success() {
-            return Err(CliFailure::new(
-                1,
-                format!(
-                    "ghapp pr list failed for {repository}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
-        }
-        serde_json::from_slice(&output.stdout)
-            .map_err(|error| CliFailure::new(1, format!("invalid gh PR JSON: {error}")))
-    };
-    status_command_with_reader(cwd, all, json, stdout, read)
+    status_command_with_reader(cwd, all, json, stdout, |repository| {
+        gh_json(cwd, repository)
+    })
+}
+
+/// The production GitHub read seam. Keeping this separate from row assembly
+/// lets the ledger entry point be exercised against captured wire fixtures.
+fn gh_json(cwd: &Path, repository: &str) -> Result<Value, CliFailure> {
+    let output = Command::new("ghapp")
+        .args([
+            "pr", "list", "--repo", repository, "--state", "open", "--limit", "100",
+            "--json", "number,headRefOid,updatedAt,body,author,mergeStateStatus,statusCheckRollup,comments,commits",
+        ])
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| CliFailure::new(1, format!("ghapp pr list failed: {error}")))?;
+    if !output.status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!(
+                "ghapp pr list failed for {repository}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| CliFailure::new(1, format!("invalid gh PR JSON: {error}")))
 }
 
 fn status_command_with_reader<W, F>(
@@ -264,16 +269,29 @@ mod tests {
     }
 
     #[test]
-    fn status_entry_point_reads_wire_fixture() {
-        let fixture = include_str!("../../tests/fixtures/github/pr_list_wire/shipyard.json");
+    fn status_entry_point_reads_committed_wire_fixtures() {
         let mut output = Vec::new();
         let cwd = Path::new(".");
-        let result = status_command_with_reader(cwd, true, true, &mut output, |_| {
+        let result = status_command_with_reader(cwd, true, true, &mut output, |repository| {
+            let fixture = match repository {
+                "Generous-Corp/pulp" => {
+                    include_str!("../../tests/fixtures/github/pr_list_wire/pulp.json")
+                }
+                "danielraffel/tartci" => {
+                    include_str!("../../tests/fixtures/github/pr_list_wire/tartci.json")
+                }
+                "Generous-Corp/vellum" | "danielraffel/Shipyard" => {
+                    include_str!("../../tests/fixtures/github/pr_list_wire/shipyard.json")
+                }
+                other => panic!("unexpected repository {other}"),
+            };
             serde_json::from_str(fixture).map_err(|e| CliFailure::new(1, e.to_string()))
         });
         assert!(result.is_ok());
         let rendered = String::from_utf8(output).expect("json");
-        assert!(rendered.contains("repository") && rendered.contains("number"));
+        assert!(rendered.contains("Generous-Corp/pulp"));
+        assert!(rendered.contains("danielraffel/tartci"));
+        assert!(rendered.contains("owner"));
     }
 
     #[test]
