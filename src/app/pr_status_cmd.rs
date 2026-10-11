@@ -144,21 +144,33 @@ fn latest_movement(item: &serde_json::Value) -> String {
     if let Some(value) = item.get("updatedAt").and_then(serde_json::Value::as_str) {
         times.push(value);
     }
-    if let Some(commits) = item.get("commits").and_then(|v| v.get("nodes")).and_then(serde_json::Value::as_array) {
+    if let Some(commits) = item.get("commits").and_then(serde_json::Value::as_array) {
         for commit in commits {
-            if let Some(value) = commit.pointer("/commit/committedDate").and_then(serde_json::Value::as_str) { times.push(value); }
-        }
-    }
-    if let Some(comments) = item.get("comments").and_then(|v| v.get("nodes")).and_then(serde_json::Value::as_array) {
-        for comment in comments {
-            for key in ["createdAt", "updatedAt"] {
-                if let Some(value) = comment.get(key).and_then(serde_json::Value::as_str) { times.push(value); }
+            if let Some(value) = commit
+                .get("committedDate")
+                .and_then(serde_json::Value::as_str)
+            {
+                times.push(value);
             }
         }
     }
-    if let Some(checks) = item.get("statusCheckRollup").and_then(serde_json::Value::as_array) {
+    if let Some(comments) = item.get("comments").and_then(serde_json::Value::as_array) {
+        for comment in comments {
+            for key in ["createdAt", "updatedAt"] {
+                if let Some(value) = comment.get(key).and_then(serde_json::Value::as_str) {
+                    times.push(value);
+                }
+            }
+        }
+    }
+    if let Some(checks) = item
+        .get("statusCheckRollup")
+        .and_then(serde_json::Value::as_array)
+    {
         for check in checks {
-            if let Some(value) = check.get("completedAt").and_then(serde_json::Value::as_str) { times.push(value); }
+            if let Some(value) = check.get("completedAt").and_then(serde_json::Value::as_str) {
+                times.push(value);
+            }
         }
     }
     times.into_iter().max().unwrap_or_default().to_owned()
@@ -170,7 +182,13 @@ fn owner_for(item: &serde_json::Value) -> String {
     {
         return session;
     }
-    item.pointer("/commits/nodes/0/commit/author/login")
+    item.get("commits")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|commits| commits.last())
+        .and_then(|commit| commit.get("authors"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|authors| authors.first())
+        .and_then(|author| author.get("login"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("team-lead")
         .to_owned()
@@ -184,8 +202,8 @@ mod tests {
     fn stalled_uses_latest_of_head_comment_and_check_movement() {
         let item = serde_json::json!({
             "updatedAt": "2026-10-11T00:00:00Z",
-            "commits": {"nodes": [{"commit": {"committedDate": "2026-10-11T01:00:00Z"}}]},
-            "comments": {"nodes": [{"createdAt": "2026-10-11T02:00:00Z", "updatedAt": "2026-10-11T02:00:00Z"}]},
+            "commits": [{"committedDate": "2026-10-11T01:00:00Z", "authors": [{"login": "alice"}]}],
+            "comments": [{"createdAt": "2026-10-11T02:00:00Z", "updatedAt": "2026-10-11T02:00:00Z"}],
             "statusCheckRollup": [{"completedAt": "2026-10-11T03:00:00Z"}]
         });
         assert_eq!(latest_movement(&item), "2026-10-11T03:00:00Z");
@@ -193,11 +211,14 @@ mod tests {
 
     #[test]
     fn owner_prefers_whence_then_last_committer_then_team_lead() {
-        let whence = serde_json::json!({"body": "<!-- whence {\"prov\": {\"session\": \"sess-1\"}} -->", "commits": {"nodes": [{"commit": {"author": {"login": "alice"}}}]}});
+        let whence = serde_json::json!({"body": "<!-- whence {\"prov\": {\"session\": \"sess-1\"}} -->", "commits": [{"authors": [{"login": "alice"}]}]});
         assert_eq!(owner_for(&whence), "sess-1");
-        let committer = serde_json::json!({"body": "plain", "commits": {"nodes": [{"commit": {"author": {"login": "alice"}}}]}});
-        assert_eq!(owner_for(&committer), "alice");
-        assert_eq!(owner_for(&serde_json::json!({"body": "plain"})), "team-lead");
+        let committer = serde_json::json!({"body": "plain", "commits": [{"authors": [{"login": "alice"}]}, {"authors": [{"login": "bob"}]}]});
+        assert_eq!(owner_for(&committer), "bob");
+        assert_eq!(
+            owner_for(&serde_json::json!({"body": "plain"})),
+            "team-lead"
+        );
     }
 }
 
@@ -208,15 +229,13 @@ fn current_repository(cwd: &Path) -> Result<String, CliFailure> {
         .output()
         .map_err(|error| CliFailure::new(1, format!("git remote failed: {error}")))?;
     let remote = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    remote
-        .trim_end_matches(".git")
-        .rsplit_once(':')
-        .map(|(_, repo)| repo.to_owned())
-        .or_else(|| {
-            remote
-                .split_once("github.com/")
-                .map(|(_, repo)| repo.to_owned())
-        })
+    let path = remote
+        .strip_prefix("https://github.com/")
+        .or_else(|| remote.strip_prefix("http://github.com/"))
+        .or_else(|| remote.strip_prefix("git@github.com:"))
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
+        .map(str::to_owned);
+    path.map(|path| path.trim_end_matches(".git").to_owned())
         .ok_or_else(|| CliFailure::new(1, "could not determine GitHub repository"))
 }
 

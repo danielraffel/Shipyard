@@ -459,8 +459,8 @@ fn classify_management(pr: &StewardPullRequest, policy: &StewardPolicy) -> Optio
     let fleet_author = pr
         .author
         .as_deref()
-        .is_some_and(|author| author.eq_ignore_ascii_case("shipyard-local[bot]"));
-    let human_or_dependabot = pr.author.as_deref().is_some_and(|author| {
+        .is_some_and(|author| author.eq_ignore_ascii_case("app/shipyard-local"));
+    let human_or_dependabot = pr.author.as_deref().is_none_or(|author| {
         author.eq_ignore_ascii_case("dependabot[bot]") || !author.ends_with("[bot]")
     });
     let fleet_branch = ["codex/", "feature/", "fix/"]
