@@ -1,6 +1,9 @@
 use super::*;
 
 #[cfg(unix)]
+mod review_774;
+
+#[cfg(unix)]
 fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     let path = temp.path().join("gh");
     crate::test_support::write_executable_script(&path, &format!("#!/bin/sh\nset -eu\n{body}\n"));

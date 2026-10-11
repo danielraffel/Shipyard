@@ -1,6 +1,7 @@
 //! Reviewer-side R1/R8 probes through the real enqueue entry point.
 use super::*;
 use crate::app::merge_steward_cmd::pr_mutations::enqueue_pull_request;
+use crate::merge_steward::StewardCheckSource;
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const EARLIER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -28,7 +29,7 @@ esac
     )
 }
 
-const POLICY_OK: &str = r#"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_logins = ["reviewer"]'"#;
+const POLICY_OK: &str = r#"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["shipyard-review[bot]", "danielraffel"]'"#;
 const POLICY_ERR: &str = r"echo 'HTTP 500 server error' >&2; exit 1";
 
 fn comment(login: &str, body: &str) -> String {
@@ -78,7 +79,7 @@ fn r774_positive_exact_head_marker_passes_the_gate() {
     let body = script(
         &log,
         POLICY_OK,
-        &comment("reviewer", &format!("LGTM\\nreviewed: {HEAD}")),
+        &comment("shipyard-review[bot]", &format!("LGTM\\nreviewed: {HEAD}")),
     );
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
     assert!(
@@ -95,13 +96,58 @@ fn r774_positive_exact_head_marker_passes_the_gate() {
 
 #[cfg(unix)]
 #[test]
+fn r774_enqueue_persists_marker_id_in_intent_and_receipt() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let body = script(
+        &log,
+        POLICY_OK,
+        &comment("shipyard-review[bot]", &format!("reviewed: {HEAD}")),
+    )
+    .replace(
+        r#"*"stackEntry"*) echo "GATE_PASSED_REACHED_STACK" >&2; exit 90 ;;"#,
+        r#"*"stackEntry"*) printf '%s' '{"data":{"repository":{"stackConfig":null,"pullRequest":{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stack":null,"stackEntry":null}}}}' ;;
+  "pr view "*) printf '%s' '{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[{"name":"steward:managed"}],"statusCheckRollup":[{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-10-11T12:00:00Z"},{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-10-11T12:00:01Z"}]}' ;;
+  *"pulls/42"*) printf '%s' '{"state":"open","head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}' ;;
+  *"enqueuePullRequest"*) printf '%s' '{}' ;;"#,
+    );
+    let actions = fake_gh(&temp, &body);
+    let mut pr = ready_pr();
+    pr.fact.labels.push("steward:managed".to_owned());
+    pr.fact.checks.push(StewardCheck {
+        name: "shipyard/steward-handoff".to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SUCCESS".to_owned()),
+        run_id: None,
+        observed_at: Some("2026-10-11T12:00:01Z".to_owned()),
+    });
+    let observation = observation_for(pr.clone(), true);
+    let mut ledger = StewardLedger::default();
+    let control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+    let mut policy = queue_policy();
+    policy.managed_label = Some("steward:managed".to_owned());
+    let (_mutation, _error) = enqueue_pull_request(&context, &pr, &policy, &mut ledger);
+    let audit = fs::read_to_string(temp.path().join("state/merge_queue/mutations.jsonl"))
+        .expect("mutation audit");
+    assert!(audit.contains("\"approval_comment_id\":12345"), "{audit}");
+}
+
+#[cfg(unix)]
+#[test]
 fn r774_r8_marker_naming_an_earlier_head_does_not_arm() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
     let body = script(
         &log,
         POLICY_OK,
-        &comment("reviewer", &format!("LGTM\\nreviewed:{EARLIER}")),
+        &comment(
+            "shipyard-review[bot]",
+            &format!("LGTM\\nreviewed:{EARLIER}"),
+        ),
     );
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
     assert_held(mutation.as_ref(), error.as_ref(), &calls);
@@ -141,7 +187,7 @@ fn r774_policy_read_error_fails_closed() {
     let body = script(
         &log,
         POLICY_ERR,
-        &comment("reviewer", &format!("reviewed:{HEAD}")),
+        &comment("shipyard-review[bot]", &format!("reviewed:{HEAD}")),
     );
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
     assert!(
@@ -165,8 +211,10 @@ fn r774_r1_later_hold_by_a_recognized_reviewer_does_not_arm() {
     let comments = format!(
         "{}
 {}",
-        comment("reviewer", &format!("LGTM\\nreviewed:{HEAD}")),
-        r#"{"login":"reviewer","type":"User","at":"2026-10-11T13:00:00Z","body":"HOLD. regression found on this head, do not arm."}"#
+        comment("shipyard-review[bot]", &format!("LGTM\\nreviewed:{HEAD}")),
+        format!(
+            r#"{{"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-11T13:00:00Z","body":"verdict: HOLD head:{HEAD}"}}"#
+        )
     );
     let body = script(&log, POLICY_OK, &comments);
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
@@ -182,8 +230,8 @@ fn r774_r1_hold_comment_carrying_a_marker_line_does_not_arm() {
         &log,
         POLICY_OK,
         &comment(
-            "reviewer",
-            &format!("HOLD. must-fix list follows.\\nreviewed:{HEAD}"),
+            "shipyard-review[bot]",
+            &format!("verdict: HOLD head:{HEAD}"),
         ),
     );
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
@@ -198,9 +246,9 @@ fn r774_r1_author_cannot_approve_own_head() {
     let body = script(
         &log,
         POLICY_OK,
-        &comment("reviewer", &format!("reviewed:{HEAD}")),
+        &comment("shipyard-review[bot]", &format!("reviewed:{HEAD}")),
     );
-    let (mutation, error, calls) = run(&temp, &body, Some("reviewer"));
+    let (mutation, error, calls) = run(&temp, &body, Some("shipyard-review[bot]"));
     assert_held(mutation.as_ref(), error.as_ref(), &calls);
 }
 
@@ -212,7 +260,7 @@ fn r774_r1_short_prefix_marker_does_not_arm() {
     let body = script(
         &log,
         POLICY_OK,
-        &comment("reviewer", &format!("reviewed:{}", &HEAD[..7])),
+        &comment("shipyard-review[bot]", &format!("reviewed:{}", &HEAD[..7])),
     );
     let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
     assert_held(mutation.as_ref(), error.as_ref(), &calls);

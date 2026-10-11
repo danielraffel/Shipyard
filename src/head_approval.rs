@@ -141,7 +141,7 @@ impl Approval {
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
-            Self::Review { login } => format!("an approving review by {login}"),
+            Self::Review { login, .. } => format!("an approving review by {login}"),
             Self::Marker { login, .. } => format!("a reviewed:<sha> marker by {login}"),
         }
     }
@@ -243,10 +243,9 @@ fn marker_verdict(body: &str) -> Option<(Verdict, String)> {
 }
 
 fn marker_names_head(body: &str, head: &str) -> bool {
-    marker_verdict(body)
-        .is_some_and(|(verdict, marker_head)| {
-            verdict == Verdict::Approve && marker_head.eq_ignore_ascii_case(head)
-        })
+    marker_verdict(body).is_some_and(|(verdict, marker_head)| {
+        verdict == Verdict::Approve && marker_head.eq_ignore_ascii_case(head)
+    })
 }
 
 fn normalized_login(value: &str) -> String {
@@ -262,13 +261,12 @@ fn is_fleet_author(login: &str) -> bool {
 }
 
 fn reviewer_allowed(login: &str, policy: &ApprovalPolicy, author: Option<&str>) -> bool {
-    policy
-        .reviewer_logins
-        .iter()
-        .any(|reviewer| reviewer.eq_ignore_ascii_case(login))
-        && author.is_none_or(|author| {
-            !author.eq_ignore_ascii_case(login) && !is_fleet_author(author)
-        })
+    !is_fleet_author(login)
+        && policy
+            .reviewer_logins
+            .iter()
+            .any(|reviewer| reviewer.eq_ignore_ascii_case(login))
+        && author.is_none_or(|author| !author.eq_ignore_ascii_case(login))
 }
 
 /// The newest approval of `head`, given reviews and comments flattened to
@@ -322,9 +320,7 @@ fn find_approval_for_author(
         .rev()
         .find(|comment| {
             fresh(comment)
-                && login(comment).is_some_and(|login| {
-                    reviewer_allowed(login, policy, author)
-                })
+                && login(comment).is_some_and(|login| reviewer_allowed(login, policy, author))
                 && comment
                     .get("body")
                     .and_then(Value::as_str)
@@ -486,7 +482,7 @@ fn latest_verdict(
         .map(|(_, verdict)| verdict)
 }
 
-fn decide_for_author(
+pub(crate) fn decide_for_author(
     policy: &ApprovalPolicy,
     head: &str,
     reviews: &[Value],
@@ -515,7 +511,8 @@ fn decide_for_author(
             .and_then(|ejection| ejection.at.as_deref())
             .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
             .map_or(DateTime::<Utc>::MAX_UTC, |at| at.with_timezone(&Utc));
-        return match find_approval_for_author(head, reviews, comments, policy, Some(floor), author) {
+        return match find_approval_for_author(head, reviews, comments, policy, Some(floor), author)
+        {
             Some(approval) => HeadGate::Approved { approval },
             None => HeadGate::EjectionCap {
                 head: head.to_owned(),
@@ -560,10 +557,11 @@ fn read_policy_inner(
         }
         Err(detail) => return Err(format!("{CONFIG_PATH} on {base} unreadable: {detail}")),
     };
-    raw.parse::<toml::Table>()
-        .map(|table| ApprovalPolicy::from_table(&table))
-        .and_then(|policy| policy.validate().map(|()| policy))
-        .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))
+    let table = raw
+        .parse::<toml::Table>()
+        .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
+    let policy = ApprovalPolicy::from_table(&table);
+    policy.validate().map(|()| policy)
 }
 
 /// Read the policy from `base` on GitHub, treating a missing file as default.
@@ -692,7 +690,9 @@ pub fn evaluate_with_policy_for_author(
         &format!("repos/{repo}/issues/{pr}/comments"),
         ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body}",
     )?;
-    Ok(decide_for_author(policy, head, &reviews, &comments, queue, false, author))
+    Ok(decide_for_author(
+        policy, head, &reviews, &comments, queue, false, author,
+    ))
 }
 
 #[cfg(test)]

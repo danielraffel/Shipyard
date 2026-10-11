@@ -205,7 +205,7 @@ fn enqueue_pull_request_with_recovery(
     } else {
         None
     };
-    let mut guard = match acquire_pr_mutation_guard(
+    let guard = match acquire_pr_mutation_guard(
         context.mutation_control,
         context.observation,
         pr,
@@ -237,8 +237,7 @@ fn enqueue_pull_request_with_recovery(
                     ledger,
                     guard,
                     recovery.as_ref(),
-                    approval_comment_id,
-                    approval_app_id,
+                    Some((approval_comment_id, approval_app_id)),
                 );
             };
             let audit_error = guard.finish("rejected_stacked_pull_request").err();
@@ -269,10 +268,10 @@ fn enqueue_unstacked_pull_request(
     ledger: &mut StewardLedger,
     guard: crate::merge_queue_control::MergeQueueMutationGuard,
     recovery: Option<&QueueRecoveryEvidence>,
-    approval_comment_id: Option<u64>,
-    approval_app_id: Option<u64>,
+    approval_evidence: Option<(Option<u64>, Option<u64>)>,
 ) -> (Option<String>, Option<String>) {
     let mut guard = guard;
+    let (approval_comment_id, approval_app_id) = approval_evidence.unwrap_or((None, None));
     if let Err(error) = guard.record_approval_evidence(approval_comment_id, approval_app_id) {
         let _ = guard.finish("approval_evidence_persistence_failed");
         return (None, Some(error));

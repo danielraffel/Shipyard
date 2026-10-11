@@ -1,8 +1,8 @@
 use serde_json::{Value, json};
 
 use super::{
-    Approval, ApprovalPolicy, EJECTION_CAP, HeadGate, decide, decide_excusing, ejection_cause,
-    find_approval, head_ejections, read_policy,
+    Approval, ApprovalPolicy, EJECTION_CAP, HeadGate, decide, decide_excusing, decide_for_author,
+    ejection_cause, find_approval, head_ejections, read_policy,
 };
 
 /// The heads Generous-Corp/pulp#9438 was force-pushed to on 2026-10-04, in
@@ -83,7 +83,11 @@ pub(crate) fn pr_9438_bot_comments() -> Vec<Value> {
 fn required(reviewers: &[&str]) -> ApprovalPolicy {
     ApprovalPolicy {
         required: true,
-        reviewer_logins: reviewers.iter().map(|login| (*login).to_owned()).collect(),
+        reviewer_logins: if reviewers.is_empty() {
+            vec!["someone".to_owned()]
+        } else {
+            reviewers.iter().map(|login| (*login).to_owned()).collect()
+        },
     }
 }
 
@@ -135,7 +139,7 @@ fn replaying_9438_with_a_marker_approves_exactly_the_marked_head() {
     comments.push(human(
         "danielraffel",
         "2026-10-04T04:45:00Z",
-        "Read it.\nreviewed:db2c94acbfdd\n",
+        &format!("Read it.\nreviewed:{}\n", PR_9438_HEADS[6]),
     ));
     let approved: Vec<&str> = PR_9438_HEADS
         .iter()
@@ -161,7 +165,8 @@ fn an_approving_review_on_the_head_counts() {
     assert_eq!(
         find_approval(HEAD, &reviews, &[], &required(&[]), None),
         Some(Approval::Review {
-            login: "someone".to_owned()
+            login: "someone".to_owned(),
+            performed_via_github_app_id: None,
         })
     );
 }
@@ -219,12 +224,13 @@ fn a_marker_from_a_listed_reviewer_counts() {
     let comments = [human(
         "reviewer",
         "2026-10-04T01:00:00Z",
-        "reviewed:aaaaaaa",
+        "reviewed:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     )];
     assert_eq!(
         find_approval(HEAD, &[], &comments, &required(&["Reviewer"]), None),
         Some(Approval::Marker {
-            login: "reviewer".to_owned()
+            login: "reviewer".to_owned(),
+            comment_id: None,
         })
     );
 }
@@ -276,6 +282,58 @@ fn a_marker_from_a_listed_bot_does_not_count() {
         ),
         None
     );
+}
+
+#[test]
+fn structured_current_head_verdicts_and_latest_hold_are_scoped() {
+    let policy = required(&["shipyard-review[bot]"]);
+    let comments = [
+        json!({"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-04T01:00:00Z","body":format!("verdict: APPROVE head:{HEAD}")}),
+        json!({"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-04T02:00:00Z","body":format!("verdict: HOLD head:{HEAD}")}),
+    ];
+    assert!(!decide(&policy, HEAD, &[], &comments, &empty_queue(HEAD)).allows());
+    let prose = [human(
+        "shipyard-review[bot]",
+        "2026-10-04T03:00:00Z",
+        "HOLD is mentioned in prose",
+    )];
+    assert_eq!(find_approval(HEAD, &[], &prose, &policy, None), None);
+}
+
+#[test]
+fn review_app_and_self_review_rules_are_enforced() {
+    let policy = required(&["shipyard-review[bot]"]);
+    let review = json!({
+        "login":"shipyard-review[bot]", "type":"Bot", "at":"2026-10-04T01:00:00Z",
+        "state":"APPROVED", "commit_id":HEAD, "performed_via_github_app_id": 42
+    });
+    assert_eq!(
+        find_approval(HEAD, &[review], &[], &policy, None),
+        Some(Approval::Review {
+            login: "shipyard-review[bot]".to_owned(),
+            performed_via_github_app_id: Some(42)
+        })
+    );
+    assert!(!decide_for_author(
+        &policy, HEAD, &[json!({"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-04T01:00:00Z","state":"APPROVED","commit_id":HEAD})], &[], &empty_queue(HEAD), false, Some("shipyard-review[bot]")
+    ).allows());
+}
+
+#[test]
+fn short_markers_and_older_head_holds_never_gate() {
+    let policy = required(&["shipyard-review[bot]"]);
+    let short = [
+        json!({"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-04T01:00:00Z","body":"reviewed:aaaaaaa"}),
+    ];
+    assert!(!decide(&policy, HEAD, &[], &short, &empty_queue(HEAD)).allows());
+    let older_hold = [
+        json!({"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-04T01:00:00Z","body":format!("verdict: HOLD head:{OTHER}")}),
+    ];
+    let approve = [
+        json!({"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-04T02:00:00Z","body":format!("reviewed: {HEAD}")}),
+    ];
+    assert!(decide(&policy, HEAD, &[], &older_hold, &empty_queue(HEAD)).allows() == false);
+    assert!(decide(&policy, HEAD, &[], &approve, &empty_queue(HEAD)).allows());
 }
 
 #[test]
@@ -377,7 +435,7 @@ fn a_head_ejected_twice_needs_an_approval_newer_than_the_last_ejection() {
 
 #[test]
 fn an_interruption_ejection_does_not_count_toward_the_cap() {
-    let policy = required(&["reviewer"]);
+    let policy = required(&["someone"]);
     let old = [review(
         "someone",
         "User",
@@ -432,6 +490,18 @@ fn the_policy_is_read_from_the_auto_merge_table() {
         ApprovalPolicy::from_table(&empty),
         ApprovalPolicy::default()
     );
+}
+
+#[test]
+fn policy_rejects_the_fleet_author_as_a_reviewer_identity() {
+    let table = toml::toml! {
+        auto_merge = {
+            arm_requires_head_approval = true,
+            reviewer_identities = ["shipyard-review[bot]", "shipyard-local[bot]"]
+        }
+    };
+    let policy = ApprovalPolicy::from_table(&table);
+    assert!(policy.validate().is_err());
 }
 
 #[test]
