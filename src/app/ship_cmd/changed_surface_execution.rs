@@ -2919,6 +2919,32 @@ mod tests {
         }
 
         impl StageRun {
+            /// Record what `command` would have been spawned with.
+            fn observe(command: &str, built: &std::process::Command) -> Self {
+                let envs: BTreeMap<String, Option<String>> = built
+                    .get_envs()
+                    .map(|(key, value)| {
+                        (
+                            key.to_string_lossy().into_owned(),
+                            value.map(|value| value.to_string_lossy().into_owned()),
+                        )
+                    })
+                    .collect();
+                let binding_present = envs
+                    .get(RESULT_DIR_ENV)
+                    .and_then(Option::as_deref)
+                    .is_some_and(|dir| {
+                        Path::new(dir)
+                            .join(crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE)
+                            .exists()
+                    });
+                Self {
+                    command: command.to_owned(),
+                    envs,
+                    binding_present,
+                }
+            }
+
             fn env(&self, name: &str) -> Option<&str> {
                 self.envs.get(name).and_then(Option::as_deref)
             }
@@ -2973,12 +2999,10 @@ mod tests {
             }
         }
 
-        /// Drive `apply_changed_surface_execution` for one real target in
-        /// `same_base_canary` mode. Every stage run goes through the production
-        /// command builder; the fake only reads the environment it was given.
-        fn run_canary(choice: Choice, script: Script) -> CanaryRun {
-            let temp = tempfile::tempdir().unwrap();
-            let global = temp.path().join("global");
+        /// A config whose trusted global layer selects `same_base_canary` and
+        /// whose `mac` target declares changed-surface selection.
+        fn canary_config(root: &Path) -> LoadedConfig {
+            let global = root.join("global");
             fs::create_dir_all(&global).unwrap();
             fs::write(
                 global.join("config.toml"),
@@ -2991,6 +3015,15 @@ mod tests {
                 "targets".to_owned(),
                 toml::toml! { [mac.changed_surface_selection] enabled = true }.into(),
             );
+            config
+        }
+
+        /// Drive `apply_changed_surface_execution` for one real target in
+        /// `same_base_canary` mode. Every stage run goes through the production
+        /// command builder; the fake only reads the environment it was given.
+        fn run_canary(choice: Choice, script: Script) -> CanaryRun {
+            let temp = tempfile::tempdir().unwrap();
+            let config = canary_config(temp.path());
             let state = temp.path().join("state");
             let cwd = temp.path().join("checkout");
             fs::create_dir_all(&cwd).unwrap();
@@ -3011,28 +3044,12 @@ mod tests {
                         compare_full,
                         record_dir,
                     );
-                    let envs: BTreeMap<String, Option<String>> = built
-                        .get_envs()
-                        .map(|(key, value)| {
-                            (
-                                key.to_string_lossy().into_owned(),
-                                value.map(|value| value.to_string_lossy().into_owned()),
-                            )
-                        })
-                        .collect();
+                    let run = StageRun::observe(command, &built);
                     let result_dir = Path::new(
-                        envs.get(RESULT_DIR_ENV)
-                            .and_then(Option::as_deref)
+                        run.env(RESULT_DIR_ENV)
                             .expect("every stage run is told its result directory"),
                     )
                     .to_path_buf();
-                    let run = StageRun {
-                        command: command.to_owned(),
-                        binding_present: result_dir
-                            .join(crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE)
-                            .exists(),
-                        envs,
-                    };
                     let first = runs.is_empty();
                     let record = run
                         .env(crate::reuse_record_store::RECORD_DIR_ENV)
@@ -3078,8 +3095,9 @@ mod tests {
             let (receipt, _, _) = crate::changed_surface::shadow_observation_parts_for_tests();
             let canary_root = result_dir(&state, "owner/repo", 42, &receipt.head_sha, "mac");
             let receipt = fs::read(canary_root.join("same-base-canary-receipt.json"))
-                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
-                .unwrap_or(serde_json::Value::Null);
+                .map_or(serde_json::Value::Null, |bytes| {
+                    serde_json::from_slice(&bytes).unwrap()
+                });
             let ResolvedValidation::Local(validation) = &targets[0].validation else {
                 unreachable!();
             };
