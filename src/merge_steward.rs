@@ -466,7 +466,8 @@ fn classify_management(pr: &StewardPullRequest, policy: &StewardPolicy) -> Optio
     let fleet_branch = ["codex/", "feature/", "fix/"]
         .iter()
         .any(|prefix| pr.head_branch.starts_with(prefix));
-    if (fleet_author || (fleet_branch && !human_or_dependabot)) && !labelled {
+    if (fleet_author || (fleet_branch && pr.author.is_some() && !human_or_dependabot)) && !labelled
+    {
         return None;
     }
     if !labelled {
