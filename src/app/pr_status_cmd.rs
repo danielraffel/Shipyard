@@ -6,6 +6,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde::Serialize;
+use serde_json::Value;
 
 use super::CliFailure;
 
@@ -36,6 +37,41 @@ pub(crate) fn status_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<std::process::ExitCode, CliFailure> {
+    let read = |repository: &str| {
+        let output = Command::new("ghapp")
+            .args([
+                "pr", "list", "--repo", repository, "--state", "open", "--limit", "100",
+                "--json", "number,headRefOid,updatedAt,body,author,mergeStateStatus,statusCheckRollup,comments,commits",
+            ])
+            .current_dir(cwd)
+            .output()
+            .map_err(|error| CliFailure::new(1, format!("ghapp pr list failed: {error}")))?;
+        if !output.status.success() {
+            return Err(CliFailure::new(
+                1,
+                format!(
+                    "ghapp pr list failed for {repository}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| CliFailure::new(1, format!("invalid gh PR JSON: {error}")))
+    };
+    status_command_with_reader(cwd, all, json, stdout, read)
+}
+
+fn status_command_with_reader<W, F>(
+    cwd: &Path,
+    all: bool,
+    json: bool,
+    stdout: &mut W,
+    read: F,
+) -> Result<std::process::ExitCode, CliFailure>
+where
+    W: Write,
+    F: Fn(&str) -> Result<Value, CliFailure>,
+{
     let repositories = if all {
         configured_repositories(cwd)
     } else {
@@ -43,33 +79,7 @@ pub(crate) fn status_command<W: Write>(
     };
     let mut rows = Vec::new();
     for repository in repositories {
-        let output = Command::new("ghapp")
-            .args([
-                "pr",
-                "list",
-                "--repo",
-                &repository,
-                "--state",
-                "open",
-                "--limit",
-                "100",
-                "--json",
-                "number,headRefOid,updatedAt,body,author,mergeStateStatus,statusCheckRollup,comments,commits",
-            ])
-            .current_dir(cwd)
-            .output()
-            .map_err(|error| CliFailure::new(1, format!("gh pr list failed: {error}")))?;
-        if !output.status.success() {
-            return Err(CliFailure::new(
-                1,
-                format!(
-                    "gh pr list failed for {repository}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
-        }
-        let values: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|error| CliFailure::new(1, format!("invalid gh PR JSON: {error}")))?;
+        let values = read(&repository)?;
         let items = values
             .as_array()
             .ok_or_else(|| CliFailure::new(1, "gh PR list response was not an array"))?;
@@ -78,18 +88,18 @@ pub(crate) fn status_command<W: Write>(
             let age_seconds = parse_age(&movement);
             let merge_state = item
                 .get("mergeStateStatus")
-                .and_then(serde_json::Value::as_str)
+                .and_then(Value::as_str)
                 .unwrap_or("UNKNOWN");
             let queue_ready = matches!(merge_state, "CLEAN" | "BEHIND");
             rows.push(LedgerRow {
                 repository: repository.clone(),
                 number: item
                     .get("number")
-                    .and_then(serde_json::Value::as_u64)
+                    .and_then(Value::as_u64)
                     .unwrap_or_default(),
                 head: item
                     .get("headRefOid")
-                    .and_then(serde_json::Value::as_str)
+                    .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned(),
                 owner: owner_for(item),
@@ -201,16 +211,18 @@ fn current_repository(cwd: &Path) -> Result<String, CliFailure> {
         .output()
         .map_err(|error| CliFailure::new(1, format!("git remote failed: {error}")))?;
     let remote = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let path = remote
+    parse_repository_remote(&remote)
+        .ok_or_else(|| CliFailure::new(1, "could not determine GitHub repository"))
+}
+
+fn parse_repository_remote(remote: &str) -> Option<String> {
+    remote
         .strip_prefix("https://github.com/")
         .or_else(|| remote.strip_prefix("http://github.com/"))
         .or_else(|| remote.strip_prefix("git@github.com:"))
         .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
-        .map(str::to_owned);
-    path.map(|path| path.trim_end_matches(".git").to_owned())
-        .ok_or_else(|| CliFailure::new(1, "could not determine GitHub repository"))
+        .map(|path| path.trim_end_matches(".git").to_owned())
 }
-
 fn configured_repositories(cwd: &Path) -> Vec<String> {
     let mut repos = FLEET_REPOSITORIES
         .iter()
@@ -237,6 +249,31 @@ mod tests {
             "statusCheckRollup": [{"completedAt": "2026-10-11T03:00:00Z"}]
         });
         assert_eq!(latest_movement(&item), "2026-10-11T03:00:00Z");
+    }
+
+    #[test]
+    fn parses_https_and_ssh_repository_remotes() {
+        assert_eq!(
+            parse_repository_remote("https://github.com/danielraffel/Shipyard.git"),
+            Some("danielraffel/Shipyard".to_owned())
+        );
+        assert_eq!(
+            parse_repository_remote("git@github.com:danielraffel/Shipyard.git"),
+            Some("danielraffel/Shipyard".to_owned())
+        );
+    }
+
+    #[test]
+    fn status_entry_point_reads_wire_fixture() {
+        let fixture = include_str!("../../tests/fixtures/github/pr_list_wire/shipyard.json");
+        let mut output = Vec::new();
+        let cwd = Path::new(".");
+        let result = status_command_with_reader(cwd, true, true, &mut output, |_| {
+            serde_json::from_str(fixture).map_err(|e| CliFailure::new(1, e.to_string()))
+        });
+        assert!(result.is_ok());
+        let rendered = String::from_utf8(output).expect("json");
+        assert!(rendered.contains("repository") && rendered.contains("number"));
     }
 
     #[test]
