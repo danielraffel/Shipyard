@@ -165,10 +165,10 @@ fn configured_repositories(cwd: &Path) -> Vec<String> {
         "danielraffel/tartci".to_owned(),
         "Generous-Corp/vellum".to_owned(),
     ];
-    if let Ok(current) = current_repository(cwd) {
-        if !repos.contains(&current) {
-            repos.push(current);
-        }
+    if let Ok(current) = current_repository(cwd)
+        && !repos.contains(&current)
+    {
+        repos.push(current);
     }
     repos
 }
