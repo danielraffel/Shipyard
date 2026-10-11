@@ -374,6 +374,19 @@ pub(super) fn ship_command<W: Write>(
                 true,
             )?;
         }
+        let mut stage_runner = |command: &str, dir: &std::path::Path, compare_full: bool| {
+            let mut child = std::process::Command::new("/bin/sh");
+            child.arg("-c").arg(command).current_dir(cwd);
+            child.env("SHIPYARD_CHANGED_SURFACE_RESULT_DIR", dir);
+            child.env(
+                "SHIPYARD_CHANGED_SURFACE_COMPARE_FULL",
+                if compare_full { "1" } else { "0" },
+            );
+            child
+                .status()
+                .map(|status| status.code().unwrap_or(1))
+                .map_err(|error| CliFailure::new(1, format!("run changed-surface stage: {error}")))
+        };
         apply_changed_surface_execution(
             config,
             cwd,
@@ -383,6 +396,7 @@ pub(super) fn ship_command<W: Write>(
             &sha,
             args.resume_from.as_deref(),
             &mut targets,
+            &mut stage_runner,
         )?;
     }
 

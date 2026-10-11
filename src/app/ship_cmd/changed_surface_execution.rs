@@ -34,13 +34,7 @@ const ACCEPTED_POLICY_DIGESTS_KEY: &str =
 const MAX_DIAGNOSTIC_CHARS: usize = 512;
 const MAX_STALE_POINTER_BYTES: u64 = 64 * 1024;
 
-#[cfg(test)]
-type TestApplyHook = Box<dyn FnMut() -> Result<(), CliFailure>>;
-
-#[cfg(test)]
-thread_local! {
-    static TEST_APPLY_HOOK: std::cell::RefCell<Option<TestApplyHook>> = std::cell::RefCell::new(None);
-}
+type StageRunner<'a> = dyn FnMut(&str, &Path, bool) -> Result<i32, CliFailure> + 'a;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -523,6 +517,7 @@ pub(super) fn apply_changed_surface_execution(
     head_sha: &str,
     resume_from: Option<&str>,
     targets: &mut [ResolvedTarget],
+    runner: &mut StageRunner<'_>,
 ) -> Result<(), CliFailure> {
     let machine = MachinePolicy::from_global(config)?;
     if machine.mode == MachineMode::Off || !cfg!(unix) {
@@ -531,10 +526,6 @@ pub(super) fn apply_changed_surface_execution(
     let Some(pr) = pr.filter(|number| *number != 0) else {
         return Ok(());
     };
-    #[cfg(test)]
-    if TEST_APPLY_HOOK.with(|hook| hook.borrow().is_some()) {
-        return TEST_APPLY_HOOK.with(|hook| hook.borrow_mut().as_mut().expect("test apply hook")());
-    }
 
     if resume_from == Some("test") {
         // This pass is deliberately read-only. A later schema-v3 target must
@@ -775,15 +766,7 @@ pub(super) fn apply_changed_surface_execution(
                 })
                 .transpose()
                 .map_err(|error| CliFailure::new(1, format!("create pass-1 record: {error}")))?;
-            let mut command = Command::new("/bin/sh");
-            command.arg("-c").arg(&full_command).current_dir(cwd);
-            command.env("SHIPYARD_CHANGED_SURFACE_RESULT_DIR", &pass1_dir);
-            if let Some(pending) = &pending {
-                command.env(crate::reuse_record_store::RECORD_DIR_ENV, pending);
-            }
-            let pass1_status = command
-                .status()
-                .map_err(|error| CliFailure::new(1, format!("run same-base pass 1: {error}")))?;
+            let pass1_rc = runner(&full_command, &pass1_dir, false)?;
             let filed = if let (Some(store), Some(pending)) = (&store, pending) {
                 Some(
                     crate::reuse_record_store::file(store, &pending, &observation.receipt.head_sha)
@@ -860,22 +843,10 @@ pub(super) fn apply_changed_surface_execution(
                     });
                 let pass2_dir = canary_root.join("same-base-pass2");
                 let mut run_pass2 = |command: &str, dir: &Path, compare_full: bool| {
-                    let mut pass2 = Command::new("/bin/sh");
-                    pass2.arg("-c").arg(command).current_dir(cwd);
-                    pass2.env("SHIPYARD_CHANGED_SURFACE_RESULT_DIR", dir);
-                    pass2.env(
-                        "SHIPYARD_CHANGED_SURFACE_COMPARE_FULL",
-                        if compare_full { "1" } else { "0" },
-                    );
-                    pass2
-                        .status()
-                        .map(|status| status.code().unwrap_or(1))
-                        .map_err(|error| {
-                            CliFailure::new(1, format!("run same-base pass 2: {error}"))
-                        })
+                    runner(command, dir, compare_full)
                 };
                 match execute_same_base_canary_passes(
-                    pass1_status.success(),
+                    pass1_rc == 0,
                     pass1.as_ref(),
                     candidate.as_ref(),
                     &plan.executable_reuse_binding,
@@ -888,7 +859,7 @@ pub(super) fn apply_changed_surface_execution(
                         ":".clone_into(&mut plan.command);
                         Some(Keyed::Planned(plan))
                     }
-                    Err(error) if pass1_status.success() => {
+                    Err(error) if pass1_rc == 0 => {
                         persist_fallback_diagnostic(
                             &pass1_dir,
                             &FallbackDiagnostic {
@@ -916,7 +887,7 @@ pub(super) fn apply_changed_surface_execution(
                     canary_root,
                     canary_root,
                     identity.as_ref(),
-                    pass1_status.code(),
+                    Some(pass1_rc),
                     Some("planner produced no keyed plan"),
                 )?;
                 None
@@ -2037,13 +2008,12 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         CurrentStaleGeneration, FallbackDiagnostic, MAX_STALE_POINTER_BYTES, MachineMode,
-        MachinePolicy, TEST_APPLY_HOOK, activation_bytes, activation_receipt,
-        apply_changed_surface_execution, bounded_diagnostic, evidence_dir,
-        execute_same_base_canary_passes, full_fallback_diagnostic, persist_exact_bytes,
-        persist_fallback_diagnostic, persist_same_base_canary_receipt,
-        publish_current_stale_generation, read_current_stale_generation, result_dir,
-        selected_resume_block_reason, shell_quote, stale_generation_has_execution_evidence,
-        target_declares_changed_surface_selection,
+        MachinePolicy, activation_bytes, activation_receipt, apply_changed_surface_execution,
+        bounded_diagnostic, evidence_dir, execute_same_base_canary_passes,
+        full_fallback_diagnostic, persist_exact_bytes, persist_fallback_diagnostic,
+        persist_same_base_canary_receipt, publish_current_stale_generation,
+        read_current_stale_generation, result_dir, selected_resume_block_reason, shell_quote,
+        stale_generation_has_execution_evidence, target_declares_changed_surface_selection,
     };
     use crate::app::CliFailure;
     use crate::changed_surface::same_base_canary::FullShadowRecord;
@@ -2815,8 +2785,8 @@ mod tests {
             LocalOverlaySource::None,
         )
         .unwrap();
-        TEST_APPLY_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(fake_stage)));
         let mut targets = [];
+        let mut runner = |_command: &str, _dir: &Path, _compare_full: bool| Ok(0);
         let result = apply_changed_surface_execution(
             &config,
             temp.path(),
@@ -2826,9 +2796,9 @@ mod tests {
             "head",
             None,
             &mut targets,
+            &mut runner,
         );
-        TEST_APPLY_HOOK.with(|hook| *hook.borrow_mut() = None);
-        result
+        result.and_then(|()| fake_stage())
     }
 
     fn binding_json(id: &str) -> Vec<u8> {
