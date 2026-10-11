@@ -153,7 +153,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let pass1 = temp.path().join("pass1");
         let pass2 = temp.path().join("pass2");
-        let record = pass1.join("full-shadow-record.json");
+        let record_path = pass1.join("full-shadow-record.json");
         let receipt = temp.path().join("canary.json");
         fs::create_dir_all(&pass1).unwrap();
         fs::write(
@@ -165,7 +165,7 @@ mod tests {
             "mkdir -p \"$SHIPYARD_CHANGED_SURFACE_RESULT_DIR\"; printf '{\"full_returncode\":0}' > \"$SHIPYARD_CHANGED_SURFACE_RESULT_DIR/result-1.json\"",
             &pass1,
             &pass2,
-            &record,
+            &record_path,
             &receipt,
         );
         let status = Command::new("/bin/sh")
