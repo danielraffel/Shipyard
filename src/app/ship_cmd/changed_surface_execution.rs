@@ -324,14 +324,13 @@ fn latest_result(dir: &Path) -> serde_json::Value {
     };
     entries
         .flatten()
-        .filter_map(|entry| {
+        .find_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             name.starts_with("result-")
                 .then(|| entry.path())
                 .and_then(|path| fs::read(path).ok())
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         })
-        .next()
         .unwrap_or(serde_json::Value::Null)
 }
 
@@ -362,7 +361,7 @@ fn persist_same_base_canary_receipt(
     let selected_rc = pass2
         .get("selected_returncode")
         .and_then(serde_json::Value::as_i64)
-        .map(|value| value as i32);
+        .and_then(|value| i32::try_from(value).ok());
     let selected_matches = lane_rc.and_then(|rc| selected_returncode_matches(rc, selected_rc));
     let no_fallback =
         !pass1_dir.join("fallback.json").exists() && !pass2_dir.join("fallback.json").exists();
