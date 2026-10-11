@@ -7,6 +7,7 @@ use super::{
 };
 use crate::merge_steward::StewardCheck;
 use crate::recovery_worker::{RecoveryFailureFact, RecoveryRequiredCheck};
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use super::recovery_worker::{
@@ -757,21 +758,34 @@ pub(super) fn wake_owner_comment(
         }
         _ => return Err("owner wake requested for a non-actionable decision".to_owned()),
     };
-    let body = owner_wake_body(pr, reason.as_str());
+    let state = wake_state(decision);
     let wake_key = format!(
-        "{}:{}:{}",
-        context.observation.repo, pr.fact.number, pr.fact.head_sha
+        "{}:{}:{}:{}",
+        context.observation.repo, pr.fact.number, pr.fact.head_sha, state
     );
-    if ledger
+    let now = Utc::now();
+    let escalation = ledger
         .wake_records
         .get(&wake_key)
-        .is_some_and(|state| state == "posted")
-    {
+        .and_then(|record| wake_record_age(record, now))
+        .is_some_and(|age| age >= chrono::Duration::hours(2));
+    if ledger.wake_records.get(&wake_key).is_some_and(|record| {
+        record == "posted"
+            || record.starts_with("escalated|")
+            || (!escalation && record.starts_with("posted|"))
+    }) {
         return Ok("owner_wake_already_posted".to_owned());
     }
-    ledger
-        .wake_records
-        .insert(wake_key.clone(), "intent".to_owned());
+    let recipient = if escalation {
+        "team-lead"
+    } else {
+        pr.owner.as_str()
+    };
+    let body = owner_wake_body(recipient, pr, reason.as_str(), escalation);
+    ledger.wake_records.insert(
+        wake_key.clone(),
+        format!("intent|{recipient}|{}", now.to_rfc3339()),
+    );
     super::save_ledger(context.ledger_path, ledger).map_err(|error| error.message().to_owned())?;
     super::handoff::verify_exact_open_pr(
         context.actions,
@@ -795,17 +809,41 @@ pub(super) fn wake_owner_comment(
         ],
     )
     .map_err(|error| format!("could not post owner wake: {error}"))?;
-    ledger.wake_records.insert(wake_key, "posted".to_owned());
+    ledger.wake_records.insert(
+        wake_key,
+        format!(
+            "{}|{}|{}",
+            if escalation { "escalated" } else { "posted" },
+            recipient,
+            now.to_rfc3339()
+        ),
+    );
     super::save_ledger(context.ledger_path, ledger).map_err(|error| error.message().to_owned())?;
     Ok("owner_wake_posted".to_owned())
 }
 
-fn owner_wake_body(pr: &ObservedPr, reason: &str) -> String {
-    let owner = &pr.owner;
+fn owner_wake_body(recipient: &str, pr: &ObservedPr, reason: &str, escalation: bool) -> String {
+    let escalation_prefix = if escalation { "Escalation: " } else { "" };
     format!(
-        "Shipyard owner wake for {owner}: PR #{} at exact head {} requires action: {reason}",
-        pr.fact.number, pr.fact.head_sha
+        "{escalation_prefix}Shipyard owner wake for {recipient}: PR #{} at exact head {} requires action: {reason}",
+        pr.fact.number, pr.fact.head_sha,
     )
+}
+
+fn wake_state(decision: &StewardDecision) -> &'static str {
+    match decision {
+        StewardDecision::NeedsUpdate { .. } => "needs_update",
+        StewardDecision::RequiredFailed { .. } => "required_failed",
+        _ => "other",
+    }
+}
+
+fn wake_record_age(record: &str, now: DateTime<Utc>) -> Option<chrono::Duration> {
+    record
+        .rsplit('|')
+        .next()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|timestamp| now - timestamp.with_timezone(&Utc))
 }
 
 pub(super) fn should_wake_owner(pr: &ObservedPr, decision: &StewardDecision) -> bool {
@@ -1155,6 +1193,29 @@ mod tests {
     fn owner_wake_body_names_the_owner() {
         let mut observed = pr(vec![], vec![]);
         observed.owner = "alice".to_owned();
-        assert!(owner_wake_body(&observed, "required checks failed").contains("for alice:"));
+        assert!(
+            owner_wake_body("alice", &observed, "required checks failed", false)
+                .contains("for alice:")
+        );
+    }
+
+    #[test]
+    fn owner_wake_escalates_after_two_hours() {
+        let now = Utc::now();
+        let record = format!(
+            "posted|alice|{}",
+            (now - chrono::Duration::hours(2)).to_rfc3339()
+        );
+        assert!(wake_record_age(&record, now).is_some_and(|age| age >= chrono::Duration::hours(2)));
+        assert!(
+            !wake_record_age(
+                &format!(
+                    "posted|alice|{}",
+                    (now - chrono::Duration::minutes(1)).to_rfc3339()
+                ),
+                now
+            )
+            .is_some_and(|age| age >= chrono::Duration::hours(2))
+        );
     }
 }
