@@ -135,7 +135,7 @@ fn replaying_9438_with_a_marker_approves_exactly_the_marked_head() {
     comments.push(human(
         "danielraffel",
         "2026-10-04T04:45:00Z",
-        "Read it.\nreviewed:db2c94acbfdd\n",
+        &format!("Read it.\nreviewed:{}\n", PR_9438_HEADS[6]),
     ));
     let approved: Vec<&str> = PR_9438_HEADS
         .iter()
@@ -223,8 +223,30 @@ fn a_marker_from_a_listed_reviewer_counts() {
     )];
     assert_eq!(
         find_approval(HEAD, &[], &comments, &required(&["Reviewer"]), None),
+        None
+    );
+}
+
+#[test]
+fn marker_approval_preserves_comment_id_for_the_enqueue_receipt() {
+    let comments = [json!({
+        "id": 4242,
+        "login": "reviewer",
+        "type": "User",
+        "at": "2026-10-04T01:00:00Z",
+        "body": "reviewed:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    })];
+    assert_eq!(
+        find_approval(
+            &"a".repeat(40),
+            &[],
+            &comments,
+            &required(&["Reviewer"]),
+            None
+        ),
         Some(Approval::Marker {
-            login: "reviewer".to_owned()
+            login: "reviewer".to_owned(),
+            comment_id: Some(4242),
         })
     );
 }

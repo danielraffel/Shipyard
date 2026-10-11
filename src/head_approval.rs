@@ -112,6 +112,9 @@ pub enum Approval {
     Marker {
         /// Commenter login.
         login: String,
+        /// GitHub comment id used as durable approval evidence.
+        #[serde(default)]
+        comment_id: Option<u64>,
     },
 }
 
@@ -121,7 +124,7 @@ impl Approval {
     pub fn describe(&self) -> String {
         match self {
             Self::Review { login } => format!("an approving review by {login}"),
-            Self::Marker { login } => format!("a reviewed:<sha> marker by {login}"),
+            Self::Marker { login, .. } => format!("a reviewed:<sha> marker by {login}"),
         }
     }
 }
@@ -207,7 +210,7 @@ fn at(record: &Value) -> Option<DateTime<Utc>> {
 
 fn marker_names_head(body: &str, head: &str) -> bool {
     let pattern =
-        Regex::new(r"(?im)^\s*reviewed:([0-9a-f]{7,40})\s*$").expect("marker pattern compiles");
+        Regex::new(r"(?im)^\s*reviewed:([0-9a-f]{40})\s*$").expect("marker pattern compiles");
     let head = head.to_ascii_lowercase();
     pattern
         .captures_iter(body)
@@ -263,9 +266,11 @@ pub fn find_approval(
                     .and_then(Value::as_str)
                     .is_some_and(|body| marker_names_head(body, head))
         })
-        .and_then(login)
-        .map(|login| Approval::Marker {
-            login: login.to_owned(),
+        .and_then(|comment| {
+            Some(Approval::Marker {
+                login: login(comment)?.to_owned(),
+                comment_id: comment.get("id").and_then(Value::as_u64),
+            })
         })
 }
 
@@ -365,6 +370,28 @@ pub fn decide_excusing(
     if !policy.required {
         return HeadGate::NotRequired;
     }
+    if comments.iter().any(|comment| {
+        comment
+            .get("login")
+            .and_then(Value::as_str)
+            .is_some_and(|login| {
+                policy
+                    .reviewer_logins
+                    .iter()
+                    .any(|reviewer| reviewer.eq_ignore_ascii_case(login))
+            })
+            && comment
+                .get("body")
+                .and_then(Value::as_str)
+                .is_some_and(|body| {
+                    let upper = body.to_ascii_uppercase();
+                    upper.contains("HOLD") || upper.contains("CHANGES REQUESTED")
+                })
+    }) {
+        return HeadGate::NotApproved {
+            head: head.to_owned(),
+        };
+    }
     let mut ejections = head_ejections(queue, head);
     if latest_was_interruption {
         ejections.pop();
@@ -408,7 +435,9 @@ pub fn read_policy(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<Approval
     ]) {
         Ok(raw) => raw,
         Err(detail) if detail.contains("404") || detail.contains("Not Found") => {
-            return Ok(ApprovalPolicy::default());
+            return Err(format!(
+                "{CONFIG_PATH} on {base} is absent; approval policy is required"
+            ));
         }
         Err(detail) => return Err(format!("{CONFIG_PATH} on {base} unreadable: {detail}")),
     };
@@ -477,7 +506,7 @@ pub fn evaluate_excusing(
     let comments = read_records(
         run_gh,
         &format!("repos/{repo}/issues/{pr}/comments"),
-        ".[] | {login: .user.login, type: .user.type, at: .created_at, body: .body}",
+        ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body}",
     )?;
     Ok(decide_excusing(
         &policy,
@@ -514,7 +543,7 @@ pub fn evaluate_with_policy(
     let comments = read_records(
         run_gh,
         &format!("repos/{repo}/issues/{pr}/comments"),
-        ".[] | {login: .user.login, type: .user.type, at: .created_at, body: .body}",
+        ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body}",
     )?;
     Ok(decide(policy, head, &reviews, &comments, queue))
 }

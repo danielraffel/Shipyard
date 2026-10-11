@@ -3,7 +3,15 @@ use super::*;
 #[cfg(unix)]
 fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     let path = temp.path().join("gh");
-    crate::test_support::write_executable_script(&path, &format!("#!/bin/sh\nset -eu\n{body}\n"));
+    let absent_policy = if body.contains("CONFIG_ERROR") {
+        String::new()
+    } else {
+        "case \"$*\" in *contents/.shipyard/config.toml*) echo '404 Not Found' >&2; exit 1 ;; esac\n".to_owned()
+    };
+    crate::test_support::write_executable_script(
+        &path,
+        &format!("#!/bin/sh\nset -eu\n{absent_policy}{body}\n"),
+    );
     let config = crate::config::LoadedConfig {
         data: toml::Table::new(),
         global_dir: temp.path().join("global"),
@@ -158,3 +166,5 @@ mod mutations;
 mod observation;
 #[cfg(unix)]
 mod recovery;
+#[cfg(unix)]
+mod review_774;
