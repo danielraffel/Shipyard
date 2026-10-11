@@ -81,7 +81,7 @@ fn fleet_management_uses_author_and_branch_quadrants() {
     for prefix in ["codex/", "feature/", "fix/"] {
         let mut fleet = green_pr();
         fleet.head_branch = format!("{prefix}work");
-        fleet.author = Some("shipyard-local[bot]".to_owned());
+        fleet.author = Some("app/shipyard-local".to_owned());
         assert!(matches!(
             classify_pr(&fleet, &policy, &BTreeMap::new()),
             StewardDecision::ArmMergeQueue
@@ -95,13 +95,18 @@ fn fleet_management_uses_author_and_branch_quadrants() {
     }
     let mut app_other_branch = green_pr();
     app_other_branch.head_branch = "topic/custom".to_owned();
-    app_other_branch.author = Some("shipyard-local[bot]".to_owned());
+    app_other_branch.author = Some("app/shipyard-local".to_owned());
     assert!(matches!(
         classify_pr(&app_other_branch, &policy, &BTreeMap::new()),
         StewardDecision::ArmMergeQueue
     ));
     let mut dependabot = app_other_branch;
     dependabot.author = Some("dependabot[bot]".to_owned());
+    assert_eq!(
+        classify_pr(&dependabot, &policy, &BTreeMap::new()),
+        StewardDecision::Unmanaged
+    );
+    dependabot.author = Some("app/dependabot".to_owned());
     assert_eq!(
         classify_pr(&dependabot, &policy, &BTreeMap::new()),
         StewardDecision::Unmanaged
@@ -114,6 +119,7 @@ fn fleet_branch_is_managed_by_default_and_opt_out_still_wins() {
     policy.managed_label = Some("shipyard:managed".to_owned());
     let mut pr = green_pr();
     pr.head_branch = "codex/fleet-close".to_owned();
+    pr.author = Some("app/shipyard-local".to_owned());
     assert_eq!(
         classify_pr(&pr, &policy, &BTreeMap::new()),
         StewardDecision::ArmMergeQueue

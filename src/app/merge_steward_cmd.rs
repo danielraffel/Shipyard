@@ -67,6 +67,7 @@ pub(super) struct AdmissionCleanArgs {
 struct ObservedPr {
     node_id: String,
     fact: StewardPullRequest,
+    owner: String,
     check_rollup_maybe_truncated: bool,
 }
 
@@ -151,6 +152,8 @@ struct StewardLedger {
     resume_records: BTreeMap<String, resume_record::ResumeRecordV1>,
     #[serde(default)]
     audit: Vec<LedgerAudit>,
+    #[serde(default)]
+    wake_records: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -264,8 +267,6 @@ struct QueueRecoveryReceipt {
     job_id: u64,
     attempted_at: String,
     phase: QueueRecoveryPhase,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    approval_comment_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

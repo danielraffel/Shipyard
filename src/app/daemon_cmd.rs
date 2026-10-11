@@ -1158,6 +1158,7 @@ fn public_ingress_findings(state_dir: &Path) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::{public_ingress_line, url_names_host};
+    use crate::app::pr_status_cmd::FLEET_REPOSITORIES;
 
     #[test]
     fn public_ingress_line_names_a_failing_check_and_its_reason() {
@@ -1181,6 +1182,13 @@ mod tests {
         // An older daemon reports no ingress check at all; say nothing.
         assert_eq!(public_ingress_line(None), None);
         assert_eq!(public_ingress_line(Some(&serde_json::Value::Null)), None);
+    }
+
+    #[test]
+    fn daemon_defaults_share_the_fleet_repository_list() {
+        assert!(FLEET_REPOSITORIES.contains(&"Generous-Corp/pulp"));
+        assert!(FLEET_REPOSITORIES.contains(&"danielraffel/tartci"));
+        assert!(FLEET_REPOSITORIES.contains(&"Generous-Corp/vellum"));
     }
 
     /// The daemon's advertised URL is compared against this host's identity to

@@ -3,6 +3,7 @@ use super::*;
 fn managed_pr(head: &str) -> ObservedPr {
     ObservedPr {
         node_id: "PR_managed".to_owned(),
+        owner: "team-lead".to_owned(),
         fact: StewardPullRequest {
             number: 42,
             head_sha: head.to_owned(),
