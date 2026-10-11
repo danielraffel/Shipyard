@@ -760,7 +760,19 @@ pub(super) fn wake_owner_comment(
     };
     let wake_key = wake_key(&context.observation.repo, pr, decision);
     let now = Utc::now();
-    let escalation = escalation_due(ledger.wake_records.get(&wake_key), now);
+    let mut escalation = escalation_due(ledger.wake_records.get(&wake_key), pr, now);
+    if escalation
+        && let Some(wake_at) = ledger
+            .wake_records
+            .get(&wake_key)
+            .and_then(|record| wake_record_time(record))
+        && let Some(replied_at) = latest_comment_after(context, pr, wake_at)?
+        && now - replied_at < WAKE_ESCALATION_AFTER
+    {
+        // Someone answered on the thread since the wake; that is movement,
+        // and the two-hour clock restarts from it.
+        escalation = false;
+    }
     if ledger.wake_records.get(&wake_key).is_some_and(|record| {
         record == "posted"
             || record.starts_with("escalated|")
@@ -814,6 +826,52 @@ pub(super) fn wake_owner_comment(
     Ok("owner_wake_posted".to_owned())
 }
 
+/// The newest comment on the PR created or edited after `since`, other than
+/// the steward's own wake comments.
+fn latest_comment_after(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    since: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, String> {
+    let raw = context
+        .actions
+        .run_gh(&[
+            "api".to_owned(),
+            format!(
+                "repos/{}/issues/{}/comments?since={}&per_page=100",
+                context.observation.repo,
+                pr.fact.number,
+                since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+        ])
+        .map_err(|error| format!("could not read comments for owner wake escalation: {error}"))?;
+    let comments: Vec<serde_json::Value> = serde_json::from_str(&raw)
+        .map_err(|error| format!("malformed comments for owner wake escalation: {error}"))?;
+    Ok(comments
+        .iter()
+        .filter(|comment| {
+            !comment
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_owner_wake_body)
+        })
+        .flat_map(|comment| {
+            ["created_at", "updated_at"]
+                .into_iter()
+                .filter_map(|key| comment.get(key).and_then(serde_json::Value::as_str))
+                .filter_map(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+        })
+        .filter(|at| *at > since)
+        .max())
+}
+
+fn is_owner_wake_body(body: &str) -> bool {
+    body.strip_prefix("Escalation: ")
+        .unwrap_or(body)
+        .starts_with("Shipyard owner wake for ")
+}
+
 fn owner_wake_body(recipient: &str, pr: &ObservedPr, reason: &str, escalation: bool) -> String {
     let escalation_prefix = if escalation { "Escalation: " } else { "" };
     format!(
@@ -845,21 +903,41 @@ fn wake_key(repo: &str, pr: &ObservedPr, decision: &StewardDecision) -> String {
     )
 }
 
-/// An owner wake for this exact head and state was posted at least
-/// [`WAKE_ESCALATION_AFTER`] ago and has not been escalated.
-fn escalation_due(record: Option<&String>, now: DateTime<Utc>) -> bool {
-    record.is_some_and(|record| {
-        record.starts_with("posted|")
-            && wake_record_age(record, now).is_some_and(|age| age >= WAKE_ESCALATION_AFTER)
-    })
+/// An owner wake for this exact head and state was posted, has not been
+/// escalated, and nothing has moved for [`WAKE_ESCALATION_AFTER`]: the clock
+/// starts at the wake and restarts at any later check-state change. The
+/// steward's own status contexts are not movement. Comments are the third
+/// axis; [`wake_owner_comment`] reads them only once this is true.
+fn escalation_due(record: Option<&String>, pr: &ObservedPr, now: DateTime<Utc>) -> bool {
+    let Some(wake_at) = record
+        .filter(|record| record.starts_with("posted|"))
+        .and_then(|record| wake_record_time(record))
+    else {
+        return false;
+    };
+    let last_movement = pr
+        .fact
+        .checks
+        .iter()
+        .filter(|check| !check.name.starts_with("shipyard/steward-"))
+        .filter_map(|check| check.observed_at.as_deref())
+        .filter_map(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+        .fold(wake_at, std::cmp::max);
+    now - last_movement >= WAKE_ESCALATION_AFTER
 }
 
-fn wake_record_age(record: &str, now: DateTime<Utc>) -> Option<chrono::Duration> {
+fn wake_record_time(record: &str) -> Option<DateTime<Utc>> {
     record
         .rsplit('|')
         .next()
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|timestamp| now - timestamp.with_timezone(&Utc))
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+fn wake_record_age(record: &str, now: DateTime<Utc>) -> Option<chrono::Duration> {
+    wake_record_time(record).map(|timestamp| now - timestamp)
 }
 
 /// Whether this pass owes the owner a wake: on the transition into an
@@ -879,7 +957,11 @@ pub(super) fn should_wake_owner(
         decision,
         StewardDecision::NeedsUpdate { .. } | StewardDecision::RequiredFailed { .. }
     ) && (!signal_is_converged(pr, true)
-        || escalation_due(ledger.wake_records.get(&wake_key(repo, pr, decision)), now))
+        || escalation_due(
+            ledger.wake_records.get(&wake_key(repo, pr, decision)),
+            pr,
+            now,
+        ))
 }
 
 fn clear_needs_agent(
