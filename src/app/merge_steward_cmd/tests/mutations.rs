@@ -1221,6 +1221,8 @@ fn steward_refuses_formal_stack_before_enqueue_mutation() {
             r#"
 printf '%s\n' "$*" >> '{}'
 case "$*" in
+  *"contents/.shipyard/config.toml"*) printf '%s\\n' '[auto_merge]' 'arm_requires_head_approval = false' ;;
+  *"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *"stackConfig"*)
     printf '%s' '{{"data":{{"repository":{{"stackConfig":{{"text":"stacked_pr_mode = \"observe\"\n"}},"pullRequest":{{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stack":{{"number":7,"size":3,"baseRefName":"main"}},"stackEntry":{{"position":2}}}}}}}}}}' ;;
   *"stackEntry"*)
