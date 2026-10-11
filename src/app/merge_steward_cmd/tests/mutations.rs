@@ -2211,7 +2211,8 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
 }
 
 /// A fake GitHub for the owner-wake scenarios. It records every comment POST
-/// in `wake-comments`, answers the exact-head read with head B once
+/// in `wake-comments`, serves `thread.json` (or no comments) for the
+/// escalation's comment read, answers the exact-head read with head B once
 /// `head-drift` exists, and, once `converged` exists, serves the PR with the
 /// needs-agent label and a FAILURE recovery status already in place.
 #[cfg(unix)]
@@ -2241,7 +2242,8 @@ case "$*" in
   *"query=query("*"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
   "pr view "*) printf '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"DIRTY","autoMergeRequest":null,"labels":[%s],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-08-27T00:00:00Z"}},{{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-27T00:00:01Z"}}%s]}}' "$labels" "$recovery" ;;
   *"repos/owner/repo/pulls/42"*) if test -f '{root}/head-drift'; then sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; else sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; fi; printf '{{"state":"open","head":{{"sha":"%s"}}}}' "$sha" ;;
-  *"issues/42/comments"*) printf '%s\n' "$*" >> '{root}/wake-comments'; printf '%s' '{{}}' ;;
+  *"-X POST"*"issues/42/comments"*) printf '%s\n' "$*" >> '{root}/wake-comments'; printf '%s' '{{}}' ;;
+  *"issues/42/comments?since="*) if test -f '{root}/thread.json'; then cat '{root}/thread.json'; else printf '%s' '[]'; fi ;;
   *) printf '%s' '{{}}' ;;
 esac
 "#
@@ -2318,6 +2320,11 @@ esac
             .unwrap_or_default()
     }
 
+    /// Serve these PR comments to the escalation's comment read.
+    fn thread(&self, comments: &serde_json::Value) {
+        fs::write(self.temp.path().join("thread.json"), comments.to_string()).expect("thread");
+    }
+
     /// Record an owner wake for the exact head, posted `hours` ago.
     fn posted_hours_ago(&mut self, hours: i64) {
         self.ledger.wake_records.insert(
@@ -2328,6 +2335,16 @@ esac
             ),
         );
     }
+}
+
+#[cfg(unix)]
+fn hours_ago(hours: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339()
+}
+
+#[cfg(unix)]
+fn minutes_ago(minutes: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339()
 }
 
 #[cfg(unix)]
@@ -2378,6 +2395,13 @@ fn owner_wake_needs_the_wake_owner_switch() {
 fn owner_wake_escalates_to_team_lead_once_the_signal_has_converged() {
     let mut harness = WakeHarness::new();
     harness.posted_hours_ago(3);
+    // Neither comment is movement: one predates the wake, and the other is
+    // the steward's own wake comment, even when it was edited recently.
+    harness.thread(&serde_json::json!([
+        {"created_at": hours_ago(4), "updated_at": hours_ago(4), "body": "earlier discussion"},
+        {"created_at": minutes_ago(170), "updated_at": minutes_ago(30),
+         "body": "Shipyard owner wake for session-owner: PR #42 at exact head aaaa requires action"},
+    ]));
     let pr = harness.converge();
     let report = harness.pass(pr.clone(), true);
     assert!(
@@ -2407,6 +2431,45 @@ fn owner_wake_escalates_to_team_lead_once_the_signal_has_converged() {
         "{again:?}"
     );
     assert_eq!(harness.comments().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_wake_does_not_escalate_after_a_reply_on_the_thread() {
+    let mut harness = WakeHarness::new();
+    harness.posted_hours_ago(3);
+    harness.thread(&serde_json::json!([
+        {"created_at": hours_ago(1), "updated_at": hours_ago(1), "body": "on it"},
+    ]));
+    let pr = harness.converge();
+    let report = harness.pass(pr, true);
+    assert!(report.error.is_none(), "{report:?}");
+    assert!(
+        !mutation_of(&report).contains("owner_wake_posted"),
+        "{report:?}"
+    );
+    assert!(harness.comments().is_empty(), "{:?}", harness.comments());
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_wake_does_not_escalate_after_a_check_state_change() {
+    let mut harness = WakeHarness::new();
+    harness.posted_hours_ago(3);
+    let mut pr = harness.converge();
+    pr.fact.checks.push(crate::merge_steward::StewardCheck {
+        name: "linux".to_owned(),
+        source: StewardCheckSource::CheckRun,
+        app_id: None,
+        status: "IN_PROGRESS".to_owned(),
+        conclusion: None,
+        run_id: None,
+        observed_at: Some(hours_ago(1)),
+    });
+    let report = harness.pass(pr, true);
+    assert!(report.error.is_none(), "{report:?}");
+    assert!(!mutation_of(&report).contains("owner_wake"), "{report:?}");
+    assert!(harness.comments().is_empty(), "{:?}", harness.comments());
 }
 
 #[cfg(unix)]
