@@ -758,17 +758,9 @@ pub(super) fn wake_owner_comment(
         }
         _ => return Err("owner wake requested for a non-actionable decision".to_owned()),
     };
-    let state = wake_state(decision);
-    let wake_key = format!(
-        "{}:{}:{}:{}",
-        context.observation.repo, pr.fact.number, pr.fact.head_sha, state
-    );
+    let wake_key = wake_key(&context.observation.repo, pr, decision);
     let now = Utc::now();
-    let escalation = ledger
-        .wake_records
-        .get(&wake_key)
-        .and_then(|record| wake_record_age(record, now))
-        .is_some_and(|age| age >= chrono::Duration::hours(2));
+    let escalation = escalation_due(ledger.wake_records.get(&wake_key), now);
     if ledger.wake_records.get(&wake_key).is_some_and(|record| {
         record == "posted"
             || record.starts_with("escalated|")
@@ -838,6 +830,30 @@ fn wake_state(decision: &StewardDecision) -> &'static str {
     }
 }
 
+/// How long an owner wake may go unanswered before it escalates to
+/// team-lead. The wake record is keyed by repository, PR, exact head and
+/// decision state, so a head movement or a change of state starts a new
+/// record and resets this clock.
+const WAKE_ESCALATION_AFTER: chrono::TimeDelta = chrono::TimeDelta::hours(2);
+
+fn wake_key(repo: &str, pr: &ObservedPr, decision: &StewardDecision) -> String {
+    format!(
+        "{repo}:{}:{}:{}",
+        pr.fact.number,
+        pr.fact.head_sha,
+        wake_state(decision)
+    )
+}
+
+/// An owner wake for this exact head and state was posted at least
+/// [`WAKE_ESCALATION_AFTER`] ago and has not been escalated.
+fn escalation_due(record: Option<&String>, now: DateTime<Utc>) -> bool {
+    record.is_some_and(|record| {
+        record.starts_with("posted|")
+            && wake_record_age(record, now).is_some_and(|age| age >= WAKE_ESCALATION_AFTER)
+    })
+}
+
 fn wake_record_age(record: &str, now: DateTime<Utc>) -> Option<chrono::Duration> {
     record
         .rsplit('|')
@@ -846,11 +862,24 @@ fn wake_record_age(record: &str, now: DateTime<Utc>) -> Option<chrono::Duration>
         .map(|timestamp| now - timestamp.with_timezone(&Utc))
 }
 
-pub(super) fn should_wake_owner(pr: &ObservedPr, decision: &StewardDecision) -> bool {
+/// Whether this pass owes the owner a wake: on the transition into an
+/// actionable state (the needs-agent signal is not yet converged), or when
+/// an earlier wake for the same exact head and state is due to escalate.
+/// The escalation check reads only the wake record, because by the second
+/// pass the needs-agent signal has converged and the transition test alone
+/// would never reach it.
+pub(super) fn should_wake_owner(
+    repo: &str,
+    pr: &ObservedPr,
+    decision: &StewardDecision,
+    ledger: &StewardLedger,
+    now: DateTime<Utc>,
+) -> bool {
     matches!(
         decision,
         StewardDecision::NeedsUpdate { .. } | StewardDecision::RequiredFailed { .. }
-    ) && !signal_is_converged(pr, true)
+    ) && (!signal_is_converged(pr, true)
+        || escalation_due(ledger.wake_records.get(&wake_key(repo, pr, decision)), now))
 }
 
 fn clear_needs_agent(
@@ -1179,13 +1208,24 @@ mod tests {
         let decision = StewardDecision::RequiredFailed {
             contexts: vec!["macos".to_owned()],
         };
-        assert!(should_wake_owner(&pr(vec![], vec![]), &decision));
+        let ledger = StewardLedger::default();
+        let now = Utc::now();
+        assert!(should_wake_owner(
+            "owner/repo",
+            &pr(vec![], vec![]),
+            &decision,
+            &ledger,
+            now
+        ));
         assert!(!should_wake_owner(
+            "owner/repo",
             &pr(
                 vec![NEEDS_AGENT_LABEL],
                 vec![("FAILURE", "2026-08-27T00:00:00Z")]
             ),
-            &decision
+            &decision,
+            &ledger,
+            now
         ));
     }
 
