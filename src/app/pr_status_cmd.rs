@@ -194,34 +194,6 @@ pub(crate) fn owner_for(item: &serde_json::Value) -> String {
         .to_owned()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stalled_uses_latest_of_head_comment_and_check_movement() {
-        let item = serde_json::json!({
-            "updatedAt": "2026-10-11T00:00:00Z",
-            "commits": [{"committedDate": "2026-10-11T01:00:00Z", "authors": [{"login": "alice"}]}],
-            "comments": [{"createdAt": "2026-10-11T02:00:00Z", "updatedAt": "2026-10-11T02:00:00Z"}],
-            "statusCheckRollup": [{"completedAt": "2026-10-11T03:00:00Z"}]
-        });
-        assert_eq!(latest_movement(&item), "2026-10-11T03:00:00Z");
-    }
-
-    #[test]
-    fn owner_prefers_whence_then_last_committer_then_team_lead() {
-        let whence = serde_json::json!({"body": "<!-- whence {\"prov\": {\"session\": \"sess-1\"}} -->", "commits": [{"authors": [{"login": "alice"}]}]});
-        assert_eq!(owner_for(&whence), "sess-1");
-        let committer = serde_json::json!({"body": "plain", "commits": [{"authors": [{"login": "alice"}]}, {"authors": [{"login": "bob"}]}]});
-        assert_eq!(owner_for(&committer), "bob");
-        assert_eq!(
-            owner_for(&serde_json::json!({"body": "plain"})),
-            "team-lead"
-        );
-    }
-}
-
 fn current_repository(cwd: &Path) -> Result<String, CliFailure> {
     let output = Command::new("git")
         .args(["remote", "get-url", "origin"])
@@ -250,4 +222,32 @@ fn configured_repositories(cwd: &Path) -> Vec<String> {
         repos.push(current);
     }
     repos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stalled_uses_latest_of_head_comment_and_check_movement() {
+        let item = serde_json::json!({
+            "updatedAt": "2026-10-11T00:00:00Z",
+            "commits": [{"committedDate": "2026-10-11T01:00:00Z", "authors": [{"login": "alice"}]}],
+            "comments": [{"createdAt": "2026-10-11T02:00:00Z", "updatedAt": "2026-10-11T02:00:00Z"}],
+            "statusCheckRollup": [{"completedAt": "2026-10-11T03:00:00Z"}]
+        });
+        assert_eq!(latest_movement(&item), "2026-10-11T03:00:00Z");
+    }
+
+    #[test]
+    fn owner_prefers_whence_then_last_committer_then_team_lead() {
+        let whence = serde_json::json!({"body": "<!-- whence {\"prov\": {\"session\": \"sess-1\"}} -->", "commits": [{"authors": [{"login": "alice"}]}]});
+        assert_eq!(owner_for(&whence), "sess-1");
+        let committer = serde_json::json!({"body": "plain", "commits": [{"authors": [{"login": "alice"}]}, {"authors": [{"login": "bob"}]}]});
+        assert_eq!(owner_for(&committer), "bob");
+        assert_eq!(
+            owner_for(&serde_json::json!({"body": "plain"})),
+            "team-lead"
+        );
+    }
 }
