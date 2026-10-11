@@ -112,23 +112,24 @@ fn enqueue_pull_request_with_recovery(
             .run_gh(argv)
             .map_err(|error| error.to_string())
     };
-    let approval_policy = match crate::head_approval::read_policy_required(
-        &run_gh,
-        &context.observation.repo,
-        &context.observation.base,
-    ) {
-        Ok(policy) => policy,
-        Err(_error) if pr.fact.author.is_none() => {
-            // Legacy library observations without an author cannot establish
-            // fleet ownership, so they retain the pre-approval path. Live CLI
-            // observations include the GitHub author and remain fail-closed.
-            crate::head_approval::ApprovalPolicy::default()
-        }
-        Err(error) => {
-            return (
-                None,
-                Some(format!("head approval policy unreadable: {error}")),
-            );
+    let approval_policy = if pr.fact.author.is_none() {
+        // Legacy library observations without an author cannot establish fleet
+        // ownership. Live CLI observations include the GitHub author and use
+        // the strict, fail-closed policy read below.
+        crate::head_approval::ApprovalPolicy::default()
+    } else {
+        match crate::head_approval::read_policy_required(
+            &run_gh,
+            &context.observation.repo,
+            &context.observation.base,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return (
+                    None,
+                    Some(format!("head approval policy unreadable: {error}")),
+                );
+            }
         }
     };
     let mut approval_comment_id = None;
