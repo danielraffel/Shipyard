@@ -6,7 +6,9 @@ fn managed_pr(head: &str) -> ObservedPr {
         fact: StewardPullRequest {
             number: 42,
             head_sha: head.to_owned(),
-            head_branch: "feature".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "feature".to_owned(),
             draft: false,
             merge_state: "BLOCKED".to_owned(),
             auto_merge_active: false,
@@ -34,6 +36,7 @@ fn admission_observation() -> RepoObservation {
         run_attempt: 1,
         workflow: "Build and Test".to_owned(),
         head_sha: "a".repeat(40),
+        author: None,
         head_branch: "feature".to_owned(),
         status: "queued".to_owned(),
         event: "pull_request".to_owned(),

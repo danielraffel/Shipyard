@@ -104,7 +104,9 @@ fn invalid_pr_head_skips_app_identity_hydration_without_blocking_repo() {
         fact: StewardPullRequest {
             number: 42,
             head_sha: "malformed".to_owned(),
-            head_branch: "topic".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "topic".to_owned(),
             draft: false,
             merge_state: "UNKNOWN".to_owned(),
             auto_merge_active: false,
@@ -753,6 +755,7 @@ fn disabled_preemption_policy_performs_no_job_hydration_reads() {
         run_attempt: 1,
         workflow: "Build and Test".to_owned(),
         head_sha: "a".repeat(40),
+        author: None,
         head_branch: "gh-readonly-queue/main/pr-42".to_owned(),
         status: "in_progress".to_owned(),
         event: "merge_group".to_owned(),

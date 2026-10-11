@@ -8,6 +8,7 @@ fn green_pr() -> StewardPullRequest {
     StewardPullRequest {
         number: 7,
         head_sha: sha('a'),
+        author: None,
         head_branch: "feature".to_owned(),
         draft: false,
         merge_state: "CLEAN".to_owned(),
@@ -88,6 +89,28 @@ fn fleet_branch_is_managed_by_default_and_opt_out_still_wins() {
         classify_pr(&pr, &policy, &BTreeMap::new()),
         StewardDecision::OptedOut
     );
+}
+
+#[test]
+fn fleet_management_uses_author_and_branch_quadrants() {
+    let mut policy = queue_policy();
+    policy.managed_label = Some("shipyard:managed".to_owned());
+    for prefix in ["codex/", "feature/", "fix/"] {
+        let mut fleet = green_pr();
+        fleet.head_branch = format!("{prefix}work");
+        fleet.author = Some("shipyard-local[bot]".to_owned());
+        assert!(matches!(classify_pr(&fleet, &policy, &BTreeMap::new()), StewardDecision::ArmMergeQueue));
+        let mut human = fleet.clone();
+        human.author = Some("alice".to_owned());
+        assert_eq!(classify_pr(&human, &policy, &BTreeMap::new()), StewardDecision::Unmanaged);
+    }
+    let mut app_other_branch = green_pr();
+    app_other_branch.head_branch = "topic/custom".to_owned();
+    app_other_branch.author = Some("shipyard-local[bot]".to_owned());
+    assert!(matches!(classify_pr(&app_other_branch, &policy, &BTreeMap::new()), StewardDecision::ArmMergeQueue));
+    let mut dependabot = app_other_branch;
+    dependabot.author = Some("dependabot[bot]".to_owned());
+    assert_eq!(classify_pr(&dependabot, &policy, &BTreeMap::new()), StewardDecision::Unmanaged);
 }
 
 #[test]
@@ -398,7 +421,9 @@ fn coalesces_only_queued_superseded_pr_runs() {
             run_attempt: 1,
             workflow: "Build and Test".to_owned(),
             head_sha: sha('a'),
-            head_branch: "feature".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "feature".to_owned(),
             status: "in_progress".to_owned(),
             event: "pull_request".to_owned(),
             pull_request_number: Some(1),
@@ -411,7 +436,9 @@ fn coalesces_only_queued_superseded_pr_runs() {
             run_attempt: 1,
             workflow: "Build and Test".to_owned(),
             head_sha: sha('a'),
-            head_branch: "feature".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "feature".to_owned(),
             status: "queued".to_owned(),
             event: "pull_request".to_owned(),
             pull_request_number: Some(1),
@@ -424,7 +451,9 @@ fn coalesces_only_queued_superseded_pr_runs() {
             run_attempt: 1,
             workflow: "Build and Test".to_owned(),
             head_sha: sha('b'),
-            head_branch: "feature".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "feature".to_owned(),
             status: "queued".to_owned(),
             event: "pull_request".to_owned(),
             pull_request_number: Some(1),
@@ -455,6 +484,7 @@ fn same_head_runs_never_authorize_cancellation() {
         run_attempt: 1,
         workflow: "Build and Test".to_owned(),
         head_sha: sha('a'),
+        author: None,
         head_branch: "feature".to_owned(),
         status: "queued".to_owned(),
         event: "pull_request".to_owned(),
@@ -494,7 +524,9 @@ fn never_cancels_in_progress_or_non_pr_runs() {
             run_attempt: 1,
             workflow: "Build and Test".to_owned(),
             head_sha: sha('a'),
-            head_branch: "feature".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "feature".to_owned(),
             status: "in_progress".to_owned(),
             event: "pull_request".to_owned(),
             pull_request_number: Some(1),
@@ -507,7 +539,9 @@ fn never_cancels_in_progress_or_non_pr_runs() {
             run_attempt: 1,
             workflow: "Build and Test".to_owned(),
             head_sha: sha('b'),
-            head_branch: "main".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "main".to_owned(),
             status: "queued".to_owned(),
             event: "push".to_owned(),
             pull_request_number: None,
@@ -535,7 +569,9 @@ fn coalescing_uses_pr_identity_and_honors_opt_out() {
             run_attempt: 1,
             workflow: "Build and Test".to_owned(),
             head_sha: sha('a'),
-            head_branch: "same-name".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "same-name".to_owned(),
             status: "queued".to_owned(),
             event: "pull_request".to_owned(),
             pull_request_number: Some(1),
@@ -548,7 +584,9 @@ fn coalescing_uses_pr_identity_and_honors_opt_out() {
             run_attempt: 1,
             workflow: "Build and Test".to_owned(),
             head_sha: sha('b'),
-            head_branch: "same-name".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "same-name".to_owned(),
             status: "queued".to_owned(),
             event: "pull_request".to_owned(),
             pull_request_number: Some(2),
@@ -575,6 +613,7 @@ fn head_move_a_to_b_to_a_does_not_leave_cached_superseded_proof() {
         run_attempt: 1,
         workflow: "Build and Test".to_owned(),
         head_sha: sha('a'),
+        author: None,
         head_branch: "feature".to_owned(),
         status: "queued".to_owned(),
         event: "pull_request".to_owned(),
@@ -612,7 +651,9 @@ fn pressure_runs() -> Vec<StewardRun> {
             run_attempt: 1,
             workflow: "Build and Test".to_owned(),
             head_sha: sha('f'),
-            head_branch: "gh-readonly-queue/main/pr-7-deadbeef".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "gh-readonly-queue/main/pr-7-deadbeef".to_owned(),
             status: "queued".to_owned(),
             event: "merge_group".to_owned(),
             pull_request_number: None,
@@ -629,7 +670,9 @@ fn pressure_runs() -> Vec<StewardRun> {
             run_attempt: 1,
             workflow: "Example validation".to_owned(),
             head_sha: sha('a'),
-            head_branch: "feature-a".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "feature-a".to_owned(),
             status: "in_progress".to_owned(),
             event: "pull_request".to_owned(),
             pull_request_number: Some(8),
@@ -653,7 +696,9 @@ fn pressure_runs() -> Vec<StewardRun> {
             run_attempt: 1,
             workflow: "Build and Test".to_owned(),
             head_sha: sha('b'),
-            head_branch: "feature-b".to_owned(),
+            author: None,
+            author: None,
+        head_branch: "feature-b".to_owned(),
             status: "in_progress".to_owned(),
             event: "pull_request".to_owned(),
             pull_request_number: Some(9),
@@ -985,6 +1030,7 @@ fn wedge_runs() -> (StewardPullRequest, Vec<StewardRun>) {
         run_attempt: 1,
         workflow: "Build and Test".to_owned(),
         head_sha: sha('a'),
+        author: None,
         head_branch: pr.head_branch.clone(),
         status: "in_progress".to_owned(),
         event: "pull_request".to_owned(),
@@ -1015,6 +1061,7 @@ fn wedge_runs() -> (StewardPullRequest, Vec<StewardRun>) {
         run_attempt: 1,
         workflow: old.workflow.clone(),
         head_sha: pr.head_sha.clone(),
+        author: None,
         head_branch: pr.head_branch.clone(),
         status: "pending".to_owned(),
         event: "pull_request".to_owned(),

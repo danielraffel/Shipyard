@@ -154,7 +154,9 @@ fn ejected_observation() -> RepoObservation {
             fact: StewardPullRequest {
                 number: 42,
                 head_sha: HEAD.to_owned(),
-                head_branch: "feature".to_owned(),
+                author: None,
+            author: None,
+        head_branch: "feature".to_owned(),
                 draft: false,
                 merge_state: "BLOCKED".to_owned(),
                 auto_merge_active: false,
