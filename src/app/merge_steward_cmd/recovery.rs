@@ -843,7 +843,6 @@ mod tests {
                 number: 7,
                 head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 author: None,
-            author: None,
         head_branch: "feature".to_owned(),
                 draft: false,
                 merge_state: "CLEAN".to_owned(),
