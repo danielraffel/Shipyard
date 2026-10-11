@@ -34,6 +34,12 @@ pub enum KeyedPassBinding {
     },
 }
 
+/// Missing selected return-code evidence is inconclusive, never equal.
+#[must_use]
+pub fn selected_returncode_matches(lane_rc: i32, selected_rc: Option<i32>) -> Option<bool> {
+    selected_rc.map(|selected| selected == lane_rc)
+}
+
 /// Build the command used by the real local lane for a same-base canary.
 /// Both passes receive the same checkout and immutable identity; pass two is
 /// permitted to run only after pass one has published its record.
@@ -145,6 +151,13 @@ mod tests {
                 KeyedPassBinding::Inconclusive { .. }
             ));
         }
+    }
+
+    #[test]
+    fn absent_selected_returncode_is_inconclusive() {
+        assert_eq!(selected_returncode_matches(0, None), None);
+        assert_eq!(selected_returncode_matches(0, Some(0)), Some(true));
+        assert_eq!(selected_returncode_matches(0, Some(1)), Some(false));
     }
 
     #[cfg(unix)]
