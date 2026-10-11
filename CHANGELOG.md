@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03000"></a>
+## [0.300.0] - 2026-10-11
+
+- feat/keyed reuse same base canary 20261011 ([#770](https://github.com/danielraffel/Shipyard/pull/770))
+- codex/gh queue removal guard ([#772](https://github.com/danielraffel/Shipyard/pull/772))
+
 <a id="v02990"></a>
 ## [0.299.0] - 2026-10-10
 
@@ -2130,6 +2136,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.300.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.300.0
 [0.299.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.299.0
 [0.298.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.298.0
 [0.297.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.297.0

@@ -2298,6 +2298,10 @@ trusted machine-global
 `changed_surface_execution.accepted_shadow_policy_digests."<owner/repo>".<target>`.
 The legacy scalar remains supported only when the scoped table is absent;
 configuring both is ambiguous and fails closed.
+The `same_base_canary` posture is a shadow-only one-lane comparison: it pins
+one base/tree and requires pass 2 to bind to pass 1's full-shadow record. A
+missing or mismatched pass-1 record is inconclusive and never grants merge
+authority.
 For `--resume-from test`, Shipyard authenticates all eligible target plans in a
 read-only preflight and refuses schema-v3 execution before activation
 persistence or substitution. It could skip producer builds and test stale warm
