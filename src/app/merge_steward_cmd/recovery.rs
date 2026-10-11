@@ -1208,14 +1208,14 @@ mod tests {
         );
         assert!(wake_record_age(&record, now).is_some_and(|age| age >= chrono::Duration::hours(2)));
         assert!(
-            !wake_record_age(
+            wake_record_age(
                 &format!(
                     "posted|alice|{}",
                     (now - chrono::Duration::minutes(1)).to_rfc3339()
                 ),
                 now
             )
-            .is_some_and(|age| age >= chrono::Duration::hours(2))
+            .is_none_or(|age| age < chrono::Duration::hours(2))
         );
     }
 }
