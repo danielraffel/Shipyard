@@ -456,8 +456,13 @@ fn classify_management(pr: &StewardPullRequest, policy: &StewardPolicy) -> Optio
     // Fleet-authored branches are managed by default. The opt-out label is
     // checked by `classify_pr` before this function, so a fleet PR cannot sit
     // unmanaged merely because a handoff label was not copied yet.
-    let fleet_author = pr.author.as_deref().is_some_and(is_fleet_app);
-    let human_or_dependabot = pr.author.as_deref().is_none_or(is_human_or_dependabot);
+    let fleet_author = pr
+        .author
+        .as_deref()
+        .is_some_and(|author| author.eq_ignore_ascii_case("app/shipyard-local"));
+    let human_or_dependabot = pr.author.as_deref().is_none_or(|author| {
+        author.eq_ignore_ascii_case("dependabot[bot]") || !author.ends_with("[bot]")
+    });
     let fleet_branch = ["codex/", "feature/", "fix/"]
         .iter()
         .any(|prefix| pr.head_branch.starts_with(prefix));
@@ -469,21 +474,6 @@ fn classify_management(pr: &StewardPullRequest, policy: &StewardPolicy) -> Optio
         return Some(StewardDecision::Unmanaged);
     }
     (!has_successful_status(pr, &policy.handoff_context)).then_some(StewardDecision::HandoffMissing)
-}
-
-fn normalized_app_login(author: &str) -> &str {
-    author.strip_prefix("app/").unwrap_or(author)
-}
-
-fn is_fleet_app(author: &str) -> bool {
-    normalized_app_login(author).eq_ignore_ascii_case("shipyard-local")
-}
-
-fn is_human_or_dependabot(author: &str) -> bool {
-    let normalized = normalized_app_login(author);
-    normalized.eq_ignore_ascii_case("dependabot")
-        || normalized.eq_ignore_ascii_case("dependabot[bot]")
-        || (!author.starts_with("app/") && !author.ends_with("[bot]"))
 }
 
 /// Whether the current immutable head carries a successful status context.
