@@ -450,16 +450,40 @@ fn has_fallback_file(dir: &Path) -> bool {
     })
 }
 
-/// The canary verdict and its reason. FAIL is any observed defect: a false
-/// skip, a re-derivation mismatch, or a fallback file in pass 2's evidence.
-/// PASS needs every fact present and true. Anything else is INCONCLUSIVE,
-/// naming the first absent fact.
+/// Why pass 2 is not a keyed observation, in the trial reader's vocabulary,
+/// when its runner reports a `derived.status` other than `derived`: an
+/// `error: binding ...` status means the runner did not use the binding and
+/// ran unkeyed (`not_derived`); any other `error:` is the runner's own
+/// derivation failing (`runner_error: <first line>`). Neither is a defect of
+/// keyed reuse, so neither is a FAIL.
+fn not_derived_reason(status: &str) -> Option<String> {
+    if status == "derived" {
+        return None;
+    }
+    let first_line = |text: &str| text.lines().next().unwrap_or_default().trim().to_owned();
+    Some(match status.strip_prefix("error:") {
+        Some(detail) if !detail.trim_start().starts_with("binding") => {
+            format!("runner_error: {}", first_line(detail))
+        }
+        _ => format!("not_derived: {}", first_line(status)),
+    })
+}
+
+/// The canary verdict and its reason. FAIL is an observed defect of keyed
+/// reuse: a false skip or a fallback file in pass 2's evidence, and it
+/// outranks every other finding. A pass 2 that was not a keyed observation
+/// is INCONCLUSIVE with that reason. PASS needs every fact present and true;
+/// anything else is INCONCLUSIVE, naming the first absent or false fact.
 fn same_base_canary_verdict(
     facts: &[(&'static str, Option<bool>)],
     defects: &[(Option<bool>, String)],
+    not_observed: Option<String>,
 ) -> (&'static str, Option<String>) {
     if let Some((_, reason)) = defects.iter().find(|(held, _)| *held == Some(false)) {
         return ("FAIL", Some(reason.clone()));
+    }
+    if let Some(reason) = not_observed {
+        return ("INCONCLUSIVE", Some(reason));
     }
     if let Some((name, _)) = facts.iter().find(|(_, value)| value.is_none()) {
         return ("INCONCLUSIVE", Some((*name).to_owned()));
@@ -523,15 +547,9 @@ fn persist_same_base_canary_receipt(
                     false_skip_count.unwrap_or_default()
                 ),
             ),
-            (
-                rederivation,
-                format!(
-                    "rederivation mismatch: derived.status = {}",
-                    derived_status.unwrap_or_default()
-                ),
-            ),
             (no_fallback, "fallback file in pass 2 evidence".to_owned()),
         ],
+        derived_status.and_then(not_derived_reason),
     );
     // A defect pass 2 showed outranks why the run stopped; otherwise the
     // caller's reason (a refusal, a failed pass) is the more specific one.
@@ -2901,7 +2919,9 @@ mod tests {
 
         const PASS2_ALL_FACTS: &[u8] = br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
         const PASS2_ONE_FALSE_SKIP: &[u8] = br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":1,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
-        const PASS2_REDERIVATION_MISMATCH: &[u8] = br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":0,"derived":{"status":"error: binding digest mismatch","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
+        const PASS2_BINDING_UNUSED: &[u8] = br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":0,"derived":{"status":"error: binding digest mismatch","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
+        const PASS2_RUNNER_ERROR: &[u8] = br#"{"selected_returncode":0,"executable_reuse":{"false_skip_count":0,"derived":{"status":"error: toolchain probe failed\nTraceback","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
+        const PASS2_FALSE_SKIP_NO_SELECTED_RC: &[u8] = br#"{"executable_reuse":{"false_skip_count":2,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
         const PASS2_NO_SELECTED_RC: &[u8] = br#"{"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#;
         const RESULT_DIR_ENV: &str = "SHIPYARD_CHANGED_SURFACE_RESULT_DIR";
         const COMPARE_FULL_ENV: &str = "SHIPYARD_CHANGED_SURFACE_COMPARE_FULL";
@@ -3008,6 +3028,9 @@ mod tests {
             pass2_result: Option<&'static [u8]>,
             pass2_spawn_fails: bool,
             pass2_writes_fallback: bool,
+            /// Pass 1 leaves a fallback file in the canary root, where no
+            /// pass-2 fact may be read from.
+            pass1_plants_stray_fallback: bool,
         }
 
         const BOUND: Script = Script {
@@ -3016,6 +3039,7 @@ mod tests {
             pass2_result: Some(PASS2_ALL_FACTS),
             pass2_spawn_fails: false,
             pass2_writes_fallback: false,
+            pass1_plants_stray_fallback: false,
         };
 
         struct CanaryRun {
@@ -3109,6 +3133,10 @@ mod tests {
                         .map(Path::to_path_buf);
                     runs.push(run);
                     if first {
+                        if script.pass1_plants_stray_fallback {
+                            let canary_root = result_dir.parent().unwrap();
+                            fs::write(canary_root.join("fallback-0-0-0.json"), b"{}").unwrap();
+                        }
                         if script.pass1_writes_record
                             && let Some(record) = record
                         {
@@ -3205,7 +3233,13 @@ mod tests {
 
         #[test]
         fn same_base_canary_refuses_a_record_the_planner_chose_instead() {
-            let run = run_canary(Choice::Other("an-older-record"), BOUND);
+            let run = run_canary(
+                Choice::Other("an-older-record"),
+                Script {
+                    pass1_plants_stray_fallback: true,
+                    ..BOUND
+                },
+            );
             run.result.unwrap();
             assert_eq!(run.runs.len(), 1, "pass 2 never runs: {:?}", run.runs);
             assert_eq!(run.receipt["verdict"], "INCONCLUSIVE", "{}", run.receipt);
@@ -3213,6 +3247,12 @@ mod tests {
             let filed = run.pass1_record.expect("pass 1 filed a record");
             assert!(reason.contains("an-older-record"), "{reason}");
             assert!(reason.contains(&filed), "{reason}");
+            assert_eq!(
+                run.receipt["no_fallback_file"],
+                serde_json::Value::Null,
+                "a refusal reads no pass-2 facts: {}",
+                run.receipt
+            );
             assert_eq!(run.test_stage, "pass-1-command");
         }
 
@@ -3289,14 +3329,44 @@ mod tests {
             );
         }
 
+        fn assert_inconclusive(script: Script, reason: &str) {
+            let run = run_canary(Choice::Pass1Record, script);
+            run.result.unwrap();
+            assert_eq!(run.runs.len(), 2, "{:?}", run.runs);
+            assert_eq!(run.receipt["verdict"], "INCONCLUSIVE", "{}", run.receipt);
+            assert_eq!(run.receipt["reason"], reason, "{}", run.receipt);
+        }
+
         #[test]
-        fn same_base_canary_fails_on_a_rederivation_mismatch() {
-            assert_fails(
+        fn same_base_canary_with_an_unused_binding_is_not_derived() {
+            assert_inconclusive(
                 Script {
-                    pass2_result: Some(PASS2_REDERIVATION_MISMATCH),
+                    pass2_result: Some(PASS2_BINDING_UNUSED),
                     ..BOUND
                 },
-                "rederivation mismatch: derived.status = error: binding digest mismatch",
+                "not_derived: error: binding digest mismatch",
+            );
+        }
+
+        #[test]
+        fn same_base_canary_with_a_runner_derivation_error_is_inconclusive() {
+            assert_inconclusive(
+                Script {
+                    pass2_result: Some(PASS2_RUNNER_ERROR),
+                    ..BOUND
+                },
+                "runner_error: toolchain probe failed",
+            );
+        }
+
+        #[test]
+        fn same_base_canary_false_skip_outranks_a_missing_field() {
+            assert_fails(
+                Script {
+                    pass2_result: Some(PASS2_FALSE_SKIP_NO_SELECTED_RC),
+                    ..BOUND
+                },
+                "false skips: false_skip_count = 2",
             );
         }
 
