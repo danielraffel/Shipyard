@@ -615,7 +615,8 @@ pub(super) fn apply_changed_surface_execution(
                 ExecutionCommandTransport::PosixShell,
                 &contract_digest,
                 &replanned.workflow_digest,
-            )?;
+            )
+            .map_err(|error| CliFailure::new(1, format!("same-base pass-2 planning: {error}")))?;
             let replanned_keyed = keyed_shadow_plan(
                 machine.mode,
                 &replanned,
