@@ -407,6 +407,18 @@ fn canary_binding_decision(
     }
 }
 
+fn same_base_keyed_command(command: &str, result_dir: &Path, canary_root: &Path) -> String {
+    let quote = |value: &Path| shell_quote(value);
+    let command = command.replace('\'', "'\"'\"'");
+    format!(
+        "set +e; export SHIPYARD_CHANGED_SURFACE_CANARY_PASS=keyed SHIPYARD_CHANGED_SURFACE_COMPARE_FULL=0; /bin/sh -c '{command}'; lane_rc=$?; python3 - {root} {pass1} {result} \"$lane_rc\" <<'PY'\nimport json, pathlib, sys\nroot, pass1, result, lane_rc = sys.argv[1:]\ndef latest(path):\n    files = sorted(pathlib.Path(path).glob('result-*.json'))\n    return json.loads(files[-1].read_text()) if files else {{}}\na = latest(pass1); b = latest(result); reuse = a.get('executable_reuse') or {{}}; derived = reuse.get('derived') or {{}}; selected = b.get('selected_returncode'); lane = int(lane_rc); facts = {{'schema_version': 1, 'mode': 'same_base_canary', 'verdict': 'INCONCLUSIVE', 'reason': None, 'binding_record_and_tree_sha': json.loads(pathlib.Path(root, 'same-base-pass1-identity.json').read_text()), 'derived.status': derived.get('status'), 'audit_staged_then_applied': (derived.get('audit') or {{}}).get('status') == 'applied', 'would_skip_gt_0': (derived.get('would_skip_count') or 0) > 0, 'false_skips_eq_0': reuse.get('false_skip_count') == 0, 'rederivation_match': derived.get('status') == 'derived', 'selected_returncode_eq_lane_rc': selected is not None and int(selected) == lane, 'no_fallback_file': not any(pathlib.Path(root).glob('*fallback*.json'))}}; complete = all(facts[k] is True for k in ('audit_staged_then_applied','would_skip_gt_0','false_skips_eq_0','rederivation_match','selected_returncode_eq_lane_rc','no_fallback_file')); facts['verdict'] = 'PASS' if complete else 'INCONCLUSIVE'; pathlib.Path(root, 'same-base-canary-receipt.json').write_text(json.dumps(facts, sort_keys=True, indent=2) + '\\n')\nPY\nexit $lane_rc",
+        command = command,
+        root = quote(canary_root),
+        pass1 = quote(&canary_root.join("same-base-pass1")),
+        result = quote(result_dir),
+    )
+}
+
 // Keep the fail-open-to-full branches adjacent to their exact diagnostics and
 // mutation point; splitting them risks one error path accidentally substituting
 // a command or losing its durable reason.
@@ -759,13 +771,10 @@ pub(super) fn apply_changed_surface_execution(
                     candidate.as_ref(),
                 ) {
                     Ok(()) => {
-                        persist_same_base_canary_receipt(
+                        persist_named_receipt(
                             canary_root,
-                            &pass1_dir,
-                            &canary_root.join("same-base-pass2"),
-                            Some(&pass1),
-                            pass1_status.code(),
-                            None,
+                            "same-base-pass1-identity.json",
+                            &pass1,
                         )?;
                         Some(Keyed::Planned(plan))
                     }
@@ -1144,7 +1153,11 @@ pub(super) fn apply_changed_surface_execution(
             },
             plan.command
         );
-        let substituted = ordinary_substituted;
+        let substituted = if machine.mode == MachineMode::SameBaseCanary {
+            same_base_keyed_command(&plan.command, &result_dir, &trial_dir)
+        } else {
+            ordinary_substituted
+        };
         let activation = activation_receipt(
             &plan,
             machine.mode,
@@ -2738,7 +2751,8 @@ mod tests {
     #[test]
     fn production_canary_mutants_are_break_confirmed() {
         let source = include_str!("changed_surface_execution.rs");
-        assert!(source.contains("canary_binding_decision(pass1_status.success()"));
+        assert!(source.contains("pass1_status.success(),"));
+        assert!(!source.contains("canary_binding_decision(\n                    true,"));
         let self_clone = ["let candidate = Some(", "pass1.clone())"].concat();
         assert!(!source.contains(&self_clone));
         assert!(source.contains("Filed::Kept"));
