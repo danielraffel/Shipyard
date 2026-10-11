@@ -71,7 +71,10 @@ mod tests {
     #[test]
     fn pass2_binds_only_to_the_exact_pass1_record() {
         let first = record();
-        assert_eq!(bind_keyed_pass(Some(&first), Some(&first)), KeyedPassBinding::Bound(first));
+        assert_eq!(
+            bind_keyed_pass(Some(&first), Some(&first)),
+            KeyedPassBinding::Bound(first)
+        );
     }
 
     #[test]

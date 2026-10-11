@@ -849,16 +849,16 @@ pub(super) fn apply_changed_surface_execution(
             )?;
             continue;
         };
-        let compare = if machine.mode.is_shadow() {
-            "1"
-        } else {
-            "0"
-        };
+        let compare = if machine.mode.is_shadow() { "1" } else { "0" };
         let substituted = format!(
             "SHIPYARD_CHANGED_SURFACE_RESULT_DIR={} SHIPYARD_CHANGED_SURFACE_COMPARE_FULL={} SHIPYARD_CHANGED_SURFACE_CANARY_MODE={} {}",
             shell_quote(&result_dir),
             compare,
-            if machine.mode == MachineMode::SameBaseCanary { "same_base" } else { "off" },
+            if machine.mode == MachineMode::SameBaseCanary {
+                "same_base"
+            } else {
+                "off"
+            },
             plan.command
         );
         let activation = activation_receipt(
