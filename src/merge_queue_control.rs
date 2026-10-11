@@ -347,6 +347,15 @@ fn apply_audit_line(
             }
             started.insert(correlation_id, value);
         }
+        Some("intent_evidence") => {
+            if let Some(existing) = started.get_mut(&correlation_id) {
+                if let Some(object) = existing.as_object_mut() {
+                    if let Some(comment_id) = value.get("approval_comment_id") {
+                        object.insert("approval_comment_id".to_owned(), comment_id.clone());
+                    }
+                }
+            }
+        }
         Some("finished") => {
             if value.get("outcome").and_then(serde_json::Value::as_str) == Some("uncertain") {
                 if let Some(existing) = started.get_mut(&correlation_id) {
