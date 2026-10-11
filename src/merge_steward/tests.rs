@@ -106,6 +106,11 @@ fn fleet_management_uses_author_and_branch_quadrants() {
         classify_pr(&dependabot, &policy, &BTreeMap::new()),
         StewardDecision::Unmanaged
     );
+    dependabot.author = Some("app/dependabot".to_owned());
+    assert_eq!(
+        classify_pr(&dependabot, &policy, &BTreeMap::new()),
+        StewardDecision::Unmanaged
+    );
 }
 
 #[test]
