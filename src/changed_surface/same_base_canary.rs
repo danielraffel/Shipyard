@@ -43,6 +43,7 @@ pub fn selected_returncode_matches(lane_rc: i32, selected_rc: Option<i32>) -> Op
 /// Build the command used by the real local lane for a same-base canary.
 /// Both passes receive the same checkout and immutable identity; pass two is
 /// permitted to run only after pass one has published its record.
+#[must_use]
 pub fn canary_command(
     command: &str,
     pass1_dir: &Path,

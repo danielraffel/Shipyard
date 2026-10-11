@@ -653,7 +653,7 @@ pub(super) fn apply_changed_surface_execution(
                 let pass1 = FullShadowRecord {
                     base_sha: observation.receipt.protected_ref_sha.clone(),
                     tree_sha: observation.receipt.tree_sha.clone(),
-                    lane_config_sha256: contract_digest.to_owned(),
+                    lane_config_sha256: contract_digest.clone(),
                     record_id: pass1_record_id,
                 };
                 let candidate = planner_record_id.map(|record_id| FullShadowRecord {
@@ -679,7 +679,7 @@ pub(super) fn apply_changed_surface_execution(
                         )?;
                         None
                     }
-                    _ => None,
+                    KeyedPassBinding::Bound(_) => None,
                 }
             } else {
                 None
