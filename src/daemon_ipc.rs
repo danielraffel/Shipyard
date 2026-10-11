@@ -43,7 +43,7 @@ pub const CLIENT_WRITER_QUEUE_CAPACITY: usize = RING_BUFFER_SIZE + 1024;
 /// gives up. Wait clients pause reading while they fetch an authoritative
 /// GitHub snapshot, which can take tens of seconds.
 #[cfg(unix)]
-pub const CLIENT_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+pub const CLIENT_WRITE_STALL_TIMEOUT: Duration = Duration::from_mins(1);
 /// Maximum bytes accepted for one newline-delimited client request.
 pub const MAX_IPC_FRAME_BYTES: usize = 64 * 1024;
 /// Maximum serialized bytes retained for one outbound IPC frame.

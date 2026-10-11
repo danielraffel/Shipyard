@@ -3,6 +3,7 @@
     test,
     allow(
         clippy::large_stack_arrays,
+        clippy::duration_suboptimal_units,
         reason = "Rust 1.92's generated libtest registry exceeds the limit; keep this waiver test-only while production and integration targets remain enforced"
     )
 )]

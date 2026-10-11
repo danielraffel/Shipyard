@@ -27,7 +27,7 @@ use crate::changed_surface::executable_reuse::{
 use crate::changed_surface::trial::{REDERIVATION_RECEIPT_PREFIX, TrialIdentity, result_directory};
 use crate::changed_surface::{KEYED_BOUNDED_SHADOW, KEYED_FULL_SHADOW, policy_from_base};
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+const COMMAND_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_COMMAND_OUTPUT: u64 = 1024 * 1024;
 const ACTIVATION_RECEIPT: &str = "activation-shadow_compare.json";
 /// The key code's marker for a build-dir string that matched no registration.

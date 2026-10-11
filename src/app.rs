@@ -1818,7 +1818,11 @@ mod tests {
     #[test]
     fn run_never_holds_the_process_stdio_locks_for_the_command() {
         // A Windows checkout may carry CRLF line endings.
-        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
+        )
+        .expect("app source")
+        .replace("\r\n", "\n");
         let start = source.find("pub fn run() -> ExitCode {").expect("run");
         let body = &source[start..start + source[start..].find("\n}\n").expect("end of run")];
         assert!(

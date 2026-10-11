@@ -4663,7 +4663,10 @@ exit 91
     /// mutation: the initial admission and both re-enqueue paths.
     #[test]
     fn every_validated_arm_checks_head_approval_first() {
-        let source = include_str!("auto_merge_cmd.rs");
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app/auto_merge_cmd.rs"),
+        )
+        .expect("auto merge source");
         let body = &source[..source.find("\n#[cfg(test)]").expect("tests marker")];
         let checks = body.matches("require_head_approval(").count();
         let arms = body.matches("arm_native_queue(").count();
