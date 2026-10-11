@@ -224,7 +224,32 @@ fn a_marker_from_a_listed_reviewer_counts() {
     assert_eq!(
         find_approval(HEAD, &[], &comments, &required(&["Reviewer"]), None),
         Some(Approval::Marker {
-            login: "reviewer".to_owned()
+            login: "reviewer".to_owned(),
+            comment_id: None,
+        })
+    );
+}
+
+#[test]
+fn marker_approval_preserves_comment_id_for_the_enqueue_receipt() {
+    let comments = [json!({
+        "id": 4242,
+        "login": "reviewer",
+        "type": "User",
+        "at": "2026-10-04T01:00:00Z",
+        "body": "reviewed:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    })];
+    assert_eq!(
+        find_approval(
+            &"a".repeat(40),
+            &[],
+            &comments,
+            &required(&["Reviewer"]),
+            None
+        ),
+        Some(Approval::Marker {
+            login: "reviewer".to_owned(),
+            comment_id: Some(4242),
         })
     );
 }

@@ -165,6 +165,7 @@ fn enqueue_pull_request_with_recovery(
             &approval_policy,
             &queue,
         ) {
+            Ok(crate::head_approval::HeadGate::Approved { .. }) => {}
             Ok(gate) if gate.allows() => {}
             Ok(gate) => {
                 return (

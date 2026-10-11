@@ -112,6 +112,9 @@ pub enum Approval {
     Marker {
         /// Commenter login.
         login: String,
+        /// GitHub comment id used as durable approval evidence.
+        #[serde(default)]
+        comment_id: Option<u64>,
     },
 }
 
@@ -121,7 +124,7 @@ impl Approval {
     pub fn describe(&self) -> String {
         match self {
             Self::Review { login } => format!("an approving review by {login}"),
-            Self::Marker { login } => format!("a reviewed:<sha> marker by {login}"),
+            Self::Marker { login, .. } => format!("a reviewed:<sha> marker by {login}"),
         }
     }
 }
@@ -263,9 +266,11 @@ pub fn find_approval(
                     .and_then(Value::as_str)
                     .is_some_and(|body| marker_names_head(body, head))
         })
-        .and_then(login)
-        .map(|login| Approval::Marker {
-            login: login.to_owned(),
+        .and_then(|comment| {
+            Some(Approval::Marker {
+                login: login(comment)?.to_owned(),
+                comment_id: comment.get("id").and_then(Value::as_u64),
+            })
         })
 }
 
