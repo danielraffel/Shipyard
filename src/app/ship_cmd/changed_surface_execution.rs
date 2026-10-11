@@ -2803,6 +2803,11 @@ mod tests {
         F: FnMut() -> Result<(), CliFailure> + 'static,
     {
         let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "[changed_surface_execution]\nmode = 'same_base_canary'\n",
+        )
+        .unwrap();
         let config = LoadedConfig::load(
             Some(temp.path().to_path_buf()),
             None,
