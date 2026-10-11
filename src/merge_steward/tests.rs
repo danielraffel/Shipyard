@@ -81,7 +81,7 @@ fn fleet_management_uses_author_and_branch_quadrants() {
     for prefix in ["codex/", "feature/", "fix/"] {
         let mut fleet = green_pr();
         fleet.head_branch = format!("{prefix}work");
-        fleet.author = Some("shipyard-local[bot]".to_owned());
+        fleet.author = Some("app/shipyard-local".to_owned());
         assert!(matches!(
             classify_pr(&fleet, &policy, &BTreeMap::new()),
             StewardDecision::ArmMergeQueue
@@ -95,7 +95,7 @@ fn fleet_management_uses_author_and_branch_quadrants() {
     }
     let mut app_other_branch = green_pr();
     app_other_branch.head_branch = "topic/custom".to_owned();
-    app_other_branch.author = Some("shipyard-local[bot]".to_owned());
+    app_other_branch.author = Some("app/shipyard-local".to_owned());
     assert!(matches!(
         classify_pr(&app_other_branch, &policy, &BTreeMap::new()),
         StewardDecision::ArmMergeQueue
