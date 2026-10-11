@@ -3219,6 +3219,7 @@ mod tests {
                 "the binding is written before pass 2 runs"
             );
             assert_eq!(run.receipt["verdict"], "PASS", "{}", run.receipt);
+            assert_eq!(run.receipt["rederivation_match"], true, "{}", run.receipt);
             assert_eq!(
                 run.receipt["binding_record_and_tree_sha"]["record_id"],
                 run.pass1_record.expect("pass 1 filed a record").as_str()
@@ -3329,17 +3330,18 @@ mod tests {
             );
         }
 
-        fn assert_inconclusive(script: Script, reason: &str) {
+        fn assert_not_derived(script: Script, reason: &str) {
             let run = run_canary(Choice::Pass1Record, script);
             run.result.unwrap();
             assert_eq!(run.runs.len(), 2, "{:?}", run.runs);
             assert_eq!(run.receipt["verdict"], "INCONCLUSIVE", "{}", run.receipt);
             assert_eq!(run.receipt["reason"], reason, "{}", run.receipt);
+            assert_eq!(run.receipt["rederivation_match"], false, "{}", run.receipt);
         }
 
         #[test]
         fn same_base_canary_with_an_unused_binding_is_not_derived() {
-            assert_inconclusive(
+            assert_not_derived(
                 Script {
                     pass2_result: Some(PASS2_BINDING_UNUSED),
                     ..BOUND
@@ -3350,7 +3352,7 @@ mod tests {
 
         #[test]
         fn same_base_canary_with_a_runner_derivation_error_is_inconclusive() {
-            assert_inconclusive(
+            assert_not_derived(
                 Script {
                     pass2_result: Some(PASS2_RUNNER_ERROR),
                     ..BOUND
