@@ -785,7 +785,7 @@ pub(super) fn apply_changed_surface_execution(
                             pass2_status.code(),
                             (!pass2_status.success()).then_some("pass 2 failed"),
                         )?;
-                        plan.command = ":".to_owned();
+                        ":".clone_into(&mut plan.command);
                         Some(Keyed::Planned(plan))
                     }
                     Err(reason) if pass1_status.success() => {
@@ -2727,6 +2727,15 @@ mod tests {
     }
 
     #[test]
+    fn apply_changed_surface_execution_t5_nonzero_pass1_is_inconclusive() {
+        let record = canary_record("R");
+        assert_eq!(
+            canary_binding_decision(false, Some(&record), Some(&record)).unwrap_err(),
+            "pass 1 failed"
+        );
+    }
+
+    #[test]
     fn apply_changed_surface_execution_t3_no_record_writes_inconclusive_receipt() {
         let temp = tempfile::tempdir().unwrap();
         let receipt_dir = temp.path().join("receipt");
@@ -2775,5 +2784,22 @@ mod tests {
         ] {
             assert!(payload.get(field).is_some(), "missing {field}");
         }
+    }
+
+    #[test]
+    fn production_receipt_names_missing_selected_returncode() {
+        let temp = tempfile::tempdir().unwrap();
+        let pass2 = temp.path().join("pass2");
+        let receipt = temp.path().join("receipt");
+        fs::create_dir_all(&pass2).unwrap();
+        fs::write(pass2.join("result-2.json"), br#"{"executable_reuse":{"false_skip_count":0,"derived":{"status":"derived","would_skip_count":2,"audit":{"status":"applied"}}}}"#).unwrap();
+        let identity = canary_record("R");
+        persist_same_base_canary_receipt(&receipt, &pass2, Some(&identity), Some(0), None).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(
+            &fs::read(receipt.join("same-base-canary-receipt.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["verdict"], "INCONCLUSIVE");
+        assert_eq!(payload["reason"], "selected_returncode_eq_lane_rc");
     }
 }
