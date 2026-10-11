@@ -2873,7 +2873,8 @@ mod tests {
         let receipt_dir = temp.path().join("receipt");
         let pass2 = temp.path().join("pass2");
         fs::create_dir_all(&pass2).unwrap();
-        let error = apply_with_fake_stage(move || execute_same_base_canary_passes(true, None, None, &binding_json("R"), &pass2, &receipt_dir, "fake", |_, _, _| Ok(0)))
+        let receipt_for_test = receipt_dir.clone();
+        let error = apply_with_fake_stage(move || execute_same_base_canary_passes(true, None, None, &binding_json("R"), &pass2, &receipt_for_test, "fake", |_, _, _| Ok(0)))
         .unwrap_err()
         .message;
         assert_eq!(error, "missing_pass1_record");
