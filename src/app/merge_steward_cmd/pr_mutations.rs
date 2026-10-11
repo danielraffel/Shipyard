@@ -112,27 +112,21 @@ fn enqueue_pull_request_with_recovery(
             .run_gh(argv)
             .map_err(|error| error.to_string())
     };
-    let approval_policy = if pr.fact.author.is_none() {
-        // Legacy library observations without an author cannot establish fleet
-        // ownership. Live CLI observations include the GitHub author and use
-        // the strict, fail-closed policy read below.
-        crate::head_approval::ApprovalPolicy::default()
-    } else {
-        match crate::head_approval::read_policy_required(
-            &run_gh,
-            &context.observation.repo,
-            &context.observation.base,
-        ) {
-            Ok(policy) => policy,
-            Err(error) => {
-                return (
-                    None,
-                    Some(format!("head approval policy unreadable: {error}")),
-                );
-            }
+    let approval_policy = match crate::head_approval::read_policy_required(
+        &run_gh,
+        &context.observation.repo,
+        &context.observation.base,
+    ) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return (
+                None,
+                Some(format!("head approval policy unreadable: {error}")),
+            );
         }
     };
     let mut approval_comment_id = None;
+    let mut approval_app_id = None;
     if approval_policy.required {
         let Some((owner, name)) = context.observation.repo.split_once('/') else {
             return (None, Some("invalid repository slug".to_owned()));
@@ -165,35 +159,28 @@ fn enqueue_pull_request_with_recovery(
                 );
             }
         };
-        match crate::head_approval::evaluate_with_policy(
+        match crate::head_approval::evaluate_with_policy_for_author(
             &run_gh,
             &context.observation.repo,
             pr.fact.number,
             &pr.fact.head_sha,
             &approval_policy,
             &queue,
+            pr.fact.author.as_deref(),
         ) {
             Ok(crate::head_approval::HeadGate::Approved { approval }) => {
-                if pr
-                    .fact
-                    .author
-                    .as_deref()
-                    .is_some_and(|author| match &approval {
-                        crate::head_approval::Approval::Marker { login, .. }
-                        | crate::head_approval::Approval::Review { login } => {
-                            author.eq_ignore_ascii_case(login)
-                        }
-                    })
-                {
-                    return (
-                        Some("waiting_head_approval".to_owned()),
-                        Some("PR author cannot approve its own head".to_owned()),
-                    );
-                }
-                approval_comment_id = match approval {
-                    crate::head_approval::Approval::Marker { comment_id, .. } => comment_id,
+                approval_comment_id = match &approval {
+                    crate::head_approval::Approval::Marker { comment_id, .. } => *comment_id,
                     crate::head_approval::Approval::Review { .. } => None,
                 };
+                let found_app_id = match &approval {
+                    crate::head_approval::Approval::Review {
+                        performed_via_github_app_id,
+                        ..
+                    } => *performed_via_github_app_id,
+                    crate::head_approval::Approval::Marker { .. } => None,
+                };
+                approval_app_id = found_app_id;
             }
             Ok(gate) if gate.allows() => {}
             Ok(gate) => {
@@ -218,7 +205,7 @@ fn enqueue_pull_request_with_recovery(
     } else {
         None
     };
-    let guard = match acquire_pr_mutation_guard(
+    let mut guard = match acquire_pr_mutation_guard(
         context.mutation_control,
         context.observation,
         pr,
@@ -251,6 +238,7 @@ fn enqueue_pull_request_with_recovery(
                     guard,
                     recovery.as_ref(),
                     approval_comment_id,
+                    approval_app_id,
                 );
             };
             let audit_error = guard.finish("rejected_stacked_pull_request").err();
@@ -282,9 +270,10 @@ fn enqueue_unstacked_pull_request(
     guard: crate::merge_queue_control::MergeQueueMutationGuard,
     recovery: Option<&QueueRecoveryEvidence>,
     approval_comment_id: Option<u64>,
+    approval_app_id: Option<u64>,
 ) -> (Option<String>, Option<String>) {
     let mut guard = guard;
-    if let Err(error) = guard.record_approval_comment_id(approval_comment_id) {
+    if let Err(error) = guard.record_approval_evidence(approval_comment_id, approval_app_id) {
         let _ = guard.finish("approval_evidence_persistence_failed");
         return (None, Some(error));
     }
@@ -432,6 +421,7 @@ fn enqueue_unstacked_pull_request(
                 attempted_at: chrono::Utc::now().to_rfc3339(),
                 phase: super::QueueRecoveryPhase::Intent,
                 approval_comment_id,
+                performed_via_github_app_id: approval_app_id,
             },
         );
         if let Err(error) = save_ledger(context.ledger_path, ledger) {
