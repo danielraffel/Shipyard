@@ -545,6 +545,7 @@ pub struct MergeQueueMutationGuard {
     head: String,
     approval_comment_id: Option<u64>,
     approval_app_id: Option<u64>,
+    verdict_audit_events: Vec<String>,
 }
 
 /// A mutation correlation that may be persisted before authority is acquired.
@@ -877,6 +878,7 @@ impl MergeQueueMutationGuard {
             head: state.head_sha.clone(),
             approval_comment_id: None,
             approval_app_id: None,
+            verdict_audit_events: Vec::new(),
         })
     }
 
@@ -903,6 +905,7 @@ impl MergeQueueMutationGuard {
                 "action": self.action,
                 "approval_comment_id": self.approval_comment_id,
                 "performed_via_github_app_id": performed_via_github_app_id,
+                "verdict_audit_events": self.verdict_audit_events,
                 "repo": self.repo,
                 "base": self.base,
                 "pr": self.pr,
@@ -910,6 +913,12 @@ impl MergeQueueMutationGuard {
             }),
         )
         .map_err(|error| format!("failed to write approval evidence to mutation intent: {error}"))
+    }
+
+    /// Attach reviewer verdict observations that were ignored by the gate.
+    pub fn record_verdict_audit_events(&mut self, events: Vec<String>) -> Result<(), String> {
+        self.verdict_audit_events = events;
+        Ok(())
     }
 
     /// Record the externally observed mutation result before releasing authority.
@@ -929,6 +938,7 @@ impl MergeQueueMutationGuard {
                 "head": self.head,
                 "approval_comment_id": self.approval_comment_id,
                 "performed_via_github_app_id": self.approval_app_id,
+                "verdict_audit_events": self.verdict_audit_events,
             }),
         )
         .map_err(|error| format!("failed to write merge-queue mutation result: {error}"))?;

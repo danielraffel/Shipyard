@@ -127,6 +127,7 @@ fn enqueue_pull_request_with_recovery(
     };
     let mut approval_comment_id = None;
     let mut approval_app_id = None;
+    let mut verdict_audit_events = Vec::new();
     {
         let Some((owner, name)) = context.observation.repo.split_once('/') else {
             return (None, Some("invalid repository slug".to_owned()));
@@ -159,7 +160,7 @@ fn enqueue_pull_request_with_recovery(
                 );
             }
         };
-        match crate::head_approval::evaluate_with_policy_for_author(
+        match crate::head_approval::evaluate_with_policy_for_author_with_events(
             &run_gh,
             &context.observation.repo,
             pr.fact.number,
@@ -168,7 +169,8 @@ fn enqueue_pull_request_with_recovery(
             &queue,
             pr.fact.author.as_deref(),
         ) {
-            Ok(crate::head_approval::HeadGate::Approved { approval }) => {
+            Ok((crate::head_approval::HeadGate::Approved { approval }, events)) => {
+                verdict_audit_events = events;
                 approval_comment_id = match &approval {
                     crate::head_approval::Approval::Marker { comment_id, .. } => *comment_id,
                     crate::head_approval::Approval::Review { .. } => None,
@@ -185,8 +187,10 @@ fn enqueue_pull_request_with_recovery(
                 };
                 approval_app_id = found_app_id;
             }
-            Ok(gate) if gate.allows() => {}
-            Ok(gate) => {
+            Ok((gate, events)) if gate.allows() => {
+                verdict_audit_events = events;
+            }
+            Ok((gate, _events)) => {
                 return (
                     Some("waiting_head_approval".to_owned()),
                     Some(gate.explain()),
@@ -240,7 +244,7 @@ fn enqueue_pull_request_with_recovery(
                     ledger,
                     guard,
                     recovery.as_ref(),
-                    Some((approval_comment_id, approval_app_id)),
+                    Some((approval_comment_id, approval_app_id, verdict_audit_events)),
                 );
             };
             let audit_error = guard.finish("rejected_stacked_pull_request").err();
@@ -271,10 +275,15 @@ fn enqueue_unstacked_pull_request(
     ledger: &mut StewardLedger,
     guard: crate::merge_queue_control::MergeQueueMutationGuard,
     recovery: Option<&QueueRecoveryEvidence>,
-    approval_evidence: Option<(Option<u64>, Option<u64>)>,
+    approval_evidence: Option<(Option<u64>, Option<u64>, Vec<String>)>,
 ) -> (Option<String>, Option<String>) {
     let mut guard = guard;
-    let (approval_comment_id, approval_app_id) = approval_evidence.unwrap_or((None, None));
+    let (approval_comment_id, approval_app_id, verdict_audit_events) =
+        approval_evidence.unwrap_or((None, None, Vec::new()));
+    if let Err(error) = guard.record_verdict_audit_events(verdict_audit_events) {
+        let _ = guard.finish("verdict_evidence_persistence_failed");
+        return (None, Some(error));
+    }
     if let Err(error) = guard.record_approval_evidence(approval_comment_id, approval_app_id) {
         let _ = guard.finish("approval_evidence_persistence_failed");
         return (None, Some(error));

@@ -321,6 +321,36 @@ fn review_app_and_self_review_rules_are_enforced() {
 }
 
 #[test]
+fn fleet_author_review_and_earlier_review_head_are_negative_controls() {
+    let policy = required(&["shipyard-review[bot]"]);
+    let fleet_review = json!({
+        "login":"app/shipyard-local", "type":"Bot", "at":"2026-10-04T01:00:00Z",
+        "state":"APPROVED", "commit_id":HEAD, "performed_via_github_app_id": 7
+    });
+    assert_eq!(
+        find_approval(HEAD, &[fleet_review], &[], &policy, None),
+        None
+    );
+    let old_review = json!({
+        "login":"shipyard-review[bot]", "type":"Bot", "at":"2026-10-04T01:00:00Z",
+        "state":"APPROVED", "commit_id":OTHER
+    });
+    assert_eq!(find_approval(HEAD, &[old_review], &[], &policy, None), None);
+}
+
+#[test]
+fn ignored_verdicts_are_auditable_without_affecting_the_gate() {
+    let policy = required(&["shipyard-review[bot]"]);
+    let comments = [
+        json!({"login":"shipyard-review[bot]", "at":"2026-10-04T01:00:00Z", "body":format!("verdict: HOLD head:{OTHER}")}),
+        json!({"login":"shipyard-review[bot]", "at":"2026-10-04T02:00:00Z", "body":"The hold is only prose."}),
+    ];
+    let events =
+        super::verdict_audit_events(HEAD, &[], &comments, &policy, Some("app/shipyard-local"));
+    assert_eq!(events, vec!["stale_hold", "unstructured_hold_mention"]);
+}
+
+#[test]
 fn short_markers_and_older_head_holds_never_gate() {
     let policy = required(&["shipyard-review[bot]"]);
     let short = [

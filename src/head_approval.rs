@@ -274,6 +274,64 @@ fn reviewer_allowed(login: &str, policy: &ApprovalPolicy, author: Option<&str>) 
         && author.is_none_or(|author| normalized_login(author) != reviewer)
 }
 
+/// Return audit labels for reviewer text that was deliberately ignored.
+///
+/// These labels are kept separate from the gate decision so a stale HOLD or
+/// an unstructured prose mention cannot accidentally block a newer head while
+/// remaining visible in the enqueue receipt's evidence trail.
+pub fn verdict_audit_events(
+    head: &str,
+    reviews: &[Value],
+    comments: &[Value],
+    policy: &ApprovalPolicy,
+    author: Option<&str>,
+) -> Vec<String> {
+    let mut events = Vec::new();
+    for comment in comments {
+        let Some(login) = login(comment) else {
+            continue;
+        };
+        if !reviewer_allowed(login, policy, author) {
+            continue;
+        }
+        let Some(body) = comment.get("body").and_then(Value::as_str) else {
+            continue;
+        };
+        match marker_verdict(body) {
+            Some((Verdict::Hold, marker_head)) if !marker_head.eq_ignore_ascii_case(head) => {
+                events.push("stale_hold".to_owned());
+            }
+            Some(_) => {}
+            None if body.lines().any(|line| {
+                let upper = line.to_ascii_uppercase();
+                upper.contains("HOLD") || upper.contains("CHANGES REQUESTED")
+            }) =>
+            {
+                events.push("unstructured_hold_mention".to_owned())
+            }
+            None => {}
+        }
+    }
+    for review in reviews {
+        let Some(login) = login(review) else { continue };
+        if !reviewer_allowed(login, policy, author) {
+            continue;
+        }
+        let Some(state) = review.get("state").and_then(Value::as_str) else {
+            continue;
+        };
+        if state.eq_ignore_ascii_case("CHANGES_REQUESTED")
+            && review
+                .get("commit_id")
+                .and_then(Value::as_str)
+                .is_some_and(|commit| !commit.eq_ignore_ascii_case(head))
+        {
+            events.push("stale_hold".to_owned());
+        }
+    }
+    events
+}
+
 /// The newest approval of `head`, given reviews and comments flattened to
 /// `{login, type, at, state, commit_id}` / `{login, type, at, body}` records.
 ///
@@ -685,8 +743,22 @@ pub fn evaluate_with_policy_for_author(
     queue: &Value,
     author: Option<&str>,
 ) -> Result<HeadGate, String> {
+    evaluate_with_policy_for_author_with_events(run_gh, repo, pr, head, policy, queue, author)
+        .map(|(gate, _)| gate)
+}
+
+/// Evaluate and return ignored verdict evidence for the mutation receipt.
+pub fn evaluate_with_policy_for_author_with_events(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    policy: &ApprovalPolicy,
+    queue: &Value,
+    author: Option<&str>,
+) -> Result<(HeadGate, Vec<String>), String> {
     if !policy.required {
-        return Ok(HeadGate::NotRequired);
+        return Ok((HeadGate::NotRequired, Vec::new()));
     }
     let reviews = read_records(
         run_gh,
@@ -721,8 +793,10 @@ pub fn evaluate_with_policy_for_author(
     } else {
         comments
     };
-    Ok(decide_for_author(
-        policy, head, &reviews, &comments, queue, false, author,
+    let events = verdict_audit_events(head, &reviews, &comments, policy, author);
+    Ok((
+        decide_for_author(policy, head, &reviews, &comments, queue, false, author),
+        events,
     ))
 }
 
