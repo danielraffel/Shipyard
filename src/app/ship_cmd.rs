@@ -374,19 +374,28 @@ pub(super) fn ship_command<W: Write>(
                 true,
             )?;
         }
-        let mut stage_runner = |command: &str, dir: &std::path::Path, compare_full: bool| {
-            let mut child = std::process::Command::new("/bin/sh");
-            child.arg("-c").arg(command).current_dir(cwd);
-            child.env("SHIPYARD_CHANGED_SURFACE_RESULT_DIR", dir);
-            child.env(
-                "SHIPYARD_CHANGED_SURFACE_COMPARE_FULL",
-                if compare_full { "1" } else { "0" },
-            );
-            child
-                .status()
-                .map(|status| status.code().unwrap_or(1))
-                .map_err(|error| CliFailure::new(1, format!("run changed-surface stage: {error}")))
-        };
+        let mut stage_runner =
+            |command: &str,
+             dir: &std::path::Path,
+             compare_full: bool,
+             record_dir: Option<&std::path::Path>| {
+                let mut child = std::process::Command::new("/bin/sh");
+                child.arg("-c").arg(command).current_dir(cwd);
+                child.env("SHIPYARD_CHANGED_SURFACE_RESULT_DIR", dir);
+                child.env(
+                    "SHIPYARD_CHANGED_SURFACE_COMPARE_FULL",
+                    if compare_full { "1" } else { "0" },
+                );
+                if let Some(record_dir) = record_dir {
+                    child.env(crate::reuse_record_store::RECORD_DIR_ENV, record_dir);
+                }
+                child
+                    .status()
+                    .map(|status| status.code().unwrap_or(1))
+                    .map_err(|error| {
+                        CliFailure::new(1, format!("run changed-surface stage: {error}"))
+                    })
+            };
         apply_changed_surface_execution(
             config,
             cwd,

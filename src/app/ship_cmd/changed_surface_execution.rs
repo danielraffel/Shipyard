@@ -33,7 +33,7 @@ const ACCEPTED_POLICY_DIGESTS_KEY: &str =
 const MAX_DIAGNOSTIC_CHARS: usize = 512;
 const MAX_STALE_POINTER_BYTES: u64 = 64 * 1024;
 
-type StageRunner<'a> = dyn FnMut(&str, &Path, bool) -> Result<i32, CliFailure> + 'a;
+type StageRunner<'a> = dyn FnMut(&str, &Path, bool, Option<&Path>) -> Result<i32, CliFailure> + 'a;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -765,7 +765,7 @@ pub(super) fn apply_changed_surface_execution(
                 })
                 .transpose()
                 .map_err(|error| CliFailure::new(1, format!("create pass-1 record: {error}")))?;
-            let pass1_rc = runner(&full_command, &pass1_dir, false)?;
+            let pass1_rc = runner(&full_command, &pass1_dir, false, pending.as_deref())?;
             let filed = if let (Some(store), Some(pending)) = (&store, pending) {
                 Some(
                     crate::reuse_record_store::file(store, &pending, &observation.receipt.head_sha)
@@ -842,7 +842,7 @@ pub(super) fn apply_changed_surface_execution(
                     });
                 let pass2_dir = canary_root.join("same-base-pass2");
                 let mut run_pass2 = |command: &str, dir: &Path, compare_full: bool| {
-                    runner(command, dir, compare_full)
+                    runner(command, dir, compare_full, None)
                 };
                 match execute_same_base_canary_passes(
                     pass1_rc == 0,
@@ -2785,7 +2785,8 @@ mod tests {
         )
         .unwrap();
         let mut targets = [];
-        let mut runner = |_command: &str, _dir: &Path, _compare_full: bool| Ok(0);
+        let mut runner =
+            |_command: &str, _dir: &Path, _compare_full: bool, _record_dir: Option<&Path>| Ok(0);
         let result = apply_changed_surface_execution(
             &config,
             temp.path(),
