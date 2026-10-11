@@ -119,7 +119,7 @@ fn enqueue_audit(temp: &tempfile::TempDir, reviews_json: &str, comments_json: &s
   *"pulls/42"*) printf '%s' '{"state":"open","head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}' ;;
   *"enqueuePullRequest"*) printf '%s' '{}' ;;"#,
     );
-    let actions = fake_gh(&temp, &body);
+    let actions = fake_gh(temp, &body);
     let mut pr = ready_pr();
     pr.fact.labels.push("steward:managed".to_owned());
     pr.fact.checks.push(StewardCheck {
@@ -133,7 +133,7 @@ fn enqueue_audit(temp: &tempfile::TempDir, reviews_json: &str, comments_json: &s
     });
     let observation = observation_for(pr.clone(), true);
     let mut ledger = StewardLedger::default();
-    let control = mutation_control(&temp, "studio", "studio");
+    let control = mutation_control(temp, "studio", "studio");
     let ledger_path = temp.path().join("ledger.json");
     let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
     let mut policy = queue_policy();
