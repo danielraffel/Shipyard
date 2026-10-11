@@ -405,6 +405,29 @@ fn genuine_failure_is_not_rerun_but_transient_is_bounded() {
 }
 
 #[test]
+fn bounded_rerun_requires_a_classified_transient_run_and_one_budgeted_attempt() {
+    let mut pr = green_pr();
+    for conclusion in ["CANCELLED", "STARTUP_FAILURE", "STALE"] {
+        pr.checks[0].conclusion = Some(conclusion.to_owned());
+        assert!(matches!(
+            classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
+            StewardDecision::RerunTransient { run_ids: vec![10] }
+        ));
+    }
+    pr.checks[0].run_id = None;
+    assert!(matches!(
+        classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
+        StewardDecision::RequiredFailed { .. }
+    ));
+    pr.checks[0].run_id = Some(10);
+    let attempts = BTreeMap::from([(10, 1)]);
+    assert!(matches!(
+        classify_pr(&pr, &queue_policy(), &attempts),
+        StewardDecision::RequiredFailed { .. }
+    ));
+}
+
+#[test]
 fn never_direct_merges_a_behind_private_pr() {
     let mut pr = green_pr();
     pr.merge_state = "BEHIND".to_owned();
