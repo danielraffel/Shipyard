@@ -2739,7 +2739,8 @@ mod tests {
     fn production_canary_mutants_are_break_confirmed() {
         let source = include_str!("changed_surface_execution.rs");
         assert!(source.contains("canary_binding_decision(pass1_status.success()"));
-        assert!(!source.contains("let candidate = Some(pass1.clone())"));
+        let self_clone = ["let candidate = Some(", "pass1.clone())"].concat();
+        assert!(!source.contains(&self_clone));
         assert!(source.contains("Filed::Kept"));
     }
 
