@@ -408,9 +408,9 @@ fn check_rustc_rustup_proxy() -> DoctorEntry {
         };
     };
     let is_cargo_proxy = path.ends_with(".cargo/bin/rustc")
-        && fs::read_link(&path).ok().is_some_and(|target| {
-            target.file_name() == Some(std::ffi::OsStr::new("rustup"))
-        });
+        && fs::read_link(&path)
+            .ok()
+            .is_some_and(|target| target.file_name() == Some(std::ffi::OsStr::new("rustup")));
     if is_cargo_proxy {
         DoctorEntry::ok(format!("{} (rustup proxy)", path.display()))
     } else {

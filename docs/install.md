@@ -589,3 +589,15 @@ project pinners all treat `~/.local/bin/shipyard` as canonical.
 You don't need everything — just what matches your setup. See the
 [main README requirements table](../README.md#requirements) for
 details.
+# Rust toolchain for local gates
+
+Shipyard reads [`rust-toolchain.toml`](../rust-toolchain.toml) for the exact
+compiler and components used by CI and the pre-push hook. On a new host, run
+the command printed by the hook doctor, or install it explicitly:
+
+```bash
+rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+```
+
+The hook requires `rustc` on `PATH` to be the rustup proxy (`~/.cargo/bin`)
+before it runs Cargo. On m3 it refuses Cargo and prints the m1 command instead.
