@@ -36,6 +36,7 @@ enum MachineMode {
     #[default]
     Off,
     ShadowCompare,
+    SameBaseCanary,
     Authoritative,
 }
 
@@ -44,6 +45,7 @@ impl MachineMode {
         match self {
             Self::Off => "off",
             Self::ShadowCompare => "shadow_compare",
+            Self::SameBaseCanary => "same_base_canary",
             Self::Authoritative => "authoritative",
         }
     }
@@ -75,6 +77,7 @@ impl MachinePolicy {
         let mode = match trusted.get_str(MODE_KEY) {
             None | Some("off") => MachineMode::Off,
             Some("shadow_compare") => MachineMode::ShadowCompare,
+            Some("same_base_canary") => MachineMode::SameBaseCanary,
             Some("authoritative") => MachineMode::Authoritative,
             Some(value) => Err(CliFailure::new(
                 2,
@@ -411,7 +414,7 @@ pub(super) fn apply_changed_surface_execution(
         // Fence the current generation before observing the protected base.
         // A snapshot taken afterwards could let an older observation treat a
         // newer pointer as permission to publish the older generation.
-        let stale_pointer_snapshot = if machine.mode == MachineMode::ShadowCompare {
+        let stale_pointer_snapshot = if machine.mode.is_shadow() {
             let evidence_root = result_dir(state_dir, repo, pr, head_sha, &target.name);
             match read_current_stale_generation(&evidence_root) {
                 Ok(pointer) => Some(pointer),
@@ -846,15 +849,16 @@ pub(super) fn apply_changed_surface_execution(
             )?;
             continue;
         };
-        let compare = if machine.mode == MachineMode::ShadowCompare {
+        let compare = if machine.mode.is_shadow() {
             "1"
         } else {
             "0"
         };
         let substituted = format!(
-            "SHIPYARD_CHANGED_SURFACE_RESULT_DIR={} SHIPYARD_CHANGED_SURFACE_COMPARE_FULL={} {}",
+            "SHIPYARD_CHANGED_SURFACE_RESULT_DIR={} SHIPYARD_CHANGED_SURFACE_COMPARE_FULL={} SHIPYARD_CHANGED_SURFACE_CANARY_MODE={} {}",
             shell_quote(&result_dir),
             compare,
+            shell_quote(if machine.mode == MachineMode::SameBaseCanary { "same_base" } else { "off" }),
             plan.command
         );
         let activation = activation_receipt(
@@ -1020,9 +1024,15 @@ fn keys_this_plan(
     fallback_reason: Option<&FallbackReason>,
     disposition: &ExecutionDisposition,
 ) -> bool {
-    mode == MachineMode::ShadowCompare
+    mode.is_shadow()
         && fallback_reason != Some(&FallbackReason::StaleBase)
         && !matches!(disposition, ExecutionDisposition::Blocked { .. })
+}
+
+impl MachineMode {
+    fn is_shadow(self) -> bool {
+        matches!(self, Self::ShadowCompare | Self::SameBaseCanary)
+    }
 }
 
 fn read_current_stale_generation(path: &Path) -> Result<Option<Vec<u8>>, CliFailure> {

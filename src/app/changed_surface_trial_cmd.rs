@@ -18,6 +18,7 @@ use crate::changed_surface::trial::{
 use crate::output::write_json_envelope;
 
 const ACTIVATION_RECEIPT: &str = "activation-shadow_compare.json";
+const SAME_BASE_ACTIVATION_RECEIPT: &str = "activation-same_base_canary.json";
 const STALE_ACTIVATION_RECEIPT: &str = "stale-activation-shadow_compare.json";
 const STALE_CLEANUP_RECEIPT: &str = "stale-cleanup-shadow_compare.json";
 const STALE_CURRENT_RECEIPT: &str = "stale-current.json";
@@ -321,9 +322,23 @@ where
     let result_dir = current_generation
         .as_ref()
         .map_or(result_root, |generation| generation.result_dir.as_path());
-    let activation_path = result_dir.join(ACTIVATION_RECEIPT);
-    let activation_bytes = match read_regular_receipt(&activation_path) {
-        Ok(bytes) => bytes,
+    let (activation_name, activation_bytes) = match read_regular_receipt(
+        &result_dir.join(ACTIVATION_RECEIPT),
+    ) {
+        Ok(Some(bytes)) => (ACTIVATION_RECEIPT, Some(bytes)),
+        Ok(None) => match read_regular_receipt(&result_dir.join(SAME_BASE_ACTIVATION_RECEIPT)) {
+            Ok(Some(bytes)) => (SAME_BASE_ACTIVATION_RECEIPT, Some(bytes)),
+            Ok(None) => (ACTIVATION_RECEIPT, None),
+            Err(reason) => {
+                return rejected_trial(
+                    identity,
+                    Some(SAME_BASE_ACTIVATION_RECEIPT.to_owned()),
+                    0,
+                    None,
+                    reason,
+                );
+            }
+        },
         Err(reason) => {
             return rejected_trial(
                 identity,
@@ -334,6 +349,15 @@ where
             );
         }
     };
+    if activation_bytes.is_none() {
+        return rejected_trial(
+            identity,
+            Some(activation_name.to_owned()),
+            0,
+            None,
+            "shadow activation is missing".to_owned(),
+        );
+    }
     let stale_activation_bytes =
         match read_regular_receipt(&result_dir.join(STALE_ACTIVATION_RECEIPT)) {
             Ok(bytes) => bytes,
@@ -366,7 +390,7 @@ where
                 identity,
                 activation_bytes
                     .as_ref()
-                    .map(|_| ACTIVATION_RECEIPT.to_owned()),
+                    .map(|_| activation_name.to_owned()),
                 failure.observed,
                 failure.receipt,
                 failure.reason,
@@ -408,7 +432,7 @@ where
         return status;
     }
     let activation = activation_bytes.as_deref().map(|bytes| ReceiptFile {
-        name: ACTIVATION_RECEIPT,
+        name: activation_name,
         bytes,
     });
     let result_files = results

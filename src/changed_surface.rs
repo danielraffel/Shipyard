@@ -16,6 +16,7 @@ pub mod executable_reuse;
 mod execution;
 pub(crate) mod integration_checkout;
 pub mod live_switch;
+pub mod same_base_canary;
 mod stale_base;
 pub mod trial;
 #[cfg(test)]
