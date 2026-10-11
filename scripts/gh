@@ -5,11 +5,12 @@ set -u
 
 GUARDS_DIR="${SHIPYARD_GHAPP_GUARDS_DIR:-$HOME/.config/shipyard/guards}"
 GUARD="${GUARDS_DIR:+${GUARDS_DIR}/queue-removal-guard}"
+trusted_path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [[ -z "$GUARD" || ! -x "$GUARD" ]]; then
     echo "gh: queue-removal guard is unavailable; refusing to run" >&2
     exit 1
 fi
-"$GUARD" "$@" || exit $?
+/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" "$GUARD" "$@" || exit $?
 
 native="${SHIPYARD_NATIVE_GH_BINARY:-}"
 if [[ -z "$native" ]]; then
