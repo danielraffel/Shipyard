@@ -27,7 +27,10 @@ pub enum KeyedPassBinding {
     /// Pass 2 is bound to the exact pass-1 record.
     Bound(FullShadowRecord),
     /// The comparison cannot be judged from this invocation.
-    Inconclusive { reason: String },
+    Inconclusive {
+        /// Bounded reason the same-base comparison cannot be judged.
+        reason: String,
+    },
 }
 
 /// Bind pass 2 to pass 1. No record from an earlier invocation or a different
