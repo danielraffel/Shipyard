@@ -16,7 +16,8 @@ from unittest import mock
 
 SCRIPT = pathlib.Path(__file__).with_name("ghapp_queue_removal_guard.py")
 SPEC = importlib.util.spec_from_file_location("ghapp_queue_removal_guard", SCRIPT)
-assert SPEC is not None and SPEC.loader is not None
+if SPEC is None or SPEC.loader is None:
+    raise RuntimeError(f"unable to load guard module from {SCRIPT}")
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 
