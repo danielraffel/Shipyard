@@ -756,6 +756,7 @@ pub(super) fn wake_owner_comment(
         }
         _ => return Err("owner wake requested for a non-actionable decision".to_owned()),
     };
+    let body = owner_wake_body(pr, reason.as_str());
     super::handoff::verify_exact_open_pr(
         context.actions,
         &context.observation.repo,
@@ -775,13 +776,27 @@ pub(super) fn wake_owner_comment(
             ),
             "-f".to_owned(),
             format!(
-                "body=Shipyard owner wake: PR #{} at exact head {} requires action: {}",
-                pr.fact.number, pr.fact.head_sha, reason
+                "body={body}",
             ),
         ],
     )
     .map_err(|error| format!("could not post owner wake: {error}"))?;
     Ok("owner_wake_posted".to_owned())
+}
+
+fn owner_wake_body(pr: &ObservedPr, reason: &str) -> String {
+    let owner = pr.fact.author.as_deref().unwrap_or("team-lead");
+    format!(
+        "Shipyard owner wake for {owner}: PR #{} at exact head {} requires action: {reason}",
+        pr.fact.number, pr.fact.head_sha
+    )
+}
+
+pub(super) fn should_wake_owner(pr: &ObservedPr, decision: &StewardDecision) -> bool {
+    matches!(
+        decision,
+        StewardDecision::NeedsUpdate { .. } | StewardDecision::RequiredFailed { .. }
+    ) && !signal_is_converged(pr, true)
 }
 
 fn clear_needs_agent(
@@ -1102,5 +1117,24 @@ mod tests {
         assert_eq!(first, reordered);
         assert_ne!(first, changed);
         assert_ne!(literal_display, structured_identity);
+    }
+
+    #[test]
+    fn owner_wake_only_occurs_on_transition_into_needs_agent() {
+        let decision = StewardDecision::RequiredFailed {
+            contexts: vec!["macos".to_owned()],
+        };
+        assert!(should_wake_owner(&pr(vec![], vec![]), &decision));
+        assert!(!should_wake_owner(
+            &pr(vec![NEEDS_AGENT_LABEL], vec![("FAILURE", "2026-08-27T00:00:00Z")]),
+            &decision
+        ));
+    }
+
+    #[test]
+    fn owner_wake_body_names_the_owner() {
+        let mut observed = pr(vec![], vec![]);
+        observed.fact.author = Some("alice".to_owned());
+        assert!(owner_wake_body(&observed, "required checks failed").contains("for alice:"));
     }
 }

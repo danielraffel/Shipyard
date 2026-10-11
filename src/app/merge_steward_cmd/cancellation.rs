@@ -323,22 +323,19 @@ pub(super) fn apply_pr_plans(
                 error = recovery_error;
                 if args.wake_owner
                     && error.is_none()
-                    && matches!(
-                        decision,
-                        StewardDecision::NeedsUpdate { .. }
-                            | StewardDecision::RequiredFailed { .. }
-                    )
+                    && super::recovery::should_wake_owner(pr, &decision)
                 {
-                    let context = mutation_context
-                        .as_ref()
-                        .expect("apply mode requires mutation control");
-                    match super::recovery::wake_owner_comment(context, pr, &decision) {
-                        Ok(action) => {
-                            mutation = Some(mutation.map_or(action.clone(), |prior| {
-                                format!("{prior},{action}")
-                            }));
+                    if let Some(context) = mutation_context.as_ref() {
+                        match super::recovery::wake_owner_comment(context, pr, &decision) {
+                            Ok(action) => {
+                                mutation = Some(mutation.map_or(action.clone(), |prior| {
+                                    format!("{prior},{action}")
+                                }));
+                            }
+                            Err(wake_error) => error = Some(wake_error),
                         }
-                        Err(wake_error) => error = Some(wake_error),
+                    } else {
+                        error = Some("owner wake requires mutation control".to_owned());
                     }
                 }
             }
