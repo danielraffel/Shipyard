@@ -6,7 +6,8 @@ fn managed_pr(head: &str) -> ObservedPr {
         fact: StewardPullRequest {
             number: 42,
             head_sha: head.to_owned(),
-            head_branch: "feature".to_owned(),
+            author: None,
+        head_branch: "feature".to_owned(),
             draft: false,
             merge_state: "BLOCKED".to_owned(),
             auto_merge_active: false,

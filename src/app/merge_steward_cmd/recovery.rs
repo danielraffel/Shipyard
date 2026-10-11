@@ -887,7 +887,8 @@ mod tests {
             fact: StewardPullRequest {
                 number: 7,
                 head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-                head_branch: "feature".to_owned(),
+                author: None,
+        head_branch: "feature".to_owned(),
                 draft: false,
                 merge_state: "CLEAN".to_owned(),
                 auto_merge_active: false,

@@ -1200,6 +1200,17 @@ fn handle_pr_variant<W: Write>(
     else {
         unreachable!("pr variant required")
     };
+    if all && action.is_none() {
+        return Err(CliFailure::new(2, "--all requires the `status` action"));
+    }
+    if let Some(action) = action.as_deref()
+        && action != "status"
+    {
+        return Err(CliFailure::new(
+            2,
+            format!("unknown pr action `{action}`; expected `status`"),
+        ));
+    }
     if action.as_deref() == Some("status") {
         return pr_status_cmd::status_command(cwd, all, json, stdout);
     }

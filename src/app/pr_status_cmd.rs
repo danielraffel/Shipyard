@@ -9,6 +9,13 @@ use serde::Serialize;
 
 use super::CliFailure;
 
+/// Single source of truth for the daemon and read-only ledger fleet scope.
+pub(crate) const FLEET_REPOSITORIES: &[&str] = &[
+    "Generous-Corp/pulp",
+    "danielraffel/tartci",
+    "Generous-Corp/vellum",
+];
+
 #[derive(Debug, Serialize)]
 struct LedgerRow {
     repository: String,
@@ -36,7 +43,7 @@ pub(crate) fn status_command<W: Write>(
     };
     let mut rows = Vec::new();
     for repository in repositories {
-        let output = Command::new("gh")
+        let output = Command::new("ghapp")
             .args([
                 "pr",
                 "list",
@@ -47,7 +54,7 @@ pub(crate) fn status_command<W: Write>(
                 "--limit",
                 "100",
                 "--json",
-                "number,headRefOid,updatedAt,author,mergeStateStatus,statusCheckRollup",
+                "number,headRefOid,updatedAt,body,author,mergeStateStatus,statusCheckRollup,comments,commits",
             ])
             .current_dir(cwd)
             .output()
@@ -67,11 +74,8 @@ pub(crate) fn status_command<W: Write>(
             .as_array()
             .ok_or_else(|| CliFailure::new(1, "gh PR list response was not an array"))?;
         for item in items {
-            let updated = item
-                .get("updatedAt")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let age_seconds = parse_age(updated);
+            let movement = latest_movement(item);
+            let age_seconds = parse_age(&movement);
             let merge_state = item
                 .get("mergeStateStatus")
                 .and_then(serde_json::Value::as_str)
@@ -88,15 +92,10 @@ pub(crate) fn status_command<W: Write>(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_owned(),
-                owner: item
-                    .get("author")
-                    .and_then(|author| author.get("login"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("team-lead")
-                    .to_owned(),
+                owner: owner_for(item),
                 next_action: if queue_ready { "observe" } else { "owner-wake" }.to_owned(),
                 age_seconds,
-                last_movement: updated.to_owned(),
+                last_movement: movement,
                 stalled: !queue_ready && age_seconds >= 2 * 60 * 60,
             });
         }
@@ -140,6 +139,68 @@ fn parse_age(updated: &str) -> u64 {
         .as_secs()
 }
 
+fn latest_movement(item: &serde_json::Value) -> String {
+    let mut times = Vec::new();
+    if let Some(value) = item.get("updatedAt").and_then(serde_json::Value::as_str) {
+        times.push(value);
+    }
+    if let Some(commits) = item.get("commits").and_then(|v| v.get("nodes")).and_then(serde_json::Value::as_array) {
+        for commit in commits {
+            if let Some(value) = commit.pointer("/commit/committedDate").and_then(serde_json::Value::as_str) { times.push(value); }
+        }
+    }
+    if let Some(comments) = item.get("comments").and_then(|v| v.get("nodes")).and_then(serde_json::Value::as_array) {
+        for comment in comments {
+            for key in ["createdAt", "updatedAt"] {
+                if let Some(value) = comment.get(key).and_then(serde_json::Value::as_str) { times.push(value); }
+            }
+        }
+    }
+    if let Some(checks) = item.get("statusCheckRollup").and_then(serde_json::Value::as_array) {
+        for check in checks {
+            if let Some(value) = check.get("completedAt").and_then(serde_json::Value::as_str) { times.push(value); }
+        }
+    }
+    times.into_iter().max().unwrap_or_default().to_owned()
+}
+
+fn owner_for(item: &serde_json::Value) -> String {
+    if let Some(body) = item.get("body").and_then(serde_json::Value::as_str)
+        && let Some(session) = crate::pr_fold::whence_session(body)
+    {
+        return session;
+    }
+    item.pointer("/commits/nodes/0/commit/author/login")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("team-lead")
+        .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stalled_uses_latest_of_head_comment_and_check_movement() {
+        let item = serde_json::json!({
+            "updatedAt": "2026-10-11T00:00:00Z",
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-10-11T01:00:00Z"}}]},
+            "comments": {"nodes": [{"createdAt": "2026-10-11T02:00:00Z", "updatedAt": "2026-10-11T02:00:00Z"}]},
+            "statusCheckRollup": [{"completedAt": "2026-10-11T03:00:00Z"}]
+        });
+        assert_eq!(latest_movement(&item), "2026-10-11T03:00:00Z");
+    }
+
+    #[test]
+    fn owner_prefers_whence_then_last_committer_then_team_lead() {
+        let whence = serde_json::json!({"body": "<!-- whence {\"prov\": {\"session\": \"sess-1\"}} -->", "commits": {"nodes": [{"commit": {"author": {"login": "alice"}}}]}});
+        assert_eq!(owner_for(&whence), "sess-1");
+        let committer = serde_json::json!({"body": "plain", "commits": {"nodes": [{"commit": {"author": {"login": "alice"}}}]}});
+        assert_eq!(owner_for(&committer), "alice");
+        assert_eq!(owner_for(&serde_json::json!({"body": "plain"})), "team-lead");
+    }
+}
+
 fn current_repository(cwd: &Path) -> Result<String, CliFailure> {
     let output = Command::new("git")
         .args(["remote", "get-url", "origin"])
@@ -160,11 +221,10 @@ fn current_repository(cwd: &Path) -> Result<String, CliFailure> {
 }
 
 fn configured_repositories(cwd: &Path) -> Vec<String> {
-    let mut repos = vec![
-        "Generous-Corp/pulp".to_owned(),
-        "danielraffel/tartci".to_owned(),
-        "Generous-Corp/vellum".to_owned(),
-    ];
+    let mut repos = FLEET_REPOSITORIES
+        .iter()
+        .map(|repo| (*repo).to_owned())
+        .collect::<Vec<_>>();
     if let Ok(current) = current_repository(cwd)
         && !repos.contains(&current)
     {

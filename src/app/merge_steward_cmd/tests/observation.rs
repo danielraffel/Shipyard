@@ -104,7 +104,8 @@ fn invalid_pr_head_skips_app_identity_hydration_without_blocking_repo() {
         fact: StewardPullRequest {
             number: 42,
             head_sha: "malformed".to_owned(),
-            head_branch: "topic".to_owned(),
+            author: None,
+        head_branch: "topic".to_owned(),
             draft: false,
             merge_state: "UNKNOWN".to_owned(),
             auto_merge_active: false,
