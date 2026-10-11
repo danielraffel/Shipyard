@@ -142,6 +142,7 @@ fn parse_scoped_policy_digests(
     let Some(value) = trusted.get(ACCEPTED_POLICY_DIGESTS_KEY) else {
         return Ok(BTreeMap::new());
     };
+    use crate::changed_surface::same_base_canary::{FullShadowRecord, selected_returncode_matches};
     let repositories = value.as_table().ok_or_else(|| {
         CliFailure::new(
             2,
@@ -1937,8 +1938,9 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         CurrentStaleGeneration, FallbackDiagnostic, MAX_STALE_POINTER_BYTES, MachineMode,
-        MachinePolicy, activation_bytes, activation_receipt, bounded_diagnostic, evidence_dir,
-        full_fallback_diagnostic, persist_exact_bytes, persist_fallback_diagnostic,
+        MachinePolicy, activation_bytes, activation_receipt, bounded_diagnostic,
+        canary_binding_decision, evidence_dir, full_fallback_diagnostic, persist_exact_bytes,
+        persist_fallback_diagnostic, persist_same_base_canary_receipt,
         publish_current_stale_generation, read_current_stale_generation, result_dir,
         selected_resume_block_reason, shell_quote, stale_generation_has_execution_evidence,
         target_declares_changed_surface_selection,
