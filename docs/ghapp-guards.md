@@ -24,13 +24,13 @@ and is managed by `shipyard fleet update`, not by this page.
 ## Install the plain `gh` wrapper
 
 To make direct `gh` calls use the same queue-removal policy, run
-`scripts/install-guarded-gh.sh`. It installs `gh` in `~/.local/bin` and the real
-`queue-removal-guard` in `~/.config/shipyard/guards` by default. Put
-`~/.local/bin` before Homebrew or `/usr/local/bin` in `PATH`; launchd, cmux, and
-Codex must inherit that ordering. The wrapper falls back to
-`~/.config/shipyard/guards` when `SHIPYARD_GHAPP_GUARDS_DIR` is unset. Verify
-with `command -v gh` and confirm it names `~/.local/bin/gh` before using a
-plain `gh api` mutation.
+`scripts/install-guarded-gh.sh`. It installs only the `gh` wrapper in
+`~/.local/bin`; guard files are owned and installed by `shipyard guards install`.
+The obsolete `--guards-dir` option is refused. Put `~/.local/bin` before
+Homebrew or `/usr/local/bin` in `PATH`; launchd, cmux, and Codex must inherit
+that ordering. The wrapper falls back to `~/.config/shipyard/guards` when
+`SHIPYARD_GHAPP_GUARDS_DIR` is unset. Verify with `command -v gh` and confirm
+it names `~/.local/bin/gh` before using a plain `gh api` mutation.
 
 ### Queue-arm guard decisions
 
