@@ -466,7 +466,7 @@ case "$*" in
   *isInMergeQueue*)
     printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
   *contents/.shipyard/config.toml*)
-    printf '[auto_merge]\narm_requires_head_approval = true\n' ;;
+    printf '[auto_merge]\narm_requires_head_approval = true\nreviewer_identities = ["someone"]\n' ;;
   *pulls/42/reviews*)
     printf '%s' '{reviews}' ;;
   *issues/42/comments*)

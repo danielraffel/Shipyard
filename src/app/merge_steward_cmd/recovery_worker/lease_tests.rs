@@ -107,7 +107,7 @@ fn model_child_retains_global_lease_after_parent_guard_drops_body() {
     // second copy of this test binary on a saturated runner can take longer
     // than any short deadline, while a child that exits without marking ready
     // fails at once. The ceiling only guards a child that is alive but wedged.
-    let hang_guard = Instant::now() + Duration::from_secs(120);
+    let hang_guard = Instant::now() + Duration::from_mins(2);
     while !ready.exists() && matches!(child.try_wait(), Ok(None)) && Instant::now() < hang_guard {
         thread::sleep(Duration::from_millis(10));
     }
@@ -151,7 +151,7 @@ fn global_model_lease_child_helper() {
     fs::write(&ready, b"ready").expect("ready marker");
     // The parent writes the release marker or kills this child; the ceiling
     // only bounds an orphan whose parent died between the two.
-    let hang_guard = Instant::now() + Duration::from_secs(120);
+    let hang_guard = Instant::now() + Duration::from_mins(2);
     while !release.exists() && Instant::now() < hang_guard {
         thread::sleep(Duration::from_millis(10));
     }
@@ -346,7 +346,7 @@ fn racing_clear_cannot_pass_record_and_witness_publication() {
     // lease deadline plus finite store writes, so this ceiling only guards a
     // genuine hang.
     done_rx
-        .recv_timeout(Duration::from_secs(120))
+        .recv_timeout(Duration::from_mins(2))
         .expect("clear completed")
         .expect("clear result");
     clear.join().expect("clear thread");

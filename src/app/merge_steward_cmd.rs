@@ -267,6 +267,10 @@ struct QueueRecoveryReceipt {
     job_id: u64,
     attempted_at: String,
     phase: QueueRecoveryPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approval_comment_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    performed_via_github_app_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -23,14 +23,14 @@
 //! ## What counts as approval
 //!
 //! * A pull-request review in state `APPROVED` whose `commit_id` is the head,
-//!   from an account that is not a bot.
-//! * A comment carrying a line `reviewed:<sha>` (seven or more hex digits, a
-//!   prefix of the head), from a login in `[auto_merge] reviewer_logins` that
-//!   is not a bot. The list is empty by default, so markers count only once a
-//!   repository names its reviewers.
+//!   from a configured reviewer identity.
+//! * A final-line `verdict: APPROVE head:<sha>` or `reviewed:<sha>` comment
+//!   from a configured reviewer identity. The sha is always the full head.
+//!   `verdict: HOLD head:<sha>` and a matching `REQUEST_CHANGES` review block.
 //!
-//! Bot accounts never count, including the one Shipyard itself posts through:
-//! every agent shares that identity, so a marker it wrote would approve itself.
+//! Bot status alone is not a rejection: the dedicated review App is configured
+//! as a reviewer. The fleet author App and the PR author cannot approve their
+//! own head.
 //!
 //! ## Ejections
 //!
@@ -53,6 +53,8 @@ pub const CONFIG_TABLE: &str = "auto_merge";
 pub const REQUIRED_KEY: &str = "arm_requires_head_approval";
 /// Key listing logins whose `reviewed:<sha>` comments count as approval.
 pub const REVIEWERS_KEY: &str = "reviewer_logins";
+/// New spelling for the configured reviewer identities.
+pub const REVIEWER_IDENTITIES_KEY: &str = "reviewer_identities";
 /// Tracked config file the setting is read from on the protected base.
 pub const CONFIG_PATH: &str = ".shipyard/config.toml";
 /// Removals of one head after which it needs a fresh approval to re-arm.
@@ -66,7 +68,7 @@ pub type RunGh<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
 pub struct ApprovalPolicy {
     /// Whether arming requires an approval of the exact head.
     pub required: bool,
-    /// Logins whose `reviewed:<sha>` comments count, lower-cased.
+    /// Identities whose exact-head approvals count, lower-cased.
     pub reviewer_logins: Vec<String>,
 }
 
@@ -85,7 +87,8 @@ impl ApprovalPolicy {
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(false),
             reviewer_logins: section
-                .get(REVIEWERS_KEY)
+                .get(REVIEWER_IDENTITIES_KEY)
+                .or_else(|| section.get(REVIEWERS_KEY))
                 .and_then(toml::Value::as_array)
                 .map(|logins| {
                     logins
@@ -97,6 +100,18 @@ impl ApprovalPolicy {
                 .unwrap_or_default(),
         }
     }
+
+    /// Reject a policy that would let Shipyard approve its own PR.
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .reviewer_logins
+            .iter()
+            .any(|login| is_fleet_author(login))
+        {
+            return Err("reviewer_identities must not include shipyard-local[bot]".to_owned());
+        }
+        Ok(())
+    }
 }
 
 /// How an approval was given.
@@ -107,11 +122,20 @@ pub enum Approval {
     Review {
         /// Reviewer login.
         login: String,
+        /// GitHub App database id that performed this review, when present.
+        #[serde(default)]
+        performed_via_github_app_id: Option<u64>,
     },
     /// A `reviewed:<sha>` comment from an allowlisted reviewer.
     Marker {
         /// Commenter login.
         login: String,
+        /// GitHub comment id used as durable approval evidence.
+        #[serde(default)]
+        comment_id: Option<u64>,
+        /// GitHub App database id that authored the comment, when present.
+        #[serde(default)]
+        performed_via_github_app_id: Option<u64>,
     },
 }
 
@@ -120,8 +144,8 @@ impl Approval {
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
-            Self::Review { login } => format!("an approving review by {login}"),
-            Self::Marker { login } => format!("a reviewed:<sha> marker by {login}"),
+            Self::Review { login, .. } => format!("an approving review by {login}"),
+            Self::Marker { login, .. } => format!("a reviewed:<sha> marker by {login}"),
         }
     }
 }
@@ -185,14 +209,6 @@ pub fn head_ejections(queue: &Value, head: &str) -> Vec<Ejection> {
         .collect()
 }
 
-fn is_bot(record: &Value) -> bool {
-    record
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
-        || login(record).is_some_and(|login| login.ends_with("[bot]"))
-}
-
 fn login(record: &Value) -> Option<&str> {
     record.get("login").and_then(Value::as_str)
 }
@@ -205,13 +221,113 @@ fn at(record: &Value) -> Option<DateTime<Utc>> {
         .map(|at| at.with_timezone(&Utc))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Verdict {
+    Approve,
+    Hold,
+}
+
+fn marker_verdict(body: &str) -> Option<(Verdict, String)> {
+    let pattern = Regex::new(
+        r"^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})|verdict:[ \t]*(APPROVE|HOLD)[ \t]+head:[ \t]*([0-9a-f]{40}))[ \t]*$",
+    )
+    .expect("marker pattern compiles");
+    let line = body.lines().rev().find(|line| !line.trim().is_empty())?;
+    pattern.captures(line).and_then(|capture| {
+        if let Some(head) = capture.get(1) {
+            return Some((Verdict::Approve, head.as_str().to_ascii_lowercase()));
+        }
+        let verdict = match capture.get(2)?.as_str().to_ascii_uppercase().as_str() {
+            "APPROVE" => Verdict::Approve,
+            "HOLD" => Verdict::Hold,
+            _ => return None,
+        };
+        Some((verdict, capture.get(3)?.as_str().to_ascii_lowercase()))
+    })
+}
+
 fn marker_names_head(body: &str, head: &str) -> bool {
-    let pattern =
-        Regex::new(r"(?im)^\s*reviewed:([0-9a-f]{7,40})\s*$").expect("marker pattern compiles");
-    let head = head.to_ascii_lowercase();
-    pattern
-        .captures_iter(body)
-        .any(|capture| head.starts_with(&capture[1].to_ascii_lowercase()))
+    marker_verdict(body).is_some_and(|(verdict, marker_head)| {
+        verdict == Verdict::Approve && marker_head.eq_ignore_ascii_case(head)
+    })
+}
+
+fn normalized_login(value: &str) -> String {
+    let value = value.strip_prefix("app/").unwrap_or(value);
+    value
+        .strip_suffix("[bot]")
+        .unwrap_or(value)
+        .to_ascii_lowercase()
+}
+
+fn is_fleet_author(login: &str) -> bool {
+    normalized_login(login) == "shipyard-local"
+}
+
+fn reviewer_allowed(login: &str, policy: &ApprovalPolicy, author: Option<&str>) -> bool {
+    let reviewer = normalized_login(login);
+    !is_fleet_author(login)
+        && policy
+            .reviewer_logins
+            .iter()
+            .any(|identity| normalized_login(identity) == reviewer)
+        && author.is_none_or(|author| normalized_login(author) != reviewer)
+}
+
+/// Return audit labels for reviewer text that was deliberately ignored.
+///
+/// These labels are kept separate from the gate decision so a stale HOLD or
+/// an unstructured prose mention cannot accidentally block a newer head while
+/// remaining visible in the enqueue receipt's evidence trail.
+pub fn verdict_audit_events(
+    head: &str,
+    reviews: &[Value],
+    comments: &[Value],
+    policy: &ApprovalPolicy,
+    author: Option<&str>,
+) -> Vec<String> {
+    let mut events = Vec::new();
+    for comment in comments {
+        let Some(login) = login(comment) else {
+            continue;
+        };
+        if !reviewer_allowed(login, policy, author) {
+            continue;
+        }
+        let Some(body) = comment.get("body").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some((Verdict::Hold, marker_head)) = marker_verdict(body)
+            && !marker_head.eq_ignore_ascii_case(head)
+        {
+            events.push("stale_hold".to_owned());
+        } else if marker_verdict(body).is_none()
+            && body.lines().any(|line| {
+                let upper = line.to_ascii_uppercase();
+                upper.contains("HOLD") || upper.contains("CHANGES REQUESTED")
+            })
+        {
+            events.push("unstructured_hold_mention".to_owned());
+        }
+    }
+    for review in reviews {
+        let Some(login) = login(review) else { continue };
+        if !reviewer_allowed(login, policy, author) {
+            continue;
+        }
+        let Some(state) = review.get("state").and_then(Value::as_str) else {
+            continue;
+        };
+        if state.eq_ignore_ascii_case("CHANGES_REQUESTED")
+            && review
+                .get("commit_id")
+                .and_then(Value::as_str)
+                .is_some_and(|commit| !commit.eq_ignore_ascii_case(head))
+        {
+            events.push("stale_hold".to_owned());
+        }
+    }
+    events
 }
 
 /// The newest approval of `head`, given reviews and comments flattened to
@@ -227,11 +343,22 @@ pub fn find_approval(
     policy: &ApprovalPolicy,
     newer_than: Option<DateTime<Utc>>,
 ) -> Option<Approval> {
+    find_approval_for_author(head, reviews, comments, policy, newer_than, None)
+}
+
+fn find_approval_for_author(
+    head: &str,
+    reviews: &[Value],
+    comments: &[Value],
+    policy: &ApprovalPolicy,
+    newer_than: Option<DateTime<Utc>>,
+    author: Option<&str>,
+) -> Option<Approval> {
     let fresh =
         |record: &Value| newer_than.is_none_or(|floor| at(record).is_some_and(|at| at > floor));
     let review = reviews.iter().rev().find(|review| {
-        !is_bot(review)
-            && fresh(review)
+        fresh(review)
+            && login(review).is_some_and(|login| reviewer_allowed(login, policy, author))
             && review
                 .get("state")
                 .and_then(Value::as_str)
@@ -244,28 +371,30 @@ pub fn find_approval(
     if let Some(login) = review.and_then(login) {
         return Some(Approval::Review {
             login: login.to_owned(),
+            performed_via_github_app_id: review
+                .and_then(|review| review.get("performed_via_github_app_id"))
+                .and_then(Value::as_u64),
         });
     }
     comments
         .iter()
         .rev()
         .find(|comment| {
-            !is_bot(comment)
-                && fresh(comment)
-                && login(comment).is_some_and(|login| {
-                    policy
-                        .reviewer_logins
-                        .iter()
-                        .any(|reviewer| reviewer.eq_ignore_ascii_case(login))
-                })
+            fresh(comment)
+                && login(comment).is_some_and(|login| reviewer_allowed(login, policy, author))
                 && comment
                     .get("body")
                     .and_then(Value::as_str)
                     .is_some_and(|body| marker_names_head(body, head))
         })
-        .and_then(login)
-        .map(|login| Approval::Marker {
-            login: login.to_owned(),
+        .and_then(|comment| {
+            Some(Approval::Marker {
+                login: login(comment)?.to_owned(),
+                comment_id: comment.get("id").and_then(Value::as_u64),
+                performed_via_github_app_id: comment
+                    .get("performed_via_github_app_id")
+                    .and_then(Value::as_u64),
+            })
         })
 }
 
@@ -362,8 +491,87 @@ pub fn decide_excusing(
     queue: &Value,
     latest_was_interruption: bool,
 ) -> HeadGate {
+    decide_for_author(
+        policy,
+        head,
+        reviews,
+        comments,
+        queue,
+        latest_was_interruption,
+        None,
+    )
+}
+
+fn latest_verdict(
+    head: &str,
+    reviews: &[Value],
+    comments: &[Value],
+    policy: &ApprovalPolicy,
+    author: Option<&str>,
+) -> Option<Verdict> {
+    let review_events = reviews.iter().filter_map(|review| {
+        let login = login(review)?;
+        if !reviewer_allowed(login, policy, author)
+            || !review
+                .get("commit_id")
+                .and_then(Value::as_str)
+                .is_some_and(|commit| commit.eq_ignore_ascii_case(head))
+        {
+            return None;
+        }
+        let state = review.get("state")?.as_str()?;
+        let verdict = if state.eq_ignore_ascii_case("APPROVED") {
+            Verdict::Approve
+        } else if state.eq_ignore_ascii_case("CHANGES_REQUESTED") {
+            Verdict::Hold
+        } else {
+            return None;
+        };
+        Some((at(review), verdict))
+    });
+    let comment_events = comments.iter().filter_map(|comment| {
+        let login = login(comment)?;
+        if !reviewer_allowed(login, policy, author) {
+            return None;
+        }
+        let (verdict, marker_head) = marker_verdict(comment.get("body")?.as_str()?)?;
+        if marker_head != head.to_ascii_lowercase() {
+            return None;
+        }
+        Some((at(comment), verdict))
+    });
+    let events: Vec<_> = review_events.chain(comment_events).collect();
+    // A HOLD whose time cannot be read cannot be ordered against an approval,
+    // so it is not allowed to lose to one.
+    if events
+        .iter()
+        .any(|(timestamp, verdict)| timestamp.is_none() && *verdict == Verdict::Hold)
+    {
+        return Some(Verdict::Hold);
+    }
+    events
+        .into_iter()
+        .filter_map(|(timestamp, verdict)| Some((timestamp?, verdict)))
+        .max_by_key(|(timestamp, _)| *timestamp)
+        .map(|(_, verdict)| verdict)
+}
+
+pub(crate) fn decide_for_author(
+    policy: &ApprovalPolicy,
+    head: &str,
+    reviews: &[Value],
+    comments: &[Value],
+    queue: &Value,
+    latest_was_interruption: bool,
+    author: Option<&str>,
+) -> HeadGate {
     if !policy.required {
         return HeadGate::NotRequired;
+    }
+    if latest_verdict(head, reviews, comments, policy, author) == Some(Verdict::Hold) {
+        return HeadGate::NotApproved {
+            head: head.to_owned(),
+        };
     }
     let mut ejections = head_ejections(queue, head);
     if latest_was_interruption {
@@ -377,7 +585,8 @@ pub fn decide_excusing(
             .and_then(|ejection| ejection.at.as_deref())
             .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
             .map_or(DateTime::<Utc>::MAX_UTC, |at| at.with_timezone(&Utc));
-        return match find_approval(head, reviews, comments, policy, Some(floor)) {
+        return match find_approval_for_author(head, reviews, comments, policy, Some(floor), author)
+        {
             Some(approval) => HeadGate::Approved { approval },
             None => HeadGate::EjectionCap {
                 head: head.to_owned(),
@@ -385,7 +594,7 @@ pub fn decide_excusing(
             },
         };
     }
-    match find_approval(head, reviews, comments, policy, None) {
+    match find_approval_for_author(head, reviews, comments, policy, None, author) {
         Some(approval) => HeadGate::Approved { approval },
         None => HeadGate::NotApproved {
             head: head.to_owned(),
@@ -399,7 +608,12 @@ pub fn decide_excusing(
 ///
 /// When the file exists but cannot be read or parsed: an unreadable policy is
 /// not an absent one.
-pub fn read_policy(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<ApprovalPolicy, String> {
+fn read_policy_inner(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    missing_is_error: bool,
+) -> Result<ApprovalPolicy, String> {
     let raw = match run_gh(&[
         "api".to_owned(),
         "-H".to_owned(),
@@ -408,13 +622,34 @@ pub fn read_policy(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<Approval
     ]) {
         Ok(raw) => raw,
         Err(detail) if detail.contains("404") || detail.contains("Not Found") => {
+            if missing_is_error {
+                return Err(format!(
+                    "{CONFIG_PATH} on {base} is absent; approval policy is required"
+                ));
+            }
             return Ok(ApprovalPolicy::default());
         }
         Err(detail) => return Err(format!("{CONFIG_PATH} on {base} unreadable: {detail}")),
     };
-    raw.parse::<toml::Table>()
-        .map(|table| ApprovalPolicy::from_table(&table))
-        .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))
+    let table = raw
+        .parse::<toml::Table>()
+        .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
+    let policy = ApprovalPolicy::from_table(&table);
+    policy.validate().map(|()| policy)
+}
+
+/// Read the policy from `base` on GitHub, treating a missing file as default.
+pub fn read_policy(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<ApprovalPolicy, String> {
+    read_policy_inner(run_gh, repo, base, false)
+}
+
+/// Read the policy for the steward enqueue gate, where absence is unsafe.
+pub fn read_policy_required(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+) -> Result<ApprovalPolicy, String> {
+    read_policy_inner(run_gh, repo, base, true)
 }
 
 fn read_records(run_gh: RunGh<'_>, path: &str, jq: &str) -> Result<Vec<Value>, String> {
@@ -472,12 +707,12 @@ pub fn evaluate_excusing(
     let reviews = read_records(
         run_gh,
         &format!("repos/{repo}/pulls/{pr}/reviews"),
-        ".[] | {login: .user.login, type: .user.type, at: .submitted_at, state: .state, commit_id: .commit_id}",
+        ".[] | {login: .user.login, type: .user.type, at: .submitted_at, state: .state, commit_id: .commit_id, performed_via_github_app_id: .performed_via_github_app.id}",
     )?;
     let comments = read_records(
         run_gh,
         &format!("repos/{repo}/issues/{pr}/comments"),
-        ".[] | {login: .user.login, type: .user.type, at: .created_at, body: .body}",
+        ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}",
     )?;
     Ok(decide_excusing(
         &policy,
@@ -503,20 +738,74 @@ pub fn evaluate_with_policy(
     policy: &ApprovalPolicy,
     queue: &Value,
 ) -> Result<HeadGate, String> {
+    evaluate_with_policy_for_author(run_gh, repo, pr, head, policy, queue, None)
+}
+
+/// Evaluate with the observed PR author available for self-review rejection.
+pub fn evaluate_with_policy_for_author(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    policy: &ApprovalPolicy,
+    queue: &Value,
+    author: Option<&str>,
+) -> Result<HeadGate, String> {
+    evaluate_with_policy_for_author_with_events(run_gh, repo, pr, head, policy, queue, author)
+        .map(|(gate, _)| gate)
+}
+
+/// Evaluate and return ignored verdict evidence for the mutation receipt.
+pub fn evaluate_with_policy_for_author_with_events(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    policy: &ApprovalPolicy,
+    queue: &Value,
+    author: Option<&str>,
+) -> Result<(HeadGate, Vec<String>), String> {
     if !policy.required {
-        return Ok(HeadGate::NotRequired);
+        return Ok((HeadGate::NotRequired, Vec::new()));
     }
     let reviews = read_records(
         run_gh,
         &format!("repos/{repo}/pulls/{pr}/reviews"),
-        ".[] | {login: .user.login, type: .user.type, at: .submitted_at, state: .state, commit_id: .commit_id}",
+        ".[] | {login: .user.login, type: .user.type, at: .submitted_at, state: .state, commit_id: .commit_id, performed_via_github_app_id: .performed_via_github_app.id}",
     )?;
     let comments = read_records(
         run_gh,
         &format!("repos/{repo}/issues/{pr}/comments"),
-        ".[] | {login: .user.login, type: .user.type, at: .created_at, body: .body}",
+        ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}",
     )?;
-    Ok(decide(policy, head, &reviews, &comments, queue))
+    let comments = if comments.iter().any(|comment| {
+        comment
+            .get("body")
+            .and_then(Value::as_str)
+            .and_then(marker_verdict)
+            .is_some_and(|(_, marker_head)| marker_head.eq_ignore_ascii_case(head))
+    }) {
+        let created_at = run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repo}/commits/{head}"),
+            "--jq".to_owned(),
+            ".commit.committer.date".to_owned(),
+        ])?
+        .trim()
+        .parse::<DateTime<Utc>>()
+        .map_err(|error| format!("head commit timestamp unreadable: {error}"))?;
+        comments
+            .into_iter()
+            .filter(|comment| at(comment).is_some_and(|comment_at| comment_at > created_at))
+            .collect()
+    } else {
+        comments
+    };
+    let events = verdict_audit_events(head, &reviews, &comments, policy, author);
+    Ok((
+        decide_for_author(policy, head, &reviews, &comments, queue, false, author),
+        events,
+    ))
 }
 
 #[cfg(test)]
