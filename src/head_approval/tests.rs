@@ -252,6 +252,19 @@ fn marker_approval_preserves_comment_id_for_the_enqueue_receipt() {
 }
 
 #[test]
+fn real_reviewer_comment_accepts_spaced_final_marker() {
+    let body = r#"## fable-graph review of 57802dbb66a6c963300cd0dd0177a9143ac4c63d: APPROVED
+
+- Required checks on the exact head: `macos` success, `linux`, `windows`, `Enforce version & skill sync` all success.
+
+reviewed: 57802dbb66a6c963300cd0dd0177a9143ac4c63d"#;
+    assert!(marker_names_head(
+        body,
+        "57802dbb66a6c963300cd0dd0177a9143ac4c63d"
+    ));
+}
+
+#[test]
 fn a_marker_counts_only_once_reviewers_are_listed() {
     let comments = [human(
         "reviewer",

@@ -209,8 +209,8 @@ fn at(record: &Value) -> Option<DateTime<Utc>> {
 }
 
 fn marker_names_head(body: &str, head: &str) -> bool {
-    let pattern =
-        Regex::new(r"(?im)^\s*reviewed:([0-9a-f]{40})\s*$").expect("marker pattern compiles");
+    let pattern = Regex::new(r"(?im)^[ \t]*reviewed:[ \t]*([0-9a-f]{40})[ \t]*$")
+        .expect("marker pattern compiles");
     let head = head.to_ascii_lowercase();
     pattern
         .captures_iter(body)
