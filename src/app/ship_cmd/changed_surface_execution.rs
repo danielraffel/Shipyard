@@ -13,6 +13,9 @@ use super::super::changed_surface_cmd::{
     ChangedSurfacePlanArgs, observe_changed_surface_plan, observe_stale_base_shadow,
 };
 use super::executable_reuse_plan::{KeyRequest, Keyed, plan_keyed};
+use crate::changed_surface::same_base_canary::{
+    FullShadowRecord, KeyedPassBinding, bind_keyed_pass, canary_command,
+};
 use crate::changed_surface::trial::{TrialIdentity, result_directory};
 use crate::changed_surface::{
     ExecutionCommandTransport, ExecutionDisposition, FallbackReason, StaleBaseShadowReceipt,
@@ -850,7 +853,7 @@ pub(super) fn apply_changed_surface_execution(
             continue;
         };
         let compare = if machine.mode.is_shadow() { "1" } else { "0" };
-        let substituted = format!(
+        let ordinary_substituted = format!(
             "SHIPYARD_CHANGED_SURFACE_RESULT_DIR={} SHIPYARD_CHANGED_SURFACE_COMPARE_FULL={} SHIPYARD_CHANGED_SURFACE_CANARY_MODE={} {}",
             shell_quote(&result_dir),
             compare,
@@ -861,6 +864,52 @@ pub(super) fn apply_changed_surface_execution(
             },
             plan.command
         );
+        let substituted = if machine.mode == MachineMode::SameBaseCanary {
+            let pass1_dir = trial_dir.join("same-base-pass1");
+            let record_path = pass1_dir.join("full-shadow-record.json");
+            let canary_receipt = trial_dir.join("same-base-canary-receipt.json");
+            let record = FullShadowRecord {
+                base_sha: plan.base_sha.clone(),
+                tree_sha: plan.tree_sha.clone(),
+                lane_config_sha256: plan.execution_payload_digest.clone(),
+                record_id: format!("{}-full-shadow", plan.execution_payload_digest),
+            };
+            let candidate = record.clone();
+            if !matches!(
+                bind_keyed_pass(Some(&record), Some(&candidate)),
+                KeyedPassBinding::Bound(_)
+            ) {
+                persist_fallback_diagnostic(
+                    &trial_dir,
+                    &FallbackDiagnostic {
+                        schema_version: 1,
+                        repository: repo,
+                        pull_request: pr,
+                        target: &target.name,
+                        machine_mode: machine.mode,
+                        category: "same_base_binding",
+                        diagnostic: "pass 2 refused the pass-1 record".to_owned(),
+                    },
+                )?;
+                continue;
+            }
+            persist_exact_bytes(
+                &pass1_dir,
+                "full-shadow-record.json.template",
+                &serde_json::to_vec_pretty(&record).map_err(|error| {
+                    CliFailure::new(1, format!("serialize full-shadow record: {error}"))
+                })?,
+            )?;
+            canary_command(
+                &plan.command,
+                &pass1_dir,
+                &result_dir,
+                &record_path,
+                &canary_receipt,
+            )
+        } else {
+            ordinary_substituted
+        };
         let activation = activation_receipt(
             &plan,
             machine.mode,
@@ -939,6 +988,24 @@ pub(super) fn apply_changed_surface_execution(
                 )?;
             }
             persist_activation(&result_dir, &activation)?;
+            if machine.mode == MachineMode::SameBaseCanary {
+                let pass1_dir = trial_dir.join("same-base-pass1");
+                persist_activation(&pass1_dir, &activation)?;
+                if !plan.audit_report.is_empty() {
+                    persist_exact_bytes(
+                        &pass1_dir,
+                        crate::changed_surface::executable_reuse::AUDIT_REPORT_FILE,
+                        &plan.audit_report,
+                    )?;
+                }
+                if !plan.executable_reuse_binding.is_empty() {
+                    persist_exact_bytes(
+                        &pass1_dir,
+                        crate::changed_surface::EXECUTABLE_REUSE_BINDING_FILE,
+                        &plan.executable_reuse_binding,
+                    )?;
+                }
+            }
             if plan.disposition != crate::changed_surface::BOUNDED {
                 persist_named_receipt(
                     &result_dir,

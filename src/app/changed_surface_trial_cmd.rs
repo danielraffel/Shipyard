@@ -350,15 +350,9 @@ where
                 );
             }
         };
-    if activation_bytes.is_none() {
-        return rejected_trial(
-            identity,
-            Some(activation_name.to_owned()),
-            0,
-            None,
-            "shadow activation is missing",
-        );
-    }
+    // A lane can be observed between planning and activation.  Preserve the
+    // collector contract: a missing activation is still collecting, while a
+    // malformed or unreadable receipt remains a rejection.
     let stale_activation_bytes =
         match read_regular_receipt(&result_dir.join(STALE_ACTIVATION_RECEIPT)) {
             Ok(bytes) => bytes,
