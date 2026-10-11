@@ -426,7 +426,12 @@ pub fn decide_excusing(
 ///
 /// When the file exists but cannot be read or parsed: an unreadable policy is
 /// not an absent one.
-pub fn read_policy(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<ApprovalPolicy, String> {
+fn read_policy_inner(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    missing_is_error: bool,
+) -> Result<ApprovalPolicy, String> {
     let raw = match run_gh(&[
         "api".to_owned(),
         "-H".to_owned(),
@@ -435,15 +440,32 @@ pub fn read_policy(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<Approval
     ]) {
         Ok(raw) => raw,
         Err(detail) if detail.contains("404") || detail.contains("Not Found") => {
-            return Err(format!(
-                "{CONFIG_PATH} on {base} is absent; approval policy is required"
-            ));
+            if missing_is_error {
+                return Err(format!(
+                    "{CONFIG_PATH} on {base} is absent; approval policy is required"
+                ));
+            }
+            return Ok(ApprovalPolicy::default());
         }
         Err(detail) => return Err(format!("{CONFIG_PATH} on {base} unreadable: {detail}")),
     };
     raw.parse::<toml::Table>()
         .map(|table| ApprovalPolicy::from_table(&table))
         .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))
+}
+
+/// Read the policy from `base` on GitHub, treating a missing file as default.
+pub fn read_policy(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<ApprovalPolicy, String> {
+    read_policy_inner(run_gh, repo, base, false)
+}
+
+/// Read the policy for the steward enqueue gate, where absence is unsafe.
+pub fn read_policy_required(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+) -> Result<ApprovalPolicy, String> {
+    read_policy_inner(run_gh, repo, base, true)
 }
 
 fn read_records(run_gh: RunGh<'_>, path: &str, jq: &str) -> Result<Vec<Value>, String> {

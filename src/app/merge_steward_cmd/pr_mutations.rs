@@ -112,7 +112,7 @@ fn enqueue_pull_request_with_recovery(
             .run_gh(argv)
             .map_err(|error| error.to_string())
     };
-    let approval_policy = match crate::head_approval::read_policy(
+    let approval_policy = match crate::head_approval::read_policy_required(
         &run_gh,
         &context.observation.repo,
         &context.observation.base,
