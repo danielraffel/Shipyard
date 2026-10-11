@@ -297,19 +297,17 @@ pub fn verdict_audit_events(
         let Some(body) = comment.get("body").and_then(Value::as_str) else {
             continue;
         };
-        match marker_verdict(body) {
-            Some((Verdict::Hold, marker_head)) if !marker_head.eq_ignore_ascii_case(head) => {
-                events.push("stale_hold".to_owned());
-            }
-            Some(_) => {}
-            None if body.lines().any(|line| {
+        if let Some((Verdict::Hold, marker_head)) = marker_verdict(body)
+            && !marker_head.eq_ignore_ascii_case(head)
+        {
+            events.push("stale_hold".to_owned());
+        } else if marker_verdict(body).is_none()
+            && body.lines().any(|line| {
                 let upper = line.to_ascii_uppercase();
                 upper.contains("HOLD") || upper.contains("CHANGES REQUESTED")
-            }) =>
-            {
-                events.push("unstructured_hold_mention".to_owned())
-            }
-            None => {}
+            })
+        {
+            events.push("unstructured_hold_mention".to_owned());
         }
     }
     for review in reviews {

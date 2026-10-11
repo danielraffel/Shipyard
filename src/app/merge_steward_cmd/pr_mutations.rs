@@ -127,7 +127,7 @@ fn enqueue_pull_request_with_recovery(
     };
     let mut approval_comment_id = None;
     let mut approval_app_id = None;
-    let mut verdict_audit_events = Vec::new();
+    let verdict_audit_events;
     {
         let Some((owner, name)) = context.observation.repo.split_once('/') else {
             return (None, Some("invalid repository slug".to_owned()));
