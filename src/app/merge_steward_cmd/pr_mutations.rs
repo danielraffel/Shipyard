@@ -101,6 +101,24 @@ fn enqueue_pull_request_with_recovery(
     ledger: &mut StewardLedger,
     recover_hosted_setup_eviction_priority: bool,
 ) -> (Option<String>, Option<String>) {
+    // B1: when the protected base requires head approval, re-read the
+    // reviewer policy and the live review/comment records immediately before
+    // the enqueue mutation. A stale local ship state or LGTM text is never
+    // sufficient evidence.
+    let run_gh = |argv: &[String]| context.actions.run_gh(argv).map_err(|error| error.to_string());
+    match crate::head_approval::evaluate_excusing(
+        &run_gh,
+        &context.observation.repo,
+        pr.fact.number,
+        &pr.fact.head_sha,
+        &context.observation.base,
+        &Value::Null,
+        false,
+    ) {
+        Ok(gate) if gate.allows() => {}
+        Ok(gate) => return (Some("waiting_head_approval".to_owned()), Some(gate.explain())),
+        Err(error) => return (None, Some(format!("head approval unreadable: {error}"))),
+    }
     let recovery = if recover_hosted_setup_eviction_priority {
         recovery_evidence(context.actions, context.observation, pr, ledger).unwrap_or_else(|_| {
             record_audit(
