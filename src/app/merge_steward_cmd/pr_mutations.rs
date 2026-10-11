@@ -118,6 +118,12 @@ fn enqueue_pull_request_with_recovery(
         &context.observation.base,
     ) {
         Ok(policy) => policy,
+        Err(_error) if policy.managed_label.is_none() => {
+            // Library callers that predate the CLI-managed policy do not have
+            // an authoritative repository policy source; the CLI always sets
+            // managed_label and therefore remains fail-closed here.
+            crate::head_approval::ApprovalPolicy::default()
+        }
         Err(error) => {
             return (
                 None,

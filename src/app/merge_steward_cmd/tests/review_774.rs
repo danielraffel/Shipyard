@@ -53,7 +53,8 @@ fn run(
     let mutation_control = mutation_control(temp, "studio", "studio");
     let ledger_path = temp.path().join("ledger.json");
     let context = mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
-    let policy = queue_policy();
+    let mut policy = queue_policy();
+    policy.managed_label = Some("steward:managed".to_owned());
     let (mutation, error) = enqueue_pull_request(&context, &pr, &policy, &mut ledger);
     let calls = fs::read_to_string(log).unwrap_or_default();
     (mutation, error, calls)
