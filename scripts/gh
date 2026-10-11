@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Guarded plain GitHub CLI entry point. Install this ahead of native gh on
+# hosts where direct gh must share ghapp's queue-removal policy.
+set -u
+
+native="${SHIPYARD_NATIVE_GH_BINARY:-${SHIPYARD_GHAPP_GH_BINARY:-}}"
+if [[ -z "$native" ]]; then
+    for candidate in /opt/homebrew/bin/gh /usr/local/bin/gh /usr/bin/gh; do
+        if [[ -x "$candidate" && "$candidate" != "$0" ]]; then
+            native="$candidate"
+            break
+        fi
+    done
+fi
+if [[ "$native" != /* || ! -x "$native" || "$native" == "$0" ]]; then
+    echo "gh: set SHIPYARD_NATIVE_GH_BINARY or SHIPYARD_GHAPP_GH_BINARY to an absolute native gh executable" >&2
+    exit 1
+fi
+export GHAPP_REAL_GH="$native"
+
+GUARDS_DIR="${SHIPYARD_GHAPP_GUARDS_DIR:-$HOME/.config/shipyard/guards}"
+GUARD="${GUARDS_DIR:+${GUARDS_DIR}/queue-removal-guard}"
+trusted_path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if [[ -z "$GUARD" || ! -x "$GUARD" ]]; then
+    echo "gh: queue-removal guard is unavailable; refusing to run" >&2
+    exit 1
+fi
+/usr/bin/env -u PYTHONHOME -u PYTHONPATH PATH="$trusted_path" "$GUARD" "$@" || exit $?
+exec "$native" "$@"
