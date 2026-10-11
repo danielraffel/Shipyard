@@ -82,18 +82,30 @@ fn fleet_management_uses_author_and_branch_quadrants() {
         let mut fleet = green_pr();
         fleet.head_branch = format!("{prefix}work");
         fleet.author = Some("shipyard-local[bot]".to_owned());
-        assert!(matches!(classify_pr(&fleet, &policy, &BTreeMap::new()), StewardDecision::ArmMergeQueue));
+        assert!(matches!(
+            classify_pr(&fleet, &policy, &BTreeMap::new()),
+            StewardDecision::ArmMergeQueue
+        ));
         let mut human = fleet.clone();
         human.author = Some("alice".to_owned());
-        assert_eq!(classify_pr(&human, &policy, &BTreeMap::new()), StewardDecision::Unmanaged);
+        assert_eq!(
+            classify_pr(&human, &policy, &BTreeMap::new()),
+            StewardDecision::Unmanaged
+        );
     }
     let mut app_other_branch = green_pr();
     app_other_branch.head_branch = "topic/custom".to_owned();
     app_other_branch.author = Some("shipyard-local[bot]".to_owned());
-    assert!(matches!(classify_pr(&app_other_branch, &policy, &BTreeMap::new()), StewardDecision::ArmMergeQueue));
+    assert!(matches!(
+        classify_pr(&app_other_branch, &policy, &BTreeMap::new()),
+        StewardDecision::ArmMergeQueue
+    ));
     let mut dependabot = app_other_branch;
     dependabot.author = Some("dependabot[bot]".to_owned());
-    assert_eq!(classify_pr(&dependabot, &policy, &BTreeMap::new()), StewardDecision::Unmanaged);
+    assert_eq!(
+        classify_pr(&dependabot, &policy, &BTreeMap::new()),
+        StewardDecision::Unmanaged
+    );
 }
 
 #[test]

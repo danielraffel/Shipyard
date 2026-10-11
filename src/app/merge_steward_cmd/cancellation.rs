@@ -245,6 +245,7 @@ pub(super) fn apply_repo_plan(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn apply_pr_plans(
     actions: &GitHubActions,
     args: &StewardCommandArgs,
@@ -334,9 +335,10 @@ pub(super) fn apply_pr_plans(
                         .expect("apply mode requires mutation control");
                     match super::recovery::wake_owner_comment(context, pr, &decision) {
                         Ok(action) => {
-                            mutation = Some(mutation.map_or(action.clone(), |prior| {
-                                format!("{prior},{action}")
-                            }));
+                            mutation = Some(
+                                mutation
+                                    .map_or(action.clone(), |prior| format!("{prior},{action}")),
+                            );
                         }
                         Err(wake_error) => error = Some(wake_error),
                     }

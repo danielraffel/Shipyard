@@ -94,6 +94,7 @@ pub(super) fn enqueue_pull_request(
     enqueue_pull_request_with_recovery(context, pr, policy, ledger, false)
 }
 
+#[allow(clippy::too_many_lines)]
 fn enqueue_pull_request_with_recovery(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
@@ -105,25 +106,71 @@ fn enqueue_pull_request_with_recovery(
     // reviewer policy and the live review/comment records immediately before
     // the enqueue mutation. A stale local ship state or LGTM text is never
     // sufficient evidence.
-    let run_gh = |argv: &[String]| context.actions.run_gh(argv).map_err(|error| error.to_string());
-    if let Ok(mut approval_policy) = crate::head_approval::read_policy(
+    let run_gh = |argv: &[String]| {
+        context
+            .actions
+            .run_gh(argv)
+            .map_err(|error| error.to_string())
+    };
+    let approval_policy = match crate::head_approval::read_policy(
         &run_gh,
         &context.observation.repo,
         &context.observation.base,
-    ) && approval_policy.required
-    {
-        approval_policy.required = true;
+    ) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return (
+                None,
+                Some(format!("head approval policy unreadable: {error}")),
+            );
+        }
+    };
+    if approval_policy.required {
+        let Some((owner, name)) = context.observation.repo.split_once('/') else {
+            return (None, Some("invalid repository slug".to_owned()));
+        };
+        let queue = match run_gh(&[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={}", crate::pr_queue_state::PR_QUEUE_STATE_QUERY),
+            "-F".to_owned(),
+            format!("owner={owner}"),
+            "-F".to_owned(),
+            format!("name={name}"),
+            "-F".to_owned(),
+            format!("number={}", pr.fact.number),
+        ]) {
+            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+                Ok(queue) => queue,
+                Err(error) => {
+                    return (
+                        None,
+                        Some(format!("merge-queue observation unreadable: {error}")),
+                    );
+                }
+            },
+            Err(error) => {
+                return (
+                    None,
+                    Some(format!("merge-queue observation unreadable: {error}")),
+                );
+            }
+        };
         match crate::head_approval::evaluate_with_policy(
             &run_gh,
             &context.observation.repo,
             pr.fact.number,
             &pr.fact.head_sha,
             &approval_policy,
-            &Value::Null,
+            &queue,
         ) {
             Ok(gate) if gate.allows() => {}
             Ok(gate) => {
-                return (Some("waiting_head_approval".to_owned()), Some(gate.explain()));
+                return (
+                    Some("waiting_head_approval".to_owned()),
+                    Some(gate.explain()),
+                );
             }
             Err(error) => return (None, Some(format!("head approval unreadable: {error}"))),
         }
