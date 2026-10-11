@@ -226,10 +226,11 @@ enum Verdict {
 
 fn marker_verdict(body: &str) -> Option<(Verdict, String)> {
     let pattern = Regex::new(
-        r"(?im)^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})|verdict:[ \t]*(APPROVE|HOLD)[ \t]+head:[ \t]*([0-9a-f]{40}))[ \t]*$",
+        r"^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})|verdict:[ \t]*(APPROVE|HOLD)[ \t]+head:[ \t]*([0-9a-f]{40}))[ \t]*$",
     )
     .expect("marker pattern compiles");
-    pattern.captures_iter(body).last().and_then(|capture| {
+    let line = body.lines().rev().find(|line| !line.trim().is_empty())?;
+    pattern.captures(line).and_then(|capture| {
         if let Some(head) = capture.get(1) {
             return Some((Verdict::Approve, head.as_str().to_ascii_lowercase()));
         }
