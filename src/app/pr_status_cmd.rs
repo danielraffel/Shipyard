@@ -187,7 +187,7 @@ pub(crate) fn owner_for(item: &serde_json::Value) -> String {
         .and_then(|commits| commits.last())
         .and_then(|commit| commit.get("authors"))
         .and_then(serde_json::Value::as_array)
-        .and_then(|authors| authors.first())
+        .and_then(|authors| authors.last())
         .and_then(|author| author.get("login"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("team-lead")
