@@ -3,7 +3,7 @@
 # hosts where direct gh must share ghapp's queue-removal policy.
 set -u
 
-GUARDS_DIR="${SHIPYARD_GHAPP_GUARDS_DIR:-}"
+GUARDS_DIR="${SHIPYARD_GHAPP_GUARDS_DIR:-$HOME/.config/shipyard/guards}"
 GUARD="${GUARDS_DIR:+${GUARDS_DIR}/queue-removal-guard}"
 if [[ -z "$GUARD" || ! -x "$GUARD" ]]; then
     echo "gh: queue-removal guard is unavailable; refusing to run" >&2
