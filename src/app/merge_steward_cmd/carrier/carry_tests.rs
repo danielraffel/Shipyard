@@ -73,6 +73,16 @@ enum Update {
     Rejected,
 }
 
+/// A GitHub answer that disagrees with what the carrier expects.
+#[derive(Clone, Copy, PartialEq)]
+enum Fault {
+    None,
+    /// GitHub's live base is the base's parent, not what the clone fetches.
+    StaleLiveBase,
+    /// GitHub answers the disarm with the auto-merge request still on it.
+    DisarmIgnored,
+}
+
 struct Scenario {
     merge_state: &'static str,
     armed: bool,
@@ -81,10 +91,7 @@ struct Scenario {
     live_run: bool,
     base: BaseChange,
     update: Update,
-    /// GitHub's live base is the base's parent, not what the clone fetches.
-    stale_live_base: bool,
-    /// GitHub answers the disarm with the auto-merge request still on it.
-    disarm_ignored: bool,
+    fault: Fault,
 }
 
 impl Default for Scenario {
@@ -97,8 +104,7 @@ impl Default for Scenario {
             live_run: false,
             base: BaseChange::Elsewhere,
             update: Update::Merge,
-            stale_live_base: false,
-            disarm_ignored: false,
+            fault: Fault::None,
         }
     }
 }
@@ -314,42 +320,14 @@ fn gh_body(scenario: &Scenario, bare: &Path, head: &str, state: &Path) -> String
     let runs = format!(
         r#"{{"total_count":1,"workflow_runs":[{{"id":300,"path":".github/workflows/build.yml","name":"Build","event":"pull_request","head_sha":"{head}","status":"{status}","conclusion":{conclusion},"run_attempt":1,"run_started_at":"2026-10-09T08:00:00Z"}}]}}"#
     );
-    let merged =
-        format!("$(git -C '{bare}' merge-tree --write-tree refs/heads/main {head} | head -n 1)");
-    let update = match scenario.update {
-        Update::Merge => format!(
-            "new=$(git -C '{bare}' commit-tree {merged} -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
-        ),
-        Update::Tampered => format!(
-            "new=$(git -C '{bare}' commit-tree $(git -C '{bare}' rev-parse 'refs/heads/main^{{tree}}') -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
-        ),
-        Update::RelocatedLines => format!(
-            "blob=$( (git -C '{bare}' show refs/heads/main:a.txt | grep -vx 'line 30'; echo feature) | git -C '{bare}' hash-object -w --stdin)\n    \
-             tree=$(printf '100644 blob %s\\ta.txt\\n' \"$blob\" | git -C '{bare}' mktree)\n    \
-             new=$(git -C '{bare}' commit-tree \"$tree\" -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
-        ),
-        Update::BaseLandsTheChange => format!(
-            "blob=$(git -C '{bare}' show refs/heads/main:a.txt | sed 's/^line 30$/feature/' | git -C '{bare}' hash-object -w --stdin)\n    \
-             tree=$(printf '100644 blob %s\\ta.txt\\n' \"$blob\" | git -C '{bare}' mktree)\n    \
-             landed=$(git -C '{bare}' commit-tree \"$tree\" -p refs/heads/main -m 'main lands the change')\n    \
-             git -C '{bare}' update-ref refs/heads/main \"$landed\"\n    \
-             new=$(git -C '{bare}' commit-tree {merged} -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
-        ),
-        Update::OffBaseParent => format!(
-            "new=$(git -C '{bare}' commit-tree $(git -C '{bare}' merge-tree --write-tree refs/heads/off-base {head} | head -n 1) -p {head} -p refs/heads/off-base -m \"Merge branch 'main' into feature\")"
-        ),
-        Update::RewrittenHead => format!(
-            "rewritten=$(git -C '{bare}' commit-tree '{head}^{{tree}}' -p '{head}^' -m rewritten)\n    new=$(git -C '{bare}' commit-tree {merged} -p \"$rewritten\" -p refs/heads/main -m \"Merge branch 'main' into feature\")"
-        ),
-        Update::Rejected => "echo 'HTTP 422: merge conflict' >&2; exit 1".to_owned(),
-    };
-    let live_base = if scenario.stale_live_base {
+    let update = update_script(scenario.update, &bare, head);
+    let live_base = if scenario.fault == Fault::StaleLiveBase {
         "refs/heads/main^"
     } else {
         "refs/heads/main"
     };
     // GitHub's answer to the disarm; an ignored disarm leaves the arm on.
-    let disarm = if scenario.disarm_ignored {
+    let disarm = if scenario.fault == Fault::DisarmIgnored {
         format!(
             "printf '%s' '{}'",
             r#"{"data":{"disablePullRequestAutoMerge":{"pullRequest":{"number":42,"autoMergeRequest":{"enabledAt":"2026-10-09T08:00:00Z"}}}}}"#
@@ -386,6 +364,40 @@ case "$*" in
 esac
 "#
     )
+}
+
+/// The fake GitHub's `update-branch`: shell that sets `new` to the commit the
+/// update creates in the origin.
+fn update_script(update: Update, bare: &dyn std::fmt::Display, head: &str) -> String {
+    let merged =
+        format!("$(git -C '{bare}' merge-tree --write-tree refs/heads/main {head} | head -n 1)");
+    match update {
+        Update::Merge => format!(
+            "new=$(git -C '{bare}' commit-tree {merged} -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
+        ),
+        Update::Tampered => format!(
+            "new=$(git -C '{bare}' commit-tree $(git -C '{bare}' rev-parse 'refs/heads/main^{{tree}}') -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
+        ),
+        Update::RelocatedLines => format!(
+            "blob=$( (git -C '{bare}' show refs/heads/main:a.txt | grep -vx 'line 30'; echo feature) | git -C '{bare}' hash-object -w --stdin)\n    \
+             tree=$(printf '100644 blob %s\\ta.txt\\n' \"$blob\" | git -C '{bare}' mktree)\n    \
+             new=$(git -C '{bare}' commit-tree \"$tree\" -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
+        ),
+        Update::BaseLandsTheChange => format!(
+            "blob=$(git -C '{bare}' show refs/heads/main:a.txt | sed 's/^line 30$/feature/' | git -C '{bare}' hash-object -w --stdin)\n    \
+             tree=$(printf '100644 blob %s\\ta.txt\\n' \"$blob\" | git -C '{bare}' mktree)\n    \
+             landed=$(git -C '{bare}' commit-tree \"$tree\" -p refs/heads/main -m 'main lands the change')\n    \
+             git -C '{bare}' update-ref refs/heads/main \"$landed\"\n    \
+             new=$(git -C '{bare}' commit-tree {merged} -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
+        ),
+        Update::OffBaseParent => format!(
+            "new=$(git -C '{bare}' commit-tree $(git -C '{bare}' merge-tree --write-tree refs/heads/off-base {head} | head -n 1) -p {head} -p refs/heads/off-base -m \"Merge branch 'main' into feature\")"
+        ),
+        Update::RewrittenHead => format!(
+            "rewritten=$(git -C '{bare}' commit-tree '{head}^{{tree}}' -p '{head}^' -m rewritten)\n    new=$(git -C '{bare}' commit-tree {merged} -p \"$rewritten\" -p refs/heads/main -m \"Merge branch 'main' into feature\")"
+        ),
+        Update::Rejected => "echo 'HTTP 422: merge conflict' >&2; exit 1".to_owned(),
+    }
 }
 
 fn hold(report: &CarrierRepoReport) -> CarrierHold {
@@ -656,7 +668,7 @@ fn a_carry_whose_own_lines_changed_after_the_prediction_is_left_disarmed() {
 #[test]
 fn a_disarm_that_leaves_auto_merge_on_stops_the_carry() {
     let fixture = Fixture::new(&Scenario {
-        disarm_ignored: true,
+        fault: Fault::DisarmIgnored,
         ..Scenario::default()
     });
     let mut report = fixture.planned();
@@ -677,7 +689,7 @@ fn a_disarm_that_leaves_auto_merge_on_stops_the_carry() {
 #[test]
 fn a_fetched_base_that_is_not_the_live_base_is_refused_before_the_update() {
     let fixture = Fixture::new(&Scenario {
-        stale_live_base: true,
+        fault: Fault::StaleLiveBase,
         ..Scenario::default()
     });
     let mut report = fixture.planned();
