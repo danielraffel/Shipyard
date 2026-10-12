@@ -55,6 +55,11 @@
 //! author nor the fleet App, with no later `HOLD` on the head), recorded in
 //! [`CarrierFacts::carry_approval`]. The arm alone never authorizes a carry.
 //!
+//! The carrier arms the head a carry creates, after verifying it. That arm is
+//! the carrier's, not a reviewer's, so a head that is a GitHub branch-update
+//! merge ([`CarrierFacts::head_is_carry`]) gets no action at all until a
+//! reviewer approves that exact head.
+//!
 //! ## What the planner never does
 //!
 //! It never acts on a pull request that is a draft, conflicting, unarmed,
@@ -255,6 +260,12 @@ pub struct CarrierFacts {
     /// 24 hours, read from its commits. `None` when not read.
     #[serde(default)]
     pub carries_last_day: Option<u32>,
+    /// Whether the current head is a merge commit GitHub made for an
+    /// `update-branch`. Its arm came from whoever carried it, so the head
+    /// needs a reviewer approval of its own ([`Self::carry_approval`]) before
+    /// any action.
+    #[serde(default)]
+    pub head_is_carry: bool,
     /// Required contexts on the current head, in policy order.
     pub required: Vec<RequiredFact>,
     /// Runs on the current head (any event), plus the merge-group runs of the
@@ -353,6 +364,12 @@ pub enum CarrierHold {
     /// No reviewer approval of the current head: a carry extends one.
     CarryNotApproved {
         /// Why none was found.
+        detail: String,
+    },
+    /// The head is a branch-update merge armed by its carrier, and no
+    /// reviewer approved it: the carrier's own arm is not approval.
+    CarriedHeadNotReviewed {
+        /// Why no approval was found.
         detail: String,
     },
     /// The day's carries could not be counted.
@@ -503,6 +520,17 @@ pub fn plan(facts: &CarrierFacts) -> CarrierPlan {
     }
     if !facts.approved_head {
         return hold(facts, CarrierHold::HeadNotApproved);
+    }
+    if facts.head_is_carry && facts.carry_approval.is_none() {
+        return hold(
+            facts,
+            CarrierHold::CarriedHeadNotReviewed {
+                detail: facts
+                    .carry_approval_detail
+                    .clone()
+                    .unwrap_or_else(|| "no reviewer approval was read".to_owned()),
+            },
+        );
     }
     match ejection {
         None => plan_armed(facts, &merge_state),

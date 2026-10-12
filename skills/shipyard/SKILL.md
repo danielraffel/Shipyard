@@ -385,8 +385,13 @@ changes whenever the base touches the same file. Git evidence is read in the
 target repository's clone (`--clone OWNER/REPO=PATH`) after fetching
 `refs/heads/<base>` and `refs/pull/<n>/head` into carrier-private refs; the
 update endpoint answers 202 with no head, so the new head is read back from
-the pull request. A mismatch before the update refuses it; a mismatch after it
-leaves the pull request disarmed with `carry_verification_failed` in the audit.
+the pull request. GitHub does not disable auto-merge when an account with write
+access updates the branch, so the carrier disarms before the `PUT` (a refused
+`PUT` re-arms the unchanged head). A mismatch before the update refuses it; a
+mismatch after it leaves the pull request disarmed with
+`carry_verification_failed` in the audit. The carrier's own arm of a carried
+head is not approval: a head that is a GitHub `Merge branch '<base>' into`
+commit gets no carrier action until a reviewer approves that head.
 
 ## A transient rerun needs the interruption signature, not a conclusion
 

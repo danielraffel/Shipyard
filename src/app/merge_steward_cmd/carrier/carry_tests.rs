@@ -55,6 +55,11 @@ enum Update {
     Merge,
     /// A merge commit whose tree drops the pull request's change.
     Tampered,
+    /// A correct merge tree whose first parent is a rewrite of the approved
+    /// head (same tree, different commit), not the approved head itself.
+    RewrittenHead,
+    /// GitHub refuses the update.
+    Rejected,
 }
 
 struct Scenario {
@@ -65,6 +70,8 @@ struct Scenario {
     live_run: bool,
     base: BaseChange,
     update: Update,
+    /// GitHub's live base is the base's parent, not what the clone fetches.
+    stale_live_base: bool,
 }
 
 impl Default for Scenario {
@@ -77,6 +84,7 @@ impl Default for Scenario {
             live_run: false,
             base: BaseChange::Elsewhere,
             update: Update::Merge,
+            stale_live_base: false,
         }
     }
 }
@@ -122,7 +130,10 @@ impl Fixture {
         git(temp.path(), &["clone", "-q", "owner/repo.git", "clone"]);
         let clone = temp.path().join("clone");
 
-        let actions = fake_gh(&temp, &gh_body(scenario, &bare, &head));
+        if scenario.armed {
+            fs::write(temp.path().join("armed-head"), &head).expect("armed");
+        }
+        let actions = fake_gh(&temp, &gh_body(scenario, &bare, &head, temp.path()));
         let observation = observation(scenario.merge_state, &head);
         Self {
             temp,
@@ -179,6 +190,14 @@ impl Fixture {
         )
     }
 
+    /// The head native auto-merge is armed on, as the fake GitHub keeps it:
+    /// set by an arm, cleared by a disarm, untouched by `update-branch`.
+    fn armed_head(&self) -> Option<String> {
+        fs::read_to_string(self.temp.path().join("armed-head"))
+            .ok()
+            .map(|head| head.trim().to_owned())
+    }
+
     fn audit(&self) -> String {
         fs::read_to_string(self.temp.path().join("state/merge_queue/mutations.jsonl"))
             .unwrap_or_default()
@@ -230,8 +249,9 @@ fn observation(merge_state: &str, head: &str) -> RepoObservation {
     }
 }
 
-fn gh_body(scenario: &Scenario, bare: &Path, head: &str) -> String {
+fn gh_body(scenario: &Scenario, bare: &Path, head: &str, state: &Path) -> String {
     let bare = bare.display();
+    let state = state.display();
     let (auto_merge, arm_event) = if scenario.armed {
         (
             r#"{"enabledAt":"2026-10-09T08:00:00Z"}"#,
@@ -271,29 +291,45 @@ fn gh_body(scenario: &Scenario, bare: &Path, head: &str) -> String {
     let runs = format!(
         r#"{{"total_count":1,"workflow_runs":[{{"id":300,"path":".github/workflows/build.yml","name":"Build","event":"pull_request","head_sha":"{head}","status":"{status}","conclusion":{conclusion},"run_attempt":1,"run_started_at":"2026-10-09T08:00:00Z"}}]}}"#
     );
-    let tree = if scenario.update == Update::Tampered {
-        format!("tree=$(git -C '{bare}' rev-parse 'refs/heads/main^{{tree}}')")
+    let merged =
+        format!("$(git -C '{bare}' merge-tree --write-tree refs/heads/main {head} | head -n 1)");
+    let update = match scenario.update {
+        Update::Merge => format!(
+            "new=$(git -C '{bare}' commit-tree {merged} -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
+        ),
+        Update::Tampered => format!(
+            "new=$(git -C '{bare}' commit-tree $(git -C '{bare}' rev-parse 'refs/heads/main^{{tree}}') -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
+        ),
+        Update::RewrittenHead => format!(
+            "rewritten=$(git -C '{bare}' commit-tree '{head}^{{tree}}' -p '{head}^' -m rewritten)\n    new=$(git -C '{bare}' commit-tree {merged} -p \"$rewritten\" -p refs/heads/main -m \"Merge branch 'main' into feature\")"
+        ),
+        Update::Rejected => "echo 'HTTP 422: merge conflict' >&2; exit 1".to_owned(),
+    };
+    let live_base = if scenario.stale_live_base {
+        "refs/heads/main^"
     } else {
-        format!(
-            "tree=$(git -C '{bare}' merge-tree --write-tree refs/heads/main {head} | head -n 1)"
-        )
+        "refs/heads/main"
     };
     format!(
         r#"
 export GIT_AUTHOR_NAME=GitHub GIT_AUTHOR_EMAIL=noreply@github.com GIT_COMMITTER_NAME=GitHub GIT_COMMITTER_EMAIL=noreply@github.com
 case "$*" in
   *"contents/.shipyard/config.toml"*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["{REVIEWER}"]' ;;
-  *enablePullRequestAutoMerge*) printf '%s' '{ARMED}' ;;
+  *disablePullRequestAutoMerge*)
+    rm -f '{state}/armed-head'
+    printf '%s' '{{"data":{{"disablePullRequestAutoMerge":{{"pullRequest":{{"number":42,"autoMergeRequest":null}}}}}}}}' ;;
+  *enablePullRequestAutoMerge*)
+    for arg in "$@"; do case "$arg" in head=*) printf '%s' "${{arg#head=}}" > '{state}/armed-head' ;; esac; done
+    printf '%s' '{ARMED}' ;;
   *timelineItems*) printf '%s' '{timeline}' ;;
   *"repos/owner/repo/pulls/42/reviews"*) printf '%s\n' '{reviews}' ;;
   *"--paginate repos/owner/repo/issues/42/comments"*) : ;;
   *"repos/owner/repo/issues/42/comments?per_page=100"*) printf '%s' '[]' ;;
   *"repos/owner/repo/pulls/42/commits"*) printf '%s\n' '{commits}' ;;
   *"actions/runs?head_sha={head}"*) printf '%s' '{runs}' ;;
-  *"repos/owner/repo/branches/main"*) printf '{{"commit":{{"sha":"%s"}}}}' "$(git -C '{bare}' rev-parse refs/heads/main)" ;;
+  *"repos/owner/repo/branches/main"*) printf '{{"commit":{{"sha":"%s"}}}}' "$(git -C '{bare}' rev-parse {live_base})" ;;
   *"--method PUT repos/owner/repo/pulls/42/update-branch"*)
-    {tree}
-    new=$(git -C '{bare}' commit-tree "$tree" -p {head} -p refs/heads/main -m "Merge branch 'main' into feature")
+    {update}
     git -C '{bare}' update-ref refs/pull/42/head "$new"
     printf '%s' '{{"message":"Updating pull request branch."}}' ;;
   "api repos/owner/repo/pulls/42") printf '{{"head":{{"sha":"%s"}}}}' "$(git -C '{bare}' rev-parse refs/pull/42/head)" ;;
@@ -319,6 +355,7 @@ fn assert_not_carried(fixture: &Fixture, mut report: CarrierRepoReport) {
     let calls = fixture.calls();
     assert!(!calls.contains("update-branch"), "{calls}");
     assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+    assert!(!calls.contains("disablePullRequestAutoMerge"), "{calls}");
     assert_eq!(fixture.pr_head(), fixture.head);
 }
 
@@ -363,6 +400,12 @@ fn an_approved_armed_behind_head_is_carried_verified_and_rearmed() {
         "{calls}"
     );
     assert!(calls.contains(&format!("head={new_head}")), "{calls}");
+    // Disarmed before the update, armed again only on the verified head.
+    let disarm = calls.find("disablePullRequestAutoMerge").expect("disarm");
+    let update = calls.find("update-branch").expect("update");
+    let arm = calls.find("enablePullRequestAutoMerge").expect("arm");
+    assert!(disarm < update && update < arm, "{calls}");
+    assert_eq!(fixture.armed_head().as_deref(), Some(new_head.as_str()));
     let audit = fixture.audit();
     assert!(audit.contains("merge_tree:"), "{audit}");
     assert!(audit.contains("own_lines_sha256:"), "{audit}");
@@ -476,26 +519,86 @@ fn a_carry_that_would_change_the_own_lines_is_refused_before_the_update() {
     let calls = fixture.calls();
     assert!(!calls.contains("update-branch"), "{calls}");
     assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+    // Refused before anything moved: the approved head stays armed.
+    assert_eq!(fixture.armed_head().as_deref(), Some(fixture.head.as_str()));
 }
 
-#[test]
-fn a_carried_tree_that_does_not_match_is_not_rearmed() {
-    let fixture = Fixture::new(&Scenario {
-        update: Update::Tampered,
-        ..Scenario::default()
-    });
+/// Apply the carry and return its error; GitHub's arm, which survives an
+/// `update-branch` by a writer, must be gone.
+fn carry_left_disarmed(fixture: &Fixture) -> String {
     let mut report = fixture.planned();
     fixture.apply(&mut report, &fixture.clones());
     let error = report.prs[0].error.clone().unwrap_or_default();
-    assert!(error.contains("not re-armed"), "{:?}", report.prs[0]);
+    assert!(error.contains("left disarmed"), "{:?}", report.prs[0]);
     let calls = fixture.calls();
+    assert!(calls.contains("disablePullRequestAutoMerge"), "{calls}");
     assert!(calls.contains("update-branch"), "{calls}");
     assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+    assert_eq!(fixture.armed_head(), None, "{calls}");
     assert!(
         fixture.audit().contains("carry_verification_failed"),
         "{}",
         fixture.audit()
     );
+    error
+}
+
+#[test]
+fn a_carried_tree_that_does_not_match_is_left_disarmed() {
+    let fixture = Fixture::new(&Scenario {
+        update: Update::Tampered,
+        ..Scenario::default()
+    });
+    carry_left_disarmed(&fixture);
+}
+
+#[test]
+fn a_carry_whose_first_parent_is_not_the_approved_head_is_left_disarmed() {
+    // Same tree and own lines as a correct carry: only the first parent
+    // shows that the approved commit is not what was carried.
+    let fixture = Fixture::new(&Scenario {
+        update: Update::RewrittenHead,
+        ..Scenario::default()
+    });
+    let error = carry_left_disarmed(&fixture);
+    assert!(
+        error.contains("does not descend from the approved head"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_fetched_base_that_is_not_the_live_base_is_refused_before_the_update() {
+    let fixture = Fixture::new(&Scenario {
+        stale_live_base: true,
+        ..Scenario::default()
+    });
+    let mut report = fixture.planned();
+    fixture.apply(&mut report, &fixture.clones());
+    let error = report.prs[0].error.clone().unwrap_or_default();
+    assert!(error.contains("live main"), "{:?}", report.prs[0]);
+    let calls = fixture.calls();
+    assert!(!calls.contains("update-branch"), "{calls}");
+    assert!(!calls.contains("disablePullRequestAutoMerge"), "{calls}");
+    assert_eq!(fixture.armed_head().as_deref(), Some(fixture.head.as_str()));
+}
+
+#[test]
+fn a_refused_update_re_arms_the_unchanged_approved_head() {
+    let fixture = Fixture::new(&Scenario {
+        update: Update::Rejected,
+        ..Scenario::default()
+    });
+    let mut report = fixture.planned();
+    fixture.apply(&mut report, &fixture.clones());
+    let error = report.prs[0].error.clone().unwrap_or_default();
+    assert!(
+        error.contains("update branch failed"),
+        "{:?}",
+        report.prs[0]
+    );
+    assert_eq!(fixture.pr_head(), fixture.head);
+    assert_eq!(fixture.armed_head().as_deref(), Some(fixture.head.as_str()));
 }
 
 #[test]

@@ -444,3 +444,81 @@ fn a_host_that_is_not_the_mutation_machine_cannot_apply() {
     assert!(report.prs[0].error.is_some());
     assert!(!gh_calls(&temp).contains("enablePullRequestAutoMerge"));
 }
+
+/// A fake `gh` for the starved removal above whose head commit is the
+/// captured commit `commit_fixture`, with `reviews` (JSON lines) on the PR.
+#[cfg(unix)]
+fn carried_head_gh(temp: &tempfile::TempDir, commit_fixture: &str, reviews: &str) -> GitHubActions {
+    let commit = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/merge-carrier")
+        .join(commit_fixture);
+    let reviews_file = temp.path().join("reviews.jsonl");
+    fs::write(&reviews_file, reviews).expect("reviews");
+    let prefix = format!(
+        r#"
+case "$*" in
+  *"repos/owner/repo/commits/{HEAD}"*) cat '{}'; exit 0 ;;
+  *"contents/.shipyard/config.toml"*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["shipyard-review[bot]"]'; exit 0 ;;
+  *"repos/owner/repo/pulls/42/reviews"*) cat '{}'; exit 0 ;;
+  *"--paginate repos/owner/repo/issues/42/comments"*) exit 0 ;;
+esac
+"#,
+        commit.display(),
+        reviews_file.display(),
+    );
+    fake_gh(temp, &(prefix + &ejected_gh_body(STARVED_MACOS, ARMED)))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_carried_head_needs_a_reviewer_approval_of_its_own_before_a_rearm() {
+    // The head is a GitHub branch-update merge (captured from
+    // Generous-Corp/pulp 3984373c): its arm was the carrier's, so it is not
+    // re-armed after the starved removal until a reviewer names it.
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = carried_head_gh(&temp, "update-branch-merge-commit.json", "");
+    let report = planned_report(&actions, &ejected_observation());
+    assert!(
+        report.prs[0].facts.head_is_carry,
+        "{:?}",
+        report.prs[0].facts
+    );
+    assert!(
+        matches!(
+            &report.prs[0].plan.decision,
+            crate::merge_carrier::CarrierDecision::Hold {
+                hold: crate::merge_carrier::CarrierHold::CarriedHeadNotReviewed { .. }
+            }
+        ),
+        "{:?}",
+        report.prs[0].plan
+    );
+
+    let temp = tempfile::tempdir().expect("temp");
+    let review = format!(
+        r#"{{"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-09T09:00:00Z","state":"APPROVED","commit_id":"{HEAD}","performed_via_github_app_id":999}}"#
+    );
+    let actions = carried_head_gh(&temp, "update-branch-merge-commit.json", &review);
+    let report = planned_report(&actions, &ejected_observation());
+    assert_eq!(
+        report.prs[0].plan.action(),
+        Some(&CarrierAction::Rearm {
+            head: HEAD.to_owned()
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_ordinary_head_keeps_its_arm_as_the_approval_record() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = carried_head_gh(&temp, "ordinary-commit.json", "");
+    let report = planned_report(&actions, &ejected_observation());
+    assert!(!report.prs[0].facts.head_is_carry);
+    assert_eq!(
+        report.prs[0].plan.action(),
+        Some(&CarrierAction::Rearm {
+            head: HEAD.to_owned()
+        })
+    );
+}

@@ -43,6 +43,9 @@ const EXACT_HEAD_ARM_MUTATION: &str = "mutation($id:ID!,$head:GitObjectID!){\
      enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:MERGE,\
      expectedHeadOid:$head}){pullRequest{number}}}";
 
+/// Disarm native auto-merge; the answer names any request left armed.
+const DISARM_MUTATION: &str = "mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){pullRequest{number autoMergeRequest{enabledAt}}}}";
+
 /// Arguments for `shipyard runner carrier`.
 #[derive(Clone, Debug)]
 pub(crate) struct CarrierCommandArgs {
@@ -364,6 +367,7 @@ fn carrier_facts(
         carry_approval: None,
         carry_approval_detail: None,
         carries_last_day: None,
+        head_is_carry: false,
         required,
         runs: Vec::new(),
         observed_at: Utc::now(),
@@ -396,6 +400,7 @@ fn carrier_facts(
     if !facts.approved_head {
         return Ok(facts);
     }
+    read_carried_head(actions, observation, pr, response.as_ref(), &mut facts)?;
     if facts
         .required
         .iter()
@@ -405,20 +410,8 @@ fn carrier_facts(
             .runs
             .extend(interrupted_head_runs(actions, &observation.repo, &facts)?);
     }
-    if let CarrierQueueFact::Ejected {
-        reason,
-        new_head_since: false,
-        merge_group_commit: Some(commit),
-    } = &facts.queue
-        && reason.eq_ignore_ascii_case("failed_checks")
-    {
-        let mut group_runs =
-            runs_for_head(actions, &observation.repo, commit, Some("merge_group"))?;
-        for run in &mut group_runs {
-            run.jobs = latest_jobs(actions, &observation.repo, run.id, false)?;
-        }
-        facts.runs.extend(group_runs);
-    }
+    let group_runs = removal_group_runs(actions, &observation.repo, &facts.queue)?;
+    facts.runs.extend(group_runs);
     if matches!(facts.queue, CarrierQueueFact::ArmedNotQueued)
         && facts.merge_state == "BEHIND"
         && let Some(queue) = &response
@@ -432,6 +425,81 @@ fn carrier_facts(
 /// run on it (a live one holds the carry), and how many merge-only updates
 /// GitHub made on the pull request in the last day.
 fn read_carry_facts(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    queue: &Value,
+    facts: &mut CarrierFacts,
+) -> Result<(), String> {
+    if facts.carry_approval.is_none() && facts.carry_approval_detail.is_none() {
+        read_head_approval(actions, observation, pr, queue, facts)?;
+    }
+    let repo = &observation.repo;
+    if facts.runs.is_empty() {
+        facts
+            .runs
+            .extend(runs_for_head(actions, repo, &pr.fact.head_sha, None)?);
+    }
+    facts.carries_last_day = Some(github_carries_last_day(
+        actions,
+        repo,
+        pr.fact.number,
+        &observation.base,
+        facts.observed_at,
+    )?);
+    Ok(())
+}
+
+/// The merge-group runs, with jobs, of a same-head removal for failed checks.
+fn removal_group_runs(
+    actions: &GitHubActions,
+    repo: &str,
+    queue: &CarrierQueueFact,
+) -> Result<Vec<RunFact>, String> {
+    let CarrierQueueFact::Ejected {
+        reason,
+        new_head_since: false,
+        merge_group_commit: Some(commit),
+    } = queue
+    else {
+        return Ok(Vec::new());
+    };
+    if !reason.eq_ignore_ascii_case("failed_checks") {
+        return Ok(Vec::new());
+    }
+    let mut group_runs = runs_for_head(actions, repo, commit, Some("merge_group"))?;
+    for run in &mut group_runs {
+        run.jobs = latest_jobs(actions, repo, run.id, false)?;
+    }
+    Ok(group_runs)
+}
+
+/// Whether the head is a branch-update merge and, when it is, the reviewer
+/// approval it needs of its own.
+fn read_carried_head(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+    queue: Option<&Value>,
+    facts: &mut CarrierFacts,
+) -> Result<(), String> {
+    facts.head_is_carry = head_is_branch_update(
+        actions,
+        &observation.repo,
+        &observation.base,
+        &pr.fact.head_sha,
+    )?;
+    if facts.head_is_carry
+        && let Some(queue) = queue
+    {
+        read_head_approval(actions, observation, pr, queue, facts)?;
+    }
+    Ok(())
+}
+
+/// The reviewer approval of the current head through [`crate::head_approval`],
+/// into [`CarrierFacts::carry_approval`], or why there is none.
+fn read_head_approval(
     actions: &GitHubActions,
     observation: &RepoObservation,
     pr: &ObservedPr,
@@ -463,19 +531,44 @@ fn read_carry_facts(
         },
         Err(error) => facts.carry_approval_detail = Some(error),
     }
-    if facts.runs.is_empty() {
-        facts
-            .runs
-            .extend(runs_for_head(actions, repo, &pr.fact.head_sha, None)?);
-    }
-    facts.carries_last_day = Some(github_carries_last_day(
-        actions,
-        repo,
-        pr.fact.number,
-        &observation.base,
-        facts.observed_at,
-    )?);
     Ok(())
+}
+
+/// Whether `head` is a merge commit GitHub made for an `update-branch`:
+/// two parents, committed by GitHub, `Merge branch '<base>' into ...`. Such a
+/// head was armed by whoever carried it, so its arm is not a reviewer's
+/// approval of it.
+fn head_is_branch_update(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    head: &str,
+) -> Result<bool, String> {
+    let commit = gh_json(
+        actions,
+        &[
+            "api".to_owned(),
+            format!("repos/{repo}/commits/{head}"),
+            "--jq".to_owned(),
+            "{parents: [.parents[].sha], committer_email: .commit.committer.email, message: \
+             .commit.message}"
+                .to_owned(),
+        ],
+        "head commit",
+    )?;
+    Ok(is_branch_update_commit(&commit, base))
+}
+
+fn is_branch_update_commit(commit: &Value, base: &str) -> bool {
+    commit
+        .get("parents")
+        .and_then(Value::as_array)
+        .is_some_and(|parents| parents.len() == 2)
+        && commit.get("committer_email").and_then(Value::as_str) == Some("noreply@github.com")
+        && commit
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.starts_with(&format!("Merge branch '{base}' into ")))
 }
 
 /// One line naming the approval a carry extends, for the plan and the audit.
@@ -1087,6 +1180,13 @@ fn update_branch(
         format!("own_lines_sha256:{}", prediction.own_lines_sha256),
         "update_method:merge".to_owned(),
     ])?;
+    // GitHub keeps auto-merge armed through an update-branch made by an
+    // account with write access, so the new head would merge on green
+    // before it is verified. Disarm first; only a verified head is armed.
+    if let Err(error) = disarm(actions, node_id) {
+        guard.finish("carry_disarm_failed")?;
+        return Err(format!("could not disarm before the carry: {error}"));
+    }
     let args = vec![
         "api".to_owned(),
         "--method".to_owned(),
@@ -1099,12 +1199,16 @@ fn update_branch(
     ];
     if let Err(error) = actions.run_gh_internal_queue_mutation(&args) {
         guard.finish("carry_failed")?;
-        return Err(format!("update branch failed: {error}"));
+        // Nothing moved: the approved head is armed again as it was.
+        let restored = rearm(actions, store, mode, global_dir, state, node_id, head)
+            .unwrap_or_else(|rearm_error| format!("re-arm failed, left disarmed: {rearm_error}"));
+        return Err(format!("update branch failed: {error}; {restored}"));
     }
     let Some(new_head) = carried_head(actions, state, head) else {
         guard.finish("carry_head_unobserved")?;
         return Err(format!(
-            "update branch was accepted but the pull request head never moved from {head};              not re-armed"
+            "update branch was accepted but the pull request head never moved from {head}; \
+             left disarmed"
         ));
     };
     let tree = match carry::verify(
@@ -1119,7 +1223,7 @@ fn update_branch(
         Err(error) => {
             guard.finish("carry_verification_failed")?;
             return Err(format!(
-                "carried {head} to {new_head}, not re-armed: {error}"
+                "carried {head} to {new_head}, left disarmed: {error}"
             ));
         }
     };
@@ -1144,6 +1248,40 @@ fn update_branch(
     Ok(format!(
         "carried {head} to {new_head} with merge tree {tree} ({approval}); {arm}"
     ))
+}
+
+/// Disarm native auto-merge. Accepted only when GitHub answers with the pull
+/// request and no auto-merge request on it.
+fn disarm(actions: &GitHubActions, node_id: &str) -> Result<(), String> {
+    if node_id.is_empty() {
+        return Err("pull request node ID unavailable".to_owned());
+    }
+    let args = vec![
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={DISARM_MUTATION}"),
+        "-F".to_owned(),
+        format!("id={node_id}"),
+    ];
+    let raw = actions
+        .run_gh_internal_queue_mutation(&args)
+        .map_err(|error| error.to_string())?;
+    let value: Value =
+        serde_json::from_str(&raw).map_err(|error| format!("disarm answer unreadable: {error}"))?;
+    let pull = value
+        .pointer("/data/disablePullRequestAutoMerge/pullRequest")
+        .filter(|pull| pull.is_object())
+        .ok_or_else(|| {
+            first_graphql_error(&raw).unwrap_or_else(|| "no pull request in the answer".to_owned())
+        })?;
+    if pull
+        .get("autoMergeRequest")
+        .is_some_and(|request| !request.is_null())
+    {
+        return Err("auto-merge is still armed after the disarm".to_owned());
+    }
+    Ok(())
 }
 
 /// The pull request's head once GitHub has applied the update, read until it

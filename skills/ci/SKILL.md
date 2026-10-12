@@ -246,6 +246,10 @@ host; agents read it, they do not run `--apply`.
   the current directory when its origin is that repository) after fetching
   the live refs, refuses before the update on a mismatch, verifies the
   commit GitHub created, and re-arms the new head only when both match.
+  GitHub keeps auto-merge armed through an update-branch by a writer, so the
+  carrier disarms before the update and a failed verification leaves the PR
+  disarmed. A head that is a GitHub branch-update merge was armed by its
+  carrier, so no class acts on it until a reviewer approves that exact head.
 - **Approval record.** Redispatch and rearm act only on a head GitHub's
   timeline shows armed: an `AutoMergeEnabledEvent` at or after the head
   arrived (its force-push, or its first check suite). Only the arming actor

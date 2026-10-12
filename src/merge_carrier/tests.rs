@@ -78,6 +78,7 @@ fn armed() -> CarrierFacts {
         carry_approval: None,
         carry_approval_detail: None,
         carries_last_day: None,
+        head_is_carry: false,
         required: vec![green("macos"), green("Enforce")],
         runs: Vec::new(),
         observed_at: at("2026-10-09T10:00:00Z"),
