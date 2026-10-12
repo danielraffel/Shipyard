@@ -2297,8 +2297,8 @@ pub(super) enum RunnerCommand {
         /// Target branch.
         #[arg(long, default_value = "main")]
         base: String,
-        /// Action class enabled for `--apply`: redispatch or rearm.
-        /// `update_branch` is planned but refused for `--apply`.
+        /// Action class enabled for `--apply`: `redispatch`, `rearm`, or
+        /// `update_branch`.
         #[arg(long = "class")]
         class: Vec<String>,
         /// JSON file naming the actions the controller intends to apply,
@@ -2308,6 +2308,12 @@ pub(super) enum RunnerCommand {
         /// Plan recorded carrier facts (JSON lines) instead of reading GitHub.
         #[arg(long)]
         replay: Option<PathBuf>,
+        /// Local clone of a repository, as `OWNER/REPO=PATH`, where
+        /// `update_branch` verifies its merge tree and own lines. Repeatable;
+        /// without one, the current directory is used when its origin is that
+        /// repository.
+        #[arg(long = "clone", value_name = "OWNER/REPO=PATH")]
+        clone: Vec<String>,
         /// Perform the intended, still-valid mutations of the enabled classes.
         #[arg(long)]
         apply: bool,

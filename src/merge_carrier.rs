@@ -17,10 +17,11 @@
 //! * [`CarrierClass::Rearm`] re-arms native auto-merge on the exact head the
 //!   queue removed, when every required merge-group job that did not pass
 //!   starved.
-//! * [`CarrierClass::UpdateBranch`] proposes a merge-only branch update for an
-//!   armed pull request that is `BEHIND`. It is planned, never applied here:
-//!   applying it needs the own-lines invariant, which extends the approval to
-//!   the merge commit it creates.
+//! * [`CarrierClass::UpdateBranch`] merges the base into an armed pull
+//!   request that is `BEHIND`, when a reviewer approved its exact head, at
+//!   most [`MAX_CARRIES_PER_DAY`] times a day and never while a run on the
+//!   head is live. The command verifies the merge tree and the pull request's
+//!   own lines before and after the update and re-arms only on a match.
 //!
 //! ## Why only GitHub facts
 //!
@@ -47,6 +48,18 @@
 //! the human cross-check. It is not trusted on its own: every agent posts
 //! through the same App identity, so any agent could write one.
 //!
+//! A carry needs more than the arm: it moves the head, so it extends an
+//! approval to a commit nobody reviewed. It therefore requires the reviewer
+//! approval of the exact current head that [`crate::head_approval`] reads for
+//! the steward's enqueue (a configured reviewer identity that is neither the
+//! author nor the fleet App, with no later `HOLD` on the head), recorded in
+//! [`CarrierFacts::carry_approval`]. The arm alone never authorizes a carry.
+//!
+//! The carrier arms the head a carry creates, after verifying it. That arm is
+//! the carrier's, not a reviewer's, so a head that is a GitHub branch-update
+//! merge ([`CarrierFacts::head_is_carry`]) gets no action at all until a
+//! reviewer approves that exact head.
+//!
 //! ## What the planner never does
 //!
 //! It never acts on a pull request that is a draft, conflicting, unarmed,
@@ -66,6 +79,9 @@ pub const MAX_REDISPATCHES_PER_RUN: u64 = crate::transient_interruption::RERUN_B
 /// Reruns the carrier may cause on one pull request within
 /// [`REDISPATCH_WINDOW_MINUTES`].
 pub const MAX_REDISPATCHES_PER_PR_WINDOW: usize = 2;
+/// Merge-only branch updates the carrier may make on one pull request in 24
+/// hours, counted from GitHub's merge commits on the pull request.
+pub const MAX_CARRIES_PER_DAY: u32 = 2;
 /// Window for [`MAX_REDISPATCHES_PER_PR_WINDOW`].
 pub const REDISPATCH_WINDOW_MINUTES: i64 = 60;
 /// Minutes a job must have waited, from creation to cancellation, before a
@@ -82,7 +98,7 @@ pub enum CarrierClass {
     Redispatch,
     /// Re-arm the exact head after an interruption removal.
     Rearm,
-    /// Merge the base into a `BEHIND` head (planned only).
+    /// Merge the base into an approved, armed, `BEHIND` head and re-arm it.
     UpdateBranch,
 }
 
@@ -231,6 +247,25 @@ pub struct CarrierFacts {
     /// trusted on its own.
     #[serde(default)]
     pub review_marker: Option<String>,
+    /// The reviewer approval of the current head that a carry extends
+    /// (`review:<login> app=<id>` or `marker:<login> comment=<id>`), read
+    /// through [`crate::head_approval`]. Read only for an armed `BEHIND` pull
+    /// request.
+    #[serde(default)]
+    pub carry_approval: Option<String>,
+    /// Why no carry approval was found, when one was looked for.
+    #[serde(default)]
+    pub carry_approval_detail: Option<String>,
+    /// Merge-only branch updates GitHub made on the pull request in the last
+    /// 24 hours, read from its commits. `None` when not read.
+    #[serde(default)]
+    pub carries_last_day: Option<u32>,
+    /// Whether the current head is a merge commit GitHub made for an
+    /// `update-branch`. Its arm came from whoever carried it, so the head
+    /// needs a reviewer approval of its own ([`Self::carry_approval`]) before
+    /// any action.
+    #[serde(default)]
+    pub head_is_carry: bool,
     /// Required contexts on the current head, in policy order.
     pub required: Vec<RequiredFact>,
     /// Runs on the current head (any event), plus the merge-group runs of the
@@ -325,6 +360,24 @@ pub enum CarrierHold {
         run_id: u64,
         /// Why it is not an interruption.
         reason: String,
+    },
+    /// No reviewer approval of the current head: a carry extends one.
+    CarryNotApproved {
+        /// Why none was found.
+        detail: String,
+    },
+    /// The head is a branch-update merge armed by its carrier, and no
+    /// reviewer approved it: the carrier's own arm is not approval.
+    CarriedHeadNotReviewed {
+        /// Why no approval was found.
+        detail: String,
+    },
+    /// The day's carries could not be counted.
+    CarryBudgetUnknown,
+    /// [`MAX_CARRIES_PER_DAY`] carries in the last 24 hours.
+    CarryBudgetSpent {
+        /// Carries GitHub recorded.
+        carries: u32,
     },
     /// Retry budget spent.
     RedispatchBudgetSpent {
@@ -468,6 +521,17 @@ pub fn plan(facts: &CarrierFacts) -> CarrierPlan {
     if !facts.approved_head {
         return hold(facts, CarrierHold::HeadNotApproved);
     }
+    if facts.head_is_carry && facts.carry_approval.is_none() {
+        return hold(
+            facts,
+            CarrierHold::CarriedHeadNotReviewed {
+                detail: facts
+                    .carry_approval_detail
+                    .clone()
+                    .unwrap_or_else(|| "no reviewer approval was read".to_owned()),
+            },
+        );
+    }
     match ejection {
         None => plan_armed(facts, &merge_state),
         Some((reason, new_head_since, commit)) => {
@@ -535,14 +599,46 @@ fn plan_armed(facts: &CarrierFacts, merge_state: &str) -> CarrierPlan {
         );
     }
     if merge_state == "BEHIND" {
-        return propose(
+        return plan_carry(facts);
+    }
+    hold(facts, CarrierHold::AwaitingQueue)
+}
+
+/// A green, armed, `BEHIND` head: carry it only with a reviewer approval of
+/// this exact head, no live run on it, and the day's budget left.
+fn plan_carry(facts: &CarrierFacts) -> CarrierPlan {
+    if facts.carry_approval.is_none() {
+        return hold(
+            facts,
+            CarrierHold::CarryNotApproved {
+                detail: facts
+                    .carry_approval_detail
+                    .clone()
+                    .unwrap_or_else(|| "no reviewer approval was read".to_owned()),
+            },
+        );
+    }
+    let live: Vec<u64> = facts
+        .runs
+        .iter()
+        .filter(|run| run.head_sha.eq_ignore_ascii_case(&facts.head_sha) && is_live(&run.status))
+        .map(|run| run.id)
+        .collect();
+    if !live.is_empty() {
+        return hold(facts, CarrierHold::RunStillLive { run_ids: live });
+    }
+    match facts.carries_last_day {
+        None => hold(facts, CarrierHold::CarryBudgetUnknown),
+        Some(carries) if carries >= MAX_CARRIES_PER_DAY => {
+            hold(facts, CarrierHold::CarryBudgetSpent { carries })
+        }
+        Some(_) => propose(
             facts,
             CarrierAction::UpdateBranch {
                 head: facts.head_sha.clone(),
             },
-        );
+        ),
     }
-    hold(facts, CarrierHold::AwaitingQueue)
 }
 
 fn plan_redispatch(facts: &CarrierFacts, interrupted: &[(String, Option<u64>)]) -> CarrierPlan {
