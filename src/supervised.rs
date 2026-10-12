@@ -48,7 +48,7 @@ pub fn supervised(mut command: Command) -> Command {
 /// for production code that should resolve `gh` on `$PATH`.
 #[must_use]
 pub fn gh_supervised(gh_command: Option<&Path>) -> Command {
-    supervised(gh_command.map_or_else(|| Command::new("gh"), Command::new))
+    supervised(gh_command.map_or_else(crate::gh::bare_gh_command, Command::new))
 }
 
 /// Build a `git` invocation marked as supervised.
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn gh_supervised_falls_back_to_gh_on_path_when_none() {
-        let cmd = gh_supervised(None);
+        let cmd = crate::gh::allow_bare_gh_for_test(|| gh_supervised(None));
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("gh"));
         assert_eq!(
             env_value(&cmd, SUPERVISED_ENV_VAR).as_deref(),

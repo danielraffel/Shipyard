@@ -1641,6 +1641,9 @@ When debugging GitHub behavior:
   variables and selects a direct native `gh`, skipping script/wrapper shims.
   Set `github.auth.ambient_gh_binary` to an absolute native GitHub CLI path when
   PATH discovery is not appropriate; never point it at a `ghapp` wrapper.
+  `shipyard doctor` checks that binary (`gh --version`, `gh auth status`)
+  when the key is set, since it is the `gh` Shipyard runs; otherwise it
+  checks `gh` on PATH.
 - Mac-to-Mac portability is config-only. Reprovision env vars, Keychain items,
   1Password sign-in, or App private keys outside Shipyard on the destination
   Mac.

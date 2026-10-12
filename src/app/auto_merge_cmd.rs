@@ -3549,12 +3549,15 @@ mod tests {
     #[test]
     fn queue_admission_arms_native_auto_merge_on_the_validated_head() {
         let client = GhClient::ambient();
-        let command = native_arm_command(
-            &client,
-            Path::new("/tmp"),
-            "PR_kw",
-            "b07b9f1ac9069484e2fa8fdb2319b134c69c3c56",
-        )
+        // Only inspected, never run.
+        let command = crate::gh::allow_bare_gh_for_test(|| {
+            native_arm_command(
+                &client,
+                Path::new("/tmp"),
+                "PR_kw",
+                "b07b9f1ac9069484e2fa8fdb2319b134c69c3c56",
+            )
+        })
         .expect("arm command");
         assert_eq!(
             command_env(&command, INTERNAL_QUEUE_MUTATION_ENV).as_deref(),
@@ -4538,7 +4541,12 @@ exit 91
             expected_validation: Some(ValidatedShipIdentity::from(&state)),
         };
         for _ in 0..2 {
-            let outcome = execute_auto_merge(&store, temp.path(), &request).expect("merge phase");
+            // This child's PATH starts with the fixture directory, so the
+            // `gh` it resolves is the fixture's.
+            let outcome = crate::gh::allow_bare_gh_for_test(|| {
+                execute_auto_merge(&store, temp.path(), &request)
+            })
+            .expect("merge phase");
             assert!(matches!(
                 outcome,
                 AutoMergeOutcome::AutomaticMergeRefused { ref detail }

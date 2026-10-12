@@ -75,6 +75,64 @@ pub fn is_rejected_credential(output: &str) -> bool {
         || lowered.contains("bad credentials")
 }
 
+/// `gh` resolved through `PATH`: what runs when nothing names a binary.
+#[cfg(not(all(test, unix)))]
+#[must_use]
+pub(crate) fn bare_gh_command() -> Command {
+    Command::new("gh")
+}
+
+/// In a test build a `gh` resolved through `PATH` is the host's: it may be
+/// authenticated, and every call it makes is a real GitHub request. So a test
+/// that reaches this panics, naming the injection points, unless it only
+/// inspects the command inside [`allow_bare_gh_for_test`].
+#[cfg(all(test, unix))]
+#[must_use]
+pub(crate) fn bare_gh_command() -> Command {
+    assert_bare_gh_allowed();
+    Command::new("gh")
+}
+
+#[cfg(all(test, unix))]
+fn assert_bare_gh_allowed() {
+    assert!(
+        BARE_GH_ALLOWED.with(std::cell::Cell::get),
+        "test is not hermetic: it would run `gh` from PATH. Give it a fake: \
+         `github.auth.ambient_gh_binary` in its config \
+         (test_support::refusing_gh_config), a gh override, or \
+         GitHubActions::hermetic_for_tests"
+    );
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static BARE_GH_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `inspect` with the bare-`gh` fallback allowed on this thread, for a
+/// test that checks the command production would build without running it.
+#[cfg(test)]
+pub(crate) fn allow_bare_gh_for_test<T>(inspect: impl FnOnce() -> T) -> T {
+    #[cfg(unix)]
+    {
+        let previous = BARE_GH_ALLOWED.with(|allowed| allowed.replace(true));
+        let result = inspect();
+        BARE_GH_ALLOWED.with(|allowed| allowed.set(previous));
+        result
+    }
+    #[cfg(not(unix))]
+    inspect()
+}
+
+/// The `gh` a loaded config names as its ambient binary
+/// (`github.auth.ambient_gh_binary`), if any.
+#[must_use]
+pub(crate) fn configured_ambient_gh_binary(config: &LoadedConfig) -> Option<PathBuf> {
+    GhAuthConfig::from_loaded_config(config)
+        .ok()
+        .and_then(|auth| auth.ambient_gh_binary)
+}
+
 /// Auth-aware GitHub CLI command factory.
 #[derive(Clone)]
 pub struct GhClient {
@@ -227,7 +285,7 @@ impl GhClient {
         let binary = ambient_binary.as_deref().or(binary_override);
         let mut command = match supervision {
             GhSupervision::Supervised => crate::supervised::gh_supervised(binary),
-            GhSupervision::Unsupervised => binary.map_or_else(|| Command::new("gh"), Command::new),
+            GhSupervision::Unsupervised => binary.map_or_else(bare_gh_command, Command::new),
         };
         command.current_dir(cwd);
         match auth_policy {
@@ -297,6 +355,8 @@ impl GhClient {
                 }
             });
         }
+        #[cfg(all(test, unix))]
+        assert_bare_gh_allowed();
         resolve_ambient_gh_from_path(env::var_os("PATH").as_deref())
     }
 

@@ -1496,3 +1496,105 @@ fn repository_slugs_differing_only_in_case_share_one_minted_token() {
         "Owner/CaseRepo\n"
     );
 }
+
+/// The panic message of `run`, or `None` when it returned.
+#[cfg(unix)]
+fn panic_message(run: impl FnOnce()) -> Option<String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .err()
+        .map(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                .unwrap_or_default()
+        })
+}
+
+/// One way a test could reach `gh`, named.
+#[cfg(unix)]
+type Reach<'a> = (&'static str, Box<dyn Fn() + 'a>);
+
+#[cfg(unix)]
+#[test]
+fn every_way_to_reach_gh_through_path_is_refused_in_a_test() {
+    let cwd = TempDir::new().expect("tempdir");
+    let client = GhClient::ambient();
+    let reaches: [Reach<'_>; 4] = [
+        ("the bare fallback", Box::new(|| drop(bare_gh_command()))),
+        (
+            "an ambient client with no binary",
+            Box::new(|| {
+                drop(client.prepare_command(
+                    cwd.path(),
+                    None,
+                    GhSupervision::Unsupervised,
+                    GhAuthPolicy::Default,
+                ));
+            }),
+        ),
+        (
+            "a supervised ambient client",
+            Box::new(|| {
+                drop(client.prepare_command(
+                    cwd.path(),
+                    None,
+                    GhSupervision::Supervised,
+                    GhAuthPolicy::Default,
+                ));
+            }),
+        ),
+        (
+            "ambient-only resolution from PATH",
+            Box::new(|| {
+                drop(client.prepare_command(
+                    cwd.path(),
+                    None,
+                    GhSupervision::Unsupervised,
+                    GhAuthPolicy::AmbientOnly,
+                ));
+            }),
+        ),
+    ];
+    for (what, reach) in &reaches {
+        let message = panic_message(reach).unwrap_or_else(|| panic!("{what} was not refused"));
+        assert!(message.contains("not hermetic"), "{what}: {message}");
+    }
+    // Inside the allowance the production command is built unchanged.
+    let command = allow_bare_gh_for_test(|| {
+        client
+            .prepare_command(
+                cwd.path(),
+                None,
+                GhSupervision::Unsupervised,
+                GhAuthPolicy::Default,
+            )
+            .expect("command")
+    });
+    assert_eq!(command.get_program(), "gh");
+    // The allowance ends with the closure.
+    assert!(panic_message(|| drop(bare_gh_command())).is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_configured_ambient_gh_binary_is_the_injection_point() {
+    let gh = crate::test_support::refusing_gh();
+    let config = config_from_toml(&crate::test_support::refusing_gh_config());
+    assert_eq!(configured_ambient_gh_binary(&config).as_deref(), Some(gh));
+    let cwd = TempDir::new().expect("tempdir");
+    let command = GhClient::from_loaded_config(&config)
+        .expect("client")
+        .prepare_command(
+            cwd.path(),
+            None,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .expect("command");
+    let program = PathBuf::from(command.get_program());
+    assert_eq!(
+        program.canonicalize().expect("program"),
+        gh.canonicalize().expect("fake")
+    );
+}
