@@ -1487,6 +1487,21 @@ context that no merged commit carries is reported as a gap, because a
 misspelled one would otherwise read as a lower red rate. Use `--no-cache` on a
 gate host: the run is read-only then.
 
+With `--selection-step` (repeatable; Pulp: `--selection-step "Test fast
+deterministic tier (pull request head)" --selection-step "Test what this pull
+request reaches (pull request head)"`) each week also reports selector recall,
+in observation mode: for every test a failed merge-group gate lists under "The
+following tests FAILED", whether the gate job on the head of a pull request in
+that group ran it in a selection step. The group is the entry the queue branch
+names plus every entry ahead of it that had not yet merged when the run was
+created. A case is `selected` (a head ran it, whatever it did there),
+`missed` (every head was read and none ran it) or `undetermined` (a head could
+not be read); recall is selected over selected plus missed. Each miss lists
+the group's heads with their selection sizes and the number of the week's
+failed gates naming the same test: one test failing many groups usually means
+the base was red. It reads the log of every failed gate and of each head, so a
+week of Pulp takes minutes.
+
 The agent-facing commands return conservative JSON findings. Use `scorecard`
 for a compact project-level view of outcomes, worker-minutes, queue time,
 distinct-PR throughput, and cache reuse. Fields without durable source data are

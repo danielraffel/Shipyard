@@ -1188,7 +1188,15 @@ pub(crate) enum MetricsCommand {
     ///   red after push = merged pull requests' commits carrying a required
     ///   context on which a required context is red (latest run per name;
     ///   `cancelled` is not red) / commits carrying a required context;
-    ///   repeat failures = check names red on two or more pull requests.
+    ///   repeat failures = check names red on two or more pull requests;
+    ///   selector recall (with --selection-step) = for each test a failed
+    ///   merge-group gate lists under "The following tests FAILED", whether
+    ///   the gate job of a `pull_request` run on the head of a pull request
+    ///   in that group ran it in a selection step: selected / (selected +
+    ///   missed), where missed means every head was read and none ran it,
+    ///   and undetermined (a head unread) is counted apart. The group is the
+    ///   pull request the queue branch names plus every entry ahead of it
+    ///   that had not merged when the run was created.
     /// Required contexts are the base's classic protection, or
     /// `--required-context`.
     ///
@@ -1250,6 +1258,12 @@ pub(crate) struct MetricsGateCostArgs {
     /// the base branch protection's. Repeatable.
     #[arg(long = "required-context", requires = "scorecard")]
     pub(crate) required_contexts: Vec<String>,
+    /// Name of a gate-job step that runs a pull-request head's test
+    /// selection. Repeatable. Given, the scorecard also reports selector
+    /// recall, reading the logs of failed merge-group gates and of their
+    /// groups' heads.
+    #[arg(long = "selection-step", requires = "scorecard")]
+    pub(crate) selection_steps: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]

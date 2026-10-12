@@ -494,6 +494,9 @@ of the one gate job (a separate number), the red-after-push rate on required che
 run per name; cancelled is not red), and check names red across two or more
 pull requests. Pass `--from`/`--to` to measure a past window again; a
 repository without branch protection needs `--required-context`.
+With `--selection-step` it adds selector recall per week: of the tests failed
+merge-group gates listed, the share a pull-request head in the group ran in a
+selection step, with every miss named.
 
 **Not ready:** `shipyard metrics scorecard`, `watch` and `trend` read the local
 metrics store, whose GitHub import has been stale since 2026-09-27 and reports

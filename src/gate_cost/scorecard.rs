@@ -94,6 +94,9 @@ pub struct ScorecardQuery {
     pub base_branch: String,
     /// Required contexts to use instead of the branch protection's.
     pub required_contexts: Vec<String>,
+    /// Gate-job steps that run a pull-request head's test selection; when
+    /// empty, selector recall is not measured.
+    pub selection_steps: Vec<String>,
     /// Window start, inclusive.
     pub from: DateTime<Utc>,
     /// Window end, exclusive.
@@ -145,6 +148,8 @@ pub struct MergeGroupRun {
     pub conclusion: Option<String>,
     /// The highest attempt of the gate job, when the run has one.
     pub gate: Option<GateJobSample>,
+    /// That attempt's job id.
+    pub gate_job_id: Option<u64>,
 }
 
 /// What happened to a pull request in the merge queue.
@@ -185,6 +190,9 @@ pub struct ScorecardObservation {
     pub merge_group_runs: Vec<MergeGroupRun>,
     /// Merge-queue events of the pull requests read, at any date.
     pub queue_events: Vec<QueueEvent>,
+    /// Failed merge-group gates with their groups' heads, when selector
+    /// recall is measured.
+    pub selection: Option<Vec<recall::GroupFailure>>,
     /// Reads that were incomplete or not cross-checked.
     pub gaps: Vec<TelemetryGap>,
 }
@@ -279,6 +287,10 @@ pub struct WeekScore {
     /// Pull requests with more commits than GitHub lists; only their first
     /// [`PR_COMMITS_CAP`] commits are counted.
     pub capped_prs: Vec<u64>,
+    /// Whether the heads of failed merge groups ran the failing tests;
+    /// present when `--selection-step` is given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_recall: Option<recall::SelectionRecall>,
 }
 
 /// Which checks each rate judges: they differ, so two rates that disagree
@@ -312,6 +324,9 @@ pub struct ScorecardReport {
     pub to: String,
     /// Required contexts applied.
     pub required_contexts: Vec<String>,
+    /// Gate-job steps read as a pull-request head's selection.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub selection_steps: Vec<String>,
     /// Where they came from, or why there are none.
     pub required_source: String,
     /// Which checks each rate judges.
@@ -390,6 +405,8 @@ pub fn gather(
     };
     cross_check_listing(gh, &listing_query, MERGE_GROUP_EVENT, &mut runs, &mut gaps);
     let merge_group_runs = read_gates(gh, cache, query, &runs)?;
+    let selection = (!query.selection_steps.is_empty())
+        .then(|| recall::gather(gh, cache, query, &runs, &merge_group_runs));
     let queued: BTreeSet<u64> = runs
         .iter()
         .filter_map(|run| text(run, "head_branch"))
@@ -403,6 +420,7 @@ pub fn gather(
         prs: prs.into_values().collect(),
         merge_group_runs,
         queue_events,
+        selection,
         gaps,
     })
 }
@@ -923,13 +941,19 @@ fn read_gates(
         };
         let gate = candidates
             .into_iter()
-            .map(|job| GateJobSample::from_job(run.id, MERGE_GROUP_EVENT, job))
-            .max_by_key(|sample| sample.attempt);
+            .map(|job| {
+                (
+                    GateJobSample::from_job(run.id, MERGE_GROUP_EVENT, job),
+                    job.get("id").and_then(Value::as_u64),
+                )
+            })
+            .max_by_key(|(sample, _)| sample.attempt);
         Ok::<_, String>(MergeGroupRun {
             run_id: run.id,
             created_at: timestamp(value, "created_at").unwrap_or(query.from),
             conclusion: text(value, "conclusion"),
-            gate,
+            gate_job_id: gate.as_ref().and_then(|(_, id)| *id),
+            gate: gate.map(|(sample, _)| sample),
         })
     });
     read.into_iter().collect()
@@ -1120,6 +1144,13 @@ pub fn compute(observation: &ScorecardObservation) -> ScorecardReport {
                 .filter(|pr| (pr.commits.len() as u64) < pr.commits_total)
                 .map(|pr| pr.number)
                 .collect(),
+            selection_recall: observation.selection.as_ref().map(|failures| {
+                let week: Vec<&recall::GroupFailure> = failures
+                    .iter()
+                    .filter(|failure| failure.created_at >= start && failure.created_at < end)
+                    .collect();
+                recall::compute(&query.repo, &week)
+            }),
         });
         start = end;
     }
@@ -1147,6 +1178,7 @@ pub fn compute(observation: &ScorecardObservation) -> ScorecardReport {
         },
         required_contexts,
         required_source,
+        selection_steps: query.selection_steps.clone(),
         weeks,
         gaps,
     }
@@ -1271,20 +1303,93 @@ pub fn render(report: &ScorecardReport) -> String {
                 repeat.prs.len()
             );
         }
-        if !week.capped_prs.is_empty() {
-            let capped: Vec<String> = week.capped_prs.iter().map(|pr| format!("#{pr}")).collect();
-            let _ = writeln!(
-                out,
-                "  only the first {PR_COMMITS_CAP} commits counted (GitHub lists no more): {}",
-                capped.join(", ")
-            );
-        }
+        render_week_tail(&mut out, week);
     }
     for gap in &report.gaps {
         let _ = writeln!(out, "gap ({}): {}", gap.signal, gap.reason);
     }
     out
 }
+
+/// Capped pull requests and selector recall, after a week's rates.
+fn render_week_tail(out: &mut String, week: &WeekScore) {
+    if !week.capped_prs.is_empty() {
+        let capped: Vec<String> = week.capped_prs.iter().map(|pr| format!("#{pr}")).collect();
+        let _ = writeln!(
+            out,
+            "  only the first {PR_COMMITS_CAP} commits counted (GitHub lists no more): {}",
+            capped.join(", ")
+        );
+    }
+    if let Some(recall) = &week.selection_recall {
+        render_recall(out, recall);
+    }
+}
+
+fn render_recall(out: &mut String, recall: &recall::SelectionRecall) {
+    let _ = writeln!(
+        out,
+        "  selector recall: {} ({} of {} merge-group test failures ran on a pull-request head in \
+         the group; {} missed, {} undetermined); {} failed gates, {} with no failing test, {} \
+         unread",
+        opt(recall.recall),
+        recall.selected,
+        recall.selected + recall.missed,
+        recall.missed,
+        recall.undetermined,
+        recall.failed_gate_runs,
+        recall.runs_without_test_failure,
+        recall.runs_unread
+    );
+    for case in recall
+        .cases
+        .iter()
+        .filter(|case| case.verdict != "selected")
+    {
+        let members: Vec<String> = case
+            .members
+            .iter()
+            .map(|member| {
+                let pr = member
+                    .pr
+                    .map_or_else(|| "unnamed".to_owned(), |pr| format!("#{pr}"));
+                if member.status == "unread" {
+                    return format!(
+                        "{pr} unread ({})",
+                        member.reason.as_deref().unwrap_or("no reason")
+                    );
+                }
+                let mut text = format!(
+                    "{pr} head selection {} test(s)",
+                    member.selection_size.unwrap_or(0)
+                );
+                if member.selection_ran == Some(false) {
+                    text.push_str(", no selection step ran");
+                }
+                if let Some(skipped) = member.declared_budget_skipped.filter(|n| *n > 0) {
+                    let _ = write!(text, ", {skipped} selected but skipped for budget");
+                }
+                text
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "    {}: `{}` ({}, failed {} gate(s) this week) in {}: {}",
+            case.verdict,
+            case.test,
+            case.result,
+            case.failed_gates_with_test,
+            case.run_url,
+            if members.is_empty() {
+                case.reason.clone().unwrap_or_default()
+            } else {
+                members.join("; ")
+            }
+        );
+    }
+}
+
+pub mod recall;
 
 #[cfg(test)]
 mod tests;
