@@ -75,6 +75,10 @@ fn armed() -> CarrierFacts {
         approved_head: true,
         approval_evidence: Some("arm_event:2026-10-09T08:00:00+00:00".to_owned()),
         review_marker: None,
+        carry_approval: None,
+        carry_approval_detail: None,
+        carries_last_day: None,
+        head_is_carry: false,
         required: vec![green("macos"), green("Enforce")],
         runs: Vec::new(),
         observed_at: at("2026-10-09T10:00:00Z"),
@@ -512,6 +516,8 @@ fn a_cancelled_status_with_no_readable_run_is_held() {
 fn a_green_behind_head_proposes_a_merge_update_and_a_clean_one_waits() {
     let mut facts = armed();
     facts.merge_state = "BEHIND".to_owned();
+    facts.carry_approval = Some("review:shipyard-review[bot] app=1".to_owned());
+    facts.carries_last_day = Some(0);
     assert_eq!(
         plan(&facts).action(),
         Some(&CarrierAction::UpdateBranch {
@@ -531,6 +537,34 @@ fn a_green_behind_head_proposes_a_merge_update_and_a_clean_one_waits() {
         held(&plan(&facts)),
         CarrierHold::WaitingRequired { .. }
     ));
+}
+
+#[test]
+fn a_carry_holds_without_approval_with_a_live_run_or_with_the_budget_spent() {
+    let mut facts = armed();
+    facts.merge_state = "BEHIND".to_owned();
+    facts.carries_last_day = Some(0);
+    // The arm record alone is not a carry approval.
+    assert!(matches!(
+        held(&plan(&facts)),
+        CarrierHold::CarryNotApproved { .. }
+    ));
+    facts.carry_approval = Some("review:shipyard-review[bot] app=1".to_owned());
+    facts.runs = vec![run(12, "pull_request", HEAD, "in_progress", 1)];
+    assert_eq!(
+        held(&plan(&facts)),
+        &CarrierHold::RunStillLive { run_ids: vec![12] }
+    );
+    facts.runs.clear();
+    facts.carries_last_day = None;
+    assert_eq!(held(&plan(&facts)), &CarrierHold::CarryBudgetUnknown);
+    facts.carries_last_day = Some(MAX_CARRIES_PER_DAY);
+    assert_eq!(
+        held(&plan(&facts)),
+        &CarrierHold::CarryBudgetSpent { carries: 2 }
+    );
+    facts.carries_last_day = Some(1);
+    assert!(plan(&facts).action().is_some());
 }
 
 #[test]

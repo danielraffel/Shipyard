@@ -1,6 +1,10 @@
 use super::*;
 
 #[cfg(unix)]
+#[path = "carry_tests.rs"]
+mod carry_tests;
+
+#[cfg(unix)]
 use crate::merge_steward::{RequiredCheck, StewardCheck, StewardCheckSource, StewardPullRequest};
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -20,18 +24,29 @@ fn apply_without_a_class_is_refused() {
 }
 
 #[test]
-fn update_branch_can_be_planned_but_never_applied() {
+fn update_branch_is_a_class_that_can_be_applied() {
     let classes = parse_classes(&["update_branch".to_owned()], false).expect("plan");
     assert!(classes.contains(&CarrierClass::UpdateBranch));
-    let error = parse_classes(&["redispatch".to_owned(), "update-branch".to_owned()], true)
-        .expect_err("refused");
-    assert!(error.message.contains("own-lines"), "{}", error.message);
+    assert!(
+        parse_classes(&["redispatch".to_owned(), "update-branch".to_owned()], true)
+            .expect("carry can be applied when its runtime predicates pass")
+            .contains(&CarrierClass::UpdateBranch)
+    );
 }
 
 #[test]
 fn unknown_classes_are_refused() {
     let error = parse_classes(&["merge".to_owned()], false).expect_err("refused");
     assert!(error.message.contains("unknown carrier class"));
+}
+
+#[test]
+fn clone_arguments_must_name_a_repository_and_a_path() {
+    let clones = parse_clones(&["owner/repo=/tmp/clone".to_owned()]).expect("clone");
+    assert_eq!(clones["owner/repo"], PathBuf::from("/tmp/clone"));
+    for bad in ["owner/repo", "repo=/tmp/clone", "owner/repo="] {
+        assert!(parse_clones(&[bad.to_owned()]).is_err(), "{bad}");
+    }
 }
 
 #[test]
@@ -297,6 +312,8 @@ fn apply_rearms_only_the_intended_action_with_the_exact_head() {
     apply_intent(
         &actions,
         &observation,
+        temp.path(),
+        &BTreeMap::new(),
         &rearm_intent(),
         &classes,
         &store,
@@ -333,6 +350,8 @@ fn apply_does_nothing_outside_the_intent_or_the_enabled_classes() {
     apply_intent(
         &actions,
         &observation,
+        temp.path(),
+        &BTreeMap::new(),
         &empty,
         &classes,
         &store,
@@ -347,6 +366,8 @@ fn apply_does_nothing_outside_the_intent_or_the_enabled_classes() {
     apply_intent(
         &actions,
         &observation,
+        temp.path(),
+        &BTreeMap::new(),
         &rearm_intent(),
         &classes,
         &store,
@@ -386,6 +407,8 @@ fn an_intent_naming_an_older_head_is_not_applied() {
     apply_intent(
         &actions,
         &observation,
+        temp.path(),
+        &BTreeMap::new(),
         &intent,
         &BTreeSet::from([CarrierClass::Rearm]),
         &store,
@@ -408,6 +431,8 @@ fn a_host_that_is_not_the_mutation_machine_cannot_apply() {
     apply_intent(
         &actions,
         &observation,
+        temp.path(),
+        &BTreeMap::new(),
         &rearm_intent(),
         &BTreeSet::from([CarrierClass::Rearm]),
         &store,
@@ -418,6 +443,84 @@ fn a_host_that_is_not_the_mutation_machine_cannot_apply() {
     assert!(report.prs[0].mutation.is_none());
     assert!(report.prs[0].error.is_some());
     assert!(!gh_calls(&temp).contains("enablePullRequestAutoMerge"));
+}
+
+/// A fake `gh` for the starved removal above whose head commit is the
+/// captured commit `commit_fixture`, with `reviews` (JSON lines) on the PR.
+#[cfg(unix)]
+fn carried_head_gh(temp: &tempfile::TempDir, commit_fixture: &str, reviews: &str) -> GitHubActions {
+    let commit = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/merge-carrier")
+        .join(commit_fixture);
+    let reviews_file = temp.path().join("reviews.jsonl");
+    fs::write(&reviews_file, reviews).expect("reviews");
+    let prefix = format!(
+        r#"
+case "$*" in
+  *"repos/owner/repo/commits/{HEAD}"*) cat '{}'; exit 0 ;;
+  *"contents/.shipyard/config.toml"*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["shipyard-review[bot]"]'; exit 0 ;;
+  *"repos/owner/repo/pulls/42/reviews"*) cat '{}'; exit 0 ;;
+  *"--paginate repos/owner/repo/issues/42/comments"*) exit 0 ;;
+esac
+"#,
+        commit.display(),
+        reviews_file.display(),
+    );
+    fake_gh(temp, &(prefix + &ejected_gh_body(STARVED_MACOS, ARMED)))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_carried_head_needs_a_reviewer_approval_of_its_own_before_a_rearm() {
+    // The head is a GitHub branch-update merge (captured from
+    // Generous-Corp/pulp 3984373c): its arm was the carrier's, so it is not
+    // re-armed after the starved removal until a reviewer names it.
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = carried_head_gh(&temp, "update-branch-merge-commit.json", "");
+    let report = planned_report(&actions, &ejected_observation());
+    assert!(
+        report.prs[0].facts.head_is_carry,
+        "{:?}",
+        report.prs[0].facts
+    );
+    assert!(
+        matches!(
+            &report.prs[0].plan.decision,
+            crate::merge_carrier::CarrierDecision::Hold {
+                hold: crate::merge_carrier::CarrierHold::CarriedHeadNotReviewed { .. }
+            }
+        ),
+        "{:?}",
+        report.prs[0].plan
+    );
+
+    let temp = tempfile::tempdir().expect("temp");
+    let review = format!(
+        r#"{{"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-09T09:00:00Z","state":"APPROVED","commit_id":"{HEAD}","performed_via_github_app_id":999}}"#
+    );
+    let actions = carried_head_gh(&temp, "update-branch-merge-commit.json", &review);
+    let report = planned_report(&actions, &ejected_observation());
+    assert_eq!(
+        report.prs[0].plan.action(),
+        Some(&CarrierAction::Rearm {
+            head: HEAD.to_owned()
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_ordinary_head_keeps_its_arm_as_the_approval_record() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = carried_head_gh(&temp, "ordinary-commit.json", "");
+    let report = planned_report(&actions, &ejected_observation());
+    assert!(!report.prs[0].facts.head_is_carry);
+    assert_eq!(
+        report.prs[0].plan.action(),
+        Some(&CarrierAction::Rearm {
+            head: HEAD.to_owned()
+        })
+    );
 }
 
 /// A fake `gh` for an armed pull request whose required `macos` run 100 was
