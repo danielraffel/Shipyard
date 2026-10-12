@@ -236,18 +236,33 @@ host; agents read it, they do not run `--apply`.
   `expectedHeadOid` when every required merge-group job that did not pass
   starved: cancelled with no runner after waiting at least ten minutes. A
   no-runner cancel within seconds is a superseding push or a concurrency
-  cancel, not starvation. `update_branch` is planned for a green, armed,
-  `BEHIND` PR and refused for `--apply` until the own-lines invariant exists.
-- **Approval record.** The carrier acts only on a head GitHub's timeline
-  shows armed: an `AutoMergeEnabledEvent` at or after the head arrived (its
-  force-push, or its first check suite). Only the arming actor arms, after
-  reading the verdict, so the arm of this head is its approval; a pushed head
-  carries no arm, and a never-armed head goes to a steward. Reviewers also add
-  a line `reviewed:<full 40-hex head>` to every approval verdict; the carrier
-  records it as a cross-check but never trusts it alone, because every agent
-  posts as the same App and could write one.
+  cancel, not starvation. `update_branch` merges the base into a green,
+  armed, `BEHIND` PR (merge only, `expected_head_sha`) when a configured
+  reviewer identity approved the exact head (`head_approval`, never the arm
+  event), no run on the head is live, and GitHub's commits show fewer than
+  two merge-only updates in 24 hours. It predicts the merge tree and the
+  PR's own lines (`-U0` added/removed lines per file, no index lines or hunk
+  headers) in the repository's own clone (`--clone OWNER/REPO=PATH`, else
+  the current directory when its origin is that repository) after fetching
+  the live refs, refuses before the update on a mismatch, verifies the
+  commit GitHub created, and re-arms the new head only when both match.
+  GitHub keeps auto-merge armed through an update-branch by a writer, so the
+  carrier disarms before the update and a failed verification leaves the PR
+  disarmed. A head that is a GitHub branch-update merge was armed by its
+  carrier, so no class acts on it until a reviewer approves that exact head.
+- **Approval record.** Redispatch and rearm act only on a head GitHub's
+  timeline shows armed: an `AutoMergeEnabledEvent` at or after the head
+  arrived (its force-push, or its first check suite). Only the arming actor
+  arms, after reading the verdict, so the arm of this head is its approval; a
+  pushed head carries no arm, and a never-armed head goes to a steward.
+  Reviewers also add a line `reviewed:<full 40-hex head>` to every approval
+  verdict; the carrier records it as a cross-check but never trusts it alone,
+  because every agent posts as the same App and could write one. A carry
+  also needs the reviewer approval, because it moves the head to a commit
+  nobody reviewed.
 - **Holds.** Draft, conflicting, unarmed, queued, or unapproved PRs; a failed
-  required check; a removal for a real failure, a conflict, or a person's
+  required check; a carry with no reviewer approval, a live run on the head,
+  or two carries already in 24 hours; a removal for a real failure, a conflict, or a person's
   decision; a head pushed after the removal; any unreadable fact.
 - **Apply.** `--apply` needs at least one `--class` and an `--intent FILE`
   the controller wrote first; it re-plans and performs only intended actions a
