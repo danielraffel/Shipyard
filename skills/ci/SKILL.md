@@ -429,6 +429,19 @@ volume was busy. `detach_dmg` now retries, forces the last attempt, and names
 the refusal. A failed run can still leave the image mounted under
 `$TMPDIR/shipyard-dmg-*/mnt` on the runner host; `hdiutil detach` it there.
 Rerunning the failed job is safe.
+
+**No draft exists until the live smoke passes.** `release.yml`'s `release` job
+needs `live-smoke`, which runs `scripts/release_live_smoke.py` on the built
+linux-x64 binary: read-only `runner admission-clean` and `runner steward`
+dry-run, `--mode isolated` under a throwaway HOME, against real repositories
+(`vars.RELEASE_SMOKE_REPOS`, default `Generous-Corp/pulp`; token
+`secrets.RELEASE_SMOKE_GH_TOKEN`, else the job token). Any `error` verdict or
+steward repository error fails the release, as does a lock-held `defer`
+(`observation_in_progress`) or a verdict that does not name the requested
+repository. The job runs with `contents: read` only. v0.302.0-v0.307.0 shipped a census
+GitHub refused on every call; a fake-backed unit test cannot see that, one real
+read does. Run the same gate by hand with
+`python3 scripts/release_live_smoke.py --binary target/release/shipyard`.
 ## Leftover validation TMPDIRs: owner files, sweep, and `cleanup --validation-tmp`
 
 A killed validation run cannot run the Drop that removes its

@@ -2098,6 +2098,12 @@ pub(super) enum RunnerCommand {
         /// current). An unreadable host fails before anything is touched.
         #[arg(long = "lagging-only")]
         lagging_only: bool,
+        /// With --apply: do not run the read-only canary smoke
+        /// (`runner admission-clean` on the first updated host). For an
+        /// emergency rollback while GitHub itself cannot be observed; the
+        /// receipt records that the smoke was skipped.
+        #[arg(long = "skip-canary-smoke")]
+        skip_canary_smoke: bool,
     },
     /// Backstop for releases that did not roll themselves out: compare the
     /// latest published release with every configured host's installed

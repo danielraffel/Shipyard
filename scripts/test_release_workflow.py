@@ -26,6 +26,19 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("--ci-mode", text)
         self.assertIn("CI_MACOS_SIGNING_ENABLED == 'true'", text)
 
+    def test_release_is_gated_on_the_live_github_smoke(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("  live-smoke:\n    needs: build\n", text)
+        self.assertIn("  release:\n    needs: [build, live-smoke]\n", text)
+        self.assertIn("scripts/release_live_smoke.py --binary", text)
+        self.assertIn("name: release-linux-x64", text)
+        self.assertIn("Generous-Corp/pulp", text)
+        live = text.split("  live-smoke:", 1)[1].split("\n  release:", 1)[0]
+        self.assertNotIn("--apply", live)
+        self.assertNotIn("continue-on-error", live)
+        self.assertIn("    permissions:\n      contents: read\n", live)
+        self.assertNotIn("write", live.split("steps:", 1)[0])
+
     def test_release_workflow_uses_current_ci_signing_secret_names_only(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("MACOS_SIGN_P12_BASE64", text)

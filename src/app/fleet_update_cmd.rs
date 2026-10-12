@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 mod auth_support;
+mod canary;
 mod command;
 mod controller_lock;
 mod evidence;
@@ -119,6 +120,7 @@ my $status = $?;
 exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
 "#;
 
+#[allow(clippy::struct_excessive_bools)] // Independent CLI switches, one per flag.
 pub(super) struct FleetUpdateArgs {
     pub(super) to: String,
     pub(super) host_classes: Vec<String>,
@@ -127,6 +129,8 @@ pub(super) struct FleetUpdateArgs {
     /// Skip hosts already at (or ahead of) the target instead of reinstalling
     /// them. A reinstall cannot be rolled back and restarts the daemon.
     pub(super) lagging_only: bool,
+    /// Skip the canary smoke; recorded in the receipt as skipped.
+    pub(super) skip_canary_smoke: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -328,6 +332,7 @@ pub(super) fn run_fleet_update<W: Write>(
         config: &config,
         cwd,
         classes: &classes,
+        skip_canary_smoke: args.skip_canary_smoke,
     };
     let result = apply_plans(&plans, &skipped_current, &target, json, stdout, &mut ops);
     if !quarantined.is_empty() {
@@ -398,6 +403,7 @@ struct LiveOps<'a> {
     config: &'a LoadedConfig,
     cwd: &'a Path,
     classes: &'a [HostClassConfig],
+    skip_canary_smoke: bool,
 }
 
 impl HostOps for LiveOps<'_> {
@@ -417,6 +423,31 @@ impl HostOps for LiveOps<'_> {
 
     fn verify(&mut self, plan: &HostUpdatePlan, daemon_pid: u32) -> verify::HostVerification {
         verify::verify_host(plan, daemon_pid)
+    }
+
+    fn canary_smoke(
+        &mut self,
+        plan: &HostUpdatePlan,
+        evidence: &HostUpdateEvidence,
+    ) -> canary::SmokeOutcome {
+        if self.skip_canary_smoke {
+            return canary::SmokeOutcome::Skipped {
+                reason: "operator passed --skip-canary-smoke".to_owned(),
+            };
+        }
+        let labels = self
+            .classes
+            .iter()
+            .find(|class| class.class == plan.class)
+            .map(|class| class.labels.clone())
+            .unwrap_or_default();
+        match canary::smoke_spec(&self.config.data, &labels, &evidence.configured_repos_after) {
+            Ok(spec) => canary::run_smoke(plan, &spec),
+            Err(reason) => canary::SmokeOutcome::Failed {
+                probes: Vec::new(),
+                reason,
+            },
+        }
     }
 
     fn rollback(
@@ -448,6 +479,7 @@ mod non_unix_tests {
             all_hosts: false,
             apply: true,
             lagging_only: false,
+            skip_canary_smoke: false,
         };
         let mut output = Vec::new();
         let error = fleet_update_command(
@@ -524,6 +556,13 @@ trait HostOps {
     fn installed_version(&mut self, plan: &HostUpdatePlan) -> Option<String>;
     fn execute(&mut self, plan: &HostUpdatePlan) -> Result<HostUpdateEvidence, PlanPhaseError>;
     fn verify(&mut self, plan: &HostUpdatePlan, daemon_pid: u32) -> verify::HostVerification;
+    /// Run the read-only canary smoke with the binary just installed on this
+    /// host. Only the first host of a rollout is smoked.
+    fn canary_smoke(
+        &mut self,
+        plan: &HostUpdatePlan,
+        evidence: &HostUpdateEvidence,
+    ) -> canary::SmokeOutcome;
     /// Restore `previous` (the pre-update version) on this host.
     fn rollback(
         &mut self,
@@ -563,6 +602,7 @@ fn apply_plans<W: Write, O: HostOps>(
 ) -> Result<ExitCode, RolloutFailure> {
     let mut installed_pair_sha256: Option<(String, Option<String>)> = None;
     let mut verified: Vec<verify::HostVerification> = Vec::new();
+    let mut canary_pending = true;
     for (index, plan) in plans.iter().enumerate() {
         let failure = apply_host(
             plan,
@@ -572,6 +612,7 @@ fn apply_plans<W: Write, O: HostOps>(
             ops,
             &mut installed_pair_sha256,
             &mut verified,
+            &mut canary_pending,
         )?;
         if let Some(failure) = failure {
             let not_attempted = plans[index + 1..]
@@ -746,6 +787,13 @@ fn phase_failure<W: Write, O: HostOps>(
 }
 
 /// Update, validate and verify one host. `Ok(Some(_))` stops the rollout.
+///
+/// The first host that can be smoked is the canary: once it verifies, the
+/// binary just installed there must also pass [`canary`]'s read-only smoke
+/// before any later host is touched. A failed smoke rolls the canary back and
+/// stops the rollout. A skipped smoke (nothing to observe on that host) leaves
+/// the canary pending, so the next host is smoked instead.
+#[allow(clippy::too_many_arguments)]
 fn apply_host<W: Write, O: HostOps>(
     plan: &HostUpdatePlan,
     target: &str,
@@ -754,6 +802,7 @@ fn apply_host<W: Write, O: HostOps>(
     ops: &mut O,
     installed_pair_sha256: &mut Option<(String, Option<String>)>,
     verified: &mut Vec<verify::HostVerification>,
+    canary_pending: &mut bool,
 ) -> Result<Option<HostFailure>, CliFailure> {
     // Read before mutating, so a rollback target exists even when the update
     // never returns evidence (a timeout).
@@ -823,6 +872,20 @@ fn apply_host<W: Write, O: HostOps>(
     let verification = ops.verify(plan, evidence.daemon_pid);
     render_verification(stdout, json, target, &verification)?;
     if verification.verified() {
+        if *canary_pending
+            && let Some(failure) = canary_gate(
+                plan,
+                target,
+                json,
+                stdout,
+                ops,
+                &evidence,
+                previous.as_deref(),
+                canary_pending,
+            )?
+        {
+            return Ok(Some(failure));
+        }
         verified.push(verification);
         return Ok(None);
     }
@@ -839,6 +902,66 @@ fn apply_host<W: Write, O: HostOps>(
             verification.failures.join("; ")
         ),
     )
+}
+
+/// Smoke a pending canary. `Ok(Some(_))` (canary rolled back) stops the
+/// rollout; a pass clears `canary_pending`, a skip leaves it for the next host.
+#[allow(clippy::too_many_arguments)]
+fn canary_gate<W: Write, O: HostOps>(
+    plan: &HostUpdatePlan,
+    target: &str,
+    json: bool,
+    stdout: &mut W,
+    ops: &mut O,
+    evidence: &HostUpdateEvidence,
+    previous: Option<&str>,
+    canary_pending: &mut bool,
+) -> Result<Option<HostFailure>, CliFailure> {
+    let smoke = ops.canary_smoke(plan, evidence);
+    render_canary_smoke(stdout, json, target, plan, &smoke)?;
+    if matches!(smoke, canary::SmokeOutcome::Passed { .. }) {
+        *canary_pending = false;
+    }
+    match smoke.failed() {
+        Some(reason) => roll_back_after(
+            plan,
+            target,
+            json,
+            stdout,
+            ops,
+            previous,
+            &format!(
+                "{} (canary) failed its post-update smoke; no later host was touched: {reason}",
+                plan.class
+            ),
+        ),
+        None => Ok(None),
+    }
+}
+
+fn render_canary_smoke<W: Write>(
+    stdout: &mut W,
+    json: bool,
+    target: &str,
+    plan: &HostUpdatePlan,
+    outcome: &canary::SmokeOutcome,
+) -> Result<(), CliFailure> {
+    if json {
+        let mut data = BTreeMap::new();
+        data.insert("event".to_owned(), Value::from("canary_smoke"));
+        data.insert("target".to_owned(), Value::from(target));
+        data.insert("host_class".to_owned(), Value::from(plan.class.clone()));
+        data.insert("summary".to_owned(), Value::from(outcome.summary()));
+        data.insert(
+            "result".to_owned(),
+            serde_json::to_value(outcome).map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+        write_json_envelope(stdout, "runner.fleet-update", data)
+            .map_err(|error| CliFailure::new(1, error.to_string()))
+    } else {
+        writeln!(stdout, "{}: {}", plan.class, outcome.summary())
+            .map_err(|error| CliFailure::new(1, error.to_string()))
+    }
 }
 
 fn render_rollback<W: Write>(
