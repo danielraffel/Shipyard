@@ -778,8 +778,7 @@ fn pulp_week_41_has_thirty_eight_ejections() {
     // those a merge-group run in the week names and those merged in it (470).
     // A recompute from GitHub's removal records found 38 check-based
     // ejections, against 59 merge-group runs whose `macos` gate did not pass.
-    let captured: Value =
-        serde_json::from_str(&fixture("w41-timelines.json")).expect("timelines");
+    let captured: Value = serde_json::from_str(&fixture("w41-timelines.json")).expect("timelines");
     let timelines = captured["timelines"].as_object().expect("timelines");
     assert_eq!(timelines.len(), 470);
     let mut queue_events = Vec::new();
