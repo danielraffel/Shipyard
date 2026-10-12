@@ -2242,6 +2242,7 @@ if test -f '{root}/converged'; then
 fi
 case "$*" in
   *"query=query("*"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view 42 --repo owner/repo --json body,commits") printf '%s\n' "$*" >> '{root}/owner-reads'; printf '%s' '{{"body":"plain","commits":[{{"authors":[{{"login":"last-committer"}}]}}]}}' ;;
   "pr view "*) printf '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"DIRTY","autoMergeRequest":null,"labels":[%s],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-08-27T00:00:00Z"}},{{"__typename":"StatusContext","context":"shipyard/steward-handoff","state":"SUCCESS","createdAt":"2026-08-27T00:00:01Z"}}%s]}}' "$labels" "$recovery" ;;
   *"repos/owner/repo/pulls/42"*) if test -f '{root}/head-drift'; then sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; else sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; fi; printf '{{"state":"open","head":{{"sha":"%s"}}}}' "$sha" ;;
   *"-X POST"*"issues/42/comments"*) printf '%s\n' "$*" >> '{root}/wake-comments'; printf '%s' '{{}}' ;;
@@ -2376,6 +2377,36 @@ fn owner_wake_posts_once_per_exact_head_and_names_the_owner() {
         "{again:?}"
     );
     assert_eq!(harness.comments().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_wake_reads_the_owner_per_pull_request_only_when_observation_left_it_open() {
+    // The bulk list no longer carries `commits`, so a PR without a whence
+    // session reaches the wake with no owner; the wake reads that one PR's
+    // body and commits and addresses the last committer.
+    let mut harness = WakeHarness::new();
+    let mut pr = ready_pr_with_wire_owner();
+    pr.owner = None;
+    let first = harness.pass(pr, true);
+    assert!(
+        mutation_of(&first).contains("owner_wake_posted"),
+        "{first:?}"
+    );
+    let comments = harness.comments();
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(comments[0].contains("for last-committer:"), "{comments:?}");
+    let reads = fs::read_to_string(harness.temp.path().join("owner-reads")).unwrap_or_default();
+    assert_eq!(reads.lines().count(), 1, "{reads}");
+
+    // An owner the observation already decided is never re-read.
+    let mut harness = WakeHarness::new();
+    let report = harness.pass(ready_pr_with_wire_owner(), true);
+    assert!(
+        mutation_of(&report).contains("owner_wake_posted"),
+        "{report:?}"
+    );
+    assert!(!harness.temp.path().join("owner-reads").exists());
 }
 
 #[cfg(unix)]

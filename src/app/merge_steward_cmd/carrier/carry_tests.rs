@@ -245,7 +245,7 @@ fn observation(merge_state: &str, head: &str) -> RepoObservation {
         }],
         prs: vec![ObservedPr {
             node_id: "PR_kw".to_owned(),
-            owner: "team-lead".to_owned(),
+            owner: Some("team-lead".to_owned()),
             fact: StewardPullRequest {
                 number: 42,
                 head_sha: head.to_owned(),
