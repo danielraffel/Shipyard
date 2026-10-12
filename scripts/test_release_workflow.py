@@ -36,6 +36,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         live = text.split("  live-smoke:", 1)[1].split("\n  release:", 1)[0]
         self.assertNotIn("--apply", live)
         self.assertNotIn("continue-on-error", live)
+        self.assertIn("    permissions:\n      contents: read\n", live)
+        self.assertNotIn("write", live.split("steps:", 1)[0])
 
     def test_release_workflow_uses_current_ci_signing_secret_names_only(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")

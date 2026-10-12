@@ -2608,7 +2608,8 @@ fn pr_watch_fleet_rows_fail_only_when_no_host_completes_passes() {
 /// [`TestOps`] with a scripted canary smoke, recording which hosts were smoked.
 struct CanaryOps<E, V, R> {
     inner: TestOps<E, V, R>,
-    smoke: canary::SmokeOutcome,
+    /// Outcomes served in order; `Passed` once exhausted.
+    smoke: Vec<canary::SmokeOutcome>,
     smoked: Vec<String>,
 }
 
@@ -2636,7 +2637,11 @@ where
         _evidence: &HostUpdateEvidence,
     ) -> canary::SmokeOutcome {
         self.smoked.push(plan.class.clone());
-        self.smoke.clone()
+        if self.smoke.is_empty() {
+            canary::SmokeOutcome::Passed { probes: Vec::new() }
+        } else {
+            self.smoke.remove(0)
+        }
     }
     fn rollback(
         &mut self,
@@ -2670,10 +2675,10 @@ fn a_failed_canary_smoke_rolls_the_canary_back_and_touches_no_other_host() {
             installed: Some("0.136.0".to_owned()),
             rollbacks: Vec::new(),
         },
-        smoke: canary::SmokeOutcome::Failed {
+        smoke: vec![canary::SmokeOutcome::Failed {
             probes: Vec::new(),
             reason: "Generous-Corp/pulp: exit 1 verdict error reason observation_failed: GraphQL: ... exceeds the maximum limit of 500,000.".to_owned(),
-        },
+        }],
         smoked: Vec::new(),
     };
     let error = apply_plans(&plans, &[], "v0.137.0", true, &mut output, &mut ops)
@@ -2736,7 +2741,7 @@ fn a_passing_canary_smoke_lets_the_rollout_continue_and_smokes_only_the_canary()
             installed: Some("0.136.0".to_owned()),
             rollbacks: Vec::new(),
         },
-        smoke: canary::SmokeOutcome::Passed { probes: Vec::new() },
+        smoke: vec![canary::SmokeOutcome::Passed { probes: Vec::new() }],
         smoked: Vec::new(),
     };
     apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops)
@@ -2762,9 +2767,9 @@ fn canary_smoke_judge_accepts_only_an_observed_verdict() {
     let spec = smoke_spec_for(&["o/a", "o/b"]);
     let passed = canary::judge(
         &spec,
-        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"admit\",\"reason\":\"clean\"}\n\
+        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"admit\",\"reason\":\"clean\",\"repo\":\"o/a\"}\n\
          SHIPYARD_CANARY_SMOKE_STDERR=o/a|\n\
-         SHIPYARD_CANARY_SMOKE=o/b|3|{\"verdict\":\"defer\",\"reason\":\"observation_in_progress\"}\n",
+         SHIPYARD_CANARY_SMOKE=o/b|3|{\"verdict\":\"defer\",\"reason\":\"stale_compatible_runs\",\"repo\":\"O/B\"}\n",
     );
     assert!(
         matches!(passed, canary::SmokeOutcome::Passed { .. }),
@@ -2773,8 +2778,8 @@ fn canary_smoke_judge_accepts_only_an_observed_verdict() {
 
     let failed = canary::judge(
         &spec,
-        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"admit\"}\n\
-         SHIPYARD_CANARY_SMOKE=o/b|1|{\"verdict\":\"error\",\"reason\":\"observation_failed\",\"error\":\"GraphQL: exceeds the maximum limit of 500,000\"}\n",
+        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"admit\",\"repo\":\"o/a\"}\n\
+         SHIPYARD_CANARY_SMOKE=o/b|1|{\"verdict\":\"error\",\"reason\":\"observation_failed\",\"repo\":\"o/b\",\"error\":\"GraphQL: exceeds the maximum limit of 500,000\"}\n",
     );
     let reason = failed.failed().expect("an error verdict fails the smoke");
     assert!(
@@ -2795,7 +2800,7 @@ fn canary_smoke_judge_accepts_only_an_observed_verdict() {
     // A repository with no result line, or two, cannot pass.
     let missing = canary::judge(
         &spec,
-        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"admit\"}\n",
+        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"admit\",\"repo\":\"o/a\"}\n",
     );
     assert!(
         missing
@@ -2806,9 +2811,36 @@ fn canary_smoke_judge_accepts_only_an_observed_verdict() {
     // Exit and verdict must agree.
     let mismatched = canary::judge(
         &smoke_spec_for(&["o/a"]),
-        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"defer\"}\n",
+        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"defer\",\"reason\":\"stale_compatible_runs\",\"repo\":\"o/a\"}\n",
     );
     assert!(mismatched.failed().is_some());
+    // The verdict must name the requested repository.
+    for repo_field in ["", ",\"repo\":\"o/other\""] {
+        let unnamed = canary::judge(
+            &smoke_spec_for(&["o/a"]),
+            &format!("SHIPYARD_CANARY_SMOKE=o/a|0|{{\"verdict\":\"admit\"{repo_field}}}\n"),
+        );
+        assert!(unnamed.failed().is_some(), "{repo_field}");
+    }
+}
+
+/// A defer returned because another admission holds the observation lock was
+/// decided before any GitHub read. It must not let a binary that cannot
+/// observe GitHub pass the canary.
+#[test]
+fn a_lock_held_defer_does_not_pass_the_canary_smoke() {
+    for reason in ["observation_in_progress", "stewardship_in_progress"] {
+        let outcome = canary::judge(
+            &smoke_spec_for(&["o/a"]),
+            &format!(
+                "SHIPYARD_CANARY_SMOKE=o/a|3|{{\"verdict\":\"defer\",\"reason\":\"{reason}\",\"repo\":\"o/a\"}}\n"
+            ),
+        );
+        let failure = outcome
+            .failed()
+            .expect("a lock-held defer is not an observation");
+        assert!(failure.contains(reason), "{failure}");
+    }
 }
 
 #[test]
@@ -2861,7 +2893,7 @@ fn canary_smoke_script_runs_admission_read_only_and_reports_each_repo() {
     crate::test_support::write_executable_script(
         &fake,
         &format!(
-            "#!/bin/sh\ncase \"$*\" in *--help*) exit 0 ;; esac\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *'--repo o/good'*) printf '%s\\n' '{{\"verdict\":\"admit\",\"reason\":\"clean\"}}' ;;\n  *) printf '%s\\n' '{{\"verdict\":\"error\",\"reason\":\"observation_failed\",\"error\":\"node limit\"}}'; echo 'gh failed' >&2; exit 1 ;;\nesac\n",
+            "#!/bin/sh\ncase \"$*\" in *--help*) exit 0 ;; esac\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *'--repo o/good'*) printf '%s\\n' '{{\"verdict\":\"admit\",\"reason\":\"clean\",\"repo\":\"o/good\"}}' ;;\n  *) printf '%s\\n' '{{\"verdict\":\"error\",\"reason\":\"observation_failed\",\"error\":\"node limit\"}}'; echo 'gh failed' >&2; exit 1 ;;\nesac\n",
             calls.display()
         ),
     );
@@ -2885,6 +2917,11 @@ fn canary_smoke_script_runs_admission_read_only_and_reports_each_repo() {
         assert!(line.contains("--labels self-hosted,macos"), "{line}");
         assert!(line.contains("--base main"), "{line}");
         assert!(!line.contains("--apply"), "the smoke never mutates: {line}");
+        assert!(
+            !line.contains(&format!("--state-dir {}", plan.state_dir.display())),
+            "the smoke never contends on the production state dir: {line}"
+        );
+        assert!(line.contains("--state-dir /"), "{line}");
     }
 }
 
@@ -2946,16 +2983,25 @@ fn remote_python_skips_a_shim_that_does_not_run_and_fails_closed_when_none_does(
     assert!(!resolver.contains("| /usr/bin/python3"), "{resolver}");
 }
 
-/// A rollback to a release without `runner admission-clean` must not be
-/// blocked by the smoke: it is reported as skipped.
+/// Whether a target can be smoked is decided from its tag. A binary whose
+/// probe errors for any other reason fails the smoke; it is never read as
+/// "too old to smoke".
 #[cfg(unix)]
 #[test]
-fn canary_smoke_of_a_release_without_admission_clean_is_skipped() {
+fn canary_smoke_unsupported_is_decided_by_tag_and_an_erroring_binary_fails() {
+    let mut old = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
+    "v0.93.0".clone_into(&mut old.target);
+    old.binary = PathBuf::from("/nonexistent/shipyard");
+    assert!(matches!(
+        canary::run_smoke(&old, &smoke_spec_for(&["o/a"])),
+        canary::SmokeOutcome::Skipped { .. }
+    ));
+
     let temp = tempfile::tempdir().expect("temp");
     let fake = temp.path().join("shipyard");
     crate::test_support::write_executable_script(
         &fake,
-        "#!/bin/sh\necho \"error: unrecognized subcommand 'admission-clean'\" >&2\nexit 2\n",
+        "#!/bin/sh\necho 'thread main panicked' >&2\nexit 101\n",
     );
     let mut plan = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
     plan.binary = fake;
@@ -2966,8 +3012,66 @@ fn canary_smoke_of_a_release_without_admission_clean_is_skipped() {
         .expect("run smoke script");
     assert!(output.status.success());
     let outcome = canary::judge(&spec, &String::from_utf8_lossy(&output.stdout));
+    let reason = outcome.failed().expect("an erroring binary fails");
+    assert!(reason.contains("panicked"), "{reason}");
+}
+
+/// A host with nothing to smoke does not use up the canary: the next host is
+/// smoked, and a failure there still stops the rollout.
+#[test]
+fn the_canary_is_the_first_host_that_can_be_smoked() {
+    let plans = three_plans();
+    let mut attempted = Vec::new();
+    let mut ops = CanaryOps {
+        inner: TestOps {
+            execute: |plan: &HostUpdatePlan| {
+                attempted.push(plan.class.clone());
+                Ok(evidence("0.137.0"))
+            },
+            verify: verified_ok,
+            rollback: rolled_back_ok,
+            installed: Some("0.136.0".to_owned()),
+            rollbacks: Vec::new(),
+        },
+        smoke: vec![
+            canary::SmokeOutcome::Skipped {
+                reason: "m1 serves no repository".to_owned(),
+            },
+            canary::SmokeOutcome::Failed {
+                probes: Vec::new(),
+                reason: "o/a: exit 1 verdict error".to_owned(),
+            },
+        ],
+        smoked: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops)
+        .expect_err("the first smokeable host's failure stops the rollout");
+    let smoked = ops.smoked.clone();
+    let rollbacks = ops.inner.rollbacks.clone();
+    drop(ops);
+    assert_eq!(attempted, ["m1", "m3"]);
+    assert_eq!(smoked, ["m1", "m3"]);
+    assert_eq!(rollbacks, [("m3".to_owned(), Some("0.136.0".to_owned()))]);
     assert!(
-        matches!(outcome, canary::SmokeOutcome::Skipped { .. }),
-        "{outcome:?}"
+        error.failure.message.contains("m3 (canary) failed"),
+        "{}",
+        error.failure.message
     );
+
+    // Once a canary passes, later hosts are not smoked.
+    let mut ops = CanaryOps {
+        inner: TestOps {
+            execute: |_: &HostUpdatePlan| Ok(evidence("0.137.0")),
+            verify: verified_ok,
+            rollback: rolled_back_ok,
+            installed: Some("0.136.0".to_owned()),
+            rollbacks: Vec::new(),
+        },
+        smoke: vec![canary::SmokeOutcome::Skipped {
+            reason: "m1 serves no repository".to_owned(),
+        }],
+        smoked: Vec::new(),
+    };
+    apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops).expect("rollout");
+    assert_eq!(ops.smoked, ["m1", "m3"]);
 }

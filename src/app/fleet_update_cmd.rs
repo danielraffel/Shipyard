@@ -602,6 +602,7 @@ fn apply_plans<W: Write, O: HostOps>(
 ) -> Result<ExitCode, RolloutFailure> {
     let mut installed_pair_sha256: Option<(String, Option<String>)> = None;
     let mut verified: Vec<verify::HostVerification> = Vec::new();
+    let mut canary_pending = true;
     for (index, plan) in plans.iter().enumerate() {
         let failure = apply_host(
             plan,
@@ -611,7 +612,7 @@ fn apply_plans<W: Write, O: HostOps>(
             ops,
             &mut installed_pair_sha256,
             &mut verified,
-            index == 0,
+            &mut canary_pending,
         )?;
         if let Some(failure) = failure {
             let not_attempted = plans[index + 1..]
@@ -787,9 +788,11 @@ fn phase_failure<W: Write, O: HostOps>(
 
 /// Update, validate and verify one host. `Ok(Some(_))` stops the rollout.
 ///
-/// The first host of a rollout is the canary: once it verifies, the binary just
-/// installed there must also pass [`canary`]'s read-only smoke before any other
-/// host is touched. A failed smoke rolls the canary back and stops the rollout.
+/// The first host that can be smoked is the canary: once it verifies, the
+/// binary just installed there must also pass [`canary`]'s read-only smoke
+/// before any later host is touched. A failed smoke rolls the canary back and
+/// stops the rollout. A skipped smoke (nothing to observe on that host) leaves
+/// the canary pending, so the next host is smoked instead.
 #[allow(clippy::too_many_arguments)]
 fn apply_host<W: Write, O: HostOps>(
     plan: &HostUpdatePlan,
@@ -799,7 +802,7 @@ fn apply_host<W: Write, O: HostOps>(
     ops: &mut O,
     installed_pair_sha256: &mut Option<(String, Option<String>)>,
     verified: &mut Vec<verify::HostVerification>,
-    canary: bool,
+    canary_pending: &mut bool,
 ) -> Result<Option<HostFailure>, CliFailure> {
     // Read before mutating, so a rollback target exists even when the update
     // never returns evidence (a timeout).
@@ -869,23 +872,19 @@ fn apply_host<W: Write, O: HostOps>(
     let verification = ops.verify(plan, evidence.daemon_pid);
     render_verification(stdout, json, target, &verification)?;
     if verification.verified() {
-        if canary {
-            let smoke = ops.canary_smoke(plan, &evidence);
-            render_canary_smoke(stdout, json, target, plan, &smoke)?;
-            if let Some(reason) = smoke.failed() {
-                return roll_back_after(
-                    plan,
-                    target,
-                    json,
-                    stdout,
-                    ops,
-                    previous.as_deref(),
-                    &format!(
-                        "{} (canary) failed its post-update smoke; no other host was touched: {reason}",
-                        plan.class
-                    ),
-                );
-            }
+        if *canary_pending
+            && let Some(failure) = canary_gate(
+                plan,
+                target,
+                json,
+                stdout,
+                ops,
+                &evidence,
+                previous.as_deref(),
+                canary_pending,
+            )?
+        {
+            return Ok(Some(failure));
         }
         verified.push(verification);
         return Ok(None);
@@ -903,6 +902,41 @@ fn apply_host<W: Write, O: HostOps>(
             verification.failures.join("; ")
         ),
     )
+}
+
+/// Smoke a pending canary. `Ok(Some(_))` (canary rolled back) stops the
+/// rollout; a pass clears `canary_pending`, a skip leaves it for the next host.
+#[allow(clippy::too_many_arguments)]
+fn canary_gate<W: Write, O: HostOps>(
+    plan: &HostUpdatePlan,
+    target: &str,
+    json: bool,
+    stdout: &mut W,
+    ops: &mut O,
+    evidence: &HostUpdateEvidence,
+    previous: Option<&str>,
+    canary_pending: &mut bool,
+) -> Result<Option<HostFailure>, CliFailure> {
+    let smoke = ops.canary_smoke(plan, evidence);
+    render_canary_smoke(stdout, json, target, plan, &smoke)?;
+    if matches!(smoke, canary::SmokeOutcome::Passed { .. }) {
+        *canary_pending = false;
+    }
+    match smoke.failed() {
+        Some(reason) => roll_back_after(
+            plan,
+            target,
+            json,
+            stdout,
+            ops,
+            previous,
+            &format!(
+                "{} (canary) failed its post-update smoke; no later host was touched: {reason}",
+                plan.class
+            ),
+        ),
+        None => Ok(None),
+    }
 }
 
 fn render_canary_smoke<W: Write>(

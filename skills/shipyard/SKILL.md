@@ -1156,18 +1156,23 @@ does not verify, the receipt says "ROLLBACK ... FAILED; the host needs an
 operator" and the run exits 7 (`verdict: rollback_failed`). Either way no later
 host is attempted.
 
-The **first host is a canary.** After it verifies, the binary just installed
-there runs `runner admission-clean` read-only (never `--apply`) once per
-repository the host serves (`[fleet_update] smoke_repos` overrides; `smoke_base`
-defaults to `main`) with the host class's own `labels`. `admit` (exit 0) or
-`defer` (exit 3) passes; anything else, including `observation_failed`, rolls
-the canary back and stops the rollout before any other host is touched (receipt
-event `canary_smoke`). Version and daemon checks cannot see a release that
-installs cleanly and then fails every GitHub read: v0.302.0-v0.307.0 did, and
-the rollout carried it to every host. A host with no repository or no labels,
-or a target release without `admission-clean`, is reported `skipped`, never
-`passed`. `--skip-canary-smoke` is for an emergency rollback while GitHub itself
-cannot be observed.
+The **first host that can be smoked is the canary.** After it verifies, the
+binary just installed there runs `runner admission-clean` read-only (never
+`--apply`) once per repository the host serves (`[fleet_update] smoke_repos`
+overrides; `smoke_base` defaults to `main`) with the host class's own `labels`,
+against a throwaway `--state-dir`. The production state dir holds the
+observation lock every TartCI admission takes, and a contended lock defers
+before any GitHub read, so a broken binary could pass on a busy host. `admit`
+(exit 0) passes; `defer` (exit 3) passes only with a reason that follows a read
+(`observation_in_progress` and `stewardship_in_progress` do not); the verdict
+must name the requested repository. Anything else rolls the canary back and
+stops the rollout before any later host is touched (receipt event
+`canary_smoke`). Version and daemon checks cannot see a release that installs
+cleanly and then fails every GitHub read: v0.302.0-v0.307.0 did, and the
+rollout carried it to every host. A host with no repository or no labels is
+`skipped` and the next host becomes the canary; a target older than v0.94.0
+(decided from the tag, not from a probe) is `skipped`. `--skip-canary-smoke` is
+for an emergency rollback while GitHub itself cannot be observed.
 
 Fleet-update's remote scripts select a `python3` that actually runs (Homebrew
 first). Naming `/usr/bin/python3` made every fleet-update to a Mac whose Xcode

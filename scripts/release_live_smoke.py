@@ -32,6 +32,9 @@ from pathlib import Path
 DEFAULT_REPOS = ("Generous-Corp/pulp",)
 DEFAULT_LABELS = "self-hosted,macos,arm64"
 PROBE_TIMEOUT_SECONDS = 300
+# Defer reasons admission-clean returns before any GitHub read (a contended
+# lock). They prove nothing about whether the binary can observe GitHub.
+UNOBSERVED_DEFER_REASONS = frozenset({"observation_in_progress", "stewardship_in_progress"})
 
 
 @dataclass
@@ -62,9 +65,15 @@ def _last_json(text: str) -> dict | None:
 def judge_admission(repo: str, code: int, stdout: str, stderr: str) -> ProbeResult:
     document = _last_json(stdout) or {}
     verdict = document.get("verdict")
-    ok = (code, verdict) in ((0, "admit"), (3, "defer"))
+    reason = document.get("reason")
+    named = str(document.get("repo") or "").lower() == repo.lower()
+    ok = named and (
+        (code, verdict) == (0, "admit")
+        or ((code, verdict) == (3, "defer") and reason not in UNOBSERVED_DEFER_REASONS and reason)
+    )
+    ok = bool(ok)
     detail = (
-        f"exit {code} verdict {verdict} reason {document.get('reason')}"
+        f"exit {code} verdict {verdict} reason {reason} repo {document.get('repo')}"
         + (f": {document.get('error')}" if document.get("error") else "")
         + ("" if document else f": {stderr.strip()[:600]}")
     )
@@ -77,9 +86,15 @@ def judge_steward(repo: str, code: int, stdout: str, stderr: str) -> ProbeResult
     except json.JSONDecodeError:
         document = None
     errors: list[str] = []
+    named = False
     if isinstance(document, dict):
         for entry in document.get("repos") or []:
+            if not isinstance(entry, dict):
+                continue
+            named = named or str(entry.get("repo") or "").lower() == repo.lower()
             errors.extend(str(error) for error in entry.get("errors") or [])
+    if isinstance(document, dict) and not named:
+        errors.append(f"steward reported no entry for {repo}")
     ok = code == 0 and isinstance(document, dict) and not errors
     if ok:
         detail = "exit 0, no repository errors"

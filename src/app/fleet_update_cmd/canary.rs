@@ -27,7 +27,13 @@ pub(super) const CANARY_SMOKE_TIMEOUT: Duration = Duration::from_mins(6);
 
 const RESULT_PREFIX: &str = "SHIPYARD_CANARY_SMOKE=";
 const STDERR_PREFIX: &str = "SHIPYARD_CANARY_SMOKE_STDERR=";
-const UNSUPPORTED_MARKER: &str = "SHIPYARD_CANARY_SMOKE_UNSUPPORTED=1";
+/// The first release with `runner admission-clean`. A target before it cannot
+/// be smoked this way and is reported skipped; that is decided from the tag,
+/// never from a probe whose failure could have any cause.
+pub(super) const MIN_ADMISSION_CLEAN_TARGET: [u64; 3] = [0, 94, 0];
+
+/// Defer reasons returned before any GitHub read: they prove nothing.
+const UNOBSERVED_DEFER_REASONS: [&str; 2] = ["observation_in_progress", "stewardship_in_progress"];
 
 /// What the canary smoke runs against.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -139,24 +145,24 @@ pub(super) fn smoke_spec(
 /// The script the canary host runs: one read-only admission call per repo.
 pub(super) fn smoke_script(plan: &HostUpdatePlan, spec: &SmokeSpec) -> String {
     let binary = shlex_quote(&plan.binary.display().to_string());
-    // A release that predates `runner admission-clean` (a rollback far enough
-    // back) cannot be smoked this way; that is reported as skipped, never as a
-    // failure that would block the rollback.
-    let mut script = format!(
-        "set -u\nif ! {binary} runner admission-clean --help >/dev/null 2>&1; then printf '%s\\n' {unsupported}; exit 0; fi\n",
-        unsupported = shlex_quote(UNSUPPORTED_MARKER),
+    // The probe uses a throwaway state directory. The production one holds the
+    // per-(repo, base, labels) observation lock every TartCI admission takes,
+    // and a contended lock defers before any GitHub read -- which would let a
+    // binary that cannot observe GitHub pass on a busy host. The global dir is
+    // kept so the probe authenticates exactly as the host does.
+    let mut script = String::from(
+        "set -u\nsmoke_state=\"$(/usr/bin/mktemp -d)\"\ntrap '/bin/rm -rf \"$smoke_state\"' EXIT\n",
     );
     for repo in &spec.repos {
         let _ = write!(
             script,
             "errf=\"$(/usr/bin/mktemp)\"\n\
-             out=\"$({binary} --mode {mode} --global-dir {global} --state-dir {state} --json runner admission-clean --repo {repo} --base {base} --labels {labels} 2>\"$errf\")\"; code=$?\n\
+             out=\"$({binary} --mode {mode} --global-dir {global} --state-dir \"$smoke_state\" --json runner admission-clean --repo {repo} --base {base} --labels {labels} 2>\"$errf\")\"; code=$?\n\
              err=\"$(/usr/bin/head -c 2000 \"$errf\" | /usr/bin/tr '\\n' ' ')\"; /bin/rm -f \"$errf\"\n\
              printf '%s%s|%s|%s\\n' {prefix} {repo} \"$code\" \"$(printf '%s' \"$out\" | /usr/bin/tr -d '\\n')\"\n\
              printf '%s%s|%s\\n' {stderr_prefix} {repo} \"$err\"\n",
             mode = shlex_quote(plan.runtime_mode.as_str()),
             global = shlex_quote(&plan.global_dir.display().to_string()),
-            state = shlex_quote(&plan.state_dir.display().to_string()),
             repo = shlex_quote(repo),
             base = shlex_quote(&spec.base),
             labels = shlex_quote(&spec.labels.join(",")),
@@ -169,14 +175,11 @@ pub(super) fn smoke_script(plan: &HostUpdatePlan, spec: &SmokeSpec) -> String {
 
 /// Judge a smoke transcript. Pure, so every branch is testable.
 ///
-/// `admit` (exit 0) and `defer` (exit 3) both prove the binary observed
-/// GitHub; anything else, including a missing line, is a failure.
+/// `admit` (exit 0) proves the binary observed GitHub, and so does `defer`
+/// (exit 3) unless its reason is one returned before any read (a contended
+/// lock). The verdict must also name the requested repository. Anything else,
+/// including a missing line, is a failure.
 pub(super) fn judge(spec: &SmokeSpec, stdout: &str) -> SmokeOutcome {
-    if stdout.lines().any(|line| line == UNSUPPORTED_MARKER) {
-        return SmokeOutcome::Skipped {
-            reason: "the installed release has no `runner admission-clean`".to_owned(),
-        };
-    }
     let mut probes = Vec::new();
     let mut failures = Vec::new();
     for repo in &spec.repos {
@@ -224,16 +227,23 @@ pub(super) fn judge(spec: &SmokeSpec, stdout: &str) -> SmokeOutcome {
             reason: field("reason"),
             error: field("error").or(stderr),
         };
-        let observed = matches!(
-            (exit_code, verdict.as_deref()),
-            (Some(0), Some("admit")) | (Some(3), Some("defer"))
-        );
+        let named_repo = field("repo").is_some_and(|named| named.eq_ignore_ascii_case(repo));
+        let observed = named_repo
+            && match (exit_code, verdict.as_deref()) {
+                (Some(0), Some("admit")) => true,
+                (Some(3), Some("defer")) => probe
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| !UNOBSERVED_DEFER_REASONS.contains(&reason)),
+                _ => false,
+            };
         if !observed {
             failures.push(format!(
-                "{repo}: exit {} verdict {} reason {}{}",
+                "{repo}: exit {} verdict {} reason {} repo {}{}",
                 exit_code.map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
                 probe.verdict.as_deref().unwrap_or("none"),
                 probe.reason.as_deref().unwrap_or("none"),
+                field("repo").as_deref().unwrap_or("none"),
                 probe
                     .error
                     .as_deref()
@@ -255,6 +265,11 @@ pub(super) fn judge(spec: &SmokeSpec, stdout: &str) -> SmokeOutcome {
 
 /// Run the canary smoke on the plan's host.
 pub(super) fn run_smoke(plan: &HostUpdatePlan, spec: &SmokeSpec) -> SmokeOutcome {
+    if !super::tag_at_least(&plan.target, MIN_ADMISSION_CLEAN_TARGET) {
+        return SmokeOutcome::Skipped {
+            reason: format!("{} predates `runner admission-clean`", plan.target),
+        };
+    }
     if spec.repos.is_empty() {
         return SmokeOutcome::Skipped {
             reason: format!(

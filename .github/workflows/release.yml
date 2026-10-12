@@ -148,6 +148,9 @@ jobs:
     needs: build
     name: Live GitHub smoke (release gate)
     runs-on: ubuntu-latest
+    # The job token is handed to the binary under test: read-only, nothing else.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
 
