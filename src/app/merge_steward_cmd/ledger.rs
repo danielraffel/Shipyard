@@ -7,6 +7,13 @@ pub(super) fn attempt_key(repo: &str, pr: u64, head: &str, run_id: u64) -> Strin
     format!("{repo}#{pr}:{head}:{run_id}")
 }
 
+/// Rerun budget key for one required check on one head. A rerun counts
+/// against the check as well as the run, so a fresh run of the same check on
+/// the same head cannot buy a second rerun.
+pub(super) fn check_attempt_key(repo: &str, pr: u64, head: &str, context: &str) -> String {
+    format!("{repo}#{pr}:{head}:check:{context}")
+}
+
 pub(super) fn record_audit(ledger: &mut StewardLedger, repo: &str, subject: &str, action: &str) {
     ledger.audit.push(LedgerAudit {
         at: Utc::now().to_rfc3339(),

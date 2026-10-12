@@ -229,8 +229,10 @@ It is the command the tartci carrier scheduler drives on its single controller
 host; agents read it, they do not run `--apply`.
 
 - **Classes.** `redispatch` reruns a cancelled required run on the current
-  head (at most two reruns per run, read from `run_attempt`, and two per PR
-  per hour). `rearm` re-arms the exact head the queue removed with
+  head only when every job that did not pass was cancelled with no runner,
+  16 to 20 minutes after creation, with no concurrency-supersede annotation
+  (`transient_interruption::classify_jobs`); one rerun per head and workflow,
+  read from `run_attempt`, and two per PR per hour. `rearm` re-arms the exact head the queue removed with
   `expectedHeadOid` when every required merge-group job that did not pass
   starved: cancelled with no runner after waiting at least ten minutes. A
   no-runner cancel within seconds is a superseding push or a concurrency

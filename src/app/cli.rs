@@ -2215,8 +2215,13 @@ pub(super) enum RunnerCommand {
         /// unresolved. Repeat to recognize additional repository vocabularies.
         #[arg(long = "provenance-blocking-label", default_value = "5·unresolved")]
         provenance_blocking_labels: Vec<String>,
-        /// Maximum reruns of the same transiently-failed run on one exact head.
-        #[arg(long = "max-transient-reruns", default_value_t = 1)]
+        /// Reruns of an interrupted required check on one exact head: 0 or 1.
+        /// One is the ceiling; the steward clamps any wider value to it.
+        #[arg(
+            long = "max-transient-reruns",
+            default_value_t = 1,
+            value_parser = clap::value_parser!(u32).range(0..=1)
+        )]
         max_transient_reruns: u32,
         /// Restore queue-front priority after a narrowly proven GitHub-hosted
         /// pre-checkout infrastructure eviction. Disabled by default.
@@ -4083,5 +4088,22 @@ mod tests {
             };
             assert_eq!(arm_unqueued, expected, "{argv:?}");
         }
+    }
+
+    /// One rerun per head and check is the ceiling: the flag refuses more.
+    #[test]
+    fn the_transient_rerun_budget_flag_refuses_more_than_one() {
+        let parse = |value: &str| {
+            Cli::try_parse_from([
+                "shipyard",
+                "runner",
+                "steward",
+                "--max-transient-reruns",
+                value,
+            ])
+        };
+        assert!(parse("0").is_ok());
+        assert!(parse("1").is_ok());
+        assert!(parse("2").is_err());
     }
 }

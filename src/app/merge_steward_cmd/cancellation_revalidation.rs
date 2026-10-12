@@ -2,8 +2,8 @@ use super::{
     BTreeMap, BTreeSet, CapacityPreemptionPolicy, CapacityRevalidation, GitHubActions, Instant,
     MergeQueueMutationGuard, MutationControl, ObservedPr, PendingCancellation, RepoObservation,
     RequiredCheck, RunCancellation, RunCancellationReason, ShipState, StewardJob, StewardLedger,
-    StewardPullRequest, StewardRun, Value, active_runs, attempt_key, coalescing_reason_authorizes,
-    fetch_run_jobs, gh_json, gh_json_before, has_successful_status,
+    StewardPullRequest, StewardRun, Value, active_runs, attempt_key, check_attempt_key,
+    coalescing_reason_authorizes, fetch_run_jobs, gh_json, gh_json_before, has_successful_status,
     hydrate_required_check_identities, hydrate_required_check_identities_before, is_full_sha,
     is_safe_capacity_preemption, merge_queue_snapshot, parse_pr, parse_run, plan_run_coalescing,
     pull_requests, queue_front_waits_for_pool, timestamp_old_enough,
@@ -532,17 +532,19 @@ pub(super) fn attempts_for(
     repo: &str,
     pr: &StewardPullRequest,
 ) -> BTreeMap<u64, u32> {
-    pr.checks
-        .iter()
-        .filter_map(|check| {
-            let run_id = check.run_id?;
-            let key = attempt_key(repo, pr.number, &pr.head_sha, run_id);
-            Some((
-                run_id,
-                ledger.transient_attempts.get(&key).copied().unwrap_or(0),
-            ))
-        })
-        .collect()
+    let mut attempts = BTreeMap::new();
+    for check in &pr.checks {
+        let Some(run_id) = check.run_id else {
+            continue;
+        };
+        let spent = |key: String| ledger.transient_attempts.get(&key).copied().unwrap_or(0);
+        let count = spent(attempt_key(repo, pr.number, &pr.head_sha, run_id)).max(spent(
+            check_attempt_key(repo, pr.number, &pr.head_sha, &check.name),
+        ));
+        let entry = attempts.entry(run_id).or_insert(0);
+        *entry = (*entry).max(count);
+    }
+    attempts
 }
 
 pub(super) fn acquire_pr_mutation_guard(

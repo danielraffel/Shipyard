@@ -373,6 +373,16 @@ rejected, and none after 2026-09-15 once arm-on-open took over. The test
 returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
 `arm native auto-merge`; `merge-queue resolve` still accepts the old
 `enqueue pull request` entries.
+## A transient rerun needs the interruption signature, not a conclusion
+
+The steward's bounded rerun and the carrier's `redispatch` both rerun only a
+`CANCELLED` required run whose every non-passing job was cancelled with no
+runner 16 to 20 minutes after it was created, with no concurrency-supersede
+annotation (`transient_interruption::classify_jobs`). `TIMED_OUT`,
+`STARTUP_FAILURE` and `STALE` are results. The budget is one rerun per PR,
+head and check; `--max-transient-reruns` refuses anything above 1 and the code
+clamps it as well. Do not add a second classifier: extend this one.
+
 ## The carrier re-arms with `expectedHeadOid`, through the internal path
 
 `runner carrier --apply --class rearm` arms native auto-merge with

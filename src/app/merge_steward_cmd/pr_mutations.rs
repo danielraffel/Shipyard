@@ -1,8 +1,8 @@
 use super::{
     GitHubActions, MutationApplyContext, ObservedPr, Path, RepoObservation, StewardDecision,
     StewardLedger, StewardPolicy, Value, acquire_pr_mutation_guard, attempt_key, attempts_for,
-    classify_pr, enqueue_requirements_pending, gh_json, merge_queue_snapshot, parse_run,
-    pull_request_with_required_checks,
+    check_attempt_key, classify_pr, enqueue_requirements_pending, gh_json, merge_queue_snapshot,
+    parse_run, pull_request_with_required_checks,
     queue_priority_recovery::{
         QueueRecoveryEvidence, final_mutable_authority_matches, receipt_key, recovery_evidence,
     },
@@ -11,6 +11,9 @@ use super::{
         mark_success_continuation_applied, persist_success_continuation,
         resolve_success_continuation,
     },
+};
+use crate::transient_interruption::{
+    InterruptionJob, annotations_mark_superseded, clamp_rerun_budget, classify_jobs, job_from_api,
 };
 
 #[cfg(test)]
@@ -790,6 +793,7 @@ pub(super) fn mutate_transient_reruns(
     let mut errors = Vec::new();
     let mut rerun = Vec::new();
     let mut exhausted = Vec::new();
+    let mut refused = Vec::new();
     for run_id in run_ids {
         let guard = match acquire_pr_mutation_guard(
             context.mutation_control,
@@ -809,7 +813,13 @@ pub(super) fn mutate_transient_reruns(
             &pr.fact.head_sha,
             *run_id,
         );
-        *ledger.transient_attempts.entry(key.clone()).or_default() += 1;
+        let check_keys = rerun_check_keys(context.observation, pr, *run_id);
+        for budget_key in std::iter::once(&key).chain(&check_keys) {
+            *ledger
+                .transient_attempts
+                .entry(budget_key.clone())
+                .or_default() += 1;
+        }
         record_audit(
             ledger,
             &context.observation.repo,
@@ -842,22 +852,50 @@ pub(super) fn mutate_transient_reruns(
                     errors.push(format!("rerun skip mutation audit failed: {error}"));
                     continue;
                 }
-                if let Err(error) = rollback_transient_attempt(
-                    ledger,
-                    context.ledger_path,
-                    &key,
-                    &context.observation.repo,
-                    *run_id,
-                    &pr.fact.head_sha,
-                    "rerun_transient_skipped_after_live_revalidation",
-                ) {
-                    errors.push(error);
+                for budget_key in std::iter::once(&key).chain(&check_keys) {
+                    if let Err(error) = rollback_transient_attempt(
+                        ledger,
+                        context.ledger_path,
+                        budget_key,
+                        &context.observation.repo,
+                        *run_id,
+                        &pr.fact.head_sha,
+                        "rerun_transient_skipped_after_live_revalidation",
+                    ) {
+                        errors.push(error);
+                    }
                 }
                 continue;
             }
+            Ok(TransientRerunRevalidation::NotInterruption { reason }) => {
+                if let Err(error) = guard.finish("refused_not_an_interruption") {
+                    errors.push(format!("rerun refusal mutation audit failed: {error}"));
+                    continue;
+                }
+                for budget_key in std::iter::once(&key).chain(&check_keys) {
+                    if let Err(error) = rollback_transient_attempt(
+                        ledger,
+                        context.ledger_path,
+                        budget_key,
+                        &context.observation.repo,
+                        *run_id,
+                        &pr.fact.head_sha,
+                        "rerun_transient_refused_not_an_interruption",
+                    ) {
+                        errors.push(error);
+                    }
+                }
+                refused.push(format!("run {run_id}: {reason}"));
+                continue;
+            }
             Ok(TransientRerunRevalidation::Exhausted { accepted_attempts }) => {
-                let synchronized = accepted_attempts.max(policy.max_transient_reruns);
-                ledger.transient_attempts.insert(key.clone(), synchronized);
+                let synchronized =
+                    accepted_attempts.max(clamp_rerun_budget(policy.max_transient_reruns));
+                for budget_key in std::iter::once(&key).chain(&check_keys) {
+                    ledger
+                        .transient_attempts
+                        .insert(budget_key.clone(), synchronized);
+                }
                 record_audit(
                     ledger,
                     &context.observation.repo,
@@ -879,16 +917,21 @@ pub(super) fn mutate_transient_reruns(
             Err(error) => {
                 let audit_error = guard.finish("revalidation_failed").err();
                 let rollback_error = audit_error.is_none().then(|| {
-                    rollback_transient_attempt(
-                        ledger,
-                        context.ledger_path,
-                        &key,
-                        &context.observation.repo,
-                        *run_id,
-                        &pr.fact.head_sha,
-                        "rerun_transient_revalidation_failed",
-                    )
-                    .err()
+                    std::iter::once(&key)
+                        .chain(&check_keys)
+                        .filter_map(|budget_key| {
+                            rollback_transient_attempt(
+                                ledger,
+                                context.ledger_path,
+                                budget_key,
+                                &context.observation.repo,
+                                *run_id,
+                                &pr.fact.head_sha,
+                                "rerun_transient_revalidation_failed",
+                            )
+                            .err()
+                        })
+                        .reduce(|first, next| format!("{first}; {next}"))
                 });
                 errors.push(format!(
                     "{error}{}{}",
@@ -926,15 +969,22 @@ pub(super) fn mutate_transient_reruns(
         }
     }
     if errors.is_empty() {
-        let mutation = match (rerun.is_empty(), exhausted.is_empty()) {
-            (false, true) => format!("reran {rerun:?}"),
-            (true, false) => format!("transient rerun budget exhausted for {exhausted:?}"),
-            (false, false) => {
-                format!("reran {rerun:?}; transient rerun budget exhausted for {exhausted:?}")
-            }
-            (true, true) => "no transient reruns remained eligible".to_owned(),
-        };
-        (Some(mutation), None)
+        let mut parts = Vec::new();
+        if !rerun.is_empty() {
+            parts.push(format!("reran {rerun:?}"));
+        }
+        if !exhausted.is_empty() {
+            parts.push(format!(
+                "transient rerun budget exhausted for {exhausted:?}"
+            ));
+        }
+        if !refused.is_empty() {
+            parts.push(format!("not an interruption: {}", refused.join("; ")));
+        }
+        if parts.is_empty() {
+            parts.push("no transient reruns remained eligible".to_owned());
+        }
+        (Some(parts.join("; ")), None)
     } else {
         (None, Some(errors.join("; ")))
     }
@@ -968,10 +1018,37 @@ pub(super) fn rollback_transient_attempt(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Budget keys for every required check the run carries on this head.
+fn rerun_check_keys(observation: &RepoObservation, pr: &ObservedPr, run_id: u64) -> Vec<String> {
+    let mut keys: Vec<String> = pr
+        .fact
+        .checks
+        .iter()
+        .filter(|check| check.run_id == Some(run_id))
+        .map(|check| {
+            check_attempt_key(
+                &observation.repo,
+                pr.fact.number,
+                &pr.fact.head_sha,
+                &check.name,
+            )
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TransientRerunRevalidation {
     Eligible,
-    Exhausted { accepted_attempts: u32 },
+    Exhausted {
+        accepted_attempts: u32,
+    },
+    /// The run's jobs do not match the interruption signature.
+    NotInterruption {
+        reason: String,
+    },
     Stale,
 }
 
@@ -1033,20 +1110,73 @@ pub(super) fn revalidate_transient_rerun(
     if !run.status.eq_ignore_ascii_case("completed")
         || !run.head_sha.eq_ignore_ascii_case(&live_pr.fact.head_sha)
         || run.pull_request_number != Some(live_pr.fact.number)
-        || !matches!(
-            conclusion.as_str(),
-            "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "STALE"
-        )
+        || conclusion != "CANCELLED"
     {
         return Ok(TransientRerunRevalidation::Stale);
     }
-    if run_attempt_allows_transient_rerun(run.run_attempt, policy.max_transient_reruns) {
-        Ok(TransientRerunRevalidation::Eligible)
-    } else {
-        Ok(TransientRerunRevalidation::Exhausted {
+    if !run_attempt_allows_transient_rerun(run.run_attempt, policy.max_transient_reruns) {
+        return Ok(TransientRerunRevalidation::Exhausted {
             accepted_attempts: u32::try_from(run.run_attempt.saturating_sub(1)).unwrap_or(u32::MAX),
-        })
+        });
     }
+    let jobs = attempt_jobs(actions, &observation.repo, run_id, run.run_attempt)?;
+    match classify_jobs(&jobs) {
+        Ok(_) => Ok(TransientRerunRevalidation::Eligible),
+        Err(reason) => Ok(TransientRerunRevalidation::NotInterruption { reason }),
+    }
+}
+
+/// Jobs of one run attempt, each runner-less cancellation checked against its
+/// check run's annotations for a concurrency supersede. A partial read fails.
+fn attempt_jobs(
+    actions: &GitHubActions,
+    repo: &str,
+    run_id: u64,
+    attempt: u64,
+) -> Result<Vec<InterruptionJob>, String> {
+    let value = gh_json(
+        actions,
+        &[
+            "api".to_owned(),
+            format!("repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100"),
+        ],
+        "transient rerun attempt jobs",
+    )?;
+    let rows = value
+        .get("jobs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("run {run_id} attempt {attempt} jobs response missing jobs"))?;
+    if value
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .is_none_or(|total| total > 100 || total != rows.len() as u64)
+    {
+        return Err(format!(
+            "run {run_id} attempt {attempt} jobs could not be read completely; refusing a \
+             partial interruption read"
+        ));
+    }
+    let mut jobs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut job = job_from_api(row);
+        if job.is_runnerless_cancel() {
+            let job_id = row
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| format!("run {run_id} has a job without an id"))?;
+            let annotations = gh_json(
+                actions,
+                &[
+                    "api".to_owned(),
+                    format!("repos/{repo}/check-runs/{job_id}/annotations"),
+                ],
+                "transient rerun job annotations",
+            )?;
+            job.superseded = annotations_mark_superseded(&annotations);
+        }
+        jobs.push(job);
+    }
+    Ok(jobs)
 }
 
 /// Fence the bounded retry budget with GitHub's durable workflow-attempt
@@ -1059,5 +1189,5 @@ pub(super) fn run_attempt_allows_transient_rerun(
     max_transient_reruns: u32,
 ) -> bool {
     let already_accepted = run_attempt.saturating_sub(1);
-    already_accepted < u64::from(max_transient_reruns)
+    already_accepted < u64::from(clamp_rerun_budget(max_transient_reruns))
 }

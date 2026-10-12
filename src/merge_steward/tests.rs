@@ -385,9 +385,9 @@ fn direct_merge_refuses_unvalidated_base_advance_even_with_authoritative_checks(
 }
 
 #[test]
-fn genuine_failure_is_not_rerun_but_transient_is_bounded() {
+fn only_a_cancellation_is_a_rerun_candidate_and_the_budget_is_one() {
     let mut pr = green_pr();
-    pr.checks[0].conclusion = Some("TIMED_OUT".to_owned());
+    pr.checks[0].conclusion = Some("CANCELLED".to_owned());
     assert_eq!(
         classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
         StewardDecision::RerunTransient { run_ids: vec![10] }
@@ -397,35 +397,29 @@ fn genuine_failure_is_not_rerun_but_transient_is_bounded() {
         classify_pr(&pr, &queue_policy(), &attempts),
         StewardDecision::RequiredFailed { .. }
     ));
-    pr.checks[0].conclusion = Some("FAILURE".to_owned());
+    // A configured budget above one is clamped to one.
+    let mut wide = queue_policy();
+    wide.max_transient_reruns = 5;
     assert!(matches!(
-        classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
+        classify_pr(&pr, &wide, &attempts),
         StewardDecision::RequiredFailed { .. }
     ));
-}
-
-#[test]
-fn bounded_rerun_requires_a_classified_transient_run_and_one_budgeted_attempt() {
-    let mut pr = green_pr();
-    for conclusion in ["CANCELLED", "STARTUP_FAILURE", "STALE"] {
-        pr.checks[0].conclusion = Some(conclusion.to_owned());
-        let decision = classify_pr(&pr, &queue_policy(), &BTreeMap::new());
-        assert_eq!(
-            decision,
-            StewardDecision::RerunTransient { run_ids: vec![10] }
-        );
-    }
     pr.checks[0].run_id = None;
     assert!(matches!(
         classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
         StewardDecision::RequiredFailed { .. }
     ));
     pr.checks[0].run_id = Some(10);
-    let attempts = BTreeMap::from([(10, 1)]);
-    assert!(matches!(
-        classify_pr(&pr, &queue_policy(), &attempts),
-        StewardDecision::RequiredFailed { .. }
-    ));
+    for conclusion in ["FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "STALE"] {
+        pr.checks[0].conclusion = Some(conclusion.to_owned());
+        assert!(
+            matches!(
+                classify_pr(&pr, &queue_policy(), &BTreeMap::new()),
+                StewardDecision::RequiredFailed { .. }
+            ),
+            "{conclusion}"
+        );
+    }
 }
 
 #[test]
