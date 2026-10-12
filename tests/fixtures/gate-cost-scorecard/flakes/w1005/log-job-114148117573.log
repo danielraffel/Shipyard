@@ -1,0 +1,246 @@
+2026-10-10T06:12:37.5006600Z ##[group]Run echo "REUSE_RECORD_JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+2026-10-10T06:12:37.5368050Z ##[group]Run set -euo pipefail
+2026-10-10T06:12:37.6601380Z ##[group]Run actions/checkout@v5
+2026-10-10T06:12:40.7233240Z ##[group]Run if [ -n "$PULP_CAPABILITY_PR_BASE_SHA" ]; then
+2026-10-10T06:12:41.8107570Z ##[group]Run python3 tools/scripts/hydrate_gpu_provenance_commits.py
+2026-10-10T06:12:45.0537990Z ##[group]Run if command -v ccache >/dev/null 2>&1 && command -v ninja >/dev/null 2>&1; then
+2026-10-10T06:12:45.0746970Z ##[group]Run if command -v ccache >/dev/null 2>&1; then
+2026-10-10T06:12:45.1212600Z ##[group]Run ./setup.sh --ci --deps-only
+2026-10-10T06:12:58.9919790Z ##[group]Run set -euo pipefail
+2026-10-10T06:13:01.7096910Z ##[group]Run set -euo pipefail
+2026-10-10T06:13:05.0837120Z ##[group]Run set -euo pipefail
+2026-10-10T06:13:05.5055190Z ##[group]Run # Proves the job-level ccache correctness overrides actually reached
+2026-10-10T06:13:05.5340380Z ##[group]Run npm ci --prefix tools/import-design/jsx-runtime --no-audit --no-fund
+2026-10-10T06:13:06.5559480Z ##[group]Run set -euo pipefail
+2026-10-10T06:13:19.9690700Z ##[group]Run bash tools/ci/install_visual_python_deps.sh "$PULP_BUILD_DIR"
+2026-10-10T06:13:24.4842760Z ##[group]Run set -euo pipefail
+2026-10-10T06:13:25.2344900Z ##[group]Run # Snapshot the cumulative ccache counters so the "Ccache stats" step
+2026-10-10T06:13:25.3475680Z ##[notice]iOS compile gate skipped by exact changed-surface authorization
+2026-10-10T06:15:17.9042700Z ##[group]Run if command -v ccache >/dev/null 2>&1; then
+2026-10-10T06:15:18.0576470Z ##[group]Run set -euo pipefail
+2026-10-10T06:15:19.1175700Z ##[notice]pull-request suite: fast (not armed for auto-merge)
+2026-10-10T06:15:19.1233210Z ##[group]Run set -euo pipefail
+2026-10-10T06:15:20.2835290Z  1/99 Test #21681: yoga-oracle-pin-lockstep ....................................   Passed    0.02 sec
+2026-10-10T06:15:20.3098050Z  2/99 Test #21670: dsp-provenance-audit ........................................   Passed    0.05 sec
+2026-10-10T06:15:20.3512560Z  3/99 Test #21689: control-authoring-examples ..................................   Passed    0.07 sec
+2026-10-10T06:15:20.3626030Z  4/99 Test #21675: doxygen-installed-header-check ..............................   Passed    0.10 sec
+2026-10-10T06:15:20.4004150Z  5/99 Test #21693: inspector-protocol-registry-check-selftest ..................   Passed    0.04 sec
+2026-10-10T06:15:20.5070660Z  6/99 Test #21696: token-coverage-ratchet ......................................   Passed    0.11 sec
+2026-10-10T06:15:20.5194580Z  7/99 Test #21691: linux-runner-lane-contract ..................................   Passed    0.21 sec
+2026-10-10T06:15:20.5411130Z  8/99 Test #21697: token-key-correctness .......................................   Passed    0.03 sec
+2026-10-10T06:15:20.7609600Z  9/99 Test #21700: raw-this-async-check ........................................   Passed    0.22 sec
+2026-10-10T06:15:21.5438630Z 10/99 Test #21692: inspector-protocol-registry-complete ........................   Passed    1.19 sec
+2026-10-10T06:15:24.1982590Z 11/99 Test #21702: thread-safe-assertions ......................................   Passed    3.44 sec
+2026-10-10T06:15:24.2224000Z 12/99 Test #21705: forced-restore-lint .........................................   Passed    2.68 sec
+2026-10-10T06:15:24.2293220Z 13/99 Test #21707: canvas-path-flush-lint ......................................   Passed    0.03 sec
+2026-10-10T06:15:24.5801710Z 14/99 Test #21710: skip-not-pass-lint-selftest .................................   Passed    0.35 sec
+2026-10-10T06:15:24.8599480Z 15/99 Test #21713: build-parallelism-guard .....................................   Passed    0.28 sec
+2026-10-10T06:15:25.0664280Z 16/99 Test #21722: msvc-string-literal-guard ...................................   Passed    0.21 sec
+2026-10-10T06:15:25.1138530Z 17/99 Test #21723: catch-discover-timeout-guard ................................   Passed    0.05 sec
+2026-10-10T06:15:25.1745450Z 18/99 Test #21724: catch-discover-timeout-guard-selftest .......................   Passed    0.06 sec
+2026-10-10T06:15:25.2799680Z 19/99 Test #21725: ctest-label-exclusion-guard .................................   Passed    0.11 sec
+2026-10-10T06:15:25.3137620Z 20/99 Test #21727: capability-contract-gate-wiring .............................   Passed    0.03 sec
+2026-10-10T06:15:25.6163110Z 21/99 Test #21709: skip-not-pass-lint ..........................................   Passed    1.39 sec
+2026-10-10T06:15:25.6518560Z 22/99 Test #21733: mac-objc-source-list-guard ..................................   Passed    0.04 sec
+2026-10-10T06:15:25.6977880Z 23/99 Test #21729: trace-span-category-lint ....................................   Passed    0.38 sec
+2026-10-10T06:15:25.7034280Z 24/99 Test #21735: setup-bootstrap-plan-guard ..................................   Passed    0.05 sec
+2026-10-10T06:15:25.7364760Z 25/99 Test #21738: example-validation-paths ....................................   Passed    0.03 sec
+2026-10-10T06:15:25.7404540Z 26/99 Test #21737: fork-pr-runner-routing ......................................   Passed    0.04 sec
+2026-10-10T06:15:26.2965200Z 27/99 Test #21739: vellum-workflow-dispatch ....................................   Passed    0.56 sec
+2026-10-10T06:15:26.3430360Z 28/99 Test #21781: repo-source-scan ............................................   Passed    0.05 sec
+2026-10-10T06:15:26.5410920Z 29/99 Test #21782: param-designator-order ......................................   Passed    0.20 sec
+2026-10-10T06:15:26.6172170Z 30/99 Test #21780: odr-macro-gated-headers .....................................   Passed    0.88 sec
+2026-10-10T06:15:27.3329180Z 31/99 Test #21783: cmake-manifest-parse ........................................   Passed    0.79 sec
+2026-10-10T06:15:28.0085610Z 32/99 Test #21784: ctest-duplicate-registration ................................   Passed    1.39 sec
+2026-10-10T06:15:28.0467590Z 33/99 Test #21791: sdk-plist-templates-installed ...............................   Passed    0.04 sec
+2026-10-10T06:15:28.7318810Z 34/99 Test #21785: ctest-measured-budgets ......................................   Passed    1.40 sec
+2026-10-10T06:15:28.8056870Z 35/99 Test #21683: agent-capability-manifest-check .............................   Passed    8.54 sec
+2026-10-10T06:15:28.8810570Z 36/99 Test #21822: gpu-probe-historical-v1-acceptance ..........................   Passed    0.08 sec
+2026-10-10T06:15:28.9234520Z 37/99 Test #21841: decisions-contract-validate .................................   Passed    0.04 sec
+2026-10-10T06:15:28.9354910Z 38/99 Test #21792: tart-home-resolution ........................................   Passed    0.89 sec
+2026-10-10T06:15:28.9634940Z 39/99 Test #21854: advisory-macos-runner-policy ................................   Passed    0.04 sec
+2026-10-10T06:15:28.9791410Z 40/99 Test #21864: skills-doc-sync .............................................   Passed    0.04 sec
+2026-10-10T06:15:29.0149760Z 41/99 Test #21877: tools-registry-check ........................................   Passed    0.04 sec
+2026-10-10T06:15:29.0217970Z 42/99 Test #21809: gpu-test-resource-locks .....................................   Passed    0.29 sec
+2026-10-10T06:15:29.0888790Z 43/99 Test #21876: style-dedup-table-sync ......................................   Passed    0.13 sec
+2026-10-10T06:15:29.2537350Z 44/99 Test #21698: framework-neutrality ........................................   Passed    8.73 sec
+2026-10-10T06:15:29.3220890Z 45/99 Test #21887: scene3d-cmake-boundary ......................................   Passed    0.31 sec
+2026-10-10T06:15:29.3280280Z 46/99 Test #21928: refactor-baseline-manifest ..................................   Passed    0.07 sec
+2026-10-10T06:15:29.3609260Z 47/99 Test #21930: refactor-downstream-consumers-manifest ......................   Passed    0.03 sec
+2026-10-10T06:15:29.6406650Z 48/99 Test #21888: scene3d-cmake-boundary-negative-contract ....................   Passed    0.62 sec
+2026-10-10T06:15:29.6881500Z 49/99 Test #21929: refactor-baseline-manifest-negative-contract ................   Passed    0.37 sec
+2026-10-10T06:15:29.7129520Z 50/99 Test #21931: refactor-downstream-consumers-negative-contract .............   Passed    0.35 sec
+2026-10-10T06:15:29.7459230Z 51/99 Test #21972: prepush-cannot-measure ......................................   Passed    0.06 sec
+2026-10-10T06:15:29.7938060Z 52/99 Test #21976: prepush-format-gate-wiring ..................................   Passed    0.08 sec
+2026-10-10T06:15:29.7970470Z 53/99 Test #21978: wasm-skia-fetch-mapping .....................................   Passed    0.05 sec
+2026-10-10T06:15:29.9166720Z 54/99 Test #21999: importer-differential-lab ...................................   Passed    0.12 sec
+2026-10-10T06:15:30.0210630Z 55/99 Test #22002: import-layout-parity ........................................   Passed    0.22 sec
+2026-10-10T06:15:30.0923560Z 56/99 Test #22004: figma-rest-export ...........................................   Passed    0.18 sec
+2026-10-10T06:15:30.1343220Z 57/99 Test #22044: minblep-table-reproducible ..................................   Passed    0.04 sec
+2026-10-10T06:15:30.1623900Z 58/99 Test #22049: timeline-transaction-launcher-complexity ....................   Passed    0.03 sec
+2026-10-10T06:15:30.1931200Z 59/99 Test #22050: timeline-transaction-launcher-complexity-mutation-control ...   Passed    0.03 sec
+2026-10-10T06:15:30.1958840Z 60/99 Test #22040: overlay-dismissal-wiring ....................................   Passed    0.17 sec
+2026-10-10T06:15:30.2249390Z 61/99 Test #22052: timeline-launcher-retained-size-contract ....................   Passed    0.03 sec
+2026-10-10T06:15:30.2261900Z 62/99 Test #22051: timeline-launcher-bulk-build-contract .......................   Passed    0.03 sec
+2026-10-10T06:15:30.2564340Z 63/99 Test #22053: timeline-launcher-resource-contract-mutation-control ........   Passed    0.03 sec
+2026-10-10T06:15:30.3136280Z 64/99 Test #22059: timeline-engine-dependency-floor ............................   Passed    0.09 sec
+2026-10-10T06:15:30.3508410Z 65/99 Test #22063: web-timeline-source-closure .................................   Passed    0.04 sec
+2026-10-10T06:15:30.4268430Z 66/99 Test #22067: timeline-schema-ts-drift ....................................   Passed    0.08 sec
+2026-10-10T06:15:30.4710020Z 67/99 Test #22061: playback-negative-capability ................................   Passed    0.21 sec
+2026-10-10T06:15:30.4989520Z 68/99 Test #22069: timeline-schema-cli-drift ...................................   Passed    0.07 sec
+2026-10-10T06:15:30.5445930Z 69/99 Test #22071: timeline-schema-js-drift ....................................   Passed    0.07 sec
+2026-10-10T06:15:30.5663060Z 70/99 Test #22073: timeline-mcp-drift ..........................................   Passed    0.07 sec
+2026-10-10T06:15:30.5760490Z 71/99 Test #22076: timeline-fixture-coverage ...................................   Passed    0.03 sec
+2026-10-10T06:15:30.6697810Z 72/99 Test #22082: vst3-bundle-layout ..........................................   Passed    0.09 sec
+2026-10-10T06:15:30.6997950Z 73/99 Test #21891: cmake-catch-multilabel-properties ...........................   Passed    1.61 sec
+2026-10-10T06:15:30.7353170Z 74/99 Test #22084: bundled-font-lists-agree ....................................   Passed    0.02 sec
+2026-10-10T06:15:30.7458890Z 75/99 Test #22080: project-package-mutation-control ............................   Passed    0.18 sec
+2026-10-10T06:15:30.7795340Z 76/99 Test #22085: sequencer-control-skill-coverage ............................   Passed    0.04 sec
+2026-10-10T06:15:30.7956810Z 77/99 Test #22087: timeline-command-doc-coverage ...............................   Passed    0.05 sec
+2026-10-10T06:15:30.8395730Z 78/99 Test #22083: pulp-uninstaller-contract ...................................   Passed    0.17 sec
+2026-10-10T06:15:30.8529450Z 79/99 Test #22088: interchange-concepts-drift ..................................   Passed    0.07 sec
+2026-10-10T06:15:30.8678960Z 80/99 Test #22089: interchange-tables-drift ....................................   Passed    0.07 sec
+2026-10-10T06:15:30.8936230Z 81/99 Test #22113: host-quirks-catalog-parity ..................................   Passed    0.04 sec
+2026-10-10T06:15:30.9018620Z 82/99 Test #22134: sample-region-i2-rt02-process-contract ......................   Passed    0.03 sec
+2026-10-10T06:15:30.9081460Z 83/99 Test #22090: interchange-matrix-docs-drift ...............................   Passed    0.07 sec
+2026-10-10T06:15:30.9633770Z 84/99 Test #22182: consumption-census-schema ...................................   Passed    0.07 sec
+2026-10-10T06:15:31.0283290Z 85/99 Test #22183: consumption-census-drift ....................................   Passed    0.13 sec
+2026-10-10T06:15:31.2522350Z 86/99 Test #22186: consumption-census-contract-control-note ....................   Passed    0.22 sec
+2026-10-10T06:15:31.3238620Z 87/99 Test #22188: sample-region-catalog-contract ..............................   Passed    0.07 sec
+2026-10-10T06:15:31.5277370Z 88/99 Test #22184: consumption-census-drift-description ........................   Passed    0.62 sec
+2026-10-10T06:15:31.5749390Z 89/99 Test #22190: pr-fast-tier-selftest .......................................   Passed    0.05 sec
+2026-10-10T06:15:31.7812440Z 90/99 Test #21969: agent-hook-paths ............................................   Passed    2.14 sec
+2026-10-10T06:15:31.9775670Z 91/99 Test #22192: ctest-unique-names-selftest .................................   Passed    0.20 sec
+2026-10-10T06:15:32.6446570Z 92/99 Test #22185: consumption-census-negative-contract ........................   Passed    1.68 sec
+2026-10-10T06:15:32.7353950Z 93/99 Test #22189: pr-fast-tier-contract .......................................   Passed    1.41 sec
+2026-10-10T06:15:32.9896110Z 94/99 Test #22191: ctest-unique-names ..........................................   Passed    1.41 sec
+2026-10-10T06:15:33.0975680Z 95/99 Test #22197: gate-python-imports-selftest ................................   Passed    0.11 sec
+2026-10-10T06:15:33.8060830Z 96/99 Test #22198: classify-changes-selftest ...................................   Passed    0.71 sec
+2026-10-10T06:15:36.9675820Z 97/99 Test #22196: gate-python-imports .........................................   Passed    4.23 sec
+2026-10-10T06:15:41.0533940Z 98/99 Test #22193: script-test-inputs-drift ....................................   Passed    9.08 sec
+2026-10-10T06:15:45.6606570Z 99/99 Test #22194: script-test-inputs-selftest .................................   Passed   13.02 sec
+2026-10-10T06:15:45.6628040Z ##[notice]{"schema":"shipyard-test-tier/v1","tier":"fast","selector":"pr-fast","full_suite_runs_in":"merge_group"}
+2026-10-10T06:15:45.6662480Z ##[group]Run set -euo pipefail
+2026-10-10T06:15:49.7434980Z  1/22 Test #21665: vellum-boundary-lint-negative-contract ......   Passed    0.29 sec
+2026-10-10T06:15:52.1803950Z  2/22 Test #21721: configure-check-cache .......................   Passed    2.44 sec
+2026-10-10T06:15:53.0398240Z  3/22 Test #21749: reuse-policy-replay-selftest ................   Passed    0.86 sec
+2026-10-10T06:15:53.1062340Z  4/22 Test #21750: changed-surface-shadow-plans-selftest .......   Passed    0.07 sec
+2026-10-10T06:15:53.9324360Z  5/22 Test #21751: binary-identity-shadow-selftest .............   Passed    0.83 sec
+2026-10-10T06:15:54.4063610Z  6/22 Test #21768: affected-tests-shadow-selftest ..............   Passed    0.47 sec
+2026-10-10T06:15:54.9348150Z  7/22 Test #21844: changed-surface-policy-inventory ............   Passed    0.53 sec
+2026-10-10T06:16:10.4845140Z  8/22 Test #21845: changed-surface-script-families-selftest ....   Passed   15.55 sec
+2026-10-10T06:16:26.6819850Z  9/22 Test #21850: changed-surface-script-families-drift .......***Failed   16.20 sec
+2026-10-10T06:16:31.6046220Z  9/22 Test #21789: combined-installer-selftest .................   Passed   42.15 sec
+2026-10-10T06:16:32.7821810Z 10/22 Test #21895: catch-test-name-guard .......................   Passed    1.18 sec
+2026-10-10T06:16:33.5064350Z 11/22 Test #21827: gpu-first-visible-role-producers-selftest ...   Passed   44.05 sec
+2026-10-10T06:16:34.0868970Z 12/22 Test #21896: catch-test-name-guard-selftest ..............   Passed    1.30 sec
+2026-10-10T06:16:34.1249000Z 13/22 Test #21994: install-sha256sums-current ..................   Passed    0.04 sec
+2026-10-10T06:16:34.8451610Z 14/22 Test #21993: install-rpath-closure .......................   Passed    1.34 sec
+2026-10-10T06:16:34.8797970Z 15/22 Test #22130: agent-panel-native-invariants ...............***Skipped   0.03 sec
+2026-10-10T06:16:34.9133120Z 16/22 Test #22131: agent-panel-clipped-is-rejected .............***Skipped   0.03 sec
+2026-10-10T06:16:42.8416460Z     Test #21850: changed-surface-script-families-drift .......***Failed   16.16 sec
+2026-10-10T06:16:45.8734160Z 18/22 Test #22122: pulp-browser-capture-node-unit ..............   Passed   11.75 sec
+2026-10-10T06:16:48.6957080Z 19/22 Test #22203: source-selftest-lane-selftest ...............   Passed    2.82 sec
+2026-10-10T06:16:48.8536100Z 20/22 Test #22155: rack-generator-safety .......................   Passed   13.94 sec
+2026-10-10T06:17:01.1384920Z 21/22 Test #22199: wide-non-native-selftest ....................   Passed   18.30 sec
+2026-10-10T06:17:10.9961700Z 22/22 Test #21934: ios-gate-digest-selftest ....................   Passed   37.49 sec
+2026-10-10T06:17:10.9981760Z 	22130 - agent-panel-native-invariants (Skipped)
+2026-10-10T06:17:10.9981960Z 	22131 - agent-panel-clipped-is-rejected (Skipped)
+2026-10-10T06:17:10.9982120Z The following tests FAILED:
+2026-10-10T06:17:10.9982260Z 	21850 - changed-surface-script-families-drift (Failed)
+2026-10-10T06:17:10.9983320Z Errors while running CTest
+2026-10-10T06:17:11.8660140Z  1/29 Test #22902: cli-forge-catalog-json ..................   Passed    0.15 sec
+2026-10-10T06:17:11.8732970Z  2/29 Test #22903: cli-forge-catalog-check .................   Passed    0.15 sec
+2026-10-10T06:17:11.8760530Z  3/29 Test #22904: cli-forge-help ..........................   Passed    0.16 sec
+2026-10-10T06:17:11.8871320Z  4/29 Test #22912: cli-doctor-versions .....................   Passed    0.01 sec
+2026-10-10T06:17:11.9914250Z  5/29 Test #22911: cli-doctor-widgetbridge-generated-api ...   Passed    0.12 sec
+2026-10-10T06:17:12.2048390Z  6/29 Test #22913: cli-doctor-ci ...........................   Passed    0.32 sec
+2026-10-10T06:17:12.2074740Z  7/29 Test #22908: cli-doctor ..............................   Passed    0.34 sec
+2026-10-10T06:17:12.2176650Z  8/29 Test #22915: cli-doctor-host-quirks ..................   Passed    0.01 sec
+2026-10-10T06:17:12.2197520Z  9/29 Test #22916: cli-doctor-host-quirks-off ..............   Passed    0.01 sec
+2026-10-10T06:17:12.2294720Z 10/29 Test #22917: cli-doctor-host-quirks-validated ........   Passed    0.01 sec
+2026-10-10T06:17:12.2382150Z 11/29 Test #22921: cli-cache-status ........................   Passed    0.01 sec
+2026-10-10T06:17:12.2471100Z 12/29 Test #22922: cli-cache-help ..........................   Passed    0.01 sec
+2026-10-10T06:17:12.2946870Z 13/29 Test #22914: cli-doctor-validators ...................   Passed    0.30 sec
+2026-10-10T06:17:12.3518490Z 14/29 Test #22919: cli-create-help .........................   Passed    0.13 sec
+2026-10-10T06:17:12.3763310Z 15/29 Test #22923: cli-audio-help ..........................   Passed    0.13 sec
+2026-10-10T06:17:12.4068670Z 16/29 Test #22924: cli-audio-sampler-mip-help ..............   Passed    0.11 sec
+2026-10-10T06:17:12.4663650Z 17/29 Test #22935: cli-coverage-help .......................   Passed    0.11 sec
+2026-10-10T06:17:12.5076850Z 18/29 Test #22936: cli-coverage-help-flag ..................   Passed    0.13 sec
+2026-10-10T06:17:12.5183260Z 19/29 Test #22937: cli-coverage-unknown-subcommand .........   Passed    0.11 sec
+2026-10-10T06:17:12.5273990Z 20/29 Test #22940: cli-dsp-help-flag .......................   Passed    0.01 sec
+2026-10-10T06:17:12.5841690Z 21/29 Test #22938: cli-coverage-diff-skip ..................   Passed    0.12 sec
+2026-10-10T06:17:12.6148050Z 22/29 Test #22939: cli-dsp-help ............................   Passed    0.11 sec
+2026-10-10T06:17:12.6320160Z 23/29 Test #22941: cli-dsp-unknown-subcommand ..............   Passed    0.10 sec
+2026-10-10T06:17:12.6411100Z 24/29 Test #22960: cli-doctor-versions-json ................   Passed    0.01 sec
+2026-10-10T06:17:12.6549620Z 25/29 Test #22961: cli-doctor-caches-empty .................   Passed    0.01 sec
+2026-10-10T06:17:12.6666500Z 26/29 Test #22962: cli-doctor-caches-json ..................   Passed    0.01 sec
+2026-10-10T06:17:12.6903790Z 27/29 Test #22942: cli-dsp-capabilities-check ..............   Passed    0.11 sec
+2026-10-10T06:17:12.7197400Z 28/29 Test #22943: cli-dsp-capabilities-json ...............   Passed    0.10 sec
+2026-10-10T06:17:15.3154080Z 29/29 Test #22009: claude-md-sync-hook .....................   Passed    3.60 sec
+2026-10-10T06:17:16.0820520Z  1/25 Test #21743: control-product-b-absence-selftest ...   Passed    0.06 sec
+2026-10-10T06:17:16.2200200Z  2/25 Test #21898: clock-only-temp-key-guard ............   Passed    0.20 sec
+2026-10-10T06:17:16.4984330Z  3/25 Test #21899: clock-only-temp-key-guard-selftest ...   Passed    0.42 sec
+2026-10-10T06:17:16.5614070Z  4/25 Test #22025: cmake-examples-reorder-init-guard ....   Passed    0.06 sec
+2026-10-10T06:17:16.5702410Z  5/25 Test #22901: cli-help .............................   Passed    0.01 sec
+2026-10-10T06:17:16.6872150Z  6/25 Test #22905: cli-forge-help-flag ..................   Passed    0.12 sec
+2026-10-10T06:17:16.6958510Z  7/25 Test #22906: cli-forge-unknown-subcommand .........   Passed    0.01 sec
+2026-10-10T06:17:16.7335850Z  8/25 Test #21937: cmake-ios-hostapp-bundle-guard .......   Passed    0.51 sec
+2026-10-10T06:17:16.8128220Z  9/25 Test #22918: cli-status ...........................   Passed    0.12 sec
+2026-10-10T06:17:16.8582650Z 10/25 Test #22920: cli-run-help .........................   Passed    0.12 sec
+2026-10-10T06:17:16.8673270Z 11/25 Test #22947: cli-minos-help-flag ..................   Passed    0.01 sec
+2026-10-10T06:17:16.9340490Z 12/25 Test #22946: cli-minos-help .......................   Passed    0.12 sec
+2026-10-10T06:17:16.9896060Z 13/25 Test #22948: cli-minos-unknown-subcommand .........   Passed    0.12 sec
+2026-10-10T06:17:17.0489880Z 14/25 Test #22949: cli-minos-measure-no-path ............   Passed    0.11 sec
+2026-10-10T06:17:17.1128330Z 15/25 Test #22950: cli-minos-measure-self ...............   Passed    0.12 sec
+2026-10-10T06:17:17.1650490Z 16/25 Test #22951: cli-minos-sweep-dryrun ...............***Skipped   0.12 sec
+2026-10-10T06:17:17.2265920Z 17/25 Test #22952: cli-minos-update-bad-version .........   Passed    0.11 sec
+2026-10-10T06:17:17.2977470Z 18/25 Test #22953: cli-minos-publish-runbook ............***Skipped   0.13 sec
+2026-10-10T06:17:17.3548120Z 19/25 Test #22956: cli-no-new-alias .....................   Passed    0.13 sec
+2026-10-10T06:17:17.4121860Z 20/25 Test #22957: cli-loop-help ........................   Passed    0.11 sec
+2026-10-10T06:17:17.4757620Z 21/25 Test #22958: cli-projects-help ....................   Passed    0.12 sec
+2026-10-10T06:17:17.5323850Z 22/25 Test #22959: cli-projects-list-empty ..............   Passed    0.12 sec
+2026-10-10T06:17:22.3130890Z 23/25 Test #21742: control-product-b-absence ............   Passed    6.29 sec
+2026-10-10T06:17:23.6973620Z 24/25 Test #22971: control-product-b-rust-cli-absence ...   Passed    6.22 sec
+2026-10-10T06:17:24.3817080Z 25/25 Test #21770: executable-keys-selftest .............   Passed    8.36 sec
+2026-10-10T06:17:24.3829820Z 	22951 - cli-minos-sweep-dryrun (Skipped)
+2026-10-10T06:17:24.3829980Z 	22953 - cli-minos-publish-runbook (Skipped)
+2026-10-10T06:17:25.3927310Z 1/7 Test #21797: gates-sh-fail-flag-selftest ..............   Passed    0.21 sec
+2026-10-10T06:17:25.5546120Z 2/7 Test #21857: graphql-filtered-count-guard .............   Passed    0.16 sec
+2026-10-10T06:17:26.6532120Z 3/7 Test #21746: pr-head-diff-scoped-registrations ........   Passed    1.47 sec
+2026-10-10T06:17:26.9379500Z 4/7 Test #22128: import-realtime-contract .................   Passed    0.28 sec
+2026-10-10T06:17:41.2380060Z 5/7 Test #21821: gpu-probe-terminal-recorder-selftest .....   Passed   16.05 sec
+2026-10-10T06:17:45.3482650Z 6/7 Test #21866: local-diff-cover-selftest ................   Passed   19.79 sec
+2026-10-10T06:17:51.2097700Z 7/7 Test #21829: gpu-trace-overhead-acceptance-selftest ...   Passed   26.03 sec
+2026-10-10T06:19:26.5894520Z  1/20 Test #22124: pulp-browser-capture-node-integration .........***Failed   94.58 sec
+2026-10-10T06:20:58.1653580Z     Test #22124: pulp-browser-capture-node-integration .........   Passed   91.58 sec
+2026-10-10T06:21:09.4647360Z  2/20 Test #22123: pulp-browser-capture-process-lifecycle ........   Passed   11.30 sec
+2026-10-10T06:21:09.5101270Z  3/20 Test #21666: pulp-ui-clean-output-lint .....................   Passed    0.04 sec
+2026-10-10T06:21:09.5974750Z  4/20 Test #21680: script-argv-selftest ..........................   Passed    0.13 sec
+2026-10-10T06:21:09.6503560Z  5/20 Test #21712: test-file-paths-lint-selftest .................   Passed    0.14 sec
+2026-10-10T06:21:09.6507580Z  6/20 Test #21731: status-tone-signal-lint .......................   Passed    0.05 sec
+2026-10-10T06:21:09.7613000Z  7/20 Test #21732: status-tone-signal-lint-selftest ..............   Passed    0.11 sec
+2026-10-10T06:21:09.8542780Z  8/20 Test #21711: test-file-paths-lint ..........................   Passed    0.39 sec
+2026-10-10T06:21:09.9601220Z  9/20 Test #21761: read-audit-selftest ...........................   Passed    0.11 sec
+2026-10-10T06:21:10.0789740Z 10/20 Test #21667: pulp-ui-clean-output-lint-negative-contract ...   Passed    0.61 sec
+2026-10-10T06:21:10.7851160Z 11/20 Test #21800: runner-topology-static-selftest ...............   Passed    0.82 sec
+2026-10-10T06:21:17.9558430Z 12/20 Test #21974: prepush-refresh-push ..........................   Passed    7.88 sec
+2026-10-10T06:21:18.0071730Z 13/20 Test #22065: timeline-schema-drift .........................   Passed    0.05 sec
+2026-10-10T06:21:18.9437860Z 14/20 Test #22111: pulp_bundle_threejs_for_jsc_smoke .............   Passed    0.94 sec
+2026-10-10T06:21:19.3488380Z 15/20 Test #21975: prepush-queue-rebase-hint .....................   Passed    8.56 sec
+2026-10-10T06:21:19.3787150Z 16/20 Test #22964: pulp-rust-gpu-trace-analysis-integration ......***Skipped   0.03 sec
+2026-10-10T06:21:19.4301670Z 17/20 Test #22965: pulp-rust-gpu-trace-analysis-ctest-selftest ...   Passed    0.05 sec
+2026-10-10T06:21:20.2072000Z 18/20 Test #22202: source-selftest-lane-contract .................   Passed    1.26 sec
+2026-10-10T06:21:27.9036890Z 19/20 Test #21754: reuse-record-selftest .........................   Passed   18.14 sec
+2026-10-10T06:21:47.2135230Z 20/20 Test #21753: test-receipts-shadow-selftest .................   Passed   37.56 sec
+2026-10-10T06:21:47.2153740Z 	22964 - pulp-rust-gpu-trace-analysis-integration (Skipped)
+2026-10-10T06:21:48.0285370Z 1/3 Test #21679: windows-posix-shims-selftest .....   Passed    0.11 sec
+2026-10-10T06:21:48.3881260Z 2/3 Test #21664: vellum-boundary-lint .............   Passed    0.47 sec
+2026-10-10T06:21:48.5020070Z 3/3 Test #22010: tool-registry-reminder-hook ......   Passed    0.59 sec
+2026-10-10T06:21:49.5623680Z ##[notice]{"budget_minutes": 10.0, "changed_files": 3, "excluded_or_absent": 62, "failed": 1, "families": {}, "minutes": 6.0, "mode": "focused", "passed": 100, "pre_existing_on_base": 0, "reason": "targets owning the diff plus their tests", "schema": "pulp-pr-head-affected-tests/v1", "selected": 168, "skipped_for_budget": 5}
+2026-10-10T06:21:49.5778720Z ##[group]Run set -uo pipefail
+2026-10-10T06:21:50.8200900Z ##[group]Run set +e
+2026-10-10T06:21:50.8535770Z ##[group]Run actions/upload-artifact@v5
+2026-10-10T06:21:52.2273780Z ##[group]Run set -uo pipefail
+2026-10-10T06:22:59.7925340Z ##[notice]{"bytes": 10505172, "codemodel_targets": 818, "executables": 626, "linked": 660, "registration_rows": 22988, "run_kind": "pr_head", "runner_image": "d5fe82597f648ed1", "schema": "pulp-reuse-record/v1", "seconds": 67.5, "suites": {"pr-affected": 106, "pr-fast": 99}, "tests": 205}
+2026-10-10T06:22:59.8142700Z ##[group]Run actions/upload-artifact@v5

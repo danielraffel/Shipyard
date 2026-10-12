@@ -1,0 +1,53 @@
+2026-10-12T21:14:13.0544410Z ##[group]Run echo "REUSE_RECORD_JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+2026-10-12T21:14:13.0877440Z ##[group]Run set -euo pipefail
+2026-10-12T21:14:13.2099700Z ##[group]Run actions/checkout@v7
+2026-10-12T21:14:17.5326700Z ##[group]Run python3 tools/scripts/hydrate_gpu_provenance_commits.py
+2026-10-12T21:14:21.5020620Z ##[group]Run if command -v ccache >/dev/null 2>&1 && command -v ninja >/dev/null 2>&1; then
+2026-10-12T21:14:21.5237710Z ##[group]Run if command -v ccache >/dev/null 2>&1; then
+2026-10-12T21:14:21.5744860Z ##[group]Run ./setup.sh --ci --deps-only
+2026-10-12T21:14:39.8357540Z ##[group]Run set -euo pipefail
+2026-10-12T21:14:43.3405770Z ##[group]Run set -euo pipefail
+2026-10-12T21:14:46.5563560Z ##[group]Run set -euo pipefail
+2026-10-12T21:14:47.0539990Z ##[group]Run # Proves the job-level ccache correctness overrides actually reached
+2026-10-12T21:14:47.0828170Z ##[group]Run npm ci --prefix tools/import-design/jsx-runtime --no-audit --no-fund
+2026-10-12T21:14:48.2134920Z ##[group]Run set -euo pipefail
+2026-10-12T21:15:04.9063810Z ##[group]Run bash tools/ci/install_visual_python_deps.sh "$PULP_BUILD_DIR"
+2026-10-12T21:15:10.8465980Z ##[group]Run set -euo pipefail
+2026-10-12T21:15:11.7785110Z ##[group]Run # Snapshot the cumulative ccache counters so the "Ccache stats" step
+2026-10-12T21:15:16.0244180Z ##[notice]{"digest": "b16609ac06ceebbf7b069f77a4a04b6542eb4fcb465690767b514d173e959f71", "event": "merge_group", "mode": "enforce", "schema": "pulp-ios-gate-shadow/v1", "source_run_id": 38305299000, "verdict": "skipped"}
+2026-10-12T21:15:16.0477550Z ##[notice]iOS compile gate skipped: input digest b16609ac06ceebbf7b069f77a4a04b6542eb4fcb465690767b514d173e959f71 passed in trusted run 38305299000
+2026-10-12T21:17:27.9924870Z ##[group]Run if command -v ccache >/dev/null 2>&1; then
+2026-10-12T21:17:28.1864300Z ##[group]Run set -euo pipefail
+2026-10-12T21:17:32.4874150Z     1/22655 Test     #5: pulp.vellum-closure-boundary ................................................................................................................................   Passed    2.60 sec
+2026-10-12T21:18:09.2533600Z     2/22655 Test #21966: sample-region-compat-baseline ...............................................................................................................................   Passed   39.37 sec
+2026-10-12T21:18:12.8281770Z     3/22655 Test #21796: gpu-trace-overhead-acceptance-selftest ......................................................................................................................   Passed   40.34 sec
+2026-10-12T21:18:13.8382570Z     4/22655 Test     #1: Installed aggregate exact-instance CLI MCP revocation and disconnect E2E ....................................................................................   Passed    1.01 sec
+2026-10-12T21:18:30.1017020Z     5/22655 Test #21794: gpu-first-visible-role-producers-selftest ...................................................................................................................   Passed   60.22 sec
+2026-10-12T21:18:37.7801010Z     6/22655 Test #21931: cmake-control-sdk-consumer ..................................................................................................................................   Passed   67.89 sec
+2026-10-12T21:18:37.9534570Z     7/22655 Test     #3: broker cancellation and revocation fence prepared topology with live audio ..................................................................................   Passed    7.85 sec
+2026-10-12T21:18:37.9932670Z     8/22655 Test     #6: pulp.vellum-closure-gate ....................................................................................................................................   Passed    0.21 sec
+2026-10-12T21:18:38.2240740Z     9/22655 Test     #8: pulp.vellum-closure-external-input-negative .................................................................................................................***Failed    0.23 sec
+2026-10-12T21:18:38.2546210Z           Test     #8: pulp.vellum-closure-external-input-negative .................................................................................................................***Failed    0.03 sec
+2026-10-12T21:18:38.2971270Z    10/22655 Test     #7: pulp.vellum-closure-gate-negative ...........................................................................................................................   Passed    0.34 sec
+2026-10-12T21:18:38.3514280Z    11/22655 Test     #4: DSPX-04 product binding reaches modulation route through broker .............................................................................................   Passed    8.25 sec
+2026-10-12T21:18:45.4739080Z    12/22655 Test     #2: sample-region control reaches editable and frozen products through CLI ......................................................................................   Passed   31.64 sec
+2026-10-12T21:18:52.6223750Z    13/22655 Test #21756: combined-installer-selftest .................................................................................................................................   Passed   43.37 sec
+2026-10-12T21:20:05.4050740Z    14/22655 Test #21654: agent-capability-installed-sdk ..............................................................................................................................   Passed  155.52 sec
+2026-10-12T21:20:05.4184040Z Errors while running CTest
+2026-10-12T21:20:05.4202680Z The following tests FAILED:
+2026-10-12T21:20:05.4202870Z 	  8 - pulp.vellum-closure-external-input-negative (Failed) pr
+2026-10-12T21:20:07.2208660Z ##[notice]{"schema":"shipyard-test-tier/v1","tier":"full"}
+2026-10-12T21:20:07.2274650Z ##[group]Run python3 tools/ci/a2t_headroom_annotation.py "$RUNNER_TEMP/a2t-scope-headroom.json"
+2026-10-12T21:20:07.2667480Z ##[notice]247 scope-touching revisions of a 512 limit (48%); the gate fails past 384.
+2026-10-12T21:20:07.2725240Z ##[group]Run python3 tools/ci/merge_group_shadows.py run \
+2026-10-12T21:20:16.9657210Z ##[notice]{"base": "606528bf325d05d2285830ef8520f8fadc529042", "compared": 606, "differing": 4, "differing_examples": ["test/a3-product/pulp-test-control-gpu-health-standalone-product", "test/pulp-test-control-gpu-health-provider", "test/pulp-test-control-shipping-real-component", "test/pulp-test-inspector-stripped-artifact"], "head": "a3d471584ceae8cc0d0eb9c82d86cd11bbaef56f", "identical": 602, "identical_share": 0.9933993399339934, "merge_sha": "6cb6bad799ddccaa04e2b9116d2075e1ba7823e9", "mode": "shadow", "only_here": 7, "only_there": 20, "our_binaries": 613, "schema": "pulp-binary-identity-shadow/v1", "source": "reuse-record", "source_run": "38305299000", "tree_identical": false, "verdict": "compared"}
+2026-10-12T21:22:35.7998570Z ##[notice]{"binary_tests": 22238, "changed_files": 1, "cmake_changed": true, "compiled_data_undeclared": 0, "compiled_selected_by_data": 0, "compiled_selected_by_spawn": 0, "compiled_spawns_undeclared": 202, "compiled_whole_checkout": 191, "event": "merge_group", "failed": 1, "failed_outside_names": [], "failed_outside_selection": 0, "mode": "shadow", "reason": "cmake changed", "schema": "pulp-affected-tests-shadow/v1", "script_declared": 344, "script_selected_declared": 0, "script_selected_undeclared": 0, "script_undeclared": 73, "scripts_changed": false, "select_all": true, "selected": 22655, "total": 22655, "unread_changed": []}
+2026-10-12T21:23:12.1381400Z ##[notice]{"exonerated_only": false, "failing": 1, "head": "6cb6bad799ddccaa04e2b9116d2075e1ba7823e9", "main_conclusion": "success", "main_evidence_read": true, "main_reason": "", "main_run_id": "38305340165", "mode": "shadow", "runs_scanned": 136, "schema": "pulp-flake-exoneration-shadow/v1", "tests": {"pulp.vellum-closure-external-input-negative": {"deterministic": false, "main_evidence_read": true, "other_heads": 0, "reason": "only 0 other head(s)", "would_exonerate": false}}, "unique_cause": 1, "window_hours": 24}
+2026-10-12T21:23:54.5582600Z ##[notice]{"key_seconds": 5.5, "keyed": 22533, "lookup_error": null, "lookup_errors": 0, "mode": "shadow", "ran_reasons": {"failed-recently": 1, "label": 142, "no-receipt": 21515, "tree-reader-or-probe": 731, "unkeyed": 79}, "receipt_keys": 386976, "receipt_runs": 20, "receipts_written": 8, "refused_receipts": 0, "run_failed": 1, "schema": "pulp-test-receipts-shadow/v1", "seconds": 42.4, "selected": 22655, "would_force_full": "cmake-changed", "would_skip": 187, "would_skip_failed": 0, "would_skip_failed_names": [], "would_skip_seconds": 144.3}
+2026-10-12T21:23:54.5878160Z ##[group]Run actions/upload-artifact@v5
+2026-10-12T21:23:56.2307730Z ##[group]Run set -uo pipefail
+2026-10-12T21:23:58.5274830Z ##[group]Run set +e
+2026-10-12T21:23:58.5689160Z ##[group]Run actions/upload-artifact@v5
+2026-10-12T21:24:00.2880530Z ##[group]Run set -uo pipefail
+2026-10-12T21:25:37.2816160Z ##[notice]{"bytes": 10497892, "codemodel_targets": 847, "executables": 633, "linked": 665, "registration_rows": 23053, "run_kind": "merge_group", "runner_image": "d5fe82597f648ed1", "schema": "pulp-reuse-record/v1", "seconds": 96.9, "suites": {"full": 14}, "tests": 14}
+2026-10-12T21:25:37.3178770Z ##[group]Run actions/upload-artifact@v5

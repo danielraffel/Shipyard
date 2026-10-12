@@ -1,0 +1,252 @@
+2026-10-12T19:38:05.1435690Z ##[group]Run echo "REUSE_RECORD_JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+2026-10-12T19:38:05.1748750Z ##[group]Run set -euo pipefail
+2026-10-12T19:38:05.2956510Z ##[group]Run actions/checkout@v7
+2026-10-12T19:38:08.0800200Z ##[group]Run if [ -n "$PULP_CAPABILITY_PR_BASE_SHA" ]; then
+2026-10-12T19:38:08.5104070Z ##[group]Run python3 tools/scripts/hydrate_gpu_provenance_commits.py
+2026-10-12T19:38:35.5250180Z ##[group]Run if command -v ccache >/dev/null 2>&1 && command -v ninja >/dev/null 2>&1; then
+2026-10-12T19:38:35.5479150Z ##[group]Run if command -v ccache >/dev/null 2>&1; then
+2026-10-12T19:38:35.5976430Z ##[group]Run ./setup.sh --ci --deps-only
+2026-10-12T19:38:51.0298830Z ##[group]Run set -euo pipefail
+2026-10-12T19:38:54.1873840Z ##[group]Run set -euo pipefail
+2026-10-12T19:38:57.1741820Z ##[group]Run set -euo pipefail
+2026-10-12T19:38:57.6366140Z ##[group]Run # Proves the job-level ccache correctness overrides actually reached
+2026-10-12T19:38:57.6668880Z ##[group]Run npm ci --prefix tools/import-design/jsx-runtime --no-audit --no-fund
+2026-10-12T19:38:58.9406800Z ##[group]Run set -euo pipefail
+2026-10-12T19:39:12.4902000Z ##[group]Run bash tools/ci/install_visual_python_deps.sh "$PULP_BUILD_DIR"
+2026-10-12T19:39:17.9103150Z ##[group]Run set -euo pipefail
+2026-10-12T19:39:18.8066010Z ##[group]Run # Snapshot the cumulative ccache counters so the "Ccache stats" step
+2026-10-12T19:39:18.9418840Z ##[notice]iOS compile gate skipped by exact changed-surface authorization
+2026-10-12T19:41:24.0600300Z ##[group]Run if command -v ccache >/dev/null 2>&1; then
+2026-10-12T19:41:24.2498560Z ##[group]Run set -euo pipefail
+2026-10-12T19:41:25.3963080Z ##[notice]pull-request suite: fast (the base branch moved since this head was merged onto it)
+2026-10-12T19:41:25.4000030Z ##[group]Run set -euo pipefail
+2026-10-12T19:41:27.2044880Z  1/99 Test #21710: yoga-oracle-pin-lockstep ....................................   Passed    0.03 sec
+2026-10-12T19:41:27.2334090Z  2/99 Test #21699: dsp-provenance-audit ........................................   Passed    0.06 sec
+2026-10-12T19:41:27.2899060Z  3/99 Test #21718: control-authoring-examples ..................................   Passed    0.09 sec
+2026-10-12T19:41:27.3189030Z  4/99 Test #21704: doxygen-installed-header-check ..............................   Passed    0.14 sec
+2026-10-12T19:41:27.3675550Z  5/99 Test #21722: inspector-protocol-registry-check-selftest ..................   Passed    0.05 sec
+2026-10-12T19:41:27.4916610Z  6/99 Test #21720: linux-runner-lane-contract ..................................   Passed    0.26 sec
+2026-10-12T19:41:27.5384920Z  7/99 Test #21725: token-coverage-ratchet ......................................   Passed    0.17 sec
+2026-10-12T19:41:27.5390860Z  8/99 Test #21726: token-key-correctness .......................................   Passed    0.05 sec
+2026-10-12T19:41:27.8254480Z  9/99 Test #21729: raw-this-async-check ........................................   Passed    0.29 sec
+2026-10-12T19:41:29.1195740Z 10/99 Test #21721: inspector-protocol-registry-complete ........................   Passed    1.83 sec
+2026-10-12T19:41:32.2338700Z 11/99 Test #21734: forced-restore-lint .........................................   Passed    3.11 sec
+2026-10-12T19:41:32.2682480Z 12/99 Test #21736: canvas-path-flush-lint ......................................   Passed    0.03 sec
+2026-10-12T19:41:32.5837610Z 13/99 Test #21731: thread-safe-assertions ......................................   Passed    4.76 sec
+2026-10-12T19:41:32.9822380Z 14/99 Test #21739: skip-not-pass-lint-selftest .................................   Passed    0.40 sec
+2026-10-12T19:41:33.3307800Z 15/99 Test #21742: build-parallelism-guard .....................................   Passed    0.35 sec
+2026-10-12T19:41:33.5628980Z 16/99 Test #21751: msvc-string-literal-guard ...................................   Passed    0.23 sec
+2026-10-12T19:41:33.6191340Z 17/99 Test #21752: catch-discover-timeout-guard ................................   Passed    0.06 sec
+2026-10-12T19:41:33.6913420Z 18/99 Test #21753: catch-discover-timeout-guard-selftest .......................   Passed    0.07 sec
+2026-10-12T19:41:33.8249960Z 19/99 Test #21754: ctest-label-exclusion-guard .................................   Passed    0.13 sec
+2026-10-12T19:41:33.8670260Z 20/99 Test #21756: capability-contract-gate-wiring .............................   Passed    0.04 sec
+2026-10-12T19:41:33.9840650Z 21/99 Test #21738: skip-not-pass-lint ..........................................   Passed    1.72 sec
+2026-10-12T19:41:34.0269070Z 22/99 Test #21762: mac-objc-source-list-guard ..................................   Passed    0.04 sec
+2026-10-12T19:41:34.0856200Z 23/99 Test #21764: setup-bootstrap-plan-guard ..................................   Passed    0.06 sec
+2026-10-12T19:41:34.1398540Z 24/99 Test #21766: fork-pr-runner-routing ......................................   Passed    0.05 sec
+2026-10-12T19:41:34.1822070Z 25/99 Test #21767: example-validation-paths ....................................   Passed    0.04 sec
+2026-10-12T19:41:34.3131540Z 26/99 Test #21758: trace-span-category-lint ....................................   Passed    0.45 sec
+2026-10-12T19:41:34.7734240Z 27/99 Test #21768: vellum-workflow-dispatch ....................................   Passed    0.59 sec
+2026-10-12T19:41:34.8239460Z 28/99 Test #21811: repo-source-scan ............................................   Passed    0.05 sec
+2026-10-12T19:41:35.0619200Z 29/99 Test #21812: param-designator-order ......................................   Passed    0.24 sec
+2026-10-12T19:41:35.3868360Z 30/99 Test #21810: odr-macro-gated-headers .....................................   Passed    1.07 sec
+2026-10-12T19:41:35.9596950Z 31/99 Test #21813: cmake-manifest-parse ........................................   Passed    0.90 sec
+2026-10-12T19:41:37.0050290Z 32/99 Test #21814: ctest-duplicate-registration ................................   Passed    1.62 sec
+2026-10-12T19:41:37.0425700Z 33/99 Test #21821: sdk-plist-templates-installed ...............................   Passed    0.04 sec
+2026-10-12T19:41:37.5392780Z 34/99 Test #21815: ctest-measured-budgets ......................................   Passed    1.58 sec
+2026-10-12T19:41:37.8450720Z 35/99 Test #21822: tart-home-resolution ........................................   Passed    0.80 sec
+2026-10-12T19:41:37.8681160Z 36/99 Test #21839: gpu-test-resource-locks .....................................   Passed    0.33 sec
+2026-10-12T19:41:37.9118370Z 37/99 Test #21871: decisions-contract-validate .................................   Passed    0.04 sec
+2026-10-12T19:41:37.9274480Z 38/99 Test #21852: gpu-probe-historical-v1-acceptance ..........................   Passed    0.08 sec
+2026-10-12T19:41:37.9531650Z 39/99 Test #21884: advisory-macos-runner-policy ................................   Passed    0.04 sec
+2026-10-12T19:41:37.9703270Z 40/99 Test #21894: skills-doc-sync .............................................   Passed    0.04 sec
+2026-10-12T19:41:38.0079640Z 41/99 Test #21908: tools-registry-check ........................................   Passed    0.04 sec
+2026-10-12T19:41:38.1020650Z 42/99 Test #21907: style-dedup-table-sync ......................................   Passed    0.15 sec
+2026-10-12T19:41:38.2696360Z 43/99 Test #21918: scene3d-cmake-boundary ......................................   Passed    0.26 sec
+2026-10-12T19:41:38.6153000Z 44/99 Test #21727: framework-neutrality ........................................   Passed   11.08 sec
+2026-10-12T19:41:38.6944460Z 45/99 Test #21959: refactor-baseline-manifest ..................................   Passed    0.08 sec
+2026-10-12T19:41:38.7318500Z 46/99 Test #21919: scene3d-cmake-boundary-negative-contract ....................   Passed    0.63 sec
+2026-10-12T19:41:38.7712650Z 47/99 Test #21961: refactor-downstream-consumers-manifest ......................   Passed    0.04 sec
+2026-10-12T19:41:38.8832380Z 48/99 Test #21712: agent-capability-manifest-check .............................   Passed   11.71 sec
+2026-10-12T19:41:39.1175900Z 49/99 Test #21960: refactor-baseline-manifest-negative-contract ................   Passed    0.42 sec
+2026-10-12T19:41:39.1758700Z 50/99 Test #22006: prepush-cannot-measure ......................................   Passed    0.06 sec
+2026-10-12T19:41:39.1769710Z 51/99 Test #21962: refactor-downstream-consumers-negative-contract .............   Passed    0.41 sec
+2026-10-12T19:41:39.2363490Z 52/99 Test #22012: wasm-skia-fetch-mapping .....................................   Passed    0.06 sec
+2026-10-12T19:41:39.2586760Z 53/99 Test #22010: prepush-format-gate-wiring ..................................   Passed    0.08 sec
+2026-10-12T19:41:39.3590040Z 54/99 Test #22033: importer-differential-lab ...................................   Passed    0.12 sec
+2026-10-12T19:41:39.4874300Z 55/99 Test #22036: import-layout-parity ........................................   Passed    0.23 sec
+2026-10-12T19:41:39.5491980Z 56/99 Test #22038: figma-rest-export ...........................................   Passed    0.19 sec
+2026-10-12T19:41:39.5961370Z 57/99 Test #22086: minblep-table-reproducible ..................................   Passed    0.05 sec
+2026-10-12T19:41:39.6311150Z 58/99 Test #22091: timeline-transaction-launcher-complexity ....................   Passed    0.03 sec
+2026-10-12T19:41:39.6666500Z 59/99 Test #22092: timeline-transaction-launcher-complexity-mutation-control ...   Passed    0.04 sec
+2026-10-12T19:41:39.7005920Z 60/99 Test #22093: timeline-launcher-bulk-build-contract .......................   Passed    0.03 sec
+2026-10-12T19:41:39.7371030Z 61/99 Test #22094: timeline-launcher-retained-size-contract ....................   Passed    0.04 sec
+2026-10-12T19:41:39.7387060Z 62/99 Test #22075: overlay-dismissal-wiring ....................................   Passed    0.25 sec
+2026-10-12T19:41:39.7735070Z 63/99 Test #22095: timeline-launcher-resource-contract-mutation-control ........   Passed    0.04 sec
+2026-10-12T19:41:39.8414320Z 64/99 Test #22101: timeline-engine-dependency-floor ............................   Passed    0.10 sec
+2026-10-12T19:41:39.8859040Z 65/99 Test #22105: web-timeline-source-closure .................................   Passed    0.04 sec
+2026-10-12T19:41:39.9663030Z 66/99 Test #22109: timeline-schema-ts-drift ....................................   Passed    0.08 sec
+2026-10-12T19:41:40.0120950Z 67/99 Test #21922: cmake-catch-multilabel-properties ...........................   Passed    1.74 sec
+2026-10-12T19:41:40.0418110Z 68/99 Test #22103: playback-negative-capability ................................   Passed    0.27 sec
+2026-10-12T19:41:40.0474430Z 69/99 Test #22111: timeline-schema-cli-drift ...................................   Passed    0.08 sec
+2026-10-12T19:41:40.0827290Z 70/99 Test #22118: timeline-fixture-coverage ...................................   Passed    0.04 sec
+2026-10-12T19:41:40.0883320Z 71/99 Test #22113: timeline-schema-js-drift ....................................   Passed    0.08 sec
+2026-10-12T19:41:40.1215650Z 72/99 Test #22115: timeline-mcp-drift ..........................................   Passed    0.08 sec
+2026-10-12T19:41:40.1930760Z 73/99 Test #22122: project-package-mutation-control ............................   Passed    0.11 sec
+2026-10-12T19:41:40.1973390Z 74/99 Test #22124: vst3-bundle-layout ..........................................   Passed    0.11 sec
+2026-10-12T19:41:40.2149120Z 75/99 Test #22126: bundled-font-lists-agree ....................................   Passed    0.02 sec
+2026-10-12T19:41:40.2475600Z 76/99 Test #22127: sequencer-control-skill-coverage ............................   Passed    0.05 sec
+2026-10-12T19:41:40.2738250Z 77/99 Test #22129: timeline-command-doc-coverage ...............................   Passed    0.06 sec
+2026-10-12T19:41:40.2791100Z 78/99 Test #22125: pulp-uninstaller-contract ...................................   Passed    0.16 sec
+2026-10-12T19:41:40.3253180Z 79/99 Test #22130: interchange-concepts-drift ..................................   Passed    0.08 sec
+2026-10-12T19:41:40.3501420Z 80/99 Test #22131: interchange-tables-drift ....................................   Passed    0.08 sec
+2026-10-12T19:41:40.3550980Z 81/99 Test #22132: interchange-matrix-docs-drift ...............................   Passed    0.08 sec
+2026-10-12T19:41:40.3680180Z 82/99 Test #22164: host-quirks-catalog-parity ..................................   Passed    0.04 sec
+2026-10-12T19:41:40.3896410Z 83/99 Test #22193: sample-region-i2-rt02-process-contract ......................   Passed    0.04 sec
+2026-10-12T19:41:40.4398380Z 84/99 Test #22241: consumption-census-schema ...................................   Passed    0.08 sec
+2026-10-12T19:41:40.5230820Z 85/99 Test #22242: consumption-census-drift ....................................   Passed    0.15 sec
+2026-10-12T19:41:40.7853190Z 86/99 Test #22245: consumption-census-contract-control-note ....................   Passed    0.26 sec
+2026-10-12T19:41:40.8670080Z 87/99 Test #22247: sample-region-catalog-contract ..............................   Passed    0.08 sec
+2026-10-12T19:41:41.0211590Z 88/99 Test #22243: consumption-census-drift-description ........................   Passed    0.63 sec
+2026-10-12T19:41:41.0667770Z 89/99 Test #22249: pr-fast-tier-selftest .......................................   Passed    0.05 sec
+2026-10-12T19:41:41.1250320Z 90/99 Test #22003: agent-hook-paths ............................................   Passed    2.24 sec
+2026-10-12T19:41:41.3371970Z 91/99 Test #22251: ctest-unique-names-selftest .................................   Passed    0.21 sec
+2026-10-12T19:41:42.4769300Z 92/99 Test #22244: consumption-census-negative-contract ........................   Passed    2.04 sec
+2026-10-12T19:41:42.5743540Z 93/99 Test #22248: pr-fast-tier-contract .......................................   Passed    1.71 sec
+2026-10-12T19:41:42.8251980Z 94/99 Test #22250: ctest-unique-names ..........................................   Passed    1.76 sec
+2026-10-12T19:41:42.9552320Z 95/99 Test #22256: gate-python-imports-selftest ................................   Passed    0.13 sec
+2026-10-12T19:41:43.7662560Z 96/99 Test #22257: classify-changes-selftest ...................................   Passed    0.81 sec
+2026-10-12T19:41:47.5717030Z 97/99 Test #22255: gate-python-imports .........................................   Passed    5.00 sec
+2026-10-12T19:41:52.7021340Z 98/99 Test #22252: script-test-inputs-drift ....................................   Passed   11.36 sec
+2026-10-12T19:41:57.5362240Z 99/99 Test #22253: script-test-inputs-selftest .................................   Passed   15.06 sec
+2026-10-12T19:41:57.5386340Z ##[notice]{"schema":"shipyard-test-tier/v1","tier":"fast","selector":"pr-fast","full_suite_runs_in":"merge_group"}
+2026-10-12T19:41:57.5427810Z ##[group]Run set -euo pipefail
+2026-10-12T19:42:02.5105490Z  1/32 Test #20430: SignalGraph accepts the audio workgroup capability handoff .......................   Passed    0.01 sec
+2026-10-12T19:42:02.5118920Z  2/32 Test #20431: SignalGraph add and remove nodes .................................................   Passed    0.01 sec
+2026-10-12T19:42:02.5119750Z  3/32 Test #20448: SignalGraph MIDI nodes ...........................................................   Passed    0.01 sec
+2026-10-12T19:42:02.5146720Z  4/32 Test #20474: SignalGraph PDC aligns parallel branches .........................................   Passed    0.01 sec
+2026-10-12T19:42:02.5188590Z  5/32 Test #20475: SignalGraph PDC aligns a latent custom node with a parallel dry path .............   Passed    0.01 sec
+2026-10-12T19:42:02.5224120Z  6/32 Test #20483: SignalGraph MIDI egress resumes partial sidecar copies ...........................   Passed    0.01 sec
+2026-10-12T19:42:02.5269920Z  7/32 Test #20482: SignalGraph MIDI sidecar drops are caller-visible ................................   Passed    0.01 sec
+2026-10-12T19:42:02.5284240Z  8/32 Test #20484: SignalGraph MIDI injection and extraction require a live node runtime ............   Passed    0.01 sec
+2026-10-12T19:42:02.5288510Z  9/32 Test #20476: SignalGraph PDC aligns a fixed-latency Custom node on the parallel path ..........   Passed    0.02 sec
+2026-10-12T19:42:02.5347980Z 10/32 Test #20485: SignalGraph MIDI ingress and egress mailboxes allocate only at prepare ...........   Passed    0.01 sec
+2026-10-12T19:42:02.5355940Z 11/32 Test #20486: SignalGraph MIDI ingress is latest wins and consumed once ........................   Passed    0.01 sec
+2026-10-12T19:42:02.5369730Z 12/32 Test #20490: SignalGraph MIDI egress queue retains earliest blocks on overflow ................   Passed    0.01 sec
+2026-10-12T19:42:02.5429040Z 13/32 Test #20491: SignalGraph MIDI ingress sequence skips zero after wrap ..........................   Passed    0.01 sec
+2026-10-12T19:42:02.5441240Z 14/32 Test #20497: ExecutionSnapshot parameter events target the pinned graph generation ............   Passed    0.01 sec
+2026-10-12T19:42:02.5446100Z 15/32 Test #20487: SignalGraph MIDI ingress survives a gap free swap ................................   Passed    0.02 sec
+2026-10-12T19:42:02.5478770Z 16/32 Test #20493: SignalGraph MIDI ingress and egress mailboxes are Race-free ......................   Passed    0.01 sec
+2026-10-12T19:42:02.5508910Z 17/32 Test #20498: ExecutionSnapshot parameter events are consumed exactly once .....................   Passed    0.01 sec
+2026-10-12T19:42:02.5513480Z 18/32 Test #20512: SignalGraph audio-rate modulation rejects non-writable params and cycle edges ....   Passed    0.01 sec
+2026-10-12T19:42:02.5516980Z 19/32 Test #20513: SignalGraph audio-rate modulation delivers one event per sample ..................   Passed    0.01 sec
+2026-10-12T19:42:02.5558620Z 20/32 Test #20514: SignalGraph audio-rate modulation validates large host-block capacity ............   Passed    0.01 sec
+2026-10-12T19:42:02.5584060Z 21/32 Test #20515: SignalGraph audio-rate add modulation clamps independent of edge order ...........   Passed    0.01 sec
+2026-10-12T19:42:02.5584980Z 22/32 Test #20516: SignalGraph audio-rate replace and add modulation clamp to parameter bounds ......   Passed    0.01 sec
+2026-10-12T19:42:02.5592440Z 23/32 Test #20518: SignalGraph audio-rate modulation composes with PDC ..............................   Passed    0.01 sec
+2026-10-12T19:42:02.5632520Z 24/32 Test #20519: SignalGraph audio-rate modulation fails closed when event capacity is exceeded ...   Passed    0.01 sec
+2026-10-12T19:42:02.5661180Z 25/32 Test #20557: PreparedTopologyEdit mirrors Processor-node authoring ............................   Passed    0.01 sec
+2026-10-12T19:42:02.5664650Z 26/32 Test #20558: Processor-node release is balanced across graph and edit lifetimes ...............   Passed    0.01 sec
+2026-10-12T19:42:02.7450690Z 27/32 Test #21786: link-members-selftest ............................................................   Passed    0.18 sec
+2026-10-12T19:42:02.7933310Z 28/32 Test #21929: clock-only-temp-key-guard ........................................................   Passed    0.23 sec
+2026-10-12T19:42:03.0308100Z 29/32 Test #21740: test-file-paths-lint .............................................................   Passed    0.47 sec
+2026-10-12T19:42:03.5679100Z 30/32 Test #21877: changed-surface-runner-selftest ..................................................   Passed    1.00 sec
+2026-10-12T19:42:05.8613220Z 31/32 Test #22267: source-selftest-lane-selftest ....................................................   Passed    3.07 sec
+2026-10-12T19:42:25.9186670Z 32/32 Test #22258: wide-non-native-selftest .........................................................   Passed   23.17 sec
+2026-10-12T19:42:26.8383100Z  1/32 Test #20432: SignalGraph authoring receipts reject stale and cross-graph edits .............   Passed    0.01 sec
+2026-10-12T19:42:26.8391140Z  2/32 Test #20438: SignalGraph custom node registry keeps versions distinct ......................   Passed    0.01 sec
+2026-10-12T19:42:26.8393860Z  3/32 Test #20437: SignalGraph generated custom state changes require re-prepare .................   Passed    0.01 sec
+2026-10-12T19:42:26.8395290Z  4/32 Test #20439: SignalGraph custom node processors require matching shapes ....................   Passed    0.01 sec
+2026-10-12T19:42:26.8455030Z  5/32 Test #20442: SignalGraph connections .......................................................   Passed    0.01 sec
+2026-10-12T19:42:26.8459950Z  6/32 Test #20440: SignalGraph custom node registrations invalidate matching snapshots ...........   Passed    0.01 sec
+2026-10-12T19:42:26.8469370Z  7/32 Test #20447: SignalGraph clear .............................................................   Passed    0.01 sec
+2026-10-12T19:42:26.8474710Z  8/32 Test #20444: SignalGraph cycle detection ...................................................   Passed    0.01 sec
+2026-10-12T19:42:26.8541530Z  9/32 Test #20460: SignalGraph exposes prepared runtime stats ....................................   Passed    0.01 sec
+2026-10-12T19:42:26.8546630Z 10/32 Test #20458: SignalGraph generated graph validation reports limit reasons ..................   Passed    0.01 sec
+2026-10-12T19:42:26.8621180Z 11/32 Test #20461: SignalGraph evaluates optional runtime budget from prepared stats .............   Passed    0.01 sec
+2026-10-12T19:42:26.8632890Z 12/32 Test #20464: SignalGraph clears prepared runtime stats after failed prepare ................   Passed    0.01 sec
+2026-10-12T19:42:26.8700380Z 13/32 Test #20467: SignalGraph disconnected output stays silent ..................................   Passed    0.01 sec
+2026-10-12T19:42:26.8705640Z 14/32 Test #20472: SignalGraph clears stale audio input channels .................................   Passed    0.01 sec
+2026-10-12T19:42:26.8776130Z 15/32 Test #20479: SignalGraph connect_feedback allows cycles with one-block delay ...............   Passed    0.01 sec
+2026-10-12T19:42:26.8781160Z 16/32 Test #20480: SignalGraph connect_midi routes events through the graph ......................   Passed    0.01 sec
+2026-10-12T19:42:26.8863360Z 17/32 Test #20504: SignalGraph connect_automation delivers two-point events per block ............   Passed    0.01 sec
+2026-10-12T19:42:26.8935300Z 18/32 Test #20507: SignalGraph connect_automation rejects duplicate Replace edges ................   Passed    0.01 sec
+2026-10-12T19:42:26.9005130Z 19/32 Test #20508: SignalGraph connect_automation rejects invalid endpoints and params ...........   Passed    0.01 sec
+2026-10-12T19:42:26.9077310Z 20/32 Test #20509: SignalGraph automation rejects non-writable params and cycle edges ............   Passed    0.01 sec
+2026-10-12T19:42:26.9154360Z 21/32 Test #20510: SignalGraph automation clamps add-mode and stored smoothing ...................   Passed    0.01 sec
+2026-10-12T19:42:26.9223850Z 22/32 Test #20492: SignalGraph audio-thread MIDI ingress is Race-free during swaps ...............   Passed    0.04 sec
+2026-10-12T19:42:26.9229250Z 23/32 Test #20511: SignalGraph connect_audio_rate_modulation gates on audio-rate params ..........   Passed    0.01 sec
+2026-10-12T19:42:26.9301570Z 24/32 Test #20522: SignalGraph automation smoothing is bypassed when smoothing_ms == 0 ...........   Passed    0.01 sec
+2026-10-12T19:42:26.9306510Z 25/32 Test #20521: SignalGraph automation smoothing slews step input over the declared time ......   Passed    0.01 sec
+2026-10-12T19:42:26.9379840Z 26/32 Test #20523: SignalGraph automation smoothing eventually reaches the target ................   Passed    0.01 sec
+2026-10-12T19:42:26.9384740Z 27/32 Test #20524: SignalGraph dispatches plugin nodes through ProcessBuffers ....................   Passed    0.01 sec
+2026-10-12T19:42:26.9453500Z 28/32 Test #20527: SignalGraph connect_sidechain rejects non-Plugin destinations and bad ports ...   Passed    0.01 sec
+2026-10-12T19:42:26.9458590Z 29/32 Test #20526: SignalGraph connect_sidechain tags the edge and routes to the named port ......   Passed    0.01 sec
+2026-10-12T19:42:26.9532350Z 30/32 Test #20556: SignalGraph authors and prepares a dense Processor node .......................   Passed    0.01 sec
+2026-10-12T19:42:27.2538040Z 31/32 Test #20454: SignalGraph control-thread node-field edits serialize against prepare .........   Passed    0.41 sec
+2026-10-12T19:42:27.2550580Z 32/32 Test #20453: SignalGraph control-thread snapshot readers pin against retirement ............   Passed    0.41 sec
+2026-10-12T19:42:28.1611010Z  1/32 Test #20450: SignalGraph live gain updates and release silence output .................................   Passed    0.01 sec
+2026-10-12T19:42:28.1617210Z  2/32 Test #20436: SignalGraph prepare reports a failed Custom instance factory .............................   Passed    0.01 sec
+2026-10-12T19:42:28.1618230Z  3/32 Test #20457: SignalGraph prepare rejects graphs beyond configured limits ..............................   Passed    0.01 sec
+2026-10-12T19:42:28.1626660Z  4/32 Test #20451: SignalGraph live gain Race is atomic while processing ....................................   Passed    0.01 sec
+2026-10-12T19:42:28.1681780Z  5/32 Test #20462: SignalGraph optional runtime budget reports unprepared graphs ............................   Passed    0.01 sec
+2026-10-12T19:42:28.1705420Z  6/32 Test #20465: SignalGraph optional runtime budget path allocates zero times ............................   Passed    0.01 sec
+2026-10-12T19:42:28.1706710Z  7/32 Test #20469: SignalGraph prepare failure leaves process output silent .................................   Passed    0.01 sec
+2026-10-12T19:42:28.1767180Z  8/32 Test #20473: SignalGraph placeholder plugin nodes preserve identity and clear extra outputs ...........   Passed    0.01 sec
+2026-10-12T19:42:28.1783230Z  9/32 Test #20489: SignalGraph ordinary failed live swap invalidates the published snapshot .................   Passed    0.01 sec
+2026-10-12T19:42:28.1810000Z 10/32 Test #20494: SignalGraph live controls and MIDI handoff are TSan-clean together .......................   Passed    0.01 sec
+2026-10-12T19:42:28.1859090Z 11/32 Test #20496: SignalGraph parameter event mailbox is one shot and latest wins ..........................   Passed    0.01 sec
+2026-10-12T19:42:28.1863470Z 12/32 Test #20463: SignalGraph optional runtime budget has deterministic large-graph cost ...................   Passed    0.02 sec
+2026-10-12T19:42:28.1885350Z 13/32 Test #20499: SignalGraph parameter event mailbox merges after graph automation ........................   Passed    0.01 sec
+2026-10-12T19:42:28.1936700Z 14/32 Test #20495: SignalGraph parameter event mailbox is TSan clean ........................................   Passed    0.02 sec
+2026-10-12T19:42:28.1941330Z 15/32 Test #20500: SignalGraph parameter event mailbox preserves automation on overflow .....................   Passed    0.01 sec
+2026-10-12T19:42:28.1942000Z 16/32 Test #20501: SignalGraph parameter event mailbox allocates only at prepare ............................   Passed    0.01 sec
+2026-10-12T19:42:28.1958000Z 17/32 Test #20502: SignalGraph parameter event mailbox survives a gap free swap .............................   Passed    0.01 sec
+2026-10-12T19:42:28.2008140Z 18/32 Test #20503: SignalGraph parameter event mailbox reports a truncated source ...........................   Passed    0.01 sec
+2026-10-12T19:42:28.2017310Z 19/32 Test #20520: SignalGraph plugin automation process uses prepared scratch without allocation ...........   Passed    0.01 sec
+2026-10-12T19:42:28.2020620Z 20/32 Test #20517: SignalGraph plugin automation path is allocation-free after prepare ......................   Passed    0.01 sec
+2026-10-12T19:42:28.2027980Z 21/32 Test #20529: SignalGraph node_loads() reports per-node CPU load after processing ......................   Passed    0.01 sec
+2026-10-12T19:42:28.2082730Z 22/32 Test #20530: SignalGraph node_loads() is reported on the canonical-executor path too ..................   Passed    0.01 sec
+2026-10-12T19:42:28.2094870Z 23/32 Test #20533: SignalGraph prepared edit keeps owned built-in additions candidate-local until commit ....   Passed    0.01 sec
+2026-10-12T19:42:28.2129230Z 24/32 Test #20536: SignalGraph owned built-in removal and replacement wait for the old execution snapshot ...   Passed    0.01 sec
+2026-10-12T19:42:28.2158150Z 25/32 Test #20537: SignalGraph owned built-ins do not relax ordinary baseline plugin removal ................   Passed    0.01 sec
+2026-10-12T19:42:28.2163610Z 26/32 Test #20531: SignalGraph node_loads() is reported on the parallel-executor path .......................   Passed    0.01 sec
+2026-10-12T19:42:28.2172860Z 27/32 Test #20538: SignalGraph prepared edit first prepare failure is a full rollback .......................   Passed    0.01 sec
+2026-10-12T19:42:28.2231730Z 28/32 Test #20540: SignalGraph prepared edit changes dimensions only for lifecycle-free custom nodes ........   Passed    0.01 sec
+2026-10-12T19:42:28.2235570Z 29/32 Test #20539: SignalGraph prepared edit publishes old or new topology without silence ..................   Passed    0.01 sec
+2026-10-12T19:42:28.2236240Z 30/32 Test #20551: SignalGraph prepared edit preserves a concurrent telemetry toggle ........................   Passed    0.01 sec
+2026-10-12T19:42:28.2250730Z 31/32 Test #20553: SignalGraph prepared edit adopts only unchanged PDC intersection .........................   Passed    0.01 sec
+2026-10-12T19:42:28.2304580Z 32/32 Test #20554: SignalGraph prepared edit feedback rejection preserves live graph ........................   Passed    0.01 sec
+2026-10-12T19:42:29.1515660Z  1/32 Test #20443: SignalGraph rejects missing-node and duplicate edge variants ........................   Passed    0.01 sec
+2026-10-12T19:42:29.1522380Z  2/32 Test #20441: SignalGraph remove_node prunes edges and invalidates live graph .....................   Passed    0.01 sec
+2026-10-12T19:42:29.1523300Z  3/32 Test #20449: SignalGraph routes input -> gain -> output ..........................................   Passed    0.01 sec
+2026-10-12T19:42:29.1532720Z  4/32 Test #20434: SignalGraph registers and processes custom nodes ....................................   Passed    0.01 sec
+2026-10-12T19:42:29.1598780Z  5/32 Test #20455: SignalGraph retired snapshots do not own removed plugins ............................   Passed    0.01 sec
+2026-10-12T19:42:29.1603700Z  6/32 Test #20456: SignalGraph query helpers handle non-plugin and cleared nodes .......................   Passed    0.01 sec
+2026-10-12T19:42:29.1671340Z  7/32 Test #20466: SignalGraph prepared runtime stats path allocates zero times ........................   Passed    0.01 sec
+2026-10-12T19:42:29.1678250Z  8/32 Test #20468: SignalGraph rejects audio connections with invalid ports ............................   Passed    0.01 sec
+2026-10-12T19:42:29.1745190Z  9/32 Test #20470: SignalGraph process silences oversized blocks .......................................   Passed    0.01 sec
+2026-10-12T19:42:29.1751000Z 10/32 Test #20471: SignalGraph process ignores non-positive block sizes ................................   Passed    0.01 sec
+2026-10-12T19:42:29.1759640Z 11/32 Test #20459: SignalGraph prepares and routes a large graph at configured limits ..................   Passed    0.02 sec
+2026-10-12T19:42:29.1817850Z 12/32 Test #20477: SignalGraph serial plugin latencies accumulate ......................................   Passed    0.01 sec
+2026-10-12T19:42:29.1824020Z 13/32 Test #20478: SignalGraph routes sidechain via named port connections .............................   Passed    0.01 sec
+2026-10-12T19:42:29.1833440Z 14/32 Test #20481: SignalGraph preserves MPE-bearing UMP events through MIDI edges .....................   Passed    0.01 sec
+2026-10-12T19:42:29.1894220Z 15/32 Test #20528: SignalGraph sidechain edges participate in cycle detection ..........................   Passed    0.01 sec
+2026-10-12T19:42:29.1899420Z 16/32 Test #20525: SignalGraph routes multi-output plugin ProcessBuffers to AudioOutput ................   Passed    0.01 sec
+2026-10-12T19:42:29.1961530Z 17/32 Test #20534: SignalGraph prepared edit rolls back a failed owned built-in prepare exactly once ...   Passed    0.01 sec
+2026-10-12T19:42:29.1970400Z 18/32 Test #20532: SignalGraph routed_walk_fallbacks() stays zero for routed + walk-by-choice graphs ...   Passed    0.01 sec
+2026-10-12T19:42:29.1976080Z 19/32 Test #20488: SignalGraph preserves pending MIDI egress by rejecting a live swap ..................   Passed    0.02 sec
+2026-10-12T19:42:29.2040660Z 20/32 Test #20542: SignalGraph quiesced abandonment restores retained custom lifecycle dimensions ......   Passed    0.01 sec
+2026-10-12T19:42:29.2047100Z 21/32 Test #20541: SignalGraph quiesced prepared edit restores retained lifecycles on every exit .......   Passed    0.01 sec
+2026-10-12T19:42:29.2058320Z 22/32 Test #20543: SignalGraph quiesced abandonment restores an unprepared base lifecycle ..............   Passed    0.01 sec
+2026-10-12T19:42:29.2120440Z 23/32 Test #20544: SignalGraph quiesced rollback balances only entered lifecycle callbacks .............   Passed    0.01 sec
+2026-10-12T19:42:29.2125820Z 24/32 Test #20545: SignalGraph prepared edit surface is fail closed and releases abandoned instances ...   Passed    0.01 sec
+2026-10-12T19:42:30.1854370Z ##[notice]{"budget_minutes": 10.0, "changed_files": 1, "excluded_or_absent": 0, "failed": 0, "families": {}, "minutes": 0.48, "mode": "focused", "passed": 140, "pre_existing_on_base": 0, "reason": "targets owning the diff plus their tests", "schema": "pulp-pr-head-affected-tests/v1", "selected": 140, "skipped_for_budget": 0}
+2026-10-12T19:42:30.1998340Z ##[group]Run set -uo pipefail
+2026-10-12T19:42:31.6087710Z ##[group]Run set -euo pipefail
+2026-10-12T19:42:32.5616780Z 1/1 Test #12772: A lane that requires a GPU adapter has one ...   Passed    0.04 sec
+2026-10-12T19:42:32.5692200Z ##[group]Run python3 tools/scripts/test_a2t_structural_verification_ci.py
+2026-10-12T19:42:39.3244360Z ##[group]Run actions/upload-artifact@v5
+2026-10-12T19:42:40.8243700Z ##[group]Run set -uo pipefail
+2026-10-12T19:44:10.6751770Z ##[notice]{"bytes": 10614831, "codemodel_targets": 847, "executables": 633, "linked": 665, "registration_rows": 23053, "run_kind": "pr_head", "runner_image": "d5fe82597f648ed1", "schema": "pulp-reuse-record/v1", "seconds": 89.8, "suites": {"pr-affected": 140, "pr-fast": 99}, "tests": 239}
+2026-10-12T19:44:10.7026800Z ##[group]Run actions/upload-artifact@v5
