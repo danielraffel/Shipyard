@@ -11,11 +11,22 @@
 //!
 //! - **open to merge**: `mergedAt - createdAt` of every pull request merged
 //!   into the base in the week, in hours; median and p90.
-//! - **ejection rate**: merge-group runs of the workflow whose final gate
-//!   attempt did not pass, over merge-group runs whose final gate attempt
-//!   completed. A run whose own conclusion is `failure` while its gate passed
-//!   (an advisory job failed) is not an ejection; the report counts those
-//!   separately. `gate_failed` is the cause that means the gate ran and failed.
+//! - **ejection rate**: queue removals GitHub made because checks failed
+//!   (`RemovedFromMergeQueueEvent` by `github-merge-queue` with reason
+//!   `failed_checks` or `checks_timed_out`) over queue entries
+//!   (`AddedToMergeQueueEvent`), both dated in the week. It covers every
+//!   required check, since GitHub's reason does. Other removals (`merged`,
+//!   `merge_conflict`, `manual`) are reported by reason and actor, never as
+//!   ejections. The pull requests read are those a merge-group run in the
+//!   window names, plus those merged in it: an entry removed before any
+//!   merge-group run was built for it is seen only through another run of the
+//!   same pull request.
+//! - **merge-group gate failure rate**: merge-group runs of the workflow whose
+//!   final attempt of the gate job did not pass, over runs whose final gate
+//!   attempt completed. It covers that one job, not the queue's other
+//!   required checks, and a failed or cancelled group is not an ejection when
+//!   the queue rebuilds it and the pull request stays queued. A run whose own
+//!   conclusion is `failure` while its gate passed is counted apart.
 //! - **red after push**: among the merged pull requests' commits that carry
 //!   at least one required context, the share on which a required context is
 //!   red (check run `failure`, `timed_out`, `startup_failure` or
@@ -67,6 +78,7 @@ const PRS_QUERY: &str = "query($q:String!,$endCursor:String){search(query:$q,typ
 /// Commits of one pull request, 25 to a page: a page of whole pull requests
 /// with their checks timed out (HTTP 504) on an 85-commit pull request.
 const COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){commits(first:25,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{commit{oid statusCheckRollup{contexts(first:100){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name conclusion startedAt completedAt} ... on StatusContext{context state createdAt}}}}}}}}}}";
+const TIMELINE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],first:100,after:$endCursor){filteredCount pageInfo{hasNextPage endCursor} nodes{__typename ... on AddedToMergeQueueEvent{createdAt actor{login}} ... on RemovedFromMergeQueueEvent{createdAt reason actor{login}}}}}}}";
 const CONTEXTS_QUERY: &str = "query($owner:String!,$name:String!,$oid:GitObjectID!,$endCursor:String){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name conclusion startedAt completedAt} ... on StatusContext{context state createdAt}}}}}}}}";
 
 /// What to measure.
@@ -135,6 +147,31 @@ pub struct MergeGroupRun {
     pub gate: Option<GateJobSample>,
 }
 
+/// What happened to a pull request in the merge queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueueEventKind {
+    /// `AddedToMergeQueueEvent`.
+    Added,
+    /// `RemovedFromMergeQueueEvent`.
+    Removed {
+        /// GitHub's reason (`failed_checks`, `merged`, `manual`, ...).
+        reason: String,
+        /// Who removed it; `None` for a deleted account.
+        actor: Option<String>,
+    },
+}
+
+/// One merge-queue event on a pull request's timeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueEvent {
+    /// Pull request number.
+    pub pr: u64,
+    /// When it happened; decides the week.
+    pub at: DateTime<Utc>,
+    /// What happened.
+    pub kind: QueueEventKind,
+}
+
 /// Everything [`compute`] needs.
 #[derive(Clone, Debug)]
 pub struct ScorecardObservation {
@@ -146,6 +183,8 @@ pub struct ScorecardObservation {
     pub prs: Vec<MergedPr>,
     /// Merge-group runs created in the window.
     pub merge_group_runs: Vec<MergeGroupRun>,
+    /// Merge-queue events of the pull requests read, at any date.
+    pub queue_events: Vec<QueueEvent>,
     /// Reads that were incomplete or not cross-checked.
     pub gaps: Vec<TelemetryGap>,
 }
@@ -159,22 +198,36 @@ pub struct OpenToMerge {
     pub p90_hours: Option<f64>,
 }
 
-/// Merge-queue ejections in one week.
+/// Merge-queue entries and removals in one week, from the pull requests'
+/// timelines.
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct Ejections {
+pub struct MergeQueue {
+    /// Queue entries (`AddedToMergeQueueEvent`).
+    pub entries: usize,
+    /// Removals GitHub made because checks failed or timed out.
+    pub ejections: usize,
+    /// `ejections / entries`.
+    pub ejection_rate: Option<f64>,
+    /// Every removal, by reason and then actor.
+    pub removals: BTreeMap<String, BTreeMap<String, usize>>,
+}
+
+/// Merge-group runs whose gate job did not pass in one week.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GateFailures {
     /// Merge-group runs created in the week.
     pub runs: usize,
     /// Of those, runs whose final gate attempt completed.
     pub gated_runs: usize,
     /// Runs whose final gate attempt did not pass.
-    pub ejections: usize,
-    /// Ejections by cause (`gate_failed`, `starved`, ...).
+    pub failures: usize,
+    /// Failures by cause (`gate_failed`, `starved`, ...).
     pub by_cause: BTreeMap<String, usize>,
-    /// `ejections / gated_runs`.
-    pub rate: Option<f64>,
+    /// `failures / gated_runs`.
+    pub failure_rate: Option<f64>,
     /// `gate_failed / gated_runs`: the gate ran and failed.
     pub gate_failed_rate: Option<f64>,
-    /// Runs that concluded `failure` while their gate passed: not ejections.
+    /// Runs that concluded `failure` while their gate passed.
     pub run_failed_gate_passed: usize,
 }
 
@@ -216,7 +269,9 @@ pub struct WeekScore {
     /// Open to merge.
     pub open_to_merge: OpenToMerge,
     /// Merge-queue ejections.
-    pub merge_queue: Ejections,
+    pub merge_queue: MergeQueue,
+    /// Merge-group runs whose gate job did not pass.
+    pub merge_group_gate: GateFailures,
     /// Red after push on required contexts; `None` with no required contexts.
     pub red_after_push: Option<RedAfterPush>,
     /// Check names red on two or more pull requests, most first.
@@ -224,6 +279,18 @@ pub struct WeekScore {
     /// Pull requests with more commits than GitHub lists; only their first
     /// [`PR_COMMITS_CAP`] commits are counted.
     pub capped_prs: Vec<u64>,
+}
+
+/// Which checks each rate judges: they differ, so two rates that disagree
+/// can both be right.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Scopes {
+    /// The ejection rate.
+    pub merge_queue: String,
+    /// The merge-group gate failure rate.
+    pub merge_group_gate: String,
+    /// The red-after-push rate.
+    pub red_after_push: String,
 }
 
 /// The scorecard.
@@ -247,6 +314,8 @@ pub struct ScorecardReport {
     pub required_contexts: Vec<String>,
     /// Where they came from, or why there are none.
     pub required_source: String,
+    /// Which checks each rate judges.
+    pub scopes: Scopes,
     /// Weeks, oldest first.
     pub weeks: Vec<WeekScore>,
     /// Reads that were incomplete or not cross-checked.
@@ -321,11 +390,19 @@ pub fn gather(
     };
     cross_check_listing(gh, &listing_query, MERGE_GROUP_EVENT, &mut runs, &mut gaps);
     let merge_group_runs = read_gates(gh, cache, query, &runs)?;
+    let queued: BTreeSet<u64> = runs
+        .iter()
+        .filter_map(|run| text(run, "head_branch"))
+        .filter_map(|branch| queue_branch_pr(&branch))
+        .chain(prs.keys().copied())
+        .collect();
+    let queue_events = read_queue_events(gh, query, &queued)?;
     Ok(ScorecardObservation {
         query: query.clone(),
         required,
         prs: prs.into_values().collect(),
         merge_group_runs,
+        queue_events,
         gaps,
     })
 }
@@ -640,6 +717,107 @@ fn read_contexts(
     Ok(nodes)
 }
 
+/// The pull request a merge-queue branch was built for:
+/// `gh-readonly-queue/<base>/pr-<number>-<sha>`.
+fn queue_branch_pr(branch: &str) -> Option<u64> {
+    let rest = branch.strip_prefix("gh-readonly-queue/")?;
+    let (_, entry) = rest.rsplit_once("/pr-")?;
+    entry.split_once('-')?.0.parse().ok()
+}
+
+/// Every merge-queue event of `prs`; [`compute`] keeps those dated in each
+/// week.
+fn read_queue_events(
+    gh: &SyncGhReader<'_>,
+    query: &ScorecardQuery,
+    prs: &BTreeSet<u64>,
+) -> Result<Vec<QueueEvent>, String> {
+    let (owner, name) = query
+        .repo
+        .split_once('/')
+        .ok_or_else(|| format!("repo `{}` is not OWNER/REPO", query.repo))?;
+    let prs: Vec<u64> = prs.iter().copied().collect();
+    let read = parallel_map(&prs, |number| {
+        read_pr_queue_events(gh, owner, name, *number)
+    });
+    let mut events = Vec::new();
+    for pr_events in read {
+        events.extend(pr_events?);
+    }
+    Ok(events)
+}
+
+/// Every merge-queue event on one pull request's timeline.
+///
+/// With `itemTypes`, the connection's `totalCount` counts the whole timeline;
+/// `filteredCount` is the number of matching events, so the read is checked
+/// against that.
+fn read_pr_queue_events(
+    gh: &SyncGhReader<'_>,
+    owner: &str,
+    name: &str,
+    number: u64,
+) -> Result<Vec<QueueEvent>, String> {
+    let pages = read_graphql(
+        gh,
+        &strings(&[
+            "api",
+            "graphql",
+            "--paginate",
+            "--slurp",
+            "-f",
+            &format!("query={TIMELINE_QUERY}"),
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number}"),
+        ]),
+    )?;
+    let pages = pages.as_array().cloned().unwrap_or_else(|| vec![pages]);
+    let what = format!("queue events of #{number}");
+    let mut nodes = Vec::new();
+    let mut filtered = None;
+    for page in &pages {
+        if let Some(errors) = page.get("errors") {
+            return Err(format!("{what}: GraphQL errors {errors}"));
+        }
+        let items = page
+            .pointer("/data/repository/pullRequest/timelineItems")
+            .ok_or_else(|| format!("{what}: no timelineItems in the answer"))?;
+        filtered = filtered.or_else(|| items.get("filteredCount").and_then(Value::as_u64));
+        nodes.extend(node_list(items, &what)?);
+    }
+    if filtered != Some(nodes.len() as u64) {
+        return Err(format!(
+            "{what}: collected {} of filteredCount {filtered:?}; refusing a partial read",
+            nodes.len()
+        ));
+    }
+    nodes
+        .iter()
+        .map(|node| {
+            let at = timestamp(node, "createdAt")
+                .ok_or_else(|| format!("{what}: an event has no createdAt"))?;
+            let kind = match text(node, "__typename").as_deref() {
+                Some("AddedToMergeQueueEvent") => QueueEventKind::Added,
+                Some("RemovedFromMergeQueueEvent") => QueueEventKind::Removed {
+                    reason: text(node, "reason")
+                        .ok_or_else(|| format!("{what}: a removal has no reason"))?,
+                    actor: node.get("actor").and_then(|actor| text(actor, "login")),
+                },
+                other => return Err(format!("{what}: unexpected event {other:?}")),
+            };
+            Ok(QueueEvent {
+                pr: number,
+                at,
+                kind,
+            })
+        })
+        .collect()
+}
+
 /// The latest outcome of each check name: a re-run supersedes the run it
 /// repeats, as it does for GitHub's required checks.
 fn latest_by_name(contexts: &[Value]) -> Vec<CheckOutcome> {
@@ -770,7 +948,40 @@ fn open_to_merge(prs: &[&MergedPr]) -> OpenToMerge {
     }
 }
 
-fn ejections(runs: &[&MergeGroupRun]) -> Ejections {
+/// Removal reasons that mean the queue's required checks failed.
+const EJECTION_REASONS: [&str; 2] = ["failed_checks", "checks_timed_out"];
+/// The actor GitHub records for removals the merge queue itself makes.
+const MERGE_QUEUE_ACTOR: &str = "github-merge-queue";
+
+fn merge_queue(events: &[&QueueEvent]) -> MergeQueue {
+    let mut entries = 0;
+    let mut ejections = 0;
+    let mut removals: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    for event in events {
+        match &event.kind {
+            QueueEventKind::Added => entries += 1,
+            QueueEventKind::Removed { reason, actor } => {
+                let actor = actor.as_deref().unwrap_or("unknown");
+                if actor == MERGE_QUEUE_ACTOR && EJECTION_REASONS.contains(&reason.as_str()) {
+                    ejections += 1;
+                }
+                *removals
+                    .entry(reason.clone())
+                    .or_default()
+                    .entry(actor.to_owned())
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+    MergeQueue {
+        entries,
+        ejections,
+        ejection_rate: share(ejections, entries),
+        removals,
+    }
+}
+
+fn gate_failures(runs: &[&MergeGroupRun]) -> GateFailures {
     let mut by_cause: BTreeMap<String, usize> = BTreeMap::new();
     let mut gated_runs = 0;
     let mut run_failed_gate_passed = 0;
@@ -785,13 +996,13 @@ fn ejections(runs: &[&MergeGroupRun]) -> Ejections {
             None => {}
         }
     }
-    let ejections = by_cause.values().sum();
+    let failures = by_cause.values().sum();
     let gate_failed = by_cause.get("gate_failed").copied().unwrap_or(0);
-    Ejections {
+    GateFailures {
         runs: runs.len(),
         gated_runs,
-        ejections,
-        rate: share(ejections, gated_runs),
+        failures,
+        failure_rate: share(failures, gated_runs),
         gate_failed_rate: share(gate_failed, gated_runs),
         by_cause,
         run_failed_gate_passed,
@@ -884,13 +1095,19 @@ pub fn compute(observation: &ScorecardObservation) -> ScorecardReport {
             .iter()
             .filter(|run| run.created_at >= start && run.created_at < end)
             .collect();
+        let events: Vec<&QueueEvent> = observation
+            .queue_events
+            .iter()
+            .filter(|event| event.at >= start && event.at < end)
+            .collect();
         weeks.push(WeekScore {
             week: week_label(start),
             from: rfc3339(start),
             to: rfc3339(end),
             merged_prs: prs.len(),
             open_to_merge: open_to_merge(&prs),
-            merge_queue: ejections(&runs),
+            merge_queue: merge_queue(&events),
+            merge_group_gate: gate_failures(&runs),
             red_after_push: (!required.is_empty()).then(|| red_after_push(&prs, &required)),
             repeat_failures: repeat_failures(&prs, &required),
             capped_prs: prs
@@ -911,6 +1128,18 @@ pub fn compute(observation: &ScorecardObservation) -> ScorecardReport {
         gate_job: query.gate_job.clone(),
         from: rfc3339(query.from),
         to: rfc3339(query.to),
+        scopes: Scopes {
+            merge_queue: "every required check, as GitHub's removal reason reports it".to_owned(),
+            merge_group_gate: format!(
+                "job `{}` of {} in merge-group runs only",
+                query.gate_job, query.workflow
+            ),
+            red_after_push: if required_contexts.is_empty() {
+                "none: no required contexts".to_owned()
+            } else {
+                format!("required contexts: {}", required_contexts.join(", "))
+            },
+        },
         required_contexts,
         required_source,
         weeks,
@@ -965,6 +1194,11 @@ pub fn render(report: &ScorecardReport) -> String {
             report.required_contexts.join(", ")
         }
     );
+    let _ = writeln!(
+        out,
+        "scopes: ejections judge {}; gate failures judge {}; red after push judges {}",
+        report.scopes.merge_queue, report.scopes.merge_group_gate, report.scopes.red_after_push
+    );
     for week in &report.weeks {
         let _ = writeln!(out, "{} ({} .. {}):", week.week, week.from, week.to);
         let _ = writeln!(
@@ -975,14 +1209,38 @@ pub fn render(report: &ScorecardReport) -> String {
             opt(week.open_to_merge.p90_hours)
         );
         let queue = &week.merge_queue;
+        let removals: Vec<String> = queue
+            .removals
+            .iter()
+            .flat_map(|(reason, actors)| {
+                actors
+                    .iter()
+                    .map(move |(actor, count)| format!("{reason} by {actor} {count}"))
+            })
+            .collect();
         let _ = writeln!(
             out,
-            "  merge queue: {} of {} gated runs ejected ({}), gate failed {}; {} runs failed with the gate green (not ejections)",
+            "  merge queue: {} ejections of {} entries ({}); removals: {}",
             queue.ejections,
-            queue.gated_runs,
-            opt(queue.rate),
-            opt(queue.gate_failed_rate),
-            queue.run_failed_gate_passed
+            queue.entries,
+            opt(queue.ejection_rate),
+            if removals.is_empty() {
+                "none".to_owned()
+            } else {
+                removals.join(", ")
+            }
+        );
+        let gate = &week.merge_group_gate;
+        let _ = writeln!(
+            out,
+            "  merge-group gate ({} job `{}`): {} of {} runs failed ({}), gate failed {}; {} runs failed with the gate green",
+            report.workflow,
+            report.gate_job,
+            gate.failures,
+            gate.gated_runs,
+            opt(gate.failure_rate),
+            opt(gate.gate_failed_rate),
+            gate.run_failed_gate_passed
         );
         match &week.red_after_push {
             Some(red) => {

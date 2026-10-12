@@ -41,6 +41,8 @@ fn query(window: &str) -> ScorecardQuery {
     let (from, to) = match window {
         "a" => ("2026-10-05T15:00:00Z", "2026-10-05T15:20:00Z"),
         "b" => ("2026-10-11T15:50:00Z", "2026-10-11T15:55:00Z"),
+        "d" => ("2026-10-06T14:05:00Z", "2026-10-06T14:15:00Z"),
+        "e" => ("2026-10-06T09:30:00Z", "2026-10-06T09:40:00Z"),
         _ => ("2026-10-09T04:50:00Z", "2026-10-09T05:00:00Z"),
     };
     ScorecardQuery {
@@ -82,6 +84,9 @@ impl FakeGh {
                 return Ok(fixture(&format!("contexts-{oid}.json")));
             }
             if let Some(number) = args.iter().find_map(|arg| arg.strip_prefix("number=")) {
+                if joined.contains("timelineItems") {
+                    return Ok(fixture(&format!("timeline-{number}.json")));
+                }
                 return Ok(fixture(&format!("pr-{number}-commits.json")));
             }
             let q = args
@@ -145,12 +150,20 @@ fn a_window_scores_open_to_merge_ejections_and_repeat_failures() {
     // 1.48, 1.94, 4.43 and 5.24 hours.
     assert_eq!(week.open_to_merge.median_hours, Some(3.18));
     assert_eq!(week.open_to_merge.p90_hours, Some(4.99));
+    // Two merge-group gates failed, yet no pull request was ejected in the
+    // window: #9606's group failed and it stayed queued until it merged.
+    let gate = &week.merge_group_gate;
+    assert_eq!((gate.runs, gate.gated_runs, gate.failures), (3, 3, 2));
+    assert_eq!(gate.by_cause.get("gate_failed"), Some(&2));
+    assert_eq!(gate.failure_rate, Some(0.67));
+    assert_eq!(gate.gate_failed_rate, Some(0.67));
+    assert_eq!(gate.run_failed_gate_passed, 0);
     let queue = &week.merge_queue;
-    assert_eq!((queue.runs, queue.gated_runs, queue.ejections), (3, 3, 2));
-    assert_eq!(queue.by_cause.get("gate_failed"), Some(&2));
-    assert_eq!(queue.rate, Some(0.67));
-    assert_eq!(queue.gate_failed_rate, Some(0.67));
-    assert_eq!(queue.run_failed_gate_passed, 0);
+    assert_eq!(
+        (queue.entries, queue.ejections, queue.ejection_rate),
+        (0, 0, None)
+    );
+    assert_eq!(removals(queue), vec![("merged", "github-merge-queue", 4)]);
     let red = week.red_after_push.as_ref().expect("required contexts");
     assert_eq!((red.pushes, red.red, red.cancelled_only), (4, 0, 0));
     let repeats: Vec<(&str, usize, bool)> = week
@@ -204,10 +217,121 @@ fn a_run_that_failed_with_its_gate_green_is_not_an_ejection() {
     let week = only_week(&report);
     assert_eq!(week.merged_prs, 0);
     assert_eq!(week.open_to_merge.median_hours, None);
+    let gate = &week.merge_group_gate;
+    assert_eq!((gate.runs, gate.gated_runs, gate.failures), (2, 2, 0));
+    assert_eq!(gate.failure_rate, Some(0.0));
+    assert_eq!(gate.run_failed_gate_passed, 1);
     let queue = &week.merge_queue;
-    assert_eq!((queue.runs, queue.gated_runs, queue.ejections), (2, 2, 0));
-    assert_eq!(queue.rate, Some(0.0));
-    assert_eq!(queue.run_failed_gate_passed, 1);
+    assert_eq!((queue.entries, queue.ejections), (2, 0));
+    assert_eq!(queue.ejection_rate, Some(0.0));
+}
+
+fn removals(queue: &MergeQueue) -> Vec<(&str, &str, usize)> {
+    queue
+        .removals
+        .iter()
+        .flat_map(|(reason, actors)| {
+            actors
+                .iter()
+                .map(move |(actor, count)| (reason.as_str(), actor.as_str(), *count))
+        })
+        .collect()
+}
+
+#[test]
+fn an_ejection_while_the_gate_passed_is_counted() {
+    // #9741's merge-group run failed with `macos` green, and the queue removed
+    // it for `failed_checks` five minutes later: another required check
+    // ejected it.
+    let fake = FakeGh::new("d");
+    let report = compute(&observe(&fake, &query("d")).expect("gather"));
+    let week = only_week(&report);
+    let gate = &week.merge_group_gate;
+    assert_eq!(
+        (gate.gated_runs, gate.failures, gate.run_failed_gate_passed),
+        (1, 0, 1)
+    );
+    let queue = &week.merge_queue;
+    assert_eq!((queue.entries, queue.ejections), (1, 1));
+    assert_eq!(queue.ejection_rate, Some(1.0));
+    assert_eq!(
+        removals(queue),
+        vec![("failed_checks", "github-merge-queue", 1)]
+    );
+    assert_eq!(
+        report.scopes.merge_queue,
+        "every required check, as GitHub's removal reason reports it"
+    );
+    assert_eq!(
+        report.scopes.merge_group_gate,
+        "job `macos` of build.yml in merge-group runs only"
+    );
+}
+
+#[test]
+fn a_cancelled_gate_and_a_manual_removal_are_not_ejections() {
+    // #9706's `macos` was cancelled after a runner took it, and shipyard-local
+    // removed the pull request by hand two minutes later.
+    let fake = FakeGh::new("e");
+    let report = compute(&observe(&fake, &query("e")).expect("gather"));
+    let week = only_week(&report);
+    let gate = &week.merge_group_gate;
+    assert_eq!((gate.gated_runs, gate.failures), (2, 1));
+    assert_eq!(gate.by_cause.get("cancelled_after_start"), Some(&1));
+    assert_eq!(gate.run_failed_gate_passed, 1);
+    let queue = &week.merge_queue;
+    assert_eq!((queue.entries, queue.ejections), (2, 0));
+    assert_eq!(removals(queue), vec![("manual", "shipyard-local", 1)]);
+}
+
+#[test]
+fn a_queue_branch_names_its_pull_request() {
+    assert_eq!(
+        queue_branch_pr("gh-readonly-queue/main/pr-9741-1f2e3d4c5b6a79881726354453627180918273645"),
+        Some(9741)
+    );
+    assert_eq!(
+        queue_branch_pr("gh-readonly-queue/release/v2/pr-12-abc"),
+        Some(12)
+    );
+    for branch in [
+        "feature/pr-12-abc",
+        "gh-readonly-queue/main/pr-x-abc",
+        "main",
+    ] {
+        assert_eq!(queue_branch_pr(branch), None, "{branch}");
+    }
+}
+
+#[test]
+fn a_short_or_unreadable_timeline_is_refused() {
+    let fake = FakeGh::new("d");
+    let captured: Value = serde_json::from_str(&fixture("timeline-9741.json")).expect("timeline");
+    let mut short = captured.clone();
+    short[0]["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
+        .as_array_mut()
+        .expect("nodes")
+        .pop();
+    let mut no_reason = captured;
+    no_reason[0]["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"][1]
+        .as_object_mut()
+        .expect("removal")
+        .remove("reason");
+    for (answer, expected) in [
+        (short, "collected 3 of filteredCount Some(4)"),
+        (no_reason, "a removal has no reason"),
+    ] {
+        let answer = answer.to_string();
+        let reader = |args: &[String]| {
+            if args.join(" ").contains("timelineItems") {
+                Ok(answer.clone())
+            } else {
+                fake.answer(args)
+            }
+        };
+        let error = gather(&reader, &query("d"), &ReadCache::disabled()).expect_err("refused");
+        assert!(error.contains(expected), "{error}");
+    }
 }
 
 #[test]
@@ -456,6 +580,7 @@ fn weeks_are_iso_weeks_clipped_to_the_window() {
             ),
         ],
         merge_group_runs: Vec::new(),
+        queue_events: Vec::new(),
         gaps: Vec::new(),
     };
     let report = compute(&observation);
@@ -598,8 +723,51 @@ fn github_s_commit_cap_is_counted_not_refused() {
         required: Ok((Vec::new(), "the base branch is not protected".to_owned())),
         prs: vec![capped],
         merge_group_runs: Vec::new(),
+        queue_events: Vec::new(),
         gaps: Vec::new(),
     });
     assert_eq!(only_week(&report).capped_prs, vec![9755]);
     assert!(render(&report).contains("first 250 commits counted"));
+}
+
+#[test]
+fn only_the_queue_s_own_check_removals_are_ejections() {
+    let event = |pr: u64, kind: QueueEventKind| QueueEvent {
+        pr,
+        at: at("2026-10-06T12:00:00Z"),
+        kind,
+    };
+    let removed = |reason: &str, actor: Option<&str>| QueueEventKind::Removed {
+        reason: reason.to_owned(),
+        actor: actor.map(str::to_owned),
+    };
+    let events = [
+        event(1, QueueEventKind::Added),
+        event(1, removed("failed_checks", Some("github-merge-queue"))),
+        event(2, QueueEventKind::Added),
+        event(2, removed("checks_timed_out", Some("github-merge-queue"))),
+        event(3, QueueEventKind::Added),
+        event(3, removed("failed_checks", Some("someone"))),
+        event(4, QueueEventKind::Added),
+        event(4, removed("merge_conflict", Some("github-merge-queue"))),
+        event(5, QueueEventKind::Added),
+        event(5, removed("manual", None)),
+        // The queue records some manual removals as its own.
+        event(6, QueueEventKind::Added),
+        event(6, removed("manual", Some("github-merge-queue"))),
+    ];
+    let queue = merge_queue(&events.iter().collect::<Vec<_>>());
+    assert_eq!((queue.entries, queue.ejections), (6, 2));
+    assert_eq!(queue.ejection_rate, Some(0.33));
+    assert_eq!(
+        removals(&queue),
+        vec![
+            ("checks_timed_out", "github-merge-queue", 1),
+            ("failed_checks", "github-merge-queue", 1),
+            ("failed_checks", "someone", 1),
+            ("manual", "github-merge-queue", 1),
+            ("manual", "unknown", 1),
+            ("merge_conflict", "github-merge-queue", 1),
+        ]
+    );
 }

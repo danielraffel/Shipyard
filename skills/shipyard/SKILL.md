@@ -1428,8 +1428,11 @@ shipyard metrics compare --project pulp --baseline github-hosted --candidate mac
 ```
 
 `gate-cost --scorecard` is the success-rate scorecard. It reports per ISO
-week: open-to-merge median and p90, the merge-queue ejection rate (a run that
-failed while its gate passed is counted apart), the red-after-push rate on
+week: open-to-merge median and p90, the merge-queue ejection rate (removals by
+`github-merge-queue` for `failed_checks` or `checks_timed_out`, per queue
+entry, read from the pull requests' timelines; other removals are listed by
+reason and actor), the merge-group failure rate of the `--gate-job` alone, the
+red-after-push rate on
 required checks (latest run per name; cancelled is not red), and check names
 red on two or more pull requests. Everything is read from GitHub, so pass
 `--from`/`--to` to measure a window from before a change and one from after it.

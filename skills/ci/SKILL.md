@@ -325,9 +325,17 @@ Each one first read as a broken instrument:
   of `totalCount` 300. That is the API's cap, not a short read, so count it
   and name the pull request rather than failing the whole report.
 
-A merge-group run that concluded `failure` is not an ejection when its gate
-job passed: an advisory job failed. On Pulp in 2026-W40 that was 274 runs,
-against 48 whose `macos` job failed.
+**An ejection is a queue removal, not a failed merge-group run.** Count
+`RemovedFromMergeQueueEvent` by `github-merge-queue` with reason
+`failed_checks` or `checks_timed_out`, and use `AddedToMergeQueueEvent` as the
+denominator. A merge-group run's gate result answers a different question, and
+the two disagree in both directions. In Pulp's 2026-W41, of 59 merge-group runs
+whose `macos` gate failed or was cancelled, only 24 were followed by a
+check-based removal of that pull request: the queue rebuilt the rest and the
+pull request stayed queued. Meanwhile 13 of the week's 38 real ejections
+happened while `macos` passed, because another of Pulp's six required contexts
+failed. With `itemTypes`, `timelineItems.totalCount` counts the whole
+timeline; check the read against `filteredCount`.
 
 ## Protected-state caches take the writer-domain lease too
 

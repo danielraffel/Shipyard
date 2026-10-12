@@ -488,8 +488,9 @@ instrument.
 merged PR, wasted attempts, starvation, placement, queue wait per job ahead,
 batch fullness, receipt reuse. Minutes are shown as load-dependent context
 only. With `--scorecard` it reports, per ISO week of the window, open-to-merge
-median and p90, the merge-queue ejection rate (a run that failed with its gate
-green is not an ejection), the red-after-push rate on required checks (latest
+median and p90, the merge-queue ejection rate (check-based queue removals per
+queue entry, from the pull requests' timelines), the merge-group failure rate
+of the one gate job (a separate number), the red-after-push rate on required checks (latest
 run per name; cancelled is not red), and check names red across two or more
 pull requests. Pass `--from`/`--to` to measure a past window again; a
 repository without branch protection needs `--required-context`.
