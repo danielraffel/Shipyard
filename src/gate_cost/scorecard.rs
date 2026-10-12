@@ -776,10 +776,15 @@ fn read_pr_queue_events(
         ]),
     )?;
     let pages = pages.as_array().cloned().unwrap_or_else(|| vec![pages]);
+    parse_queue_events(number, &pages)
+}
+
+/// The merge-queue events in one pull request's timeline pages.
+fn parse_queue_events(number: u64, pages: &[Value]) -> Result<Vec<QueueEvent>, String> {
     let what = format!("queue events of #{number}");
     let mut nodes = Vec::new();
     let mut filtered = None;
-    for page in &pages {
+    for page in pages {
         if let Some(errors) = page.get("errors") {
             return Err(format!("{what}: GraphQL errors {errors}"));
         }

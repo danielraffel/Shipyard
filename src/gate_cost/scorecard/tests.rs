@@ -771,3 +771,53 @@ fn only_the_queue_s_own_check_removals_are_ejections() {
         ]
     );
 }
+
+#[test]
+fn pulp_week_41_has_thirty_eight_ejections() {
+    // The merge-queue timeline of every pull request Pulp's 2026-W41 reads:
+    // those a merge-group run in the week names and those merged in it (470).
+    // A recompute from GitHub's removal records found 38 check-based
+    // ejections, against 59 merge-group runs whose `macos` gate did not pass.
+    let captured: Value =
+        serde_json::from_str(&fixture("w41-timelines.json")).expect("timelines");
+    let timelines = captured["timelines"].as_object().expect("timelines");
+    assert_eq!(timelines.len(), 470);
+    let mut queue_events = Vec::new();
+    for (number, pages) in timelines {
+        queue_events.extend(
+            parse_queue_events(
+                number.parse().expect("number"),
+                pages.as_array().expect("pages"),
+            )
+            .expect("events"),
+        );
+    }
+    let mut query = query("a");
+    query.from = at("2026-10-05T00:00:00Z");
+    query.to = at("2026-10-12T00:00:00Z");
+    let report = compute(&ScorecardObservation {
+        query,
+        required: Ok((Vec::new(), "the base branch is not protected".to_owned())),
+        prs: Vec::new(),
+        merge_group_runs: Vec::new(),
+        queue_events,
+        gaps: Vec::new(),
+    });
+    let week = only_week(&report);
+    assert_eq!(week.week, "2026-W41");
+    let queue = &week.merge_queue;
+    assert_eq!((queue.entries, queue.ejections), (543, 38));
+    assert_eq!(queue.ejection_rate, Some(0.07));
+    assert_eq!(
+        removals(queue),
+        vec![
+            ("checks_timed_out", "github-merge-queue", 2),
+            ("failed_checks", "github-merge-queue", 36),
+            ("manual", "danielraffel", 1),
+            ("manual", "github-merge-queue", 5),
+            ("manual", "shipyard-local", 27),
+            ("merge_conflict", "github-merge-queue", 17),
+            ("merged", "github-merge-queue", 455),
+        ]
+    );
+}
