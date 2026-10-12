@@ -167,7 +167,9 @@ envelope.
 pull request out permanently. Neither is something to reach for by default.
 
 **Head approval.** A repository whose base branch sets
-`[auto_merge] arm_requires_head_approval = true` arms only a head that carries an
+`[auto_merge] arm_requires_head_approval = true` (the default for pulp, vellum,
+tartci and Shipyard when their base is silent; there, with no identity listed,
+any verdict but the PR author's counts) arms only a head that carries an
 approval of that exact head from an identity listed in
 `[auto_merge] reviewer_identities` (empty by default; the older spelling
 `reviewer_logins` is still read), for example

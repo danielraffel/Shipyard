@@ -88,6 +88,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         } else {
             reviewers.iter().map(|login| (*login).to_owned()).collect()
         },
+        any_reviewer_but_author: false,
     }
 }
 
@@ -593,7 +594,8 @@ fn the_policy_is_read_from_the_auto_merge_table() {
         ApprovalPolicy::from_table(&table),
         ApprovalPolicy {
             required: true,
-            reviewer_logins: vec!["danielraffel".to_owned()]
+            reviewer_logins: vec!["danielraffel".to_owned()],
+            any_reviewer_but_author: false,
         }
     );
     let empty: toml::Table = "[project]\nname = \"x\"\n".parse().expect("toml");
@@ -645,4 +647,274 @@ fn an_unreadable_policy_is_an_error_not_the_default() {
     assert!(read_policy(&failing, "o/r", "main").is_err());
     let garbled = |_: &[String]| -> Result<String, String> { Ok("[auto_merge\n".to_owned()) };
     assert!(read_policy(&garbled, "o/r", "main").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Repositories that require review by default
+// ---------------------------------------------------------------------------
+
+fn by_default(repo: &str) -> ApprovalPolicy {
+    ApprovalPolicy::without_config(repo)
+}
+
+fn fleet(at: &str, body: &str) -> Value {
+    json!({"login": "shipyard-local[bot]", "type": "Bot", "at": at, "body": body})
+}
+
+#[test]
+fn a_listed_repository_requires_review_when_its_config_is_silent() {
+    for repo in super::REVIEW_REQUIRED_REPOS {
+        let policy = by_default(repo);
+        assert!(policy.required, "{repo}");
+        assert!(policy.any_reviewer_but_author, "{repo}");
+        assert!(policy.validate().is_ok(), "{repo}");
+    }
+    assert!(
+        by_default("danielraffel/shipyard").required,
+        "slugs are case-blind"
+    );
+    assert_eq!(by_default("someone/else"), ApprovalPolicy::default());
+    let silent: toml::Table = "[auto_merge]\nqueue = true\n".parse().expect("toml");
+    assert!(ApprovalPolicy::from_table_for_repo(&silent, "danielraffel/tartci").required);
+}
+
+#[test]
+fn a_config_that_sets_the_key_decides_over_the_default() {
+    let off: toml::Table = "[auto_merge]\narm_requires_head_approval = false\n"
+        .parse()
+        .expect("toml");
+    assert_eq!(
+        ApprovalPolicy::from_table_for_repo(&off, "Generous-Corp/pulp"),
+        ApprovalPolicy::default()
+    );
+    let listed: toml::Table = "[auto_merge]\narm_requires_head_approval = true\n\
+         reviewer_identities = [\"fable-graph\"]\n"
+        .parse()
+        .expect("toml");
+    let policy = ApprovalPolicy::from_table_for_repo(&listed, "Generous-Corp/pulp");
+    assert!(policy.required);
+    assert!(!policy.any_reviewer_but_author);
+    // The strict rule holds: the fleet App's marker does not count.
+    let marker = [fleet("2026-10-12T01:00:00Z", &format!("reviewed: {HEAD}"))];
+    assert!(
+        !decide_for_author(&policy, HEAD, &[], &marker, &empty_queue(HEAD), false, None).allows()
+    );
+}
+
+#[test]
+fn a_missing_config_on_a_listed_repository_requires_review() {
+    let missing =
+        |_: &[String]| -> Result<String, String> { Err("gh: Not Found (HTTP 404)".to_owned()) };
+    assert_eq!(
+        read_policy(&missing, "danielraffel/tartci", "main"),
+        Ok(by_default("danielraffel/tartci"))
+    );
+    assert!(
+        super::read_policy_required(&missing, "Generous-Corp/vellum", "main")
+            .expect("a listed repository needs no file")
+            .required
+    );
+}
+
+#[test]
+fn the_fleet_apps_verdict_counts_on_the_fleet_apps_pull_request() {
+    let policy = by_default("danielraffel/Shipyard");
+    let queue = empty_queue(HEAD);
+    let approve = [fleet(
+        "2026-10-12T01:00:00Z",
+        &format!("Delta review.\n\nverdict: APPROVE head:{HEAD}"),
+    )];
+    let gate = decide_for_author(
+        &policy,
+        HEAD,
+        &[],
+        &approve,
+        &queue,
+        false,
+        Some("app/shipyard-local"),
+    );
+    assert!(gate.allows(), "{gate:?}");
+    // No verdict, or one naming an older head, is refused and says what is needed.
+    let gate = decide_for_author(
+        &policy,
+        HEAD,
+        &[],
+        &[],
+        &queue,
+        false,
+        Some("app/shipyard-local"),
+    );
+    assert!(!gate.allows());
+    assert!(
+        gate.explain().contains(&format!(
+            "`verdict: APPROVE head:{HEAD}` or `reviewed: {HEAD}`"
+        )),
+        "{}",
+        gate.explain()
+    );
+    let older = [fleet("2026-10-12T01:00:00Z", &format!("reviewed: {OTHER}"))];
+    assert!(
+        !decide_for_author(
+            &policy,
+            HEAD,
+            &[],
+            &older,
+            &queue,
+            false,
+            Some("app/shipyard-local")
+        )
+        .allows()
+    );
+}
+
+#[test]
+fn a_distinguishable_author_cannot_approve_their_own_head() {
+    let policy = by_default("Generous-Corp/pulp");
+    let queue = empty_queue(HEAD);
+    let own = [human(
+        "DanielRaffel",
+        "2026-10-12T01:00:00Z",
+        &format!("reviewed: {HEAD}"),
+    )];
+    assert!(
+        !decide_for_author(
+            &policy,
+            HEAD,
+            &[],
+            &own,
+            &queue,
+            false,
+            Some("danielraffel")
+        )
+        .allows()
+    );
+    let other = [human(
+        "fable-graph",
+        "2026-10-12T01:00:00Z",
+        &format!("reviewed: {HEAD}"),
+    )];
+    assert!(
+        decide_for_author(
+            &policy,
+            HEAD,
+            &[],
+            &other,
+            &queue,
+            false,
+            Some("danielraffel")
+        )
+        .allows()
+    );
+    let own_review = [review(
+        "danielraffel",
+        "User",
+        "APPROVED",
+        HEAD,
+        "2026-10-12T01:00:00Z",
+    )];
+    assert!(
+        !decide_for_author(
+            &policy,
+            HEAD,
+            &own_review,
+            &[],
+            &queue,
+            false,
+            Some("danielraffel")
+        )
+        .allows()
+    );
+}
+
+#[test]
+fn a_hold_after_the_approve_refuses_by_default() {
+    let policy = by_default("danielraffel/tartci");
+    let comments = [
+        fleet(
+            "2026-10-12T01:00:00Z",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        ),
+        fleet(
+            "2026-10-12T02:00:00Z",
+            &format!("verdict: HOLD head:{HEAD}"),
+        ),
+    ];
+    assert!(
+        !decide_for_author(
+            &policy,
+            HEAD,
+            &[],
+            &comments,
+            &empty_queue(HEAD),
+            false,
+            None
+        )
+        .allows()
+    );
+    // Control: the same pair the other way round approves.
+    let reversed = [
+        fleet(
+            "2026-10-12T01:00:00Z",
+            &format!("verdict: HOLD head:{HEAD}"),
+        ),
+        fleet(
+            "2026-10-12T02:00:00Z",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        ),
+    ];
+    assert!(
+        decide_for_author(
+            &policy,
+            HEAD,
+            &[],
+            &reversed,
+            &empty_queue(HEAD),
+            false,
+            None
+        )
+        .allows()
+    );
+}
+
+#[test]
+fn the_arm_path_reads_the_author_before_judging() {
+    let calls = std::cell::RefCell::new(Vec::<String>::new());
+    let gh = |args: &[String]| -> Result<String, String> {
+        let joined = args.join(" ");
+        calls.borrow_mut().push(joined.clone());
+        if joined.contains("contents/.shipyard/config.toml") {
+            Err("gh: Not Found (HTTP 404)".to_owned())
+        } else if joined.contains("/reviews") {
+            Ok(String::new())
+        } else if joined.contains("/comments") {
+            Ok(json!({"id": 1, "login": "danielraffel", "type": "User",
+                      "at": "2026-10-12T01:00:00Z", "body": format!("reviewed: {HEAD}")})
+            .to_string())
+        } else if joined.contains("repos/Generous-Corp/pulp/pulls/7 ") {
+            Ok("danielraffel\n".to_owned())
+        } else {
+            Err(format!("unexpected gh call: {joined}"))
+        }
+    };
+    let gate = super::evaluate(
+        &gh,
+        "Generous-Corp/pulp",
+        7,
+        HEAD,
+        "main",
+        &empty_queue(HEAD),
+    )
+    .expect("readable");
+    assert!(
+        !gate.allows(),
+        "the author's own marker must not count: {gate:?}"
+    );
+    assert!(
+        calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("repos/Generous-Corp/pulp/pulls/7 --jq .user.login")),
+        "{:?}",
+        calls.borrow()
+    );
 }

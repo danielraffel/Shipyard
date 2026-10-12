@@ -32,6 +32,19 @@
 //! as a reviewer. The fleet author App and the PR author cannot approve their
 //! own head.
 //!
+//! ## Repositories that require review by default
+//!
+//! [`REVIEW_REQUIRED_REPOS`] require a verdict naming the exact head even when
+//! their base config is silent; a config that sets
+//! `arm_requires_head_approval` itself still decides. With no reviewer listed,
+//! such a repository counts a verdict from any account except the pull
+//! request's author, when the author is distinguishable. Every fleet agent
+//! posts as the same App, so that App's verdict on that App's pull request
+//! counts: the rule then rests on agents not posting a verdict they did not
+//! reach. Listing `reviewer_identities` restores the strict rule above. The
+//! queue-arm guard (`scripts/ghapp_queue_arm_guard.py`) applies the same rule
+//! to every arm that goes through `ghapp`.
+//!
 //! ## Ejections
 //!
 //! The merge queue records why it removed each entry. After
@@ -57,6 +70,24 @@ pub const REVIEWERS_KEY: &str = "reviewer_logins";
 pub const REVIEWER_IDENTITIES_KEY: &str = "reviewer_identities";
 /// Tracked config file the setting is read from on the protected base.
 pub const CONFIG_PATH: &str = ".shipyard/config.toml";
+/// Repositories that require an approval of the exact head when their base
+/// config does not say. Kept equal to `REVIEW_REQUIRED_REPOS` in
+/// `scripts/ghapp_queue_arm_guard.py` (a test reads both).
+pub const REVIEW_REQUIRED_REPOS: [&str; 4] = [
+    "Generous-Corp/pulp",
+    "Generous-Corp/vellum",
+    "danielraffel/tartci",
+    "danielraffel/Shipyard",
+];
+
+/// Whether `repo` requires review when its config is silent.
+#[must_use]
+pub fn requires_review_by_default(repo: &str) -> bool {
+    REVIEW_REQUIRED_REPOS
+        .iter()
+        .any(|required| required.eq_ignore_ascii_case(repo))
+}
+
 /// Removals of one head after which it needs a fresh approval to re-arm.
 pub const EJECTION_CAP: usize = 2;
 
@@ -70,6 +101,11 @@ pub struct ApprovalPolicy {
     pub required: bool,
     /// Identities whose exact-head approvals count, lower-cased.
     pub reviewer_logins: Vec<String>,
+    /// Required by [`REVIEW_REQUIRED_REPOS`] rather than the repository's own
+    /// setting: with no reviewer listed, any account but a distinguishable
+    /// PR author counts.
+    #[serde(default)]
+    pub any_reviewer_but_author: bool,
 }
 
 impl ApprovalPolicy {
@@ -98,7 +134,31 @@ impl ApprovalPolicy {
                         .collect()
                 })
                 .unwrap_or_default(),
+            any_reviewer_but_author: false,
         }
+    }
+
+    /// [`Self::from_table`] for `repo`: a repository in
+    /// [`REVIEW_REQUIRED_REPOS`] whose table does not set
+    /// `arm_requires_head_approval` requires review.
+    #[must_use]
+    pub fn from_table_for_repo(table: &toml::Table, repo: &str) -> Self {
+        let mut policy = Self::from_table(table);
+        let set = table
+            .get(CONFIG_TABLE)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|section| section.contains_key(REQUIRED_KEY));
+        if !set && requires_review_by_default(repo) {
+            policy.required = true;
+            policy.any_reviewer_but_author = true;
+        }
+        policy
+    }
+
+    /// The policy of a repository whose base has no config file.
+    #[must_use]
+    pub fn without_config(repo: &str) -> Self {
+        Self::from_table_for_repo(&toml::Table::new(), repo)
     }
 
     /// Reject a policy that would let Shipyard approve its own PR.
@@ -266,6 +326,12 @@ fn is_fleet_author(login: &str) -> bool {
 
 fn reviewer_allowed(login: &str, policy: &ApprovalPolicy, author: Option<&str>) -> bool {
     let reviewer = normalized_login(login);
+    if policy.any_reviewer_but_author && policy.reviewer_logins.is_empty() {
+        // The fleet App is every agent's identity, so its own pull request is
+        // not distinguishable from its reviewer's comment.
+        return author
+            .is_none_or(|author| normalized_login(author) != reviewer || is_fleet_author(author));
+    }
     !is_fleet_author(login)
         && policy
             .reviewer_logins
@@ -438,10 +504,11 @@ impl HeadGate {
             Self::NotRequired => "this repository does not require head approval".to_owned(),
             Self::Approved { approval } => format!("the head carries {}", approval.describe()),
             Self::NotApproved { head } => format!(
-                "head {} carries no approval (an APPROVED review on it, or a reviewed:{} \
-                 marker from a listed reviewer), and this repository arms only approved heads; \
-                 left disarmed. Arm deliberately with `--arm`",
-                short(head),
+                "head {} carries no approval: it needs a comment whose last line is \
+                 `verdict: APPROVE head:{head}` or `reviewed: {head}`, or an APPROVED review \
+                 on that commit, from a listed reviewer (anyone but the PR author where none \
+                 is listed), with no later HOLD naming it. This repository arms only approved \
+                 heads; left disarmed. Arm deliberately with `--arm`",
                 short(head)
             ),
             Self::EjectionCap { head, ejections } => format!(
@@ -622,6 +689,9 @@ fn read_policy_inner(
     ]) {
         Ok(raw) => raw,
         Err(detail) if detail.contains("404") || detail.contains("Not Found") => {
+            if requires_review_by_default(repo) {
+                return Ok(ApprovalPolicy::without_config(repo));
+            }
             if missing_is_error {
                 return Err(format!(
                     "{CONFIG_PATH} on {base} is absent; approval policy is required"
@@ -634,7 +704,7 @@ fn read_policy_inner(
     let table = raw
         .parse::<toml::Table>()
         .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
-    let policy = ApprovalPolicy::from_table(&table);
+    let policy = ApprovalPolicy::from_table_for_repo(&table, repo);
     policy.validate().map(|()| policy)
 }
 
@@ -704,6 +774,7 @@ pub fn evaluate_excusing(
     if !policy.required {
         return Ok(HeadGate::NotRequired);
     }
+    let author = pr_author(run_gh, repo, pr, &policy, None)?;
     let reviews = read_records(
         run_gh,
         &format!("repos/{repo}/pulls/{pr}/reviews"),
@@ -714,14 +785,40 @@ pub fn evaluate_excusing(
         &format!("repos/{repo}/issues/{pr}/comments"),
         ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}",
     )?;
-    Ok(decide_excusing(
+    Ok(decide_for_author(
         &policy,
         head,
         &reviews,
         &comments,
         queue,
         latest_was_interruption,
+        author.as_deref(),
     ))
+}
+
+/// The pull request's author, read when the policy turns on it: with no
+/// reviewer listed, a verdict counts only from someone other than the author.
+fn pr_author(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    policy: &ApprovalPolicy,
+    known: Option<&str>,
+) -> Result<Option<String>, String> {
+    if known.is_some() || !policy.any_reviewer_but_author || !policy.reviewer_logins.is_empty() {
+        return Ok(known.map(str::to_owned));
+    }
+    let login = run_gh(&[
+        "api".to_owned(),
+        format!("repos/{repo}/pulls/{pr}"),
+        "--jq".to_owned(),
+        ".user.login".to_owned(),
+    ])?;
+    let login = login.trim();
+    if login.is_empty() {
+        return Err(format!("PR #{pr} carried no author"));
+    }
+    Ok(Some(login.to_owned()))
 }
 
 /// [`evaluate`] with the policy already read, for a caller that reads the
@@ -768,6 +865,8 @@ pub fn evaluate_with_policy_for_author_with_events(
     if !policy.required {
         return Ok((HeadGate::NotRequired, Vec::new()));
     }
+    let author = pr_author(run_gh, repo, pr, policy, author)?;
+    let author = author.as_deref();
     let reviews = read_records(
         run_gh,
         &format!("repos/{repo}/pulls/{pr}/reviews"),

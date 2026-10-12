@@ -54,6 +54,56 @@ as `shipyard landing --pr <n>` (see `docs/landing-model.md`).
 A GraphQL body read from stdin (`--input -`, `query=@-`) cannot be inspected
 and is refused as ambiguous.
 
+### Review before arm
+
+An arm the table above allows is still refused when the repository requires
+review and nothing approves the PR's current head. The guard reads the policy
+from `.shipyard/config.toml` on the PR's base, the same
+`[auto_merge] arm_requires_head_approval` setting Shipyard's own arming paths
+read (`crate::head_approval`). Where the base is silent, the repositories in
+`REVIEW_REQUIRED_REPOS` require review: `Generous-Corp/pulp`,
+`Generous-Corp/vellum`, `danielraffel/tartci` and `danielraffel/Shipyard`. A
+base that sets the key decides, either way.
+
+A head is approved when the newest verdict naming it is an approval:
+
+* a comment whose last non-blank line is `verdict: APPROVE head:<40-hex>` or
+  `reviewed: <40-hex>`, or
+* an `APPROVED` review whose `commit_id` is the head.
+
+`verdict: HOLD head:<40-hex>` or a `CHANGES_REQUESTED` review on the head
+blocks an earlier approval; a verdict naming another head does not count for
+this one, and a HOLD whose time cannot be read always blocks.
+
+Whose verdict counts:
+
+* With `reviewer_identities` listed, only those identities, never the PR's
+  author and never the fleet App `shipyard-local[bot]`.
+* With none listed (the default for the four repositories), anyone except the
+  PR's author. Every fleet agent posts as the same App, so the App's verdict
+  on the App's own PR counts: the rule then rests on agents not posting a
+  verdict they did not reach. List `reviewer_identities` to make it strict.
+
+The refusal names the head and the exact marker it needs, and names the
+latest verdict when it approves a different head:
+
+```
+queue-arm-guard: refusing to arm an unreviewed head: PR #511: no reviewer verdict names head 52eda5490844 ... Post the verdict on the PR, then arm it.
+```
+
+An unreadable pull request, policy or comment list refuses rather than arming
+blind.
+
+**Operator override.** `GHAPP_ALLOW_UNREVIEWED_ARM=1` arms anyway. It prints a
+`WARNING` naming the refusal it overrode and appends one JSON line
+(`at`, `override`, `refusal`, `argv`) to `overrides.jsonl` in the guards
+directory. It is for an operator, never for an agent, and
+`GHAPP_ALLOW_QUEUE_REARM` does not bypass it. Shipyard's own validated enqueue
+carries `SHIPYARD_INTERNAL_QUEUE_MUTATION` and applies the same rule in Rust;
+its `--arm` override names who armed. An arm whose request names no head
+(a GraphQL body on stdin) needs both `GHAPP_ALLOW_QUEUE_REARM=1` and
+`GHAPP_ALLOW_UNREVIEWED_ARM=1`.
+
 ## Environment re-enqueue
 
 A batch that died because the network did (a package relay answered 403, a

@@ -4610,6 +4610,9 @@ exit 91
             if joined.contains("issues/9438/comments") {
                 return Ok(String::new());
             }
+            if joined.contains("pulls/9438 --jq .user.login") {
+                return Ok("shipyard-local[bot]\n".to_owned());
+            }
             Err(format!("unscripted gh call: {joined}"))
         }
     }
@@ -4656,8 +4659,32 @@ exit 91
     fn a_repository_without_the_policy_reads_nothing_else() {
         let calls = std::cell::RefCell::new(Vec::new());
         let gh = approval_gh(Err("gh: Not Found (HTTP 404)"), "", &calls);
-        assert_eq!(head_approval_verdict(&gh, &validated_9438()), Ok(()));
+        let mut state = validated_9438();
+        state.repo = "someone/else".to_owned();
+        assert_eq!(head_approval_verdict(&gh, &state), Ok(()));
         assert_eq!(calls.borrow().len(), 1, "{:?}", calls.borrow());
+    }
+
+    /// A repository on the review-by-default list needs no config to refuse
+    /// a validated head nobody approved, and says which marker it needs.
+    #[test]
+    fn a_listed_repository_without_a_config_refuses_an_unapproved_head() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let gh = approval_gh(Err("gh: Not Found (HTTP 404)"), "", &calls);
+        let error = head_approval_verdict(&gh, &validated_9438()).expect_err("refused");
+        let head = crate::head_approval::tests::PR_9438_HEADS[6];
+        assert!(
+            error.contains(&format!("`verdict: APPROVE head:{head}`")),
+            "{error}"
+        );
+        assert!(
+            calls
+                .borrow()
+                .iter()
+                .any(|call| call.contains("pulls/9438 --jq .user.login")),
+            "{:?}",
+            calls.borrow()
+        );
     }
 
     #[test]

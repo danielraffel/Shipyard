@@ -43,6 +43,26 @@ out of refusal text.
 
 Actor identity is deliberately not consulted: every queue mutation is
 attributed to the same App actor whether Shipyard or an agent issued it.
+
+Review before arm
+-----------------
+
+Once the queue state would allow it, an arm or enqueue also needs a reviewer
+verdict naming the exact head, in the repositories that require one: those in
+REVIEW_REQUIRED_REPOS unless the protected base's ``.shipyard/config.toml``
+sets ``[auto_merge] arm_requires_head_approval`` itself, and any other whose
+base config sets it to true. This is the Python twin of src/head_approval.rs;
+both read the policy from the base branch, never from the head being armed.
+
+A verdict is the last non-blank line of a pull-request comment,
+``verdict: APPROVE head:<sha>`` or ``reviewed: <sha>`` (``verdict: HOLD
+head:<sha>`` holds), or a review in state APPROVED / CHANGES_REQUESTED on the
+head. The latest verdict naming the head decides. When the base config lists
+``reviewer_identities``, only those count; otherwise any account counts except
+the pull request's author, when the author is distinguishable: every fleet
+agent posts as the same App, so a verdict from that App on that App's pull
+request is accepted. ``GHAPP_ALLOW_UNREVIEWED_ARM=1`` is the operator
+override for this rule alone; it prints a WARNING and appends an audit line.
 """
 
 from __future__ import annotations
@@ -83,6 +103,22 @@ MERGE_GROUP_RUN_MAX_PAGES = 3
 ATTRIBUTOR_STDERR_TAIL_LINES = 5
 ATTRIBUTOR_STDERR_TAIL_CHARS = 600
 MERGE_GROUP_ANCESTRY_PROBES = 3
+# Repositories that require a reviewer verdict on the exact head before arming
+# when their base config does not say. Kept equal to REVIEW_REQUIRED_REPOS in
+# src/head_approval.rs (a test reads both).
+REVIEW_REQUIRED_REPOS = (
+    "Generous-Corp/pulp",
+    "Generous-Corp/vellum",
+    "danielraffel/tartci",
+    "danielraffel/Shipyard",
+)
+FLEET_AUTHOR = "shipyard-local"
+REVIEW_OVERRIDE_ENV = "GHAPP_ALLOW_UNREVIEWED_ARM"
+# Same pattern as src/head_approval.rs marker_verdict.
+_MARKER = re.compile(
+    r"^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})"
+    r"|verdict:[ \t]*(APPROVE|HOLD)[ \t]+head:[ \t]*([0-9a-f]{40}))[ \t]*$"
+)
 OPERATOR_NOTE = (
     "An explicit authority override exists for operators; see docs/ghapp-guards.md."
 )
@@ -556,6 +592,217 @@ def decide(
         f"{label} merge-queue state could not be determined "
         f"({classification.get('detail', 'unknown')}); refusing to arm blind"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review before arm: the twin of src/head_approval.rs.
+# ---------------------------------------------------------------------------
+
+
+def _normalized_login(login: str) -> str:
+    login = login[len("app/"):] if login.startswith("app/") else login
+    login = login[: -len("[bot]")] if login.endswith("[bot]") else login
+    return login.lower()
+
+
+def marker_verdict(body: str) -> tuple[str, str] | None:
+    """``(APPROVE|HOLD, head)`` from a comment's last non-blank line."""
+    lines = [line for line in body.splitlines() if line.strip()]
+    if not lines:
+        return None
+    match = _MARKER.match(lines[-1])
+    if match is None:
+        return None
+    if match.group(1):
+        return "APPROVE", match.group(1)
+    return match.group(2), match.group(3)
+
+
+def review_policy(config_text: str | None, repo: str) -> dict[str, Any]:
+    """``{required, reviewers}`` from the base's config text (``None``: absent).
+
+    A config the guard cannot parse (no tomllib, or invalid TOML) is treated as
+    silent, so a repository in REVIEW_REQUIRED_REPOS still requires review.
+    """
+    default = repo.lower() in {name.lower() for name in REVIEW_REQUIRED_REPOS}
+    section: Any = None
+    if config_text is not None:
+        try:
+            import tomllib
+
+            section = tomllib.loads(config_text).get("auto_merge")
+        except (ImportError, ValueError):
+            section = None
+    section = section if isinstance(section, dict) else {}
+    required = section.get("arm_requires_head_approval")
+    reviewers = section.get("reviewer_identities", section.get("reviewer_logins")) or []
+    from_default = not isinstance(required, bool) and default
+    return {
+        "required": required if isinstance(required, bool) else default,
+        "reviewers": [str(login).lower() for login in reviewers if isinstance(login, str)],
+        # Required by REVIEW_REQUIRED_REPOS, not by the repository's own key.
+        "any_but_author": from_default,
+    }
+
+
+def _reviewer_counts(login: str, policy: dict[str, Any], author: str | None) -> bool:
+    reviewer = _normalized_login(login)
+    if policy.get("any_but_author") and not policy["reviewers"]:
+        # Anyone but a distinguishable author. Every fleet agent posts as the
+        # same App, so that App's verdict on that App's PR counts.
+        return author is None or _normalized_login(author) != reviewer or reviewer == FLEET_AUTHOR
+    # A repository's own setting: only its listed reviewers, never the fleet
+    # App or the author (an empty list admits nobody).
+    return (
+        reviewer != FLEET_AUTHOR
+        and any(_normalized_login(name) == reviewer for name in policy["reviewers"])
+        and (author is None or _normalized_login(author) != reviewer)
+    )
+
+
+def review_verdict(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> tuple[bool, str]:
+    """Whether the latest counting verdict naming ``head`` approves it.
+
+    Returns ``(allowed, why)``; a refusal says exactly what is missing.
+    """
+    head = head.lower()
+    # (time, APPROVE|HOLD, head named, description) for every counting verdict.
+    verdicts: list[tuple[datetime | None, str, str, str]] = []
+    for review in reviews:
+        login = (review.get("user") or {}).get("login")
+        state = str(review.get("state") or "").upper()
+        verdict = {"APPROVED": "APPROVE", "CHANGES_REQUESTED": "HOLD"}.get(state)
+        if not isinstance(login, str) or verdict is None:
+            continue
+        if _reviewer_counts(login, policy, author):
+            named = str(review.get("commit_id") or "").lower()
+            verdicts.append((_timestamp(review.get("submitted_at")), verdict, named,
+                             f"a {state} review by {login} at {review.get('submitted_at')}"))
+    for comment in comments:
+        login = (comment.get("user") or {}).get("login")
+        body = comment.get("body")
+        found = marker_verdict(body) if isinstance(body, str) else None
+        if not isinstance(login, str) or found is None:
+            continue
+        if _reviewer_counts(login, policy, author):
+            verdict, named = found
+            verdicts.append((_timestamp(comment.get("created_at")), verdict, named,
+                             f"`{verdict} head:{named[:12]}` by {login} at "
+                             f"{comment.get('created_at')}"))
+    wanted = (
+        f"a comment whose last line is `verdict: APPROVE head:{head}` or `reviewed: {head}`, "
+        "or an APPROVED review on that commit"
+    )
+    if policy["reviewers"]:
+        wanted += f", from one of {', '.join(policy['reviewers'])}"
+    elif not policy.get("any_but_author"):
+        wanted += ", from a reviewer the base config lists (it lists none)"
+    elif author and _normalized_login(author) != FLEET_AUTHOR:
+        wanted += f", from an account other than the PR author {author}"
+    on_head = [entry for entry in verdicts if entry[2] == head]
+    # A HOLD whose time cannot be read cannot be ordered against an approval.
+    if any(at is None and verdict == "HOLD" for at, verdict, _, _ in on_head):
+        return False, f"a HOLD naming head {head[:12]} has no readable time; it needs {wanted}"
+    dated = [entry for entry in on_head if entry[0] is not None]
+    if dated:
+        _, verdict, _, what = max(dated, key=lambda entry: entry[0])
+        if verdict == "APPROVE":
+            return True, f"head {head[:12]} carries {what}"
+        return False, f"the latest verdict naming head {head[:12]} is HOLD ({what}); it needs a newer {wanted}"
+    older = [entry for entry in verdicts if entry[0] is not None]
+    stale = ""
+    if older:
+        _, _, _, what = max(older, key=lambda entry: entry[0])
+        stale = f" The latest verdict names another head: {what}."
+    return False, f"no reviewer verdict names head {head[:12]}; it needs {wanted}.{stale}"
+
+
+def _rest_pages(path: str) -> list[dict[str, Any]]:
+    value = run_real_gh(["api", "--paginate", "--slurp", path])
+    pages = value if isinstance(value, list) else [value]
+    records: list[dict[str, Any]] = []
+    for page in pages:
+        if not isinstance(page, list):
+            raise GuardError(f"{path} did not answer a list")
+        records.extend(item for item in page if isinstance(item, dict))
+    return records
+
+
+def base_config_text(repo: str, base: str) -> str | None:
+    """The base branch's ``.shipyard/config.toml``, or ``None`` when it has none."""
+    real_gh = os.environ.get("GHAPP_REAL_GH", "/opt/homebrew/bin/gh")
+    try:
+        completed = subprocess.run(
+            [real_gh, "api", "-H", "Accept: application/vnd.github.raw+json",
+             f"repos/{repo}/contents/.shipyard/config.toml?ref={base}"],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GuardError(f"cannot read the base config: {error}") from error
+    if completed.returncode != 0:
+        if "404" in completed.stderr or "Not Found" in completed.stderr:
+            return None
+        raise GuardError(f"cannot read the base config: {completed.stderr.strip()[-200:]}")
+    return completed.stdout
+
+
+def review_gate(classification: dict[str, Any], repo: str | None) -> tuple[bool, str]:
+    """``(allowed, message)``: the review-before-arm rule for one target."""
+    repo = classification.get("repo") or repo
+    number = classification.get("pr")
+    head = classification.get("head")
+    label = f"PR #{number}"
+    if not repo or not isinstance(number, int) or not isinstance(head, str):
+        return False, f"{label}: cannot tell which head would be armed, so its review cannot be checked"
+    try:
+        pull = run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
+        base = ((pull.get("base") or {}).get("ref")) if isinstance(pull, dict) else None
+        if not isinstance(base, str) or not base:
+            raise GuardError("the pull request carries no base branch")
+        policy = review_policy(base_config_text(repo, base), repo)
+        if not policy["required"]:
+            return True, f"{repo} does not require a review before arming"
+        live_head = ((pull.get("head") or {}).get("sha") or "").lower()
+        if live_head != head.lower():
+            return False, (
+                f"{label}: the head moved while the guard read it ({head[:12]} -> "
+                f"{live_head[:12]}); read it again"
+            )
+        author = (pull.get("user") or {}).get("login")
+        comments = _rest_pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
+        reviews = _rest_pages(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+    except GuardError as error:
+        return False, f"{label}: cannot read what its review requires ({error}); refusing to arm unreviewed"
+    allowed, why = review_verdict(head, author if isinstance(author, str) else None,
+                                  comments, reviews, policy)
+    return allowed, f"{label} ({repo}): {why}"
+
+
+def audit_override(message: str) -> None:
+    """Append one line to the guards' override audit log. Never raises."""
+    directory = pathlib.Path(
+        os.environ.get("SHIPYARD_GHAPP_GUARDS_DIR")
+        or pathlib.Path.home() / ".config" / "shipyard" / "guards"
+    )
+    record = {
+        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "override": REVIEW_OVERRIDE_ENV,
+        "refusal": message,
+        "argv": sys.argv[1:],
+        "cwd": os.getcwd(),
+    }
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / "overrides.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1519,6 +1766,35 @@ def _override(message: str) -> int:
     return 0
 
 
+def review_refusal(targets: list[dict[str, Any]], repo: str | None) -> bool:
+    """Print and return whether an unreviewed head refuses the arm.
+
+    GHAPP_ALLOW_UNREVIEWED_ARM=1 arms anyway, loudly and on the audit log.
+    """
+    unreviewed = [
+        message
+        for allowed, message in (review_gate(target, repo) for target in targets)
+        if not allowed
+    ]
+    if not unreviewed:
+        return False
+    message = " | ".join(unreviewed)
+    if os.environ.get(REVIEW_OVERRIDE_ENV) == "1":
+        audit_override(message)
+        print(
+            f"queue-arm-guard: WARNING: {REVIEW_OVERRIDE_ENV}=1 arms an unreviewed head; "
+            f"recorded in the guards' overrides.jsonl: {message}",
+            file=sys.stderr,
+        )
+        return False
+    print(
+        f"queue-arm-guard: refusing to arm an unreviewed head: {message} "
+        "Post the verdict on the PR, then arm it.",
+        file=sys.stderr,
+    )
+    return True
+
+
 def main(args: list[str]) -> int:
     if os.environ.get("SHIPYARD_INTERNAL_QUEUE_MUTATION") == "1":
         return 0
@@ -1527,8 +1803,15 @@ def main(args: list[str]) -> int:
         targets = arm_request(args)
     except GuardError as error:
         message = f"refusing ambiguous queue-arm request: {error}"
-        if override:
+        if override and os.environ.get(REVIEW_OVERRIDE_ENV) == "1":
+            # Nothing names the head, so its review cannot be checked either.
+            audit_override(message)
             return _override(message)
+        if override:
+            message += (
+                f"; it names no head, so its review cannot be checked: "
+                f"{REVIEW_OVERRIDE_ENV}=1 is needed as well"
+            )
         print(
             f"queue-arm-guard: {message}. Inspect the PR with `shipyard landing --pr <n>` and "
             f"land it with `shipyard ship --pr <n>`. {OPERATOR_NOTE}",
@@ -1556,23 +1839,25 @@ def main(args: list[str]) -> int:
                 environment = {"allowed": False, "reason": f"{error}", "evidence": []}
         verdicts.append(decide(target, attribution, environment))
     refusals = [message for allowed, message in verdicts if not allowed]
-    if not refusals:
-        for allowed, message in verdicts:
-            if allowed and (
-                "batch attributor certified" in message
-                or "this re-enqueue is allowed" in message
-            ):
-                print(f"queue-arm-guard: note: {message}", file=sys.stderr)
-        return 0
-    message = " | ".join(refusals)
-    if override:
-        return _override(message)
-    print(
-        f"queue-arm-guard: refusing: {message} Inspect it with `shipyard landing --pr <n>`. "
-        f"{OPERATOR_NOTE}",
-        file=sys.stderr,
-    )
-    return 1
+    if refusals and not override:
+        print(
+            f"queue-arm-guard: refusing: {' | '.join(refusals)} Inspect it with "
+            f"`shipyard landing --pr <n>`. {OPERATOR_NOTE}",
+            file=sys.stderr,
+        )
+        return 1
+    # The queue-state override does not stand in for a review.
+    if review_refusal(targets, repo):
+        return 1
+    if refusals:
+        return _override(" | ".join(refusals))
+    for allowed, message in verdicts:
+        if allowed and (
+            "batch attributor certified" in message
+            or "this re-enqueue is allowed" in message
+        ):
+            print(f"queue-arm-guard: note: {message}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":
