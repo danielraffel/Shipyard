@@ -1441,10 +1441,25 @@ shipyard metrics summary --project pulp --json
 shipyard metrics summary --project pulp --group-by host --json
 shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
+shipyard metrics gate-cost --scorecard --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --from 2026-09-28T00:00:00Z --to 2026-10-12T00:00:00Z --json
 shipyard metrics watch --project pulp --since 14d --json   # required gates first; --required <check> overrides config
 shipyard metrics advise --project pulp --json
 shipyard metrics compare --project pulp --baseline github-hosted --candidate macstudio --json
 ```
+
+`gate-cost --scorecard` is the success-rate scorecard. It reports per ISO
+week: open-to-merge median and p90, the merge-queue ejection rate (removals by
+`github-merge-queue` for `failed_checks` or `checks_timed_out`, per queue
+entry, read from the pull requests' timelines; other removals are listed by
+reason and actor), the merge-group failure rate of the `--gate-job` alone, the
+red-after-push rate on
+required checks (latest run per name; cancelled is not red), and check names
+red on two or more pull requests. Everything is read from GitHub, so pass
+`--from`/`--to` to measure a window from before a change and one from after it.
+A repository without branch protection needs `--required-context`. A required
+context that no merged commit carries is reported as a gap, because a
+misspelled one would otherwise read as a lower red rate. Use `--no-cache` on a
+gate host: the run is read-only then.
 
 The agent-facing commands return conservative JSON findings. Use `scorecard`
 for a compact project-level view of outcomes, worker-minutes, queue time,

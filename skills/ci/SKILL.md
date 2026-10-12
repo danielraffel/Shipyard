@@ -323,6 +323,35 @@ zero runs, which reported "no receipt decisions" for a group nobody read. It is
 now an error and the group reads `unreadable`. When adding a GitHub reader,
 treat a missing collection key as an error, never as `unwrap_or_default()`.
 
+## GitHub's caps and timeouts look like partial reads
+
+Three limits met while building `metrics gate-cost --scorecard` against Pulp.
+Each one first read as a broken instrument:
+
+- **`statusCheckRollup.contexts(first:100)` holds at most 100 checks.** Pulp
+  heads carry up to 103, and a required context (`Vellum trusted freeze`) sat
+  on the second page. Compare `totalCount` with the nodes you got, and page
+  through the commit's checks when they differ.
+- **A page of whole pull requests with their checks times out.** `first:10`
+  pull requests times 100 commits times 100 checks answered HTTP 504 on a day
+  that held an 85-commit pull request, and kept doing so on retry. Search
+  for the numbers alone, then read each pull request's commits 25 to a page.
+- **GitHub lists at most 250 commits of a pull request.** #9755 answered 250
+  of `totalCount` 300. That is the API's cap, not a short read, so count it
+  and name the pull request rather than failing the whole report.
+
+**An ejection is a queue removal, not a failed merge-group run.** Count
+`RemovedFromMergeQueueEvent` by `github-merge-queue` with reason
+`failed_checks` or `checks_timed_out`, and use `AddedToMergeQueueEvent` as the
+denominator. A merge-group run's gate result answers a different question, and
+the two disagree in both directions. In Pulp's 2026-W41, of 59 merge-group runs
+whose `macos` gate failed or was cancelled, only 24 were followed by a
+check-based removal of that pull request: the queue rebuilt the rest and the
+pull request stayed queued. Meanwhile 13 of the week's 38 real ejections
+happened while `macos` passed, because another of Pulp's six required contexts
+failed. With `itemTypes`, `timelineItems.totalCount` counts the whole
+timeline; check the read against `filteredCount`.
+
 ## A unit test must not see the host's GitHub auth
 
 CI runs every test with `SHIPYARD_TEST_HOME` set to the runner's temp

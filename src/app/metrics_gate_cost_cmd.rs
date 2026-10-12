@@ -9,7 +9,7 @@ use crate::app::cli::MetricsGateCostArgs;
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
-use crate::gate_cost::{self, GateCostQuery, GateCostReport, GateProxies, ReadCache};
+use crate::gate_cost::{self, GateCostQuery, GateCostReport, GateProxies, ReadCache, scorecard};
 use crate::identity::RuntimeMode;
 use crate::output::write_pretty_json;
 
@@ -29,6 +29,8 @@ pub(super) fn gate_cost_command<W: Write>(
         .map_err(|error| CliFailure::new(2, format!("config error: {error}")))?;
     let now = Utc::now();
     let no_cache = args.no_cache;
+    let scorecard = args.scorecard;
+    let required_contexts = args.required_contexts.clone();
     let query = resolve_query(args, &config, now)?;
     let cache = if no_cache {
         ReadCache::disabled()
@@ -41,6 +43,28 @@ pub(super) fn gate_cost_command<W: Write>(
             .run_gh_with_timeout(gh_args, GITHUB_READ_TIMEOUT)
             .map_err(|error| error.to_string())
     };
+    if scorecard {
+        let query = scorecard::ScorecardQuery {
+            repo: query.repo,
+            workflow: query.workflow,
+            gate_job: query.gate_job,
+            base_branch: query.base_branch,
+            required_contexts,
+            from: query.from,
+            to: query.to,
+        };
+        let observation = scorecard::gather(&reader, &query, &cache)
+            .map_err(|error| CliFailure::new(1, format!("scorecard read failed: {error}")))?;
+        let report = scorecard::compute(&observation);
+        if json_output {
+            write_pretty_json(stdout, &report)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        } else {
+            write!(stdout, "{}", scorecard::render(&report))
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
     let observation = gate_cost::gather_cached(&reader, &query, now, &cache)
         .map_err(|error| CliFailure::new(1, format!("gate-cost read failed: {error}")))?;
     let report = gate_cost::compute(&observation);
