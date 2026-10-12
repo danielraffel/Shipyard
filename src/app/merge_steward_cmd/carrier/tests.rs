@@ -522,3 +522,69 @@ fn an_ordinary_head_keeps_its_arm_as_the_approval_record() {
         })
     );
 }
+
+/// A fake `gh` for an armed pull request whose required `macos` run 100 was
+/// cancelled with no runner after 17 minutes; `annotations` is what the
+/// cancelled job's check run carries.
+#[cfg(unix)]
+fn interrupted_gh(temp: &tempfile::TempDir, annotations: &Path) -> GitHubActions {
+    fake_gh(
+        temp,
+        &format!(
+            r#"
+case "$*" in
+  *timelineItems*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{HEAD}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":{{"enabledAt":"2026-10-09T08:00:00Z"}},"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[{{"__typename":"PullRequestCommit","commit":{{"oid":"{HEAD}","checkSuites":{{"nodes":[{{"createdAt":"2026-10-09T07:00:00Z"}}]}}}}}},{{"__typename":"AutoMergeEnabledEvent","createdAt":"2026-10-09T08:00:00Z","actor":{{"login":"shipyard-local"}}}}]}}}}}}}}}}' ;;
+  *issues/42/comments*) printf '%s' '[]' ;;
+  *"actions/runs?head_sha={HEAD}&per_page=100"*) printf '%s' '{{"total_count":1,"workflow_runs":[{{"id":100,"path":".github/workflows/build.yml","name":"Build","event":"pull_request","head_sha":"{HEAD}","status":"completed","conclusion":"cancelled","run_attempt":1,"run_started_at":"2026-10-09T08:02:00Z"}}]}}' ;;
+  *"actions/runs/100/jobs"*) printf '%s' '{{"total_count":1,"jobs":[{{"id":9001,"name":"macos","status":"completed","conclusion":"cancelled","runner_name":"","created_at":"2026-10-09T08:02:00Z","completed_at":"2026-10-09T08:19:00Z"}}]}}' ;;
+  *"check-runs/9001/annotations"*) cat '{}' ;;
+  *) printf '%s' '{{}}' ;;
+esac
+"#,
+            annotations.display()
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn interrupted_observation() -> RepoObservation {
+    let mut observation = ejected_observation();
+    observation.prs[0].fact.checks[0].conclusion = Some("CANCELLED".to_owned());
+    observation
+}
+
+#[cfg(unix)]
+#[test]
+fn the_carrier_never_redispatches_a_run_an_account_cancelled() {
+    // The real annotation GitHub writes when an account cancels a run
+    // (danielraffel/tartci job 85516736821).
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/transient-interruption/user-cancel-annotations.json");
+    let temp = tempfile::tempdir().expect("temp");
+    let report = planned_report(&interrupted_gh(&temp, &fixture), &interrupted_observation());
+    assert!(
+        matches!(
+            &report.prs[0].plan.decision,
+            crate::merge_carrier::CarrierDecision::Hold {
+                hold: crate::merge_carrier::CarrierHold::NotInterruption { run_id: 100, .. }
+            }
+        ),
+        "{:?}",
+        report.prs[0]
+    );
+    // Control: the same run with no annotation is the interruption it looks
+    // like, and is redispatched.
+    let temp = tempfile::tempdir().expect("temp");
+    let empty = temp.path().join("none.json");
+    fs::write(&empty, "[]").expect("annotations");
+    let report = planned_report(&interrupted_gh(&temp, &empty), &interrupted_observation());
+    assert_eq!(
+        report.prs[0].plan.action(),
+        Some(&CarrierAction::Redispatch {
+            head: HEAD.to_owned(),
+            run_ids: vec![100]
+        }),
+        "{:?}",
+        report.prs[0]
+    );
+}
