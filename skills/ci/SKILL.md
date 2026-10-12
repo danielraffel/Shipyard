@@ -347,9 +347,19 @@ on `PATH`, and point `SHIPYARD_TEST_HOME` (or `HOME`, with `CARGO_HOME` and
 `RUSTUP_HOME` kept) at a config whose token helper is that `ghapp`. Then run
 the suite with `--test-threads 1`. The helpers must append to the same log
 cargo writes (in append mode), because the code under test captures their
-stderr. Production paths that call `gh` through `PATH` with no client
-(`pr_merged_head_sha` and the ship and doctor observers) still do so from
-some tests.
+stderr.
+
+A `gh` resolved through `PATH` is refused too. In a unix test build,
+`gh::bare_gh_command` (the fallback of a `GhClient` with no binary, of
+`gh_supervised(None)`, of an ambient-only client resolving `gh` from `PATH`,
+and of doctor's `SystemCommandProbe`) panics with "test is not hermetic".
+The injection point is the config's `github.auth.ambient_gh_binary`: the
+ship, auto-merge, reconcile and queue observers all build their client from a
+config, and doctor now checks the `gh` that key names.
+`test_support::refusing_gh_config()` gives a native `gh` that fails every
+call, as an unauthenticated one would. A test that only inspects the command
+production builds wraps it in `gh::allow_bare_gh_for_test`, as does a child
+process whose `PATH` starts with its own fixture.
 
 ## Protected-state caches take the writer-domain lease too
 

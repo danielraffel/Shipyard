@@ -48,6 +48,32 @@ pub(super) fn seed_repo(repo: &std::path::Path) {
         repo,
     );
     git(&["checkout", "-q", "-b", "feature/test"], repo);
+    refuse_gh_in(repo);
+}
+
+/// Give `repo` a Shipyard project config that runs a refusing fake `gh`, for
+/// the commands that load their config from the checkout rather than from the
+/// one the test passes. It is excluded from git, so the tree stays clean.
+fn refuse_gh_in(repo: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        std::fs::create_dir_all(repo.join(".shipyard")).expect("project config dir");
+        std::fs::write(
+            repo.join(".shipyard/config.toml"),
+            crate::test_support::refusing_gh_config(),
+        )
+        .expect("project config");
+        std::fs::create_dir_all(repo.join(".git/info")).expect("git info dir");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(repo.join(".git/info/exclude"))
+            .and_then(|mut exclude| exclude.write_all(b"/.shipyard/\n"))
+            .expect("exclude the project config");
+    }
+    #[cfg(not(unix))]
+    let _ = repo;
 }
 
 #[cfg(unix)]
@@ -65,6 +91,7 @@ pub(super) fn seed_repo_with_local_origin(repo: &std::path::Path, remote: &std::
     );
     git(&["push", "-u", "origin", "main"], repo);
     git(&["checkout", "-q", "-b", "feature/test"], repo);
+    refuse_gh_in(repo);
 }
 
 #[cfg(unix)]
@@ -73,7 +100,8 @@ pub(super) fn fake_gh(path: &std::path::Path, script_body: &str) {
 }
 
 pub(super) fn loaded_config(root: &std::path::Path) -> LoadedConfig {
-    let data = r#"
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut data = r#"
         [validation.default]
         command = "rustc --version"
 
@@ -81,8 +109,11 @@ pub(super) fn loaded_config(root: &std::path::Path) -> LoadedConfig {
         backend = "local"
         platform = "macos-arm64"
     "#
-    .parse::<Table>()
-    .expect("config TOML");
+    .to_owned();
+    // Every GitHub client runs a refusing fake `gh` rather than the host's.
+    #[cfg(unix)]
+    data.push_str(&crate::test_support::refusing_gh_config());
+    let data = data.parse::<Table>().expect("config TOML");
     LoadedConfig {
         data,
         global_dir: root.join("global"),

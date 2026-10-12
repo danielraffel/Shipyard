@@ -109,13 +109,27 @@ impl CommandProbe for SystemCommandProbe {
     }
 
     fn run(&self, command: &str, args: &[&str]) -> Option<DoctorCommandOutput> {
-        let output = Command::new(command).args(args).output().ok()?;
+        let mut command = if command == "gh" {
+            crate::gh::bare_gh_command()
+        } else {
+            Command::new(command)
+        };
+        let output = command.args(args).output().ok()?;
         Some(DoctorCommandOutput {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         })
     }
+}
+
+/// The `gh` doctor checks: the config's `github.auth.ambient_gh_binary` when
+/// it names one, since that is the `gh` Shipyard runs, else `gh` on `PATH`.
+fn doctor_gh_program(mode: RuntimeMode, cwd: &Path) -> String {
+    LoadedConfig::load_from_cwd(mode, cwd)
+        .ok()
+        .and_then(|config| crate::gh::configured_ambient_gh_binary(&config))
+        .map_or_else(|| "gh".to_owned(), |path| path.display().to_string())
 }
 
 /// Collect the current machine-scoped doctor report.
@@ -193,14 +207,15 @@ fn collect_report_with_github_auth(
     checks.insert("Core".to_owned(), core);
 
     let mut cloud = BTreeMap::new();
-    cloud.insert("gh".to_owned(), check_command(probe, "gh", &["--version"]));
-    let ambient_gh_auth = probe_ambient_gh_cli_auth(probe);
+    let gh = doctor_gh_program(mode, cwd);
+    cloud.insert("gh".to_owned(), check_command(probe, &gh, &["--version"]));
+    let ambient_gh_auth = probe_ambient_gh_cli_auth(probe, &gh);
     cloud.insert(
         "github-auth".to_owned(),
         github_auth_entry_result(github_auth, &ambient_gh_auth),
     );
     if let Ok(summary) = github_auth
-        && let Some(entry) = check_gh_workflow_scope_for_auth(probe, summary)
+        && let Some(entry) = check_gh_workflow_scope_for_auth(probe, summary, &gh)
     {
         cloud.insert("gh-scope".to_owned(), entry);
     }
@@ -792,7 +807,8 @@ pub fn check_github_auth_for_repo(
     repo: Option<&str>,
 ) -> DoctorEntry {
     let result = github_auth_summary(mode, cwd, repo);
-    let ambient_gh_auth = probe_ambient_gh_cli_auth(&SystemCommandProbe);
+    let ambient_gh_auth =
+        probe_ambient_gh_cli_auth(&SystemCommandProbe, &doctor_gh_program(mode, cwd));
     github_auth_entry_result(&result, &ambient_gh_auth)
 }
 
@@ -881,8 +897,8 @@ enum AmbientGhCliAuth {
 }
 
 /// Probe the ambient `gh` login via the `CommandProbe` (`gh auth status`).
-fn probe_ambient_gh_cli_auth(probe: &impl CommandProbe) -> AmbientGhCliAuth {
-    ambient_gh_cli_auth_from(|args| probe.run("gh", args))
+fn probe_ambient_gh_cli_auth(probe: &impl CommandProbe, gh: &str) -> AmbientGhCliAuth {
+    ambient_gh_cli_auth_from(|args| probe.run(gh, args))
 }
 
 /// Testable core of the ambient-auth probe. Treats a non-zero
@@ -1014,9 +1030,10 @@ fn safe_auth_value(value: &str) -> String {
 fn check_gh_workflow_scope_for_auth(
     probe: &impl CommandProbe,
     summary: &GhAuthSummary,
+    gh: &str,
 ) -> Option<DoctorEntry> {
     match &summary.source {
-        GhAuthSourceSummary::GhCli => check_gh_workflow_scope(probe),
+        GhAuthSourceSummary::GhCli => check_gh_workflow_scope(probe, gh),
         GhAuthSourceSummary::Env { .. } | GhAuthSourceSummary::Command => {
             Some(configured_token_scope_entry(summary))
         }
@@ -1057,8 +1074,8 @@ fn configured_token_scope_entry(summary: &GhAuthSummary) -> DoctorEntry {
     }
 }
 
-fn check_gh_workflow_scope(probe: &impl CommandProbe) -> Option<DoctorEntry> {
-    check_gh_workflow_scope_with(|args| probe.run("gh", args))
+fn check_gh_workflow_scope(probe: &impl CommandProbe, gh: &str) -> Option<DoctorEntry> {
+    check_gh_workflow_scope_with(|args| probe.run(gh, args))
 }
 
 fn check_gh_workflow_scope_with<F>(mut run_auth_status: F) -> Option<DoctorEntry>
@@ -1452,6 +1469,39 @@ fn parse_github_repo_slug(remote: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_system_probe_refuses_gh_from_path_in_a_test() {
+        let refused =
+            std::panic::catch_unwind(|| super::SystemCommandProbe.run("gh", &["--version"]));
+        assert!(refused.is_err(), "the system probe ran `gh` from PATH");
+        // Any other command is the host's, as before.
+        assert!(super::SystemCommandProbe.run("true", &[]).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_checks_the_gh_the_config_names() {
+        // With no config doctor checks `gh` on PATH; with
+        // `github.auth.ambient_gh_binary` it checks that binary, the one
+        // Shipyard runs.
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            super::doctor_gh_program(crate::identity::RuntimeMode::Shipyard, temp.path()),
+            "gh"
+        );
+        std::fs::create_dir_all(temp.path().join(".shipyard")).expect("project dir");
+        std::fs::write(
+            temp.path().join(".shipyard/config.toml"),
+            crate::test_support::refusing_gh_config(),
+        )
+        .expect("config");
+        assert_eq!(
+            super::doctor_gh_program(crate::identity::RuntimeMode::Shipyard, temp.path()),
+            crate::test_support::refusing_gh().display().to_string()
+        );
+    }
 
     use super::{
         AmbientGhCliAuth, CommandProbe, DoctorCommandOutput, DoctorReport, GhAuthCheckError,
@@ -1946,7 +1996,7 @@ mod tests {
             )]),
         };
 
-        let entry = check_gh_workflow_scope_for_auth(&probe, &summary).expect("entry");
+        let entry = check_gh_workflow_scope_for_auth(&probe, &summary, "gh").expect("entry");
 
         assert!(entry.ok);
     }

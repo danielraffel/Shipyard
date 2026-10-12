@@ -422,8 +422,12 @@ pub(crate) mod test_support {
     /// program name is refused too: it would resolve through `PATH`.
     pub(crate) fn assert_fixture_executables(gh_binary: &Path, executables: &[PathBuf]) {
         let root = fixture_root(gh_binary);
+        let refusing = resolve_through_existing_ancestor(refusing_gh());
         for executable in executables {
             let resolved = resolve_through_existing_ancestor(executable);
+            if resolved == refusing {
+                continue;
+            }
             assert!(
                 executable.is_absolute() && resolved.starts_with(&root),
                 "test GitHub client is not hermetic: its auth config runs {} outside the \
@@ -574,6 +578,32 @@ pub(crate) mod test_support {
             "control did not reproduce ETXTBSY, so this test proves nothing"
         );
         drop(handle);
+    }
+
+    /// A native `gh` that refuses every call: it names its arguments on
+    /// stderr and exits 1, as an unauthenticated `gh` would fail. Compiled
+    /// once per test process.
+    pub(crate) fn refusing_gh() -> &'static Path {
+        static GH: LazyLock<PathBuf> = LazyLock::new(|| {
+            let directory = std::env::temp_dir()
+                .join(format!("shipyard-test-refusing-gh-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).expect("refusing gh directory");
+            compile_native_test_program(
+                &directory,
+                "gh",
+                "fn main() {\n    let args: Vec<String> = std::env::args().skip(1).collect();\n    eprintln!(\"refusing gh: {}\", args.join(\" \"));\n    std::process::exit(1);\n}\n",
+            )
+        });
+        &GH
+    }
+
+    /// A `[github.auth]` section that runs [`refusing_gh`] wherever a GitHub
+    /// client would otherwise run `gh` from `PATH`.
+    pub(crate) fn refusing_gh_config() -> String {
+        format!(
+            "[github.auth]\nambient_gh_binary = \"{}\"\n",
+            refusing_gh().display()
+        )
     }
 
     /// Compile a tiny native fixture when a security boundary deliberately

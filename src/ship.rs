@@ -3266,9 +3266,17 @@ mod tests {
         assert_eq!(result.failure_class, None);
     }
 
+    /// No settings, except that every GitHub client runs a refusing fake
+    /// `gh` rather than the host's.
     fn empty_config(root: &std::path::Path) -> LoadedConfig {
+        #[cfg(unix)]
+        let data = crate::test_support::refusing_gh_config()
+            .parse::<Table>()
+            .expect("refusing gh config");
+        #[cfg(not(unix))]
+        let data = Table::new();
         LoadedConfig {
-            data: Table::new(),
+            data,
             global_dir: root.join("global"),
             project_dir: None,
             local_dir: None,

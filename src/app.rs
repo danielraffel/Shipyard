@@ -1703,6 +1703,18 @@ mod tests {
         std::fs::set_permissions(path, permissions).expect("chmod script");
     }
 
+    /// Point `dir`'s Shipyard project config at a refusing fake `gh`, so a
+    /// command run with `--cwd dir` never runs the host's.
+    fn refuse_gh_in(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join(".shipyard")).expect("project config dir");
+        #[cfg(unix)]
+        std::fs::write(
+            dir.join(".shipyard/config.toml"),
+            crate::test_support::refusing_gh_config(),
+        )
+        .expect("project config");
+    }
+
     fn seed_git_repo(repo: &std::path::Path, branch: &str) {
         std::fs::create_dir_all(repo).expect("repo dir");
         git(&["init", "--quiet", "--initial-branch=main"], repo);
@@ -2066,7 +2078,15 @@ mod tests {
 
     #[test]
     fn doctor_json_uses_expected_envelope_shape() {
-        let cli = Cli::parse_from(["shipyard", "--json", "doctor"]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        refuse_gh_in(temp.path());
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
+            "doctor",
+        ]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let code = run_with(cli, &mut stdout, &mut stderr);
@@ -3314,8 +3334,11 @@ mod tests {
     #[test]
     fn auto_merge_missing_state_exits_two() {
         let temp = tempfile::tempdir().expect("tempdir");
+        refuse_gh_in(temp.path());
         let cli = Cli::parse_from([
             "shipyard",
+            "--cwd",
+            temp.path().to_str().expect("temp path"),
             "--state-dir",
             temp.path().to_str().expect("temp path"),
             "auto-merge",
@@ -4554,6 +4577,7 @@ mod tests {
     fn watch_json_emits_update_with_required_field() {
         let temp = tempfile::tempdir().expect("tempdir");
         seed_git_repo(temp.path(), "feature/x");
+        refuse_gh_in(temp.path());
         let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
         let mut state = ShipState::new(12, "owner/repo", "feature/x", "main", "a".repeat(40), "p1");
         state.evidence_snapshot = [
