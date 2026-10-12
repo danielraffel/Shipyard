@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn dry_run_records_would_jump_once_per_episode_and_touches_nothing() {
         let state = tempfile::tempdir().expect("tempdir");
-        let actions = GitHubActions::new(state.path());
+        let actions = GitHubActions::offline_for_tests(state.path());
 
         let first = act(
             &actions,

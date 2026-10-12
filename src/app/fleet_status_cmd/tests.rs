@@ -1050,7 +1050,7 @@ fn expected_host_config_rejects_missing_or_malformed_labels() {
 fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     let path = temp.path().join("gh");
     crate::test_support::write_executable_script(&path, &format!("#!/bin/sh\nset -eu\n{body}\n"));
-    GitHubActions::new(temp.path()).with_gh_binary_for_tests(path)
+    GitHubActions::hermetic_for_tests(temp.path(), path)
 }
 
 #[cfg(unix)]

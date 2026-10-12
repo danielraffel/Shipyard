@@ -1840,7 +1840,7 @@ fn main() {{
         );
         let binary = crate::test_support::compile_native_test_program(temp.path(), "gh", &source);
         (
-            GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary),
+            GitHubActions::hermetic_for_tests(temp.path(), binary),
             count,
         )
     }
@@ -1891,7 +1891,7 @@ fn main() {{
         let binary =
             crate::test_support::compile_native_test_program(temp.path(), "handoff-gh", &source);
         (
-            GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary),
+            GitHubActions::hermetic_for_tests(temp.path(), binary),
             count,
         )
     }
@@ -1940,10 +1940,7 @@ fn main() {{
         );
         let binary =
             crate::test_support::compile_native_test_program(temp.path(), "handoff-ok-gh", &source);
-        (
-            GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary),
-            log,
-        )
+        (GitHubActions::hermetic_for_tests(temp.path(), binary), log)
     }
 
     fn args() -> StewardHandoffArgs {

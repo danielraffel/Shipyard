@@ -114,6 +114,29 @@ impl GhClient {
         Ok(Self::new(auth))
     }
 
+    /// The executables this client's auth config would run itself: the
+    /// token helper's program and any configured `gh` or `git` binary.
+    #[cfg(all(test, unix))]
+    pub(crate) fn configured_executables(&self) -> Vec<PathBuf> {
+        let mut executables = Vec::new();
+        if let GhAuthSource::Command { token_command, .. } = &self.auth.source
+            && let Some(program) = token_command.first()
+        {
+            executables.push(PathBuf::from(program));
+        }
+        executables.extend(
+            [
+                &self.auth.ambient_gh_binary,
+                &self.auth.privileged_gh_binary,
+                &self.auth.privileged_git_binary,
+            ]
+            .into_iter()
+            .flatten()
+            .cloned(),
+        );
+        executables
+    }
+
     /// Build a client that uses ambient `gh` auth.
     #[must_use]
     pub fn ambient() -> Self {

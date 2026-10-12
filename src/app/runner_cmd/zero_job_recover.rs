@@ -1320,7 +1320,7 @@ esac
             log = log.display(),
         );
         crate::test_support::write_executable_script(&gh, &script);
-        let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         let mut output = Vec::new();
         let args = ZeroJobRecoverArgs {
             repo: PULP_REPO.to_owned(),

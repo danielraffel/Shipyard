@@ -373,6 +373,68 @@ pub(crate) mod test_support {
         let _guard = lock_process_tree_for_test();
     }
 
+    /// `path` with its nearest existing ancestor canonicalized, so a fixture
+    /// that is not written yet still resolves through symlinks such as
+    /// macOS's `/var` -> `/private/var`.
+    fn resolve_through_existing_ancestor(path: &Path) -> PathBuf {
+        let mut existing = path;
+        let mut rest = Vec::new();
+        loop {
+            if let Ok(resolved) = existing.canonicalize() {
+                return rest
+                    .iter()
+                    .rev()
+                    .fold(resolved, |path, part| path.join(part));
+            }
+            match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_owned());
+                    existing = parent;
+                }
+                _ => return path.to_path_buf(),
+            }
+        }
+    }
+
+    /// The fixture directory of a test executable: the directory directly
+    /// under the system temp directory that holds it (one `tempfile` tree),
+    /// or, outside the temp directory, its own parent.
+    fn fixture_root(executable: &Path) -> PathBuf {
+        let resolved = executable
+            .parent()
+            .map_or_else(PathBuf::new, resolve_through_existing_ancestor);
+        let temp = resolve_through_existing_ancestor(&std::env::temp_dir());
+        resolved
+            .strip_prefix(&temp)
+            .ok()
+            .and_then(|rest| rest.components().next())
+            .map_or(resolved.clone(), |first| temp.join(first))
+    }
+
+    /// Panic unless every executable a GitHub client would run is a fixture
+    /// in the same temp tree as `gh_binary`.
+    ///
+    /// A test that injects a fake `gh` but builds its client from the
+    /// machine-global Shipyard config still runs that config's token helper
+    /// (`~/.local/bin/ghapp` on the fleet hosts), which mints a real token and
+    /// reaches GitHub. Such a test passes in CI, where no global config
+    /// exists, and fails or hangs on a host where GitHub is slow. A bare
+    /// program name is refused too: it would resolve through `PATH`.
+    pub(crate) fn assert_fixture_executables(gh_binary: &Path, executables: &[PathBuf]) {
+        let root = fixture_root(gh_binary);
+        for executable in executables {
+            let resolved = resolve_through_existing_ancestor(executable);
+            assert!(
+                executable.is_absolute() && resolved.starts_with(&root),
+                "test GitHub client is not hermetic: its auth config runs {} outside the \
+                 fixture tree {} (it was read from the machine-global Shipyard config, or \
+                 resolves through PATH); build it with GitHubActions::hermetic_for_tests",
+                executable.display(),
+                root.display()
+            );
+        }
+    }
+
     /// Write an executable shell fixture without ever holding a writable
     /// descriptor on it in this process.
     ///
