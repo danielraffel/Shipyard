@@ -3,6 +3,16 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03023"></a>
+## [0.302.3] - 2026-10-12
+
+- fix/prepush rustup no download 20261011 ([#782](https://github.com/danielraffel/Shipyard/pull/782))
+
+<a id="v03022"></a>
+## [0.302.2] - 2026-10-12
+
+- codex/rust toolchain bundle 20261011 ([#777](https://github.com/danielraffel/Shipyard/pull/777))
+
 <a id="v03021"></a>
 ## [0.302.1] - 2026-10-11
 
@@ -2152,6 +2162,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.302.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.302.3
+[0.302.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.302.2
 [0.302.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.302.1
 [0.302.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.302.0
 [0.301.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.301.0
