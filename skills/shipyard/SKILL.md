@@ -373,6 +373,21 @@ rejected, and none after 2026-09-15 once arm-on-open took over. The test
 returns to `auto_merge_cmd`, `ship_cmd` or `pr_cmd`. New audit entries say
 `arm native auto-merge`; `merge-queue resolve` still accepts the old
 `enqueue pull request` entries.
+## A carry extends a reviewer approval, so it proves the merge changed nothing
+
+`runner carrier --apply --class update_branch` merges the base into an armed
+`BEHIND` head through `PUT pulls/<n>/update-branch` (merge only, with
+`expected_head_sha`). The arm event is never the approval here: the carry
+needs a `head_approval` APPROVE of the exact head by a configured reviewer
+identity. Own lines are compared semantically (`git diff -U0`, dropping
+`index` lines and hunk headers), never as a raw `git diff` digest, which
+changes whenever the base touches the same file. Git evidence is read in the
+target repository's clone (`--clone OWNER/REPO=PATH`) after fetching
+`refs/heads/<base>` and `refs/pull/<n>/head` into carrier-private refs; the
+update endpoint answers 202 with no head, so the new head is read back from
+the pull request. A mismatch before the update refuses it; a mismatch after it
+leaves the pull request disarmed with `carry_verification_failed` in the audit.
+
 ## A transient rerun needs the interruption signature, not a conclusion
 
 The steward's bounded rerun and the carrier's `redispatch` both rerun only a

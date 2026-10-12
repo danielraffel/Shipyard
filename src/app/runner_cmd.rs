@@ -425,6 +425,7 @@ fn runner_command_with_actions<W: Write>(
             class,
             intent,
             replay,
+            clone,
             apply,
         } => super::merge_steward_cmd::carrier::carrier_command(
             &super::merge_steward_cmd::carrier::CarrierCommandArgs {
@@ -433,6 +434,7 @@ fn runner_command_with_actions<W: Write>(
                 classes: class,
                 intent,
                 replay,
+                clones: clone,
                 apply,
             },
             cwd,

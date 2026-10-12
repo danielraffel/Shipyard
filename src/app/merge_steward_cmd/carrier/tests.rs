@@ -1,7 +1,8 @@
 use super::*;
 
 #[cfg(unix)]
-use std::process::Command;
+#[path = "carry_tests.rs"]
+mod carry_tests;
 
 #[cfg(unix)]
 use crate::merge_steward::{RequiredCheck, StewardCheck, StewardCheckSource, StewardPullRequest};
@@ -23,7 +24,7 @@ fn apply_without_a_class_is_refused() {
 }
 
 #[test]
-fn update_branch_can_be_planned_but_never_applied() {
+fn update_branch_is_a_class_that_can_be_applied() {
     let classes = parse_classes(&["update_branch".to_owned()], false).expect("plan");
     assert!(classes.contains(&CarrierClass::UpdateBranch));
     assert!(
@@ -39,70 +40,13 @@ fn unknown_classes_are_refused() {
     assert!(error.message.contains("unknown carrier class"));
 }
 
-#[cfg(unix)]
-fn git_test(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .expect("git");
-    assert!(output.status.success(), "git failed: {output:?}");
-    String::from_utf8(output.stdout)
-        .expect("utf8")
-        .trim()
-        .to_owned()
-}
-
-#[cfg(unix)]
 #[test]
-fn carry_evidence_captures_the_merge_tree_and_own_lines() {
-    let temp = tempfile::tempdir().expect("temp");
-    git_test(temp.path(), &["init", "-q"]);
-    git_test(
-        temp.path(),
-        &["config", "user.email", "test@example.invalid"],
-    );
-    git_test(temp.path(), &["config", "user.name", "test"]);
-    fs::write(temp.path().join("base.txt"), "base\n").expect("base");
-    git_test(temp.path(), &["add", "."]);
-    git_test(temp.path(), &["commit", "-qm", "base"]);
-    let base = git_test(temp.path(), &["rev-parse", "HEAD"]);
-    git_test(temp.path(), &["checkout", "-qb", "feature"]);
-    fs::write(temp.path().join("feature.txt"), "feature\n").expect("feature");
-    git_test(temp.path(), &["add", "."]);
-    git_test(temp.path(), &["commit", "-qm", "feature"]);
-    let head = git_test(temp.path(), &["rev-parse", "HEAD"]);
-    let (digest, tree) = carry_evidence(temp.path(), &base, &head).expect("evidence");
-    assert_eq!(
-        tree,
-        git_test(temp.path(), &["rev-parse", &format!("{head}^{{tree}}")])
-    );
-    assert_eq!(digest.len(), 64);
-}
-
-#[cfg(unix)]
-#[test]
-fn carry_evidence_rejects_a_non_automatic_merge() {
-    let temp = tempfile::tempdir().expect("temp");
-    git_test(temp.path(), &["init", "-q"]);
-    git_test(
-        temp.path(),
-        &["config", "user.email", "test@example.invalid"],
-    );
-    git_test(temp.path(), &["config", "user.name", "test"]);
-    fs::write(temp.path().join("same.txt"), "base\n").expect("base");
-    git_test(temp.path(), &["add", "."]);
-    git_test(temp.path(), &["commit", "-qm", "base"]);
-    let base = git_test(temp.path(), &["rev-parse", "HEAD"]);
-    git_test(temp.path(), &["checkout", "-qb", "feature"]);
-    fs::write(temp.path().join("same.txt"), "feature\n").expect("feature");
-    git_test(temp.path(), &["commit", "-qam", "feature"]);
-    let head = git_test(temp.path(), &["rev-parse", "HEAD"]);
-    git_test(temp.path(), &["checkout", "-q", &base]);
-    fs::write(temp.path().join("same.txt"), "main\n").expect("main");
-    git_test(temp.path(), &["commit", "-qam", "main"]);
-    let current_base = git_test(temp.path(), &["rev-parse", "HEAD"]);
-    assert!(carry_evidence(temp.path(), &current_base, &head).is_err());
+fn clone_arguments_must_name_a_repository_and_a_path() {
+    let clones = parse_clones(&["owner/repo=/tmp/clone".to_owned()]).expect("clone");
+    assert_eq!(clones["owner/repo"], PathBuf::from("/tmp/clone"));
+    for bad in ["owner/repo", "repo=/tmp/clone", "owner/repo="] {
+        assert!(parse_clones(&[bad.to_owned()]).is_err(), "{bad}");
+    }
 }
 
 #[test]
@@ -369,6 +313,7 @@ fn apply_rearms_only_the_intended_action_with_the_exact_head() {
         &actions,
         &observation,
         temp.path(),
+        &BTreeMap::new(),
         &rearm_intent(),
         &classes,
         &store,
@@ -406,6 +351,7 @@ fn apply_does_nothing_outside_the_intent_or_the_enabled_classes() {
         &actions,
         &observation,
         temp.path(),
+        &BTreeMap::new(),
         &empty,
         &classes,
         &store,
@@ -421,6 +367,7 @@ fn apply_does_nothing_outside_the_intent_or_the_enabled_classes() {
         &actions,
         &observation,
         temp.path(),
+        &BTreeMap::new(),
         &rearm_intent(),
         &classes,
         &store,
@@ -461,6 +408,7 @@ fn an_intent_naming_an_older_head_is_not_applied() {
         &actions,
         &observation,
         temp.path(),
+        &BTreeMap::new(),
         &intent,
         &BTreeSet::from([CarrierClass::Rearm]),
         &store,
@@ -484,6 +432,7 @@ fn a_host_that_is_not_the_mutation_machine_cannot_apply() {
         &actions,
         &observation,
         temp.path(),
+        &BTreeMap::new(),
         &rearm_intent(),
         &BTreeSet::from([CarrierClass::Rearm]),
         &store,
