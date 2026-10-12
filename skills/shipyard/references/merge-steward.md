@@ -24,8 +24,23 @@ queue.
 
 The transient retry ceiling is fenced twice: the local ledger records intent
 before mutation, and GitHub's durable `run_attempt` must still be within the
-configured budget at live revalidation. Losing a controller cache after GitHub
+budget at live revalidation. Losing a controller cache after GitHub
 accepted a rerun therefore cannot authorize another retry on the next pass.
+
+A rerun is for an interruption, never for a conclusion string. Only a
+`CANCELLED` required check is a candidate; `TIMED_OUT`, `STARTUP_FAILURE` and
+`STALE` are results. At live revalidation the steward reads the run's
+latest-attempt jobs and reruns only when every job that did not pass was
+cancelled with no `runner_name`, 16 to 20 minutes after it was created (the
+runner-assignment timeout), with no concurrency-supersede annotation on its
+check run (`transient_interruption::classify_jobs`). A person's cancel, a
+superseding push, a cancel after a runner took the job, or a job that ran and
+failed is reported as `not an interruption` and spends no budget. The budget
+is one rerun per PR, head and required check: `--max-transient-reruns` accepts
+only 0 or 1, the code clamps any wider value, and the ledger keys the attempt
+by check as well as by run, so a fresh run of the same check on the same head
+cannot buy a second rerun. The carrier's `redispatch` class uses the same
+classifier and the same budget of one.
 
 Ownership is explicit. Before the steward may mutate a PR, the submitting
 agent writes an exact-head receipt and management label:

@@ -40,7 +40,13 @@ fn run(id: u64, event: &str, head: &str, status: &str, attempt: u64) -> RunFact 
         conclusion: (status == "completed").then(|| "cancelled".to_owned()),
         run_attempt: attempt,
         run_started_at: Some(at("2026-10-09T08:00:00Z")),
-        jobs: Vec::new(),
+        // A completed head run carries the interruption signature unless a
+        // test replaces its jobs.
+        jobs: if status == "completed" {
+            vec![job("macos", "cancelled", None)]
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -53,6 +59,8 @@ fn job(name: &str, conclusion: &str, runner: Option<&str>) -> JobFact {
         runner_name: runner.map(str::to_owned),
         created_at: Some(at("2026-10-09T08:02:00Z")),
         completed_at: Some(at("2026-10-09T08:19:00Z")),
+        superseded: false,
+        cancelled_by_actor: false,
     }
 }
 
@@ -361,14 +369,74 @@ fn a_cancelled_required_run_is_redispatched() {
 fn the_rerun_budget_is_read_from_github_attempts() {
     let mut facts = armed();
     facts.required = vec![required("macos", "CANCELLED", 9)];
-    facts.runs = vec![run(9, "pull_request", HEAD, "completed", 2)];
+    facts.runs = vec![run(9, "pull_request", HEAD, "completed", 1)];
     facts.runs[0].run_started_at = Some(at("2026-10-09T07:00:00Z"));
-    assert!(plan(&facts).action().is_some(), "one rerun spent, one left");
-    facts.runs[0].run_attempt = 3;
+    assert!(plan(&facts).action().is_some(), "the one rerun is left");
+    // A second interruption on the same head, after the one rerun.
+    facts.runs[0].run_attempt = 2;
     assert_eq!(
         held(&plan(&facts)),
         &CarrierHold::RedispatchBudgetSpent { run_ids: vec![9] }
     );
+}
+
+#[test]
+fn a_fresh_run_of_a_rerun_check_on_the_same_head_is_not_rerun() {
+    let mut facts = armed();
+    facts.required = vec![required("macos", "CANCELLED", 12)];
+    let mut earlier = run(9, "pull_request", HEAD, "completed", 2);
+    earlier.run_started_at = Some(at("2026-10-09T07:00:00Z"));
+    facts.runs = vec![earlier, run(12, "pull_request", HEAD, "completed", 1)];
+    assert_eq!(
+        held(&plan(&facts)),
+        &CarrierHold::RedispatchBudgetSpent { run_ids: vec![12] }
+    );
+}
+
+#[test]
+fn a_cancel_without_the_interruption_signature_is_not_redispatched() {
+    let cases: [(&str, Option<&str>, &str, bool); 5] = [
+        // A person cancelled the run after a runner took it.
+        ("cancelled", Some("m3-vm-2"), "2026-10-09T08:19:00Z", false),
+        // A supersede or a person ended it within seconds.
+        ("cancelled", None, "2026-10-09T08:02:30Z", false),
+        // Well past the runner-assignment timeout.
+        ("cancelled", None, "2026-10-09T08:40:00Z", false),
+        // A concurrency supersede inside the window.
+        ("cancelled", None, "2026-10-09T08:19:00Z", true),
+        // A job that ran and failed beside the cancelled run's conclusion.
+        ("failure", Some("m3-vm-2"), "2026-10-09T08:19:00Z", false),
+    ];
+    for (conclusion, runner, completed, superseded) in cases {
+        let mut facts = armed();
+        facts.required = vec![required("macos", "CANCELLED", 9)];
+        let mut cancelled = run(9, "pull_request", HEAD, "completed", 1);
+        let mut only = job("macos", conclusion, runner);
+        only.completed_at = Some(at(completed));
+        only.superseded = superseded;
+        cancelled.jobs = vec![only];
+        facts.runs = vec![cancelled];
+        assert!(
+            matches!(
+                held(&plan(&facts)),
+                CarrierHold::NotInterruption { run_id: 9, .. }
+            ),
+            "{conclusion} {runner:?} {completed} {superseded}"
+        );
+    }
+}
+
+#[test]
+fn timed_out_startup_failure_and_stale_are_results_not_interruptions() {
+    for conclusion in ["TIMED_OUT", "STARTUP_FAILURE", "STALE"] {
+        let mut facts = armed();
+        facts.required = vec![required("macos", conclusion, 9)];
+        facts.runs = vec![run(9, "pull_request", HEAD, "completed", 1)];
+        assert!(
+            matches!(held(&plan(&facts)), CarrierHold::RequiredFailed { .. }),
+            "{conclusion}"
+        );
+    }
 }
 
 #[test]
@@ -378,11 +446,14 @@ fn reruns_are_bounded_per_pull_request_per_hour() {
         required("macos", "CANCELLED", 9),
         required("Enforce", "CANCELLED", 10),
     ];
-    let mut recent_a = run(9, "pull_request", HEAD, "completed", 2);
+    let mut recent_a = run(8, "pull_request", HEAD, "completed", 2);
+    recent_a.workflow = "drift-slow.yml".to_owned();
+    recent_a.conclusion = Some("success".to_owned());
     recent_a.run_started_at = Some(at("2026-10-09T09:30:00Z"));
+    let macos = run(9, "pull_request", HEAD, "completed", 1);
     let mut other = run(10, "pull_request", HEAD, "completed", 1);
     other.workflow = "version-skill-check.yml".to_owned();
-    facts.runs = vec![recent_a.clone(), other.clone()];
+    facts.runs = vec![recent_a.clone(), macos.clone(), other.clone()];
     // One rerun inside the hour leaves room for one more.
     let plan_one = plan(&facts);
     assert!(
@@ -393,7 +464,7 @@ fn reruns_are_bounded_per_pull_request_per_hour() {
     recent_b.workflow = "drift-fast.yml".to_owned();
     recent_b.conclusion = Some("success".to_owned());
     recent_b.run_started_at = Some(at("2026-10-09T09:45:00Z"));
-    facts.runs = vec![recent_a, other, recent_b];
+    facts.runs = vec![recent_a, macos, other, recent_b];
     assert!(matches!(
         held(&plan(&facts)),
         CarrierHold::RedispatchBudgetSpent { .. }

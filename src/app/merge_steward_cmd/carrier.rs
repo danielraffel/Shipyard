@@ -395,18 +395,14 @@ fn carrier_facts(
     if !facts.approved_head {
         return Ok(facts);
     }
-    let interrupted = facts.required.iter().any(|required| {
-        required.conclusion.as_deref().is_some_and(|conclusion| {
-            matches!(conclusion, "CANCELLED" | "STARTUP_FAILURE" | "STALE")
-        })
-    });
-    if interrupted {
-        facts.runs.extend(runs_for_head(
-            actions,
-            &observation.repo,
-            &fact.head_sha,
-            None,
-        )?);
+    if facts
+        .required
+        .iter()
+        .any(|required| required.conclusion.as_deref() == Some("CANCELLED"))
+    {
+        facts
+            .runs
+            .extend(interrupted_head_runs(actions, &observation.repo, &facts)?);
     }
     if let CarrierQueueFact::Ejected {
         reason,
@@ -418,11 +414,33 @@ fn carrier_facts(
         let mut group_runs =
             runs_for_head(actions, &observation.repo, commit, Some("merge_group"))?;
         for run in &mut group_runs {
-            run.jobs = latest_jobs(actions, &observation.repo, run.id)?;
+            run.jobs = latest_jobs(actions, &observation.repo, run.id, false)?;
         }
         facts.runs.extend(group_runs);
     }
     Ok(facts)
+}
+
+/// The head's runs, with the latest-attempt jobs of every run a cancelled
+/// required check names: the interruption signature is read from them.
+fn interrupted_head_runs(
+    actions: &GitHubActions,
+    repo: &str,
+    facts: &CarrierFacts,
+) -> Result<Vec<RunFact>, String> {
+    let interrupted: BTreeSet<u64> = facts
+        .required
+        .iter()
+        .filter(|required| required.conclusion.as_deref() == Some("CANCELLED"))
+        .filter_map(|required| required.run_id)
+        .collect();
+    let mut head_runs = runs_for_head(actions, repo, &facts.head_sha, None)?;
+    for run in &mut head_runs {
+        if interrupted.contains(&run.id) {
+            run.jobs = latest_jobs(actions, repo, run.id, true)?;
+        }
+    }
+    Ok(head_runs)
 }
 
 fn queue_fact(
@@ -573,7 +591,14 @@ fn time_field(row: &Value, key: &str) -> Option<DateTime<Utc>> {
         .map(|at| at.with_timezone(&Utc))
 }
 
-fn latest_jobs(actions: &GitHubActions, repo: &str, run_id: u64) -> Result<Vec<JobFact>, String> {
+/// Jobs of a run's latest attempt. With `read_supersede`, each runner-less
+/// cancellation's check-run annotations are read for a concurrency supersede.
+fn latest_jobs(
+    actions: &GitHubActions,
+    repo: &str,
+    run_id: u64,
+    read_supersede: bool,
+) -> Result<Vec<JobFact>, String> {
     let value = gh_json(
         actions,
         &[
@@ -596,31 +621,62 @@ fn latest_jobs(actions: &GitHubActions, repo: &str, run_id: u64) -> Result<Vec<J
             "run {run_id} has more than 100 jobs; refusing a partial read"
         ));
     }
-    Ok(rows
-        .iter()
-        .map(|row| JobFact {
-            name: row
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            status: row
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            conclusion: row
-                .get("conclusion")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            runner_name: row
-                .get("runner_name")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            created_at: time_field(row, "created_at"),
-            completed_at: time_field(row, "completed_at"),
+    rows.iter()
+        .map(|row| {
+            let mut job = job_fact(row);
+            let runnerless = job.conclusion.as_deref() == Some("cancelled")
+                && job
+                    .runner_name
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty());
+            if read_supersede && runnerless {
+                let job_id = row
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| format!("run {run_id} has a job without an id"))?;
+                let annotations = gh_json(
+                    actions,
+                    &[
+                        "api".to_owned(),
+                        format!("repos/{repo}/check-runs/{job_id}/annotations"),
+                    ],
+                    "job annotations",
+                )?;
+                let mut marks = job.interruption_job();
+                crate::transient_interruption::mark_from_annotations(&mut marks, &annotations);
+                job.superseded = marks.superseded;
+                job.cancelled_by_actor = marks.cancelled_by_actor;
+            }
+            Ok(job)
         })
-        .collect())
+        .collect()
+}
+
+fn job_fact(row: &Value) -> JobFact {
+    JobFact {
+        name: row
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        status: row
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        conclusion: row
+            .get("conclusion")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        runner_name: row
+            .get("runner_name")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        created_at: time_field(row, "created_at"),
+        completed_at: time_field(row, "completed_at"),
+        superseded: false,
+        cancelled_by_actor: false,
+    }
 }
 
 /// Execute the intent's actions that the fresh plan still proposes.
