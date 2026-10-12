@@ -7,6 +7,9 @@ if [ "${SHIPYARD_SKIP_PREPUSH:-0}" = "1" ]; then
     echo "[pre-push] SHIPYARD_SKIP_PREPUSH=1 — skipping gates." >&2
     exit 0
 fi
+# Never let a rustup proxy invoked by this hook download a toolchain: a
+# missing pin is refused immediately below instead of stalling the push.
+export RUSTUP_AUTO_INSTALL=0
 PYTHON="${PYTHON:-python3}"
 VBC="$ROOT/scripts/version_bump_check.py"
 SSC="$ROOT/scripts/skill_sync_check.py"
@@ -61,12 +64,18 @@ if [ -n "$changed_files" ]; then
     "$PYTHON" "$ROOT/scripts/check_test_include_str.py" --base "$BASE" $changed_files || blocking_fail=1
 fi
 assert_rustup_proxy() {
-    local rustc_path target
+    local rustc_path target proxy
     rustc_path="$(command -v rustc 2>/dev/null || true)"
     case "$rustc_path" in
         "$HOME/.cargo/bin/rustc")
             target="$(readlink "$rustc_path" 2>/dev/null || true)"
             case "$target" in rustup|*/rustup) return 0 ;; esac
+            # rustup installs its proxies as hardlinks or copies on some
+            # platforms: the same file, or the same bytes, as rustup itself.
+            proxy="$HOME/.cargo/bin/rustup"
+            if [ -f "$proxy" ] && { [ "$rustc_path" -ef "$proxy" ] || cmp -s "$rustc_path" "$proxy"; }; then
+                return 0
+            fi
             ;;
     esac
     echo "[pre-push] PATH rustc must be the rustup proxy; got ${rustc_path:-missing}." >&2
@@ -89,10 +98,14 @@ check_pinned_toolchain() {
     fi
 }
 is_m3() { [[ "${SHIPYARD_HOST:-}" == "m3" || "$(uname -n 2>/dev/null)" == *m3* ]]; }
-m1_cmd="ssh m1 'cd $ROOT && cargo"
+# The m1 checkout of this branch lives at a different path than this one.
+m1_cmd="ssh m1 'cd ${SHIPYARD_M1_CHECKOUT:-<m1 checkout of $(basename "$ROOT")>} && cargo"
 assert_rustup_proxy || blocking_fail=1
-check_pinned_toolchain || blocking_fail=1
-if is_m3; then
+pin_installed=1
+check_pinned_toolchain || { blocking_fail=1; pin_installed=0; }
+if [ "$pin_installed" = "0" ]; then
+    echo "[pre-push] skipping cargo gates until the pinned toolchain is installed." >&2
+elif is_m3; then
     echo "[pre-push] Rust gates require m1; Cargo is forbidden on m3." >&2
     echo "[pre-push] Run on m1: $m1_cmd fmt --all --check'" >&2
     if echo "$changed_files" | grep -Eq '^(src|tests)/'; then

@@ -599,5 +599,10 @@ the command printed by the hook doctor, or install it explicitly:
 rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
 ```
 
-The hook requires `rustc` on `PATH` to be the rustup proxy (`~/.cargo/bin`)
-before it runs Cargo. On m3 it refuses Cargo and prints the m1 command instead.
+The hook requires `rustc` on `PATH` to be the rustup proxy (`~/.cargo/bin`;
+a symlink, hardlink, or copy of `rustup`) before it runs Cargo. It sets
+`RUSTUP_AUTO_INSTALL=0` and refuses at once, without running Cargo, when the
+pinned toolchain is not installed, so a host that cannot download the pin is
+not left waiting on rustup. On m3 it refuses Cargo and prints the m1 command
+instead; set `SHIPYARD_M1_CHECKOUT` to the m1 path of the branch to have the
+command name it.
