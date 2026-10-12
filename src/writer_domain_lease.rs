@@ -573,7 +573,11 @@ mod tests {
 
     #[test]
     fn detached_daemon_sources_never_bypass_protected_stdio_fence() {
-        for (name, source) in [("daemon_runtime.rs", include_str!("daemon_runtime.rs"))] {
+        let daemon_source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon_runtime.rs"),
+        )
+        .expect("daemon runtime source");
+        for (name, source) in [("daemon_runtime.rs", daemon_source.as_str())] {
             for raw_macro in ["eprintln!", "eprint!", "println!", "print!"] {
                 assert!(
                     !source.contains(raw_macro),

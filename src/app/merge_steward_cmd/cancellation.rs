@@ -318,7 +318,13 @@ pub(super) fn apply_pr_plans(
                 }
                 if args.wake_owner
                     && error.is_none()
-                    && super::recovery::should_wake_owner(pr, &decision)
+                    && super::recovery::should_wake_owner(
+                        &observation.repo,
+                        pr,
+                        &decision,
+                        ledger,
+                        chrono::Utc::now(),
+                    )
                 {
                     if let Some(context) = mutation_context.as_ref() {
                         match super::recovery::wake_owner_comment(context, pr, &decision, ledger) {

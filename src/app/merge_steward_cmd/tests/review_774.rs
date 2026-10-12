@@ -7,6 +7,17 @@ const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const EARLIER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn script(log: &Path, config_case: &str, comments_json: &str) -> String {
+    script_with_reviews(log, config_case, "", comments_json)
+}
+
+/// [`script`], also serving `reviews_json` (one projected review per line)
+/// for the PR's reviews.
+fn script_with_reviews(
+    log: &Path,
+    config_case: &str,
+    reviews_json: &str,
+    comments_json: &str,
+) -> String {
     // The literal CONFIG_ERROR below disables fake_gh's absent-policy prefix.
     format!(
         r#"
@@ -14,7 +25,7 @@ fn script(log: &Path, config_case: &str, comments_json: &str) -> String {
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"contents/.shipyard/config.toml"*) {config_case} ;;
-  *"pulls/42/reviews"*) printf '' ;;
+  *"pulls/42/reviews"*) printf '%s\n' '{reviews}' ;;
   *"issues/42/comments"*) printf '%s\n' '{comments}' ;;
   *"commits/{head}"*) printf '%s' '2026-10-11T00:00:00Z' ;;
   *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"headRefOid":"{head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
@@ -26,6 +37,7 @@ esac
         log = log.display(),
         config_case = config_case,
         comments = comments_json,
+        reviews = reviews_json,
         head = HEAD,
     )
 }
@@ -95,16 +107,11 @@ fn r774_positive_exact_head_marker_passes_the_gate() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn r774_enqueue_persists_marker_id_in_intent_and_receipt() {
-    let temp = tempfile::tempdir().expect("temp");
+/// Drive `enqueue_pull_request` all the way to the enqueue mutation and
+/// return the mutation audit it wrote.
+fn enqueue_audit(temp: &tempfile::TempDir, reviews_json: &str, comments_json: &str) -> String {
     let log = temp.path().join("calls");
-    let body = script(
-        &log,
-        POLICY_OK,
-        &comment("shipyard-review[bot]", &format!("reviewed: {HEAD}")),
-    )
+    let body = script_with_reviews(&log, POLICY_OK, reviews_json, comments_json)
     .replace(
         r#"*"stackEntry"*) echo "GATE_PASSED_REACHED_STACK" >&2; exit 90 ;;"#,
         r#"*"stackEntry"*) printf '%s' '{"data":{"repository":{"stackConfig":null,"pullRequest":{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stack":null,"stackEntry":null}}}}' ;;
@@ -112,7 +119,7 @@ fn r774_enqueue_persists_marker_id_in_intent_and_receipt() {
   *"pulls/42"*) printf '%s' '{"state":"open","head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}' ;;
   *"enqueuePullRequest"*) printf '%s' '{}' ;;"#,
     );
-    let actions = fake_gh(&temp, &body);
+    let actions = fake_gh(temp, &body);
     let mut pr = ready_pr();
     pr.fact.labels.push("steward:managed".to_owned());
     pr.fact.checks.push(StewardCheck {
@@ -126,14 +133,24 @@ fn r774_enqueue_persists_marker_id_in_intent_and_receipt() {
     });
     let observation = observation_for(pr.clone(), true);
     let mut ledger = StewardLedger::default();
-    let control = mutation_control(&temp, "studio", "studio");
+    let control = mutation_control(temp, "studio", "studio");
     let ledger_path = temp.path().join("ledger.json");
     let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
     let mut policy = queue_policy();
     policy.managed_label = Some("steward:managed".to_owned());
     let (_mutation, _error) = enqueue_pull_request(&context, &pr, &policy, &mut ledger);
-    let audit = fs::read_to_string(temp.path().join("state/merge_queue/mutations.jsonl"))
-        .expect("mutation audit");
+    fs::read_to_string(temp.path().join("state/merge_queue/mutations.jsonl")).unwrap_or_default()
+}
+
+#[cfg(unix)]
+#[test]
+fn r774_enqueue_persists_marker_id_in_intent_and_receipt() {
+    let temp = tempfile::tempdir().expect("temp");
+    let audit = enqueue_audit(
+        &temp,
+        "",
+        &comment("shipyard-review[bot]", &format!("reviewed: {HEAD}")),
+    );
     assert!(audit.contains("\"approval_comment_id\":12345"), "{audit}");
     assert!(
         audit.contains("\"performed_via_github_app_id\":99"),
@@ -287,4 +304,151 @@ fn r774_r1_absent_policy_file_does_not_arm_unapproved_head() {
             .as_deref()
             .is_some_and(|e| e.contains("policy unreadable"))
     );
+}
+
+fn comment_at(login: &str, at: &str, body: &str) -> String {
+    format!(r#"{{"id":777,"login":"{login}","type":"Bot","at":"{at}","body":"{body}"}}"#)
+}
+
+fn review_record(login: &str, state: &str, commit: &str, at: &str) -> String {
+    format!(
+        r#"{{"login":"{login}","type":"Bot","at":"{at}","state":"{state}","commit_id":"{commit}","performed_via_github_app_id":4242}}"#
+    )
+}
+
+fn assert_gate_passed(mutation: Option<&String>, error: Option<&String>, calls: &str) {
+    assert!(
+        calls.contains("stackEntry")
+            && error.is_some_and(|e| e.contains("GATE_PASSED_REACHED_STACK")),
+        "gate did not pass: {mutation:?} {error:?}\n{calls}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn r774_hold_on_an_earlier_head_does_not_block_an_approved_head() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let comments = [
+        comment_at(
+            "shipyard-review[bot]",
+            "2026-10-11T11:00:00Z",
+            &format!("verdict: HOLD head:{EARLIER}"),
+        ),
+        comment_at(
+            "shipyard-review[bot]",
+            "2026-10-11T12:00:00Z",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        ),
+        comment_at(
+            "shipyard-review[bot]",
+            "2026-10-11T13:00:00Z",
+            &format!("verdict: HOLD head:{EARLIER}"),
+        ),
+    ]
+    .join("\n");
+    let body = script(&log, POLICY_OK, &comments);
+    let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
+    assert_gate_passed(mutation.as_ref(), error.as_ref(), &calls);
+}
+
+#[cfg(unix)]
+#[test]
+fn r774_marker_older_than_the_head_commit_does_not_arm() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    // The fixture's head commit is dated 2026-10-11T00:00:00Z.
+    let body = script(
+        &log,
+        POLICY_OK,
+        &comment_at(
+            "shipyard-review[bot]",
+            "2026-10-10T23:59:59Z",
+            &format!("reviewed:{HEAD}"),
+        ),
+    );
+    let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
+    assert!(
+        calls.contains("commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "the head commit date was read: {calls}"
+    );
+    assert_held(mutation.as_ref(), error.as_ref(), &calls);
+    assert_eq!(mutation.as_deref(), Some("waiting_head_approval"));
+}
+
+#[cfg(unix)]
+#[test]
+fn r774_review_app_approve_on_the_head_arms_and_records_the_app() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let reviews = review_record(
+        "shipyard-review[bot]",
+        "APPROVED",
+        HEAD,
+        "2026-10-11T12:00:00Z",
+    );
+    let body = script_with_reviews(&log, POLICY_OK, &reviews, "");
+    let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
+    assert_gate_passed(mutation.as_ref(), error.as_ref(), &calls);
+
+    let temp = tempfile::tempdir().expect("temp");
+    let audit = enqueue_audit(&temp, &reviews, "");
+    assert!(
+        audit.contains("\"performed_via_github_app_id\":4242"),
+        "{audit}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn r774_review_approvals_that_must_not_arm() {
+    for (case, reviews) in [
+        (
+            "fleet author App",
+            review_record(
+                "app/shipyard-local",
+                "APPROVED",
+                HEAD,
+                "2026-10-11T12:00:00Z",
+            ),
+        ),
+        (
+            "earlier head",
+            review_record(
+                "shipyard-review[bot]",
+                "APPROVED",
+                EARLIER,
+                "2026-10-11T12:00:00Z",
+            ),
+        ),
+        (
+            "changes requested after the approval",
+            [
+                review_record(
+                    "shipyard-review[bot]",
+                    "APPROVED",
+                    HEAD,
+                    "2026-10-11T12:00:00Z",
+                ),
+                review_record(
+                    "shipyard-review[bot]",
+                    "CHANGES_REQUESTED",
+                    HEAD,
+                    "2026-10-11T13:00:00Z",
+                ),
+            ]
+            .join("\n"),
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let body = script_with_reviews(&log, POLICY_OK, &reviews, "");
+        let (mutation, error, calls) = run(&temp, &body, Some("shipyard-local[bot]"));
+        assert_held(mutation.as_ref(), error.as_ref(), &calls);
+        assert_eq!(
+            mutation.as_deref(),
+            Some("waiting_head_approval"),
+            "{case}: {error:?}"
+        );
+    }
 }

@@ -3,6 +3,22 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03021"></a>
+## [0.302.1] - 2026-10-11
+
+- codex/prepush gates 20261011 ([#776](https://github.com/danielraffel/Shipyard/pull/776))
+
+<a id="v03020"></a>
+## [0.302.0] - 2026-10-11
+
+- codex/w4 fleet close b1 20261011 ([#774](https://github.com/danielraffel/Shipyard/pull/774))
+- codex/w4 fleet close b4 20261011 ([#773](https://github.com/danielraffel/Shipyard/pull/773))
+
+<a id="v03010"></a>
+## [0.301.0] - 2026-10-11
+
+- codex/w4 fleet close d 20261011 ([#771](https://github.com/danielraffel/Shipyard/pull/771))
+
 <a id="v03000"></a>
 ## [0.300.0] - 2026-10-11
 
@@ -2136,6 +2152,9 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.302.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.302.1
+[0.302.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.302.0
+[0.301.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.301.0
 [0.300.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.300.0
 [0.299.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.299.0
 [0.298.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.298.0
