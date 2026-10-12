@@ -196,3 +196,5 @@ mod mutations;
 mod observation;
 #[cfg(unix)]
 mod recovery;
+#[cfg(unix)]
+mod transient_rerun;

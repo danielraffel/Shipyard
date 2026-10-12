@@ -10,8 +10,10 @@
 //! one controller that performs those mechanical steps, one action class at a
 //! time:
 //!
-//! * [`CarrierClass::Redispatch`] reruns a cancelled required run on the
-//!   current head of an armed pull request.
+//! * [`CarrierClass::Redispatch`] reruns, once, a required run on the
+//!   current head of an armed pull request whose every non-passing job was
+//!   cancelled before any runner took it, inside the runner-assignment
+//!   timeout window ([`crate::transient_interruption`]).
 //! * [`CarrierClass::Rearm`] re-arms native auto-merge on the exact head the
 //!   queue removed, when every required merge-group job that did not pass
 //!   starved.
@@ -60,7 +62,7 @@ use crate::gate_cost::GateJobSample;
 use crate::gate_cost::proxy::ejection_cause;
 
 /// Reruns the carrier may cause on one workflow run, read from `run_attempt`.
-pub const MAX_REDISPATCHES_PER_RUN: u64 = 2;
+pub const MAX_REDISPATCHES_PER_RUN: u64 = crate::transient_interruption::RERUN_BUDGET as u64;
 /// Reruns the carrier may cause on one pull request within
 /// [`REDISPATCH_WINDOW_MINUTES`].
 pub const MAX_REDISPATCHES_PER_PR_WINDOW: usize = 2;
@@ -155,6 +157,23 @@ pub struct JobFact {
     /// When the job completed.
     #[serde(default)]
     pub completed_at: Option<DateTime<Utc>>,
+    /// Whether the job's check run carries a concurrency-supersede annotation.
+    /// Read only for runner-less cancellations.
+    #[serde(default)]
+    pub superseded: bool,
+}
+
+impl JobFact {
+    fn interruption_job(&self) -> crate::transient_interruption::InterruptionJob {
+        crate::transient_interruption::InterruptionJob {
+            name: self.name.clone(),
+            conclusion: self.conclusion.as_deref().map(str::to_ascii_lowercase),
+            runner_name: self.runner_name.clone(),
+            created_at: self.created_at,
+            completed_at: self.completed_at,
+            superseded: self.superseded,
+        }
+    }
 }
 
 /// One workflow run the plan depends on.
@@ -294,6 +313,14 @@ pub enum CarrierHold {
         /// Contexts whose run could not be checked.
         contexts: Vec<String>,
     },
+    /// A cancelled required run's jobs do not match the interruption
+    /// signature: a person, a supersede, or a runner cancelled it.
+    NotInterruption {
+        /// The run.
+        run_id: u64,
+        /// Why it is not an interruption.
+        reason: String,
+    },
     /// Retry budget spent.
     RedispatchBudgetSpent {
         /// Runs whose budget is spent.
@@ -382,8 +409,9 @@ fn propose(facts: &CarrierFacts, action: CarrierAction) -> CarrierPlan {
     }
 }
 
+/// Only a cancellation can be an interruption; its jobs then decide.
 fn is_interruption_conclusion(conclusion: &str) -> bool {
-    matches!(conclusion, "CANCELLED" | "STARTUP_FAILURE" | "STALE")
+    conclusion == "CANCELLED"
 }
 
 fn is_pass_conclusion(conclusion: &str) -> bool {
@@ -532,9 +560,26 @@ fn plan_redispatch(facts: &CarrierFacts, interrupted: &[(String, Option<u64>)]) 
             live.push(*run_id);
             continue;
         }
-        if run.run_attempt.saturating_sub(1) >= MAX_REDISPATCHES_PER_RUN {
+        // One rerun per check on this head: a rerun of this run, or of an
+        // earlier run of the same workflow on this head, spends it.
+        let reran_same_workflow = facts.runs.iter().any(|other| {
+            other.workflow == run.workflow
+                && other.head_sha.eq_ignore_ascii_case(&facts.head_sha)
+                && other.run_attempt.saturating_sub(1) >= MAX_REDISPATCHES_PER_RUN
+        });
+        if reran_same_workflow {
             spent.push(*run_id);
             continue;
+        }
+        let jobs: Vec<_> = run.jobs.iter().map(JobFact::interruption_job).collect();
+        if let Err(reason) = crate::transient_interruption::classify_jobs(&jobs) {
+            return hold(
+                facts,
+                CarrierHold::NotInterruption {
+                    run_id: *run_id,
+                    reason,
+                },
+            );
         }
         if !eligible.contains(run_id) {
             eligible.push(*run_id);

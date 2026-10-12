@@ -273,6 +273,8 @@ pub mod stale_pr_wedge;
 /// pipeline; diagnostic subcommands deliberately skip this.
 pub mod supervised;
 mod terminal_delivery_authority;
+/// Which failed workflow runs are interruptions that one rerun may repair.
+pub mod transient_interruption;
 /// Working-tree drift detection shared by future `shipyard run` wiring.
 pub mod tree_drift;
 /// Tunnel readiness, Tailscale probe decoding, and supervisor retry policy.

@@ -1369,7 +1369,7 @@ use capacity_cancellation::{
     CapacityCancelError, apply_capacity_preemption, cancel_capacity_preemption_after_revalidation,
     mark_cancellation_skipped, persist_capacity_evidence,
 };
-use ledger::{attempt_key, load_ledger, record_audit, save_ledger};
+use ledger::{attempt_key, check_attempt_key, load_ledger, record_audit, save_ledger};
 use observation::{
     active_runs, complete_checks_for_head, fetch_run_jobs, fetch_run_jobs_before, gh_json,
     gh_json_before, gh_json_timeout, hydrate_census_check_identities,

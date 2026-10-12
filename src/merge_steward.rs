@@ -107,7 +107,8 @@ pub struct StewardPolicy {
     /// Successful commit-status context required on the current immutable
     /// head when `managed_label` is configured.
     pub handoff_context: String,
-    /// Maximum transient reruns allowed per immutable head and run.
+    /// Transient reruns allowed per immutable head and required check. Values
+    /// above [`crate::transient_interruption::RERUN_BUDGET`] are clamped to it.
     pub max_transient_reruns: u32,
 }
 
@@ -354,7 +355,8 @@ pub fn classify_pr(
         }
         if is_transient_conclusion(&conclusion)
             && let Some(run_id) = check.run_id
-            && transient_attempts.get(&run_id).copied().unwrap_or(0) < policy.max_transient_reruns
+            && transient_attempts.get(&run_id).copied().unwrap_or(0)
+                < crate::transient_interruption::clamp_rerun_budget(policy.max_transient_reruns)
         {
             transient_runs.insert(run_id);
         } else {
@@ -539,11 +541,14 @@ fn check_recency(check: &StewardCheck) -> (bool, &str, bool) {
     )
 }
 
+/// Whether a required check's conclusion makes its run a rerun candidate.
+///
+/// Only a cancellation can be an interruption; the live path then requires
+/// the run's jobs to match [`crate::transient_interruption::classify_jobs`]
+/// before any rerun. A timeout, a startup failure, or a stale check is a
+/// result and is never rerun.
 pub(crate) fn is_transient_conclusion(conclusion: &str) -> bool {
-    matches!(
-        conclusion,
-        "CANCELLED" | "TIMED_OUT" | "STARTUP_FAILURE" | "STALE"
-    )
+    conclusion == "CANCELLED"
 }
 
 /// True only for a complete hexadecimal SHA-1.

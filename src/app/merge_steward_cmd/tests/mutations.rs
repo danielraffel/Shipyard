@@ -544,7 +544,9 @@ fn github_run_attempt_fences_lost_transient_retry_ledger() {
     assert!(!run_attempt_allows_transient_rerun(1, 0));
     assert!(run_attempt_allows_transient_rerun(1, 1));
     assert!(!run_attempt_allows_transient_rerun(2, 1));
-    assert!(run_attempt_allows_transient_rerun(2, 2));
+    // The budget is clamped to one rerun whatever the caller configures.
+    assert!(!run_attempt_allows_transient_rerun(2, 2));
+    assert!(run_attempt_allows_transient_rerun(1, 7));
     assert!(!run_attempt_allows_transient_rerun(3, 2));
 }
 
@@ -1333,7 +1335,7 @@ case "$*" in
   *"query=query("*"mergeQueue"*)
     printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
   "pr view "*)
-    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"TIMED_OUT","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"CANCELLED","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
   *"rerun-failed-jobs"*) echo "mutation must not run" >&2; exit 90 ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -1342,7 +1344,7 @@ esac
         ),
     );
     let mut pr = ready_pr();
-    pr.fact.checks[0].conclusion = Some("TIMED_OUT".to_owned());
+    pr.fact.checks[0].conclusion = Some("CANCELLED".to_owned());
     let observation = observation_for(pr.clone(), true);
     let mut ledger = StewardLedger::default();
     let mutation_control = mutation_control(&temp, "studio", "m1");
