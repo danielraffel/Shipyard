@@ -13,7 +13,7 @@ use super::{
     },
 };
 use crate::transient_interruption::{
-    InterruptionJob, annotations_mark_superseded, clamp_rerun_budget, classify_jobs, job_from_api,
+    InterruptionJob, clamp_rerun_budget, classify_jobs, job_from_api, mark_from_annotations,
 };
 
 #[cfg(test)]
@@ -1172,7 +1172,7 @@ fn attempt_jobs(
                 ],
                 "transient rerun job annotations",
             )?;
-            job.superseded = annotations_mark_superseded(&annotations);
+            mark_from_annotations(&mut job, &annotations);
         }
         jobs.push(job);
     }

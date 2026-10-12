@@ -70,6 +70,9 @@ pub struct InterruptionJob {
     pub completed_at: Option<DateTime<Utc>>,
     /// Whether the job's check run carries a concurrency-supersede annotation.
     pub superseded: bool,
+    /// Whether the job's check run says a person or tool cancelled the run
+    /// (`The run was canceled by @<login>.`).
+    pub cancelled_by_actor: bool,
 }
 
 impl InterruptionJob {
@@ -143,6 +146,12 @@ fn classify_job(job: &InterruptionJob) -> Result<InterruptionHit, String> {
             job.name
         ));
     }
+    if job.cancelled_by_actor {
+        return Err(format!(
+            "job `{}` was cancelled by a person or tool, whose decision stands",
+            job.name
+        ));
+    }
     let (Some(created), Some(completed)) = (job.created_at, job.completed_at) else {
         return Err(format!(
             "job `{}` has no readable created or completed time",
@@ -186,7 +195,27 @@ pub fn job_from_api(row: &serde_json::Value) -> InterruptionJob {
         created_at: time("created_at"),
         completed_at: time("completed_at"),
         superseded: false,
+        cancelled_by_actor: false,
     }
+}
+
+/// GitHub's annotation on a job whose run an account cancelled.
+pub const CANCELLED_BY_ACTOR_ANNOTATION: &str = "The run was canceled by @";
+
+/// Read the supersede and cancelled-by-an-actor marks from one job's
+/// check-run annotations.
+pub fn mark_from_annotations(job: &mut InterruptionJob, annotations: &serde_json::Value) {
+    job.superseded = annotations_mark_superseded(annotations);
+    job.cancelled_by_actor = annotations
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|annotation| {
+            annotation
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+        })
+        .any(|message| message.starts_with(CANCELLED_BY_ACTOR_ANNOTATION));
 }
 
 /// Whether a check-run annotation list marks a concurrency supersede.
@@ -227,6 +256,7 @@ mod tests {
             created_at: Some(at(0)),
             completed_at: Some(at(waited)),
             superseded: false,
+            cancelled_by_actor: false,
         }
     }
 
@@ -292,5 +322,23 @@ mod tests {
         let marked = serde_json::json!([{"message": "Canceling since a higher priority waiting request for 'x' exists"}]);
         assert!(annotations_mark_superseded(&marked));
         assert!(!annotations_mark_superseded(&serde_json::json!([])));
+    }
+
+    #[test]
+    fn a_run_an_account_cancelled_is_not_an_interruption() {
+        // A real annotation (danielraffel/tartci job 85516736821): the job
+        // had no runner, so only the annotation says who ended it.
+        let annotations: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/transient-interruption/user-cancel-annotations.json"
+        ))
+        .expect("annotations");
+        let mut cancelled = job("cancelled", Some(""), 18);
+        mark_from_annotations(&mut cancelled, &annotations);
+        assert!(cancelled.cancelled_by_actor);
+        assert!(!cancelled.superseded);
+        assert!(classify_jobs(&[cancelled]).is_err());
+        let mut plain = job("cancelled", Some(""), 18);
+        mark_from_annotations(&mut plain, &serde_json::json!([]));
+        assert!(classify_jobs(&[plain]).is_ok());
     }
 }

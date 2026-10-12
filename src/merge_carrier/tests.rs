@@ -60,6 +60,7 @@ fn job(name: &str, conclusion: &str, runner: Option<&str>) -> JobFact {
         created_at: Some(at("2026-10-09T08:02:00Z")),
         completed_at: Some(at("2026-10-09T08:19:00Z")),
         superseded: false,
+        cancelled_by_actor: false,
     }
 }
 

@@ -161,10 +161,14 @@ pub struct JobFact {
     /// Read only for runner-less cancellations.
     #[serde(default)]
     pub superseded: bool,
+    /// Whether the job's check run says an account cancelled the run.
+    /// Read only for runner-less cancellations.
+    #[serde(default)]
+    pub cancelled_by_actor: bool,
 }
 
 impl JobFact {
-    fn interruption_job(&self) -> crate::transient_interruption::InterruptionJob {
+    pub(crate) fn interruption_job(&self) -> crate::transient_interruption::InterruptionJob {
         crate::transient_interruption::InterruptionJob {
             name: self.name.clone(),
             conclusion: self.conclusion.as_deref().map(str::to_ascii_lowercase),
@@ -172,6 +176,7 @@ impl JobFact {
             created_at: self.created_at,
             completed_at: self.completed_at,
             superseded: self.superseded,
+            cancelled_by_actor: self.cancelled_by_actor,
         }
     }
 }
