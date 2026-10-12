@@ -1172,6 +1172,19 @@ pub(crate) enum MetricsCommand {
     /// newer run on the same branch at another commit had been created. Push
     /// type is not split (named as a gap).
     ///
+    /// scorecard (`--scorecard`), per ISO week of the window:
+    ///   open to merge = median and p90 hours from `createdAt` to `mergedAt`
+    ///   of pull requests merged into the base;
+    ///   ejection rate = merge-group runs whose final gate attempt did not
+    ///   pass / runs whose final gate attempt completed (a run that failed
+    ///   with its gate green is counted apart, not as an ejection);
+    ///   red after push = merged pull requests' commits carrying a required
+    ///   context on which a required context is red (latest run per name;
+    ///   `cancelled` is not red) / commits carrying a required context;
+    ///   repeat failures = check names red on two or more pull requests.
+    /// Required contexts are the base's classic protection, or
+    /// `--required-context`.
+    ///
     /// Every list is paginated completely; a read whose length disagrees with
     /// the API's `total_count` fails instead of reporting a smaller number.
     /// Defaults for every flag may be set in `[metrics.gate_cost]` of
@@ -1221,6 +1234,15 @@ pub(crate) struct MetricsGateCostArgs {
     /// runs.
     #[arg(long)]
     pub(crate) no_cache: bool,
+    /// Report the success-rate scorecard instead: per ISO week, open-to-merge
+    /// median and p90, merge-queue ejection rate, red-after-push rate on
+    /// required checks, and check names red across pull requests.
+    #[arg(long)]
+    pub(crate) scorecard: bool,
+    /// Required context for the scorecard's red-after-push rate, in place of
+    /// the base branch protection's. Repeatable.
+    #[arg(long = "required-context", requires = "scorecard")]
+    pub(crate) required_contexts: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]

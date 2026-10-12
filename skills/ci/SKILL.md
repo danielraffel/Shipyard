@@ -308,6 +308,27 @@ zero runs, which reported "no receipt decisions" for a group nobody read. It is
 now an error and the group reads `unreadable`. When adding a GitHub reader,
 treat a missing collection key as an error, never as `unwrap_or_default()`.
 
+## GitHub's caps and timeouts look like partial reads
+
+Three limits met while building `metrics gate-cost --scorecard` against Pulp.
+Each one first read as a broken instrument:
+
+- **`statusCheckRollup.contexts(first:100)` holds at most 100 checks.** Pulp
+  heads carry up to 103, and a required context (`Vellum trusted freeze`) sat
+  on the second page. Compare `totalCount` with the nodes you got, and page
+  through the commit's checks when they differ.
+- **A page of whole pull requests with their checks times out.** `first:10`
+  pull requests times 100 commits times 100 checks answered HTTP 504 on a day
+  that held an 85-commit pull request, and kept doing so on retry. Search
+  for the numbers alone, then read each pull request's commits 25 to a page.
+- **GitHub lists at most 250 commits of a pull request.** #9755 answered 250
+  of `totalCount` 300. That is the API's cap, not a short read, so count it
+  and name the pull request rather than failing the whole report.
+
+A merge-group run that concluded `failure` is not an ejection when its gate
+job passed: an advisory job failed. On Pulp in 2026-W40 that was 274 runs,
+against 48 whose `macos` job failed.
+
 ## Protected-state caches take the writer-domain lease too
 
 `gate_cost::cache::ReadCache` writes under the protected state tree

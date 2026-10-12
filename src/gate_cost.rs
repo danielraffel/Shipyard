@@ -45,6 +45,7 @@ use crate::validation_signals::{self, GhReader, ReceiptDecision};
 
 pub mod cache;
 pub mod proxy;
+pub mod scorecard;
 pub use cache::{ReadCache, ReadStats};
 pub use proxy::{GateProxies, PlacementSample, RunMeta, RunnerCensus};
 
