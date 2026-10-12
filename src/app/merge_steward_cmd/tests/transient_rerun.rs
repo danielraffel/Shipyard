@@ -35,6 +35,12 @@ impl Harness {
     /// `run_id` is the run the live check names; `attempt` is GitHub's
     /// `run_attempt` for it.
     fn new(run_id: u64, attempt: u64, job: &Job<'_>, annotation: &str) -> Self {
+        Self::with_total(run_id, attempt, job, annotation, 1)
+    }
+
+    /// `total` is the jobs listing's `total_count`; the listing always holds
+    /// one job.
+    fn with_total(run_id: u64, attempt: u64, job: &Job<'_>, annotation: &str, total: u64) -> Self {
         let temp = tempfile::tempdir().expect("temp");
         let log = temp.path().join("calls");
         let actions = fake_gh(
@@ -48,7 +54,7 @@ case "$*" in
   "pr view "*)
     printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"{HEAD}","headRefName":"feature","mergeStateStatus":"BLOCKED","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"CANCELLED","completedAt":"2026-10-11T08:19:00Z","detailsUrl":"https://github.com/owner/repo/actions/runs/{run_id}"}}]}}' ;;
   *"actions/runs/{run_id}/attempts/{attempt}/jobs"*)
-    printf '%s' '{{"total_count":1,"jobs":[{{"id":9001,"name":"macos","status":"completed","conclusion":"{conclusion}","runner_name":"{runner}","created_at":"{created}","completed_at":"{completed}"}}]}}' ;;
+    printf '%s' '{{"total_count":{total},"jobs":[{{"id":9001,"name":"macos","status":"completed","conclusion":"{conclusion}","runner_name":"{runner}","created_at":"{created}","completed_at":"{completed}"}}]}}' ;;
   "api repos/owner/repo/actions/runs/{run_id}")
     printf '%s' '{{"id":{run_id},"workflow_id":77,"run_attempt":{attempt},"name":"Build","head_sha":"{HEAD}","head_branch":"feature","status":"completed","conclusion":"cancelled","event":"pull_request","pull_requests":[{{"number":42}}],"created_at":"2026-10-11T08:02:00Z"}}' ;;
   *"check-runs/9001/annotations"*) printf '%s' '[{annotation}]' ;;
@@ -248,4 +254,49 @@ fn a_genuine_cancel_or_failure_is_not_rerun() {
             harness.ledger.transient_attempts
         );
     }
+}
+
+#[test]
+fn a_run_an_account_cancelled_is_not_rerun() {
+    // The real annotation GitHub writes when an account cancels a run
+    // (danielraffel/tartci job 85516736821, also runner-less).
+    let annotations = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/transient-interruption/user-cancel-annotations.json"),
+    )
+    .expect("annotations");
+    let inner = annotations
+        .trim()
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .expect("annotation array");
+    let mut harness = Harness::new(100, 1, &STARVED, inner);
+    let report = harness.tick(100);
+    assert!(
+        report
+            .mutation
+            .as_deref()
+            .is_some_and(|mutation| mutation.contains("cancelled by a person or tool")),
+        "{report:?}"
+    );
+    assert_eq!(harness.reruns(), 0, "{}", harness.calls());
+}
+
+#[test]
+fn a_partial_jobs_listing_is_refused_without_a_rerun() {
+    let mut harness = Harness::with_total(100, 1, &STARVED, "", 2);
+    let report = harness.tick(100);
+    assert!(
+        report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("could not be read completely")),
+        "{report:?}"
+    );
+    assert_eq!(harness.reruns(), 0, "{}", harness.calls());
+    assert!(
+        harness.ledger.transient_attempts.is_empty(),
+        "a refused read must not spend the budget: {:?}",
+        harness.ledger.transient_attempts
+    );
 }

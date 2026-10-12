@@ -760,8 +760,10 @@ fn latest_jobs(
                     ],
                     "job annotations",
                 )?;
-                job.superseded =
-                    crate::transient_interruption::annotations_mark_superseded(&annotations);
+                let mut marks = job.interruption_job();
+                crate::transient_interruption::mark_from_annotations(&mut marks, &annotations);
+                job.superseded = marks.superseded;
+                job.cancelled_by_actor = marks.cancelled_by_actor;
             }
             Ok(job)
         })
@@ -791,6 +793,7 @@ fn job_fact(row: &Value) -> JobFact {
         created_at: time_field(row, "created_at"),
         completed_at: time_field(row, "completed_at"),
         superseded: false,
+        cancelled_by_actor: false,
     }
 }
 
