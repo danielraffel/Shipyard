@@ -101,7 +101,7 @@ fn invalid_pr_head_skips_app_identity_hydration_without_blocking_repo() {
     let actions = GitHubActions::offline_for_tests(".");
     let mut prs = vec![ObservedPr {
         node_id: "PR_bad".to_owned(),
-        owner: "team-lead".to_owned(),
+        owner: Some("team-lead".to_owned()),
         fact: StewardPullRequest {
             number: 42,
             head_sha: "malformed".to_owned(),
@@ -856,4 +856,79 @@ fn absent_check_rollup_marks_only_managed_pull_requests_for_hydration() {
     observed["statusCheckRollup"] = serde_json::json!([]);
     let observed = parse_pr(&observed, &positions).expect("observed rollup");
     assert!(!observed.check_rollup_maybe_truncated);
+}
+
+/// The bulk open-PR read must stay within GitHub's per-query node budget no
+/// matter how many pull requests are open. A nested connection on the list
+/// (`commits` carries `authors`) multiplies per page and GitHub refuses the
+/// whole query, which stopped every runner admission precheck.
+#[test]
+fn open_pr_list_fields_carry_no_nested_or_heavy_connections() {
+    use crate::app::merge_steward_cmd::observation::OPEN_PR_LIST_FIELDS;
+    let fields: Vec<&str> = OPEN_PR_LIST_FIELDS.split(',').collect();
+    for forbidden in [
+        "commits",
+        "statusCheckRollup",
+        "comments",
+        "reviews",
+        "latestReviews",
+        "reviewRequests",
+        "files",
+        "closingIssuesReferences",
+        "assignees",
+        "projectItems",
+    ] {
+        assert!(
+            !fields.contains(&forbidden),
+            "{forbidden} must not be read for every open PR: {OPEN_PR_LIST_FIELDS}"
+        );
+    }
+    assert_eq!(
+        fields,
+        [
+            "id",
+            "number",
+            "isDraft",
+            "baseRefName",
+            "headRefOid",
+            "headRefName",
+            "mergeStateStatus",
+            "autoMergeRequest",
+            "labels",
+            "author",
+            "body",
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bulk_pull_request_read_requests_the_pinned_fields_and_leaves_owner_open() {
+    use crate::app::merge_steward_cmd::observation::{OPEN_PR_LIST_FIELDS, pull_requests};
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().display().to_string();
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+case "$*" in
+  "pr list "*) printf '%s\n' "$*" >> '{root}/list-args'; printf '%s' '[{{"id":"PR_a","number":1,"isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"a","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"author":{{"login":"alice"}},"body":"plain"}},{{"id":"PR_b","number":2,"isDraft":false,"baseRefName":"main","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRefName":"b","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"author":{{"login":"bob"}},"body":"<!-- whence {{\"prov\": {{\"session\": \"sess-b\"}}}} -->"}}]' ;;
+  *) printf '%s' '{{}}' ;;
+esac
+"#
+        ),
+    );
+    let prs = pull_requests(&actions, "owner/repo", "main", &BTreeMap::new()).expect("PRs");
+    let args = fs::read_to_string(temp.path().join("list-args")).expect("list args");
+    assert_eq!(args.lines().count(), 1, "{args}");
+    assert!(
+        args.trim_end()
+            .ends_with(&format!("--json {OPEN_PR_LIST_FIELDS}")),
+        "{args}"
+    );
+    assert!(!args.contains("commits"), "{args}");
+    assert_eq!(prs.len(), 2);
+    assert_eq!(prs[0].owner, None, "no whence and no commits: undecided");
+    assert_eq!(prs[0].fact.author.as_deref(), Some("alice"));
+    assert_eq!(prs[1].owner.as_deref(), Some("sess-b"));
 }

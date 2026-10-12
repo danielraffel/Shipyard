@@ -781,10 +781,12 @@ pub(super) fn wake_owner_comment(
         return Ok("owner_wake_already_posted".to_owned());
     }
     let recipient = if escalation {
-        "team-lead"
+        "team-lead".to_owned()
     } else {
-        pr.owner.as_str()
+        super::observation::hydrate_owner(context.actions, &context.observation.repo, pr)
+            .map_err(|error| format!("could not resolve owner for wake: {error}"))?
     };
+    let recipient = recipient.as_str();
     let body = owner_wake_body(recipient, pr, reason.as_str(), escalation);
     ledger.wake_records.insert(
         wake_key.clone(),
@@ -1065,7 +1067,7 @@ mod tests {
     fn pr(labels: Vec<&str>, recovery_states: Vec<(&str, &str)>) -> ObservedPr {
         ObservedPr {
             node_id: "PR_node".to_owned(),
-            owner: "team-lead".to_owned(),
+            owner: Some("team-lead".to_owned()),
             fact: StewardPullRequest {
                 number: 7,
                 head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -1315,7 +1317,7 @@ mod tests {
     #[test]
     fn owner_wake_body_names_the_owner() {
         let mut observed = pr(vec![], vec![]);
-        observed.owner = "alice".to_owned();
+        observed.owner = Some("alice".to_owned());
         assert!(
             owner_wake_body("alice", &observed, "required checks failed", false)
                 .contains("for alice:")

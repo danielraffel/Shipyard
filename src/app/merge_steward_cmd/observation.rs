@@ -419,6 +419,67 @@ fn merge_queue_next_cursor(queue: &Value) -> Result<Option<&str>, String> {
         })
 }
 
+/// Fields read for every open pull request in one bulk `gh pr list`.
+///
+/// Only scalar fields and single-node or flat connections belong here. Two
+/// fields are deliberately absent because their cost multiplies across every
+/// open pull request and the whole read then fails wholesale exactly when the
+/// backlog is deepest -- which is when admission is needed most:
+///
+/// - `statusCheckRollup` costs roughly 19 KB per pull request and exceeds
+///   GitHub's response budget. Checks are reconstructed per head in
+///   `hydrate_required_check_identities`, for the only pull requests that can
+///   have them consulted.
+/// - `commits` nests an `authors` connection inside the commit connection, so a
+///   page of pull requests requests over 500,000 possible nodes and GitHub
+///   refuses the query outright. The only consumer is the owner fallback for an
+///   owner wake, which [`hydrate_owner`] reads per pull request on demand.
+pub(super) const OPEN_PR_LIST_FIELDS: &str = "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,body";
+
+/// Fields read per pull request to resolve the owner a wake is addressed to.
+pub(super) const OWNER_VIEW_FIELDS: &str = "body,commits";
+
+/// The owner named by an observed row, when the row carries enough to decide.
+///
+/// A whence session in the body is authoritative. Without one the owner falls
+/// back to the last commit's author, which is only known when the row carries
+/// `commits`; a row without them leaves the owner unresolved rather than
+/// guessing, and [`hydrate_owner`] completes it when a wake needs it.
+pub(super) fn observed_owner(row: &Value) -> Option<String> {
+    let whence = row
+        .get("body")
+        .and_then(Value::as_str)
+        .and_then(crate::pr_fold::whence_session);
+    if whence.is_some() || row.get("commits").is_some() {
+        Some(crate::app::pr_status_cmd::owner_for(row))
+    } else {
+        None
+    }
+}
+
+/// Resolve the owner of one pull request, reading its body and commits only
+/// when the bulk observation could not decide.
+pub(super) fn hydrate_owner(
+    actions: &GitHubActions,
+    repo: &str,
+    pr: &ObservedPr,
+) -> Result<String, String> {
+    if let Some(owner) = &pr.owner {
+        return Ok(owner.clone());
+    }
+    let args = [
+        "pr".to_owned(),
+        "view".to_owned(),
+        pr.fact.number.to_string(),
+        "--repo".to_owned(),
+        repo.to_owned(),
+        "--json".to_owned(),
+        OWNER_VIEW_FIELDS.to_owned(),
+    ];
+    let view = gh_json(actions, &args, "PR owner")?;
+    Ok(crate::app::pr_status_cmd::owner_for(&view))
+}
+
 pub(super) fn pull_requests(
     actions: &GitHubActions,
     repo: &str,
@@ -437,13 +498,7 @@ pub(super) fn pull_requests(
         "--limit".to_owned(),
         "1000".to_owned(),
         "--json".to_owned(),
-        // `statusCheckRollup` is deliberately absent. It costs roughly 19 KB per
-        // pull request, so one request for every open PR exceeds GitHub's budget
-        // and fails wholesale exactly when the backlog is deepest -- which is
-        // when admission is needed most. Checks are reconstructed per head in
-        // `hydrate_required_check_identities`, for the only pull requests that
-        // can have them consulted.
-        "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,body,commits".to_owned(),
+        OPEN_PR_LIST_FIELDS.to_owned(),
     ];
     let value = gh_json(actions, &args, "open PR list")?;
     let rows = value
@@ -496,7 +551,7 @@ pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<Ob
         .collect();
     Ok(ObservedPr {
         node_id,
-        owner: crate::app::pr_status_cmd::owner_for(row),
+        owner: observed_owner(row),
         fact: StewardPullRequest {
             number,
             head_sha: row

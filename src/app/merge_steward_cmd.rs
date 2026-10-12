@@ -67,7 +67,9 @@ pub(super) struct AdmissionCleanArgs {
 struct ObservedPr {
     node_id: String,
     fact: StewardPullRequest,
-    owner: String,
+    /// `None` when the observation could not decide the owner; resolved on
+    /// demand by `observation::hydrate_owner`.
+    owner: Option<String>,
     check_rollup_maybe_truncated: bool,
 }
 
