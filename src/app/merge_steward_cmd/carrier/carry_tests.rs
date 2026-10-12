@@ -55,6 +55,17 @@ enum Update {
     Merge,
     /// A merge commit whose tree drops the pull request's change.
     Tampered,
+    /// The pull request's own lines on the base, but placed elsewhere in the
+    /// file: the `-U0` own lines match while the tree is not the automatic
+    /// merge.
+    RelocatedLines,
+    /// The base lands the pull request's change between the prediction and
+    /// the update, and GitHub automatically merges that base: the tree is
+    /// the automatic merge while the own lines are now empty.
+    BaseLandsTheChange,
+    /// The automatic merge of the approved head with a commit that is not on
+    /// the base: tree and own lines both match when measured from it.
+    OffBaseParent,
     /// A correct merge tree whose first parent is a rewrite of the approved
     /// head (same tree, different commit), not the approved head itself.
     RewrittenHead,
@@ -72,6 +83,8 @@ struct Scenario {
     update: Update,
     /// GitHub's live base is the base's parent, not what the clone fetches.
     stale_live_base: bool,
+    /// GitHub answers the disarm with the auto-merge request still on it.
+    disarm_ignored: bool,
 }
 
 impl Default for Scenario {
@@ -85,6 +98,7 @@ impl Default for Scenario {
             base: BaseChange::Elsewhere,
             update: Update::Merge,
             stale_live_base: false,
+            disarm_ignored: false,
         }
     }
 }
@@ -119,6 +133,15 @@ impl Fixture {
         };
         fs::write(work.join("a.txt"), numbered(base_edits)).expect("main");
         git(&work, &["commit", "-qam", "main moves"]);
+        // A commit off the base that never lands on it.
+        git(&work, &["checkout", "-qb", "off-base"]);
+        fs::write(
+            work.join("a.txt"),
+            numbered(&[(2, "main\nline 2"), (10, "off base")]),
+        )
+        .expect("off base");
+        git(&work, &["commit", "-qam", "off base"]);
+        git(&work, &["checkout", "-q", "main"]);
         let owner = temp.path().join("owner");
         fs::create_dir_all(&owner).expect("owner");
         git(
@@ -300,6 +323,21 @@ fn gh_body(scenario: &Scenario, bare: &Path, head: &str, state: &Path) -> String
         Update::Tampered => format!(
             "new=$(git -C '{bare}' commit-tree $(git -C '{bare}' rev-parse 'refs/heads/main^{{tree}}') -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
         ),
+        Update::RelocatedLines => format!(
+            "blob=$( (git -C '{bare}' show refs/heads/main:a.txt | grep -vx 'line 30'; echo feature) | git -C '{bare}' hash-object -w --stdin)\n    \
+             tree=$(printf '100644 blob %s\\ta.txt\\n' \"$blob\" | git -C '{bare}' mktree)\n    \
+             new=$(git -C '{bare}' commit-tree \"$tree\" -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
+        ),
+        Update::BaseLandsTheChange => format!(
+            "blob=$(git -C '{bare}' show refs/heads/main:a.txt | sed 's/^line 30$/feature/' | git -C '{bare}' hash-object -w --stdin)\n    \
+             tree=$(printf '100644 blob %s\\ta.txt\\n' \"$blob\" | git -C '{bare}' mktree)\n    \
+             landed=$(git -C '{bare}' commit-tree \"$tree\" -p refs/heads/main -m 'main lands the change')\n    \
+             git -C '{bare}' update-ref refs/heads/main \"$landed\"\n    \
+             new=$(git -C '{bare}' commit-tree {merged} -p {head} -p refs/heads/main -m \"Merge branch 'main' into feature\")"
+        ),
+        Update::OffBaseParent => format!(
+            "new=$(git -C '{bare}' commit-tree $(git -C '{bare}' merge-tree --write-tree refs/heads/off-base {head} | head -n 1) -p {head} -p refs/heads/off-base -m \"Merge branch 'main' into feature\")"
+        ),
         Update::RewrittenHead => format!(
             "rewritten=$(git -C '{bare}' commit-tree '{head}^{{tree}}' -p '{head}^' -m rewritten)\n    new=$(git -C '{bare}' commit-tree {merged} -p \"$rewritten\" -p refs/heads/main -m \"Merge branch 'main' into feature\")"
         ),
@@ -310,14 +348,25 @@ fn gh_body(scenario: &Scenario, bare: &Path, head: &str, state: &Path) -> String
     } else {
         "refs/heads/main"
     };
+    // GitHub's answer to the disarm; an ignored disarm leaves the arm on.
+    let disarm = if scenario.disarm_ignored {
+        format!(
+            "printf '%s' '{}'",
+            r#"{"data":{"disablePullRequestAutoMerge":{"pullRequest":{"number":42,"autoMergeRequest":{"enabledAt":"2026-10-09T08:00:00Z"}}}}}"#
+        )
+    } else {
+        format!(
+            "rm -f '{state}/armed-head'\n    printf '%s' '{}'",
+            r#"{"data":{"disablePullRequestAutoMerge":{"pullRequest":{"number":42,"autoMergeRequest":null}}}}"#
+        )
+    };
     format!(
         r#"
 export GIT_AUTHOR_NAME=GitHub GIT_AUTHOR_EMAIL=noreply@github.com GIT_COMMITTER_NAME=GitHub GIT_COMMITTER_EMAIL=noreply@github.com
 case "$*" in
   *"contents/.shipyard/config.toml"*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["{REVIEWER}"]' ;;
   *disablePullRequestAutoMerge*)
-    rm -f '{state}/armed-head'
-    printf '%s' '{{"data":{{"disablePullRequestAutoMerge":{{"pullRequest":{{"number":42,"autoMergeRequest":null}}}}}}}}' ;;
+    {disarm} ;;
   *enablePullRequestAutoMerge*)
     for arg in "$@"; do case "$arg" in head=*) printf '%s' "${{arg#head=}}" > '{state}/armed-head' ;; esac; done
     printf '%s' '{ARMED}' ;;
@@ -564,6 +613,64 @@ fn a_carry_whose_first_parent_is_not_the_approved_head_is_left_disarmed() {
     assert!(
         error.contains("does not descend from the approved head"),
         "{error}"
+    );
+}
+
+#[test]
+fn a_carry_merging_a_commit_that_is_not_on_the_base_is_left_disarmed() {
+    // First parent, tree and own lines all match when measured from the
+    // second parent: only its absence from the base shows that the carry
+    // brings in changes nobody reviewed.
+    let fixture = Fixture::new(&Scenario {
+        update: Update::OffBaseParent,
+        ..Scenario::default()
+    });
+    let error = carry_left_disarmed(&fixture);
+    assert!(error.contains("is not on main"), "{error}");
+}
+
+#[test]
+fn a_carried_tree_that_is_not_the_automatic_merge_is_left_disarmed() {
+    // The own lines match (the change is moved, which `-U0` cannot see): only
+    // the tree shows that GitHub's merge was not the automatic one.
+    let fixture = Fixture::new(&Scenario {
+        update: Update::RelocatedLines,
+        ..Scenario::default()
+    });
+    let error = carry_left_disarmed(&fixture);
+    assert!(error.contains("is not the automatic merge"), "{error}");
+}
+
+#[test]
+fn a_carry_whose_own_lines_changed_after_the_prediction_is_left_disarmed() {
+    // The tree is the automatic merge of a base that landed the change after
+    // the prediction: only the own lines show the approval no longer applies.
+    let fixture = Fixture::new(&Scenario {
+        update: Update::BaseLandsTheChange,
+        ..Scenario::default()
+    });
+    let error = carry_left_disarmed(&fixture);
+    assert!(error.contains("differ from the approved"), "{error}");
+}
+
+#[test]
+fn a_disarm_that_leaves_auto_merge_on_stops_the_carry() {
+    let fixture = Fixture::new(&Scenario {
+        disarm_ignored: true,
+        ..Scenario::default()
+    });
+    let mut report = fixture.planned();
+    fixture.apply(&mut report, &fixture.clones());
+    let error = report.prs[0].error.clone().unwrap_or_default();
+    assert!(error.contains("could not disarm"), "{:?}", report.prs[0]);
+    let calls = fixture.calls();
+    assert!(calls.contains("disablePullRequestAutoMerge"), "{calls}");
+    assert!(!calls.contains("update-branch"), "{calls}");
+    assert_eq!(fixture.pr_head(), fixture.head);
+    assert!(
+        fixture.audit().contains("carry_disarm_failed"),
+        "{}",
+        fixture.audit()
     );
 }
 
