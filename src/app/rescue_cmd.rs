@@ -815,7 +815,7 @@ cache_ttl_seconds = 300
             superseded_merge_group: false,
             apply: false,
         };
-        let actions = GitHubActions::new(temp.path());
+        let actions = GitHubActions::offline_for_tests(temp.path());
         let outcome =
             process_candidate(&candidate, &args, &workflows, &cfg, &actions, "owner/repo");
         assert_eq!(outcome, RunOutcome::Planned);
@@ -870,7 +870,7 @@ cache_ttl_seconds = 300
             &args,
             &workflows,
             &cfg,
-            &GitHubActions::new(temp.path()),
+            &GitHubActions::offline_for_tests(temp.path()),
             "owner/repo",
         );
         assert!(
@@ -1075,7 +1075,7 @@ cache_ttl_seconds = 300
             superseded_merge_group: false,
             apply: false,
         };
-        let actions = GitHubActions::new(temp.path());
+        let actions = GitHubActions::offline_for_tests(temp.path());
         let outcome =
             process_candidate(&candidate, &args, &workflows, &cfg, &actions, "owner/repo");
         // Skipped because process_candidate is called for cancelled but rerun_failed is off.
@@ -1103,7 +1103,7 @@ cache_ttl_seconds = 300
             superseded_merge_group: false,
             apply: false,
         };
-        let actions = GitHubActions::new(temp.path());
+        let actions = GitHubActions::offline_for_tests(temp.path());
         let outcome =
             process_candidate(&candidate, &args, &workflows, &cfg, &actions, "owner/repo");
         assert!(matches!(outcome, RunOutcome::SkippedNoPlan(_)));

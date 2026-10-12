@@ -197,7 +197,7 @@ case "$*" in
 esac
 "#,
     );
-    let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary);
+    let actions = GitHubActions::hermetic_for_tests(temp.path(), binary);
     let request = app_bound_request();
 
     let hydrated =
@@ -255,7 +255,7 @@ esac
         super::super::super::RECOVERY_CONTEXT,
     );
     crate::test_support::write_executable_script(&binary, &script);
-    let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary);
+    let actions = GitHubActions::hermetic_for_tests(temp.path(), binary);
 
     assert!(matches!(
         inspect_request(&actions, &request, Instant::now() + Duration::from_secs(30))
@@ -280,7 +280,7 @@ case "${1:-}" in
 esac
 "#,
     );
-    let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary);
+    let actions = GitHubActions::hermetic_for_tests(temp.path(), binary);
 
     for stream in ["stdout", "stderr"] {
         let error = actions
@@ -326,7 +326,7 @@ IFS= read -r signal < "$2"
 printf ready
 "#,
     );
-    let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(binary);
+    let actions = GitHubActions::hermetic_for_tests(temp.path(), binary);
 
     // The direct gh process exits only after its child has escaped the
     // supervised process group while retaining stdout/stderr. Pipe readers

@@ -779,7 +779,7 @@ esac
             calls.display()
         );
         crate::test_support::write_executable_script(&gh, &script);
-        let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(gh);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), gh);
 
         let mut live_pr = super::super::parse_pr(
             &serde_json::json!({

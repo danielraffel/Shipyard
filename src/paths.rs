@@ -119,10 +119,30 @@ pub(crate) fn home_dir() -> PathBuf {
     if let Some(test_home) = env::var_os("SHIPYARD_TEST_HOME") {
         return PathBuf::from(test_home);
     }
+    machine_home()
+}
+
+#[cfg(not(test))]
+fn machine_home() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// A unit test never reads the real home. CI sets `SHIPYARD_TEST_HOME`; a
+/// local `cargo test` without it would otherwise load the host's
+/// machine-global Shipyard config, whose `[github.auth]` token helper mints
+/// a real token, and find `~/.local/bin` helpers such as `ghapp` and
+/// `tartci` on the search path. Each test process gets its own empty home.
+#[cfg(test)]
+fn machine_home() -> PathBuf {
+    static UNIT_TEST_HOME: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        let home = env::temp_dir().join(format!("shipyard-unit-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("create the unit-test home");
+        home
+    });
+    UNIT_TEST_HOME.clone()
 }
 
 /// A deterministic PATH for unattended Shipyard children.
@@ -189,6 +209,25 @@ mod tests {
         assert!(entries.contains(&PathBuf::from("/usr/bin")));
         assert_eq!(entries, super::unattended_tool_entries());
         assert!(!entries.contains(&PathBuf::from("/tmp/repository/bin")));
+    }
+
+    #[test]
+    fn a_unit_test_home_is_never_the_real_home() {
+        let home = super::machine_home();
+        assert!(home.starts_with(std::env::temp_dir()), "{}", home.display());
+        assert!(home.is_dir(), "{}", home.display());
+        for real in ["HOME", "USERPROFILE"]
+            .map(std::env::var_os)
+            .into_iter()
+            .flatten()
+        {
+            assert_ne!(home, PathBuf::from(real));
+        }
+        // The machine-global config a host's `[github.auth]` lives in is not
+        // under it.
+        let global = RuntimePaths::for_platform(Platform::current(), &home, RuntimeMode::Shipyard)
+            .global_dir;
+        assert!(!global.join("config.toml").exists(), "{}", global.display());
     }
 
     #[test]
