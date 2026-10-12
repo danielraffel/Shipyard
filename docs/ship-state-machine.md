@@ -284,10 +284,23 @@ document:
 * It is idempotent, so a resumed or re-run ship re-issues nothing: an
   already-armed or already-queued pull request is left alone.
 * A repository that sets `[auto_merge] arm_requires_head_approval = true` on
-  its base branch arms only a head carrying an approval of that exact head: an
-  `APPROVED` review whose commit is the head from a non-bot account, or a
-  `reviewed:<sha>` comment from a login in `[auto_merge] reviewer_logins`. A
-  head the queue removed twice needs an approval newer than its last removal.
+  its base branch arms only a head carrying an approval of that exact head,
+  from an identity listed in `[auto_merge] reviewer_identities` (the older
+  spelling `reviewer_logins` is still read). The listed identity may be a bot,
+  such as the `shipyard-review[bot]` review App; it may not be the PR's author
+  or the fleet author App `shipyard-local[bot]`, and listing that App is
+  refused when the policy is read. An approval is an `APPROVED` review whose
+  `commit_id` is the head, or a comment whose last non-empty line is
+  `verdict: APPROVE head:<40-hex>` or `reviewed:<40-hex>` naming the head and
+  posted after the head commit. Only verdicts naming the current head count,
+  and the latest of them decides: `verdict: HOLD head:<sha>` or a
+  `CHANGES_REQUESTED` review on the head blocks an earlier approval, while a
+  HOLD naming another head, a quoted (`>`) line, a line above the last, and
+  prose that merely mentions "hold" never gate (the enqueue receipt records
+  the first as `stale_hold` and prose as `unstructured_hold_mention`). The
+  steward's enqueue records the approving comment id and the
+  `performed_via_github_app` id in its intent and receipt. A head the queue
+  removed twice needs an approval newer than its last removal.
   Removals are counted from the pull request's last 100 timeline events (the
   merge-queue query's `timelineItems(last:100)` window), so on a head with more
   than 100 later events older removals fall outside it and the count can be

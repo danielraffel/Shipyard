@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use serde_json::Value;
 
@@ -18,6 +18,7 @@ pub(super) fn init_command<W: Write>(
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
     let result = run_init(cwd, mode).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    install_repo_hooks(cwd)?;
     if json {
         let mut data = BTreeMap::new();
         let config_value = serde_json::to_value(&result.config)
@@ -41,4 +42,23 @@ pub(super) fn init_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn install_repo_hooks(cwd: &Path) -> Result<(), CliFailure> {
+    let script = cwd.join("scripts/install-githooks.sh");
+    if !script.is_file() || !cwd.join(".githooks").is_dir() {
+        return Ok(());
+    }
+    let status = Command::new("bash")
+        .arg(&script)
+        .current_dir(cwd)
+        .status()
+        .map_err(|error| CliFailure::new(1, format!("installing git hooks: {error}")))?;
+    if !status.success() {
+        return Err(CliFailure::new(
+            1,
+            format!("git hook installation failed with {status}"),
+        ));
+    }
+    Ok(())
 }

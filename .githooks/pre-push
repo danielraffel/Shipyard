@@ -1,37 +1,18 @@
 #!/usr/bin/env bash
 # Shipyard pre-push hook (agent-agnostic).
-#
-# Runs the versioning + skill-sync gates against origin/main before pushing.
-# Advisory by default — warnings print but don't block. Set
-# SHIPYARD_ENFORCE_PREPUSH=1 to upgrade warnings to hard errors (CI does this).
-#
-# Install once via scripts/install-githooks.sh:
-#   git config core.hooksPath .githooks
-#
-# Single-push emergency bypass:
-#   SHIPYARD_SKIP_PREPUSH=1 git push
-
 set -u
-
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 cd "$ROOT" || exit 0
-
 if [ "${SHIPYARD_SKIP_PREPUSH:-0}" = "1" ]; then
     echo "[pre-push] SHIPYARD_SKIP_PREPUSH=1 — skipping gates." >&2
     exit 0
 fi
-
 PYTHON="${PYTHON:-python3}"
 VBC="$ROOT/scripts/version_bump_check.py"
 SSC="$ROOT/scripts/skill_sync_check.py"
 CFG="$ROOT/scripts/versioning.json"
 DSC="$ROOT/scripts/doc_sync_check.py"
 DSM="$ROOT/scripts/doc_sync_map.json"
-
-# Documented exemption: a checkout from before the versioning gates existed
-# genuinely has nothing to check. Preserved, but made LOUD and specific — a
-# silent `exit 0` here is indistinguishable from a clean gate run, which is the
-# same false green this hook now refuses everywhere else.
 missing_gate_inputs=""
 [ -f "$VBC" ] || missing_gate_inputs="$missing_gate_inputs $VBC"
 [ -f "$SSC" ] || missing_gate_inputs="$missing_gate_inputs $SSC"
@@ -42,24 +23,16 @@ if [ -n "$missing_gate_inputs" ]; then
     echo "[pre-push]   Nothing was verified. This is a SKIP, not a pass." >&2
     exit 0
 fi
-
-# A gate that could not RUN is not a gate that passed.
-#
-# Exit-code contract: 0 = ran and passed, 1 = ran and FAILED, 2+ = COULD NOT
-# RUN (missing/unreadable config, or a crash) — it checked nothing. 2+ used to
-# print "internal error" and fall through as a pass, so a gate that could not
-# find its config reported SUCCESS. That false green is how a missing version
-# bump rides to main with no tag and no release.
 gate_could_not_run() {
     local name="$1" status="$2"
     echo "[pre-push] $name: COULD NOT RUN (exit $status) — treating as a FAILURE." >&2
     echo "[pre-push]   The gate performed no check, so it cannot report a pass." >&2
     echo "[pre-push]   Its output above names the config it looked for." >&2
 }
-
 BASE="${SHIPYARD_PREPUSH_BASE:-origin/main}"
 fail=0
-
+blocking_fail=0
+advisory_fail=0
 "$PYTHON" "$SSC" --base "$BASE" --config "$CFG" --mode=report
 gate_rc=$?; case $gate_rc in
     0) ;;
@@ -82,16 +55,40 @@ if [ -f "$DSC" ] && [ -f "$DSM" ]; then
         *) gate_could_not_run "doc_sync_check" "$gate_rc"; fail=1 ;;
     esac
 fi
-
-if [ "$fail" = "0" ]; then
+changed_files="$(git diff --name-only "$BASE" 2>/dev/null || true)"
+if [ -n "$changed_files" ]; then
+    # Fast source guard: only changed Rust files are inspected.
+    "$PYTHON" "$ROOT/scripts/check_test_include_str.py" --base "$BASE" $changed_files || blocking_fail=1
+fi
+is_m3() { [[ "${SHIPYARD_HOST:-}" == "m3" || "$(uname -n 2>/dev/null)" == *m3* ]]; }
+m1_cmd="ssh m1 'cd $ROOT && cargo"
+if is_m3; then
+    echo "[pre-push] Rust gates require m1; Cargo is forbidden on m3." >&2
+    echo "[pre-push] Run on m1: $m1_cmd fmt --all --check'" >&2
+    if echo "$changed_files" | grep -Eq '^(src|tests)/'; then
+      echo "[pre-push] Run on m1 (advisory clippy): $m1_cmd clippy --all-targets --locked -- -D warnings'" >&2
+    fi
+    blocking_fail=1
+else
+    cargo fmt --all --check || blocking_fail=1
+    if echo "$changed_files" | grep -Eq '^(src|tests)/'; then
+      cargo clippy --all-targets --locked -- -D warnings || {
+        echo "[pre-push] clippy advisory failed; continuing (toolchain is not pinned yet)." >&2
+        advisory_fail=1
+      }
+    fi
+fi
+if [ "$blocking_fail" = "0" ] && [ "$fail" = "0" ]; then
     echo "[pre-push] gates clean." >&2
     exit 0
 fi
-
+if [ "$blocking_fail" != "0" ]; then
+    echo "[pre-push] blocking Rust/source gates failed — push refused." >&2
+    exit 1
+fi
 if [ "${SHIPYARD_ENFORCE_PREPUSH:-0}" = "1" ]; then
     echo "[pre-push] SHIPYARD_ENFORCE_PREPUSH=1 — blocking push due to gate failures above." >&2
     exit 1
 fi
-
 echo "[pre-push] warnings above are advisory (export SHIPYARD_ENFORCE_PREPUSH=1 to block)." >&2
 exit 0

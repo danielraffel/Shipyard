@@ -527,7 +527,7 @@ fn latest_verdict(
         } else {
             return None;
         };
-        Some((at(review)?, verdict))
+        Some((at(review), verdict))
     });
     let comment_events = comments.iter().filter_map(|comment| {
         let login = login(comment)?;
@@ -538,10 +538,20 @@ fn latest_verdict(
         if marker_head != head.to_ascii_lowercase() {
             return None;
         }
-        Some((at(comment)?, verdict))
+        Some((at(comment), verdict))
     });
-    review_events
-        .chain(comment_events)
+    let events: Vec<_> = review_events.chain(comment_events).collect();
+    // A HOLD whose time cannot be read cannot be ordered against an approval,
+    // so it is not allowed to lose to one.
+    if events
+        .iter()
+        .any(|(timestamp, verdict)| timestamp.is_none() && *verdict == Verdict::Hold)
+    {
+        return Some(Verdict::Hold);
+    }
+    events
+        .into_iter()
+        .filter_map(|(timestamp, verdict)| Some((timestamp?, verdict)))
         .max_by_key(|(timestamp, _)| *timestamp)
         .map(|(_, verdict)| verdict)
 }

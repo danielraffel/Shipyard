@@ -2915,6 +2915,17 @@ signals recovery for them. A managed semantic blocker receives one deduplicated
 healthy deterministic progress clears the signal. This lets a cheap recovery
 agent handle exceptions without spending model tokens on polling.
 
+`--wake-owner` (with `--apply`) adds one owner wake comment on that
+transition. The comment names the actionable reason and the owner: the whence
+session, else the last committer with a GitHub login, else team-lead. It is
+recorded per repository, PR, exact head and decision state, so a re-run never
+posts it twice. The wake escalates once to team-lead after two hours with no
+movement. The clock starts at the wake and restarts at a later non-steward
+check change or a reply on the thread. The steward's own wake comments and
+`shipyard/steward-*` statuses do not count as movement. A new head or a new
+decision state starts a fresh record. Escalation runs on later passes, after
+the needs-agent signal has already converged.
+
 For phase-1 automated triage, run `shipyard runner recovery-worker` to inspect
 and revalidate one durable pending request's target base, exact head, and
 complete failed-required-check set or recorded merge state, or add `--apply` to launch its single

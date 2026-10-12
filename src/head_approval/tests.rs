@@ -367,6 +367,86 @@ fn short_markers_and_older_head_holds_never_gate() {
     assert!(decide(&policy, HEAD, &[], &approve, &empty_queue(HEAD)).allows());
 }
 
+fn reviewer_comment(at: &str, body: &str) -> Value {
+    json!({"login": "shipyard-review[bot]", "type": "Bot", "at": at, "body": body})
+}
+
+#[test]
+fn a_hold_on_another_head_does_not_block_an_approval_of_this_head() {
+    let policy = required(&["shipyard-review[bot]"]);
+    let approve = reviewer_comment(
+        "2026-10-04T01:00:00Z",
+        &format!("verdict: APPROVE head:{HEAD}"),
+    );
+    // The addendum's order: HOLD on head A, then APPROVE on head B.
+    let hold_first = [
+        reviewer_comment(
+            "2026-10-04T00:30:00Z",
+            &format!("verdict: HOLD head:{OTHER}"),
+        ),
+        approve.clone(),
+    ];
+    assert!(decide(&policy, HEAD, &[], &hold_first, &empty_queue(HEAD)).allows());
+    // A HOLD on another head posted after the approval is still not a
+    // verdict on this head.
+    let hold_after = [
+        approve,
+        reviewer_comment(
+            "2026-10-04T02:00:00Z",
+            &format!("verdict: HOLD head:{OTHER}"),
+        ),
+    ];
+    assert!(decide(&policy, HEAD, &[], &hold_after, &empty_queue(HEAD)).allows());
+}
+
+#[test]
+fn only_the_last_non_empty_line_is_a_verdict() {
+    let policy = required(&["shipyard-review[bot]"]);
+    let decide_on = |comments: &[Value]| decide(&policy, HEAD, &[], comments, &empty_queue(HEAD));
+
+    // An APPROVE line above trailing prose is not a verdict.
+    let approve_then_prose = [reviewer_comment(
+        "2026-10-04T01:00:00Z",
+        &format!("verdict: APPROVE head:{HEAD}\nThanks, nice work."),
+    )];
+    assert!(!decide_on(&approve_then_prose).allows());
+
+    // A quoted HOLD on the last line is not a verdict, so the earlier
+    // APPROVE stands.
+    let quoted_hold = [
+        reviewer_comment(
+            "2026-10-04T01:00:00Z",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        ),
+        reviewer_comment(
+            "2026-10-04T02:00:00Z",
+            &format!("Earlier I wrote:\n> verdict: HOLD head:{HEAD}"),
+        ),
+    ];
+    assert!(decide_on(&quoted_hold).allows());
+
+    // A HOLD above an APPROVE last line does not block.
+    let hold_above_approve = [reviewer_comment(
+        "2026-10-04T01:00:00Z",
+        &format!("verdict: HOLD head:{HEAD}\n\nverdict: APPROVE head:{HEAD}\n"),
+    )];
+    assert!(decide_on(&hold_above_approve).allows());
+}
+
+#[test]
+fn an_undated_hold_on_this_head_blocks_an_approval() {
+    let policy = required(&["shipyard-review[bot]"]);
+    let comments = [
+        reviewer_comment(
+            "2026-10-04T01:00:00Z",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        ),
+        json!({"login": "shipyard-review[bot]", "type": "Bot", "at": "not a time",
+               "body": format!("verdict: HOLD head:{HEAD}")}),
+    ];
+    assert!(!decide(&policy, HEAD, &[], &comments, &empty_queue(HEAD)).allows());
+}
+
 #[test]
 fn a_marker_must_name_this_head_on_its_own_line() {
     let policy = required(&["reviewer"]);
