@@ -57,11 +57,15 @@ def changed_lines(path: Path) -> set[int]:
         capture_output=True,
         check=False,
     )
+    if result.returncode != 0:
+        # The base is unreadable, so no line can be shown unchanged.
+        return set(range(1, len(path.read_text(encoding="utf-8").splitlines()) + 1))
     lines: set[int] = set()
     for hunk in re.finditer(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", result.stdout, re.MULTILINE):
         start = int(hunk.group(1)); count = int(hunk.group(2) or "1")
         lines.update(range(start, start + count))
-    return lines or set(range(1, len(path.read_text(encoding="utf-8").splitlines()) + 1))
+    # A deletion-only diff adds no lines, so it changed nothing to lint.
+    return lines
 
 def main(argv: list[str]) -> int:
     paths = [raw for raw in argv[1:] if raw != "--base" and not raw.startswith("--base=")]

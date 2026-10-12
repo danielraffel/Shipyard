@@ -23,43 +23,118 @@ def run_hook(extra_env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+# `rustup toolchain list` as rustup 1.29 prints it: channel plus host triple.
+REAL_LIST = "stable-aarch64-apple-darwin (active, default)\n1.88.0-aarch64-apple-darwin\n"
+PINNED_LIST = REAL_LIST + "1.97.1-aarch64-apple-darwin\n"
+
+
+def provision(
+    root: Path,
+    *,
+    toolchains: str = PINNED_LIST,
+    fmt_status: int = 0,
+    clippy_status: int = 0,
+    rustc_is_proxy: bool = True,
+) -> dict[str, str]:
+    """A HOME whose rustup proxy lists `toolchains`, plus a fake cargo."""
+    cargo_bin = root / "home/.cargo/bin"
+    cargo_bin.mkdir(parents=True)
+    listing = root / "toolchains.txt"
+    listing.write_text(toolchains, encoding="utf-8")
+    rustup = cargo_bin / "rustup"
+    rustup.write_text(
+        "#!/bin/sh\n"
+        f'[ "$1 $2" = "toolchain list" ] && cat "{listing}"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    rustup.chmod(0o755)
+    rustc = cargo_bin / "rustc"
+    if rustc_is_proxy:
+        rustc.symlink_to("rustup")
+    else:
+        rustc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        rustc.chmod(0o755)
+    cargo = cargo_bin / "cargo"
+    cargo.write_text(
+        "#!/bin/sh\n"
+        f'case "$1" in fmt) exit {fmt_status};; clippy) exit {clippy_status};; esac\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    cargo.chmod(0o755)
+    return {"HOME": str(root / "home"), "PATH": f"{cargo_bin}:{os.environ['PATH']}"}
+
+
+class PlantedSourceChange:
+    """Append a harmless line to a tracked `src/` file so clippy runs."""
+
+    def __init__(self, extra: bytes = b"\n") -> None:
+        self.target = ROOT / "src/app.rs"
+        self.extra = extra
+
+    def __enter__(self) -> None:
+        self.original = self.target.read_bytes()
+        self.target.write_bytes(self.original + self.extra)
+
+    def __exit__(self, *_: object) -> None:
+        self.target.write_bytes(self.original)
+
+
 class PrePushRustGateTests(unittest.TestCase):
-    def fake_cargo(self, directory: Path, fmt_status: int = 0) -> None:
-        cargo = directory / "cargo"
-        cargo.write_text(
-            "#!/bin/sh\n"
-            f"case \"$1\" in fmt) exit {fmt_status};; esac\n"
-            "exit 0\n", encoding="utf-8",
-        )
-        cargo.chmod(0o755)
+    def test_a_provisioned_host_with_clean_gates_passes(self) -> None:
+        # Positive control: the real `rustup toolchain list` shape names the
+        # pinned channel with its host triple, and that counts as installed.
+        with tempfile.TemporaryDirectory() as td, PlantedSourceChange():
+            proc = run_hook(provision(Path(td)))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("gates clean", proc.stderr)
+
+    def test_missing_pinned_toolchain_prints_install_command(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            proc = run_hook(provision(Path(td), toolchains=REAL_LIST))
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("pinned Rust 1.97.1 is not installed", proc.stderr)
+        self.assertIn("rustup toolchain install 1.97.1", proc.stderr)
+        self.assertNotIn("must be the rustup proxy", proc.stderr)
+
+    def test_a_longer_channel_with_the_pin_as_prefix_is_not_the_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            proc = run_hook(provision(Path(td), toolchains=REAL_LIST + "1.97.10-aarch64-apple-darwin\n"))
+        self.assertIn("pinned Rust 1.97.1 is not installed", proc.stderr)
 
     def test_real_fmt_failure_refuses(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            directory = Path(td)
-            self.fake_cargo(directory, fmt_status=1)
-            proc = run_hook({"PATH": f"{directory}:{os.environ['PATH']}"})
-            self.assertNotEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("blocking Rust/source gates failed", proc.stderr)
+            proc = run_hook(provision(Path(td), fmt_status=1))
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("cargo fmt --check failed", proc.stderr)
+        self.assertNotIn("is not installed", proc.stderr)
+
+    def test_real_clippy_failure_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as td, PlantedSourceChange():
+            proc = run_hook(provision(Path(td), clippy_status=1))
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("cargo clippy -D warnings failed", proc.stderr)
+        self.assertNotIn("cargo fmt --check failed", proc.stderr)
+
+    def test_a_rustc_that_is_not_the_rustup_proxy_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            proc = run_hook(provision(Path(td), rustc_is_proxy=False))
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("must be the rustup proxy", proc.stderr)
+        self.assertNotIn("is not installed", proc.stderr)
 
     def test_real_changed_test_lint_refuses(self) -> None:
-        target = ROOT / "src/app.rs"
-        original = target.read_bytes()
-        try:
-            target.write_bytes(
-                original
-                + b'\n#[cfg(test)]\nmod planted_prepush_test {\n'
-                + b'    #[test]\n    fn shell_spawn_is_rejected() {\n'
-                + b'        let _ = std::process::Command::new("/bin/sh");\n'
-                + b'    }\n}\n'
-            )
-            with tempfile.TemporaryDirectory() as td:
-                directory = Path(td)
-                self.fake_cargo(directory)
-                proc = run_hook({"PATH": f"{directory}:{os.environ['PATH']}"})
-            self.assertNotEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("/bin/sh is forbidden inside test code", proc.stderr)
-        finally:
-            target.write_bytes(original)
+        planted = (
+            b'\n#[cfg(test)]\nmod planted_prepush_test {\n'
+            b'    #[test]\n    fn shell_spawn_is_rejected() {\n'
+            b'        let _ = std::process::Command::new("/bin/sh");\n'
+            b'    }\n}\n'
+        )
+        with tempfile.TemporaryDirectory() as td, PlantedSourceChange(planted):
+            proc = run_hook(provision(Path(td)))
+        self.assertNotEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("/bin/sh is forbidden inside test code", proc.stderr)
 
     def test_source_lints_cover_include_cfg_return_and_shell_scope(self) -> None:
         checker = ROOT / "scripts/check_test_include_str.py"
@@ -91,6 +166,48 @@ class PrePushRustGateTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_a_deletion_only_diff_lints_no_untouched_line(self) -> None:
+        checker = ROOT / "scripts/check_test_include_str.py"
+        old = (
+            "#[cfg(test)]\nmod tests {\n\n"
+            '    #[test] fn shell() { let _ = Command::new("/bin/sh"); }\n'
+            "}\n"
+        )
+
+        def check(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["python3", str(checker), *args, "src/old.rs"],
+                cwd=repo, text=True, capture_output=True,
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            git = lambda *a: subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True)
+            git("init", "-q")
+            git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "--allow-empty", "-m", "root")
+            (repo / "src").mkdir()
+            source = repo / "src/old.rs"
+            source.write_text(old, encoding="utf-8")
+            git("add", ".")
+            git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "old")
+            # Remove only the blank line: the pre-existing violation is untouched.
+            source.write_text(old.replace("{\n\n", "{\n", 1), encoding="utf-8")
+            proc = check(repo, "--base", "HEAD")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            # Control: adding a violating line in the same file is still caught.
+            source.write_text(
+                old.removesuffix("}\n")
+                + '    #[test] fn again() { let _ = Command::new("/bin/sh"); }\n}\n',
+                encoding="utf-8",
+            )
+            proc = check(repo, "--base", "HEAD")
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("src/old.rs:5:", proc.stderr)
+            self.assertNotIn("src/old.rs:4:", proc.stderr)
+            # An unreadable base cannot prove any line unchanged.
+            source.write_text(old.replace("{\n\n", "{\n", 1), encoding="utf-8")
+            proc = check(repo, "--base", "no-such-ref")
+            self.assertEqual(proc.returncode, 1, proc.stderr)
 
 if __name__ == "__main__":
     unittest.main()
