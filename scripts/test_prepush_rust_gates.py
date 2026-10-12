@@ -12,14 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / ".githooks/pre-push"
 
 
-def run_hook(extra_env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def run_hook(extra_env: dict[str, str], timeout: float | None = None) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    env.pop("RUSTUP_AUTO_INSTALL", None)
     env.update(extra_env)
     env["SHIPYARD_PREPUSH_BASE"] = "HEAD"
     env["SHIPYARD_ENFORCE_PREPUSH"] = "0"
     return subprocess.run(
         ["bash", str(HOOK), "origin", "refs/heads/test", "refs/heads/test", "0000000", "0000000"],
-        cwd=ROOT, env=env, text=True, capture_output=True,
+        cwd=ROOT, env=env, text=True, capture_output=True, timeout=timeout,
     )
 
 
@@ -35,6 +36,7 @@ def provision(
     fmt_status: int = 0,
     clippy_status: int = 0,
     rustc_is_proxy: bool = True,
+    rustc_proxy_kind: str = "symlink",
 ) -> dict[str, str]:
     """A HOME whose rustup proxy lists `toolchains`, plus a fake cargo."""
     cargo_bin = root / "home/.cargo/bin"
@@ -50,15 +52,27 @@ def provision(
     )
     rustup.chmod(0o755)
     rustc = cargo_bin / "rustc"
-    if rustc_is_proxy:
+    if rustc_is_proxy and rustc_proxy_kind == "symlink":
         rustc.symlink_to("rustup")
+    elif rustc_is_proxy and rustc_proxy_kind == "hardlink":
+        os.link(rustup, rustc)
+    elif rustc_is_proxy:
+        rustc.write_bytes(rustup.read_bytes())
+        rustc.chmod(0o755)
     else:
         rustc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         rustc.chmod(0o755)
     cargo = cargo_bin / "cargo"
+    # Like the real rustup proxy, cargo would download a missing pinned
+    # toolchain unless RUSTUP_AUTO_INSTALL=0; the sleep stands in for that
+    # download, and every call is logged with the setting it saw.
+    calls = root / "cargo-calls.txt"
+    pinned = "1.97.1-" in toolchains
     cargo.write_text(
         "#!/bin/sh\n"
-        f'case "$1" in fmt) exit {fmt_status};; clippy) exit {clippy_status};; esac\n'
+        f'printf \'%s auto_install=%s\\n\' "$1" "${{RUSTUP_AUTO_INSTALL:-unset}}" >> "{calls}"\n'
+        + ("" if pinned else '[ "${RUSTUP_AUTO_INSTALL:-1}" = 0 ] || sleep 60\n')
+        + f'case "$1" in fmt) exit {fmt_status};; clippy) exit {clippy_status};; esac\n'
         "exit 0\n",
         encoding="utf-8",
     )
@@ -97,6 +111,41 @@ class PrePushRustGateTests(unittest.TestCase):
         self.assertIn("pinned Rust 1.97.1 is not installed", proc.stderr)
         self.assertIn("rustup toolchain install 1.97.1", proc.stderr)
         self.assertNotIn("must be the rustup proxy", proc.stderr)
+
+    def test_a_missing_pin_refuses_at_once_without_running_cargo(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            proc = run_hook(provision(root, toolchains=REAL_LIST), timeout=30)
+            calls = root / "cargo-calls.txt"
+            self.assertNotEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("skipping cargo gates", proc.stderr)
+            self.assertFalse(calls.exists(), calls.read_text() if calls.exists() else "")
+
+    def test_cargo_never_runs_with_rustup_auto_install(self) -> None:
+        with tempfile.TemporaryDirectory() as td, PlantedSourceChange():
+            root = Path(td)
+            proc = run_hook(provision(root), timeout=30)
+            calls = (root / "cargo-calls.txt").read_text().splitlines()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(calls, ["fmt auto_install=0", "clippy auto_install=0"])
+
+    def test_a_hardlinked_or_copied_rustup_proxy_is_accepted(self) -> None:
+        for kind in ("hardlink", "copy"):
+            with tempfile.TemporaryDirectory() as td:
+                proc = run_hook(provision(Path(td), rustc_proxy_kind=kind))
+            self.assertEqual(proc.returncode, 0, f"{kind}: {proc.stderr}")
+            self.assertNotIn("must be the rustup proxy", proc.stderr)
+
+    def test_the_m1_hint_does_not_embed_this_checkout_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            env = provision(Path(td))
+            env["SHIPYARD_HOST"] = "m3"
+            proc = run_hook(env)
+            env["SHIPYARD_M1_CHECKOUT"] = "~/sy-branch"
+            named = run_hook(env)
+        self.assertIn("Run on m1: ssh m1 'cd <m1 checkout of", proc.stderr)
+        self.assertNotIn(f"cd {ROOT} ", proc.stderr)
+        self.assertIn("ssh m1 'cd ~/sy-branch && cargo fmt", named.stderr)
 
     def test_a_longer_channel_with_the_pin_as_prefix_is_not_the_pin(self) -> None:
         with tempfile.TemporaryDirectory() as td:
