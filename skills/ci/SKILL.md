@@ -323,6 +323,34 @@ zero runs, which reported "no receipt decisions" for a group nobody read. It is
 now an error and the group reads `unreadable`. When adding a GitHub reader,
 treat a missing collection key as an error, never as `unwrap_or_default()`.
 
+## A unit test must not see the host's GitHub auth
+
+CI runs every test with `SHIPYARD_TEST_HOME` set to the runner's temp
+directory, so it never reads a machine-global Shipyard config. A plain local
+`cargo test` on a fleet host used to: `GitHubActions::new(temp)` loads
+`~/Library/Application Support/shipyard/config.toml`, whose `[github.auth]`
+runs `~/.local/bin/ghapp`. Injecting a fake `gh` with
+`with_gh_binary_for_tests` did not stop the real helper minting a token and
+reaching GitHub, so 31 tests failed on m1 whenever GitHub was unreachable from
+it, and passed in CI.
+
+- In a test build, `paths::home_dir()` is a per-process empty directory
+  unless `SHIPYARD_TEST_HOME` is set, so the real home is never read.
+- Build a test client with `GitHubActions::hermetic_for_tests(cwd, fake_gh)`,
+  or `offline_for_tests(cwd)` when the test must not run `gh` at all.
+- `with_gh_binary_for_tests` panics, naming the executable, when the client's
+  auth config would run a token helper or `gh`/`git` outside the fake `gh`'s
+  temp tree, or a bare name that would resolve through `PATH`.
+
+To audit for leaks, put a `ghapp`, `gh` and `tartci` that log and fail first
+on `PATH`, and point `SHIPYARD_TEST_HOME` (or `HOME`, with `CARGO_HOME` and
+`RUSTUP_HOME` kept) at a config whose token helper is that `ghapp`. Then run
+the suite with `--test-threads 1`. The helpers must append to the same log
+cargo writes (in append mode), because the code under test captures their
+stderr. Production paths that call `gh` through `PATH` with no client
+(`pr_merged_head_sha` and the ship and doctor observers) still do so from
+some tests.
+
 ## Protected-state caches take the writer-domain lease too
 
 `gate_cost::cache::ReadCache` writes under the protected state tree

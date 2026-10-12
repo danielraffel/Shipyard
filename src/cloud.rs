@@ -381,10 +381,60 @@ impl GitHubActions {
         self
     }
 
+    /// Run `gh_binary` in place of `gh`.
+    ///
+    /// # Panics
+    ///
+    /// When the client's auth config would run an executable outside the
+    /// fixture directory that holds `gh_binary` (its token helper, or a
+    /// configured `gh` or `git`). A client built with [`Self::new`] or
+    /// [`Self::from_cwd`] reads the machine-global Shipyard config, so on a
+    /// host whose `[github.auth]` runs a token helper the test would mint a
+    /// real token through it and reach GitHub. Build the client with
+    /// [`Self::hermetic_for_tests`], or from a config whose helpers are
+    /// fixtures.
     #[cfg(all(test, unix))]
     pub(crate) fn with_gh_binary_for_tests(mut self, gh_binary: impl Into<PathBuf>) -> Self {
-        self.gh_binary_override = Some(gh_binary.into());
+        let gh_binary = gh_binary.into();
+        if let Ok(client) = &self.gh {
+            crate::test_support::assert_fixture_executables(
+                &gh_binary,
+                &client.configured_executables(),
+            );
+        }
+        self.gh_binary_override = Some(gh_binary);
         self
+    }
+
+    /// A client that runs only `gh_binary`: ambient auth, no token helper, and
+    /// no machine-global config, whatever the host has configured.
+    #[cfg(all(test, unix))]
+    pub(crate) fn hermetic_for_tests(
+        cwd: impl Into<PathBuf>,
+        gh_binary: impl Into<PathBuf>,
+    ) -> Self {
+        let cwd = cwd.into();
+        Self {
+            gh: Ok(GhClient::ambient()),
+            cwd,
+            gh_binary_override: None,
+            absolute_deadline: None,
+        }
+        .with_gh_binary_for_tests(gh_binary)
+    }
+
+    /// A hermetic client for a test that must not run `gh` at all: any call
+    /// fails to start, because its `gh` is a path inside `cwd` that does not
+    /// exist.
+    #[cfg(test)]
+    pub(crate) fn offline_for_tests(cwd: impl Into<PathBuf>) -> Self {
+        let cwd = cwd.into();
+        Self {
+            gh_binary_override: Some(cwd.join(".shipyard-test-gh-is-not-provided")),
+            cwd,
+            gh: Ok(GhClient::ambient()),
+            absolute_deadline: None,
+        }
     }
 
     pub(crate) fn with_absolute_deadline(mut self, deadline: Instant) -> Self {
@@ -1989,6 +2039,95 @@ exit 2
         let log = std::fs::read_to_string(log).expect("gh log");
         assert!(log.contains("GH_TOKEN=ghs_app_token ARGS=pr view 314"));
         assert!(log.contains("GH_TOKEN=ghs_app_token ARGS=api repos/danielraffel/pulp/pulls/314"));
+    }
+
+    /// The panic message `with_gh_binary_for_tests` gives a non-hermetic
+    /// client, or `None` when it accepts the client.
+    #[cfg(unix)]
+    fn refusal(config: &LoadedConfig, gh: &Path) -> Option<String> {
+        let actions = super::GitHubActions::from_loaded_config(gh.parent().expect("dir"), config);
+        let gh = gh.to_path_buf();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            actions.with_gh_binary_for_tests(gh);
+        }))
+        .err()
+        .map(|panic| panic.downcast_ref::<String>().cloned().unwrap_or_default())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fake_gh_with_a_token_helper_outside_its_fixture_tree_is_refused() {
+        let temp = TempDir::new().expect("tempdir");
+        let gh = temp.path().join("gh");
+        // Control: a helper in the fixture tree is accepted, including one in
+        // a sibling directory of the fake `gh`.
+        let inside = temp.path().join("helpers").join("token-helper");
+        assert_eq!(refusal(&config_with_command_helper(&inside), &gh), None);
+        // The fleet's installed helper, and a bare name that would resolve
+        // through PATH, are refused with the reason.
+        for helper in ["/Users/someone/.local/bin/ghapp", "ghapp"] {
+            let message = refusal(&config_with_command_helper(Path::new(helper)), &gh)
+                .unwrap_or_else(|| panic!("{helper} was accepted"));
+            assert!(message.contains("not hermetic"), "{message}");
+            assert!(message.contains(helper), "{message}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hermetic_client_ignores_the_shipyard_config_around_it() {
+        // A token helper in the cwd's own Shipyard config is refused for a
+        // client built from that config; the hermetic client never reads it.
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join(".shipyard")).expect("project dir");
+        std::fs::write(
+            temp.path().join(".shipyard/config.toml"),
+            "[github.auth]\nsource = \"command\"\ntoken_command = [\"/Users/someone/.local/bin/ghapp\"]\n",
+        )
+        .expect("config");
+        let gh = temp.path().join("gh");
+        let loaded = std::panic::catch_unwind(|| {
+            super::GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh)
+        });
+        assert!(loaded.is_err(), "control: the cwd config was not read");
+        let client = super::GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        assert!(
+            client
+                .gh
+                .as_ref()
+                .expect("client")
+                .configured_executables()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hermetic_client_runs_only_its_fake_gh() {
+        let temp = TempDir::new().expect("tempdir");
+        let gh = temp.path().join("gh");
+        let log = temp.path().join("calls.log");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\nprintf 'ARGS=%s\\n' \"$*\" >> '{}'\nprintf '{{}}'\n",
+                log.display()
+            ),
+        );
+        let client = super::GitHubActions::hermetic_for_tests(temp.path(), &gh);
+        assert!(
+            client
+                .gh
+                .as_ref()
+                .expect("client")
+                .configured_executables()
+                .is_empty()
+        );
+        client
+            .run_gh(&["api".to_owned(), "repos/owner/repo".to_owned()])
+            .expect("fake gh");
+        let log = std::fs::read_to_string(log).expect("log");
+        assert_eq!(log, "ARGS=api repos/owner/repo\n");
     }
 
     #[cfg(unix)]

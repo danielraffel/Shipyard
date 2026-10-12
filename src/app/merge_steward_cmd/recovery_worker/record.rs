@@ -631,7 +631,7 @@ allowed_repositories = ["Generous-Corp/pulp"]
                 candidate_paths: Vec::new(),
                 focused_tests: Vec::new(),
             },
-            actions: GitHubActions::new(&repo_path),
+            actions: GitHubActions::offline_for_tests(&repo_path),
             config: trusted_config.clone(),
             policy_signature: policy_signature.clone(),
         };

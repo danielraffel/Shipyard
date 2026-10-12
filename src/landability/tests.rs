@@ -648,7 +648,7 @@ fn a_warm_cache_costs_zero_api_calls() {
 
     // A client pointed at a directory with no `gh` configured: if the cache
     // were missed, the calls would be attempted and counted. They are not.
-    let actions = GitHubActions::new(dir.path());
+    let actions = GitHubActions::offline_for_tests(dir.path());
     let facts = gather(
         &actions,
         state,

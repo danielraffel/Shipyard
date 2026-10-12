@@ -1755,7 +1755,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
         let config = empty_config(temp.path());
-        let actions = GitHubActions::new(temp.path());
+        let actions = GitHubActions::offline_for_tests(temp.path());
         let args = add_lane_args(42, "windows");
         let mut missing_out = Vec::new();
 
@@ -1809,7 +1809,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
         let config = empty_config(temp.path());
-        let actions = GitHubActions::new(temp.path());
+        let actions = GitHubActions::offline_for_tests(temp.path());
         let args = retarget_args();
         let mut missing_out = Vec::new();
 
@@ -1858,7 +1858,7 @@ mod tests {
     #[test]
     fn handoff_list_stuck_rejects_bad_threshold_before_repo_or_github() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let actions = GitHubActions::new(temp.path());
+        let actions = GitHubActions::offline_for_tests(temp.path());
         let mut out = Vec::new();
 
         let err = handoff_list_stuck("later", None, temp.path(), &actions, true, &mut out)
@@ -1884,7 +1884,7 @@ mod tests {
     #[test]
     fn cancel_matching_jobs_empty_list_is_noop() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let actions = GitHubActions::new(temp.path());
+        let actions = GitHubActions::offline_for_tests(temp.path());
 
         let summary = cancel_matching_jobs(&actions, "owner/repo", 123, &[], &[]);
 

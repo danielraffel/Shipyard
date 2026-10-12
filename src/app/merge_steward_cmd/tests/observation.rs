@@ -98,7 +98,7 @@ fn repository_settings_supply_canonical_guard_identity() {
 
 #[test]
 fn invalid_pr_head_skips_app_identity_hydration_without_blocking_repo() {
-    let actions = GitHubActions::new(".");
+    let actions = GitHubActions::offline_for_tests(".");
     let mut prs = vec![ObservedPr {
         node_id: "PR_bad".to_owned(),
         owner: "team-lead".to_owned(),

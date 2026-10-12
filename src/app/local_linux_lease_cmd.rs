@@ -1040,7 +1040,7 @@ mod tests {
     fn fake_gh_answering(temp: &tempfile::TempDir, script: &str) -> GitHubActions {
         let gh = temp.path().join("gh");
         crate::test_support::write_executable_script(&gh, &format!("#!/bin/sh\n{script}\n"));
-        GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh)
+        GitHubActions::hermetic_for_tests(temp.path(), &gh)
     }
 
     #[cfg(unix)]
@@ -1168,7 +1168,7 @@ esac"#,
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = temp.path().join("gh");
         write_executable(&gh, "#!/bin/sh\nsleep 30\n");
-        let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         let started = Instant::now();
         let error = observe_fleet_with_timeout(
             &actions,
@@ -1212,7 +1212,7 @@ esac"#,
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = temp.path().join("gh");
         write_executable(&gh, "#!/bin/sh\nsleep 30\n");
-        let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         let decision = unreadable_decision("GitHub observation timed out");
         let started = Instant::now();
         let error = apply_decision_with_timeout(
@@ -1646,7 +1646,7 @@ esac"#,
                 calls.display()
             ),
         );
-        let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(&gh);
+        let actions = GitHubActions::hermetic_for_tests(temp.path(), &gh);
         let decision = LeaseDecision {
             action: LeaseAction::Clear,
             observed_at: Utc.with_ymd_and_hms(2026, 8, 13, 18, 45, 0).unwrap(),

@@ -406,7 +406,7 @@ esac
             calls = calls.display()
         ),
     );
-    let actions = GitHubActions::new(temp.path()).with_gh_binary_for_tests(gh);
+    let actions = GitHubActions::hermetic_for_tests(temp.path(), gh);
     let settings = WatchdogSettings {
         repo_slug: "owner/repo".to_owned(),
         runner_id: None,

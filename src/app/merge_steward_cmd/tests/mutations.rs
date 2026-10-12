@@ -1405,7 +1405,7 @@ fn known_unperformed_transient_rerun_does_not_consume_budget() {
 #[test]
 fn unauthorized_steward_does_not_consume_capacity_preemption_budget() {
     let temp = tempfile::tempdir().expect("temp");
-    let actions = GitHubActions::new(temp.path());
+    let actions = GitHubActions::offline_for_tests(temp.path());
     let mut pr = ready_pr();
     pr.fact.queue_position = Some(1);
     let mut observation = observation_for(pr, true);
@@ -1733,7 +1733,7 @@ fn assert_force_cancel_revalidation_rejected(
 #[test]
 fn initial_capacity_guard_correlation_is_durable_before_started_audit_can_be_orphaned() {
     let temp = tempfile::tempdir().expect("temp");
-    let actions = GitHubActions::new(temp.path());
+    let actions = GitHubActions::offline_for_tests(temp.path());
     let mut observation = observation_for(ready_pr(), true);
     let run = queued_run(100, "2026-07-26T00:00:00Z");
     observation.runs = vec![run.clone()];
@@ -1786,7 +1786,7 @@ fn initial_capacity_guard_correlation_is_durable_before_started_audit_can_be_orp
 #[test]
 fn skipped_capacity_intent_recovers_without_sending_a_cancellation() {
     let temp = tempfile::tempdir().expect("temp");
-    let actions = GitHubActions::new(temp.path());
+    let actions = GitHubActions::offline_for_tests(temp.path());
     let mut observation = observation_for(ready_pr(), true);
     let run = queued_run(100, "2026-07-26T00:00:00Z");
     observation.runs = vec![run.clone()];
@@ -2677,7 +2677,7 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
 #[test]
 fn disabled_preemption_ignores_preemption_only_observation_errors() {
     let temp = tempfile::tempdir().expect("temp");
-    let actions = GitHubActions::new(".");
+    let actions = GitHubActions::offline_for_tests(".");
     let pr = ready_pr();
     let mut observation = observation_for(pr, true);
     observation.preemption_error = Some("preemption job hydration failed".to_owned());
@@ -2718,7 +2718,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
 #[test]
 fn direct_mode_refusal_never_reaches_rest_merge_mutation() {
     let temp = tempfile::tempdir().expect("temp");
-    let actions = GitHubActions::new(".");
+    let actions = GitHubActions::offline_for_tests(".");
     let pr = ready_pr();
     let observation = observation_for(pr.clone(), false);
     let mut policy = queue_policy();
