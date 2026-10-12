@@ -391,6 +391,7 @@ fn runner_command_with_actions<W: Write>(
             no_preempt_capacity,
             max_preemptions_per_head,
             arm_unqueued,
+            wake_owner,
             apply,
             ledger,
         } => super::merge_steward_cmd::steward_command(
@@ -407,6 +408,7 @@ fn runner_command_with_actions<W: Write>(
                 preempt_capacity: !no_preempt_capacity,
                 max_preemptions_per_head,
                 arm_unqueued,
+                wake_owner,
                 apply,
                 ledger,
             },

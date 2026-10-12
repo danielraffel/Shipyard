@@ -168,11 +168,29 @@ pull request out permanently. Neither is something to reach for by default.
 
 **Head approval.** A repository whose base branch sets
 `[auto_merge] arm_requires_head_approval = true` arms only a head that carries an
-approval of that exact head: an `APPROVED` review on that commit from a non-bot
-account, or a `reviewed:<sha>` comment line from a login listed in
-`[auto_merge] reviewer_logins` (empty by default). Bot accounts never count,
-including the Shipyard App every agent posts through, because a marker it wrote
-would approve itself. Without an approval the line reads
+approval of that exact head from an identity listed in
+`[auto_merge] reviewer_identities` (empty by default; the older spelling
+`reviewer_logins` is still read), for example
+`reviewer_identities = ["shipyard-review[bot]", "danielraffel"]`. A listed bot
+counts, which is how the review App approves. The fleet author App
+`shipyard-local[bot]`, which opens every fleet PR, never counts and is refused
+in the list, and no identity can approve a PR it authored.
+
+To give a verdict as a reviewer, prefer a PR Review from the review App: state
+`APPROVE`, or `REQUEST_CHANGES` to hold. GitHub binds the review to the head it
+was submitted on. A comment works too, but only its last non-empty line is read,
+and it must name the full current head:
+
+```
+verdict: APPROVE head:<40-hex sha>
+verdict: HOLD head:<40-hex sha>
+reviewed:<40-hex sha>
+```
+
+`reviewed:` is an alias for APPROVE. The latest verdict on the current head
+decides. A HOLD on an older head, a quoted (`>`) line, a line above the last,
+and prose that mentions "hold" or "changes requested" never gate. A marker
+posted before the head commit existed does not count. Without an approval the line reads
 `▸ Auto-merge not armed on #N: head … carries no approval …`, and the same check
 holds for the validated arm after a ship passes and for
 `runner steward --arm-unqueued`. A head the queue removed twice also needs an
@@ -1708,6 +1726,24 @@ in `[runner.watchdog]` (`reap_in_progress_max_min` /
 `event=reap_stale_run` and `phase` ∈ {`attempt`, `cancelled`, `failed`,
 `skipped`} (`skipped` only under `--dry-run`).
 
+## Waiting on local gate processes
+
+When a maintenance command must wait for a local gate process to finish, avoid
+matching the watcher itself. Use the bracketed pattern `pgrep -f '[g]ates.sh'`
+or a pid file written by the process, and give the wait a deadline. For example:
+
+```bash
+deadline=$((SECONDS + 1800))
+while pgrep -f '[g]ates.sh' >/dev/null; do
+  (( SECONDS < deadline )) || { echo "timed out waiting for gates.sh" >&2; exit 1; }
+  sleep 5
+done
+```
+
+A pid-file wait follows the same rule: check that the recorded PID is still the
+expected process, and stop with an error when the deadline expires. Prefer
+`shipyard wait ... --timeout <seconds>` for GitHub or Shipyard conditions.
+
 ## Waiting on conditions (`shipyard wait`)
 
 Whenever you'd otherwise write a polling loop around `gh` — wait for a release to upload, wait for a PR's required checks to go green, wait for a dispatched workflow run to finish — reach for `shipyard wait` instead. It opens a daemon subscription first (if one's running), takes one authoritative `gh` snapshot, and either exits 0 immediately or keeps re-evaluating immediately on relevant webhook events. While the daemon remains connected, it also reconciles an authoritative snapshot on `--poll-interval` so a missed event cannot strand the wait; this remains daemon transport, not fallback. When the daemon isn't running or disconnects, it falls back to polling transparently — safe to use on headless CI too.
@@ -2280,6 +2316,10 @@ trusted machine-global
 `changed_surface_execution.accepted_shadow_policy_digests."<owner/repo>".<target>`.
 The legacy scalar remains supported only when the scoped table is absent;
 configuring both is ambiguous and fails closed.
+The `same_base_canary` posture is a shadow-only one-lane comparison: it pins
+one base/tree and requires pass 2 to bind to pass 1's full-shadow record. A
+missing or mismatched pass-1 record is inconclusive and never grants merge
+authority.
 For `--resume-from test`, Shipyard authenticates all eligible target plans in a
 read-only preflight and refuses schema-v3 execution before activation
 persistence or substitution. It could skip producer builds and test stale warm

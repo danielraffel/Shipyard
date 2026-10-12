@@ -246,7 +246,7 @@ mod lease_tests {
         std::fs::create_dir(&dir).expect("dir");
         let stale = dir.join("old.json");
         std::fs::write(&stale, "{}").expect("stale");
-        let old = now + MAX_ENTRY_AGE + Duration::from_secs(60);
+        let old = now + MAX_ENTRY_AGE + Duration::from_mins(1);
         let cache = ReadCache::open_with_lease(&dir, old, refused);
         cache.put("k", &json!(1));
         assert!(stale.exists(), "pruned without the lease");
@@ -274,7 +274,7 @@ mod lease_tests {
         std::fs::create_dir(&dir).expect("dir");
         let stale = dir.join("old.json");
         std::fs::write(&stale, "{}").expect("stale");
-        let old = now + MAX_ENTRY_AGE + Duration::from_secs(60);
+        let old = now + MAX_ENTRY_AGE + Duration::from_mins(1);
         let _ = ReadCache::open_with_lease(&dir, old, granted);
         assert!(!stale.exists());
     }

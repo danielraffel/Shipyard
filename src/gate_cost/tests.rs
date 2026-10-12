@@ -716,7 +716,7 @@ fn entries_older_than_the_age_limit_are_pruned_on_open() {
     let now = std::time::SystemTime::now();
     ReadCache::open(dir.path(), now).put("k", &json!(1));
     assert_eq!(ReadCache::open(dir.path(), now).get("k"), Some(json!(1)));
-    let later = now + cache::MAX_ENTRY_AGE + std::time::Duration::from_secs(60);
+    let later = now + cache::MAX_ENTRY_AGE + std::time::Duration::from_mins(1);
     assert_eq!(ReadCache::open(dir.path(), later).get("k"), None);
 }
 

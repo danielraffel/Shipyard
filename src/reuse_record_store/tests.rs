@@ -255,7 +255,7 @@ fn an_empty_store_says_so() {
 fn a_cancelled_runs_pending_directory_is_swept_later() {
     let store = tempfile::tempdir().expect("store");
     let old = create_pending(store.path(), "aaa", now()).expect("pending");
-    let day_ago = SystemTime::now() - (PENDING_MAX_AGE + Duration::from_secs(60));
+    let day_ago = SystemTime::now() - (PENDING_MAX_AGE + Duration::from_mins(1));
     set_dir_modified(&old, day_ago);
     let fresh = create_pending(store.path(), "bbb", now()).expect("pending");
     assert!(

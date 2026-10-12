@@ -660,6 +660,12 @@ pub(super) enum Command {
     },
     /// One-shot push-a-PR: skill-sync, version-bump, then ship.
     Pr {
+        /// Read-only PR ledger action. `status --all` prints every open PR.
+        #[arg(value_name = "ACTION")]
+        action: Option<String>,
+        /// Include every configured repository in the read-only status ledger.
+        #[arg(long = "all")]
+        all: bool,
         /// Base branch to ship into.
         #[arg(long, default_value = "main")]
         base: String,
@@ -2236,6 +2242,10 @@ pub(super) enum RunnerCommand {
         /// Perform the planned mutations. Without this flag, only audit.
         #[arg(long)]
         apply: bool,
+        /// Post one exact-head owner wake comment for each actionable PR.
+        /// This is the B4 write; it never arms or merges.
+        #[arg(long = "wake-owner")]
+        wake_owner: bool,
         /// Override the durable retry/audit ledger path. Test hook.
         #[arg(long = "ledger", hide = true)]
         ledger: Option<PathBuf>,

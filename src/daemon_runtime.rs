@@ -2383,14 +2383,14 @@ mod tests {
         let forbidden = "HTTP 403: Resource not accessible by integration";
 
         assert!(log.should_log("o/a", forbidden, start));
-        assert!(!log.should_log("o/a", forbidden, start + StdDuration::from_secs(60)));
+        assert!(!log.should_log("o/a", forbidden, start + StdDuration::from_mins(1)));
         assert!(!log.should_log(
             "o/a",
             forbidden,
             start + StdDuration::from_secs(59 * 60 + 59)
         ));
         // Another repository is tracked independently.
-        assert!(log.should_log("o/b", forbidden, start + StdDuration::from_secs(60)));
+        assert!(log.should_log("o/b", forbidden, start + StdDuration::from_mins(1)));
         // The hourly reminder fires once the interval has passed.
         let reminder = start + REGISTRATION_ERROR_RELOG_INTERVAL;
         assert!(log.should_log("o/a", forbidden, reminder));

@@ -1,9 +1,20 @@
 use super::*;
 
 #[cfg(unix)]
+mod review_774;
+
+#[cfg(unix)]
 fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     let path = temp.path().join("gh");
-    crate::test_support::write_executable_script(&path, &format!("#!/bin/sh\nset -eu\n{body}\n"));
+    let policy_shim = if body.contains("# CONFIG_ERROR") {
+        String::new()
+    } else {
+        "case \"$*\" in *contents/.shipyard/config.toml*) printf '%s\\n' '[auto_merge]' 'arm_requires_head_approval = false'; exit 0;; esac\n".to_owned()
+    };
+    crate::test_support::write_executable_script(
+        &path,
+        &format!("#!/bin/sh\nset -eu\n{policy_shim}{body}\n"),
+    );
     let config = crate::config::LoadedConfig {
         data: toml::Table::new(),
         global_dir: temp.path().join("global"),
@@ -73,6 +84,33 @@ fn ready_pr() -> ObservedPr {
         &BTreeMap::new(),
     )
     .expect("ready PR")
+}
+
+#[cfg(unix)]
+fn ready_pr_with_wire_owner() -> ObservedPr {
+    parse_pr(
+        &serde_json::json!({
+            "id": "PR_kw",
+            "number": 42,
+            "state": "OPEN",
+            "isDraft": false,
+            "baseRefName": "main",
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "headRefName": "feature",
+            "mergeStateStatus": "DIRTY",
+            "autoMergeRequest": null,
+            "author": {"login": "app/shipyard-local", "is_bot": true},
+            "body": "<!-- whence {\"prov\": {\"session\": \"session-owner\"}} -->",
+            "commits": [{"authors": [{"login": "last-committer"}], "committedDate": "2026-08-27T00:00:00Z"}],
+            "labels": [{"name": "shipyard:managed"}],
+            "statusCheckRollup": [
+                {"__typename": "CheckRun", "name": "macos", "status": "COMPLETED", "conclusion": "FAILURE", "completedAt": "2026-08-27T00:00:00Z"},
+                {"__typename": "StatusContext", "context": "shipyard/steward-handoff", "state": "SUCCESS", "createdAt": "2026-08-27T00:00:01Z"}
+            ]
+        }),
+        &BTreeMap::new(),
+    )
+    .expect("wire-shaped PR")
 }
 
 fn observation_for(pr: ObservedPr, merge_queue: bool) -> RepoObservation {

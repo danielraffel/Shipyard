@@ -101,9 +101,11 @@ fn invalid_pr_head_skips_app_identity_hydration_without_blocking_repo() {
     let actions = GitHubActions::new(".");
     let mut prs = vec![ObservedPr {
         node_id: "PR_bad".to_owned(),
+        owner: "team-lead".to_owned(),
         fact: StewardPullRequest {
             number: 42,
             head_sha: "malformed".to_owned(),
+            author: None,
             head_branch: "topic".to_owned(),
             draft: false,
             merge_state: "UNKNOWN".to_owned(),

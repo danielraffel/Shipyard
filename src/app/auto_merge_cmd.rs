@@ -4617,7 +4617,8 @@ exit 91
         )
     }
 
-    const REQUIRES_APPROVAL: &str = "[auto_merge]\narm_requires_head_approval = true\n";
+    const REQUIRES_APPROVAL: &str =
+        "[auto_merge]\narm_requires_head_approval = true\nreviewer_identities = [\"someone\"]\n";
 
     /// Validation proves a head builds, not that anyone chose to land it: with
     /// the policy on, a validated but unapproved head is not armed.

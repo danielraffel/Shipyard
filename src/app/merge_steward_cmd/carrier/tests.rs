@@ -151,9 +151,11 @@ fn ejected_observation() -> RepoObservation {
         }],
         prs: vec![ObservedPr {
             node_id: "PR_kw".to_owned(),
+            owner: "team-lead".to_owned(),
             fact: StewardPullRequest {
                 number: 42,
                 head_sha: HEAD.to_owned(),
+                author: None,
                 head_branch: "feature".to_owned(),
                 draft: false,
                 merge_state: "BLOCKED".to_owned(),
