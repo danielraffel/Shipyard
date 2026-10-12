@@ -140,8 +140,41 @@ jobs:
           echo "macOS release artifacts are intentionally not uploaded from this unsigned build."
           echo "Run scripts/release-macos-local.sh --tag ${{ github.ref_name }} --upload to sign, notarize, upload, verify, and publish."
 
-  release:
+  # Release gate: the built binary's bulk GitHub reads must succeed against a
+  # real repository before anything is published. v0.302.0-v0.307.0 shipped an
+  # admission census GitHub refused on every call (GraphQL node limit) and no
+  # unit test against a fake could see it. Read-only probes only.
+  live-smoke:
     needs: build
+    name: Live GitHub smoke (release gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download the linux-x64 release binary
+        uses: actions/download-artifact@v5
+        with:
+          name: release-linux-x64
+          path: smoke-bin
+
+      - name: Run read-only admission and steward probes against real repositories
+        shell: bash
+        env:
+          # Public repositories only; a dedicated read token can replace the
+          # job token without changing the gate.
+          GH_TOKEN: ${{ secrets.RELEASE_SMOKE_GH_TOKEN || github.token }}
+          SMOKE_REPOS: ${{ vars.RELEASE_SMOKE_REPOS || 'Generous-Corp/pulp' }}
+        run: |
+          set -euo pipefail
+          binary=smoke-bin/shipyard-linux-x64
+          chmod +x "$binary"
+          "$binary" --version
+          repo_args=()
+          for repo in $SMOKE_REPOS; do repo_args+=(--repo "$repo"); done
+          python3 scripts/release_live_smoke.py --binary "$binary" "${repo_args[@]}"
+
+  release:
+    needs: [build, live-smoke]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:

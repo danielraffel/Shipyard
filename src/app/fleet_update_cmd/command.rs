@@ -22,6 +22,17 @@ use super::{
     write_json_envelope,
 };
 
+/// Shell expression that names a `python3` which actually runs.
+///
+/// `/usr/bin/python3` on macOS is an Xcode shim: after an unattended Xcode
+/// update it exits 69 ("You have not agreed to the Xcode license agreements")
+/// without running anything. Naming it directly made every fleet-update to such
+/// a host -- including a rollback, the emergency path -- exit 69 while a plain
+/// `shipyard update` on the same host worked. Candidates are probed by
+/// executing them, Homebrew first, the same order `ghapp` uses; when none runs
+/// the expression names the cause on stderr and the step fails closed.
+pub(super) const REMOTE_PYTHON: &str = r#""$(for shipyard_python_candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do if test -x "$shipyard_python_candidate" && "$shipyard_python_candidate" -I -c '' >/dev/null 2>&1; then /usr/bin/printf '%s' "$shipyard_python_candidate"; exit 0; fi; done; /usr/bin/printf '%s\n' 'shipyard fleet: no runnable python3 (an Xcode license shim at /usr/bin/python3 exits 69 until sudo xcodebuild -license accept)' >&2; exit 1)""#;
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn remote_update_command(
     binary: &Path,
@@ -365,7 +376,7 @@ if [ {context_required} = 1 ]; then
   auth_generation_context_sha256="$(/usr/bin/shasum -a 256 "$auth_generation_dir/ghapp.shipyard-context.json" | /usr/bin/awk '{{print $1}}')"
   test "$(/usr/bin/stat -f '%Lp' "$auth_generation_dir/ghapp.shipyard-context.json")" = 600
   test "$(auth_manifest_value context_sha256)" = "$auth_generation_context_sha256"
-  /usr/bin/python3 - "$auth_generation_dir/ghapp.shipyard-context.json" {mode} {global_dir} "$auth_generation_id" "$auth_generation_authority" <<'PY'
+  {python} - "$auth_generation_dir/ghapp.shipyard-context.json" {mode} {global_dir} "$auth_generation_id" "$auth_generation_authority" <<'PY'
 import json, sys
 path, expected_mode, expected_global_dir, expected_generation, expected_authority = sys.argv[1:]
 try:
@@ -404,6 +415,7 @@ test "$(/usr/bin/shasum -a 256 {wrapper} | /usr/bin/awk '{{print $1}}')" = "$aut
         global_dir = shlex_quote(&global_dir.display().to_string()),
         companion_required = u8::from(companion_required),
         context_required = u8::from(context_required),
+        python = REMOTE_PYTHON,
     )
 }
 
@@ -425,7 +437,7 @@ test "$daemon_loaded_executable_sha256" = "$auth_generation_binary_sha256"
 daemon_loaded_launch="$(/bin/ps -ww -p "$daemon_observed_pid" -o command=)"
 test -n "$daemon_loaded_launch"
 daemon_auth_probe="$("$auth_generation_dir/shipyard" --mode {mode} --global-dir {global_dir} --state-dir {state_dir} auth helper-argv --wrapper {wrapper} --repo {repository})"
-DAEMON_AUTH_PROBE="$daemon_auth_probe" /usr/bin/python3 - {wrapper} {repository} <<'PY'
+DAEMON_AUTH_PROBE="$daemon_auth_probe" {python} - {wrapper} {repository} <<'PY'
 import json, os, sys, unicodedata
 try:
     value = json.loads(os.environ["DAEMON_AUTH_PROBE"])
@@ -452,6 +464,7 @@ test "$(/usr/bin/tr -d '[:space:]' < {state_dir}/daemon/daemon.pid)" = "$daemon_
         state_dir = shlex_quote(&state_dir.display().to_string()),
         repository = shlex_quote(repository),
         wrapper = shlex_quote(&auth_wrapper.display().to_string()),
+        python = REMOTE_PYTHON,
     )
 }
 
@@ -538,13 +551,14 @@ if not isinstance(token, str) or not token or any(ord(character) <= 32 or ord(ch
     refuse("shipyard fleet auth wrapper returned a malformed token")
 sys.stdout.write(token)"#;
     format!(
-        "resolver_json=\"$({resolver} | /usr/bin/head -c 16385; resolver_status=${{PIPESTATUS[0]}}; exit \"$resolver_status\")\" || {{ /usr/bin/printf '%s\\n' {} >&2; exit 1; }}; if test \"${{#resolver_json}}\" -gt 16384; then /usr/bin/printf '%s\\n' 'shipyard fleet auth resolver response exceeds 16384 bytes' >&2; exit 1; fi; /usr/bin/printf '%s' \"$resolver_json\" | /usr/bin/python3 -I -c {} {} {}",
+        "resolver_json=\"$({resolver} | /usr/bin/head -c 16385; resolver_status=${{PIPESTATUS[0]}}; exit \"$resolver_status\")\" || {{ /usr/bin/printf '%s\\n' {} >&2; exit 1; }}; if test \"${{#resolver_json}}\" -gt 16384; then /usr/bin/printf '%s\\n' 'shipyard fleet auth resolver response exceeds 16384 bytes' >&2; exit 1; fi; /usr/bin/printf '%s' \"$resolver_json\" | {python} -I -c {} {} {}",
         shlex_quote(&format!(
             "shipyard fleet auth resolver unavailable; predeploy {target} with ordinary shipyard update and migrate machine-global github.auth.token_command to the exact ghapp token contract before fleet-update"
         )),
         shlex_quote(parser),
         shlex_quote(&auth_wrapper.display().to_string()),
         shlex_quote(repository),
+        python = REMOTE_PYTHON,
     )
 }
 

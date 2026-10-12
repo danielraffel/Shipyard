@@ -1154,7 +1154,28 @@ reinstalled through the same governed path and verified. The receipt says
 "rolled back to vX". If no governed earlier version exists, or the rollback
 does not verify, the receipt says "ROLLBACK ... FAILED; the host needs an
 operator" and the run exits 7 (`verdict: rollback_failed`). Either way no later
-host is attempted. `--lagging-only` reads each selected host first and skips
+host is attempted.
+
+The **first host is a canary.** After it verifies, the binary just installed
+there runs `runner admission-clean` read-only (never `--apply`) once per
+repository the host serves (`[fleet_update] smoke_repos` overrides; `smoke_base`
+defaults to `main`) with the host class's own `labels`. `admit` (exit 0) or
+`defer` (exit 3) passes; anything else, including `observation_failed`, rolls
+the canary back and stops the rollout before any other host is touched (receipt
+event `canary_smoke`). Version and daemon checks cannot see a release that
+installs cleanly and then fails every GitHub read: v0.302.0-v0.307.0 did, and
+the rollout carried it to every host. A host with no repository or no labels,
+or a target release without `admission-clean`, is reported `skipped`, never
+`passed`. `--skip-canary-smoke` is for an emergency rollback while GitHub itself
+cannot be observed.
+
+Fleet-update's remote scripts select a `python3` that actually runs (Homebrew
+first). Naming `/usr/bin/python3` made every fleet-update to a Mac whose Xcode
+license had lapsed exit 69 -- including a rollback -- while a plain
+`shipyard update` on the same host worked. The immediate host fix is
+`sudo xcodebuild -license accept`.
+
+`--lagging-only` reads each selected host first and skips
 hosts already at or ahead of the target. Reinstalling such a host cannot be
 rolled back and restarts its daemon. The release stage and reconcile always use
 it. The controller's own

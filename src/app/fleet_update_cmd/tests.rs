@@ -163,7 +163,7 @@ fn remote_daemon_auth_probe_executes_the_typed_parser_in_a_scrubbed_environment(
         );
     }
     let parser_start = remote_script
-        .find("DAEMON_AUTH_PROBE=\"$daemon_auth_probe\" /usr/bin/python3")
+        .find("DAEMON_AUTH_PROBE=\"$daemon_auth_probe\" ")
         .expect("remote daemon auth parser start");
     let parser_tail = &remote_script[parser_start..];
     let parser_end = parser_tail
@@ -1338,6 +1338,15 @@ where
     fn verify(&mut self, plan: &HostUpdatePlan, daemon_pid: u32) -> verify::HostVerification {
         (self.verify)(plan, daemon_pid)
     }
+    fn canary_smoke(
+        &mut self,
+        _plan: &HostUpdatePlan,
+        _evidence: &HostUpdateEvidence,
+    ) -> canary::SmokeOutcome {
+        canary::SmokeOutcome::Skipped {
+            reason: "not scripted".to_owned(),
+        }
+    }
     fn rollback(
         &mut self,
         plan: &HostUpdatePlan,
@@ -1594,16 +1603,19 @@ fn apply_stops_before_every_later_host_after_first_failure() {
         .into_iter::<Value>()
         .collect::<Result<Vec<_>, _>>()
         .expect("typed receipts");
-    // m1: update receipt + verification; m3: failed update; then the summary.
-    assert_eq!(receipts.len(), 4);
+    // m1: update receipt + verification + canary smoke; m3: failed update;
+    // then the summary.
+    assert_eq!(receipts.len(), 5);
     assert_eq!(receipts[0]["host_class"], "m1");
     assert_eq!(receipts[1]["event"], "host_verification");
     assert_eq!(receipts[1]["verdict"], "verified");
-    assert_eq!(receipts[3]["event"], "fleet_summary");
-    assert_eq!(receipts[3]["verified_hosts"], serde_json::json!(["m1"]));
-    assert_eq!(receipts[3]["failed_host"]["host_class"], "m3");
+    assert_eq!(receipts[2]["event"], "canary_smoke");
+    assert_eq!(receipts[2]["host_class"], "m1");
+    assert_eq!(receipts[4]["event"], "fleet_summary");
+    assert_eq!(receipts[4]["verified_hosts"], serde_json::json!(["m1"]));
+    assert_eq!(receipts[4]["failed_host"]["host_class"], "m3");
     assert_eq!(
-        receipts[3]["not_attempted_hosts"],
+        receipts[4]["not_attempted_hosts"],
         serde_json::json!(["m5"])
     );
     assert!(
@@ -1625,8 +1637,8 @@ fn apply_stops_before_every_later_host_after_first_failure() {
     assert!(receipts[0]["binary_pair_after"]["companion"].is_object());
     assert_eq!(receipts[0]["daemon_pid"], 42);
     assert_eq!(receipts[0]["configured_repos_preserved"], true);
-    assert_eq!(receipts[2]["host_class"], "m3");
-    assert_eq!(receipts[2]["ok"], false);
+    assert_eq!(receipts[3]["host_class"], "m3");
+    assert_eq!(receipts[3]["ok"], false);
     assert!(!rendered.contains("\"host_class\": \"m5\""));
 }
 
@@ -2350,6 +2362,7 @@ fn fleet_update_apply_refuses_while_another_rollout_holds_the_lock() {
         all_hosts: true,
         apply: true,
         lagging_only: true,
+        skip_canary_smoke: false,
     };
     let mut output = Vec::new();
     let error = fleet_update_command(
@@ -2590,4 +2603,371 @@ fn pr_watch_fleet_rows_fail_only_when_no_host_completes_passes() {
     // Nobody scans at all.
     let rows = reconcile_cmd::pr_watch_fleet_rows(&[("m3".to_owned(), Ok(quiet))]);
     assert!(!rows["pr-watch:fleet"].ok);
+}
+
+/// [`TestOps`] with a scripted canary smoke, recording which hosts were smoked.
+struct CanaryOps<E, V, R> {
+    inner: TestOps<E, V, R>,
+    smoke: canary::SmokeOutcome,
+    smoked: Vec<String>,
+}
+
+impl<E, V, R> HostOps for CanaryOps<E, V, R>
+where
+    E: FnMut(&HostUpdatePlan) -> Result<HostUpdateEvidence, evidence::PlanPhaseError>,
+    V: FnMut(&HostUpdatePlan, u32) -> verify::HostVerification,
+    R: FnMut(&HostUpdatePlan, Option<&str>) -> rollback::RollbackOutcome,
+{
+    fn installed_version(&mut self, plan: &HostUpdatePlan) -> Option<String> {
+        self.inner.installed_version(plan)
+    }
+    fn execute(
+        &mut self,
+        plan: &HostUpdatePlan,
+    ) -> Result<HostUpdateEvidence, evidence::PlanPhaseError> {
+        self.inner.execute(plan)
+    }
+    fn verify(&mut self, plan: &HostUpdatePlan, daemon_pid: u32) -> verify::HostVerification {
+        self.inner.verify(plan, daemon_pid)
+    }
+    fn canary_smoke(
+        &mut self,
+        plan: &HostUpdatePlan,
+        _evidence: &HostUpdateEvidence,
+    ) -> canary::SmokeOutcome {
+        self.smoked.push(plan.class.clone());
+        self.smoke.clone()
+    }
+    fn rollback(
+        &mut self,
+        plan: &HostUpdatePlan,
+        previous: Option<&str>,
+    ) -> rollback::RollbackOutcome {
+        self.inner.rollback(plan, previous)
+    }
+}
+
+fn three_plans() -> Vec<HostUpdatePlan> {
+    ["m1", "m3", "m5"]
+        .iter()
+        .map(|name| host_update_plan(&named_host(name), "v0.137.0").expect("plan"))
+        .collect()
+}
+
+#[test]
+fn a_failed_canary_smoke_rolls_the_canary_back_and_touches_no_other_host() {
+    let plans = three_plans();
+    let mut attempted = Vec::new();
+    let mut output = Vec::new();
+    let mut ops = CanaryOps {
+        inner: TestOps {
+            execute: |plan: &HostUpdatePlan| {
+                attempted.push(plan.class.clone());
+                Ok(evidence("0.137.0"))
+            },
+            verify: verified_ok,
+            rollback: rolled_back_ok,
+            installed: Some("0.136.0".to_owned()),
+            rollbacks: Vec::new(),
+        },
+        smoke: canary::SmokeOutcome::Failed {
+            probes: Vec::new(),
+            reason: "Generous-Corp/pulp: exit 1 verdict error reason observation_failed: GraphQL: ... exceeds the maximum limit of 500,000.".to_owned(),
+        },
+        smoked: Vec::new(),
+    };
+    let error = apply_plans(&plans, &[], "v0.137.0", true, &mut output, &mut ops)
+        .expect_err("a failed canary smoke must stop the rollout");
+    let rollbacks = ops.inner.rollbacks.clone();
+    let smoked = ops.smoked.clone();
+    drop(ops);
+    assert_eq!(attempted, ["m1"], "no host after the canary is touched");
+    assert_eq!(smoked, ["m1"]);
+    assert_eq!(
+        rollbacks,
+        [("m1".to_owned(), Some("0.136.0".to_owned()))],
+        "the canary is restored to its pre-update version"
+    );
+    assert!(error.rollback_failed_host.is_none());
+    assert!(!error.deferred);
+    assert_eq!(error.failure.code, 1);
+    let message = &error.failure.message;
+    assert!(
+        message.contains("m1 (canary) failed its post-update smoke"),
+        "{message}"
+    );
+    assert!(
+        message.contains("exceeds the maximum limit of 500,000"),
+        "{message}"
+    );
+    assert!(
+        message.contains("hosts not verified at v0.137.0: m1, m3, m5"),
+        "{message}"
+    );
+    let receipts = rollout_receipts(output);
+    let smoke = receipts
+        .iter()
+        .find(|receipt| receipt["event"] == "canary_smoke")
+        .expect("canary smoke receipt");
+    assert_eq!(smoke["host_class"], "m1");
+    assert_eq!(smoke["result"]["outcome"], "failed");
+    let summary = receipts.last().expect("summary");
+    assert_eq!(summary["event"], "fleet_summary");
+    assert_eq!(summary["verdict"], "failed");
+    assert_eq!(summary["verified_hosts"], serde_json::json!([]));
+    assert_eq!(
+        summary["not_attempted_hosts"],
+        serde_json::json!(["m3", "m5"])
+    );
+}
+
+#[test]
+fn a_passing_canary_smoke_lets_the_rollout_continue_and_smokes_only_the_canary() {
+    let plans = three_plans();
+    let mut attempted = Vec::new();
+    let mut ops = CanaryOps {
+        inner: TestOps {
+            execute: |plan: &HostUpdatePlan| {
+                attempted.push(plan.class.clone());
+                Ok(evidence("0.137.0"))
+            },
+            verify: verified_ok,
+            rollback: rolled_back_ok,
+            installed: Some("0.136.0".to_owned()),
+            rollbacks: Vec::new(),
+        },
+        smoke: canary::SmokeOutcome::Passed { probes: Vec::new() },
+        smoked: Vec::new(),
+    };
+    apply_plans(&plans, &[], "v0.137.0", true, &mut Vec::new(), &mut ops)
+        .expect("a passing canary lets the rollout finish");
+    let smoked = ops.smoked.clone();
+    let rollbacks = ops.inner.rollbacks.clone();
+    drop(ops);
+    assert_eq!(attempted, ["m1", "m3", "m5"]);
+    assert_eq!(smoked, ["m1"]);
+    assert!(rollbacks.is_empty());
+}
+
+fn smoke_spec_for(repos: &[&str]) -> canary::SmokeSpec {
+    canary::SmokeSpec {
+        repos: repos.iter().map(|repo| (*repo).to_owned()).collect(),
+        base: "main".to_owned(),
+        labels: vec!["self-hosted".to_owned(), "macos".to_owned()],
+    }
+}
+
+#[test]
+fn canary_smoke_judge_accepts_only_an_observed_verdict() {
+    let spec = smoke_spec_for(&["o/a", "o/b"]);
+    let passed = canary::judge(
+        &spec,
+        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"admit\",\"reason\":\"clean\"}\n\
+         SHIPYARD_CANARY_SMOKE_STDERR=o/a|\n\
+         SHIPYARD_CANARY_SMOKE=o/b|3|{\"verdict\":\"defer\",\"reason\":\"observation_in_progress\"}\n",
+    );
+    assert!(
+        matches!(passed, canary::SmokeOutcome::Passed { .. }),
+        "{passed:?}"
+    );
+
+    let failed = canary::judge(
+        &spec,
+        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"admit\"}\n\
+         SHIPYARD_CANARY_SMOKE=o/b|1|{\"verdict\":\"error\",\"reason\":\"observation_failed\",\"error\":\"GraphQL: exceeds the maximum limit of 500,000\"}\n",
+    );
+    let reason = failed.failed().expect("an error verdict fails the smoke");
+    assert!(
+        reason.contains("o/b: exit 1 verdict error reason observation_failed"),
+        "{reason}"
+    );
+    assert!(reason.contains("500,000"), "{reason}");
+    assert!(!reason.contains("o/a"), "{reason}");
+
+    // A crashed binary prints no JSON; its stderr is the evidence.
+    let crashed = canary::judge(
+        &smoke_spec_for(&["o/a"]),
+        "SHIPYARD_CANARY_SMOKE=o/a|2|\nSHIPYARD_CANARY_SMOKE_STDERR=o/a|error: unrecognized subcommand\n",
+    );
+    let reason = crashed.failed().expect("no verdict fails");
+    assert!(reason.contains("unrecognized subcommand"), "{reason}");
+
+    // A repository with no result line, or two, cannot pass.
+    let missing = canary::judge(
+        &spec,
+        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"admit\"}\n",
+    );
+    assert!(
+        missing
+            .failed()
+            .expect("missing")
+            .contains("o/b: no single smoke result")
+    );
+    // Exit and verdict must agree.
+    let mismatched = canary::judge(
+        &smoke_spec_for(&["o/a"]),
+        "SHIPYARD_CANARY_SMOKE=o/a|0|{\"verdict\":\"defer\"}\n",
+    );
+    assert!(mismatched.failed().is_some());
+}
+
+#[test]
+fn canary_smoke_spec_prefers_configured_repos_then_the_daemon_repos() {
+    let labels = vec!["self-hosted".to_owned()];
+    let daemon = vec!["o/served".to_owned()];
+    let spec = canary::smoke_spec(&toml::Table::new(), &labels, &daemon).expect("spec");
+    assert_eq!(spec.repos, ["o/served"]);
+    assert_eq!(spec.base, "main");
+    assert_eq!(spec.labels, labels);
+
+    let config: toml::Table = toml::from_str(
+        "[fleet_update]\nsmoke_repos = [\"o/x\", \"o/x\", \"o/y\"]\nsmoke_base = \"trunk\"\n",
+    )
+    .expect("config");
+    let spec = canary::smoke_spec(&config, &labels, &daemon).expect("spec");
+    assert_eq!(spec.repos, ["o/x", "o/y"]);
+    assert_eq!(spec.base, "trunk");
+
+    let bad: toml::Table =
+        toml::from_str("[fleet_update]\nsmoke_repos = \"o/x\"\n").expect("config");
+    assert!(canary::smoke_spec(&bad, &labels, &daemon).is_err());
+}
+
+#[test]
+fn canary_smoke_with_nothing_to_observe_is_reported_as_skipped_not_passed() {
+    let plan = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
+    let none = canary::run_smoke(&plan, &smoke_spec_for(&[]));
+    assert!(
+        matches!(none, canary::SmokeOutcome::Skipped { .. }),
+        "{none:?}"
+    );
+    assert!(none.failed().is_none());
+    let mut unlabeled = smoke_spec_for(&["o/a"]);
+    unlabeled.labels.clear();
+    assert!(matches!(
+        canary::run_smoke(&plan, &unlabeled),
+        canary::SmokeOutcome::Skipped { .. }
+    ));
+}
+
+/// The emitted script runs the installed binary read-only (never `--apply`)
+/// and its transcript round-trips through the judge.
+#[cfg(unix)]
+#[test]
+fn canary_smoke_script_runs_admission_read_only_and_reports_each_repo() {
+    let temp = tempfile::tempdir().expect("temp");
+    let fake = temp.path().join("shipyard");
+    let calls = temp.path().join("calls");
+    crate::test_support::write_executable_script(
+        &fake,
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in *--help*) exit 0 ;; esac\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *'--repo o/good'*) printf '%s\\n' '{{\"verdict\":\"admit\",\"reason\":\"clean\"}}' ;;\n  *) printf '%s\\n' '{{\"verdict\":\"error\",\"reason\":\"observation_failed\",\"error\":\"node limit\"}}'; echo 'gh failed' >&2; exit 1 ;;\nesac\n",
+            calls.display()
+        ),
+    );
+    let mut plan = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
+    plan.binary = fake;
+    let spec = smoke_spec_for(&["o/bad", "o/good"]);
+    let output = Command::new("/bin/bash")
+        .args(["-c", &canary::smoke_script(&plan, &spec)])
+        .output()
+        .expect("run smoke script");
+    assert!(output.status.success());
+    let outcome = canary::judge(&spec, &String::from_utf8_lossy(&output.stdout));
+    let reason = outcome.failed().expect("the bad repo fails the smoke");
+    assert!(reason.contains("o/bad: exit 1 verdict error"), "{reason}");
+    assert!(reason.contains("node limit"), "{reason}");
+    assert!(!reason.contains("o/good"), "{reason}");
+    let calls = std::fs::read_to_string(&calls).expect("calls");
+    assert_eq!(calls.lines().count(), 2, "{calls}");
+    for line in calls.lines() {
+        assert!(line.contains("runner admission-clean"), "{line}");
+        assert!(line.contains("--labels self-hosted,macos"), "{line}");
+        assert!(line.contains("--base main"), "{line}");
+        assert!(!line.contains("--apply"), "the smoke never mutates: {line}");
+    }
+}
+
+/// The remote scripts must not name `/usr/bin/python3` directly: on a Mac
+/// whose Xcode license lapsed it is a shim that exits 69, which made every
+/// fleet-update to that host (rollbacks included) exit 69.
+#[cfg(unix)]
+#[test]
+fn remote_python_skips_a_shim_that_does_not_run_and_fails_closed_when_none_does() {
+    let candidates = "/opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3";
+    assert!(command::REMOTE_PYTHON.contains(candidates));
+    let temp = tempfile::tempdir().expect("temp");
+    let shim = temp.path().join("shim-python3");
+    let good = temp.path().join("good-python3");
+    crate::test_support::write_executable_script(
+        &shim,
+        "#!/bin/sh\necho 'You have not agreed to the Xcode license agreements.' >&2\nexit 69\n",
+    );
+    crate::test_support::write_executable_script(&good, "#!/bin/sh\nexit 0\n");
+    let select = |list: &str| {
+        Command::new("/bin/bash")
+            .args([
+                "-c",
+                &format!(
+                    "printf 'selected=%s\\n' {}",
+                    command::REMOTE_PYTHON.replace(candidates, list)
+                ),
+            ])
+            .output()
+            .expect("run selector")
+    };
+    let missing = temp.path().join("missing-python3");
+    let chosen = select(&format!(
+        "{} {} {}",
+        shim.display(),
+        missing.display(),
+        good.display()
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&chosen.stdout).trim(),
+        format!("selected={}", good.display())
+    );
+    let none = select(&format!("{} {}", shim.display(), missing.display()));
+    assert_eq!(String::from_utf8_lossy(&none.stdout).trim(), "selected=");
+    assert!(
+        String::from_utf8_lossy(&none.stderr).contains("no runnable python3"),
+        "{}",
+        String::from_utf8_lossy(&none.stderr)
+    );
+    let resolver = command::resolver_auth_token_command(
+        Path::new("/Users/ci/.local/bin/shipyard"),
+        "shipyard",
+        Path::new("/Users/ci/Library/Application Support/shipyard"),
+        "v0.137.0",
+        "danielraffel/Shipyard",
+        Path::new("/Users/ci/.local/bin/ghapp"),
+    );
+    assert!(resolver.contains(command::REMOTE_PYTHON), "{resolver}");
+    assert!(!resolver.contains("| /usr/bin/python3"), "{resolver}");
+}
+
+/// A rollback to a release without `runner admission-clean` must not be
+/// blocked by the smoke: it is reported as skipped.
+#[cfg(unix)]
+#[test]
+fn canary_smoke_of_a_release_without_admission_clean_is_skipped() {
+    let temp = tempfile::tempdir().expect("temp");
+    let fake = temp.path().join("shipyard");
+    crate::test_support::write_executable_script(
+        &fake,
+        "#!/bin/sh\necho \"error: unrecognized subcommand 'admission-clean'\" >&2\nexit 2\n",
+    );
+    let mut plan = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
+    plan.binary = fake;
+    let spec = smoke_spec_for(&["o/a"]);
+    let output = Command::new("/bin/bash")
+        .args(["-c", &canary::smoke_script(&plan, &spec)])
+        .output()
+        .expect("run smoke script");
+    assert!(output.status.success());
+    let outcome = canary::judge(&spec, &String::from_utf8_lossy(&output.stdout));
+    assert!(
+        matches!(outcome, canary::SmokeOutcome::Skipped { .. }),
+        "{outcome:?}"
+    );
 }

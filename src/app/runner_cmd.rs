@@ -259,6 +259,7 @@ fn runner_command_with_actions<W: Write>(
             all_hosts,
             apply,
             lagging_only,
+            skip_canary_smoke,
         } => super::fleet_update_cmd::fleet_update_command(
             &super::fleet_update_cmd::FleetUpdateArgs {
                 to,
@@ -266,6 +267,7 @@ fn runner_command_with_actions<W: Write>(
                 all_hosts,
                 apply,
                 lagging_only,
+                skip_canary_smoke,
             },
             mode,
             cwd,

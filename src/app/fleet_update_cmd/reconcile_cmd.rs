@@ -85,6 +85,7 @@ impl ReconcileEnv for LiveEnv<'_> {
             // Re-checked at apply time: a host that caught up since the
             // decision is skipped rather than reinstalled.
             lagging_only: true,
+            skip_canary_smoke: false,
         };
         // The caller already holds the controller lock.
         match run_fleet_update(
