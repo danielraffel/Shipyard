@@ -1752,6 +1752,16 @@ Reading that failure correctly:
 - **A cheap pre-filter beats a cheaper census.** Every consumer of a pull
   request's checks is gated behind the managed label, so the expensive per-head
   work belongs behind that label rather than spread across every open PR.
+- **A nested connection on the list is refused outright, not slowly.** `gh pr
+  list --json commits` expands to `commits` times each commit's `authors`, so a
+  100-PR page requests over 1,000,000 possible nodes and GitHub answers
+  `By the time this query traverses to the authors connection ... exceeds the
+  maximum limit of 500,000` on every call, whatever the backlog. v0.302.0 to
+  v0.307.0 added `commits` to the census for the owner-wake fallback and no
+  admission call succeeded fleet-wide. The census field set is pinned as
+  `OPEN_PR_LIST_FIELDS` (scalar and flat fields only, enforced by a test); a
+  field that needs nested data is read per pull request, only for the pull
+  request that needs it (`hydrate_owner`).
 
 Because TartCI invokes `shipyard` by name from `PATH`, a gate fix ships by
 replacing that binary. No TartCI generation, supervisor restart or `pool off` is
