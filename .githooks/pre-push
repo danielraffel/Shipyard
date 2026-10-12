@@ -78,7 +78,11 @@ check_pinned_toolchain() {
     if [ -z "$channel" ] || ! command -v rustup >/dev/null 2>&1; then
         return 0
     fi
-    if ! rustup toolchain list 2>/dev/null | awk '{print $1}' | grep -Fxq "$channel"; then
+    # rustup names an installed toolchain `<channel>-<host triple>`, so match
+    # the channel itself or the channel followed by `-`. Auto-install is off
+    # so the probe never stalls fetching the pinned channel.
+    if ! RUSTUP_AUTO_INSTALL=0 rustup toolchain list 2>/dev/null \
+        | awk -v channel="$channel" '$1 == channel || index($1, channel "-") == 1 { found = 1 } END { exit !found }'; then
         echo "[pre-push] pinned Rust $channel is not installed." >&2
         echo "[pre-push] Run: rustup toolchain install $channel --profile minimal --component rustfmt --component clippy" >&2
         return 1
@@ -96,9 +100,15 @@ if is_m3; then
     fi
     blocking_fail=1
 else
-    cargo fmt --all --check || blocking_fail=1
+    cargo fmt --all --check || {
+        echo "[pre-push] cargo fmt --check failed." >&2
+        blocking_fail=1
+    }
     if echo "$changed_files" | grep -Eq '^(src|tests)/'; then
-      cargo clippy --all-targets --locked -- -D warnings || blocking_fail=1
+      cargo clippy --all-targets --locked -- -D warnings || {
+        echo "[pre-push] cargo clippy -D warnings failed." >&2
+        blocking_fail=1
+      }
     fi
 fi
 if [ "$blocking_fail" = "0" ] && [ "$fail" = "0" ]; then
