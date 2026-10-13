@@ -516,7 +516,7 @@ pub fn records_with_times(text: &str) -> Vec<(CiCause, Option<String>)> {
 
 /// When a record printed at log time `at` was named, by GitHub's clock: the
 /// completion the jobs API records for the step whose run covers `at`. Only
-/// a step that started once the failing step had completed counts: pull-request
+/// a step that started once the last failing step had completed counts: pull-request
 /// code runs in earlier steps (a build) and could print a matching record
 /// there, before anything failed. `None` when no such step covers `at`, or the
 /// job has no failing step, so the cause stays retrospective.
@@ -524,7 +524,15 @@ pub fn records_with_times(text: &str) -> Vec<(CiCause, Option<String>)> {
 pub fn printed_at(job: &Job, at: Option<&str>) -> Option<String> {
     let parse = |value: &str| chrono::DateTime::parse_from_rfc3339(value).ok();
     let at = parse(at?)?;
-    let failed_end = parse(job.failing_step()?.completed_at.as_deref()?)?;
+    // The last failing step: a record printed between two failures could
+    // still come from code that ran before the job's final failure.
+    let last_failed = job.steps().iter().rev().find(|step| {
+        matches!(
+            step.conclusion.as_deref(),
+            Some("failure" | "cancelled" | "timed_out")
+        )
+    })?;
+    let failed_end = parse(last_failed.completed_at.as_deref()?)?;
     job.steps().iter().find_map(|step| {
         let start = parse(step.started_at.as_deref()?)?;
         if start < failed_end {

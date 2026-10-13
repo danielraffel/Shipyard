@@ -497,3 +497,33 @@ fn a_printed_record_is_not_read_as_evidence() {
     assert_eq!(cause.format, "shell-exit");
     assert!(!cause.named());
 }
+
+#[test]
+fn only_a_step_after_the_last_failure_can_date_a_record() {
+    // Two failing steps: a record printed between them (in step 2) still ran
+    // before the job's final failure, so it dates nothing; one printed after
+    // the last failure (in step 4) does.
+    let job: Job = serde_json::from_value(json!({
+        "id": 9,
+        "name": "macos",
+        "status": "completed",
+        "conclusion": "failure",
+        "runner_name": "runner-1",
+        "steps": [
+            {"number": 1, "name": "Build", "conclusion": "failure",
+             "started_at": "2026-10-13T10:00:00Z", "completed_at": "2026-10-13T10:01:00Z"},
+            {"number": 2, "name": "Name the cause", "conclusion": "success",
+             "started_at": "2026-10-13T10:01:00Z", "completed_at": "2026-10-13T10:01:05Z"},
+            {"number": 3, "name": "Test", "conclusion": "failure",
+             "started_at": "2026-10-13T10:01:05Z", "completed_at": "2026-10-13T10:05:00Z"},
+            {"number": 4, "name": "Name the cause again", "conclusion": "success",
+             "started_at": "2026-10-13T10:05:00Z", "completed_at": "2026-10-13T10:05:04Z"}
+        ]
+    }))
+    .expect("job");
+    assert_eq!(printed_at(&job, Some("2026-10-13T10:01:02.0000000Z")), None);
+    assert_eq!(
+        printed_at(&job, Some("2026-10-13T10:05:02.0000000Z")).as_deref(),
+        Some("2026-10-13T10:05:04Z")
+    );
+}

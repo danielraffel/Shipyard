@@ -1570,7 +1570,7 @@ builds the cause from the log, and only when the record is bound to the
 payload (repo, head, run, attempt, job name) and names the same cause does it
 mark the cause not retrospective (counted as "named in the job itself"), with
 `named_at` set to the jobs API's completion of the step that printed the
-record, and only for a step that started once the failing step had completed
+record, and only for a step that started once the last failing step had completed
 (pull-request code runs in earlier steps and could print a matching record
 before anything failed). The record's own `named_at` is never used. Pull-request code can print any line, so
 a record is never trusted for its content; a forged one is ignored. Records
