@@ -3765,6 +3765,9 @@ Shipyard just validated** — a *flaky* required leg, not a real regression.
 `auto_rescue::classify_wedge`) decides whether that's the case and, if so,
 renders `GreenNotMergedFlakyRequired` — a hand-back that hands the operator the
 one-liner `shipyard rescue <PR> --rerun-failed` instead of the generic message.
+That command re-runs a terminal `pull_request` run's failed jobs in place
+(`rerun-applied`), keeping its `refs/pull/N/merge` checkout; only runs of other
+events get a dispatched replacement, which would check out the branch tip.
 It never mutates the merge path (only guidance text + one additive JSON field,
 `flaky_required_recovery`).
 

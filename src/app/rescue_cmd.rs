@@ -32,6 +32,9 @@ enum RunOutcome {
     Applied,
     /// A fresh replacement was accepted for a terminal failed/cancelled run.
     ReplacementApplied,
+    /// A terminal `pull_request` run's failed and cancelled jobs were re-run
+    /// in place, keeping its event and its pull request merge ref.
+    RerunApplied,
     /// Skipped: completed/cancelled run encountered without `--rerun-failed`.
     SkippedCompleted,
     /// Skipped: rescue could not plan a dispatch (e.g. workflow not found locally).
@@ -46,6 +49,7 @@ impl RunOutcome {
             Self::Planned => "planned",
             Self::Applied => "applied",
             Self::ReplacementApplied => "replacement-applied",
+            Self::RerunApplied => "rerun-applied",
             Self::SkippedCompleted => "skipped-completed",
             Self::SkippedNoPlan(_) => "skipped-no-plan",
             Self::Failed(_) => "failed",
@@ -298,6 +302,20 @@ fn process_candidate(
         return RunOutcome::SkippedCompleted;
     }
     let run = &candidate.run;
+    if matches!(candidate.kind, CandidateKind::CompletedRerunnable) && run.event == "pull_request" {
+        // A `workflow_dispatch` replacement would check out the branch tip,
+        // not `refs/pull/N/merge`, so its checks prove a different tree than
+        // the one strict protection asks about. Re-run the run itself.
+        if args.dry_run {
+            return RunOutcome::Planned;
+        }
+        return match actions.rerun_failed_run(repo_slug, run.database_id) {
+            Ok(()) => RunOutcome::RerunApplied,
+            Err(error) => RunOutcome::Failed(format!(
+                "rerun of the pull_request run's failed jobs was refused: {error}"
+            )),
+        };
+    }
     let workflow_file = workflow_filename(&run.path);
     let workflow_key = workflows
         .iter()
@@ -961,9 +979,129 @@ cache_ttl_seconds = 300
         assert!(lines[1].contains("repos/owner/repo/actions/runs/42/cancel"));
     }
 
+    fn rerun_args() -> RescueArgs {
+        RescueArgs {
+            pr: Some(7507),
+            all_stuck: false,
+            provider: None,
+            rerun_failed: true,
+            dry_run: false,
+            threshold: "30m".to_owned(),
+            repo: Some("owner/repo".to_owned()),
+            superseded_merge_group: false,
+            apply: false,
+        }
+    }
+
+    /// A terminal `pull_request` run is re-run in place: one `run rerun
+    /// --failed` call, and no `workflow_dispatch`, whose branch-tip checkout
+    /// would prove a different tree than the pull request's merge ref.
     #[cfg(unix)]
     #[test]
-    fn terminal_run_dispatches_one_replacement_without_rearming_original() {
+    fn terminal_pull_request_run_is_rerun_not_replaced() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cfg, actions, log) = scripted_actions(
+            &temp,
+            "case \"$1 $2\" in\n  \"run rerun\") exit 0 ;;\n  \"workflow run\"|\"api -X\") printf 'unexpected dispatch\\n' >&2; exit 9 ;;\nesac\nexit 2",
+        );
+        let mut workflows = BTreeMap::new();
+        workflows.insert("version".to_owned(), workflow("version.yml", true, &[]));
+        for conclusion in ["cancelled", "failure", "timed_out"] {
+            let _ = std::fs::remove_file(&log);
+            let mut run = queued_run(
+                42,
+                "feat/x",
+                "2026-05-13T10:00:00Z",
+                "completed",
+                Some(conclusion),
+            );
+            run.path = ".github/workflows/version.yml".to_owned();
+            let candidate = Candidate {
+                kind: CandidateKind::CompletedRerunnable,
+                run,
+            };
+            let outcome = process_candidate(
+                &candidate,
+                &rerun_args(),
+                &workflows,
+                &cfg,
+                &actions,
+                "owner/repo",
+            );
+            assert_eq!(outcome, RunOutcome::RerunApplied, "{conclusion}");
+            let calls = std::fs::read_to_string(&log).expect("gh log");
+            let lines = calls.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 1, "one rerun and nothing else: {calls}");
+            assert!(
+                lines[0].starts_with("run rerun 42 --failed --repo owner/repo"),
+                "{calls}"
+            );
+        }
+        // A dry run plans and calls nothing.
+        let _ = std::fs::remove_file(&log);
+        let mut run = queued_run(
+            42,
+            "feat/x",
+            "2026-05-13T10:00:00Z",
+            "completed",
+            Some("failure"),
+        );
+        run.path = ".github/workflows/version.yml".to_owned();
+        let candidate = Candidate {
+            kind: CandidateKind::CompletedRerunnable,
+            run,
+        };
+        let dry = RescueArgs {
+            dry_run: true,
+            ..rerun_args()
+        };
+        assert_eq!(
+            process_candidate(&candidate, &dry, &workflows, &cfg, &actions, "owner/repo"),
+            RunOutcome::Planned
+        );
+        assert!(!log.exists(), "a dry run calls nothing");
+    }
+
+    /// A refused rerun is a failure that names the refusal, not a silent skip.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_rerun_fails_the_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cfg, actions, _log) = scripted_actions(
+            &temp,
+            "case \"$1 $2\" in\n  \"run rerun\") printf 'cannot be rerun; This workflow is already running\\n' >&2; exit 1 ;;\nesac\nexit 2",
+        );
+        let workflows = BTreeMap::new();
+        let candidate = Candidate {
+            kind: CandidateKind::CompletedRerunnable,
+            run: queued_run(
+                42,
+                "feat/x",
+                "2026-05-13T10:00:00Z",
+                "completed",
+                Some("failure"),
+            ),
+        };
+        match process_candidate(
+            &candidate,
+            &rerun_args(),
+            &workflows,
+            &cfg,
+            &actions,
+            "owner/repo",
+        ) {
+            RunOutcome::Failed(message) => {
+                assert!(message.contains("already running"), "{message}")
+            }
+            outcome => panic!("expected a failure, got {outcome:?}"),
+        }
+    }
+
+    /// A terminal run of any other event still gets one dispatched
+    /// replacement, and the terminal original is left untouched.
+    #[cfg(unix)]
+    #[test]
+    fn terminal_non_pull_request_run_dispatches_one_replacement_without_rearming_original() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (cfg, actions, log) = scripted_actions(
             &temp,
@@ -978,25 +1116,21 @@ cache_ttl_seconds = 300
             "completed",
             Some("cancelled"),
         );
+        run.event = "workflow_dispatch".to_owned();
         run.path = ".github/workflows/version.yml".to_owned();
         let candidate = Candidate {
             kind: CandidateKind::CompletedRerunnable,
             run,
         };
-        let args = RescueArgs {
-            pr: Some(7507),
-            all_stuck: false,
-            provider: None,
-            rerun_failed: true,
-            dry_run: false,
-            threshold: "30m".to_owned(),
-            repo: Some("owner/repo".to_owned()),
-            superseded_merge_group: false,
-            apply: false,
-        };
 
-        let outcome =
-            process_candidate(&candidate, &args, &workflows, &cfg, &actions, "owner/repo");
+        let outcome = process_candidate(
+            &candidate,
+            &rerun_args(),
+            &workflows,
+            &cfg,
+            &actions,
+            "owner/repo",
+        );
 
         assert_eq!(outcome, RunOutcome::ReplacementApplied);
         let calls = std::fs::read_to_string(log).expect("gh log");
