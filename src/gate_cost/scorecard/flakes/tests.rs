@@ -50,6 +50,7 @@ fn query_for(from: &str, to: &str) -> ScorecardQuery {
         gate_job: "macos".to_owned(),
         base_branch: "main".to_owned(),
         required_contexts: Vec::new(),
+        selection_steps: Vec::new(),
         from: at(from),
         to: at(to),
     }

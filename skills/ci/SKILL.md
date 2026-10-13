@@ -441,6 +441,16 @@ sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
 cannot be had the write is skipped and the cache stops writing for that run; a
 cold read is always correct. Any new cache in the state tree needs the same.
 
+## Only the production daemon defaults to the fleet repositories
+
+`daemon run` and `daemon start` without `--repo` watch the fleet repositories
+(`FLEET_REPOSITORIES`) only in `--mode shipyard`. An isolated daemon without
+`--repo` keeps the old behaviour: the repos of in-flight ship state, which is
+nothing for a fresh state directory. Sandbox E2E's guardian requires exactly
+that (`configured_repos == []` within 10 s), so if it fails with "candidate
+daemon did not become ready" and the candidate's status lists the fleet,
+check `requested_daemon_repos` in `src/app/daemon_cmd.rs` first.
+
 ## A foreign writer-domain holder is named in the guardian receipt
 
 Sandbox E2E fails with `foreign process entered the production writer domain:
