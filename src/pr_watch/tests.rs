@@ -164,6 +164,49 @@ fn signatures_prefer_ctest_names_then_a_meaningful_error_line() {
     assert!(failure_signatures("##[error]Process completed with exit code 2.\n").is_empty());
 }
 
+#[test]
+fn signatures_skip_ctest_progress_lines_after_the_failure_summary() {
+    // The shape of Pulp job 114282131409's `macos` log: the summary, then a
+    // second `CTest` run whose progress lines follow it.
+    let log = "2026-10-11T10:00:00.1Z The following tests FAILED:\n\
+               2026-10-11T10:00:00.2Z \t21850 - changed-surface-script-families-drift (Failed)\n\
+               2026-10-11T10:00:00.3Z Test project /Users/admin/actions-runner/_work/pulp/pulp/build-macos\n\
+               2026-10-11T10:00:00.4Z       Start 12279: HeadlessHost creates processor\n\
+               2026-10-11T10:00:01.1Z  1/32 Test #12279: HeadlessHost creates processor ..........   Passed    0.01 sec\n\
+               2026-10-11T10:00:01.2Z 10/32 Test #12298: HeadlessHost forwards explicit MIDI buffers ...   Passed    0.02 sec\n\
+               2026-10-11T10:00:02.2Z ##[error]Process completed with exit code 8.\n";
+    assert_eq!(
+        failure_signatures(log),
+        vec!["changed-surface-script-families-drift".to_owned()]
+    );
+}
+
+#[test]
+fn signatures_name_unittest_and_cargo_failures_before_the_error_line() {
+    // Lines from tartci job 114081457704's `lint` log (Python unittest).
+    let unittest = "2026-10-10T00:20:01.1Z test_ok (test_x.T.test_ok) ... ok\n\
+                    2026-10-10T00:20:02.1Z ERROR: test_recorded_run_attributes_the_gate_job_to_studio (test_supply_observed.RecordedFixtureTests.test_recorded_run_attributes_the_gate_job_to_studio)\n\
+                    2026-10-10T00:20:02.2Z FAIL: test_each_host_serves_releases_first_on_exactly_one_slot (test_assignment_v2.ShippedFleetReleaseFirstSlotTests.test_each_host_serves_releases_first_on_exactly_one_slot)\n\
+                    2026-10-10T00:20:03.1Z FAILED (failures=1, errors=1, skipped=12)\n\
+                    2026-10-10T00:20:03.2Z ##[error]Process completed with exit code 1.\n";
+    assert_eq!(
+        failure_signatures(unittest),
+        vec![
+            "test_assignment_v2.ShippedFleetReleaseFirstSlotTests.test_each_host_serves_releases_first_on_exactly_one_slot".to_owned(),
+            "test_supply_observed.RecordedFixtureTests.test_recorded_run_attributes_the_gate_job_to_studio".to_owned(),
+        ]
+    );
+    let cargo = "2026-10-10T00:20:01.1Z test pr_watch::tests::fine ... ok\n\
+                 2026-10-10T00:20:01.2Z test head_approval::tests::a_hold_refuses ... FAILED\n\
+                 2026-10-10T00:20:02.2Z test result: FAILED. 1 passed; 1 failed\n";
+    assert_eq!(
+        failure_signatures(cargo),
+        vec!["head_approval::tests::a_hold_refuses".to_owned()]
+    );
+    // A bare "FAILED (failures=1)" summary names no test.
+    assert!(failure_signatures("FAILED (failures=1)\n").is_empty());
+}
+
 // ---- flag 1 -------------------------------------------------------------------
 
 fn repeat_history(other_prs_failing: usize, second_head_green: bool) -> RepoHistory {

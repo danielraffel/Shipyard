@@ -33,6 +33,7 @@ fn history_with(thresholds: &Thresholds) -> RepoHistory {
         required_checks: Vec::new(),
         from: until() - Duration::days(7),
         to: until(),
+        required_checks_optional: false,
     };
     gather(&read, &ReadCache::disabled(), &query, thresholds).expect("gather from fixtures")
 }

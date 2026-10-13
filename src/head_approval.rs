@@ -252,6 +252,12 @@ fn marker_names_head(body: &str, head: &str) -> bool {
     })
 }
 
+/// `(approve, head)` from a comment body's verdict line: the same marker the
+/// approval gate reads, for observers that only need to see verdicts.
+pub(crate) fn verdict_line(body: &str) -> Option<(bool, String)> {
+    marker_verdict(body).map(|(verdict, head)| (verdict == Verdict::Approve, head))
+}
+
 fn normalized_login(value: &str) -> String {
     let value = value.strip_prefix("app/").unwrap_or(value);
     value

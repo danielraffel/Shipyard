@@ -55,6 +55,9 @@ pub struct WatchQuery {
     pub from: DateTime<Utc>,
     /// Window end.
     pub to: DateTime<Utc>,
+    /// A base branch with no required checks reads as an empty list instead
+    /// of an error (the rules watcher still has trails and queue state).
+    pub required_checks_optional: bool,
 }
 
 fn strings(parts: &[&str]) -> Vec<String> {
@@ -151,7 +154,7 @@ fn read_required_checks(gh: &SyncGhReader<'_>, query: &WatchQuery) -> Result<Vec
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
-    if contexts.is_empty() {
+    if contexts.is_empty() && !query.required_checks_optional {
         return Err(format!(
             "no required status checks readable on {}:{}; set [pr_watch] required_checks",
             query.repo, query.base

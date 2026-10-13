@@ -1363,6 +1363,90 @@ pub(crate) enum PrWatchCommand {
     /// host with `[pr_watch] enabled` off is never stale. Reads machine-global
     /// config and local state only.
     Liveness,
+    /// Rules-first watcher: one JSONL event on stdout per new condition a
+    /// close monitor would act on (a READY head nobody reviewed, an armed
+    /// head nobody approved, a red required check with its failing tests, a
+    /// stuck or removed queue entry, a verdict to route, a host alarm), each
+    /// once, and nothing otherwise. The first pass only records the current
+    /// conditions. Read-only on GitHub.
+    Rules(PrWatchRulesArgs),
+    /// Replay the rules watcher over a past window: the same rules at every
+    /// tick, each event stamped with the tick that first saw it.
+    RulesReplay(PrWatchRulesReplayArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PrWatchRulesSource {
+    /// Repository to watch, `OWNER/REPO` or `OWNER/REPO@workflow.yml` (the
+    /// gate workflow whose pull-request runs mark each head; default
+    /// `[pr_watch] workflow`). Repeatable.
+    #[arg(long = "repo", required = true)]
+    pub(crate) repos: Vec<String>,
+    /// Repository whose `[tartci] ...` issues are host alarms.
+    #[arg(long = "alarm-repo")]
+    pub(crate) alarm_repo: Option<String>,
+    /// JSONL file of events from another source (`kind`, `key`, `at`, and
+    /// optionally `summary`, `repo`, `pr`), passed through once per key.
+    /// Repeatable.
+    #[arg(long = "input-events")]
+    pub(crate) input_events: Vec<PathBuf>,
+    /// Also report a head with neither a READY nor a verdict after this long
+    /// (for example `45m`). Off by default: it fires for every head an agent
+    /// is still working on.
+    #[arg(long = "head-unreviewed-after")]
+    pub(crate) head_unreviewed_after: Option<String>,
+    /// A merge-queue entry is reported stuck after this long.
+    #[arg(long = "queue-stuck-after", default_value = "90m")]
+    pub(crate) queue_stuck_after: String,
+    /// An approved head nobody armed is reported after this long.
+    #[arg(long = "approved-unarmed-after", default_value = "15m")]
+    pub(crate) approved_unarmed_after: String,
+    /// Read every answer live instead of reusing settled answers.
+    #[arg(long = "no-cache")]
+    pub(crate) no_cache: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PrWatchRulesArgs {
+    #[command(flatten)]
+    pub(crate) source: PrWatchRulesSource,
+    /// History to read behind now, for heads, queue state and trails.
+    #[arg(long, default_value = "3d")]
+    pub(crate) lookback: String,
+    /// Override the ledger of emitted keys.
+    #[arg(long = "state-file")]
+    pub(crate) state_file: Option<PathBuf>,
+    /// Print what would be emitted without recording it.
+    #[arg(long = "dry-run")]
+    pub(crate) dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PrWatchRulesReplayArgs {
+    #[command(flatten)]
+    pub(crate) source: PrWatchRulesSource,
+    /// Window length ending at --until (or now), for example `2d`.
+    #[arg(long, default_value = "2d")]
+    pub(crate) since: String,
+    /// Window end, RFC 3339. Defaults to now.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+    /// Evaluation step.
+    #[arg(long, default_value = "5m")]
+    pub(crate) tick: String,
+    /// History read before the window start, so the first tick knows the
+    /// heads, queue state and verdicts already in place.
+    #[arg(long, default_value = "3d")]
+    pub(crate) lookback: String,
+    /// Write the events here instead of stdout.
+    #[arg(long)]
+    pub(crate) out: Option<PathBuf>,
+    /// Record every GitHub request and answer under this directory.
+    #[arg(long, hide = true)]
+    pub(crate) record: Option<PathBuf>,
+    /// Serve GitHub answers from a recording instead of the network.
+    #[arg(long, hide = true)]
+    pub(crate) fixtures: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
