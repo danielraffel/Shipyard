@@ -1728,7 +1728,10 @@ def git_compare(repo, argv):
         _, _, old, new, letter = meta.split()
         entry = {"filename": name, "status": {"A": "added", "D": "removed"}.get(letter, "modified"),
                  "sha": new if letter != "D" else old}
-        if name not in binary:
+        # GitHub sends no patch for a binary file, nor for a text file too
+        # large to show.
+        size = int(_git(repo, "cat-file", "-s", entry["sha"])) if letter != "D" else 0
+        if name not in binary and size <= LARGE_TEXT:
             entry["patch"] = "@@"
         files.append(entry)
     return {"status": status, "ahead_by": ahead, "behind_by": behind, "total_commits": ahead,
@@ -1739,6 +1742,12 @@ def git_diff(repo, argv):
     base = _git(repo, "merge-base", x, y)
     return _sp.run(["git", "diff", "--no-renames", "--full-index", base, y], cwd=repo,
                    capture_output=True, text=True, check=True).stdout
+LARGE_TEXT = 100_000
+def git_blob(repo, argv):
+    import base64 as _b64
+    sha = next(part for part in argv.split() if "/git/blobs/" in part).rsplit("/", 1)[1]
+    data = _sp.run(["git", "cat-file", "blob", sha], cwd=repo, capture_output=True, check=True).stdout
+    return {"sha": sha, "encoding": "base64", "content": _b64.b64encode(data).decode()}
 def git_trees(repo, argv):
     import re as _re
     found = {}
@@ -1791,6 +1800,8 @@ class ReviewBeforeArm(unittest.TestCase):
             "        continue\n"
             "    if 'git_tree' in answer:\n"
             "        sys.stdout.write(json.dumps(git_trees(answer['git_tree'], argv))); sys.exit(0)\n"
+            "    if 'git_blob' in answer:\n"
+            "        sys.stdout.write(json.dumps(git_blob(answer['git_blob'], argv))); sys.exit(0)\n"
             "    if 'git' in answer and 'vnd.github.diff' in argv:\n"
             "        sys.stdout.write(git_diff(answer['git'], argv)); sys.exit(0)\n"
             "    if 'git' in answer:\n"
@@ -2143,6 +2154,7 @@ class ReviewBeforeArm(unittest.TestCase):
             body=f"verdict: APPROVE head:{history.approved}")]
         answers = self.case("shipyard-784", graphql=graphql, queue=False, comments=[trail])
         answers.insert(0, ("compare/", {"git": str(history.path)}))
+        answers.insert(0, ("/git/blobs/", {"git_blob": str(history.path)}))
         answers.insert(0, ("object(expression:", {"git_tree": str(history.path)}))
         return [(needle, {"json": pull}) if needle == "/pulls/" else (needle, answer)
                 for needle, answer in answers]
@@ -2172,6 +2184,37 @@ class ReviewBeforeArm(unittest.TestCase):
         result = self.land(history, head)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("changes a binary file (x.bin)", result.stderr)
+
+    def test_a_large_one_line_text_file_is_not_binary(self) -> None:
+        # GitHub omits the patch of a text file too large to show (tartci's
+        # 406 KB one-line JSON fixtures); its blob has no NUL, so it is text.
+        history = CarryHistory(self.root / "repo", large_text=True)
+        result = self.land(history, history.merge())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("/git/blobs/", self.calls(), "the blob decided, not the missing patch")
+        # Control: a real binary in the same pull request still refuses.
+        history = CarryHistory(self.root / "repo2", binary=True, large_text=True)
+        refused = self.land(history, history.merge())
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("changes a binary file (x.bin)", refused.stderr)
+
+    def test_an_unreadable_blob_refuses_without_calling_it_binary(self) -> None:
+        history = CarryHistory(self.root / "repo", large_text=True)
+        head = history.merge()
+        answers = self.carry_answers(history, head)
+        answers.insert(0, ("/git/blobs/", {"error": "HTTP 502"}))
+        result = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", head],
+                                answers, "danielraffel/Shipyard")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot tell whether blob", result.stderr)
+        self.assertNotIn("changes a binary file", result.stderr)
+
+    def test_a_rebase_carries_a_large_one_line_text_file(self) -> None:
+        history = CarryHistory(self.root / "repo", large_text=True)
+        head = history.rebase()
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("/git/blobs/", self.calls())
 
     def test_a_merge_that_only_flips_a_prs_file_mode_needs_a_new_verdict(self) -> None:
         # The compare API lists no mode, so the blob alone looks unchanged.
@@ -2374,7 +2417,7 @@ class CarryHistory:
     (and optionally changes a binary), its approved head, and a base commit
     since; with the updates the carry rule judges."""
 
-    def __init__(self, path: pathlib.Path, binary: bool = False) -> None:
+    def __init__(self, path: pathlib.Path, binary: bool = False, large_text: bool = False) -> None:
         self.path = path
         path.mkdir(parents=True)
         self.git("init", "-q", "-b", "main")
@@ -2391,6 +2434,10 @@ class CarryHistory:
         self.write("guard.c", "".join(lines).encode())
         if binary:
             self.write("x.bin", b"\x00\x01pr-binary-v1")
+        if large_text:
+            self.write("fixture.json", ('{"rows": [' + ",".join(['{"k": "v"}'] * 40_000)
+                                        + "]}").encode())
+            self.git("add", "fixture.json")
         self.git("commit", "-qam", "pr: add guard")
         self.approved = self.git("rev-parse", "HEAD")
         self.git("checkout", "-q", "main")

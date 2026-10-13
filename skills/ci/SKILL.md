@@ -221,6 +221,11 @@ renames `a.py` to `b.py`) is not a false refusal: the base edited the rename's
 source, and a merge that keeps the approved `b.py` drops that edit. Re-review
 the merged head.
 
+"changes a binary file" means the file's blob has a NUL byte, git's rule; a
+large one-line text file GitHub shows no patch for (tartci's JSON fixtures) is
+text and does not trip it. "cannot tell whether blob ... is binary" is an
+unreadable blob: re-run the landing, it is not a binary finding.
+
 Two things not to conclude from it:
 
 - **A refusal is usually the `ghapp` queue-arm guard agreeing there is nothing to

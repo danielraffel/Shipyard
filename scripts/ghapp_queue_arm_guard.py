@@ -907,7 +907,7 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
             return "the pull request's files are unreadable"
         before = _pr_files(before_compare, f"compare/{base}...{approved[:12]}")
         after = _pr_files(after_compare, f"compare/{base}...{head[:12]}")
-        binary = sorted(name for name, (_, _, patch) in before.items() if not patch)
+        binary = binary_files(repo, before)
         if binary:
             return f"the pull request changes a binary file ({binary[0]})"
         if sorted(before) != sorted(after):
@@ -1030,6 +1030,39 @@ def _same_patch(old_diff: str, new_diff: str, record: dict[str, Any]) -> str | N
     return None
 
 
+# Git calls a file binary when a NUL byte appears in its first 8000 bytes.
+BINARY_PROBE_BYTES = 8000
+
+
+def blob_is_binary(repo: str, sha: str) -> bool:
+    """Whether blob ``sha`` is binary by git's rule (a NUL byte early on).
+
+    GitHub omits a comparison's ``patch`` for a binary file, but also for a
+    text file too large to show (a one-line JSON fixture of hundreds of KB),
+    so a missing patch alone does not say binary. Raises GuardError when the
+    blob cannot be read: unknown is a refusal, never "binary".
+    """
+    import base64
+    try:
+        blob = run_real_gh(["api", f"repos/{repo}/git/blobs/{sha}"])
+    except GuardError as error:
+        raise GuardError(f"cannot tell whether blob {sha[:12]} is binary: {error}") from error
+    if not isinstance(blob, dict) or blob.get("encoding") != "base64":
+        raise GuardError(f"cannot tell whether blob {sha[:12]} is binary: it is unreadable")
+    try:
+        data = base64.b64decode(str(blob.get("content") or ""))
+    except ValueError as error:
+        raise GuardError(f"cannot tell whether blob {sha[:12]} is binary: {error}") from error
+    return b"\0" in data[:BINARY_PROBE_BYTES]
+
+
+def binary_files(repo: str, files: dict[str, tuple[str, str, bool]]) -> list[str]:
+    """The files a comparison lists that are binary: those with no text patch
+    whose blob is binary. A file with a patch is text."""
+    return sorted(name for name, (_, sha, has_patch) in files.items()
+                  if not has_patch and blob_is_binary(repo, sha))
+
+
 def _rename_sources(compare: dict[str, Any]) -> dict[str, str]:
     """``filename -> previous_filename`` for every rename a comparison lists."""
     return {
@@ -1086,7 +1119,7 @@ def _reapplies_exactly(repo: str, approved: str, head: str,
     (changed, renamed or deleted) none of the pull request's files between the
     merge bases, and every one of them has, at the new head, the blob and mode
     it was approved with. No binary change is accepted."""
-    binary = sorted(name for name, (_, _, has_patch) in before.items() if not has_patch)
+    binary = binary_files(repo, before)
     if binary:
         return f"the pull request changes a binary file ({binary[0]})"
     # A rename's source is the pull request's file too: a base edit to it
