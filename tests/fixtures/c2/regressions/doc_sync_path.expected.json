@@ -1,0 +1,29 @@
+[
+ {
+  "format": "gate_policy",
+  "kind": "gate_policy",
+  "subject": "docs/ship-state-machine.md",
+  "message": "mapped paths changed without updating the doc.",
+  "location": "",
+  "line": 4,
+  "step_failed": true
+ },
+ {
+  "format": "gate_policy",
+  "kind": "gate_policy",
+  "subject": "config-doc",
+  "message": "mapped paths changed without their guide (.shipyard/config.toml -> docs/guides/local-ci.md)",
+  "location": "",
+  "line": 6,
+  "step_failed": true
+ },
+ {
+  "format": "shell_exit",
+  "kind": "exit_code",
+  "subject": "python3 scripts/doc_sync_check.py --mode report",
+  "message": "exit code 1: \u2717 doc: mapped paths changed without their guide (.shipyard/config.toml -> docs/guides/local-ci.md)",
+  "location": "",
+  "line": 7,
+  "step_failed": true
+ }
+]

@@ -1,0 +1,11 @@
+[
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "operation canceled",
+  "message": "The operation was canceled.",
+  "location": "",
+  "line": 4,
+  "step_failed": true
+ }
+]

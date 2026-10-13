@@ -112,13 +112,68 @@ fn removing_a_fixtures_marker_removes_its_records() {
 
 #[test]
 fn the_regressions_yield_their_expected_records() {
-    for name in ["catch2_anchor", "step_priority_37215232810"] {
+    let mut names: Vec<String> = std::fs::read_dir(format!("{}/regressions", dir()))
+        .expect("regressions")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            name.strip_suffix(".log").map(str::to_owned)
+        })
+        .collect();
+    names.sort();
+    for name in &names {
         assert_eq!(
             extract(&read(&format!("regressions/{name}.log"))),
             expected(&format!("regressions/{name}")),
             "{name}"
         );
     }
+    assert_eq!(names.len(), 7);
+}
+
+fn gate_records(name: &str) -> Vec<Record> {
+    extract(&read(&format!("regressions/{name}.log")))
+        .into_iter()
+        .filter(|record| record.format == "gate_policy")
+        .collect()
+}
+
+#[test]
+fn gate_policy_skips_the_echoed_script() {
+    let records = gate_records("gate_policy_echo");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.subject.as_str(), record.line))
+            .collect::<Vec<_>>(),
+        vec![("provider resolution", 5)]
+    );
+}
+
+#[test]
+fn doc_sync_names_any_path() {
+    let subjects: Vec<String> = gate_records("doc_sync_path")
+        .into_iter()
+        .map(|record| record.subject)
+        .collect();
+    assert_eq!(subjects, ["docs/ship-state-machine.md", "config-doc"]);
+}
+
+#[test]
+fn skill_sync_detail_drops_the_period() {
+    let records = gate_records("skill_sync_period");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.subject.as_str(), record.message.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("Skill-sync", "")]
+    );
+}
+
+#[test]
+fn an_exits_tail_walks_past_step_settings() {
+    let records = extract(&read("regressions/exit_tail_env.log"));
+    assert_eq!(records[0].message, "exit code 1: ./guard.sh");
 }
 
 #[test]

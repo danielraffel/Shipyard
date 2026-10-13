@@ -274,7 +274,12 @@ fn named_needs_a_class_and_confidence() {
         .into_iter()
         .find(|record| record.subject == "operation canceled")
         .expect("cancel");
-    assert!(to_ci_cause_v1(&cancel, &place(), &[], None, true).named());
+    let bare = to_ci_cause_v1(&cancel, &place(), &[], None, true);
+    assert_eq!(
+        (bare.failure_class.as_str(), bare.confidence.as_str()),
+        ("cancelled", "low")
+    );
+    assert!(!bare.named());
     let missing = c2::extract_log_fetch_error("Not Found").remove(0);
     let cause = to_ci_cause_v1(&missing, &place(), &[], None, true);
     assert_eq!(cause.confidence, "high");
@@ -305,4 +310,20 @@ fn an_inline_ctest_timeout_is_a_timeout() {
             .iter()
             .all(|cause| cause.failure_class == "timeout")
     );
+}
+
+#[test]
+fn a_bare_cancel_is_low_and_not_named() {
+    let text = fixture("c2/regressions/bare_cancel.log");
+    let record = c2::extract(&text).remove(0);
+    let cause = to_ci_cause_v1(&record, &place(), &split_lines(&text), None, true);
+    assert_eq!(
+        (
+            cause.format.as_str(),
+            cause.failure_class.as_str(),
+            cause.confidence.as_str()
+        ),
+        ("infra-cancel", "cancelled", "low")
+    );
+    assert!(!cause.named());
 }

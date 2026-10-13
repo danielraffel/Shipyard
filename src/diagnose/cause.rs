@@ -163,13 +163,16 @@ pub fn v1(format: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// How sure a C2 record is: `low` for an exit code, a bare annotation, or a
-/// line outside the failing step; `medium` for formats that can name a
+/// How sure a C2 record is: `low` for an exit code, a bare annotation, a
+/// bare cancel, or a line outside the failing step; `medium` for formats that can name a
 /// symptom rather than the failure; else `high`.
 #[must_use]
 pub fn confidence(record: &Record) -> &'static str {
     if matches!(record.format.as_str(), "gha_annotation" | "shell_exit")
         || record.step_failed == Some(false)
+        // A bare cancel says nothing of who cancelled or why; it is named only
+        // once the cancel is attributed (a supersede, a timeout).
+        || (record.format == "infra" && record.subject == "operation canceled")
     {
         "low"
     } else if matches!(

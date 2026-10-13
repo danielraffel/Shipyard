@@ -727,15 +727,23 @@ type GateRule = (
 
 static GATE: LazyLock<[GateRule; 3]> = LazyLock::new(|| {
     [
+        // The verdict's own trailing period is not a detail.
         (
-            pattern(r"^(Skill-sync) check FAILED\b:?\s*(.*)$"),
+            pattern(r"^(Skill-sync) check FAILED[.:]?\s*(.*)$"),
             |m| m[1].to_owned(),
             |m| m[2].to_owned(),
         ),
+        // Pulp prints `✗ doc: ...`, Shipyard `✗ docs/<file>.md: ...`.
         (
-            pattern(r"^✗ doc: (mapped paths changed.*)$"),
-            |_| "config-doc".to_owned(),
-            |m| m[1].to_owned(),
+            pattern(r"^✗ (\S+?): (mapped paths changed.*)$"),
+            |m| {
+                if &m[1] == "doc" {
+                    "config-doc".to_owned()
+                } else {
+                    m[1].to_owned()
+                }
+            },
+            |m| m[2].to_owned(),
         ),
         (
             pattern(
@@ -747,10 +755,19 @@ static GATE: LazyLock<[GateRule; 3]> = LazyLock::new(|| {
     ]
 });
 
+/// Echoed script text naming a marker is not the event.
+fn echoed(text: &str) -> bool {
+    (text.starts_with("echo ") || text.starts_with("grep ") || text.starts_with('#'))
+        && !text.starts_with("##[error]")
+}
+
 fn rule_gate_policy(lines: &[String]) -> Vec<Record> {
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let text = line.trim();
+        if echoed(text) {
+            continue;
+        }
         for (rule, subject, message) in GATE.iter() {
             if let Some(caps) = rule.captures(text) {
                 out.push(rec(
@@ -823,10 +840,7 @@ fn rule_infra(lines: &[String]) -> Vec<Record> {
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let text = line.trim();
-        // Echoed script text naming a marker is not the event.
-        if (text.starts_with("echo ") || text.starts_with("grep ") || text.starts_with('#'))
-            && !text.starts_with("##[error]")
-        {
+        if echoed(text) {
             continue;
         }
         for (rule, _, subject) in INFRA.iter() {
