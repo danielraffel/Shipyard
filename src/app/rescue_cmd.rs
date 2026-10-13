@@ -1081,6 +1081,7 @@ cache_ttl_seconds = 300
         assert!(lines[1].contains("repos/owner/repo/actions/runs/42/cancel"));
     }
 
+    #[cfg(unix)]
     fn rerun_args() -> RescueArgs {
         RescueArgs {
             pr: Some(7507),
