@@ -3532,7 +3532,11 @@ this rule, while Shipyard's own paths still honour a repository's explicit
 (`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts only the
 fleet App and OWNER/MEMBER/COLLABORATOR verdicts; its override,
 `GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
-`docs/ghapp-guards.md`, Review before arm). See `crate::head_approval`. Its count of queue removals per
+`docs/ghapp-guards.md`, Review before arm). A HOLD acts too: on a host with
+`hold-disarms`, `verdict-hold-hook` dequeues or disarms a pull request queued
+or armed at exactly the head a HOLD names, before the HOLD posts, and never
+blocks the HOLD (`docs/ghapp-guards.md`, A HOLD takes its head out of the
+landing path). See `crate::head_approval`. Its count of queue removals per
 head reads only the last 100 timeline events, so a very busy pull request can
 under-count; that errs lenient (an approval is still required), never strict. This matters because Shipyard's own admission path enqueues only
 after it has validated a head, which happens only while a Shipyard process is

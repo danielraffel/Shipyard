@@ -17,6 +17,7 @@ present, or not executable, is skipped.
 | `queue-arm-guard` | `scripts/ghapp_queue_arm_guard.py` | `pr merge --auto`, a plain `pr merge` whose base has a merge queue, `enablePullRequestAutoMerge`, `enqueuePullRequest`, when the PR's live state makes arming harmful (below); and those plus every direct merge (`pr merge`, `--admin`, REST `PUT pulls/<n>/merge`, `mergePullRequest`) when the head has no reviewer approval or the request does not bind it ([Review before arm or merge](#review-before-arm-or-merge)) |
 | `branch-refresh-guard` | `scripts/ghapp_branch_refresh_guard.py` | `pr update-branch`, REST `pulls/<n>/update-branch`, `updatePullRequestBranch`, only when the base's `[merge] refresh_branch` policy is `"only-if-conflicting"` and the refresh is provably pointless (below) |
 | `merge-guard` | `scripts/ghapp_merge_guard.sh` | `pr merge` on a repository listed in `~/.config/shipyard/merge-guard.json` (one that cannot enforce required checks server-side) until every listed check reads `pass`, and `--auto` there outright; inert for unlisted repositories and when that file is missing or malformed |
+| `verdict-hold-hook` | `scripts/ghapp_verdict_hold_hook.py` | nothing: before a HOLD verdict posts, it dequeues or disarms that pull request when it is queued or armed at exactly the HOLD's head ([A HOLD takes its head out of the landing path](#a-hold-takes-its-head-out-of-the-landing-path)) |
 
 `pr-close-guard` is a mandatory member of the authenticated `ghapp` generation
 and is managed by `shipyard fleet update`, not by this page.
@@ -163,6 +164,70 @@ A request that names no head (a GraphQL body on stdin) needs both overrides.
 Shipyard's own validated enqueue and classic merge carry
 `SHIPYARD_INTERNAL_QUEUE_MUTATION` and apply the same rule in Rust
 (`crate::head_approval`); its `--arm` override names who armed.
+
+### A HOLD takes its head out of the landing path
+
+A HOLD posted on a head that is already armed or queued did not stop it: on
+2026-10-12/13 six Generous-Corp/pulp pull requests merged minutes after a
+`verdict: HOLD` naming their merge head, because the review rule judges only
+the arm. `verdict-hold-hook` makes the verdict act.
+
+**What it recognises:** a HOLD being posted on a pull request through `ghapp`,
+in any of these forms:
+
+* `pr comment <selector>` (`--body`, `--body-file`), the selector anywhere
+  among the arguments: a number, `#N`, a pull request URL, or none (the
+  current branch's pull request);
+* `pr review <selector> --request-changes` (a HOLD on the current head
+  unless the body names one), or a `pr review` whose body is a HOLD;
+* `api repos/O/R/issues/N/comments` (`--input` JSON `body`, or `-f/-F body=`,
+  `body=@FILE`);
+* `api -X PATCH repos/O/R/issues/comments/ID`, editing a comment into a HOLD:
+  the pull request comes from that comment's `issue_url`;
+* `api repos/O/R/pulls/N/reviews` with `event: REQUEST_CHANGES` (on its
+  `commit_id`, else the current head) or a HOLD body;
+* `api graphql` `addComment` with a HOLD body on a pull request, and
+  `addPullRequestReview` with `REQUEST_CHANGES` or a HOLD body.
+
+A body is a HOLD when its last non-blank line is `verdict: HOLD head:<sha>`.
+
+**What it does:** it reads the pull request; only when its current head is
+exactly that sha, it dequeues it (`dequeuePullRequest`) if queued, else
+disables auto-merge (`disablePullRequestAutoMerge`) if armed. Another pull
+request, another head, or one neither armed nor queued is left alone. Every
+action and every failure is a line in `holds.jsonl` in the guards directory.
+The head lands again only once a newer verdict approves it, which
+`queue-arm-guard` requires on hosts with review before arm.
+
+**The one sanctioned route around `queue-removal-guard`.** The hook's mutation
+goes to the real `gh` with the exported App token, not back through `ghapp`, so
+`queue-removal-guard` keeps refusing agents' own dequeues and disarms. On a
+host with the switch on, posting a HOLD that names a pull request's head is
+therefore the one way to dequeue or disarm it without the operator override,
+and the public HOLD is its trace. Do not add another.
+
+**It never refuses, and a failure is public:** `ghapp` runs it with `|| true`,
+after the refusing guards, and it exits 0. When it recognises a HOLD but the
+read or the dequeue/disarm fails, it posts a follow-up comment on the pull
+request ("this HOLD could not dequeue/disarm head <sha>: <error>; it may still
+land"), so GitHub never shows an ineffective HOLD as an effective one. When it
+cannot read a comment's or review's body (`--input -`, `body=@-`,
+`--body-file -`), or cannot tell which pull request it is on, it prints that a
+HOLD in it was NOT acted on.
+
+**It is the fast path, not the guarantee.** It sees only HOLDs posted through
+`ghapp` on a host that turned it on: a reviewer on another host, a Codex
+session, or the web UI bypasses it. A repository with a merge queue needs the
+server-side backstop as well: a cheap merge-group preflight that fails the
+group when a queued pull request's latest trusted verdict names its head as
+HOLD. In Generous-Corp/pulp that is `tools/ci/merge_group_hold_check.py` in the
+`classify` job, which runs the protected base branch's copy of the check and
+fails `macos` closed before any VM.
+
+**Which hosts:** off unless the host turns it on, with `SHIPYARD_HOLD_DISARMS=1`
+(`0` forces it off) or a file named `hold-disarms` in the guards directory.
+Off, it reads nothing. Roll it out one host at a time; roll back by removing
+the file.
 
 ## Environment re-enqueue
 
