@@ -32,6 +32,7 @@ pub(super) fn gate_cost_command<W: Write>(
     let scorecard = args.scorecard;
     let flakes = args.flakes;
     let required_contexts = args.required_contexts.clone();
+    let selection_steps = args.selection_steps.clone();
     let query = resolve_query(args, &config, now)?;
     let cache = if no_cache {
         ReadCache::disabled()
@@ -51,6 +52,7 @@ pub(super) fn gate_cost_command<W: Write>(
             gate_job: query.gate_job,
             base_branch: query.base_branch,
             required_contexts,
+            selection_steps,
             from: query.from,
             to: query.to,
         };

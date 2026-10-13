@@ -1188,7 +1188,20 @@ pub(crate) enum MetricsCommand {
     ///   red after push = merged pull requests' commits carrying a required
     ///   context on which a required context is red (latest run per name;
     ///   `cancelled` is not red) / commits carrying a required context;
-    ///   repeat failures = check names red on two or more pull requests.
+    ///   repeat failures = check names red on two or more pull requests;
+    ///   selector recall (with --selection-step) = for each test a failed
+    ///   merge-group gate lists under "The following tests FAILED", what the
+    ///   gate job of the `pull_request`/`workflow_dispatch` runs created
+    ///   before the group, on the head of each pull request in the group,
+    ///   did with it: `selected` (a selection step ran it), `ran_outside`
+    ///   (only another step ran it, and whether it failed there, a failure
+    ///   the head's check ignored), `missed` (every head selected tests and
+    ///   none ran it), or `undetermined` (a head unread, a head on which no
+    ///   selection step ran, or a group that could not be read). recall =
+    ///   selected / (selected + `ran_outside` + missed); recall anywhere
+    ///   counts `ran_outside` as run. The group is the pull request the queue branch
+    ///   names plus every entry ahead of it that had not merged when the run
+    ///   was created.
     /// Required contexts are the base's classic protection, or
     /// `--required-context`.
     /// same-SHA flakes (with --flakes) = tests whose `CTest` result lines in
@@ -1260,6 +1273,12 @@ pub(crate) struct MetricsGateCostArgs {
     /// the base branch protection's. Repeatable.
     #[arg(long = "required-context", requires = "scorecard")]
     pub(crate) required_contexts: Vec<String>,
+    /// Name of a gate-job step that runs a pull-request head's test
+    /// selection. Repeatable. Given, the scorecard also reports selector
+    /// recall, reading the logs of failed merge-group gates and of their
+    /// groups' heads.
+    #[arg(long = "selection-step", requires = "scorecard")]
+    pub(crate) selection_steps: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
