@@ -290,7 +290,7 @@ fn the_remedy_is_one_chain_ending_in_the_abort() {
         "{chain}"
     );
     assert_eq!(chain.matches("--abort").count(), 1, "{chain}");
-    assert!(chain.contains("[ ! -e "), "{chain}");
+    assert!(chain.contains("{ [ ! -e "), "{chain}");
     let rendered = entry(dir.path(), &CheckoutState::Stuck(findings), "s")
         .detail
         .expect("detail");
@@ -326,4 +326,68 @@ fn an_unreadable_marker_is_not_absent() {
     let state = examine(dir.path(), later(), none);
     fs::set_permissions(&git_dir, fs::Permissions::from_mode(0o755)).expect("restore");
     assert!(matches!(state, CheckoutState::Unreadable(_)), "{state:?}");
+}
+
+/// The chain is executed, not only read: when a backup step fails, sh stops
+/// before the abort. `&&` and `||` group left to right in sh, so an ungrouped
+/// optional copy would reopen the chain and let the abort run.
+#[cfg(unix)]
+#[test]
+fn a_failed_backup_step_stops_the_chain_before_the_abort() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).expect("repo");
+    assert!(git(&repo, &["init", "-q", "-b", "main"]), "git init");
+    fs::write(repo.join("file.txt"), "base\n").expect("write");
+    assert!(git(&repo, &["add", "file.txt"]) && git(&repo, &["commit", "-qm", "base"]));
+    fs::write(repo.join(".git/CHERRY_PICK_HEAD"), "abc\n").expect("marker");
+    fs::write(repo.join(".git/MERGE_MSG"), "msg\n").expect("message");
+    // The backup branch already exists, so `git branch` fails.
+    assert!(git(
+        &repo,
+        &["branch", "shipyard-backup/cherry-pick-s", "HEAD"]
+    ));
+    let findings = stuck(examine(&repo, later(), none));
+    let home = dir.path().join("home");
+    fs::create_dir(&home).expect("home");
+    let marker = dir.path().join("ABORTED");
+    // The abort is replaced by a trace, so the test aborts nothing itself.
+    let chain = remedy_chain(&repo, &findings[0], "s").replace(
+        &format!(
+            "git -C {} cherry-pick --abort",
+            shell_quote(&repo.display().to_string())
+        ),
+        &format!("touch {}", shell_quote(&marker.display().to_string())),
+    );
+    assert!(chain.ends_with(&format!(
+        "touch {}",
+        shell_quote(&marker.display().to_string())
+    )));
+    let run = |chain: &str| {
+        Command::new("sh")
+            .args(["-c", chain])
+            .env("HOME", &home)
+            .output()
+            .expect("sh")
+    };
+    let failed = run(&chain);
+    assert!(!failed.status.success(), "the chain must fail");
+    assert!(
+        !marker.exists(),
+        "the abort ran after a failed backup step: {chain}"
+    );
+    assert!(repo.join(".git/CHERRY_PICK_HEAD").exists());
+    assert!(repo.join(".git/MERGE_MSG").exists());
+    // Control: with the backup branch gone, the same chain runs to the end.
+    assert!(git(
+        &repo,
+        &["branch", "-D", "shipyard-backup/cherry-pick-s"]
+    ));
+    let passed = run(&chain);
+    assert!(
+        passed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&passed.stderr)
+    );
+    assert!(marker.exists(), "the control chain must reach the abort");
 }

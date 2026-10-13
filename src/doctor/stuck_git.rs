@@ -223,7 +223,7 @@ pub fn remedy(checkout: &Path, finding: &Finding, stamp: &str) -> Vec<String> {
         ));
         for extra in ["MERGE_MSG", "ORIG_HEAD", "AUTO_MERGE"] {
             commands.push(format!(
-                "[ ! -e {path}/.git/{extra} ] || cp -p {path}/.git/{extra} {backup_dir}/"
+                "{{ [ ! -e {path}/.git/{extra} ] || cp -p {path}/.git/{extra} {backup_dir}/; }}"
             ));
         }
     }
