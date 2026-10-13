@@ -3484,9 +3484,19 @@ release automation) from `resolve_pr_context`, the one chokepoint every route
 into `ship` passes through — so `shipyard pr`, a bare `ship`, and
 `ship --pr <n>` all arm, and no later route can quietly skip it. `--no-arm`
 opts out. A repository whose base sets `[auto_merge]
-arm_requires_head_approval = true` arms only an approved head on every arming
-path (`ship`, the validated arm, the steward backstop); `--arm` overrides it
-and names who did. See `crate::head_approval`. Its count of queue removals per
+arm_requires_head_approval = true` (the default for pulp, vellum, tartci and
+Shipyard when their base is silent, on a host that sets
+`SHIPYARD_REVIEW_BEFORE_ARM=1` or has a `review-before-arm` guards file) arms
+and classic-merges only an approved head on every path (`ship`, the validated
+arm, the classic merge, the steward backstop); `--arm` overrides it and names
+who did. A merge-only update carries the approval only when every file the PR
+changes keeps its approved blob, the base changed none of them, and no binary
+changed; with the host switch off, the guard reads nothing for this rule. `queue-arm-guard` refuses an unreviewed arm or direct merge through
+`ghapp` the same way, requires the request to bind the approved head
+(`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts only the
+fleet App and OWNER/MEMBER/COLLABORATOR verdicts; its override,
+`GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
+`docs/ghapp-guards.md`, Review before arm). See `crate::head_approval`. Its count of queue removals per
 head reads only the last 100 timeline events, so a very busy pull request can
 under-count; that errs lenient (an approval is still required), never strict. This matters because Shipyard's own admission path enqueues only
 after it has validated a head, which happens only while a Shipyard process is

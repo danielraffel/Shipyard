@@ -174,21 +174,8 @@ fn enqueue_pull_request_with_recovery(
         ) {
             Ok((crate::head_approval::HeadGate::Approved { approval }, events)) => {
                 verdict_audit_events = events;
-                approval_comment_id = match &approval {
-                    crate::head_approval::Approval::Marker { comment_id, .. } => *comment_id,
-                    crate::head_approval::Approval::Review { .. } => None,
-                };
-                let found_app_id = match &approval {
-                    crate::head_approval::Approval::Review {
-                        performed_via_github_app_id,
-                        ..
-                    }
-                    | crate::head_approval::Approval::Marker {
-                        performed_via_github_app_id,
-                        ..
-                    } => *performed_via_github_app_id,
-                };
-                approval_app_id = found_app_id;
+                approval_comment_id = approval.comment_id();
+                approval_app_id = approval.app_id();
             }
             Ok((gate, events)) if gate.allows() => {
                 verdict_audit_events = events;

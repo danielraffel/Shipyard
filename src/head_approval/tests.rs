@@ -88,6 +88,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         } else {
             reviewers.iter().map(|login| (*login).to_owned()).collect()
         },
+        any_reviewer_but_author: false,
     }
 }
 
@@ -593,7 +594,8 @@ fn the_policy_is_read_from_the_auto_merge_table() {
         ApprovalPolicy::from_table(&table),
         ApprovalPolicy {
             required: true,
-            reviewer_logins: vec!["danielraffel".to_owned()]
+            reviewer_logins: vec!["danielraffel".to_owned()],
+            any_reviewer_but_author: false,
         }
     );
     let empty: toml::Table = "[project]\nname = \"x\"\n".parse().expect("toml");
@@ -645,4 +647,736 @@ fn an_unreadable_policy_is_an_error_not_the_default() {
     assert!(read_policy(&failing, "o/r", "main").is_err());
     let garbled = |_: &[String]| -> Result<String, String> { Ok("[auto_merge\n".to_owned()) };
     assert!(read_policy(&garbled, "o/r", "main").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Repositories that require review by default
+// ---------------------------------------------------------------------------
+
+fn by_default(repo: &str) -> ApprovalPolicy {
+    ApprovalPolicy::without_config(repo, true)
+}
+
+/// A comment as GitHub reports the fleet App's: `CONTRIBUTOR`.
+fn fleet(at: &str, body: &str) -> Value {
+    json!({"login": "shipyard-local[bot]", "type": "Bot", "association": "CONTRIBUTOR",
+           "at": at, "body": body})
+}
+
+fn person(login: &str, association: &str, body: &str) -> Value {
+    json!({"login": login, "type": "User", "association": association,
+           "at": "2026-10-12T01:00:00Z", "body": body})
+}
+
+fn allows(policy: &ApprovalPolicy, comments: &[Value], author: Option<&str>) -> bool {
+    decide_for_author(
+        policy,
+        HEAD,
+        &[],
+        comments,
+        &empty_queue(HEAD),
+        false,
+        author,
+    )
+    .allows()
+}
+
+#[test]
+fn a_listed_repository_requires_review_only_on_a_host_that_turns_it_on() {
+    for repo in super::REVIEW_REQUIRED_REPOS {
+        let policy = by_default(repo);
+        assert!(policy.required, "{repo}");
+        assert!(policy.any_reviewer_but_author, "{repo}");
+        assert!(policy.validate().is_ok(), "{repo}");
+        assert_eq!(
+            ApprovalPolicy::without_config(repo, false),
+            ApprovalPolicy::default(),
+            "a new binary alone changes nothing: {repo}"
+        );
+    }
+    assert!(
+        by_default("danielraffel/shipyard").required,
+        "slugs are case-blind"
+    );
+    assert_eq!(by_default("someone/else"), ApprovalPolicy::default());
+    let silent: toml::Table = "[auto_merge]\nqueue = true\n".parse().expect("toml");
+    assert!(ApprovalPolicy::from_table_for_repo(&silent, "danielraffel/tartci", true).required);
+    assert!(!ApprovalPolicy::from_table_for_repo(&silent, "danielraffel/tartci", false).required);
+}
+
+#[test]
+fn a_config_that_sets_the_key_decides_over_the_default() {
+    let off: toml::Table = "[auto_merge]\narm_requires_head_approval = false\n"
+        .parse()
+        .expect("toml");
+    assert_eq!(
+        ApprovalPolicy::from_table_for_repo(&off, "Generous-Corp/pulp", true),
+        ApprovalPolicy::default()
+    );
+    let listed: toml::Table = "[auto_merge]\narm_requires_head_approval = true\n\
+         reviewer_identities = [\"fable-graph\"]\n"
+        .parse()
+        .expect("toml");
+    for host in [true, false] {
+        let policy = ApprovalPolicy::from_table_for_repo(&listed, "Generous-Corp/pulp", host);
+        assert!(
+            policy.required,
+            "the repository's own key needs no host switch"
+        );
+        assert!(!policy.any_reviewer_but_author);
+        // The strict rule holds: the fleet App's marker does not count.
+        let marker = [fleet("2026-10-12T01:00:00Z", &format!("reviewed: {HEAD}"))];
+        assert!(!allows(&policy, &marker, None));
+    }
+}
+
+#[test]
+fn a_missing_config_on_a_listed_repository_follows_the_host_switch() {
+    let missing =
+        |_: &[String]| -> Result<String, String> { Err("gh: Not Found (HTTP 404)".to_owned()) };
+    super::with_host_review_default(true, || {
+        assert_eq!(
+            read_policy(&missing, "danielraffel/tartci", "main"),
+            Ok(by_default("danielraffel/tartci"))
+        );
+        assert!(
+            super::read_policy_required(&missing, "Generous-Corp/vellum", "main")
+                .expect("a listed repository needs no file")
+                .required
+        );
+    });
+    super::with_host_review_default(false, || {
+        assert_eq!(
+            read_policy(&missing, "danielraffel/tartci", "main"),
+            Ok(ApprovalPolicy::default())
+        );
+        assert!(super::read_policy_required(&missing, "Generous-Corp/vellum", "main").is_err());
+    });
+}
+
+#[test]
+fn a_config_that_does_not_parse_refuses_instead_of_loosening() {
+    let garbled = |_: &[String]| -> Result<String, String> {
+        Ok("[auto_merge\nreviewer_identities = [\"fable-graph\"]\n".to_owned())
+    };
+    super::with_host_review_default(true, || {
+        assert!(read_policy(&garbled, "Generous-Corp/pulp", "main").is_err());
+    });
+}
+
+#[test]
+fn the_fleet_apps_verdict_counts_on_the_fleet_apps_pull_request() {
+    let policy = by_default("danielraffel/Shipyard");
+    let approve = [fleet(
+        "2026-10-12T01:00:00Z",
+        &format!("Delta review.\n\nverdict: APPROVE head:{HEAD}"),
+    )];
+    assert!(allows(&policy, &approve, Some("app/shipyard-local")));
+    // No verdict, or one naming an older head, is refused and says what is needed.
+    let gate = decide_for_author(
+        &policy,
+        HEAD,
+        &[],
+        &[],
+        &empty_queue(HEAD),
+        false,
+        Some("app/shipyard-local"),
+    );
+    assert!(!gate.allows());
+    assert!(
+        gate.explain().contains(&format!(
+            "`verdict: APPROVE head:{HEAD}` or `reviewed: {HEAD}`"
+        )),
+        "{}",
+        gate.explain()
+    );
+    let older = [fleet("2026-10-12T01:00:00Z", &format!("reviewed: {OTHER}"))];
+    assert!(!allows(&policy, &older, Some("app/shipyard-local")));
+}
+
+#[test]
+fn a_drive_by_account_cannot_approve_on_a_public_repository() {
+    let policy = by_default("danielraffel/tartci");
+    for association in [
+        "NONE",
+        "CONTRIBUTOR",
+        "FIRST_TIME_CONTRIBUTOR",
+        "FIRST_TIMER",
+    ] {
+        let drive_by = [person(
+            "some-random-github-user",
+            association,
+            &format!("verdict: APPROVE head:{HEAD}"),
+        )];
+        assert!(
+            !allows(&policy, &drive_by, Some("shipyard-local[bot]")),
+            "{association}"
+        );
+    }
+    let unread = [json!({"login": "some-random-github-user", "type": "User",
+                         "at": "2026-10-12T01:00:00Z", "body": format!("reviewed: {HEAD}")})];
+    assert!(!allows(&policy, &unread, Some("shipyard-local[bot]")));
+    let drive_by_review = [json!({"login": "some-random-github-user", "type": "User",
+        "association": "NONE", "at": "2026-10-12T01:00:00Z", "state": "APPROVED",
+        "commit_id": HEAD})];
+    assert!(
+        !decide_for_author(
+            &policy,
+            HEAD,
+            &drive_by_review,
+            &[],
+            &empty_queue(HEAD),
+            false,
+            Some("shipyard-local[bot]")
+        )
+        .allows()
+    );
+    for association in super::TRUSTED_ASSOCIATIONS {
+        let trusted = [person(
+            "fable-graph",
+            association,
+            &format!("reviewed: {HEAD}"),
+        )];
+        assert!(
+            allows(&policy, &trusted, Some("shipyard-local[bot]")),
+            "{association}"
+        );
+    }
+    // A drive-by HOLD does not block either.
+    let comments = [
+        fleet(
+            "2026-10-12T01:00:00Z",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        ),
+        json!({"login": "some-random-github-user", "type": "User", "association": "NONE",
+               "at": "2026-10-12T02:00:00Z", "body": format!("verdict: HOLD head:{HEAD}")}),
+    ];
+    assert!(allows(&policy, &comments, Some("shipyard-local[bot]")));
+}
+
+#[test]
+fn a_distinguishable_author_cannot_approve_their_own_head() {
+    let policy = by_default("Generous-Corp/pulp");
+    let own = [person(
+        "DanielRaffel",
+        "OWNER",
+        &format!("reviewed: {HEAD}"),
+    )];
+    assert!(!allows(&policy, &own, Some("danielraffel")));
+    let other = [person(
+        "fable-graph",
+        "COLLABORATOR",
+        &format!("reviewed: {HEAD}"),
+    )];
+    assert!(allows(&policy, &other, Some("danielraffel")));
+    let own_review = [
+        json!({"login": "danielraffel", "type": "User", "association": "OWNER",
+        "at": "2026-10-12T01:00:00Z", "state": "APPROVED", "commit_id": HEAD}),
+    ];
+    assert!(
+        !decide_for_author(
+            &policy,
+            HEAD,
+            &own_review,
+            &[],
+            &empty_queue(HEAD),
+            false,
+            Some("danielraffel")
+        )
+        .allows()
+    );
+}
+
+#[test]
+fn a_hold_after_the_approve_refuses_by_default() {
+    let policy = by_default("danielraffel/tartci");
+    let comments = [
+        fleet(
+            "2026-10-12T01:00:00Z",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        ),
+        fleet(
+            "2026-10-12T02:00:00Z",
+            &format!("verdict: HOLD head:{HEAD}"),
+        ),
+    ];
+    assert!(!allows(&policy, &comments, None));
+    // Control: the same pair the other way round approves.
+    let reversed = [
+        fleet(
+            "2026-10-12T01:00:00Z",
+            &format!("verdict: HOLD head:{HEAD}"),
+        ),
+        fleet(
+            "2026-10-12T02:00:00Z",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        ),
+    ];
+    assert!(allows(&policy, &reversed, None));
+}
+
+#[test]
+fn the_arm_path_reads_the_author_before_judging() {
+    let calls = std::cell::RefCell::new(Vec::<String>::new());
+    let gh = |args: &[String]| -> Result<String, String> {
+        let joined = args.join(" ");
+        calls.borrow_mut().push(joined.clone());
+        if joined.contains("contents/.shipyard/config.toml") {
+            Err("gh: Not Found (HTTP 404)".to_owned())
+        } else if joined.contains("/reviews") {
+            Ok(String::new())
+        } else if joined.contains("/comments") {
+            Ok(json!({"id": 1, "login": "danielraffel", "type": "User",
+                      "association": "OWNER", "at": "2026-10-12T01:00:00Z",
+                      "body": format!("reviewed: {HEAD}")})
+            .to_string())
+        } else if joined.contains("repos/Generous-Corp/pulp/pulls/7 --jq .user.login") {
+            Ok("danielraffel\n".to_owned())
+        } else if joined.contains("repos/Generous-Corp/pulp/pulls/7 ") {
+            Ok("main\n".to_owned())
+        } else {
+            Err(format!("unexpected gh call: {joined}"))
+        }
+    };
+    let gate = super::with_host_review_default(true, || {
+        super::evaluate(
+            &gh,
+            "Generous-Corp/pulp",
+            7,
+            HEAD,
+            "main",
+            &empty_queue(HEAD),
+        )
+    })
+    .expect("readable");
+    assert!(
+        !gate.allows(),
+        "the author's own marker must not count: {gate:?}"
+    );
+    assert!(
+        calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("repos/Generous-Corp/pulp/pulls/7 --jq .user.login")),
+        "{:?}",
+        calls.borrow()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Merge-only updates carry an approval: real crafted git histories (the cases
+// of the reviewer's carry_probe), answered the way GitHub's compare does.
+// ---------------------------------------------------------------------------
+
+/// A scratch git repository with a pull request that adds a guard line (and
+/// optionally changes a binary), its approved head, and a base commit since.
+struct History {
+    dir: tempfile::TempDir,
+    approved: String,
+}
+
+impl History {
+    fn new(binary: bool) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = Self {
+            dir,
+            approved: String::new(),
+        };
+        history.git(&["init", "-q", "-b", "main"]);
+        history.git(&["config", "user.email", "r@r"]);
+        history.git(&["config", "user.name", "r"]);
+        let lines: String = (1..=60)
+            .map(|n| ["line ", &n.to_string(), "\n"].concat())
+            .collect();
+        history.write("guard.c", lines.as_bytes());
+        if binary {
+            history.write("x.bin", b"\x00\x01base-binary");
+        }
+        history.git(&["add", "-A"]);
+        history.git(&["commit", "-qm", "base0"]);
+        history.git(&["checkout", "-qb", "pr"]);
+        let mut lines: Vec<String> = history.read("guard.c").lines().map(str::to_owned).collect();
+        lines.insert(9, "  if (!authorized) return;".to_owned());
+        history.write("guard.c", (lines.join("\n") + "\n").as_bytes());
+        if binary {
+            history.write("x.bin", b"\x00\x01pr-binary-v1");
+        }
+        history.git(&["commit", "-qam", "pr: add guard"]);
+        let approved = history.git(&["rev-parse", "HEAD"]);
+        history.git(&["checkout", "-q", "main"]);
+        history.write("other.txt", b"unrelated\n");
+        history.git(&["add", "other.txt"]);
+        history.git(&["commit", "-qm", "base1"]);
+        Self {
+            approved,
+            ..history
+        }
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(self.dir.path())
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn write(&self, name: &str, data: &[u8]) {
+        std::fs::write(self.dir.path().join(name), data).expect("write");
+    }
+
+    fn read(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.path().join(name)).expect("read")
+    }
+
+    /// Merge the base into the approved head, letting `edit` change the
+    /// merge before it is committed.
+    fn merge(&self, edit: impl FnOnce(&Self)) -> String {
+        self.git(&["checkout", "-q", "-B", "head", &self.approved]);
+        self.git(&["merge", "-q", "--no-commit", "main"]);
+        edit(self);
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-qm", "Merge branch 'main' into pr"]);
+        self.git(&["rev-parse", "HEAD"])
+    }
+
+    /// GitHub's answer to the carry's reads of this repository.
+    fn gh(&self, args: &[String]) -> Result<String, String> {
+        let joined = args.join(" ");
+        if joined.contains("contents/.shipyard/config.toml") {
+            return Err("gh: Not Found (HTTP 404)".to_owned());
+        }
+        if joined.contains("/reviews") {
+            return Ok(String::new());
+        }
+        if joined.contains("/comments") {
+            return Ok(fleet(
+                "2026-10-12T01:00:00Z",
+                &format!("verdict: APPROVE head:{}", self.approved),
+            )
+            .to_string());
+        }
+        if joined.contains("pulls/7 --jq .user.login") {
+            return Ok("shipyard-local[bot]\n".to_owned());
+        }
+        if joined.contains("pulls/7 --jq .base.ref") {
+            return Ok("main\n".to_owned());
+        }
+        let range = args
+            .iter()
+            .find_map(|arg| {
+                arg.split_once("/compare/")
+                    .map(|(_, range)| range.to_owned())
+            })
+            .ok_or_else(|| format!("unexpected gh call: {joined}"))?;
+        let (x, y) = range.split_once("...").expect("a three-dot range");
+        let base = self.git(&["merge-base", x, y]);
+        let count = |range: &str| {
+            self.git(&["rev-list", "--count", range])
+                .parse::<u64>()
+                .expect("count")
+        };
+        let (ahead, behind) = (
+            count(&format!("{base}..{y}")),
+            count(&format!("{base}..{x}")),
+        );
+        let status = match (ahead, behind) {
+            (0, 0) => "identical",
+            (_, 0) => "ahead",
+            (0, _) => "behind",
+            _ => "diverged",
+        };
+        if joined.ends_with("--jq .status") {
+            return Ok(format!("{status}\n"));
+        }
+        if joined.contains("merge_base") {
+            let binary: Vec<String> = self
+                .git(&["diff", "--numstat", &base, y])
+                .lines()
+                .filter(|line| line.starts_with("-\t-\t"))
+                .map(|line| line[4..].to_owned())
+                .collect();
+            let files: Vec<Value> = self
+                .git(&["diff", "--raw", "--no-abbrev", "--no-renames", &base, y])
+                .lines()
+                .map(|line| {
+                    let (meta, name) = line.split_once('\t').expect("raw line");
+                    let fields: Vec<&str> = meta.split_whitespace().collect();
+                    let status = match fields[4] {
+                        "A" => "added",
+                        "D" => "removed",
+                        _ => "modified",
+                    };
+                    let sha = if fields[4] == "D" {
+                        fields[2]
+                    } else {
+                        fields[3]
+                    };
+                    json!({"filename": name, "status": status, "sha": sha,
+                           "patch": !binary.iter().any(|b| b == name)})
+                })
+                .collect();
+            return Ok(json!({"merge_base": base, "files": files}).to_string());
+        }
+        let commits: Vec<Value> = self
+            .git(&[
+                "rev-list",
+                "--reverse",
+                "--parents",
+                &format!("{base}..{y}"),
+            ])
+            .lines()
+            .map(|line| {
+                let mut parts = line.split_whitespace();
+                let sha = parts.next().expect("sha");
+                json!({"sha": sha, "parents": parts.collect::<Vec<_>>()})
+            })
+            .collect();
+        Ok(
+            json!({"status": status, "behind_by": behind, "total_commits": ahead,
+                  "commits": commits})
+            .to_string(),
+        )
+    }
+
+    fn gate(&self, head: &str) -> HeadGate {
+        super::with_host_review_default(true, || {
+            super::evaluate(
+                &|args: &[String]| self.gh(args),
+                "danielraffel/tartci",
+                7,
+                head,
+                "main",
+                &empty_queue(head),
+            )
+        })
+        .expect("readable")
+    }
+
+    fn refusal(&self, head: &str) -> String {
+        let pr = 7;
+        super::merge_only_carry(
+            &|args: &[String]| self.gh(args),
+            "danielraffel/tartci",
+            pr,
+            &self.approved,
+            head,
+        )
+        .expect_err("refused")
+    }
+}
+
+#[test]
+fn an_honest_merge_of_the_base_carries_the_approval() {
+    let history = History::new(false);
+    let head = history.merge(|_| {});
+    match history.gate(&head) {
+        HeadGate::Approved {
+            approval: Approval::Carried { from_head, .. },
+        } => assert_eq!(from_head, history.approved),
+        gate => panic!("expected a carried approval, got {gate:?}"),
+    }
+}
+
+#[test]
+fn a_merge_that_moves_the_prs_guard_line_needs_a_new_verdict() {
+    let history = History::new(false);
+    let head = history.merge(|history| {
+        let mut lines: Vec<String> = history
+            .read("guard.c")
+            .lines()
+            .filter(|line| !line.contains("authorized"))
+            .map(str::to_owned)
+            .collect();
+        lines.insert(48, "  if (!authorized) return;".to_owned());
+        history.write("guard.c", (lines.join("\n") + "\n").as_bytes());
+    });
+    assert!(matches!(history.gate(&head), HeadGate::NotApproved { .. }));
+    assert!(
+        history.refusal(&head).contains("guard.c at"),
+        "{}",
+        history.refusal(&head)
+    );
+}
+
+#[test]
+fn a_merge_that_swaps_a_binary_the_pr_touches_needs_a_new_verdict() {
+    let history = History::new(true);
+    let head = history.merge(|history| history.write("x.bin", b"\x00\x01EVIL-binary"));
+    assert!(matches!(history.gate(&head), HeadGate::NotApproved { .. }));
+    assert_eq!(
+        history.refusal(&head),
+        "the pull request changes a binary file (x.bin)"
+    );
+}
+
+#[test]
+fn a_merge_that_adds_a_line_needs_a_new_verdict() {
+    let history = History::new(false);
+    let head = history.merge(|history| {
+        let text = history.read("guard.c") + "  backdoor();\n";
+        history.write("guard.c", text.as_bytes());
+    });
+    assert!(matches!(history.gate(&head), HeadGate::NotApproved { .. }));
+}
+
+#[test]
+fn a_file_both_the_pr_and_the_base_changed_needs_a_new_verdict() {
+    let history = History::new(false);
+    history.git(&["checkout", "-q", "main"]);
+    let text = format!("base head\n{}", history.read("guard.c"));
+    history.write("guard.c", text.as_bytes());
+    history.git(&["commit", "-qam", "base edit"]);
+    // The merge keeps the PR's blob, quietly dropping the base's change.
+    let approved = history.approved.clone();
+    let head = history.merge(|history| {
+        history.git(&["checkout", &approved, "--", "guard.c"]);
+    });
+    assert!(matches!(history.gate(&head), HeadGate::NotApproved { .. }));
+    assert_eq!(
+        history.refusal(&head),
+        "guard.c was changed by both the pull request and the base"
+    );
+}
+
+#[test]
+fn a_commit_that_is_not_a_merge_needs_a_new_verdict() {
+    let history = History::new(false);
+    history.git(&["checkout", "-q", "-B", "single", &history.approved]);
+    history.write("notes.txt", b"note\n");
+    history.git(&["add", "-A"]);
+    history.git(&["commit", "-qm", "single parent"]);
+    let head = history.git(&["rev-parse", "HEAD"]);
+    assert!(history.refusal(&head).contains("is not a merge"));
+}
+
+#[test]
+fn a_head_that_does_not_descend_from_the_approved_one_needs_a_new_verdict() {
+    let history = History::new(false);
+    history.git(&["checkout", "-q", "-B", "rewritten", "main"]);
+    history.git(&["checkout", &history.approved, "--", "guard.c"]);
+    history.git(&["commit", "-qam", "pr: add guard (rebased)"]);
+    let head = history.git(&["rev-parse", "HEAD"]);
+    assert!(history.refusal(&head).contains("does not descend from"));
+}
+
+#[test]
+fn a_hold_on_the_updated_head_is_not_overridden_by_a_carry() {
+    let history = History::new(false);
+    let head = history.merge(|_| {});
+    let comments = [
+        fleet(
+            "2026-10-12T01:00:00Z",
+            &format!("verdict: APPROVE head:{}", history.approved),
+        ),
+        fleet(
+            "2026-10-12T02:00:00Z",
+            &format!("verdict: HOLD head:{head}"),
+        ),
+    ];
+    let gh = |args: &[String]| {
+        if args.join(" ").contains("/comments") {
+            Ok(comments
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"))
+        } else {
+            history.gh(args)
+        }
+    };
+    let gate = super::with_host_review_default(true, || {
+        super::evaluate(
+            &gh,
+            "danielraffel/tartci",
+            7,
+            &head,
+            "main",
+            &empty_queue(&head),
+        )
+    })
+    .expect("readable");
+    assert!(matches!(gate, HeadGate::NotApproved { .. }), "{gate:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The host switch itself, read from a child process so no test override
+// stands in for it.
+// ---------------------------------------------------------------------------
+
+const PROBE: &str = "SHIPYARD_HOST_SWITCH_PROBE";
+
+#[test]
+fn host_switch_probe() {
+    if std::env::var_os(PROBE).is_some() {
+        println!("HOST_SWITCH={}", super::host_review_default());
+    }
+}
+
+fn host_switch(env: &[(&str, &std::path::Path)], switch: Option<&str>) -> bool {
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    command
+        .args([
+            "--exact",
+            "head_approval::tests::host_switch_probe",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROBE, "1")
+        .env_remove(super::HOST_ENABLE_ENV)
+        .env_remove("SHIPYARD_GHAPP_GUARDS_DIR");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    if let Some(switch) = switch {
+        command.env(super::HOST_ENABLE_ENV, switch);
+    }
+    let output = command.output().expect("probe runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // libtest prints the probe's line after the test's name, on one line.
+    match stdout
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("HOST_SWITCH="))
+    {
+        Some("true") => true,
+        Some("false") => false,
+        _ => panic!("probe printed no switch: {stdout}"),
+    }
+}
+
+#[test]
+fn the_host_switch_reads_the_environment_and_the_guards_file() {
+    let empty = tempfile::tempdir().expect("tempdir");
+    let marked = tempfile::tempdir().expect("tempdir");
+    std::fs::write(marked.path().join(super::HOST_ENABLE_FILE), "").expect("marker");
+    let guards = "SHIPYARD_GHAPP_GUARDS_DIR";
+    assert!(
+        !host_switch(&[(guards, empty.path())], None),
+        "off by default"
+    );
+    assert!(
+        host_switch(&[(guards, marked.path())], None),
+        "the file turns it on"
+    );
+    assert!(
+        !host_switch(&[(guards, marked.path())], Some("0")),
+        "0 wins over the file"
+    );
+    assert!(
+        host_switch(&[(guards, empty.path())], Some("1")),
+        "1 turns it on"
+    );
+    // Without the guards-dir variable, the file is read from HOME.
+    let home = tempfile::tempdir().expect("tempdir");
+    let dir = home.path().join(".config/shipyard/guards");
+    std::fs::create_dir_all(&dir).expect("dirs");
+    assert!(!host_switch(&[("HOME", home.path())], None));
+    std::fs::write(dir.join(super::HOST_ENABLE_FILE), "").expect("marker");
+    assert!(host_switch(&[("HOME", home.path())], None));
 }

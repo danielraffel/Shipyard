@@ -14,7 +14,7 @@ present, or not executable, is skipped.
 | installed name | source | refuses |
 |---|---|---|
 | `queue-removal-guard` | `scripts/ghapp_queue_removal_guard.py` | `pr merge --disable-auto`, `dequeuePullRequest`, `disablePullRequestAutoMerge` |
-| `queue-arm-guard` | `scripts/ghapp_queue_arm_guard.py` | `pr merge --auto`, a plain `pr merge` whose base has a merge queue, `enablePullRequestAutoMerge`, `enqueuePullRequest`, when the PR's live state makes arming harmful (below) |
+| `queue-arm-guard` | `scripts/ghapp_queue_arm_guard.py` | `pr merge --auto`, a plain `pr merge` whose base has a merge queue, `enablePullRequestAutoMerge`, `enqueuePullRequest`, when the PR's live state makes arming harmful (below); and those plus every direct merge (`pr merge`, `--admin`, REST `PUT pulls/<n>/merge`, `mergePullRequest`) when the head has no reviewer approval or the request does not bind it ([Review before arm or merge](#review-before-arm-or-merge)) |
 | `branch-refresh-guard` | `scripts/ghapp_branch_refresh_guard.py` | `pr update-branch`, REST `pulls/<n>/update-branch`, `updatePullRequestBranch`, only when the base's `[merge] refresh_branch` policy is `"only-if-conflicting"` and the refresh is provably pointless (below) |
 | `merge-guard` | `scripts/ghapp_merge_guard.sh` | `pr merge` on a repository listed in `~/.config/shipyard/merge-guard.json` (one that cannot enforce required checks server-side) until every listed check reads `pass`, and `--auto` there outright; inert for unlisted repositories and when that file is missing or malformed |
 
@@ -53,6 +53,94 @@ as `shipyard landing --pr <n>` (see `docs/landing-model.md`).
 
 A GraphQL body read from stdin (`--input -`, `query=@-`) cannot be inspected
 and is refused as ambiguous.
+
+### Review before arm or merge
+
+An arm or enqueue the table above allows, and any direct merge, is still
+refused when the repository requires review and nothing approves the PR's
+current head. The direct merges are `pr merge` on a base with no queue, `pr
+merge --admin`, REST `PUT pulls/<n>/merge` and GraphQL `mergePullRequest`; on
+a queue-less repository (tartci, Shipyard) they are the landing path.
+
+**Which hosts and repositories.** Nothing in this section applies unless the
+host turns it on: `SHIPYARD_REVIEW_BEFORE_ARM=1` (`0` forces it off), or a file
+named `review-before-arm` in the guards directory. With it off the guard reads
+nothing for this rule (no pull request, no config, no comments), so it is
+inert whatever the base config says and on any Python. Updating the binary or
+the guards changes nothing until a host turns it on; roll it out one host at a
+time.
+
+With it on, the guard reads `.shipyard/config.toml` on the PR's base:
+`[auto_merge] arm_requires_head_approval` decides when set, either way. When
+the base is silent, the repositories in `REVIEW_REQUIRED_REPOS`
+(`Generous-Corp/pulp`, `Generous-Corp/vellum`, `danielraffel/tartci`,
+`danielraffel/Shipyard`) require review. A config that exists but cannot be
+read or parsed (invalid TOML, or a Python without `tomllib`) refuses rather
+than loosening. Shipyard's own arming and merge paths use the same switch for
+the list default; a repository's own config key applies to them on any host.
+
+**What approves.** The newest verdict naming the head decides:
+
+* a comment whose last non-blank line is `verdict: APPROVE head:<40-hex>` or
+  `reviewed: <40-hex>`, or
+* an `APPROVED` review whose `commit_id` is the head.
+
+`verdict: HOLD head:<40-hex>` or a `CHANGES_REQUESTED` review on the head
+blocks an earlier approval. A HOLD whose time cannot be read always blocks.
+
+**Whose verdict counts.**
+
+* With `reviewer_identities` listed: only those identities, never the PR's
+  author and never the fleet App `shipyard-local[bot]`.
+* With none listed (the default for the four repositories): the fleet App,
+  which every agent posts as, and accounts whose `author_association` is
+  `OWNER`, `MEMBER` or `COLLABORATOR`. Nobody else: the repositories are
+  public, and a drive-by account's comment must not land a head. A
+  distinguishable PR author never approves their own head. List
+  `reviewer_identities` to make it strict.
+
+**The request must bind the head.** `gh pr merge` needs
+`--match-head-commit <sha>`, a GraphQL mutation `expectedHeadOid`, and the
+REST merge `sha=`, equal to the head the verdict approved. An unbound request
+is refused with the flag to add, so a push between the check and the
+mutation cannot land a head nobody reviewed.
+
+**Merge-only updates.** Updating an approved head with its base makes a new
+head no verdict names. The approval carries to it only when all of these hold:
+
+* the new head descends from the approved one;
+* every commit on the first-parent chain back to the approved head is a
+  two-parent merge whose merged parent is on the base (the other commits in
+  the range arrived through those merges);
+* every file the PR changes has the same blob at the new head as at the
+  approved head (`files[].sha` of `compare/<base>...<head>`), so a merge that
+  moves a line or swaps content cannot pass;
+* no file the PR changes was also changed by the base between the two merge
+  bases;
+* the PR changes no binary file (a file with no text patch).
+
+Anything else, or anything the guard cannot read (including a comparison at
+GitHub's 300-file cap), needs a new verdict. A HOLD naming the new head is
+never overridden by a carry.
+
+The refusal names the head, the exact marker it needs, and the latest verdict
+when it approves a different head:
+
+```
+queue-arm-guard: refusing to arm or merge an unreviewed head: PR #511 (danielraffel/tartci): no reviewer verdict names head 52eda5490844 ... Post the verdict on the PR, then land it bound to that head.
+```
+
+An unreadable pull request, policy or comment list refuses.
+
+**Operator override.** `GHAPP_ALLOW_UNREVIEWED_ARM=1` lands anyway. It prints
+a `WARNING` naming the refusal it overrode and appends one JSON line (`at`,
+`override`, `refusal`, `argv`, `cwd`) to `overrides.jsonl` in the guards
+directory. It is for an operator, never for an agent. `GHAPP_ALLOW_QUEUE_REARM`
+does not stand in for it: a queue refusal it overrides still needs the review.
+A request that names no head (a GraphQL body on stdin) needs both overrides.
+Shipyard's own validated enqueue and classic merge carry
+`SHIPYARD_INTERNAL_QUEUE_MUTATION` and apply the same rule in Rust
+(`crate::head_approval`); its `--arm` override names who armed.
 
 ## Environment re-enqueue
 
