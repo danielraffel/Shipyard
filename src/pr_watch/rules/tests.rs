@@ -78,6 +78,13 @@ fn comment(id: u64, at: i64, body: &str) -> TrailEntry {
     TrailEntry::from_comment(id, "shipyard-local[bot]", t(at), body)
 }
 
+/// A comment by `login`, with the `author_association` GitHub reported.
+fn by(id: u64, at: i64, login: &str, association: Option<&str>, body: &str) -> TrailEntry {
+    let mut entry = TrailEntry::from_comment(id, login, t(at), body);
+    entry.association = association.map(str::to_owned);
+    entry
+}
+
 fn input(pr: PrHistory, trail: Vec<TrailEntry>) -> WatchInput {
     WatchInput {
         repos: vec![history(vec![pr], Vec::new())],
@@ -405,8 +412,253 @@ fn a_ledger_drops_keys_after_two_weeks() {
         .seen
         .insert("old".to_owned(), t(0) - Duration::days(15));
     ledger.seen.insert("new".to_owned(), t(0));
+    // Just inside the fortnight is kept; just outside is dropped.
+    ledger.seen.insert(
+        "thirteen-days".to_owned(),
+        t(0) - Duration::days(14) + Duration::seconds(1),
+    );
+    ledger.seen.insert(
+        "fourteen-days".to_owned(),
+        t(0) - Duration::days(14) - Duration::seconds(1),
+    );
     ledger.prune(t(0));
-    assert_eq!(ledger.seen.keys().collect::<Vec<_>>(), vec!["new"]);
+    assert_eq!(
+        ledger.seen.keys().collect::<Vec<_>>(),
+        vec!["new", "thirteen-days"]
+    );
+}
+
+#[test]
+fn every_event_carries_a_complete_fix() {
+    let red = pr(
+        vec![
+            (1, QueueEventKind::Enqueued),
+            (
+                2,
+                QueueEventKind::Removed {
+                    reason: "failed_checks".to_owned(),
+                },
+            ),
+            (3, QueueEventKind::Armed),
+            (4, QueueEventKind::Enqueued),
+        ],
+        vec![check("macos", 9, 2, 40, "failure", &["census-drift"])],
+    );
+    let trail = vec![
+        comment(1, 10, &format!("READY head:{HEAD}")),
+        comment(2, -10, &format!("verdict: HOLD head:{OLD}")),
+    ];
+    let group = GroupRun {
+        id: 77,
+        pr: Some(7),
+        head_sha: "c".repeat(40),
+        created_at: t(10),
+        conclusion: Some("failure".to_owned()),
+        required_jobs: vec![check("macos", 5, 10, 50, "failure", &["drift-fast"])],
+        ..GroupRun::default()
+    };
+    let mut watch = input(red, trail);
+    watch.repos[0].group_runs.push(group);
+    watch.alarms.push(Alarm {
+        repo: "o/tartci".to_owned(),
+        number: 504,
+        title: "[tartci] m5: cannot boot VMs".to_owned(),
+        opened_at: t(10),
+        closed_at: None,
+    });
+    let config = RuleConfig {
+        head_unreviewed_after: Some(Duration::minutes(45)),
+        ..RuleConfig::default()
+    };
+    let events = evaluate(&watch, t(200), &config, true);
+    let seen = kinds(&events);
+    for kind in [
+        "ready_unreviewed",
+        "verdict_posted",
+        "armed_unapproved",
+        "required_red",
+        "group_red",
+        "queue_removed",
+        "queue_stuck",
+        "host_alarm",
+    ] {
+        assert!(seen.contains(kind), "{kind} not raised: {seen:?}");
+    }
+    for event in &events {
+        let fix = &event.fix;
+        for (field, value) in [
+            ("what", &fix.what),
+            ("evidence", &fix.evidence),
+            ("cause", &fix.cause),
+            ("command", &fix.command),
+            ("verify", &fix.verify),
+        ] {
+            assert!(!value.is_empty(), "{} has no {field}", event.kind);
+        }
+    }
+    let red = events
+        .iter()
+        .find(|event| event.kind == "required_red")
+        .expect("red");
+    assert_eq!(red.fix.cause, "test_failure");
+    assert!(red.fix.what.contains("census-drift"), "{}", red.fix.what);
+    assert_eq!(red.fix.evidence, "https://github.com/o/r/runs/9");
+    assert!(
+        red.fix.command.contains("--job 9 --log-failed"),
+        "{}",
+        red.fix.command
+    );
+    let group = events
+        .iter()
+        .find(|event| event.kind == "group_red")
+        .expect("group");
+    assert_eq!(group.fix.evidence, "https://github.com/o/r/actions/runs/77");
+}
+
+#[test]
+fn a_ready_head_is_routed_to_the_configured_reviewer() {
+    let watch = input(
+        pr(Vec::new(), Vec::new()),
+        vec![comment(5, 10, &format!("READY head:{HEAD}"))],
+    );
+    let unrouted = evaluate(&watch, t(20), &RuleConfig::default(), false);
+    let event = unrouted
+        .iter()
+        .find(|event| event.kind == "ready_unreviewed")
+        .expect("ready");
+    assert!(!event.fix.safe_to_auto_apply, "no reviewer to route to");
+    assert_eq!(
+        event.fix.evidence,
+        "https://github.com/o/r/pull/7#issuecomment-5"
+    );
+    let config = RuleConfig {
+        reviewers: BTreeMap::from([("o/r".to_owned(), "fable-graph".to_owned())]),
+        ..RuleConfig::default()
+    };
+    let routed = evaluate(&watch, t(20), &config, false);
+    let event = routed
+        .iter()
+        .find(|event| event.kind == "ready_unreviewed")
+        .expect("ready");
+    assert!(
+        event.fix.command.contains("to fable-graph"),
+        "{}",
+        event.fix.command
+    );
+    assert!(
+        event
+            .fix
+            .command
+            .contains(&format!("`verdict: APPROVE head:{HEAD}`"))
+    );
+    assert!(event.fix.safe_to_auto_apply);
+}
+
+/// The repositories are public: only the fleet App or an account the
+/// repository trusts approves a head, and never the pull request's author.
+/// Anything else neither yields an auto-safe arm (on a queue-less repository
+/// that arm is the merge) nor reaches the author as a reviewer's verdict.
+#[test]
+fn only_a_trusted_verdict_approves_a_head_or_reaches_the_author() {
+    let approve = format!("verdict: APPROVE head:{HEAD}");
+    let mut by_alice = pr(Vec::new(), Vec::new());
+    by_alice.author = Some("alice".to_owned());
+    let fired = |trail: Vec<TrailEntry>| {
+        kinds(&evaluate(
+            &input(by_alice.clone(), trail),
+            t(40),
+            &RuleConfig::default(),
+            false,
+        ))
+    };
+    for untrusted in [
+        by(1, 20, "drive-by", Some("NONE"), &approve),
+        by(1, 20, "contributor", Some("CONTRIBUTOR"), &approve),
+        by(1, 20, "unknown", None, &approve),
+        by(1, 20, "alice", Some("OWNER"), &approve),
+    ] {
+        let events = fired(vec![untrusted.clone()]);
+        assert!(
+            !events.contains("approved_unarmed"),
+            "{untrusted:?}: {events:?}"
+        );
+        assert!(
+            !events.contains("verdict_posted"),
+            "{untrusted:?}: {events:?}"
+        );
+    }
+    // Control: the same comment from an owner who is not the author, or from
+    // the fleet App, approves the head and is relayed.
+    for trusted in [
+        by(1, 20, "daniel", Some("OWNER"), &approve),
+        by(1, 20, "member", Some("MEMBER"), &approve),
+        by(1, 20, "shipyard-local[bot]", None, &approve),
+    ] {
+        let events = fired(vec![trusted.clone()]);
+        assert!(
+            events.contains("approved_unarmed"),
+            "{trusted:?}: {events:?}"
+        );
+        assert!(events.contains("verdict_posted"), "{trusted:?}: {events:?}");
+    }
+    // An outsider's HOLD does not block a trusted approval either.
+    let events = fired(vec![
+        by(1, 20, "daniel", Some("OWNER"), &approve),
+        by(
+            2,
+            25,
+            "drive-by",
+            Some("NONE"),
+            &format!("verdict: HOLD head:{HEAD}"),
+        ),
+    ]);
+    assert!(events.contains("approved_unarmed"), "{events:?}");
+}
+
+#[test]
+fn an_approved_head_nobody_armed_gets_the_bound_arm_command() {
+    let watch = input(
+        pr(Vec::new(), Vec::new()),
+        vec![comment(1, 20, &format!("verdict: APPROVE head:{HEAD}"))],
+    );
+    let events = evaluate(&watch, t(40), &RuleConfig::default(), false);
+    let event = events
+        .iter()
+        .find(|event| event.kind == "approved_unarmed")
+        .expect("approved");
+    assert_eq!(
+        event.fix.command,
+        format!("ghapp pr merge 7 --repo o/r --auto --merge --match-head-commit {HEAD}")
+    );
+    assert!(event.fix.safe_to_auto_apply);
+}
+
+#[test]
+fn an_input_events_fix_passes_through_and_a_missing_one_says_so() {
+    let fix = json!({"what": "w", "evidence": "e", "cause": "c", "command": "x",
+                     "safe_to_auto_apply": true, "verify": "v"});
+    let watch = WatchInput {
+        inputs: vec![
+            InputEvent {
+                kind: "codex_session_errored".to_owned(),
+                key: "a".to_owned(),
+                at: t(1),
+                rest: BTreeMap::from([("fix".to_owned(), fix)]),
+            },
+            InputEvent {
+                kind: "codex_session_idle".to_owned(),
+                key: "b".to_owned(),
+                at: t(1),
+                rest: BTreeMap::new(),
+            },
+        ],
+        ..WatchInput::default()
+    };
+    let events = evaluate(&watch, t(2), &RuleConfig::default(), false);
+    assert_eq!(events[0].fix.command, "x");
+    assert!(events[0].fix.safe_to_auto_apply);
+    assert_eq!(events[1].fix.cause, "input_without_fix");
+    assert!(!events[1].fix.safe_to_auto_apply);
 }
 
 #[test]
@@ -461,6 +713,7 @@ fn fake_gh(
 fn trails_come_from_one_repository_listing_and_batched_reviews() {
     let comments = json!([[
         {"id": 1, "user": {"login": "shipyard-local[bot]"}, "created_at": "2026-10-11T12:10:00Z",
+         "author_association": "NONE",
          "issue_url": "https://api.github.com/repos/o/r/issues/7", "body": format!("READY head:{HEAD}")},
         {"id": 2, "user": {"login": "codecov[bot]"}, "created_at": "2026-10-11T12:11:00Z",
          "issue_url": "https://api.github.com/repos/o/r/issues/7", "body": "## Codecov report"},
@@ -468,25 +721,74 @@ fn trails_come_from_one_repository_listing_and_batched_reviews() {
          "issue_url": "https://api.github.com/repos/o/r/issues/8", "body": format!("reviewed: {HEAD}")}
     ]]);
     let reviews = json!({"data": {"repository": {"p7": {"reviews": {"nodes": [
-        {"databaseId": 50, "author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED",
-         "submittedAt": "2026-10-11T12:20:00Z", "commit": {"oid": HEAD}},
+        {"databaseId": 50, "author": {"login": "reviewer"}, "authorAssociation": "MEMBER",
+         "state": "CHANGES_REQUESTED", "submittedAt": "2026-10-11T12:20:00Z", "commit": {"oid": HEAD}},
         {"databaseId": 51, "author": {"login": "reviewer"}, "state": "COMMENTED",
          "submittedAt": "2026-10-11T12:21:00Z", "commit": {"oid": HEAD}}
     ]}}}}});
+    // The review query must ask for the association, or reviews never count.
     let gh = fake_gh(vec![
         ("repos/o/r/issues/comments", comments.to_string()),
-        ("graphql", reviews.to_string()),
+        ("authorAssociation", reviews.to_string()),
     ]);
     let trails = read_trails(&gh, REPO, &BTreeSet::from([7]), t(-60)).expect("read");
     let trail = &trails[&7];
     assert_eq!(trail.len(), 2, "{trail:?}");
     assert_eq!(trail[0].ready_head.as_deref(), Some(HEAD));
+    assert_eq!(trail[0].association.as_deref(), Some("NONE"));
     assert!(trail[1].review);
+    assert_eq!(trail[1].association.as_deref(), Some("MEMBER"));
     assert_eq!(
         trail[1].verdict.as_ref().map(|verdict| verdict.approve),
         Some(false)
     );
     assert!(!trails.contains_key(&8), "pull request 8 is not watched");
+}
+
+#[test]
+fn a_pull_requests_whole_trail_is_read_from_its_own_comments() {
+    let comments = json!([[
+        {"id": 1, "user": {"login": "shipyard-local[bot]"}, "created_at": "2026-09-01T12:00:00Z",
+         "body": format!("verdict: APPROVE head:{HEAD}")},
+        {"id": 2, "user": {"login": "codecov[bot]"}, "created_at": "2026-09-01T12:01:00Z",
+         "body": "## Codecov report"}
+    ]]);
+    let reviews = json!({"data": {"repository": {"p7": {"reviews": {"nodes": []}}}}});
+    let gh = fake_gh(vec![
+        ("repos/o/r/issues/7/comments", comments.to_string()),
+        ("graphql", reviews.to_string()),
+    ]);
+    let trail = super::read::read_pr_trail(&gh, REPO, 7).expect("read");
+    assert_eq!(trail.len(), 1);
+    assert_eq!(
+        trail[0]
+            .verdict
+            .as_ref()
+            .map(|verdict| verdict.head.as_str()),
+        Some(HEAD)
+    );
+}
+
+#[test]
+fn the_rate_budget_is_the_smaller_of_core_and_graphql() {
+    let answer = json!({"resources": {
+        "core": {"remaining": 4200, "reset": 1_791_860_000},
+        "graphql": {"remaining": 900, "reset": 1_791_861_000}}});
+    let gh = fake_gh(vec![("rate_limit", answer.to_string())]);
+    let budget = super::read::read_rate_budget(&gh).expect("read");
+    assert_eq!(budget.remaining(), 900);
+    assert_eq!(
+        budget.reset.map(|at| at.timestamp()),
+        Some(1_791_861_000),
+        "the exhausted budget's reset"
+    );
+    assert!(super::read::rate_limited(
+        "gh: API rate limit exceeded for installation ID 123. (HTTP 403)"
+    ));
+    assert!(super::read::rate_limited(
+        "You have exceeded a secondary rate limit"
+    ));
+    assert!(!super::read::rate_limited("HTTP 502: Bad Gateway"));
 }
 
 #[test]

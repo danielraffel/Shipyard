@@ -167,7 +167,12 @@ envelope.
 pull request out permanently. Neither is something to reach for by default.
 
 **Head approval.** A repository whose base branch sets
-`[auto_merge] arm_requires_head_approval = true` arms only a head that carries an
+`[auto_merge] arm_requires_head_approval = true` (the default for pulp, vellum,
+tartci and Shipyard when their base is silent, on a host that sets
+`SHIPYARD_REVIEW_BEFORE_ARM=1` or has a `review-before-arm` guards file; there,
+with no identity listed, a verdict from the fleet App or an
+OWNER/MEMBER/COLLABORATOR counts, never the PR author's) arms or merges only a
+head that carries an
 approval of that exact head from an identity listed in
 `[auto_merge] reviewer_identities` (empty by default; the older spelling
 `reviewer_logins` is still read), for example
@@ -201,6 +206,14 @@ never strict.
 `--arm` arms past the check on purpose and the line names who armed it. Rebasing
 an approved pull request produces a new head with no approval, so it stays
 disarmed until it is approved again.
+
+A `ghapp` landing the guard refuses for review prints one
+`queue-arm-guard: fix: {json}` line per refusal (`what`, `evidence`, `cause`,
+`command`, `safe_to_auto_apply`, `verify`). Act on `cause`: `head_moved` and
+`unreadable` are re-reads you may run; `unbound` means repeat the landing bound
+to the named head; `unreviewed`, `hold` and `approval_does_not_carry` need a
+reviewer's verdict on the head, which an agent landing its own head must
+never post itself.
 
 Two things not to conclude from it:
 
@@ -352,6 +365,42 @@ happened while `macos` passed, because another of Pulp's six required contexts
 failed. With `itemTypes`, `timelineItems.totalCount` counts the whole
 timeline; check the read against `filteredCount`.
 
+## Reading CTest out of a job log
+
+`gate_cost::ctest_log` reads a job's `CTest` output; three things in Pulp's
+logs first read as a broken reader:
+
+- **Steps share a second.** A step's `started_at`/`completed_at` are whole
+  seconds and several steps often start in the same one (on Pulp's `macos` job,
+  steps 2, 3 and 4 all at 21:14:13), so a step's lines cannot be cut out by
+  timestamps alone. Each `run` step opens with one `##[group]Run` header; map
+  headers to steps in order, moving past any step that had ended before the
+  header's second. `Set up job`, `Complete job` and `Post` steps write no
+  header.
+- **A retry has no progress prefix.** `ctest --repeat until-pass:2` prints
+  `Test #8: name ...***Failed` again without the `9/22655` in front, so one
+  test can read as failed and then passed in one job.
+- **A pull request's `macos` check may run no tests.** When no native build is
+  needed, Pulp's `macos` job is a stand-in with none of the test steps. Read it
+  as having selected nothing, not as an unreadable head; and do not fetch its
+  log.
+
+Job logs also disappear (`BlobNotFound`, HTTP 404) for some older attempts;
+treat that as unread, never as no failures.
+
+## A dispatched gate run checks out the bare branch head
+
+A `pull_request` run checks out GitHub's merge of the head into the base, so
+diffing against `origin/main` is exact. A `workflow_dispatch` run (App-opened
+pull requests need `ci.yml` and `version-skill-check.yml` dispatched) checks
+out the branch head itself, and the gate scripts diff two-dot. Against
+`origin/main`, every commit main gained since the branch was cut reads as the
+branch's own change. Once version-at-land bumped `Cargo.toml` on main, every
+such run failed with "Version files are owned by version-at-land" while the
+pull request's own run passed (#795, #799). Diff a non-`pull_request` run from
+`git merge-base origin/main HEAD` (`scripts/resolve_diff_base.py`). Before
+calling such a failure the pull request's, diff the branch from its merge base.
+
 ## A unit test must not see the host's GitHub auth
 
 CI runs every test with `SHIPYARD_TEST_HOME` set to the runner's temp
@@ -399,6 +448,16 @@ a `shipyard metrics gate-cost` run during a Shipyard PR's macOS local lane made
 sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
 cannot be had the write is skipped and the cache stops writing for that run; a
 cold read is always correct. Any new cache in the state tree needs the same.
+
+## Only the production daemon defaults to the fleet repositories
+
+`daemon run` and `daemon start` without `--repo` watch the fleet repositories
+(`FLEET_REPOSITORIES`) only in `--mode shipyard`. An isolated daemon without
+`--repo` keeps the old behaviour: the repos of in-flight ship state, which is
+nothing for a fresh state directory. Sandbox E2E's guardian requires exactly
+that (`configured_repos == []` within 10 s), so if it fails with "candidate
+daemon did not become ready" and the candidate's status lists the fleet,
+check `requested_daemon_repos` in `src/app/daemon_cmd.rs` first.
 
 ## A foreign writer-domain holder is named in the guardian receipt
 
@@ -514,7 +573,7 @@ PRs are gone.
 | Experimental authority schema v5 | No operational command exists. Official builds are v4-only; an explicit source test build may validate the reserved request shape only to return `ExperimentalAuthorityRefused`, with no writer, queue mutation, outcome, backend, execution, or authority. |
 | Observe GitHub queue and PR transitions without mutation | `shipyard --json queue-observe --repo <owner/repo> [--follow]` (one bounded GraphQL query per tick; unchanged polls are silent and back off adaptively) |
 | Flag stuck open PRs (repeat test failure, red while armed, repeated ejection on the current head, rebase treadmill, green but unarmed for 2 h (skips drafts and `shipyard:hold` / `shipyard:no-auto-merge` holds), red and unarmed for 2 h, and any Shipyard-handed PR no rule accounts for (`unaccounted`, with the reason; counts and gaps in `pr-watch liveness` and `doctor`), ejected for failed_checks then green and never re-armed; split advisory) | `shipyard pr-watch scan --repo <owner/repo> [--post-comments] [--digest]` (read-only dry run by default; `replay --since 7d --expect PR=FLAGS --control merged-clean` simulates a past window; the daemon digest toggle is `[pr_watch.digest] enabled = true`; see `docs/pr-watch.md`) |
-| Wake a model only when something changed: a READY head nobody reviewed, a head with no READY or verdict, a verdict to route, an armed or queued head nobody approved, a red required check (with its failing tests), a failed merge group, a removed or stuck queue entry, an approved head nobody armed, a tartci host alarm; each once, nothing otherwise | `shipyard pr-watch rules --repo <owner/repo>[@workflow.yml] ... [--alarm-repo danielraffel/tartci] [--input-events FILE]` (JSONL on stdout; the first pass only primes its ledger); `rules-replay --since 2d --tick 5m` replays a window and `scripts/rules_watch_score.py` scores it against labelled turns. See `docs/pr-watch.md#rules-watcher` |
+| Wake a model only when something changed: a READY head nobody reviewed, a head with no READY or verdict, a verdict to route, an armed or queued head nobody approved, a red required check (with its failing tests), a failed merge group, a removed or stuck queue entry, an approved head nobody armed, a tartci host alarm; each once, nothing otherwise | `shipyard pr-watch rules --repo <owner/repo>[@workflow.yml] ... [--alarm-repo danielraffel/tartci] [--input-events FILE]` (JSONL on stdout; the first pass only primes its ledger); `rules-replay --since 2d --tick 5m` replays a window and `scripts/rules_watch_score.py` scores it against labelled turns. Each event's `fix` gives the exact next command; a live pass backs off (exit 75) when the App budget is low. See `docs/pr-watch.md#rules-watcher` |
 | Check pr-watch passes are still completing (the scanning host's silence otherwise mutes hand-back, comments and digest) | `shipyard pr-watch liveness [--json]` (exit 1 when stale past `[pr_watch] stale_after_minutes`, default 45); `shipyard doctor` shows a `PR watch` section on a scanning host; `shipyard doctor --fleet` asks every host class and fails `pr-watch:fleet` when none is completing passes |
 | Hand a red PR back to its owning session (label + `cmux notify` + inbox note, no input injection; the label is removed on merge/close too; never labels a PR that is no longer open; `pr-watch sweep-labels` lists, and with `--apply` removes, stale labels on closed PRs; no label when no owner resolves; an owner session is live when cmux reports it `running` or `idle` with its process alive; inbox notes name their head and age, and an unread note is retracted when its episode resolves; `pr-watch wakes` measures sent vs seen) | `shipyard pr-watch scan --repo <owner/repo> --handback` (dry run); `--deliver-handback` with `[pr_watch.handback] enabled = true` sends. See `docs/pr-watch.md#hand-back` |
 | Remove an exact queue entry | Do not use raw `ghapp pr merge --disable-auto` or `dequeuePullRequest`; use Shipyard's audited exact-head path. The ghapp queue-removal guard refuses unaudited removal, with `GHAPP_ALLOW_QUEUE_REMOVAL=1` reserved for an explicit authority action. |
@@ -624,7 +683,7 @@ writer custody before mutation.
 | **Recognize an assigned-capacity dispatch wedge** | The daemon can publish one durable `dispatch_wedge` actionable wake after two stable observations prove that the exact current merge-queue job remains queued with no assigned runner while a compatible runner is online and idle. Authority binds repository identity, PR/head, merge-group head, run/attempt/job, labels, queue position, policy, and the final authenticated PR/queue reread. Head movement, regenerated/dequeued groups, incomplete pagination, label mismatch, busy/offline capacity, or ambiguous evidence refuses publication. Restart preserves the observation deadline and exact pending publication; a failed or capacity-less observation gets a bounded durable follow-up. This is diagnosis and escalation only: it does not cancel, requeue, mutate selectors or runners, reorder GitHub's queue, or retry work. |
 | **Run sandbox E2E beside production Shipyard safely** | Each protected queue/supervisor/ship mutation holds the shared host-global writer-domain lease only for its critical section; streamed logs reacquire per append, while idle daemons and read-only commands own no lease. Sandbox E2E keeps the fair-entry turnstile and data-domain lease exclusive from snapshot through contamination assertion. A production mutation waits boundedly, then exits `75` with `sandbox_writer_domain_overlap` instead of racing evidence. If the guardian refuses before transition because production workers are active, classify the canary as safely deferred only through `scripts/sandbox_admission_deferral.py`; its exact receipt, installed hash, mutation-probe path, lease absence, daemon PID, and live process start identity must all agree at both workflow checkpoints. That admission deferral is INFRA/retryable and does not justify rerunning the production job. The macOS guardian observes only the exact no-holder/contended ambiguity through a bounded stable-idle window while continuously fencing production identity, binary, config, and active workers; any holder or drift still fails closed. If a corrected-path cleanup retains the host lease solely because workers appeared after its mutation proof, the launchd-owned guardian may reconcile it without a model: authenticate the unique prior ready/mutation/final receipts, preserve exact production identity and configuration while workers drain, prove stable idle again immediately before removing the exact device/inode/ctime plus cryptographically random lease generation, and publish a durable pending/terminal receipt. Removal first atomically detaches that generation under a unique tombstone name, then deletes only the revalidated detached identity; crash debris cannot authorize or block a later fixed-name lease and is retained for evidence rather than guessed away. A lease retained by a canary that never wrote its mutation fence is reconcilable the same way only when its receipts prove it never touched production (never quiesced or restored it, never armed or ran its mutation probe, no workers at admission, candidate dead) and the production it snapshotted was replaced out of band (daemon pid/start or installed binary changed, e.g. by a fleet update); the reconciliation then binds to the current production and its receipts say `reconciliation_basis: production-superseded` with `mutation_fence_proved: false`. With production unchanged, a fence-less lease stays fail-closed for an operator. The guardian holds the host's fleet install guard (`fleet-auth-support.guard` in the production state dir) from before lease creation until its terminal receipt, so a fleet rollout defers (exit 75, no attempt spent) instead of replacing production mid-canary; fleet-reconcile's attempt ledger never rewrites itself on an idle tick, defers a tick before recording when the controller's own guard is held, and takes the shared writer-domain lease for every real write, so it can never land inside a contamination audit (the audit stays strict; nothing in `fleet-reconcile/` is exempted); a canary that finds an install in flight waits 60s, then fails `FleetUpdateInProgress` (INFRA/retryable). A process that exits while being inspected is reported as `ProcessGone`, not a raw KERN_PROCARGS2 errno. Pre-generation legacy leases require explicit operator reconciliation; ambiguous, unexpectedly populated, live-owner, quiesced, identity-drifted, or foreign-holder cases remain untouched. A pending/deferred retained-lease result is only INFRA/retryable evidence, never physical-canary or release acceptance. After its terminal receipt proves the exact lease generation was removed, rerun only the targeted macOS Sandbox job; do not rerun the whole workflow or rebuild unchanged binaries. After cleanup, confirm daemon IPC liveness through a bounded exact-PID-fenced window and require the receipt's configured repositories rather than treating one status miss as death. The guardian must fsync its terminal receipt before self-unloading its exact launchd label; later runs may recover only a bounded set of inert, receipt-authenticated registrations, and terminal workflow paths must fail closed if a successful full inventory does not prove the current label disappeared. Keep failure artifacts inside explicit canary/runner temp roots. Do not add filename/PID/job-ID exemptions or delete either lock file. Restart v0.108.1 daemons during rollout because they hold the obsolete lifetime lease. |
 | **Sandbox E2E times out waiting for `ready.json` and the canary has no `guardian.log`** | launchd never started the guardian. `launchctl print gui/$(id -u)/com.danielraffel.shipyard.sandbox-canary.<run>.<attempt>` shows `runs = 0` and `pended nondemand spawn = speculative`: a RunAtLoad launch is speculative, and a busy host can defer it indefinitely. The workflow kickstarts the guardian right after `launchctl bootstrap` for this reason, so never drop the `launchctl kickstart` line. Its final `if: always()` step boots out the run's label, so a failed run no longer leaves its job loaded. The guardian's `launchd_recovery` reports another run's registration it cannot recover (no or foreign receipt, a guardian that may still be running) under `warnings`, which never fail the run; only this run's own label and a removal it attempted and failed land in `errors`. |
-| **Sandbox E2E exits 1 with no message at the host guard** | The macOS Sandbox job pins itself to M3 by runner name, machine tag and hostname. M3 is now `Daniels-Mac-Studio-m3.local` (renamed when a second Mac Studio joined); the guard accepts that and the old `Daniels-Mac-Studio.local`, and prints the hostname when neither matches. If a host is renamed again, update that `case` and `scripts/test_ci_matrix.py` together; failing here is host identity, not the PR. |
+| **Sandbox E2E fails at the host guard (`sandbox-e2e must run on M3`)** | The macOS Sandbox job pins itself to M3 by runner name, machine tag and the tartci fleet identity: `[host] id = "studio"` in `$TARTCI_FLEET_PROFILE` (default `~/.config/tartci/macos-fleet-profile.toml`). It never reads the live hostname, because macOS renames a host on a Bonjour name collision (`Daniels-Mac-Studio-m3` became `Daniels-Mac-Studio-m3-4.local`, which failed the old hostname `case`). The message names the profile, the identity it found and the hostname. If it fires, the job reached a host other than M3 (route it to `Shipyard-studio-02`), or M3's profile lost its `host.id`; it is host identity, not the PR. |
 | **Sandbox E2E fails at "Verify M3 guardian and production daemon invariants" although the guardian receipt says `completed`** | The production daemon's parent is checked by `scripts/production_daemon_parent.py`, never by a bare `ppid == 1`. On a daemon-launcher host (`shipyard daemon launcher install`) the daemon's parent is the resident `~/.local/libexec/shipyard/shipyard-daemon-launcher --mode shipyard daemon supervise --exec <installed>`, which launchd owns. Both shapes pass; any other parent (a candidate or sandbox supervisor, an `--in-place` hand-off, a launcher not under launchd) fails. If the launcher's argv contract (`launcher_arguments` in `src/daemon_launcher.rs`) changes, update the script and `scripts/test_production_daemon_parent.py` together. |
 | **Drain cloud-queued macOS jobs to local when a slot frees** | `shipyard runner reroute-watch [--apply] [--once] [--interval N] [--flap-window N]` (observe-only without `--apply`; logs per-host capacity + candidate list; flap-guard, one-reroute-per-tick, slot/fail-closed) |
 | **Runner provisioning: deregister a runner** | `shipyard runner remove --name <repo>-<tag>-NN --yes [--purge-dir]`; removal must use the compound `svc.sh uninstall`, not `stop`, so the LaunchAgent registration is removed before GitHub deregistration |

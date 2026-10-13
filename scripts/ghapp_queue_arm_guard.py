@@ -43,6 +43,45 @@ out of refusal text.
 
 Actor identity is deliberately not consulted: every queue mutation is
 attributed to the same App actor whether Shipyard or an agent issued it.
+
+Review before arm or merge
+--------------------------
+
+An arm, an enqueue or a direct merge (``pr merge`` on a queue-less base or with
+``--admin``, REST ``PUT pulls/<n>/merge``, GraphQL ``mergePullRequest``) also
+needs a reviewer verdict naming the exact head, in the repositories that
+require one. The protected base's ``.shipyard/config.toml`` decides when it
+sets ``[auto_merge] arm_requires_head_approval``. Otherwise the repositories in
+REVIEW_REQUIRED_REPOS require one. None of it applies unless the host turns
+review on: ``SHIPYARD_REVIEW_BEFORE_ARM=1`` (``0`` turns it off), or a
+``review-before-arm`` file in the guards directory. With it off the guard reads
+nothing for this rule, so it is inert whatever the config or Python. With it
+on, a config that cannot be read or parsed refuses rather than loosening. This is the Python twin of
+src/head_approval.rs; both read the policy from the base branch, never from
+the head being armed.
+
+A verdict is the last non-blank line of a pull-request comment,
+``verdict: APPROVE head:<sha>`` or ``reviewed: <sha>`` (``verdict: HOLD
+head:<sha>`` holds), or a review in state APPROVED / CHANGES_REQUESTED on the
+head. The latest verdict naming the head decides; a HOLD with no readable time
+always holds. When the base config lists ``reviewer_identities``, only those
+count. Otherwise the fleet App (every agent posts as it) and accounts whose
+``author_association`` is OWNER, MEMBER or COLLABORATOR count, never other
+accounts (the repositories are public) and never a distinguishable pull-request
+author.
+
+The request must bind the head it lands: ``--match-head-commit <sha>``,
+``expectedHeadOid``, or REST ``sha=``, equal to the head the verdict approved.
+
+A merge-only update of an approved head carries the approval to the new head
+only when every commit since is a two-parent merge whose merged parent is on
+the base, and every file the pull request changes has the same blob at the new
+head as at the approved head. A file the base also changed since, or any
+binary change in the pull request, needs a new verdict.
+
+``GHAPP_ALLOW_UNREVIEWED_ARM=1`` is the operator override for this rule alone;
+it prints a WARNING and appends an audit line. ``GHAPP_ALLOW_QUEUE_REARM`` does
+not stand in for it.
 """
 
 from __future__ import annotations
@@ -52,6 +91,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import posixpath
 import re
 import subprocess
 import sys
@@ -83,6 +123,26 @@ MERGE_GROUP_RUN_MAX_PAGES = 3
 ATTRIBUTOR_STDERR_TAIL_LINES = 5
 ATTRIBUTOR_STDERR_TAIL_CHARS = 600
 MERGE_GROUP_ANCESTRY_PROBES = 3
+# Repositories that require a reviewer verdict on the exact head before arming
+# when their base config does not say. Kept equal to REVIEW_REQUIRED_REPOS in
+# src/head_approval.rs (a test reads both).
+REVIEW_REQUIRED_REPOS = (
+    "Generous-Corp/pulp",
+    "Generous-Corp/vellum",
+    "danielraffel/tartci",
+    "danielraffel/Shipyard",
+)
+FLEET_AUTHOR = "shipyard-local"
+REVIEW_OVERRIDE_ENV = "GHAPP_ALLOW_UNREVIEWED_ARM"
+HOST_ENABLE_ENV = "SHIPYARD_REVIEW_BEFORE_ARM"
+HOST_ENABLE_FILE = "review-before-arm"
+TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+MERGE_MUTATIONS = ("mergepullrequest",)
+# Same pattern as src/head_approval.rs marker_verdict.
+_MARKER = re.compile(
+    r"^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})"
+    r"|verdict:[ \t]*(APPROVE|HOLD)[ \t]+head:[ \t]*([0-9a-f]{40}))[ \t]*$"
+)
 OPERATOR_NOTE = (
     "An explicit authority override exists for operators; see docs/ghapp-guards.md."
 )
@@ -556,6 +616,497 @@ def decide(
         f"{label} merge-queue state could not be determined "
         f"({classification.get('detail', 'unknown')}); refusing to arm blind"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review before arm: the twin of src/head_approval.rs.
+# ---------------------------------------------------------------------------
+
+
+def _normalized_login(login: str) -> str:
+    login = login[len("app/"):] if login.startswith("app/") else login
+    login = login[: -len("[bot]")] if login.endswith("[bot]") else login
+    return login.lower()
+
+
+def marker_verdict(body: str) -> tuple[str, str] | None:
+    """``(APPROVE|HOLD, head)`` from a comment's last non-blank line."""
+    lines = [line for line in body.splitlines() if line.strip()]
+    if not lines:
+        return None
+    match = _MARKER.match(lines[-1])
+    if match is None:
+        return None
+    if match.group(1):
+        return "APPROVE", match.group(1)
+    return match.group(2), match.group(3)
+
+
+def host_review_default() -> bool:
+    """Whether this host applies REVIEW_REQUIRED_REPOS (see the module docstring)."""
+    switch = os.environ.get(HOST_ENABLE_ENV)
+    if switch == "1":
+        return True
+    if switch == "0":
+        return False
+    return (_guards_dir() / HOST_ENABLE_FILE).is_file()
+
+
+def _guards_dir() -> pathlib.Path:
+    return pathlib.Path(
+        os.environ.get("SHIPYARD_GHAPP_GUARDS_DIR")
+        or pathlib.Path.home() / ".config" / "shipyard" / "guards"
+    )
+
+
+def review_policy(config_text: str | None, repo: str, host_default: bool) -> dict[str, Any]:
+    """``{required, reviewers, any_but_author}`` from the base's config text.
+
+    ``config_text`` is ``None`` when the base has no config. A config that
+    exists but cannot be parsed (invalid TOML, or no ``tomllib`` on this
+    Python) raises GuardError: an unreadable policy never loosens the rule.
+    """
+    default = host_default and repo.lower() in {name.lower() for name in REVIEW_REQUIRED_REPOS}
+    section: Any = None
+    if config_text is not None:
+        try:
+            import tomllib
+        except ImportError as error:
+            raise GuardError(
+                "the base's .shipyard/config.toml cannot be read on this Python "
+                "(no tomllib; run the guard with Python 3.11 or later)"
+            ) from error
+        try:
+            section = tomllib.loads(config_text).get("auto_merge")
+        except ValueError as error:
+            raise GuardError(f"the base's .shipyard/config.toml does not parse: {error}") from error
+    section = section if isinstance(section, dict) else {}
+    required = section.get("arm_requires_head_approval")
+    reviewers = section.get("reviewer_identities", section.get("reviewer_logins")) or []
+    from_default = not isinstance(required, bool) and default
+    return {
+        "required": required if isinstance(required, bool) else default,
+        "reviewers": [str(login).lower() for login in reviewers if isinstance(login, str)],
+        # Required by REVIEW_REQUIRED_REPOS, not by the repository's own key.
+        "any_but_author": from_default,
+    }
+
+
+def _reviewer_counts(
+    login: str, association: Any, policy: dict[str, Any], author: str | None
+) -> bool:
+    reviewer = _normalized_login(login)
+    if policy.get("any_but_author") and not policy["reviewers"]:
+        # The repositories are public: only the fleet App and accounts the
+        # repository trusts count. Every fleet agent posts as the same App, so
+        # that App's verdict on that App's pull request counts.
+        trusted = reviewer == FLEET_AUTHOR or association in TRUSTED_ASSOCIATIONS
+        return trusted and (
+            author is None or _normalized_login(author) != reviewer or reviewer == FLEET_AUTHOR
+        )
+    # A repository's own setting: only its listed reviewers, never the fleet
+    # App or the author (an empty list admits nobody).
+    return (
+        reviewer != FLEET_AUTHOR
+        and any(_normalized_login(name) == reviewer for name in policy["reviewers"])
+        and (author is None or _normalized_login(author) != reviewer)
+    )
+
+
+def counting_verdicts(
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> list[tuple[datetime | None, str, str, str]]:
+    """``(time, APPROVE|HOLD, head named, description)`` for every counting verdict."""
+    verdicts: list[tuple[datetime | None, str, str, str]] = []
+    for review in reviews:
+        login = (review.get("user") or {}).get("login")
+        state = str(review.get("state") or "").upper()
+        verdict = {"APPROVED": "APPROVE", "CHANGES_REQUESTED": "HOLD"}.get(state)
+        if not isinstance(login, str) or verdict is None:
+            continue
+        if _reviewer_counts(login, review.get("author_association"), policy, author):
+            named = str(review.get("commit_id") or "").lower()
+            verdicts.append((_timestamp(review.get("submitted_at")), verdict, named,
+                             f"a {state} review by {login} at {review.get('submitted_at')}"))
+    for comment in comments:
+        login = (comment.get("user") or {}).get("login")
+        body = comment.get("body")
+        found = marker_verdict(body) if isinstance(body, str) else None
+        if not isinstance(login, str) or found is None:
+            continue
+        if _reviewer_counts(login, comment.get("author_association"), policy, author):
+            verdict, named = found
+            verdicts.append((_timestamp(comment.get("created_at")), verdict, named,
+                             f"`{verdict} head:{named[:12]}` by {login} at "
+                             f"{comment.get('created_at')}"))
+    return verdicts
+
+
+def _latest_on(
+    verdicts: list[tuple[datetime | None, str, str, str]], head: str
+) -> tuple[datetime | None, str, str, str] | None:
+    """The deciding verdict on ``head``: an untimed HOLD, else the newest."""
+    on_head = [entry for entry in verdicts if entry[2] == head]
+    untimed_hold = [entry for entry in on_head if entry[0] is None and entry[1] == "HOLD"]
+    if untimed_hold:
+        return untimed_hold[0]
+    dated = [entry for entry in on_head if entry[0] is not None]
+    return max(dated, key=lambda entry: entry[0]) if dated else None
+
+
+def wanted_verdict(head: str, author: str | None, policy: dict[str, Any]) -> str:
+    wanted = (
+        f"a comment whose last line is `verdict: APPROVE head:{head}` or `reviewed: {head}`, "
+        "or an APPROVED review on that commit"
+    )
+    if policy["reviewers"]:
+        wanted += f", from one of {', '.join(policy['reviewers'])}"
+    elif not policy.get("any_but_author"):
+        wanted += ", from a reviewer the base config lists (it lists none)"
+    else:
+        wanted += ", from the fleet App or an OWNER, MEMBER or COLLABORATOR"
+        if author and _normalized_login(author) != FLEET_AUTHOR:
+            wanted += f" other than the PR author {author}"
+    return wanted
+
+
+def review_verdict(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> tuple[bool, str]:
+    """Whether the latest counting verdict naming ``head`` approves it.
+
+    Returns ``(allowed, why)``; a refusal says exactly what is missing.
+    """
+    head = head.lower()
+    verdicts = counting_verdicts(author, comments, reviews, policy)
+    wanted = wanted_verdict(head, author, policy)
+    latest = _latest_on(verdicts, head)
+    if latest is not None:
+        at, verdict, _, what = latest
+        if verdict == "APPROVE":
+            return True, f"head {head[:12]} carries {what}"
+        if at is None:
+            return False, f"a HOLD naming head {head[:12]} has no readable time; it needs {wanted}"
+        return False, f"the latest verdict naming head {head[:12]} is HOLD ({what}); it needs a newer {wanted}"
+    older = [entry for entry in verdicts if entry[0] is not None]
+    stale = ""
+    if older:
+        _, _, _, what = max(older, key=lambda entry: entry[0])
+        stale = f" The latest verdict names another head: {what}."
+    return False, f"no reviewer verdict names head {head[:12]}; it needs {wanted}.{stale}"
+
+
+def approved_earlier_head(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> str | None:
+    """The newest other head whose deciding verdict is an approval, if no verdict names ``head``."""
+    head = head.lower()
+    verdicts = counting_verdicts(author, comments, reviews, policy)
+    if _latest_on(verdicts, head) is not None:
+        return None
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    for _, _, named, _ in sorted(verdicts, key=lambda entry: entry[0] or floor, reverse=True):
+        if named == head:
+            continue
+        latest = _latest_on(verdicts, named)
+        return named if latest is not None and latest[1] == "APPROVE" else None
+    return None
+
+
+# GitHub's compare lists at most this many files; a longer list is partial.
+COMPARE_FILE_CAP = 300
+
+
+def _pr_files(compare: dict[str, Any], what: str) -> dict[str, tuple[str, str, bool]]:
+    """``filename -> (status, blob sha, has a text patch)`` of a comparison."""
+    files = compare.get("files")
+    if not isinstance(files, list):
+        raise GuardError(f"{what} lists no files")
+    if len(files) >= COMPARE_FILE_CAP:
+        raise GuardError(f"{what} lists {len(files)} files, GitHub's cap; it may be partial")
+    out: dict[str, tuple[str, str, bool]] = {}
+    for item in files:
+        name = item.get("filename") if isinstance(item, dict) else None
+        if not isinstance(name, str):
+            raise GuardError(f"{what} lists a file with no name")
+        out[name] = (str(item.get("status")), str(item.get("sha")), isinstance(item.get("patch"), str))
+    return out
+
+
+def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | None:
+    """``None`` when the approval of ``approved`` carries to ``head``; else why not.
+
+    It carries only when every commit on the first-parent chain from ``head``
+    back to ``approved`` is a two-parent merge whose merged parent is on
+    ``base``, and every file the pull request
+    changes has, at ``head``, the same blob and mode it had at ``approved``. A file the
+    base also changed since ``approved``, or any binary change in the pull
+    request, needs a new verdict: a merge could move or swap content a diff of
+    the changed lines cannot see.
+    """
+    try:
+        compare = run_real_gh(["api", f"repos/{repo}/compare/{approved}...{head}"])
+        if not isinstance(compare, dict):
+            return "the comparison is unreadable"
+        if compare.get("status") != "ahead" or compare.get("behind_by") != 0:
+            return f"{head[:12]} does not descend from {approved[:12]}"
+        commits = compare.get("commits") or []
+        if len(commits) != compare.get("total_commits"):
+            return "the comparison lists only some of its commits"
+        parents_of = {
+            str(commit.get("sha")).lower(): [str(parent.get("sha")).lower()
+                                             for parent in commit.get("parents") or []]
+            for commit in commits
+        }
+        # The update's own commits are the first-parent chain from the new head
+        # back to the approved one; the rest arrived through merged parents.
+        sha = head.lower()
+        while sha != approved.lower():
+            parents = parents_of.get(sha)
+            if parents is None:
+                return f"commit {sha[:12]} is outside the comparison"
+            if len(parents) != 2:
+                return f"commit {sha[:12]} is not a merge"
+            on_base = run_real_gh(["api", f"repos/{repo}/compare/{parents[1]}...{base}"])
+            if not isinstance(on_base, dict) or on_base.get("status") not in ("ahead", "identical"):
+                return f"merged parent {parents[1][:12]} is not on {base}"
+            sha = parents[0]
+        before_compare = run_real_gh(["api", f"repos/{repo}/compare/{base}...{approved}"])
+        after_compare = run_real_gh(["api", f"repos/{repo}/compare/{base}...{head}"])
+        if not isinstance(before_compare, dict) or not isinstance(after_compare, dict):
+            return "the pull request's files are unreadable"
+        before = _pr_files(before_compare, f"compare/{base}...{approved[:12]}")
+        after = _pr_files(after_compare, f"compare/{base}...{head[:12]}")
+        binary = sorted(name for name, (_, _, patch) in before.items() if not patch)
+        if binary:
+            return f"the pull request changes a binary file ({binary[0]})"
+        if sorted(before) != sorted(after):
+            changed = sorted(set(before) ^ set(after))
+            return f"the set of files the pull request changes moved ({changed[0]})"
+        for name, (status, sha, _) in sorted(before.items()):
+            if after[name][:2] != (status, sha):
+                return f"{name} at {head[:12]} is not the blob approved at {approved[:12]}"
+        # The comparison carries no file mode, so a merge that only flips a
+        # file's executable bit keeps its blob: read the modes themselves.
+        present = sorted(name for name, (status, _, _) in before.items() if status != "removed")
+        if present:
+            approved_modes = tree_modes(repo, approved, present)
+            head_modes = tree_modes(repo, head, present)
+            for name in present:
+                if approved_modes.get(name) != head_modes.get(name):
+                    return (f"{name} at {head[:12]} does not keep the mode approved at "
+                            f"{approved[:12]}")
+        base_before = (before_compare.get("merge_base_commit") or {}).get("sha")
+        base_after = (after_compare.get("merge_base_commit") or {}).get("sha")
+        if not isinstance(base_before, str) or not isinstance(base_after, str):
+            return "the merge bases are unreadable"
+        if base_before != base_after:
+            moved = run_real_gh(["api", f"repos/{repo}/compare/{base_before}...{base_after}"])
+            if not isinstance(moved, dict):
+                return "what the base changed is unreadable"
+            both = sorted(set(before) & set(_pr_files(moved, "the base's changes")))
+            if both:
+                return f"{both[0]} was changed by both the pull request and the base"
+    except GuardError as error:
+        return f"the carry cannot be checked ({error})"
+    return None
+
+
+TREE_BATCH = 50
+
+
+def tree_modes(repo: str, commit: str, names: list[str]) -> dict[str, int | None]:
+    """Each file's git mode at ``commit`` (``None`` when absent), from its directory's tree."""
+    owner, _, name = repo.partition("/")
+    by_dir: dict[str, list[str]] = {}
+    for path in names:
+        by_dir.setdefault(posixpath.dirname(path), []).append(path)
+    directories = sorted(by_dir)
+    modes: dict[str, int | None] = {}
+    for start in range(0, len(directories), TREE_BATCH):
+        batch = directories[start:start + TREE_BATCH]
+        fields = "".join(
+            f"d{index}:object(expression:{json.dumps(commit + ':' + directory)})"
+            "{...on Tree{entries{name mode}}}"
+            for index, directory in enumerate(batch)
+        )
+        query = f"query{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{{fields}}}}}"
+        value = run_real_gh(["api", "graphql", "-f", f"query={query}"])
+        if not isinstance(value, dict) or value.get("errors") or not isinstance(
+                (value.get("data") or {}).get("repository"), dict):
+            raise GuardError(f"the trees at {commit[:12]} are unreadable")
+        repository = value["data"]["repository"]
+        for index, directory in enumerate(batch):
+            tree = repository.get(f"d{index}") or {}
+            entries = {entry.get("name"): entry.get("mode")
+                       for entry in tree.get("entries") or [] if isinstance(entry, dict)}
+            for path in by_dir[directory]:
+                mode = entries.get(posixpath.basename(path))
+                modes[path] = mode if isinstance(mode, int) else None
+    return modes
+
+
+def _rest_pages(path: str) -> list[dict[str, Any]]:
+    value = run_real_gh(["api", "--paginate", "--slurp", path])
+    pages = value if isinstance(value, list) else [value]
+    records: list[dict[str, Any]] = []
+    for page in pages:
+        if not isinstance(page, list):
+            raise GuardError(f"{path} did not answer a list")
+        records.extend(item for item in page if isinstance(item, dict))
+    return records
+
+
+def base_config_text(repo: str, base: str) -> str | None:
+    """The base branch's ``.shipyard/config.toml``, or ``None`` when it has none."""
+    real_gh = os.environ.get("GHAPP_REAL_GH", "/opt/homebrew/bin/gh")
+    try:
+        completed = subprocess.run(
+            [real_gh, "api", "-H", "Accept: application/vnd.github.raw+json",
+             f"repos/{repo}/contents/.shipyard/config.toml?ref={base}"],
+            check=False, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GuardError(f"cannot read the base config: {error}") from error
+    if completed.returncode != 0:
+        if "404" in completed.stderr or "Not Found" in completed.stderr:
+            return None
+        raise GuardError(f"cannot read the base config: {completed.stderr.strip()[-200:]}")
+    return completed.stdout
+
+
+def _binding_refusal(target: dict[str, Any], head: str) -> str | None:
+    bound = target.get("bound_head")
+    hint = (
+        "`--match-head-commit <sha>` on `gh pr merge`, `expectedHeadOid` in the mutation, "
+        "or `sha=` on the REST merge."
+    )
+    if not isinstance(bound, str) or not bound:
+        return f"the request does not bind the head it lands; bind it to {head} with {hint}"
+    if bound.lower() != head.lower():
+        return f"the request binds {bound[:12]}, but the head is {head[:12]}"
+    return None
+
+
+def review_fix(cause: str, what: str, repo: str, number: int, head: str,
+               command: str, safe: bool) -> dict[str, Any]:
+    """The actionable fields a review refusal carries (printed as one JSON line)."""
+    return {
+        "what": what,
+        "evidence": f"https://github.com/{repo}/pull/{number}",
+        "cause": cause,
+        "command": command,
+        "safe_to_auto_apply": safe,
+        "verify": (f"`ghapp api repos/{repo}/pulls/{number} --jq .head.sha` prints {head}, and "
+                   "the same landing command passes this guard"),
+    }
+
+
+def review_gate(classification: dict[str, Any], repo: str | None
+                ) -> tuple[bool, str, dict[str, Any] | None]:
+    """``(allowed, message, fix)``: the review-before-arm rule for one target.
+
+    ``fix`` says, for a refusal it can name, what to do next.
+    """
+    repo = classification.get("repo") or repo
+    number = classification.get("pr")
+    head = classification.get("head")
+    label = f"PR #{number}"
+    if not repo or not isinstance(number, int) or not isinstance(head, str):
+        return False, f"{label}: cannot tell which head would land, so its review cannot be checked", None
+    if not host_review_default():
+        # Off is inert: nothing is read, so no config, Python version or
+        # GitHub answer can change what an arm does on a host that has not
+        # turned review on.
+        return True, f"review before arm is off on this host ({HOST_ENABLE_ENV} unset, no {HOST_ENABLE_FILE})", None
+    read_pull = f"ghapp api repos/{repo}/pulls/{number} --jq .head.sha"
+    try:
+        pull = run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
+        base = ((pull.get("base") or {}).get("ref")) if isinstance(pull, dict) else None
+        if not isinstance(base, str) or not base:
+            raise GuardError("the pull request carries no base branch")
+        policy = review_policy(base_config_text(repo, base), repo, True)
+        if not policy["required"]:
+            return True, f"{repo} does not require a review before arming", None
+        live_head = ((pull.get("head") or {}).get("sha") or "").lower()
+        if live_head != head.lower():
+            return False, (
+                f"{label}: the head moved while the guard read it ({head[:12]} -> "
+                f"{live_head[:12]}); read it again"
+            ), review_fix("head_moved", f"{label} moved from {head[:12]} to {live_head[:12]}",
+                          repo, number, live_head, read_pull, True)
+        author = (pull.get("user") or {}).get("login")
+        author = author if isinstance(author, str) else None
+        comments = _rest_pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
+        reviews = _rest_pages(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+    except GuardError as error:
+        return False, (
+            f"{label}: cannot read what its review requires ({error}); refusing to land it unreviewed"
+        ), review_fix("unreadable", f"{label}'s review state could not be read: {error}",
+                      repo, number, head, read_pull, True)
+    unbound = _binding_refusal(classification, head)
+    if unbound is not None:
+        return False, f"{label} ({repo}): {unbound}", review_fix(
+            "unbound", f"the landing request for {label} does not bind head {head}",
+            repo, number, head,
+            f"repeat the same command with `--match-head-commit {head}` (gh pr merge), "
+            f"`expectedHeadOid: \"{head}\"` (GraphQL) or `sha={head}` (REST)", False)
+    allowed, why = review_verdict(head, author, comments, reviews, policy)
+    if allowed:
+        return True, f"{label} ({repo}): {why}", None
+    cause = "hold" if "is HOLD" in why or "HOLD naming" in why else "unreviewed"
+    approved = approved_earlier_head(head, author, comments, reviews, policy)
+    if approved is not None:
+        refusal = merge_only_carry(repo, base, approved, head)
+        if refusal is None:
+            return True, (
+                f"{label} ({repo}): the approval of {approved[:12]} carries to {head[:12]}: "
+                "every commit since is a merge of the base and every file the pull request "
+                "changes keeps its approved blob and mode"
+            ), None
+        why += f" The approval of {approved[:12]} does not carry: {refusal}."
+        cause = "approval_does_not_carry" if cause == "unreviewed" else cause
+    what = {
+        "hold": f"the latest trusted verdict on {label}'s head {head[:12]} is HOLD",
+        "approval_does_not_carry": (f"{label}'s approval of {approved[:12] if approved else ''} "
+                                    f"does not carry to head {head[:12]}"),
+        "unreviewed": f"no trusted verdict names {label}'s head {head[:12]}",
+    }[cause]
+    command = (f"a reviewer (the fleet App, or an OWNER, MEMBER or COLLABORATOR who is not the "
+               f"author) reviews head {head} and posts a comment ending "
+               f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}")
+    # Approving is the reviewer's act; an agent landing its own head must not do it.
+    return False, f"{label} ({repo}): {why}", review_fix(
+        cause, what, repo, number, head, command, False)
+
+
+def audit_override(message: str) -> None:
+    """Append one line to the guards' override audit log. Never raises."""
+    directory = _guards_dir()
+    record = {
+        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "override": REVIEW_OVERRIDE_ENV,
+        "refusal": message,
+        "argv": sys.argv[1:],
+        "cwd": os.getcwd(),
+    }
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / "overrides.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1444,65 +1995,134 @@ def graphql_variables(args: list[str]) -> dict[str, Any]:
     return variables
 
 
+_LANDING_MUTATION = re.compile(
+    r"(enablePullRequestAutoMerge|enqueuePullRequest|mergePullRequest)\s*\(", re.IGNORECASE
+)
+
+
+def _argument(tail: str, name: str, variables: dict[str, Any]) -> str | None:
+    """A mutation input field's value: a literal string or a resolved variable."""
+    field = re.search(
+        rf"\b{name}\s*:\s*(\$[A-Za-z_][A-Za-z0-9_]*|\"([^\"]+)\")", tail
+    )
+    if field is None:
+        return None
+    if field.group(2) is not None:
+        return field.group(2)
+    value = variables.get(field.group(1)[1:])
+    if not isinstance(value, str) or not value:
+        raise GuardError(f"cannot resolve mutation variable {field.group(1)}")
+    return value
+
+
+def landing_mutations(document: str, variables: dict[str, Any]) -> list[tuple[str, str, str | None]]:
+    """``(action, pull request node id, bound head)`` for every arm, enqueue or merge."""
+    found: list[tuple[str, str, str | None]] = []
+    for match in _LANDING_MUTATION.finditer(document):
+        tail = document[match.end():]
+        close = tail.find(")")
+        inputs = tail[: close if close >= 0 else len(tail)]
+        target = _argument(inputs, "pullRequestId", variables)
+        if target is None:
+            raise GuardError(f"cannot find the pullRequestId {match.group(1)} targets")
+        action = "merge" if match.group(1).lower() in MERGE_MUTATIONS else "arm"
+        found.append((action, target, _argument(inputs, "expectedHeadOid", variables)))
+    if not found:
+        raise GuardError("landing mutation found but no pullRequestId could be read")
+    return found
+
+
 def arm_pull_request_ids(document: str, variables: dict[str, Any]) -> list[str]:
     """Every pull-request node id an arm mutation in ``document`` targets."""
-    ids: list[str] = []
-    mutation = re.compile(r"(enablePullRequestAutoMerge|enqueuePullRequest)\s*\(", re.IGNORECASE)
-    for match in mutation.finditer(document):
-        tail = document[match.end():]
-        target = re.search(r"pullRequestId\s*:\s*(\$[A-Za-z_][A-Za-z0-9_]*|\"([^\"]+)\")", tail)
-        if target is None:
-            raise GuardError("cannot find the pullRequestId an arm mutation targets")
-        if target.group(2) is not None:
-            ids.append(target.group(2))
-            continue
-        name = target.group(1)[1:]
-        value = variables.get(name)
-        if not isinstance(value, str) or not value:
-            raise GuardError(f"cannot resolve arm mutation variable ${name}")
-        ids.append(value)
-    if not ids:
-        raise GuardError("arm mutation found but no pullRequestId could be read")
-    return ids
+    return [node for action, node, _ in landing_mutations(document, variables) if action == "arm"]
+
+
+def rest_fields(args: list[str]) -> dict[str, Any]:
+    """``-f``/``-F`` fields and a ``--input`` file's top-level object of a REST call."""
+    fields: dict[str, Any] = {}
+    for value in _require_parser().option_values(args, {"-f", "-F", "--field", "--raw-field"}):
+        key, separator, raw = value.partition("=")
+        if separator:
+            fields[key] = raw
+    for path in _require_parser().option_values(args, {"--input"}):
+        if path == "-":
+            raise GuardError("cannot inspect a REST body read from stdin")
+        try:
+            body = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise GuardError(f"cannot inspect REST input: {error}") from error
+        if isinstance(body, dict):
+            fields.update(body)
+    return fields
+
+
+def _target(classification: dict[str, Any], action: str, bound: Any) -> dict[str, Any]:
+    return {**classification, "action": action,
+            "bound_head": bound if isinstance(bound, str) else None}
 
 
 def arm_request(args: list[str]) -> list[dict[str, Any]] | None:
-    """``None`` when ``args`` cannot arm or enqueue; else the classified targets."""
+    """``None`` when ``args`` can neither arm, enqueue nor merge; else the classified targets.
+
+    Each target carries ``action`` (``arm`` or ``merge``) and the head the
+    request binds (``bound_head``), when it binds one.
+    """
     if "--help" in args or "-h" in args:
         return None
     if len(args) >= 2 and args[0] == "pr" and args[1] == "merge":
         if "--disable-auto" in args:
             return None
         auto = "--auto" in args
-        if not auto and "--admin" in args:
-            # A direct administrator merge bypasses the queue; it enqueues nothing.
-            return None
         owner, name, number = resolve_merge_pr(args)
         response = graphql(PR_BY_NUMBER_QUERY, {"owner": owner, "name": name, "number": str(number)})
+        bound = _require_parser().option_values(args[2:], {"--match-head-commit"})
+        action = "arm"
         if not auto:
             base = _base_ref(response)
             if base is None:
                 raise GuardError("cannot read the pull request's base branch")
-            if not base_has_merge_queue(owner, name, base):
-                return None
-        return [classify_pr_queue_state(response)]
+            # A direct merge: an administrator merge, or any merge on a base
+            # with no queue. Either lands the head at once.
+            if "--admin" in args or not base_has_merge_queue(owner, name, base):
+                action = "merge"
+        return [_target(classify_pr_queue_state(response), action, bound[-1] if bound else None)]
     if args and args[0] == "api":
         parser = _require_parser()
         try:
             endpoint, query = parser.api_target(args)
-            document = "\n".join([parser.graphql_document(args), *query.get("query", [])])
         except parser.GuardError as error:
-            if any("graphql" in arg.lower() for arg in args):
+            if any("graphql" in arg.lower() or arg.rstrip("/").endswith("/merge") for arg in args):
                 raise GuardError(str(error)) from error
             return None
         if endpoint != "graphql":
-            return None
+            return rest_merge_request(args, endpoint)
+        try:
+            document = "\n".join([parser.graphql_document(args), *query.get("query", [])])
+        except parser.GuardError as error:
+            raise GuardError(str(error)) from error
         compact = "".join(document.split()).lower()
-        if not any(name in compact for name in ARM_MUTATIONS):
+        if not any(name in compact for name in (*ARM_MUTATIONS, *MERGE_MUTATIONS)):
             return None
-        ids = arm_pull_request_ids(document, graphql_variables(args))
-        return [classify_pr_queue_state(graphql(PR_BY_ID_QUERY, {"id": node})) for node in ids]
+        return [
+            _target(classify_pr_queue_state(graphql(PR_BY_ID_QUERY, {"id": node})), action, bound)
+            for action, node, bound in landing_mutations(document, graphql_variables(args))
+        ]
     return None
+
+
+def rest_merge_request(args: list[str], endpoint: str) -> list[dict[str, Any]] | None:
+    """The target of a REST ``PUT repos/<o>/<r>/pulls/<n>/merge``, else ``None``."""
+    match = re.fullmatch(r"repos/([^/]+)/([^/]+)/pulls/([1-9][0-9]*)/merge", endpoint)
+    if match is None:
+        return None
+    methods = _require_parser().option_values(args, {"-X", "--method"})
+    fields = rest_fields(args)
+    method = (methods[-1] if methods else ("POST" if fields else "GET")).upper()
+    if method == "GET":
+        return None
+    owner, name, number = match.group(1), match.group(2), match.group(3)
+    response = graphql(PR_BY_NUMBER_QUERY, {"owner": owner, "name": name, "number": number})
+    return [_target(classify_pr_queue_state(response), "merge", fields.get("sha"))]
 
 
 def _base_ref(response: Any) -> str | None:
@@ -1519,6 +2139,38 @@ def _override(message: str) -> int:
     return 0
 
 
+def review_refusal(targets: list[dict[str, Any]], repo: str | None) -> bool:
+    """Print and return whether an unreviewed head refuses the arm.
+
+    GHAPP_ALLOW_UNREVIEWED_ARM=1 arms anyway, loudly and on the audit log.
+    """
+    refused = [
+        (message, fix)
+        for allowed, message, fix in (review_gate(target, repo) for target in targets)
+        if not allowed
+    ]
+    if not refused:
+        return False
+    message = " | ".join(message for message, _ in refused)
+    if os.environ.get(REVIEW_OVERRIDE_ENV) == "1":
+        audit_override(message)
+        print(
+            f"queue-arm-guard: WARNING: {REVIEW_OVERRIDE_ENV}=1 lands an unreviewed head; "
+            f"recorded in the guards' overrides.jsonl: {message}",
+            file=sys.stderr,
+        )
+        return False
+    print(
+        f"queue-arm-guard: refusing to arm or merge an unreviewed head: {message} "
+        "Each `queue-arm-guard: fix:` line below says what to do next.",
+        file=sys.stderr,
+    )
+    for _, fix in refused:
+        if fix is not None:
+            print(f"queue-arm-guard: fix: {json.dumps(fix, sort_keys=True)}", file=sys.stderr)
+    return True
+
+
 def main(args: list[str]) -> int:
     if os.environ.get("SHIPYARD_INTERNAL_QUEUE_MUTATION") == "1":
         return 0
@@ -1527,8 +2179,15 @@ def main(args: list[str]) -> int:
         targets = arm_request(args)
     except GuardError as error:
         message = f"refusing ambiguous queue-arm request: {error}"
-        if override:
+        if override and os.environ.get(REVIEW_OVERRIDE_ENV) == "1":
+            # Nothing names the head, so its review cannot be checked either.
+            audit_override(message)
             return _override(message)
+        if override:
+            message += (
+                f"; it names no head, so its review cannot be checked: "
+                f"{REVIEW_OVERRIDE_ENV}=1 is needed as well"
+            )
         print(
             f"queue-arm-guard: {message}. Inspect the PR with `shipyard landing --pr <n>` and "
             f"land it with `shipyard ship --pr <n>`. {OPERATOR_NOTE}",
@@ -1539,7 +2198,9 @@ def main(args: list[str]) -> int:
         return 0
     repo = os.environ.get("GH_REPO") or None
     verdicts = []
-    for target in targets:
+    # The queue-state rules judge arms and enqueues; a direct merge does not
+    # enter the queue, so only the review rule applies to it.
+    for target in (target for target in targets if target.get("action", "arm") == "arm"):
         try:
             attribution = attribute_ejecting_batch(target, repo)
         except GuardError as error:
@@ -1556,23 +2217,25 @@ def main(args: list[str]) -> int:
                 environment = {"allowed": False, "reason": f"{error}", "evidence": []}
         verdicts.append(decide(target, attribution, environment))
     refusals = [message for allowed, message in verdicts if not allowed]
-    if not refusals:
-        for allowed, message in verdicts:
-            if allowed and (
-                "batch attributor certified" in message
-                or "this re-enqueue is allowed" in message
-            ):
-                print(f"queue-arm-guard: note: {message}", file=sys.stderr)
-        return 0
-    message = " | ".join(refusals)
-    if override:
-        return _override(message)
-    print(
-        f"queue-arm-guard: refusing: {message} Inspect it with `shipyard landing --pr <n>`. "
-        f"{OPERATOR_NOTE}",
-        file=sys.stderr,
-    )
-    return 1
+    if refusals and not override:
+        print(
+            f"queue-arm-guard: refusing: {' | '.join(refusals)} Inspect it with "
+            f"`shipyard landing --pr <n>`. {OPERATOR_NOTE}",
+            file=sys.stderr,
+        )
+        return 1
+    # The queue-state override does not stand in for a review.
+    if review_refusal(targets, repo):
+        return 1
+    if refusals:
+        return _override(" | ".join(refusals))
+    for allowed, message in verdicts:
+        if allowed and (
+            "batch attributor certified" in message
+            or "this re-enqueue is allowed" in message
+        ):
+            print(f"queue-arm-guard: note: {message}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":

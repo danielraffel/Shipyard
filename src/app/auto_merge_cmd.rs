@@ -882,6 +882,15 @@ fn merge_pr(
         }
     } else {
         require_proven_constrained_classic_merge_identity(admin, state.pr)?;
+        // A direct merge lands the head as surely as an arm does, and on a
+        // queue-less repository it is the landing path.
+        require_head_approval(
+            client
+                .as_ref()
+                .expect("built-in merge should have gh client"),
+            cwd,
+            state,
+        )?;
         verify_live_merge_target(
             client
                 .as_ref()
@@ -4610,6 +4619,9 @@ exit 91
             if joined.contains("issues/9438/comments") {
                 return Ok(String::new());
             }
+            if joined.contains("pulls/9438 --jq .user.login") {
+                return Ok("shipyard-local[bot]\n".to_owned());
+            }
             Err(format!("unscripted gh call: {joined}"))
         }
     }
@@ -4656,8 +4668,35 @@ exit 91
     fn a_repository_without_the_policy_reads_nothing_else() {
         let calls = std::cell::RefCell::new(Vec::new());
         let gh = approval_gh(Err("gh: Not Found (HTTP 404)"), "", &calls);
-        assert_eq!(head_approval_verdict(&gh, &validated_9438()), Ok(()));
+        let mut state = validated_9438();
+        state.repo = "someone/else".to_owned();
+        assert_eq!(head_approval_verdict(&gh, &state), Ok(()));
         assert_eq!(calls.borrow().len(), 1, "{:?}", calls.borrow());
+    }
+
+    /// A repository on the review-by-default list needs no config to refuse
+    /// a validated head nobody approved, and says which marker it needs.
+    #[test]
+    fn a_listed_repository_without_a_config_refuses_an_unapproved_head() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let gh = approval_gh(Err("gh: Not Found (HTTP 404)"), "", &calls);
+        let error = crate::head_approval::with_host_review_default(true, || {
+            head_approval_verdict(&gh, &validated_9438())
+        })
+        .expect_err("refused");
+        let head = crate::head_approval::tests::PR_9438_HEADS[6];
+        assert!(
+            error.contains(&format!("`verdict: APPROVE head:{head}`")),
+            "{error}"
+        );
+        assert!(
+            calls
+                .borrow()
+                .iter()
+                .any(|call| call.contains("pulls/9438 --jq .user.login")),
+            "{:?}",
+            calls.borrow()
+        );
     }
 
     #[test]
@@ -4668,8 +4707,9 @@ exit 91
         assert!(error.contains("refusing to arm blind"), "{error}");
     }
 
-    /// Every validated arm goes through the approval check before the
-    /// mutation: the initial admission and both re-enqueue paths.
+    /// Every validated arm and the classic merge go through the approval
+    /// check before the mutation: the initial admission, both re-enqueue
+    /// paths, and the direct merge a queue-less repository lands with.
     #[test]
     fn every_validated_arm_checks_head_approval_first() {
         let source = std::fs::read_to_string(
@@ -4685,7 +4725,20 @@ exit 91
             3,
             "arm sites changed; pair each with an approval check"
         );
-        assert_eq!(checks - 1, arms - 1);
+        let classic = body.matches("prepare_classic_merge(").count();
+        assert_eq!(classic - 1, 1, "classic merge sites changed");
+        assert_eq!(checks - 1, arms - 1 + classic - 1);
+        let classic_branch = &body[body
+            .find("require_proven_constrained_classic_merge_identity(admin, state.pr)?;")
+            .expect("classic branch")..];
+        assert!(
+            classic_branch
+                .find("require_head_approval(")
+                .expect("check")
+                < classic_branch
+                    .find("prepare_classic_merge(")
+                    .expect("merge")
+        );
         let admission = &body[body
             .find("QueueAdmission::Arm { pr_id } => {")
             .expect("arm branch")..];

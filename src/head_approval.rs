@@ -32,6 +32,34 @@
 //! as a reviewer. The fleet author App and the PR author cannot approve their
 //! own head.
 //!
+//! ## Repositories that require review by default
+//!
+//! On a host that turns it on ([`host_review_default`]: `SHIPYARD_REVIEW_BEFORE_ARM=1`,
+//! or a `review-before-arm` file in the guards directory),
+//! [`REVIEW_REQUIRED_REPOS`] require a verdict naming the exact head even when
+//! their base config is silent. Updating the binary changes nothing until a
+//! host turns it on, so the rule rolls out one host at a time. A config that
+//! sets `arm_requires_head_approval` itself still decides.
+//!
+//! With no reviewer listed, such a repository counts a verdict from the fleet
+//! App (`shipyard-local`, which every agent posts as) or from an account whose
+//! `author_association` is `OWNER`, `MEMBER` or `COLLABORATOR`; never from
+//! other accounts, because the repositories are public, and never from a
+//! distinguishable pull-request author. Listing `reviewer_identities` restores
+//! the strict rule above. The queue-arm guard
+//! (`scripts/ghapp_queue_arm_guard.py`) applies the same rule to every arm
+//! and direct merge that goes through `ghapp`.
+//!
+//! ## Merge-only updates
+//!
+//! Updating an approved head with its base makes a new head no verdict names.
+//! The approval carries to it ([`Approval::Carried`]) only when every commit
+//! on the first-parent chain back to the approved head is a two-parent merge
+//! whose merged parent is on the base, and every file the pull request
+//! changes has the same blob at the new head as at the approved one. A file
+//! the base also changed since, or any binary change in the pull request,
+//! needs a new verdict.
+//!
 //! ## Ejections
 //!
 //! The merge queue records why it removed each entry. After
@@ -57,6 +85,80 @@ pub const REVIEWERS_KEY: &str = "reviewer_logins";
 pub const REVIEWER_IDENTITIES_KEY: &str = "reviewer_identities";
 /// Tracked config file the setting is read from on the protected base.
 pub const CONFIG_PATH: &str = ".shipyard/config.toml";
+/// Repositories that require an approval of the exact head when their base
+/// config does not say. Kept equal to `REVIEW_REQUIRED_REPOS` in
+/// `scripts/ghapp_queue_arm_guard.py` (a test reads both).
+pub const REVIEW_REQUIRED_REPOS: [&str; 4] = [
+    "Generous-Corp/pulp",
+    "Generous-Corp/vellum",
+    "danielraffel/tartci",
+    "danielraffel/Shipyard",
+];
+
+/// Whether `repo` is one of [`REVIEW_REQUIRED_REPOS`].
+#[must_use]
+pub fn requires_review_by_default(repo: &str) -> bool {
+    REVIEW_REQUIRED_REPOS
+        .iter()
+        .any(|required| required.eq_ignore_ascii_case(repo))
+}
+
+/// Environment switch for [`host_review_default`]: `1` on, `0` off.
+pub const HOST_ENABLE_ENV: &str = "SHIPYARD_REVIEW_BEFORE_ARM";
+/// File in the guards directory that turns [`host_review_default`] on.
+pub const HOST_ENABLE_FILE: &str = "review-before-arm";
+/// `author_association` values whose verdicts count when no reviewer is
+/// listed (besides the fleet App's).
+pub const TRUSTED_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
+
+#[cfg(test)]
+thread_local! {
+    static HOST_DEFAULT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `body` with [`host_review_default`] pinned, on this thread.
+#[cfg(test)]
+pub(crate) fn with_host_review_default<T>(enabled: bool, body: impl FnOnce() -> T) -> T {
+    HOST_DEFAULT_OVERRIDE.with(|cell| cell.set(Some(enabled)));
+    let result = body();
+    HOST_DEFAULT_OVERRIDE.with(|cell| cell.set(None));
+    result
+}
+
+#[cfg(test)]
+fn host_review_override() -> Option<bool> {
+    HOST_DEFAULT_OVERRIDE.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn host_review_override() -> Option<bool> {
+    None
+}
+
+/// Whether this host applies [`REVIEW_REQUIRED_REPOS`]: `SHIPYARD_REVIEW_BEFORE_ARM`
+/// (`1` or `0`) decides, else a `review-before-arm` file in the guards
+/// directory (`$SHIPYARD_GHAPP_GUARDS_DIR`, else `~/.config/shipyard/guards`)
+/// turns it on. Off otherwise.
+#[must_use]
+pub fn host_review_default() -> bool {
+    if let Some(enabled) = host_review_override() {
+        return enabled;
+    }
+    match std::env::var(HOST_ENABLE_ENV).as_deref() {
+        Ok("1") => return true,
+        Ok("0") => return false,
+        _ => {}
+    }
+    let dir = std::env::var_os("SHIPYARD_GHAPP_GUARDS_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".config/shipyard/guards"))
+        });
+    dir.is_some_and(|dir| dir.join(HOST_ENABLE_FILE).is_file())
+}
+
 /// Removals of one head after which it needs a fresh approval to re-arm.
 pub const EJECTION_CAP: usize = 2;
 
@@ -70,6 +172,11 @@ pub struct ApprovalPolicy {
     pub required: bool,
     /// Identities whose exact-head approvals count, lower-cased.
     pub reviewer_logins: Vec<String>,
+    /// Required by [`REVIEW_REQUIRED_REPOS`] rather than the repository's own
+    /// setting: with no reviewer listed, the fleet App or a trusted
+    /// association counts, never a distinguishable pull-request author.
+    #[serde(default)]
+    pub any_reviewer_but_author: bool,
 }
 
 impl ApprovalPolicy {
@@ -98,7 +205,31 @@ impl ApprovalPolicy {
                         .collect()
                 })
                 .unwrap_or_default(),
+            any_reviewer_but_author: false,
         }
+    }
+
+    /// [`Self::from_table`] for `repo`: on a host that turns the default on,
+    /// a repository in [`REVIEW_REQUIRED_REPOS`] whose table does not set
+    /// `arm_requires_head_approval` requires review.
+    #[must_use]
+    pub fn from_table_for_repo(table: &toml::Table, repo: &str, host_default: bool) -> Self {
+        let mut policy = Self::from_table(table);
+        let set = table
+            .get(CONFIG_TABLE)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|section| section.contains_key(REQUIRED_KEY));
+        if !set && host_default && requires_review_by_default(repo) {
+            policy.required = true;
+            policy.any_reviewer_but_author = true;
+        }
+        policy
+    }
+
+    /// The policy of a repository whose base has no config file.
+    #[must_use]
+    pub fn without_config(repo: &str, host_default: bool) -> Self {
+        Self::from_table_for_repo(&toml::Table::new(), repo, host_default)
     }
 
     /// Reject a policy that would let Shipyard approve its own PR.
@@ -126,6 +257,15 @@ pub enum Approval {
         #[serde(default)]
         performed_via_github_app_id: Option<u64>,
     },
+    /// An approval of an earlier head, carried to this one by merge-only
+    /// updates that left every file the pull request changes at its approved
+    /// blob and mode.
+    Carried {
+        /// The head the approval names.
+        from_head: String,
+        /// The approval of that head.
+        approval: Box<Approval>,
+    },
     /// A `reviewed:<sha>` comment from an allowlisted reviewer.
     Marker {
         /// Commenter login.
@@ -140,12 +280,46 @@ pub enum Approval {
 }
 
 impl Approval {
+    /// The comment that carries the approval, when it is a marker.
+    #[must_use]
+    pub fn comment_id(&self) -> Option<u64> {
+        match self {
+            Self::Marker { comment_id, .. } => *comment_id,
+            Self::Review { .. } => None,
+            Self::Carried { approval, .. } => approval.comment_id(),
+        }
+    }
+
+    /// The GitHub App that posted the approval, when one did.
+    #[must_use]
+    pub fn app_id(&self) -> Option<u64> {
+        match self {
+            Self::Review {
+                performed_via_github_app_id,
+                ..
+            }
+            | Self::Marker {
+                performed_via_github_app_id,
+                ..
+            } => *performed_via_github_app_id,
+            Self::Carried { approval, .. } => approval.app_id(),
+        }
+    }
+
     /// One phrase naming who approved and how.
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
             Self::Review { login, .. } => format!("an approving review by {login}"),
             Self::Marker { login, .. } => format!("a reviewed:<sha> marker by {login}"),
+            Self::Carried {
+                from_head,
+                approval,
+            } => format!(
+                "{} of {}, carried by merge-only updates with byte-identical own lines",
+                approval.describe(),
+                short(from_head)
+            ),
         }
     }
 }
@@ -270,8 +444,41 @@ fn is_fleet_author(login: &str) -> bool {
     normalized_login(login) == "shipyard-local"
 }
 
-fn reviewer_allowed(login: &str, policy: &ApprovalPolicy, author: Option<&str>) -> bool {
+/// Whether a verdict by `login` (with its `author_association` when read)
+/// counts when no reviewer is listed: the fleet App or a trusted association,
+/// and never the distinguishable author of the pull request.
+#[must_use]
+pub(crate) fn trusted_reviewer(
+    login: &str,
+    association: Option<&str>,
+    author: Option<&str>,
+) -> bool {
+    let trusted = is_fleet_author(login)
+        || association.is_some_and(|association| TRUSTED_ASSOCIATIONS.contains(&association));
+    trusted
+        && author.is_none_or(|author| {
+            normalized_login(author) != normalized_login(login) || is_fleet_author(author)
+        })
+}
+
+/// Whether the verdict in `record` (`login`, and `association` when read)
+/// counts under `policy` for a pull request by `author`.
+fn reviewer_allowed(record: &Value, policy: &ApprovalPolicy, author: Option<&str>) -> bool {
+    let Some(login) = login(record) else {
+        return false;
+    };
     let reviewer = normalized_login(login);
+    if policy.any_reviewer_but_author && policy.reviewer_logins.is_empty() {
+        // The repositories are public: only the fleet App and accounts the
+        // repository trusts count. The fleet App is every agent's identity,
+        // so its own pull request is not distinguishable from its reviewer's
+        // comment.
+        return trusted_reviewer(
+            login,
+            record.get("association").and_then(Value::as_str),
+            author,
+        );
+    }
     !is_fleet_author(login)
         && policy
             .reviewer_logins
@@ -294,10 +501,7 @@ pub fn verdict_audit_events(
 ) -> Vec<String> {
     let mut events = Vec::new();
     for comment in comments {
-        let Some(login) = login(comment) else {
-            continue;
-        };
-        if !reviewer_allowed(login, policy, author) {
+        if !reviewer_allowed(comment, policy, author) {
             continue;
         }
         let Some(body) = comment.get("body").and_then(Value::as_str) else {
@@ -317,8 +521,7 @@ pub fn verdict_audit_events(
         }
     }
     for review in reviews {
-        let Some(login) = login(review) else { continue };
-        if !reviewer_allowed(login, policy, author) {
+        if !reviewer_allowed(review, policy, author) {
             continue;
         }
         let Some(state) = review.get("state").and_then(Value::as_str) else {
@@ -364,7 +567,7 @@ fn find_approval_for_author(
         |record: &Value| newer_than.is_none_or(|floor| at(record).is_some_and(|at| at > floor));
     let review = reviews.iter().rev().find(|review| {
         fresh(review)
-            && login(review).is_some_and(|login| reviewer_allowed(login, policy, author))
+            && reviewer_allowed(review, policy, author)
             && review
                 .get("state")
                 .and_then(Value::as_str)
@@ -387,7 +590,7 @@ fn find_approval_for_author(
         .rev()
         .find(|comment| {
             fresh(comment)
-                && login(comment).is_some_and(|login| reviewer_allowed(login, policy, author))
+                && reviewer_allowed(comment, policy, author)
                 && comment
                     .get("body")
                     .and_then(Value::as_str)
@@ -444,10 +647,11 @@ impl HeadGate {
             Self::NotRequired => "this repository does not require head approval".to_owned(),
             Self::Approved { approval } => format!("the head carries {}", approval.describe()),
             Self::NotApproved { head } => format!(
-                "head {} carries no approval (an APPROVED review on it, or a reviewed:{} \
-                 marker from a listed reviewer), and this repository arms only approved heads; \
-                 left disarmed. Arm deliberately with `--arm`",
-                short(head),
+                "head {} carries no approval: it needs a comment whose last line is \
+                 `verdict: APPROVE head:{head}` or `reviewed: {head}`, or an APPROVED review \
+                 on that commit, from a listed reviewer (anyone but the PR author where none \
+                 is listed), with no later HOLD naming it. This repository arms only approved \
+                 heads; left disarmed. Arm deliberately with `--arm`",
                 short(head)
             ),
             Self::EjectionCap { head, ejections } => format!(
@@ -516,8 +720,7 @@ fn latest_verdict(
     author: Option<&str>,
 ) -> Option<Verdict> {
     let review_events = reviews.iter().filter_map(|review| {
-        let login = login(review)?;
-        if !reviewer_allowed(login, policy, author)
+        if !reviewer_allowed(review, policy, author)
             || !review
                 .get("commit_id")
                 .and_then(Value::as_str)
@@ -536,8 +739,7 @@ fn latest_verdict(
         Some((at(review), verdict))
     });
     let comment_events = comments.iter().filter_map(|comment| {
-        let login = login(comment)?;
-        if !reviewer_allowed(login, policy, author) {
+        if !reviewer_allowed(comment, policy, author) {
             return None;
         }
         let (verdict, marker_head) = marker_verdict(comment.get("body")?.as_str()?)?;
@@ -628,6 +830,10 @@ fn read_policy_inner(
     ]) {
         Ok(raw) => raw,
         Err(detail) if detail.contains("404") || detail.contains("Not Found") => {
+            let host_default = host_review_default();
+            if host_default && requires_review_by_default(repo) {
+                return Ok(ApprovalPolicy::without_config(repo, host_default));
+            }
             if missing_is_error {
                 return Err(format!(
                     "{CONFIG_PATH} on {base} is absent; approval policy is required"
@@ -640,7 +846,7 @@ fn read_policy_inner(
     let table = raw
         .parse::<toml::Table>()
         .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
-    let policy = ApprovalPolicy::from_table(&table);
+    let policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_review_default());
     policy.validate().map(|()| policy)
 }
 
@@ -657,6 +863,11 @@ pub fn read_policy_required(
 ) -> Result<ApprovalPolicy, String> {
     read_policy_inner(run_gh, repo, base, true)
 }
+
+/// A review as the gate reads it.
+const REVIEW_RECORD_JQ: &str = ".[] | {login: .user.login, type: .user.type, association: .author_association, at: .submitted_at, state: .state, commit_id: .commit_id, performed_via_github_app_id: .performed_via_github_app.id}";
+/// A comment as the gate reads it.
+const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 
 fn read_records(run_gh: RunGh<'_>, path: &str, jq: &str) -> Result<Vec<Value>, String> {
     let raw = run_gh(&[
@@ -710,24 +921,64 @@ pub fn evaluate_excusing(
     if !policy.required {
         return Ok(HeadGate::NotRequired);
     }
+    let author = pr_author(run_gh, repo, pr, &policy, None)?;
     let reviews = read_records(
         run_gh,
         &format!("repos/{repo}/pulls/{pr}/reviews"),
-        ".[] | {login: .user.login, type: .user.type, at: .submitted_at, state: .state, commit_id: .commit_id, performed_via_github_app_id: .performed_via_github_app.id}",
+        REVIEW_RECORD_JQ,
     )?;
     let comments = read_records(
         run_gh,
         &format!("repos/{repo}/issues/{pr}/comments"),
-        ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}",
+        COMMENT_RECORD_JQ,
     )?;
-    Ok(decide_excusing(
+    let gate = decide_for_author(
         &policy,
         head,
         &reviews,
         &comments,
         queue,
         latest_was_interruption,
+        author.as_deref(),
+    );
+    Ok(with_carry(
+        run_gh,
+        &CarryInput {
+            repo,
+            pr,
+            head,
+            reviews: &reviews,
+            comments: &comments,
+            policy: &policy,
+            author: author.as_deref(),
+        },
+        gate,
     ))
+}
+
+/// The pull request's author, read when the policy turns on it: with no
+/// reviewer listed, a verdict counts only from someone other than the author.
+fn pr_author(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    policy: &ApprovalPolicy,
+    known: Option<&str>,
+) -> Result<Option<String>, String> {
+    if known.is_some() || !policy.any_reviewer_but_author || !policy.reviewer_logins.is_empty() {
+        return Ok(known.map(str::to_owned));
+    }
+    let login = run_gh(&[
+        "api".to_owned(),
+        format!("repos/{repo}/pulls/{pr}"),
+        "--jq".to_owned(),
+        ".user.login".to_owned(),
+    ])?;
+    let login = login.trim();
+    if login.is_empty() {
+        return Err(format!("PR #{pr} carried no author"));
+    }
+    Ok(Some(login.to_owned()))
 }
 
 /// [`evaluate`] with the policy already read, for a caller that reads the
@@ -774,15 +1025,17 @@ pub fn evaluate_with_policy_for_author_with_events(
     if !policy.required {
         return Ok((HeadGate::NotRequired, Vec::new()));
     }
+    let author = pr_author(run_gh, repo, pr, policy, author)?;
+    let author = author.as_deref();
     let reviews = read_records(
         run_gh,
         &format!("repos/{repo}/pulls/{pr}/reviews"),
-        ".[] | {login: .user.login, type: .user.type, at: .submitted_at, state: .state, commit_id: .commit_id, performed_via_github_app_id: .performed_via_github_app.id}",
+        REVIEW_RECORD_JQ,
     )?;
     let comments = read_records(
         run_gh,
         &format!("repos/{repo}/issues/{pr}/comments"),
-        ".[] | {id: .id, login: .user.login, type: .user.type, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}",
+        COMMENT_RECORD_JQ,
     )?;
     let comments = if comments.iter().any(|comment| {
         comment
@@ -808,10 +1061,404 @@ pub fn evaluate_with_policy_for_author_with_events(
         comments
     };
     let events = verdict_audit_events(head, &reviews, &comments, policy, author);
-    Ok((
-        decide_for_author(policy, head, &reviews, &comments, queue, false, author),
-        events,
-    ))
+    let gate = decide_for_author(policy, head, &reviews, &comments, queue, false, author);
+    let carry = CarryInput {
+        repo,
+        pr,
+        head,
+        reviews: &reviews,
+        comments: &comments,
+        policy,
+        author,
+    };
+    Ok((with_carry(run_gh, &carry, gate), events))
+}
+
+/// What [`with_carry`] reads about one pull request.
+struct CarryInput<'a> {
+    repo: &'a str,
+    pr: u64,
+    head: &'a str,
+    reviews: &'a [Value],
+    comments: &'a [Value],
+    policy: &'a ApprovalPolicy,
+    author: Option<&'a str>,
+}
+
+/// Heads a counting verdict names, newest verdict first.
+fn verdict_heads(input: &CarryInput<'_>) -> Vec<String> {
+    let mut named: Vec<(Option<DateTime<Utc>>, String)> = Vec::new();
+    for review in input.reviews {
+        if reviewer_allowed(review, input.policy, input.author)
+            && let Some(commit) = review.get("commit_id").and_then(Value::as_str)
+        {
+            named.push((at(review), commit.to_ascii_lowercase()));
+        }
+    }
+    for comment in input.comments {
+        if reviewer_allowed(comment, input.policy, input.author)
+            && let Some((_, head)) = comment
+                .get("body")
+                .and_then(Value::as_str)
+                .and_then(marker_verdict)
+        {
+            named.push((at(comment), head));
+        }
+    }
+    named.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let mut heads: Vec<String> = Vec::new();
+    for (_, head) in named {
+        if !heads.contains(&head) {
+            heads.push(head);
+        }
+    }
+    heads
+}
+
+/// `gate`, or an approval carried from an earlier head when no verdict names
+/// this one and the newest approved earlier head reaches it by merge-only
+/// updates with byte-identical own lines. Anything unreadable leaves `gate`.
+fn with_carry(run_gh: RunGh<'_>, input: &CarryInput<'_>, gate: HeadGate) -> HeadGate {
+    if !matches!(gate, HeadGate::NotApproved { .. }) {
+        return gate;
+    }
+    let verdict = |head: &str| {
+        latest_verdict(
+            head,
+            input.reviews,
+            input.comments,
+            input.policy,
+            input.author,
+        )
+    };
+    if verdict(input.head).is_some() {
+        // A verdict names this head; only a newer verdict can change it.
+        return gate;
+    }
+    let Some(from) = verdict_heads(input)
+        .into_iter()
+        .find(|head| !head.eq_ignore_ascii_case(input.head))
+        .filter(|head| verdict(head) == Some(Verdict::Approve))
+    else {
+        return gate;
+    };
+    let Some(approval) = find_approval_for_author(
+        &from,
+        input.reviews,
+        input.comments,
+        input.policy,
+        None,
+        input.author,
+    ) else {
+        return gate;
+    };
+    match merge_only_carry(run_gh, input.repo, input.pr, &from, input.head) {
+        Ok(()) => HeadGate::Approved {
+            approval: Approval::Carried {
+                from_head: from,
+                approval: Box::new(approval),
+            },
+        },
+        Err(_) => gate,
+    }
+}
+
+fn gh_json(run_gh: RunGh<'_>, args: &[String]) -> Result<Value, String> {
+    serde_json::from_str(run_gh(args)?.trim()).map_err(|error| format!("invalid JSON: {error}"))
+}
+
+/// GitHub's compare lists at most this many files; a longer list is partial.
+const COMPARE_FILE_CAP: usize = 300;
+
+/// `filename -> (status, blob sha, has a text patch)` of one comparison, and
+/// its merge base.
+type PrFiles = (
+    std::collections::BTreeMap<String, (String, String, bool)>,
+    String,
+);
+
+fn compare_files(run_gh: RunGh<'_>, repo: &str, range: &str) -> Result<PrFiles, String> {
+    let value = gh_json(
+        run_gh,
+        &[
+            "api".to_owned(),
+            format!("repos/{repo}/compare/{range}"),
+            "--jq".to_owned(),
+            "{merge_base: .merge_base_commit.sha, files: [.files[] | {filename, status, sha, \
+             patch: (.patch != null)}]}"
+                .to_owned(),
+        ],
+    )?;
+    let files = value
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("compare/{range} lists no files"))?;
+    if files.len() >= COMPARE_FILE_CAP {
+        return Err(format!(
+            "compare/{range} lists {} files, GitHub's cap; it may be partial",
+            files.len()
+        ));
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for file in files {
+        let text = |key: &str| file.get(key).and_then(Value::as_str).map(str::to_owned);
+        let name =
+            text("filename").ok_or_else(|| format!("compare/{range}: a file has no name"))?;
+        out.insert(
+            name,
+            (
+                text("status").unwrap_or_default(),
+                text("sha").unwrap_or_default(),
+                file.get("patch").and_then(Value::as_bool) == Some(true),
+            ),
+        );
+    }
+    let base = value
+        .get("merge_base")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("compare/{range}: no merge base"))?
+        .to_owned();
+    Ok((out, base))
+}
+
+/// Whether the approval of `from` carries to `to`.
+///
+/// It carries only when every commit on the first-parent chain from `to`
+/// back to `from` is a two-parent merge whose merged parent is on the base,
+/// and every file the pull request changes has, at `to`, the same blob and
+/// mode it had at `from`. A file the base also changed since `from`, or any binary
+/// change in the pull request, needs a new verdict: a merge could move or
+/// swap content that a diff of the changed lines cannot see.
+///
+/// # Errors
+///
+/// Why the approval of `from` does not carry to `to`.
+pub fn merge_only_carry(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    from: &str,
+    to: &str,
+) -> Result<(), String> {
+    let base = run_gh(&[
+        "api".to_owned(),
+        format!("repos/{repo}/pulls/{pr}"),
+        "--jq".to_owned(),
+        ".base.ref".to_owned(),
+    ])?
+    .trim()
+    .to_owned();
+    if base.is_empty() {
+        return Err("the pull request has no base branch".to_owned());
+    }
+    first_parent_merges(run_gh, repo, &base, from, to)?;
+    let (before, base_before) = compare_files(run_gh, repo, &format!("{base}...{from}"))?;
+    let (after, base_after) = compare_files(run_gh, repo, &format!("{base}...{to}"))?;
+    if let Some(name) = before
+        .iter()
+        .find(|(_, (_, _, patch))| !patch)
+        .map(|(name, _)| name)
+    {
+        return Err(format!("the pull request changes a binary file ({name})"));
+    }
+    if let Some(name) = before
+        .keys()
+        .find(|name| !after.contains_key(*name))
+        .or_else(|| after.keys().find(|name| !before.contains_key(*name)))
+    {
+        return Err(format!(
+            "the set of files the pull request changes moved ({name})"
+        ));
+    }
+    for (name, (status, sha, _)) in &before {
+        if after
+            .get(name)
+            .is_none_or(|(after_status, after_sha, _)| after_status != status || after_sha != sha)
+        {
+            return Err(format!(
+                "{name} at {} is not the blob approved at {}",
+                short(to),
+                short(from)
+            ));
+        }
+    }
+    // The comparison carries no file mode, so a merge that only flips a
+    // file's executable bit keeps its blob: read the modes themselves.
+    let present: Vec<&str> = before
+        .iter()
+        .filter(|(_, (status, _, _))| status != "removed")
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !present.is_empty() {
+        let approved_modes = tree_modes(run_gh, repo, from, &present)?;
+        let head_modes = tree_modes(run_gh, repo, to, &present)?;
+        if let Some(name) = present
+            .iter()
+            .find(|name| approved_modes.get(**name) != head_modes.get(**name))
+        {
+            return Err(format!(
+                "{name} at {} does not keep the mode approved at {}",
+                short(to),
+                short(from)
+            ));
+        }
+    }
+    if base_before != base_after {
+        let (moved, _) = compare_files(run_gh, repo, &format!("{base_before}...{base_after}"))?;
+        if let Some(name) = before.keys().find(|name| moved.contains_key(*name)) {
+            return Err(format!(
+                "{name} was changed by both the pull request and the base"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Directories read per GraphQL query by [`tree_modes`].
+const TREE_BATCH: usize = 50;
+
+/// Each of `names`' git mode at `commit` (absent when the file is), read from
+/// its directory's tree.
+fn tree_modes(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    commit: &str,
+    names: &[&str],
+) -> Result<std::collections::BTreeMap<String, u64>, String> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository {repo:?}"))?;
+    let mut by_dir: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for path in names {
+        let directory = path.rsplit_once('/').map_or("", |(directory, _)| directory);
+        by_dir.entry(directory).or_default().push(path);
+    }
+    let directories: Vec<&str> = by_dir.keys().copied().collect();
+    let quote = |text: &str| Value::String(text.to_owned()).to_string();
+    let mut modes = std::collections::BTreeMap::new();
+    for batch in directories.chunks(TREE_BATCH) {
+        let mut fields = String::new();
+        for (index, directory) in batch.iter().enumerate() {
+            let _ = std::fmt::Write::write_fmt(
+                &mut fields,
+                format_args!(
+                    "d{index}:object(expression:{}){{...on Tree{{entries{{name mode}}}}}}",
+                    quote(&format!("{commit}:{directory}"))
+                ),
+            );
+        }
+        let query = format!(
+            "query{{repository(owner:{},name:{}){{{fields}}}}}",
+            quote(owner),
+            quote(name)
+        );
+        let value = gh_json(
+            run_gh,
+            &[
+                "api".to_owned(),
+                "graphql".to_owned(),
+                "-f".to_owned(),
+                format!("query={query}"),
+            ],
+        )?;
+        if value.get("errors").is_some() {
+            return Err(format!("the trees at {} are unreadable", short(commit)));
+        }
+        let repository = value
+            .pointer("/data/repository")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("the trees at {} are unreadable", short(commit)))?;
+        for (index, directory) in batch.iter().enumerate() {
+            let entries = repository
+                .get(&format!("d{index}"))
+                .and_then(|tree| tree.get("entries"))
+                .and_then(Value::as_array);
+            for path in &by_dir[directory] {
+                let base = path.rsplit_once('/').map_or(*path, |(_, base)| base);
+                let mode = entries.into_iter().flatten().find_map(|entry| {
+                    (entry.get("name").and_then(Value::as_str) == Some(base))
+                        .then(|| entry.get("mode").and_then(Value::as_u64))
+                        .flatten()
+                });
+                if let Some(mode) = mode {
+                    modes.insert((*path).to_owned(), mode);
+                }
+            }
+        }
+    }
+    Ok(modes)
+}
+
+/// Every commit on the first-parent chain from `to` back to `from` is a
+/// two-parent merge whose merged parent is on `base`. The other commits in
+/// the range arrived through those merged parents.
+fn first_parent_merges(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), String> {
+    let range = gh_json(
+        run_gh,
+        &[
+            "api".to_owned(),
+            format!("repos/{repo}/compare/{from}...{to}"),
+            "--jq".to_owned(),
+            "{status, behind_by, total_commits, commits: [.commits[] | {sha, parents: [.parents[].sha]}]}"
+                .to_owned(),
+        ],
+    )?;
+    if range.get("status").and_then(Value::as_str) != Some("ahead")
+        || range.get("behind_by").and_then(Value::as_u64) != Some(0)
+    {
+        return Err(format!(
+            "{} does not descend from {}",
+            short(to),
+            short(from)
+        ));
+    }
+    let commits = range
+        .get("commits")
+        .and_then(Value::as_array)
+        .ok_or("the comparison lists no commits")?;
+    if Some(commits.len() as u64) != range.get("total_commits").and_then(Value::as_u64) {
+        return Err("the comparison lists only some of its commits".to_owned());
+    }
+    let parents_of: std::collections::BTreeMap<String, Vec<String>> = commits
+        .iter()
+        .filter_map(|commit| {
+            let sha = commit.get("sha")?.as_str()?.to_ascii_lowercase();
+            let parents = commit
+                .get("parents")?
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .collect();
+            Some((sha, parents))
+        })
+        .collect();
+    let mut sha = to.to_ascii_lowercase();
+    while sha != from.to_ascii_lowercase() {
+        let parents = parents_of
+            .get(&sha)
+            .ok_or_else(|| format!("commit {} is outside the comparison", short(&sha)))?;
+        let [first, merged] = parents.as_slice() else {
+            return Err(format!("commit {} is not a merge", short(&sha)));
+        };
+        let on_base = run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repo}/compare/{merged}...{base}"),
+            "--jq".to_owned(),
+            ".status".to_owned(),
+        ])?;
+        if !matches!(on_base.trim(), "ahead" | "identical") {
+            return Err(format!("merged parent {} is not on {base}", short(merged)));
+        }
+        sha.clone_from(first);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

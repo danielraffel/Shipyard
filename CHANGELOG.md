@@ -3,6 +3,43 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03141"></a>
+## [0.314.1] - 2026-10-13
+
+- fix/review carry mode ([#804](https://github.com/danielraffel/Shipyard/pull/804))
+- feat/watch inputs ([#800](https://github.com/danielraffel/Shipyard/pull/800))
+
+<a id="v03140"></a>
+## [0.314.0] - 2026-10-13
+
+- fix/rules watcher followups ([#801](https://github.com/danielraffel/Shipyard/pull/801))
+
+<a id="v03131"></a>
+## [0.313.1] - 2026-10-13
+
+- fix/isolated daemon no fleet default ([#803](https://github.com/danielraffel/Shipyard/pull/803))
+
+<a id="v03130"></a>
+## [0.313.0] - 2026-10-13
+
+- fix/review before arm ([#796](https://github.com/danielraffel/Shipyard/pull/796))
+- fix/version check dispatch base ([#802](https://github.com/danielraffel/Shipyard/pull/802))
+
+<a id="v03120"></a>
+## [0.312.0] - 2026-10-13
+
+- feat/scorecard selection recall ([#795](https://github.com/danielraffel/Shipyard/pull/795))
+
+<a id="v03110"></a>
+## [0.311.0] - 2026-10-13
+
+- feat/scorecard same sha flakes ([#799](https://github.com/danielraffel/Shipyard/pull/799))
+
+<a id="v03101"></a>
+## [0.310.1] - 2026-10-13
+
+- fix/sandbox e2e host identity ([#798](https://github.com/danielraffel/Shipyard/pull/798))
+
 <a id="v03100"></a>
 ## [0.310.0] - 2026-10-13
 
@@ -2202,6 +2239,13 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.314.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.314.1
+[0.314.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.314.0
+[0.313.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.313.1
+[0.313.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.313.0
+[0.312.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.312.0
+[0.311.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.311.0
+[0.310.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.310.1
 [0.310.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.310.0
 [0.309.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.309.0
 [0.308.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.308.0
