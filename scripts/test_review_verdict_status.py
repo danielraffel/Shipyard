@@ -52,6 +52,10 @@ class ReviewVerdictStatus(unittest.TestCase):
         answers = self.case("shipyard-784", queue=False, comments=[trail], config=config,
                             graphql=arm.opened(arm.review_fixture("shipyard-784-graphql.json")))
         answers.insert(0, ("/statuses/", {"json": {"state": "posted"}}))
+        answers.insert(0, (f"/commits/{HEAD}/pulls", {"json": [
+            {"number": 784, "state": "open", "head": {"sha": HEAD}},
+            {"number": 700, "state": "closed", "head": {"sha": HEAD}},
+            {"number": 701, "state": "open", "head": {"sha": arm.HOLD_784}}]}))
         return [(needle, {"json": pull}) if needle == "/pulls/" else (needle, answer)
                 for needle, answer in answers]
 
@@ -62,6 +66,7 @@ class ReviewVerdictStatus(unittest.TestCase):
 
     def post(self, answers: list[tuple[str, dict[str, Any]]], event_name: str = "issue_comment",
              event: dict[str, Any] | None = None) -> subprocess.CompletedProcess:
+        (self.root / "calls").unlink(missing_ok=True)
         fake = self.install(answers)
         payload = event if event is not None else {
             "issue": {"number": 784, "pull_request": {"url": "x"}}}
@@ -135,13 +140,57 @@ class ReviewVerdictStatus(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.root / "calls").exists())
 
-    def test_a_review_event_judges_the_live_head(self) -> None:
+    def test_a_review_judges_the_live_head_through_workflow_run(self) -> None:
         trail = [self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
-        event = {"pull_request": {"number": 784, "head": {"sha": arm.HOLD_784}}}
-        result = self.post(self.answers(trail), "pull_request_review", event)
+        event = {"workflow_run": {"pull_requests": [{"number": 784}], "head_sha": arm.HOLD_784}}
+        result = self.post(self.answers(trail), "workflow_run", event)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.posted()["url"], f"repos/{REPO}/statuses/{HEAD}")
         self.assertEqual(self.posted()["state"], "success")
+
+    def test_a_fork_review_with_no_listed_pull_request_judges_its_head(self) -> None:
+        trail = [self.comment(f"verdict: HOLD head:{HEAD}", "2026-10-12T15:00:00Z")]
+        event = {"workflow_run": {"pull_requests": [], "head_sha": HEAD}}
+        result = self.post(self.answers(trail), "workflow_run", event)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"/commits/{HEAD}/pulls", self.calls())
+        self.assertEqual(self.posted()["url"], f"repos/{REPO}/statuses/{HEAD}")
+        self.assertEqual(self.posted()["state"], "failure")
+
+    def test_a_review_event_is_never_run_directly(self) -> None:
+        # pull_request_review runs the pull request's own workflow file, so the
+        # poster must not accept it.
+        result = self.post([], "pull_request_review", {"pull_request": {"number": 784}})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsupported event", result.stderr)
+        workflow = (STATUS.parent.parent / ".github" / "workflows" / "review-verdict.yml").read_text()
+        on = workflow.split("\non:", 1)[1].split("\npermissions:", 1)[0]
+        self.assertNotIn("pull_request_review", on)
+        trigger = (STATUS.parent.parent / ".github" / "workflows"
+                   / "review-verdict-trigger.yml").read_text()
+        self.assertIn("permissions: {}", trigger)
+
+    def test_a_head_two_open_pull_requests_share_needs_both_approved(self) -> None:
+        trail = [self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
+        answers = self.answers(trail)
+        pull = copy.deepcopy(arm.review_fixture("shipyard-784-pull.json"))
+        pull.update(state="open", number=785)
+        answers[:0] = [
+            (f"/commits/{HEAD}/pulls", {"json": [
+                {"number": 784, "state": "open", "head": {"sha": HEAD}},
+                {"number": 785, "state": "open", "head": {"sha": HEAD}}]}),
+            ("issues/785/comments", {"pages": [[]]}),
+            ("pulls/785/reviews", {"pages": [[]]}),
+            ("pulls/785", {"json": pull}),
+        ]
+        result = self.post(answers)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        posted = self.posted()
+        self.assertEqual(posted["state"], "failure", result.stdout)
+        self.assertIn("PR #784: allowed", result.stdout)
+        self.assertIn("PR #785: refused", result.stdout)
+        # Control: with only #784 on the head, the same trail is success.
+        self.assertEqual(self.judged(trail), "success")
 
     def test_a_closed_pull_request_posts_nothing(self) -> None:
         answers = self.answers([])

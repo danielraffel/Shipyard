@@ -30,40 +30,86 @@ disagree:
 
 The rebase carry is a per-host switch and is always off here.
 
+A status belongs to a commit, but a decision belongs to a pull request, and
+two open pull requests can share a head (one branch opened into two bases, a
+fork pushing an approved commit). The status is `success` only when the guard
+allows the head for every open pull request whose head it is
+(`commits/{sha}/pulls`).
+
 ## Trust
 
-The workflow runs on `pull_request_target`, `pull_request_review` and
-`issue_comment`, checks out a trusted copy of the rule (the base branch, or a
-pinned Shipyard commit), and never checks out or runs the pull request's
-code. It reads every comment and review from the API, so an APPROVE from an
-account the rule does not trust counts for nothing, whoever posts it.
-Permissions are `contents: read`, `pull-requests: read`, `statuses: write`.
-A `pull_request_review` on a fork's pull request runs with a read-only token
-and cannot post; the next comment or push re-posts the status.
+Every trigger runs the default branch's definition of the poster:
+
+- `pull_request_target` and `issue_comment` always do;
+- a review is different: `pull_request_review` runs the pull request's own
+  copy of the workflow file, so a same-repository pull request could rewrite
+  a job that holds `statuses: write`. Reviews therefore start
+  `review-verdict-trigger.yml`, which does nothing and holds no permissions,
+  and its completion starts the poster through `workflow_run`, which runs the
+  default branch's definition with the head read from the API.
+
+The poster checks out the default branch, never the pull request's code, and
+reads every comment and review from the API, so an APPROVE from an account
+the rule does not trust counts for nothing, whoever posts it.
+
+**A `GITHUB_TOKEN` status is not proof of who posted it.** Every workflow in
+the repository posts as `github-actions`, and anyone who can push a branch can
+add a `pull_request` workflow that posts `review-verdict=success` with its own
+token. Report-only, that only misleads a reader; as a required check it would
+be forgeable. Stage 2 therefore posts from a dedicated GitHub App and requires
+that App as the status's expected source in branch protection, so a
+`github-actions` status of the same name does not satisfy it.
+
+Pins: the job runs on `ubuntu-24.04`, uses `actions/checkout` and
+`actions/setup-python` by commit SHA, and runs the rule on Python 3.12.12 (the
+guard needs `tomllib`, 3.11 or later; an older interpreter would fail every
+status closed). It calls only `gh api`, from the image's `gh`.
 
 ## Rollout
 
 1. Report-only: the status posts but is not required. Compare it with the
    guard's decisions on real pull requests for two or three days.
-2. Required, one repository at a time, starting with Vellum. A change to
-   branch protection is reviewed before it is applied.
+2. Required, one repository at a time, starting with Vellum: posted by the
+   dedicated App, with that App required as the source. A change to branch
+   protection is reviewed before it is applied.
 
 ## Adding it to another repository
 
-Shipyard runs `.github/workflows/review-verdict.yml` from its own base
-branch. Another repository runs the same script from a pinned Shipyard
-commit:
+Shipyard runs `.github/workflows/review-verdict.yml` and
+`review-verdict-trigger.yml` from its own default branch. Another repository
+adds both, the poster running the script from a pinned Shipyard commit:
 
 ```yaml
+# .github/workflows/review-verdict-trigger.yml
+name: Review verdict trigger
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Hand the review to Review verdict
+        run: 'true'
+```
+
+```yaml
+# .github/workflows/review-verdict.yml
 name: Review verdict
 
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
-  pull_request_review:
-    types: [submitted, edited, dismissed]
   issue_comment:
     types: [created, edited, deleted]
+  workflow_run:
+    workflows: [Review verdict trigger]
+    types: [completed]
 
 permissions:
   contents: read
@@ -71,13 +117,13 @@ permissions:
   statuses: write
 
 concurrency:
-  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
   review-verdict:
     if: github.event_name != 'issue_comment' || github.event.issue.pull_request
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check out the pinned rule
@@ -86,10 +132,15 @@ jobs:
           repository: danielraffel/Shipyard
           ref: <40-hex Shipyard commit on main>
           persist-credentials: false
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12.12'
       - name: Post review-verdict
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/review_verdict_status.py
+        run: '"${{ steps.python.outputs.python-path }}" scripts/review_verdict_status.py'
 ```
 
 Bump the pinned commit when the rule changes, like any other pin.

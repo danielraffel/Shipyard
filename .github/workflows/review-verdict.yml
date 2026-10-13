@@ -2,18 +2,20 @@
 # server-side twin of queue-arm-guard's review-before-arm rule (see
 # docs/review-verdict-status.md). Report-only until branch protection lists it.
 #
-# pull_request_target and issue_comment run in the base branch's context with
-# the base's code: the job checks out the base, never the pull request, so a
-# pull request cannot change the rule that judges it.
+# Every trigger here runs the default branch's definition of this file:
+# pull_request_target and issue_comment always do, and a review reaches it
+# through workflow_run of the permission-less "Review verdict trigger". The
+# job checks out the default branch and never the pull request's code.
 name: Review verdict
 
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
-  pull_request_review:
-    types: [submitted, edited, dismissed]
   issue_comment:
     types: [created, edited, deleted]
+  workflow_run:
+    workflows: [Review verdict trigger]
+    types: [completed]
 
 permissions:
   contents: read
@@ -21,21 +23,26 @@ permissions:
   statuses: write
 
 concurrency:
-  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
   review-verdict:
     if: github.event_name != 'issue_comment' || github.event.issue.pull_request
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Check out the base branch's rule
+      - name: Check out the default branch's rule
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12.12'
       - name: Post review-verdict
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/review_verdict_status.py
+        run: '"${{ steps.python.outputs.python-path }}" scripts/review_verdict_status.py'

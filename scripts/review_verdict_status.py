@@ -14,10 +14,15 @@ guard's merge-only carry takes to it) is ``success``. The rebase carry is off
 here: it is a per-host switch, not a repository rule.
 
 It runs from a workflow triggered by ``pull_request_target``,
-``pull_request_review`` and ``issue_comment``. It never checks out or runs the
-pull request's code, and it reads every comment and review from the API rather
-than trusting the event, so a comment from an untrusted account (a fork's
-author, a drive-by) counts only as the guard's rules allow.
+``issue_comment`` and ``workflow_run`` (a review reaches it through a
+permission-less trigger workflow), all of which run the default branch's
+definition. It never checks out or runs the pull request's code, and it reads
+every comment and review from the API rather than trusting the event, so a
+comment from an untrusted account counts only as the guard's rules allow.
+
+A status belongs to a commit, but a decision belongs to a pull request, and
+two open pull requests can share a head. The status is ``success`` only when
+the guard allows the head for every open pull request whose head it is.
 
 Usage: ``review_verdict_status.py`` with ``GITHUB_EVENT_NAME``,
 ``GITHUB_EVENT_PATH``, ``GITHUB_REPOSITORY`` and ``GH_TOKEN`` set (a GitHub
@@ -51,16 +56,26 @@ def load_guard() -> ModuleType:
     return module
 
 
-def pull_number(event_name: str, event: dict[str, Any]) -> int | None:
-    """The pull request an event is about, or ``None`` (a comment on an issue)."""
-    if event_name in ("pull_request_target", "pull_request", "pull_request_review"):
+def event_target(event_name: str, event: dict[str, Any]) -> tuple[int | None, str | None]:
+    """``(pull request, head sha)`` an event names; either may be ``None``.
+
+    ``(None, None)`` means there is nothing to judge (a comment on an issue).
+    A ``workflow_run`` from a fork lists no pull request, only its head.
+    """
+    if event_name == "pull_request_target":
         number = (event.get("pull_request") or {}).get("number")
-    elif event_name == "issue_comment":
+        return (number if isinstance(number, int) else None), None
+    if event_name == "issue_comment":
         issue = event.get("issue") or {}
         number = issue.get("number") if issue.get("pull_request") else None
-    else:
-        raise ValueError(f"unsupported event {event_name!r}")
-    return number if isinstance(number, int) else None
+        return (number if isinstance(number, int) else None), None
+    if event_name == "workflow_run":
+        run = event.get("workflow_run") or {}
+        pulls = [pull.get("number") for pull in run.get("pull_requests") or []
+                 if isinstance(pull, dict) and isinstance(pull.get("number"), int)]
+        head = run.get("head_sha") if isinstance(run.get("head_sha"), str) else None
+        return (pulls[0] if pulls else None), head
+    raise ValueError(f"unsupported event {event_name!r}")
 
 
 def describe(allowed: bool, message: str) -> str:
@@ -78,9 +93,22 @@ def decide(guard: ModuleType, repo: str, number: int, head: str) -> tuple[bool, 
     return allowed, message
 
 
+def open_pulls_on(guard: ModuleType, repo: str, head: str) -> list[int]:
+    """Every open pull request whose head is ``head``."""
+    pulls = guard.run_real_gh(["api", f"repos/{repo}/commits/{head}/pulls?per_page=100"])
+    if not isinstance(pulls, list):
+        raise guard.GuardError(f"the pull requests on {head[:12]} are unreadable")
+    return sorted(
+        pull["number"] for pull in pulls
+        if isinstance(pull, dict) and isinstance(pull.get("number"), int)
+        and pull.get("state") == "open"
+        and ((pull.get("head") or {}).get("sha") or "").lower() == head.lower()
+    )
+
+
 def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) -> int:
-    number = pull_number(event_name, event)
-    if number is None:
+    number, head = event_target(event_name, event)
+    if number is None and head is None:
         print("review-verdict: not a pull request; nothing to post")
         return 0
     # The guard's own switches, pinned: review is on (this status is the
@@ -91,15 +119,30 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     os.environ["SHIPYARD_GHAPP_GUARDS_DIR"] = tempfile.mkdtemp(prefix="review-verdict-guards-")
     os.environ.setdefault("GHAPP_REAL_GH", shutil.which("gh") or "gh")
     guard = load_guard()
-    pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
-    head = ((pull.get("head") or {}).get("sha") or "") if isinstance(pull, dict) else ""
+    if number is not None:
+        pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
+        if not isinstance(pull, dict):
+            print(f"review-verdict: PR #{number} is unreadable", file=sys.stderr)
+            return 1
+        if pull.get("state") != "open":
+            print(f"review-verdict: PR #{number} is {pull.get('state')}; nothing to post")
+            return 0
+        head = (pull.get("head") or {}).get("sha") or ""
     if not head:
         print(f"review-verdict: PR #{number} has no readable head", file=sys.stderr)
         return 1
-    if pull.get("state") != "open":
-        print(f"review-verdict: PR #{number} is {pull.get('state')}; nothing to post")
+    numbers = open_pulls_on(guard, repo, head)
+    if number is not None and number not in numbers:
+        numbers.append(number)
+    if not numbers:
+        print(f"review-verdict: no open pull request has head {head}; nothing to post")
         return 0
-    allowed, message = decide(guard, repo, number, head)
+    decisions = [(n, *decide(guard, repo, n, head)) for n in sorted(numbers)]
+    refused = [(n, message) for n, allowed, message in decisions if not allowed]
+    allowed = not refused
+    message = refused[0][1] if refused else decisions[0][2]
+    if len(decisions) > 1:
+        message += f" (judged for PRs {', '.join(f'#{n}' for n, _, _ in decisions)} on this head)"
     state = "success" if allowed else "failure"
     arguments = [
         "api", "-X", "POST", f"repos/{repo}/statuses/{head}",
@@ -110,7 +153,9 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     if run_url:
         arguments += ["-f", f"target_url={run_url}"]
     guard.run_real_gh(arguments)
-    print(f"review-verdict: {state} on {head}: {message}")
+    for n, ok, why in decisions:
+        print(f"review-verdict: PR #{n}: {'allowed' if ok else 'refused'}: {why}")
+    print(f"review-verdict: {state} on {head}")
     return 0
 
 
