@@ -1170,11 +1170,12 @@ fn gh_json(run_gh: RunGh<'_>, args: &[String]) -> Result<Value, String> {
 /// GitHub's compare lists at most this many files; a longer list is partial.
 const COMPARE_FILE_CAP: usize = 300;
 
-/// `filename -> (status, blob sha, has a text patch)` of one comparison, and
-/// its merge base.
+/// `filename -> (status, blob sha, has a text patch)` of one comparison, its
+/// merge base, and `filename -> previous_filename` for every rename in it.
 type PrFiles = (
     std::collections::BTreeMap<String, (String, String, bool)>,
     String,
+    std::collections::BTreeMap<String, String>,
 );
 
 fn compare_files(run_gh: RunGh<'_>, repo: &str, range: &str) -> Result<PrFiles, String> {
@@ -1185,7 +1186,7 @@ fn compare_files(run_gh: RunGh<'_>, repo: &str, range: &str) -> Result<PrFiles, 
             format!("repos/{repo}/compare/{range}"),
             "--jq".to_owned(),
             "{merge_base: .merge_base_commit.sha, files: [.files[] | {filename, status, sha, \
-             patch: (.patch != null)}]}"
+             previous_filename, patch: (.patch != null)}]}"
                 .to_owned(),
         ],
     )?;
@@ -1200,10 +1201,14 @@ fn compare_files(run_gh: RunGh<'_>, repo: &str, range: &str) -> Result<PrFiles, 
         ));
     }
     let mut out = std::collections::BTreeMap::new();
+    let mut sources = std::collections::BTreeMap::new();
     for file in files {
         let text = |key: &str| file.get(key).and_then(Value::as_str).map(str::to_owned);
         let name =
             text("filename").ok_or_else(|| format!("compare/{range}: a file has no name"))?;
+        if let Some(previous) = text("previous_filename") {
+            sources.insert(name.clone(), previous);
+        }
         out.insert(
             name,
             (
@@ -1218,7 +1223,47 @@ fn compare_files(run_gh: RunGh<'_>, repo: &str, range: &str) -> Result<PrFiles, 
         .and_then(Value::as_str)
         .ok_or_else(|| format!("compare/{range}: no merge base"))?
         .to_owned();
-    Ok((out, base))
+    Ok((out, base, sources))
+}
+
+/// The first of the pull request's files the base touched between two merge
+/// bases, a rename counting under both names on either side: a base edit to a
+/// file the pull request renames from would be dropped by a merge that keeps
+/// the approved destination.
+fn touched_by_base(
+    before: &std::collections::BTreeMap<String, (String, String, bool)>,
+    pr_sources: &[&std::collections::BTreeMap<String, String>],
+    moved: &std::collections::BTreeMap<String, (String, String, bool)>,
+    moved_sources: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let touched: std::collections::BTreeSet<&str> = moved
+        .keys()
+        .map(String::as_str)
+        .chain(moved_sources.values().map(String::as_str))
+        .collect();
+    before
+        .keys()
+        .map(String::as_str)
+        .chain(
+            pr_sources
+                .iter()
+                .flat_map(|sources| sources.values().map(String::as_str)),
+        )
+        .filter(|name| touched.contains(name))
+        .min()
+        .map(str::to_owned)
+}
+
+/// The first file whose rename source differs between two comparisons.
+fn rename_source_moved(
+    before: &std::collections::BTreeMap<String, String>,
+    after: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .find(|name| before.get(*name) != after.get(*name))
+        .cloned()
 }
 
 /// Whether the approval of `from` carries to `to`.
@@ -1252,8 +1297,10 @@ pub fn merge_only_carry(
         return Err("the pull request has no base branch".to_owned());
     }
     first_parent_merges(run_gh, repo, &base, from, to)?;
-    let (before, base_before) = compare_files(run_gh, repo, &format!("{base}...{from}"))?;
-    let (after, base_after) = compare_files(run_gh, repo, &format!("{base}...{to}"))?;
+    let (before, base_before, before_sources) =
+        compare_files(run_gh, repo, &format!("{base}...{from}"))?;
+    let (after, base_after, after_sources) =
+        compare_files(run_gh, repo, &format!("{base}...{to}"))?;
     if let Some(name) = before
         .iter()
         .find(|(_, (_, _, patch))| !patch)
@@ -1282,6 +1329,14 @@ pub fn merge_only_carry(
             ));
         }
     }
+    if let Some(name) = rename_source_moved(&before_sources, &after_sources) {
+        return Err(format!(
+            "{name} is renamed from {} at {}, from {} when approved",
+            after_sources.get(&name).map_or("nothing", String::as_str),
+            short(to),
+            before_sources.get(&name).map_or("nothing", String::as_str),
+        ));
+    }
     // The comparison carries no file mode, so a merge that only flips a
     // file's executable bit keeps its blob: read the modes themselves.
     let present: Vec<&str> = before
@@ -1304,8 +1359,14 @@ pub fn merge_only_carry(
         }
     }
     if base_before != base_after {
-        let (moved, _) = compare_files(run_gh, repo, &format!("{base_before}...{base_after}"))?;
-        if let Some(name) = before.keys().find(|name| moved.contains_key(*name)) {
+        let (moved, _, moved_sources) =
+            compare_files(run_gh, repo, &format!("{base_before}...{base_after}"))?;
+        if let Some(name) = touched_by_base(
+            &before,
+            &[&before_sources, &after_sources],
+            &moved,
+            &moved_sources,
+        ) {
             return Err(format!(
                 "{name} was changed by both the pull request and the base"
             ));
