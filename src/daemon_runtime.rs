@@ -3820,10 +3820,7 @@ mod tests {
             ExitCode::SUCCESS
         });
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while read_daemon_status(temp.path()).is_none() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
+        await_daemon_serving(temp.path());
 
         let daemon_status = read_daemon_status(temp.path()).expect("status");
         let ship_states = read_daemon_ship_state_list(temp.path()).expect("ship-state list");
@@ -3854,10 +3851,7 @@ mod tests {
             .expect("daemon runtime");
         });
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while read_daemon_status(temp.path()).is_none() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
+        await_daemon_serving(temp.path());
 
         let error = run_blocking(DaemonRunConfig {
             mode: RuntimeMode::Isolated,
@@ -4071,6 +4065,20 @@ mod tests {
         );
     }
 
+    /// Wait until an in-process daemon answers `status` over its socket.
+    ///
+    /// A fixed two-second budget for the runtime thread to bind its socket
+    /// was short on a loaded host; the deadline returns as soon as it serves.
+    #[cfg(unix)]
+    fn await_daemon_serving(state_dir: &Path) {
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                read_daemon_status(state_dir).is_some()
+            }),
+            "the in-process daemon never served status"
+        );
+    }
+
     /// Poll `condition` until it holds or `deadline` elapses.
     #[cfg(unix)]
     fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
@@ -4129,10 +4137,7 @@ mod tests {
             ExitCode::SUCCESS
         });
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while read_daemon_status(temp.path()).is_none() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
+        await_daemon_serving(temp.path());
 
         let socket_path = temp.path().join("daemon").join("daemon.sock");
         let mut stream = UnixStream::connect(&socket_path).expect("connect");
