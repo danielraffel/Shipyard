@@ -385,7 +385,11 @@ unread. A cause is named at `high` or `medium` confidence; a
 `low` one (only the step's last lines, or a cancel with no reason) is not.
 Fields not read are present, `null` and named in `unread`; do not fill them
 by hand. For Pulp, red required checks need `--required-context`, or the
-report says "no required contexts" and exports none of them.
+report says "no required contexts" and exports none of them. Read the receipt before
+counting: when `unread_kinds` lists `required_check_red`, the required
+contexts were unreadable and its zero rows mean unknown, not none
+(`required_source` says why). A receipt whose row count or SHA-256 disagrees
+with the file is an interrupted export: the receipt is written last.
 
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason

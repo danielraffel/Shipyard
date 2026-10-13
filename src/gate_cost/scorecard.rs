@@ -1327,14 +1327,25 @@ fn repeat_failures(prs: &[&MergedPr], required: &BTreeSet<&str>) -> Vec<RepeatFa
     repeats
 }
 
+/// Where the required contexts came from, or `unread: <error>` when they
+/// could not be read.
+pub(crate) fn required_source(observation: &ScorecardObservation) -> String {
+    match &observation.required {
+        Ok((_, source)) => source.clone(),
+        Err(error) => format!("unread: {error}"),
+    }
+}
+
 /// Score each ISO week of the window.
 #[must_use]
 pub fn compute(observation: &ScorecardObservation) -> ScorecardReport {
     let query = &observation.query;
-    let (required_contexts, required_source) = match &observation.required {
-        Ok((contexts, source)) => (contexts.clone(), source.clone()),
-        Err(error) => (Vec::new(), format!("unread: {error}")),
-    };
+    let required_contexts = observation
+        .required
+        .as_ref()
+        .map(|(contexts, _)| contexts.clone())
+        .unwrap_or_default();
+    let required_source = required_source(observation);
     let required: BTreeSet<&str> = required_contexts.iter().map(String::as_str).collect();
     let mut weeks = Vec::new();
     let mut start = query.from;

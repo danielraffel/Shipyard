@@ -1550,6 +1550,14 @@ extractor could have named it, not when anyone did. `rule_verdict`,
 `cancel_cause`, `receipt_same_tree` and `outage_window` stay `null` and listed
 in `unread`, and so does `evidence` when causes were not read or a job could
 not be.
+`merge_head_verdict` is `null` on every `merge_group_gate_failed` row (a
+batch is not one pull request) and on a `queue_removal` of a pull request that
+did not merge in the window; a `required_check_red` row always has one. The
+receipt carries `required_source`, and when the required contexts could not be
+read it lists `required_check_red` in `unread_kinds`: zero such rows then
+means unknown, not none. The receipt is written last and is the commit
+marker; a row count or hash that disagrees with the file means the export was
+interrupted.
 Everything is read from GitHub, so pass
 `--from`/`--to` to measure a window from before a change and one from after it.
 A repository without branch protection needs `--required-context`. A required
@@ -3547,7 +3555,14 @@ changes keeps its approved blob and mode (the compare API lists no mode, so
 both twins read the files' directory trees), the base changed none of them,
 and no binary changed; with the host switch off, the guard reads nothing for
 this rule, while Shipyard's own paths still honour a repository's explicit
-`arm_requires_head_approval = true`. `queue-arm-guard` refuses an unreviewed arm or direct merge through
+`arm_requires_head_approval = true`. A rebase carries only in
+`queue-arm-guard`, only on a host with a `rebase-carry` guards file (or
+`SHIPYARD_REBASE_CARRY=1`), and only when the diff's `git patch-id --stable`,
+the file set, a base that touched (changed, renamed or deleted) none of the
+PR's files with every file keeping its approved blob and mode, and the
+absence of a skipped, neutral or receipt-reused required check all agree;
+each carry is a line in `carries.jsonl`. Shipyard's own arm paths never carry a rebase.
+`queue-arm-guard` refuses an unreviewed arm or direct merge through
 `ghapp` the same way, requires the request to bind the approved head
 (`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts only the
 fleet App and OWNER/MEMBER/COLLABORATOR verdicts; its override,

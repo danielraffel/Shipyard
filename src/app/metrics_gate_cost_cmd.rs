@@ -64,17 +64,13 @@ pub(super) fn gate_cost_command<W: Write>(
         let mut report = scorecard::compute(&observation);
         let mut rows = scorecard::cases::cases(&observation);
         if causes || export_cases.is_some() {
-            let jobs = scorecard::causes::red_jobs(&observation);
-            let read =
-                scorecard::causes::gather(&reader, &cache, &query.repo, &jobs, causes_max_jobs);
-            for unreadable in &read.unreadable {
-                eprintln!(
-                    "causes: job {} unreadable: {}",
-                    unreadable.job_id, unreadable.reason
-                );
-            }
-            scorecard::causes::attach(&mut rows, &read);
-            report.cause_naming = Some(scorecard::causes::compute(&rows, &read));
+            report.cause_naming = Some(read_causes(
+                &reader,
+                &cache,
+                &observation,
+                &mut rows,
+                causes_max_jobs,
+            ));
         }
         if let Some(path) = &export_cases {
             let receipt = write_cases(path, &observation, &rows)?;
@@ -85,6 +81,14 @@ pub(super) fn gate_cost_command<W: Write>(
                 receipt.sha256,
                 receipt_path(path).display()
             );
+            if !receipt.unread_kinds.is_empty() {
+                eprintln!(
+                    "export-cases: not read, so their count is unknown, not zero: {} \
+                     (required contexts {})",
+                    receipt.unread_kinds.join(", "),
+                    receipt.required_source
+                );
+            }
         }
         if flakes {
             let read = scorecard::flakes::gather(&reader, &cache, &query)
@@ -121,6 +125,26 @@ pub(super) fn gate_cost_command<W: Write>(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
+/// Read the red cases' causes, put them on `rows`, and score them.
+fn read_causes(
+    reader: &gate_cost::SyncGhReader<'_>,
+    cache: &ReadCache,
+    observation: &scorecard::ScorecardObservation,
+    rows: &mut [scorecard::cases::Case],
+    max_jobs: usize,
+) -> scorecard::causes::CauseNaming {
+    let jobs = scorecard::causes::red_jobs(observation);
+    let read = scorecard::causes::gather(reader, cache, &observation.query.repo, &jobs, max_jobs);
+    for unreadable in &read.unreadable {
+        eprintln!(
+            "causes: job {} unreadable: {}",
+            unreadable.job_id, unreadable.reason
+        );
+    }
+    scorecard::causes::attach(rows, &read);
+    scorecard::causes::compute(rows, &read)
+}
+
 fn receipt_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".receipt.json");
@@ -128,7 +152,11 @@ fn receipt_path(path: &Path) -> PathBuf {
 }
 
 /// Write the scorecard's cases and their receipt, each through a temporary
-/// file renamed into place, so a reader never sees half an export.
+/// file renamed into place, so a reader never sees half a file. The receipt
+/// is written last and is the commit marker: a crash between the two renames
+/// leaves new rows beside an old receipt, whose row count and SHA-256 then
+/// disagree with the file. Each temporary name is unique to the run, so two
+/// exports to the same path never write the same temporary file.
 fn write_cases(
     path: &Path,
     observation: &scorecard::ScorecardObservation,
@@ -142,19 +170,33 @@ fn write_cases(
         (path.to_path_buf(), bytes),
         (receipt_path(path), receipt_json),
     ] {
-        let mut temporary = target.as_os_str().to_owned();
-        temporary.push(".tmp");
-        let temporary = PathBuf::from(temporary);
-        std::fs::write(&temporary, &content)
-            .and_then(|()| std::fs::rename(&temporary, &target))
-            .map_err(|error| {
-                CliFailure::new(
-                    1,
-                    format!("export-cases: cannot write {}: {error}", target.display()),
-                )
-            })?;
+        replace_file(&target, &content).map_err(|error| {
+            CliFailure::new(
+                1,
+                format!("export-cases: cannot write {}: {error}", target.display()),
+            )
+        })?;
     }
     Ok(receipt)
+}
+
+/// Write `content` to a temporary file unique to this call, beside `target`,
+/// and rename it over `target`.
+fn replace_file(target: &Path, content: &[u8]) -> std::io::Result<()> {
+    let directory = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let prefix = target
+        .file_name()
+        .map_or_else(|| "export".into(), |name| name.to_string_lossy());
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".{prefix}."))
+        .suffix(".tmp")
+        .tempfile_in(directory)?;
+    std::io::Write::write_all(&mut temporary, content)?;
+    temporary.persist(target).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// One cache directory per repository, under Shipyard's state directory.
@@ -499,6 +541,102 @@ mod tests {
                 .any(|name| Path::new(name).extension().is_some_and(|ext| ext == "tmp")),
             "{names:?}"
         );
+    }
+
+    /// The receipt is written last, so it is the commit marker: when the
+    /// receipt cannot be written, the cases file already holds the new rows
+    /// and the stale or missing receipt exposes the interrupted export.
+    #[test]
+    fn the_receipt_is_written_after_the_cases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("week.jsonl");
+        std::fs::write(&path, b"old rows\n").expect("old export");
+        std::fs::create_dir(dir.path().join("week.jsonl.receipt.json")).expect("blocker");
+        let observation = scorecard::ScorecardObservation {
+            query: scorecard::ScorecardQuery {
+                repo: "o/r".to_owned(),
+                workflow: "build.yml".to_owned(),
+                gate_job: "macos".to_owned(),
+                base_branch: "main".to_owned(),
+                required_contexts: Vec::new(),
+                selection_steps: Vec::new(),
+                from: Utc::now() - chrono::Duration::days(7),
+                to: Utc::now(),
+            },
+            required: Ok((Vec::new(), "--required-context".to_owned())),
+            prs: Vec::new(),
+            merge_group_runs: Vec::new(),
+            queue_events: Vec::new(),
+            selection: None,
+            gaps: Vec::new(),
+        };
+        let failure =
+            write_cases(&path, &observation, &[]).expect_err("the receipt cannot be written");
+        assert!(
+            failure.message.contains("receipt.json"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("cases"),
+            b"",
+            "the cases were written before the receipt"
+        );
+    }
+
+    /// A temporary file another run left (or is writing) at a fixed name does
+    /// not block or corrupt this run's write: each run's temporary is its own.
+    #[test]
+    fn a_temporary_at_the_old_fixed_name_does_not_block_the_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("week.jsonl");
+        std::fs::create_dir(dir.path().join("week.jsonl.tmp")).expect("blocker");
+        replace_file(&target, b"rows\n").expect("written past the blocker");
+        assert_eq!(std::fs::read(&target).expect("read"), b"rows\n");
+    }
+
+    /// Concurrent exports to one path each land whole: the file is exactly one
+    /// run's bytes, never a mix. Windows refuses to replace a file another
+    /// rename is replacing at that moment, so there a run may fail outright,
+    /// but never leaves a mix or a stray temporary.
+    #[test]
+    fn concurrent_writes_to_one_path_each_land_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("week.jsonl");
+        let contents: Vec<Vec<u8>> = (0..8u8)
+            .map(|index| vec![b'a' + index; 256 * 1024])
+            .collect();
+        let written = std::thread::scope(|scope| {
+            let handles: Vec<_> = contents
+                .iter()
+                .map(|content| {
+                    let target = &target;
+                    scope.spawn(move || replace_file(target, content).is_ok())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("joined"))
+                .filter(|ok| *ok)
+                .count()
+        });
+        if cfg!(windows) {
+            assert!(written >= 1, "no run landed");
+        } else {
+            assert_eq!(
+                written,
+                contents.len(),
+                "every run lands where renames replace"
+            );
+        }
+        let landed = std::fs::read(&target).expect("read");
+        assert!(contents.contains(&landed), "a mix of runs landed");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .filter(|name| name != "week.jsonl")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]

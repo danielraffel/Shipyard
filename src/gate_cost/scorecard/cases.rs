@@ -20,7 +20,19 @@
 //! `null`, and named in `unread`, rather than guessed.
 //!
 //! The export carries a receipt: the row count and the SHA-256 of the bytes
-//! written, so a copy can be checked without trusting where it came from.
+//! written, so a copy can be checked without trusting where it came from. The
+//! receipt also says where the required contexts came from; when they could
+//! not be read, `required_check_red` is listed in `unread_kinds`, so its zero
+//! rows read as unknown rather than as none.
+//!
+//! `merge_head_verdict` is `null` by kind, never by accident:
+//!
+//! - `required_check_red`: never `null`; the check belongs to a merged pull
+//!   request, which always has a verdict.
+//! - `merge_group_gate_failed`: always `null`; a merge-group run is not tied
+//!   to one pull request (a batch carries several).
+//! - `queue_removal`: `null` when the pull request did not merge within the
+//!   window, since only merged pull requests have a merge head to judge.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -70,7 +82,11 @@ pub struct Case {
     pub actor: Option<String>,
     /// GitHub's time for the case.
     pub created_at: Option<String>,
-    /// The merge-head verdict of the merged pull request it belongs to.
+    /// The merge-head verdict of the merged pull request it belongs to:
+    /// always set on `required_check_red`, always `null` on
+    /// `merge_group_gate_failed` (a batch is not one pull request), and
+    /// `null` on `queue_removal` when the pull request did not merge within
+    /// the window.
     pub merge_head_verdict: Option<MergeVerdict>,
     /// Hindsight label; assigned later, never here.
     pub label: Option<String>,
@@ -108,6 +124,11 @@ pub struct Receipt {
     pub rows: usize,
     /// Rows by kind.
     pub by_kind: BTreeMap<&'static str, usize>,
+    /// Where the required contexts came from, or `unread: <error>`.
+    pub required_source: String,
+    /// Kinds whose source could not be read: their row count is unknown,
+    /// not zero.
+    pub unread_kinds: Vec<&'static str>,
     /// SHA-256 of the JSONL bytes.
     pub sha256: String,
 }
@@ -243,6 +264,11 @@ pub fn export(
         bytes.push(b'\n');
         *by_kind.entry(row.kind).or_insert(0) += 1;
     }
+    let unread_kinds = if observation.required.is_err() {
+        vec!["required_check_red"]
+    } else {
+        Vec::new()
+    };
     let receipt = Receipt {
         schema: RECEIPT_SCHEMA,
         repo: observation.query.repo.clone(),
@@ -250,6 +276,8 @@ pub fn export(
         to: rfc3339(observation.query.to),
         rows: rows.len(),
         by_kind,
+        required_source: super::required_source(observation),
+        unread_kinds,
         sha256: hex::encode(Sha256::digest(&bytes)),
     };
     Ok((bytes, receipt))

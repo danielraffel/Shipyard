@@ -137,6 +137,39 @@ Anything else, or anything the guard cannot read (including a comparison at
 GitHub's 300-file cap), needs a new verdict. A HOLD naming the new head is
 never overridden by a carry.
 
+**Rebases (separate switch, off by default).** A rebased head does not descend
+from the approved one, so the rule above never carries to it. On a host that
+turns the rebase carry on (`SHIPYARD_REBASE_CARRY=1`, `0` forces it off, or a
+file named `rebase-carry` in the guards directory), the approval carries
+across a rebase only when all four hold, and the refusal names every one that
+fails:
+
+* the pull request's diff (each head against its own merge base, read as
+  `application/vnd.github.diff`) has the same `git patch-id --stable`;
+* it changes the same files, with the same status and, for a rename, the same
+  source;
+* re-applying the approved diff onto the new merge base gives exactly the new
+  head's tree. That is proved rather than computed: the new merge base
+  descends from the old one, the base touched none of the pull request's
+  files between the two merge bases (changed, renamed or deleted: a rename
+  counts under both names, on the base's side and on the pull request's, so a
+  base edit to a file the pull request renames from refuses), and every file
+  keeps its approved blob and mode,
+  so a conflict resolved by hand never carries. A binary change, or a base
+  comparison at GitHub's 300-file cap, refuses. Conditions 1 and 3 must agree:
+  a changed patch-id refuses even when condition 3 holds;
+* no required check on the new head has concluded `skipped` or `neutral`, or
+  carries a `shipyard-receipt-decision` annotation with verdict `reuse` (see
+  [validation signals](validation-signals.md)). The carry covers the review
+  only; required checks run on the new head as on any other. A rebase always
+  makes a new tree, so a receipt bound to the approved head's exact tree never
+  applies to the carried head.
+
+Every carry appends one JSON line (repository, pull request, both heads, both
+merge bases, the patch-id, the file count, argv) to `carries.jsonl` in the
+guards directory and prints a line saying so. A HOLD naming the new head still
+refuses. Roll it out one host at a time; roll back by removing the file.
+
 The refusal names the head, the exact marker it needs, and the latest verdict
 when it approves a different head. Each refusal is followed by one
 `queue-arm-guard: fix:` line of JSON with `what`, `evidence` (the pull
