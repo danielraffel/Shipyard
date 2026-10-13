@@ -209,6 +209,7 @@ fn signatures_name_unittest_and_cargo_failures_before_the_error_line() {
     // log's `##[error]` line.
     let build = "2026-10-10T00:20:01.1Z ERROR: Build failed\n\
                  2026-10-10T00:20:01.2Z ERROR: Could not find a version that satisfies pytest\n\
+                 2026-10-10T00:20:01.3Z ERROR: Cannot (open)\n\
                  2026-10-10T00:20:02.2Z ##[error]Build step failed\n";
     assert_eq!(
         failure_signatures(build),

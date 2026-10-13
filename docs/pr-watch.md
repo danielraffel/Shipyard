@@ -369,6 +369,14 @@ repository with no required checks is watched for everything but red checks.
 | `host_alarm` | a `[tartci] ...` issue opened in `--alarm-repo` |
 | any other | a line from `--input-events`, passed through once per `key` |
 
+A verdict counts, for every rule above and for the `verdict_posted` relay,
+only from the fleet App (`shipyard-local`) or an account whose
+`author_association` is `OWNER`, `MEMBER` or `COLLABORATOR`, and never from the
+pull request's own distinguishable author: the queue-arm guard's rule. The
+repositories are public, so a drive-by `verdict: APPROVE` must not produce an
+auto-safe arm, which on a queue-less repository is the merge. A comment or
+review whose association was not read (an older recording) does not count.
+
 Failing tests are read from the job log, in this order:
 
 1. `CTest` summary lines;

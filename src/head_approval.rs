@@ -443,6 +443,23 @@ fn is_fleet_author(login: &str) -> bool {
     normalized_login(login) == "shipyard-local"
 }
 
+/// Whether a verdict by `login` (with its `author_association` when read)
+/// counts when no reviewer is listed: the fleet App or a trusted association,
+/// and never the distinguishable author of the pull request.
+#[must_use]
+pub(crate) fn trusted_reviewer(
+    login: &str,
+    association: Option<&str>,
+    author: Option<&str>,
+) -> bool {
+    let trusted = is_fleet_author(login)
+        || association.is_some_and(|association| TRUSTED_ASSOCIATIONS.contains(&association));
+    trusted
+        && author.is_none_or(|author| {
+            normalized_login(author) != normalized_login(login) || is_fleet_author(author)
+        })
+}
+
 /// Whether the verdict in `record` (`login`, and `association` when read)
 /// counts under `policy` for a pull request by `author`.
 fn reviewer_allowed(record: &Value, policy: &ApprovalPolicy, author: Option<&str>) -> bool {
@@ -455,15 +472,11 @@ fn reviewer_allowed(record: &Value, policy: &ApprovalPolicy, author: Option<&str
         // repository trusts count. The fleet App is every agent's identity,
         // so its own pull request is not distinguishable from its reviewer's
         // comment.
-        let trusted = is_fleet_author(login)
-            || record
-                .get("association")
-                .and_then(Value::as_str)
-                .is_some_and(|association| TRUSTED_ASSOCIATIONS.contains(&association));
-        return trusted
-            && author.is_none_or(|author| {
-                normalized_login(author) != reviewer || is_fleet_author(author)
-            });
+        return trusted_reviewer(
+            login,
+            record.get("association").and_then(Value::as_str),
+            author,
+        );
     }
     !is_fleet_author(login)
         && policy

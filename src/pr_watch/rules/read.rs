@@ -121,7 +121,11 @@ fn comment_entry(comment: &Value) -> Option<TrailEntry> {
         .get("body")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let entry = TrailEntry::from_comment(id, login, at, body);
+    let mut entry = TrailEntry::from_comment(id, login, at, body);
+    entry.association = comment
+        .get("author_association")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     (entry.verdict.is_some() || entry.ready_head.is_some()).then_some(entry)
 }
 
@@ -142,7 +146,7 @@ fn read_reviews(
         for number in batch {
             let _ = write!(
                 fields,
-                "p{number}:pullRequest(number:{number}){{reviews(last:50){{nodes{{databaseId author{{login}} state submittedAt commit{{oid}}}}}}}}"
+                "p{number}:pullRequest(number:{number}){{reviews(last:50){{nodes{{databaseId author{{login}} authorAssociation state submittedAt commit{{oid}}}}}}}}"
             );
         }
         let query = format!("query{{repository(owner:\"{owner}\",name:\"{name}\"){{{fields}}}}}");
@@ -186,6 +190,10 @@ pub fn review_entry(node: &Value) -> Option<TrailEntry> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
+        association: node
+            .get("authorAssociation")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         at: time(node, "submittedAt")?,
         review: true,
         verdict: Some(Verdict {

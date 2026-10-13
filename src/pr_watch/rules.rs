@@ -55,6 +55,9 @@ pub struct TrailEntry {
     pub id: u64,
     /// Author login.
     pub login: String,
+    /// The author's `author_association` on the repository, when read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association: Option<String>,
     /// When it was posted.
     pub at: DateTime<Utc>,
     /// A pull-request review rather than a comment.
@@ -84,6 +87,7 @@ impl TrailEntry {
         Self {
             id,
             login: login.to_owned(),
+            association: None,
             at,
             review: false,
             verdict: crate::head_approval::verdict_line(body)
@@ -272,14 +276,23 @@ fn pr_state(pr: &PrHistory, at: DateTime<Utc>) -> PrState {
 }
 
 /// The latest verdict naming `head`, posted at or before `at`.
+/// Whether `entry`'s verdict counts for a pull request by `author`: the
+/// rule the arm guard applies (`head_approval::trusted_reviewer`), so a
+/// drive-by comment on a public repository, or the author's own, neither
+/// approves a head nor reaches the author as a reviewer's verdict.
+fn trusted(entry: &TrailEntry, author: Option<&str>) -> bool {
+    crate::head_approval::trusted_reviewer(&entry.login, entry.association.as_deref(), author)
+}
+
 fn latest_verdict<'a>(
     trail: &'a [TrailEntry],
     head: &str,
     at: DateTime<Utc>,
+    author: Option<&str>,
 ) -> Option<&'a TrailEntry> {
     trail
         .iter()
-        .filter(|entry| entry.at <= at)
+        .filter(|entry| entry.at <= at && trusted(entry, author))
         .filter(|entry| {
             entry
                 .verdict
@@ -490,7 +503,7 @@ fn evaluate_pr(
         history,
         pr,
         head,
-        verdict: latest_verdict(trail, &head.sha, emit.at),
+        verdict: latest_verdict(trail, &head.sha, emit.at, pr.author.as_deref()),
         in_flight: state.armed || state.queued_since.is_some(),
     };
     review_events(emit, &view, trail, config);
@@ -540,7 +553,11 @@ fn verdict_events(
     trail: &[TrailEntry],
 ) {
     let at = emit.at;
-    for entry in trail.iter().filter(|entry| entry.at <= at) {
+    let author = pr.author.as_deref();
+    for entry in trail
+        .iter()
+        .filter(|entry| entry.at <= at && trusted(entry, author))
+    {
         let Some(verdict) = &entry.verdict else {
             continue;
         };

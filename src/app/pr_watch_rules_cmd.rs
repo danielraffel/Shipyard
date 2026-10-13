@@ -364,7 +364,39 @@ pub(super) fn rules_command<W: Write>(
         .state_file
         .clone()
         .unwrap_or_else(|| rules::ledger_path(&runtime_paths.state_dir, &repos));
-    let backoff = backoff_path(&path);
+    let source = Source::Live {
+        cwd,
+        config,
+        runtime_paths,
+        no_cache: args.source.no_cache,
+        record: None,
+    };
+    guarded_pass(
+        &source,
+        args,
+        watch,
+        &rule_config,
+        &specs,
+        &path,
+        (from, now),
+        stdout,
+    )
+}
+
+/// One pass behind the backoff file and the budget check: an unexpired
+/// backoff reads nothing at all.
+#[allow(clippy::too_many_arguments)] // One pass's inputs, named at its one call.
+fn guarded_pass<W: Write>(
+    source: &Source<'_>,
+    args: &PrWatchRulesArgs,
+    watch: &WatchConfig,
+    rule_config: &RuleConfig,
+    specs: &[RepoSpec],
+    path: &Path,
+    (from, now): (DateTime<Utc>, DateTime<Utc>),
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let backoff = backoff_path(path);
     if let Some(waiting) = read_backoff(&backoff).filter(|waiting| waiting.until > now) {
         eprintln!(
             "pr-watch rules: skipped, nothing read: backing off until {} ({}). It resumes by \
@@ -375,15 +407,8 @@ pub(super) fn rules_command<W: Write>(
         );
         return Ok(ExitCode::from(EXIT_RATE_LIMITED));
     }
-    let source = Source::Live {
-        cwd,
-        config,
-        runtime_paths,
-        no_cache: args.source.no_cache,
-        record: None,
-    };
     let tally = ReadTally::default();
-    if let Some(refusal) = budget_refusal(&source, &specs, &tally, args.min_rate_remaining, now)? {
+    if let Some(refusal) = budget_refusal(source, specs, &tally, args.min_rate_remaining, now)? {
         eprintln!(
             "pr-watch rules: skipped, nothing read past the budget check: {}. It resumes after \
              the reset; lower --min-rate-remaining to read anyway",
@@ -392,7 +417,7 @@ pub(super) fn rules_command<W: Write>(
         write_backoff(&backoff, &refusal);
         return Ok(ExitCode::from(EXIT_RATE_LIMITED));
     }
-    let outcome = live_pass(&source, args, watch, &rule_config, &tally, &path, from, now);
+    let outcome = live_pass(source, args, watch, rule_config, &tally, path, from, now);
     if let Err(failure) = &outcome
         && failure.code == EXIT_RATE_LIMITED
     {
@@ -406,7 +431,7 @@ pub(super) fn rules_command<W: Write>(
     }
     let (ledger, outcome, completed) = outcome?;
     if !args.dry_run {
-        rules::save(&path, &ledger).map_err(|error| CliFailure::new(1, error))?;
+        rules::save(path, &ledger).map_err(|error| CliFailure::new(1, error))?;
     }
     write_events(stdout, &outcome.events)?;
     if outcome.primed {
@@ -553,6 +578,59 @@ mod tests {
         );
     }
 
+    fn rules_args(source: PrWatchRulesSource) -> PrWatchRulesArgs {
+        PrWatchRulesArgs {
+            source,
+            lookback: "3d".to_owned(),
+            state_file: None,
+            dry_run: true,
+            min_rate_remaining: 1500,
+        }
+    }
+
+    /// A pass while an unexpired backoff stands reads nothing; once it has
+    /// expired the pass reads again, starting with the budget check.
+    #[test]
+    fn an_active_backoff_skips_every_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = dir.path().join("rules.json");
+        let reads = std::sync::Mutex::new(Vec::<String>::new());
+        let gh = |argv: &[String]| -> Result<String, String> {
+            reads.lock().expect("lock").push(argv.join(" "));
+            Ok(budget(900))
+        };
+        let args = rules_args(source(vec![]));
+        let pass = |out: &mut Vec<u8>| {
+            guarded_pass(
+                &Source::Scripted(&gh),
+                &args,
+                &WatchConfig::default(),
+                &RuleConfig::default(),
+                &[spec("o/r")],
+                &ledger,
+                (at() - Duration::days(3), at()),
+                out,
+            )
+            .expect("pass")
+        };
+        let waiting = Backoff {
+            until: at() + Duration::minutes(5),
+            reason: "budget".to_owned(),
+        };
+        write_backoff(&backoff_path(&ledger), &waiting);
+        assert_eq!(pass(&mut Vec::new()), ExitCode::from(EXIT_RATE_LIMITED));
+        assert!(reads.lock().expect("lock").is_empty(), "{:?}", reads.lock());
+        // Control: an expired backoff lets the pass read (and back off again
+        // on the low budget).
+        let expired = Backoff {
+            until: at() - Duration::minutes(1),
+            ..waiting
+        };
+        write_backoff(&backoff_path(&ledger), &expired);
+        assert_eq!(pass(&mut Vec::new()), ExitCode::from(EXIT_RATE_LIMITED));
+        assert_eq!(*reads.lock().expect("lock"), ["api rate_limit"]);
+    }
+
     #[test]
     fn a_rate_limited_read_fails_with_the_backoff_status() {
         let failure = read_failure("o/r", "gh: API rate limit exceeded (HTTP 403)");
@@ -634,9 +712,8 @@ mod tests {
         assert_eq!(read, 0);
     }
 
-    #[test]
-    fn a_reviewer_must_name_its_repository() {
-        let source = |reviewers: Vec<&str>| PrWatchRulesSource {
+    fn source(reviewers: Vec<&str>) -> PrWatchRulesSource {
+        PrWatchRulesSource {
             repos: vec!["o/r".to_owned()],
             alarm_repo: None,
             input_events: Vec::new(),
@@ -645,7 +722,11 @@ mod tests {
             approved_unarmed_after: "15m".to_owned(),
             reviewers: reviewers.into_iter().map(str::to_owned).collect(),
             no_cache: false,
-        };
+        }
+    }
+
+    #[test]
+    fn a_reviewer_must_name_its_repository() {
         let config = rule_config(&source(vec!["O/R=fable-graph"])).expect("valid");
         assert_eq!(config.reviewers["o/r"], "fable-graph");
         assert!(rule_config(&source(vec!["fable-graph"])).is_err());

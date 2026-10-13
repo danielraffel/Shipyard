@@ -78,6 +78,13 @@ fn comment(id: u64, at: i64, body: &str) -> TrailEntry {
     TrailEntry::from_comment(id, "shipyard-local[bot]", t(at), body)
 }
 
+/// A comment by `login`, with the `author_association` GitHub reported.
+fn by(id: u64, at: i64, login: &str, association: Option<&str>, body: &str) -> TrailEntry {
+    let mut entry = TrailEntry::from_comment(id, login, t(at), body);
+    entry.association = association.map(str::to_owned);
+    entry
+}
+
 fn input(pr: PrHistory, trail: Vec<TrailEntry>) -> WatchInput {
     WatchInput {
         repos: vec![history(vec![pr], Vec::new())],
@@ -547,6 +554,67 @@ fn a_ready_head_is_routed_to_the_configured_reviewer() {
     assert!(event.fix.safe_to_auto_apply);
 }
 
+/// The repositories are public: only the fleet App or an account the
+/// repository trusts approves a head, and never the pull request's author.
+/// Anything else neither yields an auto-safe arm (on a queue-less repository
+/// that arm is the merge) nor reaches the author as a reviewer's verdict.
+#[test]
+fn only_a_trusted_verdict_approves_a_head_or_reaches_the_author() {
+    let approve = format!("verdict: APPROVE head:{HEAD}");
+    let mut by_alice = pr(Vec::new(), Vec::new());
+    by_alice.author = Some("alice".to_owned());
+    let fired = |trail: Vec<TrailEntry>| {
+        kinds(&evaluate(
+            &input(by_alice.clone(), trail),
+            t(40),
+            &RuleConfig::default(),
+            false,
+        ))
+    };
+    for untrusted in [
+        by(1, 20, "drive-by", Some("NONE"), &approve),
+        by(1, 20, "contributor", Some("CONTRIBUTOR"), &approve),
+        by(1, 20, "unknown", None, &approve),
+        by(1, 20, "alice", Some("OWNER"), &approve),
+    ] {
+        let events = fired(vec![untrusted.clone()]);
+        assert!(
+            !events.contains("approved_unarmed"),
+            "{untrusted:?}: {events:?}"
+        );
+        assert!(
+            !events.contains("verdict_posted"),
+            "{untrusted:?}: {events:?}"
+        );
+    }
+    // Control: the same comment from an owner who is not the author, or from
+    // the fleet App, approves the head and is relayed.
+    for trusted in [
+        by(1, 20, "daniel", Some("OWNER"), &approve),
+        by(1, 20, "member", Some("MEMBER"), &approve),
+        by(1, 20, "shipyard-local[bot]", None, &approve),
+    ] {
+        let events = fired(vec![trusted.clone()]);
+        assert!(
+            events.contains("approved_unarmed"),
+            "{trusted:?}: {events:?}"
+        );
+        assert!(events.contains("verdict_posted"), "{trusted:?}: {events:?}");
+    }
+    // An outsider's HOLD does not block a trusted approval either.
+    let events = fired(vec![
+        by(1, 20, "daniel", Some("OWNER"), &approve),
+        by(
+            2,
+            25,
+            "drive-by",
+            Some("NONE"),
+            &format!("verdict: HOLD head:{HEAD}"),
+        ),
+    ]);
+    assert!(events.contains("approved_unarmed"), "{events:?}");
+}
+
 #[test]
 fn an_approved_head_nobody_armed_gets_the_bound_arm_command() {
     let watch = input(
@@ -645,6 +713,7 @@ fn fake_gh(
 fn trails_come_from_one_repository_listing_and_batched_reviews() {
     let comments = json!([[
         {"id": 1, "user": {"login": "shipyard-local[bot]"}, "created_at": "2026-10-11T12:10:00Z",
+         "author_association": "NONE",
          "issue_url": "https://api.github.com/repos/o/r/issues/7", "body": format!("READY head:{HEAD}")},
         {"id": 2, "user": {"login": "codecov[bot]"}, "created_at": "2026-10-11T12:11:00Z",
          "issue_url": "https://api.github.com/repos/o/r/issues/7", "body": "## Codecov report"},
@@ -652,20 +721,23 @@ fn trails_come_from_one_repository_listing_and_batched_reviews() {
          "issue_url": "https://api.github.com/repos/o/r/issues/8", "body": format!("reviewed: {HEAD}")}
     ]]);
     let reviews = json!({"data": {"repository": {"p7": {"reviews": {"nodes": [
-        {"databaseId": 50, "author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED",
-         "submittedAt": "2026-10-11T12:20:00Z", "commit": {"oid": HEAD}},
+        {"databaseId": 50, "author": {"login": "reviewer"}, "authorAssociation": "MEMBER",
+         "state": "CHANGES_REQUESTED", "submittedAt": "2026-10-11T12:20:00Z", "commit": {"oid": HEAD}},
         {"databaseId": 51, "author": {"login": "reviewer"}, "state": "COMMENTED",
          "submittedAt": "2026-10-11T12:21:00Z", "commit": {"oid": HEAD}}
     ]}}}}});
+    // The review query must ask for the association, or reviews never count.
     let gh = fake_gh(vec![
         ("repos/o/r/issues/comments", comments.to_string()),
-        ("graphql", reviews.to_string()),
+        ("authorAssociation", reviews.to_string()),
     ]);
     let trails = read_trails(&gh, REPO, &BTreeSet::from([7]), t(-60)).expect("read");
     let trail = &trails[&7];
     assert_eq!(trail.len(), 2, "{trail:?}");
     assert_eq!(trail[0].ready_head.as_deref(), Some(HEAD));
+    assert_eq!(trail[0].association.as_deref(), Some("NONE"));
     assert!(trail[1].review);
+    assert_eq!(trail[1].association.as_deref(), Some("MEMBER"));
     assert_eq!(
         trail[1].verdict.as_ref().map(|verdict| verdict.approve),
         Some(false)
