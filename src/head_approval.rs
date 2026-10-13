@@ -1167,6 +1167,51 @@ fn gh_json(run_gh: RunGh<'_>, args: &[String]) -> Result<Value, String> {
     serde_json::from_str(run_gh(args)?.trim()).map_err(|error| format!("invalid JSON: {error}"))
 }
 
+/// Git calls a file binary when a NUL byte appears in its first 8000 bytes.
+const BINARY_PROBE_BYTES: usize = 8000;
+
+/// Whether blob `sha` is binary by git's rule. GitHub omits a comparison's
+/// `patch` for a binary file but also for a text file too large to show (a
+/// one-line JSON fixture of hundreds of KB), so a missing patch alone does not
+/// say binary. An unreadable blob is an error: unknown refuses, but is never
+/// reported as binary.
+fn blob_is_binary(run_gh: RunGh<'_>, repo: &str, sha: &str) -> Result<bool, String> {
+    let blob = gh_json(
+        run_gh,
+        &[
+            "api".to_owned(),
+            format!("repos/{repo}/git/blobs/{sha}"),
+            "--jq".to_owned(),
+            "{encoding, content, size}".to_owned(),
+        ],
+    )
+    .map_err(|error| format!("cannot tell whether blob {} is binary: {error}", short(sha)))?;
+    binary_blob(&blob)
+        .map_err(|error| format!("cannot tell whether blob {} is binary: {error}", short(sha)))
+}
+
+/// Whether a `git/blobs` answer is binary by git's rule. Its decoded content
+/// must be exactly its reported `size`: truncated or empty content is
+/// unknown, never text.
+fn binary_blob(blob: &Value) -> Result<bool, String> {
+    use base64::Engine as _;
+    let (Some("base64"), Some(content), Some(size)) = (
+        blob.get("encoding").and_then(Value::as_str),
+        blob.get("content").and_then(Value::as_str),
+        blob.get("size").and_then(Value::as_u64),
+    ) else {
+        return Err("it is unreadable".to_owned());
+    };
+    let compact: String = content.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(compact)
+        .map_err(|error| error.to_string())?;
+    if data.len() as u64 != size {
+        return Err(format!("{} bytes read of {size}", data.len()));
+    }
+    Ok(data.iter().take(BINARY_PROBE_BYTES).any(|byte| *byte == 0))
+}
+
 /// GitHub's compare lists at most this many files; a longer list is partial.
 const COMPARE_FILE_CAP: usize = 300;
 
@@ -1301,12 +1346,10 @@ pub fn merge_only_carry(
         compare_files(run_gh, repo, &format!("{base}...{from}"))?;
     let (after, base_after, after_sources) =
         compare_files(run_gh, repo, &format!("{base}...{to}"))?;
-    if let Some(name) = before
-        .iter()
-        .find(|(_, (_, _, patch))| !patch)
-        .map(|(name, _)| name)
-    {
-        return Err(format!("the pull request changes a binary file ({name})"));
+    for (name, (_, sha, patch)) in &before {
+        if !patch && blob_is_binary(run_gh, repo, sha)? {
+            return Err(format!("the pull request changes a binary file ({name})"));
+        }
     }
     if let Some(name) = before
         .keys()

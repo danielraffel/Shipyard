@@ -1728,7 +1728,10 @@ def git_compare(repo, argv):
         _, _, old, new, letter = meta.split()
         entry = {"filename": name, "status": {"A": "added", "D": "removed"}.get(letter, "modified"),
                  "sha": new if letter != "D" else old}
-        if name not in binary:
+        # GitHub sends no patch for a binary file, nor for a text file too
+        # large to show.
+        size = int(_git(repo, "cat-file", "-s", entry["sha"])) if letter != "D" else 0
+        if name not in binary and size <= LARGE_TEXT:
             entry["patch"] = "@@"
         files.append(entry)
     return {"status": status, "ahead_by": ahead, "behind_by": behind, "total_commits": ahead,
@@ -1739,6 +1742,27 @@ def git_diff(repo, argv):
     base = _git(repo, "merge-base", x, y)
     return _sp.run(["git", "diff", "--no-renames", "--full-index", base, y], cwd=repo,
                    capture_output=True, text=True, check=True).stdout
+LARGE_TEXT = 100_000
+def git_blob(repo, argv):
+    import base64 as _b64
+    sha = next(part for part in argv.split() if "/git/blobs/" in part).rsplit("/", 1)[1]
+    data = _sp.run(["git", "cat-file", "blob", sha], cwd=repo, capture_output=True, check=True).stdout
+    return {"sha": sha, "encoding": "base64", "content": _b64.b64encode(data).decode(),
+            "size": len(data)}
+def git_raw(repo, argv, short=0):
+    # raw.githubusercontent.com/<owner>/<repo>/<commit>/<path>, honouring Range
+    # as that host does (the API ignores it).
+    from urllib.parse import unquote
+    url = next(part for part in argv.split() if "raw.githubusercontent.com/" in part)
+    commit, path = url.split("/", 6)[5:7]
+    data = _sp.run(["git", "show", f"{commit}:{unquote(path)}"], cwd=repo, capture_output=True,
+                   check=True).stdout
+    end = int(argv.split("Range: bytes=0-", 1)[1].split()[0])
+    body = data[:end + 1]
+    body = body[:len(body) - short] if short else body
+    head = (f"HTTP/2.0 206 Partial Content\r\nContent-Range: bytes 0-{min(end, len(data) - 1)}"
+            f"/{len(data)}\r\nContent-Length: {len(body)}\r\n\r\n")
+    return head.encode() + body
 def git_trees(repo, argv):
     import re as _re
     found = {}
@@ -1791,6 +1815,10 @@ class ReviewBeforeArm(unittest.TestCase):
             "        continue\n"
             "    if 'git_tree' in answer:\n"
             "        sys.stdout.write(json.dumps(git_trees(answer['git_tree'], argv))); sys.exit(0)\n"
+            "    if 'git_raw' in answer:\n"
+            "        sys.stdout.buffer.write(git_raw(answer['git_raw'], argv, answer.get('short', 0))); sys.exit(0)\n"
+            "    if 'git_blob' in answer:\n"
+            "        sys.stdout.write(json.dumps(git_blob(answer['git_blob'], argv))); sys.exit(0)\n"
             "    if 'git' in answer and 'vnd.github.diff' in argv:\n"
             "        sys.stdout.write(git_diff(answer['git'], argv)); sys.exit(0)\n"
             "    if 'git' in answer:\n"
@@ -2143,6 +2171,8 @@ class ReviewBeforeArm(unittest.TestCase):
             body=f"verdict: APPROVE head:{history.approved}")]
         answers = self.case("shipyard-784", graphql=graphql, queue=False, comments=[trail])
         answers.insert(0, ("compare/", {"git": str(history.path)}))
+        answers.insert(0, ("/git/blobs/", {"git_blob": str(history.path)}))
+        answers.insert(0, ("raw.githubusercontent.com", {"git_raw": str(history.path)}))
         answers.insert(0, ("object(expression:", {"git_tree": str(history.path)}))
         return [(needle, {"json": pull}) if needle == "/pulls/" else (needle, answer)
                 for needle, answer in answers]
@@ -2172,6 +2202,62 @@ class ReviewBeforeArm(unittest.TestCase):
         result = self.land(history, head)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("changes a binary file (x.bin)", result.stderr)
+
+    def test_a_large_one_line_text_file_is_not_binary(self) -> None:
+        # GitHub omits the patch of a text file too large to show (tartci's
+        # 406 KB one-line JSON fixtures); its blob has no NUL, so it is text.
+        history = CarryHistory(self.root / "repo", large_text=True)
+        result = self.land(history, history.merge())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The first 8000 bytes decided, by a ranged read, not the whole blob.
+        self.assertIn("raw.githubusercontent.com", self.calls())
+        self.assertIn("Range: bytes=0-7999", self.calls())
+        self.assertNotIn("/git/blobs/", self.calls())
+        # Control: a real binary in the same pull request still refuses.
+        history = CarryHistory(self.root / "repo2", binary=True, large_text=True)
+        refused = self.land(history, history.merge())
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("changes a binary file (x.bin)", refused.stderr)
+
+    def test_an_unreadable_blob_refuses_without_calling_it_binary(self) -> None:
+        history = CarryHistory(self.root / "repo", large_text=True)
+        head = history.merge()
+        answers = self.carry_answers(history, head)
+        answers.insert(0, ("/git/blobs/", {"error": "HTTP 502"}))
+        answers.insert(0, ("raw.githubusercontent.com", {"error": "HTTP 404"}))
+        result = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", head],
+                                answers, "danielraffel/Shipyard")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot tell whether blob", result.stderr)
+        self.assertNotIn("changes a binary file", result.stderr)
+
+    def test_a_short_ranged_read_refuses_as_unknown(self) -> None:
+        history = CarryHistory(self.root / "repo", large_text=True)
+        head = history.merge()
+        answers = self.carry_answers(history, head)
+        answers.insert(0, ("raw.githubusercontent.com", {"git_raw": str(history.path), "short": 1}))
+        result = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", head],
+                                answers, "danielraffel/Shipyard")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("the read returned 7999 of 8000 bytes", result.stderr)
+        self.assertNotIn("changes a binary file", result.stderr)
+
+    def test_without_the_ranged_read_the_whole_blob_decides(self) -> None:
+        history = CarryHistory(self.root / "repo", large_text=True)
+        head = history.merge()
+        answers = self.carry_answers(history, head)
+        answers.insert(0, ("raw.githubusercontent.com", {"error": "HTTP 404"}))
+        result = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", head],
+                                answers, "danielraffel/Shipyard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("/git/blobs/", self.calls())
+
+    def test_a_rebase_carries_a_large_one_line_text_file(self) -> None:
+        history = CarryHistory(self.root / "repo", large_text=True)
+        head = history.rebase()
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("raw.githubusercontent.com", self.calls())
 
     def test_a_merge_that_only_flips_a_prs_file_mode_needs_a_new_verdict(self) -> None:
         # The compare API lists no mode, so the blob alone looks unchanged.
@@ -2374,7 +2460,7 @@ class CarryHistory:
     (and optionally changes a binary), its approved head, and a base commit
     since; with the updates the carry rule judges."""
 
-    def __init__(self, path: pathlib.Path, binary: bool = False) -> None:
+    def __init__(self, path: pathlib.Path, binary: bool = False, large_text: bool = False) -> None:
         self.path = path
         path.mkdir(parents=True)
         self.git("init", "-q", "-b", "main")
@@ -2391,6 +2477,10 @@ class CarryHistory:
         self.write("guard.c", "".join(lines).encode())
         if binary:
             self.write("x.bin", b"\x00\x01pr-binary-v1")
+        if large_text:
+            self.write("fixture.json", ('{"rows": [' + ",".join(['{"k": "v"}'] * 40_000)
+                                        + "]}").encode())
+            self.git("add", "fixture.json")
         self.git("commit", "-qam", "pr: add guard")
         self.approved = self.git("rev-parse", "HEAD")
         self.git("checkout", "-q", "main")
@@ -2590,6 +2680,24 @@ class MergeCarryRenames(unittest.TestCase):
         refusal = self.carry("a.py", "c.py", [])
         self.assertIsNotNone(refusal)
         self.assertIn("b.py is renamed from c.py", refusal)
+
+
+class BlobSize(unittest.TestCase):
+    """A whole-blob read must return exactly the blob's reported size."""
+
+    def read(self, data: bytes, size: Any) -> bool:
+        import base64
+        blob = {"encoding": "base64", "content": base64.b64encode(data).decode(), "size": size}
+        with mock.patch.object(guard, "run_real_gh", return_value=blob):
+            return guard.blob_is_binary("o/r", "a" * 40)
+
+    def test_truncated_or_empty_content_refuses_as_unknown(self) -> None:
+        self.assertFalse(self.read(b"{}" * 10, 20))
+        self.assertTrue(self.read(b"\x00\x01", 2))
+        for data, size in ((b"{}" * 10, 21), (b"", 406888), (b"text", None)):
+            with self.subTest(size=size), self.assertRaises(guard.GuardError) as raised:
+                self.read(data, size)
+            self.assertIn("cannot tell whether blob", str(raised.exception))
 
 
 class TreeModes(unittest.TestCase):

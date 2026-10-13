@@ -133,7 +133,11 @@ head no verdict names. The approval carries to it only when all of these hold:
   bases, a rename counting under both names on either side (so a base edit to
   a file the PR renames from refuses), and each renamed file keeps the source
   it was approved with;
-* the PR changes no binary file (a file with no text patch).
+* the PR changes no binary file. A file GitHub shows no patch for is read as
+  a blob and is binary only if a NUL byte appears in its first 8000 bytes,
+  git's rule: GitHub also omits the patch of a text file too large to show,
+  such as a one-line JSON fixture of hundreds of KB. A blob that cannot be
+  read refuses as unknown, never as binary.
 
 Anything else, or anything the guard cannot read (including a comparison at
 GitHub's 300-file cap), needs a new verdict. A HOLD naming the new head is

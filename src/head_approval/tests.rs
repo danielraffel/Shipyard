@@ -970,17 +970,28 @@ fn the_arm_path_reads_the_author_before_judging() {
 
 /// A scratch git repository with a pull request that adds a guard line (and
 /// optionally changes a binary), its approved head, and a base commit since.
+/// Past this size the fake GitHub, like GitHub, omits a text file's patch.
+const LARGE_TEXT: u64 = 100_000;
+
 struct History {
     dir: tempfile::TempDir,
     approved: String,
+    blobs_unreadable: bool,
 }
 
 impl History {
     fn new(binary: bool) -> Self {
+        Self::with(binary, false)
+    }
+
+    /// A history whose pull request also adds a one-line JSON text file
+    /// larger than GitHub shows a patch for, when `large_text`.
+    fn with(binary: bool, large_text: bool) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let history = Self {
             dir,
             approved: String::new(),
+            blobs_unreadable: false,
         };
         history.git(&["init", "-q", "-b", "main"]);
         history.git(&["config", "user.email", "r@r"]);
@@ -1000,6 +1011,14 @@ impl History {
         history.write("guard.c", (lines.join("\n") + "\n").as_bytes());
         if binary {
             history.write("x.bin", b"\x00\x01pr-binary-v1");
+        }
+        if large_text {
+            let rows = vec![r#"{"k": "v"}"#; 40_000].join(",");
+            history.write(
+                "fixture.json",
+                format!(r#"{{"rows": [{rows}]}}"#).as_bytes(),
+            );
+            history.git(&["add", "fixture.json"]);
         }
         history.git(&["commit", "-qam", "pr: add guard"]);
         let approved = history.git(&["rev-parse", "HEAD"]);
@@ -1108,6 +1127,12 @@ impl History {
         if joined.contains("pulls/7 --jq .base.ref") {
             return Ok("main\n".to_owned());
         }
+        if let Some(sha) = args
+            .iter()
+            .find_map(|arg| arg.split_once("/git/blobs/").map(|(_, sha)| sha.to_owned()))
+        {
+            return self.blob(&sha);
+        }
         let range = args
             .iter()
             .find_map(|arg| {
@@ -1136,33 +1161,7 @@ impl History {
             return Ok(format!("{status}\n"));
         }
         if joined.contains("merge_base") {
-            let binary: Vec<String> = self
-                .git(&["diff", "--numstat", &base, y])
-                .lines()
-                .filter(|line| line.starts_with("-\t-\t"))
-                .map(|line| line[4..].to_owned())
-                .collect();
-            let files: Vec<Value> = self
-                .git(&["diff", "--raw", "--no-abbrev", "--no-renames", &base, y])
-                .lines()
-                .map(|line| {
-                    let (meta, name) = line.split_once('\t').expect("raw line");
-                    let fields: Vec<&str> = meta.split_whitespace().collect();
-                    let status = match fields[4] {
-                        "A" => "added",
-                        "D" => "removed",
-                        _ => "modified",
-                    };
-                    let sha = if fields[4] == "D" {
-                        fields[2]
-                    } else {
-                        fields[3]
-                    };
-                    json!({"filename": name, "status": status, "sha": sha,
-                           "patch": !binary.iter().any(|b| b == name)})
-                })
-                .collect();
-            return Ok(json!({"merge_base": base, "files": files}).to_string());
+            return Ok(self.compare_files_json(&base, y));
         }
         let commits: Vec<Value> = self
             .git(&[
@@ -1183,6 +1182,66 @@ impl History {
                   "commits": commits})
             .to_string(),
         )
+    }
+
+    /// `compare/<x>...<y>` file listing, as `compare_files` asks for it.
+    fn compare_files_json(&self, base: &str, y: &str) -> String {
+        let binary: Vec<String> = self
+            .git(&["diff", "--numstat", base, y])
+            .lines()
+            .filter(|line| line.starts_with("-\t-\t"))
+            .map(|line| line[4..].to_owned())
+            .collect();
+        let files: Vec<Value> = self
+            .git(&["diff", "--raw", "--no-abbrev", "--no-renames", base, y])
+            .lines()
+            .map(|line| {
+                let (meta, name) = line.split_once('\t').expect("raw line");
+                let fields: Vec<&str> = meta.split_whitespace().collect();
+                let status = match fields[4] {
+                    "A" => "added",
+                    "D" => "removed",
+                    _ => "modified",
+                };
+                let sha = if fields[4] == "D" {
+                    fields[2]
+                } else {
+                    fields[3]
+                };
+                json!({"filename": name, "status": status, "sha": sha,
+                       "patch": !binary.iter().any(|b| b == name)
+                           && self.shows_patch(sha, fields[4] == "D")})
+            })
+            .collect();
+        json!({"merge_base": base, "files": files}).to_string()
+    }
+
+    /// GitHub sends no patch for a text file too large to show.
+    fn shows_patch(&self, sha: &str, deleted: bool) -> bool {
+        deleted
+            || self
+                .git(&["cat-file", "-s", sha])
+                .parse::<u64>()
+                .expect("size")
+                <= LARGE_TEXT
+    }
+
+    /// `git/blobs/<sha>` answered from the repository.
+    fn blob(&self, sha: &str) -> Result<String, String> {
+        use base64::Engine as _;
+        if self.blobs_unreadable {
+            return Err("HTTP 502".to_owned());
+        }
+        let data = std::process::Command::new("git")
+            .args(["cat-file", "blob", sha])
+            .current_dir(self.dir.path())
+            .output()
+            .expect("git runs")
+            .stdout;
+        Ok(json!({"encoding": "base64",
+                  "content": base64::engine::general_purpose::STANDARD.encode(&data),
+                  "size": data.len()})
+        .to_string())
     }
 
     fn gate(&self, head: &str) -> HeadGate {
@@ -1544,6 +1603,31 @@ fn a_base_change_to_a_rename_source_is_a_change_to_the_prs_file() {
     );
 }
 
+/// GitHub omits the patch of a one-line JSON fixture too large to show; its
+/// blob has no NUL byte, so it is text and the approval carries.
+#[test]
+fn a_large_one_line_text_file_is_not_binary() {
+    let history = History::with(false, true);
+    let head = history.merge(|_| {});
+    assert!(
+        matches!(
+            history.gate(&head),
+            HeadGate::Approved {
+                approval: Approval::Carried { .. }
+            }
+        ),
+        "{:?}",
+        history.gate(&head)
+    );
+    // Control: a real binary beside it still refuses.
+    let history = History::with(true, true);
+    let head = history.merge(|_| {});
+    assert_eq!(
+        history.refusal(&head),
+        "the pull request changes a binary file (x.bin)"
+    );
+}
+
 #[test]
 fn a_rename_whose_source_changed_does_not_carry() {
     assert_eq!(
@@ -1558,4 +1642,41 @@ fn a_rename_whose_source_changed_does_not_carry() {
         super::rename_source_moved(&sources(&[("b.py", "a.py")]), &sources(&[("b.py", "a.py")])),
         None
     );
+}
+
+#[test]
+fn an_unreadable_blob_refuses_without_calling_it_binary() {
+    let history = History {
+        blobs_unreadable: true,
+        ..History::with(false, true)
+    };
+    let head = history.merge(|_| {});
+    let refusal = history.refusal(&head);
+    assert!(refusal.starts_with("cannot tell whether blob"), "{refusal}");
+    assert!(!refusal.contains("binary file"), "{refusal}");
+}
+
+#[test]
+fn a_blob_whose_content_is_short_of_its_size_is_unknown() {
+    use base64::Engine as _;
+    let blob = |data: &[u8], size: Option<u64>| {
+        let mut value = json!({"encoding": "base64",
+            "content": base64::engine::general_purpose::STANDARD.encode(data)});
+        if let Some(size) = size {
+            value["size"] = json!(size);
+        }
+        value
+    };
+    assert_eq!(super::binary_blob(&blob(b"{}{}", Some(4))), Ok(false));
+    assert_eq!(super::binary_blob(&blob(b"\x00\x01", Some(2))), Ok(true));
+    for (data, size) in [
+        (&b"{}{}"[..], Some(5)),
+        (&b""[..], Some(406_888)),
+        (&b"text"[..], None),
+    ] {
+        assert!(
+            super::binary_blob(&blob(data, size)).is_err(),
+            "{data:?} of {size:?} must be unknown"
+        );
+    }
 }

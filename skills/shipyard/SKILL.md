@@ -3600,7 +3600,8 @@ changes keeps its approved blob and mode (the compare API lists no mode, so
 both twins read the files' directory trees), the base changed none of them
 (a rename counts under both names, so a base edit to a file the PR renames
 from refuses, and a rename must keep its approved source),
-and no binary changed; with the host switch off, the guard reads nothing for
+and no binary changed (binary by the blob's NUL bytes, not by GitHub omitting
+a large text file's patch); with the host switch off, the guard reads nothing for
 this rule, while Shipyard's own paths still honour a repository's explicit
 `arm_requires_head_approval = true`. A rebase carries only in
 `queue-arm-guard`, only on a host with a `rebase-carry` guards file (or

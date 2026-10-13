@@ -907,7 +907,7 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
             return "the pull request's files are unreadable"
         before = _pr_files(before_compare, f"compare/{base}...{approved[:12]}")
         after = _pr_files(after_compare, f"compare/{base}...{head[:12]}")
-        binary = sorted(name for name, (_, _, patch) in before.items() if not patch)
+        binary = binary_files(repo, before, approved)
         if binary:
             return f"the pull request changes a binary file ({binary[0]})"
         if sorted(before) != sorted(after):
@@ -1030,6 +1030,97 @@ def _same_patch(old_diff: str, new_diff: str, record: dict[str, Any]) -> str | N
     return None
 
 
+# Git calls a file binary when a NUL byte appears in its first 8000 bytes.
+BINARY_PROBE_BYTES = 8000
+
+
+def _raw_head(repo: str, commit: str, path: str) -> bytes | None:
+    """The first ``BINARY_PROBE_BYTES`` of ``path`` at ``commit``, by a ranged
+    read of its raw URL, or ``None`` when the raw URL cannot be read (the API
+    ignores ``Range``; raw.githubusercontent.com honours it).
+
+    Raises GuardError when the read answers but returns other than exactly
+    ``min(BINARY_PROBE_BYTES, size)`` bytes: a short read is never text.
+    """
+    from urllib.parse import quote
+    real_gh = os.environ.get("GHAPP_REAL_GH", "/opt/homebrew/bin/gh")
+    url = f"https://raw.githubusercontent.com/{repo}/{commit}/{quote(path)}"
+    try:
+        completed = subprocess.run(
+            [real_gh, "api", "-i", "-H", f"Range: bytes=0-{BINARY_PROBE_BYTES - 1}", url],
+            check=False, capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    raw = completed.stdout
+    split = raw.find(b"\r\n\r\n")
+    head, body = ((raw[:split], raw[split + 4:]) if split >= 0
+                  else raw.partition(b"\n\n")[::2])
+    lines = head.decode("latin-1").splitlines()
+    status = lines[0].split()[1] if lines and len(lines[0].split()) > 1 else ""
+    headers = {key.strip().lower(): value.strip()
+               for key, _, value in (line.partition(":") for line in lines[1:])}
+    if status == "206":
+        match = re.fullmatch(r"bytes \d+-\d+/(\d+)", headers.get("content-range", ""))
+        if match is None:
+            raise GuardError(f"cannot tell whether {path} is binary: the ranged read has no size")
+        size = int(match.group(1))
+    elif status == "200":
+        size = int(headers.get("content-length", -1))
+    else:
+        return None
+    if len(body) != min(BINARY_PROBE_BYTES, size) and not (status == "200" and len(body) == size):
+        raise GuardError(f"cannot tell whether {path} is binary: the read returned {len(body)} "
+                         f"of {min(BINARY_PROBE_BYTES, size)} bytes")
+    return body[:BINARY_PROBE_BYTES]
+
+
+def blob_is_binary(repo: str, sha: str, commit: str | None = None, path: str | None = None) -> bool:
+    """Whether blob ``sha`` is binary by git's rule (a NUL byte early on).
+
+    GitHub omits a comparison's ``patch`` for a binary file, but also for a
+    text file too large to show (a one-line JSON fixture of hundreds of KB),
+    so a missing patch alone does not say binary. With ``commit`` and
+    ``path`` only the first 8000 bytes are read; otherwise, or when that read
+    is unavailable, the whole blob is read and its length must equal its
+    reported size. Raises GuardError when the blob cannot be read whole:
+    unknown is a refusal, never "binary" and never text.
+    """
+    import base64
+    if commit and path:
+        head = _raw_head(repo, commit, path)
+        if head is not None:
+            return b"\0" in head
+    try:
+        blob = run_real_gh(["api", f"repos/{repo}/git/blobs/{sha}"])
+    except GuardError as error:
+        raise GuardError(f"cannot tell whether blob {sha[:12]} is binary: {error}") from error
+    if not isinstance(blob, dict) or blob.get("encoding") != "base64":
+        raise GuardError(f"cannot tell whether blob {sha[:12]} is binary: it is unreadable")
+    try:
+        data = base64.b64decode(str(blob.get("content") or ""))
+    except ValueError as error:
+        raise GuardError(f"cannot tell whether blob {sha[:12]} is binary: {error}") from error
+    if not isinstance(blob.get("size"), int) or len(data) != blob["size"]:
+        raise GuardError(f"cannot tell whether blob {sha[:12]} is binary: {len(data)} bytes "
+                         f"read of {blob.get('size')}")
+    return b"\0" in data[:BINARY_PROBE_BYTES]
+
+
+def binary_files(repo: str, files: dict[str, tuple[str, str, bool]],
+                 commit: str | None = None) -> list[str]:
+    """The files a comparison lists that are binary: those with no text patch
+    whose blob is binary. A file with a patch is text. ``commit`` is where
+    the listed files that were not removed can be read by path."""
+    return sorted(
+        name for name, (status, sha, has_patch) in files.items()
+        if not has_patch and blob_is_binary(
+            repo, sha, commit if status != "removed" else None, name)
+    )
+
+
 def _rename_sources(compare: dict[str, Any]) -> dict[str, str]:
     """``filename -> previous_filename`` for every rename a comparison lists."""
     return {
@@ -1086,7 +1177,7 @@ def _reapplies_exactly(repo: str, approved: str, head: str,
     (changed, renamed or deleted) none of the pull request's files between the
     merge bases, and every one of them has, at the new head, the blob and mode
     it was approved with. No binary change is accepted."""
-    binary = sorted(name for name, (_, _, has_patch) in before.items() if not has_patch)
+    binary = binary_files(repo, before, approved)
     if binary:
         return f"the pull request changes a binary file ({binary[0]})"
     # A rename's source is the pull request's file too: a base edit to it
