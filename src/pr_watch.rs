@@ -63,6 +63,7 @@ pub mod handback;
 pub mod ledger;
 pub mod liveness;
 pub mod replay;
+pub mod rules;
 pub mod scan;
 pub mod wakes;
 
@@ -447,11 +448,22 @@ pub fn normalize_ctest_name(line: &str) -> String {
 pub fn failure_signatures(log: &str) -> Vec<String> {
     let tail = crate::diagnostics::log_tail_clean(log, LOG_TAIL_BYTES);
     let parser = crate::diagnostics::select_parser(Some("ctest"));
-    let tests: BTreeSet<String> = parser
-        .parse(&tail)
+    let parsed = parser.parse(&tail);
+    // When the summary's `<id> - <name> (<status>)` lines are there, they are
+    // the failures; anything else the parser kept is output that followed.
+    let summary_only = parsed.iter().any(|line| ctest_summary_line(line));
+    let tests: BTreeSet<String> = parsed
         .iter()
+        .filter(|line| !summary_only || ctest_summary_line(line))
         .map(|line| normalize_ctest_name(line))
         .filter(|name| !name.is_empty())
+        .collect();
+    if !tests.is_empty() {
+        return tests.into_iter().collect();
+    }
+    let tests: BTreeSet<String> = tail
+        .lines()
+        .filter_map(|line| unit_test_failure(strip_log_timestamp(line)))
         .collect();
     if !tests.is_empty() {
         return tests.into_iter().collect();
@@ -472,6 +484,36 @@ pub fn failure_signatures(log: &str) -> Vec<String> {
         return vec![format!("error: {signature}")];
     }
     Vec::new()
+}
+
+/// A `CTest` failure-summary line: `21850 - name (Failed)`.
+fn ctest_summary_line(line: &str) -> bool {
+    line.trim().split_once(" - ").is_some_and(|(id, rest)| {
+        !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) && rest.contains(" (")
+    })
+}
+
+/// A failed test named by Python's unittest (`FAIL: test_x (module.Class.test_x)`,
+/// or `ERROR:`) or by `cargo test` (`test path::name ... FAILED`).
+fn unit_test_failure(line: &str) -> Option<String> {
+    let line = line.trim();
+    if let Some(rest) = line
+        .strip_prefix("FAIL: ")
+        .or_else(|| line.strip_prefix("ERROR: "))
+    {
+        let mut parts = rest.splitn(2, ' ');
+        let name = parts.next()?;
+        let qualified = parts
+            .next()
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.split_once(')'))
+            .map(|(inside, _)| inside)
+            .filter(|inside| inside.ends_with(name) && !inside.contains(' '));
+        let name = qualified.unwrap_or(name);
+        return (!name.is_empty() && !name.contains(':')).then(|| name.to_owned());
+    }
+    let name = line.strip_prefix("test ")?.strip_suffix(" ... FAILED")?;
+    (!name.is_empty() && !name.contains(' ')).then(|| name.to_owned())
 }
 
 /// Bytes of a job log's tail read for signatures. Pulp's `macos` logs run to

@@ -28,7 +28,7 @@ use crate::pr_watch::scan::{
 use crate::pr_watch::{WatchQuery, gather, ledger, wakes};
 
 /// Per-request bound. Observation must never strand the invoking agent.
-const GITHUB_READ_TIMEOUT: StdDuration = StdDuration::from_mins(2);
+pub(super) const GITHUB_READ_TIMEOUT: StdDuration = StdDuration::from_mins(2);
 
 pub(super) fn pr_watch_command<W: Write>(
     command: PrWatchCommand,
@@ -58,6 +58,22 @@ pub(super) fn pr_watch_command<W: Write>(
             wakes_command(args, &watch, cwd, runtime_paths, json, stdout)
         }
         PrWatchCommand::Liveness => liveness_command(runtime_paths, json, stdout),
+        PrWatchCommand::Rules(args) => super::pr_watch_rules_cmd::rules_command(
+            &args,
+            &watch,
+            config,
+            cwd,
+            runtime_paths,
+            stdout,
+        ),
+        PrWatchCommand::RulesReplay(args) => super::pr_watch_rules_cmd::rules_replay_command(
+            &args,
+            &watch,
+            config,
+            cwd,
+            runtime_paths,
+            stdout,
+        ),
     }
 }
 
@@ -329,11 +345,16 @@ fn render_wakes(repo: &str, since: &str, summary: &wakes::WakeSummary) -> String
     out
 }
 
-fn io_failure(error: impl std::fmt::Display) -> CliFailure {
+pub(super) fn io_failure(error: impl std::fmt::Display) -> CliFailure {
     CliFailure::new(1, error.to_string())
 }
 
-fn actions_for(cwd: &Path, config: &LoadedConfig, repo: &str, explicit: bool) -> GitHubActions {
+pub(super) fn actions_for(
+    cwd: &Path,
+    config: &LoadedConfig,
+    repo: &str,
+    explicit: bool,
+) -> GitHubActions {
     let actions = GitHubActions::from_loaded_config(cwd, config);
     if explicit {
         actions.with_repo_override(repo)
@@ -342,7 +363,7 @@ fn actions_for(cwd: &Path, config: &LoadedConfig, repo: &str, explicit: bool) ->
     }
 }
 
-fn cache_for(runtime_paths: &RuntimePaths, repo: &str, no_cache: bool) -> ReadCache {
+pub(super) fn cache_for(runtime_paths: &RuntimePaths, repo: &str, no_cache: bool) -> ReadCache {
     if no_cache {
         return ReadCache::disabled();
     }
@@ -596,7 +617,7 @@ fn render_digest_outcome(outcome: &DigestOutcome) -> String {
     }
 }
 
-fn parse_until(text: Option<&str>) -> Result<DateTime<Utc>, CliFailure> {
+pub(super) fn parse_until(text: Option<&str>) -> Result<DateTime<Utc>, CliFailure> {
     match text {
         None => Ok(Utc::now()),
         Some(text) => DateTime::parse_from_rfc3339(text)
@@ -642,6 +663,7 @@ fn replay_command<W: Write>(
         required_checks: watch.required_checks.clone(),
         from,
         to,
+        required_checks_optional: false,
     };
     let history = if let Some(dir) = &args.fixtures {
         let fixtures = FixtureReader::load(dir).map_err(io_failure)?;

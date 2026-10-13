@@ -51,6 +51,7 @@ mod pin_cmd;
 mod pr_cmd;
 mod pr_status_cmd;
 mod pr_watch_cmd;
+mod pr_watch_rules_cmd;
 mod profile_apply_cmd;
 mod quarantine_cmd;
 mod queue_cmd;

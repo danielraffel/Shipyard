@@ -337,6 +337,70 @@ open, failed, escalated, resolved by how, p50/p90 of raised-to-sent,
 sent-to-seen and raised-to-resolved, and every open episode sent longer ago
 than `--unseen-after` and not seen: the calls nobody answered.
 
+## Rules watcher
+
+`shipyard pr-watch rules` replaces a model polling on a timer with rules that
+wake it only when something changed. It prints one JSON line per new
+condition a close monitor would act on, each once, and nothing otherwise:
+
+```bash
+shipyard pr-watch rules --repo Generous-Corp/pulp \
+  --repo Generous-Corp/vellum@product-quality.yml \
+  --repo danielraffel/tartci@ci.yml --repo danielraffel/Shipyard@ci.yml \
+  --alarm-repo danielraffel/tartci [--input-events cmux.jsonl]
+```
+
+`--repo` takes `OWNER/REPO@workflow.yml` when the gate workflow is not
+`[pr_watch] workflow`: its pull-request runs mark when each head was pushed. A
+repository with no required checks is watched for everything but red checks.
+
+| kind | fires when |
+|---|---|
+| `ready_unreviewed` | a comment whose first line starts with READY names the current head, and no verdict names it |
+| `head_unreviewed` | opt-in, `--head-unreviewed-after 45m`: the current head has been up that long with neither a READY nor a verdict naming it (drafts excepted). Off by default because it fires for every head an agent is still working on |
+| `verdict_posted` | a verdict was posted (a last line `verdict: APPROVE/HOLD head:<sha>` or `reviewed: <sha>`, or an APPROVED / CHANGES_REQUESTED review); route it to the author |
+| `armed_unapproved` | armed or queued, and the latest verdict naming the head is not an approval |
+| `required_red` | the pull request is armed, queued or approved, and the latest attempt of a required check on its head failed or was cancelled; the line names the failing tests. A red head nobody armed or approved is its author's work in progress |
+| `group_red` | a merge group named for the pull request failed a required job; the line names the failing tests |
+| `queue_removed` | the merge queue removed it for any reason but a merge |
+| `queue_stuck` | it has been in the merge queue for `--queue-stuck-after` (90m) |
+| `approved_unarmed` | the head has been approved for `--approved-unarmed-after` (15m) and nothing armed or queued it |
+| `approved_blocked` | the head is approved but `DIRTY` or `BEHIND` (live passes only: GitHub keeps no history of merge state) |
+| `host_alarm` | a `[tartci] ...` issue opened in `--alarm-repo` |
+| any other | a line from `--input-events`, passed through once per `key` |
+
+Failing tests are read from the job log: `CTest` summary lines, then Python
+`unittest` `FAIL:`/`ERROR:` lines and `cargo test` `... FAILED` lines, then the
+first meaningful `##[error]` line. Naming the test on the event is the point:
+a red check whose annotation already named its failing test was named in a
+median 58 minutes, against 95 without.
+
+Each line is a `shipyard.pr-watch.rules/v1` object: `kind`, `key`, `at` (the
+pass), `since` (when the condition began, where known), `repo`, `pr`, `head`,
+`summary` (one actionable line) and `detail`. An input-event line needs
+`kind`, `key` and `at`, and may carry `summary`, `repo` and `pr`.
+
+Every emitted key is recorded in a ledger under
+`<state>/pr-watch/rules-<repos>.json` (`--state-file` overrides; keys are
+dropped after 14 days). A key names the condition and the head, so a new head,
+a new verdict or a new removal is a new event, and a condition that persists
+is reported once. With no ledger, the first pass records what already holds
+and emits nothing, so a new watcher reports changes rather than the backlog.
+`--dry-run` prints without recording.
+
+A pass reads `--lookback` (3d) of history: the pull-request search with queue
+timelines, the gate workflow's runs, required check runs and failed job logs
+(as `scan` does, with the same settled-answer cache), one repository-wide
+comment listing, and batched review queries. Nothing is written to GitHub.
+
+`shipyard pr-watch rules-replay --since 2d --until <RFC 3339> --tick 5m`
+runs the same rules over a past window: it records what held at the window
+start, then stamps each later event with the first tick it held.
+`scripts/rules_watch_score.py --turns <labelled turns CSV> --events <replay
+JSONL>` scores a replay against a close monitor's labelled turns: recall on
+the rule-detectable turns and the false-wake rate on the turns that found
+nothing to do.
+
 ## Daemon job and config
 
 The daemon runs one pass every 15 minutes, the first one interval after start.

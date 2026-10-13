@@ -91,15 +91,29 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Record into `dir` (created if needed).
+    /// Record into `dir` (created if needed), numbering after any recording
+    /// already there, so two recorders sharing a directory never overwrite
+    /// each other.
     ///
     /// # Errors
-    /// When the directory cannot be created.
+    /// When the directory cannot be created or read.
     pub fn new(dir: &Path) -> Result<Self, String> {
         fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+        let last = fs::read_dir(dir)
+            .map_err(|error| format!("read {}: {error}", dir.display()))?
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .path()
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0);
         Ok(Self {
             dir: dir.to_path_buf(),
-            next: AtomicU64::new(1),
+            next: AtomicU64::new(last + 1),
         })
     }
 

@@ -471,6 +471,7 @@ pub fn scan(
         required_checks: config.required_checks.clone(),
         from: now - config.lookback,
         to: now,
+        required_checks_optional: false,
     };
     let mut history = gather(reader, cache, &query, &config.thresholds)?;
     if let Some(attributor) = attributor {

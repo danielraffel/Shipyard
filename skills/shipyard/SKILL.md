@@ -740,6 +740,15 @@ daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
 `enabled` stays off with a warning in the `pr_watch_pass` event). See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
+`shipyard pr-watch rules` is the rules-first watcher: one JSONL event per new
+condition (READY or new head unreviewed, verdict to route, armed or queued
+without an approval of the head, red required check naming its failing tests,
+failed merge group, queue removal or stall, approved but unarmed, tartci host
+alarm, or a line from `--input-events`), each once per key, so a quiet pass
+prints nothing. Its first pass with no ledger only records what already holds.
+`rules-replay` runs the same rules over a past window. Failing-test names come
+from CTest, Python unittest (`FAIL:`/`ERROR:`) and `cargo test` lines.
+
 `shipyard pr-watch liveness` exits 1 when this scanning host's last completed
 pass is older than `[pr_watch] stale_after_minutes` (45); `doctor --fleet` asks
 every host and fails `pr-watch:fleet` when none is scanning. Never add a second
