@@ -3160,6 +3160,29 @@ mod tests {
         response
     }
 
+    /// Every line a `DeliveryLog` writer delivers, until its channel closes.
+    ///
+    /// The writer runs on its own thread, so lines can still be on their way
+    /// after the listener answers. Once the listener stops, the log it owns
+    /// is dropped, the writer drains its queue and drops its sender: waiting
+    /// for that close reads every line, however loaded the host. A deadline
+    /// bounds it.
+    #[cfg(unix)]
+    fn drain_log_lines(rx: &mpsc::Receiver<String>) -> Vec<String> {
+        let until = Instant::now() + Duration::from_secs(15);
+        let mut lines = Vec::new();
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(line) => lines.push(line),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return lines,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the log writer never finished; lines so far: {lines:?}")
+                }
+            }
+        }
+    }
+
     /// Send `count` forged deliveries then one genuine one, returning the
     /// forged answers and the genuine answer.
     #[cfg(unix)]
@@ -3245,16 +3268,37 @@ mod tests {
             .expect("listener");
 
         let (refused, accepted) = forged_then_genuine(listener.port, secret, 5);
-        // One more refusal after the writer frees up carries the drop count.
+        // Once the writer frees up, a later refusal carries the drop count.
+        // The writer drains what it queued first, so a refusal sent before
+        // the queue has room is dropped too and the count moves on to the
+        // next: keep refusing until a counted line arrives.
         drop(release_tx);
-        thread::sleep(Duration::from_millis(200));
-        let (last_forged, _) = check_run_delivery("the-wrong-secret", "forged-last");
-        let last = send_with_timeout(listener.port, &last_forged, Duration::from_secs(3));
+        let mut lines = Vec::new();
+        let mut last = Vec::new();
+        let until = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < until
+            && !lines
+                .iter()
+                .any(|line: &String| line.contains("earlier refusal lines dropped"))
+        {
+            let (forged, _) =
+                check_run_delivery("the-wrong-secret", &format!("forged-last-{}", last.len()));
+            last.push(send_with_timeout(
+                listener.port,
+                &forged,
+                Duration::from_secs(3),
+            ));
+            while let Ok(line) = line_rx.recv_timeout(Duration::from_millis(100)) {
+                lines.push(line);
+            }
+        }
 
         running.store(false, Ordering::Release);
         listener.stop();
+        lines.extend(drain_log_lines(&line_rx));
         assert_eq!(refused.len(), 5);
-        for answer in refused.iter().chain([&last]) {
+        assert!(!last.is_empty());
+        for answer in refused.iter().chain(&last) {
             assert!(answer.starts_with("HTTP/1.1 401"), "unexpected: {answer:?}");
         }
         assert!(
@@ -3265,7 +3309,6 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(1)).expect("event")["kind"],
             "check_run"
         );
-        let lines: Vec<String> = line_rx.iter().collect();
         assert!(
             lines.iter().any(|line| line.contains("forged-last")
                 && line.contains("earlier refusal lines dropped")),
@@ -3368,7 +3411,7 @@ mod tests {
             assert!(refused.starts_with("HTTP/1.1 405"), "{refused:?}");
         }
         assert!(rx.try_recv().is_err(), "a probe is not a webhook event");
-        let lines = line_rx.try_iter().collect::<Vec<_>>();
+        let lines = drain_log_lines(&line_rx);
         assert_eq!(
             lines.len(),
             2,
