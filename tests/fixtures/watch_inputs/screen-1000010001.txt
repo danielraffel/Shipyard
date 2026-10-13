@@ -1,0 +1,5 @@
+Last login: Sun Oct 11 21:14:03 on ttys002
+ cmux restore codex 01a126c8-4a52-7933-8136-ffaf37eb8774                                           
+danielraffel@danielsstudiom3 pulp %  cmux restore codex 01a126c8-4a52-7933-8136-ffaf37eb8774
+Error: Failed to resume session from /Users/danielraffel/.codex/sessions/2026/10/10/rollout-2026-10-10T10-07-02-01a126c8-4a52-7933-8136-ffaf37eb8774.jsonl: thread/resume failed during TUI bootstrap: thread/resume failed: failed to load configuration: Model provider `subrouter` not found (code -32600)
+danielraffel@danielsstudiom3 pulp % 

@@ -393,6 +393,39 @@ timelines, the gate workflow's runs, required check runs and failed job logs
 (as `scan` does, with the same settled-answer cache), one repository-wide
 comment listing, and batched review queries. Nothing is written to GitHub.
 
+### Input readers
+
+`scripts/watch_inputs.py` writes `--input-events` lines from what GitHub does
+not hold. Each line carries a `fix` object: `what`, `evidence`, `cause`,
+`command`, `safe_to_auto_apply` and `verify`, so an agent can act on it
+without investigating.
+
+```bash
+python3 scripts/watch_inputs.py cmux > cmux.jsonl            # Codex tab states (read-only)
+python3 scripts/watch_inputs.py hosts --host local --host m1 --host m5 --host m5s > hosts.jsonl
+python3 scripts/watch_inputs.py gate-serving --host studio --host m5studio --host m5 --host m1
+shipyard pr-watch rules --repo Generous-Corp/pulp --input-events cmux.jsonl --input-events hosts.jsonl
+```
+
+| reader | kind | fires when | fix |
+|---|---|---|---|
+| `cmux` | `codex_session_dead` | the workspace shows a failed `cmux restore codex` (`Error: Failed to resume session`), or the shell prompt after a Codex prompt | the session id and `cmux restore codex <id>` once the named cause is fixed; not auto-safe |
+| `cmux` | `codex_session_errored` | the session is idle and an error (`503`, `unexpected status`, `stream disconnected`, ...) is just above its empty prompt | `cmux send ... continue` then `send-key ... enter`; auto-safe |
+| `cmux` | `codex_draft_unsent` | an idle session holds text on its prompt | `send-key ... enter`; not auto-safe, because someone may be typing it |
+| `cmux` | `codex_draft_queued` | a working session holds a draft and shows "tab to queue" | `send-key ... tab`; auto-safe |
+| `hosts` | `host_out_of_pool` | `tartci pool status --json` reports a state other than `on`, or not participating | read the pool status before turning it on |
+| `hosts` | `host_problem` | a `fleet.config` section names a problem (self-update rolled back, a stale tool, a gate reserve shortfall, ...) | that section of the pool status names the receipt and next step |
+| `hosts` | `host_unreachable` | the status cannot be read over ssh (keyed per hour) | check the host is up |
+| `gate-serving` | `host_not_serving` | a self-hosted gate host (runner names `<host id>-...`) has started no gate job for `--absent-minutes` (45) while a gate job waited `--wait-minutes` (10) | read that host's pool status |
+
+A session still retrying by itself (`Reconnecting... n/5 ... esc to interrupt`)
+counts as working, never errored: sending `continue` would only interrupt it.
+`cmux read-screen` and `tartci pool status` are reads; the reader never types
+into a session. `gate-serving --from/--to --tick` replays a past window from
+GitHub's job history (`--save-jobs` keeps what it read, `--jobs` reads it
+back), which is how the host rules are scored offline. The Codex readers have
+no history to replay.
+
 `shipyard pr-watch rules-replay --since 2d --until <RFC 3339> --tick 5m`
 runs the same rules over a past window: it records what held at the window
 start, then stamps each later event with the first tick it held.

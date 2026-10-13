@@ -1,0 +1,43 @@
+{
+ "host": "Daniels-Mac-Studio-m3-4",
+ "state": "on",
+ "participating": true,
+ "fleet": {
+  "config": {
+   "gate_reserve": {
+    "problem": null,
+    "lines": [
+     "gate reserve: every gate lane fits"
+    ]
+   },
+   "host_vitals": {
+    "problem": null,
+    "lines": [
+     "fseventsd: 22 MB RSS, 10.1% CPU, sampled 58s ago"
+    ]
+   },
+   "profile_drift": {
+    "problem": null,
+    "lines": []
+   },
+   "self_update": {
+    "problem": "last self-update ROLLED BACK for e3e04d04d05f: relay reconcile/probe failed: {\n  \"changes\": [\n    {\n      \"action\": \"stage-disabled\",\n      \"label\": \"com.danielraffel.tartci.tart-runner-macos-fleet.studio.forge-gate\"\n    },\n    {\n      \"action\": \"stage-disabled\",\n      \"label\": \"com.danielraffel.tar",
+    "lines": [
+     "tartci: 9 commits behind main (oldest undeployed: 2026-10-12T21:34:04Z); selected 816828ca35fb9d32c9537a283db0689cfca27d57 (requested 816828ca35fb9d32c9537a283db0689cfca27d57; same) (measured 2026-10-",
+     "self-update: LAST ATTEMPT ROLLED BACK at 2026-10-13T00:20:37Z for e3e04d04d05f: relay reconcile/probe failed: {\n  \"changes\": [\n    {\n      \"action\": \"stage-disabled\",\n      \"label\": \"com.danielraffel."
+    ]
+   },
+   "supply": {
+    "problem": null,
+    "lines": []
+   },
+   "tool_freshness": {
+    "problem": "pulp 24.8 h behind v0.956.0; pulp v0.955.1 still not ready after 18.3 h (> 6 h): asset pulp-darwin-arm64.tar.gz missing; asset SHA256SUMS missing",
+    "lines": [
+     "pulp: 0.951.0 behind latest v0.956.0 by 6 release(s) for >=24.8 h (since 2026-10-12T00:51:14Z) STALE [pulp v0.955.1 not ready yet (asset pulp-darwin-arm64.tar.gz missing; asset SHA256SUMS missing), wa",
+     "shipyard: 0.310.0 (ghapp generation 0.310.0) current with latest v0.310.0 (measured 2026-10-13T01:39:13Z)"
+    ]
+   }
+  }
+ }
+}

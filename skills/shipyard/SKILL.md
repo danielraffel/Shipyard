@@ -748,6 +748,9 @@ alarm, or a line from `--input-events`), each once per key, so a quiet pass
 prints nothing. Its first pass with no ledger only records what already holds.
 `rules-replay` runs the same rules over a past window. Failing-test names come
 from CTest, Python unittest (`FAIL:`/`ERROR:`) and `cargo test` lines.
+`scripts/watch_inputs.py` (`cmux`, `hosts`, `gate-serving`) supplies its
+`--input-events` for Codex tab states and gate-host serving; every line carries
+a `fix` object (what, evidence, cause, command, safe_to_auto_apply, verify).
 
 `shipyard pr-watch liveness` exits 1 when this scanning host's last completed
 pass is older than `[pr_watch] stale_after_minutes` (45); `doctor --fleet` asks

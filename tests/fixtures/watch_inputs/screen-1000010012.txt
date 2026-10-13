@@ -1,0 +1,20 @@
+› continue
+ 
+ 
+• Explored
+  └ Read test_changed_surface_script_families.py
+    + Show details                                                                                          
+ 
+• The diagnostics now carry explicit file/test identity, evidence, cause class, fix/reproduction command,
+  auto-apply safety, and verification command. I also upgraded the affected-test failure annotation to
+  include the first JUnit failure line and an exact ctest -R reproduction command. I’m running the focused
+  real-entry-point tests now.
+ 
+• Working (1m 06s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close
+  └ Tip: Press ⌃r to search previously entered prompts.
+ 
+ 
+› Ask Codex to do anything
+ 
+  GPT-6-Sol medium · /Volumes/Workshop/Code/tartci · Execute tartci held PR plan
+  ? for shortcuts                                                                 ⚠ 3 warnings · f2 to view
