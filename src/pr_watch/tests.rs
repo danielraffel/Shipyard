@@ -205,6 +205,20 @@ fn signatures_name_unittest_and_cargo_failures_before_the_error_line() {
     );
     // A bare "FAILED (failures=1)" summary names no test.
     assert!(failure_signatures("FAILED (failures=1)\n").is_empty());
+    // Another tool's `ERROR:` line is not a test: it falls through to the
+    // log's `##[error]` line.
+    let build = "2026-10-10T00:20:01.1Z ERROR: Build failed\n\
+                 2026-10-10T00:20:01.2Z ERROR: Could not find a version that satisfies pytest\n\
+                 2026-10-10T00:20:02.2Z ##[error]Build step failed\n";
+    assert_eq!(
+        failure_signatures(build),
+        vec!["error: Build step failed".to_owned()]
+    );
+    // Python before 3.11 names the class, not the test: the name completes it.
+    assert_eq!(
+        failure_signatures("FAIL: test_x (test_mod.SomeTests)\n"),
+        vec!["test_mod.SomeTests.test_x".to_owned()]
+    );
 }
 
 // ---- flag 1 -------------------------------------------------------------------

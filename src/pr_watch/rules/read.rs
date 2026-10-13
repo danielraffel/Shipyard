@@ -74,25 +74,65 @@ pub fn read_trails(
         let Some(number) = issue_number(&comment).filter(|number| prs.contains(number)) else {
             continue;
         };
-        let (Some(id), Some(at)) = (
-            comment.get("id").and_then(Value::as_u64),
-            time(&comment, "created_at"),
-        ) else {
-            continue;
-        };
-        let login = comment
-            .pointer("/user/login")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let body = comment
-            .get("body")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let entry = TrailEntry::from_comment(id, login, at, body);
-        if entry.verdict.is_some() || entry.ready_head.is_some() {
+        if let Some(entry) = comment_entry(&comment) {
             trails.entry(number).or_default().push(entry);
         }
     }
+    read_reviews(gh, repo, prs, &mut trails)?;
+    for trail in trails.values_mut() {
+        trail.sort_by_key(|entry| (entry.at, entry.id));
+    }
+    Ok(trails)
+}
+
+/// One pull request's whole review trail: every comment it ever had, not just
+/// those updated in the window, and its reviews. Read when an event about it
+/// would fire, so an old verdict on a still-current head is not missed.
+///
+/// # Errors
+/// When a listing cannot be read.
+pub fn read_pr_trail(
+    gh: &SyncGhReader<'_>,
+    repo: &str,
+    pr: u64,
+) -> Result<Vec<TrailEntry>, String> {
+    let pages = read_pages(
+        gh,
+        &format!("repos/{repo}/issues/{pr}/comments"),
+        &["per_page=100".to_owned()],
+    )?;
+    let mut trails: BTreeMap<u64, Vec<TrailEntry>> = BTreeMap::new();
+    let mut trail: Vec<TrailEntry> = items(pages).iter().filter_map(comment_entry).collect();
+    read_reviews(gh, repo, &BTreeSet::from([pr]), &mut trails)?;
+    trail.extend(trails.remove(&pr).unwrap_or_default());
+    trail.sort_by_key(|entry| (entry.at, entry.id));
+    Ok(trail)
+}
+
+/// A comment as a trail entry, when it carries a verdict or a READY.
+fn comment_entry(comment: &Value) -> Option<TrailEntry> {
+    let id = comment.get("id").and_then(Value::as_u64)?;
+    let at = time(comment, "created_at")?;
+    let login = comment
+        .pointer("/user/login")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let body = comment
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let entry = TrailEntry::from_comment(id, login, at, body);
+    (entry.verdict.is_some() || entry.ready_head.is_some()).then_some(entry)
+}
+
+/// Every review of `prs`, batched [`REVIEW_BATCH`] to a GraphQL query, into
+/// `trails`.
+fn read_reviews(
+    gh: &SyncGhReader<'_>,
+    repo: &str,
+    prs: &BTreeSet<u64>,
+    trails: &mut BTreeMap<u64, Vec<TrailEntry>>,
+) -> Result<(), String> {
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository {repo:?}"))?;
@@ -128,10 +168,7 @@ pub fn read_trails(
             }
         }
     }
-    for trail in trails.values_mut() {
-        trail.sort_by_key(|entry| (entry.at, entry.id));
-    }
-    Ok(trails)
+    Ok(())
 }
 
 /// An `APPROVED` or `CHANGES_REQUESTED` review as a verdict on its commit.
@@ -216,4 +253,63 @@ pub fn read_inputs(path: &Path) -> Result<Vec<InputEvent>, String> {
                 .map_err(|error| format!("{}:{}: {error}", path.display(), index + 1))
         })
         .collect()
+}
+
+/// What remains of the GitHub App's hourly budget for one repository's
+/// installation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateBudget {
+    /// Core (REST) requests left.
+    pub core: u64,
+    /// GraphQL points left.
+    pub graphql: u64,
+    /// When the sooner-exhausted budget resets.
+    pub reset: Option<DateTime<Utc>>,
+}
+
+impl RateBudget {
+    /// The smaller of the two budgets.
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        self.core.min(self.graphql)
+    }
+}
+
+/// Read the App's remaining budget (`gh api rate_limit`, which costs none).
+///
+/// # Errors
+/// When the answer cannot be read.
+pub fn read_rate_budget(gh: &SyncGhReader<'_>) -> Result<RateBudget, String> {
+    let text = gh(&["api".to_owned(), "rate_limit".to_owned()])?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("rate_limit: invalid JSON: {error}"))?;
+    let field = |resource: &str, key: &str| {
+        value
+            .pointer(&format!("/resources/{resource}/{key}"))
+            .and_then(Value::as_u64)
+    };
+    let core = field("core", "remaining").ok_or("rate_limit: no core budget")?;
+    let graphql = field("graphql", "remaining").ok_or("rate_limit: no graphql budget")?;
+    let reset_of = |resource: &str| {
+        field(resource, "reset")
+            .and_then(|epoch| i64::try_from(epoch).ok())
+            .and_then(|epoch| DateTime::from_timestamp(epoch, 0))
+    };
+    let reset = if core <= graphql {
+        reset_of("core")
+    } else {
+        reset_of("graphql")
+    };
+    Ok(RateBudget {
+        core,
+        graphql,
+        reset,
+    })
+}
+
+/// Whether a read failed on GitHub's rate limit (primary or secondary).
+#[must_use]
+pub fn rate_limited(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("rate limit") || error.contains("abuse detection")
 }

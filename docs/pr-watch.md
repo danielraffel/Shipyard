@@ -369,15 +369,37 @@ repository with no required checks is watched for everything but red checks.
 | `host_alarm` | a `[tartci] ...` issue opened in `--alarm-repo` |
 | any other | a line from `--input-events`, passed through once per `key` |
 
-Failing tests are read from the job log: `CTest` summary lines, then Python
-`unittest` `FAIL:`/`ERROR:` lines and `cargo test` `... FAILED` lines, then the
-first meaningful `##[error]` line. Naming the test on the event is the point:
+Failing tests are read from the job log, in this order:
+
+1. `CTest` summary lines;
+2. Python `unittest` `FAIL:`/`ERROR:` lines that carry the test's dotted
+   location, so another tool's `ERROR: Build failed` is not a test;
+3. `cargo test` `... FAILED` lines;
+4. the first meaningful `##[error]` line. Naming the test on the event is the point:
 a red check whose annotation already named its failing test was named in a
 median 58 minutes, against 95 without.
 
 Each line is a `shipyard.pr-watch.rules/v1` object: `kind`, `key`, `at` (the
 pass), `since` (when the condition began, where known), `repo`, `pr`, `head`,
-`summary` (one actionable line) and `detail`. An input-event line needs
+`summary` (one actionable line), `detail`, and `fix`.
+
+`fix` is what an agent needs to act without investigating:
+
+* `what`: the exact subject (pull request, head, check, failing tests);
+* `evidence`: a URL (the READY or verdict comment, the check run, the merge
+  group run, the alarm issue) or a read-only command;
+* `cause`: the cause class (`unreviewed_head`, `test_failure`, `cancelled`,
+  `failed_checks`, ...);
+* `command`: the next command or edit, for a checkout with `ghapp` on `PATH`;
+* `safe_to_auto_apply`: whether an agent may run it unattended;
+* `verify`: how to confirm it worked.
+
+Two fixes are safe to apply unattended: relaying a verdict to its author, and
+the bound arm of an approved head nobody armed
+(`ghapp pr merge <n> --auto --merge --match-head-commit <sha>`). Routing a
+READY head is also safe, but only with a reviewer named by
+`--reviewer OWNER/REPO=NAME`. An input event's own `fix` passes through; one
+without a complete fix is reported as `input_without_fix`. An input-event line needs
 `kind`, `key` and `at`, and may carry `summary`, `repo` and `pr`.
 
 Every emitted key is recorded in a ledger under
@@ -387,6 +409,20 @@ a new verdict or a new removal is a new event, and a condition that persists
 is reported once. With no ledger, the first pass records what already holds
 and emits nothing, so a new watcher reports changes rather than the backlog.
 `--dry-run` prints without recording.
+
+When an event that depends on the review trail would fire
+(`ready_unreviewed`, `head_unreviewed`, `armed_unapproved`), the pass first
+re-reads that pull request's whole trail, so a verdict older than the window
+on a head that is still current is not missed.
+
+Every pass prints its GitHub reads per repository on stderr. A cold pass over
+the four fleet repositories reads about a thousand times against the App's
+shared 5000 per hour. Before reading, a live pass checks each repository's
+App budget (`gh api rate_limit`, which costs nothing). Under
+`--min-rate-remaining` (1500), it reads nothing more, records a backoff until
+the budget resets beside its ledger, and exits 75. Later passes exit 75
+without reading until then. A rate-limit error mid-pass records nothing and
+backs off 15 minutes.
 
 A pass reads `--lookback` (3d) of history: the pull-request search with queue
 timelines, the gate workflow's runs, required check runs and failed job logs

@@ -1430,6 +1430,10 @@ pub(crate) struct PrWatchRulesSource {
     /// An approved head nobody armed is reported after this long.
     #[arg(long = "approved-unarmed-after", default_value = "15m")]
     pub(crate) approved_unarmed_after: String,
+    /// `OWNER/REPO=NAME`: the reviewer a head of that repository is routed
+    /// to; each event's `fix` names it. Repeatable.
+    #[arg(long = "reviewer")]
+    pub(crate) reviewers: Vec<String>,
     /// Read every answer live instead of reusing settled answers.
     #[arg(long = "no-cache")]
     pub(crate) no_cache: bool,
@@ -1448,6 +1452,12 @@ pub(crate) struct PrWatchRulesArgs {
     /// Print what would be emitted without recording it.
     #[arg(long = "dry-run")]
     pub(crate) dry_run: bool,
+    /// Skip the pass (exit 75, nothing read past the check) when the GitHub
+    /// App's remaining core or GraphQL budget for a watched repository is
+    /// below this; later passes wait for the budget's reset. A cold pass over
+    /// four repositories reads about a thousand times.
+    #[arg(long = "min-rate-remaining", default_value_t = 1500)]
+    pub(crate) min_rate_remaining: u64,
 }
 
 #[derive(Debug, Args)]
