@@ -172,25 +172,57 @@ A HOLD posted on a head that is already armed or queued did not stop it: on
 `verdict: HOLD` naming their merge head, because the review rule judges only
 the arm. `verdict-hold-hook` makes the verdict act.
 
-**What it recognises:** a HOLD being posted on a pull request through `ghapp`:
-`api repos/O/R/issues/N/comments` (`--input` JSON `body`, or `-f/-F body=`,
-`body=@FILE`), `pr comment N` (`--body`, `--body-file`), and `api
-repos/O/R/pulls/N/reviews` with `event: REQUEST_CHANGES` and a `commit_id`. A
-comment is a HOLD when its last non-blank line is `verdict: HOLD head:<sha>`.
+**What it recognises:** a HOLD being posted on a pull request through `ghapp`,
+in any of these forms:
+
+* `pr comment <selector>` (`--body`, `--body-file`), the selector anywhere
+  among the arguments: a number, `#N`, a pull request URL, or none (the
+  current branch's pull request);
+* `pr review <selector> --request-changes` (a HOLD on the current head
+  unless the body names one), or a `pr review` whose body is a HOLD;
+* `api repos/O/R/issues/N/comments` (`--input` JSON `body`, or `-f/-F body=`,
+  `body=@FILE`);
+* `api -X PATCH repos/O/R/issues/comments/ID`, editing a comment into a HOLD:
+  the pull request comes from that comment's `issue_url`;
+* `api repos/O/R/pulls/N/reviews` with `event: REQUEST_CHANGES` (on its
+  `commit_id`, else the current head) or a HOLD body;
+* `api graphql` `addComment` with a HOLD body on a pull request, and
+  `addPullRequestReview` with `REQUEST_CHANGES` or a HOLD body.
+
+A body is a HOLD when its last non-blank line is `verdict: HOLD head:<sha>`.
 
 **What it does:** it reads the pull request; only when its current head is
 exactly that sha, it dequeues it (`dequeuePullRequest`) if queued, else
 disables auto-merge (`disablePullRequestAutoMerge`) if armed. Another pull
 request, another head, or one neither armed nor queued is left alone. Every
 action and every failure is a line in `holds.jsonl` in the guards directory.
-The mutation goes to the real `gh` with the exported App token, not back
-through `ghapp`, so `queue-removal-guard` still refuses agents' own dequeues
-and disarms. The head lands again only once a newer verdict approves it, which
+The head lands again only once a newer verdict approves it, which
 `queue-arm-guard` requires on hosts with review before arm.
 
-**It never refuses:** `ghapp` runs it with `|| true`, after the refusing
-guards, and it exits 0 even when it cannot read or act; it then prints what to
-check by hand. The HOLD always posts.
+**The one sanctioned route around `queue-removal-guard`.** The hook's mutation
+goes to the real `gh` with the exported App token, not back through `ghapp`, so
+`queue-removal-guard` keeps refusing agents' own dequeues and disarms. On a
+host with the switch on, posting a HOLD that names a pull request's head is
+therefore the one way to dequeue or disarm it without the operator override,
+and the public HOLD is its trace. Do not add another.
+
+**It never refuses, and a failure is public:** `ghapp` runs it with `|| true`,
+after the refusing guards, and it exits 0. When it recognises a HOLD but the
+read or the dequeue/disarm fails, it posts a follow-up comment on the pull
+request ("this HOLD could not dequeue/disarm head <sha>: <error>; it may still
+land"), so GitHub never shows an ineffective HOLD as an effective one. When it
+cannot read a comment's or review's body (`--input -`, `body=@-`,
+`--body-file -`), or cannot tell which pull request it is on, it prints that a
+HOLD in it was NOT acted on.
+
+**It is the fast path, not the guarantee.** It sees only HOLDs posted through
+`ghapp` on a host that turned it on: a reviewer on another host, a Codex
+session, or the web UI bypasses it. A repository with a merge queue needs the
+server-side backstop as well: a cheap merge-group preflight that fails the
+group when a queued pull request's latest trusted verdict names its head as
+HOLD. In Generous-Corp/pulp that is `tools/ci/merge_group_hold_check.py` in the
+`classify` job, which runs the protected base branch's copy of the check and
+fails `macos` closed before any VM.
 
 **Which hosts:** off unless the host turns it on, with `SHIPYARD_HOLD_DISARMS=1`
 (`0` forces it off) or a file named `hold-disarms` in the guards directory.

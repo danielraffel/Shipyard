@@ -42,14 +42,25 @@ class VerdictHoldHook(unittest.TestCase):
             f"open({str(self.calls)!r}, 'a').write(argv + '\\n')\n"
             f"state = json.loads({json.dumps(json.dumps(state))})\n"
             f"fails = {mutation_fails!r}\n"
+            "if 'issues/7/comments' in argv and 'POST' in argv:\n"
+            "    print('{}'); sys.exit(0)\n"
+            "if 'pr view' in argv:\n"
+            "    print(json.dumps({'number': 7, 'url': 'https://github.com/o/r/pull/7'})); sys.exit(0)\n"
+            "if 'issues/comments/99' in argv:\n"
+            "    print(json.dumps({'issue_url': 'https://api.github.com/repos/o/r/issues/8'})); sys.exit(0)\n"
+            "if 'node(id' in argv:\n"
+            "    print(json.dumps({'data': {'node': {'number': 8, 'repository': {'nameWithOwner': 'o/r'}}}})); sys.exit(0)\n"
             "if 'mutation' in argv:\n"
             "    if fails:\n"
             "        sys.stderr.write('GraphQL: Resource not accessible by integration\\n'); sys.exit(1)\n"
             "    print(json.dumps({'data': {}})); sys.exit(0)\n"
             "if 'pullRequest(number' in argv:\n"
-            "    if state is None:\n"
+            "    import re as _re\n"
+            "    number = int(_re.search(r'number=(\\d+)', argv).group(1))\n"
+            "    if state is None or number not in (7, 8):\n"
             "        sys.stderr.write('HTTP 502\\n'); sys.exit(1)\n"
-            "    print(json.dumps({'data': {'repository': {'pullRequest': state}}})); sys.exit(0)\n"
+            "    pull = dict(state, id=f'PR_{number}')\n"
+            "    print(json.dumps({'data': {'repository': {'pullRequest': pull}}})); sys.exit(0)\n"
             "sys.stderr.write('unexpected gh call: ' + argv + '\\n'); sys.exit(3)\n",
             encoding="utf-8",
         )
@@ -138,16 +149,32 @@ class VerdictHoldHook(unittest.TestCase):
                       switch=None)
         self.assertTrue(any("disablePullRequestAutoMerge" in call for call in self.logged()))
 
-    def test_a_failure_never_blocks_the_hold_and_says_what_to_do(self) -> None:
+    def announcements(self) -> list[str]:
+        return [call for call in self.logged()
+                if "issues/7/comments" in call and "POST" in call]
+
+    def test_a_failure_never_blocks_the_hold_and_says_so_publicly(self) -> None:
         result = self.run_hook(self.comment(f"verdict: HOLD head:{HEAD}"), None)
         self.assertEqual(result.returncode, 0)
         self.assertIn("The HOLD still posts", result.stderr)
         self.assertIn("ghapp pr view 7 --repo o/r", result.stderr)
         self.assertEqual(self.holds()[0]["action"], "failed")
+        [announcement] = self.announcements()
+        self.assertIn(f"this HOLD could not dequeue/disarm head {HEAD}", announcement)
+        self.assertIn("it may still land", announcement)
+        # The announcement is not itself a HOLD.
+        self.assertNotIn("verdict: HOLD", announcement)
+        self.calls.unlink()
         refused = self.run_hook(self.comment(f"verdict: HOLD head:{HEAD}"),
                                 self.state(armed=True), mutation_fails=True)
         self.assertEqual(refused.returncode, 0)
         self.assertIn("could not take o/r#7 out of the landing path", refused.stderr)
+        [announcement] = self.announcements()
+        self.assertIn("disarm failed", announcement)
+        # A successful disarm announces nothing.
+        self.calls.unlink()
+        self.run_hook(self.comment(f"verdict: HOLD head:{HEAD}"), self.state(armed=True))
+        self.assertEqual(self.announcements(), [])
 
     def test_every_posting_form_is_recognised(self) -> None:
         body_file = self.root / "body.md"
@@ -175,6 +202,54 @@ class VerdictHoldHook(unittest.TestCase):
         self.run_hook(["api", "repos/o/r/pulls/7/reviews", "--input", str(review)],
                       self.state(armed=True))
         self.assertEqual(self.logged(), [])
+
+    def test_every_further_posting_form_is_recognised(self) -> None:
+        hold = f"verdict: HOLD head:{HEAD}"
+        body_file = self.root / "hold.md"
+        body_file.write_text(f"Holding.\n{hold}\n", encoding="utf-8")
+        graphql = self.root / "graphql.json"
+        forms = {
+            "repo flag first": ["pr", "comment", "--repo", "o/r", "8", "--body", hold],
+            "url selector": ["pr", "comment", "https://github.com/o/r/pull/8", "-b", hold],
+            "#N selector": ["pr", "comment", "#8", "--repo", "o/r", "--body-file", str(body_file)],
+            "review request-changes": ["pr", "review", "8", "--request-changes", "-b", "see inline"],
+            "review with a HOLD body": ["pr", "review", "8", "--comment", "-b", hold],
+            "edit a comment into a HOLD": ["api", "-X", "PATCH", "repos/o/r/issues/comments/99",
+                                           "-f", f"body={hold}"],
+            "graphql addComment": ["api", "graphql", "-f",
+                                   "query=mutation($id:ID!,$body:String!){addComment(input:"
+                                   "{subjectId:$id,body:$body}){clientMutationId}}",
+                                   "-f", "id=PR_8", "-f", f"body={hold}"],
+            "graphql addPullRequestReview": ["api", "graphql", "--input", str(graphql)],
+        }
+        graphql.write_text(json.dumps({
+            "query": "mutation{addPullRequestReview(input:{pullRequestId:\"PR_8\","
+                     "event:REQUEST_CHANGES,body:\"see inline\"}){clientMutationId}}"}),
+            encoding="utf-8")
+        for name, form in forms.items():
+            self.calls.unlink(missing_ok=True)
+            result = self.run_hook(form, self.state(armed=True))
+            self.assertEqual(result.returncode, 0, (name, result.stderr))
+            mutations = [call for call in self.logged() if "disablePullRequestAutoMerge" in call]
+            self.assertEqual(len(mutations), 1, (name, self.logged(), result.stderr))
+            self.assertIn("id=PR_8", mutations[0], name)
+        # Requesting changes holds whatever head the pull request has now.
+        self.assertEqual(self.holds()[-1]["hold_head"], HEAD)
+        # With no selector, the current branch's pull request (#7).
+        self.calls.unlink()
+        self.run_hook(["pr", "comment", "--body", hold], self.state(armed=True))
+        self.assertTrue(any("disablePullRequestAutoMerge" in call and "id=PR_7" in call
+                            for call in self.logged()), self.logged())
+
+    def test_a_body_the_hook_cannot_read_is_said_to_be_unacted(self) -> None:
+        for form in (["api", "repos/o/r/issues/7/comments", "--input", "-"],
+                     ["api", "repos/o/r/issues/7/comments", "-F", "body=@-"],
+                     ["pr", "comment", "7", "--repo", "o/r", "--body-file", "-"]):
+            result = self.run_hook(form, self.state(armed=True))
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("cannot read this comment or review", result.stderr, form)
+            self.assertIn("it was NOT acted on", result.stderr, form)
+        self.assertFalse([call for call in self.logged() if "mutation" in call])
 
     def test_ghapp_runs_the_hook_without_letting_it_refuse(self) -> None:
         wrapper = (HERE / "ghapp").read_text(encoding="utf-8")
