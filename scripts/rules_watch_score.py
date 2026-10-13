@@ -24,6 +24,15 @@ and are reported separately so the gap is visible rather than hidden;
 `sourced` repeats the recall over the turns that have at least one sourced
 kind.
 
+A persistent condition (a host out of the pool, a dead Codex session) is
+re-reported turn after turn while the watcher fires once when it begins. The
+`kind_episode` variant scores that fairly: consecutive turns of a persistent
+kind no more than `--episode-gap-hours` apart form one episode, and a turn is
+recalled when a matching event fired within the window before the episode's
+first turn or at any time since, up to this turn (for other kinds it is
+`kind_time`). It also reports how many episodes were recalled at their
+opening turn.
+
 A recall measured on time alone rises with event density: a stream that emits
 often enough matches any turn. `--control-shift-hours N` scores the same
 events shifted N hours around the window as a negative control; a recall that
@@ -58,6 +67,10 @@ KIND_MAP: dict[str, tuple[str, ...]] = {
     ),
 }
 RULE_LABELS = ("rule", "rule_detect_judgement_fix")
+# Conditions that persist until fixed: the watcher reports each once, when it
+# begins, while a monitor re-reports it every turn.
+PERSISTENT_KINDS = ("host_down_or_out_of_pool", "codex_session_resume_or_flush")
+VARIANTS = ("kind_time", "kind_time_pr", "kind_time_pr_strict", "kind_episode")
 PR_REF = re.compile(r"#(\d{3,5})\b")
 
 
@@ -108,8 +121,28 @@ def matches(event: dict[str, Any], kind: str, turn: dict[str, Any], window: time
     return True
 
 
+def episode_starts(turns: list[dict[str, Any]], gap: timedelta
+                   ) -> dict[tuple[int, str], datetime]:
+    """``(turn index, persistent kind) -> its episode's first turn time``.
+
+    Consecutive rule-detectable turns naming the same persistent kind no more
+    than ``gap`` apart are one episode.
+    """
+    starts: dict[tuple[int, str], datetime] = {}
+    for kind in PERSISTENT_KINDS:
+        start = previous = None
+        for index, turn in enumerate(turns):
+            if not turn["rule"] or kind not in turn["kinds"]:
+                continue
+            if previous is None or turn["ts"] - previous > gap:
+                start = turn["ts"]
+            previous = turn["ts"]
+            starts[(index, kind)] = start
+    return starts
+
+
 def score(turns: list[dict[str, Any]], events: list[dict[str, Any]],
-          windows: list[int]) -> dict[str, Any]:
+          windows: list[int], episode_gap: timedelta = timedelta(hours=2)) -> dict[str, Any]:
     sourced = {event["kind"] for event in events}
     report: dict[str, Any] = {
         "turns": len(turns),
@@ -126,21 +159,35 @@ def score(turns: list[dict[str, Any]], events: list[dict[str, Any]],
         hours = max((turns[-1]["ts"] - turns[0]["ts"]).total_seconds() / 3600, 1e-9)
         inside = [e for e in events if turns[0]["ts"] - timedelta(minutes=10) < e["_at"] <= turns[-1]["ts"]]
         report["events_per_hour"] = round(len(inside) / hours, 2)
+    starts = episode_starts(turns, episode_gap)
     for minutes in windows:
         window = timedelta(minutes=minutes)
         entry: dict[str, Any] = {}
         for variant, by_pr in (("kind_time", False), ("kind_time_pr", True),
-                               ("kind_time_pr_strict", "strict")):
+                               ("kind_time_pr_strict", "strict"), ("kind_episode", False)):
             recalled = 0
             sourced_turns = 0
             sourced_recalled = 0
             per_kind: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-            for turn in (turn for turn in turns if turn["rule"]):
+            episodes: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+            for index, turn in enumerate(turns):
+                if not turn["rule"]:
+                    continue
                 hit = False
                 for kind in turn["kinds"]:
                     if kind not in KIND_MAP:
                         continue
-                    found = any(matches(e, kind, turn, window, by_pr) for e in events)
+                    start = starts.get((index, kind)) if variant == "kind_episode" else None
+                    if start is not None:
+                        # The episode is open from its first turn: an event
+                        # that fired as it began recalls every turn in it.
+                        reach = turn["ts"] - start + window
+                        found = any(matches(e, kind, turn, reach, False) for e in events)
+                        if start == turn["ts"]:
+                            episodes[kind][1] += 1
+                            episodes[kind][0] += found
+                    else:
+                        found = any(matches(e, kind, turn, window, by_pr) for e in events)
                     per_kind[kind][1] += 1
                     per_kind[kind][0] += found
                     hit |= found
@@ -162,6 +209,11 @@ def score(turns: list[dict[str, Any]], events: list[dict[str, Any]],
                     for kind, (hits, of) in sorted(per_kind.items())
                 },
             }
+            if variant == "kind_episode":
+                entry[variant]["episodes"] = {
+                    kind: {"recalled": hits, "of": of, "recall": round(hits / of, 3)}
+                    for kind, (hits, of) in sorted(episodes.items())
+                }
         false_wakes = 0
         previous = None
         for turn in turns:
@@ -186,7 +238,7 @@ def render(report: dict[str, Any]) -> str:
         f"unsourced kinds (counted as misses): {', '.join(report['unsourced_kinds']) or 'none'}",
     ]
     for minutes, entry in report["windows"].items():
-        for variant in ("kind_time", "kind_time_pr", "kind_time_pr_strict"):
+        for variant in VARIANTS:
             data = entry[variant]
             sourced = data["sourced"]
             lines.append(f"window {minutes}m {variant}: recall {data['recall']} "
@@ -194,6 +246,9 @@ def render(report: dict[str, Any]) -> str:
                          f"turns {sourced['recall']} ({sourced['recalled']}/{sourced['turns']})")
             for kind, numbers in data["per_kind"].items():
                 lines.append(f"  {kind}: {numbers['recalled']}/{numbers['of']} ({numbers['recall']})")
+            for kind, numbers in data.get("episodes", {}).items():
+                lines.append(f"  {kind} episodes recalled at their opening turn: "
+                             f"{numbers['recalled']}/{numbers['of']} ({numbers['recall']})")
         lines.append(f"window {minutes}m false wakes: {entry['false_wakes']}/"
                      f"{report['nothing_actionable']} ({entry['false_wake_rate']})")
     control = report.get("control")
@@ -204,6 +259,8 @@ def render(report: dict[str, Any]) -> str:
                 f"recall kind_time {entry['kind_time']['recall']}, "
                 f"kind_time_pr {entry['kind_time_pr']['recall']}, "
                 f"kind_time_pr_strict {entry['kind_time_pr_strict']['recall']}, "
+                f"kind_episode {entry['kind_episode']['recall']} (host turns "
+                f"{entry['kind_episode']['per_kind'].get('host_down_or_out_of_pool', {}).get('recalled')}), "
                 f"false wakes {entry['false_wake_rate']}")
     return "\n".join(lines) + "\n"
 
@@ -228,14 +285,17 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--windows", default="10,30,60", help="minutes, comma-separated")
     parser.add_argument("--control-shift-hours", type=float, default=None,
                         help="also score the events shifted this many hours (negative control)")
+    parser.add_argument("--episode-gap-hours", type=float, default=2.0,
+                        help="turns of a persistent kind this close are one episode")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     windows = [int(part) for part in args.windows.split(",") if part.strip()]
     turns = load_turns(args.turns, args.trigger)
     events = load_events(args.events)
-    report = score(turns, events, windows)
+    gap = timedelta(hours=args.episode_gap_hours)
+    report = score(turns, events, windows, gap)
     if args.control_shift_hours is not None:
-        control = score(turns, shifted(events, args.control_shift_hours), windows)
+        control = score(turns, shifted(events, args.control_shift_hours), windows, gap)
         report["control"] = {"shift_hours": args.control_shift_hours,
                              "windows": control["windows"]}
     if args.json:

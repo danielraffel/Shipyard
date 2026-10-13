@@ -499,6 +499,24 @@ JSONL>` scores a replay against a close monitor's labelled turns: recall on
 the rule-detectable turns and the false-wake rate on the turns that found
 nothing to do.
 
+Its variants, from loosest to strictest:
+
+- `kind_time`: an event of a mapped kind fired in the window before the turn.
+- `kind_episode`: the same for most kinds. For a persistent condition (a host out of
+  the pool, a dead Codex session), turns of that kind no more than
+  `--episode-gap-hours` (2) apart are one episode. Every turn in an episode
+  counts as recalled once a matching event fired near its opening, because
+  the watcher fires once while a monitor re-reports every turn. It also
+  reports how many episodes were recalled at their opening turn.
+- `kind_time_pr`: as `kind_time`, and the event's pull request must be one
+  the turn names, when the turn names one.
+- `kind_time_pr_strict`: only an event naming a pull request the turn names
+  counts.
+
+Recall on time alone rises with event density, so read every variant against
+`--control-shift-hours N`, which scores the same events moved N hours. A
+variant that does not beat its shifts is measuring density, not detection.
+
 ## Daemon job and config
 
 The daemon runs one pass every 15 minutes, the first one interval after start.

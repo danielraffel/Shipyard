@@ -34,7 +34,8 @@ def event(kind: str, at: str, pr: int | None = None) -> dict:
 
 
 class Score(unittest.TestCase):
-    def run_score(self, rows: list[dict[str, str]], events: list[dict]) -> dict:
+    def run_score(self, rows: list[dict[str, str]], events: list[dict],
+                  gap_hours: float = 2.0) -> dict:
         with tempfile.TemporaryDirectory() as directory:
             turns_path = pathlib.Path(directory) / "turns.csv"
             with turns_path.open("w", newline="", encoding="utf-8") as handle:
@@ -50,6 +51,7 @@ class Score(unittest.TestCase):
                 score_mod.load_turns(str(turns_path), "close_monitor"),
                 score_mod.load_events(str(events_path)),
                 [10, 30],
+                score_mod.timedelta(hours=gap_hours),
             )
 
     def test_recall_needs_a_mapped_kind_inside_the_window(self) -> None:
@@ -129,6 +131,37 @@ class Score(unittest.TestCase):
         self.assertEqual([e["kind"] for e in moved], ["y", "x"])
         self.assertEqual(moved[1]["_at"], events("2026-10-11T06:00:00Z"))
 
+
+    def test_an_event_as_an_episode_begins_recalls_every_turn_in_it(self) -> None:
+        host = "host_down_or_out_of_pool"
+        rows = [
+            # One episode: three re-reports no more than 2 h apart.
+            turn(1, "2026-10-11T01:00:00Z", "b", host, "rule"),
+            turn(2, "2026-10-11T01:40:00Z", "b", host, "rule"),
+            turn(3, "2026-10-11T02:30:00Z", "b", host, "rule"),
+            # A second episode after a 3 h gap that nothing reported.
+            turn(4, "2026-10-11T05:30:00Z", "b", host, "rule"),
+            # A per-PR kind keeps the plain window in this variant.
+            turn(5, "2026-10-11T05:40:00Z", "b", "red_or_blocked_check", "rule"),
+        ]
+        events = [event("host_not_serving", "2026-10-11T00:55:00Z"),
+                  event("required_red", "2026-10-11T04:00:00Z", 3)]
+        report = self.run_score(rows, events)
+        ten = report["windows"]["10"]
+        self.assertEqual(ten["kind_time"]["per_kind"][host]["recalled"], 1, "only the first turn")
+        episode = ten["kind_episode"]
+        self.assertEqual(episode["per_kind"][host], {"recalled": 3, "of": 4, "recall": 0.75})
+        self.assertEqual(episode["episodes"][host], {"recalled": 1, "of": 2, "recall": 0.5})
+        self.assertEqual(episode["per_kind"]["red_or_blocked_check"]["recalled"], 0)
+        # A shorter gap splits the first episode; its later turns then need
+        # their own event.
+        split = self.run_score(rows, events, gap_hours=0.5)["windows"]["10"]["kind_episode"]
+        self.assertEqual(split["per_kind"][host]["recalled"], 1)
+        self.assertEqual(split["episodes"][host], {"recalled": 1, "of": 4, "recall": 0.25})
+        # An event after the turn never recalls it.
+        late = self.run_score(rows, [event("host_not_serving", "2026-10-11T01:05:00Z")])
+        self.assertEqual(late["windows"]["10"]["kind_episode"]["per_kind"][host]["recalled"], 2)
+        self.assertEqual(late["windows"]["10"]["kind_episode"]["episodes"][host]["recalled"], 0)
 
     def test_host_and_codex_reader_kinds_map_to_their_turn_kinds(self) -> None:
         rows = [
