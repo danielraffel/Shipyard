@@ -172,3 +172,58 @@ fn a_merge_group_job_names_its_pull_request() {
     assert_eq!(queue_pr(&queued), Some(9650));
     assert_eq!(queue_pr(&job(2, "macos", "failure", false)), None);
 }
+
+#[test]
+fn annotate_carries_a_ci_cause_record_for_each_failing_required_job() {
+    let fixture = |path: &str| {
+        let path = format!("{}/tests/fixtures/{path}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path}: {error}"))
+    };
+    let jobs: Value =
+        serde_json::from_str(&fixture("ctest-log/jobs-mg-run-38308868279.json")).expect("jobs");
+    let jobs: Vec<Job> = serde_json::from_value(jobs["jobs"].clone()).expect("jobs");
+    let target = Target {
+        head_sha: "abc".to_owned(),
+        jobs,
+        required: vec!["macos".to_owned()],
+        unreadable: Vec::new(),
+    };
+    let logs = HashMap::from([(
+        115_009_634_572_i64,
+        fixture("ctest-log/log-mg-job-115009634572.log"),
+    )]);
+    let now = Utc
+        .with_ymd_and_hms(2026, 10, 13, 12, 0, 0)
+        .single()
+        .expect("time");
+    // The Linux job failed too, but is not required: one record.
+    let causes = cause_records(&target, &logs, "Generous-Corp/pulp", Some(10_154), now);
+    assert_eq!(causes.len(), 1);
+    assert_eq!(
+        causes[0].signature,
+        "pulp.vellum-closure-external-input-negative"
+    );
+    assert_eq!(causes[0].pr, Some(10_154));
+    assert_eq!(causes[0].named_at.as_deref(), Some("2026-10-13T12:00:00Z"));
+    let doc = diagnose::build(
+        &target.jobs,
+        &logs,
+        &target.required,
+        &Context::new(),
+        diagnose::DEFAULT_MAX_BYTES,
+    );
+    let payload = annotated_payload(
+        &doc,
+        &target,
+        &Tree::default(),
+        &logs,
+        "Generous-Corp/pulp",
+        Some(10_154),
+        now,
+    );
+    let text = payload.output.text.expect("records in output.text");
+    assert!(text.starts_with("ci.cause/v1 records"));
+    let record: cause::CiCause =
+        serde_json::from_str(text.lines().nth(1).expect("a record")).expect("record");
+    assert_eq!(record, causes[0]);
+}

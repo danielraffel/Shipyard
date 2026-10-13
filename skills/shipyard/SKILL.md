@@ -1563,7 +1563,26 @@ assertion never outranks the runner dying. A cause is named when its class is
 not `unknown` and its confidence is `high` or `medium`. `diagnose` adds only
 GitHub's own record (a runner that never came, a supersede, a timeout) when
 the log names nothing more certain; a log with no recognized line still gets
-a `shell-exit` record, so the miss is counted. A job whose
+a `shell-exit` record, so the miss is counted. A job that named its own cause (`shipyard cause extract --log <captured
+output> --notice` in an `if: failure()` step, which logs `##[notice]<record>`)
+only shows that its cause was named during the job: the scorecard still
+builds the cause from the log, and only when the record is bound to the
+payload (repo, head, run, attempt, job name) and names the same cause does it
+mark the cause not retrospective (counted as "named in the job itself"), with
+`named_at` set to the jobs API's completion of the step that printed the
+record, and only for a step that started once the failing step had completed
+(pull-request code runs in earlier steps and could print a matching record
+before anything failed). The record's own `named_at` is never used. Pull-request code can print any line, so
+a record is never trusted for its content; a forged one is ignored. Records
+in the log are blanked before C2 reads it, so their quoted lines are not read
+as evidence. On a `pull_request` run the record's head comes from
+`GITHUB_EVENT_PATH` (`GITHUB_SHA` is the test merge commit); pass `--job` with
+the display name when it differs from the job key. `shipyard diagnose
+--annotate plan|post` puts every failing required job's record in the check
+run's `output.text`, and `shipyard cause archive --dir <labels
+checkout>/causes --input <cases.jsonl>` appends records to `YYYY-MM.jsonl`
+files, skipping ids already archived (append-only, so a private corpus never
+loses a line). A job whose
 log GitHub no longer holds is still judged from its payload. `--causes` reads the same causes without
 exporting and adds "named causes: N/M red cases" with the time to them.
 Each uncached red job costs two API calls, so at most `--causes-max-jobs`

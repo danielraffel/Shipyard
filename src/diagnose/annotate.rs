@@ -257,6 +257,9 @@ pub struct CheckRunOutput {
     pub summary: String,
     /// Positions.
     pub annotations: Vec<Annotation>,
+    /// The failing checks' `ci.cause/v1` records, one JSON object per line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// The body of `POST /repos/{owner}/{repo}/check-runs`.
@@ -286,6 +289,7 @@ pub fn check_run_payload(doc: &Diagnosis, head_sha: &str, tree: &Tree) -> CheckR
             title: doc.summary.chars().take(255).collect(),
             summary: doc.summary.chars().take(65_000).collect(),
             annotations: annotations(doc, tree),
+            text: None,
         },
     }
 }

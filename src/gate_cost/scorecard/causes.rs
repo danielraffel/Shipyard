@@ -7,10 +7,16 @@
 //! is **named** when its class is not `unknown` and its confidence is `high`
 //! or `medium` (see [`crate::diagnose::cause`]).
 //!
-//! What a completed job yields is cached, never the log. Causes read here are
-//! retrospective: they say what the log held when the job finished, which is
-//! the earliest an extractor could have named it, so `named_at` is the job's
-//! completion and `retrospective` is true.
+//! The cause is always built here from the log. A job that named its own
+//! cause (`shipyard cause extract --notice` in an `if: failure()` step)
+//! carries a record in its log; when that record is bound to this job (repo,
+//! head, run, attempt, job name), names the same cause, and sits in a step the
+//! jobs API timed, the cause is not retrospective and its `named_at` is that
+//! step's completion by GitHub's clock. Otherwise the cause is retrospective:
+//! `named_at` is the job's completion, the earliest an extractor could have
+//! named it. A record printed by the job is never trusted for its content or
+//! its time: pull-request code can print one. What a completed job yields is
+//! cached, never the log.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -29,7 +35,7 @@ pub const DEFAULT_MAX_JOBS: usize = 200;
 /// Why a job over that budget was not read.
 pub const OVER_BUDGET: &str = "skipped: over the --causes-max-jobs budget";
 /// Cache key version: bump when a cause's shape or meaning changes.
-const EXTRACT_VERSION: u32 = 3;
+const EXTRACT_VERSION: u32 = 4;
 
 /// A red job whose cause could not be read, and why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -127,8 +133,23 @@ fn read_cause(
         repo: repo.to_owned(),
         ..Place::default()
     };
-    let cause = cause::build(&job, log.as_deref(), &place, job.completed_at.clone(), true)
+    let mut cause = cause::build(&job, log.as_deref(), &place, job.completed_at.clone(), true)
         .ok_or_else(|| format!("job {id} did not fail"))?;
+    // A record the job printed only shows that a cause the extractor confirms
+    // was named during the job; the time is the API's for the step that
+    // printed it, never the record's own.
+    if let Some(at) = log
+        .as_deref()
+        .map(cause::records_with_times)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .filter(|(recorded, _)| cause::corroborates(recorded, &cause, &job, repo))
+        .find_map(|(_, at)| cause::printed_at(&job, at.as_deref()))
+    {
+        cause.named_at = Some(at);
+        cause.retrospective = false;
+    }
     if let Ok(value) = serde_json::to_value(&cause) {
         cache.put(&key, &value);
     }
@@ -218,6 +239,8 @@ pub struct CauseNaming {
     pub time_to_named_median_minutes: Option<f64>,
     /// Named cases with both times.
     pub time_to_named_n: usize,
+    /// Causes the job named in its own log, rather than read after it.
+    pub recorded_in_job: usize,
     /// Whether every cause was read after the fact.
     pub retrospective: bool,
     /// Most uncached jobs the read could fetch (`--causes-max-jobs`).
@@ -251,6 +274,7 @@ pub fn compute(rows: &[Case], read: &CausesRead) -> CauseNaming {
         by_class: BTreeMap::new(),
         time_to_named_median_minutes: None,
         time_to_named_n: 0,
+        recorded_in_job: 0,
         retrospective: true,
         budget: read.budget,
         skipped_for_budget: read.skipped_for_budget,
@@ -269,6 +293,7 @@ pub fn compute(rows: &[Case], read: &CausesRead) -> CauseNaming {
             .entry(cause.confidence.clone())
             .or_insert(0) += 1;
         naming.retrospective &= cause.retrospective;
+        naming.recorded_in_job += usize::from(!cause.retrospective);
         if !cause.named() {
             continue;
         }
@@ -331,6 +356,7 @@ pub fn render(naming: &CauseNaming) -> String {
     let time = naming
         .time_to_named_median_minutes
         .map_or_else(|| "n/a".to_owned(), |minutes| format!("{minutes:.1} min"));
+    let _ = writeln!(out, "  named in the job itself: {}", naming.recorded_in_job);
     let _ = writeln!(
         out,
         "  time to named cause: median {time} (n={}){}",

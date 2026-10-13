@@ -30,6 +30,7 @@ use super::CliFailure;
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::diagnose::annotate::{self, Tree};
+use crate::diagnose::cause;
 use crate::diagnose::{self, Context, Diagnosis, Job, Unreadable};
 use crate::identity::RuntimeMode;
 use crate::landability::gate;
@@ -143,14 +144,13 @@ pub(super) fn diagnose_command<W: Write>(
 
     match args.annotate {
         AnnotateMode::Off => {}
-        AnnotateMode::Plan => {
+        AnnotateMode::Plan | AnnotateMode::Post => {
             let tree = head_tree(&read, &repo, &target.head_sha, cwd);
-            let payload = annotate::check_run_payload(&doc, &target.head_sha, &tree);
-            return print_json(stdout, &serde_json::to_value(&payload).unwrap_or_default());
-        }
-        AnnotateMode::Post => {
-            let tree = head_tree(&read, &repo, &target.head_sha, cwd);
-            let payload = annotate::check_run_payload(&doc, &target.head_sha, &tree);
+            let payload =
+                annotated_payload(&doc, &target, &tree, &logs, &repo, this_pr, Utc::now());
+            if matches!(args.annotate, AnnotateMode::Plan) {
+                return print_json(stdout, &serde_json::to_value(&payload).unwrap_or_default());
+            }
             post_check_run(&actions, &repo, &payload)?;
         }
     }
@@ -161,6 +161,57 @@ pub(super) fn diagnose_command<W: Write>(
     };
     written.map_err(|error| CliFailure::new(1, error.to_string()))?;
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// GitHub's limit on a check run's `output.text`, in characters.
+const CHECK_RUN_TEXT_LIMIT: usize = 65_535;
+
+/// The check-run body: the diagnosis's annotations, and every failing
+/// required job's `ci.cause/v1` record in `output.text`.
+fn annotated_payload(
+    doc: &Diagnosis,
+    target: &Target,
+    tree: &Tree,
+    logs: &HashMap<i64, String>,
+    repo: &str,
+    pr: Option<u64>,
+    now: DateTime<Utc>,
+) -> annotate::CheckRunPayload {
+    let mut payload = annotate::check_run_payload(doc, &target.head_sha, tree);
+    let causes = cause_records(target, logs, repo, pr, now);
+    payload.output.text = cause::check_run_text(&causes, CHECK_RUN_TEXT_LIMIT);
+    payload
+}
+
+/// The `ci.cause/v1` record of every failing required job, named now.
+fn cause_records(
+    target: &Target,
+    logs: &HashMap<i64, String>,
+    repo: &str,
+    pr: Option<u64>,
+    now: DateTime<Utc>,
+) -> Vec<cause::CiCause> {
+    let place = cause::Place {
+        repo: repo.to_owned(),
+        pr,
+        ..cause::Place::default()
+    };
+    let named_at = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    target
+        .jobs
+        .iter()
+        .filter(|job| job.is_bad() && target.required.contains(&job.name))
+        .take(diagnose::MAX_CHECKS)
+        .filter_map(|job| {
+            cause::build(
+                job,
+                logs.get(&job.id).map(String::as_str),
+                &place,
+                Some(named_at.clone()),
+                true,
+            )
+        })
+        .collect()
 }
 
 fn print_json<W: Write>(

@@ -327,3 +327,173 @@ fn a_bare_cancel_is_low_and_not_named() {
     );
     assert!(!cause.named());
 }
+
+#[test]
+fn only_ci_cause_notices_are_read_back_from_a_log() {
+    let log = fixture("ctest-log/log-mg-job-115009634572.log");
+    let cause = build(&gate_job(), Some(&log), &place(), None, false).expect("red");
+    let line = notice_line(&cause);
+    let data = line
+        .strip_prefix("::notice title=ci-cause::")
+        .expect("notice");
+    let text = format!(
+        "2026-10-12T21:20:07.2208660Z ##[notice]{{\"schema\":\"shipyard-test-tier/v1\",\"tier\":\"full\"}}\n\
+         2026-10-12T21:20:07.3000000Z ##[notice]{}\n\
+         2026-10-12T21:20:07.4000000Z ##[notice]not json\n\
+         2026-10-12T21:20:07.5000000Z ##[notice]{}\n",
+        data.replace("%25", "%"),
+        data.replace("%25", "%")
+            .replace("ci.cause/v1", "ci.cause/v0")
+    );
+    assert_eq!(records_in_log(&text), vec![cause]);
+    assert!(records_in_log(&log).is_empty());
+}
+
+#[test]
+fn check_run_text_lists_records_and_counts_what_did_not_fit() {
+    assert_eq!(check_run_text(&[], 65_535), None);
+    let log = fixture("ctest-log/log-mg-job-115009634572.log");
+    let cause = build(&gate_job(), Some(&log), &place(), None, true).expect("red");
+    let text = check_run_text(&[cause.clone(), cause.clone()], 65_535).expect("text");
+    assert_eq!(text.lines().count(), 3);
+    let line = text.lines().nth(1).expect("record");
+    assert_eq!(
+        serde_json::from_str::<CiCause>(line).expect("record"),
+        cause
+    );
+    let one = serde_json::to_string(&cause).expect("json").chars().count();
+    let tight = check_run_text(&[cause.clone(), cause], one + 120).expect("text");
+    assert!(tight.ends_with("1 record(s) did not fit\n"), "{tight}");
+    assert!(tight.chars().count() <= one + 120 + 40);
+}
+
+/// One way to forge a record.
+type Forge = fn(&mut CiCause);
+
+fn recorded_for(job: &Job) -> (CiCause, CiCause) {
+    let log = fixture("ctest-log/log-mg-job-115009634572.log");
+    let place = Place {
+        repo: "Generous-Corp/pulp".to_owned(),
+        ..Place::default()
+    };
+    let extracted = build(job, Some(&log), &place, None, true).expect("red");
+    let mut recorded = extracted.clone();
+    recorded.named_at = Some("2026-10-12T21:25:00Z".to_owned());
+    recorded.retrospective = false;
+    (recorded, extracted)
+}
+
+#[test]
+fn a_record_corroborates_only_when_bound_to_the_job_and_its_cause() {
+    let job = gate_job();
+    let (recorded, extracted) = recorded_for(&job);
+    let repo = "Generous-Corp/pulp";
+    assert!(corroborates(&recorded, &extracted, &job, repo));
+    let changed: [(&str, Forge); 7] = [
+        ("repo", |r| r.repo = "o/other".to_owned()),
+        ("head", |r| r.head_sha = Some("f".repeat(40))),
+        ("no head", |r| r.head_sha = None),
+        ("run", |r| r.run_id = Some(1)),
+        ("attempt", |r| r.attempt = Some(2)),
+        ("job", |r| r.job = "linux".to_owned()),
+        ("signature", |r| r.signature = "another test".to_owned()),
+    ];
+    for (what, change) in changed {
+        let mut forged = recorded.clone();
+        change(&mut forged);
+        assert!(!corroborates(&forged, &extracted, &job, repo), "{what}");
+    }
+    // The record's own time is not evidence of anything.
+    let mut early = recorded.clone();
+    early.named_at = Some("2000-01-01T00:00:00Z".to_owned());
+    assert!(corroborates(&early, &extracted, &job, repo));
+}
+
+#[test]
+fn a_record_is_timed_by_the_step_that_printed_it() {
+    let job = gate_job();
+    // Step 52 ran 21:24:00 to 21:25:37.
+    assert_eq!(
+        printed_at(&job, Some("2026-10-12T21:25:00.1234567Z")).as_deref(),
+        Some("2026-10-12T21:25:37Z")
+    );
+    // Within the API's whole second of the step's end.
+    assert_eq!(
+        printed_at(&job, Some("2026-10-12T21:25:37.9000000Z")).as_deref(),
+        Some("2026-10-12T21:25:37Z")
+    );
+    assert_eq!(printed_at(&job, Some("2026-10-12T21:30:00Z")), None);
+    // Printed before anything failed: in checkout (step 4, 21:14:13 to
+    // 21:14:17), or inside the failing step itself (step 35, 21:17:28 to
+    // 21:20:07). Neither can date a cause.
+    assert_eq!(printed_at(&job, Some("2026-10-12T21:14:15.0000000Z")), None);
+    assert_eq!(printed_at(&job, Some("2026-10-12T21:19:00.0000000Z")), None);
+    // A job with no failing step has nothing to date a record after.
+    let mut green_steps = job.clone();
+    if let Some(steps) = green_steps.steps.as_mut() {
+        for step in steps.iter_mut() {
+            step.conclusion = Some("success".to_owned());
+        }
+    }
+    assert_eq!(
+        printed_at(&green_steps, Some("2026-10-12T21:25:00.1234567Z")),
+        None
+    );
+    assert_eq!(printed_at(&job, None), None);
+    assert_eq!(printed_at(&job, Some("not a time")), None);
+    let log = format!(
+        "2026-10-12T21:25:00.5000000Z ##[notice]{}\n##[notice]{}\n",
+        serde_json::to_string(&recorded_for(&job).0).expect("json"),
+        serde_json::to_string(&recorded_for(&job).0).expect("json"),
+    );
+    let times: Vec<Option<String>> = records_with_times(&log)
+        .into_iter()
+        .map(|(_, at)| at)
+        .collect();
+    assert_eq!(
+        times,
+        vec![Some("2026-10-12T21:25:00.5000000Z".to_owned()), None]
+    );
+}
+
+#[test]
+fn a_printed_record_is_not_read_as_evidence() {
+    // The record quotes an API refusal; C2 must not read it from the log.
+    let log = fixture("ctest-log/log-mg-job-115009634572.log");
+    let mut quoted = build(&gate_job(), Some(&log), &place(), None, false).expect("red");
+    quoted.detail = Some("GitHub API PUT merge failed: HTTP 405".to_owned());
+    let line = notice_line(&quoted);
+    let data = line
+        .strip_prefix("::notice title=ci-cause::")
+        .expect("notice")
+        .replace("%25", "%");
+    let text = format!("{log}2026-10-12T21:25:00.0000000Z ##[notice]{data}\n");
+    let cleaned = without_records(&text);
+    assert_eq!(cleaned.lines().count(), text.lines().count());
+    assert!(
+        c2::extract(&cleaned)
+            .iter()
+            .all(|record| record.format != "github_api")
+    );
+    // Control: uncleaned, the quoted line would be read.
+    assert!(
+        c2::extract(&text)
+            .iter()
+            .any(|record| record.format == "github_api")
+    );
+    assert_eq!(
+        build(&gate_job(), Some(&text), &place(), None, true),
+        build(&gate_job(), Some(&log), &place(), None, true)
+    );
+    // With nothing else in the log, a quoted refusal must not become the
+    // job's cause.
+    let bare: String = log
+        .lines()
+        .filter(|line| !line.contains(VELLUM) && !line.contains("The following tests FAILED"))
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    let printed = format!("{bare}2026-10-12T21:25:00.0000000Z ##[notice]{data}\n");
+    let cause = build(&gate_job(), Some(&printed), &place(), None, true).expect("red");
+    assert_eq!(cause.format, "shell-exit");
+    assert!(!cause.named());
+}

@@ -409,6 +409,33 @@ guard's own decision posted on the head; it is report-only until a
 repository requires it. A red `review-verdict` means the guard would refuse
 that head; fix the verdict, not the status.
 
+**To record a cause when the job fails, not after.** In an `if: failure()`
+step, run `shipyard cause extract --log <captured output> --job "<the job's
+display name>" --notice || true`. Pass `--job`: the default is the job's key
+(`GITHUB_JOB`), and a job with `name:` (or a matrix job) is listed by its
+display name, so a record without it never binds. Repeat the job's own
+`name:` expression. For Pulp's build.yml test matrix (its `name:` is
+`macos` for the macos key on pull_request, workflow_dispatch and merge_group
+runs, else `<name> [<provider>]`):
+
+```yaml
+- name: Name the cause
+  if: failure()
+  env:
+    JOB_NAME: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && matrix.key == 'macos' && 'macos' || format('{0} [{1}]', matrix.name, matrix.provider) }}
+  run: shipyard cause extract --log "$RUNNER_TEMP/ctest-evidence/LastTest.full.log" --job "$JOB_NAME" --notice || true
+```
+
+The scorecard keeps a record only as proof that the cause was named during the
+job, and dates it by the jobs API's completion of the step that printed it,
+only when that step started after the failing step completed, never by the
+record's own `named_at`.
+It prints `::notice title=ci-cause::<record>`, so the job's own log holds its
+`ci.cause/v1` record; the scorecard keeps its `named_at` only when the record
+is bound to that job (repo, head, run, attempt, job name) and names the cause
+the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
+<file>` (append-only, one file per month, ids never duplicated).
+
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason
 `failed_checks` or `checks_timed_out`, and use `AddedToMergeQueueEvent` as the
