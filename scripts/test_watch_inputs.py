@@ -252,6 +252,24 @@ class PoolLogReplay(unittest.TestCase):
             "config": {"tool_freshness": {"problem": "vellum 24.8 h behind"}}}}, AT)[0]["key"]
         self.assertNotEqual(other, live[0])
 
+    def test_only_free_standing_quantities_drift(self) -> None:
+        same = [
+            ("pulp 24.8 h behind (threshold 12 h)", "pulp 31.2 h behind (threshold 12 h)"),
+            ("watchdog RSS 512 MB over 400 MB", "watchdog RSS 640.5 MB over 400 MB"),
+            ("oldest job 3 h in queue", "oldest job 17 h in queue"),
+        ]
+        changed = [
+            ("installed v0.955.1 is broken", "installed v0.957.0 is broken"),
+            ("ROLLED BACK for sha 1a2b3c4d5e6f", "ROLLED BACK for sha 9f8e7d6c5b4a"),
+            ("ROLLED BACK for sha 123456789abc", "ROLLED BACK for sha 987654321abc"),
+            ("peer m1 unreachable", "peer m5 unreachable"),
+        ]
+        for before, after in same:
+            self.assertEqual(inputs.problem_key(before), inputs.problem_key(after), (before, after))
+        for before, after in changed:
+            self.assertNotEqual(inputs.problem_key(before), inputs.problem_key(after),
+                                (before, after))
+
     def test_duplicate_lines_are_read_once(self) -> None:
         line = json.dumps(pool_record(10, gate_reserve="low")) + "\n"
         with tempfile.TemporaryDirectory() as directory:

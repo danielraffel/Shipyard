@@ -252,13 +252,17 @@ def read_cmux(runner: Runner, at: datetime) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-NUMBER = re.compile(r"\d+(?:\.\d+)?")
+# A free-standing quantity only: not part of a version (v0.955.1), a commit
+# sha, or a name (m1), whose change is a real change.
+NUMBER = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])")
 
 
 def problem_key(problem: str) -> str:
-    """A problem's identity: its text with the numbers left out, so a stale
-    tool's "24.8 h behind" that counts up every pass stays one condition, live
-    and in a replayed pool-log alike (tartci's pool-log dedupes the same way)."""
+    """A problem's identity: its text with free-standing numbers left out, so
+    a stale tool's "24.8 h behind" that counts up every pass stays one
+    condition, live and in a replayed pool-log alike, while a version, sha or
+    name inside it still tells two problems apart (tartci's pool-log dedupes
+    the same way)."""
     return digest(NUMBER.sub("#", problem))
 
 

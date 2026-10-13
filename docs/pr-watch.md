@@ -485,8 +485,9 @@ python3 scripts/watch_inputs.py hosts \
 Each record is classified as the live reader classifies a status, and an event
 is emitted when its condition begins and again only after it cleared, so a
 condition the log re-states every heartbeat fires once. A problem's identity
-leaves its numbers out, live and in replay, so a stale tool whose "24.8 h
-behind" counts up every pass stays one `host_problem`. Stderr counts the gaps
+leaves its free-standing numbers out, live and in replay, so a stale tool
+whose "24.8 h behind" counts up every pass stays one `host_problem`, while a
+version, sha or host name inside the text still tells two problems apart. Stderr counts the gaps
 over 2 h, when the agent was down. Score the result with
 `rules_watch_score.py --events` against turns labelled over the same days.
 
