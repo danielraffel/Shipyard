@@ -190,6 +190,125 @@ def job(host: str | None, created: int, started: int | None) -> dict:
             "conclusion": None}
 
 
+def pool_record(minutes: int, state: str = "on", participating: bool = True,
+                heartbeat: bool = False, **problems: str) -> dict:
+    """A record as tartci's pool-log agent writes it (scripts/pool_log.py)."""
+    record = {"at": (AT + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "host": "Daniels-Mac-Studio-m1", "state": state,
+              "participating": participating, "problems": problems}
+    if heartbeat:
+        record["heartbeat"] = True
+    return record
+
+
+class PoolLogReplay(unittest.TestCase):
+    """A pool-log replays as host events, each when its condition began."""
+
+    def replay(self, records: list[dict]) -> tuple[list[dict], int]:
+        parsed = [{**record, "_at": inputs.parse_time(record["at"])} for record in records]
+        return inputs.replay_pool_log("m1", parsed)
+
+    def test_each_condition_fires_when_it_begins_and_again_only_after_it_cleared(self) -> None:
+        stale = "pulp 24.7 h behind"
+        events, gaps = self.replay([
+            pool_record(0),
+            pool_record(10, tool_freshness=stale),
+            pool_record(70, heartbeat=True, tool_freshness=stale),
+            pool_record(130),
+            pool_record(140, tool_freshness=stale),
+            pool_record(150, state="off", participating=False, tool_freshness=stale),
+            {"at": (AT + timedelta(minutes=160)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "error": "pool status exited 1: tartci: helper interpreter failed verification"},
+            {"at": (AT + timedelta(minutes=165)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "error": "pool status exited 1: tartci: helper interpreter failed verification"},
+            pool_record(170),
+            pool_record(420, heartbeat=True),
+        ])
+        self.assertEqual([(item["kind"], item["at"][11:16]) for item in events], [
+            ("host_problem", "02:10"),
+            ("host_problem", "04:20"),
+            ("host_out_of_pool", "04:30"),
+            ("host_unreachable", "04:40"),
+        ])
+        self.assertEqual(gaps, 1, "170 -> 420 minutes: the agent was down")
+        for item in events:
+            self.assertEqual(item["host"], "m1")
+            self.assertFalse(item["fix"]["safe_to_auto_apply"])
+        self.assertIn("tool_freshness", events[0]["summary"])
+
+    def test_a_problem_whose_hour_count_drifts_is_one_condition(self) -> None:
+        records = [pool_record(index * 5, tool_freshness=f"pulp {24.8 + index * 0.1:.1f} h behind")
+                   for index in range(12)]
+        events, _ = self.replay(records)
+        self.assertEqual(kinds(events), ["host_problem"], "one condition, not twelve")
+        # Live passes key the same condition the same way, so the ledger dedupes it too.
+        live = [inputs.classify_pool("m1", {"state": "on", "participating": True, "fleet": {
+            "config": {"tool_freshness": {"problem": f"pulp {hours} h behind"}}}}, AT)[0]["key"]
+            for hours in ("24.8", "25.9")]
+        self.assertEqual(live[0], live[1])
+        self.assertEqual(live[0], events[0]["key"])
+        # Control: other words are another condition.
+        other = inputs.classify_pool("m1", {"state": "on", "participating": True, "fleet": {
+            "config": {"tool_freshness": {"problem": "vellum 24.8 h behind"}}}}, AT)[0]["key"]
+        self.assertNotEqual(other, live[0])
+
+    def test_only_free_standing_quantities_drift(self) -> None:
+        same = [
+            ("pulp 24.8 h behind (threshold 12 h)", "pulp 31.2 h behind (threshold 12 h)"),
+            ("watchdog RSS 512 MB over 400 MB", "watchdog RSS 640.5 MB over 400 MB"),
+            ("oldest job 3 h in queue", "oldest job 17 h in queue"),
+        ]
+        changed = [
+            ("installed v0.955.1 is broken", "installed v0.957.0 is broken"),
+            ("ROLLED BACK for sha 1a2b3c4d5e6f", "ROLLED BACK for sha 9f8e7d6c5b4a"),
+            ("ROLLED BACK for sha 123456789abc", "ROLLED BACK for sha 987654321abc"),
+            ("peer m1 unreachable", "peer m5 unreachable"),
+        ]
+        for before, after in same:
+            self.assertEqual(inputs.problem_key(before), inputs.problem_key(after), (before, after))
+        for before, after in changed:
+            self.assertNotEqual(inputs.problem_key(before), inputs.problem_key(after),
+                                (before, after))
+
+    def test_duplicate_lines_are_read_once(self) -> None:
+        line = json.dumps(pool_record(10, gate_reserve="low")) + "\n"
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = pathlib.Path(directory) / "a.jsonl", pathlib.Path(directory) / "b.jsonl"
+            first.write_text(json.dumps(pool_record(0)) + "\n" + line + line)
+            second.write_text(line)
+            records = inputs.read_pool_log([str(first), str(second)])
+        self.assertEqual([record["at"][11:16] for record in records], ["02:00", "02:10"])
+
+    def test_the_cli_replays_both_rotated_files_in_time_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            older, newer = root / "events.jsonl.1", root / "events.jsonl"
+            older.write_text("".join(json.dumps(r) + "\n" for r in (
+                pool_record(0), pool_record(10, gate_reserve="cores demand 6 against reserve 3"))))
+            newer.write_text("".join(json.dumps(r) + "\n" for r in (
+                pool_record(70, heartbeat=True, gate_reserve="cores demand 6 against reserve 3"),
+                pool_record(80, state="off", participating=False))))
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "hosts", "--replay-log", f"m1={newer}",
+                 "--replay-log", f"m1={older}"],
+                capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual([item["kind"] for item in lines], ["host_problem", "host_out_of_pool"])
+            self.assertIn("m1: 2 event(s) from 2 log file(s); 0 gap(s)", result.stderr)
+            both = subprocess.run(
+                [sys.executable, str(SCRIPT), "hosts", "--host", "m1", "--replay-log", f"m1={newer}"],
+                capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
+            self.assertEqual(both.returncode, 2, both.stderr)
+            bad = root / "bad.jsonl"
+            bad.write_text('{"state": "on"}\n')
+            refused = subprocess.run(
+                [sys.executable, str(SCRIPT), "hosts", "--replay-log", f"m1={bad}"],
+                capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("bad.jsonl:1: a pool-log record needs `at`", refused.stderr)
+
+
 class GateServing(unittest.TestCase):
     HOSTS = ["studio", "m5studio", "m5", "m1"]
 
