@@ -13,6 +13,9 @@ pub mod profile;
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::LazyLock;
+
+    use regex::Regex;
 
     /// Every Rust source under `dir`, recursively.
     fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -23,6 +26,62 @@ mod tests {
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 out.push(path);
             }
+        }
+    }
+
+    static STRING: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#""(?:[^"\\]|\\.)*""#).expect("string regex"));
+    /// A path through the crate root, `super` or `self` that names the
+    /// `inspect` module, directly or inside a grouped import.
+    static ROOTED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"\b(?:crate|shipyard|super|self)\s*::\s*(?:\{[^;]*?\b)?inspect\b\s*(?:::|[,};]|as\b)",
+        )
+        .expect("rooted regex")
+    });
+    /// A bare `inspect::` path; `inspect_cmd::` and `.inspect(` do not match.
+    static BARE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\binspect\s*::").expect("bare regex"));
+
+    /// Whether Rust source `text` names the `inspect` module, ignoring
+    /// comments and string literals.
+    fn names_inspect_module(text: &str) -> bool {
+        let code: String = text
+            .lines()
+            .map(|line| {
+                let line = STRING.replace_all(line, "\"\"");
+                let line = line.split("//").next().unwrap_or("").to_owned();
+                line + "\n"
+            })
+            .collect();
+        ROOTED.is_match(&code) || BARE.is_match(&code)
+    }
+
+    #[test]
+    fn the_matcher_sees_every_import_form_and_nothing_else() {
+        for flagged in [
+            "use crate::inspect;",
+            "use crate::inspect::profile::{self, gather};",
+            "use crate::{config::LoadedConfig, inspect::profile};",
+            "use super::{cloud, inspect};",
+            "use crate::inspect as probe;",
+            "use crate::{config as c, inspect as probe};",
+            "use crate::{\n    config,\n    inspect,\n};",
+            "use shipyard::inspect::profile;",
+            "let x = crate::inspect::profile::SCHEMA;",
+            "let x = inspect::profile::SCHEMA;",
+        ] {
+            assert!(names_inspect_module(flagged), "must flag: {flagged}");
+        }
+        for clean in [
+            "mod inspect_cmd;",
+            "return inspect_cmd::inspect_command(cwd);",
+            "let v: Vec<_> = iter.inspect(|x| dbg!(x)).collect();",
+            "// use crate::inspect;",
+            r#"let s = "crate::inspect";"#,
+            "use crate::{config, inspector};",
+        ] {
+            assert!(!names_inspect_module(clean), "must not flag: {clean}");
         }
     }
 
@@ -52,9 +111,7 @@ mod tests {
                 .to_string_lossy()
                 .replace('\\', "/");
             let text = fs::read_to_string(&path).expect("read source");
-            let names_inspect = text.contains("crate::inspect")
-                || text.contains("shipyard::inspect")
-                || text.contains("super::inspect::");
+            let names_inspect = names_inspect_module(&text);
             if relative == "app/inspect_cmd.rs" {
                 handler_seen = names_inspect;
                 continue;
