@@ -62,17 +62,22 @@ current head. The direct merges are `pr merge` on a base with no queue, `pr
 merge --admin`, REST `PUT pulls/<n>/merge` and GraphQL `mergePullRequest`; on
 a queue-less repository (tartci, Shipyard) they are the landing path.
 
-**Which repositories.** The guard reads `.shipyard/config.toml` on the PR's
-base: `[auto_merge] arm_requires_head_approval` decides when set, either way.
-When the base is silent, the repositories in `REVIEW_REQUIRED_REPOS`
+**Which hosts and repositories.** Nothing in this section applies unless the
+host turns it on: `SHIPYARD_REVIEW_BEFORE_ARM=1` (`0` forces it off), or a file
+named `review-before-arm` in the guards directory. With it off the guard reads
+nothing for this rule (no pull request, no config, no comments), so it is
+inert whatever the base config says and on any Python. Updating the binary or
+the guards changes nothing until a host turns it on; roll it out one host at a
+time.
+
+With it on, the guard reads `.shipyard/config.toml` on the PR's base:
+`[auto_merge] arm_requires_head_approval` decides when set, either way. When
+the base is silent, the repositories in `REVIEW_REQUIRED_REPOS`
 (`Generous-Corp/pulp`, `Generous-Corp/vellum`, `danielraffel/tartci`,
-`danielraffel/Shipyard`) require review only on a host that turns the default
-on: `SHIPYARD_REVIEW_BEFORE_ARM=1` (`0` forces it off), or a file named
-`review-before-arm` in the guards directory. Shipyard's own arming and merge
-paths read the same switch, so updating the binary or the guards changes
-nothing until a host turns it on; roll it out one host at a time. A config
-that exists but cannot be read or parsed (invalid TOML, or a Python without
-`tomllib`) refuses rather than loosening.
+`danielraffel/Shipyard`) require review. A config that exists but cannot be
+read or parsed (invalid TOML, or a Python without `tomllib`) refuses rather
+than loosening. Shipyard's own arming and merge paths use the same switch for
+the list default; a repository's own config key applies to them on any host.
 
 **What approves.** The newest verdict naming the head decides:
 
@@ -101,12 +106,22 @@ is refused with the flag to add, so a push between the check and the
 mutation cannot land a head nobody reviewed.
 
 **Merge-only updates.** Updating an approved head with its base makes a new
-head no verdict names. The approval carries to it only when every commit since
-the approved head is a two-parent merge whose merged parent is on the base,
-and the PR's own lines (the added and removed lines per file of
-`compare/<base>...<head>`, without index lines, hunk headers or context) are
-byte-identical. Anything else, or anything the guard cannot read, needs a new
-verdict. A HOLD naming the new head is never overridden by a carry.
+head no verdict names. The approval carries to it only when all of these hold:
+
+* the new head descends from the approved one;
+* every commit on the first-parent chain back to the approved head is a
+  two-parent merge whose merged parent is on the base (the other commits in
+  the range arrived through those merges);
+* every file the PR changes has the same blob at the new head as at the
+  approved head (`files[].sha` of `compare/<base>...<head>`), so a merge that
+  moves a line or swaps content cannot pass;
+* no file the PR changes was also changed by the base between the two merge
+  bases;
+* the PR changes no binary file (a file with no text patch).
+
+Anything else, or anything the guard cannot read (including a comparison at
+GitHub's 300-file cap), needs a new verdict. A HOLD naming the new head is
+never overridden by a carry.
 
 The refusal names the head, the exact marker it needs, and the latest verdict
 when it approves a different head:

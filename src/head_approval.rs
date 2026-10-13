@@ -54,10 +54,11 @@
 //!
 //! Updating an approved head with its base makes a new head no verdict names.
 //! The approval carries to it ([`Approval::Carried`]) only when every commit
-//! since the approved head is a two-parent merge whose merged parent is on
-//! the base, and the pull request's own lines (added and removed lines per
-//! file, measured from the merge base) are byte-identical before and after.
-//! Anything else needs a new verdict.
+//! on the first-parent chain back to the approved head is a two-parent merge
+//! whose merged parent is on the base, and every file the pull request
+//! changes has the same blob at the new head as at the approved one. A file
+//! the base also changed since, or any binary change in the pull request,
+//! needs a new verdict.
 //!
 //! ## Ejections
 //!
@@ -1146,8 +1147,68 @@ fn gh_json(run_gh: RunGh<'_>, args: &[String]) -> Result<Value, String> {
     serde_json::from_str(run_gh(args)?.trim()).map_err(|error| format!("invalid JSON: {error}"))
 }
 
-/// Whether `to` is `from` plus merge-only updates from the base that leave
-/// the pull request's own lines byte-identical.
+/// GitHub's compare lists at most this many files; a longer list is partial.
+const COMPARE_FILE_CAP: usize = 300;
+
+/// `filename -> (status, blob sha, has a text patch)` of one comparison, and
+/// its merge base.
+type PrFiles = (
+    std::collections::BTreeMap<String, (String, String, bool)>,
+    String,
+);
+
+fn compare_files(run_gh: RunGh<'_>, repo: &str, range: &str) -> Result<PrFiles, String> {
+    let value = gh_json(
+        run_gh,
+        &[
+            "api".to_owned(),
+            format!("repos/{repo}/compare/{range}"),
+            "--jq".to_owned(),
+            "{merge_base: .merge_base_commit.sha, files: [.files[] | {filename, status, sha, \
+             patch: (.patch != null)}]}"
+                .to_owned(),
+        ],
+    )?;
+    let files = value
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("compare/{range} lists no files"))?;
+    if files.len() >= COMPARE_FILE_CAP {
+        return Err(format!(
+            "compare/{range} lists {} files, GitHub's cap; it may be partial",
+            files.len()
+        ));
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for file in files {
+        let text = |key: &str| file.get(key).and_then(Value::as_str).map(str::to_owned);
+        let name =
+            text("filename").ok_or_else(|| format!("compare/{range}: a file has no name"))?;
+        out.insert(
+            name,
+            (
+                text("status").unwrap_or_default(),
+                text("sha").unwrap_or_default(),
+                file.get("patch").and_then(Value::as_bool) == Some(true),
+            ),
+        );
+    }
+    let base = value
+        .get("merge_base")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("compare/{range}: no merge base"))?
+        .to_owned();
+    Ok((out, base))
+}
+
+/// Whether the approval of `from` carries to `to`.
+///
+/// It carries only when every commit on the first-parent chain from `to`
+/// back to `from` is a two-parent merge whose merged parent is on the base,
+/// and every file the pull request changes has, at `to`, the same blob it
+/// had at `from`. A file the base also changed since `from`, or any binary
+/// change in the pull request, needs a new verdict: a merge could move or
+/// swap content that a diff of the changed lines cannot see.
 ///
 /// # Errors
 ///
@@ -1170,6 +1231,58 @@ pub fn merge_only_carry(
     if base.is_empty() {
         return Err("the pull request has no base branch".to_owned());
     }
+    first_parent_merges(run_gh, repo, &base, from, to)?;
+    let (before, base_before) = compare_files(run_gh, repo, &format!("{base}...{from}"))?;
+    let (after, base_after) = compare_files(run_gh, repo, &format!("{base}...{to}"))?;
+    if let Some(name) = before
+        .iter()
+        .find(|(_, (_, _, patch))| !patch)
+        .map(|(name, _)| name)
+    {
+        return Err(format!("the pull request changes a binary file ({name})"));
+    }
+    if let Some(name) = before
+        .keys()
+        .find(|name| !after.contains_key(*name))
+        .or_else(|| after.keys().find(|name| !before.contains_key(*name)))
+    {
+        return Err(format!(
+            "the set of files the pull request changes moved ({name})"
+        ));
+    }
+    for (name, (status, sha, _)) in &before {
+        if after
+            .get(name)
+            .is_none_or(|(after_status, after_sha, _)| after_status != status || after_sha != sha)
+        {
+            return Err(format!(
+                "{name} at {} is not the blob approved at {}",
+                short(to),
+                short(from)
+            ));
+        }
+    }
+    if base_before != base_after {
+        let (moved, _) = compare_files(run_gh, repo, &format!("{base_before}...{base_after}"))?;
+        if let Some(name) = before.keys().find(|name| moved.contains_key(*name)) {
+            return Err(format!(
+                "{name} was changed by both the pull request and the base"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every commit on the first-parent chain from `to` back to `from` is a
+/// two-parent merge whose merged parent is on `base`. The other commits in
+/// the range arrived through those merged parents.
+fn first_parent_merges(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), String> {
     let range = gh_json(
         run_gh,
         &[
@@ -1196,19 +1309,27 @@ pub fn merge_only_carry(
     if Some(commits.len() as u64) != range.get("total_commits").and_then(Value::as_u64) {
         return Err("the comparison lists only some of its commits".to_owned());
     }
-    for commit in commits {
-        let parents: Vec<&str> = commit
-            .get("parents")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        let [_, merged] = parents.as_slice() else {
-            return Err(format!(
-                "commit {} is not a merge",
-                commit.get("sha").and_then(Value::as_str).unwrap_or("?")
-            ));
+    let parents_of: std::collections::BTreeMap<String, Vec<String>> = commits
+        .iter()
+        .filter_map(|commit| {
+            let sha = commit.get("sha")?.as_str()?.to_ascii_lowercase();
+            let parents = commit
+                .get("parents")?
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .collect();
+            Some((sha, parents))
+        })
+        .collect();
+    let mut sha = to.to_ascii_lowercase();
+    while sha != from.to_ascii_lowercase() {
+        let parents = parents_of
+            .get(&sha)
+            .ok_or_else(|| format!("commit {} is outside the comparison", short(&sha)))?;
+        let [first, merged] = parents.as_slice() else {
+            return Err(format!("commit {} is not a merge", short(&sha)));
         };
         let on_base = run_gh(&[
             "api".to_owned(),
@@ -1219,34 +1340,9 @@ pub fn merge_only_carry(
         if !matches!(on_base.trim(), "ahead" | "identical") {
             return Err(format!("merged parent {} is not on {base}", short(merged)));
         }
+        sha.clone_from(first);
     }
-    let own = |head: &str| -> Result<String, String> {
-        let diff = run_gh(&[
-            "api".to_owned(),
-            "-H".to_owned(),
-            "Accept: application/vnd.github.diff".to_owned(),
-            format!("repos/{repo}/compare/{base}...{head}"),
-        ])?;
-        Ok(own_lines(&diff))
-    };
-    if own(from)? == own(to)? {
-        Ok(())
-    } else {
-        Err("the pull request's own lines changed".to_owned())
-    }
-}
-
-/// A diff's added and removed lines per file: no `index` lines, hunk
-/// headers, or context, so a base change that moves line numbers is not a
-/// difference.
-#[must_use]
-pub fn own_lines(diff: &str) -> String {
-    diff.lines()
-        .filter(|line| {
-            !line.starts_with("index ") && !line.starts_with("@@") && !line.starts_with(' ')
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    Ok(())
 }
 
 #[cfg(test)]

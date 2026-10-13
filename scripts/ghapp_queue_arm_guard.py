@@ -52,10 +52,11 @@ An arm, an enqueue or a direct merge (``pr merge`` on a queue-less base or with
 needs a reviewer verdict naming the exact head, in the repositories that
 require one. The protected base's ``.shipyard/config.toml`` decides when it
 sets ``[auto_merge] arm_requires_head_approval``. Otherwise the repositories in
-REVIEW_REQUIRED_REPOS require one only on a host that turns the default on:
-``SHIPYARD_REVIEW_BEFORE_ARM=1`` (``0`` turns it off), or a
-``review-before-arm`` file in the guards directory. A config that cannot be
-read or parsed refuses rather than loosening. This is the Python twin of
+REVIEW_REQUIRED_REPOS require one. None of it applies unless the host turns
+review on: ``SHIPYARD_REVIEW_BEFORE_ARM=1`` (``0`` turns it off), or a
+``review-before-arm`` file in the guards directory. With it off the guard reads
+nothing for this rule, so it is inert whatever the config or Python. With it
+on, a config that cannot be read or parsed refuses rather than loosening. This is the Python twin of
 src/head_approval.rs; both read the policy from the base branch, never from
 the head being armed.
 
@@ -74,8 +75,9 @@ The request must bind the head it lands: ``--match-head-commit <sha>``,
 
 A merge-only update of an approved head carries the approval to the new head
 only when every commit since is a two-parent merge whose merged parent is on
-the base, and the pull request's own lines (added and removed lines per file,
-from the merge base) are byte-identical. Anything else needs a new verdict.
+the base, and every file the pull request changes has the same blob at the new
+head as at the approved head. A file the base also changed since, or any
+binary change in the pull request, needs a new verdict.
 
 ``GHAPP_ALLOW_UNREVIEWED_ARM=1`` is the operator override for this rule alone;
 it prints a WARNING and appends an audit line. ``GHAPP_ALLOW_QUEUE_REARM`` does
@@ -821,31 +823,37 @@ def approved_earlier_head(
     return None
 
 
-def own_lines(diff: str) -> str:
-    """A diff's added and removed lines per file: no ``index`` lines, hunk headers or context."""
-    return "\n".join(
-        line for line in diff.splitlines()
-        if not line.startswith(("index ", "@@", " "))
-    )
+# GitHub's compare lists at most this many files; a longer list is partial.
+COMPARE_FILE_CAP = 300
 
 
-def _gh_text(arguments: list[str]) -> str:
-    real_gh = os.environ.get("GHAPP_REAL_GH", "/opt/homebrew/bin/gh")
-    try:
-        completed = subprocess.run(
-            [real_gh, *arguments], check=False, capture_output=True, text=True, timeout=60,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise GuardError(f"cannot read {arguments[-1]}: {error}") from error
-    if completed.returncode != 0:
-        detail = completed.stderr.strip().splitlines()
-        raise GuardError(f"cannot read {arguments[-1]}: {detail[-1] if detail else completed.returncode}")
-    return completed.stdout
+def _pr_files(compare: dict[str, Any], what: str) -> dict[str, tuple[str, str, bool]]:
+    """``filename -> (status, blob sha, has a text patch)`` of a comparison."""
+    files = compare.get("files")
+    if not isinstance(files, list):
+        raise GuardError(f"{what} lists no files")
+    if len(files) >= COMPARE_FILE_CAP:
+        raise GuardError(f"{what} lists {len(files)} files, GitHub's cap; it may be partial")
+    out: dict[str, tuple[str, str, bool]] = {}
+    for item in files:
+        name = item.get("filename") if isinstance(item, dict) else None
+        if not isinstance(name, str):
+            raise GuardError(f"{what} lists a file with no name")
+        out[name] = (str(item.get("status")), str(item.get("sha")), isinstance(item.get("patch"), str))
+    return out
 
 
 def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | None:
-    """``None`` when ``head`` is ``approved`` plus merge-only updates from ``base``
-    that leave the pull request's own lines byte-identical; else why not."""
+    """``None`` when the approval of ``approved`` carries to ``head``; else why not.
+
+    It carries only when every commit on the first-parent chain from ``head``
+    back to ``approved`` is a two-parent merge whose merged parent is on
+    ``base``, and every file the pull request
+    changes has, at ``head``, the same blob it had at ``approved``. A file the
+    base also changed since ``approved``, or any binary change in the pull
+    request, needs a new verdict: a merge could move or swap content a diff of
+    the changed lines cannot see.
+    """
     try:
         compare = run_real_gh(["api", f"repos/{repo}/compare/{approved}...{head}"])
         if not isinstance(compare, dict):
@@ -855,19 +863,53 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
         commits = compare.get("commits") or []
         if len(commits) != compare.get("total_commits"):
             return "the comparison lists only some of its commits"
-        for commit in commits:
-            parents = [parent.get("sha") for parent in commit.get("parents") or []]
-            if len(parents) != 2 or not isinstance(parents[1], str):
-                return f"commit {str(commit.get('sha'))[:12]} is not a merge"
+        parents_of = {
+            str(commit.get("sha")).lower(): [str(parent.get("sha")).lower()
+                                             for parent in commit.get("parents") or []]
+            for commit in commits
+        }
+        # The update's own commits are the first-parent chain from the new head
+        # back to the approved one; the rest arrived through merged parents.
+        sha = head.lower()
+        while sha != approved.lower():
+            parents = parents_of.get(sha)
+            if parents is None:
+                return f"commit {sha[:12]} is outside the comparison"
+            if len(parents) != 2:
+                return f"commit {sha[:12]} is not a merge"
             on_base = run_real_gh(["api", f"repos/{repo}/compare/{parents[1]}...{base}"])
             if not isinstance(on_base, dict) or on_base.get("status") not in ("ahead", "identical"):
                 return f"merged parent {parents[1][:12]} is not on {base}"
-        diff = ["api", "-H", "Accept: application/vnd.github.diff"]
-        before = own_lines(_gh_text([*diff, f"repos/{repo}/compare/{base}...{approved}"]))
-        after = own_lines(_gh_text([*diff, f"repos/{repo}/compare/{base}...{head}"]))
+            sha = parents[0]
+        before_compare = run_real_gh(["api", f"repos/{repo}/compare/{base}...{approved}"])
+        after_compare = run_real_gh(["api", f"repos/{repo}/compare/{base}...{head}"])
+        if not isinstance(before_compare, dict) or not isinstance(after_compare, dict):
+            return "the pull request's files are unreadable"
+        before = _pr_files(before_compare, f"compare/{base}...{approved[:12]}")
+        after = _pr_files(after_compare, f"compare/{base}...{head[:12]}")
+        binary = sorted(name for name, (_, _, patch) in before.items() if not patch)
+        if binary:
+            return f"the pull request changes a binary file ({binary[0]})"
+        if sorted(before) != sorted(after):
+            changed = sorted(set(before) ^ set(after))
+            return f"the set of files the pull request changes moved ({changed[0]})"
+        for name, (status, sha, _) in sorted(before.items()):
+            if after[name][:2] != (status, sha):
+                return f"{name} at {head[:12]} is not the blob approved at {approved[:12]}"
+        base_before = (before_compare.get("merge_base_commit") or {}).get("sha")
+        base_after = (after_compare.get("merge_base_commit") or {}).get("sha")
+        if not isinstance(base_before, str) or not isinstance(base_after, str):
+            return "the merge bases are unreadable"
+        if base_before != base_after:
+            moved = run_real_gh(["api", f"repos/{repo}/compare/{base_before}...{base_after}"])
+            if not isinstance(moved, dict):
+                return "what the base changed is unreadable"
+            both = sorted(set(before) & set(_pr_files(moved, "the base's changes")))
+            if both:
+                return f"{both[0]} was changed by both the pull request and the base"
     except GuardError as error:
         return f"the carry cannot be checked ({error})"
-    return None if before == after else "the pull request's own lines changed"
+    return None
 
 
 def _rest_pages(path: str) -> list[dict[str, Any]]:
@@ -920,12 +962,17 @@ def review_gate(classification: dict[str, Any], repo: str | None) -> tuple[bool,
     label = f"PR #{number}"
     if not repo or not isinstance(number, int) or not isinstance(head, str):
         return False, f"{label}: cannot tell which head would land, so its review cannot be checked"
+    if not host_review_default():
+        # Off is inert: nothing is read, so no config, Python version or
+        # GitHub answer can change what an arm does on a host that has not
+        # turned review on.
+        return True, f"review before arm is off on this host ({HOST_ENABLE_ENV} unset, no {HOST_ENABLE_FILE})"
     try:
         pull = run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
         base = ((pull.get("base") or {}).get("ref")) if isinstance(pull, dict) else None
         if not isinstance(base, str) or not base:
             raise GuardError("the pull request carries no base branch")
-        policy = review_policy(base_config_text(repo, base), repo, host_review_default())
+        policy = review_policy(base_config_text(repo, base), repo, True)
         if not policy["required"]:
             return True, f"{repo} does not require a review before arming"
         live_head = ((pull.get("head") or {}).get("sha") or "").lower()

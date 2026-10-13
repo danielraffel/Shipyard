@@ -1701,6 +1701,41 @@ def comment_like(template: dict[str, Any], **change: Any) -> dict[str, Any]:
     return value
 
 
+# GitHub's `compare/<x>...<y>` answered from a real git repository, for the
+# fake gh: the merge base, ahead/behind status, the commits with parents, and
+# each changed file's status, blob sha and whether it has a text patch.
+GIT_COMPARE = r"""
+import subprocess as _sp
+def _git(repo, *args):
+    return _sp.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+def git_compare(repo, argv):
+    spec = next(part for part in argv.split() if "/compare/" in part).split("/compare/", 1)[1]
+    x, y = spec.split("...", 1)
+    base = _git(repo, "merge-base", x, y)
+    ahead = int(_git(repo, "rev-list", "--count", f"{base}..{y}"))
+    behind = int(_git(repo, "rev-list", "--count", f"{base}..{x}"))
+    status = ("identical" if not ahead and not behind else "ahead" if not behind
+              else "behind" if not ahead else "diverged")
+    commits = []
+    for line in _git(repo, "rev-list", "--reverse", "--parents", f"{base}..{y}").splitlines():
+        sha, *parents = line.split()
+        commits.append({"sha": sha, "parents": [{"sha": p} for p in parents]})
+    binary = {line.split("\t")[2] for line in _git(repo, "diff", "--numstat", base, y).splitlines()
+              if line.startswith("-\t-\t")}
+    files = []
+    for line in _git(repo, "diff", "--raw", "--no-abbrev", "--no-renames", base, y).splitlines():
+        meta, name = line.split("\t", 1)
+        _, _, old, new, letter = meta.split()
+        entry = {"filename": name, "status": {"A": "added", "D": "removed"}.get(letter, "modified"),
+                 "sha": new if letter != "D" else old}
+        if name not in binary:
+            entry["patch"] = "@@"
+        files.append(entry)
+    return {"status": status, "ahead_by": ahead, "behind_by": behind, "total_commits": ahead,
+            "merge_base_commit": {"sha": base}, "commits": commits, "files": files}
+"""
+
+
 class ReviewBeforeArm(unittest.TestCase):
     """A landing needs a verdict naming the exact head, through the installed guard.
 
@@ -1725,12 +1760,15 @@ class ReviewBeforeArm(unittest.TestCase):
         fake.write_text(
             f"#!{sys.executable}\n"
             "import json, sys\n"
+            + GIT_COMPARE +
             f"answers = json.load(open({str(table)!r}))\n"
             "argv = ' '.join(sys.argv[1:])\n"
             f"open({str(self.root / 'calls')!r}, 'a').write(argv + '\\n')\n"
             "for needle, answer in answers:\n"
             "    if needle not in argv:\n"
             "        continue\n"
+            "    if 'git' in answer:\n"
+            "        sys.stdout.write(json.dumps(git_compare(answer['git'], argv))); sys.exit(0)\n"
             "    if 'error' in answer:\n"
             "        sys.stderr.write(answer['error'] + '\\n'); sys.exit(1)\n"
             "    if 'pages' in answer:\n"
@@ -1882,6 +1920,20 @@ class ReviewBeforeArm(unittest.TestCase):
         result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=None)
         self.assertEqual(result.returncode, 1, result.stderr)
 
+    def test_off_reads_nothing_even_with_a_config_this_python_cannot_parse(self) -> None:
+        # Off must be inert on any Python, including one without tomllib, and
+        # whatever the base config says: the review reads nothing at all.
+        on = "[auto_merge]\narm_requires_head_approval = true\n[validation\n"
+        for host in ("0", None):
+            result = self.arm(513, "danielraffel/tartci", self.case("tartci-513", config=on),
+                              host=host)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = self.calls()
+            self.assertNotIn("contents/.shipyard/config.toml", calls)
+            self.assertNotIn("/comments", calls)
+            self.assertNotIn("/pulls/513", calls)
+            (self.root / "calls").unlink()
+
     def test_a_repository_outside_the_list_with_no_setting_is_not_checked(self) -> None:
         graphql = copy.deepcopy(review_fixture("tartci-513-graphql.json"))
         graphql["data"]["repository"]["pullRequest"]["repository"]["nameWithOwner"] = "someone/else"
@@ -1898,7 +1950,7 @@ class ReviewBeforeArm(unittest.TestCase):
         graphql["data"]["repository"]["pullRequest"]["repository"]["nameWithOwner"] = "someone/else"
         on = "[auto_merge]\narm_requires_head_approval = true\nreviewer_identities = [\"fable-graph\"]\n"
         result = self.arm(513, "someone/else", self.case("tartci-513", graphql=graphql, config=on),
-                          host="0")
+                          host="1")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("from one of fable-graph", result.stderr)
 
@@ -2014,56 +2066,174 @@ class ReviewBeforeArm(unittest.TestCase):
                                 "danielraffel/Shipyard")
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    # A merge-only update of an approved head.
+    # A merge-only update of an approved head, over real crafted git histories
+    # (the cases of the reviewer's carry_probe.sh).
 
-    CARRIED = "e" * 40
-    BASE_TIP = "c" * 40
-
-    def carry_case(self, *, parents: list[str], head_own: str, base_status: str = "ahead"
-                   ) -> list[tuple[str, dict[str, Any]]]:
+    def carry_answers(self, history: "CarryHistory", head: str, comments: list | None = None
+                      ) -> list[tuple[str, dict[str, Any]]]:
         graphql = opened(review_fixture("shipyard-784-graphql.json"))
-        graphql["data"]["repository"]["pullRequest"]["headRefOid"] = self.CARRIED
+        graphql["data"]["repository"]["pullRequest"]["headRefOid"] = head
         pull = copy.deepcopy(review_fixture("shipyard-784-pull.json"))
-        pull["head"]["sha"] = self.CARRIED
-
-        def diff(line: str, offset: int) -> str:
-            return ("diff --git a/src/lib.rs b/src/lib.rs\nindex 1111111..2222222 100644\n"
-                    f"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -{offset},3 +{offset},4 @@\n"
-                    f" context\n+{line}\n context\n")
-
-        answers = self.case("shipyard-784", graphql=graphql, queue=False, extra=[
-            (f"compare/{HEAD_784}...{self.CARRIED}", {"json": {
-                "status": "ahead", "behind_by": 0, "total_commits": 1,
-                "commits": [{"sha": self.CARRIED, "parents": [{"sha": p} for p in parents]}]}}),
-            (f"compare/{parents[-1]}...main", {"json": {"status": base_status}}),
-            (f"compare/main...{HEAD_784}", {"text": diff("let approved = 1;", 10)}),
-            (f"compare/main...{self.CARRIED}", {"text": diff(head_own, 40)}),
-        ])
+        pull["head"]["sha"] = head
+        approve = next(c for c in review_fixture("shipyard-784-comments.json")[0]
+                       if c["id"] == APPROVE_784_COMMENT)
+        trail = comments if comments is not None else [comment_like(
+            approve, created_at="2026-10-12T15:00:00Z",
+            body=f"verdict: APPROVE head:{history.approved}")]
+        answers = self.case("shipyard-784", graphql=graphql, queue=False, comments=[trail])
+        answers.insert(0, ("compare/", {"git": str(history.path)}))
         return [(needle, {"json": pull}) if needle == "/pulls/" else (needle, answer)
                 for needle, answer in answers]
 
-    def test_a_merge_only_update_carries_the_approval(self) -> None:
-        answers = self.carry_case(parents=[HEAD_784, self.BASE_TIP], head_own="let approved = 1;")
-        result = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit",
-                                 self.CARRIED], answers, "danielraffel/Shipyard")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Accept: application/vnd.github.diff", self.calls())
+    def land(self, history: "CarryHistory", head: str, comments: list | None = None
+             ) -> subprocess.CompletedProcess:
+        return self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", head],
+                              self.carry_answers(history, head, comments), "danielraffel/Shipyard")
 
-    def test_an_update_that_is_not_a_clean_merge_of_the_base_needs_a_new_verdict(self) -> None:
-        argv = ["pr", "merge", "784", "--merge", "--match-head-commit", self.CARRIED]
-        cases = {
-            "own lines changed": self.carry_case(parents=[HEAD_784, self.BASE_TIP],
-                                                 head_own="let approved = 2;"),
-            "not a merge": self.carry_case(parents=[HEAD_784], head_own="let approved = 1;"),
-            "merged parent not on the base": self.carry_case(
-                parents=[HEAD_784, self.BASE_TIP], head_own="let approved = 1;",
-                base_status="diverged"),
-        }
-        for name, answers in cases.items():
-            with self.subTest(name=name):
-                result = self.run_guard(argv, answers, "danielraffel/Shipyard")
-                self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn("does not carry", result.stderr)
+    def test_an_honest_merge_of_the_base_carries_the_approval(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        result = self.land(history, history.merge())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"compare/main...{history.approved}", self.calls())
+
+    def test_a_merge_that_moves_the_prs_guard_line_needs_a_new_verdict(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.merge(edit=lambda: history.move_guard_line(49))
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("guard.c at", result.stderr)
+        self.assertIn("is not the blob approved", result.stderr)
+
+    def test_a_merge_that_swaps_a_binary_the_pr_touches_needs_a_new_verdict(self) -> None:
+        history = CarryHistory(self.root / "repo", binary=True)
+        head = history.merge(edit=lambda: history.write("x.bin", b"\x00\x01EVIL-binary"))
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("changes a binary file (x.bin)", result.stderr)
+
+    def test_a_merge_that_adds_a_line_needs_a_new_verdict(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.merge(edit=lambda: history.append("guard.c", "  backdoor();\n"))
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("is not the blob approved", result.stderr)
+
+    def test_a_file_both_the_pr_and_the_base_changed_needs_a_new_verdict(self) -> None:
+        # The base also edits guard.c; the merge keeps the PR's blob, which
+        # quietly drops the base's change.
+        history = CarryHistory(self.root / "repo")
+        history.on_base(lambda: history.append("guard.c", "base head\n", at_start=True))
+        head = history.merge(edit=lambda: history.restore("guard.c", history.approved))
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("guard.c was changed by both the pull request and the base", result.stderr)
+
+    def test_a_hold_on_the_new_head_is_not_overridden_by_a_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.merge()
+        approve = next(c for c in review_fixture("shipyard-784-comments.json")[0]
+                       if c["id"] == APPROVE_784_COMMENT)
+        trail = [
+            comment_like(approve, created_at="2026-10-12T15:00:00Z",
+                         body=f"verdict: APPROVE head:{history.approved}"),
+            comment_like(approve, id=approve["id"] + 1, created_at="2026-10-12T16:00:00Z",
+                         body=f"verdict: HOLD head:{head}"),
+        ]
+        result = self.land(history, head, trail)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("is HOLD", result.stderr)
+        # Control: the same honest merge without the HOLD carries.
+        self.assertEqual(self.land(history, head).returncode, 0)
+
+    def test_a_head_that_does_not_descend_from_the_approved_one_needs_a_new_verdict(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rewrite()
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"does not descend from {history.approved[:12]}", result.stderr)
+
+    def test_a_commit_that_is_not_a_merge_needs_a_new_verdict(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        history.git("checkout", "-q", "-B", "single", history.approved)
+        history.append("notes.txt", "note\n")
+        history.git("add", "-A")
+        history.git("commit", "-qm", "single parent")
+        result = self.land(history, history.git("rev-parse", "HEAD"))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("is not a merge", result.stderr)
+
+
+class CarryHistory:
+    """A scratch git repository: a base, a pull request that adds a guard line
+    (and optionally changes a binary), its approved head, and a base commit
+    since; with the updates the carry rule judges."""
+
+    def __init__(self, path: pathlib.Path, binary: bool = False) -> None:
+        self.path = path
+        path.mkdir(parents=True)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "r@r")
+        self.git("config", "user.name", "r")
+        self.write("guard.c", "".join(f"line {n}\n" for n in range(1, 61)).encode())
+        if binary:
+            self.write("x.bin", b"\x00\x01base-binary")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "base0")
+        self.git("checkout", "-qb", "pr")
+        lines = (self.path / "guard.c").read_text().splitlines(keepends=True)
+        lines.insert(9, "  if (!authorized) return;\n")
+        self.write("guard.c", "".join(lines).encode())
+        if binary:
+            self.write("x.bin", b"\x00\x01pr-binary-v1")
+        self.git("commit", "-qam", "pr: add guard")
+        self.approved = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "main")
+        self.write("other.txt", b"unrelated\n")
+        self.git("add", "other.txt")
+        self.git("commit", "-qm", "base1")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=self.path, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def write(self, name: str, data: bytes) -> None:
+        (self.path / name).write_bytes(data)
+
+    def append(self, name: str, text: str, at_start: bool = False) -> None:
+        old = (self.path / name).read_text() if (self.path / name).exists() else ""
+        (self.path / name).write_text(text + old if at_start else old + text)
+
+    def restore(self, name: str, commit: str) -> None:
+        self.git("checkout", commit, "--", name)
+
+    def move_guard_line(self, to: int) -> None:
+        lines = [line for line in (self.path / "guard.c").read_text().splitlines(keepends=True)
+                 if "authorized" not in line]
+        lines.insert(to - 1, "  if (!authorized) return;\n")
+        self.write("guard.c", "".join(lines).encode())
+
+    def on_base(self, edit: Any) -> None:
+        self.git("checkout", "-q", "main")
+        edit()
+        self.git("commit", "-qam", "base edit")
+
+    def merge(self, edit: Any = None) -> str:
+        """Merge the base into the approved head, optionally editing the merge."""
+        self.git("checkout", "-q", "-B", "head", self.approved)
+        self.git("merge", "-q", "--no-commit", "main")
+        if edit is not None:
+            edit()
+        self.git("add", "-A")
+        self.git("commit", "-qm", "Merge branch 'main' into pr")
+        return self.git("rev-parse", "HEAD")
+
+    def rewrite(self) -> str:
+        """The pull request's change re-made on the base: same content, a
+        head that does not descend from the approved one."""
+        self.git("checkout", "-q", "-B", "rewritten", "main")
+        self.restore("guard.c", self.approved)
+        self.git("commit", "-qam", "pr: add guard (rebased)")
+        return self.git("rev-parse", "HEAD")
 
 
 class ReviewIdentity(unittest.TestCase):
@@ -2123,12 +2293,6 @@ class ReviewIdentity(unittest.TestCase):
                 guard.review_policy(off, "Generous-Corp/pulp", True)
         self.assertFalse(guard.review_policy(None, "Generous-Corp/pulp", False)["required"])
         self.assertTrue(guard.review_policy(None, "Generous-Corp/pulp", True)["required"])
-
-    def test_own_lines_ignore_what_a_base_change_moves(self) -> None:
-        def diff(line: str, offset: int) -> str:
-            return f"diff --git a/x b/x\nindex 1..2 100644\n@@ -{offset},2 +{offset},3 @@\n ctx\n+{line}\n"
-        self.assertEqual(guard.own_lines(diff("a", 1)), guard.own_lines(diff("a", 90)))
-        self.assertNotEqual(guard.own_lines(diff("a", 1)), guard.own_lines(diff("b", 1)))
 
     def test_the_default_repositories_match_the_rust_list(self) -> None:
         source = (SCRIPT.parent.parent / "src" / "head_approval.rs").read_text(encoding="utf-8")

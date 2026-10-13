@@ -964,165 +964,419 @@ fn the_arm_path_reads_the_author_before_judging() {
 }
 
 // ---------------------------------------------------------------------------
-// Merge-only updates carry an approval
+// Merge-only updates carry an approval: real crafted git histories (the cases
+// of the reviewer's carry_probe), answered the way GitHub's compare does.
 // ---------------------------------------------------------------------------
 
-const BASE_TIP: &str = "cccccccccccccccccccccccccccccccccccccccc";
-const ELSEWHERE: &str = "dddddddddddddddddddddddddddddddddddddddd";
-
-/// The diff GitHub returns for `compare/main...<head>`: `own` is the pull
-/// request's change, `offset` moves its hunk the way a base change above it
-/// would.
-fn own_diff(own: &str, offset: u32) -> String {
-    format!(
-        "diff --git a/src/lib.rs b/src/lib.rs\nindex 1111111..2222222 100644\n--- a/src/lib.rs\n\
-         +++ b/src/lib.rs\n@@ -{offset},3 +{offset},4 @@ fn f()\n context\n+{own}\n context\n"
-    )
+/// A scratch git repository with a pull request that adds a guard line (and
+/// optionally changes a binary), its approved head, and a base commit since.
+struct History {
+    dir: tempfile::TempDir,
+    approved: String,
 }
 
-/// A GitHub that answers the carry's reads: `OTHER` approved, updated to
-/// `HEAD` by `commits`, with `HEAD`'s own lines `head_own`.
-fn carry_gh(
-    commits: Value,
-    head_own: &'static str,
-) -> impl Fn(&[String]) -> Result<String, String> {
-    carry_gh_with(
-        commits,
-        head_own,
-        vec![fleet(
-            "2026-10-12T01:00:00Z",
-            &format!("verdict: APPROVE head:{OTHER}"),
-        )],
-    )
-}
+impl History {
+    fn new(binary: bool) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = Self {
+            dir,
+            approved: String::new(),
+        };
+        history.git(&["init", "-q", "-b", "main"]);
+        history.git(&["config", "user.email", "r@r"]);
+        history.git(&["config", "user.name", "r"]);
+        let lines: String = (1..=60)
+            .map(|n| ["line ", &n.to_string(), "\n"].concat())
+            .collect();
+        history.write("guard.c", lines.as_bytes());
+        if binary {
+            history.write("x.bin", b"\x00\x01base-binary");
+        }
+        history.git(&["add", "-A"]);
+        history.git(&["commit", "-qm", "base0"]);
+        history.git(&["checkout", "-qb", "pr"]);
+        let mut lines: Vec<String> = history.read("guard.c").lines().map(str::to_owned).collect();
+        lines.insert(9, "  if (!authorized) return;".to_owned());
+        history.write("guard.c", (lines.join("\n") + "\n").as_bytes());
+        if binary {
+            history.write("x.bin", b"\x00\x01pr-binary-v1");
+        }
+        history.git(&["commit", "-qam", "pr: add guard"]);
+        let approved = history.git(&["rev-parse", "HEAD"]);
+        history.git(&["checkout", "-q", "main"]);
+        history.write("other.txt", b"unrelated\n");
+        history.git(&["add", "other.txt"]);
+        history.git(&["commit", "-qm", "base1"]);
+        Self {
+            approved,
+            ..history
+        }
+    }
 
-fn carry_gh_with(
-    commits: Value,
-    head_own: &'static str,
-    comments: Vec<Value>,
-) -> impl Fn(&[String]) -> Result<String, String> {
-    move |args: &[String]| {
+    fn git(&self, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(self.dir.path())
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn write(&self, name: &str, data: &[u8]) {
+        std::fs::write(self.dir.path().join(name), data).expect("write");
+    }
+
+    fn read(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.path().join(name)).expect("read")
+    }
+
+    /// Merge the base into the approved head, letting `edit` change the
+    /// merge before it is committed.
+    fn merge(&self, edit: impl FnOnce(&Self)) -> String {
+        self.git(&["checkout", "-q", "-B", "head", &self.approved]);
+        self.git(&["merge", "-q", "--no-commit", "main"]);
+        edit(self);
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-qm", "Merge branch 'main' into pr"]);
+        self.git(&["rev-parse", "HEAD"])
+    }
+
+    /// GitHub's answer to the carry's reads of this repository.
+    fn gh(&self, args: &[String]) -> Result<String, String> {
         let joined = args.join(" ");
         if joined.contains("contents/.shipyard/config.toml") {
-            Err("gh: Not Found (HTTP 404)".to_owned())
-        } else if joined.contains("/reviews") {
-            Ok(String::new())
-        } else if joined.contains("/comments") {
-            Ok(comments
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"))
-        } else if joined.contains("pulls/7 --jq .user.login") {
-            Ok("shipyard-local[bot]\n".to_owned())
-        } else if joined.contains("pulls/7 --jq .base.ref") {
-            Ok("main\n".to_owned())
-        } else if joined.contains(&format!("compare/{OTHER}...{HEAD}")) {
-            let total = commits.as_array().map_or(0, Vec::len);
-            Ok(
-                json!({"status": "ahead", "behind_by": 0, "total_commits": total,
-                      "commits": commits.clone()})
-                .to_string(),
-            )
-        } else if joined.contains(&format!("compare/{BASE_TIP}...main")) {
-            Ok("ahead\n".to_owned())
-        } else if joined.contains(&format!("compare/{OTHER}...main")) {
-            // A single-parent commit's parent is on the base too: only the
-            // merge rule refuses it.
-            Ok("ahead\n".to_owned())
-        } else if joined.contains(&format!("compare/{ELSEWHERE}...main")) {
-            Ok("diverged\n".to_owned())
-        } else if joined.contains(&format!("compare/main...{OTHER}")) {
-            Ok(own_diff("let approved = 1;", 10))
-        } else if joined.contains(&format!("compare/main...{HEAD}")) {
-            Ok(own_diff(head_own, 40))
-        } else {
-            Err(format!("unexpected gh call: {joined}"))
+            return Err("gh: Not Found (HTTP 404)".to_owned());
         }
+        if joined.contains("/reviews") {
+            return Ok(String::new());
+        }
+        if joined.contains("/comments") {
+            return Ok(fleet(
+                "2026-10-12T01:00:00Z",
+                &format!("verdict: APPROVE head:{}", self.approved),
+            )
+            .to_string());
+        }
+        if joined.contains("pulls/7 --jq .user.login") {
+            return Ok("shipyard-local[bot]\n".to_owned());
+        }
+        if joined.contains("pulls/7 --jq .base.ref") {
+            return Ok("main\n".to_owned());
+        }
+        let range = args
+            .iter()
+            .find_map(|arg| {
+                arg.split_once("/compare/")
+                    .map(|(_, range)| range.to_owned())
+            })
+            .ok_or_else(|| format!("unexpected gh call: {joined}"))?;
+        let (x, y) = range.split_once("...").expect("a three-dot range");
+        let base = self.git(&["merge-base", x, y]);
+        let count = |range: &str| {
+            self.git(&["rev-list", "--count", range])
+                .parse::<u64>()
+                .expect("count")
+        };
+        let (ahead, behind) = (
+            count(&format!("{base}..{y}")),
+            count(&format!("{base}..{x}")),
+        );
+        let status = match (ahead, behind) {
+            (0, 0) => "identical",
+            (_, 0) => "ahead",
+            (0, _) => "behind",
+            _ => "diverged",
+        };
+        if joined.ends_with("--jq .status") {
+            return Ok(format!("{status}\n"));
+        }
+        if joined.contains("merge_base") {
+            let binary: Vec<String> = self
+                .git(&["diff", "--numstat", &base, y])
+                .lines()
+                .filter(|line| line.starts_with("-\t-\t"))
+                .map(|line| line[4..].to_owned())
+                .collect();
+            let files: Vec<Value> = self
+                .git(&["diff", "--raw", "--no-abbrev", "--no-renames", &base, y])
+                .lines()
+                .map(|line| {
+                    let (meta, name) = line.split_once('\t').expect("raw line");
+                    let fields: Vec<&str> = meta.split_whitespace().collect();
+                    let status = match fields[4] {
+                        "A" => "added",
+                        "D" => "removed",
+                        _ => "modified",
+                    };
+                    let sha = if fields[4] == "D" {
+                        fields[2]
+                    } else {
+                        fields[3]
+                    };
+                    json!({"filename": name, "status": status, "sha": sha,
+                           "patch": !binary.iter().any(|b| b == name)})
+                })
+                .collect();
+            return Ok(json!({"merge_base": base, "files": files}).to_string());
+        }
+        let commits: Vec<Value> = self
+            .git(&[
+                "rev-list",
+                "--reverse",
+                "--parents",
+                &format!("{base}..{y}"),
+            ])
+            .lines()
+            .map(|line| {
+                let mut parts = line.split_whitespace();
+                let sha = parts.next().expect("sha");
+                json!({"sha": sha, "parents": parts.collect::<Vec<_>>()})
+            })
+            .collect();
+        Ok(
+            json!({"status": status, "behind_by": behind, "total_commits": ahead,
+                  "commits": commits})
+            .to_string(),
+        )
+    }
+
+    fn gate(&self, head: &str) -> HeadGate {
+        super::with_host_review_default(true, || {
+            super::evaluate(
+                &|args: &[String]| self.gh(args),
+                "danielraffel/tartci",
+                7,
+                head,
+                "main",
+                &empty_queue(head),
+            )
+        })
+        .expect("readable")
+    }
+
+    fn refusal(&self, head: &str) -> String {
+        let pr = 7;
+        super::merge_only_carry(
+            &|args: &[String]| self.gh(args),
+            "danielraffel/tartci",
+            pr,
+            &self.approved,
+            head,
+        )
+        .expect_err("refused")
     }
 }
 
-fn merge_of_base() -> Value {
-    json!([{"sha": HEAD, "parents": [OTHER, BASE_TIP]}])
-}
-
-fn carried_gate(gh: &dyn Fn(&[String]) -> Result<String, String>) -> HeadGate {
-    super::with_host_review_default(true, || {
-        super::evaluate(
-            gh,
-            "danielraffel/tartci",
-            7,
-            HEAD,
-            "main",
-            &empty_queue(HEAD),
-        )
-    })
-    .expect("readable")
-}
-
 #[test]
-fn a_merge_only_update_with_the_same_own_lines_carries_the_approval() {
-    let gh = carry_gh(merge_of_base(), "let approved = 1;");
-    match carried_gate(&gh) {
+fn an_honest_merge_of_the_base_carries_the_approval() {
+    let history = History::new(false);
+    let head = history.merge(|_| {});
+    match history.gate(&head) {
         HeadGate::Approved {
             approval: Approval::Carried { from_head, .. },
-        } => assert_eq!(from_head, OTHER),
+        } => assert_eq!(from_head, history.approved),
         gate => panic!("expected a carried approval, got {gate:?}"),
     }
 }
 
 #[test]
-fn an_update_that_changes_the_own_lines_needs_a_new_verdict() {
-    let gh = carry_gh(merge_of_base(), "let approved = 2;");
-    assert!(matches!(carried_gate(&gh), HeadGate::NotApproved { .. }));
+fn a_merge_that_moves_the_prs_guard_line_needs_a_new_verdict() {
+    let history = History::new(false);
+    let head = history.merge(|history| {
+        let mut lines: Vec<String> = history
+            .read("guard.c")
+            .lines()
+            .filter(|line| !line.contains("authorized"))
+            .map(str::to_owned)
+            .collect();
+        lines.insert(48, "  if (!authorized) return;".to_owned());
+        history.write("guard.c", (lines.join("\n") + "\n").as_bytes());
+    });
+    assert!(matches!(history.gate(&head), HeadGate::NotApproved { .. }));
+    assert!(
+        history.refusal(&head).contains("guard.c at"),
+        "{}",
+        history.refusal(&head)
+    );
+}
+
+#[test]
+fn a_merge_that_swaps_a_binary_the_pr_touches_needs_a_new_verdict() {
+    let history = History::new(true);
+    let head = history.merge(|history| history.write("x.bin", b"\x00\x01EVIL-binary"));
+    assert!(matches!(history.gate(&head), HeadGate::NotApproved { .. }));
+    assert_eq!(
+        history.refusal(&head),
+        "the pull request changes a binary file (x.bin)"
+    );
+}
+
+#[test]
+fn a_merge_that_adds_a_line_needs_a_new_verdict() {
+    let history = History::new(false);
+    let head = history.merge(|history| {
+        let text = history.read("guard.c") + "  backdoor();\n";
+        history.write("guard.c", text.as_bytes());
+    });
+    assert!(matches!(history.gate(&head), HeadGate::NotApproved { .. }));
+}
+
+#[test]
+fn a_file_both_the_pr_and_the_base_changed_needs_a_new_verdict() {
+    let history = History::new(false);
+    history.git(&["checkout", "-q", "main"]);
+    let text = format!("base head\n{}", history.read("guard.c"));
+    history.write("guard.c", text.as_bytes());
+    history.git(&["commit", "-qam", "base edit"]);
+    // The merge keeps the PR's blob, quietly dropping the base's change.
+    let approved = history.approved.clone();
+    let head = history.merge(|history| {
+        history.git(&["checkout", &approved, "--", "guard.c"]);
+    });
+    assert!(matches!(history.gate(&head), HeadGate::NotApproved { .. }));
+    assert_eq!(
+        history.refusal(&head),
+        "guard.c was changed by both the pull request and the base"
+    );
 }
 
 #[test]
 fn a_commit_that_is_not_a_merge_needs_a_new_verdict() {
-    let gh = carry_gh(
-        json!([{"sha": HEAD, "parents": [OTHER]}]),
-        "let approved = 1;",
-    );
-    assert!(matches!(carried_gate(&gh), HeadGate::NotApproved { .. }));
+    let history = History::new(false);
+    history.git(&["checkout", "-q", "-B", "single", &history.approved]);
+    history.write("notes.txt", b"note\n");
+    history.git(&["add", "-A"]);
+    history.git(&["commit", "-qm", "single parent"]);
+    let head = history.git(&["rev-parse", "HEAD"]);
+    assert!(history.refusal(&head).contains("is not a merge"));
 }
 
 #[test]
-fn a_merge_of_a_branch_not_on_the_base_needs_a_new_verdict() {
-    let gh = carry_gh(
-        json!([{"sha": HEAD, "parents": [OTHER, ELSEWHERE]}]),
-        "let approved = 1;",
-    );
-    // Its merged parent has diverged from the base: no carry.
-    assert!(matches!(carried_gate(&gh), HeadGate::NotApproved { .. }));
+fn a_head_that_does_not_descend_from_the_approved_one_needs_a_new_verdict() {
+    let history = History::new(false);
+    history.git(&["checkout", "-q", "-B", "rewritten", "main"]);
+    history.git(&["checkout", &history.approved, "--", "guard.c"]);
+    history.git(&["commit", "-qam", "pr: add guard (rebased)"]);
+    let head = history.git(&["rev-parse", "HEAD"]);
+    assert!(history.refusal(&head).contains("does not descend from"));
 }
 
 #[test]
 fn a_hold_on_the_updated_head_is_not_overridden_by_a_carry() {
-    let gh = carry_gh_with(
-        merge_of_base(),
-        "let approved = 1;",
-        vec![
-            fleet(
-                "2026-10-12T01:00:00Z",
-                &format!("verdict: APPROVE head:{OTHER}"),
-            ),
-            fleet(
-                "2026-10-12T02:00:00Z",
-                &format!("verdict: HOLD head:{HEAD}"),
-            ),
-        ],
-    );
-    assert!(matches!(carried_gate(&gh), HeadGate::NotApproved { .. }));
+    let history = History::new(false);
+    let head = history.merge(|_| {});
+    let comments = [
+        fleet(
+            "2026-10-12T01:00:00Z",
+            &format!("verdict: APPROVE head:{}", history.approved),
+        ),
+        fleet(
+            "2026-10-12T02:00:00Z",
+            &format!("verdict: HOLD head:{head}"),
+        ),
+    ];
+    let gh = |args: &[String]| {
+        if args.join(" ").contains("/comments") {
+            Ok(comments
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"))
+        } else {
+            history.gh(args)
+        }
+    };
+    let gate = super::with_host_review_default(true, || {
+        super::evaluate(
+            &gh,
+            "danielraffel/tartci",
+            7,
+            &head,
+            "main",
+            &empty_queue(&head),
+        )
+    })
+    .expect("readable");
+    assert!(matches!(gate, HeadGate::NotApproved { .. }), "{gate:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The host switch itself, read from a child process so no test override
+// stands in for it.
+// ---------------------------------------------------------------------------
+
+const PROBE: &str = "SHIPYARD_HOST_SWITCH_PROBE";
+
+#[test]
+fn host_switch_probe() {
+    if std::env::var_os(PROBE).is_some() {
+        println!("HOST_SWITCH={}", super::host_review_default());
+    }
+}
+
+fn host_switch(env: &[(&str, &std::path::Path)], switch: Option<&str>) -> bool {
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    command
+        .args([
+            "--exact",
+            "head_approval::tests::host_switch_probe",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROBE, "1")
+        .env_remove(super::HOST_ENABLE_ENV)
+        .env_remove("SHIPYARD_GHAPP_GUARDS_DIR");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    if let Some(switch) = switch {
+        command.env(super::HOST_ENABLE_ENV, switch);
+    }
+    let output = command.output().expect("probe runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // libtest prints the probe's line after the test's name, on one line.
+    match stdout
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("HOST_SWITCH="))
+    {
+        Some("true") => true,
+        Some("false") => false,
+        _ => panic!("probe printed no switch: {stdout}"),
+    }
 }
 
 #[test]
-fn own_lines_ignore_what_a_base_change_moves() {
-    assert_eq!(
-        super::own_lines(&own_diff("let a = 1;", 10)),
-        super::own_lines(&own_diff("let a = 1;", 90))
+fn the_host_switch_reads_the_environment_and_the_guards_file() {
+    let empty = tempfile::tempdir().expect("tempdir");
+    let marked = tempfile::tempdir().expect("tempdir");
+    std::fs::write(marked.path().join(super::HOST_ENABLE_FILE), "").expect("marker");
+    let guards = "SHIPYARD_GHAPP_GUARDS_DIR";
+    assert!(
+        !host_switch(&[(guards, empty.path())], None),
+        "off by default"
     );
-    assert_ne!(
-        super::own_lines(&own_diff("let a = 1;", 10)),
-        super::own_lines(&own_diff("let a = 2;", 10))
+    assert!(
+        host_switch(&[(guards, marked.path())], None),
+        "the file turns it on"
     );
+    assert!(
+        !host_switch(&[(guards, marked.path())], Some("0")),
+        "0 wins over the file"
+    );
+    assert!(
+        host_switch(&[(guards, empty.path())], Some("1")),
+        "1 turns it on"
+    );
+    // Without the guards-dir variable, the file is read from HOME.
+    let home = tempfile::tempdir().expect("tempdir");
+    let dir = home.path().join(".config/shipyard/guards");
+    std::fs::create_dir_all(&dir).expect("dirs");
+    assert!(!host_switch(&[("HOME", home.path())], None));
+    std::fs::write(dir.join(super::HOST_ENABLE_FILE), "").expect("marker");
+    assert!(host_switch(&[("HOME", home.path())], None));
 }

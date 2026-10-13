@@ -3444,8 +3444,9 @@ Shipyard when their base is silent, on a host that sets
 `SHIPYARD_REVIEW_BEFORE_ARM=1` or has a `review-before-arm` guards file) arms
 and classic-merges only an approved head on every path (`ship`, the validated
 arm, the classic merge, the steward backstop); `--arm` overrides it and names
-who did. A merge-only update with byte-identical own lines carries the
-approval. `queue-arm-guard` refuses an unreviewed arm or direct merge through
+who did. A merge-only update carries the approval only when every file the PR
+changes keeps its approved blob, the base changed none of them, and no binary
+changed; with the host switch off, the guard reads nothing for this rule. `queue-arm-guard` refuses an unreviewed arm or direct merge through
 `ghapp` the same way, requires the request to bind the approved head
 (`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts only the
 fleet App and OWNER/MEMBER/COLLABORATOR verdicts; its override,
