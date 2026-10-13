@@ -1,0 +1,13 @@
+failures:
+
+---- merge::tests::queue_order_is_stable stdout ----
+thread 'merge::tests::queue_order_is_stable' panicked at src/merge/queue.rs:214:9:
+boom
+
+failures:
+    merge::tests::queue_order_is_stable
+    steward::tests::rearm_after_rebase
+
+test result: FAILED. 41 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+error: test failed, to rerun pass `--lib`

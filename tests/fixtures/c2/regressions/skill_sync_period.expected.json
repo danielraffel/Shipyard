@@ -1,0 +1,20 @@
+[
+ {
+  "format": "gate_policy",
+  "kind": "gate_policy",
+  "subject": "Skill-sync",
+  "message": "",
+  "location": "",
+  "line": 4,
+  "step_failed": true
+ },
+ {
+  "format": "shell_exit",
+  "kind": "exit_code",
+  "subject": "python3 scripts/skill_sync_check.py --mode report",
+  "message": "exit code 1: Skill-sync check FAILED.",
+  "location": "",
+  "line": 5,
+  "step_failed": true
+ }
+]

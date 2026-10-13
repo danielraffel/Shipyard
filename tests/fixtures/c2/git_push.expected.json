@@ -1,0 +1,20 @@
+[
+ {
+  "format": "git_push",
+  "kind": "push_refused",
+  "subject": "GH006",
+  "message": "Protected branch update failed for refs/heads/main.",
+  "location": "",
+  "line": 1,
+  "step_failed": true
+ },
+ {
+  "format": "git_push",
+  "kind": "push_refused",
+  "subject": "remote rejected",
+  "message": "protected branch hook declined",
+  "location": "main",
+  "line": 3,
+  "step_failed": true
+ }
+]

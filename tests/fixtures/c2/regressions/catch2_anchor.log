@@ -1,0 +1,21 @@
+2026-10-04T16:20:00.0000000Z ##[group]Run ctest --test-dir build --output-on-failure
+2026-10-04T16:30:01.0000000Z 10/40 Test #11: Knob drag clamps to range ...............................   Passed    0.20 sec
+2026-10-04T16:30:01.1000000Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_widgets.cpp:99: FAILED:
+2026-10-04T16:30:01.1000001Z   CHECK( stray_progress_line_from_a_passing_test )
+2026-10-04T16:30:02.0000000Z 11/40 Test #12: EqCurveView draws a low-pass as a shelf ..................***Failed    0.40 sec
+2026-10-04T16:30:02.0000001Z -------------------------------------------------------------------------------
+2026-10-04T16:30:02.0000002Z EqCurveView draws a low-pass as a shelf
+2026-10-04T16:30:02.0000003Z -------------------------------------------------------------------------------
+2026-10-04T16:30:02.0000004Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_eq_curve.cpp:40
+2026-10-04T16:30:02.0000005Z ...............................................................................
+2026-10-04T16:30:02.0000006Z 
+2026-10-04T16:30:02.0000007Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_eq_curve.cpp:57: FAILED:
+2026-10-04T16:30:02.0000008Z   REQUIRE( curve.db_at(8000.0f) < -6.0f )
+2026-10-04T16:30:02.0000009Z with expansion:
+2026-10-04T16:30:02.0000010Z   0.4f < -6.0f
+2026-10-04T16:30:02.0000011Z             Start 13: EqCurveView peak band is symmetric
+2026-10-04T16:30:02.5000000Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_eq_curve.cpp:88: FAILED:
+2026-10-04T16:30:02.5000001Z   REQUIRE( interleaved_output_after_the_block_closed )
+2026-10-04T16:30:03.0000000Z The following tests FAILED:
+2026-10-04T16:30:03.0000001Z 	 12 - EqCurveView draws a low-pass as a shelf (Failed)
+2026-10-04T16:30:03.0000002Z ##[error]Process completed with exit code 8.

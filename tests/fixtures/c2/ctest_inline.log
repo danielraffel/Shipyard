@@ -1,0 +1,7 @@
+2026-09-28T23:45:21.5262350Z 87/97 Test #21435: sample-region-catalog-contract ..............................   Passed    0.12 sec
+2026-09-28T23:45:21.5943470Z 88/97 Test #21432: consumption-census-negative-contract ........................***Failed  Required regular expression not found. Regex=[case=valid-current]  0.99 sec
+2026-09-28T23:45:21.7113820Z 89/97 Test #21437: pr-fast-tier-selftest .......................................   Passed    0.06 sec
+2026-09-28T23:45:22.0953670Z 90/97 Test #21439: gpu-resource-lock-smoke ....................................***Timeout 300.02 sec
+2026-09-28T23:45:22.1000000Z 91/97 Test #10885: WorkerPool cold-idles workers without blocking later batches ..........***Failed    7.02 sec
+2026-09-28T23:45:22.2000000Z 92/97 Test #10886: Knob sprite sheet decodes ............................***SEGFAULT  0.10 sec
+2026-09-28T23:45:22.3000000Z 93/97 Test #12516: A lane that requires a GPU adapter has one .............***Skipped   0.04 sec

@@ -1,0 +1,29 @@
+[
+ {
+  "format": "cargo_test",
+  "kind": "test_failure",
+  "subject": "merge::tests::queue_order_is_stable",
+  "message": "",
+  "location": "",
+  "line": 8,
+  "step_failed": true
+ },
+ {
+  "format": "cargo_test",
+  "kind": "test_failure",
+  "subject": "steward::tests::rearm_after_rebase",
+  "message": "",
+  "location": "",
+  "line": 9,
+  "step_failed": true
+ },
+ {
+  "format": "rust_panic",
+  "kind": "panic",
+  "subject": "merge::tests::queue_order_is_stable",
+  "message": "boom",
+  "location": "queue.rs:214",
+  "line": 4,
+  "step_failed": true
+ }
+]

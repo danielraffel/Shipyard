@@ -1,0 +1,20 @@
+[
+ {
+  "format": "gate_policy",
+  "kind": "gate_policy",
+  "subject": "provider resolution",
+  "message": "failing macos gate closed",
+  "location": "",
+  "line": 5,
+  "step_failed": true
+ },
+ {
+  "format": "shell_exit",
+  "kind": "exit_code",
+  "subject": "set -euo pipefail",
+  "message": "exit code 1: provider resolution did not succeed \u2014 failing macos gate closed",
+  "location": "",
+  "line": 6,
+  "step_failed": true
+ }
+]

@@ -1,0 +1,23 @@
+2026-10-04T16:20:00.0000000Z ##[group]Run ctest --test-dir build-macos --output-on-failure --repeat until-pass:2
+2026-10-04T16:30:35.0878560Z 10686/22249 Test #10885: WorkerPool cold-idles workers without blocking later batches ..........***Failed    7.02 sec
+2026-10-04T16:30:35.0900000Z Filters: "WorkerPool cold-idles workers without blocking later batches"
+2026-10-04T16:30:35.0900001Z -------------------------------------------------------------------------------
+2026-10-04T16:30:35.0900002Z WorkerPool cold-idles workers without blocking later batches
+2026-10-04T16:30:35.0900003Z -------------------------------------------------------------------------------
+2026-10-04T16:30:35.0900004Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_graph_runtime_worker_pool.cpp:284
+2026-10-04T16:30:35.0900005Z ...............................................................................
+2026-10-04T16:30:35.0900006Z 
+2026-10-04T16:30:35.0900007Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_graph_runtime_worker_pool.cpp:290: FAILED:
+2026-10-04T16:30:35.0900008Z   REQUIRE( parked.wait(kParkTimeout) )
+2026-10-04T16:30:35.0900009Z with expansion:
+2026-10-04T16:30:35.0900010Z   false
+2026-10-04T16:30:35.0900011Z 
+2026-10-04T16:30:35.0900012Z             Start 10885: WorkerPool cold-idles workers without blocking later batches
+2026-10-04T16:30:42.0000000Z 10700/22249 Test #10885: WorkerPool cold-idles workers without blocking later batches ..........   Passed    0.31 sec
+2026-10-04T16:37:30.0000000Z 100% tests passed, 0 tests failed out of 22249
+2026-10-04T16:47:08.4485490Z ##[group]Run actions/upload-artifact@v5
+2026-10-04T16:47:30.0000000Z Upload progress stalled. Retrying artifact upload
+2026-10-04T16:48:05.4596780Z Artifact plugins-macos has been successfully uploaded!
+2026-10-04T16:48:05.4918890Z Post job cleanup.
+2026-10-04T16:48:05.5846140Z ##[error]An error occurred trying to start process '/Users/admin/actions-runner/externals/node24/bin/node' with working directory '/Users/admin/actions-runner/_work/pulp/pulp'. Exec format error
+2026-10-04T16:48:05.5948670Z Cleaning up orphan processes

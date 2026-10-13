@@ -1,148 +1,35 @@
-//! Named causes of red cases, read from each case's job log by the same
-//! extractor `shipyard diagnose` uses.
+//! Named causes of red cases, read from each case's job log.
 //!
 //! A red required check, or a merge-group gate that did not pass, is a job
-//! with a log. Its cause is usually in that log: the failing test of a `CTest`
-//! summary, a compiler error, a runner failure GitHub recorded. This module
-//! reads the job and its log, runs [`crate::diagnose::build`] on it, and
-//! reduces the diagnosis to one [`CaseCause`]: a class, a signature, the
-//! evidence lines and a confidence.
+//! with a log. This module reads the job and its log and builds its
+//! `ci.cause/v1` record with [`crate::diagnose::cause::build`]: C2 names the
+//! cause, `diagnose` adds GitHub's own record and the evidence lines. A cause
+//! is **named** when its class is not `unknown` and its confidence is `high`
+//! or `medium` (see [`crate::diagnose::cause`]).
 //!
-//! A cause is **named** when its confidence is `high` or `medium`:
-//!
-//! | confidence | when |
-//! |---|---|
-//! | `high` | the log names failing tests, or GitHub's own record proves an infrastructure failure, a timeout, a supersede or a stale base |
-//! | `medium` | no test, but scored error lines in the failing step |
-//! | `low` | only the step's last lines before it exited, or a cancel with no recorded reason |
-//! | `none` | nothing to read: no log, no evidence |
-//!
-//! What a completed job yields is cached, never the log. Causes read here
-//! are retrospective: they say what the log held when the job finished,
-//! which is the earliest an extractor could have named it, so `named_at` is
-//! the job's completion and `retrospective` is true.
+//! What a completed job yields is cached, never the log. Causes read here are
+//! retrospective: they say what the log held when the job finished, which is
+//! the earliest an extractor could have named it, so `named_at` is the job's
+//! completion and `retrospective` is true.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use super::super::{ReadCache, SyncGhReader, parallel_map, strings};
 use super::cases::Case;
 use super::{ScorecardObservation, ejection_cause, is_red};
-use crate::diagnose::{self, CheckDiagnosis, Context, Job, classify};
+use crate::diagnose::Job;
+use crate::diagnose::cause::{self, CiCause, Place};
 
-/// Who named a cause read here.
-pub const SOURCE_EXTRACTOR: &str = "extractor";
 /// Default most job logs one run reads (`--causes-max-jobs`). Each costs two
 /// GitHub API calls; a cached job costs none and does not count.
 pub const DEFAULT_MAX_JOBS: usize = 200;
 /// Why a job over that budget was not read.
 pub const OVER_BUDGET: &str = "skipped: over the --causes-max-jobs budget";
 /// Cache key version: bump when a cause's shape or meaning changes.
-const EXTRACT_VERSION: u32 = 1;
-/// Most evidence lines kept per cause.
-pub const MAX_EXCERPT: usize = diagnose::evidence::MAX_GROUP_LINES;
-
-/// The cause of one red job.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CaseCause {
-    /// [`SOURCE_EXTRACTOR`] here; `human`, `agent` or `fix-link` elsewhere.
-    pub source: String,
-    /// `test`, `infra`, `cancelled`, `timeout`, `drift` or `unknown`.
-    pub class: String,
-    /// `high`, `medium`, `low` or `none`.
-    pub confidence: String,
-    /// The most specific name for the cause: the first failing test, else
-    /// the most decisive evidence line.
-    pub signature: Option<String>,
-    /// The step that failed.
-    pub failing_step: Option<String>,
-    /// Failing tests, capped as `diagnose` caps them.
-    pub failing_tests: Vec<String>,
-    /// `diagnose`'s class and rule, verbatim.
-    pub diagnose_class: String,
-    /// `diagnose`'s rule.
-    pub diagnose_rule: String,
-    /// 1-based line of the evidence in the job log.
-    pub evidence_line: Option<usize>,
-    /// The evidence lines.
-    pub excerpt: Vec<String>,
-    /// When the cause was nameable: the job's completion.
-    pub named_at: Option<String>,
-    /// Read after the fact rather than recorded when the job finished.
-    pub retrospective: bool,
-}
-
-impl CaseCause {
-    /// Whether the cause counts as named (`high` or `medium`).
-    #[must_use]
-    pub fn named(&self) -> bool {
-        matches!(self.confidence.as_str(), "high" | "medium")
-    }
-}
-
-/// Reduce one check's diagnosis to its cause.
-#[must_use]
-pub fn from_diagnosis(check: &CheckDiagnosis, completed_at: Option<&str>) -> CaseCause {
-    let rule = check.classification.rule.as_str();
-    let tests = &check.failing_tests.names;
-    let signal = check.evidence.iter().find(|group| group.kind == "signal");
-    let tail = check.evidence.iter().find(|group| group.kind == "tail");
-    let decisive = check.evidence.first();
-    let (class, confidence, signature): (&str, &str, Option<String>) =
-        match check.classification.class.as_str() {
-            classify::INFRA => ("infra", "high", Some(check.classification.why.clone())),
-            classify::INTERRUPTED => match rule {
-                "timeout" => ("timeout", "high", Some(check.classification.why.clone())),
-                "superseded" => ("cancelled", "high", Some(check.classification.why.clone())),
-                _ => ("cancelled", "low", Some(check.classification.why.clone())),
-            },
-            classify::STALE_BASE => ("drift", "high", Some(check.classification.why.clone())),
-            _ if !tests.is_empty() => ("test", "high", tests.first().cloned()),
-            _ => match (signal, tail) {
-                (Some(group), _) => ("unknown", "medium", group.lines.first().cloned()),
-                (None, Some(group)) => ("unknown", "low", group.lines.last().cloned()),
-                (None, None) => ("unknown", "none", None),
-            },
-        };
-    CaseCause {
-        source: SOURCE_EXTRACTOR.to_owned(),
-        class: class.to_owned(),
-        confidence: confidence.to_owned(),
-        signature,
-        failing_step: check.failing_step.as_ref().map(|step| step.name.clone()),
-        failing_tests: tests.clone(),
-        diagnose_class: check.classification.class.clone(),
-        diagnose_rule: check.classification.rule.clone(),
-        evidence_line: decisive.map(|group| group.line),
-        excerpt: decisive
-            .map(|group| group.lines.iter().take(MAX_EXCERPT).cloned().collect())
-            .unwrap_or_default(),
-        named_at: completed_at.map(str::to_owned),
-        retrospective: true,
-    }
-}
-
-/// Diagnose one red job from its jobs-API payload and log. `None` when the
-/// job is not red.
-#[must_use]
-pub fn cause_of(job: &Job, log: Option<&str>) -> Option<CaseCause> {
-    let mut logs = std::collections::HashMap::new();
-    if let Some(log) = log {
-        logs.insert(job.id, log.to_owned());
-    }
-    let doc = diagnose::build(
-        std::slice::from_ref(job),
-        &logs,
-        std::slice::from_ref(&job.name),
-        &Context::new(),
-        diagnose::DEFAULT_MAX_BYTES,
-    );
-    doc.checks
-        .first()
-        .map(|check| from_diagnosis(check, job.completed_at.as_deref()))
-}
+const EXTRACT_VERSION: u32 = 3;
 
 /// A red job whose cause could not be read, and why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -157,7 +44,7 @@ pub struct Unreadable {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CausesRead {
     /// Cause by job id.
-    pub by_job: BTreeMap<u64, CaseCause>,
+    pub by_job: BTreeMap<u64, CiCause>,
     /// Jobs that could not be read, including those over the budget.
     pub unreadable: Vec<Unreadable>,
     /// Most uncached jobs this read could fetch.
@@ -208,7 +95,7 @@ fn cache_key(repo: &str, id: u64) -> String {
     format!("case-cause:v{EXTRACT_VERSION}:{repo}:{id}")
 }
 
-fn cached(cache: &ReadCache, repo: &str, id: u64) -> Option<CaseCause> {
+fn cached(cache: &ReadCache, repo: &str, id: u64) -> Option<CiCause> {
     serde_json::from_value(cache.get(&cache_key(repo, id))?).ok()
 }
 
@@ -217,7 +104,7 @@ fn read_cause(
     cache: &ReadCache,
     repo: &str,
     id: u64,
-) -> Result<CaseCause, String> {
+) -> Result<CiCause, String> {
     let key = cache_key(repo, id);
     let payload = gh(&strings(&[
         "api",
@@ -236,7 +123,12 @@ fn read_cause(
         Err(error) if log_absent(&error) => None,
         Err(error) => return Err(format!("log of job {id}: {error}")),
     };
-    let cause = cause_of(&job, log.as_deref()).ok_or_else(|| format!("job {id} did not fail"))?;
+    let place = Place {
+        repo: repo.to_owned(),
+        ..Place::default()
+    };
+    let cause = cause::build(&job, log.as_deref(), &place, job.completed_at.clone(), true)
+        .ok_or_else(|| format!("job {id} did not fail"))?;
     if let Ok(value) = serde_json::to_value(&cause) {
         cache.put(&key, &value);
     }
@@ -295,8 +187,11 @@ pub fn attach(rows: &mut [Case], read: &CausesRead) {
         let Some(cause) = row.job_id.and_then(|id| read.by_job.get(&id)) else {
             continue;
         };
-        row.evidence = (!cause.excerpt.is_empty()).then(|| cause.excerpt.join("\n"));
-        row.cause = Some(cause.clone());
+        let mut cause = cause.clone();
+        cause.pr = cause.pr.or(row.pr);
+        row.evidence =
+            (!cause.evidence.excerpt.is_empty()).then(|| cause.evidence.excerpt.join("\n"));
+        row.cause = Some(cause);
         row.unread.retain(|field| *field != "evidence");
     }
 }
@@ -311,7 +206,7 @@ pub struct CauseNaming {
     pub without_job: usize,
     /// Cases whose job could not be read.
     pub unreadable: usize,
-    /// Cases with a named cause (`high` or `medium`).
+    /// Cases with a named cause: a class, at `high` or `medium` confidence.
     pub named: usize,
     /// `named / reds`.
     pub named_share: Option<f64>,
@@ -378,7 +273,10 @@ pub fn compute(rows: &[Case], read: &CausesRead) -> CauseNaming {
             continue;
         }
         naming.named += 1;
-        *naming.by_class.entry(cause.class.clone()).or_insert(0) += 1;
+        *naming
+            .by_class
+            .entry(cause.failure_class.clone())
+            .or_insert(0) += 1;
         if let (Some(at), Some(named_at)) = (&row.created_at, &cause.named_at)
             && let Some(value) = minutes_between(at, named_at)
         {

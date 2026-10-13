@@ -1,0 +1,6 @@
+2026-10-13T12:00:00.0000000Z ##[group]Run set -euo pipefail
+2026-10-13T12:00:00.0000000Z set -euo pipefail
+2026-10-13T12:00:00.0000000Z echo "provider resolution did not succeed — failing macos gate closed"
+2026-10-13T12:00:00.0000000Z ##[endgroup]
+2026-10-13T12:00:00.0000000Z provider resolution did not succeed — failing macos gate closed
+2026-10-13T12:00:00.0000000Z ##[error]Process completed with exit code 1.

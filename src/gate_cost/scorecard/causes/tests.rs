@@ -1,7 +1,8 @@
-//! Causes over a captured Pulp merge-group gate: run 38308868279's `macos`
-//! job 115009634572 (`tests/fixtures/ctest-log/`), in which
-//! `pulp.vellum-closure-external-input-negative` failed, plus small
-//! synthetic jobs for the classes the capture does not hold.
+//! Reading, caching and counting causes over a captured Pulp merge-group
+//! gate: run 38308868279's `macos` job 115009634572
+//! (`tests/fixtures/ctest-log/`), in which
+//! `pulp.vellum-closure-external-input-negative` failed. How one job's cause
+//! is chosen is tested in `diagnose::cause`.
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -36,134 +37,8 @@ fn gate_job_payload() -> Value {
         .expect("gate job")
 }
 
-fn gate_job() -> Job {
-    serde_json::from_value(gate_job_payload()).expect("job")
-}
-
 fn gate_log() -> String {
     fixture("ctest-log/log-mg-job-115009634572.log")
-}
-
-/// A red job with one failed step that ran 00:00:01..00:00:09.
-fn synthetic_job(id: i64, conclusion: &str) -> Job {
-    serde_json::from_value(json!({
-        "id": id,
-        "name": "lint",
-        "status": "completed",
-        "conclusion": conclusion,
-        "runner_name": "runner-1",
-        "started_at": "2026-10-01T00:00:00Z",
-        "completed_at": "2026-10-01T00:00:10Z",
-        "run_id": 7,
-        "run_attempt": 1,
-        "steps": [{
-            "number": 3,
-            "name": "Check",
-            "conclusion": conclusion,
-            "started_at": "2026-10-01T00:00:01Z",
-            "completed_at": "2026-10-01T00:00:09Z"
-        }]
-    }))
-    .expect("job")
-}
-
-fn stamped(lines: &[&str]) -> String {
-    let mut text = String::new();
-    for line in lines {
-        text.push_str("2026-10-01T00:00:05.0000000Z ");
-        text.push_str(line);
-        text.push('\n');
-    }
-    text
-}
-
-#[test]
-fn a_ctest_failure_is_named_by_its_test() {
-    let cause = cause_of(&gate_job(), Some(&gate_log())).expect("red");
-    assert_eq!(cause.class, "test");
-    assert_eq!(cause.confidence, "high");
-    assert!(cause.named());
-    assert_eq!(cause.signature.as_deref(), Some(VELLUM));
-    assert_eq!(cause.failing_tests, vec![VELLUM.to_owned()]);
-    assert_eq!(cause.failing_step.as_deref(), Some("Test (non-Windows)"));
-    assert_eq!(cause.source, SOURCE_EXTRACTOR);
-    assert_eq!(cause.named_at.as_deref(), Some("2026-10-12T21:25:47Z"));
-    assert!(cause.retrospective);
-    assert!(cause.evidence_line.is_some());
-    assert!(!cause.excerpt.is_empty() && cause.excerpt.len() <= MAX_EXCERPT);
-}
-
-#[test]
-fn without_its_ctest_block_the_same_job_names_no_test() {
-    // Negative control: the identical job with the failure lines removed
-    // must not still read as a named test failure.
-    let stripped: String = gate_log()
-        .lines()
-        .filter(|line| !line.contains(VELLUM) && !line.contains("The following tests FAILED"))
-        .flat_map(|line| [line, "\n"])
-        .collect();
-    let cause = cause_of(&gate_job(), Some(&stripped)).expect("red");
-    assert!(cause.failing_tests.is_empty());
-    assert_ne!(cause.class, "test");
-    assert_ne!(cause.signature.as_deref(), Some(VELLUM));
-}
-
-#[test]
-fn a_job_without_a_log_is_not_named() {
-    let cause = cause_of(&gate_job(), None).expect("red");
-    assert_eq!(cause.confidence, "none");
-    assert_eq!(cause.class, "unknown");
-    assert!(!cause.named());
-    assert!(cause.excerpt.is_empty());
-}
-
-#[test]
-fn a_scored_error_line_is_named_at_medium_confidence() {
-    let log = stamped(&[
-        "##[group]Run make",
-        "src/widget.cpp:12:3: error: use of undeclared identifier 'Approx'",
-        "##[error]Process completed with exit code 2.",
-    ]);
-    let cause = cause_of(&synthetic_job(11, "failure"), Some(&log)).expect("red");
-    assert_eq!(cause.confidence, "medium");
-    assert!(cause.named());
-    assert!(
-        cause
-            .signature
-            .as_deref()
-            .is_some_and(|line| line.contains("use of undeclared identifier"))
-    );
-}
-
-#[test]
-fn only_a_tail_is_low_and_not_named() {
-    let log = stamped(&[
-        "##[group]Run ./check.sh",
-        "sandbox-e2e must run on the sandbox host",
-        "##[error]Process completed with exit code 1.",
-    ]);
-    let cause = cause_of(&synthetic_job(12, "failure"), Some(&log)).expect("red");
-    assert_eq!(cause.confidence, "low");
-    assert!(!cause.named());
-    assert_eq!(
-        cause.signature.as_deref(),
-        Some("sandbox-e2e must run on the sandbox host")
-    );
-}
-
-#[test]
-fn a_cancel_without_a_reason_is_low() {
-    let cause = cause_of(&synthetic_job(13, "cancelled"), Some("")).expect("red");
-    assert_eq!(cause.class, "cancelled");
-    assert_eq!(cause.confidence, "low");
-    assert!(!cause.named());
-}
-
-#[test]
-fn a_green_job_has_no_cause() {
-    let mut job = gate_job();
-    job.conclusion = Some("success".to_owned());
-    assert_eq!(cause_of(&job, Some(&gate_log())), None);
 }
 
 fn at(text: &str) -> DateTime<Utc> {
@@ -289,8 +164,9 @@ fn gather_reads_each_job_and_a_missing_log_still_yields_a_cause() {
         &jobs,
         DEFAULT_MAX_JOBS,
     );
-    assert_eq!(read.by_job[&GATE_JOB].signature.as_deref(), Some(VELLUM));
-    assert_eq!(read.by_job[&42].confidence, "none");
+    assert_eq!(read.by_job[&GATE_JOB].signature, VELLUM);
+    assert_eq!(read.by_job[&42].format, "log-missing");
+    assert!(!read.by_job[&42].named());
     assert_eq!(read.unreadable.len(), 1);
     assert_eq!(read.unreadable[0].job_id, 7);
     assert!(read.unreadable[0].reason.contains("unexpected request"));
@@ -330,12 +206,12 @@ fn attached_causes_fill_evidence_and_are_counted_as_named() {
         .find(|row| row.job_id == Some(GATE_JOB))
         .expect("red macos row");
     assert_eq!(gate.run_id, Some(38_308_868_279));
+    // The record takes the pull request from its case.
+    assert_eq!(gate.cause.as_ref().and_then(|cause| cause.pr), Some(10_154));
     assert!(gate.evidence.is_some());
     assert!(!gate.unread.contains(&"evidence"));
     assert_eq!(
-        gate.cause
-            .as_ref()
-            .and_then(|cause| cause.signature.as_deref()),
+        gate.cause.as_ref().map(|cause| cause.signature.as_str()),
         Some(VELLUM)
     );
     let status = rows
@@ -353,11 +229,8 @@ fn attached_causes_fill_evidence_and_are_counted_as_named() {
     assert_eq!(naming.named_share, Some(1.0 / 3.0));
     assert_eq!(
         naming.by_confidence,
-        BTreeMap::from([
-            ("high".to_owned(), 1),
-            ("none".to_owned(), 1),
-            ("unread".to_owned(), 1),
-        ])
+        // The missing log is a certain record that names nothing.
+        BTreeMap::from([("high".to_owned(), 2), ("unread".to_owned(), 1)])
     );
     assert_eq!(naming.by_class, BTreeMap::from([("test".to_owned(), 1)]));
     // The check completed when its job did, so the cause was nameable then.

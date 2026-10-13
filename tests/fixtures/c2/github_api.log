@@ -1,0 +1,2 @@
+2026-10-07T05:00:00.0000000Z gh: Merge method merge commits are not allowed on this repository (HTTP 405)
+2026-10-07T05:00:01.0000000Z ##[error]GitHub API PUT /repos/Generous-Corp/vellum/pulls/88/merge returned 405 Method Not Allowed

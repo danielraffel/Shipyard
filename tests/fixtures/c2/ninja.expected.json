@@ -1,0 +1,20 @@
+[
+ {
+  "format": "ninja",
+  "kind": "build_step",
+  "subject": "widgets.cpp.o",
+  "message": "",
+  "location": "",
+  "line": 2,
+  "step_failed": true
+ },
+ {
+  "format": "ninja",
+  "kind": "build_step",
+  "subject": "test_osc.cpp.o",
+  "message": "Error 1",
+  "location": "",
+  "line": 5,
+  "step_failed": true
+ }
+]

@@ -1,0 +1,11 @@
+[
+ {
+  "format": "cargo_build",
+  "kind": "compile_error",
+  "subject": "shipyard",
+  "message": "lib",
+  "location": "",
+  "line": 2,
+  "step_failed": true
+ }
+]
