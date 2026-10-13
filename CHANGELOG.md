@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03220"></a>
+## [0.322.0] - 2026-10-13
+
+- feat/doctor stuck git ops ([#821](https://github.com/danielraffel/Shipyard/pull/821))
+
 <a id="v03213"></a>
 ## [0.321.3] - 2026-10-13
 
@@ -2306,6 +2311,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.322.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.322.0
 [0.321.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.321.3
 [0.321.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.321.2
 [0.321.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.321.1
