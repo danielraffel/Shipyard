@@ -381,6 +381,15 @@ v1 does not read are present, `null` and named in `unread`; do not fill them
 by hand. For Pulp, red required checks need `--required-context`, or the
 report says "no required contexts" and exports none of them.
 
+**Where a routed lane actually runs is a run fact, not a file fact.**
+`shipyard inspect --profile` reads every job's `runs-on:`, and for a computed
+one (`fromJSON(vars.X)`, a `needs` output, a matrix value) it reads the
+runner of the latest completed run instead of guessing from the variable's
+name or fallback. On Pulp the required `macos` check comes from the `build`
+matrix job, whose `runs-on:` is `fromJSON(matrix.runs_on_json)`, and the run
+shows it on `self-hosted [.., pulp-build-vm, pulp-build-pr-head]`. Quote the
+observed class when saying where a gate runs.
+
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason
 `failed_checks` or `checks_timed_out`, and use `AddedToMergeQueueEvent` as the

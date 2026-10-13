@@ -142,6 +142,8 @@ pub mod identity;
 pub(crate) mod immutable_store;
 /// Project initialization and ecosystem detection.
 pub mod init_config;
+/// Reading a repository's CI and saying what to change.
+pub mod inspect;
 /// Job and target-result domain types used by executors and queues.
 pub mod job;
 pub mod landability;

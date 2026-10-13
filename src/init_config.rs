@@ -386,6 +386,23 @@ fn pubspec_contains(path: &Path, needle: &str) -> bool {
     fs::read_to_string(path.join("pubspec.yaml")).is_ok_and(|content| content.contains(needle))
 }
 
+/// Every marker file name the ecosystem registry recognises, with the family
+/// and ecosystem it identifies: the same registry `shipyard init` detects
+/// with, for readers (`shipyard inspect --profile`) that see a file list
+/// rather than a directory.
+#[must_use]
+pub fn ecosystem_markers() -> Vec<(&'static str, &'static str, &'static str)> {
+    registry()
+        .into_iter()
+        .filter(|spec| spec.check == CheckKind::Markers)
+        .flat_map(|spec| {
+            spec.markers
+                .iter()
+                .map(move |marker| (*marker, spec.family, spec.name))
+        })
+        .collect()
+}
+
 fn registry() -> Vec<EcosystemSpec> {
     let mut specs = Vec::new();
     specs.extend(cpp_and_apple_specs());
