@@ -31,6 +31,8 @@ pub(super) fn gate_cost_command<W: Write>(
     let no_cache = args.no_cache;
     let scorecard = args.scorecard;
     let flakes = args.flakes;
+    let causes = args.causes;
+    let causes_max_jobs = args.causes_max_jobs;
     let required_contexts = args.required_contexts.clone();
     let selection_steps = args.selection_steps.clone();
     let export_cases = args.export_cases.clone();
@@ -60,8 +62,18 @@ pub(super) fn gate_cost_command<W: Write>(
         let observation = scorecard::gather(&reader, &query, &cache)
             .map_err(|error| CliFailure::new(1, format!("scorecard read failed: {error}")))?;
         let mut report = scorecard::compute(&observation);
+        let mut rows = scorecard::cases::cases(&observation);
+        if causes || export_cases.is_some() {
+            report.cause_naming = Some(read_causes(
+                &reader,
+                &cache,
+                &observation,
+                &mut rows,
+                causes_max_jobs,
+            ));
+        }
         if let Some(path) = &export_cases {
-            let receipt = write_cases(path, &observation)?;
+            let receipt = write_cases(path, &observation, &rows)?;
             eprintln!(
                 "export-cases: {} row(s) to {}, sha256 {} (receipt {})",
                 receipt.rows,
@@ -93,6 +105,10 @@ pub(super) fn gate_cost_command<W: Write>(
                 write!(stdout, "{}", scorecard::flakes::render(flakes))
                     .map_err(|error| CliFailure::new(1, error.to_string()))?;
             }
+            if let Some(naming) = &report.cause_naming {
+                write!(stdout, "{}", scorecard::causes::render(naming))
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            }
         }
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -107,6 +123,26 @@ pub(super) fn gate_cost_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Read the red cases' causes, put them on `rows`, and score them.
+fn read_causes(
+    reader: &gate_cost::SyncGhReader<'_>,
+    cache: &ReadCache,
+    observation: &scorecard::ScorecardObservation,
+    rows: &mut [scorecard::cases::Case],
+    max_jobs: usize,
+) -> scorecard::causes::CauseNaming {
+    let jobs = scorecard::causes::red_jobs(observation);
+    let read = scorecard::causes::gather(reader, cache, &observation.query.repo, &jobs, max_jobs);
+    for unreadable in &read.unreadable {
+        eprintln!(
+            "causes: job {} unreadable: {}",
+            unreadable.job_id, unreadable.reason
+        );
+    }
+    scorecard::causes::attach(rows, &read);
+    scorecard::causes::compute(rows, &read)
 }
 
 fn receipt_path(path: &Path) -> PathBuf {
@@ -124,9 +160,9 @@ fn receipt_path(path: &Path) -> PathBuf {
 fn write_cases(
     path: &Path,
     observation: &scorecard::ScorecardObservation,
+    rows: &[scorecard::cases::Case],
 ) -> Result<scorecard::cases::Receipt, CliFailure> {
-    let rows = scorecard::cases::cases(observation);
-    let (bytes, receipt) = scorecard::cases::export(observation, &rows)
+    let (bytes, receipt) = scorecard::cases::export(observation, rows)
         .map_err(|error| CliFailure::new(1, format!("export-cases: {error}")))?;
     let receipt_json = serde_json::to_vec_pretty(&receipt)
         .map_err(|error| CliFailure::new(1, format!("export-cases: {error}")))?;
@@ -479,7 +515,8 @@ mod tests {
             selection: None,
             gaps: Vec::new(),
         };
-        let receipt = write_cases(&path, &observation).expect("written");
+        let rows = scorecard::cases::cases(&observation);
+        let receipt = write_cases(&path, &observation, &rows).expect("written");
         let bytes = std::fs::read(&path).expect("export");
         assert_eq!(receipt.rows, 0);
         assert_eq!(receipt.sha256, hex::encode(sha2::Sha256::digest(&bytes)));
@@ -533,7 +570,8 @@ mod tests {
             selection: None,
             gaps: Vec::new(),
         };
-        let failure = write_cases(&path, &observation).expect_err("the receipt cannot be written");
+        let failure =
+            write_cases(&path, &observation, &[]).expect_err("the receipt cannot be written");
         assert!(
             failure.message.contains("receipt.json"),
             "{}",

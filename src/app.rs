@@ -16,6 +16,7 @@ mod auto_merge_cmd;
 mod base_health_cmd;
 mod branch_cmd;
 mod capacity_cmd;
+mod cause_cmd;
 pub(crate) mod changed_surface_cmd;
 mod changed_surface_trial_cmd;
 mod changelog_cmd;
@@ -660,6 +661,9 @@ where
                 stdout,
             );
         }
+        Command::Cause { command } => {
+            return cause_cmd::cause_command(*command, cli.json, stdout);
+        }
         Command::Reuse { command } => {
             let config = LoadedConfig::load_from_cwd_with_global_dir(
                 cli.mode.into(),
@@ -849,6 +853,7 @@ fn handle_operational_variant<W: Write>(
         | Command::QueueDigest { .. }
         | Command::PrWatch { .. }
         | Command::Reuse { .. }
+        | Command::Cause { .. }
         | Command::ChangedSurfacePlan { .. }
         | Command::ChangedSurfaceTrialStatus { .. }
         | Command::ParallelProofCanary { .. }

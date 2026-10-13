@@ -1,0 +1,38 @@
+[
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "exec format error",
+  "message": "An error occurred trying to start process '/Users/admin/actions-runner/externals/node24/bin/node' with working directory '/Users/admin/actions-runner/_work/pulp/pulp'. Exec format error",
+  "location": "",
+  "line": 22,
+  "step_failed": true
+ },
+ {
+  "format": "ctest_inline",
+  "kind": "test_failure",
+  "subject": "WorkerPool cold-idles workers without blocking later batches",
+  "message": "Failed <dur>",
+  "location": "",
+  "line": 2,
+  "step_failed": false
+ },
+ {
+  "format": "catch2",
+  "kind": "assertion",
+  "subject": "WorkerPool cold-idles workers without blocking later batches",
+  "message": "REQUIRE( parked.wait(kParkTimeout) ) => false",
+  "location": "test_graph_runtime_worker_pool.cpp:290",
+  "line": 10,
+  "step_failed": false
+ },
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "upload stalled",
+  "message": "Upload progress stalled. Retrying artifact upload",
+  "location": "",
+  "line": 19,
+  "step_failed": false
+ }
+]

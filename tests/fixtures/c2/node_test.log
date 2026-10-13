@@ -1,0 +1,8 @@
+2026-10-03T01:00:00.0000000Z ✔ captures the panel at its own size (812.4ms)
+2026-10-03T01:00:01.0000000Z ✖ lowers grid gaps into DesignIR (33.1ms)
+2026-10-03T01:00:01.0000001Z   AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+2026-10-03T01:00:01.0000002Z   12 !== 8
+2026-10-03T01:00:02.0000000Z not ok 4 - materialized runtime keeps the root id
+2026-10-03T01:00:02.0000001Z   ---
+2026-10-03T01:00:02.0000002Z   error: 'root id changed'
+2026-10-03T01:00:02.0000003Z   ...

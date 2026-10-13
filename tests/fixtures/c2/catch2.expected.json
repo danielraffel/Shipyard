@@ -1,0 +1,11 @@
+[
+ {
+  "format": "catch2",
+  "kind": "assertion",
+  "subject": "Knob drag clamps to range / upward drag",
+  "message": "REQUIRE( knob.value() == Approx(1.0f) ) => 1.25f == Approx( 1.0 )",
+  "location": "test_widgets.cpp:431",
+  "line": 8,
+  "step_failed": true
+ }
+]

@@ -1733,6 +1733,12 @@ def git_compare(repo, argv):
         files.append(entry)
     return {"status": status, "ahead_by": ahead, "behind_by": behind, "total_commits": ahead,
             "merge_base_commit": {"sha": base}, "commits": commits, "files": files}
+def git_diff(repo, argv):
+    spec = next(part for part in argv.split() if "/compare/" in part).split("/compare/", 1)[1]
+    x, y = spec.split("...", 1)
+    base = _git(repo, "merge-base", x, y)
+    return _sp.run(["git", "diff", "--no-renames", "--full-index", base, y], cwd=repo,
+                   capture_output=True, text=True, check=True).stdout
 def git_trees(repo, argv):
     import re as _re
     found = {}
@@ -1785,6 +1791,8 @@ class ReviewBeforeArm(unittest.TestCase):
             "        continue\n"
             "    if 'git_tree' in answer:\n"
             "        sys.stdout.write(json.dumps(git_trees(answer['git_tree'], argv))); sys.exit(0)\n"
+            "    if 'git' in answer and 'vnd.github.diff' in argv:\n"
+            "        sys.stdout.write(git_diff(answer['git'], argv)); sys.exit(0)\n"
             "    if 'git' in answer:\n"
             "        sys.stdout.write(json.dumps(git_compare(answer['git'], argv))); sys.exit(0)\n"
             "    if 'error' in answer:\n"
@@ -2221,6 +2229,135 @@ class ReviewBeforeArm(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn(f"does not descend from {history.approved[:12]}", result.stderr)
 
+    # A rebase of an approved head carries only behind its own host switch,
+    # and only when all four conditions hold.
+
+    def rebase_answers(self, history: "CarryHistory", head: str, conclusion: str = "success",
+                       receipt: str | None = None) -> list[tuple[str, dict[str, Any]]]:
+        answers = self.carry_answers(history, head)
+        answers.insert(0, ("rules/branches/", {"json": [
+            {"type": "required_status_checks",
+             "parameters": {"required_status_checks": [{"context": "macos"}]}}]}))
+        answers.insert(0, ("/protection/required_status_checks",
+                           {"error": "gh: Branch not protected (HTTP 404)"}))
+        answers.insert(0, ("/check-runs", {"json": {"total_count": 1, "check_runs": [
+            {"id": 7, "name": "macos", "status": "completed", "conclusion": conclusion,
+             "output": {"annotations_count": 0 if receipt is None else 1}}]}}))
+        # Matched before /check-runs, which its URL also contains.
+        if receipt is not None:
+            answers.insert(0, ("/annotations", {"json": [{
+                "title": "shipyard-receipt-decision",
+                "message": json.dumps({"schema": "shipyard-receipt-decision/v1", "target": "macos",
+                                       "verdict": receipt, "reason": "inputs unchanged"})}]}))
+        return answers
+
+    def land_rebased(self, history: "CarryHistory", head: str, switch: str | None = "1",
+                     conclusion: str = "success", receipt: str | None = None
+                     ) -> subprocess.CompletedProcess:
+        env = {} if switch is None else {"SHIPYARD_REBASE_CARRY": switch}
+        return self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", head],
+                              self.rebase_answers(history, head, conclusion, receipt),
+                              "danielraffel/Shipyard", **env)
+
+    def carries(self) -> list[dict[str, Any]]:
+        log = self.guards / "carries.jsonl"
+        if not log.is_file():
+            return []
+        return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+    def test_a_clean_rebase_carries_only_with_the_switch_on_and_is_logged(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase()
+        # A rebase makes a different tree, so a receipt bound to the approved
+        # head's exact tree can never be reused for the carried head.
+        self.assertNotEqual(history.git("rev-parse", f"{head}^{{tree}}"),
+                            history.git("rev-parse", f"{history.approved}^{{tree}}"))
+        off = self.land_rebased(history, head, switch=None)
+        self.assertEqual(off.returncode, 1, off.stderr)
+        self.assertIn(f"does not descend from {history.approved[:12]}", off.stderr)
+        self.assertEqual(self.carries(), [])
+        forced_off = self.land_rebased(history, head, switch="0")
+        self.assertEqual(forced_off.returncode, 1, forced_off.stderr)
+        on = self.land_rebased(history, head)
+        self.assertEqual(on.returncode, 0, on.stderr)
+        self.assertIn("carried across a rebase", on.stderr)
+        [record] = self.carries()
+        self.assertEqual((record["approved"], record["head"], record["pr"], record["kind"]),
+                         (history.approved, head, 784, "rebase"))
+        self.assertTrue(record["patch_id"])
+        self.assertNotEqual(record["old_base"], record["new_base"])
+        # The file switch turns it on too.
+        (self.guards / "rebase-carry").write_text("", encoding="utf-8")
+        self.assertEqual(self.land_rebased(history, head, switch=None).returncode, 0)
+
+    def test_a_rebase_over_a_base_edit_to_a_pr_file_does_not_carry(self) -> None:
+        # Even a clean rebase: the base edited a file the PR changes, so the
+        # head's blob is no longer the approved one.
+        history = CarryHistory(self.root / "repo")
+        history.on_base(lambda: history.replace_line(50, "line fifty (base)\n"))
+        head = history.rebase()
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("guard.c was changed, renamed or deleted by the base", result.stderr)
+        self.assertEqual(self.carries(), [])
+
+    def test_a_hand_resolved_conflict_does_not_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        history.on_base(lambda: history.replace_line(10, "line ten (base)\n"))
+        head = history.rebase(resolve=lambda: history.write(
+            "guard.c", (history.path / "guard.c").read_text().split("<<<<<<<")[0].encode()
+            + b"  if (!authorized) return;\nline ten (base)\n"
+            + "".join(f"line {n}\n" for n in range(11, 61)).encode()))
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("guard.c was changed, renamed or deleted by the base", result.stderr)
+        self.assertIn("the diff's patch-id changed", result.stderr)
+
+    def test_a_rebase_that_changes_the_patch_does_not_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase(after=lambda: history.append("guard.c", "  backdoor();\n"))
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("the diff's patch-id changed", result.stderr)
+        self.assertIn("guard.c at", result.stderr)
+        self.assertIn("is not the blob approved", result.stderr)
+
+    def test_a_rebase_that_adds_a_file_does_not_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase(after=lambda: history.write("notes.txt", b"new\n"))
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("the set of files the pull request changes moved (notes.txt)", result.stderr)
+
+    def test_a_rebase_that_flips_a_mode_does_not_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase(after=lambda: (history.path / "guard.c").chmod(0o755))
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("does not keep the mode approved", result.stderr)
+
+    def test_a_skipped_required_check_does_not_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase()
+        for conclusion in ("skipped", "neutral"):
+            with self.subTest(conclusion=conclusion):
+                result = self.land_rebased(history, head, conclusion=conclusion)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"required check `macos` on {head[:12]} concluded `{conclusion}`",
+                              result.stderr)
+        self.assertEqual(self.carries(), [])
+
+    def test_a_reused_receipt_on_a_required_check_does_not_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase()
+        reused = self.land_rebased(history, head, receipt="reuse")
+        self.assertEqual(reused.returncode, 1, reused.stderr)
+        self.assertIn(f"required check `macos` on {head[:12]} reused a receipt (inputs unchanged)",
+                      reused.stderr)
+        # Control: a receipt the job refused leaves the check run in full.
+        refused = self.land_rebased(history, head, receipt="refuse")
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+
     def test_a_commit_that_is_not_a_merge_needs_a_new_verdict(self) -> None:
         history = CarryHistory(self.root / "repo")
         history.git("checkout", "-q", "-B", "single", history.approved)
@@ -2296,6 +2433,33 @@ class CarryHistory:
         self.git("commit", "-qm", "Merge branch 'main' into pr")
         return self.git("rev-parse", "HEAD")
 
+    def replace_line(self, number: int, text: str) -> None:
+        lines = (self.path / "guard.c").read_text().splitlines(keepends=True)
+        index = next(i for i, line in enumerate(lines) if line == f"line {number}\n")
+        lines[index] = text
+        self.write("guard.c", "".join(lines).encode())
+
+    def rebase(self, after: Any = None, resolve: Any = None) -> str:
+        """Rebase the approved head onto the base; ``resolve`` settles a
+        conflict by hand, ``after`` amends the rebased head."""
+        self.git("checkout", "-q", "-B", "rebased", self.approved)
+        done = subprocess.run(["git", "rebase", "-q", "main"], cwd=self.path,
+                              capture_output=True, text=True)
+        if done.returncode != 0:
+            if resolve is None:
+                raise AssertionError(f"unexpected conflict: {done.stdout}{done.stderr}")
+            resolve()
+            self.git("add", "-A")
+            subprocess.run(["git", "-c", "core.editor=true", "rebase", "--continue"],
+                           cwd=self.path, capture_output=True, text=True, check=True)
+        elif resolve is not None:
+            raise AssertionError("the rebase was expected to conflict")
+        if after is not None:
+            after()
+            self.git("add", "-A")
+            self.git("commit", "-q", "--amend", "--no-edit")
+        return self.git("rev-parse", "HEAD")
+
     def rewrite(self) -> str:
         """The pull request's change re-made on the base: same content, a
         head that does not descend from the approved one."""
@@ -2303,6 +2467,129 @@ class CarryHistory:
         self.restore("guard.c", self.approved)
         self.git("commit", "-qam", "pr: add guard (rebased)")
         return self.git("rev-parse", "HEAD")
+
+
+class RebaseCarryRenames(unittest.TestCase):
+    """A pull request's rename source is its file too (in-process, over
+    crafted comparison answers, since the git-backed fake lists no renames)."""
+
+    APPROVED, HEAD, OLD, NEW = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+
+    def carry(self, approved_source: str, head_source: str, base_files: list[str]
+              ) -> str | None:
+        def rename(source: str) -> list[dict[str, Any]]:
+            return [{"filename": "b.py", "status": "renamed", "previous_filename": source,
+                     "sha": "1" * 40, "patch": "@@"}]
+
+        def fake(arguments: list[str]) -> Any:
+            path = arguments[-1]
+            if path.endswith(f"compare/main...{self.APPROVED}"):
+                return {"merge_base_commit": {"sha": self.OLD}, "files": rename(approved_source)}
+            if path.endswith(f"compare/main...{self.HEAD}"):
+                return {"merge_base_commit": {"sha": self.NEW}, "files": rename(head_source)}
+            if path.endswith(f"compare/{self.OLD}...{self.NEW}"):
+                return {"status": "ahead", "files": [
+                    {"filename": name, "status": "modified", "sha": "2" * 40, "patch": "@@"}
+                    for name in base_files]}
+            raise AssertionError(f"unexpected read {arguments}")
+
+        with mock.patch.object(guard, "run_real_gh", side_effect=fake), \
+                mock.patch.object(guard, "run_real_gh_text", return_value="diff"), \
+                mock.patch.object(guard, "patch_id", return_value="5" * 40), \
+                mock.patch.object(guard, "tree_modes", return_value={"b.py": 0o100644}), \
+                mock.patch.object(guard, "required_not_run_in_full", return_value=None):
+            refusal, _ = guard.rebase_carry("o/r", "main", self.APPROVED, self.HEAD)
+        return refusal
+
+    def test_a_base_edit_to_the_prs_rename_source_does_not_carry(self) -> None:
+        # The base re-indents a.py; a rebase that keeps the approved b.py drops
+        # it, and patch-id (whitespace-blind) cannot see that.
+        refusal = self.carry("a.py", "a.py", ["a.py"])
+        self.assertIsNotNone(refusal)
+        self.assertIn("a.py was changed, renamed or deleted by the base", refusal)
+        # Control: a base edit elsewhere carries.
+        self.assertIsNone(self.carry("a.py", "a.py", ["elsewhere.py"]))
+
+    def test_a_different_rename_source_does_not_carry(self) -> None:
+        refusal = self.carry("a.py", "c.py", [])
+        self.assertIsNotNone(refusal)
+        self.assertIn("b.py is renamed from c.py", refusal)
+        self.assertNotIn("changed, renamed or deleted by the base", refusal)
+
+
+class BaseTouched(unittest.TestCase):
+    """A file the base renamed or deleted is touched under both of its names."""
+
+    def test_renames_and_deletions_are_touched(self) -> None:
+        touched = guard._base_touched({"files": [
+            {"filename": "new/guard.c", "previous_filename": "guard.c", "status": "renamed"},
+            {"filename": "gone.c", "status": "removed"},
+            {"filename": "edited.c", "status": "modified"},
+        ]})
+        self.assertEqual(touched, {"new/guard.c", "guard.c", "gone.c", "edited.c"})
+        before = {"guard.c": ("modified", "a" * 40, True)}
+        refusal = guard._reapplies_exactly("o/r", "b" * 40, "c" * 40, before, before, touched)
+        self.assertEqual(refusal, "guard.c was changed, renamed or deleted by the base between "
+                                  "the merge bases")
+
+    def test_a_listing_at_the_cap_refuses(self) -> None:
+        with self.assertRaises(guard.GuardError):
+            guard._base_touched({"files": [{"filename": f"f{n}"} for n in range(300)]})
+
+
+class MergeCarryRenames(unittest.TestCase):
+    """The merge-only carry counts rename sources (in-process, over crafted
+    comparison answers, since the git-backed fake lists no renames)."""
+
+    APPROVED, HEAD, OLD, NEW, BASE_TIP = "a" * 40, "b" * 40, "c" * 40, "d" * 40, "e" * 40
+
+    def carry(self, approved_source: str, head_source: str,
+              base_files: list[dict[str, Any]]) -> str | None:
+        def rename(source: str) -> list[dict[str, Any]]:
+            return [{"filename": "b.py", "status": "renamed", "previous_filename": source,
+                     "sha": "1" * 40, "patch": "@@"}]
+
+        def fake(arguments: list[str]) -> Any:
+            path = arguments[-1]
+            if path.endswith(f"compare/{self.APPROVED}...{self.HEAD}"):
+                return {"status": "ahead", "behind_by": 0, "total_commits": 1, "commits": [
+                    {"sha": self.HEAD, "parents": [{"sha": self.APPROVED}, {"sha": self.BASE_TIP}]}]}
+            if path.endswith(f"compare/{self.BASE_TIP}...main"):
+                return {"status": "identical"}
+            if path.endswith(f"compare/main...{self.APPROVED}"):
+                return {"merge_base_commit": {"sha": self.OLD}, "files": rename(approved_source)}
+            if path.endswith(f"compare/main...{self.HEAD}"):
+                return {"merge_base_commit": {"sha": self.NEW}, "files": rename(head_source)}
+            if path.endswith(f"compare/{self.OLD}...{self.NEW}"):
+                return {"status": "ahead", "files": base_files}
+            raise AssertionError(f"unexpected read {arguments}")
+
+        with mock.patch.object(guard, "run_real_gh", side_effect=fake), \
+                mock.patch.object(guard, "tree_modes", return_value={"b.py": 0o100644}):
+            return guard.merge_only_carry("o/r", "main", self.APPROVED, self.HEAD)
+
+    @staticmethod
+    def edited(name: str, previous: str | None = None) -> dict[str, Any]:
+        entry = {"filename": name, "status": "renamed" if previous else "modified",
+                 "sha": "2" * 40, "patch": "@@"}
+        if previous:
+            entry["previous_filename"] = previous
+        return entry
+
+    def test_a_base_edit_to_the_prs_rename_source_does_not_carry(self) -> None:
+        refusal = self.carry("a.py", "a.py", [self.edited("a.py")])
+        self.assertEqual(refusal, "a.py was changed by both the pull request and the base")
+        # Control: a base edit elsewhere carries.
+        self.assertIsNone(self.carry("a.py", "a.py", [self.edited("elsewhere.py")]))
+
+    def test_a_base_rename_of_the_prs_rename_source_does_not_carry(self) -> None:
+        refusal = self.carry("a.py", "a.py", [self.edited("moved.py", previous="a.py")])
+        self.assertEqual(refusal, "a.py was changed by both the pull request and the base")
+
+    def test_a_different_rename_source_does_not_carry(self) -> None:
+        refusal = self.carry("a.py", "c.py", [])
+        self.assertIsNotNone(refusal)
+        self.assertIn("b.py is renamed from c.py", refusal)
 
 
 class TreeModes(unittest.TestCase):

@@ -1,0 +1,5 @@
+[412/1880] Building CXX object core/view/CMakeFiles/pulp-view.dir/src/widgets.cpp.o
+/Users/admin/actions-runner/_work/pulp/pulp/core/view/src/widgets.cpp:2207:18: error: no member named 'set_sprite' in 'pulp::view::Knob'
+ 2207 |     knob->set_sprite(sheet);
+      |     ~~~~  ^
+1 error generated.

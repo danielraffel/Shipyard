@@ -1,0 +1,8 @@
+2026-10-13T12:00:00.0000000Z ##[group]Run ./guard.sh
+2026-10-13T12:00:00.0000000Z ./guard.sh
+2026-10-13T12:00:00.0000000Z shell: /usr/bin/bash -e {0}
+2026-10-13T12:00:00.0000000Z env:
+2026-10-13T12:00:00.0000000Z   CARGO_HOME: /opt/cargo
+2026-10-13T12:00:00.0000000Z   CCACHE_DIR: /tmp/cache
+2026-10-13T12:00:00.0000000Z ##[endgroup]
+2026-10-13T12:00:00.0000000Z ##[error]Process completed with exit code 1.

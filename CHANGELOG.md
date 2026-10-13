@@ -3,6 +3,34 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03250"></a>
+## [0.325.0] - 2026-10-13
+
+- feat/ci cause sinks ([#826](https://github.com/danielraffel/Shipyard/pull/826))
+
+<a id="v03240"></a>
+## [0.324.0] - 2026-10-13
+
+- feat/c2 cause record ([#825](https://github.com/danielraffel/Shipyard/pull/825))
+
+<a id="v03230"></a>
+## [0.323.0] - 2026-10-13
+
+- feat/scorecard case evidence ([#823](https://github.com/danielraffel/Shipyard/pull/823))
+
+<a id="v03220"></a>
+## [0.322.0] - 2026-10-13
+
+- feat/doctor stuck git ops ([#821](https://github.com/danielraffel/Shipyard/pull/821))
+
+<a id="v03213"></a>
+## [0.321.3] - 2026-10-13
+
+- fix/merge carry rename sources ([#828](https://github.com/danielraffel/Shipyard/pull/828))
+- fix/review verdict concurrency ([#827](https://github.com/danielraffel/Shipyard/pull/827))
+- feat/review verdict status ([#824](https://github.com/danielraffel/Shipyard/pull/824))
+- feat/rebase carry ([#822](https://github.com/danielraffel/Shipyard/pull/822))
+
 <a id="v03212"></a>
 ## [0.321.2] - 2026-10-13
 
@@ -2298,6 +2326,11 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.325.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.325.0
+[0.324.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.324.0
+[0.323.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.323.0
+[0.322.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.322.0
+[0.321.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.321.3
 [0.321.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.321.2
 [0.321.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.321.1
 [0.321.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.321.0

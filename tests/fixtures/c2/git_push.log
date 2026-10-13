@@ -1,0 +1,4 @@
+2026-10-06T04:00:00.0000000Z remote: error: GH006: Protected branch update failed for refs/heads/main.
+2026-10-06T04:00:01.0000000Z To https://github.com/Generous-Corp/vellum.git
+2026-10-06T04:00:02.0000000Z  ! [remote rejected] HEAD -> main (protected branch hook declined)
+2026-10-06T04:00:03.0000000Z error: failed to push some refs to 'https://github.com/Generous-Corp/vellum.git'

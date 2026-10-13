@@ -18,6 +18,8 @@ use crate::gh::{
 use crate::identity::RuntimeMode;
 use crate::job::ValidationMode;
 
+pub mod stuck_git;
+
 const RELEASE_CHAIN_WORKFLOW: &str = "auto-release.yml";
 const RELEASE_CHAIN_POLL_ATTEMPTS: usize = 30;
 const RELEASE_CHAIN_POLL_INTERVAL_SECS: u64 = 10;

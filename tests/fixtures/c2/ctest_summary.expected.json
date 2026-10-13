@@ -1,0 +1,20 @@
+[
+ {
+  "format": "ctest_summary",
+  "kind": "test_failure",
+  "subject": "consumption-census-drift",
+  "message": "Failed",
+  "location": "",
+  "line": 4,
+  "step_failed": true
+ },
+ {
+  "format": "ctest_summary",
+  "kind": "test_failure",
+  "subject": "consumption-census-drift-description",
+  "message": "Timeout",
+  "location": "",
+  "line": 5,
+  "step_failed": true
+ }
+]

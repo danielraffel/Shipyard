@@ -1,0 +1,9 @@
+2026-10-05T03:00:00.0000000Z ##[error]The operation was canceled.
+2026-10-05T03:00:01.0000000Z Upload progress stalled. Retrying artifact upload
+2026-10-05T03:00:02.0000000Z /bin/sh: ./pulp: cannot execute binary file: Exec format error
+2026-10-05T03:00:03.0000000Z npm ERR! request to https://registry.npmjs.org/esbuild failed, reason: getaddrinfo ENOTFOUND registry.npmjs.org
+2026-10-05T03:00:04.0000000Z ##[error]The runner has received a shutdown signal. This can happen when the runner service is stopped.
+2026-10-05T03:00:05.0000000Z ##[error]The self-hosted runner: m5s-gate-2 lost communication with the server.
+2026-10-05T03:00:06.0000000Z ccache: error: Failed to create temporary file: No space left on device
+2026-10-05T03:00:07.0000000Z echo "Upload progress stalled is retried by the wrapper"
+2026-10-05T03:00:08.0000000Z fatal: unable to access https://github.com/: Could not resolve host: github.com (EAI_AGAIN)

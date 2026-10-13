@@ -1,0 +1,10 @@
+[
+ {
+  "format": "log_missing",
+  "kind": "log_missing",
+  "subject": "job log unavailable",
+  "message": "BlobNotFound",
+  "location": "",
+  "line": 0
+ }
+]

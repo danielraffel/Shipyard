@@ -215,6 +215,12 @@ to the named head; `unreviewed`, `hold` and `approval_does_not_carry` need a
 reviewer's verdict on the head, which an agent landing its own head must
 never post itself.
 
+`approval_does_not_carry` naming a file the pull request renames from (for
+example "a.py was changed by both the pull request and the base" on a PR that
+renames `a.py` to `b.py`) is not a false refusal: the base edited the rename's
+source, and a merge that keeps the approved `b.py` drops that edit. Re-review
+the merged head.
+
 Two things not to conclude from it:
 
 - **A refusal is usually the `ghapp` queue-arm guard agreeing there is nothing to
@@ -376,8 +382,17 @@ landed against a reviewer, not as a slow review.
 merged pull requests' commits, failed merge-group gates, queue removals other
 than `merged`, each with its merge-head verdict) as JSONL with `label` null,
 plus a receipt with the row count and SHA-256. Label a row only after its
-`label_not_before` (24 h on), when hindsight says whether it was real. Fields
-v1 does not read are present, `null` and named in `unread`; do not fill them
+`label_not_before` (24 h on), when hindsight says whether it was real. Each red
+case with a job also carries `cause` (its `ci.cause/v1` record) and
+`evidence`, read from its job log by C2, the rules-only extractor in
+`src/diagnose/c2.rs` (a port of EXP-A3's, sharing its fixtures); `--causes`
+alone prints the "named causes" share without exporting. Each uncached red job
+costs two API calls, capped per run by `--causes-max-jobs` (default 200, newest
+first); the rest count as unread. A cause is named when its class is not
+`unknown` and its confidence is `high` or `medium`; an exit code, a bare
+annotation, a bare "The operation was canceled." (nothing says who or why)
+or a line outside the failing step is `low` and is not.
+Fields not read are present, `null` and named in `unread`; do not fill them
 by hand. For Pulp, red required checks need `--required-context`, or the
 report says "no required contexts" and exports none of them. Read the receipt before
 counting: when `unread_kinds` lists `required_check_red`, the required
@@ -393,6 +408,42 @@ name or fallback. On Pulp the required `macos` check comes from the `build`
 matrix job, whose `runs-on:` is `fromJSON(matrix.runs_on_json)`, and the run
 shows it on `self-hosted [.., pulp-build-vm, pulp-build-pr-head]`. Quote the
 observed class when saying where a gate runs.
+
+**The guard stops only landings sent through `ghapp`.** GitHub-native
+auto-merge armed before a HOLD (tartci allows it) and Vellum's merge-on-green
+steward, which merges with its own token and reads no verdict, never reach
+`queue-arm-guard`. The `review-verdict` commit status
+(`scripts/review_verdict_status.py`, docs/review-verdict-status.md) is the
+guard's own decision posted on the head; it is report-only until a
+repository requires it. A red `review-verdict` means the guard would refuse
+that head; fix the verdict, not the status.
+
+**To record a cause when the job fails, not after.** In an `if: failure()`
+step, run `shipyard cause extract --log <captured output> --job "<the job's
+display name>" --notice || true`. Pass `--job`: the default is the job's key
+(`GITHUB_JOB`), and a job with `name:` (or a matrix job) is listed by its
+display name, so a record without it never binds. Repeat the job's own
+`name:` expression. For Pulp's build.yml test matrix (its `name:` is
+`macos` for the macos key on pull_request, workflow_dispatch and merge_group
+runs, else `<name> [<provider>]`):
+
+```yaml
+- name: Name the cause
+  if: failure()
+  env:
+    JOB_NAME: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && matrix.key == 'macos' && 'macos' || format('{0} [{1}]', matrix.name, matrix.provider) }}
+  run: shipyard cause extract --log "$RUNNER_TEMP/ctest-evidence/LastTest.full.log" --job "$JOB_NAME" --notice || true
+```
+
+The scorecard keeps a record only as proof that the cause was named during the
+job, and dates it by the jobs API's completion of the step that printed it,
+only when that step started after the failing step completed, never by the
+record's own `named_at`.
+It prints `::notice title=ci-cause::<record>`, so the job's own log holds its
+`ci.cause/v1` record; the scorecard keeps its `named_at` only when the record
+is bound to that job (repo, head, run, attempt, job name) and names the cause
+the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
+<file>` (append-only, one file per month, ids never duplicated).
 
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason
@@ -822,6 +873,7 @@ writer custody before mutation.
 | Proceed with unreachable lanes (VALIDATION GAP) | `shipyard run --allow-unreachable-targets` (prints a loud warning; exits 3 without the flag) |
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |
+| A primary checkout stuck mid cherry-pick / merge / revert / rebase / am, or with a conflicted index, for over an hour | `shipyard doctor` ("Git checkouts": this repo's primary, its pulp/Shipyard/tartci/vellum siblings, `doctor.git_checkouts`). Run its backup commands, then its abort command, and only if nobody is still finishing the operation; doctor itself never aborts |
 | Probe SSH runner reachability | `shipyard doctor --runners --json` |
 | Inspect GitHub REST + GraphQL rate-limit buckets (both separately) | `shipyard doctor --rate-limit --json` (`--repo OWNER/REPO` when remotes are ambiguous) |
 | Inspect effective GitHub auth only | `shipyard auth doctor --json` (`--repo OWNER/REPO` when remotes are ambiguous) |

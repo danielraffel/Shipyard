@@ -1,0 +1,10 @@
+running 3 tests
+test merge::tests::stale_base_is_named ... ok
+test merge::tests::queue_order_is_stable ... FAILED
+
+thread 'merge::tests::queue_order_is_stable' panicked at src/merge/queue.rs:214:9:
+assertion `left == right` failed: batch order changed
+  left: [3, 1]
+ right: [1, 3]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+thread 'steward::tests::rearm_after_rebase' panicked at 'called `Option::unwrap()` on a `None` value', src/steward.rs:77:30

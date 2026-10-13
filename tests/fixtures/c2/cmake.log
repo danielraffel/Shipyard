@@ -1,0 +1,5 @@
+-- Configuring incomplete, errors occurred!
+CMake Error at tools/cmake/PulpSkia.cmake:142 (message):
+  Skia prebuilt not found under external/skia-build/mac-gpu/lib/Release
+Call Stack (most recent call first):
+  CMakeLists.txt:310 (include)

@@ -1,0 +1,38 @@
+[
+ {
+  "format": "ctest_summary",
+  "kind": "test_failure",
+  "subject": "EqCurveView draws a low-pass as a shelf",
+  "message": "Failed",
+  "location": "",
+  "line": 20,
+  "step_failed": true
+ },
+ {
+  "format": "ctest_inline",
+  "kind": "test_failure",
+  "subject": "EqCurveView draws a low-pass as a shelf",
+  "message": "Failed <dur>",
+  "location": "",
+  "line": 5,
+  "step_failed": true
+ },
+ {
+  "format": "catch2",
+  "kind": "assertion",
+  "subject": "EqCurveView draws a low-pass as a shelf",
+  "message": "REQUIRE( curve.db_at(8000.0f) < -6.0f ) => 0.4f < -6.0f",
+  "location": "test_eq_curve.cpp:57",
+  "line": 12,
+  "step_failed": true
+ },
+ {
+  "format": "shell_exit",
+  "kind": "exit_code",
+  "subject": "ctest --test-dir build --output-on-failure",
+  "message": "exit code 8: 12 - EqCurveView draws a low-pass as a shelf (Failed)",
+  "location": "",
+  "line": 21,
+  "step_failed": true
+ }
+]

@@ -1,0 +1,5 @@
+2026-10-13T12:00:00.0000000Z ##[group]Run python3 scripts/skill_sync_check.py --mode report
+2026-10-13T12:00:00.0000000Z python3 scripts/skill_sync_check.py --mode report
+2026-10-13T12:00:00.0000000Z ##[endgroup]
+2026-10-13T12:00:00.0000000Z Skill-sync check FAILED.
+2026-10-13T12:00:00.0000000Z ##[error]Process completed with exit code 1.

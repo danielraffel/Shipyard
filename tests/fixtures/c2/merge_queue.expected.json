@@ -1,0 +1,10 @@
+[
+ {
+  "format": "merge_queue",
+  "kind": "queue_ejection",
+  "subject": "removed_from_merge_queue",
+  "message": "Required status check \"macos\" failed for the merge group ref <hex>",
+  "location": "",
+  "line": 0
+ }
+]

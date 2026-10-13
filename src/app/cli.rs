@@ -293,6 +293,14 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: Box<PrWatchCommand>,
     },
+    /// Name failed jobs' causes as `ci.cause/v1` records with C2, the
+    /// rules-only failing-line extractor, and keep them.
+    #[command(name = "cause")]
+    Cause {
+        /// Cause subcommand.
+        #[command(subcommand)]
+        command: Box<CauseCommand>,
+    },
     /// Read the live test-reuse kill switch, or turn it off and file the
     /// tracking issue. Only the exact value `live` lets a changed-surface plan
     /// skip work; anything else, including unset or unreadable, is shadow.
@@ -1248,6 +1256,7 @@ pub(crate) enum MetricsCommand {
 }
 
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)] // Independent opt-in report switches.
 pub(crate) struct MetricsGateCostArgs {
     /// Owner/repo slug.
     #[arg(long)]
@@ -1312,9 +1321,94 @@ pub(crate) struct MetricsGateCostArgs {
     /// the merge-head verdict. Rows are unlabelled (`label` null,
     /// `label_not_before` 24 h after the case). A receipt with the row count
     /// and the SHA-256 of the file is written next to it as
-    /// `<file>.receipt.json` and printed to stderr.
+    /// `<file>.receipt.json` and printed to stderr. Implies `--causes`, so
+    /// each red case carries its `cause` and `evidence`.
     #[arg(long = "export-cases", value_name = "FILE", requires = "scorecard")]
     pub(crate) export_cases: Option<PathBuf>,
+    /// Also name the cause of every red case: read each red required check's
+    /// and failed merge-group gate's job and log through `shipyard
+    /// diagnose`'s extractor, and report how many have a named cause (`high`
+    /// or `medium` confidence) and the time to it. What a completed job
+    /// yields is cached, never the log.
+    #[arg(long, requires = "scorecard")]
+    pub(crate) causes: bool,
+    /// Most red jobs whose job and log `--causes` (or `--export-cases`)
+    /// fetches in one run, newest first; each costs two GitHub API calls. A
+    /// job whose cause is cached does not count. Jobs over the budget count
+    /// as unreadable ("skipped: over the --causes-max-jobs budget").
+    #[arg(
+        long,
+        requires = "scorecard",
+        default_value_t = crate::gate_cost::scorecard::causes::DEFAULT_MAX_JOBS
+    )]
+    pub(crate) causes_max_jobs: usize,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum CauseCommand {
+    /// Name the cause in one job log. Prints C2's records (`--format c2`)
+    /// or the job's `ci.cause/v1` record (`--format record`, the default);
+    /// with `--notice`, the workflow command that puts the record in the
+    /// job's own log. Where the job ran comes from the flags, else from the
+    /// runner's `GITHUB_*` environment. Never fails the step it runs in:
+    /// only a missing or unreadable log exits non-zero.
+    Extract(CauseExtractArgs),
+    /// Append `ci.cause/v1` records to an append-only archive: one
+    /// `YYYY-MM.jsonl` per month of `named_at` under `--dir`. A record whose
+    /// id is already archived is skipped; nothing is rewritten.
+    Archive(CauseArchiveArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CauseExtractArgs {
+    /// The job log (a step's captured output also works).
+    #[arg(long, value_name = "FILE")]
+    pub(crate) log: PathBuf,
+    /// The job's payload from the jobs API; gives its steps, so the cause is
+    /// read from the failing step.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) job_json: Option<PathBuf>,
+    /// `record` (default) or `c2`.
+    #[arg(long, default_value = "record", value_name = "record|c2")]
+    pub(crate) format: String,
+    /// Print `::notice title=ci-cause::<record>` instead of JSON.
+    #[arg(long)]
+    pub(crate) notice: bool,
+    /// OWNER/REPO; defaults to `GITHUB_REPOSITORY`.
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub(crate) repo: Option<String>,
+    /// Workflow run; defaults to `GITHUB_RUN_ID`.
+    #[arg(long, value_name = "ID")]
+    pub(crate) run_id: Option<u64>,
+    /// Run attempt; defaults to `GITHUB_RUN_ATTEMPT`.
+    #[arg(long)]
+    pub(crate) attempt: Option<u64>,
+    /// Job name as the jobs API shows it; defaults to `GITHUB_JOB` (the job's
+    /// key). A record whose name differs from the job's display name is not
+    /// trusted by the scorecard, so pass the display name for a matrix job.
+    #[arg(long)]
+    pub(crate) job: Option<String>,
+    /// Commit; defaults to the pull request's head from `GITHUB_EVENT_PATH`,
+    /// else `GITHUB_SHA`.
+    #[arg(long, value_name = "SHA")]
+    pub(crate) head_sha: Option<String>,
+    /// Workflow-run event; defaults to `GITHUB_EVENT_NAME`.
+    #[arg(long)]
+    pub(crate) event: Option<String>,
+    /// Pull request, when known.
+    #[arg(long)]
+    pub(crate) pr: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CauseArchiveArgs {
+    /// Archive directory (for example `causes/` in a private labels checkout).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) dir: PathBuf,
+    /// JSONL of `ci.cause/v1` records, or of scorecard case rows (their
+    /// `cause` is taken). Repeatable.
+    #[arg(long = "input", value_name = "FILE", required = true)]
+    pub(crate) inputs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]

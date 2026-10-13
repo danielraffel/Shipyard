@@ -1,0 +1,5 @@
+[413/1880] Building CXX object core/view/CMakeFiles/pulp-view.dir/src/widgets.cpp.o
+FAILED: core/view/CMakeFiles/pulp-view.dir/src/widgets.cpp.o
+/usr/bin/c++ -O3 -DNDEBUG -c core/view/src/widgets.cpp
+ninja: build stopped: subcommand failed.
+make[2]: *** [test/CMakeFiles/pulp-test-osc.dir/test_osc.cpp.o] Error 1

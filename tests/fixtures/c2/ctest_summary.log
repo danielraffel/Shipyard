@@ -1,0 +1,8 @@
+2026-09-28T23:45:27.4088710Z Total Test time (real) =  28.71 sec
+2026-09-28T23:45:27.4088850Z 
+2026-09-28T23:45:27.4088920Z The following tests FAILED:
+2026-09-28T23:45:27.4089190Z 	21430 - consumption-census-drift (Failed)                 pr-fast
+2026-09-28T23:45:27.4089550Z 	21431 - consumption-census-drift-description (Timeout)     pr-fast
+2026-09-28T23:45:27.4091110Z Errors while running CTest
+2026-09-28T23:45:27.5000000Z ##[group]Run git log --format='%h - %s (%an)' -3
+2026-09-28T23:45:27.5000010Z 	1 - restore build cache (hit)

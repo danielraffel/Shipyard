@@ -1,0 +1,74 @@
+[
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "operation canceled",
+  "message": "The operation was canceled.",
+  "location": "",
+  "line": 1,
+  "step_failed": true
+ },
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "upload stalled",
+  "message": "Upload progress stalled. Retrying artifact upload",
+  "location": "",
+  "line": 2,
+  "step_failed": true
+ },
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "exec format error",
+  "message": "/bin/sh: ./pulp: cannot execute binary file: Exec format error",
+  "location": "",
+  "line": 3,
+  "step_failed": true
+ },
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "ENOTFOUND",
+  "message": "npm ERR! request to https://registry.npmjs.org/esbuild failed, reason: getaddrinfo ENOTFOUND registry.npmjs.org",
+  "location": "",
+  "line": 4,
+  "step_failed": true
+ },
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "runner shutdown signal",
+  "message": "The runner has received a shutdown signal. This can happen when the runner service is stopped.",
+  "location": "",
+  "line": 5,
+  "step_failed": true
+ },
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "runner lost communication",
+  "message": "The self-hosted runner: m5s-gate-2 lost communication with the server.",
+  "location": "",
+  "line": 6,
+  "step_failed": true
+ },
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "disk full",
+  "message": "ccache: error: Failed to create temporary file: No space left on device",
+  "location": "",
+  "line": 7,
+  "step_failed": true
+ },
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "EAI_AGAIN",
+  "message": "fatal: unable to access https://github.com/: Could not resolve host: github.com (EAI_AGAIN)",
+  "location": "",
+  "line": 9,
+  "step_failed": true
+ }
+]

@@ -1,0 +1,4 @@
+2026-10-01T09:12:00.0000000Z ##[group]Run tools/ci/pr_fast_tier.sh
+2026-10-01T09:14:31.0000000Z 1/1 Test #9113: wide-non-native-selftest ...........***Failed    0.41 sec
+2026-10-01T09:14:32.0000000Z ##[error]wide-non-native-selftest failed on this pull request head; it is a test this diff reaches, and it would fail the merge group too
+2026-10-01T09:14:32.1000000Z ##[error]Process completed with exit code 1.

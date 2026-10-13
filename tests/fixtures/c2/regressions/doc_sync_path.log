@@ -1,0 +1,7 @@
+2026-10-13T12:00:00.0000000Z ##[group]Run python3 scripts/doc_sync_check.py --mode report
+2026-10-13T12:00:00.0000000Z python3 scripts/doc_sync_check.py --mode report
+2026-10-13T12:00:00.0000000Z ##[endgroup]
+2026-10-13T12:00:00.0000000Z ✗ docs/ship-state-machine.md: mapped paths changed without updating the doc.
+2026-10-13T12:00:00.0000000Z     - src/app/auto_merge_cmd.rs
+2026-10-13T12:00:00.0000000Z ✗ doc: mapped paths changed without their guide (.shipyard/config.toml -> docs/guides/local-ci.md)
+2026-10-13T12:00:00.0000000Z ##[error]Process completed with exit code 1.

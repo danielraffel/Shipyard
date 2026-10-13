@@ -1,0 +1,9 @@
+2026-09-28T23:45:21.2452310Z ======================================================================
+2026-09-28T23:45:21.2637790Z FAIL: test_committed_lists_match_the_checkout (__main__.HeaderNameDrift.test_committed_lists_match_the_checkout)
+2026-09-28T23:45:21.2740380Z ----------------------------------------------------------------------
+2026-09-28T23:45:21.2853710Z Traceback (most recent call last):
+2026-09-28T23:45:21.3041150Z   File "/Users/admin/actions-runner/_work/pulp/pulp/tools/scripts/test_consumption_census.py", line 124, in test_committed_lists_match_the_checkout
+2026-09-28T23:45:21.3143900Z     self.assertEqual(names, cc.header_names(REPO_ROOT, root), root)
+2026-09-28T23:45:21.3345750Z AssertionError: Lists differ: ['a.hpp'] != ['b.hpp']
+2026-09-28T23:45:21.4558200Z ----------------------------------------------------------------------
+2026-09-28T23:45:21.4677530Z Ran 14 tests in 0.602s

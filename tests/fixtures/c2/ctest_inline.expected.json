@@ -1,0 +1,38 @@
+[
+ {
+  "format": "ctest_inline",
+  "kind": "test_failure",
+  "subject": "consumption-census-negative-contract",
+  "message": "Failed Required regular expression not found. Regex=[case=valid-current] <dur>",
+  "location": "",
+  "line": 2,
+  "step_failed": true
+ },
+ {
+  "format": "ctest_inline",
+  "kind": "test_failure",
+  "subject": "gpu-resource-lock-smoke",
+  "message": "Timeout <dur>",
+  "location": "",
+  "line": 4,
+  "step_failed": true
+ },
+ {
+  "format": "ctest_inline",
+  "kind": "test_failure",
+  "subject": "WorkerPool cold-idles workers without blocking later batches",
+  "message": "Failed <dur>",
+  "location": "",
+  "line": 5,
+  "step_failed": true
+ },
+ {
+  "format": "ctest_inline",
+  "kind": "test_failure",
+  "subject": "Knob sprite sheet decodes",
+  "message": "SEGFAULT <dur>",
+  "location": "",
+  "line": 6,
+  "step_failed": true
+ }
+]

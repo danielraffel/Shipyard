@@ -1,0 +1,29 @@
+[
+ {
+  "format": "gate_policy",
+  "kind": "gate_policy",
+  "subject": "Skill-sync",
+  "message": "core/view/src/widgets.cpp maps to skill view-bridge but .agents/skills/view-bridge/SKILL.md is unchanged",
+  "location": "",
+  "line": 1,
+  "step_failed": true
+ },
+ {
+  "format": "gate_policy",
+  "kind": "gate_policy",
+  "subject": "config-doc",
+  "message": "mapped paths changed without their guide (.shipyard/config.toml -> docs/guides/local-ci.md)",
+  "location": "",
+  "line": 2,
+  "step_failed": true
+ },
+ {
+  "format": "gate_policy",
+  "kind": "gate_policy",
+  "subject": "Native macOS leg",
+  "message": "failing macos gate closed (conclusion=cancelled)",
+  "location": "",
+  "line": 3,
+  "step_failed": true
+ }
+]

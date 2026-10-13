@@ -183,7 +183,15 @@ project will automatically recover or merge every PR.
   ejections, red required checks), plus each merged PR's merge-head verdict,
   naming PRs that merged with a HOLD on their head. `--export-cases FILE`
   writes the cases it read as unlabelled JSONL with a SHA-256 receipt, for
-  labelling later.
+  labelling later. `--causes` (implied by `--export-cases`) reads each red
+  case's job log through C2, the rules-only failing-line extractor behind
+  `shipyard diagnose` (`src/diagnose/c2.rs`, one fixture per log format),
+  puts its `ci.cause/v1` record and evidence lines on the row (a record the
+  job printed with `shipyard cause extract --notice` lends its time only when
+  it is bound to that job and names the same cause), and
+  reports the share of red cases with a named cause and the time to it.
+  `--causes-max-jobs` (default 200) caps the job logs one run reads; the rest
+  are reported as skipped.
 - **Rules-first PR watching.** `shipyard pr-watch scan` flags open PRs stuck
   in a way a person should look at, read-only by default.
   `shipyard pr-watch rules` wakes an agent only when something changed (a

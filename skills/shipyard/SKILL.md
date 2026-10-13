@@ -230,6 +230,20 @@ and are deliberate:
 - A fixture's `package.json` or an example's `Cargo.toml` is a fact marked
   `incidental`, and makes no label.
 
+## `doctor`: a git operation left in progress
+
+`shipyard doctor` has a "Git checkouts" section. It reads the primary
+checkout of the repository it runs in, its sibling checkouts named pulp,
+Shipyard, tartci and vellum when they exist, and every path in
+`doctor.git_checkouts`. A cherry-pick, merge, revert, rebase or `git am` whose
+state (`CHERRY_PICK_HEAD`, `MERGE_HEAD`, `REVERT_HEAD`, `rebase-merge/`,
+`rebase-apply/`), or a conflicted index with no such marker, is older than an
+hour is a failing row with the exact commands to back it up (a
+`shipyard-backup/...` branch at HEAD, the working-tree patch, the status, a
+copy of the operation's state) and then abort it. It only reports: run the
+backup commands before the abort, and never abort an operation someone may
+still be finishing. A checkout it cannot read is a failing row, never "clean".
+
 ## Core Rule
 
 Preserve the user's active Shipyard install and rollback path. Rust Shipyard is
@@ -1553,9 +1567,53 @@ Read `hold` as "merged anyway": the week names those pull requests.
 scorecard read (a red required check on a merged pull request's commit, a
 merge-group gate that did not pass, a queue removal other than `merged`), with
 `<FILE>.receipt.json` holding the row count and the file's SHA-256. Label a
-row no sooner than its `label_not_before`. v1 reads only those three sources
-and the merge-head verdict; `evidence`, `rule_verdict`, `cancel_cause`,
-`receipt_same_tree` and `outage_window` are `null` and listed in `unread`.
+row no sooner than its `label_not_before`. A red case with a job also gets
+`cause`, its `ci.cause/v1` record, and `evidence` (the record's excerpt).
+The record is EXP-A3's `to_ci_cause_v1` mapping of C2's first record:
+`repo`, `run_id`, `attempt`, `job_id`, `job`, `head_sha`, `event`, `pr`,
+`failed_step`, `failure_class`, `format`, `signature`, `detail`, `evidence`
+(`log_line`, `excerpt`), `fix_hint`, `confidence`, `source`, `extractor`,
+`named_at`, `supersedes`, plus C2's `kind`, `location` and `step_failed` and
+`retrospective`. C2 (`src/diagnose/c2.rs`) is a port of EXP-A3's
+`c2_extract.py`; the fixture set in `tests/fixtures/c2/` is shared verbatim
+and is the contract, so a rule change lands in both with its fixture.
+Records from the step that ended in `##[error]` come first, so a retried
+assertion never outranks the runner dying. A cause is named when its class is
+not `unknown` and its confidence is `high` or `medium`. `diagnose` adds only
+GitHub's own record (a runner that never came, a supersede, a timeout) when
+the log names nothing more certain; a log with no recognized line still gets
+a `shell-exit` record, so the miss is counted. A job that named its own cause (`shipyard cause extract --log <captured
+output> --notice` in an `if: failure()` step, which logs `##[notice]<record>`)
+only shows that its cause was named during the job: the scorecard still
+builds the cause from the log, and only when the record is bound to the
+payload (repo, head, run, attempt, job name) and names the same cause does it
+mark the cause not retrospective (counted as "named in the job itself"), with
+`named_at` set to the jobs API's completion of the step that printed the
+record, and only for a step that started once the failing step had completed
+(pull-request code runs in earlier steps and could print a matching record
+before anything failed). The record's own `named_at` is never used. Pull-request code can print any line, so
+a record is never trusted for its content; a forged one is ignored. Records
+in the log are blanked before C2 reads it, so their quoted lines are not read
+as evidence. On a `pull_request` run the record's head comes from
+`GITHUB_EVENT_PATH` (`GITHUB_SHA` is the test merge commit); pass `--job` with
+the display name when it differs from the job key. `shipyard diagnose
+--annotate plan|post` puts every failing required job's record in the check
+run's `output.text`, and `shipyard cause archive --dir <labels
+checkout>/causes --input <cases.jsonl>` appends records to `YYYY-MM.jsonl`
+files, skipping ids already archived (append-only, so a private corpus never
+loses a line). A job whose
+log GitHub no longer holds is still judged from its payload. `--causes` reads the same causes without
+exporting and adds "named causes: N/M red cases" with the time to them.
+Each uncached red job costs two API calls, so at most `--causes-max-jobs`
+(default 200) are fetched per run, newest first; cached jobs are free. The
+rest are unreadable with "skipped: over the --causes-max-jobs budget" and the
+report shows `budget` and `skipped_for_budget`: an over-budget case is unread,
+never a cause.
+Causes are retrospective: `named_at` is the job's completion, the earliest an
+extractor could have named it, not when anyone did. `rule_verdict`,
+`cancel_cause`, `receipt_same_tree` and `outage_window` stay `null` and listed
+in `unread`, and so does `evidence` when causes were not read or a job could
+not be.
 `merge_head_verdict` is `null` on every `merge_group_gate_failed` row (a
 batch is not one pull request) and on a `queue_removal` of a pull request that
 did not merge in the window; a `required_check_red` row always has one. The
@@ -3558,10 +3616,19 @@ and classic-merges only an approved head on every path (`ship`, the validated
 arm, the classic merge, the steward backstop); `--arm` overrides it and names
 who did. A merge-only update carries the approval only when every file the PR
 changes keeps its approved blob and mode (the compare API lists no mode, so
-both twins read the files' directory trees), the base changed none of them,
+both twins read the files' directory trees), the base changed none of them
+(a rename counts under both names, so a base edit to a file the PR renames
+from refuses, and a rename must keep its approved source),
 and no binary changed; with the host switch off, the guard reads nothing for
 this rule, while Shipyard's own paths still honour a repository's explicit
-`arm_requires_head_approval = true`. `queue-arm-guard` refuses an unreviewed arm or direct merge through
+`arm_requires_head_approval = true`. A rebase carries only in
+`queue-arm-guard`, only on a host with a `rebase-carry` guards file (or
+`SHIPYARD_REBASE_CARRY=1`), and only when the diff's `git patch-id --stable`,
+the file set, a base that touched (changed, renamed or deleted) none of the
+PR's files with every file keeping its approved blob and mode, and the
+absence of a skipped, neutral or receipt-reused required check all agree;
+each carry is a line in `carries.jsonl`. Shipyard's own arm paths never carry a rebase.
+`queue-arm-guard` refuses an unreviewed arm or direct merge through
 `ghapp` the same way, requires the request to bind the approved head
 (`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts only the
 fleet App and OWNER/MEMBER/COLLABORATOR verdicts; its override,
@@ -3577,7 +3644,11 @@ after it has validated a head, which happens only while a Shipyard process is
 alive; native auto-merge is server-owned, so a pull request whose ship lost its
 merge phase still lands instead of sitting green, unqueued and unarmed. Arming
 never fails the ship: a refusal is normally the guard agreeing there is nothing
-to arm.
+to arm. The `review-verdict`
+commit status (`scripts/review_verdict_status.py`) posts that same decision
+on every pull request's head from a workflow, so a repository can require it
+and stop landings that never pass through `ghapp`
+(docs/review-verdict-status.md).
 
 Unlike Shipyard's validated enqueue, these requests deliberately do **not**
 carry `SHIPYARD_INTERNAL_QUEUE_MUTATION`, so the arm guard judges them — an
