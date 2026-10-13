@@ -760,6 +760,13 @@ request's whole trail before emitting a trail-dependent event.
 `scripts/watch_inputs.py` (`cmux`, `hosts`, `gate-serving`) supplies its
 `--input-events` for Codex tab states and gate-host serving; every line carries
 a `fix` object (what, evidence, cause, command, safe_to_auto_apply, verify).
+`scripts/rules_watch_score.py` scores a replay against labelled turns. Read
+every variant against `--control-shift-hours N`: a recall that does not beat
+the shifted events is density, not detection. For persistent conditions
+(hosts, Codex sessions), `kind_episode` groups turns no more than
+`--episode-gap-hours` (2) apart into one episode. Its per-turn recall credits a
+whole episode to one early event, so judge a host reader by the "episodes
+recalled at their opening turn" line, not by per-turn recall.
 
 `shipyard pr-watch liveness` exits 1 when this scanning host's last completed
 pass is older than `[pr_watch] stale_after_minutes` (45); `doctor --fleet` asks
