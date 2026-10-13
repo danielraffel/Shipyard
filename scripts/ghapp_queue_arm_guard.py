@@ -1020,15 +1020,32 @@ def _same_patch(old_diff: str, new_diff: str, record: dict[str, Any]) -> str | N
     return None
 
 
+def _rename_sources(compare: dict[str, Any]) -> dict[str, str]:
+    """``filename -> previous_filename`` for every rename a comparison lists."""
+    return {
+        item["filename"]: item["previous_filename"]
+        for item in compare.get("files") or []
+        if isinstance(item, dict) and isinstance(item.get("filename"), str)
+        and isinstance(item.get("previous_filename"), str)
+    }
+
+
 def _same_files(before: dict[str, tuple[str, str, bool]], after: dict[str, tuple[str, str, bool]],
-                head: str) -> str | None:
-    """Condition 2: the same files, with the same status."""
+                head: str, before_sources: dict[str, str] | None = None,
+                after_sources: dict[str, str] | None = None) -> str | None:
+    """Condition 2: the same files, with the same status and, for a rename,
+    the same source."""
     if sorted(before) != sorted(after):
         changed = sorted(set(before) ^ set(after))
         return f"the set of files the pull request changes moved ({changed[0]})"
     for name in sorted(before):
         if before[name][0] != after[name][0]:
             return f"{name} is {after[name][0]} at {head[:12]}, {before[name][0]} when approved"
+    before_sources, after_sources = before_sources or {}, after_sources or {}
+    for name in sorted(before):
+        if before_sources.get(name) != after_sources.get(name):
+            return (f"{name} is renamed from {after_sources.get(name) or 'nothing'} at {head[:12]}, "
+                    f"from {before_sources.get(name) or 'nothing'} when approved")
     return None
 
 
@@ -1053,7 +1070,7 @@ def _base_touched(moved: dict[str, Any]) -> set[str]:
 def _reapplies_exactly(repo: str, approved: str, head: str,
                        before: dict[str, tuple[str, str, bool]],
                        after: dict[str, tuple[str, str, bool]],
-                       base_touched: set[str]) -> str | None:
+                       base_touched: set[str], rename_sources: set[str] | None = None) -> str | None:
     """Condition 3: re-applying the approved diff onto the new merge base gives
     exactly the new head's tree. That is proved, not computed: the base touched
     (changed, renamed or deleted) none of the pull request's files between the
@@ -1062,7 +1079,9 @@ def _reapplies_exactly(repo: str, approved: str, head: str,
     binary = sorted(name for name, (_, _, has_patch) in before.items() if not has_patch)
     if binary:
         return f"the pull request changes a binary file ({binary[0]})"
-    both = sorted(set(before) & base_touched)
+    # A rename's source is the pull request's file too: a base edit to it
+    # would be dropped by a rebase that keeps the approved destination.
+    both = sorted((set(before) | set(after) | (rename_sources or set())) & base_touched)
     if both:
         return f"{both[0]} was changed, renamed or deleted by the base between the merge bases"
     for name, (status, approved_blob, _) in sorted(before.items()):
@@ -1118,6 +1137,8 @@ def rebase_carry(repo: str, base: str, approved: str, head: str) -> tuple[str | 
             return f"the new merge base {new_base[:12]} does not descend from {old_base[:12]}", record
         before = _pr_files(before_compare, f"compare/{base}...{approved[:12]}")
         after = _pr_files(after_compare, f"compare/{base}...{head[:12]}")
+        before_sources = _rename_sources(before_compare)
+        after_sources = _rename_sources(after_compare)
         base_touched = _base_touched(moved) if moved.get("status") == "ahead" else set()
         record["files"] = len(before)
         diff_header = ["-H", "Accept: application/vnd.github.diff"]
@@ -1125,8 +1146,9 @@ def rebase_carry(repo: str, base: str, approved: str, head: str) -> tuple[str | 
         new_diff = run_real_gh_text(["api", *diff_header, f"repos/{repo}/compare/{new_base}...{head}"])
         reasons = [reason for reason in (
             _same_patch(old_diff, new_diff, record),
-            _same_files(before, after, head),
-            _reapplies_exactly(repo, approved, head, before, after, base_touched),
+            _same_files(before, after, head, before_sources, after_sources),
+            _reapplies_exactly(repo, approved, head, before, after, base_touched,
+                               set(before_sources.values()) | set(after_sources.values())),
             required_not_run_in_full(repo, base, head),
         ) if reason is not None]
     except GuardError as error:

@@ -2469,6 +2469,54 @@ class CarryHistory:
         return self.git("rev-parse", "HEAD")
 
 
+class RebaseCarryRenames(unittest.TestCase):
+    """A pull request's rename source is its file too (in-process, over
+    crafted comparison answers, since the git-backed fake lists no renames)."""
+
+    APPROVED, HEAD, OLD, NEW = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+
+    def carry(self, approved_source: str, head_source: str, base_files: list[str]
+              ) -> str | None:
+        def rename(source: str) -> list[dict[str, Any]]:
+            return [{"filename": "b.py", "status": "renamed", "previous_filename": source,
+                     "sha": "1" * 40, "patch": "@@"}]
+
+        def fake(arguments: list[str]) -> Any:
+            path = arguments[-1]
+            if path.endswith(f"compare/main...{self.APPROVED}"):
+                return {"merge_base_commit": {"sha": self.OLD}, "files": rename(approved_source)}
+            if path.endswith(f"compare/main...{self.HEAD}"):
+                return {"merge_base_commit": {"sha": self.NEW}, "files": rename(head_source)}
+            if path.endswith(f"compare/{self.OLD}...{self.NEW}"):
+                return {"status": "ahead", "files": [
+                    {"filename": name, "status": "modified", "sha": "2" * 40, "patch": "@@"}
+                    for name in base_files]}
+            raise AssertionError(f"unexpected read {arguments}")
+
+        with mock.patch.object(guard, "run_real_gh", side_effect=fake), \
+                mock.patch.object(guard, "run_real_gh_text", return_value="diff"), \
+                mock.patch.object(guard, "patch_id", return_value="5" * 40), \
+                mock.patch.object(guard, "tree_modes", return_value={"b.py": 0o100644}), \
+                mock.patch.object(guard, "required_not_run_in_full", return_value=None):
+            refusal, _ = guard.rebase_carry("o/r", "main", self.APPROVED, self.HEAD)
+        return refusal
+
+    def test_a_base_edit_to_the_prs_rename_source_does_not_carry(self) -> None:
+        # The base re-indents a.py; a rebase that keeps the approved b.py drops
+        # it, and patch-id (whitespace-blind) cannot see that.
+        refusal = self.carry("a.py", "a.py", ["a.py"])
+        self.assertIsNotNone(refusal)
+        self.assertIn("a.py was changed, renamed or deleted by the base", refusal)
+        # Control: a base edit elsewhere carries.
+        self.assertIsNone(self.carry("a.py", "a.py", ["elsewhere.py"]))
+
+    def test_a_different_rename_source_does_not_carry(self) -> None:
+        refusal = self.carry("a.py", "c.py", [])
+        self.assertIsNotNone(refusal)
+        self.assertIn("b.py is renamed from c.py", refusal)
+        self.assertNotIn("changed, renamed or deleted by the base", refusal)
+
+
 class BaseTouched(unittest.TestCase):
     """A file the base renamed or deleted is touched under both of its names."""
 

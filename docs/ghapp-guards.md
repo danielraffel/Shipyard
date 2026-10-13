@@ -146,12 +146,15 @@ fails:
 
 * the pull request's diff (each head against its own merge base, read as
   `application/vnd.github.diff`) has the same `git patch-id --stable`;
-* it changes the same files, with the same status;
+* it changes the same files, with the same status and, for a rename, the same
+  source;
 * re-applying the approved diff onto the new merge base gives exactly the new
   head's tree. That is proved rather than computed: the new merge base
   descends from the old one, the base touched none of the pull request's
   files between the two merge bases (changed, renamed or deleted: a rename
-  counts under both names), and every file keeps its approved blob and mode,
+  counts under both names, on the base's side and on the pull request's, so a
+  base edit to a file the pull request renames from refuses), and every file
+  keeps its approved blob and mode,
   so a conflict resolved by hand never carries. A binary change, or a base
   comparison at GitHub's 300-file cap, refuses. Conditions 1 and 3 must agree:
   a changed patch-id refuses even when condition 3 holds;
