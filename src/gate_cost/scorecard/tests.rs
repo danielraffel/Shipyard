@@ -558,6 +558,8 @@ fn pr(number: u64, created: &str, merged: &str, checks: &[(&str, &str)]) -> Merg
                     name: (*name).to_owned(),
                     outcome: Some((*outcome).to_owned()),
                     at: None,
+                    job_id: None,
+                    run_id: None,
                 })
                 .collect(),
         }],
@@ -670,6 +672,8 @@ fn a_rerun_supersedes_the_run_it_repeats_in_either_order() {
                 name: "macos".to_owned(),
                 outcome: Some("SUCCESS".to_owned()),
                 at: Some(at("2026-10-05T11:30:00Z")),
+                job_id: None,
+                run_id: None,
             }]
         );
     }
@@ -1298,6 +1302,25 @@ fn the_receipt_counts_the_rows_and_hashes_the_bytes() {
         assert_eq!(receipt.sha256, hex::encode(sha2::Sha256::digest(&bytes)));
     }
     assert_eq!(receipt.from, "2026-10-05T15:00:00Z");
+}
+
+#[test]
+fn a_check_run_carries_its_job_and_run_ids_and_a_status_context_none() {
+    let contexts = vec![
+        serde_json::json!({"__typename": "CheckRun", "name": "macos", "conclusion": "FAILURE", "completedAt": "2026-10-05T10:30:00Z", "databaseId": 115_009_634_572_u64, "checkSuite": {"workflowRun": {"databaseId": 38_308_868_279_u64}}}),
+        serde_json::json!({"__typename": "StatusContext", "context": "status/ci", "state": "ERROR", "createdAt": "2026-10-05T10:00:00Z"}),
+    ];
+    let checks = latest_by_name(&contexts);
+    assert_eq!(
+        checks
+            .iter()
+            .map(|check| (check.name.as_str(), check.job_id, check.run_id))
+            .collect::<Vec<_>>(),
+        vec![
+            ("macos", Some(115_009_634_572), Some(38_308_868_279)),
+            ("status/ci", None, None),
+        ]
+    );
 }
 
 /// An in-progress merge-group gate has no conclusion yet and is not a case;

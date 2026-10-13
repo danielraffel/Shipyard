@@ -1548,9 +1548,22 @@ Read `hold` as "merged anyway": the week names those pull requests.
 scorecard read (a red required check on a merged pull request's commit, a
 merge-group gate that did not pass, a queue removal other than `merged`), with
 `<FILE>.receipt.json` holding the row count and the file's SHA-256. Label a
-row no sooner than its `label_not_before`. v1 reads only those three sources
-and the merge-head verdict; `evidence`, `rule_verdict`, `cancel_cause`,
-`receipt_same_tree` and `outage_window` are `null` and listed in `unread`.
+row no sooner than its `label_not_before`. A red case with a job also gets
+`cause` (class, signature, confidence, failing step and tests, `diagnose`'s
+class and rule, `named_at`) and `evidence` (the decisive log lines), read
+through `diagnose::build`; a job whose log GitHub no longer holds is still
+diagnosed from its payload. `--causes` reads the same causes without
+exporting and adds "named causes: N/M red cases" with the time to them.
+Each uncached red job costs two API calls, so at most `--causes-max-jobs`
+(default 200) are fetched per run, newest first; cached jobs are free. The
+rest are unreadable with "skipped: over the --causes-max-jobs budget" and the
+report shows `budget` and `skipped_for_budget`: an over-budget case is unread,
+never a cause.
+Causes are retrospective: `named_at` is the job's completion, the earliest an
+extractor could have named it, not when anyone did. `rule_verdict`,
+`cancel_cause`, `receipt_same_tree` and `outage_window` stay `null` and listed
+in `unread`, and so does `evidence` when causes were not read or a job could
+not be.
 `merge_head_verdict` is `null` on every `merge_group_gate_failed` row (a
 batch is not one pull request) and on a `queue_removal` of a pull request that
 did not merge in the window; a `required_check_red` row always has one. The
