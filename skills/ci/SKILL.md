@@ -306,6 +306,17 @@ Its source is `scripts/ghapp_merge_guard.sh`, its test
 `scripts/test_ghapp_merge_guard.py` (CI's Python helper tests), and it is a
 managed guard, so `shipyard guards install` places the tested copy and
 `guards status` reports a drifted one.
+
+## A HOLD now dequeues or disarms its head
+
+`verdict-hold-hook` (managed, `scripts/ghapp_verdict_hold_hook.py`) runs before
+every `ghapp` command and never refuses. When a `verdict: HOLD head:<sha>`
+comment or a REQUEST_CHANGES review is about to post and that pull request is
+queued or armed at exactly that sha, it dequeues or disarms it through the real
+`gh` first and logs to `holds.jsonl`. Only on a host with `hold-disarms` in the
+guards directory (or `SHIPYARD_HOLD_DISARMS=1`). If it prints "could not take
+… out of the landing path", the HOLD still posted: check `autoMergeRequest`
+and `headRefOid` yourself and ask the steward to disarm or dequeue.
 ## The merge path arms native auto-merge; it never enqueues
 
 `shipyard auto-merge` / `ship` admit a PR to a merge queue by arming native

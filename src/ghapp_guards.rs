@@ -1,7 +1,7 @@
 //! Install and audit the `ghapp` wrapper's optional queue guards.
 //!
 //! `scripts/ghapp` runs `queue-removal-guard`, `queue-arm-guard`,
-//! `branch-refresh-guard` and `merge-guard` from
+//! `branch-refresh-guard`, `merge-guard` and `verdict-hold-hook` from
 //! `$SHIPYARD_GHAPP_GUARDS_DIR` (default `~/.config/shipyard/guards`) when they
 //! are present and executable. Nothing else puts them there, so a host keeps
 //! whatever copy somebody placed by hand, possibly months stale. This module
@@ -41,7 +41,7 @@ pub struct ManagedGuard {
 /// Every guard `shipyard guards install` manages, in install order: the arm
 /// and branch-refresh guards import the removal guard's request parser, so the
 /// parser lands first.
-pub const MANAGED_GUARDS: [ManagedGuard; 4] = [
+pub const MANAGED_GUARDS: [ManagedGuard; 5] = [
     ManagedGuard {
         name: "queue-removal-guard",
         source_path: "scripts/ghapp_queue_removal_guard.py",
@@ -64,6 +64,13 @@ pub const MANAGED_GUARDS: [ManagedGuard; 4] = [
         name: "merge-guard",
         source_path: "scripts/ghapp_merge_guard.sh",
         contents: include_bytes!("../scripts/ghapp_merge_guard.sh"),
+    },
+    // Before a HOLD verdict posts, dequeues or disarms that pull request at
+    // exactly that head. Never refuses; loads the removal guard's parser.
+    ManagedGuard {
+        name: "verdict-hold-hook",
+        source_path: "scripts/ghapp_verdict_hold_hook.py",
+        contents: include_bytes!("../scripts/ghapp_verdict_hold_hook.py"),
     },
 ];
 
