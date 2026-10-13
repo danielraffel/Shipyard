@@ -3506,8 +3506,11 @@ Shipyard when their base is silent, on a host that sets
 and classic-merges only an approved head on every path (`ship`, the validated
 arm, the classic merge, the steward backstop); `--arm` overrides it and names
 who did. A merge-only update carries the approval only when every file the PR
-changes keeps its approved blob, the base changed none of them, and no binary
-changed; with the host switch off, the guard reads nothing for this rule. `queue-arm-guard` refuses an unreviewed arm or direct merge through
+changes keeps its approved blob and mode (the compare API lists no mode, so
+both twins read the files' directory trees), the base changed none of them,
+and no binary changed; with the host switch off, the guard reads nothing for
+this rule, while Shipyard's own paths still honour a repository's explicit
+`arm_requires_head_approval = true`. `queue-arm-guard` refuses an unreviewed arm or direct merge through
 `ghapp` the same way, requires the request to bind the approved head
 (`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts only the
 fleet App and OWNER/MEMBER/COLLABORATOR verdicts; its override,

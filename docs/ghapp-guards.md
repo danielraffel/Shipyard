@@ -70,6 +70,15 @@ inert whatever the base config says and on any Python. Updating the binary or
 the guards changes nothing until a host turns it on; roll it out one host at a
 time.
 
+Off differs in one place between the two twins, deliberately. Shipyard's own
+arming and merge paths (Rust) still honour a repository that sets
+`[auto_merge] arm_requires_head_approval = true` itself, on every host: that
+key is the repository's own opt-in and predates the host switch. The guard
+cannot: off means it reads nothing, which is what keeps it inert on a Python
+without `tomllib`. No fleet repository sets the key today, so off hosts behave
+the same through both paths; a repository that sets it should expect raw
+`ghapp` landings on off hosts to pass the guard.
+
 With it on, the guard reads `.shipyard/config.toml` on the PR's base:
 `[auto_merge] arm_requires_head_approval` decides when set, either way. When
 the base is silent, the repositories in `REVIEW_REQUIRED_REPOS`
@@ -115,6 +124,10 @@ head no verdict names. The approval carries to it only when all of these hold:
 * every file the PR changes has the same blob at the new head as at the
   approved head (`files[].sha` of `compare/<base>...<head>`), so a merge that
   moves a line or swaps content cannot pass;
+* every file the PR changes keeps its mode. The comparison lists no mode, so
+  the guard reads each file's directory tree at both heads (GraphQL
+  `object(expression: "<sha>:<dir>")` entries' `mode`); a merge that only
+  flips an executable bit keeps the blob but not the mode;
 * no file the PR changes was also changed by the base between the two merge
   bases;
 * the PR changes no binary file (a file with no text patch).
@@ -124,11 +137,20 @@ GitHub's 300-file cap), needs a new verdict. A HOLD naming the new head is
 never overridden by a carry.
 
 The refusal names the head, the exact marker it needs, and the latest verdict
-when it approves a different head:
+when it approves a different head. Each refusal is followed by one
+`queue-arm-guard: fix:` line of JSON with `what`, `evidence` (the pull
+request's URL), `cause` (`unreviewed`, `hold`, `approval_does_not_carry`,
+`unbound`, `head_moved` or `unreadable`), `command`, `safe_to_auto_apply` and
+`verify`:
 
 ```
-queue-arm-guard: refusing to arm or merge an unreviewed head: PR #511 (danielraffel/tartci): no reviewer verdict names head 52eda5490844 ... Post the verdict on the PR, then land it bound to that head.
+queue-arm-guard: refusing to arm or merge an unreviewed head: PR #511 (danielraffel/tartci): no reviewer verdict names head 52eda5490844 ... Each `queue-arm-guard: fix:` line below says what to do next.
+queue-arm-guard: fix: {"cause": "unreviewed", "command": "a reviewer (the fleet App, or an OWNER, MEMBER or COLLABORATOR who is not the author) reviews head 52eda549... and posts a comment ending `verdict: APPROVE head:52eda549...` on https://github.com/danielraffel/tartci/pull/511", "evidence": "https://github.com/danielraffel/tartci/pull/511", "safe_to_auto_apply": false, ...}
 ```
+
+Only a re-read (`head_moved`, `unreadable`) is safe to apply unattended.
+Binding a request (`unbound`) is still a landing, and approving is a
+reviewer's act: an agent landing its own head must not post the verdict.
 
 An unreadable pull request, policy or comment list refuses.
 

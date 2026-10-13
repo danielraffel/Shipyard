@@ -300,7 +300,7 @@ class NewHeadIsDecidedBySha(unittest.TestCase):
 def stub_review(case: unittest.TestCase) -> None:
     """Allow every review: these cases decide queue state; ReviewBeforeArm decides review."""
     patcher = mock.patch.object(
-        guard, "review_gate", return_value=(True, "reviewed (stubbed for queue-state cases)")
+        guard, "review_gate", return_value=(True, "reviewed (stubbed for queue-state cases)", None)
     )
     patcher.start()
     case.addCleanup(patcher.stop)
@@ -1733,6 +1733,22 @@ def git_compare(repo, argv):
         files.append(entry)
     return {"status": status, "ahead_by": ahead, "behind_by": behind, "total_commits": ahead,
             "merge_base_commit": {"sha": base}, "commits": commits, "files": files}
+def git_trees(repo, argv):
+    import re as _re
+    found = {}
+    for alias, expression in _re.findall(r'(d\d+):object\(expression:("(?:[^"\\]|\\.)*")\)', argv):
+        commit, _, directory = json.loads(expression).partition(":")
+        listing = _sp.run(["git", "ls-tree", f"{commit}:{directory}" if directory else commit],
+                          cwd=repo, capture_output=True, text=True)
+        if listing.returncode != 0:
+            found[alias] = None
+            continue
+        entries = []
+        for line in listing.stdout.splitlines():
+            meta, name = line.split("\t", 1)
+            entries.append({"name": name, "mode": int(meta.split()[0], 8)})
+        found[alias] = {"entries": entries}
+    return {"data": {"repository": found}}
 """
 
 
@@ -1767,6 +1783,8 @@ class ReviewBeforeArm(unittest.TestCase):
             "for needle, answer in answers:\n"
             "    if needle not in argv:\n"
             "        continue\n"
+            "    if 'git_tree' in answer:\n"
+            "        sys.stdout.write(json.dumps(git_trees(answer['git_tree'], argv))); sys.exit(0)\n"
             "    if 'git' in answer:\n"
             "        sys.stdout.write(json.dumps(git_compare(answer['git'], argv))); sys.exit(0)\n"
             "    if 'error' in answer:\n"
@@ -1909,6 +1927,41 @@ class ReviewBeforeArm(unittest.TestCase):
         stale = self.arm(784, "danielraffel/Shipyard", self.approved_784(), bind=HOLD_784)
         self.assertEqual(stale.returncode, 1, stale.stderr)
         self.assertIn("binds cb5c1f796dac, but the head is fd0e94e25f44", stale.stderr)
+
+    def fixes(self, stderr: str) -> list[dict[str, Any]]:
+        prefix = "queue-arm-guard: fix: "
+        return [json.loads(line[len(prefix):]) for line in stderr.splitlines()
+                if line.startswith(prefix)]
+
+    def test_every_review_refusal_says_what_to_do_next(self) -> None:
+        head = review_fixture("tartci-513-pull.json")["head"]["sha"]
+        unreviewed = self.arm(513, "danielraffel/tartci", self.case("tartci-513"))
+        self.assertEqual(unreviewed.returncode, 1, unreviewed.stderr)
+        [fix] = self.fixes(unreviewed.stderr)
+        self.assertEqual(set(fix), {"what", "evidence", "cause", "command",
+                                    "safe_to_auto_apply", "verify"})
+        self.assertEqual(fix["cause"], "unreviewed")
+        self.assertEqual(fix["evidence"], "https://github.com/danielraffel/tartci/pull/513")
+        self.assertIn(f"`verdict: APPROVE head:{head}`", fix["command"])
+        self.assertIs(fix["safe_to_auto_apply"], False, "approving is the reviewer's act")
+        self.assertIn(head, fix["verify"])
+        unbound = self.run_guard(["pr", "merge", "784", "--auto"], self.approved_784(),
+                                 "danielraffel/Shipyard")
+        [fix] = self.fixes(unbound.stderr)
+        self.assertEqual(fix["cause"], "unbound")
+        live = review_fixture("shipyard-784-pull.json")["head"]["sha"]
+        self.assertIn(f"--match-head-commit {live}", fix["command"])
+        self.assertIs(fix["safe_to_auto_apply"], False)
+        self.assertIn("on the REST merge.", unbound.stderr)
+        self.assertNotIn("Post the verdict", unbound.stderr)
+        # An allowed landing prints no fix.
+        pages = review_fixture("tartci-513-comments.json")
+        verdict = comment_like(pages[0][0], id=2, created_at="2026-10-12T23:00:00Z",
+                               body=f"verdict: APPROVE head:{head}")
+        allowed = self.arm(513, "danielraffel/tartci",
+                           self.case("tartci-513", comments=[pages[0] + [verdict]]))
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(self.fixes(allowed.stderr), [])
 
     def test_the_host_switch_decides_for_a_silent_repository(self) -> None:
         for host in ("0", None):
@@ -2082,6 +2135,7 @@ class ReviewBeforeArm(unittest.TestCase):
             body=f"verdict: APPROVE head:{history.approved}")]
         answers = self.case("shipyard-784", graphql=graphql, queue=False, comments=[trail])
         answers.insert(0, ("compare/", {"git": str(history.path)}))
+        answers.insert(0, ("object(expression:", {"git_tree": str(history.path)}))
         return [(needle, {"json": pull}) if needle == "/pulls/" else (needle, answer)
                 for needle, answer in answers]
 
@@ -2110,6 +2164,21 @@ class ReviewBeforeArm(unittest.TestCase):
         result = self.land(history, head)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("changes a binary file (x.bin)", result.stderr)
+
+    def test_a_merge_that_only_flips_a_prs_file_mode_needs_a_new_verdict(self) -> None:
+        # The compare API lists no mode, so the blob alone looks unchanged.
+        history = CarryHistory(self.root / "repo")
+        head = history.merge(edit=lambda: (history.path / "guard.c").chmod(0o755))
+        self.assertEqual(history.git("rev-parse", f"{head}:guard.c"),
+                         history.git("rev-parse", f"{history.approved}:guard.c"))
+        self.assertEqual(history.git("ls-tree", head, "guard.c").split()[0], "100755")
+        self.assertEqual(history.git("ls-tree", history.approved, "guard.c").split()[0], "100644")
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("guard.c at", result.stderr)
+        self.assertIn("does not keep the mode approved", result.stderr)
+        # Control: the honest merge reads the same trees and carries.
+        self.assertEqual(self.land(history, history.merge()).returncode, 0)
 
     def test_a_merge_that_adds_a_line_needs_a_new_verdict(self) -> None:
         history = CarryHistory(self.root / "repo")
@@ -2234,6 +2303,26 @@ class CarryHistory:
         self.restore("guard.c", self.approved)
         self.git("commit", "-qam", "pr: add guard (rebased)")
         return self.git("rev-parse", "HEAD")
+
+
+class TreeModes(unittest.TestCase):
+    """Each file's mode is its own entry's, even behind a sibling with another mode."""
+
+    def test_each_file_reads_its_own_entry(self) -> None:
+        queries: list[str] = []
+
+        def fake(arguments: list[str]) -> Any:
+            queries.append(" ".join(arguments))
+            return json.loads('''{"data": {"repository": {
+            "d0": {"entries": [{"name": "a.sh", "mode": 33261}, {"name": "guard.c", "mode": 33188}]},
+            "d1": {"entries": [{"name": "run", "mode": 33261}, {"name": "tool.py", "mode": 33188}]}}}}''')
+
+        with mock.patch.object(guard, "run_real_gh", side_effect=fake):
+            modes = guard.tree_modes("o/r", "abc", ["guard.c", "bin/sub/tool.py", "bin/sub/gone.txt"])
+        self.assertIn('d0:object(expression:"abc:")', queries[0])
+        self.assertIn('d1:object(expression:"abc:bin/sub")', queries[0])
+        self.assertEqual(modes, {"guard.c": 0o100644, "bin/sub/tool.py": 0o100644,
+                                 "bin/sub/gone.txt": None})
 
 
 class ReviewIdentity(unittest.TestCase):

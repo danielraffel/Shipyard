@@ -1046,9 +1046,49 @@ impl History {
         self.git(&["rev-parse", "HEAD"])
     }
 
+    /// GitHub's answer to a tree query: each `dN:object(expression:"<sha>:<dir>")`
+    /// alias's entries, from `git ls-tree`.
+    fn trees(&self, query: &str) -> String {
+        const MARK: &str = ":object(expression:";
+        let mut repository = serde_json::Map::new();
+        for (at, _) in query.match_indices(MARK) {
+            let alias: String = query[..at]
+                .chars()
+                .rev()
+                .take_while(char::is_ascii_alphanumeric)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let rest = &query[at + MARK.len()..];
+            let literal = &rest[..rest.find(')').expect("literal")];
+            let expression: String = serde_json::from_str(literal).expect("string");
+            let (commit, directory) = expression.split_once(':').expect("sha:dir");
+            let spec = if directory.is_empty() {
+                commit.to_owned()
+            } else {
+                expression.clone()
+            };
+            let entries: Vec<Value> = self
+                .git(&["ls-tree", &spec])
+                .lines()
+                .map(|line| {
+                    let (meta, name) = line.split_once('\t').expect("ls-tree line");
+                    let mode = meta.split_whitespace().next().expect("mode");
+                    json!({"name": name, "mode": u64::from_str_radix(mode, 8).expect("octal")})
+                })
+                .collect();
+            repository.insert(alias, json!({"entries": entries}));
+        }
+        json!({"data": {"repository": repository}}).to_string()
+    }
+
     /// GitHub's answer to the carry's reads of this repository.
     fn gh(&self, args: &[String]) -> Result<String, String> {
         let joined = args.join(" ");
+        if joined.contains(":object(expression:") {
+            return Ok(self.trees(&joined));
+        }
         if joined.contains("contents/.shipyard/config.toml") {
             return Err("gh: Not Found (HTTP 404)".to_owned());
         }
@@ -1214,6 +1254,72 @@ fn a_merge_that_swaps_a_binary_the_pr_touches_needs_a_new_verdict() {
         history.refusal(&head),
         "the pull request changes a binary file (x.bin)"
     );
+}
+
+/// Each file's mode is its own entry's, even when a sibling with another
+/// mode is listed first, and a file its directory does not list has none.
+#[test]
+fn tree_modes_reads_each_files_own_entry() {
+    let gh = |args: &[String]| -> Result<String, String> {
+        let query = args.join(" ");
+        assert!(query.contains("d0:object(expression:\"abc:\")"), "{query}");
+        assert!(
+            query.contains("d1:object(expression:\"abc:bin/sub\")"),
+            "{query}"
+        );
+        Ok(json!({"data": {"repository": {
+            "d0": {"entries": [{"name": "a.sh", "mode": 33261}, {"name": "guard.c", "mode": 33188}]},
+            "d1": {"entries": [{"name": "run", "mode": 33261}, {"name": "tool.py", "mode": 33188}]}}}})
+        .to_string())
+    };
+    let modes = super::tree_modes(
+        &gh,
+        "o/r",
+        "abc",
+        &["guard.c", "bin/sub/tool.py", "bin/sub/gone.txt"],
+    )
+    .expect("read");
+    assert_eq!(modes.get("guard.c"), Some(&0o100_644));
+    assert_eq!(modes.get("bin/sub/tool.py"), Some(&0o100_644));
+    assert_eq!(modes.get("bin/sub/gone.txt"), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_merge_that_only_flips_a_prs_file_mode_needs_a_new_verdict() {
+    use std::os::unix::fs::PermissionsExt;
+    let history = History::new(false);
+    let head = history.merge(|history| {
+        let path = history.dir.path().join("guard.c");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    });
+    // The blob is unchanged; only the mode moved, which compare cannot show.
+    assert_eq!(
+        history.git(&["rev-parse", &format!("{head}:guard.c")]),
+        history.git(&["rev-parse", &format!("{}:guard.c", history.approved)])
+    );
+    assert!(
+        history
+            .git(&["ls-tree", &head, "guard.c"])
+            .starts_with("100755")
+    );
+    assert!(matches!(history.gate(&head), HeadGate::NotApproved { .. }));
+    assert_eq!(
+        history.refusal(&head),
+        format!(
+            "guard.c at {} does not keep the mode approved at {}",
+            &head[..12],
+            &history.approved[..12]
+        )
+    );
+    // Control: the honest merge reads the same trees and carries.
+    let honest = history.merge(|_| {});
+    assert!(matches!(
+        history.gate(&honest),
+        HeadGate::Approved {
+            approval: Approval::Carried { .. }
+        }
+    ));
 }
 
 #[test]

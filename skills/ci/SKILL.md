@@ -207,6 +207,14 @@ never strict.
 an approved pull request produces a new head with no approval, so it stays
 disarmed until it is approved again.
 
+A `ghapp` landing the guard refuses for review prints one
+`queue-arm-guard: fix: {json}` line per refusal (`what`, `evidence`, `cause`,
+`command`, `safe_to_auto_apply`, `verify`). Act on `cause`: `head_moved` and
+`unreadable` are re-reads you may run; `unbound` means repeat the landing bound
+to the named head; `unreviewed`, `hold` and `approval_does_not_carry` need a
+reviewer's verdict on the head, which an agent landing its own head must
+never post itself.
+
 Two things not to conclude from it:
 
 - **A refusal is usually the `ghapp` queue-arm guard agreeing there is nothing to

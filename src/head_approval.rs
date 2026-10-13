@@ -258,7 +258,8 @@ pub enum Approval {
         performed_via_github_app_id: Option<u64>,
     },
     /// An approval of an earlier head, carried to this one by merge-only
-    /// updates that left the pull request's own lines byte-identical.
+    /// updates that left every file the pull request changes at its approved
+    /// blob and mode.
     Carried {
         /// The head the approval names.
         from_head: String,
@@ -1224,8 +1225,8 @@ fn compare_files(run_gh: RunGh<'_>, repo: &str, range: &str) -> Result<PrFiles, 
 ///
 /// It carries only when every commit on the first-parent chain from `to`
 /// back to `from` is a two-parent merge whose merged parent is on the base,
-/// and every file the pull request changes has, at `to`, the same blob it
-/// had at `from`. A file the base also changed since `from`, or any binary
+/// and every file the pull request changes has, at `to`, the same blob and
+/// mode it had at `from`. A file the base also changed since `from`, or any binary
 /// change in the pull request, needs a new verdict: a merge could move or
 /// swap content that a diff of the changed lines cannot see.
 ///
@@ -1281,6 +1282,27 @@ pub fn merge_only_carry(
             ));
         }
     }
+    // The comparison carries no file mode, so a merge that only flips a
+    // file's executable bit keeps its blob: read the modes themselves.
+    let present: Vec<&str> = before
+        .iter()
+        .filter(|(_, (status, _, _))| status != "removed")
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !present.is_empty() {
+        let approved_modes = tree_modes(run_gh, repo, from, &present)?;
+        let head_modes = tree_modes(run_gh, repo, to, &present)?;
+        if let Some(name) = present
+            .iter()
+            .find(|name| approved_modes.get(**name) != head_modes.get(**name))
+        {
+            return Err(format!(
+                "{name} at {} does not keep the mode approved at {}",
+                short(to),
+                short(from)
+            ));
+        }
+    }
     if base_before != base_after {
         let (moved, _) = compare_files(run_gh, repo, &format!("{base_before}...{base_after}"))?;
         if let Some(name) = before.keys().find(|name| moved.contains_key(*name)) {
@@ -1290,6 +1312,81 @@ pub fn merge_only_carry(
         }
     }
     Ok(())
+}
+
+/// Directories read per GraphQL query by [`tree_modes`].
+const TREE_BATCH: usize = 50;
+
+/// Each of `names`' git mode at `commit` (absent when the file is), read from
+/// its directory's tree.
+fn tree_modes(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    commit: &str,
+    names: &[&str],
+) -> Result<std::collections::BTreeMap<String, u64>, String> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository {repo:?}"))?;
+    let mut by_dir: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for path in names {
+        let directory = path.rsplit_once('/').map_or("", |(directory, _)| directory);
+        by_dir.entry(directory).or_default().push(path);
+    }
+    let directories: Vec<&str> = by_dir.keys().copied().collect();
+    let quote = |text: &str| Value::String(text.to_owned()).to_string();
+    let mut modes = std::collections::BTreeMap::new();
+    for batch in directories.chunks(TREE_BATCH) {
+        let mut fields = String::new();
+        for (index, directory) in batch.iter().enumerate() {
+            let _ = std::fmt::Write::write_fmt(
+                &mut fields,
+                format_args!(
+                    "d{index}:object(expression:{}){{...on Tree{{entries{{name mode}}}}}}",
+                    quote(&format!("{commit}:{directory}"))
+                ),
+            );
+        }
+        let query = format!(
+            "query{{repository(owner:{},name:{}){{{fields}}}}}",
+            quote(owner),
+            quote(name)
+        );
+        let value = gh_json(
+            run_gh,
+            &[
+                "api".to_owned(),
+                "graphql".to_owned(),
+                "-f".to_owned(),
+                format!("query={query}"),
+            ],
+        )?;
+        if value.get("errors").is_some() {
+            return Err(format!("the trees at {} are unreadable", short(commit)));
+        }
+        let repository = value
+            .pointer("/data/repository")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("the trees at {} are unreadable", short(commit)))?;
+        for (index, directory) in batch.iter().enumerate() {
+            let entries = repository
+                .get(&format!("d{index}"))
+                .and_then(|tree| tree.get("entries"))
+                .and_then(Value::as_array);
+            for path in &by_dir[directory] {
+                let base = path.rsplit_once('/').map_or(*path, |(_, base)| base);
+                let mode = entries.into_iter().flatten().find_map(|entry| {
+                    (entry.get("name").and_then(Value::as_str) == Some(base))
+                        .then(|| entry.get("mode").and_then(Value::as_u64))
+                        .flatten()
+                });
+                if let Some(mode) = mode {
+                    modes.insert((*path).to_owned(), mode);
+                }
+            }
+        }
+    }
+    Ok(modes)
 }
 
 /// Every commit on the first-parent chain from `to` back to `from` is a
