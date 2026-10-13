@@ -477,6 +477,7 @@ mod tests {
 
     fn queued_run(id: u64, workflow: &str, branch: &str, created_at: &str) -> QueuedRun {
         QueuedRun {
+            head_sha: String::new(),
             database_id: id,
             name: workflow.to_owned(),
             head_branch: branch.to_owned(),
@@ -664,6 +665,7 @@ mod tests {
         created_at: &str,
     ) -> QueuedRun {
         QueuedRun {
+            head_sha: String::new(),
             database_id: id,
             name: workflow.to_owned(),
             head_branch: branch.to_owned(),
@@ -688,6 +690,7 @@ mod tests {
         run_started_at: Option<&str>,
     ) -> QueuedRun {
         QueuedRun {
+            head_sha: String::new(),
             run_started_at: run_started_at.map(ToOwned::to_owned),
             ..run_with_status(id, "Coverage", branch, "in_progress", created_at)
         }
@@ -894,6 +897,7 @@ mod tests {
         // reaped even though a stray recent `run_started_at` is present.
         let now = Utc::now();
         let queued = vec![QueuedRun {
+            head_sha: String::new(),
             run_started_at: Some((now - ChronoDuration::minutes(1)).to_rfc3339()),
             ..run_with_status(
                 4,

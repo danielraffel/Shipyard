@@ -157,6 +157,8 @@ pub struct QueuedRun {
     pub name: String,
     /// Branch associated with the run.
     pub head_branch: String,
+    /// Commit the run tested; empty when the answer carried none.
+    pub head_sha: String,
     /// GitHub event that created the run (`pull_request`, `merge_group`, etc.).
     pub event: String,
     /// ISO-8601 creation timestamp.
@@ -927,6 +929,23 @@ impl GitHubActions {
         parse_run_metadata(&stdout)
     }
 
+    /// The commit a branch of `repository` points at now.
+    pub fn branch_head_sha(&self, repository: &str, branch: &str) -> Result<String, GitHubError> {
+        let stdout = self.run_gh(&[
+            "api".to_owned(),
+            format!("repos/{repository}/git/ref/heads/{branch}"),
+        ])?;
+        serde_json::from_str::<Value>(&stdout)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/object/sha")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .ok_or_else(|| GitHubError::new(format!("no head commit for branch {branch}")))
+    }
+
     /// Fetch a PR's head ref from GitHub.
     pub fn pr_head_ref(&self, repository: &str, pr: u64) -> Result<Option<String>, GitHubError> {
         let args = vec![
@@ -1615,6 +1634,11 @@ pub fn parse_queued_runs(stdout: &str) -> Result<Vec<QueuedRun>, GitHubError> {
             workflow_name: name.clone(),
             name,
             head_branch,
+            head_sha: run
+                .get("head_sha")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             event,
             created_at,
             run_started_at,

@@ -2217,6 +2217,7 @@ mod tests {
 
     fn queued_run(id: u64, workflow: &str, branch: &str, created_at: &str) -> QueuedRun {
         QueuedRun {
+            head_sha: String::new(),
             database_id: id,
             name: format!("{workflow} run"),
             head_branch: branch.to_owned(),

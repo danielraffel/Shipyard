@@ -3143,8 +3143,10 @@ pub(super) struct RescueArgs {
     pub(super) provider: Option<String>,
     /// Also recover completed runs that ended cancelled / failed / timed-out
     /// (e.g. a watchdog sweep, or a flaky required leg): a `pull_request` run
-    /// has its failed jobs re-run in place, keeping its merge ref; any other
-    /// run gets a dispatched replacement.
+    /// has its failed jobs re-run in place, keeping its merge ref, when it is
+    /// the latest run of its workflow on its branch's current head (other
+    /// such runs are skipped as superseded); any other run gets a dispatched
+    /// replacement.
     #[arg(long = "rerun-failed", action = ArgAction::SetTrue)]
     pub(super) rerun_failed: bool,
     /// Plan the rescue without acting.
