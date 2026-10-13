@@ -3537,9 +3537,10 @@ this rule, while Shipyard's own paths still honour a repository's explicit
 `arm_requires_head_approval = true`. A rebase carries only in
 `queue-arm-guard`, only on a host with a `rebase-carry` guards file (or
 `SHIPYARD_REBASE_CARRY=1`), and only when the diff's `git patch-id --stable`,
-the file set, an exact strict re-application onto the new merge base, and
-the absence of a skipped or neutral required check all agree; each carry is a
-line in `carries.jsonl`. Shipyard's own arm paths never carry a rebase.
+the file set, a base that touched (changed, renamed or deleted) none of the
+PR's files with every file keeping its approved blob and mode, and the
+absence of a skipped, neutral or receipt-reused required check all agree;
+each carry is a line in `carries.jsonl`. Shipyard's own arm paths never carry a rebase.
 `queue-arm-guard` refuses an unreviewed arm or direct merge through
 `ghapp` the same way, requires the request to bind the approved head
 (`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts only the

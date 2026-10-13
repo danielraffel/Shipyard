@@ -148,16 +148,19 @@ fails:
   `application/vnd.github.diff`) has the same `git patch-id --stable`;
 * it changes the same files, with the same status;
 * re-applying the approved diff onto the new merge base gives exactly the new
-  head's blob, and the approved mode, for every file it changes: a file the
-  base did not touch between the two merge bases must keep its approved blob,
-  and one the base did touch is re-applied with a strict `git apply` to the
-  base's new blob and must hash to the head's, so a conflict resolved by hand
-  never carries. The new merge base must descend from the old one. A binary
-  change, a base that touched more than 50 of the pull request's files, or a
-  base comparison at GitHub's 300-file cap refuses;
-* no required check on the new head has concluded `skipped` or `neutral`. The
-  carry covers the review only; required checks run on the new head as on any
-  other.
+  head's tree. That is proved rather than computed: the new merge base
+  descends from the old one, the base touched none of the pull request's
+  files between the two merge bases (changed, renamed or deleted: a rename
+  counts under both names), and every file keeps its approved blob and mode,
+  so a conflict resolved by hand never carries. A binary change, or a base
+  comparison at GitHub's 300-file cap, refuses. Conditions 1 and 3 must agree:
+  a changed patch-id refuses even when condition 3 holds;
+* no required check on the new head has concluded `skipped` or `neutral`, or
+  carries a `shipyard-receipt-decision` annotation with verdict `reuse` (see
+  [validation signals](validation-signals.md)). The carry covers the review
+  only; required checks run on the new head as on any other. A rebase always
+  makes a new tree, so a receipt bound to the approved head's exact tree never
+  applies to the carried head.
 
 Every carry appends one JSON line (repository, pull request, both heads, both
 merge bases, the patch-id, the file count, argv) to `carries.jsonl` in the
