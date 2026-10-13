@@ -211,6 +211,20 @@ invalid timestamps produce unavailable queue coverage; do not synthesize
 submit-to-receipt, cache, or model-token measurements. New providers must bind
 those values to authenticated durable events before they are imported.
 
+## `doctor`: a git operation left in progress
+
+`shipyard doctor` has a "Git checkouts" section. It reads the primary
+checkout of the repository it runs in, its sibling checkouts named pulp,
+Shipyard, tartci and vellum when they exist, and every path in
+`doctor.git_checkouts`. A cherry-pick, merge, revert, rebase or `git am` whose
+state (`CHERRY_PICK_HEAD`, `MERGE_HEAD`, `REVERT_HEAD`, `rebase-merge/`,
+`rebase-apply/`), or a conflicted index with no such marker, is older than an
+hour is a failing row with the exact commands to back it up (a
+`shipyard-backup/...` branch at HEAD, the working-tree patch, the status, a
+copy of the operation's state) and then abort it. It only reports: run the
+backup commands before the abort, and never abort an operation someone may
+still be finishing. A checkout it cannot read is a failing row, never "clean".
+
 ## Core Rule
 
 Preserve the user's active Shipyard install and rollback path. Rust Shipyard is
