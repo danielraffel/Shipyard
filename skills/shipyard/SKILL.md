@@ -1481,10 +1481,22 @@ shipyard metrics summary --project pulp --group-by host --json
 shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
 shipyard metrics gate-cost --scorecard --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --from 2026-09-28T00:00:00Z --to 2026-10-12T00:00:00Z --json
+shipyard metrics gate-cost --scorecard --flakes --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 14d --no-cache --json
 shipyard metrics watch --project pulp --since 14d --json   # required gates first; --required <check> overrides config
 shipyard metrics advise --project pulp --json
 shipyard metrics compare --project pulp --baseline github-hosted --candidate macstudio --json
 ```
+
+`gate-cost --scorecard --flakes` (use `--since 14d`) adds same-SHA flakes to
+the success-rate scorecard below: tests whose `CTest` results in the gate
+job's logs include both a pass and a failure on one head commit, over the
+window's `pull_request`, `merge_group` and `workflow_dispatch` runs. A `retry` is one job showing both
+(`ctest --repeat until-pass` passing a failed test on its retry); a `rerun` is
+different jobs on the commit disagreeing. The top ten are ranked by the number
+of such commits, each with links to its jobs. It is a report: it changes no
+label and quarantines nothing. It reads the log of every completed gate job in
+the window once (what a log yields is cached), so the first run over fourteen
+days of Pulp is long.
 
 `gate-cost --scorecard` is the success-rate scorecard. It reports per ISO
 week: open-to-merge median and p90, the merge-queue ejection rate (removals by

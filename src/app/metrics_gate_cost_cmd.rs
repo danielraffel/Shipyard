@@ -30,6 +30,7 @@ pub(super) fn gate_cost_command<W: Write>(
     let now = Utc::now();
     let no_cache = args.no_cache;
     let scorecard = args.scorecard;
+    let flakes = args.flakes;
     let required_contexts = args.required_contexts.clone();
     let query = resolve_query(args, &config, now)?;
     let cache = if no_cache {
@@ -55,13 +56,22 @@ pub(super) fn gate_cost_command<W: Write>(
         };
         let observation = scorecard::gather(&reader, &query, &cache)
             .map_err(|error| CliFailure::new(1, format!("scorecard read failed: {error}")))?;
-        let report = scorecard::compute(&observation);
+        let mut report = scorecard::compute(&observation);
+        if flakes {
+            let read = scorecard::flakes::gather(&reader, &cache, &query)
+                .map_err(|error| CliFailure::new(1, format!("flake read failed: {error}")))?;
+            report.same_sha_flakes = Some(scorecard::flakes::compute(&query.repo, &read));
+        }
         if json_output {
             write_pretty_json(stdout, &report)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
         } else {
             write!(stdout, "{}", scorecard::render(&report))
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            if let Some(flakes) = &report.same_sha_flakes {
+                write!(stdout, "{}", scorecard::flakes::render(flakes))
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            }
         }
         return Ok(std::process::ExitCode::SUCCESS);
     }

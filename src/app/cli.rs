@@ -1191,6 +1191,11 @@ pub(crate) enum MetricsCommand {
     ///   repeat failures = check names red on two or more pull requests.
     /// Required contexts are the base's classic protection, or
     /// `--required-context`.
+    /// same-SHA flakes (with --flakes) = tests whose `CTest` result lines in
+    /// the gate job's logs, over the window's `pull_request`, `merge_group`
+    /// and `workflow_dispatch` runs, include both a pass and a failure on one head
+    /// commit: in one job (a `--repeat` retry) or across its jobs (a
+    /// re-run). Ranked by such commits; a report only.
     ///
     /// Every list is paginated completely; a read whose length disagrees with
     /// the API's `total_count` fails instead of reporting a smaller number.
@@ -1246,6 +1251,11 @@ pub(crate) struct MetricsGateCostArgs {
     /// required checks, and check names red across pull requests.
     #[arg(long)]
     pub(crate) scorecard: bool,
+    /// Also list the tests that both passed and failed on one head commit in
+    /// the window (a `--repeat` retry, or a re-run), top ten by commits,
+    /// reading the log of every completed gate job. Use `--since 14d`.
+    #[arg(long, requires = "scorecard")]
+    pub(crate) flakes: bool,
     /// Required context for the scorecard's red-after-push rate, in place of
     /// the base branch protection's. Repeatable.
     #[arg(long = "required-context", requires = "scorecard")]

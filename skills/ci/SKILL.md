@@ -352,6 +352,29 @@ happened while `macos` passed, because another of Pulp's six required contexts
 failed. With `itemTypes`, `timelineItems.totalCount` counts the whole
 timeline; check the read against `filteredCount`.
 
+## Reading CTest out of a job log
+
+`gate_cost::ctest_log` reads a job's `CTest` output; three things in Pulp's
+logs first read as a broken reader:
+
+- **Steps share a second.** A step's `started_at`/`completed_at` are whole
+  seconds and several steps often start in the same one (on Pulp's `macos` job,
+  steps 2, 3 and 4 all at 21:14:13), so a step's lines cannot be cut out by
+  timestamps alone. Each `run` step opens with one `##[group]Run` header; map
+  headers to steps in order, moving past any step that had ended before the
+  header's second. `Set up job`, `Complete job` and `Post` steps write no
+  header.
+- **A retry has no progress prefix.** `ctest --repeat until-pass:2` prints
+  `Test #8: name ...***Failed` again without the `9/22655` in front, so one
+  test can read as failed and then passed in one job.
+- **A pull request's `macos` check may run no tests.** When no native build is
+  needed, Pulp's `macos` job is a stand-in with none of the test steps. Read it
+  as having selected nothing, not as an unreadable head; and do not fetch its
+  log.
+
+Job logs also disappear (`BlobNotFound`, HTTP 404) for some older attempts;
+treat that as unread, never as no failures.
+
 ## A unit test must not see the host's GitHub auth
 
 CI runs every test with `SHIPYARD_TEST_HOME` set to the runner's temp

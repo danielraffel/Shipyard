@@ -55,6 +55,8 @@ use super::{
     read_run_jobs, resolved_gate_jobs, round2, strings, text, timestamp,
 };
 
+pub mod flakes;
+
 /// Report schema identifier.
 pub const SCHEMA: &str = "shipyard-gate-cost-scorecard/v1";
 /// GitHub search returns at most this many results for one query.
@@ -320,6 +322,10 @@ pub struct ScorecardReport {
     pub weeks: Vec<WeekScore>,
     /// Reads that were incomplete or not cross-checked.
     pub gaps: Vec<TelemetryGap>,
+    /// Tests that both passed and failed on one head commit in the window;
+    /// present with `--flakes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_sha_flakes: Option<flakes::SameShaFlakes>,
 }
 
 /// Check-run conclusions and status states that make a check red.
@@ -1149,6 +1155,7 @@ pub fn compute(observation: &ScorecardObservation) -> ScorecardReport {
         required_source,
         weeks,
         gaps,
+        same_sha_flakes: None,
     }
 }
 
