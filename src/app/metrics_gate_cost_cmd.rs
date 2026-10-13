@@ -31,6 +31,7 @@ pub(super) fn gate_cost_command<W: Write>(
     let no_cache = args.no_cache;
     let scorecard = args.scorecard;
     let flakes = args.flakes;
+    let causes = args.causes;
     let required_contexts = args.required_contexts.clone();
     let selection_steps = args.selection_steps.clone();
     let export_cases = args.export_cases.clone();
@@ -60,8 +61,21 @@ pub(super) fn gate_cost_command<W: Write>(
         let observation = scorecard::gather(&reader, &query, &cache)
             .map_err(|error| CliFailure::new(1, format!("scorecard read failed: {error}")))?;
         let mut report = scorecard::compute(&observation);
+        let mut rows = scorecard::cases::cases(&observation);
+        if causes || export_cases.is_some() {
+            let jobs = scorecard::causes::red_jobs(&observation);
+            let read = scorecard::causes::gather(&reader, &cache, &query.repo, &jobs);
+            for unreadable in &read.unreadable {
+                eprintln!(
+                    "causes: job {} unreadable: {}",
+                    unreadable.job_id, unreadable.reason
+                );
+            }
+            scorecard::causes::attach(&mut rows, &read);
+            report.cause_naming = Some(scorecard::causes::compute(&rows));
+        }
         if let Some(path) = &export_cases {
-            let receipt = write_cases(path, &observation)?;
+            let receipt = write_cases(path, &observation, &rows)?;
             eprintln!(
                 "export-cases: {} row(s) to {}, sha256 {} (receipt {})",
                 receipt.rows,
@@ -83,6 +97,10 @@ pub(super) fn gate_cost_command<W: Write>(
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
             if let Some(flakes) = &report.same_sha_flakes {
                 write!(stdout, "{}", scorecard::flakes::render(flakes))
+                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+            }
+            if let Some(naming) = &report.cause_naming {
+                write!(stdout, "{}", scorecard::causes::render(naming))
                     .map_err(|error| CliFailure::new(1, error.to_string()))?;
             }
         }
@@ -112,9 +130,9 @@ fn receipt_path(path: &Path) -> PathBuf {
 fn write_cases(
     path: &Path,
     observation: &scorecard::ScorecardObservation,
+    rows: &[scorecard::cases::Case],
 ) -> Result<scorecard::cases::Receipt, CliFailure> {
-    let rows = scorecard::cases::cases(observation);
-    let (bytes, receipt) = scorecard::cases::export(observation, &rows)
+    let (bytes, receipt) = scorecard::cases::export(observation, rows)
         .map_err(|error| CliFailure::new(1, format!("export-cases: {error}")))?;
     let receipt_json = serde_json::to_vec_pretty(&receipt)
         .map_err(|error| CliFailure::new(1, format!("export-cases: {error}")))?;
@@ -453,7 +471,8 @@ mod tests {
             selection: None,
             gaps: Vec::new(),
         };
-        let receipt = write_cases(&path, &observation).expect("written");
+        let rows = scorecard::cases::cases(&observation);
+        let receipt = write_cases(&path, &observation, &rows).expect("written");
         let bytes = std::fs::read(&path).expect("export");
         assert_eq!(receipt.rows, 0);
         assert_eq!(receipt.sha256, hex::encode(sha2::Sha256::digest(&bytes)));

@@ -376,8 +376,12 @@ landed against a reviewer, not as a slow review.
 merged pull requests' commits, failed merge-group gates, queue removals other
 than `merged`, each with its merge-head verdict) as JSONL with `label` null,
 plus a receipt with the row count and SHA-256. Label a row only after its
-`label_not_before` (24 h on), when hindsight says whether it was real. Fields
-v1 does not read are present, `null` and named in `unread`; do not fill them
+`label_not_before` (24 h on), when hindsight says whether it was real. Each red
+case with a job also carries `cause` and `evidence`, read from its job log by
+`shipyard diagnose`'s extractor; `--causes` alone prints the "named causes"
+share without exporting. A cause is named at `high` or `medium` confidence; a
+`low` one (only the step's last lines, or a cancel with no reason) is not.
+Fields not read are present, `null` and named in `unread`; do not fill them
 by hand. For Pulp, red required checks need `--required-context`, or the
 report says "no required contexts" and exports none of them.
 

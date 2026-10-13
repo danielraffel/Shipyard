@@ -69,6 +69,7 @@ use super::{
 };
 
 pub mod cases;
+pub mod causes;
 pub mod flakes;
 
 /// Report schema identifier.
@@ -93,12 +94,12 @@ const ERROR_TAIL: usize = 400;
 const PRS_QUERY: &str = "query($q:String!,$endCursor:String){search(query:$q,type:ISSUE,first:100,after:$endCursor){issueCount pageInfo{hasNextPage endCursor} nodes{... on PullRequest{number createdAt mergedAt}}}}";
 /// Commits of one pull request, 25 to a page: a page of whole pull requests
 /// with their checks timed out (HTTP 504) on an 85-commit pull request.
-const COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){commits(first:25,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{commit{oid statusCheckRollup{contexts(first:100){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name conclusion startedAt completedAt} ... on StatusContext{context state createdAt}}}}}}}}}}";
+const COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){commits(first:25,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{commit{oid statusCheckRollup{contexts(first:100){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name conclusion startedAt completedAt databaseId checkSuite{workflowRun{databaseId}}} ... on StatusContext{context state createdAt}}}}}}}}}}";
 const TIMELINE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],first:100,after:$endCursor){filteredCount pageInfo{hasNextPage endCursor} nodes{__typename ... on AddedToMergeQueueEvent{createdAt actor{login}} ... on RemovedFromMergeQueueEvent{createdAt reason actor{login}}}}}}}";
 /// A merged pull request's head, author, and last comments and reviews, for
 /// the verdict on its merge head.
 const VERDICTS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid author{login} comments(last:100){totalCount nodes{author{login} authorAssociation body createdAt lastEditedAt}} reviews(last:100){totalCount nodes{author{login} authorAssociation state submittedAt commit{oid}}}}}}";
-const CONTEXTS_QUERY: &str = "query($owner:String!,$name:String!,$oid:GitObjectID!,$endCursor:String){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name conclusion startedAt completedAt} ... on StatusContext{context state createdAt}}}}}}}}";
+const CONTEXTS_QUERY: &str = "query($owner:String!,$name:String!,$oid:GitObjectID!,$endCursor:String){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name conclusion startedAt completedAt databaseId checkSuite{workflowRun{databaseId}}} ... on StatusContext{context state createdAt}}}}}}}}";
 
 /// What to measure.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +132,11 @@ pub struct CheckOutcome {
     pub outcome: Option<String>,
     /// When it completed (else started); a status context's creation time.
     pub at: Option<DateTime<Utc>>,
+    /// Check-run id, which is the Actions job id; `None` for a status
+    /// context or a check run GitHub listed without one.
+    pub job_id: Option<u64>,
+    /// Workflow run of an Actions check run.
+    pub run_id: Option<u64>,
 }
 
 /// One commit of a merged pull request.
@@ -394,6 +400,10 @@ pub struct ScorecardReport {
     /// present with `--flakes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub same_sha_flakes: Option<flakes::SameShaFlakes>,
+    /// How many red cases have a cause named from their job log; present
+    /// with `--causes` or `--export-cases`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause_naming: Option<causes::CauseNaming>,
 }
 
 /// Check-run conclusions and status states that make a check red.
@@ -1042,33 +1052,51 @@ fn parse_queue_events(number: u64, pages: &[Value]) -> Result<Vec<QueueEvent>, S
 /// The latest outcome of each check name: a re-run supersedes the run it
 /// repeats, as it does for GitHub's required checks.
 fn latest_by_name(contexts: &[Value]) -> Vec<CheckOutcome> {
-    let mut latest: BTreeMap<String, (Option<DateTime<Utc>>, Option<String>)> = BTreeMap::new();
+    type Latest = (
+        Option<DateTime<Utc>>,
+        Option<String>,
+        Option<u64>,
+        Option<u64>,
+    );
+    let mut latest: BTreeMap<String, Latest> = BTreeMap::new();
     for context in contexts {
-        let (name, outcome, at) = match text(context, "__typename").as_deref() {
+        let (name, outcome, at, job_id, run_id) = match text(context, "__typename").as_deref() {
             Some("CheckRun") => (
                 text(context, "name"),
                 text(context, "conclusion"),
                 timestamp(context, "completedAt").or_else(|| timestamp(context, "startedAt")),
+                context.get("databaseId").and_then(Value::as_u64),
+                context
+                    .pointer("/checkSuite/workflowRun/databaseId")
+                    .and_then(Value::as_u64),
             ),
             Some("StatusContext") => (
                 text(context, "context"),
                 text(context, "state"),
                 timestamp(context, "createdAt"),
+                None,
+                None,
             ),
             _ => continue,
         };
         let Some(name) = name else { continue };
         let outcome = outcome.map(|outcome| outcome.to_ascii_uppercase());
         match latest.get(&name) {
-            Some((Some(seen), _)) if at.is_none_or(|at| at < *seen) => {}
+            Some((Some(seen), ..)) if at.is_none_or(|at| at < *seen) => {}
             _ => {
-                latest.insert(name, (at, outcome));
+                latest.insert(name, (at, outcome, job_id, run_id));
             }
         }
     }
     latest
         .into_iter()
-        .map(|(name, (at, outcome))| CheckOutcome { name, outcome, at })
+        .map(|(name, (at, outcome, job_id, run_id))| CheckOutcome {
+            name,
+            outcome,
+            at,
+            job_id,
+            run_id,
+        })
         .collect()
 }
 
@@ -1381,6 +1409,7 @@ pub fn compute(observation: &ScorecardObservation) -> ScorecardReport {
         weeks,
         gaps,
         same_sha_flakes: None,
+        cause_naming: None,
     }
 }
 

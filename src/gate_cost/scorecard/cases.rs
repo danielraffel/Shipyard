@@ -10,12 +10,14 @@
 //! `label` is always `null` here and `label_not_before` says when it may be
 //! set.
 //!
-//! v1 reads four sources only, all of them reads the scorecard already makes:
-//! required checks on merged pull requests' commits, merge-group gate runs and
-//! their cause, merge-queue removals with reason and actor, and the merge-head
-//! verdict. The corpus fields that need other sources (`evidence`,
-//! `rule_verdict`, `cancel_cause`, `receipt_same_tree`, `outage_window`) are
-//! present and `null`, and named in `unread`, rather than guessed.
+//! v1 reads four sources the scorecard already reads: required checks on
+//! merged pull requests' commits, merge-group gate runs and their cause,
+//! merge-queue removals with reason and actor, and the merge-head verdict.
+//! When causes are read (see [`super::causes`]), a red case with a job also
+//! carries `cause` and `evidence` from its job log. Every corpus field that
+//! was not read (`evidence` when causes were not, `rule_verdict`,
+//! `cancel_cause`, `receipt_same_tree`, `outage_window`) is present and
+//! `null`, and named in `unread`, rather than guessed.
 //!
 //! The export carries a receipt: the row count and the SHA-256 of the bytes
 //! written, so a copy can be checked without trusting where it came from.
@@ -74,8 +76,11 @@ pub struct Case {
     pub label: Option<String>,
     /// Earliest time the label may be assigned.
     pub label_not_before: Option<String>,
-    /// Evidence for the case (log excerpts, annotations): not read in v1.
+    /// The decisive lines of the case's job log, when its cause was read
+    /// (`--causes` or `--export-cases`); else `null` and named in `unread`.
     pub evidence: Option<String>,
+    /// The cause read from the case's job log, when it was read.
+    pub cause: Option<super::causes::CaseCause>,
     /// What a rule would have decided: not read in v1.
     pub rule_verdict: Option<String>,
     /// Why a run was cancelled: not read in v1.
@@ -124,6 +129,7 @@ fn case(kind: &'static str, repo: &str, at: Option<DateTime<Utc>>) -> Case {
         label: None,
         label_not_before: at.map(|at| rfc3339(at + Duration::hours(LABEL_DELAY_HOURS))),
         evidence: None,
+        cause: None,
         rule_verdict: None,
         cancel_cause: None,
         receipt_same_tree: None,
@@ -159,6 +165,8 @@ pub fn cases(observation: &ScorecardObservation) -> Vec<Case> {
                 rows.push(Case {
                     pr: Some(pr.number),
                     head_sha: Some(commit.oid.clone()),
+                    run_id: check.run_id,
+                    job_id: check.job_id,
                     check: Some(check.name.clone()),
                     outcome: Some(outcome.to_owned()),
                     merge_head_verdict: Some(pr.verdict),

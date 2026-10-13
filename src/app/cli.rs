@@ -1224,6 +1224,7 @@ pub(crate) enum MetricsCommand {
 }
 
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)] // Independent opt-in report switches.
 pub(crate) struct MetricsGateCostArgs {
     /// Owner/repo slug.
     #[arg(long)]
@@ -1288,9 +1289,17 @@ pub(crate) struct MetricsGateCostArgs {
     /// the merge-head verdict. Rows are unlabelled (`label` null,
     /// `label_not_before` 24 h after the case). A receipt with the row count
     /// and the SHA-256 of the file is written next to it as
-    /// `<file>.receipt.json` and printed to stderr.
+    /// `<file>.receipt.json` and printed to stderr. Implies `--causes`, so
+    /// each red case carries its `cause` and `evidence`.
     #[arg(long = "export-cases", value_name = "FILE", requires = "scorecard")]
     pub(crate) export_cases: Option<PathBuf>,
+    /// Also name the cause of every red case: read each red required check's
+    /// and failed merge-group gate's job and log through `shipyard
+    /// diagnose`'s extractor, and report how many have a named cause (`high`
+    /// or `medium` confidence) and the time to it. What a completed job
+    /// yields is cached, never the log.
+    #[arg(long, requires = "scorecard")]
+    pub(crate) causes: bool,
 }
 
 #[derive(Debug, Subcommand)]
