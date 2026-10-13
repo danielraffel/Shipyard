@@ -1,0 +1,20 @@
+  GitHub’s PR API still reports the previous head aec027d6b25d05ba819b5408329e067377736b77, while the branch
+  API reports the pushed commit above; CI is pending.
+
+  ### #513
+
+  • Rebased onto current main and removed the #509 stack.
+  • Head: https://github.com/danielraffel/tartci/commit/9ea2af0a75a320548ad2dd4d916b96922a5f934d
+  • One-hour alert applies only when queued gate demand exists; otherwise it remains six hours.
+  • Full self-update suite: 238 passed.
+  • Docs updated.
+  • Evidence: https://github.com/danielraffel/tartci/pull/513#issuecomment-6134373132
+  • No hosts changed; CI is pending.
+
+  Worked for 3m 59s • 4:10 PM                                                                               
+
+ 
+› Ask Codex to do anything
+ 
+  GPT-6-Sol medium · /Volumes/Workshop/Code/tartci · Review Tartci migration plan
+  ? for shortcuts                                                                 ⚠ 3 warnings · f2 to view

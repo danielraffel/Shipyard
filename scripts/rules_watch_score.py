@@ -11,7 +11,9 @@ The labelled turns are a close monitor's periodic checks, one CSV row each
 For each rule-detectable turn the watcher **recalls** it when, within the
 window before the turn, it emitted an event of a kind that maps to one of the
 turn's kinds (KIND_MAP). The `pr` variant also requires the event's pull
-request to be one the turn names, when the turn names any. A
+request to be one the turn names, when the turn names any; the `pr_strict`
+variant counts only events that name a pull request the turn names, so an
+event with no pull request (a host alarm) never matches. A
 nothing-actionable turn is a **false wake** when the watcher emitted any event
 between the previous turn and this one: the watcher would have woken a model
 that then found nothing to do.
@@ -48,9 +50,11 @@ KIND_MAP: dict[str, tuple[str, ...]] = {
         "required_red", "group_red", "queue_removed", "queue_stuck", "approved_blocked",
     ),
     "merge_or_arm": ("approved_unarmed",),
-    "host_down_or_out_of_pool": ("host_alarm",),
+    "host_down_or_out_of_pool": (
+        "host_alarm", "host_not_serving", "host_problem", "host_out_of_pool", "host_unreachable",
+    ),
     "codex_session_resume_or_flush": (
-        "codex_session_errored", "codex_session_idle", "codex_draft_queued",
+        "codex_session_dead", "codex_session_errored", "codex_draft_unsent", "codex_draft_queued",
     ),
 }
 RULE_LABELS = ("rule", "rule_detect_judgement_fix")
@@ -92,11 +96,13 @@ def load_events(path: str) -> list[dict[str, Any]]:
 
 
 def matches(event: dict[str, Any], kind: str, turn: dict[str, Any], window: timedelta,
-            by_pr: bool) -> bool:
+            by_pr: str | bool) -> bool:
     if event["kind"] not in KIND_MAP.get(kind, ()):
         return False
     if not turn["ts"] - window < event["_at"] <= turn["ts"]:
         return False
+    if by_pr == "strict":
+        return event.get("pr") is not None and event["pr"] in turn["prs"]
     if by_pr and turn["prs"] and event.get("pr") is not None:
         return event["pr"] in turn["prs"]
     return True
@@ -123,7 +129,8 @@ def score(turns: list[dict[str, Any]], events: list[dict[str, Any]],
     for minutes in windows:
         window = timedelta(minutes=minutes)
         entry: dict[str, Any] = {}
-        for variant, by_pr in (("kind_time", False), ("kind_time_pr", True)):
+        for variant, by_pr in (("kind_time", False), ("kind_time_pr", True),
+                               ("kind_time_pr_strict", "strict")):
             recalled = 0
             sourced_turns = 0
             sourced_recalled = 0
@@ -179,7 +186,7 @@ def render(report: dict[str, Any]) -> str:
         f"unsourced kinds (counted as misses): {', '.join(report['unsourced_kinds']) or 'none'}",
     ]
     for minutes, entry in report["windows"].items():
-        for variant in ("kind_time", "kind_time_pr"):
+        for variant in ("kind_time", "kind_time_pr", "kind_time_pr_strict"):
             data = entry[variant]
             sourced = data["sourced"]
             lines.append(f"window {minutes}m {variant}: recall {data['recall']} "
@@ -196,6 +203,7 @@ def render(report: dict[str, Any]) -> str:
                 f"control (events shifted {control['shift_hours']} h) window {minutes}m: "
                 f"recall kind_time {entry['kind_time']['recall']}, "
                 f"kind_time_pr {entry['kind_time_pr']['recall']}, "
+                f"kind_time_pr_strict {entry['kind_time_pr_strict']['recall']}, "
                 f"false wakes {entry['false_wake_rate']}")
     return "\n".join(lines) + "\n"
 

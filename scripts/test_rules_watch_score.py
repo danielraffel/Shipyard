@@ -85,6 +85,13 @@ class Score(unittest.TestCase):
         self.assertEqual(wrong["windows"]["10"]["kind_time_pr"]["recalled"], 0)
         right = self.run_score(rows, [event("ready_unreviewed", "2026-10-11T00:05:00Z", 10156)])
         self.assertEqual(right["windows"]["10"]["kind_time_pr"]["recalled"], 1)
+        self.assertEqual(right["windows"]["10"]["kind_time_pr_strict"]["recalled"], 1)
+
+    def test_the_strict_variant_never_matches_an_event_without_a_pull_request(self) -> None:
+        rows = [turn(1, "2026-10-11T00:10:00Z", "b", "host_down_or_out_of_pool", "rule", "m5s off")]
+        report = self.run_score(rows, [event("host_alarm", "2026-10-11T00:05:00Z")])
+        self.assertEqual(report["windows"]["10"]["kind_time_pr"]["recalled"], 1)
+        self.assertEqual(report["windows"]["10"]["kind_time_pr_strict"]["recalled"], 0)
 
     def test_a_false_wake_is_any_event_since_the_previous_turn(self) -> None:
         rows = [
@@ -121,6 +128,19 @@ class Score(unittest.TestCase):
         moved = score_mod.shifted(stream, 6)
         self.assertEqual([e["kind"] for e in moved], ["y", "x"])
         self.assertEqual(moved[1]["_at"], events("2026-10-11T06:00:00Z"))
+
+
+    def test_host_and_codex_reader_kinds_map_to_their_turn_kinds(self) -> None:
+        rows = [
+            turn(1, "2026-10-11T00:10:00Z", "b", "host_down_or_out_of_pool", "rule"),
+            turn(2, "2026-10-11T01:10:00Z", "b", "codex_session_resume_or_flush", "rule"),
+        ]
+        events = [event("host_not_serving", "2026-10-11T00:05:00Z"),
+                  event("codex_session_dead", "2026-10-11T01:05:00Z")]
+        report = self.run_score(rows, events)
+        self.assertEqual(report["windows"]["10"]["kind_time"]["recalled"], 2)
+        self.assertNotIn("host_down_or_out_of_pool", report["unsourced_kinds"])
+        self.assertNotIn("codex_session_resume_or_flush", report["unsourced_kinds"])
 
 
 if __name__ == "__main__":

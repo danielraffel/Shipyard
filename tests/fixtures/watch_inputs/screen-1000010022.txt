@@ -1,0 +1,20 @@
+  • Merged: No. There is no PR for codex/gpu-audio-p2-vellum-20261006; it remains an unmerged documentation
+    branch.
+
+  • Worktrees clear: No. The relevant active worktree is /Volumes/Workshop/Code/agent-worktrees/pulp-
+    unblock-gpu-audio-open-gates-20261008. It is clean but still registered active. The planning worktree is
+    also present and clean.
+
+  • Nothing left: The hard realtime p99/p99.9 gate remains explicitly open. The current screening executable
+    rejected a fresh run, so the required 30-pair confirmation and 100,000-block long-tail campaign still
+    need a campaign-capable producer.
+
+  The original Pulp checkout /Volumes/Workshop/Code/pulp is already marked merged/superseded and must not be
+  resumed.
+
+  Worked for 4m 52s • 11:16 PM                                                                              
+
+                                                                                                            
+› subrouter: signal: terminated                                                                             
+                               %                                                                            danielraffel@Daniels-Mac-Studio-m3 pulp % 
+danielraffel@Daniels-Mac-Studio-m3 pulp % 

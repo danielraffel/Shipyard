@@ -757,6 +757,9 @@ command, safe_to_auto_apply, verify); `--reviewer OWNER/REPO=NAME` names who a
 head routes to. A live pass prints its reads, checks the App budget first and
 backs off (exit 75) under `--min-rate-remaining`, and re-reads a pull
 request's whole trail before emitting a trail-dependent event.
+`scripts/watch_inputs.py` (`cmux`, `hosts`, `gate-serving`) supplies its
+`--input-events` for Codex tab states and gate-host serving; every line carries
+a `fix` object (what, evidence, cause, command, safe_to_auto_apply, verify).
 
 `shipyard pr-watch liveness` exits 1 when this scanning host's last completed
 pass is older than `[pr_watch] stale_after_minutes` (45); `doctor --fleet` asks

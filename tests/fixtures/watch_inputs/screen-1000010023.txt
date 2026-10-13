@@ -1,0 +1,20 @@
+  • Focused tests: 22 + 82 passed.
+  • Generated-only and config-excluded native diffs skip coverage; covered C++ changes retain it.
+  • Mutant negative control passes.
+  • auto_merge: null; CI is pending.
+  • Evidence comment: full details
+ 
+  Worked for 50m 14s • 3:39 PM                                                                     
+ 
+ 
+› Add to G6 (pre-push diff-cover): the pre-push hook and tools/scripts/gates.sh must not run a
+  configure or build on a gate host (m3, m5, m5s). Three agents tripped this today: a forgotten
+  PULP_SKIP_DIFF_COVER=1 started a 12-job ninja build on m3, and gates.sh ran setup.sh plus a
+  cmake configure and 5 minutes of self-tests on m3. On a gate host, skip the build-backed parts
+  automatically, print one actionable line (what was skipped, why, and the exact command to run it
+  on m1 or a disposable VM), and still run the cheap gates. Identify gate hosts from tartci's host
+  profile, not the hostname (m3 was just renamed to Daniels-Mac-Studio-m3-4 by macOS). Test both
+  branches; check the decisions contract first.
+ 
+  GPT-6-Sol medium · /Volumes/Workshop/Code/pulp · Verify post-landing changes
+                                                                         ⚠ 3 warnings · f2 to view
