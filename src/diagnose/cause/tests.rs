@@ -389,7 +389,7 @@ fn a_record_corroborates_only_when_bound_to_the_job_and_its_cause() {
     let (recorded, extracted) = recorded_for(&job);
     let repo = "Generous-Corp/pulp";
     assert!(corroborates(&recorded, &extracted, &job, repo));
-    let changed: [(&str, Forge); 9] = [
+    let changed: [(&str, Forge); 7] = [
         ("repo", |r| r.repo = "o/other".to_owned()),
         ("head", |r| r.head_sha = Some("f".repeat(40))),
         ("no head", |r| r.head_sha = None),
@@ -397,21 +397,47 @@ fn a_record_corroborates_only_when_bound_to_the_job_and_its_cause() {
         ("attempt", |r| r.attempt = Some(2)),
         ("job", |r| r.job = "linux".to_owned()),
         ("signature", |r| r.signature = "another test".to_owned()),
-        ("before the run", |r| {
-            r.named_at = Some("2026-10-12T21:14:07Z".to_owned());
-        }),
-        ("after the run", |r| {
-            r.named_at = Some("2026-10-12T21:25:48Z".to_owned());
-        }),
     ];
     for (what, change) in changed {
         let mut forged = recorded.clone();
         change(&mut forged);
         assert!(!corroborates(&forged, &extracted, &job, repo), "{what}");
     }
-    let mut no_start = job.clone();
-    no_start.started_at = None;
-    assert!(!corroborates(&recorded, &extracted, &no_start, repo));
+    // The record's own time is not evidence of anything.
+    let mut early = recorded.clone();
+    early.named_at = Some("2000-01-01T00:00:00Z".to_owned());
+    assert!(corroborates(&early, &extracted, &job, repo));
+}
+
+#[test]
+fn a_record_is_timed_by_the_step_that_printed_it() {
+    let job = gate_job();
+    // Step 52 ran 21:24:00 to 21:25:37.
+    assert_eq!(
+        printed_at(&job, Some("2026-10-12T21:25:00.1234567Z")).as_deref(),
+        Some("2026-10-12T21:25:37Z")
+    );
+    // Within the API's whole second of the step's end.
+    assert_eq!(
+        printed_at(&job, Some("2026-10-12T21:25:37.9000000Z")).as_deref(),
+        Some("2026-10-12T21:25:37Z")
+    );
+    assert_eq!(printed_at(&job, Some("2026-10-12T21:30:00Z")), None);
+    assert_eq!(printed_at(&job, None), None);
+    assert_eq!(printed_at(&job, Some("not a time")), None);
+    let log = format!(
+        "2026-10-12T21:25:00.5000000Z ##[notice]{}\n##[notice]{}\n",
+        serde_json::to_string(&recorded_for(&job).0).expect("json"),
+        serde_json::to_string(&recorded_for(&job).0).expect("json"),
+    );
+    let times: Vec<Option<String>> = records_with_times(&log)
+        .into_iter()
+        .map(|(_, at)| at)
+        .collect();
+    assert_eq!(
+        times,
+        vec![Some("2026-10-12T21:25:00.5000000Z".to_owned()), None]
+    );
 }
 
 #[test]

@@ -147,7 +147,7 @@ impl FakeGh {
             p if p == format!("repos/{PULP}/actions/jobs/42/logs") => {
                 Err("gh: Not Found (HTTP 404)".to_owned())
             }
-            p if (43..=48).any(|id| p == format!("repos/{PULP}/actions/jobs/{id}")) => {
+            p if (43..=49).any(|id| p == format!("repos/{PULP}/actions/jobs/{id}")) => {
                 let mut job = gate_job_payload();
                 job["id"] = json!(p.rsplit('/').next().and_then(|id| id.parse::<u64>().ok()));
                 Ok(job.to_string())
@@ -185,10 +185,11 @@ fn gather_reads_each_job_and_a_missing_log_still_yields_a_cause() {
     assert!(read.unreadable[0].reason.contains("unexpected request"));
 }
 
-/// A log in which the job printed its own record, named at 21:25:00 during
-/// its run (21:14:08 to 21:25:47). Jobs 44 to 48 print a forged one: wrong
-/// head, wrong run, wrong attempt, named after the run, or a cause the log
-/// does not hold.
+/// A log in which the job printed its own record at 21:25:00, inside step 52
+/// (21:24:00 to 21:25:37). Jobs 44 to 46 and 48 print a forged one: wrong
+/// head, wrong run, wrong attempt, or a cause the log does not hold. Job 47's
+/// record claims an earlier `named_at` than it was printed at; job 49 prints a
+/// genuine record at a time no step covers.
 fn self_named_log(id: u64) -> String {
     let job: crate::diagnose::Job = serde_json::from_value(gate_job_payload()).expect("job");
     let place = Place {
@@ -207,12 +208,18 @@ fn self_named_log(id: u64) -> String {
         44 => record.head_sha = Some("f".repeat(40)),
         45 => record.run_id = Some(1),
         46 => record.attempt = Some(2),
-        47 => record.named_at = Some("2026-10-12T21:25:48Z".to_owned()),
+        47 => record.named_at = Some("2026-10-12T21:14:09Z".to_owned()),
         48 => record.signature = "a test that never failed".to_owned(),
         _ => {}
     }
+    let printed = if id == 49 {
+        "2026-10-12T21:30:00.0000000Z"
+    } else {
+        "2026-10-12T21:25:00.0000000Z"
+    };
     let mut log = gate_log();
-    log.push_str("2026-10-12T21:25:00.0000000Z ##[notice]");
+    log.push_str(printed);
+    log.push_str(" ##[notice]");
     log.push_str(&serde_json::to_string(&record).expect("json"));
     log.push('\n');
     log
@@ -232,7 +239,8 @@ fn a_cause_the_job_recorded_keeps_its_time() {
     );
     let cause = &read.by_job[&43];
     assert!(!cause.retrospective);
-    assert_eq!(cause.named_at.as_deref(), Some("2026-10-12T21:25:00Z"));
+    // GitHub's time for the step that printed it, not the record's.
+    assert_eq!(cause.named_at.as_deref(), Some("2026-10-12T21:25:37Z"));
     // The content is the extractor's, bound to the payload.
     assert_eq!(cause.job_id, Some(43));
     assert_eq!(cause.signature, VELLUM);
@@ -242,7 +250,7 @@ fn a_cause_the_job_recorded_keeps_its_time() {
 fn a_forged_record_is_ignored_and_the_extractor_answers() {
     let gh = FakeGh::new();
     let reader = |args: &[String]| gh.answer(args);
-    let jobs = (44..=48).collect();
+    let jobs = (44..=49).collect();
     let read = gather(
         &reader,
         &ReadCache::disabled(),
@@ -250,7 +258,7 @@ fn a_forged_record_is_ignored_and_the_extractor_answers() {
         &jobs,
         DEFAULT_MAX_JOBS,
     );
-    for id in 44..=48 {
+    for id in [44, 45, 46, 48, 49] {
         let cause = &read.by_job[&id];
         assert!(cause.retrospective, "job {id}: a forged record was trusted");
         assert_eq!(
@@ -260,6 +268,11 @@ fn a_forged_record_is_ignored_and_the_extractor_answers() {
         );
         assert_eq!(cause.signature, VELLUM, "job {id}");
     }
+    // A record that only moves its own time gains nothing: the time is the
+    // API's for the step that printed it.
+    let moved = &read.by_job[&47];
+    assert!(!moved.retrospective);
+    assert_eq!(moved.named_at.as_deref(), Some("2026-10-12T21:25:37Z"));
 }
 
 #[test]

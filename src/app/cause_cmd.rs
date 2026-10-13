@@ -37,6 +37,13 @@ pub(super) fn cause_command<W: Write>(
 ) -> Result<std::process::ExitCode, CliFailure> {
     match command {
         CauseCommand::Extract(args) => {
+            if args.job.is_none() && args.format == "record" {
+                eprintln!(
+                    "cause extract: no --job, so the record names the job by its key \
+                     (GITHUB_JOB); for a job with `name:` pass --job with that name, or \
+                     the scorecard will not take the record's time"
+                );
+            }
             let env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
             let text = extract(
                 &args,

@@ -10,11 +10,12 @@
 //! The cause is always built here from the log. A job that named its own
 //! cause (`shipyard cause extract --notice` in an `if: failure()` step)
 //! carries a record in its log; when that record is bound to this job (repo,
-//! head, run, attempt, job name), names the same cause, and was named during
-//! the run, its `named_at` is kept and the cause is not retrospective.
-//! Otherwise the cause is retrospective: `named_at` is the job's completion,
-//! the earliest an extractor could have named it. A record printed by the
-//! job is never trusted for its content: pull-request code can print one. What a completed job yields is
+//! head, run, attempt, job name), names the same cause, and sits in a step the
+//! jobs API timed, the cause is not retrospective and its `named_at` is that
+//! step's completion by GitHub's clock. Otherwise the cause is retrospective:
+//! `named_at` is the job's completion, the earliest an extractor could have
+//! named it. A record printed by the job is never trusted for its content or
+//! its time: pull-request code can print one. What a completed job yields is
 //! cached, never the log.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,7 +35,7 @@ pub const DEFAULT_MAX_JOBS: usize = 200;
 /// Why a job over that budget was not read.
 pub const OVER_BUDGET: &str = "skipped: over the --causes-max-jobs budget";
 /// Cache key version: bump when a cause's shape or meaning changes.
-const EXTRACT_VERSION: u32 = 3;
+const EXTRACT_VERSION: u32 = 4;
 
 /// A red job whose cause could not be read, and why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -134,17 +135,19 @@ fn read_cause(
     };
     let mut cause = cause::build(&job, log.as_deref(), &place, job.completed_at.clone(), true)
         .ok_or_else(|| format!("job {id} did not fail"))?;
-    // A record the job printed only says when a cause the extractor confirms
-    // was named; it is ignored unless it is bound to this job and run.
-    if let Some(recorded) = log
+    // A record the job printed only shows that a cause the extractor confirms
+    // was named during the job; the time is the API's for the step that
+    // printed it, never the record's own.
+    if let Some(at) = log
         .as_deref()
-        .map(cause::records_in_log)
+        .map(cause::records_with_times)
         .unwrap_or_default()
         .into_iter()
         .rev()
-        .find(|recorded| cause::corroborates(recorded, &cause, &job, repo))
+        .filter(|(recorded, _)| cause::corroborates(recorded, &cause, &job, repo))
+        .find_map(|(_, at)| cause::printed_at(&job, at.as_deref()))
     {
-        cause.named_at = recorded.named_at;
+        cause.named_at = Some(at);
         cause.retrospective = false;
     }
     if let Ok(value) = serde_json::to_value(&cause) {

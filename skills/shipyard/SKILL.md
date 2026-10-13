@@ -1551,11 +1551,12 @@ GitHub's own record (a runner that never came, a supersede, a timeout) when
 the log names nothing more certain; a log with no recognized line still gets
 a `shell-exit` record, so the miss is counted. A job that named its own cause (`shipyard cause extract --log <captured
 output> --notice` in an `if: failure()` step, which logs `##[notice]<record>`)
-only testifies to *when* its cause was named: the scorecard still builds the
-cause from the log, and keeps the record's `named_at` (and `retrospective:
-false`, counted as "named in the job itself") only when the record is bound
-to the payload (repo, head, run, attempt, job name), names the same cause,
-and was named during the job's run. Pull-request code can print any line, so
+only shows that its cause was named during the job: the scorecard still
+builds the cause from the log, and only when the record is bound to the
+payload (repo, head, run, attempt, job name) and names the same cause does it
+mark the cause not retrospective (counted as "named in the job itself"), with
+`named_at` set to the jobs API's completion of the step that printed the
+record. The record's own `named_at` is never used. Pull-request code can print any line, so
 a record is never trusted for its content; a forged one is ignored. Records
 in the log are blanked before C2 reads it, so their quoted lines are not read
 as evidence. On a `pull_request` run the record's head comes from

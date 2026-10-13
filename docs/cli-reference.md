@@ -69,9 +69,11 @@ shipyard diagnose 123 --annotate plan|post   # check-run annotations on the fail
 # Name a failed job's cause (ci.cause/v1, a superset of C2's c2.cause.v0) and keep it
 shipyard cause extract --log FILE            # the job's record as JSON; where it ran from --repo/--run-id/--attempt/--job/
                                              #   --head-sha/--event/--pr, else GITHUB_*; --job-json FILE reads the failing step
-shipyard cause extract --log FILE --notice   # `::notice title=ci-cause::<record>`: run in an `if: failure()` step so the cause
-                                             #   lands in the job's own log; the scorecard keeps its named_at only when it is
-                                             #   bound to the job (repo/head/run/attempt/job) and names the cause it reads
+shipyard cause extract --log FILE --job NAME --notice  # `::notice title=ci-cause::<record>`: run in an `if: failure()` step so the cause
+                                             #   lands in the job's own log. --job must be the job's display name
+                                             #   (default GITHUB_JOB is its key). The scorecard uses the record only when
+                                             #   bound to the job (repo/head/run/attempt/job) and naming the cause it reads,
+                                             #   and dates it by the API time of the step that printed it
 shipyard cause extract --log FILE --format c2  # C2's raw records (the extractor EXP-A3 shares)
 shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/YYYY-MM.jsonl;
                                              #   ids already archived are skipped, nothing is rewritten

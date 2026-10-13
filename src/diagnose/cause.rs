@@ -475,15 +475,13 @@ pub fn without_records(text: &str) -> String {
 
 /// Whether a record a job printed into its own log (`recorded`) may stand
 /// for that job: its identity must be the payload's (`repo`, `head_sha`,
-/// `run_id`, `attempt`, `job`), its cause must be the one the extractor reads
-/// from the same log (`format`, `signature`), and its `named_at` must fall
-/// within the job's run. A pull request's own code runs in the job and can
-/// print any line, so a record is never taken on its word: it can only
-/// testify to *when* a cause the extractor confirms was named.
+/// `run_id`, `attempt`, `job`), and its cause must be the one the extractor
+/// reads from the same log (`format`, `signature`). A pull request's own code
+/// runs in the job and can print any line, so a record is never taken on its
+/// word: its content is the extractor's, and its time is GitHub's (see
+/// [`printed_at`]), never its own `named_at`.
 #[must_use]
 pub fn corroborates(recorded: &CiCause, extracted: &CiCause, job: &Job, repo: &str) -> bool {
-    let parse =
-        |value: Option<&str>| value.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
     let identity = recorded.repo == repo
         && recorded.head_sha.is_some()
         && recorded.head_sha == job.head_sha
@@ -494,15 +492,42 @@ pub fn corroborates(recorded: &CiCause, extracted: &CiCause, job: &Job, repo: &s
     let same_cause = recorded.format == extracted.format
         && recorded.signature == extracted.signature
         && extracted.named();
-    let in_run = match (
-        parse(recorded.named_at.as_deref()),
-        parse(job.started_at.as_deref()),
-        parse(job.completed_at.as_deref()),
-    ) {
-        (Some(at), Some(start), Some(end)) => start <= at && at <= end,
-        _ => false,
-    };
-    identity && same_cause && in_run
+    identity && same_cause
+}
+
+static LOG_TIME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^\x{feff}?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z) ")
+        .expect("log time pattern compiles")
+});
+
+/// The `ci.cause/v1` records a job printed, each with the runner's timestamp
+/// on its log line.
+#[must_use]
+pub fn records_with_times(text: &str) -> Vec<(CiCause, Option<String>)> {
+    split_lines(text)
+        .into_iter()
+        .filter_map(|line| {
+            let cause = records_in_log(line).pop()?;
+            let at = LOG_TIME.captures(line).map(|caps| caps[1].to_owned());
+            Some((cause, at))
+        })
+        .collect()
+}
+
+/// When a record printed at log time `at` was named, by GitHub's clock: the
+/// completion the jobs API records for the step whose run covers `at`.
+/// `None` when no step does, so a line the runner did not time is not used.
+#[must_use]
+pub fn printed_at(job: &Job, at: Option<&str>) -> Option<String> {
+    let parse = |value: &str| chrono::DateTime::parse_from_rfc3339(value).ok();
+    let at = parse(at?)?;
+    job.steps().iter().find_map(|step| {
+        let start = parse(step.started_at.as_deref()?)?;
+        let end = step.completed_at.as_deref()?;
+        // The API keeps whole seconds; the log keeps fractions of one.
+        let within = start <= at && at < parse(end)? + chrono::Duration::seconds(1);
+        within.then(|| end.to_owned())
+    })
 }
 
 /// Records as the `output.text` of a check run: one compact JSON record per
