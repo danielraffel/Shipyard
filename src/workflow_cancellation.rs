@@ -46,6 +46,7 @@ mod tests {
 
     fn run(id: u64, name: &str, event: &str, path: &str) -> QueuedRun {
         QueuedRun {
+            head_sha: String::new(),
             database_id: id,
             name: name.to_owned(),
             head_branch: "main".to_owned(),

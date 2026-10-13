@@ -3141,8 +3141,12 @@ pub(super) struct RescueArgs {
     /// hosted runner can return local. Pass `--to <provider>` to force one.
     #[arg(long = "to")]
     pub(super) provider: Option<String>,
-    /// Also re-dispatch completed runs that ended cancelled / failed / timed-out
-    /// (e.g. a watchdog sweep, or a flaky required leg) before handoff.
+    /// Also recover completed runs that ended cancelled / failed / timed-out
+    /// (e.g. a watchdog sweep, or a flaky required leg): a `pull_request` run
+    /// has its failed jobs re-run in place, keeping its merge ref, when it is
+    /// the latest run of its workflow on its branch's current head (other
+    /// such runs are skipped as superseded); any other run gets a dispatched
+    /// replacement.
     #[arg(long = "rerun-failed", action = ArgAction::SetTrue)]
     pub(super) rerun_failed: bool,
     /// Plan the rescue without acting.

@@ -32,10 +32,17 @@ enum RunOutcome {
     Applied,
     /// A fresh replacement was accepted for a terminal failed/cancelled run.
     ReplacementApplied,
+    /// A terminal `pull_request` run's failed and cancelled jobs were re-run
+    /// in place, keeping its event and its pull request merge ref.
+    RerunApplied,
     /// Skipped: completed/cancelled run encountered without `--rerun-failed`.
     SkippedCompleted,
     /// Skipped: rescue could not plan a dispatch (e.g. workflow not found locally).
     SkippedNoPlan(String),
+    /// Skipped: a terminal `pull_request` run that is not the latest run of
+    /// its workflow on its branch's current head; re-running it would test a
+    /// commit no required check reads.
+    SkippedSuperseded(String),
     /// Run was processed but a step failed.
     Failed(String),
 }
@@ -46,15 +53,19 @@ impl RunOutcome {
             Self::Planned => "planned",
             Self::Applied => "applied",
             Self::ReplacementApplied => "replacement-applied",
+            Self::RerunApplied => "rerun-applied",
             Self::SkippedCompleted => "skipped-completed",
             Self::SkippedNoPlan(_) => "skipped-no-plan",
+            Self::SkippedSuperseded(_) => "skipped-superseded",
             Self::Failed(_) => "failed",
         }
     }
 
     fn detail(&self) -> Option<String> {
         match self {
-            Self::SkippedNoPlan(message) | Self::Failed(message) => Some(message.clone()),
+            Self::SkippedNoPlan(message)
+            | Self::SkippedSuperseded(message)
+            | Self::Failed(message) => Some(message.clone()),
             _ => None,
         }
     }
@@ -103,18 +114,28 @@ pub(super) fn rescue_with_actions<W: Write>(
     })?;
     let repo_slug = resolve_repo_slug(args.repo.clone(), cwd)?;
     let branch = resolve_branch(args, actions, &repo_slug)?;
-    let candidates = collect_candidates(
-        args,
+    let (candidates, superseded) = current_head_only(
         actions,
         &repo_slug,
-        branch.as_deref(),
-        threshold_secs,
-        now,
-    )?;
+        collect_candidates(
+            args,
+            actions,
+            &repo_slug,
+            branch.as_deref(),
+            threshold_secs,
+            now,
+        )?,
+    );
 
     let workflows = discover_workflows(cwd);
     let mut rows: Vec<BTreeMap<String, Value>> = Vec::with_capacity(candidates.len());
     let mut any_failure = false;
+    for (candidate, reason) in &superseded {
+        rows.push(candidate_row(
+            candidate,
+            &RunOutcome::SkippedSuperseded(reason.clone()),
+        ));
+    }
     for candidate in &candidates {
         let outcome = process_candidate(candidate, args, &workflows, config, actions, &repo_slug);
         if matches!(outcome, RunOutcome::Failed(_)) {
@@ -216,6 +237,90 @@ fn collect_candidates(
     Ok(candidates)
 }
 
+/// Split off the terminal `pull_request` candidates a re-run must not touch:
+/// any run not on its branch's current head, and any run that is not the
+/// latest of its workflow on that head. Each is returned with the reason.
+/// Other candidates pass through.
+fn current_head_only(
+    actions: &GitHubActions,
+    repo_slug: &str,
+    candidates: Vec<Candidate>,
+) -> (Vec<Candidate>, Vec<(Candidate, String)>) {
+    let mut heads: BTreeMap<String, Result<String, String>> = BTreeMap::new();
+    let mut runs: BTreeMap<String, Result<Vec<crate::cloud::HeadShaRun>, String>> = BTreeMap::new();
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for candidate in candidates {
+        if candidate.kind != CandidateKind::CompletedRerunnable
+            || candidate.run.event != "pull_request"
+        {
+            kept.push(candidate);
+            continue;
+        }
+        let branch = candidate.run.head_branch.clone();
+        let head = heads
+            .entry(branch.clone())
+            .or_insert_with(|| {
+                actions
+                    .branch_head_sha(repo_slug, &branch)
+                    .map_err(|error| error.to_string())
+            })
+            .clone();
+        let head = match head {
+            Ok(head) => head,
+            Err(error) => {
+                skipped.push((
+                    candidate,
+                    format!("current head of {branch} unread: {error}"),
+                ));
+                continue;
+            }
+        };
+        if !candidate.run.head_sha.eq_ignore_ascii_case(&head) {
+            let reason = format!(
+                "run is on {} but {branch}'s current head is {}",
+                short_sha(&candidate.run.head_sha),
+                short_sha(&head)
+            );
+            skipped.push((candidate, reason));
+            continue;
+        }
+        let on_head = runs.entry(head.clone()).or_insert_with(|| {
+            actions
+                .workflow_runs_for_head_sha(repo_slug, &head)
+                .map_err(|error| error.to_string())
+        });
+        let latest = match on_head {
+            Ok(on_head) => on_head
+                .iter()
+                .filter(|run| run.event == "pull_request" && run.path == candidate.run.path)
+                .max_by_key(|run| (run.created_at, run.id))
+                .map(|run| run.id),
+            Err(error) => {
+                let reason = format!("runs on {} unread: {error}", short_sha(&head));
+                skipped.push((candidate, reason));
+                continue;
+            }
+        };
+        if latest == Some(candidate.run.database_id) {
+            kept.push(candidate);
+        } else {
+            let reason = format!(
+                "a newer run of {} on {} exists ({})",
+                candidate.run.path,
+                short_sha(&head),
+                latest.map_or_else(|| "unlisted".to_owned(), |id| id.to_string())
+            );
+            skipped.push((candidate, reason));
+        }
+    }
+    (kept, skipped)
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
 fn rescue_run_cancellation_safe(run: &QueuedRun) -> bool {
     is_bulk_run_cancellation_safe(run)
 }
@@ -298,6 +403,20 @@ fn process_candidate(
         return RunOutcome::SkippedCompleted;
     }
     let run = &candidate.run;
+    if matches!(candidate.kind, CandidateKind::CompletedRerunnable) && run.event == "pull_request" {
+        // A `workflow_dispatch` replacement would check out the branch tip,
+        // not `refs/pull/N/merge`, so its checks prove a different tree than
+        // the one strict protection asks about. Re-run the run itself.
+        if args.dry_run {
+            return RunOutcome::Planned;
+        }
+        return match actions.rerun_failed_run(repo_slug, run.database_id) {
+            Ok(()) => RunOutcome::RerunApplied,
+            Err(error) => RunOutcome::Failed(format!(
+                "rerun of the pull_request run's failed jobs was refused: {error}"
+            )),
+        };
+    }
     let workflow_file = workflow_filename(&run.path);
     let workflow_key = workflows
         .iter()
@@ -486,7 +605,7 @@ fn render_human_summary(
     }
     if !args.rerun_failed {
         lines.push(
-            "Hint: pass --rerun-failed to also re-arm completed/cancelled runs (e.g. watchdog-cancelled)."
+            "Hint: pass --rerun-failed to also recover completed/cancelled runs (e.g. watchdog-cancelled)."
                 .to_owned(),
         );
     }
@@ -613,6 +732,7 @@ mod tests {
         conclusion: Option<&str>,
     ) -> QueuedRun {
         QueuedRun {
+            head_sha: String::new(),
             database_id: id,
             name: format!("CI #{id}"),
             head_branch: branch.to_owned(),
@@ -962,8 +1082,267 @@ cache_ttl_seconds = 300
     }
 
     #[cfg(unix)]
+    fn rerun_args() -> RescueArgs {
+        RescueArgs {
+            pr: Some(7507),
+            all_stuck: false,
+            provider: None,
+            rerun_failed: true,
+            dry_run: false,
+            threshold: "30m".to_owned(),
+            repo: Some("owner/repo".to_owned()),
+            superseded_merge_group: false,
+            apply: false,
+        }
+    }
+
+    /// A terminal `pull_request` run is re-run in place: one `run rerun
+    /// --failed` call, and no `workflow_dispatch`, whose branch-tip checkout
+    /// would prove a different tree than the pull request's merge ref.
+    #[cfg(unix)]
     #[test]
-    fn terminal_run_dispatches_one_replacement_without_rearming_original() {
+    fn terminal_pull_request_run_is_rerun_not_replaced() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cfg, actions, log) = scripted_actions(
+            &temp,
+            "case \"$1 $2\" in\n  \"run rerun\") exit 0 ;;\n  \"workflow run\"|\"api -X\") printf 'unexpected dispatch\\n' >&2; exit 9 ;;\nesac\nexit 2",
+        );
+        let mut workflows = BTreeMap::new();
+        workflows.insert("version".to_owned(), workflow("version.yml", true, &[]));
+        for conclusion in ["cancelled", "failure", "timed_out"] {
+            let _ = std::fs::remove_file(&log);
+            let mut run = queued_run(
+                42,
+                "feat/x",
+                "2026-05-13T10:00:00Z",
+                "completed",
+                Some(conclusion),
+            );
+            run.path = ".github/workflows/version.yml".to_owned();
+            let candidate = Candidate {
+                kind: CandidateKind::CompletedRerunnable,
+                run,
+            };
+            let outcome = process_candidate(
+                &candidate,
+                &rerun_args(),
+                &workflows,
+                &cfg,
+                &actions,
+                "owner/repo",
+            );
+            assert_eq!(outcome, RunOutcome::RerunApplied, "{conclusion}");
+            let calls = std::fs::read_to_string(&log).expect("gh log");
+            let lines = calls.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 1, "one rerun and nothing else: {calls}");
+            assert!(
+                lines[0].starts_with("run rerun 42 --failed --repo owner/repo"),
+                "{calls}"
+            );
+        }
+        // A dry run plans and calls nothing.
+        let _ = std::fs::remove_file(&log);
+        let mut run = queued_run(
+            42,
+            "feat/x",
+            "2026-05-13T10:00:00Z",
+            "completed",
+            Some("failure"),
+        );
+        run.path = ".github/workflows/version.yml".to_owned();
+        let candidate = Candidate {
+            kind: CandidateKind::CompletedRerunnable,
+            run,
+        };
+        let dry = RescueArgs {
+            dry_run: true,
+            ..rerun_args()
+        };
+        assert_eq!(
+            process_candidate(&candidate, &dry, &workflows, &cfg, &actions, "owner/repo"),
+            RunOutcome::Planned
+        );
+        assert!(!log.exists(), "a dry run calls nothing");
+    }
+
+    /// Only the latest run of a workflow on the branch's current head is
+    /// re-run: old heads' runs, an older attempt on the current head, and a
+    /// branch whose head cannot be read are skipped with the reason.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_current_heads_latest_run_is_rerun() {
+        const CUR: &str = "cccccccccccccccccccccccccccccccccccccccc";
+        const OLD: &str = "dddddddddddddddddddddddddddddddddddddddd";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let body = format!(
+            r#"case "$*" in
+  *git/ref/heads/feat/x*) printf '{{"object":{{"sha":"{CUR}"}}}}' ;;
+  *git/ref/heads/*) printf 'gh: Not Found (HTTP 404)\n' >&2; exit 1 ;;
+  *head_sha={CUR}*) printf '{{"workflow_runs":[{{"id":29,"event":"pull_request","path":".github/workflows/version.yml","status":"completed","conclusion":"failure","created_at":"2026-05-13T10:00:00Z"}},{{"id":30,"event":"pull_request","path":".github/workflows/version.yml","status":"completed","conclusion":"failure","created_at":"2026-05-13T11:00:00Z"}}]}}' ;;
+  "run rerun 30 "*) exit 0 ;;
+  *) printf 'unexpected: %s\n' "$*" >&2; exit 9 ;;
+esac"#
+        );
+        let (cfg, actions, log) = scripted_actions(&temp, &body);
+        let mut workflows = BTreeMap::new();
+        workflows.insert("version".to_owned(), workflow("version.yml", true, &[]));
+        let completed = |id: u64, branch: &str, head: &str, conclusion: &str| {
+            let mut run = queued_run(
+                id,
+                branch,
+                "2026-05-13T10:00:00Z",
+                "completed",
+                Some(conclusion),
+            );
+            run.path = ".github/workflows/version.yml".to_owned();
+            run.head_sha = head.to_owned();
+            Candidate {
+                kind: CandidateKind::CompletedRerunnable,
+                run,
+            }
+        };
+        let candidates = vec![
+            completed(10, "feat/x", OLD, "failure"),
+            completed(11, "feat/x", OLD, "cancelled"),
+            completed(29, "feat/x", CUR, "failure"),
+            completed(30, "feat/x", CUR, "failure"),
+            completed(31, "fork/y", CUR, "failure"),
+        ];
+        let (kept, skipped) = current_head_only(&actions, "owner/repo", candidates);
+        assert_eq!(
+            kept.iter().map(|c| c.run.database_id).collect::<Vec<_>>(),
+            vec![30]
+        );
+        let reasons: BTreeMap<u64, String> = skipped
+            .iter()
+            .map(|(candidate, reason)| (candidate.run.database_id, reason.clone()))
+            .collect();
+        assert!(
+            reasons[&10].contains("current head is cccccccccccc"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons[&11].contains("run is on dddddddddddd"),
+            "{reasons:?}"
+        );
+        assert!(reasons[&29].contains("a newer run"), "{reasons:?}");
+        assert!(
+            reasons[&31].contains("current head of fork/y unread"),
+            "{reasons:?}"
+        );
+        for candidate in &kept {
+            assert_eq!(
+                process_candidate(
+                    candidate,
+                    &rerun_args(),
+                    &workflows,
+                    &cfg,
+                    &actions,
+                    "owner/repo"
+                ),
+                RunOutcome::RerunApplied
+            );
+        }
+        let calls = std::fs::read_to_string(&log).expect("gh log");
+        let reruns: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.starts_with("run rerun"))
+            .collect();
+        assert_eq!(
+            reruns,
+            vec!["run rerun 30 --failed --repo owner/repo"],
+            "{calls}"
+        );
+        // One head read per branch and one run listing per head.
+        assert_eq!(calls.matches("git/ref/heads/feat/x").count(), 1, "{calls}");
+        assert_eq!(calls.matches("head_sha=").count(), 1, "{calls}");
+        // A superseded run reports why it was skipped.
+        let row = candidate_row(
+            &skipped[0].0,
+            &RunOutcome::SkippedSuperseded(skipped[0].1.clone()),
+        );
+        assert_eq!(row["status"], "skipped-superseded");
+        assert!(
+            row["detail"]
+                .as_str()
+                .is_some_and(|detail| !detail.is_empty())
+        );
+    }
+
+    /// Queued runs and runs of other events are not filtered by head.
+    #[cfg(unix)]
+    #[test]
+    fn the_head_filter_leaves_queued_and_other_runs_alone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_cfg, actions, log) = scripted_actions(&temp, "exit 9");
+        let mut other = queued_run(
+            5,
+            "feat/x",
+            "2026-05-13T10:00:00Z",
+            "completed",
+            Some("failure"),
+        );
+        other.event = "workflow_dispatch".to_owned();
+        let queued = queued_run(6, "feat/x", "2026-05-13T10:00:00Z", "queued", None);
+        let (kept, skipped) = current_head_only(
+            &actions,
+            "owner/repo",
+            vec![
+                Candidate {
+                    kind: CandidateKind::CompletedRerunnable,
+                    run: other,
+                },
+                Candidate {
+                    kind: CandidateKind::QueuedStuck,
+                    run: queued,
+                },
+            ],
+        );
+        assert_eq!(kept.len(), 2);
+        assert!(skipped.is_empty());
+        assert!(!log.exists(), "nothing read");
+    }
+
+    /// A refused rerun is a failure that names the refusal, not a silent skip.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_rerun_fails_the_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cfg, actions, _log) = scripted_actions(
+            &temp,
+            "case \"$1 $2\" in\n  \"run rerun\") printf 'cannot be rerun; This workflow is already running\\n' >&2; exit 1 ;;\nesac\nexit 2",
+        );
+        let workflows = BTreeMap::new();
+        let candidate = Candidate {
+            kind: CandidateKind::CompletedRerunnable,
+            run: queued_run(
+                42,
+                "feat/x",
+                "2026-05-13T10:00:00Z",
+                "completed",
+                Some("failure"),
+            ),
+        };
+        match process_candidate(
+            &candidate,
+            &rerun_args(),
+            &workflows,
+            &cfg,
+            &actions,
+            "owner/repo",
+        ) {
+            RunOutcome::Failed(message) => {
+                assert!(message.contains("already running"), "{message}");
+            }
+            outcome => panic!("expected a failure, got {outcome:?}"),
+        }
+    }
+
+    /// A terminal run of any other event still gets one dispatched
+    /// replacement, and the terminal original is left untouched.
+    #[cfg(unix)]
+    #[test]
+    fn terminal_non_pull_request_run_dispatches_one_replacement_without_rearming_original() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (cfg, actions, log) = scripted_actions(
             &temp,
@@ -978,25 +1357,21 @@ cache_ttl_seconds = 300
             "completed",
             Some("cancelled"),
         );
+        run.event = "workflow_dispatch".to_owned();
         run.path = ".github/workflows/version.yml".to_owned();
         let candidate = Candidate {
             kind: CandidateKind::CompletedRerunnable,
             run,
         };
-        let args = RescueArgs {
-            pr: Some(7507),
-            all_stuck: false,
-            provider: None,
-            rerun_failed: true,
-            dry_run: false,
-            threshold: "30m".to_owned(),
-            repo: Some("owner/repo".to_owned()),
-            superseded_merge_group: false,
-            apply: false,
-        };
 
-        let outcome =
-            process_candidate(&candidate, &args, &workflows, &cfg, &actions, "owner/repo");
+        let outcome = process_candidate(
+            &candidate,
+            &rerun_args(),
+            &workflows,
+            &cfg,
+            &actions,
+            "owner/repo",
+        );
 
         assert_eq!(outcome, RunOutcome::ReplacementApplied);
         let calls = std::fs::read_to_string(log).expect("gh log");

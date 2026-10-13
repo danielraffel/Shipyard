@@ -26,6 +26,7 @@ fn recorded_refs() -> Result<String, String> {
 
 fn run(id: u64, event: &str, branch: &str, status: &str, workflow: &str, path: &str) -> QueuedRun {
     QueuedRun {
+        head_sha: String::new(),
         database_id: id,
         name: workflow.to_owned(),
         head_branch: branch.to_owned(),
