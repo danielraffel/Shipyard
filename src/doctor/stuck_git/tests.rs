@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use super::{
     CheckoutState, FLEET_SIBLINGS, Finding, Operation, STALE_AFTER, checkouts, entry, examine,
-    git_unmerged, remedy,
+    git_unmerged, remedy, remedy_chain, shell_quote,
 };
 
 const LATER: Duration = Duration::from_hours(2);
@@ -64,7 +64,13 @@ fn each_marker_names_its_operation_and_abort() {
         let commands = remedy(dir.path(), &findings[0], "stamp");
         assert_eq!(
             commands.last().map(String::as_str),
-            Some(format!("git -C {} {abort}", dir.path().display()).as_str()),
+            Some(
+                format!(
+                    "git -C {} {abort}",
+                    shell_quote(&dir.path().display().to_string())
+                )
+                .as_str()
+            ),
             "{marker}: the abort is the last command"
         );
     }
@@ -102,7 +108,7 @@ fn the_backup_precedes_the_abort() {
     assert_eq!(abort, commands.len() - 1);
     for backup in [
         "branch shipyard-backup/cherry-pick-20261013T1200 HEAD",
-        "diff HEAD >",
+        "diff --binary HEAD >",
         "status --porcelain=v2 >",
         "/.git/CHERRY_PICK_HEAD",
         "MERGE_MSG",
@@ -154,7 +160,7 @@ fn unmerged_entries_without_a_marker_are_reported() {
             .last()
             .is_some_and(|c| c.ends_with(" reset --merge"))
     );
-    assert!(commands.iter().any(|c| c.contains("diff HEAD >")));
+    assert!(commands.iter().any(|c| c.contains("diff --binary HEAD >")));
 }
 
 /// A checkout that cannot be read is never reported clean.
@@ -256,4 +262,68 @@ fn checkouts_include_existing_siblings_and_configured_paths() {
     assert!(!found.contains(&canonical(&root.path().join("not-fleet"))));
     assert_eq!(found.len(), 3, "each once: {found:?}");
     assert!(FLEET_SIBLINGS.contains(&"vellum"));
+}
+
+/// The block is one `&&` chain ending in the abort, so a failed backup step
+/// stops it before the abort; optional copies never fail the chain.
+#[test]
+fn the_remedy_is_one_chain_ending_in_the_abort() {
+    let dir = checkout();
+    fs::write(dir.path().join(".git/CHERRY_PICK_HEAD"), "abc\n").expect("marker");
+    let findings = stuck(examine(dir.path(), later(), none));
+    let chain = remedy_chain(dir.path(), &findings[0], "s");
+    let lines: Vec<&str> = chain.lines().collect();
+    assert!(lines.len() > 3, "{chain}");
+    let (last, rest) = lines.split_last().expect("lines");
+    for line in rest {
+        assert!(
+            line.ends_with(" &&"),
+            "every step but the last chains: {line}"
+        );
+        assert!(
+            !line.contains("] &&"),
+            "an optional copy must not fail the chain: {line}"
+        );
+    }
+    assert!(
+        last.trim_start().ends_with("cherry-pick --abort"),
+        "{chain}"
+    );
+    assert_eq!(chain.matches("--abort").count(), 1, "{chain}");
+    assert!(chain.contains("[ ! -e "), "{chain}");
+    let rendered = entry(dir.path(), &CheckoutState::Stuck(findings), "s")
+        .detail
+        .expect("detail");
+    assert!(rendered.contains(&chain), "{rendered}");
+    assert!(rendered.contains("POSIX shell"), "{rendered}");
+}
+
+/// The checkout's name is reduced to a safe file name in the backup path.
+#[test]
+fn the_backup_directory_name_is_sanitised() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let odd = root.path().join("my repo;$(x)");
+    fs::create_dir_all(odd.join(".git")).expect(".git");
+    fs::write(odd.join(".git/MERGE_HEAD"), "abc\n").expect("marker");
+    let findings = stuck(examine(&odd, later(), none));
+    let commands = remedy(&odd, &findings[0], "s");
+    assert_eq!(
+        commands[0],
+        "mkdir -p \"$HOME/.shipyard-git-backups/my_repo___x_-s\""
+    );
+}
+
+/// Only a marker that does not exist is absent; one that cannot be read
+/// makes the checkout unreadable, never clean.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_marker_is_not_absent() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = checkout();
+    let git_dir = dir.path().join(".git");
+    fs::write(git_dir.join("MERGE_HEAD"), "abc\n").expect("marker");
+    fs::set_permissions(&git_dir, fs::Permissions::from_mode(0o600)).expect("chmod");
+    let state = examine(dir.path(), later(), none);
+    fs::set_permissions(&git_dir, fs::Permissions::from_mode(0o755)).expect("restore");
+    assert!(matches!(state, CheckoutState::Unreadable(_)), "{state:?}");
 }

@@ -122,7 +122,11 @@ pub fn examine(
     };
     let age = |relative: &str| -> Option<Result<Duration, String>> {
         let path = git_dir.join(relative);
-        let metadata = fs::symlink_metadata(&path).ok()?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => return Some(Err(format!("cannot read {}: {error}", path.display()))),
+        };
         Some(
             metadata
                 .modified()
@@ -193,16 +197,23 @@ pub fn remedy(checkout: &Path, finding: &Finding, stamp: &str) -> Vec<String> {
         "shipyard-backup/{}-{stamp}",
         finding.operation.name().replace(' ', "-")
     );
-    let backup_dir = format!(
-        "\"$HOME/.shipyard-git-backups/{}-{stamp}\"",
-        checkout
-            .file_name()
-            .map_or_else(|| "checkout".into(), |name| name.to_string_lossy())
-    );
+    let name: String = checkout
+        .file_name()
+        .map_or_else(|| "checkout".into(), |name| name.to_string_lossy())
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || "._-".contains(ch) {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let backup_dir = format!("\"$HOME/.shipyard-git-backups/{name}-{stamp}\"");
     let mut commands = vec![
         format!("mkdir -p {backup_dir}"),
         format!("git -C {path} branch {backup} HEAD"),
-        format!("git -C {path} diff HEAD > {backup_dir}/worktree.patch"),
+        format!("git -C {path} diff --binary HEAD > {backup_dir}/worktree.patch"),
         format!("git -C {path} status --porcelain=v2 > {backup_dir}/status.txt"),
     ];
     if finding.operation != Operation::UnmergedEntries {
@@ -212,12 +223,19 @@ pub fn remedy(checkout: &Path, finding: &Finding, stamp: &str) -> Vec<String> {
         ));
         for extra in ["MERGE_MSG", "ORIG_HEAD", "AUTO_MERGE"] {
             commands.push(format!(
-                "[ -e {path}/.git/{extra} ] && cp -p {path}/.git/{extra} {backup_dir}/"
+                "[ ! -e {path}/.git/{extra} ] || cp -p {path}/.git/{extra} {backup_dir}/"
             ));
         }
     }
     commands.push(format!("git -C {path} {}", finding.operation.abort()));
     commands
+}
+
+/// [`remedy`] as one POSIX shell chain: each step runs only if every step
+/// before it succeeded, so the abort never runs after a failed backup.
+#[must_use]
+pub fn remedy_chain(checkout: &Path, finding: &Finding, stamp: &str) -> String {
+    remedy(checkout, finding, stamp).join(" &&\n  ")
 }
 
 fn shell_quote(text: &str) -> String {
@@ -274,10 +292,11 @@ pub fn entry(checkout: &Path, state: &CheckoutState, stamp: &str) -> DoctorEntry
                 if !finding.unmerged.is_empty() {
                     let _ = writeln!(detail, "unmerged: {}", finding.unmerged.join(", "));
                 }
-                detail.push_str("back up, then abort (shipyard never aborts it for you):\n");
-                for command in remedy(checkout, finding, stamp) {
-                    let _ = writeln!(detail, "  {command}");
-                }
+                detail.push_str(
+                    "back up, then abort, as one POSIX shell chain (run it in a POSIX shell; \
+                     shipyard never aborts it for you):\n",
+                );
+                let _ = writeln!(detail, "  {}", remedy_chain(checkout, finding, stamp));
             }
             let names: BTreeSet<&str> = findings
                 .iter()
