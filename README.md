@@ -118,13 +118,30 @@ project will automatically recover or merge every PR.
   explicit one-shot equivalent. See [docs/runner-watchdog.md](docs/runner-watchdog.md).
 - **One-shot PR rescue.** `shipyard rescue <pr>` cancels and
   redispatches every stuck queued workflow run on a PR onto
-  `github-hosted` (or any provider via `--to`). `--rerun-failed`
-  dispatches fresh replacements for terminal failed/cancelled runs without
-  re-arming the originals; `--all-stuck` is the
+  `github-hosted` (or any provider via `--to`). `--rerun-failed` also
+  recovers terminal failed, cancelled, and timed-out runs: a `pull_request`
+  run is re-run in place (`gh run rerun --failed`), so its checks still prove
+  the PR's merge ref, and only the latest run of each workflow on the branch's
+  current head is touched; a run of any other event gets a dispatched
+  replacement. `--all-stuck` is the
   repo-wide variant. `--superseded-merge-group` instead reaps merge_group
   runs whose `gh-readonly-queue/*` ref GitHub already deleted (audit-only
   unless `--apply`). It complements the watchdog for explicitly supported
   recovery cases.
+- **Review before arm, and a HOLD that acts.** With the optional `ghapp`
+  guards installed, a host can require, for repositories that ask for review,
+  that a reviewer verdict
+  (`verdict: APPROVE head:<sha>`, `reviewed: <sha>`, or an `APPROVED` review)
+  names the PR's exact head before it is armed, enqueued, or merged, and that
+  the request binds that head (`--match-head-commit`). An approval carries
+  to a new head only through merges from the base that leave every file the
+  PR changes with the same content and mode; anything else needs a new
+  verdict. Posting `verdict: HOLD head:<sha>` through
+  `ghapp` dequeues or disarms a PR armed or queued at exactly that head; if
+  that fails, it posts a public note on the PR saying the HOLD may still land.
+  Each behaviour is switched on per host by a file in the guards directory
+  (`review-before-arm`, `hold-disarms`), so it rolls out one host at a time.
+  See [`ghapp` guards](docs/ghapp-guards.md).
 - **Durable cancellation.** `shipyard cancel <job> --reason <why>` records the
   operator reason and terminates an active local or SSH validation process tree
   on its next progress event, including descendant build processes.
@@ -152,7 +169,21 @@ project will automatically recover or merge every PR.
   findings, placement advice, or one compact stewardship scorecard without
   requiring tartci or any observability service. The scorecard labels missing
   submit-to-receipt and model-token telemetry as unavailable rather than
-  estimating it.
+  estimating it. `shipyard metrics gate-cost --scorecard` reports success
+  rates per ISO week read from GitHub (open-to-merge time, merge-queue
+  ejections, red required checks), plus each merged PR's merge-head verdict,
+  naming PRs that merged with a HOLD on their head. `--export-cases FILE`
+  writes the cases it read as unlabelled JSONL with a SHA-256 receipt, for
+  labelling later.
+- **Rules-first PR watching.** `shipyard pr-watch scan` flags open PRs stuck
+  in a way a person should look at, read-only by default.
+  `shipyard pr-watch rules` wakes an agent only when something changed (a
+  READY head nobody reviewed, a verdict posted, a red required check, a queue
+  removal), printing each event once as JSON with the fix to apply.
+  `scripts/watch_inputs.py` adds events GitHub does not hold, such as Codex
+  session states and tartci host health, and can replay a host's tartci
+  pool-log as host events, keying each problem without its changing numbers
+  so a condition the log repeats fires once. See [PR watch](docs/pr-watch.md).
 
 See [exact-head changed-surface selection](docs/changed-surface-selection.md)
 for the base-owned schema, receipt fields, and hard-fail/fallback boundary.
@@ -248,6 +279,10 @@ passed for the exact change.
 
 ## Documentation
 
+- [PR watch](docs/pr-watch.md): stuck-PR flags, the rules watcher, input
+  readers, and replay.
+- [`ghapp` guards](docs/ghapp-guards.md): operator reference for the queue,
+  review-before-arm, and HOLD guards, including how to switch each on.
 - [Queue observer](docs/queue-observer.md) — one-query queue snapshots,
   persisted state hashes, delta-only output, replay, and adaptive backoff.
 - [Examples & Scenarios](docs/examples.md) — real-world setups for Xcode,
@@ -308,7 +343,20 @@ macOS, Linux, and Windows on every push. The release workflow at
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds
 Linux, Windows, and macOS ARM64 release candidates when a version is
 tagged; the macOS DMG is signed/notarized and published through the
-release runbook.
+release runbook. Before a release draft is created, a `live-smoke` job runs
+the built binary's read-only commands against real repositories. The
+[`sandbox-e2e.yml`](.github/workflows/sandbox-e2e.yml) workflow runs Shipyard
+under an isolated HOME and PATH and fails on any write outside them; writes to
+the host's agent-session inbox (`~/.local/state/shipyard/inbox/`) by other
+sessions are listed but not counted. Third-party actions are pinned by commit
+SHA, and cargo caches are saved only from `main` on GitHub-hosted
+runners.
+
+## Planned
+
+**`shipyard inspect`** (planned, not yet shipped): an on-demand CI health
+check you reach by asking your agent, for example "why is CI slow?". It only
+reads, and it runs only when asked, so it never slows Shipyard down.
 
 ## FAQ
 
