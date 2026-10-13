@@ -147,6 +147,19 @@ impl FakeGh {
             p if p == format!("repos/{PULP}/actions/jobs/42/logs") => {
                 Err("gh: Not Found (HTTP 404)".to_owned())
             }
+            p if (43..=48).any(|id| p == format!("repos/{PULP}/actions/jobs/{id}")) => {
+                let mut job = gate_job_payload();
+                job["id"] = json!(p.rsplit('/').next().and_then(|id| id.parse::<u64>().ok()));
+                Ok(job.to_string())
+            }
+            p if p.starts_with(&format!("repos/{PULP}/actions/jobs/4")) && p.ends_with("/logs") => {
+                let id: u64 = p
+                    .split('/')
+                    .nth(5)
+                    .and_then(|id| id.parse().ok())
+                    .expect("id");
+                Ok(self_named_log(id))
+            }
             _ => Err(format!("unexpected request {path}")),
         }
     }
@@ -170,6 +183,83 @@ fn gather_reads_each_job_and_a_missing_log_still_yields_a_cause() {
     assert_eq!(read.unreadable.len(), 1);
     assert_eq!(read.unreadable[0].job_id, 7);
     assert!(read.unreadable[0].reason.contains("unexpected request"));
+}
+
+/// A log in which the job printed its own record, named at 21:25:00 during
+/// its run (21:14:08 to 21:25:47). Jobs 44 to 48 print a forged one: wrong
+/// head, wrong run, wrong attempt, named after the run, or a cause the log
+/// does not hold.
+fn self_named_log(id: u64) -> String {
+    let job: crate::diagnose::Job = serde_json::from_value(gate_job_payload()).expect("job");
+    let place = Place {
+        repo: PULP.to_owned(),
+        ..Place::default()
+    };
+    let mut record = cause::build(
+        &job,
+        Some(&gate_log()),
+        &place,
+        Some("2026-10-12T21:25:00Z".to_owned()),
+        false,
+    )
+    .expect("red");
+    match id {
+        44 => record.head_sha = Some("f".repeat(40)),
+        45 => record.run_id = Some(1),
+        46 => record.attempt = Some(2),
+        47 => record.named_at = Some("2026-10-12T21:25:48Z".to_owned()),
+        48 => record.signature = "a test that never failed".to_owned(),
+        _ => {}
+    }
+    let mut log = gate_log();
+    log.push_str("2026-10-12T21:25:00.0000000Z ##[notice]");
+    log.push_str(&serde_json::to_string(&record).expect("json"));
+    log.push('\n');
+    log
+}
+
+#[test]
+fn a_cause_the_job_recorded_keeps_its_time() {
+    let gh = FakeGh::new();
+    let reader = |args: &[String]| gh.answer(args);
+    let jobs = std::iter::once(43).collect();
+    let read = gather(
+        &reader,
+        &ReadCache::disabled(),
+        PULP,
+        &jobs,
+        DEFAULT_MAX_JOBS,
+    );
+    let cause = &read.by_job[&43];
+    assert!(!cause.retrospective);
+    assert_eq!(cause.named_at.as_deref(), Some("2026-10-12T21:25:00Z"));
+    // The content is the extractor's, bound to the payload.
+    assert_eq!(cause.job_id, Some(43));
+    assert_eq!(cause.signature, VELLUM);
+}
+
+#[test]
+fn a_forged_record_is_ignored_and_the_extractor_answers() {
+    let gh = FakeGh::new();
+    let reader = |args: &[String]| gh.answer(args);
+    let jobs = (44..=48).collect();
+    let read = gather(
+        &reader,
+        &ReadCache::disabled(),
+        PULP,
+        &jobs,
+        DEFAULT_MAX_JOBS,
+    );
+    for id in 44..=48 {
+        let cause = &read.by_job[&id];
+        assert!(cause.retrospective, "job {id}: a forged record was trusted");
+        assert_eq!(
+            cause.named_at.as_deref(),
+            Some("2026-10-12T21:25:47Z"),
+            "job {id}"
+        );
+        assert_eq!(cause.signature, VELLUM, "job {id}");
+    }
 }
 
 #[test]

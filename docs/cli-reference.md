@@ -62,8 +62,19 @@ shipyard diagnose 123                        # PR head: per failing REQUIRED che
                                              #   rule, and the command for the full log; never over --max-bytes (16384)
 shipyard diagnose --run ID [--required NAME] # one workflow run (required checks from the base policy unless named)
 shipyard --json diagnose 123                 # the JSON document
-shipyard diagnose 123 --annotate plan|post   # check-run annotations on the failing file:line (neutral "shipyard diagnose" check run)
+shipyard diagnose 123 --annotate plan|post   # check-run annotations on the failing file:line (neutral "shipyard diagnose" check run);
+                                             #   output.text carries each failing required job's ci.cause/v1 record, one JSON per line
                                              # config: [diagnose] stale_base_markers / fail_closed_markers = ["regex", ...]
+
+# Name a failed job's cause (ci.cause/v1, a superset of C2's c2.cause.v0) and keep it
+shipyard cause extract --log FILE            # the job's record as JSON; where it ran from --repo/--run-id/--attempt/--job/
+                                             #   --head-sha/--event/--pr, else GITHUB_*; --job-json FILE reads the failing step
+shipyard cause extract --log FILE --notice   # `::notice title=ci-cause::<record>`: run in an `if: failure()` step so the cause
+                                             #   lands in the job's own log; the scorecard keeps its named_at only when it is
+                                             #   bound to the job (repo/head/run/attempt/job) and names the cause it reads
+shipyard cause extract --log FILE --format c2  # C2's raw records (the extractor EXP-A3 shares)
+shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/YYYY-MM.jsonl;
+                                             #   ids already archived are skipped, nothing is rewritten
 
 # ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard)
 shipyard guards status                       # missing/stale/current vs this build's copies; exit 1 unless all current

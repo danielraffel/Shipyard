@@ -403,6 +403,14 @@ guard's own decision posted on the head; it is report-only until a
 repository requires it. A red `review-verdict` means the guard would refuse
 that head; fix the verdict, not the status.
 
+**To record a cause when the job fails, not after.** In an `if: failure()`
+step, run `shipyard cause extract --log <captured output> --notice || true`.
+It prints `::notice title=ci-cause::<record>`, so the job's own log holds its
+`ci.cause/v1` record; the scorecard keeps its `named_at` only when the record
+is bound to that job (repo, head, run, attempt, job name) and names the cause
+the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
+<file>` (append-only, one file per month, ids never duplicated).
+
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason
 `failed_checks` or `checks_timed_out`, and use `AddedToMergeQueueEvent` as the

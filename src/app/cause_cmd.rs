@@ -1,0 +1,268 @@
+//! `shipyard cause`: name a failed job's cause from its log, and keep the
+//! records in an append-only archive.
+//!
+//! `extract` is what a workflow runs in an `if: failure()` step over the
+//! output it captured: `--notice` prints the record as a workflow command, so
+//! the cause lands in the job's own log, where `diagnose` and the scorecard
+//! read it back. It is also EXP-A3's entry point to C2 (`--format c2`), so the
+//! corpus and Shipyard use one extractor.
+//!
+//! `archive` appends records to `<dir>/YYYY-MM.jsonl` by the month of
+//! `named_at`. A record whose id is already in the archive is skipped; no
+//! line is ever rewritten.
+
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+
+use chrono::Utc;
+use fs2::FileExt;
+use serde::Serialize;
+use serde_json::Value;
+
+use super::CliFailure;
+use super::cli::{CauseArchiveArgs, CauseCommand, CauseExtractArgs};
+use crate::diagnose::c2;
+use crate::diagnose::cause::{self, CiCause, Place};
+use crate::diagnose::{Job, Step};
+
+/// The step a job assembled from the environment failed in.
+const CAPTURED_STEP: &str = "captured output";
+
+pub(super) fn cause_command<W: Write>(
+    command: CauseCommand,
+    json: bool,
+    stdout: &mut W,
+) -> Result<std::process::ExitCode, CliFailure> {
+    match command {
+        CauseCommand::Extract(args) => {
+            let env = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+            let text = extract(
+                &args,
+                &env,
+                &Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            )?;
+            writeln!(stdout, "{text}").map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+        CauseCommand::Archive(args) => {
+            let report = archive_inputs(&args)?;
+            let written = if json {
+                writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string(&report).unwrap_or_default()
+                )
+            } else {
+                writeln!(
+                    stdout,
+                    "archive: {} appended, {} already archived, {} line(s) without a record",
+                    report.appended, report.already_archived, report.without_record
+                )
+            };
+            written.map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// The job and where it ran: the `--job-json` payload when given, else a
+/// failed job assembled from the flags and the runner's environment.
+fn job_and_place(
+    args: &CauseExtractArgs,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(Job, Place), CliFailure> {
+    let number = |flag: Option<u64>, key: &str| flag.or_else(|| env(key)?.parse().ok());
+    let mut job = match &args.job_json {
+        Some(path) => {
+            let text = fs::read_to_string(path).map_err(|error| {
+                CliFailure::new(2, format!("cannot read {}: {error}", path.display()))
+            })?;
+            serde_json::from_str::<Job>(&text).map_err(|error| {
+                CliFailure::new(
+                    2,
+                    format!("{} is not a job payload: {error}", path.display()),
+                )
+            })?
+        }
+        // A job with no recorded steps reads to `diagnose` as a lost runner,
+        // so the captured output stands in as the one failed step.
+        None => Job {
+            status: Some("completed".to_owned()),
+            conclusion: Some("failure".to_owned()),
+            runner_name: env("RUNNER_NAME"),
+            steps: Some(vec![Step {
+                name: CAPTURED_STEP.to_owned(),
+                conclusion: Some("failure".to_owned()),
+                ..Step::default()
+            }]),
+            ..Job::default()
+        },
+    };
+    if let Some(name) = args.job.clone().or_else(|| env("GITHUB_JOB")) {
+        job.name = name;
+    }
+    job.run_id = number(args.run_id, "GITHUB_RUN_ID").or(job.run_id);
+    job.run_attempt = number(args.attempt, "GITHUB_RUN_ATTEMPT").or(job.run_attempt);
+    job.head_sha = args
+        .head_sha
+        .clone()
+        .or_else(|| pull_request_head(env))
+        .or_else(|| env("GITHUB_SHA"))
+        .or(job.head_sha);
+    let place = Place {
+        repo: args
+            .repo
+            .clone()
+            .or_else(|| env("GITHUB_REPOSITORY"))
+            .unwrap_or_default(),
+        event: args.event.clone().or_else(|| env("GITHUB_EVENT_NAME")),
+        pr: args.pr,
+        ..Place::default()
+    };
+    Ok((job, place))
+}
+
+/// The pull request's head commit from the event payload: on a
+/// `pull_request` run `GITHUB_SHA` is the test merge commit, while the jobs
+/// API (and so the record's binding) names the head.
+fn pull_request_head(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let event: Value =
+        serde_json::from_str(&fs::read_to_string(env("GITHUB_EVENT_PATH")?).ok()?).ok()?;
+    event
+        .pointer("/pull_request/head/sha")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// What `extract` prints.
+fn extract(
+    args: &CauseExtractArgs,
+    env: &dyn Fn(&str) -> Option<String>,
+    now: &str,
+) -> Result<String, CliFailure> {
+    let text = fs::read_to_string(&args.log).map_err(|error| {
+        CliFailure::new(2, format!("cannot read {}: {error}", args.log.display()))
+    })?;
+    match args.format.as_str() {
+        "c2" => Ok(serde_json::to_string(&c2::extract(&text)).unwrap_or_default()),
+        "record" => {
+            let (job, place) = job_and_place(args, env)?;
+            // A job that did not fail has no cause; its record is `null`.
+            let record = cause::build(&job, Some(&text), &place, Some(now.to_owned()), false);
+            Ok(match (record, args.notice) {
+                (Some(record), true) => cause::notice_line(&record),
+                (None, true) => String::new(),
+                (record, false) => serde_json::to_string(&record).unwrap_or_default(),
+            })
+        }
+        other => Err(CliFailure::new(
+            2,
+            format!("--format must be record or c2, not `{other}`"),
+        )),
+    }
+}
+
+/// What one archive call did.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub(super) struct ArchiveReport {
+    /// Records appended.
+    pub appended: usize,
+    /// Records whose id was already archived (or repeated in the input).
+    pub already_archived: usize,
+    /// Input lines that held no record.
+    pub without_record: usize,
+}
+
+/// A `ci.cause/v1` record from one JSONL line: the line itself, or a
+/// scorecard case row's `cause`.
+fn record_of(line: &str) -> Option<CiCause> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let candidate = if value.get("schema").and_then(Value::as_str) == Some(cause::SCHEMA) {
+        value
+    } else {
+        value.get("cause").filter(|cause| !cause.is_null())?.clone()
+    };
+    let record: CiCause = serde_json::from_value(candidate).ok()?;
+    (record.schema == cause::SCHEMA).then_some(record)
+}
+
+fn month_file(record: &CiCause) -> String {
+    let month = record
+        .named_at
+        .as_deref()
+        .and_then(|at| at.get(..7))
+        .filter(|month| {
+            month.len() == 7
+                && month.as_bytes()[4] == b'-'
+                && month
+                    .bytes()
+                    .enumerate()
+                    .all(|(i, byte)| i == 4 || byte.is_ascii_digit())
+        })
+        .unwrap_or("undated");
+    format!("{month}.jsonl")
+}
+
+fn archived_ids(dir: &Path) -> Result<BTreeSet<String>, String> {
+    let mut ids = BTreeSet::new();
+    for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        ids.extend(text.lines().filter_map(record_of).map(|record| record.id()));
+    }
+    Ok(ids)
+}
+
+/// Append `records` to the archive under `dir`, holding its lock.
+pub(super) fn archive(dir: &Path, lines: &[String]) -> Result<ArchiveReport, String> {
+    fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".lock"))
+        .map_err(|error| error.to_string())?;
+    lock.lock_exclusive().map_err(|error| error.to_string())?;
+    let mut seen = archived_ids(dir)?;
+    let mut report = ArchiveReport::default();
+    for line in lines.iter().filter(|line| !line.trim().is_empty()) {
+        let Some(record) = record_of(line) else {
+            report.without_record += 1;
+            continue;
+        };
+        if !seen.insert(record.id()) {
+            report.already_archived += 1;
+            continue;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(month_file(&record)))
+            .map_err(|error| error.to_string())?;
+        let mut bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+        bytes.push(b'\n');
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        report.appended += 1;
+    }
+    Ok(report)
+}
+
+fn archive_inputs(args: &CauseArchiveArgs) -> Result<ArchiveReport, CliFailure> {
+    let mut lines = Vec::new();
+    for path in &args.inputs {
+        let text = fs::read_to_string(path).map_err(|error| {
+            CliFailure::new(2, format!("cannot read {}: {error}", path.display()))
+        })?;
+        lines.extend(text.lines().map(str::to_owned));
+    }
+    archive(&args.dir, &lines)
+        .map_err(|error| CliFailure::new(1, format!("archive {}: {error}", args.dir.display())))
+}
+
+#[cfg(test)]
+mod tests;

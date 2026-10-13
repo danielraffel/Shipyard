@@ -18,6 +18,7 @@
 //! `high` or `medium`.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -397,7 +398,10 @@ pub fn build(
             .clone()
             .or_else(|| check.failing_step.as_ref().map(|step| step.name.clone())),
     };
-    let (records, raw) = match log {
+    // A record the job printed is not evidence of its own failure: its JSON
+    // quotes failing lines, which C2 would read again.
+    let cleaned = log.map(without_records);
+    let (records, raw) = match cleaned.as_deref() {
         Some(text) => (c2::extract(text), split_lines(text)),
         None => (c2::extract_log_fetch_error("Not Found"), Vec::new()),
     };
@@ -420,6 +424,110 @@ pub fn build(
         // record, so the miss is counted rather than lost.
         (None, None) => Some(unrecognized(&place, named_at_copy, retrospective)),
     }
+}
+
+/// Title of the workflow command that carries a record in a job log.
+pub const NOTICE_TITLE: &str = "ci-cause";
+
+/// The workflow command a job prints so its cause lands in its own log:
+/// `::notice title=ci-cause::<record as compact JSON>`, with the data escaped
+/// as GitHub's workflow commands require.
+#[must_use]
+pub fn notice_line(cause: &CiCause) -> String {
+    let json = serde_json::to_string(cause).unwrap_or_default();
+    let data = json
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A");
+    format!("::notice title={NOTICE_TITLE}::{data}")
+}
+
+/// The records a job printed with [`notice_line`], as its log shows them
+/// (`##[notice]<record>`, the runner having dropped the title and unescaped
+/// the data). Lines that are not a `ci.cause/v1` record are ignored.
+#[must_use]
+pub fn records_in_log(text: &str) -> Vec<CiCause> {
+    split_lines(text)
+        .into_iter()
+        .filter_map(|line| {
+            let line = c2::strip_line(line);
+            let data = line.trim().strip_prefix("##[notice]")?;
+            let cause: CiCause = serde_json::from_str(data).ok()?;
+            (cause.schema == SCHEMA).then_some(cause)
+        })
+        .collect()
+}
+
+/// `text` with every `ci.cause/v1` notice line blanked, keeping line numbers.
+#[must_use]
+pub fn without_records(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in split_lines(text) {
+        if !records_in_log(line).is_empty() {
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether a record a job printed into its own log (`recorded`) may stand
+/// for that job: its identity must be the payload's (`repo`, `head_sha`,
+/// `run_id`, `attempt`, `job`), its cause must be the one the extractor reads
+/// from the same log (`format`, `signature`), and its `named_at` must fall
+/// within the job's run. A pull request's own code runs in the job and can
+/// print any line, so a record is never taken on its word: it can only
+/// testify to *when* a cause the extractor confirms was named.
+#[must_use]
+pub fn corroborates(recorded: &CiCause, extracted: &CiCause, job: &Job, repo: &str) -> bool {
+    let parse =
+        |value: Option<&str>| value.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
+    let identity = recorded.repo == repo
+        && recorded.head_sha.is_some()
+        && recorded.head_sha == job.head_sha
+        && recorded.run_id.is_some()
+        && recorded.run_id == job.run_id
+        && recorded.attempt == job.run_attempt
+        && recorded.job == job.name;
+    let same_cause = recorded.format == extracted.format
+        && recorded.signature == extracted.signature
+        && extracted.named();
+    let in_run = match (
+        parse(recorded.named_at.as_deref()),
+        parse(job.started_at.as_deref()),
+        parse(job.completed_at.as_deref()),
+    ) {
+        (Some(at), Some(start), Some(end)) => start <= at && at <= end,
+        _ => false,
+    };
+    identity && same_cause && in_run
+}
+
+/// Records as the `output.text` of a check run: one compact JSON record per
+/// line under a header, never longer than `limit` characters; records that
+/// do not fit are counted, not cut.
+#[must_use]
+pub fn check_run_text(causes: &[CiCause], limit: usize) -> Option<String> {
+    if causes.is_empty() {
+        return None;
+    }
+    let mut text = format!("{SCHEMA} records, one JSON object per line:\n");
+    let mut dropped = 0;
+    for cause in causes {
+        let line = serde_json::to_string(cause).unwrap_or_default();
+        if text.chars().count() + line.chars().count() + 64 > limit {
+            dropped += 1;
+            continue;
+        }
+        text.push_str(&line);
+        text.push('\n');
+    }
+    if dropped > 0 {
+        let _ = writeln!(text, "{dropped} record(s) did not fit");
+    }
+    Some(text)
 }
 
 #[cfg(test)]
