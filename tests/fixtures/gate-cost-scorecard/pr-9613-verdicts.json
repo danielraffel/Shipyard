@@ -1,0 +1,75 @@
+{
+ "data": {
+  "repository": {
+   "pullRequest": {
+    "headRefOid": "ca0bf1716a2525f3b3c94b713dda22eb4c283d4a",
+    "author": {
+     "login": "shipyard-local"
+    },
+    "comments": {
+     "totalCount": 6,
+     "nodes": [
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-05T10:02:16Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-05T10:02:20Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "shipyard-local"
+       },
+       "authorAssociation": "CONTRIBUTOR",
+       "body": "**fable-graph review: APPROVED at head ca0bf1716a2525f3b3c94b713dda22eb4c283d4a (unarmed; one commit on ab7e48d234; one manifest line).** pulp-test-clap-midi-events gains `harness/rt_allocation_probe.cpp` under `$<NOT:$<BOOL:${UNIX}>>`, the same pattern the other host tests use for the plain probe, while UNIX keeps `rt_intercept_test_support.cpp`. Diff read on the exact head; the change is MSVC-only in effect and inert elsewhere. macOS build and test results are the author's (seeded Ninja Release tree). **Owed before arm:** the per-target Windows result for the targets this PR unblocks (built yes/no, ctest cases passed/failed) from proof run 37286474075, pasted into this body, since the proof branch carries all seven changes and attribution is by target. Arm is team-lead's after that.\n",
+       "createdAt": "2026-10-05T10:11:53Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "<!-- pulp-coverage-diff-gate -->\n\n## Diff coverage (Phase 1 advisory)\n\nAdvisory window: this gate is **informational only** until **2026-05-04**, after which diff coverage below **75%** will block merges (issue #566 Phase 3).\nThis percentage applies only to the coverage surfaces currently represented on Codecov; see `docs/guides/coverage.md` for the current perimeter.\n\n<details><summary>diff-cover report</summary>\n\n## Diff: origin/main...HEAD, staged and unstaged changes\n\nNo lines with coverage information in this diff.\n\n</details>\n\nSee [coverage.md](https://github.com/Generous-Corp/pulp/blob/main/docs/guides/coverage.md) for the current represented surface, how to interpret this number, and the full Phase 1 \u2192 Phase 3 roadmap.",
+       "createdAt": "2026-10-05T12:17:16Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "codecov"
+       },
+       "authorAssociation": "NONE",
+       "body": "## [Codecov](https://app.codecov.io/gh/Generous-Corp/pulp/pull/9613?dropdown=coverage&src=pr&el=h1&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=Generous-Corp) Report\n:white_check_mark: All modified and coverable lines are covered by tests.\n\n:loudspeaker: Thoughts on this report? [Let us know!](https://github.com/codecov/feedback/issues/255)",
+       "createdAt": "2026-10-05T12:17:20Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "shipyard-local"
+       },
+       "authorAssociation": "CONTRIBUTOR",
+       "body": "**fable-graph: arm condition MET on run 37300976928 (db0b31c3, Windows job 111751045717): pulp-test-clap-midi-events linked and its 43 CLAP cases passed.** Full per-target read: https://github.com/Generous-Corp/pulp/pull/9610#issuecomment (the run read posted on #9610).\n",
+       "createdAt": "2026-10-05T14:05:04Z",
+       "lastEditedAt": null
+      }
+     ]
+    },
+    "reviews": {
+     "totalCount": 0,
+     "nodes": []
+    }
+   }
+  }
+ }
+}

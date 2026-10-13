@@ -1,0 +1,228 @@
+{
+ "data": {
+  "repository": {
+   "pullRequest": {
+    "headRefOid": "57802dbb66a6c963300cd0dd0177a9143ac4c63d",
+    "author": {
+     "login": "shipyard-local"
+    },
+    "comments": {
+     "totalCount": 23,
+     "nodes": [
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-10T21:54:10Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-10T21:54:13Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "<!-- ruleset-drift-check -->\n## Ruleset drift report\n\n_Checked-in intent: `.github/rulesets/main-protection.json`_\n_Live ruleset name: `main-protection`_\n\n**Could not read classic branch protection.**\n\n`GITHUB_TOKEN` likely lacks `administration: read`. Treating this\nas drift rather than as \"nothing required\" \u2014 an unreadable surface\nmust never look like an empty one.\n\n### Required checks (merge-blocking)\n\n**Checked in:**\n- `Build + prove + (owner-gated) deploy`\n- `Enforce version & skill sync`\n- `Vellum freeze`\n- `Vellum trusted freeze`\n- `drift-fast`\n- `macos`\n\n**Live on GitHub (union of both surfaces):**\n_(none)_\n\n- via ruleset `main-protection`: _(none)_\n- via classic branch protection: _(none)_\n\n**Missing on GitHub (declared in repo, not enforced live):**\n- `Build + prove + (owner-gated) deploy`\n- `Enforce version & skill sync`\n- `Vellum freeze`\n- `Vellum trusted freeze`\n- `drift-fast`\n- `macos`\n\n### Advisory checks (visibility only, never required)\n\n- `AddressSanitizer (macOS ARM64)`\n- `RealtimeSanitizer (Linux x86_64, Clang 18)`\n- `ThreadSanitizer (macOS ARM64)`\n- `UndefinedBehaviorSanitizer (macOS ARM64)`\n\n---\n**Drift detected.** Update `.github/rulesets/main-protection.json`\nto match intent, or update the ruleset on GitHub to match the file.",
+       "createdAt": "2026-10-10T21:54:14Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "codecov"
+       },
+       "authorAssociation": "NONE",
+       "body": "## [Codecov](https://app.codecov.io/gh/Generous-Corp/pulp/pull/10042?dropdown=coverage&src=pr&el=h1&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=Generous-Corp) Report\n:white_check_mark: All modified and coverable lines are covered by tests.\n\n:loudspeaker: Thoughts on this report? [Let us know!](https://github.com/codecov/feedback/issues/255)",
+       "createdAt": "2026-10-10T21:55:35Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "<!-- pulp-coverage-diff-gate -->\n\n## Diff coverage (Phase 1 advisory)\n\nAdvisory window: this gate is **informational only** until **2026-05-04**, after which diff coverage below **75%** will block merges (issue #566 Phase 3).\nThis percentage applies only to the coverage surfaces currently represented on Codecov; see `docs/guides/coverage.md` for the current perimeter.\n\n<details><summary>diff-cover report</summary>\n\n## Diff: origin/main...HEAD, staged and unstaged changes\n\nNo lines with coverage information in this diff.\n\n</details>\n\nSee [coverage.md](https://github.com/Generous-Corp/pulp/blob/main/docs/guides/coverage.md) for the current represented surface, how to interpret this number, and the full Phase 1 \u2192 Phase 3 roadmap.",
+       "createdAt": "2026-10-10T23:57:04Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "shipyard-local"
+       },
+       "authorAssociation": "CONTRIBUTOR",
+       "body": "<!-- shipyard-pr-watch v1 -->\n**Shipyard PR watch**: resolved. No flags hold on this pull request.\n",
+       "createdAt": "2026-10-11T00:34:14Z",
+       "lastEditedAt": "2026-10-11T15:35:09Z"
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-11T07:29:16Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-11T07:29:20Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "shipyard-local"
+       },
+       "authorAssociation": "CONTRIBUTOR",
+       "body": "## fable-graph review of e24cd344030ac93811544543a915eb90b0cc6cc9: CHANGES REQUESTED (two must-fix items)\n\nWhat holds:\n- The failing gate on the Dependabot PRs is confirmed as the **Skill-sync check** step (e.g. #10010, job 114416152613), so the exemption is aimed at the real red.\n- `test/ctest_script_inputs.json` at this head is blob `7a0f1a5f4f01`, identical to `origin/main`'s blob; ws24's restore is exact, and the +221/-1 shown by the PR view is only the stale base. The macos/ASan/UBSan/Rosetta reds on the prior head are explained by that drift, not by the `actions/checkout@v7` bump.\n- `.github/dependabot.yml` groups the `github-actions` ecosystem into one PR with a limit of 2: eight PRs become one.\n- Trailers present (`Config-Doc: skip`, `Skill-Update: skip` for ci, intel-canary, pulp-vellum-change-routing, render-toolchain-update, ship, web-plugins). Test updates for the v5 -> v7 pin are mechanical and correct.\n\n**M1. The exemption keys on `GITHUB_ACTOR == \"dependabot[bot]\"`, and the required check also runs on `merge_group`.** `version-skill-check.yml` triggers on `pull_request`, `merge_group` and `workflow_dispatch`. In a merge-group run the actor is the enqueuer or the queue bot, not `dependabot[bot]`, and on a maintainer re-run it is the re-runner. So a Dependabot PR passes the gate on its PR head, gets armed, and is then ejected from the queue when the same gate runs in the merge group without the exemption. The predicate must not depend on the actor. Use what git itself carries in both events: every commit in `base..head` authored by `dependabot[bot]` (author email `49699333+dependabot[bot]@users.noreply.github.com`), AND the whole diff confined to `.github/workflows/**`, AND every changed line a `uses:` line. Keep the actor check only as an additional fast path on `pull_request` if you want it; it must never be the sole gate. Test: the merge_group shape (actor `github-merge-queue[bot]`, commits by dependabot[bot]) passes; a human-authored uses-only diff does not; a dependabot range with one non-dependabot commit does not.\n\n**M2. `workflow_uses_only_diff` only inspects the `.github/workflows` subtree, but callers treat it as \"this PR is uses-only\".** The diff it runs is `git diff ... -- .github/workflows`, so a PR that bumps one `uses:` line AND changes `core/timeline/*` returns True. `sequencer_exposure_check.py` then sets `changed_paths = []` and clears trailer_ids/semantic_paths/mechanical_paths for ANY actor (that call has no Dependabot gate at all), which silences the sequencer exposure gate for a real timeline change. `skill_sync_check` and `config_doc_check` have the same contract hole, masked today only because Dependabot never touches anything else. Fix in `gate_common`: first require `git diff --name-only base...head` to contain only `.github/workflows/**` paths, then apply the uses-only line test; and gate the sequencer exemption on the same Dependabot predicate as the others. Test: a diff with `core/timeline/x.cpp` plus a `uses:` bump returns False from `workflow_uses_only_diff`, and the sequencer check keeps its changed_paths.\n\nMinor, not blocking: the `_USES_DIFF_LINE_RE` accepts a deleted `uses:` line with no replacement, which is a legitimate Dependabot shape (removed step) only in theory; fine to keep.\n\nProcedure after the fix: this PR is BEHIND; approve at the fixed head, then a merge-only update-branch plus own-lines check (the manifest hunk disappears against current main, as it should), then arm with MERGE. Required checks on the exact head must all be success before the `reviewed:` line; macos and the sanitizers were still queued at this head.\n\nNo `reviewed:` line; this head is not approved.\n",
+       "createdAt": "2026-10-11T07:39:10Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-11T08:02:08Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-11T08:02:11Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "shipyard-local"
+       },
+       "authorAssociation": "CONTRIBUTOR",
+       "body": "## fable-graph review of 37901feab07c72e3f1edd7d2224e3ed144f937a3: CHANGES REQUESTED (one item left, surfaced by fixing M2)\n\nM1 and M2 are fixed as specified:\n- `dependabot_uses_only_diff` now requires every commit in `base..head` to be authored `dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>`, after `workflow_uses_only_diff` has required `git diff --name-only base...head` to contain only `.github/workflows/**` and every changed line to be a `uses:` line. The actor is no longer consulted (the kwarg survives, unused, which is fine). Tests cover the merge-group actor, a human-authored uses-only range, a mixed-author range, and a `core/timeline/x.cpp` plus `uses:` diff rejected before the line scan.\n- `sequencer_exposure_check.py` now gates its exemption on the same predicate.\n\n**M3. The required gate is red on this head, and the red is real: `Sequencer exposure ledger` fails with four \"sequencer-owned changed path is not covered by an added or materially changed pending row\" findings** for `.github/workflows/gcc-compile-gate.yml`, `install-consumer-smoke.yml`, `timeline-fuzz.yml`, `timeline-hardening.yml` (job 114422563910). On e24cd344 this gate passed only because the subtree-only helper (M2) exempted this PR's own hunks; with M2 fixed, this PR is not Dependabot-authored and touches `tools/scripts`, so the exemption correctly does not apply, and the `uses:` bumps in sequencer-owned workflows fall back to the transition rule. Adding four pending ledger rows for pin bumps would be the wrong shape (ledger noise for mechanical edits). The right shape, and it is what the commit \"exempt action-only workflow transition checks\" intended: a **per-path mechanical classification**, author-agnostic. For each sequencer-owned changed path under `.github/workflows/`, if `git diff --unified=0 base...head -- <path>` is uses-only, classify it as mechanical (the same bucket `_mechanical_version_paths` feeds for version artifacts), so the transition rule never sees it; everything else keeps today's behavior. This is a hunk property of one file, so it is safe for any author (a `uses:` pin bump cannot change sequencer semantics), unlike the skill/config-doc exemption, which stays Dependabot-only. Test: a sequencer-owned workflow with a uses-only hunk produces no transition finding; the same file with a `run:` change still does; `core/timeline/x.cpp` is unaffected. Confirm by re-running the gate on the fixed head: `Enforce version & skill sync` must be success.\n\nThen: approve at the fixed head, merge-only update-branch, own-lines, arm with MERGE. No `reviewed:` line; this head is not approved.\n",
+       "createdAt": "2026-10-11T08:08:24Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-11T08:16:32Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-11T08:16:36Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-11T08:23:30Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-11T08:23:34Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "shipyard-local"
+       },
+       "authorAssociation": "CONTRIBUTOR",
+       "body": "## fable-graph review of e363683ac6e3d352a7b20e62b77111ba91d87018: content approved; `reviewed:` line follows when `macos` is green\n\nM3 is implemented as ruled. `_mechanical_workflow_paths` classifies each changed `.github/workflows/*` file by its own `--unified=0` diff: uses-only hunks are mechanical, for any author, and feed the same `mechanical_paths` bucket `_mechanical_version_paths` uses. `validate_transition` now excludes mechanical paths before the sequencer-owned / semantic-added / watched tests rather than only inside the `watched` arm, which is what lets a sequencer-named workflow with a pin bump pass without a ledger row. The Dependabot predicate stays separate and Dependabot-only for the skill and config-doc gates.\n\nTests are real-git fixtures through the selftest: a `uses: v4 -> v5` commit in `timeline-fuzz.yml` is mechanical; a `run: ctest` change in the same file is not (control); `validate_transition` green with the path mechanical, red with it not (control). The required gate `Enforce version & skill sync` is **success** on this head (the Sequencer exposure ledger step included), which is the proof I asked for.\n\nOne note, not blocking: widening the mechanical exclusion to all `mechanical_version_paths` means a declared version artifact whose diff is a pure version rewrite is now excluded even when its path is sequencer-owned; that is the correct reading of \"mechanical\", and `_mechanical_version_paths` only admits declared artifacts with key-only diffs, so no undeclared path can reach it.\n\nStill outstanding on the exact head: `macos` queued (linux/windows advisory). Approval posts when it is green; then merge-only update-branch (BEHIND), own-lines, arm with MERGE. After merge, Dependabot re-runs with the new grouping and the eight open bump PRs are superseded by one grouped PR.\n",
+       "createdAt": "2026-10-11T08:48:05Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-11T10:08:18Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-11T10:08:21Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "shipyard-local"
+       },
+       "authorAssociation": "CONTRIBUTOR",
+       "body": "## fable-graph review of b7b50ce5a59b1373fb35bd312a3e45691ce42c23: CHANGES REQUESTED (one procedural item)\n\nThe only delta since e363683a is `test/ctest_script_inputs.json` (+27/-240). It was regenerated on the PR tree as asked, but the PR tree is BEHIND main, so the regenerated manifest compared with `origin/main` now **removes 87 entries (29 tests x entry/inputs/kind) that exist on main**, e.g. `archive-symbol-closure-selftest`, `clean-worktree-planning-selftest`, and changes 30 inputs. The 30 changed inputs (the agent-capability, changed-surface and policy selftests that read `gate_common.py` / `sequencer_exposure_check.py`) are the PR's legitimate effect. The 87 removals are not: they are main's newer tests missing from the stale tree, and the moment this PR takes its merge-only update-branch the manifest will lack them again and `script-test-inputs-drift` goes red in the merge group, the same red as e363683a from the other direction.\n\nProcedure that lands: merge-only update-branch first (BEHIND -> current main), THEN regenerate the manifest on the updated tree, then push. Expected shape of the resulting diff against main: zero removals, and changes/additions only for the tests this PR touches. Everything else required is green on this head (`Enforce version & skill sync`, `Build + prove`, `Vellum freeze`, `drift-fast`); `macos` is queued and must be success on the final head before the `reviewed:` line.\n\nNo `reviewed:` line; this head is not approved.\n",
+       "createdAt": "2026-10-11T10:49:26Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-11T11:05:27Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-11T11:05:30Z",
+       "lastEditedAt": null
+      },
+      {
+       "author": {
+        "login": "shipyard-local"
+       },
+       "authorAssociation": "CONTRIBUTOR",
+       "body": "## fable-graph review of 57802dbb66a6c963300cd0dd0177a9143ac4c63d: APPROVED\n\n- Order fixed: cc089dc7 is the merge-only update (parents b7b50ce5 + main ec1dc33b), and 57802dbb regenerates `test/ctest_script_inputs.json` on the updated tree. Against its merge base ec1dc33b the manifest is **added 0 / removed 0 / changed 26**, the PR's own entries only (the tests that read `gate_common.py` and `sequencer_exposure_check.py`). The three entries it lacks relative to today's main (`apple-bundle-signing-check`) were added on main by #10097 after this base; the merge group unions them, and `mergeable_state` is not dirty.\n- Own-lines: the 102 non-manifest files carry the same hunks as b7b50ce5; the only digest difference is `workflow-lint.yml`'s hunk header shifted one line by #10079's `timeout-minutes`.\n- Required checks on the exact head: `macos` success, `linux`, `windows`, `Enforce version & skill sync` (Sequencer exposure ledger included), `Vellum freeze` all success.\n- Content as judged on e24cd344 / 37901fea / e363683a: Dependabot grouping to one PR; skill and config-doc exemption keyed on git authorship plus whole-diff confinement plus uses-only lines; per-path mechanical classification of uses-only workflow hunks for the sequencer gate; tests for the merge-group actor, human author, mixed author, mixed paths, and the run-change control.\n\nQueue repo: arm with MERGE, never SQUASH. After merge, Dependabot re-runs with the new grouping and the eight open bump PRs are superseded by one grouped PR.\n\nreviewed:57802dbb66a6c963300cd0dd0177a9143ac4c63d\n",
+       "createdAt": "2026-10-11T15:24:57Z",
+       "lastEditedAt": null
+      }
+     ]
+    },
+    "reviews": {
+     "totalCount": 0,
+     "nodes": []
+    }
+   }
+  }
+ }
+}

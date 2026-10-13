@@ -1189,6 +1189,9 @@ pub(crate) enum MetricsCommand {
     ///   context on which a required context is red (latest run per name;
     ///   `cancelled` is not red) / commits carrying a required context;
     ///   repeat failures = check names red on two or more pull requests;
+    ///   merge-head verdict = per merged pull request, the latest verdict
+    ///   naming its merge head posted by the merge (the queue-arm guard's
+    ///   trusted reviewers): approve, hold (merged anyway), none, or unread;
     ///   selector recall (with --selection-step) = for each test a failed
     ///   merge-group gate lists under "The following tests FAILED", what the
     ///   gate job of the `pull_request`/`workflow_dispatch` runs created

@@ -85,6 +85,9 @@ impl FakeGh {
                 return Ok(fixture(&format!("contexts-{oid}.json")));
             }
             if let Some(number) = args.iter().find_map(|arg| arg.strip_prefix("number=")) {
+                if joined.contains("reviews(last:100)") {
+                    return Ok(fixture(&format!("pr-{number}-verdicts.json")));
+                }
                 if joined.contains("timelineItems") {
                     return Ok(fixture(&format!("timeline-{number}.json")));
                 }
@@ -179,6 +182,19 @@ fn a_window_scores_open_to_merge_ejections_and_repeat_failures() {
             ("Request Codex review on an App-authored PR", 3, false),
             ("AddressSanitizer (macOS ARM64)", 2, false),
         ]
+    );
+    // None of the four carried a verdict on its merge head.
+    assert_eq!(
+        week.merge_verdicts,
+        MergeVerdicts {
+            none: 4,
+            ..MergeVerdicts::default()
+        }
+    );
+    assert!(
+        render(&report).contains("merge-head verdict: 0 approved, 0 HOLD, 4 none, 0 unread"),
+        "{}",
+        render(&report)
     );
     // `Analyze c-cpp` was cancelled on all four: cancelled is not red.
     assert!(
@@ -533,6 +549,7 @@ fn pr(number: u64, created: &str, merged: &str, checks: &[(&str, &str)]) -> Merg
         created_at: at(created),
         merged_at: at(merged),
         commits_total: 1,
+        verdict: MergeVerdict::None,
         commits: vec![PrCommit {
             oid: format!("{number:040}"),
             checks: checks
@@ -822,5 +839,323 @@ fn pulp_week_41_has_thirty_eight_ejections() {
             ("merge_conflict", "github-merge-queue", 17),
             ("merged", "github-merge-queue", 455),
         ]
+    );
+}
+
+// ---- merge-head verdict ------------------------------------------------------
+
+fn verdicts_of(number: u64) -> Value {
+    let answer: Value =
+        serde_json::from_str(&fixture(&format!("pr-{number}-verdicts.json"))).expect("json");
+    answer["data"]["repository"]["pullRequest"].clone()
+}
+
+/// #10042's merge head carries `reviewed: <head>` from the fleet App, posted
+/// before it merged; the gather reads it through the fake `gh`.
+#[test]
+fn an_approval_on_the_merge_head_reads_approve() {
+    let fake = FakeGh::new("b");
+    let report = compute(&observe(&fake, &query("b")).expect("gather"));
+    assert_eq!(
+        only_week(&report).merge_verdicts,
+        MergeVerdicts {
+            approve: 1,
+            ..MergeVerdicts::default()
+        }
+    );
+    assert!(
+        fake.calls()
+            .iter()
+            .any(|call| call.contains("reviews(last:100)") && call.contains("number=10042"))
+    );
+}
+
+/// #10114 merged at 05:52:01Z, 2.5 minutes after a fleet `verdict: HOLD`
+/// naming its merge head (captured 2026-10-13).
+#[test]
+fn a_hold_on_the_merge_head_reads_hold() {
+    let pr = verdicts_of(10_114);
+    assert_eq!(
+        merge_verdict(&pr, at("2026-10-12T05:52:01Z")),
+        Ok(MergeVerdict::Hold)
+    );
+    // Control: judged before the HOLD was posted, it was not held.
+    assert_ne!(
+        merge_verdict(&pr, at("2026-10-12T05:49:00Z")),
+        Ok(MergeVerdict::Hold)
+    );
+}
+
+fn synthetic(comments: &[Value], reviews: &[Value], totals: (u64, u64)) -> Value {
+    serde_json::json!({
+        "headRefOid": HEAD,
+        "author": {"login": "alice"},
+        "comments": {"totalCount": totals.0, "nodes": comments},
+        "reviews": {"totalCount": totals.1, "nodes": reviews},
+    })
+}
+
+const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn comment(login: &str, association: &str, at: &str, body: &str) -> Value {
+    serde_json::json!({"author": {"login": login}, "authorAssociation": association,
+                       "createdAt": at, "body": body})
+}
+
+#[test]
+fn only_a_trusted_verdict_before_the_merge_decides() {
+    let merged = at("2026-10-12T12:00:00Z");
+    let hold = format!("verdict: HOLD head:{HEAD}");
+    let approve = format!("verdict: APPROVE head:{HEAD}");
+    let read = |comments: Vec<Value>, reviews: Vec<Value>| {
+        let totals = (comments.len() as u64, reviews.len() as u64);
+        merge_verdict(&synthetic(&comments, &reviews, totals), merged).expect("read")
+    };
+    // The latest trusted verdict decides.
+    assert_eq!(
+        read(
+            vec![
+                comment(
+                    "shipyard-local",
+                    "CONTRIBUTOR",
+                    "2026-10-12T10:00:00Z",
+                    &approve
+                ),
+                comment("daniel", "OWNER", "2026-10-12T11:00:00Z", &hold),
+            ],
+            vec![]
+        ),
+        MergeVerdict::Hold
+    );
+    // A HOLD posted after the merge does not count.
+    assert_eq!(
+        read(
+            vec![
+                comment(
+                    "shipyard-local",
+                    "CONTRIBUTOR",
+                    "2026-10-12T10:00:00Z",
+                    &approve
+                ),
+                comment("daniel", "OWNER", "2026-10-12T13:00:00Z", &hold),
+            ],
+            vec![]
+        ),
+        MergeVerdict::Approve
+    );
+    // A drive-by account and the author never decide.
+    assert_eq!(
+        read(
+            vec![
+                comment("drive-by", "NONE", "2026-10-12T10:00:00Z", &hold),
+                comment("alice", "OWNER", "2026-10-12T10:30:00Z", &approve),
+            ],
+            vec![]
+        ),
+        MergeVerdict::None
+    );
+    // A verdict naming another head is not about the merge head.
+    let other = format!("verdict: HOLD head:{}", "b".repeat(40));
+    assert_eq!(
+        read(
+            vec![comment("daniel", "OWNER", "2026-10-12T10:00:00Z", &other)],
+            vec![]
+        ),
+        MergeVerdict::None
+    );
+    // A review on the merge head decides like a comment.
+    let review = serde_json::json!({"author": {"login": "daniel"}, "authorAssociation": "OWNER",
+        "state": "CHANGES_REQUESTED", "submittedAt": "2026-10-12T11:00:00Z",
+        "commit": {"oid": HEAD}});
+    assert_eq!(read(vec![], vec![review]), MergeVerdict::Hold);
+    // A tie goes to the HOLD.
+    assert_eq!(
+        read(
+            vec![
+                comment("daniel", "OWNER", "2026-10-12T10:00:00Z", &approve),
+                comment(
+                    "shipyard-local",
+                    "CONTRIBUTOR",
+                    "2026-10-12T10:00:00Z",
+                    &hold
+                ),
+            ],
+            vec![]
+        ),
+        MergeVerdict::Hold
+    );
+}
+
+fn edited(login: &str, association: &str, at: &str, edited: &str, body: &str) -> Value {
+    let mut node = comment(login, association, at, body);
+    node["lastEditedAt"] = Value::from(edited);
+    node
+}
+
+/// A comment is read as it is now, so one posted before the merge and edited
+/// after it cannot say what it said at the merge.
+#[test]
+fn a_verdict_edited_after_the_merge_is_unknown() {
+    let merged = at("2026-10-12T12:00:00Z");
+    let hold = format!("verdict: HOLD head:{HEAD}");
+    let approve = format!("verdict: APPROVE head:{HEAD}");
+    let read = |comments: Vec<Value>, reviews: Vec<Value>| {
+        let totals = (comments.len() as u64, reviews.len() as u64);
+        merge_verdict(&synthetic(&comments, &reviews, totals), merged).expect("read")
+    };
+    // An APPROVE edited to HOLD after the merge is not a held merge.
+    assert_eq!(
+        read(
+            vec![edited(
+                "shipyard-local",
+                "CONTRIBUTOR",
+                "2026-10-12T10:00:00Z",
+                "2026-10-12T13:00:00Z",
+                &hold
+            )],
+            vec![]
+        ),
+        MergeVerdict::Unread
+    );
+    // A verdict line added after the merge is not a pre-merge approval.
+    assert_eq!(
+        read(
+            vec![
+                comment("daniel", "OWNER", "2026-10-12T09:00:00Z", &hold),
+                edited(
+                    "daniel",
+                    "OWNER",
+                    "2026-10-12T10:00:00Z",
+                    "2026-10-12T14:00:00Z",
+                    &approve
+                ),
+            ],
+            vec![]
+        ),
+        MergeVerdict::Unread
+    );
+    // A newer verdict that was not edited still decides.
+    assert_eq!(
+        read(
+            vec![
+                edited(
+                    "daniel",
+                    "OWNER",
+                    "2026-10-12T09:00:00Z",
+                    "2026-10-12T14:00:00Z",
+                    &approve
+                ),
+                comment("daniel", "OWNER", "2026-10-12T10:00:00Z", &hold),
+            ],
+            vec![]
+        ),
+        MergeVerdict::Hold
+    );
+    // An edit made before the merge is the body at the merge.
+    assert_eq!(
+        read(
+            vec![edited(
+                "daniel",
+                "OWNER",
+                "2026-10-12T09:00:00Z",
+                "2026-10-12T11:00:00Z",
+                &hold
+            )],
+            vec![]
+        ),
+        MergeVerdict::Hold
+    );
+    // An untrusted account's edit is not a verdict either way.
+    assert_eq!(
+        read(
+            vec![
+                edited(
+                    "drive-by",
+                    "NONE",
+                    "2026-10-12T11:00:00Z",
+                    "2026-10-12T14:00:00Z",
+                    &hold
+                ),
+                comment("daniel", "OWNER", "2026-10-12T10:00:00Z", &approve),
+            ],
+            vec![]
+        ),
+        MergeVerdict::Approve
+    );
+}
+
+/// A review on the merge head dismissed since no longer says what it said.
+#[test]
+fn a_review_dismissed_since_is_unknown() {
+    let merged = at("2026-10-12T12:00:00Z");
+    let review = |state: &str, at: &str| {
+        serde_json::json!({"author": {"login": "daniel"}, "authorAssociation": "OWNER",
+            "state": state, "submittedAt": at, "commit": {"oid": HEAD}})
+    };
+    let read = |reviews: Vec<Value>| {
+        let total = reviews.len() as u64;
+        merge_verdict(&synthetic(&[], &reviews, (0, total)), merged).expect("read")
+    };
+    assert_eq!(
+        read(vec![
+            review("APPROVED", "2026-10-12T09:00:00Z"),
+            review("DISMISSED", "2026-10-12T10:00:00Z"),
+        ]),
+        MergeVerdict::Unread
+    );
+    // An older dismissal does not hide a newer decision.
+    assert_eq!(
+        read(vec![
+            review("DISMISSED", "2026-10-12T09:00:00Z"),
+            review("CHANGES_REQUESTED", "2026-10-12T10:00:00Z"),
+        ]),
+        MergeVerdict::Hold
+    );
+}
+
+#[test]
+fn a_partial_listing_without_a_decision_is_unread() {
+    let merged = at("2026-10-12T12:00:00Z");
+    assert_eq!(
+        merge_verdict(&synthetic(&[], &[], (150, 0)), merged),
+        Ok(MergeVerdict::Unread)
+    );
+    assert_eq!(
+        merge_verdict(&synthetic(&[], &[], (0, 0)), merged),
+        Ok(MergeVerdict::None)
+    );
+}
+
+#[test]
+fn a_held_merge_is_named_in_the_week() {
+    let mut held = pr(7, "2026-10-12T01:00:00Z", "2026-10-12T05:00:00Z", &[]);
+    held.verdict = MergeVerdict::Hold;
+    let mut approved = pr(8, "2026-10-12T01:00:00Z", "2026-10-12T05:00:00Z", &[]);
+    approved.verdict = MergeVerdict::Approve;
+    let mut query = query("a");
+    query.from = at("2026-10-12T00:00:00Z");
+    query.to = at("2026-10-13T00:00:00Z");
+    let report = compute(&ScorecardObservation {
+        query,
+        required: Ok((Vec::new(), "--required-context".to_owned())),
+        prs: vec![held, approved],
+        merge_group_runs: Vec::new(),
+        queue_events: Vec::new(),
+        selection: None,
+        gaps: Vec::new(),
+    });
+    let verdicts = &only_week(&report).merge_verdicts;
+    assert_eq!(
+        (
+            verdicts.approve,
+            verdicts.hold,
+            verdicts.held_merged.clone()
+        ),
+        (1, 1, vec![7])
+    );
+    assert!(
+        render(&report).contains("1 HOLD (merged anyway: #7)"),
+        "{}",
+        render(&report)
     );
 }

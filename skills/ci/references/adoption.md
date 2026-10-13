@@ -493,8 +493,10 @@ on one head commit in the window, top ten by commits, with job links. With
 median and p90, the merge-queue ejection rate (check-based queue removals per
 queue entry, from the pull requests' timelines), the merge-group failure rate
 of the one gate job (a separate number), the red-after-push rate on required checks (latest
-run per name; cancelled is not red), and check names red across two or more
-pull requests. Pass `--from`/`--to` to measure a past window again; a
+run per name; cancelled is not red), check names red across two or more
+pull requests, and how many merged pull requests had an approval, a HOLD
+(merged anyway, named), no verdict, or an unread verdict on their merge head.
+Pass `--from`/`--to` to measure a past window again; a
 repository without branch protection needs `--required-context`.
 With `--selection-step` it adds selector recall per week: of the tests failed
 merge-group gates listed, the share a pull-request head in the group ran in a

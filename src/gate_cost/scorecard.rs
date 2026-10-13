@@ -36,6 +36,19 @@
 //!   (a newer push cancels the older head's runs) and is counted apart.
 //! - **repeat failures**: check names red on commits of at least two
 //!   different merged pull requests in the week, with those pull requests.
+//! - **merge-head verdict**: for each merged pull request, the latest
+//!   structured verdict naming its merge head (`headRefOid`) posted at or
+//!   before `mergedAt`: a comment whose last line is `verdict: APPROVE|HOLD
+//!   head:<sha>` or `reviewed: <sha>`, or an `APPROVED`/`CHANGES_REQUESTED`
+//!   review on that commit, from the fleet App or an `OWNER`, `MEMBER` or
+//!   `COLLABORATOR` who is not the author (the queue-arm guard's rule).
+//!   `approve`, `hold` (merged anyway), `none`, or `unread` when GitHub listed
+//!   only some of the comments or reviews and none of those decided. A
+//!   comment is judged by its current body, so one posted before the merge
+//!   but edited after it (`lastEditedAt`), and a review on the merge head
+//!   since dismissed, are unknown: they decide nothing, and when one is at
+//!   least as new as the verdict that would decide, the pull request reads
+//!   `unread` rather than guessing what it said at the merge.
 //!
 //! Required contexts come from the base branch's classic protection, or from
 //! `--required-context` when given (a repository without protection has
@@ -81,6 +94,9 @@ const PRS_QUERY: &str = "query($q:String!,$endCursor:String){search(query:$q,typ
 /// with their checks timed out (HTTP 504) on an 85-commit pull request.
 const COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){commits(first:25,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{commit{oid statusCheckRollup{contexts(first:100){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name conclusion startedAt completedAt} ... on StatusContext{context state createdAt}}}}}}}}}}";
 const TIMELINE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],first:100,after:$endCursor){filteredCount pageInfo{hasNextPage endCursor} nodes{__typename ... on AddedToMergeQueueEvent{createdAt actor{login}} ... on RemovedFromMergeQueueEvent{createdAt reason actor{login}}}}}}}";
+/// A merged pull request's head, author, and last comments and reviews, for
+/// the verdict on its merge head.
+const VERDICTS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid author{login} comments(last:100){totalCount nodes{author{login} authorAssociation body createdAt lastEditedAt}} reviews(last:100){totalCount nodes{author{login} authorAssociation state submittedAt commit{oid}}}}}}";
 const CONTEXTS_QUERY: &str = "query($owner:String!,$name:String!,$oid:GitObjectID!,$endCursor:String){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name conclusion startedAt completedAt} ... on StatusContext{context state createdAt}}}}}}}}";
 
 /// What to measure.
@@ -137,6 +153,23 @@ pub struct MergedPr {
     pub commits: Vec<PrCommit>,
     /// Commits the pull request has (`totalCount`).
     pub commits_total: u64,
+    /// The latest trusted verdict on the merge head before the merge.
+    pub verdict: MergeVerdict,
+}
+
+/// The latest trusted verdict naming a merged pull request's merge head,
+/// posted at or before the merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeVerdict {
+    /// An approval decided.
+    Approve,
+    /// A HOLD decided: the pull request merged anyway.
+    Hold,
+    /// No trusted verdict named the merge head.
+    None,
+    /// GitHub listed only some comments or reviews, and none of those decided.
+    Unread,
 }
 
 /// One merge-group run and its final gate attempt.
@@ -254,6 +287,21 @@ pub struct RedAfterPush {
     pub cancelled_only: usize,
 }
 
+/// Merged pull requests by the verdict on their merge head, in one week.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct MergeVerdicts {
+    /// Approved heads.
+    pub approve: usize,
+    /// Held heads that merged anyway.
+    pub hold: usize,
+    /// Heads no trusted verdict named.
+    pub none: usize,
+    /// Heads whose verdict could not be read in full.
+    pub unread: usize,
+    /// The held pull requests that merged.
+    pub held_merged: Vec<u64>,
+}
+
 /// One check name red across pull requests.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RepeatFailure {
@@ -286,6 +334,8 @@ pub struct WeekScore {
     pub red_after_push: Option<RedAfterPush>,
     /// Check names red on two or more pull requests, most first.
     pub repeat_failures: Vec<RepeatFailure>,
+    /// Merged pull requests by the verdict on their merge head.
+    pub merge_verdicts: MergeVerdicts,
     /// Pull requests with more commits than GitHub lists; only their first
     /// [`PR_COMMITS_CAP`] commits are counted.
     pub capped_prs: Vec<u64>,
@@ -621,13 +671,152 @@ fn merged_pr(
             checks: latest_by_name(&contexts),
         });
     }
+    let verdict = read_merge_verdict(gh, owner, name, number, merged_at)?;
     Ok(MergedPr {
         number,
         created_at,
         merged_at,
         commits,
         commits_total,
+        verdict,
     })
+}
+
+fn read_merge_verdict(
+    gh: &SyncGhReader<'_>,
+    owner: &str,
+    name: &str,
+    number: u64,
+    merged_at: DateTime<Utc>,
+) -> Result<MergeVerdict, String> {
+    let answer = read_graphql(
+        gh,
+        &strings(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={VERDICTS_QUERY}"),
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number}"),
+        ]),
+    )?;
+    if let Some(errors) = answer.get("errors") {
+        return Err(format!("verdicts of #{number}: GraphQL errors {errors}"));
+    }
+    let pr = answer
+        .pointer("/data/repository/pullRequest")
+        .ok_or_else(|| format!("verdicts of #{number}: no pullRequest in the answer"))?;
+    merge_verdict(pr, merged_at).map_err(|error| format!("verdicts of #{number}: {error}"))
+}
+
+/// The verdict on `pr`'s merge head from its comments and reviews (see the
+/// module docs).
+fn merge_verdict(pr: &Value, merged_at: DateTime<Utc>) -> Result<MergeVerdict, String> {
+    let head = text(pr, "headRefOid").ok_or("no headRefOid")?;
+    let author = pr.pointer("/author/login").and_then(Value::as_str);
+    let trusted = |node: &Value| {
+        node.pointer("/author/login")
+            .and_then(Value::as_str)
+            .is_some_and(|login| {
+                crate::head_approval::trusted_reviewer(
+                    login,
+                    node.get("authorAssociation").and_then(Value::as_str),
+                    author,
+                )
+            })
+    };
+    let mut verdicts: Vec<(DateTime<Utc>, bool)> = Vec::new();
+    // The newest pre-merge entry whose verdict at the merge cannot be read.
+    let mut unknown: Option<DateTime<Utc>> = None;
+    let comments = pr.get("comments").ok_or("no comments")?;
+    let comment_nodes = node_list(comments, "comments")?;
+    for comment in &comment_nodes {
+        let Some(at) = timestamp(comment, "createdAt") else {
+            continue;
+        };
+        if at <= merged_at
+            && timestamp(comment, "lastEditedAt").is_some_and(|edited| edited > merged_at)
+            && trusted(comment)
+        {
+            unknown = unknown.max(Some(at));
+            continue;
+        }
+        let body = comment.get("body").and_then(Value::as_str).unwrap_or("");
+        if let Some((approve, named)) = crate::head_approval::verdict_line(body)
+            && named.eq_ignore_ascii_case(&head)
+            && at <= merged_at
+            && trusted(comment)
+        {
+            verdicts.push((at, approve));
+        }
+    }
+    let reviews = pr.get("reviews").ok_or("no reviews")?;
+    let review_nodes = node_list(reviews, "reviews")?;
+    for review in &review_nodes {
+        let state = review.get("state").and_then(Value::as_str);
+        let Some(at) = timestamp(review, "submittedAt") else {
+            continue;
+        };
+        let on_head = review
+            .pointer("/commit/oid")
+            .and_then(Value::as_str)
+            .is_some_and(|oid| oid.eq_ignore_ascii_case(&head));
+        if !on_head || at > merged_at || !trusted(review) {
+            continue;
+        }
+        match state {
+            Some("APPROVED") => verdicts.push((at, true)),
+            Some("CHANGES_REQUESTED") => verdicts.push((at, false)),
+            // Dismissed since: what it said at the merge is no longer read.
+            Some("DISMISSED") => unknown = unknown.max(Some(at)),
+            _ => {}
+        }
+    }
+    let decided = verdicts.iter().max_by_key(|(at, approve)| (*at, !*approve));
+    if unknown.is_some_and(|unknown| decided.is_none_or(|(at, _)| unknown >= *at)) {
+        return Ok(MergeVerdict::Unread);
+    }
+    if let Some((_, approve)) = decided {
+        return Ok(if *approve {
+            MergeVerdict::Approve
+        } else {
+            MergeVerdict::Hold
+        });
+    }
+    let partial = |connection: &Value, listed: usize| {
+        connection
+            .get("totalCount")
+            .and_then(Value::as_u64)
+            .is_none_or(|total| total > listed as u64)
+    };
+    Ok(
+        if partial(comments, comment_nodes.len()) || partial(reviews, review_nodes.len()) {
+            MergeVerdict::Unread
+        } else {
+            MergeVerdict::None
+        },
+    )
+}
+
+fn merge_verdicts(prs: &[&MergedPr]) -> MergeVerdicts {
+    let mut out = MergeVerdicts::default();
+    for pr in prs {
+        match pr.verdict {
+            MergeVerdict::Approve => out.approve += 1,
+            MergeVerdict::Hold => {
+                out.hold += 1;
+                out.held_merged.push(pr.number);
+            }
+            MergeVerdict::None => out.none += 1,
+            MergeVerdict::Unread => out.unread += 1,
+        }
+    }
+    out.held_merged.sort_unstable();
+    out
 }
 
 /// Every commit of one pull request GitHub lists, with the first page of its
@@ -1145,6 +1334,7 @@ pub fn compute(observation: &ScorecardObservation) -> ScorecardReport {
             merge_group_gate: gate_failures(&runs),
             red_after_push: (!required.is_empty()).then(|| red_after_push(&prs, &required)),
             repeat_failures: repeat_failures(&prs, &required),
+            merge_verdicts: merge_verdicts(&prs),
             capped_prs: prs
                 .iter()
                 .filter(|pr| (pr.commits.len() as u64) < pr.commits_total)
@@ -1320,6 +1510,25 @@ pub fn render(report: &ScorecardReport) -> String {
 
 /// Capped pull requests and selector recall, after a week's rates.
 fn render_week_tail(out: &mut String, week: &WeekScore) {
+    let verdicts = &week.merge_verdicts;
+    let held: Vec<String> = verdicts
+        .held_merged
+        .iter()
+        .map(|pr| format!("#{pr}"))
+        .collect();
+    let _ = writeln!(
+        out,
+        "  merge-head verdict: {} approved, {} HOLD{}, {} none, {} unread",
+        verdicts.approve,
+        verdicts.hold,
+        if held.is_empty() {
+            String::new()
+        } else {
+            format!(" (merged anyway: {})", held.join(", "))
+        },
+        verdicts.none,
+        verdicts.unread
+    );
     if !week.capped_prs.is_empty() {
         let capped: Vec<String> = week.capped_prs.iter().map(|pr| format!("#{pr}")).collect();
         let _ = writeln!(
