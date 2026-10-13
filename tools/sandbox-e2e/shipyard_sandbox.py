@@ -47,6 +47,19 @@ PROTECTED_PATHS: tuple[Path, ...] = (
     Path.home() / ".cache" / "shipyard-dev",
 )
 
+# Agent sessions' hand-back inboxes. Every agent session's own hook moves its
+# entries to `<session>.shown.jsonl`, and the host's production pr-watch
+# hand-back appends to `<session>.jsonl`. Neither takes the writer-domain
+# lease, so on a shared gate host they write here while a sandbox runs. The
+# sandbox's own processes run with HOME inside the sandbox and write their
+# inbox there. Only files of exactly that shape directly in this directory
+# are attributed to a concurrent session, never anything else under a
+# protected path.
+SESSION_INBOX_DIR = Path.home() / ".local" / "state" / "shipyard" / "inbox"
+SESSION_INBOX_FILE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\.shown)?\.jsonl"
+)
+
 DESTRUCTIVE_TOP_LEVEL: frozenset[str] = frozenset({
     "ship",
     "run",
@@ -101,6 +114,7 @@ class PythonShipyardSource:
 class ContaminationReport:
     offenders: tuple[Path, ...]
     sentinel_mtime: float
+    concurrent_sessions: tuple[Path, ...] = ()
 
     @property
     def clean(self) -> bool:
@@ -111,6 +125,9 @@ class ContaminationReport:
             return "clean"
         lines = ["sandbox wrote outside its isolated HOME/PATH:"]
         lines.extend(f"  {path}" for path in self.offenders)
+        if self.concurrent_sessions:
+            lines.append("not counted (agent sessions' inboxes, written outside the sandbox):")
+            lines.extend(f"  {path}" for path in self.concurrent_sessions)
         lines.append(f"sentinel_mtime={self.sentinel_mtime}")
         return "\n".join(lines)
 
@@ -351,6 +368,29 @@ def _find_newer(
     )
 
 
+def is_concurrent_session_write(path: Path, inbox_dir: Path = SESSION_INBOX_DIR) -> bool:
+    """A change an agent session outside the sandbox makes (see SESSION_INBOX_DIR)."""
+    return path == inbox_dir or (
+        path.parent == inbox_dir and SESSION_INBOX_FILE.fullmatch(path.name) is not None
+    )
+
+
+def contamination(
+    protected: Sequence[Path],
+    pre_existing: Mapping[Path, Mapping[Path, PathFingerprint]],
+    sentinel_mtime: float,
+    inbox_dir: Path = SESSION_INBOX_DIR,
+) -> ContaminationReport:
+    changed = sorted(
+        path
+        for root in protected
+        for path in _find_newer(root, sentinel_mtime, pre_existing.get(root, {}))
+    )
+    concurrent = tuple(path for path in changed if is_concurrent_session_write(path, inbox_dir))
+    offenders = tuple(path for path in changed if path not in concurrent)
+    return ContaminationReport(offenders, sentinel_mtime, concurrent)
+
+
 def _otool_dylibs(binary: Path) -> list[Path]:
     if sys.platform != "darwin":
         return []
@@ -568,16 +608,13 @@ class Sandbox:
     def assert_no_contamination(self) -> None:
         if self._sentinel_mtime is None:
             raise RuntimeError("sandbox not set up")
-        offenders: list[Path] = []
-        for path in PROTECTED_PATHS:
-            offenders.extend(
-                _find_newer(
-                    path,
-                    self._sentinel_mtime,
-                    self._pre_existing.get(path, set()),
-                )
+        report = contamination(PROTECTED_PATHS, self._pre_existing, self._sentinel_mtime)
+        if report.clean and report.concurrent_sessions:
+            print(
+                "sandbox isolation: clean; not counted (agent sessions' inboxes): "
+                + ", ".join(str(path) for path in report.concurrent_sessions),
+                file=sys.stderr,
             )
-        report = ContaminationReport(tuple(sorted(offenders)), self._sentinel_mtime)
         if not report.clean:
             raise AssertionError(report.format())
 

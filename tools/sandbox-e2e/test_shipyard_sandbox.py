@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 
 from shipyard_sandbox import (
+    PROTECTED_PATHS,
+    SESSION_INBOX_DIR,
     WRITER_DOMAIN_LOCK_NAME,
     WRITER_DOMAIN_OVERLAP_CLASSIFICATION,
     WRITER_DOMAIN_TURNSTILE_NAME,
@@ -17,6 +19,7 @@ from shipyard_sandbox import (
     WriterDomainOverlap,
     _find_newer,
     _snapshot_paths,
+    contamination,
     production_writer_domain_lock_path,
     production_writer_domain_turnstile_path,
 )
@@ -513,3 +516,61 @@ def test_preexisting_protected_file_mutation_is_reported(
         file.unlink()
 
     assert file in _find_newer(protected, 0.0, before)
+
+
+def _uuid(n: int) -> str:
+    return f"{n:08x}-0000-4000-8000-{n:012x}"
+
+
+def test_a_concurrent_agent_session_inbox_write_is_not_contamination(tmp_path: Path) -> None:
+    # The real-HOME shape: a protected state root holding the sessions' inbox.
+    state = tmp_path / "state" / "shipyard"
+    inbox = state / "inbox"
+    inbox.mkdir(parents=True)
+    old = inbox / f"{_uuid(1)}.jsonl"
+    old.write_text("{}\n", encoding="utf-8")
+    before = {state: _snapshot_paths(state)}
+
+    # During the run, other agent sessions append, acknowledge and start.
+    old.write_text("{}\n{}\n", encoding="utf-8")
+    (inbox / f"{_uuid(1)}.shown.jsonl").write_text("{}\n", encoding="utf-8")
+    (inbox / f"{_uuid(2)}.jsonl").write_text("{}\n", encoding="utf-8")
+
+    report = contamination((state,), before, 0.0, inbox_dir=inbox)
+
+    assert report.clean, report.format()
+    assert len(report.concurrent_sessions) == 3
+
+
+def test_a_sandbox_write_to_real_home_is_still_flagged(tmp_path: Path) -> None:
+    state = tmp_path / "state" / "shipyard"
+    inbox = state / "inbox"
+    inbox.mkdir(parents=True)
+    before = {state: _snapshot_paths(state)}
+
+    queue = state / "queue" / "outcomes" / "sy-1.json"
+    queue.parent.mkdir(parents=True)
+    queue.write_text("{}", encoding="utf-8")
+    named = inbox / "sandbox-session.jsonl"
+    named.write_text("{}\n", encoding="utf-8")
+    nested = inbox / _uuid(3) / "escape.jsonl"
+    nested.parent.mkdir()
+    nested.write_text("{}\n", encoding="utf-8")
+    beside = state / f"{_uuid(4)}.jsonl"
+    beside.write_text("{}\n", encoding="utf-8")
+    alongside = inbox / f"{_uuid(5)}.jsonl"
+    alongside.write_text("{}\n", encoding="utf-8")
+
+    report = contamination((state,), before, 0.0, inbox_dir=inbox)
+
+    for offender in (queue, named, nested, beside):
+        assert offender in report.offenders, report.format()
+    assert alongside not in report.offenders
+    assert alongside in report.concurrent_sessions
+    assert "sandbox wrote outside its isolated HOME/PATH" in report.format()
+    assert "not counted (agent sessions' inboxes" in report.format()
+
+
+def test_the_session_inbox_is_the_real_home_one() -> None:
+    assert SESSION_INBOX_DIR == Path.home() / ".local" / "state" / "shipyard" / "inbox"
+    assert any(SESSION_INBOX_DIR.is_relative_to(root) for root in PROTECTED_PATHS)

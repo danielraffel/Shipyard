@@ -449,6 +449,17 @@ sandbox-e2e report "sandbox wrote outside its isolated HOME/PATH". If the lease
 cannot be had the write is skipped and the cache stops writing for that run; a
 cold read is always correct. Any new cache in the state tree needs the same.
 
+The one unleased writer the isolation check does not count is the agent
+sessions' hand-back inbox: files named exactly `<session-uuid>.jsonl` or
+`<session-uuid>.shown.jsonl` directly in `~/.local/state/shipyard/inbox/`.
+Each agent session's hook and the production pr-watch hand-back write there
+while a sandbox runs on a shared gate host. The sandbox's own processes run
+with HOME inside the sandbox, so its own inbox is never the real one. Those
+paths are listed as "not counted (agent sessions' inboxes)". Anything else,
+including another name or a nested path in that directory, is still
+contamination. Do not widen this to other files: a writer under a protected
+path takes the lease instead.
+
 ## Only the production daemon defaults to the fleet repositories
 
 `daemon run` and `daemon start` without `--repo` watch the fleet repositories
