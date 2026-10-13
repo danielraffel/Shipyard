@@ -379,7 +379,11 @@ plus a receipt with the row count and SHA-256. Label a row only after its
 `label_not_before` (24 h on), when hindsight says whether it was real. Fields
 v1 does not read are present, `null` and named in `unread`; do not fill them
 by hand. For Pulp, red required checks need `--required-context`, or the
-report says "no required contexts" and exports none of them.
+report says "no required contexts" and exports none of them. Read the receipt before
+counting: when `unread_kinds` lists `required_check_red`, the required
+contexts were unreadable and its zero rows mean unknown, not none
+(`required_source` says why). A receipt whose row count or SHA-256 disagrees
+with the file is an interrupted export: the receipt is written last.
 
 **Where a routed lane actually runs is a run fact, not a file fact.**
 `shipyard inspect --profile` reads every job's `runs-on:`, and for a computed
@@ -573,6 +577,17 @@ locally), and only pushes to main save it. `scripts/test_ci_matrix.py` checks
 both. Check the budget with
 `gh api repos/danielraffel/Shipyard/actions/cache/usage`. A cache whose `ref`
 is a tag or a PR branch is quota nothing else can read.
+
+## Matrix check names carry their workflow
+
+A check run carries the job name, not the workflow. ci.yml, sandbox-e2e.yml
+and package-smoke.yml all render their legs from `scripts/ci_matrix.py`, so
+they used to emit identical names: two `macOS ARM64 [local]` checks on one
+commit. Timing and queue reports then merged a 7-minute unit-test leg with
+the M3 sandbox canary. The legs are now `Test ...`, `Sandbox ...` and
+`Package ...`. `scripts/test_ci_matrix.py` fails if two workflows render the
+same matrix job name. Shipyard's own `main` has no required contexts, so a
+rename here needs no protection change.
 
 ## Leftover validation TMPDIRs: owner files, sweep, and `cleanup --validation-tmp`
 

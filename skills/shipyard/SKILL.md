@@ -1556,6 +1556,14 @@ merge-group gate that did not pass, a queue removal other than `merged`), with
 row no sooner than its `label_not_before`. v1 reads only those three sources
 and the merge-head verdict; `evidence`, `rule_verdict`, `cancel_cause`,
 `receipt_same_tree` and `outage_window` are `null` and listed in `unread`.
+`merge_head_verdict` is `null` on every `merge_group_gate_failed` row (a
+batch is not one pull request) and on a `queue_removal` of a pull request that
+did not merge in the window; a `required_check_red` row always has one. The
+receipt carries `required_source`, and when the required contexts could not be
+read it lists `required_check_red` in `unread_kinds`: zero such rows then
+means unknown, not none. The receipt is written last and is the commit
+marker; a row count or hash that disagrees with the file means the export was
+interrupted.
 Everything is read from GitHub, so pass
 `--from`/`--to` to measure a window from before a change and one from after it.
 A repository without branch protection needs `--required-context`. A required
