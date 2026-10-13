@@ -224,6 +224,11 @@ HOLD. In Generous-Corp/pulp that is `tools/ci/merge_group_hold_check.py` in the
 `classify` job, which runs the protected base branch's copy of the check and
 fails `macos` closed before any VM.
 
+The `review-verdict` status (see [review-verdict-status.md](review-verdict-status.md))
+is the repository-side twin of the review-before-arm rule: once required, it
+also stops GitHub-native auto-merge armed before a HOLD and merges a workflow
+makes with its own token.
+
 **Which hosts:** off unless the host turns it on, with `SHIPYARD_HOLD_DISARMS=1`
 (`0` forces it off) or a file named `hold-disarms` in the guards directory.
 Off, it reads nothing. Roll it out one host at a time; roll back by removing

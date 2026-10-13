@@ -1,0 +1,41 @@
+# Posts the `review-verdict` commit status on a pull request's head: the
+# server-side twin of queue-arm-guard's review-before-arm rule (see
+# docs/review-verdict-status.md). Report-only until branch protection lists it.
+#
+# pull_request_target and issue_comment run in the base branch's context with
+# the base's code: the job checks out the base, never the pull request, so a
+# pull request cannot change the rule that judges it.
+name: Review verdict
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  issue_comment:
+    types: [created, edited, deleted]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  review-verdict:
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the base branch's rule
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Post review-verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/review_verdict_status.py

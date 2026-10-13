@@ -381,6 +381,15 @@ v1 does not read are present, `null` and named in `unread`; do not fill them
 by hand. For Pulp, red required checks need `--required-context`, or the
 report says "no required contexts" and exports none of them.
 
+**The guard stops only landings sent through `ghapp`.** GitHub-native
+auto-merge armed before a HOLD (tartci allows it) and Vellum's merge-on-green
+steward, which merges with its own token and reads no verdict, never reach
+`queue-arm-guard`. The `review-verdict` commit status
+(`scripts/review_verdict_status.py`, docs/review-verdict-status.md) is the
+guard's own decision posted on the head; it is report-only until a
+repository requires it. A red `review-verdict` means the guard would refuse
+that head; fix the verdict, not the status.
+
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason
 `failed_checks` or `checks_timed_out`, and use `AddedToMergeQueueEvent` as the
