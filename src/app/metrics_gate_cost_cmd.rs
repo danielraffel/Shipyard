@@ -33,6 +33,7 @@ pub(super) fn gate_cost_command<W: Write>(
     let flakes = args.flakes;
     let required_contexts = args.required_contexts.clone();
     let selection_steps = args.selection_steps.clone();
+    let export_cases = args.export_cases.clone();
     let query = resolve_query(args, &config, now)?;
     let cache = if no_cache {
         ReadCache::disabled()
@@ -59,6 +60,16 @@ pub(super) fn gate_cost_command<W: Write>(
         let observation = scorecard::gather(&reader, &query, &cache)
             .map_err(|error| CliFailure::new(1, format!("scorecard read failed: {error}")))?;
         let mut report = scorecard::compute(&observation);
+        if let Some(path) = &export_cases {
+            let receipt = write_cases(path, &observation)?;
+            eprintln!(
+                "export-cases: {} row(s) to {}, sha256 {} (receipt {})",
+                receipt.rows,
+                path.display(),
+                receipt.sha256,
+                receipt_path(path).display()
+            );
+        }
         if flakes {
             let read = scorecard::flakes::gather(&reader, &cache, &query)
                 .map_err(|error| CliFailure::new(1, format!("flake read failed: {error}")))?;
@@ -88,6 +99,42 @@ pub(super) fn gate_cost_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+fn receipt_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".receipt.json");
+    PathBuf::from(name)
+}
+
+/// Write the scorecard's cases and their receipt, each through a temporary
+/// file renamed into place, so a reader never sees half an export.
+fn write_cases(
+    path: &Path,
+    observation: &scorecard::ScorecardObservation,
+) -> Result<scorecard::cases::Receipt, CliFailure> {
+    let rows = scorecard::cases::cases(observation);
+    let (bytes, receipt) = scorecard::cases::export(observation, &rows)
+        .map_err(|error| CliFailure::new(1, format!("export-cases: {error}")))?;
+    let receipt_json = serde_json::to_vec_pretty(&receipt)
+        .map_err(|error| CliFailure::new(1, format!("export-cases: {error}")))?;
+    for (target, content) in [
+        (path.to_path_buf(), bytes),
+        (receipt_path(path), receipt_json),
+    ] {
+        let mut temporary = target.as_os_str().to_owned();
+        temporary.push(".tmp");
+        let temporary = PathBuf::from(temporary);
+        std::fs::write(&temporary, &content)
+            .and_then(|()| std::fs::rename(&temporary, &target))
+            .map_err(|error| {
+                CliFailure::new(
+                    1,
+                    format!("export-cases: cannot write {}: {error}", target.display()),
+                )
+            })?;
+    }
+    Ok(receipt)
 }
 
 /// One cache directory per repository, under Shipyard's state directory.
@@ -380,6 +427,58 @@ mod tests {
 
     use super::*;
     use crate::gate_cost::{GateCostObservation, compute};
+
+    /// The export and its receipt land next to each other, whole, and the
+    /// receipt's hash is the file's.
+    #[test]
+    fn cases_and_their_receipt_are_written_together() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("week.jsonl");
+        let observation = scorecard::ScorecardObservation {
+            query: scorecard::ScorecardQuery {
+                repo: "o/r".to_owned(),
+                workflow: "build.yml".to_owned(),
+                gate_job: "macos".to_owned(),
+                base_branch: "main".to_owned(),
+                required_contexts: Vec::new(),
+                selection_steps: Vec::new(),
+                from: Utc::now() - chrono::Duration::days(7),
+                to: Utc::now(),
+            },
+            required: Ok((Vec::new(), "--required-context".to_owned())),
+            prs: Vec::new(),
+            merge_group_runs: Vec::new(),
+            queue_events: Vec::new(),
+            selection: None,
+            gaps: Vec::new(),
+        };
+        let receipt = write_cases(&path, &observation).expect("written");
+        let bytes = std::fs::read(&path).expect("export");
+        assert_eq!(receipt.rows, 0);
+        assert_eq!(receipt.sha256, hex::encode(sha2::Sha256::digest(&bytes)));
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("week.jsonl.receipt.json")).expect("receipt"),
+        )
+        .expect("json");
+        assert_eq!(saved["sha256"], receipt.sha256);
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|name| Path::new(name).extension().is_some_and(|ext| ext == "tmp")),
+            "{names:?}"
+        );
+    }
 
     #[test]
     fn human_output_puts_each_signal_on_its_own_line() {

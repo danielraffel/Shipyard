@@ -68,6 +68,7 @@ use super::{
     read_run_jobs, resolved_gate_jobs, round2, strings, text, timestamp,
 };
 
+pub mod cases;
 pub mod flakes;
 
 /// Report schema identifier.
@@ -128,6 +129,8 @@ pub struct CheckOutcome {
     pub name: String,
     /// Upper-case conclusion or state; `None` while pending.
     pub outcome: Option<String>,
+    /// When it completed (else started); a status context's creation time.
+    pub at: Option<DateTime<Utc>>,
 }
 
 /// One commit of a merged pull request.
@@ -1065,7 +1068,7 @@ fn latest_by_name(contexts: &[Value]) -> Vec<CheckOutcome> {
     }
     latest
         .into_iter()
-        .map(|(name, (_, outcome))| CheckOutcome { name, outcome })
+        .map(|(name, (at, outcome))| CheckOutcome { name, outcome, at })
         .collect()
 }
 

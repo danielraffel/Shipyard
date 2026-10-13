@@ -371,6 +371,16 @@ On 2026-10-12, 6 pulp pull requests merged that way: each was armed before the
 HOLD, and review-before-arm judges only the arm. Read `hold` as a merge that
 landed against a reviewer, not as a slow review.
 
+**To build a labelled corpus, export the cases, then label them later.**
+`--export-cases FILE` writes the scorecard's cases (red required checks on
+merged pull requests' commits, failed merge-group gates, queue removals other
+than `merged`, each with its merge-head verdict) as JSONL with `label` null,
+plus a receipt with the row count and SHA-256. Label a row only after its
+`label_not_before` (24 h on), when hindsight says whether it was real. Fields
+v1 does not read are present, `null` and named in `unread`; do not fill them
+by hand. For Pulp, red required checks need `--required-context`, or the
+report says "no required contexts" and exports none of them.
+
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason
 `failed_checks` or `checks_timed_out`, and use `AddedToMergeQueueEvent` as the

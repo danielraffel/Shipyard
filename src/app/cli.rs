@@ -1282,6 +1282,15 @@ pub(crate) struct MetricsGateCostArgs {
     /// groups' heads.
     #[arg(long = "selection-step", requires = "scorecard")]
     pub(crate) selection_steps: Vec<String>,
+    /// Also write one JSONL row per case the scorecard read to this file: a
+    /// red required check on a merged pull request's commit, a merge-group
+    /// gate that did not pass, or a queue removal other than `merged`, with
+    /// the merge-head verdict. Rows are unlabelled (`label` null,
+    /// `label_not_before` 24 h after the case). A receipt with the row count
+    /// and the SHA-256 of the file is written next to it as
+    /// `<file>.receipt.json` and printed to stderr.
+    #[arg(long = "export-cases", value_name = "FILE", requires = "scorecard")]
+    pub(crate) export_cases: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
