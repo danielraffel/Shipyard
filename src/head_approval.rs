@@ -1176,30 +1176,39 @@ const BINARY_PROBE_BYTES: usize = 8000;
 /// say binary. An unreadable blob is an error: unknown refuses, but is never
 /// reported as binary.
 fn blob_is_binary(run_gh: RunGh<'_>, repo: &str, sha: &str) -> Result<bool, String> {
-    use base64::Engine as _;
     let blob = gh_json(
         run_gh,
         &[
             "api".to_owned(),
             format!("repos/{repo}/git/blobs/{sha}"),
             "--jq".to_owned(),
-            "{encoding, content}".to_owned(),
+            "{encoding, content, size}".to_owned(),
         ],
     )
     .map_err(|error| format!("cannot tell whether blob {} is binary: {error}", short(sha)))?;
-    let (Some("base64"), Some(content)) = (
+    binary_blob(&blob)
+        .map_err(|error| format!("cannot tell whether blob {} is binary: {error}", short(sha)))
+}
+
+/// Whether a `git/blobs` answer is binary by git's rule. Its decoded content
+/// must be exactly its reported `size`: truncated or empty content is
+/// unknown, never text.
+fn binary_blob(blob: &Value) -> Result<bool, String> {
+    use base64::Engine as _;
+    let (Some("base64"), Some(content), Some(size)) = (
         blob.get("encoding").and_then(Value::as_str),
         blob.get("content").and_then(Value::as_str),
+        blob.get("size").and_then(Value::as_u64),
     ) else {
-        return Err(format!(
-            "cannot tell whether blob {} is binary: it is unreadable",
-            short(sha)
-        ));
+        return Err("it is unreadable".to_owned());
     };
     let compact: String = content.chars().filter(|ch| !ch.is_whitespace()).collect();
     let data = base64::engine::general_purpose::STANDARD
         .decode(compact)
-        .map_err(|error| format!("cannot tell whether blob {} is binary: {error}", short(sha)))?;
+        .map_err(|error| error.to_string())?;
+    if data.len() as u64 != size {
+        return Err(format!("{} bytes read of {size}", data.len()));
+    }
     Ok(data.iter().take(BINARY_PROBE_BYTES).any(|byte| *byte == 0))
 }
 

@@ -1239,7 +1239,8 @@ impl History {
             .expect("git runs")
             .stdout;
         Ok(json!({"encoding": "base64",
-                  "content": base64::engine::general_purpose::STANDARD.encode(data)})
+                  "content": base64::engine::general_purpose::STANDARD.encode(&data),
+                  "size": data.len()})
         .to_string())
     }
 
@@ -1653,4 +1654,29 @@ fn an_unreadable_blob_refuses_without_calling_it_binary() {
     let refusal = history.refusal(&head);
     assert!(refusal.starts_with("cannot tell whether blob"), "{refusal}");
     assert!(!refusal.contains("binary file"), "{refusal}");
+}
+
+#[test]
+fn a_blob_whose_content_is_short_of_its_size_is_unknown() {
+    use base64::Engine as _;
+    let blob = |data: &[u8], size: Option<u64>| {
+        let mut value = json!({"encoding": "base64",
+            "content": base64::engine::general_purpose::STANDARD.encode(data)});
+        if let Some(size) = size {
+            value["size"] = json!(size);
+        }
+        value
+    };
+    assert_eq!(super::binary_blob(&blob(b"{}{}", Some(4))), Ok(false));
+    assert_eq!(super::binary_blob(&blob(b"\x00\x01", Some(2))), Ok(true));
+    for (data, size) in [
+        (&b"{}{}"[..], Some(5)),
+        (&b""[..], Some(406_888)),
+        (&b"text"[..], None),
+    ] {
+        assert!(
+            super::binary_blob(&blob(data, size)).is_err(),
+            "{data:?} of {size:?} must be unknown"
+        );
+    }
 }
