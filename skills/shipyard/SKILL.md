@@ -2394,6 +2394,14 @@ the default `0`, execution is byte-identical to no retry. Composes with
 `classify_local_failures` (a relabelled-`INFRA` failure becomes retry-eligible).
 Full behavior: `docs/local-mac-pool.md` § Same-backend transient retry.
 
+## The fleet default is production-only
+
+A daemon started without `--repo` watches the fleet repositories only in
+`--mode shipyard`. An isolated daemon is a sandbox or a test; watching the
+fleet from it would poll the real repositories, and with a tunnel enabled it
+would register webhooks on them. Keep any new default list behind
+`requested_daemon_repos`, which applies it per mode.
+
 ## Durable Queue: daemon-owned execution
 
 The detached daemon must own a trusted temporary root independent of the

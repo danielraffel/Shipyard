@@ -714,14 +714,7 @@ fn daemon_start<W: Write>(
     repos: &[String],
     no_detach: bool,
 ) -> Result<ExitCode, CliFailure> {
-    let requested_repos: Vec<String> = if repos.is_empty() {
-        super::pr_status_cmd::FLEET_REPOSITORIES
-            .iter()
-            .map(|repo| (*repo).to_owned())
-            .collect()
-    } else {
-        repos.to_vec()
-    };
+    let requested_repos = requested_daemon_repos(mode, repos);
     let resolved_repos = resolve_watch_list(
         mode,
         &runtime_paths.state_dir,
@@ -790,13 +783,29 @@ fn daemon_run(
     runtime_paths: &RuntimePaths,
     repos: &[String],
 ) -> Result<ExitCode, CliFailure> {
-    let defaults = super::pr_status_cmd::FLEET_REPOSITORIES
-        .iter()
-        .map(|repo| (*repo).to_owned())
-        .collect::<Vec<_>>();
-    let requested = if repos.is_empty() { &defaults } else { repos };
-    let resolved_repos = resolve_repos(&runtime_paths.state_dir, requested);
+    let resolved_repos = daemon_run_repos(mode, &runtime_paths.state_dir, repos);
     daemon_run_with_repos(mode, runtime_paths, resolved_repos)
+}
+
+/// The repositories a daemon started without `--repo` asks to watch.
+///
+/// Only the production daemon defaults to the fleet. An isolated daemon is a
+/// sandbox or a test: watching the fleet would register webhooks and poll the
+/// real repositories from it, so it keeps the in-flight ship state's repos,
+/// which is nothing for a fresh state directory.
+fn requested_daemon_repos(mode: RuntimeMode, repos: &[String]) -> Vec<String> {
+    if repos.is_empty() && mode == RuntimeMode::Shipyard {
+        super::pr_status_cmd::FLEET_REPOSITORIES
+            .iter()
+            .map(|repo| (*repo).to_owned())
+            .collect()
+    } else {
+        repos.to_vec()
+    }
+}
+
+fn daemon_run_repos(mode: RuntimeMode, state_dir: &Path, repos: &[String]) -> Vec<String> {
+    resolve_repos(state_dir, &requested_daemon_repos(mode, repos))
 }
 
 fn daemon_run_with_repos(
@@ -1157,7 +1166,7 @@ fn public_ingress_findings(state_dir: &Path) -> Vec<Finding> {
 
 #[cfg(test)]
 mod tests {
-    use super::{public_ingress_line, url_names_host};
+    use super::{daemon_run_repos, public_ingress_line, requested_daemon_repos, url_names_host};
     use crate::app::pr_status_cmd::FLEET_REPOSITORIES;
 
     #[test]
@@ -1189,6 +1198,47 @@ mod tests {
         assert!(FLEET_REPOSITORIES.contains(&"Generous-Corp/pulp"));
         assert!(FLEET_REPOSITORIES.contains(&"danielraffel/tartci"));
         assert!(FLEET_REPOSITORIES.contains(&"Generous-Corp/vellum"));
+    }
+
+    #[test]
+    fn an_isolated_daemon_without_repos_watches_nothing() {
+        let state = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            daemon_run_repos(RuntimeMode::Isolated, state.path(), &[]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            requested_daemon_repos(RuntimeMode::Isolated, &[]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn the_production_daemon_without_repos_watches_the_fleet() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let mut fleet = FLEET_REPOSITORIES
+            .iter()
+            .map(|repo| repo.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        fleet.sort();
+        let mut watched = daemon_run_repos(RuntimeMode::Shipyard, state.path(), &[])
+            .into_iter()
+            .map(|repo| repo.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        watched.sort();
+        assert_eq!(watched, fleet);
+        assert_eq!(
+            requested_daemon_repos(RuntimeMode::Shipyard, &[]).len(),
+            FLEET_REPOSITORIES.len()
+        );
+    }
+
+    #[test]
+    fn explicit_repos_are_watched_in_either_mode() {
+        let explicit = vec!["owner/one".to_owned()];
+        for mode in [RuntimeMode::Isolated, RuntimeMode::Shipyard] {
+            assert_eq!(requested_daemon_repos(mode, &explicit), explicit);
+        }
     }
 
     /// The daemon's advertised URL is compared against this host's identity to
