@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03120"></a>
+## [0.312.0] - 2026-10-13
+
+- feat/scorecard selection recall ([#795](https://github.com/danielraffel/Shipyard/pull/795))
+
 <a id="v03110"></a>
 ## [0.311.0] - 2026-10-13
 
@@ -2212,6 +2217,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.312.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.312.0
 [0.311.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.311.0
 [0.310.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.310.1
 [0.310.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.310.0
