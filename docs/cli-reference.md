@@ -54,6 +54,13 @@ shipyard landing --pr 123                    # one PR. First line: the VERDICT t
                                              # Then queued / armed_not_queued / ejected / never_armed / merged, with sources;
                                              #   plus VALIDATION: head test tier (fast / full / unknown) and merge-group receipt decisions
 
+# What does this project build, pin, run on and test with? (read-only)
+shipyard inspect --profile                   # detected facts, each with its file:line or API row: build systems, lockfiles,
+                                             #   pin manifests, CI commands, runner classes (as written, and as observed in a
+                                             #   recent run for each computed runs-on), merge queue, required checks, test
+                                             #   frameworks, release workflows; labels like desktop-native / rust-cli
+shipyard --json inspect --profile --repo OWNER/REPO --base main --max-runs 8
+
 # Is the base red? (reads the repo's own base-poison-signal/v1 annotation)
 shipyard base-health                         # status; for `poisoned` + a named fix PR: "main red: <test>, fix PR #n, jump it" and the commands
 shipyard base-health --workflow FILE         # detector workflow (default base_health.workflow, else main-health-detector.yml)
@@ -425,6 +432,43 @@ PR. After checking GitHub's authoritative queue/timeline state, resolve it with
 repo-owned TOML profile from `.tartci/`, `.shipyard/ci-profiles/`, or
 `ci-profiles/`, then reports the concrete GitHub runner variables/selectors
 that would be used for each lane. It does not require tartci to be installed.
+
+## Inspect
+
+`shipyard inspect` reads a repository's CI and says what to change. It is
+read-only and runs only when asked: nothing on the path of `ship`, `pr`, the
+guards or the daemon calls it.
+
+`shipyard inspect --profile` prints the facts every inspect check applies to,
+read from the repository rather than declared:
+
+- build systems, from the marker files `shipyard init` detects (plus
+  `pyproject.toml`, and Python sources with no manifest);
+- lockfiles and pin manifests;
+- the build, install, test and setup commands workflows run, each with its
+  `path:line`;
+- runner classes: every job's `runs-on:` as written, and for each workflow
+  whose `runs-on:` is computed (a routing variable or a job output), the
+  runner its latest completed run's jobs actually used;
+- the base branch's merge queue (from its active rules; branch protection
+  cannot express one) and its required checks (rules plus branch protection);
+- test frameworks, from test files and from the commands CI runs;
+- workflows triggered by tags or releases.
+
+Every kind reports what it searched. A kind whose source could not be read is
+`unavailable` (or `partial`) with the error, and is never reported as absent.
+Paths under fixtures, tests, examples, vendored or experimental directories
+are kept but marked incidental. Labels (`desktop-native`, `rust-cli`,
+`python-tool`, `web`) are names for bundles of these facts; `[inspect]
+profile` in config shows a chosen label beside the detected ones without
+adding any fact.
+
+The read is bounded: five settings and file reads, then two per sampled
+workflow, at most `--max-runs` (default 8) of them, the ones producing a
+required check first; the rest are named as not read. The token is the one
+for the repository you run it in, so reading another organisation's
+repository can leave branch protection unreadable (reported `partial`): run
+it inside that repository's clone.
 
 ## Runner Metrics
 

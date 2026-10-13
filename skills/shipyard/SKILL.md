@@ -211,6 +211,25 @@ invalid timestamps produce unavailable queue coverage; do not synthesize
 submit-to-receipt, cache, or model-token measurements. New providers must bind
 those values to authenticated durable events before they are imported.
 
+## `inspect --profile`: what checks apply to comes from the repo
+
+`shipyard inspect --profile` reads what a project builds with, pins, runs on
+and tests with, with the `path:line` or API row for each fact. Inspect checks
+declare which of these facts they apply to; a check whose facts are absent is
+listed as not applicable, never as zero findings. Three things that look wrong
+and are deliberate:
+
+- A computed `runs-on:` (a routing variable, a job output) is never read as a
+  platform. Only the runner a recent run's job actually used says where it
+  lands, so the run budget goes first to the workflows producing a required
+  check, and every workflow it skips is named.
+- A failed read is `unavailable` or `partial` with the error, never "none". A
+  protection 404 alone means "unprotected"; a 403 is unreadable. Reading
+  another organisation's repository with this checkout's token can 403 on
+  branch protection: run it in that repository's clone.
+- A fixture's `package.json` or an example's `Cargo.toml` is a fact marked
+  `incidental`, and makes no label.
+
 ## `doctor`: a git operation left in progress
 
 `shipyard doctor` has a "Git checkouts" section. It reads the primary

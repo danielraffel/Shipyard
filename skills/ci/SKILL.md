@@ -405,6 +405,15 @@ contexts were unreadable and its zero rows mean unknown, not none
 (`required_source` says why). A receipt whose row count or SHA-256 disagrees
 with the file is an interrupted export: the receipt is written last.
 
+**Where a routed lane actually runs is a run fact, not a file fact.**
+`shipyard inspect --profile` reads every job's `runs-on:`, and for a computed
+one (`fromJSON(vars.X)`, a `needs` output, a matrix value) it reads the
+runner of the latest completed run instead of guessing from the variable's
+name or fallback. On Pulp the required `macos` check comes from the `build`
+matrix job, whose `runs-on:` is `fromJSON(matrix.runs_on_json)`, and the run
+shows it on `self-hosted [.., pulp-build-vm, pulp-build-pr-head]`. Quote the
+observed class when saying where a gate runs.
+
 **The guard stops only landings sent through `ghapp`.** GitHub-native
 auto-merge armed before a HOLD (tartci allows it) and Vellum's merge-on-green
 steward, which merges with its own token and reads no verdict, never reach

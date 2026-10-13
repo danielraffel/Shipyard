@@ -455,6 +455,30 @@ pub(super) enum Command {
         #[arg(long, value_name = "NUMBER")]
         pr: Option<u64>,
     },
+    /// Read the repository's CI and say what to change. Read-only.
+    ///
+    /// `--profile` prints the facts every check applies to: build systems,
+    /// lockfiles and pin manifests, the commands workflows run, runner
+    /// classes (as written, and as observed in a recent run for each
+    /// computed `runs-on:`), the merge queue, required checks, test
+    /// frameworks and release workflows. Each fact names the file line or
+    /// API row it came from; a kind that could not be read says so and is
+    /// never reported as absent.
+    Inspect {
+        /// Print the detected project profile.
+        #[arg(long)]
+        profile: bool,
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Branch to read. Defaults to the configured base branch.
+        #[arg(long, value_name = "BRANCH")]
+        base: Option<String>,
+        /// Workflows with a computed `runs-on:` whose latest run is read to
+        /// observe their runner (two API calls each). Defaults to 8.
+        #[arg(long = "max-runs", value_name = "COUNT")]
+        max_runs: Option<usize>,
+    },
     /// Bounded diagnosis of a red pull request or workflow run.
     ///
     /// For each failing REQUIRED check: the failing step, the failing tests,

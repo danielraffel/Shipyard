@@ -39,6 +39,7 @@ mod fleet_update_cmd;
 mod governance_cmd;
 mod guards_cmd;
 mod init_cmd;
+mod inspect_cmd;
 mod landability_cmd;
 mod landing_cmd;
 mod local_linux_lease_cmd;
@@ -524,6 +525,25 @@ where
                 stdout,
             );
         }
+        Command::Inspect {
+            profile,
+            repo,
+            base,
+            max_runs,
+        } => {
+            return inspect_cmd::inspect_command(
+                cli.mode.into(),
+                &cwd,
+                inspect_cmd::InspectArgs {
+                    profile,
+                    repo,
+                    base,
+                    max_runs,
+                    json: cli.json,
+                },
+                stdout,
+            );
+        }
         Command::Quarantine { command } => {
             return quarantine_command(command, cli.mode.into(), &cwd, cli.json, stdout);
         }
@@ -842,6 +862,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Quarantine { .. }
         | Command::Landability { .. }
         | Command::Landing { .. }
+        | Command::Inspect { .. }
         | Command::BaseHealth { .. }
         | Command::Diagnose { .. }
         | Command::Doctor { .. }
