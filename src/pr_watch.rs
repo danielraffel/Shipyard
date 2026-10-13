@@ -495,22 +495,33 @@ fn ctest_summary_line(line: &str) -> bool {
 
 /// A failed test named by Python's unittest (`FAIL: test_x (module.Class.test_x)`,
 /// or `ERROR:`) or by `cargo test` (`test path::name ... FAILED`).
+///
+/// unittest always follows the name with its dotted location in parentheses;
+/// a line without one (`ERROR: Build failed`) is some other tool's message,
+/// not a test, and names nothing.
 fn unit_test_failure(line: &str) -> Option<String> {
     let line = line.trim();
     if let Some(rest) = line
         .strip_prefix("FAIL: ")
         .or_else(|| line.strip_prefix("ERROR: "))
     {
-        let mut parts = rest.splitn(2, ' ');
-        let name = parts.next()?;
-        let qualified = parts
-            .next()
-            .and_then(|rest| rest.strip_prefix('('))
-            .and_then(|rest| rest.split_once(')'))
-            .map(|(inside, _)| inside)
-            .filter(|inside| inside.ends_with(name) && !inside.contains(' '));
-        let name = qualified.unwrap_or(name);
-        return (!name.is_empty() && !name.contains(':')).then(|| name.to_owned());
+        let (name, location) = rest.split_once(' ')?;
+        let location = location.strip_prefix('(')?.split_once(')')?.0;
+        let identifier = |text: &str| {
+            !text.is_empty()
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
+        };
+        if !identifier(name) || !identifier(location) || !location.contains('.') {
+            return None;
+        }
+        // Python 3.11+ prints the full id; older versions print the class.
+        return Some(if location.ends_with(&format!(".{name}")) {
+            location.to_owned()
+        } else {
+            format!("{location}.{name}")
+        });
     }
     let name = line.strip_prefix("test ")?.strip_suffix(" ... FAILED")?;
     (!name.is_empty() && !name.contains(' ')).then(|| name.to_owned())

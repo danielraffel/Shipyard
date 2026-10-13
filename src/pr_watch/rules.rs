@@ -35,8 +35,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use self::fix::Fix;
 use super::{CheckFact, PrHistory, QueueEventKind, RepoHistory, head_at, open_at, short};
 
+pub mod fix;
 pub mod read;
 
 /// Schema of one emitted event line.
@@ -53,6 +55,9 @@ pub struct TrailEntry {
     pub id: u64,
     /// Author login.
     pub login: String,
+    /// The author's `author_association` on the repository, when read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association: Option<String>,
     /// When it was posted.
     pub at: DateTime<Utc>,
     /// A pull-request review rather than a comment.
@@ -82,6 +87,7 @@ impl TrailEntry {
         Self {
             id,
             login: login.to_owned(),
+            association: None,
             at,
             review: false,
             verdict: crate::head_approval::verdict_line(body)
@@ -166,8 +172,8 @@ pub struct WatchInput {
     pub inputs: Vec<InputEvent>,
 }
 
-/// Rule timings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Rule timings, and who reviews each repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuleConfig {
     /// A head with no READY and no verdict is reported after this long;
     /// `None` turns the rule off (it fires for every head an agent is still
@@ -177,6 +183,17 @@ pub struct RuleConfig {
     pub queue_stuck_after: Duration,
     /// An approved head nobody armed is reported after this long.
     pub approved_unarmed_after: Duration,
+    /// The reviewer to route each repository's heads to, by `OWNER/REPO`
+    /// (lower-cased); a fix names it.
+    pub reviewers: BTreeMap<String, String>,
+}
+
+impl RuleConfig {
+    fn reviewer(&self, repo: &str) -> Option<&str> {
+        self.reviewers
+            .get(&repo.to_ascii_lowercase())
+            .map(String::as_str)
+    }
 }
 
 impl Default for RuleConfig {
@@ -185,6 +202,7 @@ impl Default for RuleConfig {
             head_unreviewed_after: None,
             queue_stuck_after: Duration::minutes(90),
             approved_unarmed_after: Duration::minutes(15),
+            reviewers: BTreeMap::new(),
         }
     }
 }
@@ -217,6 +235,9 @@ pub struct RuleEvent {
     /// Structured facts behind it.
     #[serde(default)]
     pub detail: Value,
+    /// What to do about it.
+    #[serde(default)]
+    pub fix: Fix,
 }
 
 struct PrState {
@@ -255,14 +276,23 @@ fn pr_state(pr: &PrHistory, at: DateTime<Utc>) -> PrState {
 }
 
 /// The latest verdict naming `head`, posted at or before `at`.
+/// Whether `entry`'s verdict counts for a pull request by `author`: the
+/// rule the arm guard applies (`head_approval::trusted_reviewer`), so a
+/// drive-by comment on a public repository, or the author's own, neither
+/// approves a head nor reaches the author as a reviewer's verdict.
+fn trusted(entry: &TrailEntry, author: Option<&str>) -> bool {
+    crate::head_approval::trusted_reviewer(&entry.login, entry.association.as_deref(), author)
+}
+
 fn latest_verdict<'a>(
     trail: &'a [TrailEntry],
     head: &str,
     at: DateTime<Utc>,
+    author: Option<&str>,
 ) -> Option<&'a TrailEntry> {
     trail
         .iter()
-        .filter(|entry| entry.at <= at)
+        .filter(|entry| entry.at <= at && trusted(entry, author))
         .filter(|entry| {
             entry
                 .verdict
@@ -326,6 +356,7 @@ impl Emit<'_> {
         head: Option<&str>,
         summary: &str,
         detail: Value,
+        fix: Fix,
     ) {
         self.out.push(RuleEvent {
             schema: EVENT_SCHEMA.to_owned(),
@@ -338,6 +369,7 @@ impl Emit<'_> {
             head: head.map(str::to_owned),
             summary: format!("{}#{}: {summary}", self.repo, pr.number),
             detail,
+            fix,
         });
     }
 }
@@ -396,6 +428,7 @@ pub fn evaluate(
                     tests_text(&tests)
                 ),
                 json!({"run_id": group.id, "checks": checks, "tests": tests}),
+                fix::group_red(&history.repo, pr, group.id, &tests),
             );
         }
     }
@@ -415,6 +448,7 @@ pub fn evaluate(
             summary: format!("{}#{}: {}", alarm.repo, alarm.number, alarm.title),
             detail: json!({"issue": alarm.number, "title": alarm.title,
                            "closed_at": alarm.closed_at.map(stamp)}),
+            fix: fix::host_alarm(alarm),
         });
     }
     for event in &input.inputs {
@@ -441,6 +475,7 @@ pub fn evaluate(
             head: None,
             summary,
             detail: serde_json::to_value(&event.rest).unwrap_or(Value::Null),
+            fix: fix::from_input(&event.kind, &event.key, &event.rest),
         });
     }
     out
@@ -468,11 +503,11 @@ fn evaluate_pr(
         history,
         pr,
         head,
-        verdict: latest_verdict(trail, &head.sha, emit.at),
+        verdict: latest_verdict(trail, &head.sha, emit.at, pr.author.as_deref()),
         in_flight: state.armed || state.queued_since.is_some(),
     };
     review_events(emit, &view, trail, config);
-    armed_events(emit, &view, &state);
+    armed_events(emit, &view, &state, config);
     check_events(emit, &view);
     queue_events(emit, &view, &state, config);
     approval_events(emit, &view, config, live);
@@ -518,7 +553,11 @@ fn verdict_events(
     trail: &[TrailEntry],
 ) {
     let at = emit.at;
-    for entry in trail.iter().filter(|entry| entry.at <= at) {
+    let author = pr.author.as_deref();
+    for entry in trail
+        .iter()
+        .filter(|entry| entry.at <= at && trusted(entry, author))
+    {
         let Some(verdict) = &entry.verdict else {
             continue;
         };
@@ -541,6 +580,7 @@ fn verdict_events(
             ),
             json!({"verdict": word, "reviewer": entry.login, "verdict_head": verdict.head,
                    "author": pr.author}),
+            fix::verdict(&history.repo, pr, entry, verdict.approve, &verdict.head),
         );
     }
 }
@@ -564,6 +604,7 @@ fn removal_events(emit: &mut Emit<'_>, history: &RepoHistory, pr: &PrHistory) {
                 None,
                 &format!("the merge queue removed it ({reason})"),
                 json!({"reason": reason}),
+                fix::queue_removed(&history.repo, pr, reason),
             );
         }
     }
@@ -602,6 +643,13 @@ fn review_events(
                 ready.login
             ),
             json!({"ready_by": ready.login, "ready_comment": ready.id}),
+            fix::ready(
+                &view.history.repo,
+                view.pr,
+                sha,
+                ready,
+                config.reviewer(&view.history.repo),
+            ),
         );
     } else if let Some(wait) = config.head_unreviewed_after
         && !view.pr.draft
@@ -619,11 +667,12 @@ fn review_events(
                 stamp(view.head.first_seen_at)
             ),
             json!({"head_since": stamp(view.head.first_seen_at)}),
+            fix::head_unreviewed(&view.history.repo, view.pr, sha),
         );
     }
 }
 
-fn armed_events(emit: &mut Emit<'_>, view: &HeadView<'_>, state: &PrState) {
+fn armed_events(emit: &mut Emit<'_>, view: &HeadView<'_>, state: &PrState, config: &RuleConfig) {
     if !view.in_flight || view.approved().is_some() {
         return;
     }
@@ -644,6 +693,12 @@ fn armed_events(emit: &mut Emit<'_>, view: &HeadView<'_>, state: &PrState) {
         Some(view.sha()),
         &format!("{what} at head {}, but {latest}", short(view.sha())),
         json!({"state": what}),
+        fix::armed_unapproved(
+            &view.history.repo,
+            view.pr,
+            view.sha(),
+            config.reviewer(&view.history.repo),
+        ),
     );
 }
 
@@ -673,6 +728,7 @@ fn check_events(emit: &mut Emit<'_>, view: &HeadView<'_>) {
             ),
             json!({"check": check.name, "check_run": check.id, "conclusion": conclusion,
                    "tests": check.signatures, "armed": view.in_flight}),
+            fix::required_red(&view.history.repo, view.pr, sha, check),
         );
     }
 }
@@ -697,6 +753,12 @@ fn queue_events(emit: &mut Emit<'_>, view: &HeadView<'_>, state: &PrState, confi
         Some(view.sha()),
         &format!("in the merge queue since {} and not merged", stamp(since)),
         json!({"queued_since": stamp(since)}),
+        fix::queue_stuck(
+            &view.history.repo,
+            &view.history.base,
+            view.pr,
+            &stamp(since),
+        ),
     );
 }
 
@@ -718,6 +780,7 @@ fn approval_events(emit: &mut Emit<'_>, view: &HeadView<'_>, config: &RuleConfig
                 approval.login
             ),
             json!({"approved_by": approval.login}),
+            fix::approved_unarmed(&view.history.repo, view.pr, sha, approval),
         );
     }
     if live
@@ -733,6 +796,7 @@ fn approval_events(emit: &mut Emit<'_>, view: &HeadView<'_>, config: &RuleConfig
             Some(sha),
             &format!("head {} is approved but {merge_state}", short(sha)),
             json!({"merge_state": merge_state}),
+            fix::approved_blocked(&view.history.repo, view.pr, sha, merge_state),
         );
     }
 }

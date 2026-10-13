@@ -751,7 +751,12 @@ failed merge group, queue removal or stall, approved but unarmed, tartci host
 alarm, or a line from `--input-events`), each once per key, so a quiet pass
 prints nothing. Its first pass with no ledger only records what already holds.
 `rules-replay` runs the same rules over a past window. Failing-test names come
-from CTest, Python unittest (`FAIL:`/`ERROR:`) and `cargo test` lines.
+from CTest, Python unittest (`FAIL:`/`ERROR:` with a dotted location) and
+`cargo test` lines. Every event carries a `fix` (what, evidence URL, cause,
+command, safe_to_auto_apply, verify); `--reviewer OWNER/REPO=NAME` names who a
+head routes to. A live pass prints its reads, checks the App budget first and
+backs off (exit 75) under `--min-rate-remaining`, and re-reads a pull
+request's whole trail before emitting a trail-dependent event.
 
 `shipyard pr-watch liveness` exits 1 when this scanning host's last completed
 pass is older than `[pr_watch] stale_after_minutes` (45); `doctor --fleet` asks
