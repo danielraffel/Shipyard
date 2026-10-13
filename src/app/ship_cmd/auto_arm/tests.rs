@@ -11,7 +11,8 @@ struct FakeGh {
 
 impl FakeGh {
     /// A repository with no `.shipyard/config.toml` on its base answers 404,
-    /// so head approval is not required unless a test scripts the file.
+    /// so head approval is not required unless a test scripts the file or
+    /// names a repository in `head_approval::REVIEW_REQUIRED_REPOS`.
     fn new(mut routes: Vec<(&'static str, Result<String, String>)>) -> Self {
         routes.push((
             "contents/.shipyard/config.toml",
@@ -532,8 +533,9 @@ fn each_arm_request_reaches_the_arm_as_asked() {
 
 /// `ship`'s arm-on-open re-enqueues a starved head of #8678 at exactly that
 /// head: the mutation carries `expectedHeadOid`, never the plain arm.
-#[test]
-fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
+/// #8678 as `ship` re-enqueues it on Generous-Corp/pulp, which requires a
+/// reviewer verdict naming the head; `comments` is its comment list.
+fn reenqueue_8678(comments: &str) -> FakeGh {
     let state = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/github/pr_real_8678_first_environment_ejection.json"
@@ -542,8 +544,14 @@ fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
     let group = "2410ca497342cfc0264bf5b72713de0b56099a0f";
     let runs = r#"{"total_count":1,"check_runs":[{"id":7,"name":"macos","status":"completed","conclusion":"cancelled","app":{"slug":"github-actions"}}]}"#;
     let job = r#"{"id":7,"status":"completed","conclusion":"cancelled","created_at":"2026-09-23T03:30:00Z","completed_at":"2026-09-23T03:46:00Z","runner_name":"","steps":[]}"#;
-    let gh = FakeGh::new(vec![
+    FakeGh::new(vec![
         ("pr view", Ok(pr_view("PR_node8678", false))),
+        ("pulls/8678/reviews", Ok(String::new())),
+        ("issues/8678/comments", Ok(comments.to_owned())),
+        (
+            "pulls/8678 --jq .user.login",
+            Ok("shipyard-local[bot]\n".to_owned()),
+        ),
         ("isInMergeQueue", Ok(state)),
         ("rules/branches/main", Ok("[]".to_owned())),
         (
@@ -562,9 +570,16 @@ fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
         ("check-runs/7/annotations", Ok("[]".to_owned())),
         ("actions/jobs/7", Ok(job.to_owned())),
         ("enablePullRequestAutoMerge", Ok(arm_accepted())),
-    ]);
-    let outcome =
-        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None);
+    ])
+}
+
+#[test]
+fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
+    let approval = r#"{"id":1,"login":"fable-graph","type":"User","association":"COLLABORATOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:f0fb2fb38ef5c900efad7ea0630906f081db53a9"}"#;
+    let gh = reenqueue_8678(approval);
+    let outcome = crate::head_approval::with_host_review_default(true, || {
+        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None)
+    });
     assert!(outcome.armed, "{}", outcome.line);
     assert!(
         outcome.line.contains("at exactly its current head"),
@@ -581,4 +596,24 @@ fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
         arm.contains("head=f0fb2fb38ef5c900efad7ea0630906f081db53a9"),
         "{arm}"
     );
+}
+
+/// The same re-enqueue with no verdict naming the head is not armed: ship's
+/// own arm path refuses an unreviewed head on a review-by-default repository.
+#[test]
+fn ship_does_not_arm_an_unreviewed_head_on_a_listed_repository() {
+    let stale = r#"{"id":1,"login":"fable-graph","type":"User","association":"COLLABORATOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:2410ca497342cfc0264bf5b72713de0b56099a0f"}"#;
+    let gh = reenqueue_8678(stale);
+    let outcome = crate::head_approval::with_host_review_default(true, || {
+        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None)
+    });
+    assert!(!outcome.armed, "{}", outcome.line);
+    assert!(
+        outcome
+            .line
+            .contains("`verdict: APPROVE head:f0fb2fb38ef5c900efad7ea0630906f081db53a9`"),
+        "{}",
+        outcome.line
+    );
+    assert!(!gh.called("enablePullRequestAutoMerge"));
 }

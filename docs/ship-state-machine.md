@@ -283,6 +283,16 @@ document:
   line; the ship proceeds to submission either way.
 * It is idempotent, so a resumed or re-run ship re-issues nothing: an
   already-armed or already-queued pull request is left alone.
+* On a host that turns it on (`SHIPYARD_REVIEW_BEFORE_ARM=1`, or a
+  `review-before-arm` file in the guards directory), `Generous-Corp/pulp`,
+  `Generous-Corp/vellum`, `danielraffel/tartci` and `danielraffel/Shipyard`
+  require an approval when their base does not set the key. With no identity
+  listed, a verdict counts from the fleet App or an `OWNER`, `MEMBER` or
+  `COLLABORATOR`, never from the PR's distinguishable author. A merge-only
+  update carries the approval only when every file the PR changes keeps its
+  approved blob, the base changed none of them and no binary changed, and the
+  classic merge is gated like an arm (see `docs/ghapp-guards.md`, Review
+  before arm or merge).
 * A repository that sets `[auto_merge] arm_requires_head_approval = true` on
   its base branch arms only a head carrying an approval of that exact head,
   from an identity listed in `[auto_merge] reviewer_identities` (the older

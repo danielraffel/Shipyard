@@ -7,6 +7,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import stat
 import subprocess
@@ -24,6 +25,10 @@ guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 
 FIXTURES = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "github"
+
+
+def review_fixture(name: str) -> Any:
+    return json.loads((FIXTURES / "review_before_arm" / name).read_text(encoding="utf-8"))
 
 
 def fixture(name: str) -> dict[str, Any]:
@@ -292,6 +297,15 @@ class NewHeadIsDecidedBySha(unittest.TestCase):
         self.assertIn("HeadRefForcePushedEvent{createdAt afterCommit{oid}}", guard.PR_BY_NUMBER_QUERY)
 
 
+def stub_review(case: unittest.TestCase) -> None:
+    """Allow every review: these cases decide queue state; ReviewBeforeArm decides review."""
+    patcher = mock.patch.object(
+        guard, "review_gate", return_value=(True, "reviewed (stubbed for queue-state cases)")
+    )
+    patcher.start()
+    case.addCleanup(patcher.stop)
+
+
 class QueueArmGuardTests(unittest.TestCase):
     def setUp(self) -> None:
         # Run from a directory with no `.shipyard/config.toml` above it, so these
@@ -302,6 +316,7 @@ class QueueArmGuardTests(unittest.TestCase):
         previous = pathlib.Path.cwd()
         os.chdir(directory)
         self.addCleanup(os.chdir, previous)
+        stub_review(self)
 
     def run_guard(
         self, args: list[str], responses: list[Any] | None = None, **env: str
@@ -333,7 +348,6 @@ class QueueArmGuardTests(unittest.TestCase):
         for args in (
             ["pr", "view", "7"],
             ["pr", "merge", "7", "--disable-auto"],
-            ["pr", "merge", "7", "--admin", "--merge"],
             ["api", "graphql", "-f", "query=query { viewer { login } }"],
             ["api", "repos/o/r/pulls/7"],
             ["pr", "merge", "--help"],
@@ -645,6 +659,7 @@ class BatchAttributionTests(unittest.TestCase):
         cwd = pathlib.Path.cwd()
         os.chdir(self.root)
         self.addCleanup(os.chdir, cwd)
+        stub_review(self)
 
     def declare(
         self, verdict: Any, *, exit_code: int = 0, command: Any = None, stderr: str = ""
@@ -1210,11 +1225,30 @@ class BatchAttributionTests(unittest.TestCase):
                 if name.startswith("merge_group_run_"):
                     body = body["jobs"]
                 (answers / f"{index}.json").write_text(json.dumps(body), encoding="utf-8")
+            # Then the review reads: the pull request, its comments (one
+            # approval of the head, shaped like Shipyard#784's), its reviews.
+            head = "e147f2d09972babcc9977e82a46470e17f9de538"
+            approval = copy.deepcopy(next(
+                c for c in review_fixture("shipyard-784-comments.json")[0] if c["id"] == 6127196414
+            ))
+            approval["body"] = f"Delta review.\n\nverdict: APPROVE head:{head}"
+            for index, body in enumerate(
+                (
+                    {"number": 8811, "base": {"ref": "main"}, "head": {"sha": head},
+                     "user": {"login": "shipyard-local[bot]"}},
+                    [[approval]],
+                    [[]],
+                ),
+                start=3,
+            ):
+                (answers / f"{index}.json").write_text(json.dumps(body), encoding="utf-8")
             fake_gh = guards / "gh"
             fake_gh.write_text(
                 "#!/bin/sh\n"
-                f"n=$(cat '{guards / 'n'}' 2>/dev/null || echo 0)\n"
                 f"printf '%s\\n' \"$*\" >> '{guards / 'calls'}'\n"
+                "case \"$*\" in *contents/.shipyard/config.toml*)\n"
+                "  echo 'gh: Not Found (HTTP 404)' >&2; exit 1;; esac\n"
+                f"n=$(cat '{guards / 'n'}' 2>/dev/null || echo 0)\n"
                 f"echo $((n+1)) > '{guards / 'n'}'\n"
                 f"cat '{answers}'/$n.json\n",
                 encoding="utf-8",
@@ -1222,11 +1256,13 @@ class BatchAttributionTests(unittest.TestCase):
             for executable in (fake_gh, guards / "queue-arm-guard"):
                 executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
             result = subprocess.run(
-                [sys.executable, str(guards / "queue-arm-guard"), "pr", "merge", "8811", "--auto"],
+                [sys.executable, str(guards / "queue-arm-guard"), "pr", "merge", "8811", "--auto",
+                 "--match-head-commit", head],
                 env={
                     "PATH": "/usr/bin:/bin",
                     "GHAPP_REAL_GH": str(fake_gh),
                     "GH_REPO": "Generous-Corp/pulp",
+                    "SHIPYARD_REVIEW_BEFORE_ARM": "1",
                 },
                 cwd=str(repo),
                 capture_output=True,
@@ -1240,6 +1276,7 @@ class BatchAttributionTests(unittest.TestCase):
             self.assertIn("number=8811", calls)
             self.assertIn("event=merge_group&status=failure", calls)
             self.assertIn(f"runs/{self.RUN_ID}/jobs", calls)
+            self.assertIn("repos/Generous-Corp/pulp/issues/8811/comments", calls)
 
 
 
@@ -1636,3 +1673,632 @@ class EnvironmentRequeueWorkedExamples(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+REMOVAL = SCRIPT.with_name("ghapp_queue_removal_guard.py")
+
+
+def opened(graphql_response: dict[str, Any]) -> dict[str, Any]:
+    """A merged pull request's captured response, as it read while open."""
+    response = copy.deepcopy(graphql_response)
+    pr = response["data"]["repository"]["pullRequest"]
+    pr["state"] = "OPEN"
+    pr["timelineItems"]["nodes"] = [
+        node for node in pr["timelineItems"]["nodes"] if node.get("__typename") != "MergedEvent"
+    ]
+    return response
+
+
+HEAD_784 = "fd0e94e25f447578256f3aae97cc0ab6103d5f0c"
+HOLD_784 = "cb5c1f796dac6851062af69def634aade161fb1f"
+APPROVE_784_COMMENT = 6127196414
+
+
+def comment_like(template: dict[str, Any], **change: Any) -> dict[str, Any]:
+    """A copy of a captured comment with some fields changed."""
+    value = copy.deepcopy(template)
+    value.update(change)
+    return value
+
+
+# GitHub's `compare/<x>...<y>` answered from a real git repository, for the
+# fake gh: the merge base, ahead/behind status, the commits with parents, and
+# each changed file's status, blob sha and whether it has a text patch.
+GIT_COMPARE = r"""
+import subprocess as _sp
+def _git(repo, *args):
+    return _sp.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+def git_compare(repo, argv):
+    spec = next(part for part in argv.split() if "/compare/" in part).split("/compare/", 1)[1]
+    x, y = spec.split("...", 1)
+    base = _git(repo, "merge-base", x, y)
+    ahead = int(_git(repo, "rev-list", "--count", f"{base}..{y}"))
+    behind = int(_git(repo, "rev-list", "--count", f"{base}..{x}"))
+    status = ("identical" if not ahead and not behind else "ahead" if not behind
+              else "behind" if not ahead else "diverged")
+    commits = []
+    for line in _git(repo, "rev-list", "--reverse", "--parents", f"{base}..{y}").splitlines():
+        sha, *parents = line.split()
+        commits.append({"sha": sha, "parents": [{"sha": p} for p in parents]})
+    binary = {line.split("\t")[2] for line in _git(repo, "diff", "--numstat", base, y).splitlines()
+              if line.startswith("-\t-\t")}
+    files = []
+    for line in _git(repo, "diff", "--raw", "--no-abbrev", "--no-renames", base, y).splitlines():
+        meta, name = line.split("\t", 1)
+        _, _, old, new, letter = meta.split()
+        entry = {"filename": name, "status": {"A": "added", "D": "removed"}.get(letter, "modified"),
+                 "sha": new if letter != "D" else old}
+        if name not in binary:
+            entry["patch"] = "@@"
+        files.append(entry)
+    return {"status": status, "ahead_by": ahead, "behind_by": behind, "total_commits": ahead,
+            "merge_base_commit": {"sha": base}, "commits": commits, "files": files}
+"""
+
+
+class ReviewBeforeArm(unittest.TestCase):
+    """A landing needs a verdict naming the exact head, through the installed guard.
+
+    Each case runs the guard as ghapp does: installed names, a real
+    subprocess, and a fake native gh answering from live captures. Its
+    answers are matched in order by a substring of the argv; a paginated
+    answer serves every page only when the request carries ``--paginate``.
+    """
+
+    def setUp(self) -> None:
+        self.root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.guards = self.root / "guards"
+        self.guards.mkdir()
+        shutil.copy(SCRIPT, self.guards / "queue-arm-guard")
+        shutil.copy(REMOVAL, self.guards / "queue-removal-guard")
+
+    def install(self, answers: list[tuple[str, dict[str, Any]]]) -> pathlib.Path:
+        table = self.root / "answers.json"
+        table.write_text(json.dumps(answers), encoding="utf-8")
+        fake = self.root / "gh"
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            + GIT_COMPARE +
+            f"answers = json.load(open({str(table)!r}))\n"
+            "argv = ' '.join(sys.argv[1:])\n"
+            f"open({str(self.root / 'calls')!r}, 'a').write(argv + '\\n')\n"
+            "for needle, answer in answers:\n"
+            "    if needle not in argv:\n"
+            "        continue\n"
+            "    if 'git' in answer:\n"
+            "        sys.stdout.write(json.dumps(git_compare(answer['git'], argv))); sys.exit(0)\n"
+            "    if 'error' in answer:\n"
+            "        sys.stderr.write(answer['error'] + '\\n'); sys.exit(1)\n"
+            "    if 'pages' in answer:\n"
+            "        pages = answer['pages'] if '--paginate' in sys.argv else answer['pages'][:1]\n"
+            "        sys.stdout.write(json.dumps(pages if '--slurp' in sys.argv else pages[0])); sys.exit(0)\n"
+            "    if 'text' in answer:\n"
+            "        sys.stdout.write(answer['text']); sys.exit(0)\n"
+            "    sys.stdout.write(json.dumps(answer['json'])); sys.exit(0)\n"
+            "sys.stderr.write('unexpected gh call: ' + argv + '\\n'); sys.exit(3)\n",
+            encoding="utf-8",
+        )
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+        return fake
+
+    def case(self, prefix: str, *, graphql: Any = None, comments: Any = None,
+             config: str | None = None, queue: bool = True,
+             extra: list[tuple[str, dict[str, Any]]] | None = None) -> list[tuple[str, dict[str, Any]]]:
+        config_answer = {"error": "gh: Not Found (HTTP 404)"} if config is None else {"text": config}
+        return [
+            ("contents/.shipyard/config.toml", config_answer),
+            ("mergeQueue(branch", {"json": {"data": {"repository": {
+                "mergeQueue": {"id": "MQ_1"} if queue else None}}}}),
+            *(extra or []),
+            ("graphql", {"json": graphql if graphql is not None
+                         else review_fixture(f"{prefix}-graphql.json")}),
+            ("/reviews", {"pages": review_fixture(f"{prefix}-reviews.json")}),
+            ("/comments", {"pages": comments if comments is not None
+                           else review_fixture(f"{prefix}-comments.json")}),
+            ("/pulls/", {"json": review_fixture(f"{prefix}-pull.json")}),
+        ]
+
+    def run_guard(self, argv: list[str], answers: list[tuple[str, dict[str, Any]]],
+                  repo: str, host: str | None = "1", **env: str) -> subprocess.CompletedProcess:
+        fake = self.install(answers)
+        environment = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake), "GH_REPO": repo,
+                       "SHIPYARD_GHAPP_GUARDS_DIR": str(self.guards), "HOME": str(self.root)}
+        if host is not None:
+            environment["SHIPYARD_REVIEW_BEFORE_ARM"] = host
+        environment.update(env)
+        return subprocess.run(
+            [sys.executable, str(self.guards / "queue-arm-guard"), *argv],
+            env=environment, capture_output=True, text=True, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+
+    def arm(self, number: int, repo: str, answers: list[tuple[str, dict[str, Any]]],
+            bind: str | None = None, **kwargs: Any) -> subprocess.CompletedProcess:
+        head = bind or review_fixture(
+            {513: "tartci-513", 511: "tartci-511", 490: "tartci-490", 784: "shipyard-784"}[number]
+            + "-pull.json")["head"]["sha"]
+        return self.run_guard(["pr", "merge", str(number), "--auto", "--match-head-commit", head],
+                              answers, repo, **kwargs)
+
+    def calls(self) -> str:
+        return (self.root / "calls").read_text(encoding="utf-8")
+
+    def approved_784(self, **kwargs: Any) -> list[tuple[str, dict[str, Any]]]:
+        return self.case("shipyard-784", graphql=opened(review_fixture("shipyard-784-graphql.json")),
+                         **kwargs)
+
+    def test_no_verdict_is_refused(self) -> None:
+        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        head = review_fixture("tartci-513-pull.json")["head"]["sha"]
+        self.assertIn(f"no reviewer verdict names head {head[:12]}", result.stderr)
+        self.assertIn(f"`verdict: APPROVE head:{head}` or `reviewed: {head}`", result.stderr)
+        self.assertIn("from the fleet App or an OWNER, MEMBER or COLLABORATOR", result.stderr)
+
+    def test_a_verdict_on_an_older_head_is_refused(self) -> None:
+        result = self.arm(511, "danielraffel/tartci", self.case("tartci-511", extra=[
+            ("compare/", {"error": "gh: Not Found (HTTP 404)"})]))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("no reviewer verdict names head 52eda5490844", result.stderr)
+        self.assertIn("The latest verdict names another head: `APPROVE head:0d7179d1", result.stderr)
+        self.assertIn("The approval of 0d7179d1", result.stderr)
+
+    def test_a_hold_naming_the_head_is_refused(self) -> None:
+        result = self.arm(490, "danielraffel/tartci", self.case("tartci-490"))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("the latest verdict naming head 82eeaab8a6bd is HOLD", result.stderr)
+
+    def test_a_verdict_naming_the_head_is_allowed(self) -> None:
+        # The App's APPROVE on the App's own PR counts: the author is the
+        # shared fleet identity, so the two are not distinguishable.
+        result = self.arm(784, "danielraffel/Shipyard", self.approved_784())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("repos/danielraffel/Shipyard/issues/784/comments", self.calls())
+        self.assertIn("contents/.shipyard/config.toml?ref=main", self.calls())
+
+    def test_a_hold_after_the_approve_is_refused(self) -> None:
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        pages[0].append(comment_like(
+            approve, id=approve["id"] + 1, created_at="2026-10-12T16:00:00Z",
+            body=f"Delta review.\n\nverdict: HOLD head:{HEAD_784}"))
+        result = self.arm(784, "danielraffel/Shipyard", self.approved_784(comments=pages))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("the latest verdict naming head fd0e94e25f44 is HOLD", result.stderr)
+        self.assertIn("2026-10-12T16:00:00Z", result.stderr)
+
+    def test_a_hold_on_a_later_page_refuses(self) -> None:
+        # Comments arrive 100 per page; the HOLD that decides may be on the last.
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        hold = comment_like(approve, id=approve["id"] + 1, created_at="2026-10-12T16:00:00Z",
+                            body=f"verdict: HOLD head:{HEAD_784}")
+        filler = [comment_like(approve, id=approve["id"] + 10 + n, body="noted")
+                  for n in range(100 - len(pages[0]))]
+        result = self.arm(784, "danielraffel/Shipyard",
+                          self.approved_784(comments=[pages[0] + filler, [hold]]))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("is HOLD", result.stderr)
+        self.assertIn("--paginate", self.calls())
+
+    def test_a_drive_by_account_cannot_approve(self) -> None:
+        pages = review_fixture("tartci-513-comments.json")
+        head = review_fixture("tartci-513-pull.json")["head"]["sha"]
+        template = pages[0][0]
+        drive_by = comment_like(
+            template, id=1, created_at="2026-10-12T23:00:00Z",
+            user={"login": "some-random-github-user", "type": "User"},
+            author_association="NONE", body=f"verdict: APPROVE head:{head}")
+        result = self.arm(513, "danielraffel/tartci",
+                          self.case("tartci-513", comments=[pages[0] + [drive_by]]))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        # Control: the same comment from a collaborator approves.
+        trusted = comment_like(drive_by, user={"login": "fable-graph", "type": "User"},
+                               author_association="COLLABORATOR")
+        result = self.arm(513, "danielraffel/tartci",
+                          self.case("tartci-513", comments=[pages[0] + [trusted]]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_request_must_bind_the_approved_head(self) -> None:
+        unbound = self.run_guard(["pr", "merge", "784", "--auto"], self.approved_784(),
+                                 "danielraffel/Shipyard")
+        self.assertEqual(unbound.returncode, 1, unbound.stderr)
+        self.assertIn("does not bind the head it lands", unbound.stderr)
+        stale = self.arm(784, "danielraffel/Shipyard", self.approved_784(), bind=HOLD_784)
+        self.assertEqual(stale.returncode, 1, stale.stderr)
+        self.assertIn("binds cb5c1f796dac, but the head is fd0e94e25f44", stale.stderr)
+
+    def test_the_host_switch_decides_for_a_silent_repository(self) -> None:
+        for host in ("0", None):
+            result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=host)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("/comments", self.calls())
+            (self.root / "calls").unlink()
+        (self.guards / "review-before-arm").write_text("", encoding="utf-8")
+        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=None)
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_off_reads_nothing_even_with_a_config_this_python_cannot_parse(self) -> None:
+        # Off must be inert on any Python, including one without tomllib, and
+        # whatever the base config says: the review reads nothing at all.
+        on = "[auto_merge]\narm_requires_head_approval = true\n[validation\n"
+        for host in ("0", None):
+            result = self.arm(513, "danielraffel/tartci", self.case("tartci-513", config=on),
+                              host=host)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = self.calls()
+            self.assertNotIn("contents/.shipyard/config.toml", calls)
+            self.assertNotIn("/comments", calls)
+            self.assertNotIn("/pulls/513", calls)
+            (self.root / "calls").unlink()
+
+    def test_a_repository_outside_the_list_with_no_setting_is_not_checked(self) -> None:
+        graphql = copy.deepcopy(review_fixture("tartci-513-graphql.json"))
+        graphql["data"]["repository"]["pullRequest"]["repository"]["nameWithOwner"] = "someone/else"
+        result = self.arm(513, "someone/else", self.case("tartci-513", graphql=graphql))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("/comments", self.calls())
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "reading the base config needs tomllib")
+    def test_the_base_config_decides_over_the_default(self) -> None:
+        off = "[auto_merge]\narm_requires_head_approval = false\n"
+        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513", config=off))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        graphql = copy.deepcopy(review_fixture("tartci-513-graphql.json"))
+        graphql["data"]["repository"]["pullRequest"]["repository"]["nameWithOwner"] = "someone/else"
+        on = "[auto_merge]\narm_requires_head_approval = true\nreviewer_identities = [\"fable-graph\"]\n"
+        result = self.arm(513, "someone/else", self.case("tartci-513", graphql=graphql, config=on),
+                          host="1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("from one of fable-graph", result.stderr)
+
+    def test_a_config_that_does_not_parse_refuses(self) -> None:
+        broken = "[auto_merge\narm_requires_head_approval = false\n"
+        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513", config=broken))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot read what its review requires", result.stderr)
+
+    def test_the_operator_override_is_loud_and_recorded(self) -> None:
+        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"),
+                          GHAPP_ALLOW_UNREVIEWED_ARM="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WARNING: GHAPP_ALLOW_UNREVIEWED_ARM=1 lands an unreviewed head", result.stderr)
+        audit = [json.loads(line) for line in
+                 (self.guards / "overrides.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(audit), 1)
+        self.assertEqual(audit[0]["override"], "GHAPP_ALLOW_UNREVIEWED_ARM")
+        self.assertIn("no reviewer verdict names head", audit[0]["refusal"])
+
+    def test_the_queue_override_never_stands_in_for_a_review(self) -> None:
+        # A queue refusal (armed, not yet queued) the operator overrides,
+        # on a head nobody reviewed: still refused.
+        graphql = copy.deepcopy(review_fixture("tartci-513-graphql.json"))
+        graphql["data"]["repository"]["pullRequest"]["autoMergeRequest"] = {
+            "enabledAt": "2026-10-12T22:00:00Z"}
+        answers = self.case("tartci-513", graphql=graphql)
+        refused = self.arm(513, "danielraffel/tartci", answers, host="0")
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("is already armed since", refused.stderr)
+        result = self.arm(513, "danielraffel/tartci", answers, GHAPP_ALLOW_QUEUE_REARM="1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("refusing to arm or merge an unreviewed head", result.stderr)
+        # Control: with a verdict on the head the queue override lands it.
+        head = review_fixture("tartci-513-pull.json")["head"]["sha"]
+        pages = review_fixture("tartci-513-comments.json")
+        verdict = comment_like(pages[0][0], id=2, created_at="2026-10-12T23:00:00Z",
+                               body=f"verdict: APPROVE head:{head}")
+        answers = self.case("tartci-513", graphql=graphql, comments=[pages[0] + [verdict]])
+        result = self.arm(513, "danielraffel/tartci", answers, GHAPP_ALLOW_QUEUE_REARM="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GHAPP_ALLOW_QUEUE_REARM=1 overrides a refusal", result.stderr)
+
+    def test_an_ambiguous_request_needs_both_overrides(self) -> None:
+        argv = ["api", "graphql", "--input", "-"]
+        result = self.run_guard(argv, [], "danielraffel/tartci", GHAPP_ALLOW_QUEUE_REARM="1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("GHAPP_ALLOW_UNREVIEWED_ARM=1 is needed as well", result.stderr)
+        result = self.run_guard(argv, [], "danielraffel/tartci", GHAPP_ALLOW_QUEUE_REARM="1",
+                                GHAPP_ALLOW_UNREVIEWED_ARM="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.guards / "overrides.jsonl").is_file())
+
+    def test_an_unreadable_review_trail_refuses(self) -> None:
+        answers = self.case("tartci-513", extra=[("/comments", {"error": "HTTP 502"})])
+        result = self.arm(513, "danielraffel/tartci", answers)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot read what its review requires", result.stderr)
+
+    # Direct merges: on a queue-less base a merge is the landing path.
+
+    def merge_paths(self, head: str) -> dict[str, list[str]]:
+        body = self.root / "merge.json"
+        body.write_text(json.dumps({"sha": head, "merge_method": "merge"}), encoding="utf-8")
+        mutation = ("query=mutation{mergePullRequest(input:{pullRequestId:\"PR_784\","
+                    f"expectedHeadOid:\"{head}\"}}){{pullRequest{{number}}}}}}")
+        return {
+            "pr merge": ["pr", "merge", "784", "--merge", "--match-head-commit", head],
+            "pr merge --admin": ["pr", "merge", "784", "--admin", "--match-head-commit", head],
+            "REST -f sha": ["api", "-X", "PUT", "repos/danielraffel/Shipyard/pulls/784/merge",
+                            "-f", f"sha={head}"],
+            "REST --input": ["api", "-X", "PUT", "repos/danielraffel/Shipyard/pulls/784/merge",
+                             "--input", str(body)],
+            "mergePullRequest": ["api", "graphql", "-f", mutation],
+        }
+
+    def test_direct_merges_need_the_verdict_too(self) -> None:
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        held = [pages[0] + [comment_like(approve, id=approve["id"] + 1,
+                                         created_at="2026-10-12T16:00:00Z",
+                                         body=f"verdict: HOLD head:{HEAD_784}")]]
+        for path, argv in self.merge_paths(HEAD_784).items():
+            with self.subTest(path=path):
+                allowed = self.run_guard(argv, self.approved_784(queue=False), "danielraffel/Shipyard")
+                self.assertEqual(allowed.returncode, 0, allowed.stderr)
+                refused = self.run_guard(argv, self.approved_784(queue=False, comments=held),
+                                         "danielraffel/Shipyard")
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+                self.assertIn("is HOLD", refused.stderr)
+
+    def test_direct_merges_must_bind_the_approved_head(self) -> None:
+        for path, argv in self.merge_paths(HOLD_784).items():
+            with self.subTest(path=path):
+                stale = self.run_guard(argv, self.approved_784(queue=False), "danielraffel/Shipyard")
+                self.assertEqual(stale.returncode, 1, stale.stderr)
+                self.assertIn("binds cb5c1f796dac, but the head is fd0e94e25f44", stale.stderr)
+        unbound = {
+            "pr merge": ["pr", "merge", "784", "--merge"],
+            "REST": ["api", "-X", "PUT", "repos/danielraffel/Shipyard/pulls/784/merge"],
+            "mergePullRequest": ["api", "graphql", "-f",
+                                 "query=mutation{mergePullRequest(input:{pullRequestId:\"PR_784\"})"
+                                 "{pullRequest{number}}}"],
+        }
+        for path, argv in unbound.items():
+            with self.subTest(path=path):
+                result = self.run_guard(argv, self.approved_784(queue=False), "danielraffel/Shipyard")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("does not bind the head it lands", result.stderr)
+
+    def test_a_read_of_the_merge_endpoint_is_not_a_merge(self) -> None:
+        result = self.run_guard(["api", "repos/danielraffel/Shipyard/pulls/784/merge"], [],
+                                "danielraffel/Shipyard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    # A merge-only update of an approved head, over real crafted git histories
+    # (the cases of the reviewer's carry_probe.sh).
+
+    def carry_answers(self, history: "CarryHistory", head: str, comments: list | None = None
+                      ) -> list[tuple[str, dict[str, Any]]]:
+        graphql = opened(review_fixture("shipyard-784-graphql.json"))
+        graphql["data"]["repository"]["pullRequest"]["headRefOid"] = head
+        pull = copy.deepcopy(review_fixture("shipyard-784-pull.json"))
+        pull["head"]["sha"] = head
+        approve = next(c for c in review_fixture("shipyard-784-comments.json")[0]
+                       if c["id"] == APPROVE_784_COMMENT)
+        trail = comments if comments is not None else [comment_like(
+            approve, created_at="2026-10-12T15:00:00Z",
+            body=f"verdict: APPROVE head:{history.approved}")]
+        answers = self.case("shipyard-784", graphql=graphql, queue=False, comments=[trail])
+        answers.insert(0, ("compare/", {"git": str(history.path)}))
+        return [(needle, {"json": pull}) if needle == "/pulls/" else (needle, answer)
+                for needle, answer in answers]
+
+    def land(self, history: "CarryHistory", head: str, comments: list | None = None
+             ) -> subprocess.CompletedProcess:
+        return self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", head],
+                              self.carry_answers(history, head, comments), "danielraffel/Shipyard")
+
+    def test_an_honest_merge_of_the_base_carries_the_approval(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        result = self.land(history, history.merge())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"compare/main...{history.approved}", self.calls())
+
+    def test_a_merge_that_moves_the_prs_guard_line_needs_a_new_verdict(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.merge(edit=lambda: history.move_guard_line(49))
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("guard.c at", result.stderr)
+        self.assertIn("is not the blob approved", result.stderr)
+
+    def test_a_merge_that_swaps_a_binary_the_pr_touches_needs_a_new_verdict(self) -> None:
+        history = CarryHistory(self.root / "repo", binary=True)
+        head = history.merge(edit=lambda: history.write("x.bin", b"\x00\x01EVIL-binary"))
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("changes a binary file (x.bin)", result.stderr)
+
+    def test_a_merge_that_adds_a_line_needs_a_new_verdict(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.merge(edit=lambda: history.append("guard.c", "  backdoor();\n"))
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("is not the blob approved", result.stderr)
+
+    def test_a_file_both_the_pr_and_the_base_changed_needs_a_new_verdict(self) -> None:
+        # The base also edits guard.c; the merge keeps the PR's blob, which
+        # quietly drops the base's change.
+        history = CarryHistory(self.root / "repo")
+        history.on_base(lambda: history.append("guard.c", "base head\n", at_start=True))
+        head = history.merge(edit=lambda: history.restore("guard.c", history.approved))
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("guard.c was changed by both the pull request and the base", result.stderr)
+
+    def test_a_hold_on_the_new_head_is_not_overridden_by_a_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.merge()
+        approve = next(c for c in review_fixture("shipyard-784-comments.json")[0]
+                       if c["id"] == APPROVE_784_COMMENT)
+        trail = [
+            comment_like(approve, created_at="2026-10-12T15:00:00Z",
+                         body=f"verdict: APPROVE head:{history.approved}"),
+            comment_like(approve, id=approve["id"] + 1, created_at="2026-10-12T16:00:00Z",
+                         body=f"verdict: HOLD head:{head}"),
+        ]
+        result = self.land(history, head, trail)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("is HOLD", result.stderr)
+        # Control: the same honest merge without the HOLD carries.
+        self.assertEqual(self.land(history, head).returncode, 0)
+
+    def test_a_head_that_does_not_descend_from_the_approved_one_needs_a_new_verdict(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rewrite()
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"does not descend from {history.approved[:12]}", result.stderr)
+
+    def test_a_commit_that_is_not_a_merge_needs_a_new_verdict(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        history.git("checkout", "-q", "-B", "single", history.approved)
+        history.append("notes.txt", "note\n")
+        history.git("add", "-A")
+        history.git("commit", "-qm", "single parent")
+        result = self.land(history, history.git("rev-parse", "HEAD"))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("is not a merge", result.stderr)
+
+
+class CarryHistory:
+    """A scratch git repository: a base, a pull request that adds a guard line
+    (and optionally changes a binary), its approved head, and a base commit
+    since; with the updates the carry rule judges."""
+
+    def __init__(self, path: pathlib.Path, binary: bool = False) -> None:
+        self.path = path
+        path.mkdir(parents=True)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "r@r")
+        self.git("config", "user.name", "r")
+        self.write("guard.c", "".join(f"line {n}\n" for n in range(1, 61)).encode())
+        if binary:
+            self.write("x.bin", b"\x00\x01base-binary")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "base0")
+        self.git("checkout", "-qb", "pr")
+        lines = (self.path / "guard.c").read_text().splitlines(keepends=True)
+        lines.insert(9, "  if (!authorized) return;\n")
+        self.write("guard.c", "".join(lines).encode())
+        if binary:
+            self.write("x.bin", b"\x00\x01pr-binary-v1")
+        self.git("commit", "-qam", "pr: add guard")
+        self.approved = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "main")
+        self.write("other.txt", b"unrelated\n")
+        self.git("add", "other.txt")
+        self.git("commit", "-qm", "base1")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=self.path, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def write(self, name: str, data: bytes) -> None:
+        (self.path / name).write_bytes(data)
+
+    def append(self, name: str, text: str, at_start: bool = False) -> None:
+        old = (self.path / name).read_text() if (self.path / name).exists() else ""
+        (self.path / name).write_text(text + old if at_start else old + text)
+
+    def restore(self, name: str, commit: str) -> None:
+        self.git("checkout", commit, "--", name)
+
+    def move_guard_line(self, to: int) -> None:
+        lines = [line for line in (self.path / "guard.c").read_text().splitlines(keepends=True)
+                 if "authorized" not in line]
+        lines.insert(to - 1, "  if (!authorized) return;\n")
+        self.write("guard.c", "".join(lines).encode())
+
+    def on_base(self, edit: Any) -> None:
+        self.git("checkout", "-q", "main")
+        edit()
+        self.git("commit", "-qam", "base edit")
+
+    def merge(self, edit: Any = None) -> str:
+        """Merge the base into the approved head, optionally editing the merge."""
+        self.git("checkout", "-q", "-B", "head", self.approved)
+        self.git("merge", "-q", "--no-commit", "main")
+        if edit is not None:
+            edit()
+        self.git("add", "-A")
+        self.git("commit", "-qm", "Merge branch 'main' into pr")
+        return self.git("rev-parse", "HEAD")
+
+    def rewrite(self) -> str:
+        """The pull request's change re-made on the base: same content, a
+        head that does not descend from the approved one."""
+        self.git("checkout", "-q", "-B", "rewritten", "main")
+        self.restore("guard.c", self.approved)
+        self.git("commit", "-qam", "pr: add guard (rebased)")
+        return self.git("rev-parse", "HEAD")
+
+
+class ReviewIdentity(unittest.TestCase):
+    """Who may approve, in-process."""
+
+    HEAD = "a" * 40
+
+    def comment(self, login: str, body: str, at: str | None = "2026-10-12T01:00:00Z",
+                association: str = "COLLABORATOR") -> dict[str, Any]:
+        return {"user": {"login": login}, "created_at": at, "body": body,
+                "author_association": association}
+
+    def policy(self) -> dict[str, Any]:
+        return guard.review_policy(None, "danielraffel/tartci", True)
+
+    def test_a_distinguishable_author_cannot_approve_their_own_head(self) -> None:
+        mine = [self.comment("danielraffel", f"verdict: APPROVE head:{self.HEAD}", association="OWNER")]
+        allowed, why = guard.review_verdict(self.HEAD, "danielraffel", mine, [], self.policy())
+        self.assertFalse(allowed, why)
+        self.assertIn("other than the PR author danielraffel", why)
+        theirs = [self.comment("fable-graph", f"reviewed: {self.HEAD}")]
+        self.assertTrue(guard.review_verdict(self.HEAD, "danielraffel", theirs, [], self.policy())[0])
+
+    def test_only_the_fleet_app_and_trusted_accounts_count(self) -> None:
+        for association in ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", None):
+            outsider = [self.comment("drive-by", f"reviewed: {self.HEAD}", association=association)]
+            self.assertFalse(
+                guard.review_verdict(self.HEAD, "shipyard-local[bot]", outsider, [], self.policy())[0],
+                association)
+        fleet = [self.comment("shipyard-local[bot]", f"reviewed: {self.HEAD}", association="CONTRIBUTOR")]
+        self.assertTrue(guard.review_verdict(self.HEAD, "shipyard-local[bot]", fleet, [], self.policy())[0])
+
+    def test_an_approved_review_on_the_head_counts(self) -> None:
+        review = {"user": {"login": "fable-graph"}, "state": "APPROVED", "commit_id": self.HEAD,
+                  "submitted_at": "2026-10-12T01:00:00Z", "author_association": "MEMBER"}
+        self.assertTrue(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review], self.policy())[0])
+        hold = dict(review, state="CHANGES_REQUESTED", submitted_at="2026-10-12T02:00:00Z")
+        self.assertFalse(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review, hold], self.policy())[0])
+
+    def test_a_hold_with_no_readable_time_refuses_beside_a_newer_approval(self) -> None:
+        comments = [
+            self.comment("fable-graph", f"verdict: HOLD head:{self.HEAD}", at=None),
+            self.comment("fable-graph", f"verdict: APPROVE head:{self.HEAD}", at="2026-10-12T05:00:00Z"),
+        ]
+        allowed, why = guard.review_verdict(self.HEAD, "shipyard-local[bot]", comments, [], self.policy())
+        self.assertFalse(allowed, why)
+        self.assertIn("has no readable time", why)
+
+    def test_only_the_last_line_is_a_verdict(self) -> None:
+        self.assertIsNone(guard.marker_verdict(f"verdict: APPROVE head:{self.HEAD}\nthen more"))
+        self.assertEqual(guard.marker_verdict(f"prose\n\nreviewed: {self.HEAD}\n"), ("APPROVE", self.HEAD))
+
+    def test_without_tomllib_an_existing_config_refuses(self) -> None:
+        off = "[auto_merge]\narm_requires_head_approval = false\n"
+        with mock.patch.dict(sys.modules, {"tomllib": None}):
+            with self.assertRaises(guard.GuardError):
+                guard.review_policy(off, "Generous-Corp/pulp", True)
+        self.assertFalse(guard.review_policy(None, "Generous-Corp/pulp", False)["required"])
+        self.assertTrue(guard.review_policy(None, "Generous-Corp/pulp", True)["required"])
+
+    def test_the_default_repositories_match_the_rust_list(self) -> None:
+        source = (SCRIPT.parent.parent / "src" / "head_approval.rs").read_text(encoding="utf-8")
+        block = source.split("pub const REVIEW_REQUIRED_REPOS", 1)[1].split("];", 1)[0]
+        rust = tuple(re.findall(r'"([^"]+)"', block))
+        self.assertEqual(rust, guard.REVIEW_REQUIRED_REPOS)
+        self.assertEqual(len(rust), 4)
+        trusted = source.split("pub const TRUSTED_ASSOCIATIONS", 1)[1].split("];", 1)[0]
+        self.assertEqual(tuple(re.findall(r'"([^"]+)"', trusted)), guard.TRUSTED_ASSOCIATIONS)

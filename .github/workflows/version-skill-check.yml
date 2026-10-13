@@ -33,12 +33,15 @@ jobs:
 
       - name: Resolve diff base
         id: base
+        # A pull_request run checks out the merge, so origin/<base> is exact;
+        # any other run checks out the bare branch head, whose base is where
+        # it left main (scripts/resolve_diff_base.py).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "ref=origin/${{ github.base_ref }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=origin/main" >> "$GITHUB_OUTPUT"
-          fi
+          ref="$(python3 scripts/resolve_diff_base.py --event "$EVENT_NAME" --base-ref "$BASE_REF")"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
       - name: Skill-sync check
         run: |

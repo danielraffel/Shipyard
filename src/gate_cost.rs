@@ -44,6 +44,7 @@ use crate::metrics::job_name;
 use crate::validation_signals::{self, GhReader, ReceiptDecision};
 
 pub mod cache;
+pub mod ctest_log;
 pub mod proxy;
 pub mod scorecard;
 pub use cache::{ReadCache, ReadStats};

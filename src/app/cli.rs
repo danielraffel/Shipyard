@@ -1188,9 +1188,27 @@ pub(crate) enum MetricsCommand {
     ///   red after push = merged pull requests' commits carrying a required
     ///   context on which a required context is red (latest run per name;
     ///   `cancelled` is not red) / commits carrying a required context;
-    ///   repeat failures = check names red on two or more pull requests.
+    ///   repeat failures = check names red on two or more pull requests;
+    ///   selector recall (with --selection-step) = for each test a failed
+    ///   merge-group gate lists under "The following tests FAILED", what the
+    ///   gate job of the `pull_request`/`workflow_dispatch` runs created
+    ///   before the group, on the head of each pull request in the group,
+    ///   did with it: `selected` (a selection step ran it), `ran_outside`
+    ///   (only another step ran it, and whether it failed there, a failure
+    ///   the head's check ignored), `missed` (every head selected tests and
+    ///   none ran it), or `undetermined` (a head unread, a head on which no
+    ///   selection step ran, or a group that could not be read). recall =
+    ///   selected / (selected + `ran_outside` + missed); recall anywhere
+    ///   counts `ran_outside` as run. The group is the pull request the queue branch
+    ///   names plus every entry ahead of it that had not merged when the run
+    ///   was created.
     /// Required contexts are the base's classic protection, or
     /// `--required-context`.
+    /// same-SHA flakes (with --flakes) = tests whose `CTest` result lines in
+    /// the gate job's logs, over the window's `pull_request`, `merge_group`
+    /// and `workflow_dispatch` runs, include both a pass and a failure on one head
+    /// commit: in one job (a `--repeat` retry) or across its jobs (a
+    /// re-run). Ranked by such commits; a report only.
     ///
     /// Every list is paginated completely; a read whose length disagrees with
     /// the API's `total_count` fails instead of reporting a smaller number.
@@ -1246,10 +1264,21 @@ pub(crate) struct MetricsGateCostArgs {
     /// required checks, and check names red across pull requests.
     #[arg(long)]
     pub(crate) scorecard: bool,
+    /// Also list the tests that both passed and failed on one head commit in
+    /// the window (a `--repeat` retry, or a re-run), top ten by commits,
+    /// reading the log of every completed gate job. Use `--since 14d`.
+    #[arg(long, requires = "scorecard")]
+    pub(crate) flakes: bool,
     /// Required context for the scorecard's red-after-push rate, in place of
     /// the base branch protection's. Repeatable.
     #[arg(long = "required-context", requires = "scorecard")]
     pub(crate) required_contexts: Vec<String>,
+    /// Name of a gate-job step that runs a pull-request head's test
+    /// selection. Repeatable. Given, the scorecard also reports selector
+    /// recall, reading the logs of failed merge-group gates and of their
+    /// groups' heads.
+    #[arg(long = "selection-step", requires = "scorecard")]
+    pub(crate) selection_steps: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1401,6 +1430,10 @@ pub(crate) struct PrWatchRulesSource {
     /// An approved head nobody armed is reported after this long.
     #[arg(long = "approved-unarmed-after", default_value = "15m")]
     pub(crate) approved_unarmed_after: String,
+    /// `OWNER/REPO=NAME`: the reviewer a head of that repository is routed
+    /// to; each event's `fix` names it. Repeatable.
+    #[arg(long = "reviewer")]
+    pub(crate) reviewers: Vec<String>,
     /// Read every answer live instead of reusing settled answers.
     #[arg(long = "no-cache")]
     pub(crate) no_cache: bool,
@@ -1419,6 +1452,12 @@ pub(crate) struct PrWatchRulesArgs {
     /// Print what would be emitted without recording it.
     #[arg(long = "dry-run")]
     pub(crate) dry_run: bool,
+    /// Skip the pass (exit 75, nothing read past the check) when the GitHub
+    /// App's remaining core or GraphQL budget for a watched repository is
+    /// below this; later passes wait for the budget's reset. A cold pass over
+    /// four repositories reads about a thousand times.
+    #[arg(long = "min-rate-remaining", default_value_t = 1500)]
+    pub(crate) min_rate_remaining: u64,
 }
 
 #[derive(Debug, Args)]

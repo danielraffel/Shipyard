@@ -96,6 +96,10 @@ Another run's leftover canary registration, or a concurrent canary, lands in
 the guardian receipt's `launchd_recovery.warnings`, never in `errors`, so it
 cannot fail an unrelated run.
 
+The macOS Sandbox E2E job proves it is on M3 by the tartci fleet profile's
+`[host] id = "studio"`, never the live hostname, which macOS changes on a
+Bonjour name collision (`Daniels-Mac-Studio-m3-4.local`). See the ci skill.
+
 A quiet `daemon.log` during a Sandbox E2E run is expected: the sandbox audit
 holds the writer-domain lock exclusively, so `write_stderr` waits up to 30s
 for its shared lease and then gives up. The webhook listener never waits on
@@ -747,7 +751,12 @@ failed merge group, queue removal or stall, approved but unarmed, tartci host
 alarm, or a line from `--input-events`), each once per key, so a quiet pass
 prints nothing. Its first pass with no ledger only records what already holds.
 `rules-replay` runs the same rules over a past window. Failing-test names come
-from CTest, Python unittest (`FAIL:`/`ERROR:`) and `cargo test` lines.
+from CTest, Python unittest (`FAIL:`/`ERROR:` with a dotted location) and
+`cargo test` lines. Every event carries a `fix` (what, evidence URL, cause,
+command, safe_to_auto_apply, verify); `--reviewer OWNER/REPO=NAME` names who a
+head routes to. A live pass prints its reads, checks the App budget first and
+backs off (exit 75) under `--min-rate-remaining`, and re-reads a pull
+request's whole trail before emitting a trail-dependent event.
 `scripts/watch_inputs.py` (`cmux`, `hosts`, `gate-serving`) supplies its
 `--input-events` for Codex tab states and gate-host serving; every line carries
 a `fix` object (what, evidence, cause, command, safe_to_auto_apply, verify).
@@ -1480,10 +1489,22 @@ shipyard metrics summary --project pulp --group-by host --json
 shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
 shipyard metrics gate-cost --scorecard --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --from 2026-09-28T00:00:00Z --to 2026-10-12T00:00:00Z --json
+shipyard metrics gate-cost --scorecard --flakes --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 14d --no-cache --json
 shipyard metrics watch --project pulp --since 14d --json   # required gates first; --required <check> overrides config
 shipyard metrics advise --project pulp --json
 shipyard metrics compare --project pulp --baseline github-hosted --candidate macstudio --json
 ```
+
+`gate-cost --scorecard --flakes` (use `--since 14d`) adds same-SHA flakes to
+the success-rate scorecard below: tests whose `CTest` results in the gate
+job's logs include both a pass and a failure on one head commit, over the
+window's `pull_request`, `merge_group` and `workflow_dispatch` runs. A `retry` is one job showing both
+(`ctest --repeat until-pass` passing a failed test on its retry); a `rerun` is
+different jobs on the commit disagreeing. The top ten are ranked by the number
+of such commits, each with links to its jobs. It is a report: it changes no
+label and quarantines nothing. It reads the log of every completed gate job in
+the window once (what a log yields is cached), so the first run over fourteen
+days of Pulp is long.
 
 `gate-cost --scorecard` is the success-rate scorecard. It reports per ISO
 week: open-to-merge median and p90, the merge-queue ejection rate (removals by
@@ -1498,6 +1519,26 @@ A repository without branch protection needs `--required-context`. A required
 context that no merged commit carries is reported as a gap, because a
 misspelled one would otherwise read as a lower red rate. Use `--no-cache` on a
 gate host: the run is read-only then.
+
+With `--selection-step` (repeatable; Pulp: `--selection-step "Test fast
+deterministic tier (pull request head)" --selection-step "Test what this pull
+request reaches (pull request head)"`) each week also reports selector recall,
+in observation mode. For every test a failed merge-group gate lists under "The
+following tests FAILED", it reads the gate job on the head of each pull request
+in that group (runs created before the group only; the group is the entry the
+queue branch names plus every entry ahead of it that had not yet merged when
+the run was created). A case is `selected` (a selection step on a head ran it,
+whatever it did there), `ran_outside` (only another step ran it, such as Pulp's
+non-gating full suite; when it failed there the head's check ignored a real
+signal, counted as `failed_on_head_ignored`), `missed` (every head selected
+tests and none ran it) or `undetermined` (a head unread, a head where no
+selection step ran, such as Pulp's stand-in `macos` job, or a group that could
+not be read). `recall` is selected over selected plus ran outside plus missed;
+`recall_anywhere` counts ran outside as run. Each case not selected is listed
+with the group's heads, their selection sizes, and the number of the week's
+failed gates naming the same test: one test failing many groups usually means
+the base was red. It reads the log of every failed gate and of each head, so a
+week of Pulp takes minutes.
 
 The agent-facing commands return conservative JSON findings. Use `scorecard`
 for a compact project-level view of outcomes, worker-minutes, queue time,
@@ -2360,6 +2401,14 @@ a recovered leg is noted in `phase`, an exhausted one in its error message. With
 the default `0`, execution is byte-identical to no retry. Composes with
 `classify_local_failures` (a relabelled-`INFRA` failure becomes retry-eligible).
 Full behavior: `docs/local-mac-pool.md` § Same-backend transient retry.
+
+## The fleet default is production-only
+
+A daemon started without `--repo` watches the fleet repositories only in
+`--mode shipyard`. An isolated daemon is a sandbox or a test; watching the
+fleet from it would poll the real repositories, and with a tunnel enabled it
+would register webhooks on them. Keep any new default list behind
+`requested_daemon_repos`, which applies it per mode.
 
 ## Durable Queue: daemon-owned execution
 
@@ -3451,9 +3500,19 @@ release automation) from `resolve_pr_context`, the one chokepoint every route
 into `ship` passes through — so `shipyard pr`, a bare `ship`, and
 `ship --pr <n>` all arm, and no later route can quietly skip it. `--no-arm`
 opts out. A repository whose base sets `[auto_merge]
-arm_requires_head_approval = true` arms only an approved head on every arming
-path (`ship`, the validated arm, the steward backstop); `--arm` overrides it
-and names who did. See `crate::head_approval`. Its count of queue removals per
+arm_requires_head_approval = true` (the default for pulp, vellum, tartci and
+Shipyard when their base is silent, on a host that sets
+`SHIPYARD_REVIEW_BEFORE_ARM=1` or has a `review-before-arm` guards file) arms
+and classic-merges only an approved head on every path (`ship`, the validated
+arm, the classic merge, the steward backstop); `--arm` overrides it and names
+who did. A merge-only update carries the approval only when every file the PR
+changes keeps its approved blob, the base changed none of them, and no binary
+changed; with the host switch off, the guard reads nothing for this rule. `queue-arm-guard` refuses an unreviewed arm or direct merge through
+`ghapp` the same way, requires the request to bind the approved head
+(`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts only the
+fleet App and OWNER/MEMBER/COLLABORATOR verdicts; its override,
+`GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
+`docs/ghapp-guards.md`, Review before arm). See `crate::head_approval`. Its count of queue removals per
 head reads only the last 100 timeline events, so a very busy pull request can
 under-count; that errs lenient (an approval is still required), never strict. This matters because Shipyard's own admission path enqueues only
 after it has validated a head, which happens only while a Shipyard process is

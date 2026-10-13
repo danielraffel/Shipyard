@@ -51,6 +51,7 @@ fn query(window: &str) -> ScorecardQuery {
         gate_job: "macos".to_owned(),
         base_branch: "main".to_owned(),
         required_contexts: Vec::new(),
+        selection_steps: Vec::new(),
         from: at(from),
         to: at(to),
     }
@@ -581,6 +582,7 @@ fn weeks_are_iso_weeks_clipped_to_the_window() {
         ],
         merge_group_runs: Vec::new(),
         queue_events: Vec::new(),
+        selection: None,
         gaps: Vec::new(),
     };
     let report = compute(&observation);
@@ -724,6 +726,7 @@ fn github_s_commit_cap_is_counted_not_refused() {
         prs: vec![capped],
         merge_group_runs: Vec::new(),
         queue_events: Vec::new(),
+        selection: None,
         gaps: Vec::new(),
     });
     assert_eq!(only_week(&report).capped_prs, vec![9755]);
@@ -800,6 +803,7 @@ fn pulp_week_41_has_thirty_eight_ejections() {
         prs: Vec::new(),
         merge_group_runs: Vec::new(),
         queue_events,
+        selection: None,
         gaps: Vec::new(),
     });
     let week = only_week(&report);
