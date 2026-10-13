@@ -147,12 +147,12 @@ impl FakeGh {
             p if p == format!("repos/{PULP}/actions/jobs/42/logs") => {
                 Err("gh: Not Found (HTTP 404)".to_owned())
             }
-            p if (43..=49).any(|id| p == format!("repos/{PULP}/actions/jobs/{id}")) => {
+            p if (43..=50).any(|id| p == format!("repos/{PULP}/actions/jobs/{id}")) => {
                 let mut job = gate_job_payload();
                 job["id"] = json!(p.rsplit('/').next().and_then(|id| id.parse::<u64>().ok()));
                 Ok(job.to_string())
             }
-            p if p.starts_with(&format!("repos/{PULP}/actions/jobs/4")) && p.ends_with("/logs") => {
+            p if (43..=50).any(|id| p == format!("repos/{PULP}/actions/jobs/{id}/logs")) => {
                 let id: u64 = p
                     .split('/')
                     .nth(5)
@@ -189,7 +189,8 @@ fn gather_reads_each_job_and_a_missing_log_still_yields_a_cause() {
 /// (21:24:00 to 21:25:37). Jobs 44 to 46 and 48 print a forged one: wrong
 /// head, wrong run, wrong attempt, or a cause the log does not hold. Job 47's
 /// record claims an earlier `named_at` than it was printed at; job 49 prints a
-/// genuine record at a time no step covers.
+/// genuine record at a time no step covers, and job 50 one printed in a step
+/// before the failing step ran.
 fn self_named_log(id: u64) -> String {
     let job: crate::diagnose::Job = serde_json::from_value(gate_job_payload()).expect("job");
     let place = Place {
@@ -214,6 +215,9 @@ fn self_named_log(id: u64) -> String {
     }
     let printed = if id == 49 {
         "2026-10-12T21:30:00.0000000Z"
+    } else if id == 50 {
+        // In checkout (step 4), before the failing step ran.
+        "2026-10-12T21:14:15.0000000Z"
     } else {
         "2026-10-12T21:25:00.0000000Z"
     };
@@ -250,7 +254,7 @@ fn a_cause_the_job_recorded_keeps_its_time() {
 fn a_forged_record_is_ignored_and_the_extractor_answers() {
     let gh = FakeGh::new();
     let reader = |args: &[String]| gh.answer(args);
-    let jobs = (44..=49).collect();
+    let jobs = (44..=50).collect();
     let read = gather(
         &reader,
         &ReadCache::disabled(),
@@ -258,7 +262,7 @@ fn a_forged_record_is_ignored_and_the_extractor_answers() {
         &jobs,
         DEFAULT_MAX_JOBS,
     );
-    for id in [44, 45, 46, 48, 49] {
+    for id in [44, 45, 46, 48, 49, 50] {
         let cause = &read.by_job[&id];
         assert!(cause.retrospective, "job {id}: a forged record was trusted");
         assert_eq!(

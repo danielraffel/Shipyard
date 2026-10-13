@@ -515,14 +515,21 @@ pub fn records_with_times(text: &str) -> Vec<(CiCause, Option<String>)> {
 }
 
 /// When a record printed at log time `at` was named, by GitHub's clock: the
-/// completion the jobs API records for the step whose run covers `at`.
-/// `None` when no step does, so a line the runner did not time is not used.
+/// completion the jobs API records for the step whose run covers `at`. Only
+/// a step that started once the failing step had completed counts: pull-request
+/// code runs in earlier steps (a build) and could print a matching record
+/// there, before anything failed. `None` when no such step covers `at`, or the
+/// job has no failing step, so the cause stays retrospective.
 #[must_use]
 pub fn printed_at(job: &Job, at: Option<&str>) -> Option<String> {
     let parse = |value: &str| chrono::DateTime::parse_from_rfc3339(value).ok();
     let at = parse(at?)?;
+    let failed_end = parse(job.failing_step()?.completed_at.as_deref()?)?;
     job.steps().iter().find_map(|step| {
         let start = parse(step.started_at.as_deref()?)?;
+        if start < failed_end {
+            return None;
+        }
         let end = step.completed_at.as_deref()?;
         // The API keeps whole seconds; the log keeps fractions of one.
         let within = start <= at && at < parse(end)? + chrono::Duration::seconds(1);

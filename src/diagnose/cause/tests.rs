@@ -423,6 +423,22 @@ fn a_record_is_timed_by_the_step_that_printed_it() {
         Some("2026-10-12T21:25:37Z")
     );
     assert_eq!(printed_at(&job, Some("2026-10-12T21:30:00Z")), None);
+    // Printed before anything failed: in checkout (step 4, 21:14:13 to
+    // 21:14:17), or inside the failing step itself (step 35, 21:17:28 to
+    // 21:20:07). Neither can date a cause.
+    assert_eq!(printed_at(&job, Some("2026-10-12T21:14:15.0000000Z")), None);
+    assert_eq!(printed_at(&job, Some("2026-10-12T21:19:00.0000000Z")), None);
+    // A job with no failing step has nothing to date a record after.
+    let mut green_steps = job.clone();
+    if let Some(steps) = green_steps.steps.as_mut() {
+        for step in steps.iter_mut() {
+            step.conclusion = Some("success".to_owned());
+        }
+    }
+    assert_eq!(
+        printed_at(&green_steps, Some("2026-10-12T21:25:00.1234567Z")),
+        None
+    );
     assert_eq!(printed_at(&job, None), None);
     assert_eq!(printed_at(&job, Some("not a time")), None);
     let log = format!(

@@ -422,7 +422,8 @@ runs, else `<name> [<provider>]`):
 
 The scorecard keeps a record only as proof that the cause was named during the
 job, and dates it by the jobs API's completion of the step that printed it,
-never by the record's own `named_at`.
+only when that step started after the failing step completed, never by the
+record's own `named_at`.
 It prints `::notice title=ci-cause::<record>`, so the job's own log holds its
 `ci.cause/v1` record; the scorecard keeps its `named_at` only when the record
 is bound to that job (repo, head, run, attempt, job name) and names the cause
