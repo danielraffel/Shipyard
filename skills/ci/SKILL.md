@@ -379,7 +379,9 @@ plus a receipt with the row count and SHA-256. Label a row only after its
 `label_not_before` (24 h on), when hindsight says whether it was real. Each red
 case with a job also carries `cause` and `evidence`, read from its job log by
 `shipyard diagnose`'s extractor; `--causes` alone prints the "named causes"
-share without exporting. A cause is named at `high` or `medium` confidence; a
+share without exporting. Each uncached red job costs two API calls, capped
+per run by `--causes-max-jobs` (default 200, newest first); the rest count as
+unread. A cause is named at `high` or `medium` confidence; a
 `low` one (only the step's last lines, or a cancel with no reason) is not.
 Fields not read are present, `null` and named in `unread`; do not fill them
 by hand. For Pulp, red required checks need `--required-context`, or the

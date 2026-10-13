@@ -1300,6 +1300,16 @@ pub(crate) struct MetricsGateCostArgs {
     /// yields is cached, never the log.
     #[arg(long, requires = "scorecard")]
     pub(crate) causes: bool,
+    /// Most red jobs whose job and log `--causes` (or `--export-cases`)
+    /// fetches in one run, newest first; each costs two GitHub API calls. A
+    /// job whose cause is cached does not count. Jobs over the budget count
+    /// as unreadable ("skipped: over the --causes-max-jobs budget").
+    #[arg(
+        long,
+        requires = "scorecard",
+        default_value_t = crate::gate_cost::scorecard::causes::DEFAULT_MAX_JOBS
+    )]
+    pub(crate) causes_max_jobs: usize,
 }
 
 #[derive(Debug, Subcommand)]

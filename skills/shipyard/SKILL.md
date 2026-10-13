@@ -1540,6 +1540,11 @@ class and rule, `named_at`) and `evidence` (the decisive log lines), read
 through `diagnose::build`; a job whose log GitHub no longer holds is still
 diagnosed from its payload. `--causes` reads the same causes without
 exporting and adds "named causes: N/M red cases" with the time to them.
+Each uncached red job costs two API calls, so at most `--causes-max-jobs`
+(default 200) are fetched per run, newest first; cached jobs are free. The
+rest are unreadable with "skipped: over the --causes-max-jobs budget" and the
+report shows `budget` and `skipped_for_budget`: an over-budget case is unread,
+never a cause.
 Causes are retrospective: `named_at` is the job's completion, the earliest an
 extractor could have named it, not when anyone did. `rule_verdict`,
 `cancel_cause`, `receipt_same_tree` and `outage_window` stay `null` and listed

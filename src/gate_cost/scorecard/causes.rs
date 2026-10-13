@@ -34,6 +34,11 @@ use crate::diagnose::{self, CheckDiagnosis, Context, Job, classify};
 
 /// Who named a cause read here.
 pub const SOURCE_EXTRACTOR: &str = "extractor";
+/// Default most job logs one run reads (`--causes-max-jobs`). Each costs two
+/// GitHub API calls; a cached job costs none and does not count.
+pub const DEFAULT_MAX_JOBS: usize = 200;
+/// Why a job over that budget was not read.
+pub const OVER_BUDGET: &str = "skipped: over the --causes-max-jobs budget";
 /// Cache key version: bump when a cause's shape or meaning changes.
 const EXTRACT_VERSION: u32 = 1;
 /// Most evidence lines kept per cause.
@@ -153,8 +158,12 @@ pub struct Unreadable {
 pub struct CausesRead {
     /// Cause by job id.
     pub by_job: BTreeMap<u64, CaseCause>,
-    /// Jobs that could not be read.
+    /// Jobs that could not be read, including those over the budget.
     pub unreadable: Vec<Unreadable>,
+    /// Most uncached jobs this read could fetch.
+    pub budget: usize,
+    /// Uncached jobs left unread because the budget ran out.
+    pub skipped_for_budget: usize,
 }
 
 /// The jobs of every red case the scorecard read: red required checks on
@@ -195,18 +204,21 @@ fn log_absent(error: &str) -> bool {
         .any(|marker| error.contains(marker))
 }
 
+fn cache_key(repo: &str, id: u64) -> String {
+    format!("case-cause:v{EXTRACT_VERSION}:{repo}:{id}")
+}
+
+fn cached(cache: &ReadCache, repo: &str, id: u64) -> Option<CaseCause> {
+    serde_json::from_value(cache.get(&cache_key(repo, id))?).ok()
+}
+
 fn read_cause(
     gh: &SyncGhReader<'_>,
     cache: &ReadCache,
     repo: &str,
     id: u64,
 ) -> Result<CaseCause, String> {
-    let key = format!("case-cause:v{EXTRACT_VERSION}:{repo}:{id}");
-    if let Some(value) = cache.get(&key)
-        && let Ok(cause) = serde_json::from_value(value)
-    {
-        return Ok(cause);
-    }
+    let key = cache_key(repo, id);
     let payload = gh(&strings(&[
         "api",
         &format!("repos/{repo}/actions/jobs/{id}"),
@@ -231,18 +243,35 @@ fn read_cause(
     Ok(cause)
 }
 
-/// Read the cause of every job in `jobs`.
+/// Read the cause of every job in `jobs`. A cached cause costs nothing; at
+/// most `max_jobs` uncached jobs are fetched, newest first (Actions job ids
+/// grow with creation time), and the rest are unreadable with
+/// [`OVER_BUDGET`], so they count as unread rather than as a cause.
 #[must_use]
 pub fn gather(
     gh: &SyncGhReader<'_>,
     cache: &ReadCache,
     repo: &str,
     jobs: &BTreeSet<u64>,
+    max_jobs: usize,
 ) -> CausesRead {
-    let ids: Vec<u64> = jobs.iter().copied().collect();
-    let results = parallel_map(&ids, |id| read_cause(gh, cache, repo, *id));
-    let mut read = CausesRead::default();
-    for (id, result) in ids.into_iter().zip(results) {
+    let mut read = CausesRead {
+        budget: max_jobs,
+        ..CausesRead::default()
+    };
+    let mut uncached = Vec::new();
+    for &id in jobs {
+        match cached(cache, repo, id) {
+            Some(cause) => {
+                read.by_job.insert(id, cause);
+            }
+            None => uncached.push(id),
+        }
+    }
+    uncached.sort_unstable_by(|a, b| b.cmp(a));
+    let over = uncached.split_off(max_jobs.min(uncached.len()));
+    let results = parallel_map(&uncached, |id| read_cause(gh, cache, repo, *id));
+    for (id, result) in uncached.into_iter().zip(results) {
         match result {
             Ok(cause) => {
                 read.by_job.insert(id, cause);
@@ -250,6 +279,12 @@ pub fn gather(
             Err(reason) => read.unreadable.push(Unreadable { job_id: id, reason }),
         }
     }
+    read.skipped_for_budget = over.len();
+    read.unreadable
+        .extend(over.into_iter().map(|job_id| Unreadable {
+            job_id,
+            reason: OVER_BUDGET.to_owned(),
+        }));
     read
 }
 
@@ -290,6 +325,11 @@ pub struct CauseNaming {
     pub time_to_named_n: usize,
     /// Whether every cause was read after the fact.
     pub retrospective: bool,
+    /// Most uncached jobs the read could fetch (`--causes-max-jobs`).
+    pub budget: usize,
+    /// Red jobs left unread because the budget ran out; counted in
+    /// `unreadable`, never as a cause.
+    pub skipped_for_budget: usize,
 }
 
 fn minutes_between(from: &str, to: &str) -> Option<f64> {
@@ -299,9 +339,9 @@ fn minutes_between(from: &str, to: &str) -> Option<f64> {
     Some(seconds / 60.0)
 }
 
-/// Score the red cases among `rows` (after [`attach`]).
+/// Score the red cases among `rows` (after [`attach`]) read by `read`.
 #[must_use]
-pub fn compute(rows: &[Case]) -> CauseNaming {
+pub fn compute(rows: &[Case], read: &CausesRead) -> CauseNaming {
     let reds: Vec<&Case> = rows
         .iter()
         .filter(|row| matches!(row.kind, "required_check_red" | "merge_group_gate_failed"))
@@ -317,6 +357,8 @@ pub fn compute(rows: &[Case]) -> CauseNaming {
         time_to_named_median_minutes: None,
         time_to_named_n: 0,
         retrospective: true,
+        budget: read.budget,
+        skipped_for_budget: read.skipped_for_budget,
     };
     let mut minutes = Vec::new();
     for row in &reds {
@@ -367,8 +409,14 @@ pub fn render(naming: &CauseNaming) -> String {
     );
     let _ = writeln!(
         out,
-        "named causes: {}/{} red cases ({share}); {} without a job, {} unreadable",
-        naming.named, naming.reds, naming.without_job, naming.unreadable
+        "named causes: {}/{} red cases ({share}); {} without a job, {} unreadable \
+         ({} skipped over the --causes-max-jobs budget of {})",
+        naming.named,
+        naming.reds,
+        naming.without_job,
+        naming.unreadable,
+        naming.skipped_for_budget,
+        naming.budget
     );
     let confidence: Vec<String> = naming
         .by_confidence

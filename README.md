@@ -177,7 +177,8 @@ project will automatically recover or merge every PR.
   labelling later. `--causes` (implied by `--export-cases`) reads each red
   case's job log through `shipyard diagnose`'s extractor, puts its cause and
   evidence lines on the row, and reports the share of red cases with a named
-  cause and the time to it.
+  cause and the time to it. `--causes-max-jobs` (default 200) caps the job
+  logs one run reads; the rest are reported as skipped.
 - **Rules-first PR watching.** `shipyard pr-watch scan` flags open PRs stuck
   in a way a person should look at, read-only by default.
   `shipyard pr-watch rules` wakes an agent only when something changed (a

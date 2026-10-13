@@ -32,6 +32,7 @@ pub(super) fn gate_cost_command<W: Write>(
     let scorecard = args.scorecard;
     let flakes = args.flakes;
     let causes = args.causes;
+    let causes_max_jobs = args.causes_max_jobs;
     let required_contexts = args.required_contexts.clone();
     let selection_steps = args.selection_steps.clone();
     let export_cases = args.export_cases.clone();
@@ -64,7 +65,8 @@ pub(super) fn gate_cost_command<W: Write>(
         let mut rows = scorecard::cases::cases(&observation);
         if causes || export_cases.is_some() {
             let jobs = scorecard::causes::red_jobs(&observation);
-            let read = scorecard::causes::gather(&reader, &cache, &query.repo, &jobs);
+            let read =
+                scorecard::causes::gather(&reader, &cache, &query.repo, &jobs, causes_max_jobs);
             for unreadable in &read.unreadable {
                 eprintln!(
                     "causes: job {} unreadable: {}",
@@ -72,7 +74,7 @@ pub(super) fn gate_cost_command<W: Write>(
                 );
             }
             scorecard::causes::attach(&mut rows, &read);
-            report.cause_naming = Some(scorecard::causes::compute(&rows));
+            report.cause_naming = Some(scorecard::causes::compute(&rows, &read));
         }
         if let Some(path) = &export_cases {
             let receipt = write_cases(path, &observation, &rows)?;

@@ -282,7 +282,13 @@ fn gather_reads_each_job_and_a_missing_log_still_yields_a_cause() {
     let gh = FakeGh::new();
     let reader = |args: &[String]| gh.answer(args);
     let jobs = [GATE_JOB, 42, 7].into_iter().collect();
-    let read = gather(&reader, &ReadCache::disabled(), PULP, &jobs);
+    let read = gather(
+        &reader,
+        &ReadCache::disabled(),
+        PULP,
+        &jobs,
+        DEFAULT_MAX_JOBS,
+    );
     assert_eq!(read.by_job[&GATE_JOB].signature.as_deref(), Some(VELLUM));
     assert_eq!(read.by_job[&42].confidence, "none");
     assert_eq!(read.unreadable.len(), 1);
@@ -297,10 +303,10 @@ fn a_read_cause_is_cached_and_not_read_again() {
     let gh = FakeGh::new();
     let reader = |args: &[String]| gh.answer(args);
     let jobs = std::iter::once(GATE_JOB).collect();
-    let first = gather(&reader, &cache, PULP, &jobs);
+    let first = gather(&reader, &cache, PULP, &jobs, DEFAULT_MAX_JOBS);
     let reads = gh.calls.lock().expect("calls").len();
     assert_eq!(reads, 2);
-    let second = gather(&reader, &cache, PULP, &jobs);
+    let second = gather(&reader, &cache, PULP, &jobs, DEFAULT_MAX_JOBS);
     assert_eq!(gh.calls.lock().expect("calls").len(), reads);
     assert_eq!(first, second);
 }
@@ -316,6 +322,7 @@ fn attached_causes_fill_evidence_and_are_counted_as_named() {
         &ReadCache::disabled(),
         PULP,
         &red_jobs(&observation),
+        DEFAULT_MAX_JOBS,
     );
     attach(&mut rows, &read);
     let gate = rows
@@ -337,7 +344,7 @@ fn attached_causes_fill_evidence_and_are_counted_as_named() {
         .expect("status row");
     assert!(status.cause.is_none() && status.unread.contains(&"evidence"));
 
-    let naming = compute(&rows);
+    let naming = compute(&rows, &read);
     // macos (named, high), status/ci (no job), merge-group gate 42 (no log).
     assert_eq!(naming.reds, 3);
     assert_eq!(naming.without_job, 1);
@@ -360,6 +367,10 @@ fn attached_causes_fill_evidence_and_are_counted_as_named() {
     let text = render(&naming);
     assert!(text.contains("named causes: 1/3 red cases (33%)"), "{text}");
     assert!(text.contains("retrospective"), "{text}");
+    assert_eq!(
+        (naming.budget, naming.skipped_for_budget),
+        (DEFAULT_MAX_JOBS, 0)
+    );
 }
 
 #[test]
@@ -369,7 +380,76 @@ fn rows_without_causes_keep_evidence_unread() {
         rows.iter()
             .all(|row| row.cause.is_none() && row.unread.contains(&"evidence"))
     );
-    let naming = compute(&rows);
+    let naming = compute(&rows, &CausesRead::default());
     assert_eq!(naming.named, 0);
     assert_eq!(naming.time_to_named_median_minutes, None);
+}
+
+#[test]
+fn the_budget_reads_newest_first_and_skipped_jobs_count_as_unread() {
+    let observation = observation();
+    let gh = FakeGh::new();
+    let reader = |args: &[String]| gh.answer(args);
+    // Two uncached red jobs, budget one: the newer (larger id) is read.
+    let read = gather(
+        &reader,
+        &ReadCache::disabled(),
+        PULP,
+        &red_jobs(&observation),
+        1,
+    );
+    assert!(read.by_job.contains_key(&GATE_JOB));
+    assert!(!read.by_job.contains_key(&42));
+    assert_eq!(read.skipped_for_budget, 1);
+    assert_eq!(
+        read.unreadable,
+        vec![Unreadable {
+            job_id: 42,
+            reason: OVER_BUDGET.to_owned(),
+        }]
+    );
+    assert!(
+        gh.calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .all(|path| !path.contains("/jobs/42")),
+        "a job over the budget was fetched"
+    );
+    let mut rows = cases(&observation);
+    attach(&mut rows, &read);
+    let naming = compute(&rows, &read);
+    assert_eq!((naming.budget, naming.skipped_for_budget), (1, 1));
+    // The skipped gate is unread, never a cause with no confidence.
+    assert_eq!(naming.unreadable, 1);
+    assert_eq!(naming.by_confidence.get("unread"), Some(&2));
+    assert_eq!(naming.by_confidence.get("none"), None);
+    let text = render(&naming);
+    assert!(
+        text.contains("1 unreadable (1 skipped over the --causes-max-jobs budget of 1)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_cached_cause_does_not_count_against_the_budget() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = ReadCache::open(dir.path(), std::time::SystemTime::now());
+    let gh = FakeGh::new();
+    let reader = |args: &[String]| gh.answer(args);
+    let _ = gather(
+        &reader,
+        &cache,
+        PULP,
+        &std::iter::once(GATE_JOB).collect(),
+        1,
+    );
+    let reads = gh.calls.lock().expect("calls").len();
+    // Budget zero: the cached job is still read, the uncached one is skipped.
+    let jobs = [GATE_JOB, 42].into_iter().collect();
+    let read = gather(&reader, &cache, PULP, &jobs, 0);
+    assert!(read.by_job.contains_key(&GATE_JOB));
+    assert_eq!(read.skipped_for_budget, 1);
+    assert_eq!(read.unreadable[0].job_id, 42);
+    assert_eq!(gh.calls.lock().expect("calls").len(), reads);
 }
