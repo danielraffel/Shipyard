@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -249,9 +250,35 @@ class CiMatrixTests(unittest.TestCase):
         self.assertEqual(workflow.count(predicate), 3)
         self.assertNotIn("startsWith(runner.name, 'pulp-studio')", workflow)
         self.assertIn('test "$RUNNER_NAME" = "Shipyard-studio-02"', workflow)
-        self.assertIn('Daniels-Mac-Studio.local|Daniels-Mac-Studio-m3.local) ;;', workflow)
-        self.assertIn('sandbox-e2e must run on M3; hostname is', workflow)
+        self.assertIn('if [ "$host_id" != "studio" ]; then', workflow)
+        self.assertIn("sandbox-e2e must run on M3: tartci host.id", workflow)
+        self.assertNotIn('case "$(hostname)" in', workflow)
         self.assertIn('test "$($installed runner tag)" = "studio"', workflow)
+
+    def test_sandbox_m3_host_identity_comes_from_the_fleet_profile(self) -> None:
+        """The M3 check reads tartci's host.id, so a hostname rename cannot fail it."""
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github/workflows/sandbox-e2e.yml").read_text(encoding="utf-8")
+        start = workflow.index('host_id="$(awk ')
+        program = workflow[start:workflow.index("' \"$profile\"", start)]
+        program = program[program.index("'") + 1:]
+        profiles = {
+            # The live m3 profile's shape.
+            '[host]\nid = "studio"\nssh = "m3"\n[[lane]]\nid = "gate"\n': "studio",
+            '# comment\n[runner]\nid = "other"\n[host]  # identity\n  id="studio"\n': "studio",
+            '[host.limits]\nid = "studio"\n[host]\nssh = "m3"\n': "",
+            '[host]\nssh = "m5"\n[lane]\nid = "studio"\n': "",
+            '[host]\nid = "m5"\n': "m5",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for text, expected in profiles.items():
+                path = Path(directory) / "profile.toml"
+                path.write_text(text, encoding="utf-8")
+                with self.subTest(profile=text):
+                    found = subprocess.run(
+                        ["awk", program, str(path)], capture_output=True, text=True, check=True
+                    ).stdout.strip()
+                    self.assertEqual(found, expected)
 
     def test_sandbox_m3_candidate_is_exact_and_production_is_restored(self) -> None:
         root = Path(__file__).resolve().parents[1]

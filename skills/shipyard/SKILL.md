@@ -96,6 +96,10 @@ Another run's leftover canary registration, or a concurrent canary, lands in
 the guardian receipt's `launchd_recovery.warnings`, never in `errors`, so it
 cannot fail an unrelated run.
 
+The macOS Sandbox E2E job proves it is on M3 by the tartci fleet profile's
+`[host] id = "studio"`, never the live hostname, which macOS changes on a
+Bonjour name collision (`Daniels-Mac-Studio-m3-4.local`). See the ci skill.
+
 A quiet `daemon.log` during a Sandbox E2E run is expected: the sandbox audit
 holds the writer-domain lock exclusively, so `write_stderr` waits up to 30s
 for its shared lease and then gives up. The webhook listener never waits on

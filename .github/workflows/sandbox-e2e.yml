@@ -105,13 +105,19 @@ jobs:
         run: |
           set -euo pipefail
           test "$RUNNER_NAME" = "Shipyard-studio-02"
-          # M3 was renamed Daniels-Mac-Studio -> Daniels-Mac-Studio-m3 when a second
-          # Mac Studio joined the fleet; accept either so the rename cannot fail
-          # this job silently, and name the mismatch when it does fail.
-          case "$(hostname)" in
-            Daniels-Mac-Studio.local|Daniels-Mac-Studio-m3.local) ;;
-            *) echo "sandbox-e2e must run on M3; hostname is $(hostname)" >&2; exit 1 ;;
-          esac
+          # The host is M3 by its configured fleet identity, never its live
+          # hostname: macOS renames a host on a Bonjour name collision
+          # (Daniels-Mac-Studio-m3 became Daniels-Mac-Studio-m3-4.local).
+          profile="${TARTCI_FLEET_PROFILE:-$HOME/.config/tartci/macos-fleet-profile.toml}"
+          host_id="$(awk '/^[[:space:]]*\[/ { in_host = ($0 ~ /^[[:space:]]*\[host\][[:space:]]*(#.*)?$/) }
+            in_host && /^[[:space:]]*id[[:space:]]*=/ {
+              sub(/^[^=]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit }' "$profile" 2>/dev/null || true)"
+          if [ "$host_id" != "studio" ]; then
+            echo "sandbox-e2e must run on M3: tartci host.id \"studio\" in $profile;" \
+              "this host declares \"${host_id:-no host.id}\" (hostname $(hostname))." \
+              "Route the job to M3's Shipyard-studio-02 runner, or set [host] id in that profile." >&2
+            exit 1
+          fi
           installed="$HOME/.local/bin/shipyard"
           test -x "$installed"
           test "$($installed runner tag)" = "studio"
