@@ -409,10 +409,10 @@ shipyard pr-watch rules --repo Generous-Corp/pulp --input-events cmux.jsonl --in
 
 | reader | kind | fires when | fix |
 |---|---|---|---|
-| `cmux` | `codex_session_dead` | the workspace shows a failed `cmux restore codex` (`Error: Failed to resume session`), or the shell prompt after a Codex prompt | the session id and `cmux restore codex <id>` once the named cause is fixed; not auto-safe |
-| `cmux` | `codex_session_errored` | the session is idle and an error (`503`, `unexpected status`, `stream disconnected`, ...) is just above its empty prompt | `cmux send ... continue` then `send-key ... enter`; auto-safe |
+| `cmux` | `codex_session_dead` | the workspace shows a failed `cmux restore codex` (`Error: Failed to resume session`), or, in a workspace that is a Codex session (title starts `codex`, or the screen shows Codex's own text), the shell prompt after a `› ` prompt | the session id and `cmux restore codex <id>` once the named cause is fixed; not auto-safe |
+| `cmux` | `codex_session_errored` | the session is idle and an error (`503`, `unexpected status`, `stream disconnected`, ...) is just above its empty prompt | `cmux send ... continue` then `send-key ... enter`; not auto-safe, since typing into an agent session needs a steward |
 | `cmux` | `codex_draft_unsent` | an idle session holds text on its prompt | `send-key ... enter`; not auto-safe, because someone may be typing it |
-| `cmux` | `codex_draft_queued` | a working session holds a draft and shows "tab to queue" | `send-key ... tab`; auto-safe |
+| `cmux` | `codex_draft_queued` | a working session holds a draft and shows "tab to queue" | `send-key ... tab`; not auto-safe, since typing into an agent session needs a steward |
 | `hosts` | `host_out_of_pool` | `tartci pool status --json` reports a state other than `on`, or not participating | read the pool status before turning it on |
 | `hosts` | `host_problem` | a `fleet.config` section names a problem (self-update rolled back, a stale tool, a gate reserve shortfall, ...) | that section of the pool status names the receipt and next step |
 | `hosts` | `host_unreachable` | the status cannot be read over ssh (keyed per hour) | check the host is up |

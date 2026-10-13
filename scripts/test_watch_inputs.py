@@ -49,6 +49,36 @@ class CodexScreens(unittest.TestCase):
         self.assertEqual(events[0]["fix"]["cause"], "session_exited")
         self.assertIn("subrouter: signal: terminated", events[0]["summary"])
 
+    def test_a_non_codex_screen_with_a_prompt_mark_above_a_shell_is_not_a_dead_session(self) -> None:
+        text = ("$ ./build.sh\n› step 3 of 4: linking\nbuild failed\n"
+                "danielraffel@Daniels-Mac-Studio-m3 pulp % \n")
+        self.assertEqual(inputs.classify_screen("workspace:9", "build", text, AT), [])
+        # Control: the same screen in a Codex workspace is a dead session.
+        self.assertEqual(kinds(inputs.classify_screen("workspace:9", "codex: build", text, AT)),
+                         ["codex_session_dead"])
+
+    def test_the_reader_only_lists_and_reads_screens(self) -> None:
+        listing = ("* workspace:1  optimize-import  [selected]\n"
+                   "  workspace:2  codex: dead\n  workspace:3  codex: drafting\n")
+        screens = {"workspace:1": screen("screen-1000010004.txt"),
+                   "workspace:2": screen("screen-1000010001.txt"),
+                   "workspace:3": screen("screen-1000010023.txt")}
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            calls.append(argv)
+            if argv[1:] == ["workspace", "list"]:
+                return 0, listing
+            return 0, screens[argv[argv.index("--workspace") + 1]]
+
+        events = inputs.read_cmux(runner, AT)
+        self.assertEqual(sorted(kinds(events)), ["codex_draft_unsent", "codex_session_dead"])
+        self.assertEqual(len(calls), 4)
+        for argv in calls:
+            self.assertEqual(argv[0], inputs.CMUX)
+            self.assertIn(argv[1:3], (["workspace", "list"], ["read-screen", "--workspace"]), argv)
+            self.assertFalse(any(word in ("send", "send-key", "paste") for word in argv), argv)
+
     def test_an_idle_or_working_session_with_an_empty_prompt_is_quiet(self) -> None:
         self.assertEqual(self.classify("screen-1000010004.txt"), [])
         self.assertEqual(self.classify("screen-1000010012.txt"), [])
@@ -87,7 +117,7 @@ class CodexScreens(unittest.TestCase):
         self.assertEqual(
             fix["command"],
             "cmux send --workspace workspace:9 continue && cmux send-key --workspace workspace:9 enter")
-        self.assertTrue(fix["safe_to_auto_apply"])
+        self.assertFalse(fix["safe_to_auto_apply"], "typing into a session needs a steward")
         # The same error while the session is working again is not reported.
         working = screen("screen-1000010012.txt").replace(
             "include the first JUnit failure line", "■ unexpected status 503 Service Unavailable")
@@ -101,6 +131,7 @@ class CodexScreens(unittest.TestCase):
         events = self.classify("", text)
         self.assertEqual(kinds(events), ["codex_draft_queued"])
         self.assertEqual(events[0]["fix"]["command"], "cmux send-key --workspace workspace:9 tab")
+        self.assertFalse(events[0]["fix"]["safe_to_auto_apply"], "typing into a session needs a steward")
         # Without the queue hint a draft in a working session is someone typing.
         typing = text.replace("tab to queue message", "? for shortcuts")
         self.assertEqual(self.classify("", typing), [])
@@ -134,7 +165,8 @@ class Hosts(unittest.TestCase):
 
     def test_an_unreachable_host_is_reported_once_an_hour(self) -> None:
         def runner(argv: list[str]) -> tuple[int, str]:
-            self.assertIn("BatchMode=yes", argv)
+            self.assertEqual(argv[:7], ["ssh", "-n", "-o", "BatchMode=yes", "-o",
+                                        "ConnectTimeout=10", "m1"])
             return 255, "ssh: connect to host m1 port 22: Host is down"
         first = inputs.read_hosts(runner, ["m1"], AT)
         later = inputs.read_hosts(runner, ["m1"], AT + timedelta(minutes=30))

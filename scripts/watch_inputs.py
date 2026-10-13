@@ -60,6 +60,9 @@ ERROR_SIGNATURES = (
     "Service Unavailable", "stream error",
 )
 TAB_TO_QUEUE = "tab to queue"
+# Text only a Codex session prints; a `› ` line alone is not enough, since
+# other tools and shells print it too.
+CODEX_MARKERS = ("Ask Codex", "Worked for ", "GPT-", "codex")
 GATE_JOB = "macos"
 
 Runner = Callable[[list[str]], tuple[int, str]]
@@ -105,7 +108,9 @@ def classify_screen(workspace: str, title: str, screen: str, at: datetime) -> li
     text = "\n".join(lines)
     where = f"cmux workspace {workspace} ({title})"
     read = f"cmux read-screen --workspace {workspace} --lines {SCREEN_LINES}"
-    prompts = [i for i, line in enumerate(lines) if CODEX_PROMPT.match(line)]
+    codex = title.lower().startswith("codex") or any(
+        marker.lower() in text.lower() for marker in CODEX_MARKERS)
+    prompts = [i for i, line in enumerate(lines) if CODEX_PROMPT.match(line)] if codex else []
     last = next((line for line in reversed(lines) if line.strip()), "")
     if not prompts or SHELL_PROMPT.match(last.strip()):
         for line in reversed(lines):
@@ -168,7 +173,9 @@ def classify_screen(workspace: str, title: str, screen: str, at: datetime) -> li
             {
                 "what": f"draft in {workspace}", "evidence": read, "cause": "draft_not_queued",
                 "command": f"{key_cmd} tab",
-                "safe_to_auto_apply": True,
+                # Typing into an agent session needs an applier with that
+                # authority; until one exists, a steward applies it.
+                "safe_to_auto_apply": False,
                 "verify": f"{read} no longer shows the draft on the `› ` line",
             },
             workspace=workspace,
@@ -200,7 +207,9 @@ def classify_screen(workspace: str, title: str, screen: str, at: datetime) -> li
                     "what": f"Codex session in {workspace}", "evidence": read,
                     "cause": "provider_error",
                     "command": f"{send} continue && {key_cmd} enter",
-                    "safe_to_auto_apply": True,
+                    # Typing into an agent session needs an applier with that
+                    # authority; until one exists, a steward applies it.
+                    "safe_to_auto_apply": False,
                     "verify": f"{read} shows `Working (` within a minute",
                 },
                 workspace=workspace,
