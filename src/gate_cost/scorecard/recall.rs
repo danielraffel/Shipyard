@@ -51,7 +51,9 @@ use super::super::{
     MERGE_GROUP_EVENT, ReadCache, RunRef, SyncGhReader, collect_counted, parallel_map, read_json,
     read_pages, read_run_jobs, round2, strings, text, timestamp,
 };
-use super::{MergeGroupRun, ScorecardQuery, opt, queue_branch_pr};
+use super::{
+    GRAPHQL_ATTEMPTS, GRAPHQL_RETRY_PAUSE, MergeGroupRun, ScorecardQuery, opt, queue_branch_pr,
+};
 
 /// Events of the runs on a pull-request head. Checks of a pull request
 /// opened by an App are dispatched (`workflow_dispatch`), and their gate
@@ -237,7 +239,29 @@ fn queue_branch_base(branch: &str) -> Option<String> {
     (!sha.is_empty()).then(|| sha.to_owned())
 }
 
-/// Read the groups and heads behind every failed merge-group gate.
+/// `read` again while GitHub answers a gateway error (`HTTP 502`, `503` or
+/// `504`), as a page of runs or a large log does under load; any other
+/// failure, or the last attempt's, is returned.
+fn retrying<T>(read: impl Fn() -> Result<T, String>) -> Result<T, String> {
+    let mut attempt = 1;
+    loop {
+        match read() {
+            Err(error)
+                if attempt < GRAPHQL_ATTEMPTS
+                    && ["HTTP 502", "HTTP 503", "HTTP 504"]
+                        .iter()
+                        .any(|status| error.contains(status)) =>
+            {
+                attempt += 1;
+                std::thread::sleep(GRAPHQL_RETRY_PAUSE);
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Read the groups and heads behind every failed merge-group gate. Every
+/// read is retried on a gateway error.
 pub fn gather(
     gh: &SyncGhReader<'_>,
     cache: &ReadCache,
@@ -245,6 +269,8 @@ pub fn gather(
     listed: &[Value],
     runs: &[MergeGroupRun],
 ) -> Vec<GroupFailure> {
+    let retried = |args: &[String]| retrying(|| gh(args));
+    let gh: &SyncGhReader<'_> = &retried;
     let by_head: BTreeMap<String, &Value> = listed
         .iter()
         .filter_map(|run| Some((text(run, "head_sha")?, run)))

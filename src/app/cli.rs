@@ -1198,8 +1198,8 @@ pub(crate) enum MetricsCommand {
     ///   the head's check ignored), `missed` (every head selected tests and
     ///   none ran it), or `undetermined` (a head unread, a head on which no
     ///   selection step ran, or a group that could not be read). recall =
-    ///   selected / (selected + ran_outside + missed); recall anywhere counts
-    ///   ran_outside as run. The group is the pull request the queue branch
+    ///   selected / (selected + `ran_outside` + missed); recall anywhere
+    ///   counts `ran_outside` as run. The group is the pull request the queue branch
     ///   names plus every entry ahead of it that had not merged when the run
     ///   was created.
     /// Required contexts are the base's classic protection, or

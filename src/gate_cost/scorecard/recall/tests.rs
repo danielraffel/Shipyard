@@ -75,6 +75,9 @@ struct FakeGh {
     refuse: Vec<String>,
     /// Requests ending in the first string, answered with the second.
     replace: Vec<(String, String)>,
+    /// Requests containing this string are answered `HTTP 502` this many
+    /// times before the capture.
+    gateway_errors: Option<(String, Mutex<u32>)>,
 }
 
 impl FakeGh {
@@ -83,6 +86,7 @@ impl FakeGh {
             calls: Mutex::new(Vec::new()),
             refuse: Vec::new(),
             replace: Vec::new(),
+            gateway_errors: None,
         }
     }
 
@@ -91,6 +95,15 @@ impl FakeGh {
         self.calls.lock().expect("calls").push(joined.clone());
         if self.refuse.iter().any(|refused| joined.contains(refused)) {
             return Err(format!("refused: {joined}"));
+        }
+        if let Some((pattern, left)) = &self.gateway_errors
+            && joined.contains(pattern.as_str())
+        {
+            let mut left = left.lock().expect("count");
+            if *left > 0 {
+                *left -= 1;
+                return Err(format!("gh: Server Error (HTTP 502) {joined}"));
+            }
         }
         if let Some((_, answer)) = self.replace.iter().find(|(end, _)| joined.ends_with(end)) {
             return Ok(answer.clone());
@@ -356,6 +369,13 @@ fn an_unreadable_head_makes_the_case_undetermined() {
     );
     assert_eq!(recall.recall, None);
     assert_eq!(recall.cases[0].members.len(), 2);
+    // A refusal is not a gateway error: each head's listing is asked once.
+    let asked = fake
+        .calls()
+        .iter()
+        .filter(|call| call.contains(&format!("/runs -f head_sha={HEAD_10115}")))
+        .count();
+    assert_eq!(asked, 1);
     assert!(recall.cases[0].members.iter().all(|member| {
         member.status == "unread"
             && member
@@ -715,4 +735,35 @@ fn a_queue_merge_whose_first_parent_is_not_the_base_has_no_head() {
     // as run outside, not failed on a head.
     assert_eq!(recall.cases[0].verdict, "ran_outside");
     assert!(!recall.cases[0].failed_on_head);
+}
+
+#[test]
+fn a_gateway_error_is_read_again_and_a_lasting_one_leaves_the_read_unread() {
+    // Two `HTTP 502` answers on #10115's head log: the third read lands.
+    let mut fake = FakeGh::new();
+    fake.gateway_errors = Some(("jobs/114668299889/logs".to_owned(), Mutex::new(2)));
+    let recall = recall_of(&observe(&fake, &chain()));
+    assert_eq!(recall.cases[0].members[0].status, "ran_outside");
+    let reads = log_reads(&fake)
+        .iter()
+        .filter(|call| call.contains("114668299889"))
+        .count();
+    assert_eq!(reads, 3);
+    // Three in a row leave that head unread, naming the status.
+    let mut fake = FakeGh::new();
+    fake.gateway_errors = Some(("jobs/114668299889/logs".to_owned(), Mutex::new(3)));
+    let recall = recall_of(&observe(&fake, &chain()));
+    let own = &recall.cases[0].members[0];
+    assert_eq!(own.status, "unread");
+    assert!(
+        own.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("HTTP 502")),
+        "{own:?}"
+    );
+    // A gateway error on a merge-group listing in the walk is read again too.
+    let mut fake = FakeGh::new();
+    fake.gateway_errors = Some(("event=merge_group -f head_sha=".to_owned(), Mutex::new(1)));
+    let recall = recall_of(&observe(&fake, &chain()));
+    assert_eq!(recall.undetermined, 0);
 }
