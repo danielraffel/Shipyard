@@ -1512,8 +1512,12 @@ week: open-to-merge median and p90, the merge-queue ejection rate (removals by
 entry, read from the pull requests' timelines; other removals are listed by
 reason and actor), the merge-group failure rate of the `--gate-job` alone, the
 red-after-push rate on
-required checks (latest run per name; cancelled is not red), and check names
-red on two or more pull requests. Everything is read from GitHub, so pass
+required checks (latest run per name; cancelled is not red), check names
+red on two or more pull requests, and each merged pull request's merge-head
+verdict: the latest trusted `verdict:`/`reviewed:` comment or review naming
+its merge head, posted by the merge (`approve`, `hold`, `none`, `unread`).
+Read `hold` as "merged anyway": the week names those pull requests.
+Everything is read from GitHub, so pass
 `--from`/`--to` to measure a window from before a change and one from after it.
 A repository without branch protection needs `--required-context`. A required
 context that no merged commit carries is reported as a gap, because a

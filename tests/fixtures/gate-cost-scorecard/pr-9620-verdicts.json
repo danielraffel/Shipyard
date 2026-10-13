@@ -1,0 +1,181 @@
+{
+ "data": {
+  "repository": {
+   "pullRequest": {
+    "headRefOid": "0c3a79de5f7d7f998145fb07cefd52113f2309f4",
+    "author": {
+     "login": "shipyard-local"
+    },
+    "comments": {
+     "totalCount": 20,
+     "nodes": [
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-05T10:39:58Z"
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-05T10:40:01Z"
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-05T10:45:34Z"
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-05T10:45:37Z"
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-05T10:51:50Z"
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-05T10:51:54Z"
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-05T10:55:41Z"
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-05T10:55:44Z"
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-05T11:01:58Z"
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-05T11:02:03Z"
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-05T11:17:29Z"
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-05T11:17:32Z"
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-05T11:26:54Z"
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-05T11:26:57Z"
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-05T12:46:23Z"
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-05T12:46:27Z"
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "@codex review",
+       "createdAt": "2026-10-05T13:22:27Z"
+      },
+      {
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "authorAssociation": "NONE",
+       "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+       "createdAt": "2026-10-05T13:22:30Z"
+      },
+      {
+       "author": {
+        "login": "codecov"
+       },
+       "authorAssociation": "NONE",
+       "body": "## [Codecov](https://app.codecov.io/gh/Generous-Corp/pulp/pull/9620?dropdown=coverage&src=pr&el=h1&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=Generous-Corp) Report\n:x: Patch coverage is `40.81633%` with `29 lines` in your changes missing coverage. Please review.\n| [Files with missing lines](https://app.codecov.io/gh/Generous-Corp/pulp/pull/9620?dropdown=coverage&src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=Generous-Corp) | Patch % | Lines |\n|---|---|---|\n| [...audio/src/detail/gpu\\_convolver\\_raw\\_trace\\_jsonl.hpp](https://app.codecov.io/gh/Generous-Corp/pulp/pull/9620?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=Generous-Corp#diff-Y29yZS9ncHVfYXVkaW8vc3JjL2RldGFpbC9ncHVfY29udm9sdmVyX3Jhd190cmFjZV9qc29ubC5ocHA=) | 42.10% | [5 Missing and 17 partials :warning: ](https://app.codecov.io/gh/Generous-Corp/pulp/pull/9620?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=Generous-Corp) |\n| [...pu\\_audio/src/detail/gpu\\_convolver\\_trial\\_config.hpp](https://app.codecov.io/gh/Generous-Corp/pulp/pull/9620?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=Generous-Corp#diff-Y29yZS9ncHVfYXVkaW8vc3JjL2RldGFpbC9ncHVfY29udm9sdmVyX3RyaWFsX2NvbmZpZy5ocHA=) | 36.36% | [0 Missing and 7 partials :warning: ](https://app.codecov.io/gh/Generous-Corp/pulp/pull/9620?src=pr&el=tree&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=Generous-Corp) |\n\n:loudspeaker: Thoughts on this report? [Let us know!](https://github.com/codecov/feedback/issues/255)",
+       "createdAt": "2026-10-05T15:59:58Z"
+      },
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "<!-- pulp-coverage-diff-gate -->\n\n## Diff coverage (Phase 1 advisory)\n\nAdvisory window: this gate is **informational only** until **2026-05-04**, after which diff coverage below **75%** will block merges (issue #566 Phase 3).\nThis percentage applies only to the coverage surfaces currently represented on Codecov; see `docs/guides/coverage.md` for the current perimeter.\n\n<details><summary>diff-cover report</summary>\n\n## Diff: origin/main...HEAD, staged and unstaged changes\n\nNo lines with coverage information in this diff.\n\n</details>\n\nSee [coverage.md](https://github.com/Generous-Corp/pulp/blob/main/docs/guides/coverage.md) for the current represented surface, how to interpret this number, and the full Phase 1 \u2192 Phase 3 roadmap.",
+       "createdAt": "2026-10-05T16:00:09Z"
+      }
+     ]
+    },
+    "reviews": {
+     "totalCount": 0,
+     "nodes": []
+    }
+   }
+  }
+ }
+}

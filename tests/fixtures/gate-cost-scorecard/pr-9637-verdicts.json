@@ -1,0 +1,37 @@
+{
+ "data": {
+  "repository": {
+   "pullRequest": {
+    "headRefOid": "498af93294e62c639dab0138b08906319dd455af",
+    "author": {
+     "login": "danielraffel"
+    },
+    "comments": {
+     "totalCount": 2,
+     "nodes": [
+      {
+       "author": {
+        "login": "github-actions"
+       },
+       "authorAssociation": "NONE",
+       "body": "<!-- pulp-coverage-diff-gate -->\n\n## Diff coverage (Phase 1 advisory)\n\nAdvisory window: this gate is **informational only** until **2026-05-04**, after which diff coverage below **75%** will block merges (issue #566 Phase 3).\nThis percentage applies only to the coverage surfaces currently represented on Codecov; see `docs/guides/coverage.md` for the current perimeter.\n\n<details><summary>diff-cover report</summary>\n\n## Diff: origin/main...HEAD, staged and unstaged changes\n\nNo lines with coverage information in this diff.\n\n</details>\n\nSee [coverage.md](https://github.com/Generous-Corp/pulp/blob/main/docs/guides/coverage.md) for the current represented surface, how to interpret this number, and the full Phase 1 \u2192 Phase 3 roadmap.",
+       "createdAt": "2026-10-05T16:47:22Z"
+      },
+      {
+       "author": {
+        "login": "codecov"
+       },
+       "authorAssociation": "NONE",
+       "body": "## [Codecov](https://app.codecov.io/gh/Generous-Corp/pulp/pull/9637?dropdown=coverage&src=pr&el=h1&utm_medium=referral&utm_source=github&utm_content=comment&utm_campaign=pr+comments&utm_term=Generous-Corp) Report\n:white_check_mark: All modified and coverable lines are covered by tests.\n\n:loudspeaker: Thoughts on this report? [Let us know!](https://github.com/codecov/feedback/issues/255)",
+       "createdAt": "2026-10-05T16:49:36Z"
+      }
+     ]
+    },
+    "reviews": {
+     "totalCount": 0,
+     "nodes": []
+    }
+   }
+  }
+ }
+}

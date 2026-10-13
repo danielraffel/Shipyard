@@ -353,6 +353,13 @@ Each one first read as a broken instrument:
   of `totalCount` 300. That is the API's cap, not a short read, so count it
   and name the pull request rather than failing the whole report.
 
+**A HOLD does not stop a head that is already armed or queued.** The
+scorecard's merge-head verdict counts merged pull requests whose latest trusted
+verdict on the merge head, posted before the merge, was HOLD, and names them.
+On 2026-10-12, 6 pulp pull requests merged that way: each was armed before the
+HOLD, and review-before-arm judges only the arm. Read `hold` as a merge that
+landed against a reviewer, not as a slow review.
+
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason
 `failed_checks` or `checks_timed_out`, and use `AddedToMergeQueueEvent` as the
