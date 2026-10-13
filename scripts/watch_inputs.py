@@ -324,6 +324,74 @@ def read_hosts(runner: Runner, aliases: list[str], at: datetime) -> list[dict[st
     return events
 
 
+def read_pool_log(paths: list[str]) -> list[dict[str, Any]]:
+    """The records of a tartci pool-log (`events.jsonl` and its rotated
+    `events.jsonl.1`), oldest first, each with its time parsed as `_at`."""
+    records: dict[tuple[str, str], dict[str, Any]] = {}
+    for path in paths:
+        with open(path, encoding="utf-8") as handle:
+            for number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                    at = parse_time(record.get("at"))
+                except (json.JSONDecodeError, ValueError, AttributeError) as error:
+                    raise RuntimeError(f"{path}:{number}: not a pool-log record ({error})") from None
+                if at is None:
+                    raise RuntimeError(f"{path}:{number}: a pool-log record needs `at`")
+                records[(record["at"], json.dumps(record, sort_keys=True))] = {**record, "_at": at}
+    return sorted(records.values(), key=lambda record: record["_at"])
+
+
+def replay_pool_log(alias: str, records: list[dict[str, Any]],
+                    gap: timedelta = timedelta(hours=2)) -> tuple[list[dict[str, Any]], int]:
+    """Host events from a pool-log, each stamped when its condition began.
+
+    Each record is classified as the live `hosts` reader classifies a status
+    (an `error` record as an unreadable status). An event is emitted when its
+    condition first holds and again only after it cleared, so a condition the
+    log re-states every heartbeat fires once, as the watcher would. Returns the
+    events and how many gaps longer than `gap` the log has (the agent was down
+    then, so nothing is known about that time).
+    """
+    events: list[dict[str, Any]] = []
+    holding: set[str] = set()
+    gaps = 0
+    previous: datetime | None = None
+    for record in records:
+        at = record["_at"]
+        if previous is not None and at - previous > gap:
+            gaps += 1
+        previous = at
+        if "error" in record:
+            now = [event(
+                "host_unreachable", f"host_unreachable:{alias}:pool-log", at,
+                f"{alias}: tartci pool status could not be read ({str(record['error'])[:160]})",
+                {
+                    "what": f"gate host {alias}", "evidence": f"{alias} pool-log record at {record['at']}",
+                    "cause": "unreadable",
+                    "command": f"ssh {alias} '~/.local/bin/tartci pool status'  # read the error",
+                    "safe_to_auto_apply": False,
+                    "verify": f"ssh {alias} '~/.local/bin/tartci pool status --json' prints JSON",
+                },
+                host=alias,
+            )]
+        else:
+            status = {
+                "host": record.get("host"),
+                "state": record.get("state"),
+                "participating": record.get("participating"),
+                "fleet": {"config": {section: {"problem": text} for section, text
+                                     in (record.get("problems") or {}).items()}},
+            }
+            now = classify_pool(alias, status, at)
+        keys = {item["key"] for item in now}
+        events.extend(item for item in now if item["key"] not in holding)
+        holding = keys
+    return events, gaps
+
+
 # ---------------------------------------------------------------------------
 # Gate serving, from GitHub jobs
 # ---------------------------------------------------------------------------
@@ -427,8 +495,11 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="reader", required=True)
     sub.add_parser("cmux", help="Codex tab states from cmux (read-only)")
     hosts = sub.add_parser("hosts", help="tartci pool status from each gate host (read-only)")
-    hosts.add_argument("--host", action="append", required=True,
+    hosts.add_argument("--host", action="append",
                        help="ssh alias, or `local` for this host; repeatable")
+    hosts.add_argument("--replay-log", action="append", metavar="ALIAS=PATH",
+                       help="replay a tartci pool-log (events.jsonl, and events.jsonl.1 by "
+                            "repeating the alias) instead of reading hosts live; repeatable")
     serving = sub.add_parser("gate-serving", help="gate hosts absent while gate jobs waited")
     serving.add_argument("--repo", default="Generous-Corp/pulp")
     serving.add_argument("--workflow", default="build.yml")
@@ -446,7 +517,26 @@ def main(argv: list[str]) -> int:
     try:
         if args.reader == "cmux":
             emit(read_cmux(run, at))
+        elif args.reader == "hosts" and args.replay_log:
+            if args.host:
+                parser.error("--host reads live; --replay-log replays; give one")
+            logs: dict[str, list[str]] = {}
+            for item in args.replay_log:
+                alias, sep, path = item.partition("=")
+                if not sep or not alias or not path:
+                    parser.error(f"--replay-log wants ALIAS=PATH, got {item!r}")
+                logs.setdefault(alias, []).append(path)
+            out = []
+            for alias, paths in sorted(logs.items()):
+                replayed, gaps = replay_pool_log(alias, read_pool_log(paths))
+                out.extend(replayed)
+                sys.stderr.write(f"watch_inputs: {alias}: {len(replayed)} event(s) from "
+                                 f"{len(paths)} log file(s); {gaps} gap(s) over 2 h, when the "
+                                 "pool-log agent was down\n")
+            emit(sorted(out, key=lambda item: item["at"]))
         elif args.reader == "hosts":
+            if not args.host:
+                parser.error("hosts needs --host (live) or --replay-log")
             emit(read_hosts(run, args.host, at))
         else:
             wait = timedelta(minutes=args.wait_minutes)

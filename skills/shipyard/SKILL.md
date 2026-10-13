@@ -760,6 +760,9 @@ request's whole trail before emitting a trail-dependent event.
 `scripts/watch_inputs.py` (`cmux`, `hosts`, `gate-serving`) supplies its
 `--input-events` for Codex tab states and gate-host serving; every line carries
 a `fix` object (what, evidence, cause, command, safe_to_auto_apply, verify).
+`hosts --replay-log ALIAS=PATH` replays a tartci pool-log (`tartci pool log`)
+as host events stamped when each condition began, for scoring the host reader
+against a past window; live `pool status` keeps no history.
 
 `shipyard pr-watch liveness` exits 1 when this scanning host's last completed
 pass is older than `[pr_watch] stale_after_minutes` (45); `doctor --fleet` asks

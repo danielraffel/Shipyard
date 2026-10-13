@@ -472,6 +472,22 @@ no history to replay. `gate-serving` reads GitHub through the App-authenticated
 `~/.local/bin/ghapp`, never a `gh` found on `PATH`; `WATCH_INPUTS_GH` names
 another pinned binary.
 
+`tartci pool status` keeps no history, so the `hosts` reader replays a host's
+tartci pool-log instead (the `pool-log` support agent writes one record to
+`~/.tartci/state/pool-log/events.jsonl` on each change and an hourly
+heartbeat):
+
+```sh
+python3 scripts/watch_inputs.py hosts \
+  --replay-log m1=events.jsonl.1 --replay-log m1=events.jsonl > host-events.jsonl
+```
+
+Each record is classified as the live reader classifies a status, and an event
+is emitted when its condition begins and again only after it cleared, so a
+condition the log re-states every heartbeat fires once. Stderr counts the gaps
+over 2 h, when the agent was down. Score the result with
+`rules_watch_score.py --events` against turns labelled over the same days.
+
 `shipyard pr-watch rules-replay --since 2d --until <RFC 3339> --tick 5m`
 runs the same rules over a past window: it records what held at the window
 start, then stamps each later event with the first tick it held.
