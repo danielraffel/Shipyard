@@ -1535,10 +1535,22 @@ scorecard read (a red required check on a merged pull request's commit, a
 merge-group gate that did not pass, a queue removal other than `merged`), with
 `<FILE>.receipt.json` holding the row count and the file's SHA-256. Label a
 row no sooner than its `label_not_before`. A red case with a job also gets
-`cause` (class, signature, confidence, failing step and tests, `diagnose`'s
-class and rule, `named_at`) and `evidence` (the decisive log lines), read
-through `diagnose::build`; a job whose log GitHub no longer holds is still
-diagnosed from its payload. `--causes` reads the same causes without
+`cause`, its `ci.cause/v1` record, and `evidence` (the record's excerpt).
+The record is EXP-A3's `to_ci_cause_v1` mapping of C2's first record:
+`repo`, `run_id`, `attempt`, `job_id`, `job`, `head_sha`, `event`, `pr`,
+`failed_step`, `failure_class`, `format`, `signature`, `detail`, `evidence`
+(`log_line`, `excerpt`), `fix_hint`, `confidence`, `source`, `extractor`,
+`named_at`, `supersedes`, plus C2's `kind`, `location` and `step_failed` and
+`retrospective`. C2 (`src/diagnose/c2.rs`) is a port of EXP-A3's
+`c2_extract.py`; the fixture set in `tests/fixtures/c2/` is shared verbatim
+and is the contract, so a rule change lands in both with its fixture.
+Records from the step that ended in `##[error]` come first, so a retried
+assertion never outranks the runner dying. A cause is named when its class is
+not `unknown` and its confidence is `high` or `medium`. `diagnose` adds only
+GitHub's own record (a runner that never came, a supersede, a timeout) when
+the log names nothing more certain; a log with no recognized line still gets
+a `shell-exit` record, so the miss is counted. A job whose
+log GitHub no longer holds is still judged from its payload. `--causes` reads the same causes without
 exporting and adds "named causes: N/M red cases" with the time to them.
 Each uncached red job costs two API calls, so at most `--causes-max-jobs`
 (default 200) are fetched per run, newest first; cached jobs are free. The

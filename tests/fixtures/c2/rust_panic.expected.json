@@ -1,0 +1,20 @@
+[
+ {
+  "format": "rust_panic",
+  "kind": "panic",
+  "subject": "merge::tests::queue_order_is_stable",
+  "message": "assertion `left == right` failed: batch order changed",
+  "location": "queue.rs:214",
+  "line": 5,
+  "step_failed": true
+ },
+ {
+  "format": "rust_panic",
+  "kind": "panic",
+  "subject": "steward::tests::rearm_after_rebase",
+  "message": "called `Option::unwrap()` on a `None` value",
+  "location": "steward.rs:77",
+  "line": 10,
+  "step_failed": true
+ }
+]

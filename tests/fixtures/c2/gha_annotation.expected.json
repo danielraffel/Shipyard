@@ -1,0 +1,29 @@
+[
+ {
+  "format": "infra",
+  "kind": "infra",
+  "subject": "runner shutdown signal",
+  "message": "The runner has received a shutdown signal. This can happen when the runner service is stopped, or a manually started runner is canceled.",
+  "location": "",
+  "line": 3,
+  "step_failed": true
+ },
+ {
+  "format": "gha_annotation",
+  "kind": "annotation",
+  "subject": "error",
+  "message": "Unable to resolve action `actions/upload-artifact@v9`, unable to find version `v9`",
+  "location": "",
+  "line": 2,
+  "step_failed": true
+ },
+ {
+  "format": "shell_exit",
+  "kind": "exit_code",
+  "subject": "actions/upload-artifact@v9",
+  "message": "exit code 143",
+  "location": "",
+  "line": 4,
+  "step_failed": true
+ }
+]

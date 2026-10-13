@@ -1,0 +1,29 @@
+[
+ {
+  "format": "pulp_affected",
+  "kind": "test_failure",
+  "subject": "wide-non-native-selftest",
+  "message": "it is a test this diff reaches, and it would fail the merge group too",
+  "location": "",
+  "line": 3,
+  "step_failed": true
+ },
+ {
+  "format": "ctest_inline",
+  "kind": "test_failure",
+  "subject": "wide-non-native-selftest",
+  "message": "Failed <dur>",
+  "location": "",
+  "line": 2,
+  "step_failed": true
+ },
+ {
+  "format": "shell_exit",
+  "kind": "exit_code",
+  "subject": "tools/ci/pr_fast_tier.sh",
+  "message": "exit code 1: 1/1 Test #9113: wide-non-native-selftest ...........***Failed <dur>",
+  "location": "",
+  "line": 4,
+  "step_failed": true
+ }
+]

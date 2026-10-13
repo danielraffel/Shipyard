@@ -95,8 +95,9 @@ pub struct Case {
     /// The decisive lines of the case's job log, when its cause was read
     /// (`--causes` or `--export-cases`); else `null` and named in `unread`.
     pub evidence: Option<String>,
-    /// The cause read from the case's job log, when it was read.
-    pub cause: Option<super::causes::CaseCause>,
+    /// The case's `ci.cause/v1` record, read from its job log, when it was
+    /// read.
+    pub cause: Option<crate::diagnose::cause::CiCause>,
     /// What a rule would have decided: not read in v1.
     pub rule_verdict: Option<String>,
     /// Why a run was cancelled: not read in v1.

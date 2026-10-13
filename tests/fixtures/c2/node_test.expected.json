@@ -1,0 +1,20 @@
+[
+ {
+  "format": "node_test",
+  "kind": "test_failure",
+  "subject": "lowers grid gaps into DesignIR",
+  "message": "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:",
+  "location": "",
+  "line": 2,
+  "step_failed": true
+ },
+ {
+  "format": "node_test",
+  "kind": "test_failure",
+  "subject": "materialized runtime keeps the root id",
+  "message": "root id changed",
+  "location": "",
+  "line": 5,
+  "step_failed": true
+ }
+]

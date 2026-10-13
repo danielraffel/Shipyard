@@ -1,0 +1,20 @@
+[
+ {
+  "format": "pytest",
+  "kind": "test_failure",
+  "subject": "test_runner_topology_check.py::test_m5_slot_count",
+  "message": "AssertionError: assert 3 == 2",
+  "location": "test_runner_topology_check.py",
+  "line": 2,
+  "step_failed": true
+ },
+ {
+  "format": "pytest",
+  "kind": "test_failure",
+  "subject": "test_pr_flow_audit.py",
+  "message": "ERROR",
+  "location": "test_pr_flow_audit.py",
+  "line": 3,
+  "step_failed": true
+ }
+]

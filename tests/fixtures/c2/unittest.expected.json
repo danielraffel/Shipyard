@@ -1,0 +1,20 @@
+[
+ {
+  "format": "unittest",
+  "kind": "test_failure",
+  "subject": "__main__.HeaderNameDrift.test_committed_lists_match_the_checkout",
+  "message": "AssertionError: Lists differ: ['a.hpp'] != ['b.hpp']",
+  "location": "",
+  "line": 2,
+  "step_failed": true
+ },
+ {
+  "format": "python_traceback",
+  "kind": "assertion",
+  "subject": "AssertionError",
+  "message": "AssertionError: Lists differ: ['a.hpp'] != ['b.hpp']",
+  "location": "test_consumption_census.py:124",
+  "line": 7,
+  "step_failed": true
+ }
+]

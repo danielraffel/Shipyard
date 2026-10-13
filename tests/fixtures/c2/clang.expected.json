@@ -1,0 +1,11 @@
+[
+ {
+  "format": "clang",
+  "kind": "compile_error",
+  "subject": "widgets.cpp",
+  "message": "no member named 'set_sprite' in 'pulp::view::Knob'",
+  "location": "widgets.cpp:2207",
+  "line": 2,
+  "step_failed": true
+ }
+]

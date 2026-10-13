@@ -1,0 +1,20 @@
+[
+ {
+  "format": "rust_compile",
+  "kind": "compile_error",
+  "subject": "E0308",
+  "message": "mismatched types",
+  "location": "ship_state.rs:88",
+  "line": 2,
+  "step_failed": true
+ },
+ {
+  "format": "cargo_build",
+  "kind": "compile_error",
+  "subject": "shipyard",
+  "message": "lib",
+  "location": "",
+  "line": 8,
+  "step_failed": true
+ }
+]
