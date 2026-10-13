@@ -66,13 +66,12 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
         with:
-          save-if: ${{ runner.os != 'macOS' }}
+          toolchain: stable
 
+      # No cargo cache: this dispatch-only smoke builds the release profile,
+      # which main never caches, so a restore could not hit.
       - name: Build release binaries
         run: cargo build --release --locked --bin shipyard --bin shipyard-workstream-provider
 

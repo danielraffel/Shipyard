@@ -99,13 +99,13 @@ jobs:
           esac
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
         with:
-          save-if: ${{ runner.os != 'macOS' }}
+          toolchain: stable
 
+      # No cargo cache: release binaries build from a clean target/, and a tag
+      # ref can only restore its own or main's entries, neither of which holds
+      # a release-profile build, so the cache never hit and only filled quota.
       - name: Build release binaries
         run: cargo build --release --locked --bin shipyard --bin shipyard-workstream-provider
 
@@ -242,7 +242,7 @@ jobs:
             release/shipyard-workstream-provider-windows-*.exe
 
       - name: Create draft GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: release/*
           generate_release_notes: true
@@ -256,13 +256,13 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
         with:
-          save-if: ${{ runner.os != 'macOS' }}
+          toolchain: stable
 
+      # No cargo cache: release binaries build from a clean target/, and a tag
+      # ref can only restore its own or main's entries, neither of which holds
+      # a release-profile build, so the cache never hit and only filled quota.
       - name: Import Developer ID signing identity
         env:
           SIGN_P12_B64: ${{ secrets.MACOS_SIGN_P12_BASE64 }}
