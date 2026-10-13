@@ -252,6 +252,16 @@ def read_cmux(runner: Runner, at: datetime) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+NUMBER = re.compile(r"\d+(?:\.\d+)?")
+
+
+def problem_key(problem: str) -> str:
+    """A problem's identity: its text with the numbers left out, so a stale
+    tool's "24.8 h behind" that counts up every pass stays one condition, live
+    and in a replayed pool-log alike (tartci's pool-log dedupes the same way)."""
+    return digest(NUMBER.sub("#", problem))
+
+
 def classify_pool(alias: str, status: dict[str, Any], at: datetime) -> list[dict[str, Any]]:
     host = status.get("host") or alias
     inspect = ("~/.local/bin/tartci pool status" if alias == "local"
@@ -278,7 +288,7 @@ def classify_pool(alias: str, status: dict[str, Any], at: datetime) -> list[dict
             continue
         first = str(problem).splitlines()[0]
         events.append(event(
-            "host_problem", f"host_problem:{alias}:{section_name}:{digest(str(problem))}", at,
+            "host_problem", f"host_problem:{alias}:{section_name}:{problem_key(str(problem))}", at,
             f"{alias} ({host}) {section_name}: {first[:200]}",
             {
                 "what": f"{section_name} on {alias}", "evidence": inspect,

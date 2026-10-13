@@ -236,6 +236,31 @@ class PoolLogReplay(unittest.TestCase):
             self.assertFalse(item["fix"]["safe_to_auto_apply"])
         self.assertIn("tool_freshness", events[0]["summary"])
 
+    def test_a_problem_whose_hour_count_drifts_is_one_condition(self) -> None:
+        records = [pool_record(index * 5, tool_freshness=f"pulp {24.8 + index * 0.1:.1f} h behind")
+                   for index in range(12)]
+        events, _ = self.replay(records)
+        self.assertEqual(kinds(events), ["host_problem"], "one condition, not twelve")
+        # Live passes key the same condition the same way, so the ledger dedupes it too.
+        live = [inputs.classify_pool("m1", {"state": "on", "participating": True, "fleet": {
+            "config": {"tool_freshness": {"problem": f"pulp {hours} h behind"}}}}, AT)[0]["key"]
+            for hours in ("24.8", "25.9")]
+        self.assertEqual(live[0], live[1])
+        self.assertEqual(live[0], events[0]["key"])
+        # Control: other words are another condition.
+        other = inputs.classify_pool("m1", {"state": "on", "participating": True, "fleet": {
+            "config": {"tool_freshness": {"problem": "vellum 24.8 h behind"}}}}, AT)[0]["key"]
+        self.assertNotEqual(other, live[0])
+
+    def test_duplicate_lines_are_read_once(self) -> None:
+        line = json.dumps(pool_record(10, gate_reserve="low")) + "\n"
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = pathlib.Path(directory) / "a.jsonl", pathlib.Path(directory) / "b.jsonl"
+            first.write_text(json.dumps(pool_record(0)) + "\n" + line + line)
+            second.write_text(line)
+            records = inputs.read_pool_log([str(first), str(second)])
+        self.assertEqual([record["at"][11:16] for record in records], ["02:00", "02:10"])
+
     def test_the_cli_replays_both_rotated_files_in_time_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
