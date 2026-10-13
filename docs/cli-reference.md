@@ -5,6 +5,10 @@
 shipyard init                  # configure project
 shipyard doctor                # check environment + suggest fixes
 shipyard doctor --rate-limit   # show effective GitHub auth + REST/GraphQL buckets
+                               # also: "Git checkouts" reports a cherry-pick, merge, revert, rebase,
+                               #   am or unmerged index left in progress over 1 h in a primary checkout
+                               #   (this repo's, its pulp/Shipyard/tartci/vellum siblings, doctor.git_checkouts)
+                               #   with the backup-then-abort commands; it never aborts anything
 shipyard auth doctor           # show Shipyard's configured GitHub auth source
 shipyard doctor --rate-limit --repo OWNER/REPO  # resolve auth for an exact repo
 shipyard auth doctor --repo OWNER/REPO          # same override, auth-only

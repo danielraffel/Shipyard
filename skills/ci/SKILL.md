@@ -828,6 +828,7 @@ writer custody before mutation.
 | Proceed with unreachable lanes (VALIDATION GAP) | `shipyard run --allow-unreachable-targets` (prints a loud warning; exits 3 without the flag) |
 | Inspect tracked cloud runs | `shipyard cloud status --json` |
 | Environment check | `shipyard doctor --json` |
+| A primary checkout stuck mid cherry-pick / merge / revert / rebase / am, or with a conflicted index, for over an hour | `shipyard doctor` ("Git checkouts": this repo's primary, its pulp/Shipyard/tartci/vellum siblings, `doctor.git_checkouts`). Run its backup commands, then its abort command, and only if nobody is still finishing the operation; doctor itself never aborts |
 | Probe SSH runner reachability | `shipyard doctor --runners --json` |
 | Inspect GitHub REST + GraphQL rate-limit buckets (both separately) | `shipyard doctor --rate-limit --json` (`--repo OWNER/REPO` when remotes are ambiguous) |
 | Inspect effective GitHub auth only | `shipyard auth doctor --json` (`--repo OWNER/REPO` when remotes are ambiguous) |

@@ -52,6 +52,23 @@ pub(super) fn doctor<W: Write>(
     ) {
         report.checks.insert("ghapp guards".to_owned(), section);
     }
+    {
+        let config = LoadedConfig::load_from_cwd(mode, cwd).ok();
+        let checkouts = crate::doctor::stuck_git::checkouts(
+            cwd,
+            &crate::doctor::stuck_git::configured_checkouts(config.as_ref()),
+            &crate::paths::home_dir(),
+        );
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        report.checks.insert(
+            "Git checkouts".to_owned(),
+            crate::doctor::stuck_git::doctor_section(
+                &checkouts,
+                std::time::SystemTime::now(),
+                &stamp,
+            ),
+        );
+    }
     if rate_limit {
         let entries = collect_rate_limit_section(mode, cwd, repo);
         report
