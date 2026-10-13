@@ -7,39 +7,51 @@
 //! should have caught. Nothing here changes what runs.
 //!
 //! - **failure**: a merge-group run created in the week whose final gate
-//!   attempt failed, and the tests in that attempt's log under "The
-//!   following tests FAILED". A failed gate with no such block (a build
-//!   break, a crash) is counted apart.
+//!   attempt failed (`failure` or `timed_out`; a cancelled gate is not a
+//!   failure), and the tests in that attempt's log under "The following
+//!   tests FAILED". A failed gate with no such block (a build break, a
+//!   crash) is counted apart.
 //! - **group**: the pull request the queue branch names, and every entry
 //!   ahead of it. A queue branch `gh-readonly-queue/<base>/pr-<n>-<sha>` is
 //!   built on `<sha>`, which is either the base branch or the head of the
-//!   entry ahead; it is the base once that entry's pull request had merged
-//!   as exactly that commit before the run was created.
+//!   entry ahead. The walk stops at an entry whose pull request had merged
+//!   as exactly that commit before the run was created, or at a commit no
+//!   merge-group run was built for, once GitHub confirms it is on the base
+//!   branch; a commit that is neither is an unread group.
 //! - **pull-request head**: the second parent of the entry's queue merge
 //!   commit, and its gate job in every [`HEAD_EVENTS`] run of the workflow
-//!   on that commit.
-//! - **selected**: some pull-request head in the group ran the test in a
-//!   selection step (whatever its outcome there: a test that passed on its
-//!   head and failed in the group was selected, and failed for another
-//!   reason). **missed**: every head was read and none ran it.
-//!   **undetermined**: no head ran it and at least one could not be read.
-//!   **recall** = selected / (selected + missed).
+//!   on that commit created before the merge-group run (a run started after
+//!   the group failed, to diagnose it, is not what the head ran).
+//! - Each head, for each failing test: `ran` it in a selection step;
+//!   `ran_outside` it in another step of the gate job only (Pulp's
+//!   non-gating full suite), with its outcome; `not_selected`; `no_selection`
+//!   when no selection step ran on the head at all (a stand-in job for a
+//!   change that needs no build); or `unread`.
+//! - Each case: **selected** when some head ran the test in a selection step
+//!   (whatever its outcome there); **ran outside** when none did but some
+//!   head ran it in another step, and **failed on the head** when it failed
+//!   there, a signal the head's check ignored; **missed** when every head was
+//!   read, selected, and none ran it; otherwise **undetermined**.
+//! - **recall** = selected / (selected + ran outside + missed), and
+//!   **recall anywhere** = (selected + ran outside) / the same.
 //!
 //! Logs are read only for failed merge-group gates and the heads of their
 //! groups. What a completed job's log yields is cached, never the log.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-use super::super::ctest_log::{self, JobLog};
+use super::super::ctest_log::{self, CtestResult, JobLog};
 use super::super::{
     MERGE_GROUP_EVENT, ReadCache, RunRef, SyncGhReader, collect_counted, parallel_map, read_json,
     read_pages, read_run_jobs, round2, strings, text, timestamp,
 };
-use super::{MergeGroupRun, ScorecardQuery, queue_branch_pr};
+use super::{MergeGroupRun, ScorecardQuery, opt, queue_branch_pr};
 
 /// Events of the runs on a pull-request head. Checks of a pull request
 /// opened by an App are dispatched (`workflow_dispatch`), and their gate
@@ -49,7 +61,7 @@ pub const HEAD_EVENTS: [&str; 2] = ["pull_request", "workflow_dispatch"];
 /// Longest chain of queue entries walked for one group.
 const MAX_GROUP: usize = 20;
 /// Cache key version: bump when an extract's shape or meaning changes.
-const EXTRACT_VERSION: u32 = 1;
+const EXTRACT_VERSION: u32 = 2;
 
 /// One test a merge-group gate failed on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +85,9 @@ pub struct JobSelection {
     /// Test results the job's other steps printed (a full suite run as
     /// evidence, say). They are not the selection.
     pub ran_outside: usize,
+    /// Of the tests asked about, those other steps ran, with a failing
+    /// outcome when any of their runs failed and the last one otherwise.
+    pub outside: BTreeMap<String, String>,
     /// Whether any selection step ran in the job; a job that has none (a
     /// stand-in for a change that needs no build, say) selected nothing.
     pub selection_ran: bool,
@@ -80,19 +95,22 @@ pub struct JobSelection {
     pub missing_sections: Vec<String>,
 }
 
-/// One pull-request head's selection, over every gate attempt on it.
+/// One run on a pull-request head, over its gate attempts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadRun {
+    /// Run id.
+    pub id: u64,
+    /// Run creation.
+    pub created_at: Option<DateTime<Utc>>,
+    /// What its gate attempts ran.
+    pub selection: JobSelection,
+}
+
+/// One pull-request head's runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeadEvidence {
-    /// The head's gate attempts were read.
-    Read {
-        /// Runs on the head commit ([`HEAD_EVENTS`]).
-        runs: Vec<u64>,
-        /// Whether a selection step ran in any gate attempt; when none did,
-        /// nothing was selected.
-        selection_ran: bool,
-        /// The union of what the attempts ran.
-        selection: JobSelection,
-    },
+    /// Its [`HEAD_EVENTS`] runs were read.
+    Read(Vec<HeadRun>),
     /// Why it could not be read.
     Unread(String),
 }
@@ -115,7 +133,7 @@ pub struct GroupMember {
 pub struct GroupFailure {
     /// Run id.
     pub run_id: u64,
-    /// Run creation; decides the week.
+    /// Run creation; decides the week and bounds the heads' runs.
     pub created_at: DateTime<Utc>,
     /// The tests it failed on, or why the log could not be read.
     pub failed: Result<Vec<FailedTest>, String>,
@@ -130,9 +148,9 @@ pub struct MemberStatus {
     pub pr: Option<u64>,
     /// Its head commit.
     pub head_sha: Option<String>,
-    /// Runs read for it ([`HEAD_EVENTS`]).
+    /// Runs counted for it: created before the merge-group run.
     pub runs: Vec<u64>,
-    /// `ran`, `not_selected` or `unread`.
+    /// `ran`, `ran_outside`, `not_selected`, `no_selection` or `unread`.
     pub status: &'static str,
     /// The test's outcome on the head, when it ran there.
     pub outcome: Option<String>,
@@ -161,8 +179,10 @@ pub struct RecallCase {
     pub test: String,
     /// `CTest`'s result for it.
     pub result: String,
-    /// `selected`, `missed` or `undetermined`.
+    /// `selected`, `ran_outside`, `missed` or `undetermined`.
     pub verdict: &'static str,
+    /// A head ran the test outside its selection and it failed there.
+    pub failed_on_head: bool,
     /// Failed merge-group gates in the week that list the same test; more
     /// than one suggests the base branch, not one group, was red.
     pub failed_gates_with_test: usize,
@@ -185,14 +205,25 @@ pub struct SelectionRecall {
     pub runs_unread: usize,
     /// (run, failing test) pairs.
     pub test_failures: usize,
-    /// Pairs whose test a head in the group ran.
+    /// Pairs whose test a head in the group ran in a selection step.
     pub selected: usize,
-    /// Pairs whose test no head in the group ran, every head read.
+    /// Pairs no head selected but some head ran in another step.
+    pub ran_outside: usize,
+    /// Of those, pairs whose test failed on a head that ran it there: a
+    /// failure the head's check did not act on.
+    pub failed_on_head_ignored: usize,
+    /// Pairs whose test no head in the group ran, every head read and
+    /// selected.
     pub missed: usize,
-    /// Pairs no head ran with at least one head unread.
+    /// Pairs no head ran, with a head unread or one that selected nothing,
+    /// or a group that could not be read.
     pub undetermined: usize,
-    /// `selected / (selected + missed)`.
+    /// Of those, pairs with a head on which no selection step ran.
+    pub undetermined_no_selection: usize,
+    /// `selected / (selected + ran_outside + missed)`.
     pub recall: Option<f64>,
+    /// `(selected + ran_outside) / (selected + ran_outside + missed)`.
+    pub recall_anywhere: Option<f64>,
     /// Every pair, in run order.
     pub cases: Vec<RecallCase>,
 }
@@ -243,22 +274,32 @@ pub fn gather(
         };
         (*run, failed, entries)
     });
-    // A pull request sits in many groups; read each head once.
-    let heads: Vec<String> = groups
+    // A pull request sits in many groups; read each head once, asking
+    // about every test any of its groups failed on.
+    let mut asked: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (_, failed, entries) in &groups {
+        let (Ok(tests), Ok(entries)) = (failed, entries) else {
+            continue;
+        };
+        for head in entries
+            .iter()
+            .filter_map(|entry| entry.head_sha.as_ref().ok())
+        {
+            asked
+                .entry(head.clone())
+                .or_default()
+                .extend(tests.iter().map(|test| test.name.clone()));
+        }
+    }
+    let heads: Vec<(&String, &BTreeSet<String>)> = asked
         .iter()
-        .filter_map(|(_, failed, entries)| {
-            failed.as_ref().ok().filter(|tests| !tests.is_empty())?;
-            entries.as_ref().ok()
-        })
-        .flatten()
-        .filter_map(|entry| entry.head_sha.clone().ok())
-        .collect::<BTreeSet<String>>()
-        .into_iter()
+        .filter(|(_, tests)| !tests.is_empty())
         .collect();
     let evidence: BTreeMap<&String, HeadEvidence> = heads
         .iter()
-        .zip(parallel_map(&heads, |head| {
-            head_evidence(gh, cache, query, head)
+        .map(|(head, _)| *head)
+        .zip(parallel_map(&heads, |(head, tests)| {
+            read_head(gh, cache, query, head, tests).unwrap_or_else(HeadEvidence::Unread)
         }))
         .collect();
     groups
@@ -351,7 +392,17 @@ fn group(
             Some(run) => Some((*run).clone()),
             None => merge_group_run_on(gh, query, &base)?,
         };
-        let Some(ahead) = ahead else { break };
+        let Some(ahead) = ahead else {
+            // No merge group was built for it, so it should be the base
+            // branch itself; confirm rather than assume.
+            if on_base_branch(gh, cache, query, &base)? {
+                break;
+            }
+            return Err(format!(
+                "{base} has no merge-group run and is not on {}",
+                query.base_branch
+            ));
+        };
         let pr = text(&ahead, "head_branch")
             .as_deref()
             .and_then(queue_branch_pr)
@@ -410,6 +461,37 @@ fn merge_group_run_on(
         &format!("merge-group runs on {sha}"),
     )?;
     Ok(runs.into_iter().next())
+}
+
+/// Whether `sha` is on the base branch: the branch is at it or ahead of it.
+/// Once true it stays true, so only that answer is cached.
+fn on_base_branch(
+    gh: &SyncGhReader<'_>,
+    cache: &ReadCache,
+    query: &ScorecardQuery,
+    sha: &str,
+) -> Result<bool, String> {
+    let key = format!("on-base-branch:{}:{}:{sha}", query.repo, query.base_branch);
+    if cache.get(&key).is_some() {
+        return Ok(true);
+    }
+    let compare = read_json(
+        gh,
+        &strings(&[
+            "api",
+            "-X",
+            "GET",
+            &format!("repos/{}/compare/{sha}...{}", query.repo, query.base_branch),
+            "-f",
+            "per_page=1",
+        ]),
+    )?;
+    let status = text(&compare, "status").ok_or_else(|| format!("compare of {sha}: no status"))?;
+    let on = matches!(status.as_str(), "ahead" | "identical");
+    if on {
+        cache.put(&key, &Value::Bool(true));
+    }
+    Ok(on)
 }
 
 /// Whether pull request `pr` had merged as exactly `sha` by `at`: then `sha`
@@ -484,23 +566,14 @@ fn pr_head(
     }
 }
 
-fn head_evidence(
-    gh: &SyncGhReader<'_>,
-    cache: &ReadCache,
-    query: &ScorecardQuery,
-    head: &str,
-) -> HeadEvidence {
-    match read_head(gh, cache, query, head) {
-        Ok(evidence) => evidence,
-        Err(error) => HeadEvidence::Unread(error),
-    }
-}
-
+/// Every [`HEAD_EVENTS`] run on `head`, with what its gate attempts ran
+/// and, of `tests`, what their other steps ran.
 fn read_head(
     gh: &SyncGhReader<'_>,
     cache: &ReadCache,
     query: &ScorecardQuery,
     head: &str,
+    tests: &BTreeSet<String>,
 ) -> Result<HeadEvidence, String> {
     let pages = read_pages(
         gh,
@@ -520,14 +593,11 @@ fn read_head(
             query.workflow
         ));
     }
-    let mut run_ids = Vec::new();
-    let mut selection_ran = false;
-    let mut union = JobSelection::default();
+    let mut read = Vec::new();
     for run in &runs {
         let Some(id) = run.get("id").and_then(Value::as_u64) else {
             continue;
         };
-        run_ids.push(id);
         let jobs = read_run_jobs(
             gh,
             cache,
@@ -538,14 +608,12 @@ fn read_head(
                 completed: text(run, "status").as_deref() == Some("completed"),
             },
         )?;
-        for job in jobs
-            .iter()
-            .filter(|job| text(job, "name").as_deref() == Some(query.gate_job.as_str()))
-        {
-            if text(job, "conclusion").as_deref() == Some("skipped") {
-                continue;
-            }
-            let selection = job_selection(gh, cache, query, job)?;
+        let mut union = JobSelection::default();
+        for job in jobs.iter().filter(|job| {
+            text(job, "name").as_deref() == Some(query.gate_job.as_str())
+                && text(job, "conclusion").as_deref() != Some("skipped")
+        }) {
+            let selection = job_selection(gh, cache, query, job, tests)?;
             if !selection.missing_sections.is_empty() {
                 return Err(format!(
                     "job {}: selection step(s) {} ran but their log section was not found",
@@ -553,16 +621,16 @@ fn read_head(
                     selection.missing_sections.join(", ")
                 ));
             }
-            selection_ran |= selection.selection_ran;
             merge_selection(&mut union, selection);
         }
+        read.push(HeadRun {
+            id,
+            created_at: timestamp(run, "created_at"),
+            selection: union,
+        });
     }
-    run_ids.sort_unstable();
-    Ok(HeadEvidence::Read {
-        runs: run_ids,
-        selection_ran,
-        selection: union,
-    })
+    read.sort_by_key(|run| run.id);
+    Ok(HeadEvidence::Read(read))
 }
 
 fn add(total: Option<u64>, more: Option<u64>) -> Option<u64> {
@@ -572,22 +640,46 @@ fn add(total: Option<u64>, more: Option<u64>) -> Option<u64> {
     }
 }
 
+/// Keep a failing outcome over a passing one.
+fn record(outcomes: &mut BTreeMap<String, String>, name: &str, outcome: &str, failed: bool) {
+    let keep_old = outcomes
+        .get(name)
+        .is_some_and(|old| outcome_failed(old) && !failed);
+    if !keep_old {
+        outcomes.insert(name.to_owned(), outcome.to_owned());
+    }
+}
+
+fn outcome_failed(outcome: &str) -> bool {
+    CtestResult {
+        name: String::new(),
+        outcome: outcome.to_owned(),
+        retry: false,
+    }
+    .failed()
+}
+
 fn merge_selection(union: &mut JobSelection, selection: JobSelection) {
     union.ran.extend(selection.ran);
+    for (name, outcome) in &selection.outside {
+        record(&mut union.outside, name, outcome, outcome_failed(outcome));
+    }
     union.declared_selected = union.declared_selected.max(selection.declared_selected);
     union.declared_budget_skipped = union
         .declared_budget_skipped
         .max(selection.declared_budget_skipped);
     union.ran_outside = union.ran_outside.max(selection.ran_outside);
+    union.selection_ran |= selection.selection_ran;
 }
 
-/// What one gate job ran in its selection steps; cached once the job is
-/// complete.
+/// What one gate job ran in its selection steps, and of `tests` in its
+/// other steps; cached once the job is complete.
 fn job_selection(
     gh: &SyncGhReader<'_>,
     cache: &ReadCache,
     query: &ScorecardQuery,
     job: &Value,
+    tests: &BTreeSet<String>,
 ) -> Result<JobSelection, String> {
     let id = job
         .get("id")
@@ -600,10 +692,16 @@ fn job_selection(
         return Ok(JobSelection::default());
     }
     let completed = text(job, "status").as_deref() == Some("completed");
+    let mut digest = Sha256::new();
+    for name in tests {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+    }
     let key = format!(
-        "selection:v{EXTRACT_VERSION}:{}:{id}:{}",
+        "selection:v{EXTRACT_VERSION}:{}:{id}:{}:{:x}",
         query.repo,
-        query.selection_steps.join("\u{1f}")
+        query.selection_steps.join("\u{1f}"),
+        digest.finalize()
     );
     if completed
         && let Some(value) = cache.get(&key)
@@ -612,16 +710,22 @@ fn job_selection(
         return Ok(selection);
     }
     let text = read_log(gh, &query.repo, id)?;
-    let selection = selection_from_log(&text, job, &query.selection_steps);
+    let selection = selection_from_log(&text, job, &query.selection_steps, tests);
     if completed && let Ok(value) = serde_json::to_value(&selection) {
         cache.put(&key, &value);
     }
     Ok(selection)
 }
 
-/// What the selection steps of one job's log ran.
+/// What the selection steps of one job's log ran, and of `tests` what its
+/// other steps ran.
 #[must_use]
-pub fn selection_from_log(text: &str, job: &Value, wanted: &[String]) -> JobSelection {
+pub fn selection_from_log(
+    text: &str,
+    job: &Value,
+    wanted: &[String],
+    tests: &BTreeSet<String>,
+) -> JobSelection {
     let steps = ctest_log::job_steps(job);
     let log = JobLog::new(text);
     let (lines, found) = log.lines_of(&steps, wanted);
@@ -658,18 +762,25 @@ pub fn selection_from_log(text: &str, job: &Value, wanted: &[String]) -> JobSele
             notice.get("skipped_for_budget").and_then(Value::as_u64),
         );
     }
-    let ran_outside = ctest_log::results(&log.lines_outside(&steps, wanted)).len();
+    let others = ctest_log::results(&log.lines_outside(&steps, wanted));
+    let mut outside = BTreeMap::new();
+    for result in others.iter().filter(|result| tests.contains(&result.name)) {
+        record(&mut outside, &result.name, &result.outcome, result.failed());
+    }
     JobSelection {
         ran,
         declared_selected,
         declared_budget_skipped,
-        ran_outside,
+        ran_outside: others.len(),
+        outside,
         selection_ran,
         missing_sections,
     }
 }
 
-fn member_status(member: &GroupMember, test: &str) -> MemberStatus {
+/// One head's part in the case of `test`, counting only runs created before
+/// `before`.
+fn member_status(member: &GroupMember, test: &str, before: DateTime<Utc>) -> MemberStatus {
     let mut status = MemberStatus {
         pr: member.pr,
         head_sha: member.head_sha.clone(),
@@ -683,29 +794,68 @@ fn member_status(member: &GroupMember, test: &str) -> MemberStatus {
         declared_budget_skipped: None,
         ran_outside: None,
     };
-    match &member.evidence {
-        HeadEvidence::Unread(reason) => status.reason = Some(reason.clone()),
-        HeadEvidence::Read {
-            runs,
-            selection_ran,
-            selection,
-        } => {
-            status.runs.clone_from(runs);
-            status.selection_ran = Some(*selection_ran);
-            status.selection_size = Some(selection.ran.len());
-            status.declared_selected = selection.declared_selected;
-            status.declared_budget_skipped = selection.declared_budget_skipped;
-            status.ran_outside = Some(selection.ran_outside);
-            match selection.ran.get(test) {
-                Some(outcome) => {
-                    status.status = "ran";
-                    status.outcome = Some(outcome.clone());
-                }
-                None => status.status = "not_selected",
-            }
+    let runs = match &member.evidence {
+        HeadEvidence::Unread(reason) => {
+            status.reason = Some(reason.clone());
+            return status;
         }
+        HeadEvidence::Read(runs) => runs,
+    };
+    let mut union = JobSelection::default();
+    for run in runs
+        .iter()
+        .filter(|run| run.created_at.is_some_and(|at| at < before))
+    {
+        status.runs.push(run.id);
+        merge_selection(&mut union, run.selection.clone());
+    }
+    if status.runs.is_empty() {
+        status.reason = Some("no run on the head before the merge-group run".to_owned());
+        return status;
+    }
+    status.selection_ran = Some(union.selection_ran);
+    status.selection_size = Some(union.ran.len());
+    status.declared_selected = union.declared_selected;
+    status.declared_budget_skipped = union.declared_budget_skipped;
+    status.ran_outside = Some(union.ran_outside);
+    if let Some(outcome) = union.ran.get(test) {
+        status.status = "ran";
+        status.outcome = Some(outcome.clone());
+    } else if let Some(outcome) = union.outside.get(test) {
+        status.status = "ran_outside";
+        status.outcome = Some(outcome.clone());
+    } else if union.selection_ran {
+        status.status = "not_selected";
+    } else {
+        status.status = "no_selection";
     }
     status
+}
+
+/// A case's verdict from its heads, and whether a head that ran the test
+/// outside its selection failed it.
+fn verdict(members: &[MemberStatus], group_read: bool) -> (&'static str, bool) {
+    let failed_on_head = members.iter().any(|member| {
+        member.status == "ran_outside" && member.outcome.as_deref().is_some_and(outcome_failed)
+    });
+    let verdict = if members.iter().any(|member| member.status == "ran") {
+        "selected"
+    } else if members.iter().any(|member| member.status == "ran_outside") {
+        "ran_outside"
+    } else if group_read
+        && !members.is_empty()
+        && members.iter().all(|member| member.status == "not_selected")
+    {
+        "missed"
+    } else {
+        "undetermined"
+    };
+    (verdict, failed_on_head)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn share(numerator: usize, denominator: usize) -> Option<f64> {
+    (denominator > 0).then(|| round2(numerator as f64 / denominator as f64))
 }
 
 /// Score the failures of one week.
@@ -718,9 +868,13 @@ pub fn compute(repo: &str, failures: &[&GroupFailure]) -> SelectionRecall {
         runs_unread: 0,
         test_failures: 0,
         selected: 0,
+        ran_outside: 0,
+        failed_on_head_ignored: 0,
         missed: 0,
         undetermined: 0,
+        undetermined_no_selection: 0,
         recall: None,
+        recall_anywhere: None,
         cases: Vec::new(),
     };
     let mut gates_by_test: BTreeMap<&str, usize> = BTreeMap::new();
@@ -749,23 +903,25 @@ pub fn compute(repo: &str, failures: &[&GroupFailure]) -> SelectionRecall {
                 Ok(members) => (
                     members
                         .iter()
-                        .map(|member| member_status(member, &test.name))
+                        .map(|member| member_status(member, &test.name, failure.created_at))
                         .collect::<Vec<_>>(),
                     None,
                 ),
                 Err(error) => (Vec::new(), Some(error.clone())),
             };
-            let verdict = if members.iter().any(|member| member.status == "ran") {
-                "selected"
-            } else if reason.is_none() && members.iter().all(|member| member.status != "unread") {
-                "missed"
-            } else {
-                "undetermined"
-            };
+            let (verdict, failed_on_head) = verdict(&members, reason.is_none());
             match verdict {
                 "selected" => recall.selected += 1,
+                "ran_outside" => {
+                    recall.ran_outside += 1;
+                    recall.failed_on_head_ignored += usize::from(failed_on_head);
+                }
                 "missed" => recall.missed += 1,
-                _ => recall.undetermined += 1,
+                _ => {
+                    recall.undetermined += 1;
+                    recall.undetermined_no_selection +=
+                        usize::from(members.iter().any(|member| member.status == "no_selection"));
+                }
             }
             recall.test_failures += 1;
             recall.cases.push(RecallCase {
@@ -774,19 +930,96 @@ pub fn compute(repo: &str, failures: &[&GroupFailure]) -> SelectionRecall {
                 test: test.name.clone(),
                 result: test.result.clone(),
                 verdict,
+                failed_on_head,
                 failed_gates_with_test: gates_by_test.get(test.name.as_str()).copied().unwrap_or(0),
                 reason,
                 members,
             });
         }
     }
-    #[allow(clippy::cast_precision_loss)]
-    let judged = recall.selected + recall.missed;
-    #[allow(clippy::cast_precision_loss)]
-    {
-        recall.recall = (judged > 0).then(|| round2(recall.selected as f64 / judged as f64));
-    }
+    let judged = recall.selected + recall.ran_outside + recall.missed;
+    recall.recall = share(recall.selected, judged);
+    recall.recall_anywhere = share(recall.selected + recall.ran_outside, judged);
     recall
+}
+
+fn render_member(member: &MemberStatus) -> String {
+    let pr = member
+        .pr
+        .map_or_else(|| "unnamed".to_owned(), |pr| format!("#{pr}"));
+    match member.status {
+        "unread" => format!(
+            "{pr} unread ({})",
+            member.reason.as_deref().unwrap_or("no reason")
+        ),
+        "no_selection" => format!("{pr} no selection step ran"),
+        status => {
+            let mut text = format!(
+                "{pr} head selection {} test(s)",
+                member.selection_size.unwrap_or(0)
+            );
+            if status == "ran_outside" {
+                let _ = write!(
+                    text,
+                    ", ran it outside the selection: {}",
+                    member.outcome.as_deref().unwrap_or("unknown")
+                );
+            }
+            if let Some(skipped) = member.declared_budget_skipped.filter(|n| *n > 0) {
+                let _ = write!(text, ", {skipped} selected but skipped for budget");
+            }
+            text
+        }
+    }
+}
+
+/// Human rendering of one week's recall, every case not selected listed.
+pub fn render(out: &mut String, recall: &SelectionRecall) {
+    let _ = writeln!(
+        out,
+        "  selector recall: {} ({} of {} merge-group test failures ran in a pull-request head's \
+         selection; {} ran outside it, {} of them failing on the head unheeded; {} missed); \
+         recall anywhere {}; {} undetermined ({} with a head that selected nothing); {} failed \
+         gates, {} with no failing test, {} unread",
+        opt(recall.recall),
+        recall.selected,
+        recall.selected + recall.ran_outside + recall.missed,
+        recall.ran_outside,
+        recall.failed_on_head_ignored,
+        recall.missed,
+        opt(recall.recall_anywhere),
+        recall.undetermined,
+        recall.undetermined_no_selection,
+        recall.failed_gate_runs,
+        recall.runs_without_test_failure,
+        recall.runs_unread
+    );
+    for case in recall
+        .cases
+        .iter()
+        .filter(|case| case.verdict != "selected")
+    {
+        let members: Vec<String> = case.members.iter().map(render_member).collect();
+        let _ = writeln!(
+            out,
+            "    {}{}: `{}` ({}, failed {} gate(s) this week) in {}: {}",
+            case.verdict,
+            if case.failed_on_head {
+                " (failed on the head)"
+            } else {
+                ""
+            },
+            case.test,
+            case.result,
+            case.failed_gates_with_test,
+            case.run_url,
+            if members.is_empty() {
+                case.reason.clone().unwrap_or_default()
+            } else {
+                members.join("; ")
+            }
+        );
+    }
 }
 
 #[cfg(test)]

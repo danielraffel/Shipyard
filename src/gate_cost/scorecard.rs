@@ -1322,70 +1322,7 @@ fn render_week_tail(out: &mut String, week: &WeekScore) {
         );
     }
     if let Some(recall) = &week.selection_recall {
-        render_recall(out, recall);
-    }
-}
-
-fn render_recall(out: &mut String, recall: &recall::SelectionRecall) {
-    let _ = writeln!(
-        out,
-        "  selector recall: {} ({} of {} merge-group test failures ran on a pull-request head in \
-         the group; {} missed, {} undetermined); {} failed gates, {} with no failing test, {} \
-         unread",
-        opt(recall.recall),
-        recall.selected,
-        recall.selected + recall.missed,
-        recall.missed,
-        recall.undetermined,
-        recall.failed_gate_runs,
-        recall.runs_without_test_failure,
-        recall.runs_unread
-    );
-    for case in recall
-        .cases
-        .iter()
-        .filter(|case| case.verdict != "selected")
-    {
-        let members: Vec<String> = case
-            .members
-            .iter()
-            .map(|member| {
-                let pr = member
-                    .pr
-                    .map_or_else(|| "unnamed".to_owned(), |pr| format!("#{pr}"));
-                if member.status == "unread" {
-                    return format!(
-                        "{pr} unread ({})",
-                        member.reason.as_deref().unwrap_or("no reason")
-                    );
-                }
-                let mut text = format!(
-                    "{pr} head selection {} test(s)",
-                    member.selection_size.unwrap_or(0)
-                );
-                if member.selection_ran == Some(false) {
-                    text.push_str(", no selection step ran");
-                }
-                if let Some(skipped) = member.declared_budget_skipped.filter(|n| *n > 0) {
-                    let _ = write!(text, ", {skipped} selected but skipped for budget");
-                }
-                text
-            })
-            .collect();
-        let _ = writeln!(
-            out,
-            "    {}: `{}` ({}, failed {} gate(s) this week) in {}: {}",
-            case.verdict,
-            case.test,
-            case.result,
-            case.failed_gates_with_test,
-            case.run_url,
-            if members.is_empty() {
-                case.reason.clone().unwrap_or_default()
-            } else {
-                members.join("; ")
-            }
-        );
+        recall::render(out, recall);
     }
 }
 

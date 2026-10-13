@@ -1190,13 +1190,18 @@ pub(crate) enum MetricsCommand {
     ///   `cancelled` is not red) / commits carrying a required context;
     ///   repeat failures = check names red on two or more pull requests;
     ///   selector recall (with --selection-step) = for each test a failed
-    ///   merge-group gate lists under "The following tests FAILED", whether
-    ///   the gate job of a `pull_request` run on the head of a pull request
-    ///   in that group ran it in a selection step: selected / (selected +
-    ///   missed), where missed means every head was read and none ran it,
-    ///   and undetermined (a head unread) is counted apart. The group is the
-    ///   pull request the queue branch names plus every entry ahead of it
-    ///   that had not merged when the run was created.
+    ///   merge-group gate lists under "The following tests FAILED", what the
+    ///   gate job of the `pull_request`/`workflow_dispatch` runs created
+    ///   before the group, on the head of each pull request in the group,
+    ///   did with it: `selected` (a selection step ran it), `ran_outside`
+    ///   (only another step ran it, and whether it failed there, a failure
+    ///   the head's check ignored), `missed` (every head selected tests and
+    ///   none ran it), or `undetermined` (a head unread, a head on which no
+    ///   selection step ran, or a group that could not be read). recall =
+    ///   selected / (selected + ran_outside + missed); recall anywhere counts
+    ///   ran_outside as run. The group is the pull request the queue branch
+    ///   names plus every entry ahead of it that had not merged when the run
+    ///   was created.
     /// Required contexts are the base's classic protection, or
     /// `--required-context`.
     ///
