@@ -375,6 +375,19 @@ logs first read as a broken reader:
 Job logs also disappear (`BlobNotFound`, HTTP 404) for some older attempts;
 treat that as unread, never as no failures.
 
+## A dispatched gate run checks out the bare branch head
+
+A `pull_request` run checks out GitHub's merge of the head into the base, so
+diffing against `origin/main` is exact. A `workflow_dispatch` run (App-opened
+pull requests need `ci.yml` and `version-skill-check.yml` dispatched) checks
+out the branch head itself, and the gate scripts diff two-dot. Against
+`origin/main`, every commit main gained since the branch was cut reads as the
+branch's own change. Once version-at-land bumped `Cargo.toml` on main, every
+such run failed with "Version files are owned by version-at-land" while the
+pull request's own run passed (#795, #799). Diff a non-`pull_request` run from
+`git merge-base origin/main HEAD` (`scripts/resolve_diff_base.py`). Before
+calling such a failure the pull request's, diff the branch from its merge base.
+
 ## A unit test must not see the host's GitHub auth
 
 CI runs every test with `SHIPYARD_TEST_HOME` set to the runner's temp
