@@ -43,7 +43,12 @@
 //!   review on that commit, from the fleet App or an `OWNER`, `MEMBER` or
 //!   `COLLABORATOR` who is not the author (the queue-arm guard's rule).
 //!   `approve`, `hold` (merged anyway), `none`, or `unread` when GitHub listed
-//!   only some of the comments or reviews and none of those decided.
+//!   only some of the comments or reviews and none of those decided. A
+//!   comment is judged by its current body, so one posted before the merge
+//!   but edited after it (`lastEditedAt`), and a review on the merge head
+//!   since dismissed, are unknown: they decide nothing, and when one is at
+//!   least as new as the verdict that would decide, the pull request reads
+//!   `unread` rather than guessing what it said at the merge.
 //!
 //! Required contexts come from the base branch's classic protection, or from
 //! `--required-context` when given (a repository without protection has
@@ -91,7 +96,7 @@ const COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$en
 const TIMELINE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT],first:100,after:$endCursor){filteredCount pageInfo{hasNextPage endCursor} nodes{__typename ... on AddedToMergeQueueEvent{createdAt actor{login}} ... on RemovedFromMergeQueueEvent{createdAt reason actor{login}}}}}}}";
 /// A merged pull request's head, author, and last comments and reviews, for
 /// the verdict on its merge head.
-const VERDICTS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid author{login} comments(last:100){totalCount nodes{author{login} authorAssociation body createdAt}} reviews(last:100){totalCount nodes{author{login} authorAssociation state submittedAt commit{oid}}}}}}";
+const VERDICTS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid author{login} comments(last:100){totalCount nodes{author{login} authorAssociation body createdAt lastEditedAt}} reviews(last:100){totalCount nodes{author{login} authorAssociation state submittedAt commit{oid}}}}}}";
 const CONTEXTS_QUERY: &str = "query($owner:String!,$name:String!,$oid:GitObjectID!,$endCursor:String){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$endCursor){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ... on CheckRun{name conclusion startedAt completedAt} ... on StatusContext{context state createdAt}}}}}}}}";
 
 /// What to measure.
@@ -725,12 +730,21 @@ fn merge_verdict(pr: &Value, merged_at: DateTime<Utc>) -> Result<MergeVerdict, S
             })
     };
     let mut verdicts: Vec<(DateTime<Utc>, bool)> = Vec::new();
+    // The newest pre-merge entry whose verdict at the merge cannot be read.
+    let mut unknown: Option<DateTime<Utc>> = None;
     let comments = pr.get("comments").ok_or("no comments")?;
     let comment_nodes = node_list(comments, "comments")?;
     for comment in &comment_nodes {
         let Some(at) = timestamp(comment, "createdAt") else {
             continue;
         };
+        if at <= merged_at
+            && timestamp(comment, "lastEditedAt").is_some_and(|edited| edited > merged_at)
+            && trusted(comment)
+        {
+            unknown = unknown.max(Some(at));
+            continue;
+        }
         let body = comment.get("body").and_then(Value::as_str).unwrap_or("");
         if let Some((approve, named)) = crate::head_approval::verdict_line(body)
             && named.eq_ignore_ascii_case(&head)
@@ -743,25 +757,30 @@ fn merge_verdict(pr: &Value, merged_at: DateTime<Utc>) -> Result<MergeVerdict, S
     let reviews = pr.get("reviews").ok_or("no reviews")?;
     let review_nodes = node_list(reviews, "reviews")?;
     for review in &review_nodes {
-        let approve = match review.get("state").and_then(Value::as_str) {
-            Some("APPROVED") => true,
-            Some("CHANGES_REQUESTED") => false,
-            _ => continue,
-        };
+        let state = review.get("state").and_then(Value::as_str);
         let Some(at) = timestamp(review, "submittedAt") else {
             continue;
         };
-        if review
+        let on_head = review
             .pointer("/commit/oid")
             .and_then(Value::as_str)
-            .is_some_and(|oid| oid.eq_ignore_ascii_case(&head))
-            && at <= merged_at
-            && trusted(review)
-        {
-            verdicts.push((at, approve));
+            .is_some_and(|oid| oid.eq_ignore_ascii_case(&head));
+        if !on_head || at > merged_at || !trusted(review) {
+            continue;
+        }
+        match state {
+            Some("APPROVED") => verdicts.push((at, true)),
+            Some("CHANGES_REQUESTED") => verdicts.push((at, false)),
+            // Dismissed since: what it said at the merge is no longer read.
+            Some("DISMISSED") => unknown = unknown.max(Some(at)),
+            _ => {}
         }
     }
-    if let Some((_, approve)) = verdicts.iter().max_by_key(|(at, approve)| (*at, !*approve)) {
+    let decided = verdicts.iter().max_by_key(|(at, approve)| (*at, !*approve));
+    if unknown.is_some_and(|unknown| decided.is_none_or(|(at, _)| unknown >= *at)) {
+        return Ok(MergeVerdict::Unread);
+    }
+    if let Some((_, approve)) = decided {
         return Ok(if *approve {
             MergeVerdict::Approve
         } else {

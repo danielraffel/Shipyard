@@ -986,6 +986,133 @@ fn only_a_trusted_verdict_before_the_merge_decides() {
     );
 }
 
+fn edited(login: &str, association: &str, at: &str, edited: &str, body: &str) -> Value {
+    let mut node = comment(login, association, at, body);
+    node["lastEditedAt"] = Value::from(edited);
+    node
+}
+
+/// A comment is read as it is now, so one posted before the merge and edited
+/// after it cannot say what it said at the merge.
+#[test]
+fn a_verdict_edited_after_the_merge_is_unknown() {
+    let merged = at("2026-10-12T12:00:00Z");
+    let hold = format!("verdict: HOLD head:{HEAD}");
+    let approve = format!("verdict: APPROVE head:{HEAD}");
+    let read = |comments: Vec<Value>, reviews: Vec<Value>| {
+        let totals = (comments.len() as u64, reviews.len() as u64);
+        merge_verdict(&synthetic(&comments, &reviews, totals), merged).expect("read")
+    };
+    // An APPROVE edited to HOLD after the merge is not a held merge.
+    assert_eq!(
+        read(
+            vec![edited(
+                "shipyard-local",
+                "CONTRIBUTOR",
+                "2026-10-12T10:00:00Z",
+                "2026-10-12T13:00:00Z",
+                &hold
+            )],
+            vec![]
+        ),
+        MergeVerdict::Unread
+    );
+    // A verdict line added after the merge is not a pre-merge approval.
+    assert_eq!(
+        read(
+            vec![
+                comment("daniel", "OWNER", "2026-10-12T09:00:00Z", &hold),
+                edited(
+                    "daniel",
+                    "OWNER",
+                    "2026-10-12T10:00:00Z",
+                    "2026-10-12T14:00:00Z",
+                    &approve
+                ),
+            ],
+            vec![]
+        ),
+        MergeVerdict::Unread
+    );
+    // A newer verdict that was not edited still decides.
+    assert_eq!(
+        read(
+            vec![
+                edited(
+                    "daniel",
+                    "OWNER",
+                    "2026-10-12T09:00:00Z",
+                    "2026-10-12T14:00:00Z",
+                    &approve
+                ),
+                comment("daniel", "OWNER", "2026-10-12T10:00:00Z", &hold),
+            ],
+            vec![]
+        ),
+        MergeVerdict::Hold
+    );
+    // An edit made before the merge is the body at the merge.
+    assert_eq!(
+        read(
+            vec![edited(
+                "daniel",
+                "OWNER",
+                "2026-10-12T09:00:00Z",
+                "2026-10-12T11:00:00Z",
+                &hold
+            )],
+            vec![]
+        ),
+        MergeVerdict::Hold
+    );
+    // An untrusted account's edit is not a verdict either way.
+    assert_eq!(
+        read(
+            vec![
+                edited(
+                    "drive-by",
+                    "NONE",
+                    "2026-10-12T11:00:00Z",
+                    "2026-10-12T14:00:00Z",
+                    &hold
+                ),
+                comment("daniel", "OWNER", "2026-10-12T10:00:00Z", &approve),
+            ],
+            vec![]
+        ),
+        MergeVerdict::Approve
+    );
+}
+
+/// A review on the merge head dismissed since no longer says what it said.
+#[test]
+fn a_review_dismissed_since_is_unknown() {
+    let merged = at("2026-10-12T12:00:00Z");
+    let review = |state: &str, at: &str| {
+        serde_json::json!({"author": {"login": "daniel"}, "authorAssociation": "OWNER",
+            "state": state, "submittedAt": at, "commit": {"oid": HEAD}})
+    };
+    let read = |reviews: Vec<Value>| {
+        let total = reviews.len() as u64;
+        merge_verdict(&synthetic(&[], &reviews, (0, total)), merged).expect("read")
+    };
+    assert_eq!(
+        read(vec![
+            review("APPROVED", "2026-10-12T09:00:00Z"),
+            review("DISMISSED", "2026-10-12T10:00:00Z"),
+        ]),
+        MergeVerdict::Unread
+    );
+    // An older dismissal does not hide a newer decision.
+    assert_eq!(
+        read(vec![
+            review("DISMISSED", "2026-10-12T09:00:00Z"),
+            review("CHANGES_REQUESTED", "2026-10-12T10:00:00Z"),
+        ]),
+        MergeVerdict::Hold
+    );
+}
+
 #[test]
 fn a_partial_listing_without_a_decision_is_unread() {
     let merged = at("2026-10-12T12:00:00Z");
