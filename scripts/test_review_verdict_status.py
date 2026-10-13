@@ -170,6 +170,20 @@ class ReviewVerdictStatus(unittest.TestCase):
                    / "review-verdict-trigger.yml").read_text()
         self.assertIn("permissions: {}", trigger)
 
+    def test_every_trigger_queues_in_one_group_per_pull_request(self) -> None:
+        # A review's run and a comment's run on one pull request must share a
+        # concurrency group, or a stale success can land after a newer HOLD.
+        root = STATUS.parent.parent
+        for path in (root / ".github" / "workflows" / "review-verdict.yml",
+                     root / "docs" / "review-verdict-status.md"):
+            text = path.read_text(encoding="utf-8")
+            groups = [line.strip() for line in text.splitlines()
+                      if line.strip().startswith("group: review-verdict-")]
+            self.assertEqual(groups, [
+                "group: review-verdict-${{ github.event.pull_request.number || "
+                "github.event.issue.number || github.event.workflow_run.pull_requests[0].number "
+                "|| github.event.workflow_run.head_sha }}"], path)
+
     def test_a_head_two_open_pull_requests_share_needs_both_approved(self) -> None:
         trail = [self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
         answers = self.answers(trail)

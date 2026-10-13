@@ -117,7 +117,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.head_sha }}
+  group: review-verdict-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
