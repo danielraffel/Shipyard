@@ -2537,6 +2537,61 @@ class BaseTouched(unittest.TestCase):
             guard._base_touched({"files": [{"filename": f"f{n}"} for n in range(300)]})
 
 
+class MergeCarryRenames(unittest.TestCase):
+    """The merge-only carry counts rename sources (in-process, over crafted
+    comparison answers, since the git-backed fake lists no renames)."""
+
+    APPROVED, HEAD, OLD, NEW, BASE_TIP = "a" * 40, "b" * 40, "c" * 40, "d" * 40, "e" * 40
+
+    def carry(self, approved_source: str, head_source: str,
+              base_files: list[dict[str, Any]]) -> str | None:
+        def rename(source: str) -> list[dict[str, Any]]:
+            return [{"filename": "b.py", "status": "renamed", "previous_filename": source,
+                     "sha": "1" * 40, "patch": "@@"}]
+
+        def fake(arguments: list[str]) -> Any:
+            path = arguments[-1]
+            if path.endswith(f"compare/{self.APPROVED}...{self.HEAD}"):
+                return {"status": "ahead", "behind_by": 0, "total_commits": 1, "commits": [
+                    {"sha": self.HEAD, "parents": [{"sha": self.APPROVED}, {"sha": self.BASE_TIP}]}]}
+            if path.endswith(f"compare/{self.BASE_TIP}...main"):
+                return {"status": "identical"}
+            if path.endswith(f"compare/main...{self.APPROVED}"):
+                return {"merge_base_commit": {"sha": self.OLD}, "files": rename(approved_source)}
+            if path.endswith(f"compare/main...{self.HEAD}"):
+                return {"merge_base_commit": {"sha": self.NEW}, "files": rename(head_source)}
+            if path.endswith(f"compare/{self.OLD}...{self.NEW}"):
+                return {"status": "ahead", "files": base_files}
+            raise AssertionError(f"unexpected read {arguments}")
+
+        with mock.patch.object(guard, "run_real_gh", side_effect=fake), \
+                mock.patch.object(guard, "tree_modes", return_value={"b.py": 0o100644}):
+            return guard.merge_only_carry("o/r", "main", self.APPROVED, self.HEAD)
+
+    @staticmethod
+    def edited(name: str, previous: str | None = None) -> dict[str, Any]:
+        entry = {"filename": name, "status": "renamed" if previous else "modified",
+                 "sha": "2" * 40, "patch": "@@"}
+        if previous:
+            entry["previous_filename"] = previous
+        return entry
+
+    def test_a_base_edit_to_the_prs_rename_source_does_not_carry(self) -> None:
+        refusal = self.carry("a.py", "a.py", [self.edited("a.py")])
+        self.assertEqual(refusal, "a.py was changed by both the pull request and the base")
+        # Control: a base edit elsewhere carries.
+        self.assertIsNone(self.carry("a.py", "a.py", [self.edited("elsewhere.py")]))
+
+    def test_a_base_rename_of_the_prs_rename_source_does_not_carry(self) -> None:
+        refusal = self.carry("a.py", "a.py", [self.edited("moved.py", previous="a.py")])
+        self.assertEqual(refusal, "a.py was changed by both the pull request and the base")
+
+    def test_a_different_rename_source_does_not_carry(self) -> None:
+        refusal = self.carry("a.py", "c.py", [])
+        self.assertIsNotNone(refusal)
+        self.assertIn("b.py is renamed from c.py", refusal)
+
+
 class TreeModes(unittest.TestCase):
     """Each file's mode is its own entry's, even behind a sibling with another mode."""
 

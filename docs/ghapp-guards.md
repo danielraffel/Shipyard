@@ -130,7 +130,9 @@ head no verdict names. The approval carries to it only when all of these hold:
   `object(expression: "<sha>:<dir>")` entries' `mode`); a merge that only
   flips an executable bit keeps the blob but not the mode;
 * no file the PR changes was also changed by the base between the two merge
-  bases;
+  bases, a rename counting under both names on either side (so a base edit to
+  a file the PR renames from refuses), and each renamed file keeps the source
+  it was approved with;
 * the PR changes no binary file (a file with no text patch).
 
 Anything else, or anything the guard cannot read (including a comparison at

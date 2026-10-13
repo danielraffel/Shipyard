@@ -1486,3 +1486,76 @@ fn the_host_switch_reads_the_environment_and_the_guards_file() {
     std::fs::write(dir.join(super::HOST_ENABLE_FILE), "").expect("marker");
     assert!(host_switch(&[("HOME", home.path())], None));
 }
+
+fn files(names: &[&str]) -> std::collections::BTreeMap<String, (String, String, bool)> {
+    names
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_owned(),
+                ("modified".to_owned(), "1".repeat(40), true),
+            )
+        })
+        .collect()
+}
+
+fn sources(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(name, previous)| ((*name).to_owned(), (*previous).to_owned()))
+        .collect()
+}
+
+/// A rename counts under both names, on the pull request's side and on the
+/// base's: a base edit to the file a pull request renames from would be
+/// dropped by a merge that keeps the approved destination.
+#[test]
+fn a_base_change_to_a_rename_source_is_a_change_to_the_prs_file() {
+    let pr = files(&["b.py"]);
+    let pr_sources = sources(&[("b.py", "a.py")]);
+    let none = sources(&[]);
+    assert_eq!(
+        super::touched_by_base(&pr, &[&pr_sources, &none], &files(&["a.py"]), &none),
+        Some("a.py".to_owned())
+    );
+    // The base renamed the source away.
+    assert_eq!(
+        super::touched_by_base(
+            &pr,
+            &[&pr_sources, &pr_sources],
+            &files(&["moved.py"]),
+            &sources(&[("moved.py", "a.py")])
+        ),
+        Some("a.py".to_owned())
+    );
+    // Control: a base edit elsewhere touches nothing of the pull request's.
+    assert_eq!(
+        super::touched_by_base(
+            &pr,
+            &[&pr_sources, &pr_sources],
+            &files(&["elsewhere.py"]),
+            &none
+        ),
+        None
+    );
+    assert_eq!(
+        super::touched_by_base(&pr, &[&none, &none], &files(&["b.py"]), &none),
+        Some("b.py".to_owned())
+    );
+}
+
+#[test]
+fn a_rename_whose_source_changed_does_not_carry() {
+    assert_eq!(
+        super::rename_source_moved(&sources(&[("b.py", "a.py")]), &sources(&[("b.py", "c.py")])),
+        Some("b.py".to_owned())
+    );
+    assert_eq!(
+        super::rename_source_moved(&sources(&[("b.py", "a.py")]), &sources(&[])),
+        Some("b.py".to_owned())
+    );
+    assert_eq!(
+        super::rename_source_moved(&sources(&[("b.py", "a.py")]), &sources(&[("b.py", "a.py")])),
+        None
+    );
+}

@@ -215,6 +215,12 @@ to the named head; `unreviewed`, `hold` and `approval_does_not_carry` need a
 reviewer's verdict on the head, which an agent landing its own head must
 never post itself.
 
+`approval_does_not_carry` naming a file the pull request renames from (for
+example "a.py was changed by both the pull request and the base" on a PR that
+renames `a.py` to `b.py`) is not a false refusal: the base edited the rename's
+source, and a merge that keeps the approved `b.py` drops that edit. Re-review
+the merged head.
+
 Two things not to conclude from it:
 
 - **A refusal is usually the `ghapp` queue-arm guard agreeing there is nothing to

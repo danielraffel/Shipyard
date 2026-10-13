@@ -916,6 +916,12 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
         for name, (status, sha, _) in sorted(before.items()):
             if after[name][:2] != (status, sha):
                 return f"{name} at {head[:12]} is not the blob approved at {approved[:12]}"
+        before_sources = _rename_sources(before_compare)
+        after_sources = _rename_sources(after_compare)
+        for name in sorted(before):
+            if before_sources.get(name) != after_sources.get(name):
+                return (f"{name} is renamed from {after_sources.get(name) or 'nothing'} at "
+                        f"{head[:12]}, from {before_sources.get(name) or 'nothing'} when approved")
         # The comparison carries no file mode, so a merge that only flips a
         # file's executable bit keeps its blob: read the modes themselves.
         present = sorted(name for name, (status, _, _) in before.items() if status != "removed")
@@ -934,7 +940,11 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
             moved = run_real_gh(["api", f"repos/{repo}/compare/{base_before}...{base_after}"])
             if not isinstance(moved, dict):
                 return "what the base changed is unreadable"
-            both = sorted(set(before) & set(_pr_files(moved, "the base's changes")))
+            # A rename counts under both names, on either side: a base edit to
+            # a file the pull request renames from would be dropped by a merge
+            # that keeps the approved destination.
+            pr_paths = set(before) | set(before_sources.values()) | set(after_sources.values())
+            both = sorted(pr_paths & _base_touched(moved))
             if both:
                 return f"{both[0]} was changed by both the pull request and the base"
     except GuardError as error:
