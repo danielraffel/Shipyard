@@ -575,10 +575,11 @@ fn reenqueue_8678(comments: &str) -> FakeGh {
 
 #[test]
 fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
-    let approval = r#"{"id":1,"login":"fable-graph","type":"User","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:f0fb2fb38ef5c900efad7ea0630906f081db53a9"}"#;
+    let approval = r#"{"id":1,"login":"fable-graph","type":"User","association":"COLLABORATOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:f0fb2fb38ef5c900efad7ea0630906f081db53a9"}"#;
     let gh = reenqueue_8678(approval);
-    let outcome =
-        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None);
+    let outcome = crate::head_approval::with_host_review_default(true, || {
+        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None)
+    });
     assert!(outcome.armed, "{}", outcome.line);
     assert!(
         outcome.line.contains("at exactly its current head"),
@@ -601,10 +602,11 @@ fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
 /// own arm path refuses an unreviewed head on a review-by-default repository.
 #[test]
 fn ship_does_not_arm_an_unreviewed_head_on_a_listed_repository() {
-    let stale = r#"{"id":1,"login":"fable-graph","type":"User","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:2410ca497342cfc0264bf5b72713de0b56099a0f"}"#;
+    let stale = r#"{"id":1,"login":"fable-graph","type":"User","association":"COLLABORATOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:2410ca497342cfc0264bf5b72713de0b56099a0f"}"#;
     let gh = reenqueue_8678(stale);
-    let outcome =
-        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None);
+    let outcome = crate::head_approval::with_host_review_default(true, || {
+        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None)
+    });
     assert!(!outcome.armed, "{}", outcome.line);
     assert!(
         outcome

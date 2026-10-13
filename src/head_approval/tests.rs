@@ -654,20 +654,45 @@ fn an_unreadable_policy_is_an_error_not_the_default() {
 // ---------------------------------------------------------------------------
 
 fn by_default(repo: &str) -> ApprovalPolicy {
-    ApprovalPolicy::without_config(repo)
+    ApprovalPolicy::without_config(repo, true)
 }
 
+/// A comment as GitHub reports the fleet App's: `CONTRIBUTOR`.
 fn fleet(at: &str, body: &str) -> Value {
-    json!({"login": "shipyard-local[bot]", "type": "Bot", "at": at, "body": body})
+    json!({"login": "shipyard-local[bot]", "type": "Bot", "association": "CONTRIBUTOR",
+           "at": at, "body": body})
+}
+
+fn person(login: &str, association: &str, body: &str) -> Value {
+    json!({"login": login, "type": "User", "association": association,
+           "at": "2026-10-12T01:00:00Z", "body": body})
+}
+
+fn allows(policy: &ApprovalPolicy, comments: &[Value], author: Option<&str>) -> bool {
+    decide_for_author(
+        policy,
+        HEAD,
+        &[],
+        comments,
+        &empty_queue(HEAD),
+        false,
+        author,
+    )
+    .allows()
 }
 
 #[test]
-fn a_listed_repository_requires_review_when_its_config_is_silent() {
+fn a_listed_repository_requires_review_only_on_a_host_that_turns_it_on() {
     for repo in super::REVIEW_REQUIRED_REPOS {
         let policy = by_default(repo);
         assert!(policy.required, "{repo}");
         assert!(policy.any_reviewer_but_author, "{repo}");
         assert!(policy.validate().is_ok(), "{repo}");
+        assert_eq!(
+            ApprovalPolicy::without_config(repo, false),
+            ApprovalPolicy::default(),
+            "a new binary alone changes nothing: {repo}"
+        );
     }
     assert!(
         by_default("danielraffel/shipyard").required,
@@ -675,7 +700,8 @@ fn a_listed_repository_requires_review_when_its_config_is_silent() {
     );
     assert_eq!(by_default("someone/else"), ApprovalPolicy::default());
     let silent: toml::Table = "[auto_merge]\nqueue = true\n".parse().expect("toml");
-    assert!(ApprovalPolicy::from_table_for_repo(&silent, "danielraffel/tartci").required);
+    assert!(ApprovalPolicy::from_table_for_repo(&silent, "danielraffel/tartci", true).required);
+    assert!(!ApprovalPolicy::from_table_for_repo(&silent, "danielraffel/tartci", false).required);
 }
 
 #[test]
@@ -684,63 +710,75 @@ fn a_config_that_sets_the_key_decides_over_the_default() {
         .parse()
         .expect("toml");
     assert_eq!(
-        ApprovalPolicy::from_table_for_repo(&off, "Generous-Corp/pulp"),
+        ApprovalPolicy::from_table_for_repo(&off, "Generous-Corp/pulp", true),
         ApprovalPolicy::default()
     );
     let listed: toml::Table = "[auto_merge]\narm_requires_head_approval = true\n\
          reviewer_identities = [\"fable-graph\"]\n"
         .parse()
         .expect("toml");
-    let policy = ApprovalPolicy::from_table_for_repo(&listed, "Generous-Corp/pulp");
-    assert!(policy.required);
-    assert!(!policy.any_reviewer_but_author);
-    // The strict rule holds: the fleet App's marker does not count.
-    let marker = [fleet("2026-10-12T01:00:00Z", &format!("reviewed: {HEAD}"))];
-    assert!(
-        !decide_for_author(&policy, HEAD, &[], &marker, &empty_queue(HEAD), false, None).allows()
-    );
+    for host in [true, false] {
+        let policy = ApprovalPolicy::from_table_for_repo(&listed, "Generous-Corp/pulp", host);
+        assert!(
+            policy.required,
+            "the repository's own key needs no host switch"
+        );
+        assert!(!policy.any_reviewer_but_author);
+        // The strict rule holds: the fleet App's marker does not count.
+        let marker = [fleet("2026-10-12T01:00:00Z", &format!("reviewed: {HEAD}"))];
+        assert!(!allows(&policy, &marker, None));
+    }
 }
 
 #[test]
-fn a_missing_config_on_a_listed_repository_requires_review() {
+fn a_missing_config_on_a_listed_repository_follows_the_host_switch() {
     let missing =
         |_: &[String]| -> Result<String, String> { Err("gh: Not Found (HTTP 404)".to_owned()) };
-    assert_eq!(
-        read_policy(&missing, "danielraffel/tartci", "main"),
-        Ok(by_default("danielraffel/tartci"))
-    );
-    assert!(
-        super::read_policy_required(&missing, "Generous-Corp/vellum", "main")
-            .expect("a listed repository needs no file")
-            .required
-    );
+    super::with_host_review_default(true, || {
+        assert_eq!(
+            read_policy(&missing, "danielraffel/tartci", "main"),
+            Ok(by_default("danielraffel/tartci"))
+        );
+        assert!(
+            super::read_policy_required(&missing, "Generous-Corp/vellum", "main")
+                .expect("a listed repository needs no file")
+                .required
+        );
+    });
+    super::with_host_review_default(false, || {
+        assert_eq!(
+            read_policy(&missing, "danielraffel/tartci", "main"),
+            Ok(ApprovalPolicy::default())
+        );
+        assert!(super::read_policy_required(&missing, "Generous-Corp/vellum", "main").is_err());
+    });
+}
+
+#[test]
+fn a_config_that_does_not_parse_refuses_instead_of_loosening() {
+    let garbled = |_: &[String]| -> Result<String, String> {
+        Ok("[auto_merge\nreviewer_identities = [\"fable-graph\"]\n".to_owned())
+    };
+    super::with_host_review_default(true, || {
+        assert!(read_policy(&garbled, "Generous-Corp/pulp", "main").is_err());
+    });
 }
 
 #[test]
 fn the_fleet_apps_verdict_counts_on_the_fleet_apps_pull_request() {
     let policy = by_default("danielraffel/Shipyard");
-    let queue = empty_queue(HEAD);
     let approve = [fleet(
         "2026-10-12T01:00:00Z",
         &format!("Delta review.\n\nverdict: APPROVE head:{HEAD}"),
     )];
-    let gate = decide_for_author(
-        &policy,
-        HEAD,
-        &[],
-        &approve,
-        &queue,
-        false,
-        Some("app/shipyard-local"),
-    );
-    assert!(gate.allows(), "{gate:?}");
+    assert!(allows(&policy, &approve, Some("app/shipyard-local")));
     // No verdict, or one naming an older head, is refused and says what is needed.
     let gate = decide_for_author(
         &policy,
         HEAD,
         &[],
         &[],
-        &queue,
+        &empty_queue(HEAD),
         false,
         Some("app/shipyard-local"),
     );
@@ -753,72 +791,95 @@ fn the_fleet_apps_verdict_counts_on_the_fleet_apps_pull_request() {
         gate.explain()
     );
     let older = [fleet("2026-10-12T01:00:00Z", &format!("reviewed: {OTHER}"))];
+    assert!(!allows(&policy, &older, Some("app/shipyard-local")));
+}
+
+#[test]
+fn a_drive_by_account_cannot_approve_on_a_public_repository() {
+    let policy = by_default("danielraffel/tartci");
+    for association in [
+        "NONE",
+        "CONTRIBUTOR",
+        "FIRST_TIME_CONTRIBUTOR",
+        "FIRST_TIMER",
+    ] {
+        let drive_by = [person(
+            "some-random-github-user",
+            association,
+            &format!("verdict: APPROVE head:{HEAD}"),
+        )];
+        assert!(
+            !allows(&policy, &drive_by, Some("shipyard-local[bot]")),
+            "{association}"
+        );
+    }
+    let unread = [json!({"login": "some-random-github-user", "type": "User",
+                         "at": "2026-10-12T01:00:00Z", "body": format!("reviewed: {HEAD}")})];
+    assert!(!allows(&policy, &unread, Some("shipyard-local[bot]")));
+    let drive_by_review = [json!({"login": "some-random-github-user", "type": "User",
+        "association": "NONE", "at": "2026-10-12T01:00:00Z", "state": "APPROVED",
+        "commit_id": HEAD})];
     assert!(
         !decide_for_author(
             &policy,
             HEAD,
+            &drive_by_review,
             &[],
-            &older,
-            &queue,
+            &empty_queue(HEAD),
             false,
-            Some("app/shipyard-local")
+            Some("shipyard-local[bot]")
         )
         .allows()
     );
+    for association in super::TRUSTED_ASSOCIATIONS {
+        let trusted = [person(
+            "fable-graph",
+            association,
+            &format!("reviewed: {HEAD}"),
+        )];
+        assert!(
+            allows(&policy, &trusted, Some("shipyard-local[bot]")),
+            "{association}"
+        );
+    }
+    // A drive-by HOLD does not block either.
+    let comments = [
+        fleet(
+            "2026-10-12T01:00:00Z",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        ),
+        json!({"login": "some-random-github-user", "type": "User", "association": "NONE",
+               "at": "2026-10-12T02:00:00Z", "body": format!("verdict: HOLD head:{HEAD}")}),
+    ];
+    assert!(allows(&policy, &comments, Some("shipyard-local[bot]")));
 }
 
 #[test]
 fn a_distinguishable_author_cannot_approve_their_own_head() {
     let policy = by_default("Generous-Corp/pulp");
-    let queue = empty_queue(HEAD);
-    let own = [human(
+    let own = [person(
         "DanielRaffel",
-        "2026-10-12T01:00:00Z",
+        "OWNER",
         &format!("reviewed: {HEAD}"),
     )];
-    assert!(
-        !decide_for_author(
-            &policy,
-            HEAD,
-            &[],
-            &own,
-            &queue,
-            false,
-            Some("danielraffel")
-        )
-        .allows()
-    );
-    let other = [human(
+    assert!(!allows(&policy, &own, Some("danielraffel")));
+    let other = [person(
         "fable-graph",
-        "2026-10-12T01:00:00Z",
+        "COLLABORATOR",
         &format!("reviewed: {HEAD}"),
     )];
-    assert!(
-        decide_for_author(
-            &policy,
-            HEAD,
-            &[],
-            &other,
-            &queue,
-            false,
-            Some("danielraffel")
-        )
-        .allows()
-    );
-    let own_review = [review(
-        "danielraffel",
-        "User",
-        "APPROVED",
-        HEAD,
-        "2026-10-12T01:00:00Z",
-    )];
+    assert!(allows(&policy, &other, Some("danielraffel")));
+    let own_review = [
+        json!({"login": "danielraffel", "type": "User", "association": "OWNER",
+        "at": "2026-10-12T01:00:00Z", "state": "APPROVED", "commit_id": HEAD}),
+    ];
     assert!(
         !decide_for_author(
             &policy,
             HEAD,
             &own_review,
             &[],
-            &queue,
+            &empty_queue(HEAD),
             false,
             Some("danielraffel")
         )
@@ -839,18 +900,7 @@ fn a_hold_after_the_approve_refuses_by_default() {
             &format!("verdict: HOLD head:{HEAD}"),
         ),
     ];
-    assert!(
-        !decide_for_author(
-            &policy,
-            HEAD,
-            &[],
-            &comments,
-            &empty_queue(HEAD),
-            false,
-            None
-        )
-        .allows()
-    );
+    assert!(!allows(&policy, &comments, None));
     // Control: the same pair the other way round approves.
     let reversed = [
         fleet(
@@ -862,18 +912,7 @@ fn a_hold_after_the_approve_refuses_by_default() {
             &format!("verdict: APPROVE head:{HEAD}"),
         ),
     ];
-    assert!(
-        decide_for_author(
-            &policy,
-            HEAD,
-            &[],
-            &reversed,
-            &empty_queue(HEAD),
-            false,
-            None
-        )
-        .allows()
-    );
+    assert!(allows(&policy, &reversed, None));
 }
 
 #[test]
@@ -888,22 +927,27 @@ fn the_arm_path_reads_the_author_before_judging() {
             Ok(String::new())
         } else if joined.contains("/comments") {
             Ok(json!({"id": 1, "login": "danielraffel", "type": "User",
-                      "at": "2026-10-12T01:00:00Z", "body": format!("reviewed: {HEAD}")})
+                      "association": "OWNER", "at": "2026-10-12T01:00:00Z",
+                      "body": format!("reviewed: {HEAD}")})
             .to_string())
-        } else if joined.contains("repos/Generous-Corp/pulp/pulls/7 ") {
+        } else if joined.contains("repos/Generous-Corp/pulp/pulls/7 --jq .user.login") {
             Ok("danielraffel\n".to_owned())
+        } else if joined.contains("repos/Generous-Corp/pulp/pulls/7 ") {
+            Ok("main\n".to_owned())
         } else {
             Err(format!("unexpected gh call: {joined}"))
         }
     };
-    let gate = super::evaluate(
-        &gh,
-        "Generous-Corp/pulp",
-        7,
-        HEAD,
-        "main",
-        &empty_queue(HEAD),
-    )
+    let gate = super::with_host_review_default(true, || {
+        super::evaluate(
+            &gh,
+            "Generous-Corp/pulp",
+            7,
+            HEAD,
+            "main",
+            &empty_queue(HEAD),
+        )
+    })
     .expect("readable");
     assert!(
         !gate.allows(),
@@ -916,5 +960,169 @@ fn the_arm_path_reads_the_author_before_judging() {
             .any(|call| call.contains("repos/Generous-Corp/pulp/pulls/7 --jq .user.login")),
         "{:?}",
         calls.borrow()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Merge-only updates carry an approval
+// ---------------------------------------------------------------------------
+
+const BASE_TIP: &str = "cccccccccccccccccccccccccccccccccccccccc";
+const ELSEWHERE: &str = "dddddddddddddddddddddddddddddddddddddddd";
+
+/// The diff GitHub returns for `compare/main...<head>`: `own` is the pull
+/// request's change, `offset` moves its hunk the way a base change above it
+/// would.
+fn own_diff(own: &str, offset: u32) -> String {
+    format!(
+        "diff --git a/src/lib.rs b/src/lib.rs\nindex 1111111..2222222 100644\n--- a/src/lib.rs\n\
+         +++ b/src/lib.rs\n@@ -{offset},3 +{offset},4 @@ fn f()\n context\n+{own}\n context\n"
+    )
+}
+
+/// A GitHub that answers the carry's reads: `OTHER` approved, updated to
+/// `HEAD` by `commits`, with `HEAD`'s own lines `head_own`.
+fn carry_gh(
+    commits: Value,
+    head_own: &'static str,
+) -> impl Fn(&[String]) -> Result<String, String> {
+    carry_gh_with(
+        commits,
+        head_own,
+        vec![fleet(
+            "2026-10-12T01:00:00Z",
+            &format!("verdict: APPROVE head:{OTHER}"),
+        )],
+    )
+}
+
+fn carry_gh_with(
+    commits: Value,
+    head_own: &'static str,
+    comments: Vec<Value>,
+) -> impl Fn(&[String]) -> Result<String, String> {
+    move |args: &[String]| {
+        let joined = args.join(" ");
+        if joined.contains("contents/.shipyard/config.toml") {
+            Err("gh: Not Found (HTTP 404)".to_owned())
+        } else if joined.contains("/reviews") {
+            Ok(String::new())
+        } else if joined.contains("/comments") {
+            Ok(comments
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"))
+        } else if joined.contains("pulls/7 --jq .user.login") {
+            Ok("shipyard-local[bot]\n".to_owned())
+        } else if joined.contains("pulls/7 --jq .base.ref") {
+            Ok("main\n".to_owned())
+        } else if joined.contains(&format!("compare/{OTHER}...{HEAD}")) {
+            let total = commits.as_array().map_or(0, Vec::len);
+            Ok(
+                json!({"status": "ahead", "behind_by": 0, "total_commits": total,
+                      "commits": commits.clone()})
+                .to_string(),
+            )
+        } else if joined.contains(&format!("compare/{BASE_TIP}...main")) {
+            Ok("ahead\n".to_owned())
+        } else if joined.contains(&format!("compare/{OTHER}...main")) {
+            // A single-parent commit's parent is on the base too: only the
+            // merge rule refuses it.
+            Ok("ahead\n".to_owned())
+        } else if joined.contains(&format!("compare/{ELSEWHERE}...main")) {
+            Ok("diverged\n".to_owned())
+        } else if joined.contains(&format!("compare/main...{OTHER}")) {
+            Ok(own_diff("let approved = 1;", 10))
+        } else if joined.contains(&format!("compare/main...{HEAD}")) {
+            Ok(own_diff(head_own, 40))
+        } else {
+            Err(format!("unexpected gh call: {joined}"))
+        }
+    }
+}
+
+fn merge_of_base() -> Value {
+    json!([{"sha": HEAD, "parents": [OTHER, BASE_TIP]}])
+}
+
+fn carried_gate(gh: &dyn Fn(&[String]) -> Result<String, String>) -> HeadGate {
+    super::with_host_review_default(true, || {
+        super::evaluate(
+            gh,
+            "danielraffel/tartci",
+            7,
+            HEAD,
+            "main",
+            &empty_queue(HEAD),
+        )
+    })
+    .expect("readable")
+}
+
+#[test]
+fn a_merge_only_update_with_the_same_own_lines_carries_the_approval() {
+    let gh = carry_gh(merge_of_base(), "let approved = 1;");
+    match carried_gate(&gh) {
+        HeadGate::Approved {
+            approval: Approval::Carried { from_head, .. },
+        } => assert_eq!(from_head, OTHER),
+        gate => panic!("expected a carried approval, got {gate:?}"),
+    }
+}
+
+#[test]
+fn an_update_that_changes_the_own_lines_needs_a_new_verdict() {
+    let gh = carry_gh(merge_of_base(), "let approved = 2;");
+    assert!(matches!(carried_gate(&gh), HeadGate::NotApproved { .. }));
+}
+
+#[test]
+fn a_commit_that_is_not_a_merge_needs_a_new_verdict() {
+    let gh = carry_gh(
+        json!([{"sha": HEAD, "parents": [OTHER]}]),
+        "let approved = 1;",
+    );
+    assert!(matches!(carried_gate(&gh), HeadGate::NotApproved { .. }));
+}
+
+#[test]
+fn a_merge_of_a_branch_not_on_the_base_needs_a_new_verdict() {
+    let gh = carry_gh(
+        json!([{"sha": HEAD, "parents": [OTHER, ELSEWHERE]}]),
+        "let approved = 1;",
+    );
+    // Its merged parent has diverged from the base: no carry.
+    assert!(matches!(carried_gate(&gh), HeadGate::NotApproved { .. }));
+}
+
+#[test]
+fn a_hold_on_the_updated_head_is_not_overridden_by_a_carry() {
+    let gh = carry_gh_with(
+        merge_of_base(),
+        "let approved = 1;",
+        vec![
+            fleet(
+                "2026-10-12T01:00:00Z",
+                &format!("verdict: APPROVE head:{OTHER}"),
+            ),
+            fleet(
+                "2026-10-12T02:00:00Z",
+                &format!("verdict: HOLD head:{HEAD}"),
+            ),
+        ],
+    );
+    assert!(matches!(carried_gate(&gh), HeadGate::NotApproved { .. }));
+}
+
+#[test]
+fn own_lines_ignore_what_a_base_change_moves() {
+    assert_eq!(
+        super::own_lines(&own_diff("let a = 1;", 10)),
+        super::own_lines(&own_diff("let a = 1;", 90))
+    );
+    assert_ne!(
+        super::own_lines(&own_diff("let a = 1;", 10)),
+        super::own_lines(&own_diff("let a = 2;", 10))
     );
 }

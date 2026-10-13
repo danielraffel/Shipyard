@@ -348,7 +348,6 @@ class QueueArmGuardTests(unittest.TestCase):
         for args in (
             ["pr", "view", "7"],
             ["pr", "merge", "7", "--disable-auto"],
-            ["pr", "merge", "7", "--admin", "--merge"],
             ["api", "graphql", "-f", "query=query { viewer { login } }"],
             ["api", "repos/o/r/pulls/7"],
             ["pr", "merge", "--help"],
@@ -1257,11 +1256,13 @@ class BatchAttributionTests(unittest.TestCase):
             for executable in (fake_gh, guards / "queue-arm-guard"):
                 executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
             result = subprocess.run(
-                [sys.executable, str(guards / "queue-arm-guard"), "pr", "merge", "8811", "--auto"],
+                [sys.executable, str(guards / "queue-arm-guard"), "pr", "merge", "8811", "--auto",
+                 "--match-head-commit", head],
                 env={
                     "PATH": "/usr/bin:/bin",
                     "GHAPP_REAL_GH": str(fake_gh),
                     "GH_REPO": "Generous-Corp/pulp",
+                    "SHIPYARD_REVIEW_BEFORE_ARM": "1",
                 },
                 cwd=str(repo),
                 capture_output=True,
@@ -1688,11 +1689,25 @@ def opened(graphql_response: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
+HEAD_784 = "fd0e94e25f447578256f3aae97cc0ab6103d5f0c"
+HOLD_784 = "cb5c1f796dac6851062af69def634aade161fb1f"
+APPROVE_784_COMMENT = 6127196414
+
+
+def comment_like(template: dict[str, Any], **change: Any) -> dict[str, Any]:
+    """A copy of a captured comment with some fields changed."""
+    value = copy.deepcopy(template)
+    value.update(change)
+    return value
+
+
 class ReviewBeforeArm(unittest.TestCase):
-    """An arm needs a verdict naming the exact head, through the installed guard.
+    """A landing needs a verdict naming the exact head, through the installed guard.
 
     Each case runs the guard as ghapp does: installed names, a real
-    subprocess, and a fake native gh answering from live captures.
+    subprocess, and a fake native gh answering from live captures. Its
+    answers are matched in order by a substring of the argv; a paginated
+    answer serves every page only when the request carries ``--paginate``.
     """
 
     def setUp(self) -> None:
@@ -1703,50 +1718,78 @@ class ReviewBeforeArm(unittest.TestCase):
         shutil.copy(SCRIPT, self.guards / "queue-arm-guard")
         shutil.copy(REMOVAL, self.guards / "queue-removal-guard")
 
-    def install(self, answers: dict[str, Any], config: str | None = None) -> pathlib.Path:
-        """A fake gh: each answer is keyed by what its argv must contain."""
+    def install(self, answers: list[tuple[str, dict[str, Any]]]) -> pathlib.Path:
         table = self.root / "answers.json"
-        table.write_text(json.dumps({"answers": answers, "config": config}), encoding="utf-8")
+        table.write_text(json.dumps(answers), encoding="utf-8")
         fake = self.root / "gh"
         fake.write_text(
             f"#!{sys.executable}\n"
             "import json, sys\n"
-            f"spec = json.load(open({str(table)!r}))\n"
+            f"answers = json.load(open({str(table)!r}))\n"
             "argv = ' '.join(sys.argv[1:])\n"
             f"open({str(self.root / 'calls')!r}, 'a').write(argv + '\\n')\n"
-            "if 'contents/.shipyard/config.toml' in argv:\n"
-            "    if spec['config'] is None:\n"
-            "        sys.stderr.write('gh: Not Found (HTTP 404)\\n'); sys.exit(1)\n"
-            "    sys.stdout.write(spec['config']); sys.exit(0)\n"
-            "for key in ('graphql', '/reviews', '/comments', '/pulls/'):\n"
-            "    if key in argv:\n"
-            "        sys.stdout.write(json.dumps(spec['answers'][key])); sys.exit(0)\n"
+            "for needle, answer in answers:\n"
+            "    if needle not in argv:\n"
+            "        continue\n"
+            "    if 'error' in answer:\n"
+            "        sys.stderr.write(answer['error'] + '\\n'); sys.exit(1)\n"
+            "    if 'pages' in answer:\n"
+            "        pages = answer['pages'] if '--paginate' in sys.argv else answer['pages'][:1]\n"
+            "        sys.stdout.write(json.dumps(pages if '--slurp' in sys.argv else pages[0])); sys.exit(0)\n"
+            "    if 'text' in answer:\n"
+            "        sys.stdout.write(answer['text']); sys.exit(0)\n"
+            "    sys.stdout.write(json.dumps(answer['json'])); sys.exit(0)\n"
             "sys.stderr.write('unexpected gh call: ' + argv + '\\n'); sys.exit(3)\n",
             encoding="utf-8",
         )
         fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
         return fake
 
-    def case(self, prefix: str, **change: Any) -> dict[str, Any]:
-        answers = {
-            "graphql": review_fixture(f"{prefix}-graphql.json"),
-            "/pulls/": review_fixture(f"{prefix}-pull.json"),
-            "/comments": review_fixture(f"{prefix}-comments.json"),
-            "/reviews": review_fixture(f"{prefix}-reviews.json"),
-        }
-        answers.update(change)
-        return answers
+    def case(self, prefix: str, *, graphql: Any = None, comments: Any = None,
+             config: str | None = None, queue: bool = True,
+             extra: list[tuple[str, dict[str, Any]]] | None = None) -> list[tuple[str, dict[str, Any]]]:
+        config_answer = {"error": "gh: Not Found (HTTP 404)"} if config is None else {"text": config}
+        return [
+            ("contents/.shipyard/config.toml", config_answer),
+            ("mergeQueue(branch", {"json": {"data": {"repository": {
+                "mergeQueue": {"id": "MQ_1"} if queue else None}}}}),
+            *(extra or []),
+            ("graphql", {"json": graphql if graphql is not None
+                         else review_fixture(f"{prefix}-graphql.json")}),
+            ("/reviews", {"pages": review_fixture(f"{prefix}-reviews.json")}),
+            ("/comments", {"pages": comments if comments is not None
+                           else review_fixture(f"{prefix}-comments.json")}),
+            ("/pulls/", {"json": review_fixture(f"{prefix}-pull.json")}),
+        ]
 
-    def arm(self, number: int, repo: str, answers: dict[str, Any], config: str | None = None,
-            **env: str) -> subprocess.CompletedProcess:
-        fake = self.install(answers, config)
+    def run_guard(self, argv: list[str], answers: list[tuple[str, dict[str, Any]]],
+                  repo: str, host: str | None = "1", **env: str) -> subprocess.CompletedProcess:
+        fake = self.install(answers)
         environment = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake), "GH_REPO": repo,
                        "SHIPYARD_GHAPP_GUARDS_DIR": str(self.guards), "HOME": str(self.root)}
+        if host is not None:
+            environment["SHIPYARD_REVIEW_BEFORE_ARM"] = host
         environment.update(env)
         return subprocess.run(
-            [sys.executable, str(self.guards / "queue-arm-guard"), "pr", "merge", str(number), "--auto"],
+            [sys.executable, str(self.guards / "queue-arm-guard"), *argv],
             env=environment, capture_output=True, text=True, check=False,
+            stdin=subprocess.DEVNULL,
         )
+
+    def arm(self, number: int, repo: str, answers: list[tuple[str, dict[str, Any]]],
+            bind: str | None = None, **kwargs: Any) -> subprocess.CompletedProcess:
+        head = bind or review_fixture(
+            {513: "tartci-513", 511: "tartci-511", 490: "tartci-490", 784: "shipyard-784"}[number]
+            + "-pull.json")["head"]["sha"]
+        return self.run_guard(["pr", "merge", str(number), "--auto", "--match-head-commit", head],
+                              answers, repo, **kwargs)
+
+    def calls(self) -> str:
+        return (self.root / "calls").read_text(encoding="utf-8")
+
+    def approved_784(self, **kwargs: Any) -> list[tuple[str, dict[str, Any]]]:
+        return self.case("shipyard-784", graphql=opened(review_fixture("shipyard-784-graphql.json")),
+                         **kwargs)
 
     def test_no_verdict_is_refused(self) -> None:
         result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"))
@@ -1754,12 +1797,15 @@ class ReviewBeforeArm(unittest.TestCase):
         head = review_fixture("tartci-513-pull.json")["head"]["sha"]
         self.assertIn(f"no reviewer verdict names head {head[:12]}", result.stderr)
         self.assertIn(f"`verdict: APPROVE head:{head}` or `reviewed: {head}`", result.stderr)
+        self.assertIn("from the fleet App or an OWNER, MEMBER or COLLABORATOR", result.stderr)
 
     def test_a_verdict_on_an_older_head_is_refused(self) -> None:
-        result = self.arm(511, "danielraffel/tartci", self.case("tartci-511"))
+        result = self.arm(511, "danielraffel/tartci", self.case("tartci-511", extra=[
+            ("compare/", {"error": "gh: Not Found (HTTP 404)"})]))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("no reviewer verdict names head 52eda5490844", result.stderr)
         self.assertIn("The latest verdict names another head: `APPROVE head:0d7179d1", result.stderr)
+        self.assertIn("The approval of 0d7179d1", result.stderr)
 
     def test_a_hold_naming_the_head_is_refused(self) -> None:
         result = self.arm(490, "danielraffel/tartci", self.case("tartci-490"))
@@ -1769,86 +1815,255 @@ class ReviewBeforeArm(unittest.TestCase):
     def test_a_verdict_naming_the_head_is_allowed(self) -> None:
         # The App's APPROVE on the App's own PR counts: the author is the
         # shared fleet identity, so the two are not distinguishable.
-        answers = self.case("shipyard-784",
-                            graphql=opened(review_fixture("shipyard-784-graphql.json")))
-        result = self.arm(784, "danielraffel/Shipyard", answers)
+        result = self.arm(784, "danielraffel/Shipyard", self.approved_784())
         self.assertEqual(result.returncode, 0, result.stderr)
-        calls = (self.root / "calls").read_text(encoding="utf-8")
-        self.assertIn("repos/danielraffel/Shipyard/issues/784/comments", calls)
-        self.assertIn("contents/.shipyard/config.toml?ref=main", calls)
+        self.assertIn("repos/danielraffel/Shipyard/issues/784/comments", self.calls())
+        self.assertIn("contents/.shipyard/config.toml?ref=main", self.calls())
 
     def test_a_hold_after_the_approve_is_refused(self) -> None:
         pages = review_fixture("shipyard-784-comments.json")
-        approve = copy.deepcopy(next(c for c in pages[0] if c["id"] == 6127196414))
-        approve["id"] += 1
-        approve["created_at"] = "2026-10-12T16:00:00Z"
-        approve["body"] = "Delta review.\n\nverdict: HOLD head:fd0e94e25f447578256f3aae97cc0ab6103d5f0c"
-        pages[0].append(approve)
-        answers = self.case("shipyard-784", graphql=opened(review_fixture("shipyard-784-graphql.json")),
-                            **{"/comments": pages})
-        result = self.arm(784, "danielraffel/Shipyard", answers)
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        pages[0].append(comment_like(
+            approve, id=approve["id"] + 1, created_at="2026-10-12T16:00:00Z",
+            body=f"Delta review.\n\nverdict: HOLD head:{HEAD_784}"))
+        result = self.arm(784, "danielraffel/Shipyard", self.approved_784(comments=pages))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("the latest verdict naming head fd0e94e25f44 is HOLD", result.stderr)
         self.assertIn("2026-10-12T16:00:00Z", result.stderr)
 
-    def test_a_repository_outside_the_list_with_no_setting_is_not_checked(self) -> None:
-        answers = self.case("tartci-513")
-        answers["graphql"] = copy.deepcopy(answers["graphql"])
-        answers["graphql"]["data"]["repository"]["pullRequest"]["repository"]["nameWithOwner"] = "someone/else"
-        result = self.arm(513, "someone/else", answers)
+    def test_a_hold_on_a_later_page_refuses(self) -> None:
+        # Comments arrive 100 per page; the HOLD that decides may be on the last.
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        hold = comment_like(approve, id=approve["id"] + 1, created_at="2026-10-12T16:00:00Z",
+                            body=f"verdict: HOLD head:{HEAD_784}")
+        filler = [comment_like(approve, id=approve["id"] + 10 + n, body="noted")
+                  for n in range(100 - len(pages[0]))]
+        result = self.arm(784, "danielraffel/Shipyard",
+                          self.approved_784(comments=[pages[0] + filler, [hold]]))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("is HOLD", result.stderr)
+        self.assertIn("--paginate", self.calls())
+
+    def test_a_drive_by_account_cannot_approve(self) -> None:
+        pages = review_fixture("tartci-513-comments.json")
+        head = review_fixture("tartci-513-pull.json")["head"]["sha"]
+        template = pages[0][0]
+        drive_by = comment_like(
+            template, id=1, created_at="2026-10-12T23:00:00Z",
+            user={"login": "some-random-github-user", "type": "User"},
+            author_association="NONE", body=f"verdict: APPROVE head:{head}")
+        result = self.arm(513, "danielraffel/tartci",
+                          self.case("tartci-513", comments=[pages[0] + [drive_by]]))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        # Control: the same comment from a collaborator approves.
+        trusted = comment_like(drive_by, user={"login": "fable-graph", "type": "User"},
+                               author_association="COLLABORATOR")
+        result = self.arm(513, "danielraffel/tartci",
+                          self.case("tartci-513", comments=[pages[0] + [trusted]]))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("/comments", (self.root / "calls").read_text(encoding="utf-8"))
+
+    def test_the_request_must_bind_the_approved_head(self) -> None:
+        unbound = self.run_guard(["pr", "merge", "784", "--auto"], self.approved_784(),
+                                 "danielraffel/Shipyard")
+        self.assertEqual(unbound.returncode, 1, unbound.stderr)
+        self.assertIn("does not bind the head it lands", unbound.stderr)
+        stale = self.arm(784, "danielraffel/Shipyard", self.approved_784(), bind=HOLD_784)
+        self.assertEqual(stale.returncode, 1, stale.stderr)
+        self.assertIn("binds cb5c1f796dac, but the head is fd0e94e25f44", stale.stderr)
+
+    def test_the_host_switch_decides_for_a_silent_repository(self) -> None:
+        for host in ("0", None):
+            result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=host)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("/comments", self.calls())
+            (self.root / "calls").unlink()
+        (self.guards / "review-before-arm").write_text("", encoding="utf-8")
+        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=None)
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_a_repository_outside_the_list_with_no_setting_is_not_checked(self) -> None:
+        graphql = copy.deepcopy(review_fixture("tartci-513-graphql.json"))
+        graphql["data"]["repository"]["pullRequest"]["repository"]["nameWithOwner"] = "someone/else"
+        result = self.arm(513, "someone/else", self.case("tartci-513", graphql=graphql))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("/comments", self.calls())
 
     @unittest.skipUnless(sys.version_info >= (3, 11), "reading the base config needs tomllib")
     def test_the_base_config_decides_over_the_default(self) -> None:
         off = "[auto_merge]\narm_requires_head_approval = false\n"
-        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), config=off)
+        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513", config=off))
         self.assertEqual(result.returncode, 0, result.stderr)
-        # And a repository outside the list opts in through its own base config.
-        answers = self.case("tartci-513")
-        answers["graphql"] = copy.deepcopy(answers["graphql"])
-        answers["graphql"]["data"]["repository"]["pullRequest"]["repository"]["nameWithOwner"] = "someone/else"
+        graphql = copy.deepcopy(review_fixture("tartci-513-graphql.json"))
+        graphql["data"]["repository"]["pullRequest"]["repository"]["nameWithOwner"] = "someone/else"
         on = "[auto_merge]\narm_requires_head_approval = true\nreviewer_identities = [\"fable-graph\"]\n"
-        result = self.arm(513, "someone/else", answers, config=on)
+        result = self.arm(513, "someone/else", self.case("tartci-513", graphql=graphql, config=on),
+                          host="0")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("from one of fable-graph", result.stderr)
+
+    def test_a_config_that_does_not_parse_refuses(self) -> None:
+        broken = "[auto_merge\narm_requires_head_approval = false\n"
+        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513", config=broken))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("cannot read what its review requires", result.stderr)
 
     def test_the_operator_override_is_loud_and_recorded(self) -> None:
         result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"),
                           GHAPP_ALLOW_UNREVIEWED_ARM="1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("WARNING: GHAPP_ALLOW_UNREVIEWED_ARM=1 arms an unreviewed head", result.stderr)
+        self.assertIn("WARNING: GHAPP_ALLOW_UNREVIEWED_ARM=1 lands an unreviewed head", result.stderr)
         audit = [json.loads(line) for line in
                  (self.guards / "overrides.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(audit), 1)
         self.assertEqual(audit[0]["override"], "GHAPP_ALLOW_UNREVIEWED_ARM")
         self.assertIn("no reviewer verdict names head", audit[0]["refusal"])
-        # The queue-state override does not bypass the review rule.
-        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"),
-                          GHAPP_ALLOW_QUEUE_REARM="1")
+
+    def test_the_queue_override_never_stands_in_for_a_review(self) -> None:
+        # A queue refusal (armed, not yet queued) the operator overrides,
+        # on a head nobody reviewed: still refused.
+        graphql = copy.deepcopy(review_fixture("tartci-513-graphql.json"))
+        graphql["data"]["repository"]["pullRequest"]["autoMergeRequest"] = {
+            "enabledAt": "2026-10-12T22:00:00Z"}
+        answers = self.case("tartci-513", graphql=graphql)
+        refused = self.arm(513, "danielraffel/tartci", answers, host="0")
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("is already armed since", refused.stderr)
+        result = self.arm(513, "danielraffel/tartci", answers, GHAPP_ALLOW_QUEUE_REARM="1")
         self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("refusing to arm or merge an unreviewed head", result.stderr)
+        # Control: with a verdict on the head the queue override lands it.
+        head = review_fixture("tartci-513-pull.json")["head"]["sha"]
+        pages = review_fixture("tartci-513-comments.json")
+        verdict = comment_like(pages[0][0], id=2, created_at="2026-10-12T23:00:00Z",
+                               body=f"verdict: APPROVE head:{head}")
+        answers = self.case("tartci-513", graphql=graphql, comments=[pages[0] + [verdict]])
+        result = self.arm(513, "danielraffel/tartci", answers, GHAPP_ALLOW_QUEUE_REARM="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GHAPP_ALLOW_QUEUE_REARM=1 overrides a refusal", result.stderr)
 
     def test_an_ambiguous_request_needs_both_overrides(self) -> None:
-        fake = self.install({})
-        environment = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake),
-                       "GH_REPO": "danielraffel/tartci", "HOME": str(self.root),
-                       "SHIPYARD_GHAPP_GUARDS_DIR": str(self.guards), "GHAPP_ALLOW_QUEUE_REARM": "1"}
-        argv = [sys.executable, str(self.guards / "queue-arm-guard"), "api", "graphql", "--input", "-"]
-        result = subprocess.run(argv, env=environment, capture_output=True, text=True,
-                                stdin=subprocess.DEVNULL, check=False)
+        argv = ["api", "graphql", "--input", "-"]
+        result = self.run_guard(argv, [], "danielraffel/tartci", GHAPP_ALLOW_QUEUE_REARM="1")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("GHAPP_ALLOW_UNREVIEWED_ARM=1 is needed as well", result.stderr)
-        environment["GHAPP_ALLOW_UNREVIEWED_ARM"] = "1"
-        result = subprocess.run(argv, env=environment, capture_output=True, text=True,
-                                stdin=subprocess.DEVNULL, check=False)
+        result = self.run_guard(argv, [], "danielraffel/tartci", GHAPP_ALLOW_QUEUE_REARM="1",
+                                GHAPP_ALLOW_UNREVIEWED_ARM="1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.guards / "overrides.jsonl").is_file())
 
     def test_an_unreadable_review_trail_refuses(self) -> None:
-        answers = self.case("tartci-513", **{"/comments": {"message": "Not Found"}})
+        answers = self.case("tartci-513", extra=[("/comments", {"error": "HTTP 502"})])
         result = self.arm(513, "danielraffel/tartci", answers)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("cannot read what its review requires", result.stderr)
+
+    # Direct merges: on a queue-less base a merge is the landing path.
+
+    def merge_paths(self, head: str) -> dict[str, list[str]]:
+        body = self.root / "merge.json"
+        body.write_text(json.dumps({"sha": head, "merge_method": "merge"}), encoding="utf-8")
+        mutation = ("query=mutation{mergePullRequest(input:{pullRequestId:\"PR_784\","
+                    f"expectedHeadOid:\"{head}\"}}){{pullRequest{{number}}}}}}")
+        return {
+            "pr merge": ["pr", "merge", "784", "--merge", "--match-head-commit", head],
+            "pr merge --admin": ["pr", "merge", "784", "--admin", "--match-head-commit", head],
+            "REST -f sha": ["api", "-X", "PUT", "repos/danielraffel/Shipyard/pulls/784/merge",
+                            "-f", f"sha={head}"],
+            "REST --input": ["api", "-X", "PUT", "repos/danielraffel/Shipyard/pulls/784/merge",
+                             "--input", str(body)],
+            "mergePullRequest": ["api", "graphql", "-f", mutation],
+        }
+
+    def test_direct_merges_need_the_verdict_too(self) -> None:
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        held = [pages[0] + [comment_like(approve, id=approve["id"] + 1,
+                                         created_at="2026-10-12T16:00:00Z",
+                                         body=f"verdict: HOLD head:{HEAD_784}")]]
+        for path, argv in self.merge_paths(HEAD_784).items():
+            with self.subTest(path=path):
+                allowed = self.run_guard(argv, self.approved_784(queue=False), "danielraffel/Shipyard")
+                self.assertEqual(allowed.returncode, 0, allowed.stderr)
+                refused = self.run_guard(argv, self.approved_784(queue=False, comments=held),
+                                         "danielraffel/Shipyard")
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+                self.assertIn("is HOLD", refused.stderr)
+
+    def test_direct_merges_must_bind_the_approved_head(self) -> None:
+        for path, argv in self.merge_paths(HOLD_784).items():
+            with self.subTest(path=path):
+                stale = self.run_guard(argv, self.approved_784(queue=False), "danielraffel/Shipyard")
+                self.assertEqual(stale.returncode, 1, stale.stderr)
+                self.assertIn("binds cb5c1f796dac, but the head is fd0e94e25f44", stale.stderr)
+        unbound = {
+            "pr merge": ["pr", "merge", "784", "--merge"],
+            "REST": ["api", "-X", "PUT", "repos/danielraffel/Shipyard/pulls/784/merge"],
+            "mergePullRequest": ["api", "graphql", "-f",
+                                 "query=mutation{mergePullRequest(input:{pullRequestId:\"PR_784\"})"
+                                 "{pullRequest{number}}}"],
+        }
+        for path, argv in unbound.items():
+            with self.subTest(path=path):
+                result = self.run_guard(argv, self.approved_784(queue=False), "danielraffel/Shipyard")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("does not bind the head it lands", result.stderr)
+
+    def test_a_read_of_the_merge_endpoint_is_not_a_merge(self) -> None:
+        result = self.run_guard(["api", "repos/danielraffel/Shipyard/pulls/784/merge"], [],
+                                "danielraffel/Shipyard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    # A merge-only update of an approved head.
+
+    CARRIED = "e" * 40
+    BASE_TIP = "c" * 40
+
+    def carry_case(self, *, parents: list[str], head_own: str, base_status: str = "ahead"
+                   ) -> list[tuple[str, dict[str, Any]]]:
+        graphql = opened(review_fixture("shipyard-784-graphql.json"))
+        graphql["data"]["repository"]["pullRequest"]["headRefOid"] = self.CARRIED
+        pull = copy.deepcopy(review_fixture("shipyard-784-pull.json"))
+        pull["head"]["sha"] = self.CARRIED
+
+        def diff(line: str, offset: int) -> str:
+            return ("diff --git a/src/lib.rs b/src/lib.rs\nindex 1111111..2222222 100644\n"
+                    f"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -{offset},3 +{offset},4 @@\n"
+                    f" context\n+{line}\n context\n")
+
+        answers = self.case("shipyard-784", graphql=graphql, queue=False, extra=[
+            (f"compare/{HEAD_784}...{self.CARRIED}", {"json": {
+                "status": "ahead", "behind_by": 0, "total_commits": 1,
+                "commits": [{"sha": self.CARRIED, "parents": [{"sha": p} for p in parents]}]}}),
+            (f"compare/{parents[-1]}...main", {"json": {"status": base_status}}),
+            (f"compare/main...{HEAD_784}", {"text": diff("let approved = 1;", 10)}),
+            (f"compare/main...{self.CARRIED}", {"text": diff(head_own, 40)}),
+        ])
+        return [(needle, {"json": pull}) if needle == "/pulls/" else (needle, answer)
+                for needle, answer in answers]
+
+    def test_a_merge_only_update_carries_the_approval(self) -> None:
+        answers = self.carry_case(parents=[HEAD_784, self.BASE_TIP], head_own="let approved = 1;")
+        result = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit",
+                                 self.CARRIED], answers, "danielraffel/Shipyard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Accept: application/vnd.github.diff", self.calls())
+
+    def test_an_update_that_is_not_a_clean_merge_of_the_base_needs_a_new_verdict(self) -> None:
+        argv = ["pr", "merge", "784", "--merge", "--match-head-commit", self.CARRIED]
+        cases = {
+            "own lines changed": self.carry_case(parents=[HEAD_784, self.BASE_TIP],
+                                                 head_own="let approved = 2;"),
+            "not a merge": self.carry_case(parents=[HEAD_784], head_own="let approved = 1;"),
+            "merged parent not on the base": self.carry_case(
+                parents=[HEAD_784, self.BASE_TIP], head_own="let approved = 1;",
+                base_status="diverged"),
+        }
+        for name, answers in cases.items():
+            with self.subTest(name=name):
+                result = self.run_guard(argv, answers, "danielraffel/Shipyard")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("does not carry", result.stderr)
 
 
 class ReviewIdentity(unittest.TestCase):
@@ -1856,36 +2071,64 @@ class ReviewIdentity(unittest.TestCase):
 
     HEAD = "a" * 40
 
-    def comment(self, login: str, body: str, at: str = "2026-10-12T01:00:00Z") -> dict[str, Any]:
-        return {"user": {"login": login}, "created_at": at, "body": body}
+    def comment(self, login: str, body: str, at: str | None = "2026-10-12T01:00:00Z",
+                association: str = "COLLABORATOR") -> dict[str, Any]:
+        return {"user": {"login": login}, "created_at": at, "body": body,
+                "author_association": association}
+
+    def policy(self) -> dict[str, Any]:
+        return guard.review_policy(None, "danielraffel/tartci", True)
 
     def test_a_distinguishable_author_cannot_approve_their_own_head(self) -> None:
-        policy = guard.review_policy(None, "danielraffel/tartci")
-        mine = [self.comment("danielraffel", f"verdict: APPROVE head:{self.HEAD}")]
-        allowed, why = guard.review_verdict(self.HEAD, "danielraffel", mine, [], policy)
+        mine = [self.comment("danielraffel", f"verdict: APPROVE head:{self.HEAD}", association="OWNER")]
+        allowed, why = guard.review_verdict(self.HEAD, "danielraffel", mine, [], self.policy())
         self.assertFalse(allowed, why)
         self.assertIn("other than the PR author danielraffel", why)
         theirs = [self.comment("fable-graph", f"reviewed: {self.HEAD}")]
-        self.assertTrue(guard.review_verdict(self.HEAD, "danielraffel", theirs, [], policy)[0])
+        self.assertTrue(guard.review_verdict(self.HEAD, "danielraffel", theirs, [], self.policy())[0])
+
+    def test_only_the_fleet_app_and_trusted_accounts_count(self) -> None:
+        for association in ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", None):
+            outsider = [self.comment("drive-by", f"reviewed: {self.HEAD}", association=association)]
+            self.assertFalse(
+                guard.review_verdict(self.HEAD, "shipyard-local[bot]", outsider, [], self.policy())[0],
+                association)
+        fleet = [self.comment("shipyard-local[bot]", f"reviewed: {self.HEAD}", association="CONTRIBUTOR")]
+        self.assertTrue(guard.review_verdict(self.HEAD, "shipyard-local[bot]", fleet, [], self.policy())[0])
 
     def test_an_approved_review_on_the_head_counts(self) -> None:
-        policy = guard.review_policy(None, "danielraffel/tartci")
         review = {"user": {"login": "fable-graph"}, "state": "APPROVED", "commit_id": self.HEAD,
-                  "submitted_at": "2026-10-12T01:00:00Z"}
-        self.assertTrue(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review], policy)[0])
+                  "submitted_at": "2026-10-12T01:00:00Z", "author_association": "MEMBER"}
+        self.assertTrue(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review], self.policy())[0])
         hold = dict(review, state="CHANGES_REQUESTED", submitted_at="2026-10-12T02:00:00Z")
-        self.assertFalse(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review, hold], policy)[0])
+        self.assertFalse(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review, hold], self.policy())[0])
 
-    def test_without_tomllib_a_listed_repository_still_requires_review(self) -> None:
-        off = "[auto_merge]\narm_requires_head_approval = false\n"
-        with mock.patch.dict(sys.modules, {"tomllib": None}):
-            policy = guard.review_policy(off, "Generous-Corp/pulp")
-        self.assertTrue(policy["required"])
-        self.assertFalse(guard.review_policy(None, "someone/else")["required"])
+    def test_a_hold_with_no_readable_time_refuses_beside_a_newer_approval(self) -> None:
+        comments = [
+            self.comment("fable-graph", f"verdict: HOLD head:{self.HEAD}", at=None),
+            self.comment("fable-graph", f"verdict: APPROVE head:{self.HEAD}", at="2026-10-12T05:00:00Z"),
+        ]
+        allowed, why = guard.review_verdict(self.HEAD, "shipyard-local[bot]", comments, [], self.policy())
+        self.assertFalse(allowed, why)
+        self.assertIn("has no readable time", why)
 
     def test_only_the_last_line_is_a_verdict(self) -> None:
         self.assertIsNone(guard.marker_verdict(f"verdict: APPROVE head:{self.HEAD}\nthen more"))
         self.assertEqual(guard.marker_verdict(f"prose\n\nreviewed: {self.HEAD}\n"), ("APPROVE", self.HEAD))
+
+    def test_without_tomllib_an_existing_config_refuses(self) -> None:
+        off = "[auto_merge]\narm_requires_head_approval = false\n"
+        with mock.patch.dict(sys.modules, {"tomllib": None}):
+            with self.assertRaises(guard.GuardError):
+                guard.review_policy(off, "Generous-Corp/pulp", True)
+        self.assertFalse(guard.review_policy(None, "Generous-Corp/pulp", False)["required"])
+        self.assertTrue(guard.review_policy(None, "Generous-Corp/pulp", True)["required"])
+
+    def test_own_lines_ignore_what_a_base_change_moves(self) -> None:
+        def diff(line: str, offset: int) -> str:
+            return f"diff --git a/x b/x\nindex 1..2 100644\n@@ -{offset},2 +{offset},3 @@\n ctx\n+{line}\n"
+        self.assertEqual(guard.own_lines(diff("a", 1)), guard.own_lines(diff("a", 90)))
+        self.assertNotEqual(guard.own_lines(diff("a", 1)), guard.own_lines(diff("b", 1)))
 
     def test_the_default_repositories_match_the_rust_list(self) -> None:
         source = (SCRIPT.parent.parent / "src" / "head_approval.rs").read_text(encoding="utf-8")
@@ -1893,3 +2136,5 @@ class ReviewIdentity(unittest.TestCase):
         rust = tuple(re.findall(r'"([^"]+)"', block))
         self.assertEqual(rust, guard.REVIEW_REQUIRED_REPOS)
         self.assertEqual(len(rust), 4)
+        trusted = source.split("pub const TRUSTED_ASSOCIATIONS", 1)[1].split("];", 1)[0]
+        self.assertEqual(tuple(re.findall(r'"([^"]+)"', trusted)), guard.TRUSTED_ASSOCIATIONS)
