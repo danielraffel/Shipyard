@@ -79,6 +79,16 @@ the base, and every file the pull request changes has the same blob at the new
 head as at the approved head. A file the base also changed since, or any
 binary change in the pull request, needs a new verdict.
 
+A rebase of an approved head carries the approval only on a host that turned
+the rebase carry on (``SHIPYARD_REBASE_CARRY=1`` or a ``rebase-carry`` file in
+the guards directory), and only when all of these hold: the pull request's
+diff has the same ``git patch-id --stable`` before and after; it changes the
+same files with the same status; re-applying the approved diff onto the new
+merge base gives exactly the new head's blob and mode for every one of them
+(no conflict was resolved by hand); and no required check on the new head has
+concluded ``skipped`` or ``neutral``. Every carry appends a line to
+``carries.jsonl`` in the guards directory.
+
 ``GHAPP_ALLOW_UNREVIEWED_ARM=1`` is the operator override for this rule alone;
 it prints a WARNING and appends an audit line. ``GHAPP_ALLOW_QUEUE_REARM`` does
 not stand in for it.
@@ -136,6 +146,12 @@ FLEET_AUTHOR = "shipyard-local"
 REVIEW_OVERRIDE_ENV = "GHAPP_ALLOW_UNREVIEWED_ARM"
 HOST_ENABLE_ENV = "SHIPYARD_REVIEW_BEFORE_ARM"
 HOST_ENABLE_FILE = "review-before-arm"
+# The rebase carry (see rebase_carry) is a separate switch, off by default.
+REBASE_CARRY_ENV = "SHIPYARD_REBASE_CARRY"
+REBASE_CARRY_FILE = "rebase-carry"
+REBASE_CARRY_LOG = "carries.jsonl"
+# A required check that concluded one of these on the new head did not run in full.
+NOT_RUN_IN_FULL = ("skipped", "neutral")
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
 MERGE_MUTATIONS = ("mergepullrequest",)
 # Same pattern as src/head_approval.rs marker_verdict.
@@ -923,6 +939,236 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
     return None
 
 
+def rebase_carry_enabled() -> bool:
+    """Whether this host carries approvals across a rebase (off unless turned on)."""
+    switch = os.environ.get(REBASE_CARRY_ENV)
+    if switch == "1":
+        return True
+    if switch == "0":
+        return False
+    return (_guards_dir() / REBASE_CARRY_FILE).is_file()
+
+
+def patch_id(diff: str) -> str | None:
+    """``git patch-id --stable`` of a diff (no repository needed); ``None`` when empty."""
+    try:
+        completed = subprocess.run(["git", "patch-id", "--stable"], input=diff,
+                                   capture_output=True, text=True, check=False, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GuardError(f"cannot run git patch-id: {error}") from error
+    if completed.returncode != 0:
+        raise GuardError(f"git patch-id failed: {completed.stderr.strip()[-200:]}")
+    ids = [line.split()[0] for line in completed.stdout.splitlines() if line.strip()]
+    if len(ids) > 1:
+        raise GuardError("the diff read as more than one patch")
+    return ids[0] if ids else None
+
+
+def _diff_sections(diff: str) -> dict[str, str]:
+    """``path -> its section`` of a ``git diff`` text, keyed by the ``b/`` path."""
+    sections: dict[str, str] = {}
+    current: list[str] = []
+    name: str | None = None
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if name is not None:
+                sections[name] = "".join(current)
+            current = [line]
+            match = re.match(r"diff --git a/(.+) b/(.+)$", line.rstrip("\n"))
+            name = match.group(2) if match else None
+            if name is None:
+                raise GuardError(f"cannot read the file of diff header {line.strip()[:120]}")
+            continue
+        current.append(line)
+    if name is not None:
+        sections[name] = "".join(current)
+    return sections
+
+
+def _blob_bytes(repo: str, sha: str) -> bytes:
+    import base64
+    blob = run_real_gh(["api", f"repos/{repo}/git/blobs/{sha}"])
+    if not isinstance(blob, dict) or blob.get("encoding") != "base64":
+        raise GuardError(f"blob {sha[:12]} is unreadable")
+    return base64.b64decode(str(blob.get("content") or ""))
+
+
+def reapplied_blob(section: str, path: str, before: bytes | None) -> str | None:
+    """The blob sha of ``path`` after applying ``section`` to ``before``
+    (``None`` content: the file is absent), or ``None`` when the result is no
+    file. Raises GuardError when the patch does not apply cleanly."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as scratch:
+        root = pathlib.Path(scratch)
+        target = root / path
+        if before is not None:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(before)
+        applied = subprocess.run(["git", "apply", "--whitespace=nowarn", "-"], cwd=root,
+                                 input=section.encode(), capture_output=True, check=False,
+                                 timeout=60)
+        if applied.returncode != 0:
+            raise GuardError(f"the approved change to {path} does not apply cleanly to the new base")
+        if not target.exists():
+            return None
+        hashed = subprocess.run(["git", "hash-object", "--", str(target)], cwd=root,
+                                capture_output=True, text=True, check=False, timeout=60)
+        if hashed.returncode != 0:
+            raise GuardError(f"cannot hash the re-applied {path}")
+        return hashed.stdout.strip()
+
+
+# Re-applying reads one blob per file the base also changed; past this, refuse.
+REAPPLY_FILE_CAP = 50
+
+
+def required_not_run_in_full(repo: str, base: str, head: str) -> str | None:
+    """Why a required check on ``head`` did not run in full, or ``None``."""
+    required = _required_contexts(run_real_gh, repo, base)
+    if not required:
+        return None
+    runs = run_real_gh(["api", f"repos/{repo}/commits/{head}/check-runs?per_page=100"])
+    listed = runs.get("check_runs") if isinstance(runs, dict) else None
+    if not isinstance(listed, list) or runs.get("total_count") != len(listed):
+        raise GuardError(f"the check runs of {head[:12]} are unreadable or partial")
+    for context in required:
+        named = [run for run in listed if isinstance(run, dict) and run.get("name") == context]
+        if not named:
+            continue
+        latest = max(named, key=lambda run: run.get("id") if isinstance(run.get("id"), int) else 0)
+        if latest.get("status") == "completed" and latest.get("conclusion") in NOT_RUN_IN_FULL:
+            return f"required check `{context}` on {head[:12]} concluded `{latest['conclusion']}`"
+    return None
+
+
+def _same_patch(old_diff: str, new_diff: str, record: dict[str, Any]) -> str | None:
+    """Condition 1: the diff's ``git patch-id --stable`` did not change."""
+    old_id, new_id = patch_id(old_diff), patch_id(new_diff)
+    record["patch_id"] = old_id
+    if old_id is None or old_id != new_id:
+        return f"the diff's patch-id changed ({(old_id or 'none')[:12]} -> {(new_id or 'none')[:12]})"
+    return None
+
+
+def _same_files(before: dict[str, tuple[str, str, bool]], after: dict[str, tuple[str, str, bool]],
+                head: str) -> str | None:
+    """Condition 2: the same files, with the same status."""
+    if sorted(before) != sorted(after):
+        changed = sorted(set(before) ^ set(after))
+        return f"the set of files the pull request changes moved ({changed[0]})"
+    for name in sorted(before):
+        if before[name][0] != after[name][0]:
+            return f"{name} is {after[name][0]} at {head[:12]}, {before[name][0]} when approved"
+    return None
+
+
+def _reapplies_exactly(repo: str, approved: str, head: str, old_diff: str,
+                       before: dict[str, tuple[str, str, bool]],
+                       after: dict[str, tuple[str, str, bool]],
+                       base_changed: dict[str, tuple[str, str, bool]]) -> str | None:
+    """Condition 3: re-applying the approved diff onto the new merge base gives
+    exactly the new head's blob and the approved mode for every file it changes."""
+    binary = sorted(name for name, (_, _, has_patch) in before.items() if not has_patch)
+    if binary:
+        return f"the pull request changes a binary file ({binary[0]})"
+    overlap = sorted(set(before) & set(base_changed))
+    if len(overlap) > REAPPLY_FILE_CAP:
+        return f"the base changed {len(overlap)} of the pull request's files; too many to re-apply"
+    sections = _diff_sections(old_diff)
+    for name, (status, approved_blob, _) in sorted(before.items()):
+        if name not in after:
+            continue  # condition 2's finding
+        head_blob = after[name][1] if after[name][0] != "removed" else None
+        if name not in overlap:
+            expected = approved_blob if status != "removed" else None
+        else:
+            section = sections.get(name)
+            if section is None:
+                return f"the approved diff has no section for {name}"
+            base_status, base_blob, _ = base_changed[name]
+            content = None if base_status == "removed" else _blob_bytes(repo, base_blob)
+            try:
+                expected = reapplied_blob(section, name, content)
+            except GuardError as error:
+                return str(error)
+        if expected != head_blob:
+            return f"re-applying the approved change to {name} does not give the blob at {head[:12]}"
+    present = sorted(name for name, (status, _, _) in before.items()
+                     if status != "removed" and name in after)
+    if present:
+        approved_modes = tree_modes(repo, approved, present)
+        head_modes = tree_modes(repo, head, present)
+        for name in present:
+            if approved_modes.get(name) != head_modes.get(name):
+                return f"{name} at {head[:12]} does not keep the mode approved at {approved[:12]}"
+    return None
+
+
+def rebase_carry(repo: str, base: str, approved: str, head: str) -> tuple[str | None, dict[str, Any]]:
+    """``(None, record)`` when the approval of ``approved`` carries across a
+    rebase to ``head``; else ``(why not, record)``.
+
+    Four conditions, each checked on its own and every failing one named:
+
+    1. the pull request's diff has the same ``git patch-id --stable`` at both
+       heads (each against its own merge base);
+    2. it changes the same files, with the same status;
+    3. re-applying the approved diff onto the new merge base gives exactly the
+       new head's blob, and the approved mode, for every one of those files:
+       a file the base did not change between the merge bases must keep its
+       approved blob, and one it did change must come out of a clean
+       ``git apply`` as the new blob, so no conflict was resolved by hand;
+    4. no required check on the new head concluded ``skipped`` or ``neutral``:
+       the carry covers the review, never the checks.
+
+    Any binary change, or anything unreadable, refuses.
+    """
+    record: dict[str, Any] = {"repo": repo, "approved": approved, "head": head}
+    try:
+        before_compare = run_real_gh(["api", f"repos/{repo}/compare/{base}...{approved}"])
+        after_compare = run_real_gh(["api", f"repos/{repo}/compare/{base}...{head}"])
+        if not isinstance(before_compare, dict) or not isinstance(after_compare, dict):
+            return "the pull request's files are unreadable", record
+        old_base = (before_compare.get("merge_base_commit") or {}).get("sha")
+        new_base = (after_compare.get("merge_base_commit") or {}).get("sha")
+        if not isinstance(old_base, str) or not isinstance(new_base, str):
+            return "the merge bases are unreadable", record
+        record.update(old_base=old_base, new_base=new_base)
+        moved = run_real_gh(["api", f"repos/{repo}/compare/{old_base}...{new_base}"])
+        if not isinstance(moved, dict) or moved.get("status") not in ("ahead", "identical"):
+            return f"the new merge base {new_base[:12]} does not descend from {old_base[:12]}", record
+        before = _pr_files(before_compare, f"compare/{base}...{approved[:12]}")
+        after = _pr_files(after_compare, f"compare/{base}...{head[:12]}")
+        base_changed = (_pr_files(moved, "the base's changes")
+                        if moved.get("status") == "ahead" else {})
+        record["files"] = len(before)
+        diff_header = ["-H", "Accept: application/vnd.github.diff"]
+        old_diff = run_real_gh_text(["api", *diff_header, f"repos/{repo}/compare/{old_base}...{approved}"])
+        new_diff = run_real_gh_text(["api", *diff_header, f"repos/{repo}/compare/{new_base}...{head}"])
+        reasons = [reason for reason in (
+            _same_patch(old_diff, new_diff, record),
+            _same_files(before, after, head),
+            _reapplies_exactly(repo, approved, head, old_diff, before, after, base_changed),
+            required_not_run_in_full(repo, base, head),
+        ) if reason is not None]
+    except GuardError as error:
+        return f"the rebase carry cannot be checked ({error})", record
+    return ("; ".join(reasons) if reasons else None), record
+
+
+def log_carry(record: dict[str, Any]) -> None:
+    """Append one carry to the guards directory's carry log. Never raises."""
+    entry = dict(record, at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 kind="rebase", argv=sys.argv[1:])
+    try:
+        directory = _guards_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / REBASE_CARRY_LOG).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
 TREE_BATCH = 50
 
 
@@ -1075,6 +1321,20 @@ def review_gate(classification: dict[str, Any], repo: str | None
                 "every commit since is a merge of the base and every file the pull request "
                 "changes keeps its approved blob and mode"
             ), None
+        if cause == "unreviewed" and rebase_carry_enabled():
+            rebase_refusal, record = rebase_carry(repo, base, approved, head)
+            if rebase_refusal is None:
+                record["pr"] = number
+                log_carry(record)
+                print(f"ghapp: {label} ({repo}): approval of {approved[:12]} carried across a "
+                      f"rebase to {head[:12]} (logged to {REBASE_CARRY_LOG})", file=sys.stderr)
+                return True, (
+                    f"{label} ({repo}): the approval of {approved[:12]} carries across the rebase "
+                    f"to {head[:12]}: same patch-id, same files, the approved change re-applies "
+                    "to exactly the new tree, and no required check was skipped. The carry "
+                    "covers the review only; required checks still run on the new head"
+                ), None
+            refusal += f"; across a rebase: {rebase_refusal}"
         why += f" The approval of {approved[:12]} does not carry: {refusal}."
         cause = "approval_does_not_carry" if cause == "unreviewed" else cause
     what = {

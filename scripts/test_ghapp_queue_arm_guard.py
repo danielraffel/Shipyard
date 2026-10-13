@@ -1733,6 +1733,17 @@ def git_compare(repo, argv):
         files.append(entry)
     return {"status": status, "ahead_by": ahead, "behind_by": behind, "total_commits": ahead,
             "merge_base_commit": {"sha": base}, "commits": commits, "files": files}
+def git_diff(repo, argv):
+    spec = next(part for part in argv.split() if "/compare/" in part).split("/compare/", 1)[1]
+    x, y = spec.split("...", 1)
+    base = _git(repo, "merge-base", x, y)
+    return _sp.run(["git", "diff", "--no-renames", "--full-index", base, y], cwd=repo,
+                   capture_output=True, text=True, check=True).stdout
+def git_blob(repo, argv):
+    import base64 as _b64
+    sha = next(part for part in argv.split() if "/git/blobs/" in part).rsplit("/", 1)[1]
+    data = _sp.run(["git", "cat-file", "blob", sha], cwd=repo, capture_output=True, check=True).stdout
+    return {"sha": sha, "encoding": "base64", "content": _b64.b64encode(data).decode()}
 def git_trees(repo, argv):
     import re as _re
     found = {}
@@ -1785,6 +1796,10 @@ class ReviewBeforeArm(unittest.TestCase):
             "        continue\n"
             "    if 'git_tree' in answer:\n"
             "        sys.stdout.write(json.dumps(git_trees(answer['git_tree'], argv))); sys.exit(0)\n"
+            "    if 'git_blob' in answer:\n"
+            "        sys.stdout.write(json.dumps(git_blob(answer['git_blob'], argv))); sys.exit(0)\n"
+            "    if 'git' in answer and 'vnd.github.diff' in argv:\n"
+            "        sys.stdout.write(git_diff(answer['git'], argv)); sys.exit(0)\n"
             "    if 'git' in answer:\n"
             "        sys.stdout.write(json.dumps(git_compare(answer['git'], argv))); sys.exit(0)\n"
             "    if 'error' in answer:\n"
@@ -2221,6 +2236,108 @@ class ReviewBeforeArm(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn(f"does not descend from {history.approved[:12]}", result.stderr)
 
+    # A rebase of an approved head carries only behind its own host switch,
+    # and only when all four conditions hold.
+
+    def rebase_answers(self, history: "CarryHistory", head: str,
+                       conclusion: str = "success") -> list[tuple[str, dict[str, Any]]]:
+        answers = self.carry_answers(history, head)
+        answers.insert(0, ("git/blobs/", {"git_blob": str(history.path)}))
+        answers.insert(0, ("rules/branches/", {"json": [
+            {"type": "required_status_checks",
+             "parameters": {"required_status_checks": [{"context": "macos"}]}}]}))
+        answers.insert(0, ("/protection/required_status_checks",
+                           {"error": "gh: Branch not protected (HTTP 404)"}))
+        answers.insert(0, ("/check-runs", {"json": {"total_count": 1, "check_runs": [
+            {"id": 7, "name": "macos", "status": "completed", "conclusion": conclusion}]}}))
+        return answers
+
+    def land_rebased(self, history: "CarryHistory", head: str, switch: str | None = "1",
+                     conclusion: str = "success") -> subprocess.CompletedProcess:
+        env = {} if switch is None else {"SHIPYARD_REBASE_CARRY": switch}
+        return self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", head],
+                              self.rebase_answers(history, head, conclusion),
+                              "danielraffel/Shipyard", **env)
+
+    def carries(self) -> list[dict[str, Any]]:
+        log = self.guards / "carries.jsonl"
+        if not log.is_file():
+            return []
+        return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+    def test_a_clean_rebase_carries_only_with_the_switch_on_and_is_logged(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase()
+        off = self.land_rebased(history, head, switch=None)
+        self.assertEqual(off.returncode, 1, off.stderr)
+        self.assertIn(f"does not descend from {history.approved[:12]}", off.stderr)
+        self.assertEqual(self.carries(), [])
+        forced_off = self.land_rebased(history, head, switch="0")
+        self.assertEqual(forced_off.returncode, 1, forced_off.stderr)
+        on = self.land_rebased(history, head)
+        self.assertEqual(on.returncode, 0, on.stderr)
+        self.assertIn("carried across a rebase", on.stderr)
+        [record] = self.carries()
+        self.assertEqual((record["approved"], record["head"], record["pr"], record["kind"]),
+                         (history.approved, head, 784, "rebase"))
+        self.assertTrue(record["patch_id"])
+        self.assertNotEqual(record["old_base"], record["new_base"])
+        # The file switch turns it on too.
+        (self.guards / "rebase-carry").write_text("", encoding="utf-8")
+        self.assertEqual(self.land_rebased(history, head, switch=None).returncode, 0)
+
+    def test_a_rebase_over_a_base_edit_to_the_same_file_reapplies_cleanly(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        history.on_base(lambda: history.replace_line(50, "line fifty (base)\n"))
+        head = history.rebase()
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("git/blobs/", self.calls(), "the overlap was re-applied, not assumed")
+
+    def test_a_hand_resolved_conflict_does_not_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        history.on_base(lambda: history.replace_line(10, "line ten (base)\n"))
+        head = history.rebase(resolve=lambda: history.write(
+            "guard.c", (history.path / "guard.c").read_text().split("<<<<<<<")[0].encode()
+            + b"  if (!authorized) return;\nline ten (base)\n"
+            + "".join(f"line {n}\n" for n in range(11, 61)).encode()))
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("does not apply cleanly to the new base", result.stderr)
+
+    def test_a_rebase_that_changes_the_patch_does_not_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase(after=lambda: history.append("guard.c", "  backdoor();\n"))
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("the diff's patch-id changed", result.stderr)
+        self.assertIn("re-applying the approved change to guard.c", result.stderr)
+
+    def test_a_rebase_that_adds_a_file_does_not_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase(after=lambda: history.write("notes.txt", b"new\n"))
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("the set of files the pull request changes moved (notes.txt)", result.stderr)
+
+    def test_a_rebase_that_flips_a_mode_does_not_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase(after=lambda: (history.path / "guard.c").chmod(0o755))
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("does not keep the mode approved", result.stderr)
+
+    def test_a_skipped_required_check_does_not_carry(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase()
+        for conclusion in ("skipped", "neutral"):
+            with self.subTest(conclusion=conclusion):
+                result = self.land_rebased(history, head, conclusion=conclusion)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"required check `macos` on {head[:12]} concluded `{conclusion}`",
+                              result.stderr)
+        self.assertEqual(self.carries(), [])
+
     def test_a_commit_that_is_not_a_merge_needs_a_new_verdict(self) -> None:
         history = CarryHistory(self.root / "repo")
         history.git("checkout", "-q", "-B", "single", history.approved)
@@ -2294,6 +2411,33 @@ class CarryHistory:
             edit()
         self.git("add", "-A")
         self.git("commit", "-qm", "Merge branch 'main' into pr")
+        return self.git("rev-parse", "HEAD")
+
+    def replace_line(self, number: int, text: str) -> None:
+        lines = (self.path / "guard.c").read_text().splitlines(keepends=True)
+        index = next(i for i, line in enumerate(lines) if line == f"line {number}\n")
+        lines[index] = text
+        self.write("guard.c", "".join(lines).encode())
+
+    def rebase(self, after: Any = None, resolve: Any = None) -> str:
+        """Rebase the approved head onto the base; ``resolve`` settles a
+        conflict by hand, ``after`` amends the rebased head."""
+        self.git("checkout", "-q", "-B", "rebased", self.approved)
+        done = subprocess.run(["git", "rebase", "-q", "main"], cwd=self.path,
+                              capture_output=True, text=True)
+        if done.returncode != 0:
+            if resolve is None:
+                raise AssertionError(f"unexpected conflict: {done.stdout}{done.stderr}")
+            resolve()
+            self.git("add", "-A")
+            subprocess.run(["git", "-c", "core.editor=true", "rebase", "--continue"],
+                           cwd=self.path, capture_output=True, text=True, check=True)
+        elif resolve is not None:
+            raise AssertionError("the rebase was expected to conflict")
+        if after is not None:
+            after()
+            self.git("add", "-A")
+            self.git("commit", "-q", "--amend", "--no-edit")
         return self.git("rev-parse", "HEAD")
 
     def rewrite(self) -> str:

@@ -137,6 +137,33 @@ Anything else, or anything the guard cannot read (including a comparison at
 GitHub's 300-file cap), needs a new verdict. A HOLD naming the new head is
 never overridden by a carry.
 
+**Rebases (separate switch, off by default).** A rebased head does not descend
+from the approved one, so the rule above never carries to it. On a host that
+turns the rebase carry on (`SHIPYARD_REBASE_CARRY=1`, `0` forces it off, or a
+file named `rebase-carry` in the guards directory), the approval carries
+across a rebase only when all four hold, and the refusal names every one that
+fails:
+
+* the pull request's diff (each head against its own merge base, read as
+  `application/vnd.github.diff`) has the same `git patch-id --stable`;
+* it changes the same files, with the same status;
+* re-applying the approved diff onto the new merge base gives exactly the new
+  head's blob, and the approved mode, for every file it changes: a file the
+  base did not touch between the two merge bases must keep its approved blob,
+  and one the base did touch is re-applied with a strict `git apply` to the
+  base's new blob and must hash to the head's, so a conflict resolved by hand
+  never carries. The new merge base must descend from the old one. A binary
+  change, a base that touched more than 50 of the pull request's files, or a
+  base comparison at GitHub's 300-file cap refuses;
+* no required check on the new head has concluded `skipped` or `neutral`. The
+  carry covers the review only; required checks run on the new head as on any
+  other.
+
+Every carry appends one JSON line (repository, pull request, both heads, both
+merge bases, the patch-id, the file count, argv) to `carries.jsonl` in the
+guards directory and prints a line saying so. A HOLD naming the new head still
+refuses. Roll it out one host at a time; roll back by removing the file.
+
 The refusal names the head, the exact marker it needs, and the latest verdict
 when it approves a different head. Each refusal is followed by one
 `queue-arm-guard: fix:` line of JSON with `what`, `evidence` (the pull
