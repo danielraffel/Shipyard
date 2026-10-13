@@ -144,9 +144,10 @@ project will automatically recover or merge every PR.
   `ghapp` dequeues or disarms a PR armed or queued at exactly that head; if
   that fails, it posts a public note on the PR saying the HOLD may still land.
   That is the fast path only: a HOLD posted from the web UI, a Codex session
-  or a host without the guard is not seen by it, and relies on the
-  repository's own merge-group backstop (in pulp, a preflight that fails the
-  merge group when a queued PR's latest verdict is a HOLD on its head).
+  or a host without the guard is not seen by it. pulp backstops that with a
+  merge-group preflight that fails the group when a queued PR's latest
+  verdict is a HOLD on its head; in other repositories such a HOLD does not
+  stop a head that is already armed or queued, so post HOLDs through `ghapp`.
   Each behaviour is switched on per host by a file in the guards directory
   (`review-before-arm`, `hold-disarms`), so it rolls out one host at a time.
   See [`ghapp` guards](docs/ghapp-guards.md).
