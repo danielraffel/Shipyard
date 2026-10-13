@@ -290,7 +290,7 @@ document:
   listed, a verdict counts from the fleet App or an `OWNER`, `MEMBER` or
   `COLLABORATOR`, never from the PR's distinguishable author. A merge-only
   update carries the approval only when every file the PR changes keeps its
-  approved blob, the base changed none of them and no binary changed, and the
+  approved blob and mode, the base changed none of them and no binary changed, and the
   classic merge is gated like an arm (see `docs/ghapp-guards.md`, Review
   before arm or merge).
 * A repository that sets `[auto_merge] arm_requires_head_approval = true` on

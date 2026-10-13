@@ -91,6 +91,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import posixpath
 import re
 import subprocess
 import sys
@@ -849,7 +850,7 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
     It carries only when every commit on the first-parent chain from ``head``
     back to ``approved`` is a two-parent merge whose merged parent is on
     ``base``, and every file the pull request
-    changes has, at ``head``, the same blob it had at ``approved``. A file the
+    changes has, at ``head``, the same blob and mode it had at ``approved``. A file the
     base also changed since ``approved``, or any binary change in the pull
     request, needs a new verdict: a merge could move or swap content a diff of
     the changed lines cannot see.
@@ -896,6 +897,16 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
         for name, (status, sha, _) in sorted(before.items()):
             if after[name][:2] != (status, sha):
                 return f"{name} at {head[:12]} is not the blob approved at {approved[:12]}"
+        # The comparison carries no file mode, so a merge that only flips a
+        # file's executable bit keeps its blob: read the modes themselves.
+        present = sorted(name for name, (status, _, _) in before.items() if status != "removed")
+        if present:
+            approved_modes = tree_modes(repo, approved, present)
+            head_modes = tree_modes(repo, head, present)
+            for name in present:
+                if approved_modes.get(name) != head_modes.get(name):
+                    return (f"{name} at {head[:12]} does not keep the mode approved at "
+                            f"{approved[:12]}")
         base_before = (before_compare.get("merge_base_commit") or {}).get("sha")
         base_after = (after_compare.get("merge_base_commit") or {}).get("sha")
         if not isinstance(base_before, str) or not isinstance(base_after, str):
@@ -910,6 +921,40 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
     except GuardError as error:
         return f"the carry cannot be checked ({error})"
     return None
+
+
+TREE_BATCH = 50
+
+
+def tree_modes(repo: str, commit: str, names: list[str]) -> dict[str, int | None]:
+    """Each file's git mode at ``commit`` (``None`` when absent), from its directory's tree."""
+    owner, _, name = repo.partition("/")
+    by_dir: dict[str, list[str]] = {}
+    for path in names:
+        by_dir.setdefault(posixpath.dirname(path), []).append(path)
+    directories = sorted(by_dir)
+    modes: dict[str, int | None] = {}
+    for start in range(0, len(directories), TREE_BATCH):
+        batch = directories[start:start + TREE_BATCH]
+        fields = "".join(
+            f"d{index}:object(expression:{json.dumps(commit + ':' + directory)})"
+            "{...on Tree{entries{name mode}}}"
+            for index, directory in enumerate(batch)
+        )
+        query = f"query{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{{fields}}}}}"
+        value = run_real_gh(["api", "graphql", "-f", f"query={query}"])
+        if not isinstance(value, dict) or value.get("errors") or not isinstance(
+                (value.get("data") or {}).get("repository"), dict):
+            raise GuardError(f"the trees at {commit[:12]} are unreadable")
+        repository = value["data"]["repository"]
+        for index, directory in enumerate(batch):
+            tree = repository.get(f"d{index}") or {}
+            entries = {entry.get("name"): entry.get("mode")
+                       for entry in tree.get("entries") or [] if isinstance(entry, dict)}
+            for path in by_dir[directory]:
+                mode = entries.get(posixpath.basename(path))
+                modes[path] = mode if isinstance(mode, int) else None
+    return modes
 
 
 def _rest_pages(path: str) -> list[dict[str, Any]]:
@@ -945,7 +990,7 @@ def _binding_refusal(target: dict[str, Any], head: str) -> str | None:
     bound = target.get("bound_head")
     hint = (
         "`--match-head-commit <sha>` on `gh pr merge`, `expectedHeadOid` in the mutation, "
-        "or `sha=` on the REST merge"
+        "or `sha=` on the REST merge."
     )
     if not isinstance(bound, str) or not bound:
         return f"the request does not bind the head it lands; bind it to {head} with {hint}"
@@ -954,19 +999,38 @@ def _binding_refusal(target: dict[str, Any], head: str) -> str | None:
     return None
 
 
-def review_gate(classification: dict[str, Any], repo: str | None) -> tuple[bool, str]:
-    """``(allowed, message)``: the review-before-arm rule for one target."""
+def review_fix(cause: str, what: str, repo: str, number: int, head: str,
+               command: str, safe: bool) -> dict[str, Any]:
+    """The actionable fields a review refusal carries (printed as one JSON line)."""
+    return {
+        "what": what,
+        "evidence": f"https://github.com/{repo}/pull/{number}",
+        "cause": cause,
+        "command": command,
+        "safe_to_auto_apply": safe,
+        "verify": (f"`ghapp api repos/{repo}/pulls/{number} --jq .head.sha` prints {head}, and "
+                   "the same landing command passes this guard"),
+    }
+
+
+def review_gate(classification: dict[str, Any], repo: str | None
+                ) -> tuple[bool, str, dict[str, Any] | None]:
+    """``(allowed, message, fix)``: the review-before-arm rule for one target.
+
+    ``fix`` says, for a refusal it can name, what to do next.
+    """
     repo = classification.get("repo") or repo
     number = classification.get("pr")
     head = classification.get("head")
     label = f"PR #{number}"
     if not repo or not isinstance(number, int) or not isinstance(head, str):
-        return False, f"{label}: cannot tell which head would land, so its review cannot be checked"
+        return False, f"{label}: cannot tell which head would land, so its review cannot be checked", None
     if not host_review_default():
         # Off is inert: nothing is read, so no config, Python version or
         # GitHub answer can change what an arm does on a host that has not
         # turned review on.
-        return True, f"review before arm is off on this host ({HOST_ENABLE_ENV} unset, no {HOST_ENABLE_FILE})"
+        return True, f"review before arm is off on this host ({HOST_ENABLE_ENV} unset, no {HOST_ENABLE_FILE})", None
+    read_pull = f"ghapp api repos/{repo}/pulls/{number} --jq .head.sha"
     try:
         pull = run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
         base = ((pull.get("base") or {}).get("ref")) if isinstance(pull, dict) else None
@@ -974,34 +1038,57 @@ def review_gate(classification: dict[str, Any], repo: str | None) -> tuple[bool,
             raise GuardError("the pull request carries no base branch")
         policy = review_policy(base_config_text(repo, base), repo, True)
         if not policy["required"]:
-            return True, f"{repo} does not require a review before arming"
+            return True, f"{repo} does not require a review before arming", None
         live_head = ((pull.get("head") or {}).get("sha") or "").lower()
         if live_head != head.lower():
             return False, (
                 f"{label}: the head moved while the guard read it ({head[:12]} -> "
                 f"{live_head[:12]}); read it again"
-            )
+            ), review_fix("head_moved", f"{label} moved from {head[:12]} to {live_head[:12]}",
+                          repo, number, live_head, read_pull, True)
         author = (pull.get("user") or {}).get("login")
         author = author if isinstance(author, str) else None
         comments = _rest_pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
         reviews = _rest_pages(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
     except GuardError as error:
-        return False, f"{label}: cannot read what its review requires ({error}); refusing to land it unreviewed"
+        return False, (
+            f"{label}: cannot read what its review requires ({error}); refusing to land it unreviewed"
+        ), review_fix("unreadable", f"{label}'s review state could not be read: {error}",
+                      repo, number, head, read_pull, True)
     unbound = _binding_refusal(classification, head)
     if unbound is not None:
-        return False, f"{label} ({repo}): {unbound}"
+        return False, f"{label} ({repo}): {unbound}", review_fix(
+            "unbound", f"the landing request for {label} does not bind head {head}",
+            repo, number, head,
+            f"repeat the same command with `--match-head-commit {head}` (gh pr merge), "
+            f"`expectedHeadOid: \"{head}\"` (GraphQL) or `sha={head}` (REST)", False)
     allowed, why = review_verdict(head, author, comments, reviews, policy)
-    if not allowed:
-        approved = approved_earlier_head(head, author, comments, reviews, policy)
-        if approved is not None:
-            refusal = merge_only_carry(repo, base, approved, head)
-            if refusal is None:
-                return True, (
-                    f"{label} ({repo}): the approval of {approved[:12]} carries to {head[:12]}: "
-                    "every commit since is a merge of the base and the own lines are byte-identical"
-                )
-            why += f" The approval of {approved[:12]} does not carry: {refusal}."
-    return allowed, f"{label} ({repo}): {why}"
+    if allowed:
+        return True, f"{label} ({repo}): {why}", None
+    cause = "hold" if "is HOLD" in why or "HOLD naming" in why else "unreviewed"
+    approved = approved_earlier_head(head, author, comments, reviews, policy)
+    if approved is not None:
+        refusal = merge_only_carry(repo, base, approved, head)
+        if refusal is None:
+            return True, (
+                f"{label} ({repo}): the approval of {approved[:12]} carries to {head[:12]}: "
+                "every commit since is a merge of the base and every file the pull request "
+                "changes keeps its approved blob and mode"
+            ), None
+        why += f" The approval of {approved[:12]} does not carry: {refusal}."
+        cause = "approval_does_not_carry" if cause == "unreviewed" else cause
+    what = {
+        "hold": f"the latest trusted verdict on {label}'s head {head[:12]} is HOLD",
+        "approval_does_not_carry": (f"{label}'s approval of {approved[:12] if approved else ''} "
+                                    f"does not carry to head {head[:12]}"),
+        "unreviewed": f"no trusted verdict names {label}'s head {head[:12]}",
+    }[cause]
+    command = (f"a reviewer (the fleet App, or an OWNER, MEMBER or COLLABORATOR who is not the "
+               f"author) reviews head {head} and posts a comment ending "
+               f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}")
+    # Approving is the reviewer's act; an agent landing its own head must not do it.
+    return False, f"{label} ({repo}): {why}", review_fix(
+        cause, what, repo, number, head, command, False)
 
 
 def audit_override(message: str) -> None:
@@ -2057,14 +2144,14 @@ def review_refusal(targets: list[dict[str, Any]], repo: str | None) -> bool:
 
     GHAPP_ALLOW_UNREVIEWED_ARM=1 arms anyway, loudly and on the audit log.
     """
-    unreviewed = [
-        message
-        for allowed, message in (review_gate(target, repo) for target in targets)
+    refused = [
+        (message, fix)
+        for allowed, message, fix in (review_gate(target, repo) for target in targets)
         if not allowed
     ]
-    if not unreviewed:
+    if not refused:
         return False
-    message = " | ".join(unreviewed)
+    message = " | ".join(message for message, _ in refused)
     if os.environ.get(REVIEW_OVERRIDE_ENV) == "1":
         audit_override(message)
         print(
@@ -2075,9 +2162,12 @@ def review_refusal(targets: list[dict[str, Any]], repo: str | None) -> bool:
         return False
     print(
         f"queue-arm-guard: refusing to arm or merge an unreviewed head: {message} "
-        "Post the verdict on the PR, then land it bound to that head.",
+        "Each `queue-arm-guard: fix:` line below says what to do next.",
         file=sys.stderr,
     )
+    for _, fix in refused:
+        if fix is not None:
+            print(f"queue-arm-guard: fix: {json.dumps(fix, sort_keys=True)}", file=sys.stderr)
     return True
 
 
