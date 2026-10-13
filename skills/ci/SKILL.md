@@ -379,7 +379,11 @@ plus a receipt with the row count and SHA-256. Label a row only after its
 `label_not_before` (24 h on), when hindsight says whether it was real. Fields
 v1 does not read are present, `null` and named in `unread`; do not fill them
 by hand. For Pulp, red required checks need `--required-context`, or the
-report says "no required contexts" and exports none of them.
+report says "no required contexts" and exports none of them. Read the receipt before
+counting: when `unread_kinds` lists `required_check_red`, the required
+contexts were unreadable and its zero rows mean unknown, not none
+(`required_source` says why). A receipt whose row count or SHA-256 disagrees
+with the file is an interrupted export: the receipt is written last.
 
 **The guard stops only landings sent through `ghapp`.** GitHub-native
 auto-merge armed before a HOLD (tartci allows it) and Vellum's merge-on-green

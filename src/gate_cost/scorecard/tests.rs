@@ -1299,3 +1299,82 @@ fn the_receipt_counts_the_rows_and_hashes_the_bytes() {
     }
     assert_eq!(receipt.from, "2026-10-05T15:00:00Z");
 }
+
+/// An in-progress merge-group gate has no conclusion yet and is not a case;
+/// only completed gates that did not pass are.
+#[test]
+fn an_in_progress_merge_group_gate_is_not_a_case() {
+    let fake = FakeGh::new("a");
+    let mut observation = observe(&fake, &query("a")).expect("gather");
+    let completed = cases::cases(&observation).len();
+    assert_eq!(completed, 2, "control: the window's failed gates are cases");
+    let mut running = observation.merge_group_runs[0].clone();
+    running.run_id += 1_000_000;
+    let gate = running.gate.as_mut().expect("the captured run has a gate");
+    gate.status = "in_progress".to_owned();
+    gate.conclusion = None;
+    gate.completed_at = None;
+    observation.merge_group_runs.push(running);
+    let rows = cases::cases(&observation);
+    assert_eq!(rows.len(), completed, "{rows:#?}");
+    assert!(
+        rows.iter()
+            .all(|row| row.outcome.as_deref() != Some("no_conclusion")),
+        "{rows:#?}"
+    );
+}
+
+/// Unread required contexts make `required_check_red` unknown in the
+/// receipt, never a silent zero.
+#[test]
+fn the_receipt_names_where_required_contexts_came_from() {
+    let fake = FakeGh::new("a");
+    let mut observation = observe(&fake, &query("a")).expect("gather");
+    let (_, read) = cases::export(&observation, &cases::cases(&observation)).expect("export");
+    assert!(read.unread_kinds.is_empty(), "{read:?}");
+    assert!(!read.required_source.starts_with("unread"), "{read:?}");
+    observation.required = Err("HTTP 403: branch protection".to_owned());
+    let rows = cases::cases(&observation);
+    assert!(rows.iter().all(|row| row.kind != "required_check_red"));
+    let (_, unread) = cases::export(&observation, &rows).expect("export");
+    assert_eq!(unread.unread_kinds, ["required_check_red"]);
+    assert_eq!(
+        unread.required_source,
+        "unread: HTTP 403: branch protection"
+    );
+    assert_eq!(
+        unread.required_source,
+        compute(&observation).required_source,
+        "the receipt and the report name the same source"
+    );
+}
+
+/// `merge_head_verdict` is null by kind: always on a merge-group gate, and on
+/// a removal of a pull request that did not merge in the window.
+#[test]
+fn merge_head_verdict_is_null_only_where_documented() {
+    let fake = FakeGh::new("a");
+    let mut observation = observe(&fake, &query("a")).expect("gather");
+    observation.queue_events.push(QueueEvent {
+        pr: 999_999,
+        at: observation.query.from + Duration::minutes(1),
+        kind: QueueEventKind::Removed {
+            reason: "failed_checks".to_owned(),
+            actor: Some("github-merge-queue".to_owned()),
+        },
+    });
+    let rows = cases::cases(&observation);
+    let merged: BTreeSet<u64> = observation.prs.iter().map(|pr| pr.number).collect();
+    assert!(
+        rows.iter().any(|row| row.kind == "queue_removal"),
+        "control"
+    );
+    for row in &rows {
+        let expect_null = match row.kind {
+            "merge_group_gate_failed" => true,
+            "queue_removal" => !row.pr.is_some_and(|pr| merged.contains(&pr)),
+            _ => false,
+        };
+        assert_eq!(row.merge_head_verdict.is_none(), expect_null, "{row:?}");
+    }
+}
