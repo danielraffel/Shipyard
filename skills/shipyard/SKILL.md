@@ -3578,7 +3578,11 @@ after it has validated a head, which happens only while a Shipyard process is
 alive; native auto-merge is server-owned, so a pull request whose ship lost its
 merge phase still lands instead of sitting green, unqueued and unarmed. Arming
 never fails the ship: a refusal is normally the guard agreeing there is nothing
-to arm.
+to arm. The `review-verdict`
+commit status (`scripts/review_verdict_status.py`) posts that same decision
+on every pull request's head from a workflow, so a repository can require it
+and stop landings that never pass through `ghapp`
+(docs/review-verdict-status.md).
 
 Unlike Shipyard's validated enqueue, these requests deliberately do **not**
 carry `SHIPYARD_INTERNAL_QUEUE_MUTATION`, so the arm guard judges them — an
