@@ -518,7 +518,9 @@ mod tests {
     }
 
     /// Concurrent exports to one path each land whole: the file is exactly one
-    /// run's bytes, never a mix.
+    /// run's bytes, never a mix. Windows refuses to replace a file another
+    /// rename is replacing at that moment, so there a run may fail outright,
+    /// but never leaves a mix or a stray temporary.
     #[test]
     fn concurrent_writes_to_one_path_each_land_whole() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -526,12 +528,29 @@ mod tests {
         let contents: Vec<Vec<u8>> = (0..8u8)
             .map(|index| vec![b'a' + index; 256 * 1024])
             .collect();
-        std::thread::scope(|scope| {
-            for content in &contents {
-                let target = &target;
-                scope.spawn(move || replace_file(target, content).expect("written"));
-            }
+        let written = std::thread::scope(|scope| {
+            let handles: Vec<_> = contents
+                .iter()
+                .map(|content| {
+                    let target = &target;
+                    scope.spawn(move || replace_file(target, content).is_ok())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("joined"))
+                .filter(|ok| *ok)
+                .count()
         });
+        if cfg!(windows) {
+            assert!(written >= 1, "no run landed");
+        } else {
+            assert_eq!(
+                written,
+                contents.len(),
+                "every run lands where renames replace"
+            );
+        }
         let landed = std::fs::read(&target).expect("read");
         assert!(contents.contains(&landed), "a mix of runs landed");
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
