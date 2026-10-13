@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03211"></a>
+## [0.321.1] - 2026-10-13
+
+- ci/distinct matrix check names ([#816](https://github.com/danielraffel/Shipyard/pull/816))
+- docs/readme recent features ([#817](https://github.com/danielraffel/Shipyard/pull/817))
+
 <a id="v03210"></a>
 ## [0.321.0] - 2026-10-13
 
@@ -2286,6 +2292,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.321.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.321.1
 [0.321.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.321.0
 [0.320.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.320.1
 [0.320.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.320.0

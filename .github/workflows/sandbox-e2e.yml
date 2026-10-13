@@ -59,7 +59,7 @@ jobs:
 
   sandbox:
     needs: resolve-runners
-    name: ${{ matrix.name }} [${{ matrix.provider }}]
+    name: Sandbox ${{ matrix.name }} [${{ matrix.provider }}]
     runs-on: ${{ fromJSON(matrix.runs_on_json) }}
     strategy:
       fail-fast: false
