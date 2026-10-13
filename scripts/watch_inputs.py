@@ -46,6 +46,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 CMUX = os.environ.get("CMUX_BIN", "/Applications/cmux.app/Contents/Resources/bin/cmux")
+
+
+def gh_binary(environ: "os._Environ[str] | dict[str, str]") -> str:
+    """The GitHub reader: the App-authenticated `ghapp`, never a `gh` on PATH.
+
+    Reads go out under the fleet App's identity and budget, through the
+    installed wrapper's grammar; `WATCH_INPUTS_GH` names another pinned binary.
+    """
+    return environ.get("WATCH_INPUTS_GH") or os.path.join(
+        environ.get("HOME") or os.path.expanduser("~"), ".local", "bin", "ghapp")
+
+
+GH = gh_binary(os.environ)
 SCREEN_LINES = 20
 PLACEHOLDER = "Ask Codex to do anything"
 # A turn in progress, including Codex retrying a provider error by itself.
@@ -358,7 +371,7 @@ def serving_events(jobs: list[dict[str, Any]], hosts: list[str], at: datetime,
         if last is not None and at - last < absent:
             continue
         since = stamp(last) if last else "the window start"
-        evidence = (f"gh api 'repos/{repo}/actions/runs?status=queued' and the runner list "
+        evidence = (f"ghapp api 'repos/{repo}/actions/runs?status=queued' and the runner list "
                     f"for {host}")
         events.append(event(
             "host_not_serving", f"host_not_serving:{host}:{since}", at,
@@ -376,20 +389,20 @@ def serving_events(jobs: list[dict[str, Any]], hosts: list[str], at: datetime,
 
 
 def read_gate_jobs(runner: Runner, repo: str, workflow: str, start: datetime,
-                   end: datetime) -> list[dict[str, Any]]:
-    """Every `macos` job of the gate workflow's runs created in `start..end`."""
+                   end: datetime, gh: str = GH) -> list[dict[str, Any]]:
+    """Every `macos` job of the gate workflow's runs created in `start..end`, read with `gh`."""
     jobs: list[dict[str, Any]] = []
     day = start
     while day < end:
         until = min(day + timedelta(days=1), end)
-        code, out = runner(["gh", "api", "--paginate", "--slurp", "-X", "GET",
+        code, out = runner([gh, "api", "--paginate", "--slurp", "-X", "GET",
                             f"repos/{repo}/actions/workflows/{workflow}/runs",
                             "-f", f"created={stamp(day)}..{stamp(until)}", "-f", "per_page=100"])
         if code != 0:
             raise RuntimeError(f"run listing failed: {out.strip()[:200]}")
         runs = [run for page in json.loads(out) for run in page.get("workflow_runs", [])]
         for item in runs:
-            code, out = runner(["gh", "api", f"repos/{repo}/actions/runs/{item['id']}/jobs?per_page=100",
+            code, out = runner([gh, "api", f"repos/{repo}/actions/runs/{item['id']}/jobs?per_page=100",
                                 "--jq", f'[.jobs[] | select(.name == "{GATE_JOB}") | '
                                 '{created_at, started_at, completed_at, conclusion, runner_name}]'])
             if code != 0:

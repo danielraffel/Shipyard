@@ -424,7 +424,9 @@ counts as working, never errored: sending `continue` would only interrupt it.
 into a session. `gate-serving --from/--to --tick` replays a past window from
 GitHub's job history (`--save-jobs` keeps what it read, `--jobs` reads it
 back), which is how the host rules are scored offline. The Codex readers have
-no history to replay.
+no history to replay. `gate-serving` reads GitHub through the App-authenticated
+`~/.local/bin/ghapp`, never a `gh` found on `PATH`; `WATCH_INPUTS_GH` names
+another pinned binary.
 
 `shipyard pr-watch rules-replay --since 2d --until <RFC 3339> --tick 5m`
 runs the same rules over a past window: it records what held at the window

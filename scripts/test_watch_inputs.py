@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -223,6 +224,53 @@ class GateServing(unittest.TestCase):
         self.assertEqual(self.events(jobs, 120), [])
         # A job queued less than the wait is not waiting yet.
         self.assertEqual(self.events([job("studio", 0, 1), job(None, 115, None)], 120), [])
+
+    def test_gate_jobs_are_read_through_ghapp_never_a_bare_gh(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            calls.append(argv)
+            if "--paginate" in argv:
+                return 0, json.dumps([{"workflow_runs": [{"id": 11}]}])
+            return 0, json.dumps([job("studio", 0, 1)])
+
+        jobs = inputs.read_gate_jobs(runner, "o/r", "build.yml", AT - timedelta(hours=1), AT)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(len(calls), 2)
+        for argv in calls:
+            self.assertEqual(argv[0], inputs.GH, argv)
+        self.assertTrue(os.path.isabs(inputs.GH), inputs.GH)
+        if "WATCH_INPUTS_GH" not in os.environ:
+            self.assertTrue(inputs.GH.endswith("/.local/bin/ghapp"), inputs.GH)
+
+    def test_the_github_reader_is_ghapp_or_a_named_pinned_binary(self) -> None:
+        self.assertEqual(inputs.gh_binary({"HOME": "/h"}), "/h/.local/bin/ghapp")
+        self.assertEqual(inputs.gh_binary({"HOME": "/h", "WATCH_INPUTS_GH": "/opt/gh/2.60/gh"}),
+                         "/opt/gh/2.60/gh")
+
+    def test_the_cli_never_runs_the_gh_on_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "bin").mkdir()
+            log = root / "calls.log"
+            fake = ("#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> " + str(log) + "\n"
+                    "case \"$*\" in *--paginate*) echo '[{\"workflow_runs\": []}]';; *) echo '[]';; esac\n")
+            for name in ("gh", "ghapp"):
+                path = root / "bin" / name
+                path.write_text(fake, encoding="utf-8")
+                path.chmod(0o755)
+            env = {**os.environ, "HOME": str(root), "PATH": f"{root / 'bin'}:{os.environ['PATH']}"}
+            env.pop("WATCH_INPUTS_GH", None)
+            (root / ".local" / "bin").mkdir(parents=True)
+            (root / ".local" / "bin" / "ghapp").symlink_to(root / "bin" / "ghapp")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "gate-serving", "--host", "studio",
+                 "--from", "2026-10-12T00:00:00Z", "--to", "2026-10-12T00:10:00Z"],
+                capture_output=True, text=True, check=False, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = log.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(calls, "the reader read nothing")
+        self.assertTrue(all(line.startswith("ghapp api ") for line in calls), calls)
 
     def test_the_replay_emits_each_absence_once(self) -> None:
         jobs = [job("studio", 0, 1), job(None, 60, None)]
