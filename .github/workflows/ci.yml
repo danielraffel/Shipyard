@@ -63,7 +63,7 @@ jobs:
 
   test:
     needs: resolve-runners
-    name: ${{ matrix.name }} [${{ matrix.provider }}]
+    name: Test ${{ matrix.name }} [${{ matrix.provider }}]
     runs-on: ${{ fromJSON(matrix.runs_on_json) }}
     strategy:
       fail-fast: false

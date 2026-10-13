@@ -208,6 +208,22 @@ class CiMatrixTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("MACOS_ARM64_LOCAL_SELECTOR_JSON", text, path.name)
 
+    def test_matrix_check_names_say_which_workflow_ran_them(self) -> None:
+        # GitHub reports a check by job name alone, so two workflows whose
+        # matrix legs render the same name ("macOS ARM64 [local]") cannot be
+        # told apart by anything that reads check runs.
+        root = Path(__file__).resolve().parents[1]
+        names = {}
+        for path in sorted((root / ".github" / "workflows").glob("*.yml")):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if stripped.startswith("name:") and "${{ matrix." in stripped:
+                    names.setdefault(stripped, []).append(path.name)
+        duplicated = {name: files for name, files in names.items() if len(files) > 1}
+        self.assertEqual(duplicated, {})
+        self.assertIn("name: Test ${{ matrix.name }} [${{ matrix.provider }}]", names)
+        self.assertIn("name: Sandbox ${{ matrix.name }} [${{ matrix.provider }}]", names)
+
     def test_rust_cache_never_runs_the_macos_save_hook(self) -> None:
         root = Path(__file__).resolve().parents[1]
         guarded_save = (

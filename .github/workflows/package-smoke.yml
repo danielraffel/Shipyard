@@ -57,7 +57,7 @@ jobs:
 
   package:
     needs: resolve-runners
-    name: ${{ matrix.name }} [${{ matrix.provider }}]
+    name: Package ${{ matrix.name }} [${{ matrix.provider }}]
     runs-on: ${{ fromJSON(matrix.runs_on_json) }}
     strategy:
       fail-fast: false

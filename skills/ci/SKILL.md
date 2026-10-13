@@ -565,6 +565,17 @@ both. Check the budget with
 `gh api repos/danielraffel/Shipyard/actions/cache/usage`. A cache whose `ref`
 is a tag or a PR branch is quota nothing else can read.
 
+## Matrix check names carry their workflow
+
+A check run carries the job name, not the workflow. ci.yml, sandbox-e2e.yml
+and package-smoke.yml all render their legs from `scripts/ci_matrix.py`, so
+they used to emit identical names: two `macOS ARM64 [local]` checks on one
+commit. Timing and queue reports then merged a 7-minute unit-test leg with
+the M3 sandbox canary. The legs are now `Test ...`, `Sandbox ...` and
+`Package ...`. `scripts/test_ci_matrix.py` fails if two workflows render the
+same matrix job name. Shipyard's own `main` has no required contexts, so a
+rename here needs no protection change.
+
 ## Leftover validation TMPDIRs: owner files, sweep, and `cleanup --validation-tmp`
 
 A killed validation run cannot run the Drop that removes its
