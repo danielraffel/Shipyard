@@ -557,6 +557,7 @@ fn pr(number: u64, created: &str, merged: &str, checks: &[(&str, &str)]) -> Merg
                 .map(|(name, outcome)| CheckOutcome {
                     name: (*name).to_owned(),
                     outcome: Some((*outcome).to_owned()),
+                    at: None,
                 })
                 .collect(),
         }],
@@ -668,6 +669,7 @@ fn a_rerun_supersedes_the_run_it_repeats_in_either_order() {
             vec![CheckOutcome {
                 name: "macos".to_owned(),
                 outcome: Some("SUCCESS".to_owned()),
+                at: Some(at("2026-10-05T11:30:00Z")),
             }]
         );
     }
@@ -1158,4 +1160,142 @@ fn a_held_merge_is_named_in_the_week() {
         "{}",
         render(&report)
     );
+}
+
+// ---- export cases --------------------------------------------------------------
+
+/// Window `a`'s two failed merge-group gates are cases; its four merged pull
+/// requests had no red required check and no removal but `merged`.
+#[test]
+fn the_captured_window_exports_its_failed_gates() {
+    let fake = FakeGh::new("a");
+    let observation = observe(&fake, &query("a")).expect("gather");
+    let rows = cases::cases(&observation);
+    assert_eq!(rows.len(), 2, "{rows:#?}");
+    for row in &rows {
+        assert_eq!(row.kind, "merge_group_gate_failed");
+        assert_eq!(row.repo, PULP);
+        assert_eq!(row.outcome.as_deref(), Some("gate_failed"));
+        assert_eq!(row.check.as_deref(), Some("macos"));
+        assert!(row.run_id.is_some() && row.job_id.is_some(), "{row:?}");
+        assert_eq!(row.label, None);
+        let created = at(row.created_at.as_deref().expect("created"));
+        assert_eq!(
+            at(row.label_not_before.as_deref().expect("label time")),
+            created + Duration::hours(24)
+        );
+        assert!(row.unread.contains(&"rule_verdict"));
+    }
+    assert!(rows[0].created_at <= rows[1].created_at, "oldest first");
+}
+
+#[test]
+fn red_required_checks_and_removals_are_cases() {
+    let mut red = pr(
+        7,
+        "2026-10-12T01:00:00Z",
+        "2026-10-12T05:00:00Z",
+        &[
+            ("macos", "FAILURE"),
+            ("advisory", "FAILURE"),
+            ("drift-fast", "CANCELLED"),
+        ],
+    );
+    red.commits[0].checks[0].at = Some(at("2026-10-12T02:00:00Z"));
+    red.verdict = MergeVerdict::Hold;
+    let mut query = query("a");
+    query.from = at("2026-10-12T00:00:00Z");
+    query.to = at("2026-10-13T00:00:00Z");
+    let removed = |pr: u64, when: &str, reason: &str| QueueEvent {
+        pr,
+        at: at(when),
+        kind: QueueEventKind::Removed {
+            reason: reason.to_owned(),
+            actor: Some("github-merge-queue".to_owned()),
+        },
+    };
+    let observation = ScorecardObservation {
+        query,
+        required: Ok((
+            vec!["macos".to_owned(), "drift-fast".to_owned()],
+            "--required-context".to_owned(),
+        )),
+        prs: vec![red],
+        merge_group_runs: Vec::new(),
+        queue_events: vec![
+            removed(7, "2026-10-12T03:00:00Z", "failed_checks"),
+            removed(7, "2026-10-12T05:00:00Z", "merged"),
+            removed(9, "2026-10-11T23:00:00Z", "failed_checks"),
+        ],
+        selection: None,
+        gaps: Vec::new(),
+    };
+    let rows = cases::cases(&observation);
+    let kinds: Vec<(&str, Option<&str>)> = rows
+        .iter()
+        .map(|row| (row.kind, row.outcome.as_deref()))
+        .collect();
+    // The advisory check is not required, a cancelled check is not red, a
+    // `merged` removal and one before the window are not cases.
+    assert_eq!(
+        kinds,
+        vec![
+            ("required_check_red", Some("FAILURE")),
+            ("queue_removal", Some("failed_checks")),
+        ]
+    );
+    assert_eq!(rows[0].check.as_deref(), Some("macos"));
+    assert_eq!(
+        rows[0].head_sha.as_deref(),
+        Some(format!("{:040}", 7).as_str())
+    );
+    assert_eq!(rows[0].created_at.as_deref(), Some("2026-10-12T02:00:00Z"));
+    assert_eq!(rows[1].actor.as_deref(), Some("github-merge-queue"));
+    for row in &rows {
+        assert_eq!(row.merge_head_verdict, Some(MergeVerdict::Hold));
+    }
+}
+
+#[test]
+fn the_receipt_counts_the_rows_and_hashes_the_bytes() {
+    let fake = FakeGh::new("a");
+    let observation = observe(&fake, &query("a")).expect("gather");
+    let rows = cases::cases(&observation);
+    let (bytes, receipt) = cases::export(&observation, &rows).expect("export");
+    let text = String::from_utf8(bytes.clone()).expect("utf-8");
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON row per line"))
+        .collect();
+    assert_eq!(lines.len(), receipt.rows);
+    assert_eq!(lines[0]["schema"], cases::SCHEMA);
+    // Every field v1 does not read is present, null, and named as unread.
+    for line in &lines {
+        let unread: Vec<&str> = line["unread"]
+            .as_array()
+            .expect("unread")
+            .iter()
+            .map(|name| name.as_str().expect("name"))
+            .collect();
+        assert_eq!(
+            unread,
+            [
+                "evidence",
+                "rule_verdict",
+                "cancel_cause",
+                "receipt_same_tree",
+                "outage_window"
+            ]
+        );
+        for name in unread {
+            assert!(line.get(name).is_some_and(Value::is_null), "{name}: {line}");
+        }
+        assert!(line["label"].is_null(), "{line}");
+    }
+    assert_eq!(receipt.by_kind.get("merge_group_gate_failed"), Some(&2));
+    {
+        use sha2::Digest;
+        assert_eq!(receipt.sha256, hex::encode(sha2::Sha256::digest(&bytes)));
+    }
+    assert_eq!(receipt.from, "2026-10-05T15:00:00Z");
 }

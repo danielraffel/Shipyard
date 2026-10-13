@@ -1530,6 +1530,13 @@ red on two or more pull requests, and each merged pull request's merge-head
 verdict: the latest trusted `verdict:`/`reviewed:` comment or review naming
 its merge head, posted by the merge (`approve`, `hold`, `none`, `unread`).
 Read `hold` as "merged anyway": the week names those pull requests.
+`--export-cases FILE` also writes one unlabelled JSONL row per case the
+scorecard read (a red required check on a merged pull request's commit, a
+merge-group gate that did not pass, a queue removal other than `merged`), with
+`<FILE>.receipt.json` holding the row count and the file's SHA-256. Label a
+row no sooner than its `label_not_before`. v1 reads only those three sources
+and the merge-head verdict; `evidence`, `rule_verdict`, `cancel_cause`,
+`receipt_same_tree` and `outage_window` are `null` and listed in `unread`.
 Everything is read from GitHub, so pass
 `--from`/`--to` to measure a window from before a change and one from after it.
 A repository without branch protection needs `--required-context`. A required
