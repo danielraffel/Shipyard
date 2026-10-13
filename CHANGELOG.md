@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03150"></a>
+## [0.315.0] - 2026-10-13
+
+- fix/daemon stop running flake ([#809](https://github.com/danielraffel/Shipyard/pull/809))
+- feat/episode scoring ([#805](https://github.com/danielraffel/Shipyard/pull/805))
+
 <a id="v03141"></a>
 ## [0.314.1] - 2026-10-13
 
@@ -2239,6 +2245,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.315.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.315.0
 [0.314.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.314.1
 [0.314.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.314.0
 [0.313.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.313.1
