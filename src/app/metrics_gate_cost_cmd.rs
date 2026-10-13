@@ -506,6 +506,46 @@ mod tests {
         );
     }
 
+    /// The receipt is written last, so it is the commit marker: when the
+    /// receipt cannot be written, the cases file already holds the new rows
+    /// and the stale or missing receipt exposes the interrupted export.
+    #[test]
+    fn the_receipt_is_written_after_the_cases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("week.jsonl");
+        std::fs::write(&path, b"old rows\n").expect("old export");
+        std::fs::create_dir(dir.path().join("week.jsonl.receipt.json")).expect("blocker");
+        let observation = scorecard::ScorecardObservation {
+            query: scorecard::ScorecardQuery {
+                repo: "o/r".to_owned(),
+                workflow: "build.yml".to_owned(),
+                gate_job: "macos".to_owned(),
+                base_branch: "main".to_owned(),
+                required_contexts: Vec::new(),
+                selection_steps: Vec::new(),
+                from: Utc::now() - chrono::Duration::days(7),
+                to: Utc::now(),
+            },
+            required: Ok((Vec::new(), "--required-context".to_owned())),
+            prs: Vec::new(),
+            merge_group_runs: Vec::new(),
+            queue_events: Vec::new(),
+            selection: None,
+            gaps: Vec::new(),
+        };
+        let failure = write_cases(&path, &observation).expect_err("the receipt cannot be written");
+        assert!(
+            failure.message.contains("receipt.json"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("cases"),
+            b"",
+            "the cases were written before the receipt"
+        );
+    }
+
     /// A temporary file another run left (or is writing) at a fixed name does
     /// not block or corrupt this run's write: each run's temporary is its own.
     #[test]
