@@ -541,6 +541,20 @@ repository. The job runs with `contents: read` only. v0.302.0-v0.307.0 shipped a
 GitHub refused on every call; a fake-backed unit test cannot see that, one real
 read does. Run the same gate by hand with
 `python3 scripts/release_live_smoke.py --binary target/release/shipyard`.
+## Cargo caches: GitHub-hosted restore, main-only save, none for releases
+
+A tag ref can restore only its own cache entries and main's, and main never
+writes a release-profile key, so a cargo cache on `release.yml` or
+`package-smoke.yml` misses every time and only writes. On 2026-10-13 those
+tag entries (~430 MB each) held ~95% of the 10 GB Actions cache and evicted
+main's entries, which the PR jobs restore. Release builds therefore carry no
+cargo cache. In `ci.yml` and `sandbox-e2e.yml` the cache restores only when
+`runner.environment == 'github-hosted'` (self-hosted Macs keep `target/`
+locally), and only pushes to main save it. `scripts/test_ci_matrix.py` checks
+both. Check the budget with
+`gh api repos/danielraffel/Shipyard/actions/cache/usage`. A cache whose `ref`
+is a tag or a PR branch is quota nothing else can read.
+
 ## Leftover validation TMPDIRs: owner files, sweep, and `cleanup --validation-tmp`
 
 A killed validation run cannot run the Drop that removes its

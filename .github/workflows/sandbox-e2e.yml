@@ -68,20 +68,30 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
         with:
-          save-if: ${{ runner.os != 'macOS' }}
+          toolchain: stable
+
+      # Restore on GitHub-hosted runners only: self-hosted Macs keep target/
+      # warm locally and never had an entry to restore. Only pushes to main
+      # save, so PR runs read main's entry instead of writing their own.
+      - name: Cache cargo
+        if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: false
+          # Its macOS save hook invokes interactive `sudo purge`, which can
+          # strand a self-hosted runner indefinitely.
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.os != 'macOS' }}
 
       - name: Build release binary
         run: cargo build --release --locked --bin shipyard
 
-      - name: Install pytest
+      - name: Install pinned pytest
         run: |
           python3 -m venv .venv-sandbox
-          .venv-sandbox/bin/python -m pip install pytest
+          .venv-sandbox/bin/python -m pip install --require-hashes \
+            -r tools/sandbox-e2e/requirements.txt
 
       - name: Run sandbox E2E
         # M3's ephemeral Tart runners use Shipyard-studio-NN. Keep the target,
