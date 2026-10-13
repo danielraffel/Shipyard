@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03161"></a>
+## [0.316.1] - 2026-10-13
+
+- fix/sandbox concurrent session inbox ([#810](https://github.com/danielraffel/Shipyard/pull/810))
+
 <a id="v03160"></a>
 ## [0.316.0] - 2026-10-13
 
@@ -2251,6 +2256,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.316.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.316.1
 [0.316.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.316.0
 [0.315.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.315.0
 [0.314.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.314.1
