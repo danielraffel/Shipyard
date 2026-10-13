@@ -401,6 +401,17 @@ pull request's own run passed (#795, #799). Diff a non-`pull_request` run from
 `git merge-base origin/main HEAD` (`scripts/resolve_diff_base.py`). Before
 calling such a failure the pull request's, diff the branch from its merge base.
 
+## A file existing is not the file written
+
+`echo $$ > file` creates the file empty and writes after. A test that waits
+only for `path.exists()` and then hands the file to code under test races the
+write; on a loaded CI host the reader finds it empty. The daemon stop tests
+did this: `stop_running` read no pid, removed the pid file as stale and
+reported nothing stopped, at `assert!(stop_running(...))`, in 0.1 s. Wait with
+a deadline for the content the code reads (`read_pid_file(path) == Some(pid)`).
+To prove a fix, widen the window rather than loop on luck: delaying the stub's
+write by 0.5 s failed the old test on every run.
+
 ## A unit test must not see the host's GitHub auth
 
 CI runs every test with `SHIPYARD_TEST_HOME` set to the runner's temp

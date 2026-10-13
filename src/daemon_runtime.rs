@@ -4000,25 +4000,12 @@ mod tests {
             "rm -f \"$pid_file\"; exit 0",
         );
         let child = &mut stub.child;
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !pid_path.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(pid_path.exists(), "pid file was not written");
-        let identity_deadline = Instant::now() + Duration::from_secs(1);
-        while !process_looks_like_shipyard_daemon(child.id()) && Instant::now() < identity_deadline
-        {
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            process_looks_like_shipyard_daemon(child.id()),
-            "daemon identity was not observable"
-        );
+        await_stub_ready(&pid_path, child.id());
 
         assert!(stop_running(temp.path()));
 
         let status = child
-            .wait_timeout(Duration::from_secs(1))
+            .wait_timeout(Duration::from_secs(15))
             .expect("wait")
             .or_else(|| {
                 let _ = child.kill();
@@ -4043,20 +4030,7 @@ mod tests {
             "rm -f \"$pid_file\"",
         );
         let child = &mut stub.child;
-        // Every wait below polls a condition. The deadlines are generous
-        // because a loaded CI host can take seconds to start a shell or to
-        // finish tearing a killed one down; a healthy run passes in well
-        // under a second either way.
-        assert!(
-            wait_until(Duration::from_secs(15), || pid_path.exists()),
-            "pid file was not written"
-        );
-        assert!(
-            wait_until(Duration::from_secs(15), || {
-                process_looks_like_shipyard_daemon(child.id())
-            }),
-            "daemon identity was not observable"
-        );
+        await_stub_ready(&pid_path, child.id());
 
         assert!(stop_running(temp.path()));
 
@@ -4071,6 +4045,30 @@ mod tests {
         assert!(!status.success(), "stubborn daemon should require SIGKILL");
         assert!(!pid_alive(child.id()));
         assert!(!pid_path.exists());
+    }
+
+    /// Wait until the stub's pid file names it and its command line reads as
+    /// a daemon, which is what `stop_running` reads.
+    ///
+    /// The file existing is not enough: the stub's `echo $$ > file` creates
+    /// it empty before writing, and `stop_running` reading it in between
+    /// finds no pid, removes the file as stale and reports nothing stopped.
+    /// The deadlines are generous because a loaded host can take seconds to
+    /// start a shell; a healthy run is ready in milliseconds.
+    #[cfg(unix)]
+    fn await_stub_ready(pid_path: &Path, pid: u32) {
+        assert!(
+            wait_until(Duration::from_secs(15), || read_pid_file(pid_path)
+                == Some(pid)),
+            "pid file never named the stub (holds {:?})",
+            fs::read_to_string(pid_path).ok()
+        );
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                process_looks_like_shipyard_daemon(pid)
+            }),
+            "daemon identity was not observable"
+        );
     }
 
     /// Poll `condition` until it holds or `deadline` elapses.
