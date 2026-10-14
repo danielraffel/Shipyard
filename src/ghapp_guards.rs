@@ -224,9 +224,11 @@ pub enum SwitchState {
         /// The opt-out record (`reason`, `at`, `by`), as written.
         record: String,
     },
-    /// The opt-out file exists but could not be read: the rule is off.
+    /// Something at the opt-out path that is not a valid opt-out record:
+    /// the guards keep the rule ON, and status fails until it is fixed or
+    /// removed.
     Unreadable {
-        /// The I/O error.
+        /// Why it does not count.
         detail: String,
     },
 }
@@ -243,22 +245,17 @@ pub struct SwitchAudit {
     pub state: SwitchState,
 }
 
-/// Read the review-before-arm rule's state in `dir`: on unless the opt-out
-/// file exists.
+/// Read the review-before-arm rule's state in `dir`: on unless it holds a
+/// valid opt-out record, by the guards' own rule
+/// ([`crate::head_approval::read_opt_out`]).
 #[must_use]
 pub fn audit_review_switch(dir: &Path) -> SwitchAudit {
     let path = dir.join(REVIEW_OPT_OUT);
-    let state = match fs::read_to_string(&path) {
-        Ok(record) => SwitchState::OptedOut {
-            record: if record.trim().is_empty() {
-                "(no reason recorded)".to_owned()
-            } else {
-                record.trim().to_owned()
-            },
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => SwitchState::Current,
-        Err(error) => SwitchState::Unreadable {
-            detail: error.to_string(),
+    let state = match crate::head_approval::read_opt_out(&path) {
+        crate::head_approval::OptOut::Absent => SwitchState::Current,
+        crate::head_approval::OptOut::Valid { record, .. } => SwitchState::OptedOut { record },
+        crate::head_approval::OptOut::Invalid { detail } => SwitchState::Unreadable {
+            detail: format!("{detail}; review before arm stays on"),
         },
     };
     SwitchAudit {
@@ -640,15 +637,64 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_opt_out_file_is_still_an_opt_out() {
+    fn only_a_written_opt_out_record_turns_review_off() {
+        type Make = fn(&Path);
+        let opt_out = |dir: &Path| {
+            // The guards' own predicate, so the audit and the guards cannot drift.
+            matches!(
+                crate::head_approval::read_opt_out(&dir.join(REVIEW_OPT_OUT)),
+                crate::head_approval::OptOut::Valid { .. }
+            )
+        };
+        let bad: [(&str, Make); 5] = [
+            ("empty", |path| fs::write(path, "").expect("write")),
+            ("plain text", |path| {
+                fs::write(path, "lab host").expect("write");
+            }),
+            ("no reason", |path| {
+                fs::write(path, r#"{"reason":" ","at":"t","by":"me"}"#).expect("write");
+            }),
+            ("a directory", |path| fs::create_dir(path).expect("dir")),
+            ("a symlink to a directory", |path| {
+                let target = path.with_extension("target");
+                fs::create_dir(&target).expect("dir");
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target, path).expect("link");
+                #[cfg(not(unix))]
+                fs::create_dir(path).expect("dir");
+            }),
+        ];
+        for (label, make) in bad {
+            let temp = tempfile::tempdir().expect("temp");
+            make(&temp.path().join(REVIEW_OPT_OUT));
+            assert!(
+                !opt_out(temp.path()),
+                "{label}: the guards must keep review on"
+            );
+            assert!(
+                matches!(
+                    audit_review_switch(temp.path()).state,
+                    SwitchState::Unreadable { .. }
+                ),
+                "{label}: status must fail, not report on or off"
+            );
+            assert!(
+                !doctor_section(temp.path(), temp.path()).expect("section")[REVIEW_SWITCH].ok,
+                "{label}: doctor must fail"
+            );
+        }
+        // A dangling symlink is nothing there: review on, and status says so.
+        #[cfg(unix)]
+        {
+            let temp = tempfile::tempdir().expect("temp");
+            std::os::unix::fs::symlink("/nonexistent", temp.path().join(REVIEW_OPT_OUT))
+                .expect("link");
+            assert!(!opt_out(temp.path()));
+            assert_eq!(audit_review_switch(temp.path()).state, SwitchState::Current);
+        }
         let temp = tempfile::tempdir().expect("temp");
-        fs::write(temp.path().join(REVIEW_OPT_OUT), "").expect("touch");
-        assert_eq!(
-            audit_review_switch(temp.path()).state,
-            SwitchState::OptedOut {
-                record: "(no reason recorded)".to_owned()
-            }
-        );
+        opt_out_review(temp.path(), "lab host").expect("opt out");
+        assert!(opt_out(temp.path()), "the written record is an opt-out");
     }
 
     #[test]

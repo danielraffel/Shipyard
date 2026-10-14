@@ -3613,7 +3613,8 @@ arm_requires_head_approval = true` (the default for pulp, vellum, tartci and
 Shipyard when their base is silent, on every host unless it has a
 `review-before-arm.opt-out` file, written with a reason by
 `guards install --opt-out-review-before-arm "<reason>"` and logged to
-`switches.jsonl`; `guards status` shows a host that is off) arms
+`switches.jsonl`, and only that written record counts; `guards status` shows
+a host that is off and fails on anything else at the path) arms
 and classic-merges only an approved head on every path (`ship`, the validated
 arm, the classic merge, the steward backstop); `--arm` overrides it and names
 who did. An approval comment stamped (by `ghapp`) with the arming session is

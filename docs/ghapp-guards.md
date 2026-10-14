@@ -70,7 +70,11 @@ queued an unapproved pull request and one on HOLD. The only way off is a file,
 `review-before-arm.opt-out` in the guards directory:
 `shipyard guards install --opt-out-review-before-arm "<reason>"` writes it
 with the reason, time and binary and appends to `switches.jsonl`, and
-`--opt-in-review-before-arm` removes it, logged too. Nothing in the
+`--opt-in-review-before-arm` removes it, logged too. Only that record counts:
+a regular file holding JSON with a non-empty `reason`, `at` and `by`. Anything
+else at the path (an empty or hand-made file, a directory) keeps the rule on,
+and `guards status`, `doctor` and fleet-update verification fail on it until
+it is fixed or removed, so a stray file cannot opt a host out. Nothing in the
 environment turns it off (`SHIPYARD_REVIEW_BEFORE_ARM=1` only forces it on).
 While a host is opted out, every landing prints that review is OFF and why,
 and the arms ledger records `review: off: <reason>`; `shipyard guards status`

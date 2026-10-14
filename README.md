@@ -150,8 +150,9 @@ project will automatically recover or merge every PR.
   stop a head that is already armed or queued, so post HOLDs through `ghapp`.
   Review before arm is on by default on every host; the only way off is a
   `review-before-arm.opt-out` file (written with a reason by
-  `shipyard guards install --opt-out-review-before-arm "<reason>"`, logged),
-  and `guards status` shows a host that is off. An approval does not count for
+  `shipyard guards install --opt-out-review-before-arm "<reason>"`, logged;
+  anything else at that path keeps review on and fails `guards status`), and
+  `guards status` shows a host that is off. An approval does not count for
   the session that posted it: `ghapp` stamps verdict comments with the
   session, and an arm from the approving session is refused. `hold-disarms`
   is still switched on one host at a time.

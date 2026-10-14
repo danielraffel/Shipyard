@@ -17,6 +17,8 @@ import unittest
 from typing import Any
 from unittest import mock
 
+OPT_OUT_RECORD = '{"reason": "lab host", "at": "2026-10-14T00:00:00Z", "by": "shipyard test"}'
+
 
 SCRIPT = pathlib.Path(__file__).with_name("ghapp_queue_arm_guard.py")
 SPEC = importlib.util.spec_from_file_location("ghapp_queue_arm_guard", SCRIPT)
@@ -2014,20 +2016,33 @@ class ReviewBeforeArm(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("/comments", self.calls())
             (self.root / "calls").unlink()
-        (self.guards / "review-before-arm.opt-out").write_text("lab host", encoding="utf-8")
+        # Anything but a written opt-out record keeps review on.
+        opt_out = self.guards / "review-before-arm.opt-out"
+        for junk in ("", "lab host", '{"reason": "lab host"}', '["lab host"]'):
+            opt_out.write_text(junk, encoding="utf-8")
+            result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=None)
+            self.assertEqual(result.returncode, 1, (junk, result.stderr))
+            (self.root / "calls").unlink()
+        opt_out.unlink()
+        opt_out.mkdir()
+        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=None)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        (self.root / "calls").unlink()
+        opt_out.rmdir()
+        opt_out.write_text(OPT_OUT_RECORD, encoding="utf-8")
         result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=None)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("/comments", self.calls())
         self.assertIn("review before arm is OFF on this host", result.stderr)
         self.assertIn("lab host", result.stderr)
         self.assertEqual([entry["review"] for entry in self.ledger()],
-                         ["on", "on", "off: lab host"])
+                         ["on"] * 7 + ["off: lab host"])
 
     def test_off_reads_nothing_even_with_a_config_this_python_cannot_parse(self) -> None:
         # Off must be inert on any Python, including one without tomllib, and
         # whatever the base config says: the review reads nothing at all.
         on = "[auto_merge]\narm_requires_head_approval = true\n[validation\n"
-        (self.guards / "review-before-arm.opt-out").write_text("lab host", encoding="utf-8")
+        (self.guards / "review-before-arm.opt-out").write_text(OPT_OUT_RECORD, encoding="utf-8")
         for host in ("0", None):
             result = self.arm(513, "danielraffel/tartci", self.case("tartci-513", config=on),
                               host=host)

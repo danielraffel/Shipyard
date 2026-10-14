@@ -58,8 +58,10 @@ needs a reviewer verdict naming the exact head, in the repositories that
 require one. The protected base's ``.shipyard/config.toml`` decides when it
 sets ``[auto_merge] arm_requires_head_approval``. Otherwise the repositories in
 REVIEW_REQUIRED_REPOS require one. It is on unless the host opted out with a
-``review-before-arm.opt-out`` file in the guards directory (a file only; the
-opt-out is printed on every landing and recorded in the arms ledger). With it
+``review-before-arm.opt-out`` record in the guards directory, written with a
+reason by ``shipyard guards install --opt-out-review-before-arm`` (anything
+else at that path keeps it on; the opt-out is printed on every landing and
+recorded in the arms ledger). With it
 off the guard reads nothing for this rule, so it is inert whatever the config
 or Python. With it on, a config that cannot be read or parsed refuses rather
 than loosening.
@@ -681,21 +683,41 @@ def marker_verdict(body: str) -> tuple[str, str] | None:
     return match.group(2), match.group(3)
 
 
+def valid_opt_out() -> str | None:
+    """The reason of this host's opt-out, or ``None`` when there is no valid one.
+
+    Only a regular file holding the JSON ``shipyard guards install
+    --opt-out-review-before-arm`` writes, with a non-empty ``reason``, ``at``
+    and ``by``, counts. A directory, an empty or hand-made file, or garbage
+    leaves review on (and ``guards status`` fails on it). The Rust twin is
+    ``head_approval::read_opt_out``.
+    """
+    path = _guards_dir() / HOST_OPT_OUT_FILE
+    try:
+        if not path.is_file():
+            return None
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    fields = [record.get(key) for key in ("reason", "at", "by")]
+    if not all(isinstance(value, str) and value.strip() for value in fields):
+        return None
+    return fields[0].strip()
+
+
 def host_review_default() -> bool:
     """Whether this host applies REVIEW_REQUIRED_REPOS: on unless the guards
-    directory holds the opt-out file (see the module docstring)."""
+    directory holds a valid opt-out (see ``valid_opt_out``)."""
     if os.environ.get(HOST_ENABLE_ENV) == "1":
         return True
-    return not (_guards_dir() / HOST_OPT_OUT_FILE).exists()
+    return valid_opt_out() is None
 
 
 def opt_out_reason() -> str:
     """The recorded reason of this host's opt-out, for messages and the ledger."""
-    try:
-        text = (_guards_dir() / HOST_OPT_OUT_FILE).read_text(encoding="utf-8").strip()
-    except OSError as error:
-        return f"unreadable opt-out file: {error}"
-    return text or "no reason recorded"
+    return valid_opt_out() or "no valid opt-out"
 
 
 def host_name() -> str:

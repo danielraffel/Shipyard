@@ -203,10 +203,77 @@ const fn host_review_override() -> Option<bool> {
     None
 }
 
+/// What sits at a [`HOST_OPT_OUT_FILE`] path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OptOut {
+    /// Nothing (a dangling symlink included): review before arm is on.
+    Absent,
+    /// A regular file holding the JSON `shipyard guards install
+    /// --opt-out-review-before-arm` writes, with a non-empty `reason`, `at`
+    /// and `by`: the only thing that turns review before arm off.
+    Valid {
+        /// The recorded reason.
+        reason: String,
+        /// The record as written.
+        record: String,
+    },
+    /// Anything else: a directory, an empty or hand-made file, garbage.
+    /// Review before arm stays on, and `guards status` fails until it is
+    /// fixed or removed.
+    Invalid {
+        /// Why it does not count.
+        detail: String,
+    },
+}
+
+/// Classify the opt-out at `path`. The Python twin
+/// (`ghapp_queue_arm_guard.valid_opt_out`) applies the same rules.
+#[must_use]
+pub fn read_opt_out(path: &std::path::Path) -> OptOut {
+    match std::fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return OptOut::Absent,
+        Err(error) => {
+            return OptOut::Invalid {
+                detail: error.to_string(),
+            };
+        }
+        Ok(meta) if !meta.is_file() => {
+            return OptOut::Invalid {
+                detail: "not a regular file".to_owned(),
+            };
+        }
+        Ok(_) => {}
+    }
+    let record = match std::fs::read_to_string(path) {
+        Ok(record) => record.trim().to_owned(),
+        Err(error) => {
+            return OptOut::Invalid {
+                detail: error.to_string(),
+            };
+        }
+    };
+    let parsed = serde_json::from_str::<Value>(&record).ok();
+    let field = |key: &str| {
+        parsed
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    match (field("reason"), field("at"), field("by")) {
+        (Some(reason), Some(_), Some(_)) => OptOut::Valid { reason, record },
+        _ => OptOut::Invalid {
+            detail: "not an opt-out record (needs JSON with reason, at and by)".to_owned(),
+        },
+    }
+}
+
 /// Whether this host applies [`REVIEW_REQUIRED_REPOS`]: on, unless the
 /// guards directory (`$SHIPYARD_GHAPP_GUARDS_DIR`, else
-/// `~/.config/shipyard/guards`) holds [`HOST_OPT_OUT_FILE`].
-/// `SHIPYARD_REVIEW_BEFORE_ARM=1` forces it on.
+/// `~/.config/shipyard/guards`) holds a valid [`HOST_OPT_OUT_FILE`] (see
+/// [`read_opt_out`]). `SHIPYARD_REVIEW_BEFORE_ARM=1` forces it on.
 #[must_use]
 pub fn host_review_default() -> bool {
     if let Some(enabled) = host_review_override() {
@@ -222,7 +289,12 @@ pub fn host_review_default() -> bool {
             std::env::var_os("HOME")
                 .map(|home| std::path::PathBuf::from(home).join(".config/shipyard/guards"))
         });
-    !dir.is_some_and(|dir| dir.join(HOST_OPT_OUT_FILE).exists())
+    !dir.is_some_and(|dir| {
+        matches!(
+            read_opt_out(&dir.join(HOST_OPT_OUT_FILE)),
+            OptOut::Valid { .. }
+        )
+    })
 }
 
 /// Removals of one head after which it needs a fresh approval to re-arm.

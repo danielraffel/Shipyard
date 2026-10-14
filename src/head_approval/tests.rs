@@ -1515,11 +1515,14 @@ fn host_switch(env: &[(&str, &std::path::Path)], switch: Option<&str>) -> bool {
     }
 }
 
+const OPT_OUT_RECORD: &str =
+    r#"{"reason":"lab host","at":"2026-10-14T00:00:00Z","by":"shipyard test"}"#;
+
 #[test]
 fn the_host_switch_is_on_unless_the_opt_out_file_exists() {
     let empty = tempfile::tempdir().expect("tempdir");
     let opted = tempfile::tempdir().expect("tempdir");
-    std::fs::write(opted.path().join(super::HOST_OPT_OUT_FILE), "lab host").expect("opt-out");
+    std::fs::write(opted.path().join(super::HOST_OPT_OUT_FILE), OPT_OUT_RECORD).expect("opt-out");
     let guards = "SHIPYARD_GHAPP_GUARDS_DIR";
     assert!(
         host_switch(&[(guards, empty.path())], None),
@@ -1543,6 +1546,11 @@ fn the_host_switch_is_on_unless_the_opt_out_file_exists() {
     std::fs::create_dir_all(&dir).expect("dirs");
     assert!(host_switch(&[("HOME", home.path())], None));
     std::fs::write(dir.join(super::HOST_OPT_OUT_FILE), "").expect("opt-out");
+    assert!(
+        host_switch(&[("HOME", home.path())], None),
+        "an empty file is not an opt-out"
+    );
+    std::fs::write(dir.join(super::HOST_OPT_OUT_FILE), OPT_OUT_RECORD).expect("opt-out");
     assert!(!host_switch(&[("HOME", home.path())], None));
 }
 

@@ -170,7 +170,8 @@ pull request out permanently. Neither is something to reach for by default.
 `[auto_merge] arm_requires_head_approval = true` (the default for pulp, vellum,
 tartci and Shipyard when their base is silent, on every host unless the host
 has a `review-before-arm.opt-out` file, written with a reason by
-`shipyard guards install --opt-out-review-before-arm "<reason>"`; there,
+`shipyard guards install --opt-out-review-before-arm "<reason>"`, and only
+that written record counts; there,
 with no identity listed, a verdict from the fleet App or an
 OWNER/MEMBER/COLLABORATOR counts, never the PR author's) arms or merges only a
 head that carries an
