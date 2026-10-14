@@ -883,8 +883,10 @@ impl HeadGate {
             Self::NotApproved { head } => format!(
                 "head {} carries no approval: it needs a comment whose last line is \
                  `verdict: APPROVE head:{head}` or `reviewed: {head}`, or an APPROVED review \
-                 on that commit, from a listed reviewer (anyone but the PR author where none \
-                 is listed), with no later HOLD naming it. This repository arms only approved \
+                 on that commit, from a listed reviewer, or where none is listed from the \
+                 fleet App (a `ghapp` verdict comment) or a human the base lists in \
+                 `[auto_merge] human_reviewers`, never the PR author, with no later HOLD \
+                 naming it. This repository arms only approved \
                  heads; left disarmed. Arm deliberately with `--arm`",
                 short(head)
             ),
