@@ -428,6 +428,12 @@ guard's own decision posted on the head; it is report-only until a
 repository requires it. A red `review-verdict` means the guard would refuse
 that head; fix the verdict, not the status.
 
+**Shipyard's own CI names its reds.** When any job in a `ci.yml` run fails,
+the advisory `ci-cause` job reads the failed jobs' finished logs and prints one
+`ci.cause/v1` record per job as a `::notice title=ci-cause::` annotation
+(`scripts/ci_cause_notices.sh`, on the pinned and checksum-verified release).
+It never gates. Pulp and tartci run the same script.
+
 **To record a cause when the job fails, not after.** In an `if: failure()`
 step, run `shipyard cause extract --log <captured output> --job "<the job's
 display name>" --notice || true`. Pass `--job`: the default is the job's key
