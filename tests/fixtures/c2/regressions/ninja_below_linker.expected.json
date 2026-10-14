@@ -1,0 +1,29 @@
+[
+ {
+  "format": "linker",
+  "kind": "link_error",
+  "subject": "pulp::signal::Biquad::coefficients() const",
+  "message": "Undefined symbols for architecture arm64:",
+  "location": "",
+  "line": 4,
+  "step_failed": true
+ },
+ {
+  "format": "linker",
+  "kind": "link_error",
+  "subject": "ld",
+  "message": "symbol(s) not found for architecture arm64",
+  "location": "",
+  "line": 7,
+  "step_failed": true
+ },
+ {
+  "format": "ninja",
+  "kind": "build_step",
+  "subject": "pulp-test-eq",
+  "message": "",
+  "location": "",
+  "line": 2,
+  "step_failed": true
+ }
+]

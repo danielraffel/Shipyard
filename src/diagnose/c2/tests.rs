@@ -127,7 +127,7 @@ fn the_regressions_yield_their_expected_records() {
             "{name}"
         );
     }
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), 9);
 }
 
 fn gate_records(name: &str) -> Vec<Record> {

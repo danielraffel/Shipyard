@@ -45,8 +45,10 @@ pub const FORMATS: [&str; 24] = [
     "python_traceback",
     "clang",
     "cmake",
-    "ninja",
     "linker",
+    // A make or ninja failure names the target that broke, not why: it ranks
+    // below every runner and compiler record that could explain it.
+    "ninja",
     "gate_policy",
     "infra",
     "git_push",

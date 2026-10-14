@@ -1,0 +1,8 @@
+[1879/1880] Linking CXX executable test/pulp-test-eq
+FAILED: test/pulp-test-eq
+/usr/bin/c++ -O3 test_eq_curve.cpp.o -o test/pulp-test-eq
+Undefined symbols for architecture arm64:
+  "pulp::signal::Biquad::coefficients() const", referenced from:
+      _main in test_eq_curve.cpp.o
+ld: symbol(s) not found for architecture arm64
+ninja: build stopped: subcommand failed.

@@ -1,0 +1,5 @@
+From test_popupwin.vim:
+Found errors in Test_popup_with_border_and_padding():
+Executed 52 tests
+make[1]: *** [test_popupwin] Error 1
+make: *** [test] Error 2

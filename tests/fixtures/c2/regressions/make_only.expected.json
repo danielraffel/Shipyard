@@ -1,0 +1,20 @@
+[
+ {
+  "format": "ninja",
+  "kind": "build_step",
+  "subject": "test_popupwin",
+  "message": "Error 1",
+  "location": "",
+  "line": 4,
+  "step_failed": true
+ },
+ {
+  "format": "ninja",
+  "kind": "build_step",
+  "subject": "test",
+  "message": "Error 2",
+  "location": "",
+  "line": 5,
+  "step_failed": true
+ }
+]
