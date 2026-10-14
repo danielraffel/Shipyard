@@ -1596,7 +1596,9 @@ a record is never trusted for its content; a forged one is ignored. Records
 in the log are blanked before C2 reads it, so their quoted lines are not read
 as evidence. On a `pull_request` run the record's head comes from
 `GITHUB_EVENT_PATH` (`GITHUB_SHA` is the test merge commit); pass `--job` with
-the display name when it differs from the job key. `shipyard diagnose
+the display name when it differs from the job key. A workflow that wants every red named without editing its jobs adds a job
+that needs them and runs `scripts/ci_cause_notices.sh` (a job cannot read its
+own log while it runs, so the records come from the finished logs). `shipyard diagnose
 --annotate plan|post` puts every failing required job's record in the check
 run's `output.text`, and `shipyard cause archive --dir <labels
 checkout>/causes --input <cases.jsonl>` appends records to `YYYY-MM.jsonl`
