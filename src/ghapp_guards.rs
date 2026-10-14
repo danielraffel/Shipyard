@@ -16,6 +16,13 @@
 //!
 //! The arm and branch-refresh guards load their request parser from the
 //! removal guard sitting next to them, so all three are installed together.
+//!
+//! `install` also turns on review-before-arm by creating its switch file
+//! ([`REVIEW_SWITCH`]): the arm guard checks reviewer verdicts only on a host
+//! where that file exists, and a host without it lands unreviewed and held
+//! heads. Turning it off is an explicit, logged opt-out ([`opt_out_review`])
+//! that later installs respect; without one, a missing switch file is
+//! reported as not current.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -81,6 +88,15 @@ pub const FLEET_NOTE: &str = "note: this directory is shared by every Shipyard b
      installed their same-head re-enqueues after failed_checks/merge_conflict (the intended \
      ALLGREEN refusal) or after a manual removal, and any enqueue whose live state cannot be read, \
      are refused. Update every Shipyard binary on the host first; see docs/ghapp-guards.md.";
+
+/// The file whose presence turns on the arm guard's review-before-arm check
+/// (`HOST_ENABLE_FILE` in `scripts/ghapp_queue_arm_guard.py`).
+pub const REVIEW_SWITCH: &str = "review-before-arm";
+/// Present when an operator opted this host out of review-before-arm; holds
+/// the reason, the time and the binary that recorded it.
+pub const REVIEW_OPT_OUT: &str = "review-before-arm.opt-out";
+/// Append-only log of every change to the review switch.
+pub const SWITCH_LOG: &str = "switches.jsonl";
 
 /// Where `scripts/ghapp` looks for guards on this host.
 #[must_use]
@@ -190,6 +206,157 @@ pub fn audit(dir: &Path) -> Vec<GuardAudit> {
         .collect()
 }
 
+/// State of the review-before-arm switch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SwitchState {
+    /// The switch file exists: the arm guard checks verdicts.
+    Current,
+    /// Neither the switch nor an opt-out: the check is off by accident.
+    Missing,
+    /// Turned off on purpose, with the recorded reason.
+    OptedOut {
+        /// The opt-out record (`reason`, `at`, `by`), as written.
+        record: String,
+    },
+    /// The switch or opt-out could not be read.
+    Unreadable {
+        /// The I/O error.
+        detail: String,
+    },
+}
+
+/// The review switch's audit row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SwitchAudit {
+    /// [`REVIEW_SWITCH`].
+    pub name: String,
+    /// Absolute path of the switch file.
+    pub path: PathBuf,
+    /// What is there.
+    #[serde(flatten)]
+    pub state: SwitchState,
+}
+
+/// Read the review-before-arm switch in `dir`. An opt-out wins over a stray
+/// switch file, since the arm guard is off only when the switch is absent and
+/// opting out removes it.
+#[must_use]
+pub fn audit_review_switch(dir: &Path) -> SwitchAudit {
+    let path = dir.join(REVIEW_SWITCH);
+    let state = match fs::read_to_string(dir.join(REVIEW_OPT_OUT)) {
+        Ok(record) => SwitchState::OptedOut {
+            record: record.trim().to_owned(),
+        },
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => SwitchState::Unreadable {
+            detail: error.to_string(),
+        },
+        Err(_) => match fs::symlink_metadata(&path) {
+            Ok(_) => SwitchState::Current,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => SwitchState::Missing,
+            Err(error) => SwitchState::Unreadable {
+                detail: error.to_string(),
+            },
+        },
+    };
+    SwitchAudit {
+        name: REVIEW_SWITCH.to_owned(),
+        path,
+        state,
+    }
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn log_switch(dir: &Path, change: &str, reason: Option<&str>) -> Result<(), String> {
+    let record = serde_json::json!({
+        "at": now_rfc3339(),
+        "switch": REVIEW_SWITCH,
+        "change": change,
+        "reason": reason,
+        "by": format!("shipyard {}", env!("CARGO_PKG_VERSION")),
+    });
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(SWITCH_LOG))
+        .map_err(|error| format!("open {}: {error}", dir.join(SWITCH_LOG).display()))?;
+    writeln!(file, "{record}").map_err(|error| format!("log switch change: {error}"))
+}
+
+/// Turn the review switch on unless the host opted out: the install step
+/// every `shipyard guards install` (and so every fleet update) runs.
+fn ensure_review_switch(dir: &Path, dry_run: bool) -> Result<InstallAction, String> {
+    let audit = audit_review_switch(dir);
+    let (action, detail) = match &audit.state {
+        SwitchState::Current => ("unchanged", None),
+        SwitchState::OptedOut { record } => ("opted_out", Some(record.clone())),
+        SwitchState::Unreadable { detail } => ("refused", Some(detail.clone())),
+        SwitchState::Missing => ("installed", None),
+    };
+    if !dry_run && action == "installed" {
+        fs::write(&audit.path, b"")
+            .map_err(|error| format!("create {}: {error}", audit.path.display()))?;
+        log_switch(dir, "enabled by guards install", None)?;
+    }
+    Ok(InstallAction {
+        name: audit.name,
+        path: audit.path,
+        action: action.to_owned(),
+        detail,
+    })
+}
+
+/// Opt this host out of review-before-arm, with a reason that is recorded in
+/// the opt-out file and the switch log. Later installs leave it off.
+///
+/// # Errors
+///
+/// An empty reason, or a write that fails.
+pub fn opt_out_review(dir: &Path, reason: &str) -> Result<SwitchAudit, String> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err("opting out of review-before-arm needs a reason".to_owned());
+    }
+    fs::create_dir_all(dir)
+        .map_err(|error| format!("create guards directory {}: {error}", dir.display()))?;
+    let record = serde_json::json!({
+        "reason": reason,
+        "at": now_rfc3339(),
+        "by": format!("shipyard {}", env!("CARGO_PKG_VERSION")),
+    });
+    fs::write(dir.join(REVIEW_OPT_OUT), format!("{record}\n"))
+        .map_err(|error| format!("write {}: {error}", dir.join(REVIEW_OPT_OUT).display()))?;
+    match fs::remove_file(dir.join(REVIEW_SWITCH)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("remove {REVIEW_SWITCH}: {error}")),
+    }
+    log_switch(dir, "opted out", Some(reason))?;
+    Ok(audit_review_switch(dir))
+}
+
+/// Undo an opt-out: remove it and turn the switch back on, logged.
+///
+/// # Errors
+///
+/// A write that fails.
+pub fn opt_in_review(dir: &Path) -> Result<SwitchAudit, String> {
+    fs::create_dir_all(dir)
+        .map_err(|error| format!("create guards directory {}: {error}", dir.display()))?;
+    match fs::remove_file(dir.join(REVIEW_OPT_OUT)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("remove {REVIEW_OPT_OUT}: {error}")),
+    }
+    fs::write(dir.join(REVIEW_SWITCH), b"")
+        .map_err(|error| format!("create {}: {error}", dir.join(REVIEW_SWITCH).display()))?;
+    log_switch(dir, "opted back in", None)?;
+    Ok(audit_review_switch(dir))
+}
+
 /// What `install` did, or would do, for one guard.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct InstallAction {
@@ -204,7 +371,9 @@ pub struct InstallAction {
     pub detail: Option<String>,
 }
 
-/// Install every managed guard into `dir`.
+/// Install every managed guard into `dir`, then turn the review-before-arm
+/// switch on unless the host opted out (its action is the last row:
+/// `installed`, `unchanged`, `opted_out`, or `refused`).
 ///
 /// Each file is written to a temporary sibling and renamed into place, so a
 /// concurrently running `ghapp` sees either the old or the new guard, never a
@@ -240,6 +409,7 @@ pub fn install(dir: &Path, dry_run: bool) -> Result<Vec<InstallAction>, String> 
             detail,
         });
     }
+    actions.push(ensure_review_switch(dir, dry_run)?);
     Ok(actions)
 }
 
@@ -268,55 +438,86 @@ pub fn doctor_section(dir: &Path, home: &Path) -> Option<BTreeMap<String, Doctor
     if !dir.exists() && !home.join(".local/bin/ghapp").exists() {
         return None;
     }
-    Some(
-        audit(dir)
-            .into_iter()
-            .map(|audit| {
-                let fix = "run `shipyard guards install`".to_owned();
-                let entry = match &audit.state {
-                    GuardState::Current => DoctorEntry {
-                        ok: true,
-                        version: Some(format!("current ({})", &audit.expected_sha256[..12])),
-                        detail: None,
-                        error: None,
-                    },
-                    GuardState::Missing => DoctorEntry {
+    let switch = audit_review_switch(dir);
+    let switch_entry = match &switch.state {
+        SwitchState::Current => DoctorEntry {
+            ok: true,
+            version: Some("on".to_owned()),
+            detail: None,
+            error: None,
+        },
+        SwitchState::OptedOut { record } => DoctorEntry {
+            ok: true,
+            version: Some("opted out".to_owned()),
+            detail: Some(record.clone()),
+            error: None,
+        },
+        SwitchState::Missing => DoctorEntry {
+            ok: false,
+            version: None,
+            detail: Some(
+                "the arm guard checks reviewer verdicts only when this file exists, so this \
+                 host lands unreviewed and held heads; run `shipyard guards install`"
+                    .to_owned(),
+            ),
+            error: Some("not current".to_owned()),
+        },
+        SwitchState::Unreadable { detail } => DoctorEntry {
+            ok: false,
+            version: None,
+            detail: Some(detail.clone()),
+            error: Some("unreadable".to_owned()),
+        },
+    };
+    let mut section: BTreeMap<String, DoctorEntry> = audit(dir)
+        .into_iter()
+        .map(|audit| {
+            let fix = "run `shipyard guards install`".to_owned();
+            let entry = match &audit.state {
+                GuardState::Current => DoctorEntry {
+                    ok: true,
+                    version: Some(format!("current ({})", &audit.expected_sha256[..12])),
+                    detail: None,
+                    error: None,
+                },
+                GuardState::Missing => DoctorEntry {
+                    ok: false,
+                    version: None,
+                    detail: Some(format!(
+                        "ghapp skips an absent guard, so this protection is off; {fix}"
+                    )),
+                    error: Some("not installed".to_owned()),
+                },
+                GuardState::Stale { installed_sha256 } => DoctorEntry {
+                    ok: false,
+                    version: Some("stale".to_owned()),
+                    detail: Some(format!(
+                        "installed sha256 {} differs from this build's {}; {fix}",
+                        &installed_sha256[..12],
+                        &audit.expected_sha256[..12]
+                    )),
+                    error: None,
+                },
+                GuardState::NotExecutable => DoctorEntry {
+                    ok: false,
+                    version: None,
+                    detail: Some(format!("ghapp only runs executable guards; {fix}")),
+                    error: Some("not executable".to_owned()),
+                },
+                GuardState::Unmanaged { detail } | GuardState::Unreadable { detail } => {
+                    DoctorEntry {
                         ok: false,
                         version: None,
-                        detail: Some(format!(
-                            "ghapp skips an absent guard, so this protection is off; {fix}"
-                        )),
-                        error: Some("not installed".to_owned()),
-                    },
-                    GuardState::Stale { installed_sha256 } => DoctorEntry {
-                        ok: false,
-                        version: Some("stale".to_owned()),
-                        detail: Some(format!(
-                            "installed sha256 {} differs from this build's {}; {fix}",
-                            &installed_sha256[..12],
-                            &audit.expected_sha256[..12]
-                        )),
-                        error: None,
-                    },
-                    GuardState::NotExecutable => DoctorEntry {
-                        ok: false,
-                        version: None,
-                        detail: Some(format!("ghapp only runs executable guards; {fix}")),
-                        error: Some("not executable".to_owned()),
-                    },
-                    GuardState::Unmanaged { detail } | GuardState::Unreadable { detail } => {
-                        DoctorEntry {
-                            ok: false,
-                            version: None,
-                            detail: Some(format!("{} is {detail}", audit.path.display())),
-                            error: Some("unmanaged".to_owned()),
-                        }
+                        detail: Some(format!("{} is {detail}", audit.path.display())),
+                        error: Some("unmanaged".to_owned()),
                     }
-                };
-                (audit.name, entry)
-            })
-            .collect(),
-    )
+                }
+            };
+            (audit.name, entry)
+        })
+        .collect();
+    section.insert(switch.name, switch_entry);
+    Some(section)
 }
 
 #[cfg(test)]
@@ -430,6 +631,102 @@ mod tests {
                 .join("docs/ghapp-guards.md")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn install_turns_review_before_arm_on_and_logs_it() {
+        let temp = tempfile::tempdir().expect("temp");
+        let dir = temp.path().join("guards");
+        assert_eq!(audit_review_switch(&dir).state, SwitchState::Missing);
+        let planned = install(&dir, true).expect("dry run");
+        assert_eq!(
+            planned
+                .last()
+                .map(|row| (row.name.as_str(), row.action.as_str())),
+            Some((REVIEW_SWITCH, "installed"))
+        );
+        assert!(!dir.exists(), "dry run must not write");
+        let done = install(&dir, false).expect("install");
+        assert_eq!(done.last().expect("switch row").action, "installed");
+        assert!(dir.join(REVIEW_SWITCH).is_file());
+        assert_eq!(audit_review_switch(&dir).state, SwitchState::Current);
+        let log = fs::read_to_string(dir.join(SWITCH_LOG)).expect("log");
+        assert!(log.contains("enabled by guards install"), "{log}");
+        let again = install(&dir, false).expect("again");
+        assert_eq!(again.last().expect("switch row").action, "unchanged");
+        assert_eq!(
+            fs::read_to_string(dir.join(SWITCH_LOG))
+                .expect("log")
+                .lines()
+                .count(),
+            1,
+            "an unchanged switch is not logged again"
+        );
+    }
+
+    #[test]
+    fn a_missing_switch_is_not_current_in_doctor() {
+        let temp = tempfile::tempdir().expect("temp");
+        let dir = temp.path();
+        install(dir, false).expect("install");
+        let on = doctor_section(dir, dir).expect("section");
+        assert!(on[REVIEW_SWITCH].ok);
+        fs::remove_file(dir.join(REVIEW_SWITCH)).expect("remove");
+        let off = doctor_section(dir, dir).expect("section");
+        assert!(!off[REVIEW_SWITCH].ok);
+        assert_eq!(off[REVIEW_SWITCH].error.as_deref(), Some("not current"));
+    }
+
+    #[test]
+    fn an_opt_out_needs_a_reason_is_logged_and_survives_install() {
+        let temp = tempfile::tempdir().expect("temp");
+        let dir = temp.path();
+        install(dir, false).expect("install");
+        assert!(opt_out_review(dir, "  ").is_err(), "a reason is required");
+        assert!(
+            dir.join(REVIEW_SWITCH).is_file(),
+            "a refused opt-out changes nothing"
+        );
+        let audit = opt_out_review(dir, "lab host, no landings").expect("opt out");
+        assert!(
+            matches!(&audit.state, SwitchState::OptedOut { record } if record.contains("lab host, no landings")),
+            "{audit:?}"
+        );
+        assert!(
+            !dir.join(REVIEW_SWITCH).exists(),
+            "opting out turns the check off"
+        );
+        let again = install(dir, false).expect("install");
+        let row = again.last().expect("switch row");
+        assert_eq!(row.action, "opted_out");
+        assert!(
+            !dir.join(REVIEW_SWITCH).exists(),
+            "install respects the opt-out"
+        );
+        assert!(doctor_section(dir, dir).expect("section")[REVIEW_SWITCH].ok);
+        let log = fs::read_to_string(dir.join(SWITCH_LOG)).expect("log");
+        assert!(
+            log.contains("\"opted out\"") && log.contains("lab host, no landings"),
+            "{log}"
+        );
+        opt_in_review(dir).expect("opt in");
+        assert_eq!(audit_review_switch(dir).state, SwitchState::Current);
+        assert!(!dir.join(REVIEW_OPT_OUT).exists());
+        assert!(
+            fs::read_to_string(dir.join(SWITCH_LOG))
+                .expect("log")
+                .contains("opted back in")
+        );
+    }
+
+    #[test]
+    fn the_switch_name_is_the_arm_guards_host_enable_file() {
+        let guard = String::from_utf8_lossy(MANAGED_GUARDS[1].contents);
+        assert!(
+            guard.contains(&format!("HOST_ENABLE_FILE = \"{REVIEW_SWITCH}\"")),
+            "the arm guard reads a different switch file"
+        );
+        assert_eq!(crate::head_approval::HOST_ENABLE_FILE, REVIEW_SWITCH);
     }
 
     #[test]

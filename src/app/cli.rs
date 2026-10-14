@@ -2769,14 +2769,17 @@ pub(super) enum DaemonLauncherCommand {
 #[derive(Debug, Subcommand)]
 pub(super) enum GuardsCommand {
     /// Report whether each managed guard is installed and identical to this
-    /// build's copy. Exit 1 when any is missing, stale, or not executable.
+    /// build's copy, and whether review-before-arm is on. Exit 1 when any
+    /// guard is missing, stale, or not executable, or the review switch is
+    /// missing without an explicit opt-out.
     Status {
         /// Guards directory. Defaults to `$SHIPYARD_GHAPP_GUARDS_DIR` or
         /// `~/.config/shipyard/guards`, where `ghapp` looks.
         #[arg(long, value_name = "DIR")]
         dir: Option<std::path::PathBuf>,
     },
-    /// Install this build's guards atomically. Never overwrites a symlink.
+    /// Install this build's guards atomically and turn review-before-arm on
+    /// unless this host opted out. Never overwrites a symlink.
     Install {
         /// Guards directory. Defaults to where `ghapp` looks.
         #[arg(long, value_name = "DIR")]
@@ -2784,6 +2787,18 @@ pub(super) enum GuardsCommand {
         /// Report what would change without writing.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Turn review-before-arm off on this host, with the reason recorded
+        /// in `review-before-arm.opt-out` and `switches.jsonl`. Later
+        /// installs leave it off until `--opt-in-review-before-arm`.
+        #[arg(
+            long = "opt-out-review-before-arm",
+            value_name = "REASON",
+            conflicts_with_all = ["opt_in_review", "dry_run"]
+        )]
+        opt_out_review: Option<String>,
+        /// Undo an opt-out: turn review-before-arm back on (logged).
+        #[arg(long = "opt-in-review-before-arm", conflicts_with = "dry_run")]
+        opt_in_review: bool,
     },
 }
 

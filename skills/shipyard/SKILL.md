@@ -3611,7 +3611,10 @@ into `ship` passes through — so `shipyard pr`, a bare `ship`, and
 opts out. A repository whose base sets `[auto_merge]
 arm_requires_head_approval = true` (the default for pulp, vellum, tartci and
 Shipyard when their base is silent, on a host that sets
-`SHIPYARD_REVIEW_BEFORE_ARM=1` or has a `review-before-arm` guards file) arms
+`SHIPYARD_REVIEW_BEFORE_ARM=1` or has a `review-before-arm` guards file;
+`shipyard guards install` creates it on every host unless the host opted out
+with `--opt-out-review-before-arm "<reason>"`, logged to `switches.jsonl`, and
+`guards status` fails on a host missing it without an opt-out) arms
 and classic-merges only an approved head on every path (`ship`, the validated
 arm, the classic merge, the steward backstop); `--arm` overrides it and names
 who did. A merge-only update carries the approval only when every file the PR

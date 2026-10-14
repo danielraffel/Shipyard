@@ -148,8 +148,12 @@ project will automatically recover or merge every PR.
   merge-group preflight that fails the group when a queued PR's latest
   verdict is a HOLD on its head; in other repositories such a HOLD does not
   stop a head that is already armed or queued, so post HOLDs through `ghapp`.
-  Each behaviour is switched on per host by a file in the guards directory
-  (`review-before-arm`, `hold-disarms`), so it rolls out one host at a time.
+  Each behaviour is switched on per host by a file in the guards directory.
+  `shipyard guards install` (run by every update and fleet update) creates
+  `review-before-arm`, and `guards status` reports a host without it as not
+  current; turning it off takes an explicit, logged
+  `--opt-out-review-before-arm "<reason>"`. `hold-disarms` is still switched
+  on one host at a time.
   See [`ghapp` guards](docs/ghapp-guards.md).
 - **Durable cancellation.** `shipyard cancel <job> --reason <why>` records the
   operator reason and terminates an active local or SSH validation process tree

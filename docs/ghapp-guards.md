@@ -63,13 +63,25 @@ current head. The direct merges are `pr merge` on a base with no queue, `pr
 merge --admin`, REST `PUT pulls/<n>/merge` and GraphQL `mergePullRequest`; on
 a queue-less repository (tartci, Shipyard) they are the landing path.
 
-**Which hosts and repositories.** Nothing in this section applies unless the
-host turns it on: `SHIPYARD_REVIEW_BEFORE_ARM=1` (`0` forces it off), or a file
-named `review-before-arm` in the guards directory. With it off the guard reads
-nothing for this rule (no pull request, no config, no comments), so it is
-inert whatever the base config says and on any Python. Updating the binary or
-the guards changes nothing until a host turns it on; roll it out one host at a
-time.
+**Which hosts and repositories.** The rule applies on a host whose guards
+directory holds a file named `review-before-arm` (or with
+`SHIPYARD_REVIEW_BEFORE_ARM=1`; `0` forces it off for one process). `shipyard
+guards install`, which every `shipyard update` and fleet update runs, creates
+that file, so every host the fleet updates has the rule on. A host left
+without it lands unreviewed and held heads: on 2026-10-14 an agent on a host
+without the file queued an unapproved pull request and one on HOLD. So:
+
+* `shipyard guards status` (exit 1), `shipyard doctor` and fleet-update
+  verification report a missing switch file as not current;
+* turning it off is an explicit, logged opt-out:
+  `shipyard guards install --opt-out-review-before-arm "<reason>"` writes
+  `review-before-arm.opt-out` (reason, time, binary), removes the switch, and
+  appends to `switches.jsonl`; later installs leave it off and report
+  `opted_out`; `--opt-in-review-before-arm` turns it back on, logged too.
+
+With the switch off the guard reads nothing for this rule (no pull request, no
+config, no comments), so it is inert whatever the base config says and on any
+Python.
 
 Off differs in one place between the two twins, deliberately. Shipyard's own
 arming and merge paths (Rust) still honour a repository that sets

@@ -1770,6 +1770,8 @@ const GUARDS_BEFORE_STALE: &str = r#"{"guards":[{"name":"queue-arm-guard","statu
 const INSTALL_OK: &str = r#"{"guards":[{"name":"queue-removal-guard","action":"unchanged"},{"name":"queue-arm-guard","action":"replaced"}]}"#;
 const INSTALL_REFUSED: &str = r#"{"guards":[{"name":"queue-removal-guard","action":"unchanged"},{"name":"queue-arm-guard","action":"refused","detail":"a symlink"}]}"#;
 const GUARDS_CURRENT: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"current"},{"name":"queue-arm-guard","status":"current"}]}"#;
+const GUARDS_CURRENT_SWITCH_OFF: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"current"},{"name":"queue-arm-guard","status":"current"}],"switches":[{"name":"review-before-arm","status":"missing"}]}"#;
+const GUARDS_CURRENT_OPTED_OUT: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"current"},{"name":"queue-arm-guard","status":"current"}],"switches":[{"name":"review-before-arm","status":"opted_out","record":"{\"reason\":\"lab host\"}"}]}"#;
 const GUARDS_STALE: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"stale"},{"name":"queue-arm-guard","status":"missing"}]}"#;
 
 #[test]
@@ -1852,6 +1854,42 @@ fn verification_accepts_only_the_target_binary_daemon_and_current_guards() {
             verdict.failures
         );
     }
+}
+
+/// A host without review-before-arm lands unreviewed heads, so a release
+/// that reports the switch must have it on, or opted out on purpose.
+#[test]
+fn verification_requires_review_before_arm_on_or_explicitly_opted_out() {
+    let plan = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
+    let off = verify::judge(
+        &plan,
+        42,
+        &verify_transcript(
+            "shipyard 0.137.0",
+            "0.137.0",
+            "42",
+            "1",
+            GUARDS_CURRENT_SWITCH_OFF,
+        ),
+    );
+    assert!(!off.verified(), "{off:?}");
+    assert!(
+        off.failures
+            .iter()
+            .any(|failure| failure.contains("review-before-arm=missing")),
+        "{:?}",
+        off.failures
+    );
+    let opted_out = verify::judge(
+        &plan,
+        42,
+        &verify_transcript("shipyard 0.137.0", "0.137.0", "42", "1", GUARDS_CURRENT_OPTED_OUT)
+            .replace(
+                INSTALL_OK,
+                r#"{"guards":[{"name":"queue-removal-guard","action":"unchanged"},{"name":"queue-arm-guard","action":"replaced"},{"name":"review-before-arm","action":"opted_out","detail":"lab host"}]}"#,
+            ),
+    );
+    assert!(opted_out.verified(), "{opted_out:?}");
 }
 
 #[test]
