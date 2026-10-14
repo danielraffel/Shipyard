@@ -172,8 +172,10 @@ tartci and Shipyard when their base is silent, on every host unless the host
 has a `review-before-arm.opt-out` file, written with a reason by
 `shipyard guards install --opt-out-review-before-arm "<reason>"`, and only
 that written record counts; there,
-with no identity listed, a verdict from the fleet App or an
-OWNER/MEMBER/COLLABORATOR counts, never the PR author's) arms or merges only a
+with no identity listed, an approval counts only from the fleet App or a
+human the base lists in `[auto_merge] human_reviewers`, empty by default; a
+HOLD from any OWNER/MEMBER/COLLABORATOR still counts; never the PR author's)
+arms or merges only a
 head that carries an
 approval of that exact head from an identity listed in
 `[auto_merge] reviewer_identities` (empty by default; the older spelling

@@ -37,10 +37,11 @@ pub struct LedgerEntry {
     pub agent: Option<String>,
     /// When the guard judged it.
     pub at: DateTime<Utc>,
-    /// `OWNER/REPO`.
-    pub repo: String,
-    /// Pull request.
-    pub pr: u64,
+    /// `OWNER/REPO`, when recorded.
+    pub repo: Option<String>,
+    /// Pull request, when recorded. A Shipyard-internal GraphQL landing names
+    /// only a node id, so its entry is matched by repository and head.
+    pub pr: Option<u64>,
     /// Head the request landed, when recorded.
     pub head: Option<String>,
     /// `arm`, `merge` or `remove`.
@@ -99,8 +100,8 @@ fn arm_entry(host: &str, value: &Value) -> Option<LedgerEntry> {
         session: text(value, "session").unwrap_or_else(|| "unattributed".to_owned()),
         agent: text(value, "agent"),
         at: time(value.get("at")?)?,
-        repo: text(value, "repo")?,
-        pr: value.get("pr")?.as_u64()?,
+        repo: text(value, "repo"),
+        pr: value.get("pr").and_then(Value::as_u64),
         head: text(value, "head").map(|head| head.to_ascii_lowercase()),
         verb: text(value, "verb")?,
         verdict: text(value, "verdict")?,
@@ -122,8 +123,8 @@ fn removal_entries(host: &str, value: &Value) -> Vec<LedgerEntry> {
                 session: text(value, "session").unwrap_or_else(|| "unattributed".to_owned()),
                 agent: text(value, "agent"),
                 at,
-                repo: text(target, "repo")?,
-                pr: target.get("pr")?.as_u64()?,
+                repo: Some(text(target, "repo")?),
+                pr: Some(target.get("pr")?.as_u64()?),
                 head: text(target, "head").map(|head| head.to_ascii_lowercase()),
                 verb: "remove".to_owned(),
                 verdict: "allowed".to_owned(),
@@ -269,11 +270,33 @@ impl Attribution {
     }
 }
 
+/// Whether `entry` is about `repo#pr`: by number, or, when the entry carries
+/// no number (a Shipyard-internal GraphQL landing), by the exact head the
+/// event landed. A recorded repository must agree either way.
+fn names_this_pull_request(entry: &LedgerEntry, repo: &str, pr: u64, event: &TimelineEvent) -> bool {
+    if entry
+        .repo
+        .as_deref()
+        .is_some_and(|recorded| !recorded.eq_ignore_ascii_case(repo))
+    {
+        return false;
+    }
+    match entry.pr {
+        Some(number) => number == pr && entry.repo.is_some(),
+        None => matches!(
+            (&entry.head, &event.head),
+            (Some(left), Some(right)) if left.eq_ignore_ascii_case(right)
+        ),
+    }
+}
+
 /// Join `events` of `repo#pr` to `entries`.
 ///
 /// An entry explains an event when the repository, pull request and verb
-/// agree, the guard allowed it, and it was written from an hour before the
-/// event to two minutes after. Among those, an entry whose head equals the
+/// agree (an entry with no pull request number, which Shipyard's own GraphQL
+/// landings write, must name the event's exact head instead), the guard
+/// allowed it, and it was written from an hour before the event to two
+/// minutes after. Among those, an entry whose head equals the
 /// event's head wins; time breaks the remaining ties (the latest entry not
 /// after the event, else the earliest after it).
 #[must_use]
@@ -289,8 +312,7 @@ pub fn attribute(
             let candidates: Vec<&LedgerEntry> = entries
                 .iter()
                 .filter(|entry| {
-                    entry.repo.eq_ignore_ascii_case(repo)
-                        && entry.pr == pr
+                    names_this_pull_request(entry, repo, pr, event)
                         && entry.verb == event.verb
                         && entry.verdict == "allowed"
                         && entry.at <= event.at + Duration::seconds(AFTER_SKEW_SECONDS)

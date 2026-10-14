@@ -82,10 +82,14 @@ A verdict is the last non-blank line of a pull-request comment,
 head:<sha>`` holds), or a review in state APPROVED / CHANGES_REQUESTED on the
 head. The latest verdict naming the head decides; a HOLD with no readable time
 always holds. When the base config lists ``reviewer_identities``, only those
-count. Otherwise the fleet App (every agent posts as it) and accounts whose
-``author_association`` is OWNER, MEMBER or COLLABORATOR count, never other
-accounts (the repositories are public) and never a distinguishable pull-request
-author.
+count. Otherwise an approval counts only from the fleet App (every agent posts
+as it through ghapp), or from an account the base lists in ``[auto_merge]
+human_reviewers`` (empty by default) whose ``author_association`` is OWNER,
+MEMBER or COLLABORATOR: any agent holding the owner's own gh login could post
+a human approval. Each human approval excluded this way is printed and recorded
+in the arms ledger (``excluded_approvals``). A HOLD from an OWNER, MEMBER or
+COLLABORATOR still counts. Never other accounts (the repositories are public),
+and never a distinguishable pull-request author.
 
 The request must bind the head it lands: ``--match-head-commit <sha>``,
 ``expectedHeadOid``, or REST ``sha=``, equal to the head the verdict approved.
@@ -795,6 +799,9 @@ def record_arms(targets: list[dict[str, Any]] | None, repo: str | None, verdict:
                     **({"agent": agent_id()} if agent_id() else {}),
                     **({"same_session_approval": True}
                        if target.get("same_session_approval") else {}),
+                    **({"excluded_approvals": target["excluded_approvals"]}
+                       if target.get("excluded_approvals") else {}),
+                    **({"node": target["node"]} if target.get("node") else {}),
                 }, sort_keys=True) + "\n")
     except OSError as error:
         print(f"queue-arm-guard: note: the arms ledger was not written: {error}", file=sys.stderr)
@@ -832,16 +839,26 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
     required = section.get("arm_requires_head_approval")
     reviewers = section.get("reviewer_identities", section.get("reviewer_logins")) or []
     from_default = not isinstance(required, bool) and default
+    humans = section.get("human_reviewers") or []
     return {
         "required": required if isinstance(required, bool) else default,
         "reviewers": [str(login).lower() for login in reviewers if isinstance(login, str)],
         # Required by REVIEW_REQUIRED_REPOS, not by the repository's own key.
         "any_but_author": from_default,
+        # Human accounts whose approvals count under any_but_author; empty by
+        # default, so only the fleet App approves.
+        "humans": [_normalized_login(login) for login in humans if isinstance(login, str)],
     }
 
 
+# Human approvals the default rule refused this run, for the warning and the
+# arms ledger (see review_gate).
+EXCLUDED_APPROVALS: list[str] = []
+
+
 def _reviewer_counts(
-    login: str, association: Any, policy: dict[str, Any], author: str | None
+    login: str, association: Any, policy: dict[str, Any], author: str | None,
+    verdict: str,
 ) -> bool:
     reviewer = _normalized_login(login)
     if policy.get("any_but_author") and not policy["reviewers"]:
@@ -849,9 +866,17 @@ def _reviewer_counts(
         # repository trusts count. Every fleet agent posts as the same App, so
         # that App's verdict on that App's pull request counts.
         trusted = reviewer == FLEET_AUTHOR or association in TRUSTED_ASSOCIATIONS
-        return trusted and (
+        counts = trusted and (
             author is None or _normalized_login(author) != reviewer or reviewer == FLEET_AUTHOR
         )
+        # An approval comes only from the fleet App or a human the base lists
+        # in human_reviewers: any agent holding the owner's own gh login could
+        # post a human one. A HOLD from a trusted human still counts.
+        if (counts and verdict == "APPROVE" and reviewer != FLEET_AUTHOR
+                and reviewer not in policy.get("humans", [])):
+            EXCLUDED_APPROVALS.append(login)
+            return False
+        return counts
     # A repository's own setting: only its listed reviewers, never the fleet
     # App or the author (an empty list admits nobody).
     return (
@@ -875,7 +900,7 @@ def counting_verdicts(
         verdict = {"APPROVED": "APPROVE", "CHANGES_REQUESTED": "HOLD"}.get(state)
         if not isinstance(login, str) or verdict is None:
             continue
-        if _reviewer_counts(login, review.get("author_association"), policy, author):
+        if _reviewer_counts(login, review.get("author_association"), policy, author, verdict):
             named = str(review.get("commit_id") or "").lower()
             verdicts.append((_timestamp(review.get("submitted_at")), verdict, named,
                              f"a {state} review by {login} at {review.get('submitted_at')}"))
@@ -885,7 +910,7 @@ def counting_verdicts(
         found = marker_verdict(body) if isinstance(body, str) else None
         if not isinstance(login, str) or found is None:
             continue
-        if _reviewer_counts(login, comment.get("author_association"), policy, author):
+        if _reviewer_counts(login, comment.get("author_association"), policy, author, found[0]):
             verdict, named = found
             verdicts.append((_timestamp(comment.get("created_at")), verdict, named,
                              f"`{verdict} head:{named[:12]}` by {login} at "
@@ -915,7 +940,10 @@ def wanted_verdict(head: str, author: str | None, policy: dict[str, Any]) -> str
     elif not policy.get("any_but_author"):
         wanted += ", from a reviewer the base config lists (it lists none)"
     else:
-        wanted += ", from the fleet App or an OWNER, MEMBER or COLLABORATOR"
+        wanted += (", from the fleet App (a `ghapp` verdict comment), or a human the base "
+                   "lists in `[auto_merge] human_reviewers`")
+        if policy.get("humans"):
+            wanted += f" ({', '.join(policy['humans'])})"
         if author and _normalized_login(author) != FLEET_AUTHOR:
             wanted += f" other than the PR author {author}"
     return wanted
@@ -969,7 +997,8 @@ def _deciding_approval_body(
         if (isinstance(login, str) and isinstance(body, str)
                 and marker_verdict(body) == ("APPROVE", head)
                 and _timestamp(comment.get("created_at")) == latest[0]
-                and _reviewer_counts(login, comment.get("author_association"), policy, author)):
+                and _reviewer_counts(login, comment.get("author_association"), policy, author,
+                                     "APPROVE")):
             return body
     return None
 
@@ -1577,6 +1606,22 @@ def _note_same_session(classification: dict[str, Any], label: str, repo: str,
 
 def review_gate(classification: dict[str, Any], repo: str | None
                 ) -> tuple[bool, str, dict[str, Any] | None]:
+    """``(allowed, message, fix)``: the review-before-arm rule for one target,
+    with every human approval it excluded printed and kept on the target for
+    the arms ledger."""
+    EXCLUDED_APPROVALS.clear()
+    result = _review_gate(classification, repo)
+    excluded = sorted(set(EXCLUDED_APPROVALS))
+    if excluded:
+        classification["excluded_approvals"] = excluded
+        print(f"queue-arm-guard: note: PR #{classification.get('pr')}: ignored the approval "
+              f"of {', '.join(excluded)}: only the fleet App's verdict, or a login the base "
+              "lists in `[auto_merge] human_reviewers`, approves", file=sys.stderr)
+    return result
+
+
+def _review_gate(classification: dict[str, Any], repo: str | None
+                 ) -> tuple[bool, str, dict[str, Any] | None]:
     """``(allowed, message, fix)``: the review-before-arm rule for one target.
 
     ``fix`` says, for a refusal it can name, what to do next.
@@ -1677,9 +1722,10 @@ def review_gate(classification: dict[str, Any], repo: str | None
                                     f"does not carry to head {head[:12]}"),
         "unreviewed": f"no trusted verdict names {label}'s head {head[:12]}",
     }[cause]
-    command = (f"a reviewer (the fleet App, or an OWNER, MEMBER or COLLABORATOR who is not the "
-               f"author) reviews head {head} and posts a comment ending "
-               f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}")
+    command = (f"a reviewer agent reviews head {head} and posts, through `ghapp` (the fleet "
+               f"App), a comment ending `verdict: APPROVE head:{head}` on "
+               f"https://github.com/{repo}/pull/{number}; a human approval counts only for a "
+               "login the base lists in `[auto_merge] human_reviewers`")
     # Approving is the reviewer's act; an agent landing its own head must not do it.
     return False, f"{label} ({repo}): {why}", review_fix(
         cause, what, repo, number, head, command, False)
@@ -2704,6 +2750,52 @@ def arm_request(args: list[str]) -> list[dict[str, Any]] | None:
     return None
 
 
+def internal_targets(args: list[str]) -> list[dict[str, Any]] | None:
+    """What a Shipyard-internal landing binds, read from ``args`` alone.
+
+    Shipyard judged it already, so no GitHub call is spent here: the ledger
+    gets the repository, pull request (or GraphQL node), head and verb the
+    request itself names. ``shipyard who`` matches an entry without a pull
+    request number by its repository and head.
+    """
+    parser = _require_parser()
+    repo_flag = parser.option_values(args, {"--repo", "-R"})
+    repo = repo_flag[-1] if repo_flag else (os.environ.get("GH_REPO") or None)
+    if len(args) >= 2 and args[0] == "pr" and args[1] == "merge":
+        if "--disable-auto" in args:
+            return None
+        selector, flag_repo = pr_merge_target(args)
+        repo = flag_repo or repo
+        number: int | None = None
+        if selector:
+            url = re.search(r"github\.com/([^/]+/[^/]+)/pull/([1-9][0-9]*)", selector)
+            if url:
+                repo, number = url.group(1), int(url.group(2))
+            elif re.fullmatch(r"#?[1-9][0-9]*", selector):
+                number = int(selector.lstrip("#"))
+        bound = parser.option_values(args[2:], {"--match-head-commit"})
+        action = "arm" if "--auto" in args else "merge"
+        return [{"repo": repo, "pr": number, "head": bound[-1].lower() if bound else None,
+                 "action": action}]
+    if args and args[0] == "api":
+        endpoint, query = parser.api_target(args)
+        rest = re.fullmatch(r"repos/([^/]+/[^/]+)/pulls/([1-9][0-9]*)/merge", endpoint)
+        if rest:
+            sha = rest_fields(args).get("sha")
+            return [{"repo": rest.group(1), "pr": int(rest.group(2)),
+                     "head": sha.lower() if isinstance(sha, str) else None, "action": "merge"}]
+        if endpoint != "graphql":
+            return None
+        document = "\n".join([parser.graphql_document(args), *query.get("query", [])])
+        compact = "".join(document.split()).lower()
+        if not any(name in compact for name in (*ARM_MUTATIONS, *MERGE_MUTATIONS)):
+            return None
+        return [{"repo": repo, "pr": None, "node": node,
+                 "head": bound.lower() if isinstance(bound, str) else None, "action": action}
+                for action, node, bound in landing_mutations(document, graphql_variables(args))]
+    return None
+
+
 def rest_merge_request(args: list[str], endpoint: str) -> list[dict[str, Any]] | None:
     """The target of a REST ``PUT repos/<o>/<r>/pulls/<n>/merge``, else ``None``."""
     match = re.fullmatch(r"repos/([^/]+)/([^/]+)/pulls/([1-9][0-9]*)/merge", endpoint)
@@ -2767,6 +2859,14 @@ def review_refusal(targets: list[dict[str, Any]], repo: str | None) -> bool:
 
 def main(args: list[str]) -> int:
     if os.environ.get("SHIPYARD_INTERNAL_QUEUE_MUTATION") == "1":
+        # Shipyard's own arm and merge paths judged this already
+        # (head_approval.rs); record it so `shipyard who` can name them too.
+        # Never refuse here, and never fail: parsing is best effort.
+        try:
+            record_arms(internal_targets(args), os.environ.get("GH_REPO") or None,
+                        "allowed", "shipyard internal")
+        except Exception:  # noqa: BLE001 - the ledger never gates
+            pass
         return 0
     seen: dict[str, Any] = {}
     status = judge(args, seen)
