@@ -1175,6 +1175,12 @@ const BINARY_PROBE_BYTES: usize = 8000;
 /// one-line JSON fixture of hundreds of KB), so a missing patch alone does not
 /// say binary. An unreadable blob is an error: unknown refuses, but is never
 /// reported as binary.
+///
+/// It reads the whole blob, even for a public repository where the Python
+/// guard reads only the first 8000 bytes from raw.githubusercontent.com: the
+/// `gh` transport here returns text, which cannot carry a byte-exact ranged
+/// body (issue #831). For a private repository both twins read the whole
+/// blob, since gh sends no credentials to the raw host.
 fn blob_is_binary(run_gh: RunGh<'_>, repo: &str, sha: &str) -> Result<bool, String> {
     let blob = gh_json(
         run_gh,

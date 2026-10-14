@@ -1037,7 +1037,13 @@ BINARY_PROBE_BYTES = 8000
 def _raw_head(repo: str, commit: str, path: str) -> bytes | None:
     """The first ``BINARY_PROBE_BYTES`` of ``path`` at ``commit``, by a ranged
     read of its raw URL, or ``None`` when the raw URL cannot be read (the API
-    ignores ``Range``; raw.githubusercontent.com honours it).
+    ignores ``Range``, the contents endpoint included; raw.githubusercontent.com
+    honours it).
+
+    This helps public repositories only: gh sends no ``Authorization`` header
+    to raw.githubusercontent.com, so for a private repository the read fails
+    and the caller falls back to the full blob read with its size check. That
+    fallback is correct; it just saves nothing there.
 
     Raises GuardError when the read answers but returns other than exactly
     ``min(BINARY_PROBE_BYTES, size)`` bytes: a short read is never text.
@@ -1083,8 +1089,9 @@ def blob_is_binary(repo: str, sha: str, commit: str | None = None, path: str | N
     GitHub omits a comparison's ``patch`` for a binary file, but also for a
     text file too large to show (a one-line JSON fixture of hundreds of KB),
     so a missing patch alone does not say binary. With ``commit`` and
-    ``path`` only the first 8000 bytes are read; otherwise, or when that read
-    is unavailable, the whole blob is read and its length must equal its
+    ``path`` only the first 8000 bytes are read, which works for public
+    repositories; otherwise, or when that read is unavailable (any private
+    repository), the whole blob is read and its length must equal its
     reported size. Raises GuardError when the blob cannot be read whole:
     unknown is a refusal, never "binary" and never text.
     """
