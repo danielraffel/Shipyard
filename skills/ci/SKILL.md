@@ -399,7 +399,9 @@ costs two API calls, capped per run by `--causes-max-jobs` (default 200, newest
 first); the rest count as unread. A cause is named when its class is not
 `unknown` and its confidence is `high` or `medium`; an exit code, a bare
 annotation, a bare "The operation was canceled." (nothing says who or why)
-or a line outside the failing step is `low` and is not.
+or a line outside the failing step is `low` and is not. A make or ninja
+line alone is `low` too: it names the target that broke, not why, so a link
+or compile error that ninja reported is what gets named.
 Fields not read are present, `null` and named in `unread`; do not fill them
 by hand. For Pulp, red required checks need `--required-context`, or the
 report says "no required contexts" and exports none of them. Read the receipt before
