@@ -1578,7 +1578,9 @@ The record is EXP-A3's `to_ci_cause_v1` mapping of C2's first record:
 `c2_extract.py`; the fixture set in `tests/fixtures/c2/` is shared verbatim
 and is the contract, so a rule change lands in both with its fixture.
 Records from the step that ended in `##[error]` come first, so a retried
-assertion never outranks the runner dying. A cause is named when its class is
+assertion never outranks the runner dying. A make or ninja failure ranks
+below every runner and compiler record and is `low`: on its own it names the
+target that broke, not why. A cause is named when its class is
 not `unknown` and its confidence is `high` or `medium`. `diagnose` adds only
 GitHub's own record (a runner that never came, a supersede, a timeout) when
 the log names nothing more certain; a log with no recognized line still gets

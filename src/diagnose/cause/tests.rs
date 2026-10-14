@@ -125,6 +125,31 @@ fn an_assertion_outside_the_failing_step_is_low() {
 }
 
 #[test]
+fn a_link_error_outranks_the_ninja_line_that_reported_it() {
+    let log = fixture("c2/regressions/ninja_below_linker.log");
+    let lines = split_lines(&log);
+    let first = c2::extract(&log).into_iter().next().expect("record");
+    let cause = to_ci_cause_v1(&first, &place(), &lines, None, true);
+    assert_eq!((first.format.as_str(), first.line), ("linker", 4));
+    assert_eq!(cause.confidence, "medium");
+    assert!(cause.named());
+}
+
+#[test]
+fn a_make_failure_alone_names_a_target_not_a_cause() {
+    let log = fixture("c2/regressions/make_only.log");
+    let lines = split_lines(&log);
+    let first = c2::extract(&log).into_iter().next().expect("record");
+    let cause = to_ci_cause_v1(&first, &place(), &lines, None, true);
+    assert_eq!(
+        (cause.format.as_str(), cause.failure_class.as_str()),
+        ("ninja", "build")
+    );
+    assert_eq!(cause.confidence, "low");
+    assert!(!cause.named());
+}
+
+#[test]
 fn a_cancel_with_no_reason_is_githubs_low_record() {
     let cause = build(&job("cancelled", "Test"), Some(""), &place(), None, true).expect("red");
     assert_eq!(cause.format, "infra-cancel");
