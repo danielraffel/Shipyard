@@ -224,7 +224,10 @@ the merged head.
 "changes a binary file" means the file's blob has a NUL byte, git's rule; a
 large one-line text file GitHub shows no patch for (tartci's JSON fixtures) is
 text and does not trip it. "cannot tell whether blob ... is binary" is an
-unreadable blob: re-run the landing, it is not a binary finding.
+unreadable blob: re-run the landing, it is not a binary finding. The guard reads
+only the first 8000 bytes in a public repository; in a private one it reads
+the whole blob, since gh sends no credentials to raw.githubusercontent.com, so
+a landing there that touches a very large file is slower, not wrong (#831).
 
 Two things not to conclude from it:
 

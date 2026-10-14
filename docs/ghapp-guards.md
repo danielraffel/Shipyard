@@ -136,8 +136,11 @@ head no verdict names. The approval carries to it only when all of these hold:
 * the PR changes no binary file. A file GitHub shows no patch for is read as
   a blob and is binary only if a NUL byte appears in its first 8000 bytes,
   git's rule: GitHub also omits the patch of a text file too large to show,
-  such as a one-line JSON fixture of hundreds of KB. A blob that cannot be
-  read refuses as unknown, never as binary.
+  such as a one-line JSON fixture of hundreds of KB. In a public repository
+  the guard reads just those bytes with a ranged request to
+  raw.githubusercontent.com; a private repository (gh sends no credentials
+  there) and the Rust twin read the whole blob and require its exact size.
+  A blob that cannot be read refuses as unknown, never as binary.
 
 Anything else, or anything the guard cannot read (including a comparison at
 GitHub's 300-file cap), needs a new verdict. A HOLD naming the new head is
