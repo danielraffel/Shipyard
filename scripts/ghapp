@@ -1626,6 +1626,21 @@ fi
 if [[ -x "$guards/verdict-hold-hook" ]]; then
     PATH="$trusted_path" "$guards/verdict-hold-hook" "$@" || true
 fi
+# Optional, and never a refusal: a verdict comment gets a
+# `<!-- session: <host>/<session> -->` line above its marker, so
+# queue-arm-guard can refuse an arm from the session that approved it. The
+# rewritten argument list is used only when the stamper answers with its
+# sentinel first; anything else posts the comment unstamped.
+if [[ -x "$guards/verdict-session-stamp" ]]; then
+    ghapp_stamped=()
+    while IFS= read -r -d '' ghapp_stamp_item; do
+        ghapp_stamped+=("$ghapp_stamp_item")
+    done < <(PATH="$trusted_path" "$guards/verdict-session-stamp" "$@" 2>/dev/null || true)
+    if [[ "${#ghapp_stamped[@]}" -ge 1 && "${ghapp_stamped[0]}" == "SHIPYARD-STAMP-V1" ]]; then
+        set -- "${ghapp_stamped[@]:1}"
+    fi
+    unset ghapp_stamped ghapp_stamp_item
+fi
 
 if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \
       -n "${release_upload_stage_dir:-}" ]]; then

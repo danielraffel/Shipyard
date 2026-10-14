@@ -90,11 +90,14 @@ shipyard cause archive --dir DIR --input F   # append records (or scorecard case
                                              #   ids already archived are skipped, nothing is rewritten
 
 # ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard)
-shipyard guards status                       # missing/stale/current vs this build's copies, plus the review-before-arm
-                                             #   switch; exit 1 unless all current (an explicit opt-out counts as current)
-shipyard guards install [--dir DIR] [--dry-run]  # install this build's copies atomically and create review-before-arm
-shipyard guards install --opt-out-review-before-arm "<reason>"  # turn review-before-arm off here, logged
-shipyard guards install --opt-in-review-before-arm               # turn it back on, logged
+shipyard guards status                       # missing/stale/current vs this build's copies, plus whether
+                                             #   review-before-arm is on (default) or OFF by opt-out; exit 1 unless all current
+shipyard guards install [--dir DIR] [--dry-run]  # install this build's copies atomically
+shipyard guards install --opt-out-review-before-arm "<reason>"  # turn review-before-arm off here (the opt-out file), logged
+shipyard guards install --opt-in-review-before-arm               # remove the opt-out, logged
+shipyard who --pr 123 [--repo OWNER/REPO]    # which host/session armed, enqueued, merged or removed it; joins every
+                                             #   host's queue-arms.jsonl + queue-removals.jsonl to the PR timeline
+                                             #   (repo+PR+verb+head; time breaks ties); unexplained = unattributed
 shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all
 
 # Keep the fleet on the latest release (controller only)

@@ -57,8 +57,8 @@ pub(super) fn guards_command<W: Write>(
             } else {
                 Err(CliFailure::new(
                     1,
-                    "one or more ghapp guards are missing or stale, or review-before-arm is off \
-                     without an opt-out; run `shipyard guards install`",
+                    "one or more ghapp guards are missing or stale, or the review-before-arm \
+                     opt-out is unreadable; run `shipyard guards install`",
                 ))
             }
         }
@@ -123,9 +123,8 @@ pub(super) fn guards_command<W: Write>(
 
 fn describe_switch(state: &SwitchState) -> String {
     match state {
-        SwitchState::Current => "on".to_owned(),
-        SwitchState::Missing => "MISSING (review-before-arm is off without an opt-out)".to_owned(),
-        SwitchState::OptedOut { record } => format!("OPTED OUT {record}"),
+        SwitchState::Current => "on (default)".to_owned(),
+        SwitchState::OptedOut { record } => format!("OFF, opted out: {record}"),
         SwitchState::Unreadable { detail } => format!("UNREADABLE ({detail})"),
     }
 }
@@ -174,31 +173,40 @@ mod tests {
         )
     }
 
-    /// Status fails on a host where review-before-arm is off by accident, and
-    /// passes when it is on or explicitly opted out.
+    /// Status shows the rule on by default and OFF under an opt-out, and the
+    /// opt-out survives installs until opted back in.
     #[test]
-    fn status_reports_a_missing_review_switch_as_not_current() {
+    fn status_shows_review_before_arm_on_by_default_and_off_when_opted_out() {
         let temp = tempfile::tempdir().expect("temp");
         let dir = temp.path();
         install_cmd(dir, None, false).expect("install");
-        assert!(status(dir).is_ok(), "control: a fresh install is current");
-        std::fs::remove_file(dir.join(crate::ghapp_guards::REVIEW_SWITCH)).expect("remove");
-        assert!(status(dir).is_err(), "a missing switch is not current");
-        install_cmd(dir, Some("lab host"), false).expect("opt out");
-        assert!(status(dir).is_ok(), "an explicit opt-out is current");
-        let mut out = Vec::new();
-        let _ = guards_command(
-            GuardsCommand::Status {
-                dir: Some(dir.to_path_buf()),
-            },
-            true,
-            &mut out,
+        assert!(status(dir).is_ok(), "a fresh install is current");
+        let read = |dir: &std::path::Path| {
+            let mut out = Vec::new();
+            let _ = guards_command(
+                GuardsCommand::Status {
+                    dir: Some(dir.to_path_buf()),
+                },
+                true,
+                &mut out,
+            );
+            String::from_utf8(out).expect("utf8")
+        };
+        let on = read(dir);
+        assert!(
+            on.contains("\"switches\"") && !on.contains("opted_out"),
+            "{on}"
         );
-        let text = String::from_utf8(out).expect("utf8");
-        assert!(text.contains("\"switches\""), "{text}");
-        assert!(text.contains("opted_out"), "{text}");
+        install_cmd(dir, Some("lab host"), false).expect("opt out");
+        let text = read(dir);
+        assert!(
+            text.contains("opted_out") && text.contains("lab host"),
+            "{text}"
+        );
+        install_cmd(dir, None, false).expect("install again");
+        assert!(read(dir).contains("opted_out"), "install keeps the opt-out");
         install_cmd(dir, None, true).expect("opt in");
-        assert!(dir.join(crate::ghapp_guards::REVIEW_SWITCH).is_file());
+        assert!(!dir.join(crate::ghapp_guards::REVIEW_OPT_OUT).exists());
         assert!(status(dir).is_ok());
     }
 }

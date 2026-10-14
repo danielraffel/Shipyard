@@ -608,7 +608,8 @@ class InstalledLayoutEndToEnd(unittest.TestCase):
             )
             for executable in (fake_gh, guards / "queue-arm-guard"):
                 executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
-            env = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake_gh), "GH_REPO": "Generous-Corp/pulp"}
+            env = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake_gh), "GH_REPO": "Generous-Corp/pulp",
+                   "HOME": str(guards)}
             result = subprocess.run(
                 [sys.executable, str(guards / "queue-arm-guard"), "pr", "merge", "8669", "--auto"],
                 env=env,
@@ -1263,6 +1264,7 @@ class BatchAttributionTests(unittest.TestCase):
                     "GHAPP_REAL_GH": str(fake_gh),
                     "GH_REPO": "Generous-Corp/pulp",
                     "SHIPYARD_REVIEW_BEFORE_ARM": "1",
+                    "HOME": str(guards),
                 },
                 cwd=str(repo),
                 capture_output=True,
@@ -1879,6 +1881,12 @@ class ReviewBeforeArm(unittest.TestCase):
     def calls(self) -> str:
         return (self.root / "calls").read_text(encoding="utf-8")
 
+    def ledger(self) -> list[dict[str, Any]]:
+        path = self.root / ".local" / "state" / "shipyard" / "queue-arms.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
     def approved_784(self, **kwargs: Any) -> list[tuple[str, dict[str, Any]]]:
         return self.case("shipyard-784", graphql=opened(review_fixture("shipyard-784-graphql.json")),
                          **kwargs)
@@ -1999,20 +2007,27 @@ class ReviewBeforeArm(unittest.TestCase):
         self.assertEqual(allowed.returncode, 0, allowed.stderr)
         self.assertEqual(self.fixes(allowed.stderr), [])
 
-    def test_the_host_switch_decides_for_a_silent_repository(self) -> None:
+    def test_review_is_on_by_default_and_off_only_by_the_opt_out_file(self) -> None:
+        # On by default, and nothing in the environment turns it off.
         for host in ("0", None):
             result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=host)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertNotIn("/comments", self.calls())
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("/comments", self.calls())
             (self.root / "calls").unlink()
-        (self.guards / "review-before-arm").write_text("", encoding="utf-8")
+        (self.guards / "review-before-arm.opt-out").write_text("lab host", encoding="utf-8")
         result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=None)
-        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("/comments", self.calls())
+        self.assertIn("review before arm is OFF on this host", result.stderr)
+        self.assertIn("lab host", result.stderr)
+        self.assertEqual([entry["review"] for entry in self.ledger()],
+                         ["on", "on", "off: lab host"])
 
     def test_off_reads_nothing_even_with_a_config_this_python_cannot_parse(self) -> None:
         # Off must be inert on any Python, including one without tomllib, and
         # whatever the base config says: the review reads nothing at all.
         on = "[auto_merge]\narm_requires_head_approval = true\n[validation\n"
+        (self.guards / "review-before-arm.opt-out").write_text("lab host", encoding="utf-8")
         for host in ("0", None):
             result = self.arm(513, "danielraffel/tartci", self.case("tartci-513", config=on),
                               host=host)
@@ -2453,6 +2468,68 @@ class ReviewBeforeArm(unittest.TestCase):
         result = self.land(history, history.git("rev-parse", "HEAD"))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("is not a merge", result.stderr)
+
+
+class ArmsLedgerAndSelfApproval(unittest.TestCase):
+    """Every judged landing is recorded with its host and session, and a
+    session cannot approve its own landing."""
+
+    install = ReviewBeforeArm.install
+    case = ReviewBeforeArm.case
+    run_guard = ReviewBeforeArm.run_guard
+    calls = ReviewBeforeArm.calls
+    ledger = ReviewBeforeArm.ledger
+    setUp = ReviewBeforeArm.setUp
+    approved_784 = ReviewBeforeArm.approved_784
+
+    def approval(self, session: str | None) -> list[list[dict[str, Any]]]:
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        stamp = f"<!-- session: m5s/{session} -->\n" if session else ""
+        return [[comment_like(approve, created_at="2026-10-12T15:00:00Z",
+                              body=f"Reviewed.\n{stamp}verdict: APPROVE head:{HEAD_784}")]]
+
+    def merge(self, session: str | None, approver: str | None) -> subprocess.CompletedProcess:
+        env = {"CLAUDE_CODE_SESSION_ID": session} if session else {}
+        return self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD_784],
+                              self.approved_784(queue=False, comments=self.approval(approver)),
+                              "danielraffel/Shipyard", **env)
+
+    def test_the_approving_session_cannot_land_its_own_approval(self) -> None:
+        result = self.merge("sess-A", "sess-A")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("was posted by this same session", result.stderr)
+        self.assertIn('"cause": "self_approval"', result.stderr)
+
+    def test_another_session_lands_it(self) -> None:
+        result = self.merge("sess-B", "sess-A")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_unstamped_verdict_and_an_unattributed_arm_behave_as_before(self) -> None:
+        self.assertEqual(self.merge("sess-A", None).returncode, 0)
+        self.assertEqual(self.merge(None, "sess-A").returncode, 0)
+        self.assertEqual(self.merge("sess-B", "unattributed").returncode, 0)
+
+    def test_every_judged_landing_is_in_the_ledger_with_its_session(self) -> None:
+        self.merge("sess-B", "sess-A")
+        self.merge("sess-A", "sess-A")
+        self.merge(None, None)
+        entries = self.ledger()
+        self.assertEqual([(e["session"], e["verdict"]) for e in entries],
+                         [("sess-B", "allowed"), ("sess-A", "refused"),
+                          ("unattributed", "allowed")])
+        for entry in entries:
+            self.assertEqual((entry["repo"], entry["pr"], entry["head"], entry["verb"]),
+                             ("danielraffel/Shipyard", 784, HEAD_784, "merge"))
+            self.assertTrue(entry["host"])
+            self.assertRegex(entry["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+            self.assertEqual(entry["review"], "on")
+
+    def test_codex_session_is_read_when_claude_is_absent(self) -> None:
+        self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD_784],
+                       self.approved_784(queue=False, comments=self.approval(None)),
+                       "danielraffel/Shipyard", CODEX_COMPANION_SESSION_ID="codex-1")
+        self.assertEqual(self.ledger()[0]["session"], "codex-1")
 
 
 class CarryHistory:

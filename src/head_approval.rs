@@ -34,12 +34,18 @@
 //!
 //! ## Repositories that require review by default
 //!
-//! On a host that turns it on ([`host_review_default`]: `SHIPYARD_REVIEW_BEFORE_ARM=1`,
-//! or a `review-before-arm` file in the guards directory),
-//! [`REVIEW_REQUIRED_REPOS`] require a verdict naming the exact head even when
-//! their base config is silent. Updating the binary changes nothing until a
-//! host turns it on, so the rule rolls out one host at a time. A config that
-//! sets `arm_requires_head_approval` itself still decides.
+//! Unless the host opted out ([`host_review_default`]: a
+//! `review-before-arm.opt-out` file in the guards directory, the only way
+//! off), [`REVIEW_REQUIRED_REPOS`] require a verdict naming the exact head
+//! even when their base config is silent. A config that sets
+//! `arm_requires_head_approval` itself still decides.
+//!
+//! An approval does not count for the session that posted it: `ghapp`
+//! stamps verdict comments with `<!-- session: <host>/<session> -->`, and a
+//! marker approval stamped with this process's session
+//! (`CLAUDE_CODE_SESSION_ID`, else `CODEX_COMPANION_SESSION_ID`) is
+//! [`HeadGate::SelfApproved`]. Unstamped verdicts and unattributed sessions
+//! count as before.
 //!
 //! With no reviewer listed, such a repository counts a verdict from the fleet
 //! App (`shipyard-local`, which every agent posts as) or from an account whose
@@ -103,10 +109,13 @@ pub fn requires_review_by_default(repo: &str) -> bool {
         .any(|required| required.eq_ignore_ascii_case(repo))
 }
 
-/// Environment switch for [`host_review_default`]: `1` on, `0` off.
+/// Environment switch for [`host_review_default`]: `1` forces it on for one
+/// process. Nothing in the environment turns it off.
 pub const HOST_ENABLE_ENV: &str = "SHIPYARD_REVIEW_BEFORE_ARM";
-/// File in the guards directory that turns [`host_review_default`] on.
-pub const HOST_ENABLE_FILE: &str = "review-before-arm";
+/// File in the guards directory that turns [`host_review_default`] off.
+pub const HOST_OPT_OUT_FILE: &str = "review-before-arm.opt-out";
+/// Where an agent session's id is read from, in order.
+pub const SESSION_ENVS: [&str; 2] = ["CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID"];
 /// `author_association` values whose verdicts count when no reviewer is
 /// listed (besides the fleet App's).
 pub const TRUSTED_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
@@ -114,6 +123,65 @@ pub const TRUSTED_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
 #[cfg(test)]
 thread_local! {
     static HOST_DEFAULT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static SESSION_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SESSION_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` with [`arming_session`] pinned, on this thread.
+#[cfg(test)]
+pub(crate) fn with_arming_session<T>(session: Option<&str>, body: impl FnOnce() -> T) -> T {
+    SESSION_PINNED.with(|cell| cell.set(true));
+    SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = session.map(str::to_owned));
+    let result = body();
+    SESSION_PINNED.with(|cell| cell.set(false));
+    SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    result
+}
+
+#[cfg(test)]
+fn arming_session_pinned() -> bool {
+    SESSION_PINNED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn arming_session_pinned() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn pinned_arming_session() -> Option<String> {
+    SESSION_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(not(test))]
+const fn pinned_arming_session() -> Option<String> {
+    None
+}
+
+/// This process's agent session, when one is known.
+#[must_use]
+pub fn arming_session() -> Option<String> {
+    if arming_session_pinned() {
+        return pinned_arming_session();
+    }
+    SESSION_ENVS.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// The session a verdict comment was stamped with by `ghapp`, if any.
+#[must_use]
+pub fn stamped_session(body: &str) -> Option<String> {
+    let pattern =
+        Regex::new(r"<!--\s*session:\s*([^/\s]+)/(\S+?)\s*-->").expect("stamp pattern compiles");
+    pattern
+        .captures_iter(body)
+        .last()
+        .and_then(|capture| capture.get(2))
+        .map(|session| session.as_str().to_owned())
 }
 
 /// Run `body` with [`host_review_default`] pinned, on this thread.
@@ -135,19 +203,17 @@ const fn host_review_override() -> Option<bool> {
     None
 }
 
-/// Whether this host applies [`REVIEW_REQUIRED_REPOS`]: `SHIPYARD_REVIEW_BEFORE_ARM`
-/// (`1` or `0`) decides, else a `review-before-arm` file in the guards
-/// directory (`$SHIPYARD_GHAPP_GUARDS_DIR`, else `~/.config/shipyard/guards`)
-/// turns it on. Off otherwise.
+/// Whether this host applies [`REVIEW_REQUIRED_REPOS`]: on, unless the
+/// guards directory (`$SHIPYARD_GHAPP_GUARDS_DIR`, else
+/// `~/.config/shipyard/guards`) holds [`HOST_OPT_OUT_FILE`].
+/// `SHIPYARD_REVIEW_BEFORE_ARM=1` forces it on.
 #[must_use]
 pub fn host_review_default() -> bool {
     if let Some(enabled) = host_review_override() {
         return enabled;
     }
-    match std::env::var(HOST_ENABLE_ENV).as_deref() {
-        Ok("1") => return true,
-        Ok("0") => return false,
-        _ => {}
+    if std::env::var(HOST_ENABLE_ENV).as_deref() == Ok("1") {
+        return true;
     }
     let dir = std::env::var_os("SHIPYARD_GHAPP_GUARDS_DIR")
         .filter(|dir| !dir.is_empty())
@@ -156,7 +222,7 @@ pub fn host_review_default() -> bool {
             std::env::var_os("HOME")
                 .map(|home| std::path::PathBuf::from(home).join(".config/shipyard/guards"))
         });
-    dir.is_some_and(|dir| dir.join(HOST_ENABLE_FILE).is_file())
+    !dir.is_some_and(|dir| dir.join(HOST_OPT_OUT_FILE).exists())
 }
 
 /// Removals of one head after which it needs a fresh approval to re-arm.
@@ -623,6 +689,14 @@ pub enum HeadGate {
         /// The head that needs one.
         head: String,
     },
+    /// The approval deciding this head was posted by the session now arming
+    /// it: a session cannot approve its own landing.
+    SelfApproved {
+        /// The head.
+        head: String,
+        /// The session that both approved and armed.
+        session: String,
+    },
     /// The queue removed this head [`EJECTION_CAP`] or more times and no
     /// approval followed the last removal.
     EjectionCap {
@@ -652,6 +726,12 @@ impl HeadGate {
                  on that commit, from a listed reviewer (anyone but the PR author where none \
                  is listed), with no later HOLD naming it. This repository arms only approved \
                  heads; left disarmed. Arm deliberately with `--arm`",
+                short(head)
+            ),
+            Self::SelfApproved { head, session } => format!(
+                "the approval of head {} was posted by this same session ({session}); a \
+                 session cannot approve its own landing. Left disarmed until a reviewer in \
+                 another session approves it, or someone arms it with `--arm`",
                 short(head)
             ),
             Self::EjectionCap { head, ejections } => format!(
@@ -802,12 +882,51 @@ pub(crate) fn decide_for_author(
             },
         };
     }
-    match find_approval_for_author(head, reviews, comments, policy, None, author) {
+    let gate = match find_approval_for_author(head, reviews, comments, policy, None, author) {
         Some(approval) => HeadGate::Approved { approval },
         None => HeadGate::NotApproved {
             head: head.to_owned(),
         },
+    };
+    refuse_self_approval(gate, head, comments)
+}
+
+/// `gate`, or [`HeadGate::SelfApproved`] when its approval is a marker
+/// comment stamped with this process's session. Reviews, unstamped markers
+/// and an unknown arming session pass unchanged.
+fn refuse_self_approval(gate: HeadGate, head: &str, comments: &[Value]) -> HeadGate {
+    let HeadGate::Approved { approval } = &gate else {
+        return gate;
+    };
+    let mut approval = approval;
+    while let Approval::Carried {
+        approval: inner, ..
+    } = approval
+    {
+        approval = inner;
     }
+    let Approval::Marker {
+        comment_id: Some(id),
+        ..
+    } = approval
+    else {
+        return gate;
+    };
+    let Some(mine) = arming_session() else {
+        return gate;
+    };
+    let stamped = comments
+        .iter()
+        .find(|comment| comment.get("id").and_then(Value::as_u64) == Some(*id))
+        .and_then(|comment| comment.get("body").and_then(Value::as_str))
+        .and_then(stamped_session);
+    if stamped.as_deref() == Some(mine.as_str()) {
+        return HeadGate::SelfApproved {
+            head: head.to_owned(),
+            session: mine,
+        };
+    }
+    gate
 }
 
 /// Read the policy from `base` on GitHub. A missing file is the default.
@@ -1071,7 +1190,10 @@ pub fn evaluate_with_policy_for_author_with_events(
         policy,
         author,
     };
-    Ok((with_carry(run_gh, &carry, gate), events))
+    Ok((
+        refuse_self_approval(with_carry(run_gh, &carry, gate), head, &comments),
+        events,
+    ))
 }
 
 /// What [`with_carry`] reads about one pull request.

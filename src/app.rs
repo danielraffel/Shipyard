@@ -78,6 +78,7 @@ mod verdicts_cmd;
 mod wait_cmd;
 mod watch_cmd;
 mod watch_local_cmd;
+mod who_cmd;
 
 use self::auth_cmd::auth_command;
 use self::auto_merge_cmd::auto_merge;
@@ -525,6 +526,19 @@ where
                 stdout,
             );
         }
+        Command::Who { pr, repo } => {
+            return who_cmd::who_command(
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths,
+                who_cmd::WhoArgs {
+                    pr,
+                    repo,
+                    json: cli.json,
+                },
+                stdout,
+            );
+        }
         Command::Inspect {
             profile,
             repo,
@@ -863,6 +877,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Landability { .. }
         | Command::Landing { .. }
         | Command::Inspect { .. }
+        | Command::Who { .. }
         | Command::BaseHealth { .. }
         | Command::Diagnose { .. }
         | Command::Doctor { .. }

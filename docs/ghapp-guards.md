@@ -63,25 +63,47 @@ current head. The direct merges are `pr merge` on a base with no queue, `pr
 merge --admin`, REST `PUT pulls/<n>/merge` and GraphQL `mergePullRequest`; on
 a queue-less repository (tartci, Shipyard) they are the landing path.
 
-**Which hosts and repositories.** The rule applies on a host whose guards
-directory holds a file named `review-before-arm` (or with
-`SHIPYARD_REVIEW_BEFORE_ARM=1`; `0` forces it off for one process). `shipyard
-guards install`, which every `shipyard update` and fleet update runs, creates
-that file, so every host the fleet updates has the rule on. A host left
-without it lands unreviewed and held heads: on 2026-10-14 an agent on a host
-without the file queued an unapproved pull request and one on HOLD. So:
+**Which hosts and repositories.** The rule is on by default, in both twins
+(this guard and Shipyard's own arm paths). An opt-in host switch left most of
+the fleet unguarded: on 2026-10-14 an agent on a host without the switch file
+queued an unapproved pull request and one on HOLD. The only way off is a file,
+`review-before-arm.opt-out` in the guards directory:
+`shipyard guards install --opt-out-review-before-arm "<reason>"` writes it
+with the reason, time and binary and appends to `switches.jsonl`, and
+`--opt-in-review-before-arm` removes it, logged too. Nothing in the
+environment turns it off (`SHIPYARD_REVIEW_BEFORE_ARM=1` only forces it on).
+While a host is opted out, every landing prints that review is OFF and why,
+and the arms ledger records `review: off: <reason>`; `shipyard guards status`
+and `shipyard doctor` show the host as OFF. Off, the guard reads nothing for
+this rule (no pull request, no config, no comments), so it is inert whatever
+the base config says and on any Python.
 
-* `shipyard guards status` (exit 1), `shipyard doctor` and fleet-update
-  verification report a missing switch file as not current;
-* turning it off is an explicit, logged opt-out:
-  `shipyard guards install --opt-out-review-before-arm "<reason>"` writes
-  `review-before-arm.opt-out` (reason, time, binary), removes the switch, and
-  appends to `switches.jsonl`; later installs leave it off and report
-  `opted_out`; `--opt-in-review-before-arm` turns it back on, logged too.
+**A session cannot approve its own landing.** `verdict-session-stamp` (run by
+`ghapp` before native `gh`) adds `<!-- session: <host>/<session> -->` above the
+marker line of a verdict comment, where the session is
+`CLAUDE_CODE_SESSION_ID`, else `CODEX_COMPANION_SESSION_ID`, else
+`unattributed`; the marker stays the last line, so every verdict reader is
+unchanged. The arm guard, and `head_approval` for Shipyard's own paths, refuse
+an arm whose deciding approval is a comment stamped with the arming session
+(cause `self_approval`). An unstamped verdict (older comments, the web UI, a
+review), or an unattributed session on either side, behaves exactly as
+before. The stamp is not a signature: any writer can type one; it stops a
+session approving its own work by habit, not a determined forger.
 
-With the switch off the guard reads nothing for this rule (no pull request, no
-config, no comments), so it is inert whatever the base config says and on any
-Python.
+**The arms ledger.** Every arm, enqueue or merge the guard judges, allowed or
+refused, appends one line to `queue-arms.jsonl` in
+`${XDG_STATE_HOME:-~/.local/state}/shipyard/` (`SHIPYARD_QUEUE_ARMS_LOG`
+overrides): `at`, `host`, `session`, `repo`, `pr`, `head`, `verb` (`arm` or
+`merge`), `verdict` (`allowed` or `refused`) and `review`. Override removals in
+`queue-removals.jsonl` now carry `host` and `session` too. A missing session
+is recorded as `unattributed` and never refuses anything; a ledger that cannot
+be written is reported and does not block. Shipyard's own marked mutations
+bypass the guard and are not in it. `shipyard who --pr N` joins both ledgers,
+read from every `[host_class.*]` host over SSH, to the pull request's
+timeline by repository, pull request, verb and head, with time only breaking
+ties, and prints its own time to answer. An event no ledger explains (a
+landing through native `gh`, which passes no guard) is `unattributed`, never
+guessed.
 
 Off differs in one place between the two twins, deliberately. Shipyard's own
 arming and merge paths (Rust) still honour a repository that sets

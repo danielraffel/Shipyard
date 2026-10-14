@@ -41,8 +41,13 @@ and bypasses the guard; an operator override exists and always prints a
 WARNING. Both are documented for humans in docs/ghapp-guards.md and are kept
 out of refusal text.
 
-Actor identity is deliberately not consulted: every queue mutation is
-attributed to the same App actor whether Shipyard or an agent issued it.
+Every queue mutation is attributed on GitHub to the same App actor whether
+Shipyard or an agent issued it, so the guard records each one it judges in
+``queue-arms.jsonl`` (next to the removal guard's ``queue-removals.jsonl``):
+time, host, session (``CLAUDE_CODE_SESSION_ID``, else
+``CODEX_COMPANION_SESSION_ID``, else ``unattributed``), repository, pull
+request, head, verb and verdict. ``shipyard who --pr N`` joins those records
+to the pull request's timeline. A missing session never refuses anything.
 
 Review before arm or merge
 --------------------------
@@ -52,11 +57,17 @@ An arm, an enqueue or a direct merge (``pr merge`` on a queue-less base or with
 needs a reviewer verdict naming the exact head, in the repositories that
 require one. The protected base's ``.shipyard/config.toml`` decides when it
 sets ``[auto_merge] arm_requires_head_approval``. Otherwise the repositories in
-REVIEW_REQUIRED_REPOS require one. None of it applies unless the host turns
-review on: ``SHIPYARD_REVIEW_BEFORE_ARM=1`` (``0`` turns it off), or a
-``review-before-arm`` file in the guards directory. With it off the guard reads
-nothing for this rule, so it is inert whatever the config or Python. With it
-on, a config that cannot be read or parsed refuses rather than loosening. This is the Python twin of
+REVIEW_REQUIRED_REPOS require one. It is on unless the host opted out with a
+``review-before-arm.opt-out`` file in the guards directory (a file only; the
+opt-out is printed on every landing and recorded in the arms ledger). With it
+off the guard reads nothing for this rule, so it is inert whatever the config
+or Python. With it on, a config that cannot be read or parsed refuses rather
+than loosening.
+
+An approval does not count for the session that posted it: ``ghapp`` stamps
+each verdict comment with ``<!-- session: <host>/<session> -->``, and an arm
+from the same session as the deciding approval is refused. An unstamped
+verdict, or one from an unattributed session, counts exactly as before. This is the Python twin of
 src/head_approval.rs; both read the policy from the base branch, never from
 the head being armed.
 
@@ -145,8 +156,17 @@ REVIEW_REQUIRED_REPOS = (
 )
 FLEET_AUTHOR = "shipyard-local"
 REVIEW_OVERRIDE_ENV = "GHAPP_ALLOW_UNREVIEWED_ARM"
+# `1` forces review on for one process (the review-verdict status uses it);
+# nothing in the environment turns it off.
 HOST_ENABLE_ENV = "SHIPYARD_REVIEW_BEFORE_ARM"
-HOST_ENABLE_FILE = "review-before-arm"
+# The only way off: a file in the guards directory, holding the reason.
+HOST_OPT_OUT_FILE = "review-before-arm.opt-out"
+# The arms ledger, the mirror of the removal guard's queue-removals.jsonl.
+ARMS_LOG_ENV = "SHIPYARD_QUEUE_ARMS_LOG"
+SESSION_ENVS = ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
+UNATTRIBUTED = "unattributed"
+# `<!-- session: <host>/<session> -->`, stamped by ghapp on verdict comments.
+_SESSION_STAMP = re.compile(r"<!--\s*session:\s*([^/\s]+)/([^\s]+?)\s*-->")
 # The rebase carry (see rebase_carry) is a separate switch, off by default.
 REBASE_CARRY_ENV = "SHIPYARD_REBASE_CARRY"
 REBASE_CARRY_FILE = "rebase-carry"
@@ -662,13 +682,76 @@ def marker_verdict(body: str) -> tuple[str, str] | None:
 
 
 def host_review_default() -> bool:
-    """Whether this host applies REVIEW_REQUIRED_REPOS (see the module docstring)."""
-    switch = os.environ.get(HOST_ENABLE_ENV)
-    if switch == "1":
+    """Whether this host applies REVIEW_REQUIRED_REPOS: on unless the guards
+    directory holds the opt-out file (see the module docstring)."""
+    if os.environ.get(HOST_ENABLE_ENV) == "1":
         return True
-    if switch == "0":
-        return False
-    return (_guards_dir() / HOST_ENABLE_FILE).is_file()
+    return not (_guards_dir() / HOST_OPT_OUT_FILE).exists()
+
+
+def opt_out_reason() -> str:
+    """The recorded reason of this host's opt-out, for messages and the ledger."""
+    try:
+        text = (_guards_dir() / HOST_OPT_OUT_FILE).read_text(encoding="utf-8").strip()
+    except OSError as error:
+        return f"unreadable opt-out file: {error}"
+    return text or "no reason recorded"
+
+
+def host_name() -> str:
+    import socket
+    return socket.gethostname().split(".")[0] or "unknown-host"
+
+
+def session_id() -> str:
+    """This process's agent session, or ``unattributed``; never an error."""
+    for name in SESSION_ENVS:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return UNATTRIBUTED
+
+
+def stamped_session(body: Any) -> str | None:
+    """The session a verdict comment was stamped with, if any."""
+    if not isinstance(body, str):
+        return None
+    found = _SESSION_STAMP.findall(body)
+    return found[-1][1] if found else None
+
+
+def arms_log_path() -> pathlib.Path:
+    configured = os.environ.get(ARMS_LOG_ENV)
+    if configured:
+        return pathlib.Path(configured)
+    state = os.environ.get("XDG_STATE_HOME") or str(pathlib.Path.home() / ".local" / "state")
+    return pathlib.Path(state) / "shipyard" / "queue-arms.jsonl"
+
+
+def record_arms(targets: list[dict[str, Any]] | None, repo: str | None, verdict: str,
+                review: str) -> None:
+    """Append one ledger entry per judged target. Never raises: the ledger
+    attributes landings, it does not gate them."""
+    if not targets:
+        return
+    try:
+        path = arms_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as log:
+            for target in targets:
+                log.write(json.dumps({
+                    "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "host": host_name(),
+                    "session": session_id(),
+                    "repo": target.get("repo") or repo,
+                    "pr": target.get("pr"),
+                    "head": target.get("head"),
+                    "verb": target.get("action", "arm"),
+                    "verdict": verdict,
+                    "review": review,
+                }, sort_keys=True) + "\n")
+    except OSError as error:
+        print(f"queue-arm-guard: note: the arms ledger was not written: {error}", file=sys.stderr)
 
 
 def _guards_dir() -> pathlib.Path:
@@ -820,6 +903,41 @@ def review_verdict(
         _, _, _, what = max(older, key=lambda entry: entry[0])
         stale = f" The latest verdict names another head: {what}."
     return False, f"no reviewer verdict names head {head[:12]}; it needs {wanted}.{stale}"
+
+
+def self_approval(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> str | None:
+    """Why the approval deciding ``head`` cannot land it from this session.
+
+    The deciding verdict is the newest counting one naming ``head``; when it
+    is an APPROVE comment stamped with this process's session, the session is
+    approving its own work. Unstamped verdicts, reviews, and unattributed
+    sessions are never refused here.
+    """
+    mine = session_id()
+    if mine == UNATTRIBUTED:
+        return None
+    head = head.lower()
+    latest = _latest_on(counting_verdicts(author, comments, reviews, policy), head)
+    if latest is None or latest[1] != "APPROVE" or latest[0] is None:
+        return None
+    for comment in comments:
+        login = (comment.get("user") or {}).get("login")
+        body = comment.get("body")
+        if (not isinstance(login, str) or not isinstance(body, str)
+                or marker_verdict(body) != ("APPROVE", head)
+                or _timestamp(comment.get("created_at")) != latest[0]
+                or not _reviewer_counts(login, comment.get("author_association"), policy, author)):
+            continue
+        if stamped_session(body) == mine:
+            return (f"the approval of head {head[:12]} was posted by this same session "
+                    f"({host_name()}/{mine}); a session cannot approve its own landing")
+    return None
 
 
 def approved_earlier_head(
@@ -1381,9 +1499,9 @@ def review_gate(classification: dict[str, Any], repo: str | None
         return False, f"{label}: cannot tell which head would land, so its review cannot be checked", None
     if not host_review_default():
         # Off is inert: nothing is read, so no config, Python version or
-        # GitHub answer can change what an arm does on a host that has not
-        # turned review on.
-        return True, f"review before arm is off on this host ({HOST_ENABLE_ENV} unset, no {HOST_ENABLE_FILE})", None
+        # GitHub answer can change what an arm does on a host that opted out.
+        return True, (f"review before arm is OFF on this host ({HOST_OPT_OUT_FILE}: "
+                      f"{opt_out_reason()})"), None
     read_pull = f"ghapp api repos/{repo}/pulls/{number} --jq .head.sha"
     try:
         pull = run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
@@ -1418,11 +1536,23 @@ def review_gate(classification: dict[str, Any], repo: str | None
             f"`expectedHeadOid: \"{head}\"` (GraphQL) or `sha={head}` (REST)", False)
     allowed, why = review_verdict(head, author, comments, reviews, policy)
     if allowed:
+        own = self_approval(head, author, comments, reviews, policy)
+        if own is not None:
+            return False, f"{label} ({repo}): {own}", review_fix(
+                "self_approval", own, repo, number, head,
+                f"a reviewer in another session reviews head {head} and posts "
+                f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}", False)
         return True, f"{label} ({repo}): {why}", None
     cause = "hold" if "is HOLD" in why or "HOLD naming" in why else "unreviewed"
     approved = approved_earlier_head(head, author, comments, reviews, policy)
     if approved is not None:
         refusal = merge_only_carry(repo, base, approved, head)
+        own = self_approval(approved, author, comments, reviews, policy)
+        if own is not None:
+            return False, f"{label} ({repo}): {own}", review_fix(
+                "self_approval", own, repo, number, head,
+                f"a reviewer in another session reviews head {head} and posts "
+                f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}", False)
         if refusal is None:
             return True, (
                 f"{label} ({repo}): the approval of {approved[:12]} carries to {head[:12]}: "
@@ -2543,9 +2673,23 @@ def review_refusal(targets: list[dict[str, Any]], repo: str | None) -> bool:
 def main(args: list[str]) -> int:
     if os.environ.get("SHIPYARD_INTERNAL_QUEUE_MUTATION") == "1":
         return 0
+    seen: dict[str, Any] = {}
+    status = judge(args, seen)
+    review = "on" if host_review_default() else f"off: {opt_out_reason()}"
+    if review != "on":
+        print(f"queue-arm-guard: note: review before arm is OFF on this host "
+              f"({HOST_OPT_OUT_FILE}: {opt_out_reason()})", file=sys.stderr)
+    record_arms(seen.get("targets"), os.environ.get("GH_REPO") or None,
+                "allowed" if status == 0 else "refused", review)
+    return status
+
+
+def judge(args: list[str], seen: dict[str, Any]) -> int:
+    """The guard's decision for one request; ``seen["targets"]`` gets what it judged."""
     override = os.environ.get("GHAPP_ALLOW_QUEUE_REARM") == "1"
     try:
         targets = arm_request(args)
+        seen["targets"] = targets
     except GuardError as error:
         message = f"refusing ambiguous queue-arm request: {error}"
         if override and os.environ.get(REVIEW_OVERRIDE_ENV) == "1":

@@ -148,12 +148,20 @@ project will automatically recover or merge every PR.
   merge-group preflight that fails the group when a queued PR's latest
   verdict is a HOLD on its head; in other repositories such a HOLD does not
   stop a head that is already armed or queued, so post HOLDs through `ghapp`.
-  Each behaviour is switched on per host by a file in the guards directory.
-  `shipyard guards install` (run by every update and fleet update) creates
-  `review-before-arm`, and `guards status` reports a host without it as not
-  current; turning it off takes an explicit, logged
-  `--opt-out-review-before-arm "<reason>"`. `hold-disarms` is still switched
-  on one host at a time.
+  Review before arm is on by default on every host; the only way off is a
+  `review-before-arm.opt-out` file (written with a reason by
+  `shipyard guards install --opt-out-review-before-arm "<reason>"`, logged),
+  and `guards status` shows a host that is off. An approval does not count for
+  the session that posted it: `ghapp` stamps verdict comments with the
+  session, and an arm from the approving session is refused. `hold-disarms`
+  is still switched on one host at a time.
+- **Who landed it.** GitHub attributes every queue mutation to the App, so
+  the arm guard records each arm, enqueue and merge it judges in
+  `~/.local/state/shipyard/queue-arms.jsonl` (time, host, agent session,
+  repository, PR, head, verb, verdict). `shipyard who --pr N` reads that
+  ledger and the removals ledger from every configured host and names the
+  host and session behind each queue and merge event on the PR's timeline,
+  or says `unattributed` when no ledger explains it.
   See [`ghapp` guards](docs/ghapp-guards.md).
 - **Durable cancellation.** `shipyard cancel <job> --reason <why>` records the
   operator reason and terminates an active local or SSH validation process tree

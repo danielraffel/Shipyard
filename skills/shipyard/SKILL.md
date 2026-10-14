@@ -3610,14 +3610,16 @@ into `ship` passes through — so `shipyard pr`, a bare `ship`, and
 `ship --pr <n>` all arm, and no later route can quietly skip it. `--no-arm`
 opts out. A repository whose base sets `[auto_merge]
 arm_requires_head_approval = true` (the default for pulp, vellum, tartci and
-Shipyard when their base is silent, on a host that sets
-`SHIPYARD_REVIEW_BEFORE_ARM=1` or has a `review-before-arm` guards file;
-`shipyard guards install` creates it on every host unless the host opted out
-with `--opt-out-review-before-arm "<reason>"`, logged to `switches.jsonl`, and
-`guards status` fails on a host missing it without an opt-out) arms
+Shipyard when their base is silent, on every host unless it has a
+`review-before-arm.opt-out` file, written with a reason by
+`guards install --opt-out-review-before-arm "<reason>"` and logged to
+`switches.jsonl`; `guards status` shows a host that is off) arms
 and classic-merges only an approved head on every path (`ship`, the validated
 arm, the classic merge, the steward backstop); `--arm` overrides it and names
-who did. A merge-only update carries the approval only when every file the PR
+who did. An approval comment stamped (by `ghapp`) with the arming session is
+`SelfApproved`: a session cannot approve its own landing; unstamped verdicts
+count as before. `shipyard who --pr N` names the host and session behind each
+queue and merge event from the guards' ledgers on every host. A merge-only update carries the approval only when every file the PR
 changes keeps its approved blob and mode (the compare API lists no mode, so
 both twins read the files' directory trees), the base changed none of them
 (a rename counts under both names, so a base edit to a file the PR renames

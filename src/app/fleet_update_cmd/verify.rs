@@ -293,11 +293,9 @@ fn install_verdict(stdout: &str) -> Result<(), String> {
         .map(|rows| {
             rows.iter()
                 .filter(|row| {
-                    // `opted_out`: the host turned review-before-arm off on
-                    // purpose, recorded with a reason; install leaves it off.
                     !matches!(
                         row.get("action").and_then(Value::as_str),
-                        Some("installed" | "replaced" | "unchanged" | "opted_out")
+                        Some("installed" | "replaced" | "unchanged")
                     )
                 })
                 .map(|row| {
@@ -354,8 +352,8 @@ fn guards_verdict(raw: &str) -> Result<(), String> {
         .and_then(Value::as_array)
         .filter(|rows| !rows.is_empty())
         .ok_or_else(|| "guards status listed no guards".to_owned())?;
-    // A release that reports switches must have review-before-arm on or
-    // explicitly opted out; an older release reports none.
+    // Review-before-arm is on, or off by a readable opt-out; an unreadable
+    // opt-out is not current. An older release reports no switches.
     let switches = value
         .get("switches")
         .and_then(Value::as_array)
