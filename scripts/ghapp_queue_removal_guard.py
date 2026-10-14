@@ -545,6 +545,8 @@ def judge_override(args: list[str]) -> tuple[bool, str]:
                 "session": next((os.environ[name].strip() for name in
                                  ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
                                  if os.environ.get(name, "").strip()), "unattributed"),
+                **({"agent": os.environ["SHIPYARD_AGENT_ID"].strip()}
+                   if os.environ.get("SHIPYARD_AGENT_ID", "").strip() else {}),
                 "reason": reason,
                 "note": note,
                 "fix_pr": os.environ.get(FIX_PR_ENV) or None,

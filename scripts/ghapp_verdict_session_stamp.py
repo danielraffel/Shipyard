@@ -6,20 +6,24 @@ pull-request comment whose last non-blank line is a verdict marker
 (``verdict: APPROVE|HOLD head:<sha>`` or ``reviewed: <sha>``), the body gets
 one more line just above that marker::
 
-    <!-- session: <host>/<session> -->
+    <!-- session: <host>/<session>[ agent: <id>] -->
 
 ``<session>`` is ``CLAUDE_CODE_SESSION_ID``, else ``CODEX_COMPANION_SESSION_ID``,
-else ``unattributed``. The marker stays the last line, so every verdict reader
-is unchanged; ``queue-arm-guard`` uses the stamp to refuse an arm from the same
-session as the approval deciding it.
+else ``unattributed``; ``agent`` is ``SHIPYARD_AGENT_ID`` when set. The marker
+stays the last line, so every verdict reader is unchanged. ``queue-arm-guard``
+refuses an arm whose agent id equals the deciding approval's, and only warns
+when just the session matches (every agent of one team shares it).
 
-Output: ``SHIPYARD-STAMP-V1`` and then the (possibly rewritten) argv, every
-item NUL-terminated. ``ghapp`` uses the rewritten argv only when that first
-item is present, so a failure here posts the comment unstamped, never blocks
-it. Handled: ``pr comment``/``issue comment`` with ``--body``/``-b``; ``api``
-on an issue-comment endpoint with ``-f``/``-F``/``--field``/``--raw-field
-body=...``, or ``--input <file>`` holding a JSON ``body``. Anything else
-(``--body-file``, stdin) passes through unstamped.
+Output: ``SHIPYARD-STAMP-V1``, the (possibly rewritten) argv, then
+``SHIPYARD-STAMP-END``, every item NUL-terminated. ``ghapp`` uses the
+rewritten argv only when both sentinels are present and reads for at most 5
+seconds, so a failure, a hang or a truncated answer posts the comment
+unstamped, never blocks it; the stamper also stops itself after 5 seconds.
+Handled: ``pr comment``/``issue comment`` with ``--body``/``-b``; ``api`` on an
+issue-comment endpoint with ``-f``/``-F``/``--field``/``--raw-field body=...``,
+or ``--input <file>`` holding exactly ``{"body": ...}``, which becomes a
+``--raw-field body=...`` (no file is written). Anything else (``--body-file``,
+stdin, other fields) passes through unstamped.
 """
 
 from __future__ import annotations
@@ -27,12 +31,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import socket
 import sys
-import tempfile
 
 SENTINEL = "SHIPYARD-STAMP-V1"
+END = "SHIPYARD-STAMP-END"
+DEADLINE_SECONDS = 5
 SESSION_ENVS = ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
+AGENT_ENV = "SHIPYARD_AGENT_ID"
 # Same pattern as queue-arm-guard's _MARKER and src/head_approval.rs marker_verdict.
 _MARKER = re.compile(
     r"^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})"
@@ -45,7 +52,9 @@ _COMMENT_ENDPOINT = re.compile(r"^/?repos/[^/]+/[^/]+/issues/(?:[0-9]+/comments|
 def stamp() -> str:
     session = next((os.environ[name].strip() for name in SESSION_ENVS
                     if os.environ.get(name, "").strip()), "unattributed")
-    return f"<!-- session: {socket.gethostname().split('.')[0]}/{session} -->"
+    agent = os.environ.get(AGENT_ENV, "").strip()
+    tail = f" agent: {agent}" if agent and not any(c.isspace() for c in agent) else ""
+    return f"<!-- session: {socket.gethostname().split('.')[0]}/{session}{tail} -->"
 
 
 def stamped(body: str) -> str | None:
@@ -83,16 +92,14 @@ def _rewrite_input(args: list[str]) -> bool:
             continue
         with open(args[i + 1], encoding="utf-8") as handle:
             payload = json.load(handle)
-        if not isinstance(payload, dict) or not isinstance(payload.get("body"), str):
+        if (not isinstance(payload, dict) or set(payload) != {"body"}
+                or not isinstance(payload["body"], str)):
             return False
         new = stamped(payload["body"])
         if new is None:
             return False
-        payload["body"] = new
-        handle_fd, path = tempfile.mkstemp(prefix="shipyard-stamped-", suffix=".json")
-        with os.fdopen(handle_fd, "w", encoding="utf-8") as out:
-            json.dump(payload, out)
-        args[i + 1] = path
+        # The same request as a field: nothing to write, so nothing to clean up.
+        args[i:i + 2] = ["--raw-field", "body=" + new]
         return True
     return False
 
@@ -122,12 +129,20 @@ def rewrite(args: list[str]) -> list[str]:
     return out
 
 
+def _give_up(_signum: int, _frame: object) -> None:
+    os._exit(0)
+
+
 def main(args: list[str]) -> int:
+    if hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, _give_up)
+        signal.alarm(DEADLINE_SECONDS)
     try:
         result = rewrite(args)
     except Exception:  # noqa: BLE001 - never block a comment over a stamp
         return 0
-    sys.stdout.buffer.write(b"".join(item.encode() + b"\0" for item in [SENTINEL, *result]))
+    sys.stdout.buffer.write(
+        b"".join(item.encode() + b"\0" for item in [SENTINEL, *result, END]))
     return 0
 
 

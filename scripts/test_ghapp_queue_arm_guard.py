@@ -2486,8 +2486,8 @@ class ReviewBeforeArm(unittest.TestCase):
 
 
 class ArmsLedgerAndSelfApproval(unittest.TestCase):
-    """Every judged landing is recorded with its host and session, and a
-    session cannot approve its own landing."""
+    """Every judged landing is recorded with its host, session and agent, and
+    an agent cannot approve its own landing. A shared session only warns."""
 
     install = ReviewBeforeArm.install
     case = ReviewBeforeArm.case
@@ -2497,42 +2497,62 @@ class ArmsLedgerAndSelfApproval(unittest.TestCase):
     setUp = ReviewBeforeArm.setUp
     approved_784 = ReviewBeforeArm.approved_784
 
-    def approval(self, session: str | None) -> list[list[dict[str, Any]]]:
+    def approval(self, session: str | None,
+                 agent: str | None = None) -> list[list[dict[str, Any]]]:
         pages = review_fixture("shipyard-784-comments.json")
         approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
-        stamp = f"<!-- session: m5s/{session} -->\n" if session else ""
+        tail = f" agent: {agent}" if agent else ""
+        stamp = f"<!-- session: m5s/{session}{tail} -->\n" if session else ""
         return [[comment_like(approve, created_at="2026-10-12T15:00:00Z",
                               body=f"Reviewed.\n{stamp}verdict: APPROVE head:{HEAD_784}")]]
 
-    def merge(self, session: str | None, approver: str | None) -> subprocess.CompletedProcess:
+    def merge(self, session: str | None, approver: str | None, agent: str | None = None,
+              approver_agent: str | None = None) -> subprocess.CompletedProcess:
         env = {"CLAUDE_CODE_SESSION_ID": session} if session else {}
+        if agent:
+            env["SHIPYARD_AGENT_ID"] = agent
         return self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD_784],
-                              self.approved_784(queue=False, comments=self.approval(approver)),
+                              self.approved_784(queue=False,
+                                                comments=self.approval(approver, approver_agent)),
                               "danielraffel/Shipyard", **env)
 
-    def test_the_approving_session_cannot_land_its_own_approval(self) -> None:
-        result = self.merge("sess-A", "sess-A")
+    def test_the_approving_agent_cannot_land_its_own_approval(self) -> None:
+        result = self.merge("team-1", "team-1", agent="impl", approver_agent="impl")
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("was posted by this same session", result.stderr)
+        self.assertIn("was posted by this same agent", result.stderr)
         self.assertIn('"cause": "self_approval"', result.stderr)
 
-    def test_another_session_lands_it(self) -> None:
-        result = self.merge("sess-B", "sess-A")
+    def test_a_shared_session_lands_with_a_warning_never_a_refusal(self) -> None:
+        # One Claude Code team: reviewer and lead share the session.
+        for agent, approver_agent in (("lead", "reviewer"), (None, None),
+                                      ("lead", None), (None, "reviewer")):
+            with self.subTest(agent=agent, approver_agent=approver_agent):
+                result = self.merge("team-1", "team-1", agent=agent,
+                                    approver_agent=approver_agent)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("carries this process's session (team-1); allowed", result.stderr)
+        self.assertEqual([entry.get("same_session_approval") for entry in self.ledger()],
+                         [True] * 4)
+
+    def test_another_session_lands_it_without_a_warning(self) -> None:
+        result = self.merge("team-2", "team-1", agent="impl", approver_agent="impl-other")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("warning", result.stderr)
+        self.assertNotIn("same_session_approval", self.ledger()[0])
 
     def test_an_unstamped_verdict_and_an_unattributed_arm_behave_as_before(self) -> None:
-        self.assertEqual(self.merge("sess-A", None).returncode, 0)
-        self.assertEqual(self.merge(None, "sess-A").returncode, 0)
+        self.assertEqual(self.merge("sess-A", None, agent="impl").returncode, 0)
+        self.assertEqual(self.merge(None, "sess-A", approver_agent="impl").returncode, 0)
         self.assertEqual(self.merge("sess-B", "unattributed").returncode, 0)
 
-    def test_every_judged_landing_is_in_the_ledger_with_its_session(self) -> None:
-        self.merge("sess-B", "sess-A")
-        self.merge("sess-A", "sess-A")
+    def test_every_judged_landing_is_in_the_ledger_with_its_session_and_agent(self) -> None:
+        self.merge("sess-B", "sess-A", agent="lead", approver_agent="reviewer")
+        self.merge("sess-A", "sess-A", agent="impl", approver_agent="impl")
         self.merge(None, None)
         entries = self.ledger()
-        self.assertEqual([(e["session"], e["verdict"]) for e in entries],
-                         [("sess-B", "allowed"), ("sess-A", "refused"),
-                          ("unattributed", "allowed")])
+        self.assertEqual([(e["session"], e.get("agent"), e["verdict"]) for e in entries],
+                         [("sess-B", "lead", "allowed"), ("sess-A", "impl", "refused"),
+                          ("unattributed", None, "allowed")])
         for entry in entries:
             self.assertEqual((entry["repo"], entry["pr"], entry["head"], entry["verb"]),
                              ("danielraffel/Shipyard", 784, HEAD_784, "merge"))

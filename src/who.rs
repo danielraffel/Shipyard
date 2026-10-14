@@ -4,7 +4,8 @@
 //! GitHub attributes every queue mutation to the same App actor, whoever
 //! issued it. The guards record what they judge: `queue-arm-guard` appends
 //! one line per arm, enqueue or merge to `queue-arms.jsonl` (time, host,
-//! session, repository, pull request, head, verb, verdict), and
+//! session, agent id when set, repository, pull request, head, verb,
+//! verdict), and
 //! `queue-removal-guard` appends each overridden removal to
 //! `queue-removals.jsonl`. This module joins those ledgers, read from every
 //! fleet host, to the pull request's timeline.
@@ -29,8 +30,11 @@ const BEFORE_WINDOW_SECONDS: i64 = 3600;
 pub struct LedgerEntry {
     /// Host the line was read from (the class name when the line has none).
     pub host: String,
-    /// Agent session, or `unattributed`.
+    /// Agent session, or `unattributed`. Every agent of one Claude Code team
+    /// shares it.
     pub session: String,
+    /// The per-agent id (`SHIPYARD_AGENT_ID`), when the arming process had one.
+    pub agent: Option<String>,
     /// When the guard judged it.
     pub at: DateTime<Utc>,
     /// `OWNER/REPO`.
@@ -93,6 +97,7 @@ fn arm_entry(host: &str, value: &Value) -> Option<LedgerEntry> {
     Some(LedgerEntry {
         host: text(value, "host").unwrap_or_else(|| host.to_owned()),
         session: text(value, "session").unwrap_or_else(|| "unattributed".to_owned()),
+        agent: text(value, "agent"),
         at: time(value.get("at")?)?,
         repo: text(value, "repo")?,
         pr: value.get("pr")?.as_u64()?,
@@ -115,6 +120,7 @@ fn removal_entries(host: &str, value: &Value) -> Vec<LedgerEntry> {
             Some(LedgerEntry {
                 host: text(value, "host").unwrap_or_else(|| host.to_owned()),
                 session: text(value, "session").unwrap_or_else(|| "unattributed".to_owned()),
+                agent: text(value, "agent"),
                 at,
                 repo: text(target, "repo")?,
                 pr: target.get("pr")?.as_u64()?,
@@ -248,12 +254,17 @@ pub struct Attribution {
 }
 
 impl Attribution {
-    /// `host/session`, or `unattributed`.
+    /// `host/session`, with ` agent <id>` when the ledger recorded one, or
+    /// `unattributed`. Without an agent id this names the host and the team
+    /// session, not which agent within it.
     #[must_use]
     pub fn who(&self) -> String {
         self.entry.as_ref().map_or_else(
             || "unattributed".to_owned(),
-            |entry| format!("{}/{}", entry.host, entry.session),
+            |entry| match &entry.agent {
+                Some(agent) => format!("{}/{} agent {agent}", entry.host, entry.session),
+                None => format!("{}/{}", entry.host, entry.session),
+            },
         )
     }
 }

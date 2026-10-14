@@ -458,11 +458,13 @@ the scorecard reads from the log, so a forged line changes nothing. Keep records
 **"Who armed it?" is `shipyard who --pr N`, not a timeline read.** Every queue
 event shows the fleet App as its actor. `who` joins the arm guard's
 `queue-arms.jsonl` and the removal guard's `queue-removals.jsonl` from every
-host to the timeline and names host and session per event, with its own time
-to answer. `unattributed` means no guard saw it (native `gh`, the web UI, or a
+host to the timeline and names host and session (and agent, when
+`SHIPYARD_AGENT_ID` was set) per event, with its own time to answer. A
+session alone is the whole team's, not one agent's. `unattributed` means no guard saw it (native `gh`, the web UI, or a
 host whose ledger was unreachable, which it lists); do not guess from timing.
 An arm refused with cause `self_approval` means the approval came from the
-arming session itself: get a review from another session.
+arming agent itself (same `SHIPYARD_AGENT_ID`): get a review from another
+agent. A same-session warning without a refusal is expected inside one team.
 
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason

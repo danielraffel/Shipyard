@@ -82,30 +82,40 @@ and `shipyard doctor` show the host as OFF. Off, the guard reads nothing for
 this rule (no pull request, no config, no comments), so it is inert whatever
 the base config says and on any Python.
 
-**A session cannot approve its own landing.** `verdict-session-stamp` (run by
-`ghapp` before native `gh`) adds `<!-- session: <host>/<session> -->` above the
-marker line of a verdict comment, where the session is
-`CLAUDE_CODE_SESSION_ID`, else `CODEX_COMPANION_SESSION_ID`, else
-`unattributed`; the marker stays the last line, so every verdict reader is
-unchanged. The arm guard, and `head_approval` for Shipyard's own paths, refuse
-an arm whose deciding approval is a comment stamped with the arming session
-(cause `self_approval`). An unstamped verdict (older comments, the web UI, a
-review), or an unattributed session on either side, behaves exactly as
-before. The stamp is not a signature: any writer can type one; it stops a
-session approving its own work by habit, not a determined forger.
+**An agent cannot approve its own landing.** `verdict-session-stamp` (run by
+`ghapp` before native `gh`, bounded to 5 seconds) adds
+`<!-- session: <host>/<session> agent: <id> -->` above the marker line of a
+verdict comment. The session is `CLAUDE_CODE_SESSION_ID`, else
+`CODEX_COMPANION_SESSION_ID`, else `unattributed`; `agent: <id>` appears only
+when `SHIPYARD_AGENT_ID` is set. The marker stays the last line, so every
+verdict reader is unchanged. The arm guard, and `head_approval` for Shipyard's
+own paths, refuse an arm only when the deciding approval is stamped with an
+agent id and the arming process carries the same `SHIPYARD_AGENT_ID` (cause
+`self_approval`). The session never refuses on its own: every agent of one
+Claude Code team (implementer, reviewer, lead) shares `CLAUDE_CODE_SESSION_ID`,
+so it cannot tell them apart. When only the session matches, the arm guard
+prints a warning and flags the ledger entry `same_session_approval: true`. An
+unstamped verdict (older comments, the web UI, a review), or either side
+without an agent id, behaves exactly as before. The stamp is not a signature:
+any writer can type one; it stops an agent approving its own work by habit,
+not a determined forger.
 
 **The arms ledger.** Every arm, enqueue or merge the guard judges, allowed or
 refused, appends one line to `queue-arms.jsonl` in
 `${XDG_STATE_HOME:-~/.local/state}/shipyard/` (`SHIPYARD_QUEUE_ARMS_LOG`
 overrides): `at`, `host`, `session`, `repo`, `pr`, `head`, `verb` (`arm` or
-`merge`), `verdict` (`allowed` or `refused`) and `review`. Override removals in
-`queue-removals.jsonl` now carry `host` and `session` too. A missing session
+`merge`), `verdict` (`allowed` or `refused`) and `review`, plus `agent` when
+`SHIPYARD_AGENT_ID` is set and `same_session_approval` when the approval
+carried the arming session. Override removals in `queue-removals.jsonl` now
+carry `host`, `session` and `agent` too. A missing session
 is recorded as `unattributed` and never refuses anything; a ledger that cannot
 be written is reported and does not block. Shipyard's own marked mutations
 bypass the guard and are not in it. `shipyard who --pr N` joins both ledgers,
 read from every `[host_class.*]` host over SSH, to the pull request's
 timeline by repository, pull request, verb and head, with time only breaking
-ties, and prints its own time to answer. An event no ledger explains (a
+ties, and prints its own time to answer. It names `host/session`, plus the
+agent when the ledger recorded one; without an agent id that is the team
+session, not which agent within it. An event no ledger explains (a
 landing through native `gh`, which passes no guard) is `unattributed`, never
 guessed.
 

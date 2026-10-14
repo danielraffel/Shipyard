@@ -40,11 +40,13 @@
 //! even when their base config is silent. A config that sets
 //! `arm_requires_head_approval` itself still decides.
 //!
-//! An approval does not count for the session that posted it: `ghapp`
-//! stamps verdict comments with `<!-- session: <host>/<session> -->`, and a
-//! marker approval stamped with this process's session
-//! (`CLAUDE_CODE_SESSION_ID`, else `CODEX_COMPANION_SESSION_ID`) is
-//! [`HeadGate::SelfApproved`]. Unstamped verdicts and unattributed sessions
+//! An approval does not count for the agent that posted it: `ghapp` stamps
+//! verdict comments with `<!-- session: <host>/<session> -->`, plus
+//! `agent: <id>` when [`AGENT_ENV`] is set, and a marker approval stamped
+//! with this process's agent id is [`HeadGate::SelfApproved`]. The session
+//! alone never refuses: every agent of one Claude Code team shares
+//! `CLAUDE_CODE_SESSION_ID`, so it cannot tell the reviewer from the agent
+//! that arms. Unstamped verdicts, and either side without an agent id,
 //! count as before.
 //!
 //! With no reviewer listed, such a repository counts a verdict from the fleet
@@ -114,7 +116,11 @@ pub fn requires_review_by_default(repo: &str) -> bool {
 pub const HOST_ENABLE_ENV: &str = "SHIPYARD_REVIEW_BEFORE_ARM";
 /// File in the guards directory that turns [`host_review_default`] off.
 pub const HOST_OPT_OUT_FILE: &str = "review-before-arm.opt-out";
-/// Where an agent session's id is read from, in order.
+/// Per-agent identity the orchestrator sets for each agent. Only it can
+/// refuse a self-approval; see [`HeadGate::SelfApproved`].
+pub const AGENT_ENV: &str = "SHIPYARD_AGENT_ID";
+/// Where an agent session's id is read from, in order. Shared by every agent
+/// of one team, so it attributes but never refuses.
 pub const SESSION_ENVS: [&str; 2] = ["CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID"];
 /// `author_association` values whose verdicts count when no reviewer is
 /// listed (besides the fleet App's).
@@ -123,65 +129,76 @@ pub const TRUSTED_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
 #[cfg(test)]
 thread_local! {
     static HOST_DEFAULT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    static SESSION_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static SESSION_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static AGENT_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AGENT_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Run `body` with [`arming_session`] pinned, on this thread.
+/// Run `body` with [`arming_agent`] pinned, on this thread.
 #[cfg(test)]
-pub(crate) fn with_arming_session<T>(session: Option<&str>, body: impl FnOnce() -> T) -> T {
-    SESSION_PINNED.with(|cell| cell.set(true));
-    SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = session.map(str::to_owned));
+pub(crate) fn with_arming_agent<T>(agent: Option<&str>, body: impl FnOnce() -> T) -> T {
+    AGENT_PINNED.with(|cell| cell.set(true));
+    AGENT_OVERRIDE.with(|cell| *cell.borrow_mut() = agent.map(str::to_owned));
     let result = body();
-    SESSION_PINNED.with(|cell| cell.set(false));
-    SESSION_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    AGENT_PINNED.with(|cell| cell.set(false));
+    AGENT_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
     result
 }
 
 #[cfg(test)]
-fn arming_session_pinned() -> bool {
-    SESSION_PINNED.with(std::cell::Cell::get)
+fn arming_agent_pinned() -> bool {
+    AGENT_PINNED.with(std::cell::Cell::get)
 }
 
 #[cfg(not(test))]
-const fn arming_session_pinned() -> bool {
+const fn arming_agent_pinned() -> bool {
     false
 }
 
 #[cfg(test)]
-fn pinned_arming_session() -> Option<String> {
-    SESSION_OVERRIDE.with(|cell| cell.borrow().clone())
+fn pinned_arming_agent() -> Option<String> {
+    AGENT_OVERRIDE.with(|cell| cell.borrow().clone())
 }
 
 #[cfg(not(test))]
-const fn pinned_arming_session() -> Option<String> {
+const fn pinned_arming_agent() -> Option<String> {
     None
 }
 
-/// This process's agent session, when one is known.
+/// This process's agent id ([`AGENT_ENV`]), when the orchestrator set one.
 #[must_use]
-pub fn arming_session() -> Option<String> {
-    if arming_session_pinned() {
-        return pinned_arming_session();
+pub fn arming_agent() -> Option<String> {
+    if arming_agent_pinned() {
+        return pinned_arming_agent();
     }
-    SESSION_ENVS.iter().find_map(|name| {
-        std::env::var(name)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    })
+    std::env::var(AGENT_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn stamp_pattern() -> Regex {
+    Regex::new(r"<!--\s*session:\s*([^/\s]+)/(\S+?)(?:\s+agent:\s*(\S+?))?\s*-->")
+        .expect("stamp pattern compiles")
 }
 
 /// The session a verdict comment was stamped with by `ghapp`, if any.
 #[must_use]
 pub fn stamped_session(body: &str) -> Option<String> {
-    let pattern =
-        Regex::new(r"<!--\s*session:\s*([^/\s]+)/(\S+?)\s*-->").expect("stamp pattern compiles");
-    pattern
+    stamp_pattern()
         .captures_iter(body)
         .last()
         .and_then(|capture| capture.get(2))
         .map(|session| session.as_str().to_owned())
+}
+
+/// The agent id a verdict comment was stamped with by `ghapp`, if any.
+#[must_use]
+pub fn stamped_agent(body: &str) -> Option<String> {
+    stamp_pattern()
+        .captures_iter(body)
+        .last()
+        .and_then(|capture| capture.get(3))
+        .map(|agent| agent.as_str().to_owned())
 }
 
 /// Run `body` with [`host_review_default`] pinned, on this thread.
@@ -761,13 +778,14 @@ pub enum HeadGate {
         /// The head that needs one.
         head: String,
     },
-    /// The approval deciding this head was posted by the session now arming
-    /// it: a session cannot approve its own landing.
+    /// The approval deciding this head was posted by the agent now arming
+    /// it (both stamped with the same [`AGENT_ENV`] id): an agent cannot
+    /// approve its own landing.
     SelfApproved {
         /// The head.
         head: String,
-        /// The session that both approved and armed.
-        session: String,
+        /// The agent that both approved and armed.
+        agent: String,
     },
     /// The queue removed this head [`EJECTION_CAP`] or more times and no
     /// approval followed the last removal.
@@ -800,10 +818,10 @@ impl HeadGate {
                  heads; left disarmed. Arm deliberately with `--arm`",
                 short(head)
             ),
-            Self::SelfApproved { head, session } => format!(
-                "the approval of head {} was posted by this same session ({session}); a \
-                 session cannot approve its own landing. Left disarmed until a reviewer in \
-                 another session approves it, or someone arms it with `--arm`",
+            Self::SelfApproved { head, agent } => format!(
+                "the approval of head {} was posted by this same agent ({agent}); an agent \
+                 cannot approve its own landing. Left disarmed until another agent approves \
+                 it, or someone arms it with `--arm`",
                 short(head)
             ),
             Self::EjectionCap { head, ejections } => format!(
@@ -964,8 +982,9 @@ pub(crate) fn decide_for_author(
 }
 
 /// `gate`, or [`HeadGate::SelfApproved`] when its approval is a marker
-/// comment stamped with this process's session. Reviews, unstamped markers
-/// and an unknown arming session pass unchanged.
+/// comment stamped with this process's agent id. Reviews, markers without an
+/// agent stamp, and an arming process without an agent id pass unchanged; a
+/// shared session id never refuses.
 fn refuse_self_approval(gate: HeadGate, head: &str, comments: &[Value]) -> HeadGate {
     let HeadGate::Approved { approval } = &gate else {
         return gate;
@@ -984,18 +1003,18 @@ fn refuse_self_approval(gate: HeadGate, head: &str, comments: &[Value]) -> HeadG
     else {
         return gate;
     };
-    let Some(mine) = arming_session() else {
+    let Some(mine) = arming_agent() else {
         return gate;
     };
     let stamped = comments
         .iter()
         .find(|comment| comment.get("id").and_then(Value::as_u64) == Some(*id))
         .and_then(|comment| comment.get("body").and_then(Value::as_str))
-        .and_then(stamped_session);
+        .and_then(stamped_agent);
     if stamped.as_deref() == Some(mine.as_str()) {
         return HeadGate::SelfApproved {
             head: head.to_owned(),
-            session: mine,
+            agent: mine,
         };
     }
     gate

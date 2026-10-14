@@ -117,6 +117,33 @@ fn the_10219_enqueue_is_attributed_to_its_host_and_session() {
     assert_eq!(found[0].head_match, Some(true));
 }
 
+#[test]
+fn an_agent_id_in_the_ledger_is_named_and_a_shared_session_alone_is_not() {
+    let events = timeline_events(&timeline_10219()).expect("timeline");
+    let with_agent = json!({"at": "2026-10-14T03:12:00Z", "host": "m3", "session": "team-1",
+        "agent": "sy-impl", "repo": REPO, "pr": 10219, "head": H2, "verb": "arm",
+        "verdict": "allowed", "review": "on"})
+    .to_string();
+    let (entries, skipped) = parse_ledgers("studio", &with_agent, "");
+    assert_eq!(skipped, 0);
+    let found = attribute(REPO, 10219, &events, &entries);
+    assert_eq!(found[0].who(), "m3/team-1 agent sy-impl");
+    let without = line(
+        "m3",
+        "team-1",
+        "2026-10-14T03:12:00Z",
+        10219,
+        H2,
+        "arm",
+        "allowed",
+    );
+    let (entries, _) = parse_ledgers("studio", &without, "");
+    assert_eq!(
+        attribute(REPO, 10219, &events, &entries)[0].who(),
+        "m3/team-1"
+    );
+}
+
 /// Negative control: with no ledger entry for the event (a landing through
 /// native gh passes no guard), the answer is `unattributed`, never a guess
 /// from a nearby entry for another pull request or a refused arm.

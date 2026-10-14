@@ -32,6 +32,7 @@ class Stamp(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         os.environ.pop("CODEX_COMPANION_SESSION_ID", None)
+        os.environ.pop("SHIPYARD_AGENT_ID", None)
 
     def test_a_verdict_body_gets_the_stamp_above_its_marker(self) -> None:
         out = stamp.stamped(VERDICT)
@@ -41,6 +42,15 @@ class Stamp(unittest.TestCase):
         # Every verdict reader still reads the same verdict.
         self.assertEqual(guard.marker_verdict(out), ("APPROVE", HEAD))
         self.assertEqual(guard.stamped_session(out), "sess-A")
+
+    def test_an_agent_id_is_stamped_when_set(self) -> None:
+        with mock.patch.dict(os.environ, {"SHIPYARD_AGENT_ID": "reviewer-2"}):
+            out = stamp.stamped(VERDICT)
+        assert out is not None
+        self.assertEqual(guard.stamped_session(out), "sess-A")
+        self.assertEqual(guard.stamped_agent(out), "reviewer-2")
+        self.assertEqual(guard.marker_verdict(out), ("APPROVE", HEAD))
+        self.assertIsNone(guard.stamped_agent(stamp.stamped(VERDICT)))
 
     def test_only_verdicts_are_stamped_and_never_twice(self) -> None:
         self.assertIsNone(stamp.stamped("just a note"))
@@ -72,16 +82,29 @@ class Stamp(unittest.TestCase):
                      ["pr", "merge", "5", "--auto"]):
             self.assertEqual(stamp.rewrite(args), args)
 
-    def test_an_input_file_body_is_stamped_into_a_new_file(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
+    def test_an_input_file_body_becomes_a_field_and_no_file_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch, \
+                tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"TMPDIR": tmp}):
+            tempfile.tempdir = None
             original = pathlib.Path(scratch) / "body.json"
             original.write_text(json.dumps({"body": VERDICT}), encoding="utf-8")
-            out = stamp.rewrite(["api", "repos/o/r/issues/5/comments", "--input", str(original)])
-            self.assertNotEqual(out[-1], str(original))
+            args = ["api", "-X", "POST", "repos/o/r/issues/5/comments", "--input", str(original)]
+            out = stamp.rewrite(args)
+            self.assertEqual(out[:4], args[:4])
+            self.assertEqual(out[4], "--raw-field")
+            self.assertTrue(out[5].startswith("body="))
+            self.assertEqual(guard.stamped_session(out[5][len("body="):]), "sess-A")
+            self.assertEqual(len(out), 6)
             self.assertEqual(json.loads(original.read_text())["body"], VERDICT)
-            body = json.loads(pathlib.Path(out[-1]).read_text())["body"]
-            os.unlink(out[-1])
-            self.assertEqual(guard.stamped_session(body), "sess-A")
+            self.assertEqual(os.listdir(tmp), [], "the stamper wrote a file")
+        tempfile.tempdir = None
+        # A payload with more than the body is left for gh to send unstamped.
+        with tempfile.TemporaryDirectory() as scratch:
+            other = pathlib.Path(scratch) / "body.json"
+            other.write_text(json.dumps({"body": VERDICT, "x": 1}), encoding="utf-8")
+            args = ["api", "repos/o/r/issues/5/comments", "--input", str(other)]
+            self.assertEqual(stamp.rewrite(args), args)
 
     def test_the_output_starts_with_the_sentinel_and_keeps_every_argument(self) -> None:
         result = subprocess.run(
@@ -93,12 +116,30 @@ class Stamp(unittest.TestCase):
         self.assertEqual(items[0], b"SHIPYARD-STAMP-V1")
         self.assertEqual(items[1:4], [b"pr", b"comment", b"5"])
         self.assertIn(b"<!-- session:", items[5])
+        self.assertEqual(items[-1], b"SHIPYARD-STAMP-END")
+        self.assertEqual(len(items), 7)
 
     def test_a_failure_prints_nothing_so_ghapp_posts_unstamped(self) -> None:
         with mock.patch.object(stamp, "rewrite", side_effect=RuntimeError("boom")):
             with mock.patch.object(sys, "stdout") as out:
                 self.assertEqual(stamp.main(["pr", "comment"]), 0)
                 out.buffer.write.assert_not_called()
+
+    def test_a_stuck_stamper_stops_itself_and_prints_nothing(self) -> None:
+        import time
+        probe = (
+            "import importlib.util, sys, time\n"
+            f"spec = importlib.util.spec_from_file_location('s', {str(SCRIPT)!r})\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "m.DEADLINE_SECONDS = 1\n"
+            "m.rewrite = lambda args: time.sleep(30)\n"
+            "sys.exit(m.main(['pr', 'comment']))\n"
+        )
+        started = time.monotonic()
+        result = subprocess.run([sys.executable, "-c", probe], capture_output=True, timeout=20)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"")
 
     def test_the_marker_pattern_is_the_arm_guards(self) -> None:
         self.assertEqual(stamp._MARKER.pattern, guard._MARKER.pattern)
@@ -107,7 +148,7 @@ class Stamp(unittest.TestCase):
 class GhappStampWiring(unittest.TestCase):
     """The ghapp snippet that applies the stamper keeps the arguments intact."""
 
-    def run_snippet(self, stamper_body: str) -> list[str]:
+    def run_snippet(self, stamper_body: str, deadline: float = 30) -> list[str]:
         ghapp = (SCRIPT.parent / "ghapp").read_text(encoding="utf-8")
         start = ghapp.index('if [[ -x "$guards/verdict-session-stamp" ]]; then')
         end = ghapp.index("\nfi\n", start) + 4
@@ -121,22 +162,32 @@ class GhappStampWiring(unittest.TestCase):
             result = subprocess.run(
                 ["/bin/bash", "-c", script, "ghapp", str(guards), "pr", "comment", "5",
                  "--body", "a b\nverdict: APPROVE head:x"],
-                capture_output=True, check=True,
+                capture_output=True, check=True, timeout=deadline,
             )
         return [item.decode() for item in result.stdout.split(b"\0")[:-1]]
 
     def test_the_rewritten_arguments_replace_the_originals(self) -> None:
         out = self.run_snippet(
             "#!/bin/sh\nprintf 'SHIPYARD-STAMP-V1\\0pr\\0comment\\0'\n"
-            "printf '5\\0--body\\0stamped body\\0'\n")
+            "printf '5\\0--body\\0stamped body\\0SHIPYARD-STAMP-END\\0'\n")
         self.assertEqual(out, ["pr", "comment", "5", "--body", "stamped body"])
 
-    def test_without_the_sentinel_the_originals_stand(self) -> None:
-        for body in ("#!/bin/sh\nexit 3\n", "#!/bin/sh\nprintf 'x\\0y\\0'\n"):
+    def test_without_both_sentinels_the_originals_stand(self) -> None:
+        truncated = "#!/bin/sh\nprintf 'SHIPYARD-STAMP-V1\\0pr\\0comment\\0'\n"
+        for body in ("#!/bin/sh\nexit 3\n", "#!/bin/sh\nprintf 'x\\0y\\0'\n", truncated):
             with self.subTest(body=body):
                 out = self.run_snippet(body)
                 self.assertEqual(out, ["pr", "comment", "5", "--body",
                                        "a b\nverdict: APPROVE head:x"])
+
+    def test_a_hung_stamper_posts_unstamped_within_the_deadline(self) -> None:
+        import time
+        started = time.monotonic()
+        # Starts its answer, then hangs.
+        out = self.run_snippet(
+            "#!/bin/sh\nprintf 'SHIPYARD-STAMP-V1\\0pr\\0'\nexec sleep 60\n", deadline=20)
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertEqual(out, ["pr", "comment", "5", "--body", "a b\nverdict: APPROVE head:x"])
 
 
 if __name__ == "__main__":

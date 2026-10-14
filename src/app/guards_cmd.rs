@@ -208,5 +208,11 @@ mod tests {
         install_cmd(dir, None, true).expect("opt in");
         assert!(!dir.join(crate::ghapp_guards::REVIEW_OPT_OUT).exists());
         assert!(status(dir).is_ok());
+        // A hand-made opt-out is not one: review stays on and status exits 1.
+        std::fs::write(dir.join(crate::ghapp_guards::REVIEW_OPT_OUT), "lab host")
+            .expect("hand-made opt-out");
+        let failure = status(dir).expect_err("an invalid opt-out fails status");
+        assert_eq!(failure.code, 1);
+        assert!(read(dir).contains("unreadable"));
     }
 }

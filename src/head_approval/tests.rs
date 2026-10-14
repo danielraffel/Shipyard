@@ -1558,17 +1558,18 @@ fn the_host_switch_is_on_unless_the_opt_out_file_exists() {
 // A session cannot approve its own landing.
 // ---------------------------------------------------------------------------
 
-fn stamped_approval(session: Option<&str>) -> Value {
+fn stamped_approval(session: Option<&str>, agent: Option<&str>) -> Value {
     let stamp = session.map_or_else(String::new, |session| {
-        format!("<!-- session: m5s/{session} -->\n")
+        let agent = agent.map_or_else(String::new, |agent| format!(" agent: {agent}"));
+        format!("<!-- session: m5s/{session}{agent} -->\n")
     });
     json!({"id": 77, "login": "shipyard-local[bot]", "type": "Bot", "association": "CONTRIBUTOR",
            "at": "2026-10-14T01:00:00Z",
            "body": format!("Reviewed.\n{stamp}verdict: APPROVE head:{HEAD}")})
 }
 
-fn gate_for(comment: &Value, arming: Option<&str>) -> HeadGate {
-    super::with_arming_session(arming, || {
+fn gate_for(comment: &Value, arming_agent: Option<&str>) -> HeadGate {
+    super::with_arming_agent(arming_agent, || {
         decide_for_author(
             &by_default("Generous-Corp/pulp"),
             HEAD,
@@ -1582,13 +1583,16 @@ fn gate_for(comment: &Value, arming: Option<&str>) -> HeadGate {
 }
 
 #[test]
-fn the_session_that_approved_a_head_cannot_arm_it() {
-    let gate = gate_for(&stamped_approval(Some("sess-A")), Some("sess-A"));
+fn the_agent_that_approved_a_head_cannot_arm_it() {
+    let gate = gate_for(
+        &stamped_approval(Some("team-1"), Some("impl")),
+        Some("impl"),
+    );
     assert_eq!(
         gate,
         HeadGate::SelfApproved {
             head: HEAD.to_owned(),
-            session: "sess-A".to_owned()
+            agent: "impl".to_owned()
         }
     );
     assert!(!gate.allows());
@@ -1596,26 +1600,47 @@ fn the_session_that_approved_a_head_cannot_arm_it() {
 }
 
 #[test]
-fn another_session_unstamped_verdicts_and_unknown_sessions_arm_as_before() {
+fn a_shared_session_never_refuses_only_a_shared_agent_does() {
     let approved = |gate: HeadGate| matches!(gate, HeadGate::Approved { .. });
+    // One Claude Code team: reviewer and lead share the session, not the agent.
     assert!(approved(gate_for(
-        &stamped_approval(Some("sess-A")),
-        Some("sess-B")
+        &stamped_approval(Some("team-1"), Some("reviewer")),
+        Some("lead")
     )));
-    assert!(approved(gate_for(&stamped_approval(None), Some("sess-A"))));
-    assert!(approved(gate_for(&stamped_approval(Some("sess-A")), None)));
+    // The same session with no agent id on either side, or on one side.
     assert!(approved(gate_for(
-        &stamped_approval(Some("unattributed")),
-        Some("sess-B")
+        &stamped_approval(Some("team-1"), None),
+        None
+    )));
+    assert!(approved(gate_for(
+        &stamped_approval(Some("team-1"), None),
+        Some("lead")
+    )));
+    assert!(approved(gate_for(
+        &stamped_approval(Some("team-1"), Some("reviewer")),
+        None
+    )));
+    // Unstamped verdicts count as before.
+    assert!(approved(gate_for(
+        &stamped_approval(None, None),
+        Some("lead")
+    )));
+    // Only the stamp's agent is compared: an arming agent id equal to the
+    // approval's session string is still another agent.
+    assert!(approved(gate_for(
+        &stamped_approval(Some("team-1"), Some("reviewer")),
+        Some("team-1")
     )));
 }
 
 #[test]
 fn the_stamp_is_read_from_the_comment_body() {
-    assert_eq!(
-        super::stamped_session("x\n<!-- session: m3/abc-123 -->\nverdict: APPROVE head:a"),
-        Some("abc-123".to_owned())
-    );
+    let body = "x\n<!-- session: m3/abc-123 agent: reviewer -->\nverdict: APPROVE head:a";
+    assert_eq!(super::stamped_session(body), Some("abc-123".to_owned()));
+    assert_eq!(super::stamped_agent(body), Some("reviewer".to_owned()));
+    let plain = "x\n<!-- session: m3/abc-123 -->\nverdict: APPROVE head:a";
+    assert_eq!(super::stamped_session(plain), Some("abc-123".to_owned()));
+    assert_eq!(super::stamped_agent(plain), None);
     assert_eq!(super::stamped_session("verdict: APPROVE head:a"), None);
 }
 

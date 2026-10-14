@@ -66,10 +66,14 @@ off the guard reads nothing for this rule, so it is inert whatever the config
 or Python. With it on, a config that cannot be read or parsed refuses rather
 than loosening.
 
-An approval does not count for the session that posted it: ``ghapp`` stamps
-each verdict comment with ``<!-- session: <host>/<session> -->``, and an arm
-from the same session as the deciding approval is refused. An unstamped
-verdict, or one from an unattributed session, counts exactly as before. This is the Python twin of
+An approval does not count for the agent that posted it: ``ghapp`` stamps
+each verdict comment with ``<!-- session: <host>/<session> -->``, plus
+``agent: <id>`` when ``SHIPYARD_AGENT_ID`` is set, and an arm whose agent id
+equals the deciding approval's is refused. A session alone never refuses:
+every agent of one Claude Code team shares ``CLAUDE_CODE_SESSION_ID``, so an
+arm from the approving session only warns and is flagged in the arms ledger.
+An unstamped verdict, or either side without an agent id, counts exactly as
+before. This is the Python twin of
 src/head_approval.rs; both read the policy from the base branch, never from
 the head being armed.
 
@@ -166,9 +170,13 @@ HOST_OPT_OUT_FILE = "review-before-arm.opt-out"
 # The arms ledger, the mirror of the removal guard's queue-removals.jsonl.
 ARMS_LOG_ENV = "SHIPYARD_QUEUE_ARMS_LOG"
 SESSION_ENVS = ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
+# Per-agent identity the orchestrator sets; only it can refuse a self-approval.
+AGENT_ENV = "SHIPYARD_AGENT_ID"
 UNATTRIBUTED = "unattributed"
-# `<!-- session: <host>/<session> -->`, stamped by ghapp on verdict comments.
-_SESSION_STAMP = re.compile(r"<!--\s*session:\s*([^/\s]+)/([^\s]+?)\s*-->")
+# `<!-- session: <host>/<session>[ agent: <id>] -->`, stamped by ghapp on
+# verdict comments.
+_SESSION_STAMP = re.compile(
+    r"<!--\s*session:\s*([^/\s]+)/(\S+?)(?:\s+agent:\s*(\S+?))?\s*-->")
 # The rebase carry (see rebase_carry) is a separate switch, off by default.
 REBASE_CARRY_ENV = "SHIPYARD_REBASE_CARRY"
 REBASE_CARRY_FILE = "rebase-carry"
@@ -734,12 +742,25 @@ def session_id() -> str:
     return UNATTRIBUTED
 
 
+def agent_id() -> str | None:
+    """This process's per-agent id (``SHIPYARD_AGENT_ID``), when set."""
+    return os.environ.get(AGENT_ENV, "").strip() or None
+
+
 def stamped_session(body: Any) -> str | None:
     """The session a verdict comment was stamped with, if any."""
     if not isinstance(body, str):
         return None
     found = _SESSION_STAMP.findall(body)
     return found[-1][1] if found else None
+
+
+def stamped_agent(body: Any) -> str | None:
+    """The agent id a verdict comment was stamped with, if any."""
+    if not isinstance(body, str):
+        return None
+    found = _SESSION_STAMP.findall(body)
+    return (found[-1][2] or None) if found else None
 
 
 def arms_log_path() -> pathlib.Path:
@@ -771,6 +792,9 @@ def record_arms(targets: list[dict[str, Any]] | None, repo: str | None, verdict:
                     "verb": target.get("action", "arm"),
                     "verdict": verdict,
                     "review": review,
+                    **({"agent": agent_id()} if agent_id() else {}),
+                    **({"same_session_approval": True}
+                       if target.get("same_session_approval") else {}),
                 }, sort_keys=True) + "\n")
     except OSError as error:
         print(f"queue-arm-guard: note: the arms ledger was not written: {error}", file=sys.stderr)
@@ -927,23 +951,14 @@ def review_verdict(
     return False, f"no reviewer verdict names head {head[:12]}; it needs {wanted}.{stale}"
 
 
-def self_approval(
+def _deciding_approval_body(
     head: str,
     author: str | None,
     comments: list[dict[str, Any]],
     reviews: list[dict[str, Any]],
     policy: dict[str, Any],
 ) -> str | None:
-    """Why the approval deciding ``head`` cannot land it from this session.
-
-    The deciding verdict is the newest counting one naming ``head``; when it
-    is an APPROVE comment stamped with this process's session, the session is
-    approving its own work. Unstamped verdicts, reviews, and unattributed
-    sessions are never refused here.
-    """
-    mine = session_id()
-    if mine == UNATTRIBUTED:
-        return None
+    """The body of the APPROVE comment deciding ``head``, when one does."""
     head = head.lower()
     latest = _latest_on(counting_verdicts(author, comments, reviews, policy), head)
     if latest is None or latest[1] != "APPROVE" or latest[0] is None:
@@ -951,15 +966,59 @@ def self_approval(
     for comment in comments:
         login = (comment.get("user") or {}).get("login")
         body = comment.get("body")
-        if (not isinstance(login, str) or not isinstance(body, str)
-                or marker_verdict(body) != ("APPROVE", head)
-                or _timestamp(comment.get("created_at")) != latest[0]
-                or not _reviewer_counts(login, comment.get("author_association"), policy, author)):
-            continue
-        if stamped_session(body) == mine:
-            return (f"the approval of head {head[:12]} was posted by this same session "
-                    f"({host_name()}/{mine}); a session cannot approve its own landing")
+        if (isinstance(login, str) and isinstance(body, str)
+                and marker_verdict(body) == ("APPROVE", head)
+                and _timestamp(comment.get("created_at")) == latest[0]
+                and _reviewer_counts(login, comment.get("author_association"), policy, author)):
+            return body
     return None
+
+
+def self_approval(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> str | None:
+    """Why the approval deciding ``head`` cannot land it from this agent.
+
+    Refused only when the deciding APPROVE comment is stamped with an agent id
+    and this process carries the same ``SHIPYARD_AGENT_ID``. A shared session
+    never refuses (see ``same_session_note``).
+    """
+    mine = agent_id()
+    if mine is None:
+        return None
+    body = _deciding_approval_body(head, author, comments, reviews, policy)
+    if body is not None and stamped_agent(body) == mine:
+        return (f"the approval of head {head.lower()[:12]} was posted by this same agent "
+                f"({host_name()}/{mine}); an agent cannot approve its own landing")
+    return None
+
+
+def same_session_note(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> str | None:
+    """A warning when the deciding approval carries this process's session.
+
+    Every agent of one Claude Code team shares the session, so this cannot
+    tell the reviewer from the agent arming: it warns and flags the ledger,
+    never refuses.
+    """
+    mine = session_id()
+    if mine == UNATTRIBUTED:
+        return None
+    body = _deciding_approval_body(head, author, comments, reviews, policy)
+    if body is None or stamped_session(body) != mine:
+        return None
+    return (f"the approval of head {head.lower()[:12]} carries this process's session "
+            f"({mine}); allowed, because a session is shared by every agent of a team. "
+            f"Set {AGENT_ENV} per agent to have the same agent refused")
 
 
 def approved_earlier_head(
@@ -1507,6 +1566,15 @@ def review_fix(cause: str, what: str, repo: str, number: int, head: str,
     }
 
 
+def _note_same_session(classification: dict[str, Any], label: str, repo: str,
+                       note: str | None) -> None:
+    """Print a same-session warning and flag the target for the arms ledger."""
+    if note is None:
+        return
+    classification["same_session_approval"] = True
+    print(f"queue-arm-guard: warning: {label} ({repo}): {note}", file=sys.stderr)
+
+
 def review_gate(classification: dict[str, Any], repo: str | None
                 ) -> tuple[bool, str, dict[str, Any] | None]:
     """``(allowed, message, fix)``: the review-before-arm rule for one target.
@@ -1562,8 +1630,10 @@ def review_gate(classification: dict[str, Any], repo: str | None
         if own is not None:
             return False, f"{label} ({repo}): {own}", review_fix(
                 "self_approval", own, repo, number, head,
-                f"a reviewer in another session reviews head {head} and posts "
+                f"another agent reviews head {head} and posts "
                 f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}", False)
+        _note_same_session(classification, label, repo,
+                           same_session_note(head, author, comments, reviews, policy))
         return True, f"{label} ({repo}): {why}", None
     cause = "hold" if "is HOLD" in why or "HOLD naming" in why else "unreviewed"
     approved = approved_earlier_head(head, author, comments, reviews, policy)
@@ -1573,9 +1643,11 @@ def review_gate(classification: dict[str, Any], repo: str | None
         if own is not None:
             return False, f"{label} ({repo}): {own}", review_fix(
                 "self_approval", own, repo, number, head,
-                f"a reviewer in another session reviews head {head} and posts "
+                f"another agent reviews head {head} and posts "
                 f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}", False)
+        carry_note = same_session_note(approved, author, comments, reviews, policy)
         if refusal is None:
+            _note_same_session(classification, label, repo, carry_note)
             return True, (
                 f"{label} ({repo}): the approval of {approved[:12]} carries to {head[:12]}: "
                 "every commit since is a merge of the base and every file the pull request "
@@ -1588,6 +1660,7 @@ def review_gate(classification: dict[str, Any], repo: str | None
                 log_carry(record)
                 print(f"ghapp: {label} ({repo}): approval of {approved[:12]} carried across a "
                       f"rebase to {head[:12]} (logged to {REBASE_CARRY_LOG})", file=sys.stderr)
+                _note_same_session(classification, label, repo, carry_note)
                 return True, (
                     f"{label} ({repo}): the approval of {approved[:12]} carries across the rebase "
                     f"to {head[:12]}: same patch-id, same files, the base touched none of them "
