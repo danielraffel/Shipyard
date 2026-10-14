@@ -979,7 +979,9 @@ fn latest_verdict(
     });
     let comment_events = comments.iter().filter_map(|comment| {
         let (verdict, marker_head) = marker_verdict(comment.get("body")?.as_str()?)?;
-        if marker_head != head.to_ascii_lowercase() || !verdict_counts(comment, verdict, policy, author) {
+        if marker_head != head.to_ascii_lowercase()
+            || !verdict_counts(comment, verdict, policy, author)
+        {
             return None;
         }
         Some((at(comment), verdict))

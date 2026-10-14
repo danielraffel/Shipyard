@@ -273,7 +273,12 @@ impl Attribution {
 /// Whether `entry` is about `repo#pr`: by number, or, when the entry carries
 /// no number (a Shipyard-internal GraphQL landing), by the exact head the
 /// event landed. A recorded repository must agree either way.
-fn names_this_pull_request(entry: &LedgerEntry, repo: &str, pr: u64, event: &TimelineEvent) -> bool {
+fn names_this_pull_request(
+    entry: &LedgerEntry,
+    repo: &str,
+    pr: u64,
+    event: &TimelineEvent,
+) -> bool {
     if entry
         .repo
         .as_deref()

@@ -662,7 +662,10 @@ fn by_default(repo: &str) -> ApprovalPolicy {
 /// [`by_default`] with `humans` listed in `human_reviewers`.
 fn by_default_with_humans(repo: &str, humans: &[&str]) -> ApprovalPolicy {
     let mut policy = by_default(repo);
-    policy.human_reviewer_logins = humans.iter().map(|login| login.to_ascii_lowercase()).collect();
+    policy.human_reviewer_logins = humans
+        .iter()
+        .map(|login| login.to_ascii_lowercase())
+        .collect();
     policy
 }
 
@@ -944,14 +947,20 @@ fn a_human_review_approves_only_when_the_base_lists_that_human() {
     )];
     assert!(!gate(&unlisted, &[], &owner_marker).allows());
     let listed = by_default_with_humans("Generous-Corp/pulp", &["DanielRaffel"]);
-    assert!(gate(&listed, &owner_review, &[]).allows(), "a listed human approves");
+    assert!(
+        gate(&listed, &owner_review, &[]).allows(),
+        "a listed human approves"
+    );
     assert!(gate(&listed, &[], &owner_marker).allows());
     assert!(super::verdict_audit_events(HEAD, &owner_review, &[], &listed, None).is_empty());
     let app = [fleet(
         "2026-10-14T17:00:00Z",
         &format!("verdict: APPROVE head:{HEAD}"),
     )];
-    assert!(gate(&unlisted, &[], &app).allows(), "the fleet App approves");
+    assert!(
+        gate(&unlisted, &[], &app).allows(),
+        "the fleet App approves"
+    );
     // An unlisted human's HOLD still stops the landing: it cannot approve.
     let held = [review("danielraffel", "CHANGES_REQUESTED")];
     assert!(!gate(&unlisted, &held, &app).allows());
