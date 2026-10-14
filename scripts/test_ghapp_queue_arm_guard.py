@@ -2607,6 +2607,29 @@ class HumanApprovalsAndInternalArms(unittest.TestCase):
         entry = self.ledger()[-1]
         self.assertEqual((entry["verdict"], entry["excluded_approvals"]), ("refused", ["danielraffel"]))
 
+    def test_an_unlisted_humans_verdict_comment_is_refused_and_recorded(self) -> None:
+        # pulp#10302: a comment ending `verdict: APPROVE head:<sha>` from the
+        # owner's personal login, not the App.
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        owner = comment_like(approve, created_at="2026-10-14T21:30:00Z",
+                             user={"login": "danielraffel", "type": "User"},
+                             author_association="OWNER",
+                             body=f"Reviewed.\nverdict: APPROVE head:{HEAD_784}")
+        result = self.run_guard(
+            ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD_784],
+            self.approved_784(queue=False, reviews=[[]], comments=[[owner]]),
+            "danielraffel/Shipyard")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("ignored the approval of danielraffel", result.stderr)
+        self.assertEqual(self.ledger()[-1]["excluded_approvals"], ["danielraffel"])
+        listed = self.run_guard(
+            ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD_784],
+            self.approved_784(queue=False, reviews=[[]], comments=[[owner]],
+                              config='[auto_merge]\nhuman_reviewers = ["danielraffel"]\n'),
+            "danielraffel/Shipyard")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+
     def test_a_listed_human_review_is_allowed(self) -> None:
         result = self.merge(config='[auto_merge]\nhuman_reviewers = ["danielraffel"]\n')
         self.assertEqual(result.returncode, 0, result.stderr)
