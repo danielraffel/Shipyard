@@ -1626,6 +1626,27 @@ fi
 if [[ -x "$guards/verdict-hold-hook" ]]; then
     PATH="$trusted_path" "$guards/verdict-hold-hook" "$@" || true
 fi
+# Optional, and never a refusal: a verdict comment gets a
+# `<!-- session: <host>/<session>[ agent: <id>] -->` line above its marker,
+# so queue-arm-guard can refuse an arm from the agent that approved it. The
+# rewritten argument list is used only when the stamper's answer starts and
+# ends with its sentinels; each read waits at most 5 seconds, so a hung,
+# failed or truncated stamper posts the comment unstamped.
+if [[ -x "$guards/verdict-session-stamp" ]]; then
+    ghapp_stamped=()
+    while IFS= read -r -d '' -t 5 ghapp_stamp_item; do
+        ghapp_stamped+=("$ghapp_stamp_item")
+    # The substitution holds none of ghapp's own streams, so a hung stamper
+    # cannot keep a caller that captures ghapp's output waiting.
+    done < <(exec </dev/null 2>/dev/null
+             PATH="$trusted_path" "$guards/verdict-session-stamp" "$@" || true)
+    ghapp_stamp_count="${#ghapp_stamped[@]}"
+    if [[ "$ghapp_stamp_count" -ge 2 && "${ghapp_stamped[0]}" == "SHIPYARD-STAMP-V1" && \
+          "${ghapp_stamped[$((ghapp_stamp_count - 1))]}" == "SHIPYARD-STAMP-END" ]]; then
+        set -- "${ghapp_stamped[@]:1:$((ghapp_stamp_count - 2))}"
+    fi
+    unset ghapp_stamped ghapp_stamp_item ghapp_stamp_count
+fi
 
 if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \
       -n "${release_upload_stage_dir:-}" ]]; then

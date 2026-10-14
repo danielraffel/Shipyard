@@ -63,13 +63,61 @@ current head. The direct merges are `pr merge` on a base with no queue, `pr
 merge --admin`, REST `PUT pulls/<n>/merge` and GraphQL `mergePullRequest`; on
 a queue-less repository (tartci, Shipyard) they are the landing path.
 
-**Which hosts and repositories.** Nothing in this section applies unless the
-host turns it on: `SHIPYARD_REVIEW_BEFORE_ARM=1` (`0` forces it off), or a file
-named `review-before-arm` in the guards directory. With it off the guard reads
-nothing for this rule (no pull request, no config, no comments), so it is
-inert whatever the base config says and on any Python. Updating the binary or
-the guards changes nothing until a host turns it on; roll it out one host at a
-time.
+**Which hosts and repositories.** The rule is on by default, in both twins
+(this guard and Shipyard's own arm paths). An opt-in host switch left most of
+the fleet unguarded: on 2026-10-14 an agent on a host without the switch file
+queued an unapproved pull request and one on HOLD. The only way off is a file,
+`review-before-arm.opt-out` in the guards directory:
+`shipyard guards install --opt-out-review-before-arm "<reason>"` writes it
+with the reason, time and binary and appends to `switches.jsonl`, and
+`--opt-in-review-before-arm` removes it, logged too. Only that record counts:
+a regular file holding JSON with a non-empty `reason`, `at` and `by`. Anything
+else at the path (an empty or hand-made file, a directory) keeps the rule on,
+and `guards status`, `doctor` and fleet-update verification fail on it until
+it is fixed or removed, so a stray file cannot opt a host out. Nothing in the
+environment turns it off (`SHIPYARD_REVIEW_BEFORE_ARM=1` only forces it on).
+While a host is opted out, every landing prints that review is OFF and why,
+and the arms ledger records `review: off: <reason>`; `shipyard guards status`
+and `shipyard doctor` show the host as OFF. Off, the guard reads nothing for
+this rule (no pull request, no config, no comments), so it is inert whatever
+the base config says and on any Python.
+
+**An agent cannot approve its own landing.** `verdict-session-stamp` (run by
+`ghapp` before native `gh`, bounded to 5 seconds) adds
+`<!-- session: <host>/<session> agent: <id> -->` above the marker line of a
+verdict comment. The session is `CLAUDE_CODE_SESSION_ID`, else
+`CODEX_COMPANION_SESSION_ID`, else `unattributed`; `agent: <id>` appears only
+when `SHIPYARD_AGENT_ID` is set. The marker stays the last line, so every
+verdict reader is unchanged. The arm guard, and `head_approval` for Shipyard's
+own paths, refuse an arm only when the deciding approval is stamped with an
+agent id and the arming process carries the same `SHIPYARD_AGENT_ID` (cause
+`self_approval`). The session never refuses on its own: every agent of one
+Claude Code team (implementer, reviewer, lead) shares `CLAUDE_CODE_SESSION_ID`,
+so it cannot tell them apart. When only the session matches, the arm guard
+prints a warning and flags the ledger entry `same_session_approval: true`. An
+unstamped verdict (older comments, the web UI, a review), or either side
+without an agent id, behaves exactly as before. The stamp is not a signature:
+any writer can type one; it stops an agent approving its own work by habit,
+not a determined forger.
+
+**The arms ledger.** Every arm, enqueue or merge the guard judges, allowed or
+refused, appends one line to `queue-arms.jsonl` in
+`${XDG_STATE_HOME:-~/.local/state}/shipyard/` (`SHIPYARD_QUEUE_ARMS_LOG`
+overrides): `at`, `host`, `session`, `repo`, `pr`, `head`, `verb` (`arm` or
+`merge`), `verdict` (`allowed` or `refused`) and `review`, plus `agent` when
+`SHIPYARD_AGENT_ID` is set and `same_session_approval` when the approval
+carried the arming session. Override removals in `queue-removals.jsonl` now
+carry `host`, `session` and `agent` too. A missing session
+is recorded as `unattributed` and never refuses anything; a ledger that cannot
+be written is reported and does not block. Shipyard's own marked mutations
+bypass the guard and are not in it. `shipyard who --pr N` joins both ledgers,
+read from every `[host_class.*]` host over SSH, to the pull request's
+timeline by repository, pull request, verb and head, with time only breaking
+ties, and prints its own time to answer. It names `host/session`, plus the
+agent when the ledger recorded one; without an agent id that is the team
+session, not which agent within it. An event no ledger explains (a
+landing through native `gh`, which passes no guard) is `unattributed`, never
+guessed.
 
 Off differs in one place between the two twins, deliberately. Shipyard's own
 arming and merge paths (Rust) still honour a repository that sets

@@ -1,7 +1,8 @@
 //! Install and audit the `ghapp` wrapper's optional queue guards.
 //!
 //! `scripts/ghapp` runs `queue-removal-guard`, `queue-arm-guard`,
-//! `branch-refresh-guard`, `merge-guard` and `verdict-hold-hook` from
+//! `branch-refresh-guard`, `merge-guard`, `verdict-hold-hook` and
+//! `verdict-session-stamp` from
 //! `$SHIPYARD_GHAPP_GUARDS_DIR` (default `~/.config/shipyard/guards`) when they
 //! are present and executable. Nothing else puts them there, so a host keeps
 //! whatever copy somebody placed by hand, possibly months stale. This module
@@ -16,6 +17,12 @@
 //!
 //! The arm and branch-refresh guards load their request parser from the
 //! removal guard sitting next to them, so all three are installed together.
+//!
+//! Review-before-arm is on by default in both twins (the arm guard and
+//! `head_approval`). The only way off is the opt-out file
+//! ([`REVIEW_OPT_OUT`]), written with a reason by [`opt_out_review`] and
+//! logged to [`SWITCH_LOG`]; `guards status` and `doctor` show a host that is
+//! off.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -41,7 +48,7 @@ pub struct ManagedGuard {
 /// Every guard `shipyard guards install` manages, in install order: the arm
 /// and branch-refresh guards import the removal guard's request parser, so the
 /// parser lands first.
-pub const MANAGED_GUARDS: [ManagedGuard; 5] = [
+pub const MANAGED_GUARDS: [ManagedGuard; 6] = [
     ManagedGuard {
         name: "queue-removal-guard",
         source_path: "scripts/ghapp_queue_removal_guard.py",
@@ -72,6 +79,13 @@ pub const MANAGED_GUARDS: [ManagedGuard; 5] = [
         source_path: "scripts/ghapp_verdict_hold_hook.py",
         contents: include_bytes!("../scripts/ghapp_verdict_hold_hook.py"),
     },
+    // Stamps a verdict comment with the posting session, so the arm guard can
+    // refuse an arm from the session that approved it. Never refuses.
+    ManagedGuard {
+        name: "verdict-session-stamp",
+        source_path: "scripts/ghapp_verdict_session_stamp.py",
+        contents: include_bytes!("../scripts/ghapp_verdict_session_stamp.py"),
+    },
 ];
 
 /// Printed with every `shipyard guards` report: installing into the shared
@@ -81,6 +95,15 @@ pub const FLEET_NOTE: &str = "note: this directory is shared by every Shipyard b
      installed their same-head re-enqueues after failed_checks/merge_conflict (the intended \
      ALLGREEN refusal) or after a manual removal, and any enqueue whose live state cannot be read, \
      are refused. Update every Shipyard binary on the host first; see docs/ghapp-guards.md.";
+
+/// The review-before-arm rule, as `guards status` names it.
+pub const REVIEW_SWITCH: &str = "review-before-arm";
+/// Present when an operator opted this host out of review-before-arm; holds
+/// the reason, the time and the binary that recorded it. The arm guard
+/// (`HOST_OPT_OUT_FILE`) and `head_approval` (`HOST_OPT_OUT_FILE`) read it.
+pub const REVIEW_OPT_OUT: &str = "review-before-arm.opt-out";
+/// Append-only log of every change to the review switch.
+pub const SWITCH_LOG: &str = "switches.jsonl";
 
 /// Where `scripts/ghapp` looks for guards on this host.
 #[must_use]
@@ -190,6 +213,119 @@ pub fn audit(dir: &Path) -> Vec<GuardAudit> {
         .collect()
 }
 
+/// State of the review-before-arm rule on this host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SwitchState {
+    /// On: the default, with no opt-out file.
+    Current,
+    /// Turned off on purpose, with the recorded reason.
+    OptedOut {
+        /// The opt-out record (`reason`, `at`, `by`), as written.
+        record: String,
+    },
+    /// Something at the opt-out path that is not a valid opt-out record:
+    /// the guards keep the rule ON, and status fails until it is fixed or
+    /// removed.
+    Unreadable {
+        /// Why it does not count.
+        detail: String,
+    },
+}
+
+/// The review rule's audit row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SwitchAudit {
+    /// [`REVIEW_SWITCH`].
+    pub name: String,
+    /// Absolute path of the opt-out file.
+    pub path: PathBuf,
+    /// What is there.
+    #[serde(flatten)]
+    pub state: SwitchState,
+}
+
+/// Read the review-before-arm rule's state in `dir`: on unless it holds a
+/// valid opt-out record, by the guards' own rule
+/// ([`crate::head_approval::read_opt_out`]).
+#[must_use]
+pub fn audit_review_switch(dir: &Path) -> SwitchAudit {
+    let path = dir.join(REVIEW_OPT_OUT);
+    let state = match crate::head_approval::read_opt_out(&path) {
+        crate::head_approval::OptOut::Absent => SwitchState::Current,
+        crate::head_approval::OptOut::Valid { record, .. } => SwitchState::OptedOut { record },
+        crate::head_approval::OptOut::Invalid { detail } => SwitchState::Unreadable {
+            detail: format!("{detail}; review before arm stays on"),
+        },
+    };
+    SwitchAudit {
+        name: REVIEW_SWITCH.to_owned(),
+        path,
+        state,
+    }
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn log_switch(dir: &Path, change: &str, reason: Option<&str>) -> Result<(), String> {
+    let record = serde_json::json!({
+        "at": now_rfc3339(),
+        "switch": REVIEW_SWITCH,
+        "change": change,
+        "reason": reason,
+        "by": format!("shipyard {}", env!("CARGO_PKG_VERSION")),
+    });
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(SWITCH_LOG))
+        .map_err(|error| format!("open {}: {error}", dir.join(SWITCH_LOG).display()))?;
+    writeln!(file, "{record}").map_err(|error| format!("log switch change: {error}"))
+}
+
+/// Opt this host out of review-before-arm, with a reason that is recorded in
+/// the opt-out file and the switch log. Later installs leave it off.
+///
+/// # Errors
+///
+/// An empty reason, or a write that fails.
+pub fn opt_out_review(dir: &Path, reason: &str) -> Result<SwitchAudit, String> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err("opting out of review-before-arm needs a reason".to_owned());
+    }
+    fs::create_dir_all(dir)
+        .map_err(|error| format!("create guards directory {}: {error}", dir.display()))?;
+    let record = serde_json::json!({
+        "reason": reason,
+        "at": now_rfc3339(),
+        "by": format!("shipyard {}", env!("CARGO_PKG_VERSION")),
+    });
+    fs::write(dir.join(REVIEW_OPT_OUT), format!("{record}\n"))
+        .map_err(|error| format!("write {}: {error}", dir.join(REVIEW_OPT_OUT).display()))?;
+    log_switch(dir, "opted out", Some(reason))?;
+    Ok(audit_review_switch(dir))
+}
+
+/// Undo an opt-out: remove it, logged. The rule is on again.
+///
+/// # Errors
+///
+/// A write that fails.
+pub fn opt_in_review(dir: &Path) -> Result<SwitchAudit, String> {
+    fs::create_dir_all(dir)
+        .map_err(|error| format!("create guards directory {}: {error}", dir.display()))?;
+    match fs::remove_file(dir.join(REVIEW_OPT_OUT)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("remove {REVIEW_OPT_OUT}: {error}")),
+    }
+    log_switch(dir, "opted back in", None)?;
+    Ok(audit_review_switch(dir))
+}
+
 /// What `install` did, or would do, for one guard.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct InstallAction {
@@ -268,55 +404,78 @@ pub fn doctor_section(dir: &Path, home: &Path) -> Option<BTreeMap<String, Doctor
     if !dir.exists() && !home.join(".local/bin/ghapp").exists() {
         return None;
     }
-    Some(
-        audit(dir)
-            .into_iter()
-            .map(|audit| {
-                let fix = "run `shipyard guards install`".to_owned();
-                let entry = match &audit.state {
-                    GuardState::Current => DoctorEntry {
-                        ok: true,
-                        version: Some(format!("current ({})", &audit.expected_sha256[..12])),
-                        detail: None,
-                        error: None,
-                    },
-                    GuardState::Missing => DoctorEntry {
+    let switch = audit_review_switch(dir);
+    let switch_entry = match &switch.state {
+        SwitchState::Current => DoctorEntry {
+            ok: true,
+            version: Some("on".to_owned()),
+            detail: None,
+            error: None,
+        },
+        // Off on purpose is reported, not failed: the opt-out is the
+        // operator's recorded decision.
+        SwitchState::OptedOut { record } => DoctorEntry {
+            ok: true,
+            version: Some("OFF (opted out)".to_owned()),
+            detail: Some(record.clone()),
+            error: None,
+        },
+        SwitchState::Unreadable { detail } => DoctorEntry {
+            ok: false,
+            version: None,
+            detail: Some(detail.clone()),
+            error: Some("unreadable".to_owned()),
+        },
+    };
+    let mut section: BTreeMap<String, DoctorEntry> = audit(dir)
+        .into_iter()
+        .map(|audit| {
+            let fix = "run `shipyard guards install`".to_owned();
+            let entry = match &audit.state {
+                GuardState::Current => DoctorEntry {
+                    ok: true,
+                    version: Some(format!("current ({})", &audit.expected_sha256[..12])),
+                    detail: None,
+                    error: None,
+                },
+                GuardState::Missing => DoctorEntry {
+                    ok: false,
+                    version: None,
+                    detail: Some(format!(
+                        "ghapp skips an absent guard, so this protection is off; {fix}"
+                    )),
+                    error: Some("not installed".to_owned()),
+                },
+                GuardState::Stale { installed_sha256 } => DoctorEntry {
+                    ok: false,
+                    version: Some("stale".to_owned()),
+                    detail: Some(format!(
+                        "installed sha256 {} differs from this build's {}; {fix}",
+                        &installed_sha256[..12],
+                        &audit.expected_sha256[..12]
+                    )),
+                    error: None,
+                },
+                GuardState::NotExecutable => DoctorEntry {
+                    ok: false,
+                    version: None,
+                    detail: Some(format!("ghapp only runs executable guards; {fix}")),
+                    error: Some("not executable".to_owned()),
+                },
+                GuardState::Unmanaged { detail } | GuardState::Unreadable { detail } => {
+                    DoctorEntry {
                         ok: false,
                         version: None,
-                        detail: Some(format!(
-                            "ghapp skips an absent guard, so this protection is off; {fix}"
-                        )),
-                        error: Some("not installed".to_owned()),
-                    },
-                    GuardState::Stale { installed_sha256 } => DoctorEntry {
-                        ok: false,
-                        version: Some("stale".to_owned()),
-                        detail: Some(format!(
-                            "installed sha256 {} differs from this build's {}; {fix}",
-                            &installed_sha256[..12],
-                            &audit.expected_sha256[..12]
-                        )),
-                        error: None,
-                    },
-                    GuardState::NotExecutable => DoctorEntry {
-                        ok: false,
-                        version: None,
-                        detail: Some(format!("ghapp only runs executable guards; {fix}")),
-                        error: Some("not executable".to_owned()),
-                    },
-                    GuardState::Unmanaged { detail } | GuardState::Unreadable { detail } => {
-                        DoctorEntry {
-                            ok: false,
-                            version: None,
-                            detail: Some(format!("{} is {detail}", audit.path.display())),
-                            error: Some("unmanaged".to_owned()),
-                        }
+                        detail: Some(format!("{} is {detail}", audit.path.display())),
+                        error: Some("unmanaged".to_owned()),
                     }
-                };
-                (audit.name, entry)
-            })
-            .collect(),
-    )
+                }
+            };
+            (audit.name, entry)
+        })
+        .collect();
+    section.insert(switch.name, switch_entry);
+    Some(section)
 }
 
 #[cfg(test)]
@@ -430,6 +589,122 @@ mod tests {
                 .join("docs/ghapp-guards.md")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn review_before_arm_is_on_by_default_and_off_only_by_a_logged_opt_out() {
+        let temp = tempfile::tempdir().expect("temp");
+        let dir = temp.path();
+        assert_eq!(audit_review_switch(dir).state, SwitchState::Current);
+        install(dir, false).expect("install");
+        assert!(
+            !dir.join(REVIEW_SWITCH).exists(),
+            "install no longer needs an enable file"
+        );
+        assert!(doctor_section(dir, dir).expect("section")[REVIEW_SWITCH].ok);
+        assert!(opt_out_review(dir, "  ").is_err(), "a reason is required");
+        assert!(
+            !dir.join(REVIEW_OPT_OUT).exists(),
+            "a refused opt-out writes nothing"
+        );
+        let audit = opt_out_review(dir, "lab host, no landings").expect("opt out");
+        assert!(
+            matches!(&audit.state, SwitchState::OptedOut { record } if record.contains("lab host, no landings")),
+            "{audit:?}"
+        );
+        install(dir, false).expect("install");
+        assert!(
+            dir.join(REVIEW_OPT_OUT).exists(),
+            "install leaves an opt-out in place"
+        );
+        let off = doctor_section(dir, dir).expect("section");
+        assert_eq!(
+            off[REVIEW_SWITCH].version.as_deref(),
+            Some("OFF (opted out)")
+        );
+        let log = fs::read_to_string(dir.join(SWITCH_LOG)).expect("log");
+        assert!(
+            log.contains("\"opted out\"") && log.contains("lab host, no landings"),
+            "{log}"
+        );
+        opt_in_review(dir).expect("opt in");
+        assert_eq!(audit_review_switch(dir).state, SwitchState::Current);
+        assert!(
+            fs::read_to_string(dir.join(SWITCH_LOG))
+                .expect("log")
+                .contains("opted back in")
+        );
+    }
+
+    #[test]
+    fn only_a_written_opt_out_record_turns_review_off() {
+        type Make = fn(&Path);
+        let opt_out = |dir: &Path| {
+            // The guards' own predicate, so the audit and the guards cannot drift.
+            matches!(
+                crate::head_approval::read_opt_out(&dir.join(REVIEW_OPT_OUT)),
+                crate::head_approval::OptOut::Valid { .. }
+            )
+        };
+        let bad: [(&str, Make); 5] = [
+            ("empty", |path| fs::write(path, "").expect("write")),
+            ("plain text", |path| {
+                fs::write(path, "lab host").expect("write");
+            }),
+            ("no reason", |path| {
+                fs::write(path, r#"{"reason":" ","at":"t","by":"me"}"#).expect("write");
+            }),
+            ("a directory", |path| fs::create_dir(path).expect("dir")),
+            ("a symlink to a directory", |path| {
+                let target = path.with_extension("target");
+                fs::create_dir(&target).expect("dir");
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target, path).expect("link");
+                #[cfg(not(unix))]
+                fs::create_dir(path).expect("dir");
+            }),
+        ];
+        for (label, make) in bad {
+            let temp = tempfile::tempdir().expect("temp");
+            make(&temp.path().join(REVIEW_OPT_OUT));
+            assert!(
+                !opt_out(temp.path()),
+                "{label}: the guards must keep review on"
+            );
+            assert!(
+                matches!(
+                    audit_review_switch(temp.path()).state,
+                    SwitchState::Unreadable { .. }
+                ),
+                "{label}: status must fail, not report on or off"
+            );
+            assert!(
+                !doctor_section(temp.path(), temp.path()).expect("section")[REVIEW_SWITCH].ok,
+                "{label}: doctor must fail"
+            );
+        }
+        // A dangling symlink is nothing there: review on, and status says so.
+        #[cfg(unix)]
+        {
+            let temp = tempfile::tempdir().expect("temp");
+            std::os::unix::fs::symlink("/nonexistent", temp.path().join(REVIEW_OPT_OUT))
+                .expect("link");
+            assert!(!opt_out(temp.path()));
+            assert_eq!(audit_review_switch(temp.path()).state, SwitchState::Current);
+        }
+        let temp = tempfile::tempdir().expect("temp");
+        opt_out_review(temp.path(), "lab host").expect("opt out");
+        assert!(opt_out(temp.path()), "the written record is an opt-out");
+    }
+
+    #[test]
+    fn every_twin_reads_the_same_opt_out_file() {
+        let guard = String::from_utf8_lossy(MANAGED_GUARDS[1].contents);
+        assert!(
+            guard.contains(&format!("HOST_OPT_OUT_FILE = \"{REVIEW_OPT_OUT}\"")),
+            "the arm guard reads a different opt-out file"
+        );
+        assert_eq!(crate::head_approval::HOST_OPT_OUT_FILE, REVIEW_OPT_OUT);
     }
 
     #[test]

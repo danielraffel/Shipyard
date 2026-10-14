@@ -168,8 +168,10 @@ pull request out permanently. Neither is something to reach for by default.
 
 **Head approval.** A repository whose base branch sets
 `[auto_merge] arm_requires_head_approval = true` (the default for pulp, vellum,
-tartci and Shipyard when their base is silent, on a host that sets
-`SHIPYARD_REVIEW_BEFORE_ARM=1` or has a `review-before-arm` guards file; there,
+tartci and Shipyard when their base is silent, on every host unless the host
+has a `review-before-arm.opt-out` file, written with a reason by
+`shipyard guards install --opt-out-review-before-arm "<reason>"`, and only
+that written record counts; there,
 with no identity listed, a verdict from the fleet App or an
 OWNER/MEMBER/COLLABORATOR counts, never the PR author's) arms or merges only a
 head that carries an
@@ -458,6 +460,17 @@ It prints `::notice title=ci-cause::<record>`, so the job's own log holds its
 is bound to that job (repo, head, run, attempt, job name) and names the cause
 the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
 <file>` (append-only, one file per month, ids never duplicated).
+
+**"Who armed it?" is `shipyard who --pr N`, not a timeline read.** Every queue
+event shows the fleet App as its actor. `who` joins the arm guard's
+`queue-arms.jsonl` and the removal guard's `queue-removals.jsonl` from every
+host to the timeline and names host and session (and agent, when
+`SHIPYARD_AGENT_ID` was set) per event, with its own time to answer. A
+session alone is the whole team's, not one agent's. `unattributed` means no guard saw it (native `gh`, the web UI, or a
+host whose ledger was unreachable, which it lists); do not guess from timing.
+An arm refused with cause `self_approval` means the approval came from the
+arming agent itself (same `SHIPYARD_AGENT_ID`): get a review from another
+agent. A same-session warning without a refusal is expected inside one team.
 
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason

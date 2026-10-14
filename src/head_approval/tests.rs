@@ -1515,35 +1515,133 @@ fn host_switch(env: &[(&str, &std::path::Path)], switch: Option<&str>) -> bool {
     }
 }
 
+const OPT_OUT_RECORD: &str =
+    r#"{"reason":"lab host","at":"2026-10-14T00:00:00Z","by":"shipyard test"}"#;
+
 #[test]
-fn the_host_switch_reads_the_environment_and_the_guards_file() {
+fn the_host_switch_is_on_unless_the_opt_out_file_exists() {
     let empty = tempfile::tempdir().expect("tempdir");
-    let marked = tempfile::tempdir().expect("tempdir");
-    std::fs::write(marked.path().join(super::HOST_ENABLE_FILE), "").expect("marker");
+    let opted = tempfile::tempdir().expect("tempdir");
+    std::fs::write(opted.path().join(super::HOST_OPT_OUT_FILE), OPT_OUT_RECORD).expect("opt-out");
     let guards = "SHIPYARD_GHAPP_GUARDS_DIR";
     assert!(
-        !host_switch(&[(guards, empty.path())], None),
-        "off by default"
+        host_switch(&[(guards, empty.path())], None),
+        "on by default"
     );
     assert!(
-        host_switch(&[(guards, marked.path())], None),
-        "the file turns it on"
+        !host_switch(&[(guards, opted.path())], None),
+        "the opt-out file turns it off"
     );
     assert!(
-        !host_switch(&[(guards, marked.path())], Some("0")),
-        "0 wins over the file"
+        host_switch(&[(guards, empty.path())], Some("0")),
+        "nothing in the environment turns it off"
     );
     assert!(
-        host_switch(&[(guards, empty.path())], Some("1")),
-        "1 turns it on"
+        host_switch(&[(guards, opted.path())], Some("1")),
+        "1 forces it on for one process"
     );
-    // Without the guards-dir variable, the file is read from HOME.
+    // Without the guards-dir variable, the opt-out is read from HOME.
     let home = tempfile::tempdir().expect("tempdir");
     let dir = home.path().join(".config/shipyard/guards");
     std::fs::create_dir_all(&dir).expect("dirs");
-    assert!(!host_switch(&[("HOME", home.path())], None));
-    std::fs::write(dir.join(super::HOST_ENABLE_FILE), "").expect("marker");
     assert!(host_switch(&[("HOME", home.path())], None));
+    std::fs::write(dir.join(super::HOST_OPT_OUT_FILE), "").expect("opt-out");
+    assert!(
+        host_switch(&[("HOME", home.path())], None),
+        "an empty file is not an opt-out"
+    );
+    std::fs::write(dir.join(super::HOST_OPT_OUT_FILE), OPT_OUT_RECORD).expect("opt-out");
+    assert!(!host_switch(&[("HOME", home.path())], None));
+}
+
+// ---------------------------------------------------------------------------
+// A session cannot approve its own landing.
+// ---------------------------------------------------------------------------
+
+fn stamped_approval(session: Option<&str>, agent: Option<&str>) -> Value {
+    let stamp = session.map_or_else(String::new, |session| {
+        let agent = agent.map_or_else(String::new, |agent| format!(" agent: {agent}"));
+        format!("<!-- session: m5s/{session}{agent} -->\n")
+    });
+    json!({"id": 77, "login": "shipyard-local[bot]", "type": "Bot", "association": "CONTRIBUTOR",
+           "at": "2026-10-14T01:00:00Z",
+           "body": format!("Reviewed.\n{stamp}verdict: APPROVE head:{HEAD}")})
+}
+
+fn gate_for(comment: &Value, arming_agent: Option<&str>) -> HeadGate {
+    super::with_arming_agent(arming_agent, || {
+        decide_for_author(
+            &by_default("Generous-Corp/pulp"),
+            HEAD,
+            &[],
+            std::slice::from_ref(comment),
+            &empty_queue(HEAD),
+            false,
+            Some("someone-else"),
+        )
+    })
+}
+
+#[test]
+fn the_agent_that_approved_a_head_cannot_arm_it() {
+    let gate = gate_for(
+        &stamped_approval(Some("team-1"), Some("impl")),
+        Some("impl"),
+    );
+    assert_eq!(
+        gate,
+        HeadGate::SelfApproved {
+            head: HEAD.to_owned(),
+            agent: "impl".to_owned()
+        }
+    );
+    assert!(!gate.allows());
+    assert!(gate.explain().contains("cannot approve its own landing"));
+}
+
+#[test]
+fn a_shared_session_never_refuses_only_a_shared_agent_does() {
+    let approved = |gate: HeadGate| matches!(gate, HeadGate::Approved { .. });
+    // One Claude Code team: reviewer and lead share the session, not the agent.
+    assert!(approved(gate_for(
+        &stamped_approval(Some("team-1"), Some("reviewer")),
+        Some("lead")
+    )));
+    // The same session with no agent id on either side, or on one side.
+    assert!(approved(gate_for(
+        &stamped_approval(Some("team-1"), None),
+        None
+    )));
+    assert!(approved(gate_for(
+        &stamped_approval(Some("team-1"), None),
+        Some("lead")
+    )));
+    assert!(approved(gate_for(
+        &stamped_approval(Some("team-1"), Some("reviewer")),
+        None
+    )));
+    // Unstamped verdicts count as before.
+    assert!(approved(gate_for(
+        &stamped_approval(None, None),
+        Some("lead")
+    )));
+    // Only the stamp's agent is compared: an arming agent id equal to the
+    // approval's session string is still another agent.
+    assert!(approved(gate_for(
+        &stamped_approval(Some("team-1"), Some("reviewer")),
+        Some("team-1")
+    )));
+}
+
+#[test]
+fn the_stamp_is_read_from_the_comment_body() {
+    let body = "x\n<!-- session: m3/abc-123 agent: reviewer -->\nverdict: APPROVE head:a";
+    assert_eq!(super::stamped_session(body), Some("abc-123".to_owned()));
+    assert_eq!(super::stamped_agent(body), Some("reviewer".to_owned()));
+    let plain = "x\n<!-- session: m3/abc-123 -->\nverdict: APPROVE head:a";
+    assert_eq!(super::stamped_session(plain), Some("abc-123".to_owned()));
+    assert_eq!(super::stamped_agent(plain), None);
+    assert_eq!(super::stamped_session("verdict: APPROVE head:a"), None);
 }
 
 fn files(names: &[&str]) -> std::collections::BTreeMap<String, (String, String, bool)> {

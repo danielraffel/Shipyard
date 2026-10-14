@@ -1770,6 +1770,8 @@ const GUARDS_BEFORE_STALE: &str = r#"{"guards":[{"name":"queue-arm-guard","statu
 const INSTALL_OK: &str = r#"{"guards":[{"name":"queue-removal-guard","action":"unchanged"},{"name":"queue-arm-guard","action":"replaced"}]}"#;
 const INSTALL_REFUSED: &str = r#"{"guards":[{"name":"queue-removal-guard","action":"unchanged"},{"name":"queue-arm-guard","action":"refused","detail":"a symlink"}]}"#;
 const GUARDS_CURRENT: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"current"},{"name":"queue-arm-guard","status":"current"}]}"#;
+const GUARDS_CURRENT_SWITCH_OFF: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"current"},{"name":"queue-arm-guard","status":"current"}],"switches":[{"name":"review-before-arm","status":"unreadable","detail":"Permission denied"}]}"#;
+const GUARDS_CURRENT_OPTED_OUT: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"current"},{"name":"queue-arm-guard","status":"current"}],"switches":[{"name":"review-before-arm","status":"opted_out","record":"{\"reason\":\"lab host\"}"}]}"#;
 const GUARDS_STALE: &str = r#"{"guards":[{"name":"queue-removal-guard","status":"stale"},{"name":"queue-arm-guard","status":"missing"}]}"#;
 
 #[test]
@@ -1852,6 +1854,44 @@ fn verification_accepts_only_the_target_binary_daemon_and_current_guards() {
             verdict.failures
         );
     }
+}
+
+/// Review-before-arm must be on, or off by an opt-out the host can read; an
+/// unreadable opt-out is not current.
+#[test]
+fn verification_requires_review_before_arm_on_or_readably_opted_out() {
+    let plan = host_update_plan(&named_host("m1"), "v0.137.0").expect("plan");
+    let off = verify::judge(
+        &plan,
+        42,
+        &verify_transcript(
+            "shipyard 0.137.0",
+            "0.137.0",
+            "42",
+            "1",
+            GUARDS_CURRENT_SWITCH_OFF,
+        ),
+    );
+    assert!(!off.verified(), "{off:?}");
+    assert!(
+        off.failures
+            .iter()
+            .any(|failure| failure.contains("review-before-arm=unreadable")),
+        "{:?}",
+        off.failures
+    );
+    let opted_out = verify::judge(
+        &plan,
+        42,
+        &verify_transcript(
+            "shipyard 0.137.0",
+            "0.137.0",
+            "42",
+            "1",
+            GUARDS_CURRENT_OPTED_OUT,
+        ),
+    );
+    assert!(opted_out.verified(), "{opted_out:?}");
 }
 
 #[test]
