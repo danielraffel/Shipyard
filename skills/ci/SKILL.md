@@ -455,6 +455,29 @@ is bound to that job (repo, head, run, attempt, job name) and names the cause
 the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
 <file>` (append-only, one file per month, ids never duplicated).
 
+**To keep a labels archive current as checks go red and green**, run
+`shipyard cause record --repo <OWNER/REPO> --workflow <file> --dir
+<labels checkout>/data/ci-cause [--since <RFC 3339>]` on a schedule. It is a
+read-only observer, never part of `ship`, `pr` or `run`. Each pass writes one
+`ci.cause/v1` row per red job not yet archived, to `causes/YYYY-MM.jsonl` by the
+job's `completed_at`. It adds `completed_at`, `workflow`, `head_branch`, `owner`
+(`pr:N`, else `branch:<name>`, else `sha:<head>`) and `provenance`.
+Then, for each red run attempt in the window without a fix-link, it looks for
+the earliest later green run on the same pull request branch and appends one row
+to `fixlinks.jsonl`: `files_raw` from compare red...fix, and `own_files`, which
+drops what the base branch changed between the two merge bases. It also writes
+`rerun_green` when a rerun of the red head passed.
+Cancelled jobs are counted and skipped; they belong to outage windows, not
+causes. Strings are scrubbed of local paths, addresses, credentials and private
+host names; run and job URLs are kept.
+The layout and fields are the 90-day backfill's, so live and backfilled rows
+join. A red with no green yet stays pending and is retried on the next pass.
+A generated-file drift check (`<generator>: N drift problem(s)` or
+`<generator>: the <file> no longer matches <source>`) is C2's
+`generated_drift`, class `drift`, high confidence. Its `signature` is the
+generator and its `fix_hint` the `--write` command the check printed. It
+outranks the ctest line that ran the check.
+
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason
 `failed_checks` or `checks_timed_out`, and use `AddedToMergeQueueEvent` as the

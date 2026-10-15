@@ -88,6 +88,9 @@ shipyard cause extract --log FILE --job NAME --notice  # `::notice title=ci-caus
 shipyard cause extract --log FILE --format c2  # C2's raw records (the extractor EXP-A3 shares)
 shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/YYYY-MM.jsonl;
                                              #   ids already archived are skipped, nothing is rewritten
+shipyard cause record --repo OWNER/REPO --workflow FILE --dir DIR [--since TIME] [--base main]
+                                             # read-only observer: a cause row per new red job (DIR/causes/YYYY-MM.jsonl)
+                                             #   and a fix-link once its PR or branch goes green (DIR/fixlinks.jsonl)
 
 # ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard)
 shipyard guards status                       # missing/stale/current vs this build's copies; exit 1 unless all current

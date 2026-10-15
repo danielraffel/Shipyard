@@ -140,6 +140,7 @@ impl CiCause {
 #[must_use]
 pub fn v1(format: &str) -> (&'static str, &'static str) {
     match format {
+        "generated_drift" => ("generated-drift", "drift"),
         "ctest_summary" | "ctest_inline" => ("ctest", "test"),
         "pulp_affected" => ("pulp-affected", "test"),
         "unittest" => ("unittest", "test"),
@@ -269,7 +270,9 @@ pub fn to_ci_cause_v1(
             log_line: record.line,
             excerpt,
         },
-        fix_hint: None,
+        // A drift check prints the command that rewrites its file.
+        fix_hint: (record.format == "generated_drift" && !record.message.is_empty())
+            .then(|| record.message.clone()),
         confidence: confidence(record).to_owned(),
         source: SOURCE_EXTRACTOR.to_owned(),
         extractor: EXTRACTOR.to_owned(),
@@ -426,6 +429,25 @@ pub fn build(
         // A red job whose log holds no line C2 recognizes still gets a
         // record, so the miss is counted rather than lost.
         (None, None) => Some(unrecognized(&place, named_at_copy, retrospective)),
+    }
+}
+
+/// When the job printed a record of its own that names `cause` (bound to this
+/// job and confirmed by the extractor), `named_at` becomes the API's time for
+/// the step that printed it and the cause is no longer retrospective. The
+/// record's content and its own time are never trusted: pull-request code can
+/// print one.
+pub fn adopt_printed_time(cause: &mut CiCause, log: Option<&str>, job: &Job, repo: &str) {
+    if let Some(at) = log
+        .map(records_with_times)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .filter(|(recorded, _)| corroborates(recorded, cause, job, repo))
+        .find_map(|(_, at)| printed_at(job, at.as_deref()))
+    {
+        cause.named_at = Some(at);
+        cause.retrospective = false;
     }
 }
 
