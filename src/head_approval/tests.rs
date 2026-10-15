@@ -91,6 +91,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         any_reviewer_but_author: false,
         human_reviewer_logins: Vec::new(),
         signers: None,
+        rebase_carry: false,
     }
 }
 
@@ -600,6 +601,7 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             any_reviewer_but_author: false,
             human_reviewer_logins: Vec::new(),
             signers: None,
+            rebase_carry: false,
         }
     );
     let empty: toml::Table = "[project]\nname = \"x\"\n".parse().expect("toml");
@@ -1188,6 +1190,8 @@ struct History {
     dir: tempfile::TempDir,
     approved: String,
     blobs_unreadable: bool,
+    /// The base requires `macos`, and it concluded `skipped` on every head.
+    skipped_required: bool,
 }
 
 impl History {
@@ -1203,10 +1207,14 @@ impl History {
             dir,
             approved: String::new(),
             blobs_unreadable: false,
+            skipped_required: false,
         };
         history.git(&["init", "-q", "-b", "main"]);
         history.git(&["config", "user.email", "r@r"]);
         history.git(&["config", "user.name", "r"]);
+        // Windows runners set core.autocrlf: a checkout would turn the LF
+        // lines these tests edit by text into CRLF.
+        history.git(&["config", "core.autocrlf", "false"]);
         let lines: String = (1..=60)
             .map(|n| ["line ", &n.to_string(), "\n"].concat())
             .collect();
@@ -1276,6 +1284,54 @@ impl History {
         self.git(&["rev-parse", "HEAD"])
     }
 
+    /// Rebase the approved head onto the base after `on_base` changes the
+    /// base (and commits, when it changed anything), then let `on_pr` change
+    /// the rebased head (amended into it).
+    fn rebase(&self, on_base: impl FnOnce(&Self), on_pr: impl FnOnce(&Self)) -> String {
+        self.git(&["checkout", "-q", "main"]);
+        on_base(self);
+        if !self.git(&["status", "--porcelain"]).is_empty() {
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-qm", "base edit"]);
+        }
+        self.git(&["checkout", "-q", "-B", "head", &self.approved]);
+        self.git(&["rebase", "-q", "main"]);
+        on_pr(self);
+        if !self.git(&["status", "--porcelain"]).is_empty() {
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-q", "--amend", "--no-edit"]);
+        }
+        self.git(&["rev-parse", "HEAD"])
+    }
+
+    /// The gate on `head`, with the rebase carry on for this evaluation when
+    /// `rebase_carry`.
+    fn gate_with(&self, head: &str, rebase_carry: bool) -> HeadGate {
+        let mut policy = by_default("danielraffel/tartci");
+        policy.rebase_carry = rebase_carry;
+        super::evaluate_with_policy_for_author(
+            &|args: &[String]| self.gh(args),
+            "danielraffel/tartci",
+            7,
+            head,
+            &policy,
+            &empty_queue(head),
+            None,
+        )
+        .expect("readable")
+    }
+
+    fn rebase_refusal(&self, head: &str) -> String {
+        super::rebase_carry(
+            &|args: &[String]| self.gh(args),
+            "danielraffel/tartci",
+            7,
+            &self.approved,
+            head,
+        )
+        .expect_err("refused")
+    }
+
     /// GitHub's answer to a tree query: each `dN:object(expression:"<sha>:<dir>")`
     /// alias's entries, from `git ls-tree`.
     fn trees(&self, query: &str) -> String {
@@ -1314,6 +1370,38 @@ impl History {
     }
 
     /// GitHub's answer to the carry's reads of this repository.
+    /// The rebase carry's reads: rulesets, classic protection, check runs,
+    /// and a comparison as a diff.
+    fn rebase_reads(&self, joined: &str, args: &[String]) -> Option<Result<String, String>> {
+        if joined.contains("/rules/branches/") {
+            return Some(Ok(if self.skipped_required {
+                r#"[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"macos"}]}}]"#
+            } else {
+                "[]"
+            }
+            .to_owned()));
+        }
+        if joined.contains("/protection/required_status_checks") {
+            return Some(Err("gh: Not Found (HTTP 404)".to_owned()));
+        }
+        if joined.contains("/check-runs") {
+            return Some(Ok(r#"{"total_count":1,"check_runs":[{"id":1,"name":"macos","status":"completed","conclusion":"skipped","output":{"annotations_count":0}}]}"#.to_owned()));
+        }
+        if joined.contains("application/vnd.github.diff") {
+            let range = args
+                .iter()
+                .find_map(|arg| {
+                    arg.split_once("/compare/")
+                        .map(|(_, range)| range.to_owned())
+                })
+                .expect("a compare range");
+            let (x, y) = range.split_once("...").expect("a three-dot range");
+            let base = self.git(&["merge-base", x, y]);
+            return Some(Ok(self.git(&["diff", &base, y]) + "\n"));
+        }
+        None
+    }
+
     fn gh(&self, args: &[String]) -> Result<String, String> {
         let joined = args.join(" ");
         if joined.contains(":object(expression:") {
@@ -1343,6 +1431,9 @@ impl History {
             .find_map(|arg| arg.split_once("/git/blobs/").map(|(_, sha)| sha.to_owned()))
         {
             return self.blob(&sha);
+        }
+        if let Some(answer) = self.rebase_reads(&joined, args) {
+            return answer;
         }
         let range = args
             .iter()
@@ -1480,6 +1571,120 @@ impl History {
         )
         .expect_err("refused")
     }
+}
+
+// ---------------------------------------------------------------------------
+// The rebase carry (the twin of the Python guard's rebase_carry).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_rebase_that_keeps_every_file_carries_only_when_the_rebase_carry_is_on() {
+    let history = History::new(false);
+    let head = history.rebase(|history| history.write("more.txt", b"more base\n"), |_| {});
+    assert_ne!(head, history.approved);
+    match history.gate_with(&head, true) {
+        HeadGate::Approved {
+            approval: Approval::Carried {
+                from_head, rebase, ..
+            },
+        } => {
+            assert_eq!(from_head, history.approved);
+            assert!(rebase, "carried across the rebase, not by merges");
+        }
+        gate => panic!("expected a rebase carry, got {gate:?}"),
+    }
+    // Off (the default, and every host without the switch): a rebase is not
+    // a merge-only update, so it needs a new verdict.
+    assert!(matches!(
+        history.gate_with(&head, false),
+        HeadGate::NotApproved { .. }
+    ));
+    let carried = HeadGate::Approved {
+        approval: Approval::Carried {
+            from_head: history.approved.clone(),
+            approval: Box::new(Approval::Review {
+                login: "x".to_owned(),
+                performed_via_github_app_id: None,
+            }),
+            rebase: true,
+        },
+    };
+    assert!(carried.explain().contains("across a rebase"));
+}
+
+#[test]
+fn a_rebase_that_changes_the_prs_file_needs_a_new_verdict() {
+    let history = History::new(false);
+    let head = history.rebase(
+        |_| {},
+        |history| {
+            let before = history.read("guard.c");
+            let text = before.replace(
+                "  if (!authorized) return;",
+                "  if (!authorized) { return; }",
+            );
+            assert_ne!(text, before, "the edit must change guard.c");
+            history.write("guard.c", text.as_bytes());
+        },
+    );
+    assert!(matches!(
+        history.gate_with(&head, true),
+        HeadGate::NotApproved { .. }
+    ));
+    let why = history.rebase_refusal(&head);
+    assert!(why.contains("patch-id changed"), "{why}");
+    assert!(why.contains("guard.c at"), "{why}");
+}
+
+#[test]
+fn a_rebase_over_a_base_that_touched_the_prs_file_needs_a_new_verdict() {
+    let history = History::new(false);
+    // The base edits a line far from the pull request's: the rebase applies
+    // cleanly and the patch keeps its id, but the file is no longer the one
+    // approved.
+    let head = history.rebase(
+        |history| {
+            let before = history.read("guard.c");
+            let text = before.replace("line 50\n", "line fifty\n");
+            assert_ne!(text, before, "the base edit must change guard.c");
+            history.write("guard.c", text.as_bytes());
+        },
+        |_| {},
+    );
+    let why = history.rebase_refusal(&head);
+    assert!(
+        why.contains("guard.c was changed, renamed or deleted by the base"),
+        "{why}"
+    );
+    assert!(
+        !why.contains("patch-id"),
+        "the patch itself is unchanged: {why}"
+    );
+}
+
+#[test]
+fn a_rebase_whose_required_check_was_skipped_needs_a_new_verdict() {
+    let mut history = History::new(false);
+    let head = history.rebase(|history| history.write("more.txt", b"more\n"), |_| {});
+    history.skipped_required = true;
+    let why = history.rebase_refusal(&head);
+    assert!(
+        why.contains("required check `macos`") && why.contains("concluded `skipped`"),
+        "{why}"
+    );
+}
+
+#[test]
+fn patch_id_is_none_for_an_empty_diff_and_stable_across_line_numbers() {
+    assert_eq!(super::patch_id("").expect("git runs"), None);
+    let at = |line: u32| {
+        format!(
+            "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -{line},2 +{line},3 @@\n a\n+b\n c\n"
+        )
+    };
+    let first = super::patch_id(&at(3)).expect("git runs");
+    assert!(first.is_some());
+    assert_eq!(first, super::patch_id(&at(40)).expect("git runs"));
 }
 
 #[test]

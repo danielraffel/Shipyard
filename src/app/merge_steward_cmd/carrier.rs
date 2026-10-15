@@ -591,7 +591,12 @@ fn approval_evidence(approval: &crate::head_approval::Approval) -> String {
         crate::head_approval::Approval::Carried {
             from_head,
             approval,
-        } => format!("carried:{} from={from_head}", approval_evidence(approval)),
+            rebase,
+        } => format!(
+            "carried:{} from={from_head}{}",
+            approval_evidence(approval),
+            if *rebase { " via=rebase" } else { "" }
+        ),
     }
 }
 

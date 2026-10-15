@@ -3635,13 +3635,15 @@ and no binary changed (binary by the blob's NUL bytes, not by GitHub omitting
 a large text file's patch; the guard reads just the first 8000 bytes in a
 public repository and the whole blob in a private one, #831); with the host switch off, the guard reads nothing for
 this rule, while Shipyard's own paths still honour a repository's explicit
-`arm_requires_head_approval = true`. A rebase carries only in
-`queue-arm-guard`, only on a host with a `rebase-carry` guards file (or
+`arm_requires_head_approval = true`. A rebase carries in `queue-arm-guard`
+and in Shipyard's own arm paths (`head_approval::rebase_carry`, the Rust
+twin), only on a host with a `rebase-carry` guards file (or
 `SHIPYARD_REBASE_CARRY=1`), and only when the diff's `git patch-id --stable`,
 the file set, a base that touched (changed, renamed or deleted) none of the
 PR's files with every file keeping its approved blob and mode, and the
 absence of a skipped, neutral or receipt-reused required check all agree;
-each carry is a line in `carries.jsonl`. Shipyard's own arm paths never carry a rebase.
+each carry is a line in `carries.jsonl` (Shipyard's own carries say
+`"by": "shipyard"`).
 `queue-arm-guard` refuses an unreviewed arm or direct merge through
 `ghapp` the same way, requires the request to bind the approved head
 (`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts an

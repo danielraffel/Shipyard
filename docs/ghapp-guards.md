@@ -255,6 +255,9 @@ Every carry appends one JSON line (repository, pull request, both heads, both
 merge bases, the patch-id, the file count, argv) to `carries.jsonl` in the
 guards directory and prints a line saying so. A HOLD naming the new head still
 refuses. Roll it out one host at a time; roll back by removing the file.
+Shipyard's own arm paths read the same switch and apply the same four
+conditions (`head_approval::rebase_carry`, the Rust twin); their carries are
+logged to the same file with `"by": "shipyard"`.
 
 The refusal names the head, the exact marker it needs, and the latest verdict
 when it approves a different head. Each refusal is followed by one

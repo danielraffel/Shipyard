@@ -228,6 +228,13 @@ renames `a.py` to `b.py`) is not a false refusal: the base edited the rename's
 source, and a merge that keeps the approved `b.py` drops that edit. Re-review
 the merged head.
 
+A rebased head carries its approval only on a host with the rebase carry on
+(`SHIPYARD_REBASE_CARRY=1` or a `rebase-carry` guards file), and now in
+Shipyard's own arm and steward paths as well as `queue-arm-guard`: the steward
+evidence says `via=rebase` and the carry is a line in `carries.jsonl`. A
+rebase that changed any PR file, or crossed a base edit to one, still needs a
+fresh verdict.
+
 "changes a binary file" means the file's blob has a NUL byte, git's rule; a
 large one-line text file GitHub shows no patch for (tartci's JSON fixtures) is
 text and does not trip it. "cannot tell whether blob ... is binary" is an
