@@ -21,8 +21,12 @@ use fs2::FileExt;
 use serde::Serialize;
 use serde_json::Value;
 
+mod record;
+
 use super::CliFailure;
-use super::cli::{CauseArchiveArgs, CauseCommand, CauseExtractArgs};
+use super::cli::{CauseArchiveArgs, CauseCommand, CauseExtractArgs, CauseRecordArgs};
+use crate::cloud::GitHubActions;
+use crate::config::LoadedConfig;
 use crate::diagnose::c2;
 use crate::diagnose::cause::{self, CiCause, Place};
 use crate::diagnose::{Job, Step};
@@ -52,6 +56,15 @@ pub(super) fn cause_command<W: Write>(
             )?;
             writeln!(stdout, "{text}").map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
+        CauseCommand::Record(args) => {
+            return Err(CliFailure::new(
+                2,
+                format!(
+                    "cause record for {} needs the configured GitHub reader",
+                    args.repo
+                ),
+            ));
+        }
         CauseCommand::Archive(args) => {
             let report = archive_inputs(&args)?;
             let written = if json {
@@ -69,6 +82,63 @@ pub(super) fn cause_command<W: Write>(
             };
             written.map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
+    }
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// `cause record`: one observer pass over the live GitHub reader.
+pub(super) fn record_command<W: Write>(
+    args: &CauseRecordArgs,
+    config: &LoadedConfig,
+    cwd: &Path,
+    json: bool,
+    stdout: &mut W,
+) -> Result<std::process::ExitCode, CliFailure> {
+    let actions = GitHubActions::from_loaded_config(cwd, config);
+    let gh = |gh_args: &[String]| {
+        actions
+            .run_gh_with_timeout(gh_args, std::time::Duration::from_mins(1))
+            .map_err(|error| error.to_string())
+    };
+    let now = Utc::now();
+    let query = record::RecordQuery {
+        repo: args.repo.clone(),
+        workflow: args.workflow.clone(),
+        dir: args.dir.clone(),
+        since: args.since.clone().unwrap_or_else(|| {
+            (now - chrono::Duration::days(3))
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        }),
+        base: args.base.clone(),
+        now: now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    };
+    let report = record::record(&gh, &query).map_err(|error| CliFailure::new(1, error))?;
+    let written = if json {
+        writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string(&report).unwrap_or_default()
+        )
+    } else {
+        writeln!(
+            stdout,
+            "record: {} run(s) listed, {} read; {} cause(s) written, {} already recorded, \
+             {} cancelled job(s) left to outages; {} fix-link(s) written, {} red(s) pending; \
+             {} unreadable",
+            report.runs_listed,
+            report.runs_read,
+            report.causes_written,
+            report.already_recorded,
+            report.cancelled_skipped,
+            report.fixlinks_written,
+            report.reds_pending,
+            report.unreadable.len()
+        )
+    };
+    written.map_err(|error| CliFailure::new(1, error.to_string()))?;
+    for reason in &report.unreadable {
+        eprintln!("cause record: {reason}");
     }
     Ok(std::process::ExitCode::SUCCESS)
 }

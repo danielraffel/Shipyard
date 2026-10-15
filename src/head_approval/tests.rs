@@ -90,6 +90,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         },
         any_reviewer_but_author: false,
         human_reviewer_logins: Vec::new(),
+        signers: None,
         rebase_carry: false,
     }
 }
@@ -599,6 +600,7 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             reviewer_logins: vec!["danielraffel".to_owned()],
             any_reviewer_but_author: false,
             human_reviewer_logins: Vec::new(),
+            signers: None,
             rebase_carry: false,
         }
     );
@@ -986,6 +988,121 @@ fn human_reviewers_is_read_from_the_base_config() {
             .is_empty(),
         "empty by default"
     );
+}
+
+/// A REST comment fixture as the gate's records read it.
+fn record_from(name: &str) -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/github/review_before_arm")
+        .join(name);
+    let rest: Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).expect("json");
+    json!({"id": rest["id"], "login": rest["user"]["login"], "type": rest["user"]["type"],
+           "association": rest["author_association"], "at": rest["created_at"],
+           "body": rest["body"]})
+}
+
+fn marker_head(record: &Value) -> String {
+    super::marker_verdict(record["body"].as_str().expect("body"))
+        .expect("a verdict")
+        .1
+}
+
+fn gate_on(policy: &ApprovalPolicy, head: &str, comments: &[Value]) -> HeadGate {
+    decide_for_author(
+        policy,
+        head,
+        &[],
+        comments,
+        &empty_queue(head),
+        false,
+        Some("shipyard-local[bot]"),
+    )
+}
+
+/// GitHub's GraphQL names the App `shipyard-local`, a login anyone can
+/// register as a user; only the App itself is a Bot.
+#[test]
+fn a_user_account_named_like_the_app_never_counts() {
+    let policy = by_default("Generous-Corp/pulp");
+    for login in ["shipyard-local", "shipyard-local[bot]"] {
+        for association in ["NONE", "OWNER"] {
+            let spoof = json!({"login": login, "type": "User", "association": association,
+                "at": "2026-10-12T01:00:00Z",
+                "body": format!("reviewer: pulp-review\nverdict: APPROVE head:{HEAD}")});
+            assert!(
+                !gate_on(&policy, HEAD, &[spoof]).allows(),
+                "{login} {association}"
+            );
+        }
+    }
+    let control = fleet(
+        "2026-10-12T01:00:00Z",
+        &format!("verdict: APPROVE head:{HEAD}"),
+    );
+    assert!(gate_on(&policy, HEAD, &[control]).allows());
+}
+
+/// pulp#10315: a bare APPROVE posted through ghapp from a session with no
+/// identity armed the pull request.
+#[test]
+fn pulp_10315s_bare_unattributed_approve_never_counts() {
+    let comment = record_from("pulp-10315-unattributed-approve.json");
+    let head = marker_head(&comment);
+    let policy = by_default("Generous-Corp/pulp");
+    assert!(!gate_on(&policy, &head, std::slice::from_ref(&comment)).allows());
+    assert_eq!(
+        super::verdict_audit_events(&head, &[], &[comment], &policy, None),
+        vec!["excluded_app_approval:its session stamp is unattributed".to_owned()]
+    );
+}
+
+/// pulp#10320: an App APPROVE with no reviewer of record, on a head CI had
+/// failed. On a host with a signers file it needs an allowed signer.
+#[test]
+fn pulp_10320s_unsigned_approve_needs_an_allowed_signer() {
+    let comment = record_from("pulp-10320-unsigned-approve.json");
+    let head = marker_head(&comment);
+    let mut signed = by_default("Generous-Corp/pulp");
+    signed.signers = Some(vec!["pulp-review".to_owned(), "infra-review2".to_owned()]);
+    assert!(!gate_on(&signed, &head, std::slice::from_ref(&comment)).allows());
+    assert_eq!(
+        super::verdict_audit_events(&head, &[], std::slice::from_ref(&comment), &signed, None),
+        vec!["excluded_app_approval:it has no `reviewer: <name>` line".to_owned()],
+        "an unsigned APPROVE is refused for having no signer, not for its signer"
+    );
+    let body = comment["body"].as_str().expect("body");
+    let (prose, verdict) = body.trim_end().rsplit_once('\n').expect("two parts");
+    for (signer, counts) in [
+        ("pulp-review", true),
+        ("Infra-Review2", true),
+        ("codex-g2h", false),
+    ] {
+        let mut signed_comment = comment.clone();
+        signed_comment["body"] = json!(format!("{prose}\nreviewer: {signer}\n{verdict}"));
+        assert_eq!(
+            gate_on(&signed, &head, &[signed_comment]).allows(),
+            counts,
+            "{signer}"
+        );
+    }
+    // A host with no signers file does not apply the rule.
+    assert!(gate_on(&by_default("Generous-Corp/pulp"), &head, &[comment]).allows());
+}
+
+#[test]
+fn the_signers_file_names_a_list_per_repository() {
+    let data = json!({"default": ["pulp-review", "Infra-Review2"],
+                      "repos": {"danielraffel/tartci": ["tartci-review"]}});
+    assert_eq!(
+        super::signers_from(&data, "Generous-Corp/pulp"),
+        vec!["pulp-review", "infra-review2"]
+    );
+    assert_eq!(
+        super::signers_from(&data, "DanielRaffel/Tartci"),
+        vec!["tartci-review"]
+    );
+    assert!(super::signers_from(&json!({"default": "x"}), "o/r").is_empty());
 }
 
 #[test]

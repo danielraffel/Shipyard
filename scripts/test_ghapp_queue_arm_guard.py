@@ -2554,7 +2554,13 @@ class ArmsLedgerAndSelfApproval(unittest.TestCase):
     def test_an_unstamped_verdict_and_an_unattributed_arm_behave_as_before(self) -> None:
         self.assertEqual(self.merge("sess-A", None, agent="impl").returncode, 0)
         self.assertEqual(self.merge(None, "sess-A", approver_agent="impl").returncode, 0)
-        self.assertEqual(self.merge("sess-B", "unattributed").returncode, 0)
+
+    def test_an_approve_stamped_unattributed_never_counts(self) -> None:
+        # pulp#10315: a bare APPROVE posted through ghapp from a session with
+        # no identity, stamped Daniels-M5-Studio/unattributed, armed the PR.
+        result = self.merge("sess-B", "unattributed")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("its session stamp is unattributed", result.stderr)
 
     def test_every_judged_landing_is_in_the_ledger_with_its_session_and_agent(self) -> None:
         self.merge("sess-B", "sess-A", agent="lead", approver_agent="reviewer")
@@ -2967,12 +2973,14 @@ class ReviewIdentity(unittest.TestCase):
 
     def comment(self, login: str, body: str, at: str | None = "2026-10-12T01:00:00Z",
                 association: str = "COLLABORATOR") -> dict[str, Any]:
-        return {"user": {"login": login}, "created_at": at, "body": body,
+        kind = "Bot" if login.endswith("[bot]") else "User"
+        return {"user": {"login": login, "type": kind}, "created_at": at, "body": body,
                 "author_association": association}
 
     def policy(self, humans: tuple[str, ...] = ()) -> dict[str, Any]:
         policy = guard.review_policy(None, "danielraffel/tartci", True)
         policy["humans"] = list(humans)
+        policy["signers"] = None  # whatever this host's guards directory holds
         return policy
 
     def test_a_distinguishable_author_cannot_approve_their_own_head(self) -> None:
@@ -3044,6 +3052,74 @@ class ReviewIdentity(unittest.TestCase):
         allowed, why = guard.review_verdict(self.HEAD, "shipyard-local[bot]", comments, [], self.policy())
         self.assertFalse(allowed, why)
         self.assertIn("has no readable time", why)
+
+    def test_a_user_account_named_like_the_app_never_counts(self) -> None:
+        # GitHub's GraphQL names the App `shipyard-local`, a login anyone can
+        # register as a user; only the App itself is a Bot.
+        for login in ("shipyard-local", "shipyard-local[bot]"):
+            for association in ("NONE", "OWNER"):
+                spoof = {"user": {"login": login, "type": "User"}, "author_association": association,
+                         "created_at": "2026-10-12T01:00:00Z",
+                         "body": f"reviewer: pulp-review\nverdict: APPROVE head:{self.HEAD}"}
+                self.assertFalse(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [spoof], [],
+                                                      self.policy())[0], (login, association))
+        review = {"user": {"login": "shipyard-local", "type": "User"}, "state": "APPROVED",
+                  "commit_id": self.HEAD, "submitted_at": "2026-10-12T01:00:00Z",
+                  "author_association": "OWNER", "body": ""}
+        self.assertFalse(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review],
+                                              self.policy())[0])
+        app = self.comment("shipyard-local[bot]", f"verdict: APPROVE head:{self.HEAD}",
+                           association="CONTRIBUTOR")
+        self.assertTrue(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [app], [],
+                                             self.policy())[0], "control: the App itself counts")
+
+    def incident(self, name: str) -> tuple[dict[str, Any], str]:
+        comment = review_fixture(name)
+        head = guard.marker_verdict(comment["body"])[1]
+        return comment, head
+
+    def test_pulp_10315s_bare_unattributed_approve_never_counts(self) -> None:
+        comment, head = self.incident("pulp-10315-unattributed-approve.json")
+        guard.EXCLUDED_APPROVALS.clear()
+        allowed, why = guard.review_verdict(head, "shipyard-local[bot]", [comment], [], self.policy())
+        self.assertFalse(allowed, why)
+        self.assertIn("shipyard-local[bot] (its session stamp is unattributed)",
+                      guard.EXCLUDED_APPROVALS)
+
+    def test_pulp_10320s_unsigned_approve_needs_an_allowed_signer(self) -> None:
+        comment, head = self.incident("pulp-10320-unsigned-approve.json")
+        signed = self.policy()
+        signed["signers"] = ["pulp-review", "infra-review2"]
+        guard.EXCLUDED_APPROVALS.clear()
+        self.assertFalse(guard.review_verdict(head, "shipyard-local[bot]", [comment], [], signed)[0])
+        self.assertIn("shipyard-local[bot] (it has no `reviewer: <name>` line)",
+                      guard.EXCLUDED_APPROVALS)
+        lines = comment["body"].rstrip("\n").split("\n")
+        for signer, counts in (("pulp-review", True), ("Infra-Review2", True),
+                               ("codex-g2h", False)):
+            body = "\n".join([*lines[:-1], f"reviewer: {signer}", lines[-1]])
+            self.assertEqual(guard.review_verdict(head, "shipyard-local[bot]",
+                                                  [dict(comment, body=body)], [], signed)[0],
+                             counts, signer)
+        # A host with no signers file does not apply the rule.
+        self.assertTrue(guard.review_verdict(head, "shipyard-local[bot]", [comment], [],
+                                             self.policy())[0])
+
+    def test_the_signers_file_is_read_per_repository_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch, \
+                mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": scratch}):
+            path = pathlib.Path(scratch) / guard.SIGNERS_FILE
+            self.assertIsNone(guard.reviewer_signers("Generous-Corp/pulp"), "no file: off")
+            path.write_text(json.dumps({"default": ["pulp-review", "Infra-Review2"],
+                                        "repos": {"danielraffel/tartci": ["tartci-review"]}}))
+            self.assertEqual(guard.reviewer_signers("Generous-Corp/pulp"),
+                             ["pulp-review", "infra-review2"])
+            self.assertEqual(guard.reviewer_signers("DanielRaffel/Tartci"), ["tartci-review"])
+            self.assertEqual(guard.review_policy(None, "Generous-Corp/pulp", True)["signers"],
+                             ["pulp-review", "infra-review2"])
+            path.write_text("{not json")
+            self.assertEqual(guard.reviewer_signers("Generous-Corp/pulp"), [],
+                             "an unreadable file admits nobody")
 
     def test_only_the_last_line_is_a_verdict(self) -> None:
         self.assertIsNone(guard.marker_verdict(f"verdict: APPROVE head:{self.HEAD}\nthen more"))

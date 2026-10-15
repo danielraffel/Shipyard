@@ -1,0 +1,47 @@
+[
+ {
+  "format": "generated_drift",
+  "kind": "generated_file_drift",
+  "subject": "script-test-inputs",
+  "message": "python3 tools/scripts/script_test_inputs.py --build-dir build-macos --write",
+  "location": "",
+  "line": 3,
+  "step_failed": true
+ },
+ {
+  "format": "generated_drift",
+  "kind": "generated_file_drift",
+  "subject": "consumption_census",
+  "message": "python3 tools/scripts/consumption_census.py --build-dir build-macos --write",
+  "location": "",
+  "line": 7,
+  "step_failed": true
+ },
+ {
+  "format": "ctest_summary",
+  "kind": "test_failure",
+  "subject": "script-test-inputs-drift",
+  "message": "Failed",
+  "location": "",
+  "line": 13,
+  "step_failed": true
+ },
+ {
+  "format": "ctest_inline",
+  "kind": "test_failure",
+  "subject": "script-test-inputs-drift",
+  "message": "Failed <dur>",
+  "location": "",
+  "line": 2,
+  "step_failed": true
+ },
+ {
+  "format": "shell_exit",
+  "kind": "exit_code",
+  "subject": "ctest --test-dir build-macos --output-on-failure",
+  "message": "exit code 8: Errors while running CTest",
+  "location": "",
+  "line": 15,
+  "step_failed": true
+ }
+]

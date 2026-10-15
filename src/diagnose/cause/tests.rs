@@ -187,6 +187,7 @@ fn a_green_job_has_no_cause() {
 #[test]
 fn the_mapping_covers_every_fixture_record() {
     let allowed = [
+        "generated-drift",
         "ctest",
         "pulp-affected",
         "catch2",
