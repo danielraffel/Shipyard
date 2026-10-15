@@ -88,6 +88,12 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 
+mod rebase;
+pub use rebase::{
+    CarryRecord, REBASE_CARRY_ENV, REBASE_CARRY_FILE, REBASE_CARRY_LOG, patch_id, rebase_carry,
+    rebase_carry_enabled,
+};
+
 /// Config table holding the settings this module reads.
 pub const CONFIG_TABLE: &str = "auto_merge";
 /// Key turning the check on.
@@ -307,19 +313,36 @@ pub fn host_review_default() -> bool {
     if std::env::var(HOST_ENABLE_ENV).as_deref() == Ok("1") {
         return true;
     }
-    let dir = std::env::var_os("SHIPYARD_GHAPP_GUARDS_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(".config/shipyard/guards"))
-        });
-    !dir.is_some_and(|dir| {
+    !guards_dir().is_some_and(|dir| {
         matches!(
             read_opt_out(&dir.join(HOST_OPT_OUT_FILE)),
             OptOut::Valid { .. }
         )
     })
+}
+
+/// The guards directory: `$SHIPYARD_GHAPP_GUARDS_DIR`, else
+/// `~/.config/shipyard/guards`.
+pub(crate) fn guards_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("SHIPYARD_GHAPP_GUARDS_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".config/shipyard/guards"))
+        })
+}
+
+/// Whether this evaluation may try the rebase carry: the host switch
+/// ([`rebase_carry_enabled`]). Tests read no host state.
+#[cfg(not(test))]
+fn host_rebase_carry() -> bool {
+    rebase_carry_enabled()
+}
+
+#[cfg(test)]
+const fn host_rebase_carry() -> bool {
+    false
 }
 
 /// Removals of one head after which it needs a fresh approval to re-arm.
@@ -344,6 +367,10 @@ pub struct ApprovalPolicy {
     /// ([`HUMAN_REVIEWERS_KEY`]), lower-cased. Empty by default.
     #[serde(default)]
     pub human_reviewer_logins: Vec<String>,
+    /// Try the rebase carry for this evaluation whatever the host switch
+    /// says (`shipyard review-verdict` sets it; a config never does).
+    #[serde(default)]
+    pub rebase_carry: bool,
 }
 
 impl ApprovalPolicy {
@@ -384,6 +411,7 @@ impl ApprovalPolicy {
                         .collect()
                 })
                 .unwrap_or_default(),
+            rebase_carry: false,
         }
     }
 
@@ -436,13 +464,16 @@ pub enum Approval {
         performed_via_github_app_id: Option<u64>,
     },
     /// An approval of an earlier head, carried to this one by merge-only
-    /// updates that left every file the pull request changes at its approved
-    /// blob and mode.
+    /// updates, or across a rebase ([`rebase_carry`]), that left every file
+    /// the pull request changes at its approved blob and mode.
     Carried {
         /// The head the approval names.
         from_head: String,
         /// The approval of that head.
         approval: Box<Approval>,
+        /// Carried across a rebase rather than by merge-only updates.
+        #[serde(default)]
+        rebase: bool,
     },
     /// A `reviewed:<sha>` comment from an allowlisted reviewer.
     Marker {
@@ -493,10 +524,16 @@ impl Approval {
             Self::Carried {
                 from_head,
                 approval,
+                rebase,
             } => format!(
-                "{} of {}, carried by merge-only updates with byte-identical own lines",
+                "{} of {}, carried {} with byte-identical own lines",
                 approval.describe(),
-                short(from_head)
+                short(from_head),
+                if *rebase {
+                    "across a rebase (same patch-id, the base touched none of its files)"
+                } else {
+                    "by merge-only updates"
+                }
             ),
         }
     }
@@ -1444,14 +1481,25 @@ fn with_carry(run_gh: RunGh<'_>, input: &CarryInput<'_>, gate: HeadGate) -> Head
     ) else {
         return gate;
     };
-    match merge_only_carry(run_gh, input.repo, input.pr, &from, input.head) {
-        Ok(()) => HeadGate::Approved {
-            approval: Approval::Carried {
-                from_head: from,
-                approval: Box::new(approval),
-            },
+    let rebase = match merge_only_carry(run_gh, input.repo, input.pr, &from, input.head) {
+        Ok(()) => false,
+        Err(_) if input.policy.rebase_carry || host_rebase_carry() => {
+            match rebase_carry(run_gh, input.repo, input.pr, &from, input.head) {
+                Ok(record) => {
+                    rebase::log_carry(input.repo, input.pr, &from, input.head, &record);
+                    true
+                }
+                Err(_) => return gate,
+            }
+        }
+        Err(_) => return gate,
+    };
+    HeadGate::Approved {
+        approval: Approval::Carried {
+            from_head: from,
+            approval: Box::new(approval),
+            rebase,
         },
-        Err(_) => gate,
     }
 }
 
