@@ -91,7 +91,10 @@ pub struct CiCause {
     pub detail: Option<String>,
     /// Where in the log.
     pub evidence: Evidence,
-    /// How to fix it, when known.
+    /// How to fix it, when known. A log is written by the code under test, so
+    /// a command is kept here only when it matches [`known_fix_command`]'s
+    /// allowlist; the line as logged stays in `detail`, which is never a
+    /// command.
     pub fix_hint: Option<String>,
     /// `high`, `medium` or `low`.
     pub confidence: String,
@@ -190,6 +193,25 @@ pub fn confidence(record: &Record) -> &'static str {
     }
 }
 
+static FIX_COMMAND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"^python3 tools/scripts/[A-Za-z0-9_]+\.py(?: --[a-z][a-z-]*(?: [A-Za-z0-9_./-]+)?)* --write$",
+    )
+    .expect("fix command pattern compiles")
+});
+
+/// A drift check's regenerate command, only in the one shape a repository
+/// generator prints: `python3 tools/scripts/<name>.py [--flag [value]]...
+/// --write`, with no shell metacharacters, quoting or substitution. A log
+/// line is text the pull request under test controls, so anything else
+/// (`bash -c '...' --write`, a pipe, a redirect) is not a hint.
+#[must_use]
+pub fn known_fix_command(message: &str) -> Option<String> {
+    FIX_COMMAND
+        .is_match(message.trim())
+        .then(|| message.trim().to_owned())
+}
+
 /// Where a job ran.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Place {
@@ -271,8 +293,9 @@ pub fn to_ci_cause_v1(
             excerpt,
         },
         // A drift check prints the command that rewrites its file.
-        fix_hint: (record.format == "generated_drift" && !record.message.is_empty())
-            .then(|| record.message.clone()),
+        fix_hint: (record.format == "generated_drift")
+            .then(|| known_fix_command(&record.message))
+            .flatten(),
         confidence: confidence(record).to_owned(),
         source: SOURCE_EXTRACTOR.to_owned(),
         extractor: EXTRACTOR.to_owned(),

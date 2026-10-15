@@ -132,7 +132,7 @@ impl FakeGh {
     }
 
     fn answer(&self, args: &[String]) -> Result<String, String> {
-        let path = args.get(1).cloned().unwrap_or_default();
+        let path = args.last().cloned().unwrap_or_default();
         self.calls.lock().expect("calls").push(path.clone());
         match path.as_str() {
             p if p == format!("repos/{PULP}/actions/jobs/{GATE_JOB}") => {

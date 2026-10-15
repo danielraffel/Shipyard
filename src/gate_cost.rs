@@ -53,6 +53,22 @@ pub use proxy::{GateProxies, PlacementSample, RunMeta, RunnerCensus};
 /// A [`GhReader`] that may be shared across the bounded read workers.
 pub type SyncGhReader<'a> = dyn Fn(&[String]) -> Result<String, String> + Sync + 'a;
 
+/// A job's log. Logs carry ANSI colour, and a `gh` that guards against
+/// terminal escape sequences refuses such a response unless asked, so the
+/// read asks; a `gh` too old to know the flag rejects it as unknown, and then
+/// the bare read is the one that works.
+pub fn fetch_job_log(gh: &SyncGhReader<'_>, repo: &str, job_id: u64) -> Result<String, String> {
+    let path = format!("repos/{repo}/actions/jobs/{job_id}/logs");
+    match gh(&[
+        "api".to_owned(),
+        "--allow-escape-sequences".to_owned(),
+        path.clone(),
+    ]) {
+        Err(error) if error.contains("unknown flag") => gh(&["api".to_owned(), path]),
+        result => result,
+    }
+}
+
 /// Report schema identifier.
 pub const SCHEMA: &str = "shipyard-gate-cost/v1";
 /// Event name GitHub gives merge-queue workflow runs.

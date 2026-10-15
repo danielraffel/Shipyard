@@ -830,3 +830,45 @@ fn a_gate_reported_under_an_unevaluated_name_is_counted_once_and_named() {
         gap.reason
     );
 }
+
+#[test]
+fn a_job_log_is_read_with_escape_sequences_allowed() {
+    // A current gh refuses a log's ANSI colour unless the read allows it.
+    let asked = std::sync::Mutex::new(Vec::new());
+    let gh = |args: &[String]| {
+        asked.lock().expect("lock").push(args.join(" "));
+        if args.iter().any(|arg| arg == "--allow-escape-sequences") {
+            Ok("\u{1b}[31mFAILED\u{1b}[0m".to_owned())
+        } else {
+            Err(
+                "the response contains terminal escape sequences; pass --allow-escape-sequences"
+                    .to_owned(),
+            )
+        }
+    };
+    assert_eq!(
+        fetch_job_log(&gh, "o/r", 7).expect("log"),
+        "\u{1b}[31mFAILED\u{1b}[0m"
+    );
+    assert_eq!(
+        asked.lock().expect("lock").as_slice(),
+        ["api --allow-escape-sequences repos/o/r/actions/jobs/7/logs"]
+    );
+}
+
+#[test]
+fn a_gh_without_the_escape_flag_falls_back_to_the_bare_read() {
+    let gh = |args: &[String]| {
+        if args.iter().any(|arg| arg == "--allow-escape-sequences") {
+            Err("unknown flag: --allow-escape-sequences".to_owned())
+        } else {
+            Ok("log".to_owned())
+        }
+    };
+    assert_eq!(fetch_job_log(&gh, "o/r", 7).expect("log"), "log");
+    let gone = |_: &[String]| Err::<String, String>("gh: Not Found (HTTP 404)".to_owned());
+    assert_eq!(
+        fetch_job_log(&gone, "o/r", 7).expect_err("absent"),
+        "gh: Not Found (HTTP 404)"
+    );
+}

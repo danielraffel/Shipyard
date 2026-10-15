@@ -28,7 +28,7 @@ use serde_json::{Map, Value, json};
 use crate::diagnose::Job;
 use crate::diagnose::c2;
 use crate::diagnose::cause::{self, Place};
-use crate::gate_cost::SyncGhReader;
+use crate::gate_cost::{SyncGhReader, fetch_job_log};
 
 /// Who wrote a row.
 pub(super) const COLLECTOR: &str = "shipyard cause record";
@@ -113,6 +113,8 @@ static SCRUB: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
             r"(?i)(token|api[_-]?key|secret|password)(\s*[:=]\s*)[A-Za-z0-9_./+=-]{8,}",
             "$1$2<secret>",
         ),
+        (r"\b(?:gh[oprsu])_[A-Za-z0-9]{20,}\b", "<secret>"),
+        (r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "<secret>"),
         (r"(?i)tailscale", "<vpn>"),
         (
             r"(?i)\b[\w-]*(?:mac-?studio|macmini|macbook)[\w.-]*",
@@ -442,10 +444,10 @@ fn cause_row(
     job: &Job,
     owner: &Owner,
 ) -> Result<Option<Value>, String> {
-    let log = match gh(&[
-        "api".to_owned(),
-        format!("repos/{}/actions/jobs/{}/logs", query.repo, job.id),
-    ]) {
+    let log = match u64::try_from(job.id)
+        .map_err(|error| error.to_string())
+        .and_then(|id| fetch_job_log(gh, &query.repo, id))
+    {
         Ok(text) => Some(text),
         Err(error) if log_absent(&error) => None,
         Err(error) => return Err(format!("log of job {}: {error}", job.id)),
