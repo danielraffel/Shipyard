@@ -170,9 +170,20 @@ state dir (`~/Library/Application Support/shipyard/` on macOS), flock
 `.sandbox-writer-domain.lock` shared, release the turnstile, write, then
 release the shared lock; poll non-blocking for at most 30s and skip the write
 on timeout. Hold the shared lock only around the write itself. The one
-exception the audit does not count is the agent sessions' hand-back inbox
+exceptions the audit does not count are the agent sessions' hand-back inbox
 (`~/.local/state/shipyard/inbox/<session-uuid>.jsonl` and `.shown.jsonl`),
-which session hooks write without the lease; any other file needs it.
+which session hooks write without the lease, and a pure append of JSON lines
+(same inode, old bytes unchanged, no line naming the sandbox) to a production
+guard log: `holds.jsonl`, `overrides.jsonl`, `switches.jsonl` and
+`carries.jsonl` in the guards directory, and `queue-arms.jsonl` and
+`queue-removals.jsonl` in `~/.local/state/shipyard/`. Every row each of those
+writers appends names its `session` (and `agent` when set), in the Python
+guards and in Rust; a test ties each writer's resolved path to the list. Other agents' HOLDs and arms grow
+those on a shared host while the sandbox runs (#837). Every sandbox process
+runs with a per-run nonce (`sandbox-<uuid>`) as `SHIPYARD_AGENT_ID` and its
+session id, so a guard that leaked out of the sandbox's HOME writes rows
+carrying it, and such a row fails the audit. Any other file, or any other
+change to those, needs the lease.
 
 ## A healthy local funnel is not a reachable daemon
 
@@ -1428,7 +1439,7 @@ missing.
 After changing `mutation_machine` or upgrading the release bot, regenerate the
 post-tag workflow with `shipyard release-bot hook install`. Its tag extraction
 must remain literal Bash, `tag="${GITHUB_REF#refs/tags/}"`; the double-braced
-`${{GITHUB_REF#refs/tags/}}` form is not a valid GitHub expression. Because the
+{% raw %}`${{GITHUB_REF#refs/tags/}}`{% endraw %} form is not a valid GitHub expression. Because the
 workflow checks out the release tag in detached-HEAD state, branch pushes must
 first attach the deterministic local PR branch and then use Shipyard's
 supervised push with the fully qualified `HEAD:refs/heads/<branch>` refspec.

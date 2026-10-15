@@ -77,7 +77,7 @@ shipyard diagnose 123 --annotate plan|post   # check-run annotations on the fail
                                              #   output.text carries each failing required job's ci.cause/v1 record, one JSON per line
                                              # config: [diagnose] stale_base_markers / fail_closed_markers = ["regex", ...]
 
-# Name a failed job's cause (ci.cause/v1, a superset of C2's c2.cause.v0) and keep it
+# Name a failed job's cause (ci.cause/v1, a superset of C2's c2.cause.v0) and keep it; see docs/cause-records.md
 shipyard cause extract --log FILE            # the job's record as JSON; where it ran from --repo/--run-id/--attempt/--job/
                                              #   --head-sha/--event/--pr, else GITHUB_*; --job-json FILE reads the failing step
 shipyard cause extract --log FILE --job NAME --notice  # `::notice title=ci-cause::<record>`: run in an `if: failure()` step so the cause
@@ -85,19 +85,24 @@ shipyard cause extract --log FILE --job NAME --notice  # `::notice title=ci-caus
                                              #   (default GITHUB_JOB is its key). The scorecard uses the record only when
                                              #   bound to the job (repo/head/run/attempt/job) and naming the cause it reads,
                                              #   and dates it by the API time of the step that printed it
-shipyard cause extract --log FILE --format c2  # C2's raw records (the extractor EXP-A3 shares)
+shipyard cause extract --log FILE --format c2  # C2's raw records
 shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/YYYY-MM.jsonl;
                                              #   ids already archived are skipped, nothing is rewritten
 shipyard cause record --repo OWNER/REPO --workflow FILE --dir DIR [--since TIME] [--base main]
                                              # read-only observer: a cause row per new red job (DIR/causes/YYYY-MM.jsonl)
-                                             #   and a fix-link once its PR or branch goes green (DIR/fixlinks.jsonl)
+                                             #   and a fix-link once its PR or branch goes green (DIR/fixlinks.jsonl);
+                                             #   --since defaults to three days ago. fix_hint is an allowlisted suggestion, never run
 
-# ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard)
+# ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard, merge-guard,
+#   verdict-hold-hook, verdict-session-stamp); see docs/ghapp-guards.md
 shipyard guards status                       # missing/stale/current vs this build's copies, plus whether
                                              #   review-before-arm is on (default) or OFF by opt-out; exit 1 unless all current
 shipyard guards install [--dir DIR] [--dry-run]  # install this build's copies atomically
 shipyard guards install --opt-out-review-before-arm "<reason>"  # turn review-before-arm off here (the opt-out file), logged
 shipyard guards install --opt-in-review-before-arm               # remove the opt-out, logged
+# Other per-host switches are files in the guards directory, all off by default:
+#   reviewer-signers.json (an App APPROVE needs a `reviewer: <name>` signer),
+#   rebase-carry (an approval carries across a pure rebase), hold-disarms (a HOLD dequeues its head)
 shipyard who --pr 123 [--repo OWNER/REPO]    # which host/session (and agent, if set) armed, enqueued, merged or removed it; joins every
                                              #   host's queue-arms.jsonl + queue-removals.jsonl to the PR timeline
                                              #   (repo+PR+verb+head; time breaks ties); unexplained = unattributed
@@ -363,7 +368,7 @@ bounded. Each provenance read scans at most four explicit 100-status pages. A
 machine-global file lease permits one model invocation at a time.
 Shipyard accepts only the strict versioned JSON result
 documented in
-[the merge-steward reference](../skills/shipyard/references/merge-steward.md).
+[the merge-steward reference](https://github.com/danielraffel/Shipyard/blob/main/skills/shipyard/references/merge-steward.md).
 Phase 1 is escalation routing only: `bounded_repair`, `no_change`, evidence,
 candidate paths, and focused tests are rejected. Every accepted result
 explicitly escalates; category and confidence are routing metadata only.
@@ -617,7 +622,7 @@ for `metrics import github` rows is the ephemeral runner.
 
 `advise` keys lanes by resolved job name and host the same way, so a gate
 served by throwaway runners accumulates samples. A job GitHub reported with an
-unevaluated name (a job skipped by its `if:` keeps its `${{ }}` `name:`
+unevaluated name (a job skipped by its `if:` keeps its {% raw %}`${{ }}`{% endraw %} `name:`
 expression, for example `... && 'macos' || 'macos-pr-unused'`) files under the
 name it evaluates to when it runs. Only success and failure count: skipped,
 cancelled, and unfinished jobs say nothing about a lane's health. Signals:
@@ -657,7 +662,7 @@ filtered listing short with a `total_count` that agreed with the short list
 (11 `pull_request` runs where 624 existed), which a page-count check cannot
 see. Runs the walk finds are counted and the disagreement is a `run_listing`
 gap. And when a run has no job named exactly `--gate-job`, one job per run
-attempt whose reported name is an unevaluated expression or `${{ matrix.* }}`
+attempt whose reported name is an unevaluated expression or {% raw %}`${{ matrix.* }}`{% endraw %}
 placeholder resolving to it stands for the gate (the one that got a runner,
 else the first that was not skipped). GitHub leaves every `name:` unevaluated
 in a run cancelled before its jobs started, so such a run counts one unstarted

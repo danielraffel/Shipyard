@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,32 @@ PROTECTED_PATHS: tuple[Path, ...] = (
 SESSION_INBOX_DIR = Path.home() / ".local" / "state" / "shipyard" / "inbox"
 SESSION_INBOX_FILE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\.shown)?\.jsonl"
+)
+
+# The host's production guard logs. Every guard appends one JSON line per
+# decision it makes for any agent on the host (a HOLD, an arm, an override, a
+# removal, a carry, a switch change), without the writer-domain lease, so on a
+# shared gate host they grow while a sandbox runs. The sandbox's own guards
+# write under its own HOME. A change to one of these exact files is
+# attributed to a concurrent writer only when it is a pure append of
+# well-formed JSON lines that do not name the sandbox; a truncation, a
+# rewrite, a replaced or new file, or a line naming the sandbox still counts.
+# A guard that leaked out of the sandbox's HOME would write an ordinary row
+# with no path in it, so every sandbox process also runs with a per-run nonce
+# as its agent and session identity (SANDBOX_IDENTITY_ENVS): the guards record
+# it in every row, and a row carrying it is the sandbox's own.
+CONCURRENT_GUARD_LOGS: frozenset[Path] = frozenset({
+    Path.home() / ".config" / "shipyard" / "guards" / name
+    for name in ("holds.jsonl", "overrides.jsonl", "switches.jsonl", "carries.jsonl")
+} | {
+    Path.home() / ".local" / "state" / "shipyard" / name
+    for name in ("queue-arms.jsonl", "queue-removals.jsonl")
+})
+
+SANDBOX_IDENTITY_ENVS: tuple[str, ...] = (
+    "SHIPYARD_AGENT_ID",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_COMPANION_SESSION_ID",
 )
 
 DESTRUCTIVE_TOP_LEVEL: frozenset[str] = frozenset({
@@ -126,7 +153,8 @@ class ContaminationReport:
         lines = ["sandbox wrote outside its isolated HOME/PATH:"]
         lines.extend(f"  {path}" for path in self.offenders)
         if self.concurrent_sessions:
-            lines.append("not counted (agent sessions' inboxes, written outside the sandbox):")
+            lines.append("not counted (agent sessions' inboxes and production guard-log "
+                         "appends, written outside the sandbox):")
             lines.extend(f"  {path}" for path in self.concurrent_sessions)
         lines.append(f"sentinel_mtime={self.sentinel_mtime}")
         return "\n".join(lines)
@@ -375,18 +403,66 @@ def is_concurrent_session_write(path: Path, inbox_dir: Path = SESSION_INBOX_DIR)
     )
 
 
+def is_concurrent_guard_log_append(
+    path: Path,
+    before: PathFingerprint | None,
+    guard_logs: frozenset[Path] = CONCURRENT_GUARD_LOGS,
+    sandbox_root: Path | None = None,
+    nonce: str | None = None,
+) -> bool:
+    """A production guard's append to its log (see CONCURRENT_GUARD_LOGS)."""
+    if path not in guard_logs or before is None or before.digest is None:
+        return False
+    try:
+        metadata = path.lstat()
+        data = path.read_bytes()
+    except OSError:
+        return False
+    if ((metadata.st_dev, metadata.st_ino) != (before.device, before.inode)
+            or len(data) <= before.size
+            or hashlib.sha256(data[:before.size]).hexdigest() != before.digest):
+        return False
+    try:
+        tail = data[before.size:].decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if not tail.endswith("\n") or (sandbox_root is not None and str(sandbox_root) in tail):
+        return False
+    if nonce and nonce in tail:
+        # The sandbox's own identity: a guard ran outside its HOME.
+        return False
+    for line in tail.splitlines():
+        if not line.strip():
+            continue
+        try:
+            if not isinstance(json.loads(line), dict):
+                return False
+        except ValueError:
+            return False
+    return True
+
+
 def contamination(
     protected: Sequence[Path],
     pre_existing: Mapping[Path, Mapping[Path, PathFingerprint]],
     sentinel_mtime: float,
     inbox_dir: Path = SESSION_INBOX_DIR,
+    guard_logs: frozenset[Path] = CONCURRENT_GUARD_LOGS,
+    sandbox_root: Path | None = None,
+    nonce: str | None = None,
 ) -> ContaminationReport:
     changed = sorted(
         path
         for root in protected
         for path in _find_newer(root, sentinel_mtime, pre_existing.get(root, {}))
     )
-    concurrent = tuple(path for path in changed if is_concurrent_session_write(path, inbox_dir))
+    before = {path: fingerprint for snapshot in pre_existing.values()
+              for path, fingerprint in snapshot.items()}
+    concurrent = tuple(
+        path for path in changed
+        if is_concurrent_session_write(path, inbox_dir)
+        or is_concurrent_guard_log_append(path, before.get(path), guard_logs, sandbox_root, nonce)
+    )
     offenders = tuple(path for path in changed if path not in concurrent)
     return ContaminationReport(offenders, sentinel_mtime, concurrent)
 
@@ -485,6 +561,8 @@ class Sandbox:
     def __init__(self, *, keep: bool = False) -> None:
         self.keep = keep
         self.root: Path | None = None
+        # This run's identity in every guard row its processes write.
+        self.nonce = f"sandbox-{uuid.uuid4()}"
         self._sentinel_mtime: float | None = None
         self._pre_existing: dict[Path, set[Path]] = {}
         self._writer_domain_lease: WriterDomainLease | None = None
@@ -608,7 +686,8 @@ class Sandbox:
     def assert_no_contamination(self) -> None:
         if self._sentinel_mtime is None:
             raise RuntimeError("sandbox not set up")
-        report = contamination(PROTECTED_PATHS, self._pre_existing, self._sentinel_mtime)
+        report = contamination(PROTECTED_PATHS, self._pre_existing, self._sentinel_mtime,
+                               sandbox_root=self.root, nonce=self.nonce)
         if report.clean and report.concurrent_sessions:
             print(
                 "sandbox isolation: clean; not counted (agent sessions' inboxes): "
@@ -628,6 +707,7 @@ class Sandbox:
             "XDG_STATE_HOME": str(self.home_dir / ".local" / "state"),
             "XDG_CACHE_HOME": str(self.home_dir / ".cache"),
             "RUST_BACKTRACE": "1",
+            **{name: self.nonce for name in SANDBOX_IDENTITY_ENVS},
         }
         if extra_env:
             env.update(extra_env)

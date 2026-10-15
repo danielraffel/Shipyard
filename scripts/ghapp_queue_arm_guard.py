@@ -185,6 +185,8 @@ _SESSION_STAMP = re.compile(
 REBASE_CARRY_ENV = "SHIPYARD_REBASE_CARRY"
 REBASE_CARRY_FILE = "rebase-carry"
 REBASE_CARRY_LOG = "carries.jsonl"
+# The guards directory's override audit log.
+OVERRIDES_LOG = "overrides.jsonl"
 # A required check that concluded one of these on the new head did not run in full.
 NOT_RUN_IN_FULL = ("skipped", "neutral")
 # The annotation a job prints when it decides whether a receipt is reused.
@@ -765,6 +767,13 @@ def stamped_agent(body: Any) -> str | None:
         return None
     found = _SESSION_STAMP.findall(body)
     return (found[-1][2] or None) if found else None
+
+
+def writer_identity() -> dict[str, str]:
+    """``session`` (and ``agent`` when set) for every row a guard writes, so a
+    row says which process wrote it."""
+    agent = agent_id()
+    return {"session": session_id(), **({"agent": agent} if agent else {})}
 
 
 def arms_log_path() -> pathlib.Path:
@@ -1559,7 +1568,7 @@ def rebase_carry(repo: str, base: str, approved: str, head: str) -> tuple[str | 
 def log_carry(record: dict[str, Any]) -> None:
     """Append one carry to the guards directory's carry log. Never raises."""
     entry = dict(record, at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                 kind="rebase", argv=sys.argv[1:])
+                 kind="rebase", argv=sys.argv[1:], **writer_identity())
     try:
         directory = _guards_dir()
         directory.mkdir(parents=True, exist_ok=True)
@@ -1805,10 +1814,11 @@ def audit_override(message: str) -> None:
         "refusal": message,
         "argv": sys.argv[1:],
         "cwd": os.getcwd(),
+        **writer_identity(),
     }
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        with (directory / "overrides.jsonl").open("a", encoding="utf-8") as handle:
+        with (directory / OVERRIDES_LOG).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
     except OSError:
         pass
