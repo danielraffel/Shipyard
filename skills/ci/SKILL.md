@@ -175,9 +175,9 @@ that written record counts; there,
 with no identity listed, an approval counts only from the fleet App or a
 human the base lists in `[auto_merge] human_reviewers`, empty by default; a
 HOLD from any OWNER/MEMBER/COLLABORATOR still counts; never the PR author's;
-an App APPROVE must be signed with a `reviewer: <name>` line from the host's
-`reviewer-signers.json`, where that file exists, and never counts when
-stamped `unattributed`)
+an App APPROVE must be signed with a `reviewer: <name>` line from the base's
+`[auto_merge] reviewer_signers`, else the host's `reviewer-signers.json`,
+where either exists, and never counts when stamped `unattributed`)
 arms or merges only a
 head that carries an
 approval of that exact head from an identity listed in
@@ -535,6 +535,12 @@ It outranks the ctest line that ran the check. Job logs are read through
 ANSI colour, and a current `gh` refuses them without it) and falls back to the
 bare read for a `gh` that does not know the flag. The recorder's scrub also
 replaces `ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_` and `github_pat_` tokens.
+
+GitHub Pages runs every tracked markdown file through Liquid, so a GitHub
+Actions expression quoted in one must sit inside a Liquid raw block (wrap the
+code span or the fenced block); outside one it renders as `$`, or fails the
+whole site build. `every_liquid_delimiter_in_tracked_markdown_is_inside_a_raw_block`
+enforces it.
 
 **"Who armed it?" is `shipyard who --pr N`, not a timeline read.** Every queue
 event shows the fleet App as its actor. `who` joins the arm guard's

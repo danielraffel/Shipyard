@@ -105,6 +105,9 @@ pub const REVIEWER_IDENTITIES_KEY: &str = "reviewer_identities";
 /// Human accounts whose approvals count when no reviewer is listed. Empty by
 /// default: then only the fleet App's verdicts approve.
 pub const HUMAN_REVIEWERS_KEY: &str = "human_reviewers";
+/// Who may sign the fleet App's APPROVE, set by the protected base; it takes
+/// precedence over a host's [`SIGNERS_FILE`].
+pub const SIGNERS_KEY: &str = "reviewer_signers";
 /// Tracked config file the setting is read from on the protected base.
 pub const CONFIG_PATH: &str = ".shipyard/config.toml";
 /// Repositories that require an approval of the exact head when their base
@@ -145,6 +148,18 @@ thread_local! {
     static HOST_DEFAULT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static AGENT_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AGENT_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static HOST_SIGNERS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `body` as if this host's signers file allowed `signers`, on this thread.
+#[cfg(test)]
+pub(crate) fn with_host_signers<T>(signers: &[&str], body: impl FnOnce() -> T) -> T {
+    HOST_SIGNERS.with(|cell| {
+        *cell.borrow_mut() = signers.iter().map(|name| (*name).to_owned()).collect();
+    });
+    let result = body();
+    HOST_SIGNERS.with(|cell| cell.borrow_mut().clear());
+    result
 }
 
 /// Run `body` with [`arming_agent`] pinned, on this thread.
@@ -370,12 +385,17 @@ pub const SIGNERS_FILE: &str = "reviewer-signers.json";
 /// that cannot be read admits nobody.
 #[must_use]
 pub fn reviewer_signers(repo: &str) -> Option<Vec<String>> {
-    let path = guards_dir()?.join(SIGNERS_FILE);
+    signers_at(&guards_dir()?.join(SIGNERS_FILE), repo)
+}
+
+/// [`reviewer_signers`] read from `path`: `None` when there is no file,
+/// nobody when it cannot be read or parsed.
+fn signers_at(path: &std::path::Path, repo: &str) -> Option<Vec<String>> {
     if !path.exists() {
         return None;
     }
     Some(
-        std::fs::read_to_string(&path)
+        std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .map_or_else(Vec::new, |data| signers_from(&data, repo)),
@@ -405,15 +425,41 @@ fn signers_from(data: &Value, repo: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// This host's [`reviewer_signers`] for `repo`. Tests read no host state.
+/// Whether a config's `[auto_merge] reviewer_signers`, when set, is a list of
+/// names. Anything else is an error, never a silent fall back to the host's
+/// signers file.
+///
+/// # Errors
+///
+/// When the key is set to something other than a list of strings.
+pub fn signers_shape(table: &toml::Table) -> Result<(), String> {
+    let Some(value) = table
+        .get(CONFIG_TABLE)
+        .and_then(toml::Value::as_table)
+        .and_then(|section| section.get(SIGNERS_KEY))
+    else {
+        return Ok(());
+    };
+    match value.as_array() {
+        Some(names) if names.iter().all(toml::Value::is_str) => Ok(()),
+        _ => Err(format!(
+            "[{CONFIG_TABLE}] {SIGNERS_KEY} must be a list of reviewer names, not {value}"
+        )),
+    }
+}
+
+/// This host's [`reviewer_signers`] for `repo`. Tests read `with_host_signers`.
 #[cfg(not(test))]
 fn host_signers(repo: &str) -> Option<Vec<String>> {
     reviewer_signers(repo)
 }
 
 #[cfg(test)]
-const fn host_signers(_repo: &str) -> Option<Vec<String>> {
-    None
+fn host_signers(_repo: &str) -> Option<Vec<String>> {
+    HOST_SIGNERS.with(|cell| {
+        let signers = cell.borrow();
+        (!signers.is_empty()).then(|| signers.clone())
+    })
 }
 
 /// Whether this evaluation may try the rebase carry: the host switch
@@ -498,7 +544,16 @@ impl ApprovalPolicy {
                         .collect()
                 })
                 .unwrap_or_default(),
-            signers: None,
+            signers: section
+                .get(SIGNERS_KEY)
+                .and_then(toml::Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_ascii_lowercase)
+                        .collect()
+                }),
             rebase_carry: false,
         }
     }
@@ -1291,7 +1346,7 @@ fn read_policy_inner(
             let host_default = host_review_default();
             if host_default && requires_review_by_default(repo) {
                 let mut policy = ApprovalPolicy::without_config(repo, host_default);
-                policy.signers = host_signers(repo);
+                policy.signers = policy.signers.or_else(|| host_signers(repo));
                 return Ok(policy);
             }
             if missing_is_error {
@@ -1306,8 +1361,9 @@ fn read_policy_inner(
     let table = raw
         .parse::<toml::Table>()
         .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
+    signers_shape(&table).map_err(|error| format!("{CONFIG_PATH} on {base}: {error}"))?;
     let mut policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_review_default());
-    policy.signers = host_signers(repo);
+    policy.signers = policy.signers.or_else(|| host_signers(repo));
     policy.validate().map(|()| policy)
 }
 

@@ -3,6 +3,18 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03320"></a>
+## [0.332.0] - 2026-10-15
+
+- feat/cause record coverage ([#848](https://github.com/danielraffel/Shipyard/pull/848))
+
+<a id="v03312"></a>
+## [0.331.2] - 2026-10-15
+
+- fix/followup signers status pages ([#845](https://github.com/danielraffel/Shipyard/pull/845))
+- ci/reviewer signers config ([#847](https://github.com/danielraffel/Shipyard/pull/847))
+- docs/readme revamp 20261015 ([#846](https://github.com/danielraffel/Shipyard/pull/846))
+
 <a id="v03311"></a>
 ## [0.331.1] - 2026-10-15
 
@@ -2387,6 +2399,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.332.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.332.0
+[0.331.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.331.2
 [0.331.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.331.1
 [0.331.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.331.0
 [0.330.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.330.0

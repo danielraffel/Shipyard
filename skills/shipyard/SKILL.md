@@ -3674,8 +3674,9 @@ approval only from the fleet App or a login the base lists in `[auto_merge]
 human_reviewers` (each ignored human approval is printed and recorded); the
 App counts only as a `Bot` (a user account named `shipyard-local` counts for
 nothing), an App APPROVE stamped `unattributed` never counts, and on a host
-with `reviewer-signers.json` it needs a `reviewer: <name>` line naming an
-allowed signer; its
+with `reviewer-signers.json` (or a base that sets `[auto_merge]
+reviewer_signers`, which wins and is what the server-side status applies) it
+needs a `reviewer: <name>` line naming an allowed signer; its
 override,
 `GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
 `docs/ghapp-guards.md`, Review before arm). A HOLD acts too: on a host with
