@@ -1100,6 +1100,9 @@ impl History {
         history.git(&["init", "-q", "-b", "main"]);
         history.git(&["config", "user.email", "r@r"]);
         history.git(&["config", "user.name", "r"]);
+        // Windows runners set core.autocrlf: a checkout would turn the LF
+        // lines these tests edit by text into CRLF.
+        history.git(&["config", "core.autocrlf", "false"]);
         let lines: String = (1..=60)
             .map(|n| ["line ", &n.to_string(), "\n"].concat())
             .collect();
@@ -1503,10 +1506,12 @@ fn a_rebase_that_changes_the_prs_file_needs_a_new_verdict() {
     let head = history.rebase(
         |_| {},
         |history| {
-            let text = history.read("guard.c").replace(
+            let before = history.read("guard.c");
+            let text = before.replace(
                 "  if (!authorized) return;",
                 "  if (!authorized) { return; }",
             );
+            assert_ne!(text, before, "the edit must change guard.c");
             history.write("guard.c", text.as_bytes());
         },
     );
@@ -1527,7 +1532,9 @@ fn a_rebase_over_a_base_that_touched_the_prs_file_needs_a_new_verdict() {
     // approved.
     let head = history.rebase(
         |history| {
-            let text = history.read("guard.c").replace("line 50\n", "line fifty\n");
+            let before = history.read("guard.c");
+            let text = before.replace("line 50\n", "line fifty\n");
+            assert_ne!(text, before, "the base edit must change guard.c");
             history.write("guard.c", text.as_bytes());
         },
         |_| {},
