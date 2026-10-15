@@ -37,10 +37,13 @@ const COMPARE_FILE_CAP: usize = 300;
 /// Most pages of runs one pass lists.
 const MAX_RUN_PAGES: usize = 10;
 
-pub(super) const OWN_FILES_RULE: &str = "own_files = files_raw (compare red_head...fix_head) minus the \
-    files changed on the base branch between merge-base(red_head, base) and merge-base(fix_head, base); \
-    rerun_same_head: []; branch_is_default and merge_base_unavailable: null; own_files_truncated when \
-    either compare reached 300 files";
+pub(super) const OWN_FILES_RULE: &str = "own_files = the union of the files of the non-merge \
+    commits on fix_head's first-parent chain back to red_head (commits and parents from compare \
+    red_head...fix_head; files from commits/<sha>); merges of the base branch sit on that chain as \
+    merge commits and are skipped. rerun_same_head: []; null when red_head is not an ancestor of \
+    fix_head (red_not_ancestor), the range exceeds the 250 commits compare lists (too_many_commits), \
+    the chain leaves the listed commits (chain_broken), or the fix is on the default branch \
+    (branch_is_default); own_files_truncated when a commit lists 300 or more files";
 const FIXLINK_RULE: &str = "earliest successful run of the same workflow on the red's pull request \
     branch (or branch) created after the red attempt's last failed job completed; a later attempt of \
     the red run itself is rerun_green with pushed_at = its run_started_at; files_raw = compare red \
@@ -530,40 +533,8 @@ fn pending_reds(dir: &Path, since: &str, linked: &BTreeSet<(String, u64, u64)>) 
     reds.into_values().collect()
 }
 
-fn merge_base(
-    gh: &SyncGhReader<'_>,
-    query: &RecordQuery,
-    sha: &str,
-    cache: &mut BTreeMap<String, Option<String>>,
-) -> Option<String> {
-    cache
-        .entry(sha.to_owned())
-        .or_insert_with(|| {
-            api(
-                gh,
-                &format!(
-                    "repos/{}/compare/{}...{sha}?per_page=1",
-                    query.repo, query.base
-                ),
-            )
-            .ok()
-            .and_then(|compare| {
-                compare["merge_base_commit"]["sha"]
-                    .as_str()
-                    .map(str::to_owned)
-            })
-        })
-        .clone()
-}
-
-fn compare_files(
-    gh: &SyncGhReader<'_>,
-    query: &RecordQuery,
-    from: &str,
-    to: &str,
-) -> Result<Vec<String>, String> {
-    let compare = api(gh, &format!("repos/{}/compare/{from}...{to}", query.repo))?;
-    let mut files: Vec<String> = compare["files"]
+fn file_names(value: &Value) -> Vec<String> {
+    let mut files: Vec<String> = value["files"]
         .as_array()
         .map(|files| {
             files
@@ -573,7 +544,64 @@ fn compare_files(
         })
         .unwrap_or_default();
     files.sort();
-    Ok(files)
+    files
+}
+
+/// `own_files`, its method, and whether a commit's file list was cut short.
+type OwnFiles = (Option<Vec<String>>, &'static str, Option<bool>);
+
+/// The pull request's own files between `compare`'s two ends: the non-merge
+/// commits on the newer end's first-parent chain back to the older end. A
+/// merge of the base branch is a merge commit on that chain and is skipped,
+/// so what the base branch changed never counts. Today's base branch is never
+/// consulted: once the pull request has merged, both ends are its ancestors.
+fn own_by_first_parent(
+    gh: &SyncGhReader<'_>,
+    query: &RecordQuery,
+    compare: &Value,
+    red: &str,
+    fix: &str,
+) -> Result<OwnFiles, String> {
+    if !matches!(compare["status"].as_str(), Some("ahead" | "identical")) {
+        return Ok((None, "red_not_ancestor", None));
+    }
+    let commits = compare["commits"].as_array().cloned().unwrap_or_default();
+    if compare["total_commits"].as_u64().unwrap_or_default() > commits.len() as u64 {
+        return Ok((None, "too_many_commits", None));
+    }
+    let by_sha: BTreeMap<&str, &Value> = commits
+        .iter()
+        .filter_map(|commit| Some((commit["sha"].as_str()?, commit)))
+        .collect();
+    let mut chain = Vec::new();
+    let mut current = fix;
+    while current != red {
+        let Some(commit) = by_sha.get(current) else {
+            return Ok((None, "chain_broken", None));
+        };
+        let Some(parent) = commit["parents"][0]["sha"].as_str() else {
+            return Ok((None, "chain_broken", None));
+        };
+        chain.push(*commit);
+        current = parent;
+    }
+    let mut own = BTreeSet::new();
+    let mut truncated = false;
+    for commit in chain {
+        if commit["parents"].as_array().map_or(0, Vec::len) != 1 {
+            continue; // a merge, of the base branch or another branch
+        }
+        let sha = commit["sha"].as_str().unwrap_or_default();
+        let detail = api(gh, &format!("repos/{}/commits/{sha}", query.repo))?;
+        let names = file_names(&detail);
+        truncated |= names.len() >= COMPARE_FILE_CAP;
+        own.extend(names);
+    }
+    Ok((
+        Some(own.into_iter().collect()),
+        "first_parent_non_merge_commits",
+        Some(truncated),
+    ))
 }
 
 /// A green run that ends a red: a later push, or a rerun of the red head.
@@ -591,7 +619,6 @@ struct FileSets {
     own: Option<Vec<String>>,
     method: &'static str,
     own_truncated: Option<bool>,
-    main_count: Option<usize>,
 }
 
 /// The branch a red is fixed on: a merge-group red's pull request branch,
@@ -661,15 +688,14 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
 }
 
 /// The files a fix changed. A rerun changed none; on the base branch the
-/// pull request's own share is undefined; elsewhere it is the raw compare
-/// minus what the base branch changed between the two merge bases.
+/// pull request's own share is undefined; elsewhere it is the first-parent
+/// walk from the fix back to the red.
 fn file_sets(
     gh: &SyncGhReader<'_>,
     query: &RecordQuery,
     red: &Red,
     fix: &Fix,
     branch: &str,
-    bases: &mut BTreeMap<String, Option<String>>,
 ) -> Result<FileSets, String> {
     if fix.derivation == "rerun_green" {
         return Ok(FileSets {
@@ -678,47 +704,30 @@ fn file_sets(
             own: Some(Vec::new()),
             method: "rerun_same_head",
             own_truncated: Some(false),
-            main_count: None,
         });
     }
-    let raw = compare_files(gh, query, &red.head_sha, &fix.head_sha)
-        .map_err(|error| format!("compare for run {}: {error}", red.run_id))?;
+    let compare = api(
+        gh,
+        &format!(
+            "repos/{}/compare/{}...{}",
+            query.repo, red.head_sha, fix.head_sha
+        ),
+    )
+    .map_err(|error| format!("compare for run {}: {error}", red.run_id))?;
+    let raw = file_names(&compare);
     let raw_truncated = raw.len() >= COMPARE_FILE_CAP;
-    let unset = |raw, method| FileSets {
-        raw,
-        raw_truncated,
-        own: None,
-        method,
-        own_truncated: None,
-        main_count: None,
-    };
-    if branch == query.base {
-        return Ok(unset(raw, "branch_is_default"));
-    }
-    let (Some(a), Some(b)) = (
-        merge_base(gh, query, &red.head_sha, bases),
-        merge_base(gh, query, &fix.head_sha, bases),
-    ) else {
-        return Ok(unset(raw, "merge_base_unavailable"));
-    };
-    let main_files = if a == b {
-        Vec::new()
+    let (own, method, own_truncated) = if branch == query.base {
+        (None, "branch_is_default", None)
     } else {
-        compare_files(gh, query, &a, &b).unwrap_or_default()
+        own_by_first_parent(gh, query, &compare, &red.head_sha, &fix.head_sha)
+            .map_err(|error| format!("own files for run {}: {error}", red.run_id))?
     };
-    let main: BTreeSet<&String> = main_files.iter().collect();
-    let own = raw
-        .iter()
-        .filter(|file| !main.contains(file))
-        .cloned()
-        .collect();
     Ok(FileSets {
-        own: Some(own),
-        method: "raw_minus_main_between_merge_bases",
-        own_truncated: Some(raw_truncated || main_files.len() >= COMPARE_FILE_CAP),
-        main_count: Some(main_files.len()),
         raw,
         raw_truncated,
+        own,
+        method,
+        own_truncated,
     })
 }
 
@@ -736,10 +745,6 @@ fn fix_row(red: &Red, fix: &Fix, branch: &str, files: &FileSets) -> Value {
     row.insert("own_files".into(), json!(files.own));
     row.insert("own_files_method".into(), json!(files.method));
     row.insert("own_files_truncated".into(), json!(files.own_truncated));
-    row.insert(
-        "main_files_between_merge_bases".into(),
-        json!(files.main_count),
-    );
     row.insert("fix_run_id".into(), json!(fix.run_id));
     row.insert("red_run_id".into(), json!(red.run_id));
     row.insert("red_attempt".into(), json!(red.attempt));
@@ -771,7 +776,6 @@ fn fixlinks(
         })
         .collect();
     let mut greens: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    let mut bases = BTreeMap::new();
     let mut out = Vec::new();
     for red in pending_reds(&query.dir, &query.since, &linked) {
         if red.repo != query.repo {
@@ -804,7 +808,7 @@ fn fixlinks(
             continue;
         }
         for fix in &fixes {
-            let sets = file_sets(gh, query, &red, fix, &branch, &mut bases)?;
+            let sets = file_sets(gh, query, &red, fix, &branch)?;
             out.push(fix_row(&red, fix, &branch, &sets));
         }
     }

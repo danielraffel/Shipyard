@@ -189,13 +189,25 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
                 "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
             }]}),
         ),
+        // The pull request fixed the red in c1, then merged main (m1, which
+        // brought docs/main-only.md); the fix head is that merge. Both ends are
+        // already in main, as they are once the pull request has landed, so
+        // a merge base taken against today's main would erase every file.
         (
             "compare/abc123...def456",
-            json!({"files": [{"filename": "test/ctest_script_inputs.json"}, {"filename": "docs/main-only.md"}]}),
+            json!({
+                "status": "ahead", "total_commits": 3,
+                "files": [{"filename": "test/ctest_script_inputs.json"}, {"filename": "docs/main-only.md"}],
+                "commits": [
+                    {"sha": "c1", "parents": [{"sha": "abc123"}]},
+                    {"sha": "m1", "parents": [{"sha": "main0"}]},
+                    {"sha": "def456", "parents": [{"sha": "c1"}, {"sha": "m1"}]}
+                ]
+            }),
         ),
-        ("compare/main...abc123", json!({"merge_base_commit": {"sha": "base1"}})),
-        ("compare/main...def456", json!({"merge_base_commit": {"sha": "base2"}})),
-        ("compare/base1...base2", json!({"files": [{"filename": "docs/main-only.md"}]})),
+        ("commits/c1", json!({"files": [{"filename": "test/ctest_script_inputs.json"}]})),
+        ("commits/m1", json!({"files": [{"filename": "docs/main-only.md"}]})),
+        ("compare/main...", json!({"merge_base_commit": {"sha": "abc123"}})),
     ]);
     let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
     let gh = |args: &[String]| second.read(args);
@@ -222,16 +234,50 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
         json!(["docs/main-only.md", "test/ctest_script_inputs.json"])
     );
     assert_eq!(link["own_files"], json!(["test/ctest_script_inputs.json"]));
-    assert_eq!(
-        link["own_files_method"],
-        "raw_minus_main_between_merge_bases"
+    assert_eq!(link["own_files_method"], "first_parent_non_merge_commits");
+    assert_eq!(link["own_files_truncated"], false);
+    let asked = second.asked();
+    assert!(
+        asked.iter().all(|path| !path.contains("compare/main...")
+            && !path.contains("commits/m1")
+            && !path.contains("commits/def456")),
+        "{asked:?}"
     );
-    assert_eq!(link["main_files_between_merge_bases"], 1);
 
     // Linked once: the next pass does not link it again.
     let again = record(&gh, &query(dir.path())).expect("pass");
     assert_eq!(again.fixlinks_written, 0);
     assert_eq!(rows(&dir.path().join("fixlinks.jsonl")).len(), 1);
+}
+
+#[test]
+fn a_force_pushed_fix_has_no_own_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(dir.path())).expect("red pass");
+    let mut routes = red_routes();
+    routes.retain(|(needle, _)| !needle.starts_with("runs?branch="));
+    routes.extend([
+        (
+            "runs?branch=feat%2Fx&status=success",
+            json!({"workflow_runs": [{
+                "id": 200, "conclusion": "success", "head_sha": "def456",
+                "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
+            }]}),
+        ),
+        (
+            "compare/abc123...def456",
+            json!({"status": "diverged", "files": [{"filename": "a.cpp"}], "commits": []}),
+        ),
+    ]);
+    let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    record(&gh, &query(dir.path())).expect("green pass");
+    let link = &rows(&dir.path().join("fixlinks.jsonl"))[0];
+    assert_eq!(link["files_raw"], json!(["a.cpp"]));
+    assert_eq!(link["own_files"], Value::Null);
+    assert_eq!(link["own_files_method"], "red_not_ancestor");
 }
 
 #[test]

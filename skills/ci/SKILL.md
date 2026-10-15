@@ -474,8 +474,13 @@ job's `completed_at`. It adds `completed_at`, `workflow`, `head_branch`, `owner`
 (`pr:N`, else `branch:<name>`, else `sha:<head>`) and `provenance`.
 Then, for each red run attempt in the window without a fix-link, it looks for
 the earliest later green run on the same pull request branch and appends one row
-to `fixlinks.jsonl`: `files_raw` from compare red...fix, and `own_files`, which
-drops what the base branch changed between the two merge bases. It also writes
+to `fixlinks.jsonl`: `files_raw` from compare red...fix, and `own_files`, the
+files of the non-merge commits on the fix's first-parent chain back to the red
+(a merge of main is a merge commit on that chain and is skipped). Never take a
+merge base against today's main for this: once the pull request has landed,
+both heads are main's ancestors and the subtraction erases every file.
+`own_files` is null when the red is not an ancestor of the fix (a force-push).
+It also writes
 `rerun_green` when a rerun of the red head passed.
 Cancelled jobs are counted and skipped; they belong to outage windows, not
 causes. Strings are scrubbed of local paths, addresses, credentials and private
