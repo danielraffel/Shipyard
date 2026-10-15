@@ -174,9 +174,11 @@ exceptions the audit does not count are the agent sessions' hand-back inbox
 (`~/.local/state/shipyard/inbox/<session-uuid>.jsonl` and `.shown.jsonl`),
 which session hooks write without the lease, and a pure append of JSON lines
 (same inode, old bytes unchanged, no line naming the sandbox) to a production
-guard log: `holds.jsonl`, `overrides.jsonl`, `switches.jsonl`,
-`queue-removals.jsonl` and `carries.jsonl` in the guards directory, and
-`~/.local/state/shipyard/queue-arms.jsonl`. Other agents' HOLDs and arms grow
+guard log: `holds.jsonl`, `overrides.jsonl`, `switches.jsonl` and
+`carries.jsonl` in the guards directory, and `queue-arms.jsonl` and
+`queue-removals.jsonl` in `~/.local/state/shipyard/`. Every row each of those
+writers appends names its `session` (and `agent` when set), in the Python
+guards and in Rust; a test ties each writer's resolved path to the list. Other agents' HOLDs and arms grow
 those on a shared host while the sandbox runs (#837). Every sandbox process
 runs with a per-run nonce (`sandbox-<uuid>`) as `SHIPYARD_AGENT_ID` and its
 session id, so a guard that leaked out of the sandbox's HOME writes rows

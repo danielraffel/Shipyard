@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from unittest import mock
 from pathlib import Path
 
 import pytest
@@ -665,10 +666,48 @@ def test_every_sandbox_process_runs_with_the_runs_nonce_as_its_identity() -> Non
     assert Sandbox().nonce != sandbox.nonce, "a new nonce per run"
 
 
-def test_the_guard_logs_are_the_real_home_ones() -> None:
-    home = Path.home()
-    assert home / ".config" / "shipyard" / "guards" / "holds.jsonl" in CONCURRENT_GUARD_LOGS
-    assert home / ".local" / "state" / "shipyard" / "queue-arms.jsonl" in CONCURRENT_GUARD_LOGS
+def _load_script(name: str):
+    import importlib.util
+    path = Path(__file__).resolve().parents[2] / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _rust_const(source: str, name: str) -> str:
+    import re
+    text = (Path(__file__).resolve().parents[2] / "src" / source).read_text(encoding="utf-8")
+    match = re.search(rf'pub const {name}: &str = "([^"]+)";', text)
+    assert match, f"{name} in src/{source}"
+    return match.group(1)
+
+
+def test_the_guard_logs_are_exactly_where_every_writer_writes() -> None:
+    # Each writer's own path, resolved as it resolves it on a host with no
+    # overrides: a writer that moves its log fails here, not on a gate host.
+    scrubbed = {name: value for name, value in os.environ.items()
+                if name not in ("XDG_STATE_HOME", "SHIPYARD_GHAPP_GUARDS_DIR",
+                                "SHIPYARD_QUEUE_ARMS_LOG", "SHIPYARD_QUEUE_REMOVALS_LOG")}
+    with mock.patch.dict(os.environ, scrubbed, clear=True):
+        arm = _load_script("ghapp_queue_arm_guard")
+        removal = _load_script("ghapp_queue_removal_guard")
+        hold = _load_script("ghapp_verdict_hold_hook")
+        written = {
+            arm.arms_log_path(),
+            arm._guards_dir() / arm.REBASE_CARRY_LOG,
+            arm._guards_dir() / arm.OVERRIDES_LOG,
+            removal.removal_log_path(),
+            hold._guards_dir() / hold.HOLDS_LOG,
+        }
+    guards = Path.home() / ".config" / "shipyard" / "guards"
+    for source in ("head_approval.rs", "ghapp_guards.rs"):
+        text = (Path(__file__).resolve().parents[2] / "src" / source).read_text(encoding="utf-8")
+        assert '.join(".config/shipyard/guards")' in text, f"the guards directory in {source}"
+    written |= {guards / _rust_const("ghapp_guards.rs", "SWITCH_LOG"),
+                guards / _rust_const("head_approval/rebase.rs", "REBASE_CARRY_LOG")}
+    assert written == set(CONCURRENT_GUARD_LOGS)
 
 
 def test_the_session_inbox_is_the_real_home_one() -> None:

@@ -120,6 +120,20 @@ def _load_request_parser() -> ModuleType | None:
 PARSER = _load_request_parser()
 
 
+# The guards directory's HOLD audit log.
+HOLDS_LOG = "holds.jsonl"
+SESSION_ENVS = ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
+
+
+def writer_identity() -> dict[str, str]:
+    """``session`` (and ``agent`` when set) for every row this hook writes,
+    the same fields queue-arm-guard records."""
+    session = next((os.environ[name].strip() for name in SESSION_ENVS
+                    if os.environ.get(name, "").strip()), "unattributed")
+    agent = os.environ.get("SHIPYARD_AGENT_ID", "").strip()
+    return {"session": session, **({"agent": agent} if agent else {})}
+
+
 def _guards_dir() -> pathlib.Path:
     return pathlib.Path(
         os.environ.get("SHIPYARD_GHAPP_GUARDS_DIR")
@@ -355,11 +369,12 @@ def announce_failure(repo: str, number: int, head: str, error: str) -> bool:
 
 
 def audit(record: dict[str, Any]) -> None:
-    line = {"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), **record}
+    line = {"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), **record,
+            **writer_identity()}
     try:
         directory = _guards_dir()
         directory.mkdir(parents=True, exist_ok=True)
-        with (directory / "holds.jsonl").open("a", encoding="utf-8") as handle:
+        with (directory / HOLDS_LOG).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(line, sort_keys=True) + "\n")
     except OSError:
         pass

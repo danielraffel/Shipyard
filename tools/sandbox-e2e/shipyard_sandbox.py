@@ -75,9 +75,11 @@ SESSION_INBOX_FILE = re.compile(
 # it in every row, and a row carrying it is the sandbox's own.
 CONCURRENT_GUARD_LOGS: frozenset[Path] = frozenset({
     Path.home() / ".config" / "shipyard" / "guards" / name
-    for name in ("holds.jsonl", "overrides.jsonl", "switches.jsonl",
-                 "queue-removals.jsonl", "carries.jsonl")
-} | {Path.home() / ".local" / "state" / "shipyard" / "queue-arms.jsonl"})
+    for name in ("holds.jsonl", "overrides.jsonl", "switches.jsonl", "carries.jsonl")
+} | {
+    Path.home() / ".local" / "state" / "shipyard" / name
+    for name in ("queue-arms.jsonl", "queue-removals.jsonl")
+})
 
 SANDBOX_IDENTITY_ENVS: tuple[str, ...] = (
     "SHIPYARD_AGENT_ID",

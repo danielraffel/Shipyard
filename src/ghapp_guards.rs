@@ -270,13 +270,16 @@ fn now_rfc3339() -> String {
 }
 
 fn log_switch(dir: &Path, change: &str, reason: Option<&str>) -> Result<(), String> {
-    let record = serde_json::json!({
+    let mut record = serde_json::json!({
         "at": now_rfc3339(),
         "switch": REVIEW_SWITCH,
         "change": change,
         "reason": reason,
         "by": format!("shipyard {}", env!("CARGO_PKG_VERSION")),
     });
+    if let Some(map) = record.as_object_mut() {
+        map.extend(crate::head_approval::writer_identity());
+    }
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -627,6 +630,13 @@ mod tests {
             log.contains("\"opted out\"") && log.contains("lab host, no landings"),
             "{log}"
         );
+        // Each row says which process wrote it.
+        let identity = crate::head_approval::writer_identity();
+        for line in log.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).expect("json row");
+            assert_eq!(row.get("session"), identity.get("session"), "{line}");
+            assert_eq!(row.get("agent"), identity.get("agent"), "{line}");
+        }
         opt_in_review(dir).expect("opt in");
         assert_eq!(audit_review_switch(dir).state, SwitchState::Current);
         assert!(
