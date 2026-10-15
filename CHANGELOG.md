@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03330"></a>
+## [0.333.0] - 2026-10-15
+
+- feat/expected host alert any target ([#849](https://github.com/danielraffel/Shipyard/pull/849))
+- fix/guard tests real ledger ([#850](https://github.com/danielraffel/Shipyard/pull/850))
+
 <a id="v03320"></a>
 ## [0.332.0] - 2026-10-15
 
@@ -2399,6 +2405,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.333.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.333.0
 [0.332.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.332.0
 [0.331.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.331.2
 [0.331.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.331.1
