@@ -297,6 +297,101 @@ fn a_long_range_is_read_page_by_page() {
     assert_eq!(link["own_files"], json!(["a.cpp"]));
 }
 
+/// A red recorded, then a green push to `def456` whose compare answers with
+/// `compare` routes; returns the fix-link and every path asked.
+fn fix_link_with(compare: Vec<(&'static str, Value)>) -> (Value, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(dir.path())).expect("red pass");
+    let mut routes = red_routes();
+    routes.retain(|(needle, _)| !needle.starts_with("runs?branch="));
+    routes.push((
+        "runs?branch=feat%2Fx&status=success",
+        json!({"workflow_runs": [{
+            "id": 200, "conclusion": "success", "head_sha": "def456",
+            "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
+        }]}),
+    ));
+    routes.extend(compare);
+    let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    record(&gh, &query(dir.path())).expect("green pass");
+    let link = rows(&dir.path().join("fixlinks.jsonl"))[0].clone();
+    (link, second.asked())
+}
+
+fn hundred_commits() -> Value {
+    Value::Array(
+        (0..100)
+            .map(|i| json!({"sha": format!("x{i}"), "parents": [{"sha": format!("y{i}")}]}))
+            .collect(),
+    )
+}
+
+#[test]
+fn a_range_past_the_paging_cap_is_too_many_commits() {
+    let (link, asked) = fix_link_with(vec![
+        (
+            "compare/abc123...def456?per_page=100",
+            json!({"status": "ahead", "total_commits": 1001, "commits": hundred_commits()}),
+        ),
+        (
+            "compare/abc123...def456",
+            json!({"status": "ahead", "total_commits": 1001,
+                   "files": [{"filename": "a.cpp"}], "commits": []}),
+        ),
+    ]);
+    assert_eq!(link["own_files"], Value::Null);
+    assert_eq!(link["own_files_method"], "too_many_commits");
+    assert_eq!(link["files_raw"], json!(["a.cpp"]));
+    let pages = asked
+        .iter()
+        .filter(|path| path.contains("compare/abc123...def456?per_page=100"))
+        .count();
+    assert_eq!(pages, COMPARE_COMMIT_PAGES, "{asked:?}");
+    assert!(
+        asked.iter().all(|path| !path.contains("/commits/")),
+        "{asked:?}"
+    );
+}
+
+#[test]
+fn pages_that_run_out_before_the_total_are_too_many_commits() {
+    let (link, _) = fix_link_with(vec![
+        (
+            "compare/abc123...def456?per_page=100&page=1",
+            json!({"status": "ahead", "total_commits": 300, "commits": hundred_commits()}),
+        ),
+        (
+            "compare/abc123...def456?per_page=100",
+            json!({"status": "ahead", "total_commits": 300, "commits": []}),
+        ),
+        (
+            "compare/abc123...def456",
+            json!({"status": "ahead", "total_commits": 300,
+                   "files": [{"filename": "a.cpp"}], "commits": []}),
+        ),
+    ]);
+    assert_eq!(link["own_files"], Value::Null);
+    assert_eq!(link["own_files_method"], "too_many_commits");
+}
+
+#[test]
+fn scrub_removes_github_tokens() {
+    let row = scrub(json!({"detail": [
+        "pushed with ghp_0123456789abcdefghijABCDEFGHIJ012345",
+        "app token ghs_0123456789abcdefghijABCDEF and gho_0123456789abcdefghijABCD",
+        "user ghu_0123456789abcdefghijABCDEFGH refresh ghr_0123456789abcdefghijABCDEF",
+        "fine-grained github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz"
+    ]}));
+    let text = row.to_string();
+    for prefix in ["ghp_", "ghs_", "gho_", "ghu_", "ghr_", "github_pat_"] {
+        assert!(!text.contains(prefix), "{text}");
+    }
+    assert_eq!(text.matches("<secret>").count(), 6, "{text}");
+}
+
 #[test]
 fn a_force_pushed_fix_has_no_own_files() {
     let dir = tempfile::tempdir().expect("tempdir");

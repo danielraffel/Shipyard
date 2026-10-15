@@ -500,8 +500,21 @@ join. A red with no green yet stays pending and is retried on the next pass.
 A generated-file drift check (`<generator>: N drift problem(s)` or
 `<generator>: the <file> no longer matches <source>`) is C2's
 `generated_drift`, class `drift`, high confidence. Its `signature` is the
-generator and its `fix_hint` the `--write` command the check printed. It
-outranks the ctest line that ran the check.
+generator. Its `fix_hint` is set only when the command the check printed is
+exactly `python3 tools/scripts/<name>.py [--flag [value]]... --write`, with no
+shell metacharacters and every value a relative path inside the checkout (no
+leading `/`, `~` or `-`, no `..` segment); otherwise it is null. The log is text
+the pull request under test controls, so a `fix_hint` is a suggested command
+matching the known generator shape: review it before running it, and run it from
+a checkout of the main branch, never from the pull request's own checkout, where
+`tools/scripts/<name>.py` is the pull request's own script. Nothing in Shipyard
+executes a `fix_hint` and nothing auto-applies one. A `detail` is log text and
+is never a command.
+It outranks the ctest line that ran the check. Job logs are read through
+`gate_cost::fetch_job_log`, which passes `--allow-escape-sequences` (logs carry
+ANSI colour, and a current `gh` refuses them without it) and falls back to the
+bare read for a `gh` that does not know the flag. The recorder's scrub also
+replaces `ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_` and `github_pat_` tokens.
 
 **"Who armed it?" is `shipyard who --pr N`, not a timeline read.** Every queue
 event shows the fleet App as its actor. `who` joins the arm guard's
