@@ -622,7 +622,7 @@ for `metrics import github` rows is the ephemeral runner.
 
 `advise` keys lanes by resolved job name and host the same way, so a gate
 served by throwaway runners accumulates samples. A job GitHub reported with an
-unevaluated name (a job skipped by its `if:` keeps its `${{ }}` `name:`
+unevaluated name (a job skipped by its `if:` keeps its {% raw %}`${{ }}`{% endraw %} `name:`
 expression, for example `... && 'macos' || 'macos-pr-unused'`) files under the
 name it evaluates to when it runs. Only success and failure count: skipped,
 cancelled, and unfinished jobs say nothing about a lane's health. Signals:
@@ -662,7 +662,7 @@ filtered listing short with a `total_count` that agreed with the short list
 (11 `pull_request` runs where 624 existed), which a page-count check cannot
 see. Runs the walk finds are counted and the disagreement is a `run_listing`
 gap. And when a run has no job named exactly `--gate-job`, one job per run
-attempt whose reported name is an unevaluated expression or `${{ matrix.* }}`
+attempt whose reported name is an unevaluated expression or {% raw %}`${{ matrix.* }}`{% endraw %}
 placeholder resolving to it stands for the gate (the one that got a runner,
 else the first that was not skipped). GitHub leaves every `name:` unevaluated
 in a run cancelled before its jobs started, so such a run counts one unstarted

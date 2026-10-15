@@ -37,6 +37,11 @@ approved blob and mode, and no required check on the new head was skipped,
 neutral or reused a receipt. `shipyard review-verdict --pr N --json` gives the
 same answer from the command line (Rust, `crate::review_verdict`).
 
+Signers: when the base's `.shipyard/config.toml` sets `[auto_merge]
+reviewer_signers`, an App APPROVE counts for the status only with a
+`reviewer: <name>` line naming one of them. The status reads no host's
+`reviewer-signers.json`.
+
 A status belongs to a commit, but a decision belongs to a pull request, and
 two open pull requests can share a head (one branch opened into two bases, a
 fork pushing an approved commit). The status is `success` only when the guard
@@ -105,6 +110,7 @@ jobs:
         run: 'true'
 ```
 
+{% raw %}
 ```yaml
 # .github/workflows/review-verdict.yml
 name: Review verdict
@@ -149,5 +155,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: '"${{ steps.python.outputs.python-path }}" scripts/review_verdict_status.py'
 ```
+{% endraw %}
 
 Bump the pinned commit when the rule changes, like any other pin.

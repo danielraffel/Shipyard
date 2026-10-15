@@ -134,6 +134,16 @@ class ReviewVerdictStatus(unittest.TestCase):
                          f"status {posted['state']} disagrees with the guard: {guard.stderr}")
         return posted["state"]
 
+    def test_a_base_signer_list_makes_the_status_require_a_signer(self) -> None:
+        # The status reads no host's signers file; the base config's list
+        # applies the same rule server-side.
+        config = '[auto_merge]\nreviewer_signers = ["pulp-review", "infra-review2"]\n'
+        unsigned = [self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
+        self.assertEqual(self.judged(unsigned, config), "failure")
+        signed = [self.comment(f"Reviewed.\nreviewer: infra-review2\nverdict: APPROVE head:{HEAD}",
+                               "2026-10-12T15:00:00Z")]
+        self.assertEqual(self.judged(signed, config), "success")
+
     def test_an_approve_naming_the_head_is_success(self) -> None:
         trail = [self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
         self.assertEqual(self.judged(trail), "success")

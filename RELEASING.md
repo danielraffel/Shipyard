@@ -68,7 +68,7 @@ Run `shipyard doctor` to check whether the secret is configured. If it shows `RE
 
 Both can be true at once. Verify by checking the timestamp of the secret (`gh secret list --repo <owner>/<repo>`) against the last token regeneration time on https://github.com/settings/personal-access-tokens.
 
-That's it — no code change needed. The workflow already reads `${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}`. `shipyard doctor` will then report `RELEASE_BOT_TOKEN: configured`.
+That's it — no code change needed. The workflow already reads {% raw %}`${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}`{% endraw %}. `shipyard doctor` will then report `RELEASE_BOT_TOKEN: configured`.
 
 ### What if you can't or don't want to set the secret?
 

@@ -181,7 +181,11 @@ blocks an earlier approval. A HOLD whose time cannot be read always blocks.
   with no reviewer of record). The file is
   `{"default": ["pulp-review", "infra-review2"], "repos": {"OWNER/REPO": [...]}}`;
   a repository's own list replaces the default, and a file that cannot be
-  read admits nobody. Without the file the signer rule is off on that host;
+  read admits nobody. A protected base can name its own signers instead, with
+  `[auto_merge] reviewer_signers = [...]` in `.shipyard/config.toml`; that
+  list takes precedence over the host file, and it is the one the server-side
+  `review-verdict` status applies (the status reads no host's file). Without
+  either, the signer rule is off on that host;
   roll it out one host at a time. Each refusal is printed and recorded in
   `excluded_approvals`, and Shipyard's own paths report
   `excluded_app_approval:<why>`. A HOLD never needs a signer.

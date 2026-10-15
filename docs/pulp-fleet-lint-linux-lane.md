@@ -19,9 +19,11 @@ preamble-scoping change (branch `ci/preamble-merge-group-scope`). Until then all
 nine consumers on `main` route every event through the variable, so it must
 stay unset. Once the scoping change lands, every consumer reads:
 
+{% raw %}
 ```yaml
 runs-on: ${{ fromJSON(github.event_name == 'merge_group' && vars.PULP_PREAMBLE_RUNS_ON_JSON || '"ubuntu-latest"') }}
 ```
+{% endraw %}
 
 With that change, the selector reaches the fleet for `merge_group` runs only;
 pull-request, push and dispatch runs stay GitHub-hosted whatever it holds. A
