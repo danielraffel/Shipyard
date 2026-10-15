@@ -174,7 +174,10 @@ has a `review-before-arm.opt-out` file, written with a reason by
 that written record counts; there,
 with no identity listed, an approval counts only from the fleet App or a
 human the base lists in `[auto_merge] human_reviewers`, empty by default; a
-HOLD from any OWNER/MEMBER/COLLABORATOR still counts; never the PR author's)
+HOLD from any OWNER/MEMBER/COLLABORATOR still counts; never the PR author's;
+an App APPROVE must be signed with a `reviewer: <name>` line from the host's
+`reviewer-signers.json`, where that file exists, and never counts when
+stamped `unattributed`)
 arms or merges only a
 head that carries an
 approval of that exact head from an identity listed in
@@ -479,6 +482,34 @@ kept the patch-id and every file's approved blob), 1 when refused (the JSON
 names excluded human approvals and the fix), 2 when unreadable (treat as
 refused). Pass `--head <sha>` to judge the head a merge group lands rather
 than the pull request's current one.
+
+**To keep a labels archive current as checks go red and green**, run
+`shipyard cause record --repo <OWNER/REPO> --workflow <file> --dir
+<labels checkout>/data/ci-cause [--since <RFC 3339>]` on a schedule. It is a
+read-only observer, never part of `ship`, `pr` or `run`. Each pass writes one
+`ci.cause/v1` row per red job not yet archived, to `causes/YYYY-MM.jsonl` by the
+job's `completed_at`. It adds `completed_at`, `workflow`, `head_branch`, `owner`
+(`pr:N`, else `branch:<name>`, else `sha:<head>`) and `provenance`.
+Then, for each red run attempt in the window without a fix-link, it looks for
+the earliest later green run on the same pull request branch and appends one row
+to `fixlinks.jsonl`: `files_raw` from compare red...fix, and `own_files`, the
+files of the non-merge commits on the fix's first-parent chain back to the red
+(a merge of main is a merge commit on that chain and is skipped). Never take a
+merge base against today's main for this: once the pull request has landed,
+both heads are main's ancestors and the subtraction erases every file.
+`own_files` is null when the red is not an ancestor of the fix (a force-push).
+It also writes
+`rerun_green` when a rerun of the red head passed.
+Cancelled jobs are counted and skipped; they belong to outage windows, not
+causes. Strings are scrubbed of local paths, addresses, credentials and private
+host names; run and job URLs are kept.
+The layout and fields are the 90-day backfill's, so live and backfilled rows
+join. A red with no green yet stays pending and is retried on the next pass.
+A generated-file drift check (`<generator>: N drift problem(s)` or
+`<generator>: the <file> no longer matches <source>`) is C2's
+`generated_drift`, class `drift`, high confidence. Its `signature` is the
+generator and its `fix_hint` the `--write` command the check printed. It
+outranks the ctest line that ran the check.
 
 **"Who armed it?" is `shipyard who --pr N`, not a timeline read.** Every queue
 event shows the fleet App as its actor. `who` joins the arm guard's

@@ -696,6 +696,15 @@ where
             );
         }
         Command::Cause { command } => {
+            if let cli::CauseCommand::Record(args) = *command {
+                let config = LoadedConfig::load_from_cwd_with_global_dir(
+                    cli.mode.into(),
+                    &cwd,
+                    runtime_paths.global_dir.clone(),
+                )
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+                return cause_cmd::record_command(&args, &config, &cwd, cli.json, stdout);
+            }
             return cause_cmd::cause_command(*command, cli.json, stdout);
         }
         Command::Reuse { command } => {

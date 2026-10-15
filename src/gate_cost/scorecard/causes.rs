@@ -35,7 +35,7 @@ pub const DEFAULT_MAX_JOBS: usize = 200;
 /// Why a job over that budget was not read.
 pub const OVER_BUDGET: &str = "skipped: over the --causes-max-jobs budget";
 /// Cache key version: bump when a cause's shape or meaning changes.
-const EXTRACT_VERSION: u32 = 5;
+const EXTRACT_VERSION: u32 = 6;
 
 /// A red job whose cause could not be read, and why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -135,21 +135,7 @@ fn read_cause(
     };
     let mut cause = cause::build(&job, log.as_deref(), &place, job.completed_at.clone(), true)
         .ok_or_else(|| format!("job {id} did not fail"))?;
-    // A record the job printed only shows that a cause the extractor confirms
-    // was named during the job; the time is the API's for the step that
-    // printed it, never the record's own.
-    if let Some(at) = log
-        .as_deref()
-        .map(cause::records_with_times)
-        .unwrap_or_default()
-        .into_iter()
-        .rev()
-        .filter(|(recorded, _)| cause::corroborates(recorded, &cause, &job, repo))
-        .find_map(|(_, at)| cause::printed_at(&job, at.as_deref()))
-    {
-        cause.named_at = Some(at);
-        cause.retrospective = false;
-    }
+    cause::adopt_printed_time(&mut cause, log.as_deref(), &job, repo);
     if let Ok(value) = serde_json::to_value(&cause) {
         cache.put(&key, &value);
     }

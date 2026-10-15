@@ -1,0 +1,15 @@
+##[group]Run ctest --test-dir build-macos --output-on-failure
+95/95 Test #21401: script-test-inputs-drift ....................................***Failed   11.97 sec
+script-test-inputs: 2 drift problem(s) in scripts this change touches (diff-scoped against origin/main).
+  file=test/ctest_script_inputs.json; test=ctest-measured-budgets; cause_class=INVENTORY_DRIFT; evidence=stale entry: ctest-measured-budgets; fix=`python3 tools/scripts/script_test_inputs.py --build-dir build-macos --write`; safe_to_auto_apply=no; verify=`python3 tools/scripts/script_test_inputs.py --check`
+Fix: regenerate the list from a configure of THIS tree and commit it:
+  python3 tools/scripts/script_test_inputs.py --build-dir build-macos --write
+consumption_census: the census no longer matches the build tree
+  Pulp::inspect: closure detail changed
+  regenerate with: python3 tools/scripts/consumption_census.py --build-dir build-macos --write
+error: the lockfile no longer matches the manifest
+
+The following tests FAILED:
+	21401 - script-test-inputs-drift (Failed)                 pr-fast
+Errors while running CTest
+##[error]Process completed with exit code 8.

@@ -1396,6 +1396,12 @@ pub(crate) enum CauseCommand {
     /// `YYYY-MM.jsonl` per month of `named_at` under `--dir`. A record whose
     /// id is already archived is skipped; nothing is rewritten.
     Archive(CauseArchiveArgs),
+    /// Keep a labels archive current: read the workflow's completed runs
+    /// since `--since`, write a `ci.cause/v1` record for each red job not yet
+    /// in `--dir`, and a fix-link for each red that a later run on its pull
+    /// request or branch turned green. Read-only toward GitHub; never part of
+    /// `ship`, `pr` or `run`.
+    Record(CauseRecordArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1437,6 +1443,25 @@ pub(crate) struct CauseExtractArgs {
     /// Pull request, when known.
     #[arg(long)]
     pub(crate) pr: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CauseRecordArgs {
+    /// OWNER/REPO.
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub(crate) repo: String,
+    /// Workflow file whose jobs are read, for example `build.yml`.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) workflow: String,
+    /// The archive: `data/ci-cause` in a private labels checkout.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) dir: PathBuf,
+    /// Earliest run creation read, RFC 3339; default three days ago.
+    #[arg(long, value_name = "TIME")]
+    pub(crate) since: Option<String>,
+    /// The repository's default branch.
+    #[arg(long, default_value = "main")]
+    pub(crate) base: String,
 }
 
 #[derive(Debug, Args)]

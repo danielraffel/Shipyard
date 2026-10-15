@@ -848,7 +848,58 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
         # Human accounts whose approvals count under any_but_author; empty by
         # default, so only the fleet App approves.
         "humans": [_normalized_login(login) for login in humans if isinstance(login, str)],
+        # Who may sign the fleet App's APPROVE on this host (see
+        # reviewer_signers); None when the host has no signers file.
+        "signers": reviewer_signers(repo),
     }
+
+
+# Guards-directory file naming who may sign the fleet App's APPROVE:
+# {"default": ["pulp-review", ...], "repos": {"OWNER/REPO": [...]}}.
+SIGNERS_FILE = "reviewer-signers.json"
+_SIGNER_LINE = re.compile(r"^[ \t]*reviewer:[ \t]*([A-Za-z0-9._-]+)[ \t]*$", re.MULTILINE)
+
+
+def reviewer_signers(repo: str) -> list[str] | None:
+    """The reviewer names that may sign an App APPROVE in ``repo``, or None
+    when this host has no signers file (the rule is off). A file that cannot
+    be read admits nobody: an unreadable allowlist never loosens the rule."""
+    path = _guards_dir() / SIGNERS_FILE
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        repos = data.get("repos") or {}
+        names = next((value for key, value in repos.items() if key.lower() == repo.lower()),
+                     data.get("default"))
+        if not isinstance(names, list):
+            return []
+        return [str(name).lower() for name in names if isinstance(name, str)]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
+    """Why the fleet App's APPROVE in ``body`` does not count, or None.
+
+    Every agent posts as the same App, so the App's identity says nothing
+    about who reviewed. An APPROVE stamped by ``ghapp`` with an
+    ``unattributed`` session never counts, and on a host with a signers file
+    the body must carry a ``reviewer: <name>`` line naming an allowed signer.
+    """
+    text = body if isinstance(body, str) else ""
+    stamp = _SESSION_STAMP.findall(text)
+    if stamp and stamp[-1][1] == UNATTRIBUTED:
+        return "its session stamp is unattributed"
+    signers = policy.get("signers")
+    if signers is None:
+        return None
+    signed = [name.lower() for name in _SIGNER_LINE.findall(text)]
+    if not signed:
+        return "it has no `reviewer: <name>` line"
+    if not any(name in signers for name in signed):
+        return f"its signer {signed[-1]} is not one of {', '.join(signers) or 'nobody'}"
+    return None
 
 
 # Human approvals the default rule refused this run, for the warning and the
@@ -858,9 +909,19 @@ EXCLUDED_APPROVALS: list[str] = []
 
 def _reviewer_counts(
     login: str, association: Any, policy: dict[str, Any], author: str | None,
-    verdict: str,
+    verdict: str, bot: bool = False, body: Any = None,
 ) -> bool:
     reviewer = _normalized_login(login)
+    if reviewer == FLEET_AUTHOR and not bot:
+        # Only the App itself is a Bot; a user account named like it is
+        # anyone at all.
+        EXCLUDED_APPROVALS.append(f"{login} (not the App: a user account)")
+        return False
+    if reviewer == FLEET_AUTHOR and verdict == "APPROVE":
+        refusal = app_approval_refusal(body, policy)
+        if refusal is not None:
+            EXCLUDED_APPROVALS.append(f"{login} ({refusal})")
+            return False
     if policy.get("any_but_author") and not policy["reviewers"]:
         # The repositories are public: only the fleet App and accounts the
         # repository trusts count. Every fleet agent posts as the same App, so
@@ -900,7 +961,8 @@ def counting_verdicts(
         verdict = {"APPROVED": "APPROVE", "CHANGES_REQUESTED": "HOLD"}.get(state)
         if not isinstance(login, str) or verdict is None:
             continue
-        if _reviewer_counts(login, review.get("author_association"), policy, author, verdict):
+        if _reviewer_counts(login, review.get("author_association"), policy, author, verdict,
+                            (review.get("user") or {}).get("type") == "Bot", review.get("body")):
             named = str(review.get("commit_id") or "").lower()
             verdicts.append((_timestamp(review.get("submitted_at")), verdict, named,
                              f"a {state} review by {login} at {review.get('submitted_at')}"))
@@ -910,7 +972,8 @@ def counting_verdicts(
         found = marker_verdict(body) if isinstance(body, str) else None
         if not isinstance(login, str) or found is None:
             continue
-        if _reviewer_counts(login, comment.get("author_association"), policy, author, found[0]):
+        if _reviewer_counts(login, comment.get("author_association"), policy, author, found[0],
+                            (comment.get("user") or {}).get("type") == "Bot", body):
             verdict, named = found
             verdicts.append((_timestamp(comment.get("created_at")), verdict, named,
                              f"`{verdict} head:{named[:12]}` by {login} at "
@@ -998,7 +1061,8 @@ def _deciding_approval_body(
                 and marker_verdict(body) == ("APPROVE", head)
                 and _timestamp(comment.get("created_at")) == latest[0]
                 and _reviewer_counts(login, comment.get("author_association"), policy, author,
-                                     "APPROVE")):
+                                     "APPROVE", (comment.get("user") or {}).get("type") == "Bot",
+                                     body)):
             return body
     return None
 
@@ -1615,8 +1679,9 @@ def review_gate(classification: dict[str, Any], repo: str | None
     if excluded:
         classification["excluded_approvals"] = excluded
         print(f"queue-arm-guard: note: PR #{classification.get('pr')}: ignored the approval "
-              f"of {', '.join(excluded)}: only the fleet App's verdict, or a login the base "
-              "lists in `[auto_merge] human_reviewers`, approves", file=sys.stderr)
+              f"of {', '.join(excluded)}: only the fleet App's verdict (signed by an allowed "
+              "reviewer where the host lists signers), or a login the base lists in "
+              "`[auto_merge] human_reviewers`, approves", file=sys.stderr)
     return result
 
 

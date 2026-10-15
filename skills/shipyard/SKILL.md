@@ -1581,7 +1581,10 @@ Records from the step that ended in `##[error]` come first, so a retried
 assertion never outranks the runner dying. A make or ninja failure ranks
 below every runner and compiler record and is `low`: on its own it names the
 target that broke, not why. A cause is named when its class is
-not `unknown` and its confidence is `high` or `medium`. `diagnose` adds only
+not `unknown` and its confidence is `high` or `medium`. A generated-file drift check is `generated_drift`
+(class `drift`), named by its generator with the `--write` command as its
+`fix_hint`. `shipyard cause record` is the read-only observer that writes
+live cause rows and fix-links into a labels archive in the backfill's layout. `diagnose` adds only
 GitHub's own record (a runner that never came, a supersede, a timeout) when
 the log names nothing more certain; a log with no recognized line still gets
 a `shell-exit` record, so the miss is counted. A job that named its own cause (`shipyard cause extract --log <captured
@@ -3654,7 +3657,11 @@ each carry is a line in `carries.jsonl` (Shipyard's own carries say
 `ghapp` the same way, requires the request to bind the approved head
 (`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts an
 approval only from the fleet App or a login the base lists in `[auto_merge]
-human_reviewers` (each ignored human approval is printed and recorded); its
+human_reviewers` (each ignored human approval is printed and recorded); the
+App counts only as a `Bot` (a user account named `shipyard-local` counts for
+nothing), an App APPROVE stamped `unattributed` never counts, and on a host
+with `reviewer-signers.json` it needs a `reviewer: <name>` line naming an
+allowed signer; its
 override,
 `GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
 `docs/ghapp-guards.md`, Review before arm). A HOLD acts too: on a host with
