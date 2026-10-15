@@ -54,3 +54,10 @@ workflow_shipyard_version = "latest"
 [release.post_tag_hook.bot_identity]
 name  = "shipyard-release-bot"
 email = "shipyard-release-bot@users.noreply.github.com"
+
+[auto_merge]
+# Who may sign the fleet App's `verdict: APPROVE`: an approval posted through
+# ghapp counts only with a `reviewer: <name>` line naming one of these. The
+# server-side `review-verdict` reads only this list and refuses every App
+# approval when it is missing.
+reviewer_signers = ["pulp-review", "infra-review2"]
