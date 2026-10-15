@@ -99,6 +99,7 @@ jobs:
         run: 'true'
 ```
 
+{% raw %}
 ```yaml
 # .github/workflows/review-verdict.yml
 name: Review verdict
@@ -143,5 +144,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: '"${{ steps.python.outputs.python-path }}" scripts/review_verdict_status.py'
 ```
+{% endraw %}
 
 Bump the pinned commit when the rule changes, like any other pin.

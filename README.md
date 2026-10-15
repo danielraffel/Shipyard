@@ -25,6 +25,26 @@ only the machines and services you intend to use. See the
 [CLI reference](docs/cli-reference.md) for monitoring, recovery, fleet,
 governance, and release commands.
 
+## What Shipyard does
+
+- **Validates the exact commit.** `shipyard run` sends one commit to every
+  target you configured (this Mac, SSH machines, cloud runners) and records
+  pass or fail for that SHA.
+- **Ships on evidence.** `shipyard pr` and `shipyard ship` open the pull
+  request and land it only when every required platform passed on the exact
+  head.
+- **Hands landing to GitHub's merge queue** where a branch has one, and
+  limits who may write to it.
+- **Guards the landing path.** With the optional `ghapp` guards installed, an
+  arm, enqueue or merge needs a reviewer approval naming the exact head, and
+  a dequeue or disarm is refused unless an operator gives a reason. On hosts
+  that turn it on, posting a HOLD dequeues or disarms its head.
+- **Explains red checks.** `shipyard diagnose` and `shipyard cause` name a
+  failed job's cause from its log, as a small record instead of a 10 MB log.
+- **Watches, and stops to ask.** It keeps state across restarts, retries the
+  routine cases it supports, and stops with a reason when a person or model
+  must decide.
+
 ## How it fits
 
 Shipyard sits between the work and the machines that run it:
@@ -67,7 +87,7 @@ project will automatically recover or merge every PR.
   never treated as proof a provider accepted anything. See [terminal and
   provider adapters](docs/terminal-adapters.md).
 
-## Highlights
+## Features
 
 - **Built for bounded unattended delivery.** With an explicit, authorized
   handoff, Shipyard preserves exact state, watches the required systems, and
@@ -108,9 +128,10 @@ project will automatically recover or merge every PR.
   release and build attestations, materializes exact digests, and opens the pin
   PR with GitHub App authority. See
   [Pulp dependency channels](docs/dependency-channels.md).
-- **22 ecosystem detectors.** `shipyard init` recognises CMake, Swift,
-  Xcode, Rust, Go, Node (pnpm/bun/yarn/npm), Python (uv/poetry/pip),
-  Gradle, Maven, .NET, Flutter, Dart, Deno, Ruby, Elixir, PHP.
+- **Ecosystem detection.** `shipyard init` recognises CMake, Swift, Xcode,
+  Rust, Go, Node (pnpm, bun, yarn, npm), Python (uv, poetry, pipenv, pip,
+  setuptools), Gradle, Maven, .NET, Flutter, Dart, Deno, Ruby, Elixir and
+  PHP.
 - **Self-hosted runner watchdog.** `shipyard runner status` /
   `cleanup --fix` / `watch --fix` / `watch --kill-hung-workers` detect
   and auto-recover the stuck-runner failure mode (orphaned busy state,
@@ -128,46 +149,52 @@ project will automatically recover or merge every PR.
   runs whose `gh-readonly-queue/*` ref GitHub already deleted (audit-only
   unless `--apply`). It complements the watchdog for explicitly supported
   recovery cases.
-- **Review before arm, and a HOLD that acts.** With the optional `ghapp`
-  guards installed, a host can require, for repositories that ask for review
-  (`[auto_merge] arm_requires_head_approval` in the base branch's
-  `.shipyard/config.toml`; when that is unset, the built-in
-  `REVIEW_REQUIRED_REPOS` list: pulp, vellum, tartci and Shipyard),
-  that a reviewer verdict
-  (`verdict: APPROVE head:<sha>`, `reviewed: <sha>`, or an `APPROVED` review)
-  names the PR's exact head before it is armed, enqueued, or merged, and that
-  the request binds that head (`--match-head-commit`). An approval carries
-  to a new head only through merges from the base that leave every file the
-  PR changes with the same content and mode, where the base changed none of
-  those files in between and the PR changes no binary file; anything else
-  needs a new verdict. Posting `verdict: HOLD head:<sha>` through
-  `ghapp` dequeues or disarms a PR armed or queued at exactly that head; if
-  that fails, it posts a public note on the PR saying the HOLD may still land.
-  That is the fast path only: a HOLD posted from the web UI, a Codex session
-  or a host without the guard is not seen by it. pulp backstops that with a
-  merge-group preflight that fails the group when a queued PR's latest
-  verdict is a HOLD on its head; in other repositories such a HOLD does not
-  stop a head that is already armed or queued, so post HOLDs through `ghapp`.
-  Review before arm is on by default on every host; the only way off is a
-  `review-before-arm.opt-out` file (written with a reason by
-  `shipyard guards install --opt-out-review-before-arm "<reason>"`, logged;
-  anything else at that path keeps review on and fails `guards status`), and
-  `guards status` shows a host that is off. An approval does not count for
-  the agent that posted it: `ghapp` stamps verdict comments with the session
-  and, when `SHIPYARD_AGENT_ID` is set, the agent, and an arm from the
-  approving agent is refused. A shared session alone (every agent of one
-  Claude Code team has the same one) only warns. `hold-disarms`
-  is still switched on one host at a time.
+- **Review before arm or merge.** With the optional `ghapp` guards installed
+  (`shipyard guards install`), an arm, enqueue or direct merge needs a
+  reviewer verdict naming the PR's exact head, and the request must bind that
+  head (`--match-head-commit`). A verdict is a comment whose last line is
+  `verdict: APPROVE head:<sha>` or `reviewed: <sha>`, or an `APPROVED`
+  review. It applies to repositories whose base sets `[auto_merge]
+  arm_requires_head_approval` in `.shipyard/config.toml`, and by default to
+  pulp, vellum, tartci and Shipyard. It is on for every host; the only way off
+  is an opt-out file written with a reason by
+  `shipyard guards install --opt-out-review-before-arm "<reason>"`.
+  See [`ghapp` guards](docs/ghapp-guards.md#review-before-arm-or-merge).
+- **Whose approval counts.** Every agent posts through `ghapp` as the same
+  GitHub App, so an approval counts only when its author is the App's `Bot`
+  account (a user account with the same name counts for nothing), or a human
+  the base lists in `[auto_merge] human_reviewers`. A base that lists
+  `reviewer_identities` counts only those instead. `ghapp` stamps each
+  verdict comment with the posting session, and an App approval stamped
+  `unattributed` never counts. On a host with
+  `~/.config/shipyard/guards/reviewer-signers.json`, an App approval also
+  needs a `reviewer: <name>` line naming an allowed signer. An arm from the
+  agent that posted the approval (same `SHIPYARD_AGENT_ID`) is refused.
+- **Approvals that carry.** An approval carries to a new head after a
+  merge-only update from the base when every file the PR changes keeps its
+  content and mode, the base changed none of them, and the PR changes no
+  binary file. A rebase that leaves the PR's diff, files and file contents
+  unchanged carries it only on a host that turns the rebase carry on
+  (`SHIPYARD_REBASE_CARRY=1`, or a `rebase-carry` file in the guards
+  directory); it is off by default. Anything else needs a new verdict.
+- **A HOLD that acts, and removals that need a reason.** On a host that turns
+  on `hold-disarms`, posting `verdict: HOLD head:<sha>` through `ghapp`
+  dequeues or disarms the PR at exactly that head; if that fails, it posts a
+  note on the PR saying the HOLD may still land. HOLDs posted another way (the
+  web UI, another host) are not seen by it. The queue-removal guard refuses
+  an agent's own dequeue or disarm unless an operator override names a
+  reason class that allows it.
 - **Who landed it.** GitHub attributes every queue mutation to the App, so
-  the arm guard records each arm, enqueue and merge it judges in
-  `~/.local/state/shipyard/queue-arms.jsonl` (time, host, agent session,
-  agent id when set, repository, PR, head, verb, verdict). `shipyard who
-  --pr N` reads that ledger and the removals ledger from every configured
-  host and names the host and session (and agent, when recorded) behind each
-  queue and merge event on the PR's timeline, or says `unattributed` when no
-  ledger explains it. Without an agent id it names the team session, not
-  which agent within it.
-  See [`ghapp` guards](docs/ghapp-guards.md).
+  the guards record each arm, enqueue, merge and overridden removal in a
+  per-host ledger. `shipyard who --pr N` reads those ledgers from every
+  configured host and names the host and session (and agent, when recorded)
+  behind each queue and merge event, or says `unattributed` when no ledger
+  explains it.
+- **A `review-verdict` status.** The `review-verdict` workflow posts the
+  guard's decision on each PR head as a commit status, so a repository that
+  makes it a required check also stops merges that never pass through
+  `ghapp`. See
+  [the `review-verdict` status](docs/review-verdict-status.md).
 - **Durable cancellation.** `shipyard cancel <job> --reason <why>` records the
   operator reason and terminates an active local or SSH validation process tree
   on its next progress event, including descendant build processes.
@@ -209,6 +236,20 @@ project will automatically recover or merge every PR.
   reports the share of red cases with a named cause and the time to it.
   `--causes-max-jobs` (default 200) caps the job logs one run reads; the rest
   are reported as skipped.
+- **Named causes for red checks.** `shipyard diagnose <pr>` reports each
+  failing required check's step, tests and a few evidence lines, never more
+  than 16 KB. `shipyard cause extract` names one job log's cause as a
+  `ci.cause/v1` record, using C2, a rules-only failing-line extractor.
+  `shipyard cause record` is a read-only observer: each pass writes a cause
+  record for every new red job of one workflow, and a fix-link once a later
+  run on the same PR or branch goes green. It reads GitHub and writes only
+  to a local archive. A record's `fix_hint` is text copied from the log (a
+  generated-file drift check's own fix command); Shipyard never runs it. See
+  [cause records](docs/cause-records.md).
+- **Read-only project profile.** `shipyard inspect --profile` lists what a
+  repository builds, pins, runs on and tests with, each fact with the file
+  line or API row it came from. See
+  [CLI reference](docs/cli-reference.md#inspect).
 - **Rules-first PR watching.** `shipyard pr-watch scan` flags open PRs stuck
   in a way a person should look at, read-only by default.
   `shipyard pr-watch rules` wakes an agent only when something changed (a
@@ -291,13 +332,13 @@ without its provenance. Explicit `shipyard ship --pr` recovery never runs the
 hook and therefore cannot overwrite the original submitting context.
 
 For a multi-Mac fleet, store a stable tag on each host with
-`shipyard runner tag --set <studio|m1|m5>` and select exactly one queue
+`shipyard runner tag --set <name>` and select exactly one queue
 writer in the trusted machine-global `config.toml` reported by
 `shipyard paths`:
 
 ```toml
 [merge_queue]
-mutation_machine = "studio"
+mutation_machine = "mac-a"
 ```
 
 Validation may run anywhere. Only the selected machine can enqueue, disable
@@ -317,8 +358,14 @@ passed for the exact change.
   readers, and replay.
 - [`ghapp` guards](docs/ghapp-guards.md): operator reference for the queue,
   review-before-arm, and HOLD guards, including how to switch each on.
-- [Queue observer](docs/queue-observer.md) — one-query queue snapshots,
+- [Queue observer](docs/queue-observer.md): one-query queue snapshots,
   persisted state hashes, delta-only output, replay, and adaptive backoff.
+- [The `review-verdict` status](docs/review-verdict-status.md): the
+  review-before-arm decision as a commit status a repository can require.
+- [Cause records](docs/cause-records.md): `ci.cause/v1` records,
+  `shipyard cause extract`, `archive` and `record`, and fix-links.
+- [Landing model](docs/landing-model.md): how `shipyard landing` reads a
+  repository's merge queue, required checks and PR queue state.
 - [Examples & Scenarios](docs/examples.md) — real-world setups for Xcode,
   CMake, Swift, Tauri, etc.
 - [Targets & Fallback Chains](docs/targets.md) — how local/SSH/cloud
@@ -362,7 +409,6 @@ You don't need everything — just what matches your setup:
 | [gh](https://github.com/cli/cli) | Yes (for PRs) | GitHub integration[^gh-scope] | `brew install gh` |
 | `ssh` | For remote targets | Connect to VMs | Pre-installed on macOS / [Ubuntu](https://ubuntu.com/server/docs/how-to/security/openssh-server/) / [Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse?tabs=gui&pivots=windows-11) |
 | [nsc](https://namespace.so/docs/reference/cli/installation) | Optional | Namespace runner visibility when your account has access | `brew install namespace-cli` |
-| [UTM](https://mac.getutm.app) / [Parallels](https://www.parallels.com/products/desktop/) | For VM fallback | Auto-boot VMs | `brew install --cask utm` |
 
 `shipyard doctor` checks all of this and tells you what's missing.
 
@@ -389,9 +435,10 @@ stall a runner.
 
 ## Planned
 
-**`shipyard inspect`** (planned, not yet shipped): an on-demand CI health
-check you reach by asking your agent, for example "why is CI slow?". It only
-reads, and it runs only when asked, so it never slows Shipyard down.
+**More `shipyard inspect` checks.** Today `shipyard inspect` answers only
+`--profile`. Checks that say what to change in a repository's CI ("why is CI
+slow?") are planned. Like `--profile`, they will only read, and run only when
+asked.
 
 ## FAQ
 
