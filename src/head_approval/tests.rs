@@ -92,7 +92,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         human_reviewer_logins: Vec::new(),
         signers: None,
         rebase_carry: false,
-        signers_required: false,
+        signer_source: super::SignerSource::Host,
     }
 }
 
@@ -603,7 +603,7 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             human_reviewer_logins: Vec::new(),
             signers: None,
             rebase_carry: false,
-            signers_required: false,
+            signer_source: super::SignerSource::Host,
         }
     );
     let empty: toml::Table = "[project]\nname = \"x\"\n".parse().expect("toml");
@@ -1452,6 +1452,10 @@ impl History {
                     .map(str::to_owned)
                     .ok_or_else(|| "gh: Not Found (HTTP 404)".to_owned()),
             );
+        }
+        if joined.contains(".commit.committer.date") {
+            // Before the fleet App's approval, so the approval counts.
+            return Some(Ok("2026-10-11T00:00:00Z\n".to_owned()));
         }
         if joined.contains("pulls/7 --jq {head") {
             return Some(Ok(json!({"head": self.approved, "base": "main",

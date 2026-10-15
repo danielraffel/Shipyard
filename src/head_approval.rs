@@ -454,11 +454,24 @@ pub struct ApprovalPolicy {
     /// says (`shipyard review-verdict` sets it; a config never does).
     #[serde(default)]
     pub rebase_carry: bool,
-    /// The repository-side rule ([`read_policy_repository_side`]): signers
-    /// come only from the base's `[auto_merge] reviewer_signers`, never a
-    /// host, and with none listed an App APPROVE does not count.
+    /// Where [`Self::signers`] came from. [`SignerSource::Base`] is the
+    /// repository-side rule ([`read_policy_repository_side`]): only the
+    /// base's `[auto_merge] reviewer_signers`, never a host, and with none
+    /// listed an App APPROVE does not count.
     #[serde(default)]
-    pub signers_required: bool,
+    pub signer_source: SignerSource,
+}
+
+/// Where an [`ApprovalPolicy`]'s signers came from.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignerSource {
+    /// The base's list, else this host's signers file; neither leaves the
+    /// signer rule off.
+    #[default]
+    Host,
+    /// The base's list only; none listed refuses every App APPROVE.
+    Base,
 }
 
 impl ApprovalPolicy {
@@ -510,7 +523,7 @@ impl ApprovalPolicy {
                         .collect()
                 }),
             rebase_carry: false,
-            signers_required: false,
+            signer_source: SignerSource::Host,
         }
     }
 
@@ -839,7 +852,7 @@ fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<Strin
     if stamped_session(body).as_deref() == Some("unattributed") {
         return Some("its session stamp is unattributed".to_owned());
     }
-    if policy.signers_required && policy.signers.is_none() {
+    if policy.signer_source == SignerSource::Base && policy.signers.is_none() {
         return Some(format!(
             "no signer list is configured on the base branch (`[{CONFIG_TABLE}] {SIGNERS_KEY}`)"
         ));
@@ -1348,8 +1361,7 @@ pub fn read_policy_repository_side(
     // No host's signers file reaches the repository-side rule: only the base
     // config's list, and with none listed no App APPROVE counts.
     policy.signers = read_base_signers(run_gh, repo, base)?;
-    policy.signers_required =
-        policy.required && policy.any_reviewer_but_author && policy.reviewer_logins.is_empty();
+    policy.signer_source = SignerSource::Base;
     Ok(policy)
 }
 

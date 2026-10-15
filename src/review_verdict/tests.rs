@@ -51,10 +51,10 @@ fn gh(
 }
 
 fn app_approval(head: &str, signer: Option<&str>) -> Value {
-    let signed = signer.map_or_else(String::new, |name| format!("reviewer: {name}\n"));
+    let line = signer.map_or_else(String::new, |name| format!("reviewer: {name}\n"));
     json!({"id": 5, "login": "shipyard-local[bot]", "type": "Bot", "association": "CONTRIBUTOR",
            "at": "2026-10-14T17:00:00Z",
-           "body": format!("Reviewed.\n{signed}verdict: APPROVE head:{head}")})
+           "body": format!("Reviewed.\n{line}verdict: APPROVE head:{head}")})
 }
 
 fn owner_review(head: &str) -> Value {
