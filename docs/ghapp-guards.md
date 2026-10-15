@@ -110,7 +110,11 @@ carried the arming session. Override removals in `queue-removals.jsonl` now
 carry `host`, `session` and `agent` too. A missing session
 is recorded as `unattributed` and never refuses anything; a ledger that cannot
 be written is reported and does not block. Shipyard's own marked mutations
-bypass the guard and are not in it. `shipyard who --pr N` joins both ledgers,
+(`SHIPYARD_INTERNAL_QUEUE_MUTATION=1`) are not judged again, but each is
+recorded with `review: shipyard internal` from what the request itself binds,
+with no GitHub call: repository, pull request (or, for a GraphQL landing, the
+`node` id and no number), head and verb. An entry also records
+`excluded_approvals` when it ignored a human approval (below). `shipyard who --pr N` joins both ledgers,
 read from every `[host_class.*]` host over SSH, to the pull request's
 timeline by repository, pull request, verb and head, with time only breaking
 ties, and prints its own time to answer. It names `host/session`, plus the
@@ -150,12 +154,20 @@ blocks an earlier approval. A HOLD whose time cannot be read always blocks.
 
 * With `reviewer_identities` listed: only those identities, never the PR's
   author and never the fleet App `shipyard-local[bot]`.
-* With none listed (the default for the four repositories): the fleet App,
-  which every agent posts as, and accounts whose `author_association` is
-  `OWNER`, `MEMBER` or `COLLABORATOR`. Nobody else: the repositories are
-  public, and a drive-by account's comment must not land a head. A
-  distinguishable PR author never approves their own head. List
-  `reviewer_identities` to make it strict.
+* With none listed (the default for the four repositories): an approval
+  counts only from the fleet App, which every agent posts as through
+  `ghapp`, or from a human the base lists in `[auto_merge] human_reviewers`
+  (empty by default) whose `author_association` is `OWNER`, `MEMBER` or
+  `COLLABORATOR`. A human approval outside that list does not count: an agent
+  holding the owner's own `gh` login posted `APPROVED` reviews a minute
+  before arming its own pull requests (pulp#10293, #10291). Each one ignored
+  is printed (`ignored the approval of <login>`) and recorded in the arms
+  ledger's `excluded_approvals`, and Shipyard's own paths report it as
+  `excluded_human_approval:<login>`. A HOLD from an `OWNER`, `MEMBER` or
+  `COLLABORATOR` still counts: it can only stop a landing. Nobody else: the
+  repositories are public, and a drive-by account's comment must not land a
+  head. A distinguishable PR author never approves their own head, listed or
+  not. List `reviewer_identities` to make it strict.
 
 **The request must bind the head.** `gh pr merge` needs
 `--match-head-commit <sha>`, a GraphQL mutation `expectedHeadOid`, and the
@@ -236,7 +248,7 @@ request's URL), `cause` (`unreviewed`, `hold`, `approval_does_not_carry`,
 
 ```
 queue-arm-guard: refusing to arm or merge an unreviewed head: PR #511 (danielraffel/tartci): no reviewer verdict names head 52eda5490844 ... Each `queue-arm-guard: fix:` line below says what to do next.
-queue-arm-guard: fix: {"cause": "unreviewed", "command": "a reviewer (the fleet App, or an OWNER, MEMBER or COLLABORATOR who is not the author) reviews head 52eda549... and posts a comment ending `verdict: APPROVE head:52eda549...` on https://github.com/danielraffel/tartci/pull/511", "evidence": "https://github.com/danielraffel/tartci/pull/511", "safe_to_auto_apply": false, ...}
+queue-arm-guard: fix: {"cause": "unreviewed", "command": "a reviewer agent reviews head 52eda549... and posts, through `ghapp` (the fleet App), a comment ending `verdict: APPROVE head:52eda549...` on https://github.com/danielraffel/tartci/pull/511; a human approval counts only for a login the base lists in `[auto_merge] human_reviewers`", "evidence": "https://github.com/danielraffel/tartci/pull/511", "safe_to_auto_apply": false, ...}
 ```
 
 Only a re-read (`head_moved`, `unreadable`) is safe to apply unattended.

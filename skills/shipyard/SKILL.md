@@ -3644,8 +3644,10 @@ absence of a skipped, neutral or receipt-reused required check all agree;
 each carry is a line in `carries.jsonl`. Shipyard's own arm paths never carry a rebase.
 `queue-arm-guard` refuses an unreviewed arm or direct merge through
 `ghapp` the same way, requires the request to bind the approved head
-(`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts only the
-fleet App and OWNER/MEMBER/COLLABORATOR verdicts; its override,
+(`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts an
+approval only from the fleet App or a login the base lists in `[auto_merge]
+human_reviewers` (each ignored human approval is printed and recorded); its
+override,
 `GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
 `docs/ghapp-guards.md`, Review before arm). A HOLD acts too: on a host with
 `hold-disarms`, `verdict-hold-hook` dequeues or disarms a pull request queued

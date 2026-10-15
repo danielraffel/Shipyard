@@ -144,6 +144,43 @@ fn an_agent_id_in_the_ledger_is_named_and_a_shared_session_alone_is_not() {
     );
 }
 
+#[test]
+fn a_shipyard_internal_entry_without_a_number_joins_by_its_exact_head() {
+    let events = timeline_events(&timeline_10219()).expect("timeline");
+    let internal = |head: &str, repo: Option<&str>| {
+        json!({"at": "2026-10-14T03:12:00Z", "host": "m5s", "session": "codex-7f3e",
+            "repo": repo, "pr": null, "node": "PR_kwDO", "head": head, "verb": "arm",
+            "verdict": "allowed", "review": "shipyard internal"})
+        .to_string()
+    };
+    let (entries, skipped) = parse_ledgers("m5studio", &internal(H2, Some(REPO)), "");
+    assert_eq!(skipped, 0);
+    assert_eq!(
+        attribute(REPO, 10219, &events, &entries)[0].who(),
+        "m5s/codex-7f3e"
+    );
+    // Another head, or another repository, explains nothing.
+    let (entries, _) = parse_ledgers("m5studio", &internal(H1, Some(REPO)), "");
+    assert_eq!(
+        attribute(REPO, 10219, &events, &entries)[0].who(),
+        "unattributed"
+    );
+    let (entries, _) = parse_ledgers("m5studio", &internal(H2, Some("someone/else")), "");
+    assert_eq!(
+        attribute(REPO, 10219, &events, &entries)[0].who(),
+        "unattributed"
+    );
+    // A numbered entry with no repository is ambiguous and explains nothing.
+    let unnamed = json!({"at": "2026-10-14T03:12:00Z", "host": "m5s", "session": "s",
+        "pr": 10219, "head": H2, "verb": "arm", "verdict": "allowed"})
+    .to_string();
+    let (entries, _) = parse_ledgers("m5studio", &unnamed, "");
+    assert_eq!(
+        attribute(REPO, 10219, &events, &entries)[0].who(),
+        "unattributed"
+    );
+}
+
 /// Negative control: with no ledger entry for the event (a landing through
 /// native gh passes no guard), the answer is `unattributed`, never a guess
 /// from a nearby entry for another pull request or a refused arm.

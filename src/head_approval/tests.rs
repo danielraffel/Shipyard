@@ -89,6 +89,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
             reviewers.iter().map(|login| (*login).to_owned()).collect()
         },
         any_reviewer_but_author: false,
+        human_reviewer_logins: Vec::new(),
     }
 }
 
@@ -596,6 +597,7 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             required: true,
             reviewer_logins: vec!["danielraffel".to_owned()],
             any_reviewer_but_author: false,
+            human_reviewer_logins: Vec::new(),
         }
     );
     let empty: toml::Table = "[project]\nname = \"x\"\n".parse().expect("toml");
@@ -655,6 +657,16 @@ fn an_unreadable_policy_is_an_error_not_the_default() {
 
 fn by_default(repo: &str) -> ApprovalPolicy {
     ApprovalPolicy::without_config(repo, true)
+}
+
+/// [`by_default`] with `humans` listed in `human_reviewers`.
+fn by_default_with_humans(repo: &str, humans: &[&str]) -> ApprovalPolicy {
+    let mut policy = by_default(repo);
+    policy.human_reviewer_logins = humans
+        .iter()
+        .map(|login| login.to_ascii_lowercase())
+        .collect();
+    policy
 }
 
 /// A comment as GitHub reports the fleet App's: `CONTRIBUTOR`.
@@ -831,6 +843,7 @@ fn a_drive_by_account_cannot_approve_on_a_public_repository() {
         )
         .allows()
     );
+    let listed = by_default_with_humans("danielraffel/tartci", &["fable-graph"]);
     for association in super::TRUSTED_ASSOCIATIONS {
         let trusted = [person(
             "fable-graph",
@@ -838,7 +851,11 @@ fn a_drive_by_account_cannot_approve_on_a_public_repository() {
             &format!("reviewed: {HEAD}"),
         )];
         assert!(
-            allows(&policy, &trusted, Some("shipyard-local[bot]")),
+            !allows(&policy, &trusted, Some("shipyard-local[bot]")),
+            "an unlisted human does not approve: {association}"
+        );
+        assert!(
+            allows(&listed, &trusted, Some("shipyard-local[bot]")),
             "{association}"
         );
     }
@@ -868,7 +885,12 @@ fn a_distinguishable_author_cannot_approve_their_own_head() {
         "COLLABORATOR",
         &format!("reviewed: {HEAD}"),
     )];
-    assert!(allows(&policy, &other, Some("danielraffel")));
+    let listed = by_default_with_humans("Generous-Corp/pulp", &["fable-graph", "danielraffel"]);
+    assert!(allows(&listed, &other, Some("danielraffel")));
+    assert!(
+        !allows(&listed, &own, Some("danielraffel")),
+        "listing a human never lets them approve their own pull request"
+    );
     let own_review = [
         json!({"login": "danielraffel", "type": "User", "association": "OWNER",
         "at": "2026-10-12T01:00:00Z", "state": "APPROVED", "commit_id": HEAD}),
@@ -884,6 +906,83 @@ fn a_distinguishable_author_cannot_approve_their_own_head() {
             Some("danielraffel")
         )
         .allows()
+    );
+}
+
+/// pulp#10293: an APPROVED review by the owner's own account, posted a minute
+/// before an agent armed the App's pull request. Only the fleet App's verdict,
+/// or a human listed in `human_reviewers`, approves.
+#[test]
+fn a_human_review_approves_only_when_the_base_lists_that_human() {
+    let review = |login: &str, state: &str| {
+        json!({"login": login, "type": "User", "association": "OWNER",
+               "at": "2026-10-14T17:50:05Z", "state": state, "commit_id": HEAD})
+    };
+    let gate = |policy: &ApprovalPolicy, reviews: &[Value], comments: &[Value]| {
+        decide_for_author(
+            policy,
+            HEAD,
+            reviews,
+            comments,
+            &empty_queue(HEAD),
+            false,
+            Some("shipyard-local"),
+        )
+    };
+    let unlisted = by_default("Generous-Corp/pulp");
+    let owner_review = [review("danielraffel", "APPROVED")];
+    assert!(
+        !gate(&unlisted, &owner_review, &[]).allows(),
+        "an unlisted human's APPROVED review does not approve"
+    );
+    assert_eq!(
+        super::verdict_audit_events(HEAD, &owner_review, &[], &unlisted, Some("shipyard-local")),
+        vec!["excluded_human_approval:danielraffel".to_owned()],
+        "the exclusion is reported"
+    );
+    let owner_marker = [person(
+        "danielraffel",
+        "OWNER",
+        &format!("verdict: APPROVE head:{HEAD}"),
+    )];
+    assert!(!gate(&unlisted, &[], &owner_marker).allows());
+    let listed = by_default_with_humans("Generous-Corp/pulp", &["DanielRaffel"]);
+    assert!(
+        gate(&listed, &owner_review, &[]).allows(),
+        "a listed human approves"
+    );
+    assert!(gate(&listed, &[], &owner_marker).allows());
+    assert!(super::verdict_audit_events(HEAD, &owner_review, &[], &listed, None).is_empty());
+    let app = [fleet(
+        "2026-10-14T17:00:00Z",
+        &format!("verdict: APPROVE head:{HEAD}"),
+    )];
+    assert!(
+        gate(&unlisted, &[], &app).allows(),
+        "the fleet App approves"
+    );
+    // An unlisted human's HOLD still stops the landing: it cannot approve.
+    let held = [review("danielraffel", "CHANGES_REQUESTED")];
+    assert!(!gate(&unlisted, &held, &app).allows());
+    // A repository that lists reviewer_identities decides by that list alone.
+    let strict = required(&["danielraffel"]);
+    assert!(gate(&strict, &owner_review, &[]).allows());
+}
+
+#[test]
+fn human_reviewers_is_read_from_the_base_config() {
+    let table: toml::Table = "[auto_merge]\nhuman_reviewers = [\"DanielRaffel\", \"app/x[bot]\"]\n"
+        .parse()
+        .expect("toml");
+    assert_eq!(
+        ApprovalPolicy::from_table(&table).human_reviewer_logins,
+        vec!["danielraffel".to_owned(), "x".to_owned()]
+    );
+    assert!(
+        ApprovalPolicy::without_config("Generous-Corp/pulp", true)
+            .human_reviewer_logins
+            .is_empty(),
+        "empty by default"
     );
 }
 
