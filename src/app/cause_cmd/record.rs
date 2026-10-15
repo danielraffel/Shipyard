@@ -30,6 +30,8 @@ use crate::diagnose::c2;
 use crate::diagnose::cause::{self, Place};
 use crate::gate_cost::{SyncGhReader, fetch_job_log};
 
+mod labels;
+
 /// Who wrote a row.
 pub(super) const COLLECTOR: &str = "shipyard cause record";
 /// The compare API lists at most this many files.
@@ -45,7 +47,11 @@ pub(super) const OWN_FILES_RULE: &str = "own_files = the union of the files of t
     merge commits and are skipped. rerun_same_head: []; null when red_head is not an ancestor of \
     fix_head (red_not_ancestor), the range exceeds 1000 commits (too_many_commits), \
     the chain leaves the listed commits (chain_broken), or the fix is on the default branch \
-    (branch_is_default); own_files_truncated when a commit lists 300 or more files";
+    (branch_is_default). When the red is not an ancestor: a merge-queue red walks the fix back to the \
+    pull request head the queue merged (merge_queue_pr_head); else, within 72 hours, own_files are the \
+    non-merge commits up to the fix in the pull request's commit list (post_force_push), null when the \
+    fix is no longer in that list (post_force_push_superseded) or came later (post_force_push_too_late). \
+    own_files_truncated when a commit lists 300 or more files";
 const FIXLINK_RULE: &str = "earliest successful run of the same workflow on the red's pull request \
     branch (or branch) created after the red attempt's last failed job completed; a later attempt of \
     the red run itself is rerun_green with pushed_at = its run_started_at; files_raw = compare red \
@@ -85,6 +91,18 @@ pub(super) struct RecordReport {
     pub fixlinks_written: usize,
     /// Red run attempts in the window still without a green.
     pub reds_pending: usize,
+    /// Of those, how many went red under 24 h, 24 to 72 h, and over 72 h
+    /// before this pass: what is still young against what is likely unfixed
+    /// or unlinkable.
+    pub pending_under_24h: usize,
+    /// Pending 24 to 72 h.
+    pub pending_24h_to_72h: usize,
+    /// Pending over 72 h.
+    pub pending_over_72h: usize,
+    /// Bare exits labelled by their step.
+    pub labelled_by_step: usize,
+    /// Summary jobs that took the cause of the job they summarise.
+    pub inherited: usize,
     /// Reads that failed, with why.
     pub unreadable: Vec<String>,
 }
@@ -357,7 +375,8 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
 
     let mut report = RecordReport::default();
     let mut pulls = BTreeMap::new();
-    let recorded: BTreeSet<(String, u64)> = archived_causes(&query.dir)
+    let archived = archived_causes(&query.dir);
+    let recorded: BTreeSet<(String, u64)> = archived
         .iter()
         .filter_map(|row| Some((row["repo"].as_str()?.to_owned(), row["job_id"].as_u64()?)))
         .collect();
@@ -389,6 +408,7 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
             }
         };
         let owner = owner_of(gh, query, run, &mut pulls);
+        let mut run_rows = Vec::new();
         for value in jobs {
             let Ok(job) = serde_json::from_value::<Job>(value.clone()) else {
                 continue;
@@ -409,18 +429,23 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
                 continue;
             }
             match cause_row(gh, query, run, &job, &owner) {
-                Ok(Some(row)) => {
-                    let month = row["completed_at"]
-                        .as_str()
-                        .and_then(|at| at.get(..7))
-                        .unwrap_or("undated")
-                        .to_owned();
-                    by_month.entry(month).or_default().push(row);
-                    report.causes_written += 1;
-                }
+                Ok(Some(row)) => run_rows.push(row),
                 Ok(None) => {}
                 Err(error) => report.unreadable.push(error),
             }
+        }
+        report.inherited += labels::inherit_from_summarised(&mut run_rows, &archived);
+        for row in run_rows {
+            if row["labelled_by"] == "step" {
+                report.labelled_by_step += 1;
+            }
+            let month = row["completed_at"]
+                .as_str()
+                .and_then(|at| at.get(..7))
+                .unwrap_or("undated")
+                .to_owned();
+            by_month.entry(month).or_default().push(row);
+            report.causes_written += 1;
         }
     }
     for (month, rows) in &by_month {
@@ -463,8 +488,12 @@ fn cause_row(
         return Ok(None);
     };
     cause::adopt_printed_time(&mut cause, log.as_deref(), job, &query.repo);
+    let label = labels::label_bare_exit(&mut cause, log.as_deref());
     let mut row = serde_json::to_value(&cause).map_err(|error| error.to_string())?;
     let fields = row.as_object_mut().ok_or("cause is not an object")?;
+    if let Some(label) = label {
+        fields.insert("labelled_by".into(), json!(label));
+    }
     fields.insert("completed_at".into(), json!(job.completed_at));
     fields.insert(
         "workflow".into(),
@@ -713,6 +742,106 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
     rerun.into_iter().chain(push).collect()
 }
 
+/// Longest a force-pushed red waits for its pull request's next green push.
+const FORCE_PUSH_WINDOW_HOURS: i64 = 72;
+
+fn minutes_between(from: &str, to: &str) -> Option<i64> {
+    let parse = |at: &str| chrono::DateTime::parse_from_rfc3339(at).ok();
+    Some((parse(to)? - parse(from)?).num_minutes())
+}
+
+/// Own files for a red whose head is not an ancestor of its fix.
+///
+/// A merge-queue red's head is the queue's merge commit; its second parent
+/// is the pull request's head when it was queued, and the fix is walked back
+/// to that (`merge_queue_pr_head`). Otherwise, or when that head was
+/// force-pushed away too, the red was force-pushed: within 72 hours the fix
+/// is matched in the pull request's commit list, and its own files are the
+/// non-merge commits up to it there (`post_force_push`).
+fn recover_own(
+    gh: &SyncGhReader<'_>,
+    query: &RecordQuery,
+    red: &Red,
+    fix: &Fix,
+) -> Result<OwnFiles, String> {
+    if queue_pr(&red.branch).is_some() {
+        let queued = api(
+            gh,
+            &format!("repos/{}/commits/{}", query.repo, red.head_sha),
+        )?;
+        if let Some(pr_head) = queued["parents"]
+            .as_array()
+            .filter(|parents| parents.len() == 2)
+            .and_then(|parents| parents[1]["sha"].as_str())
+        {
+            let compare = api(
+                gh,
+                &format!("repos/{}/compare/{pr_head}...{}", query.repo, fix.head_sha),
+            )?;
+            if let (Some(own), _, truncated) =
+                own_by_first_parent(gh, query, &compare, pr_head, &fix.head_sha)?
+            {
+                return Ok((Some(own), "merge_queue_pr_head", truncated));
+            }
+        }
+    }
+    post_force_push(gh, query, red, fix)
+}
+
+fn post_force_push(
+    gh: &SyncGhReader<'_>,
+    query: &RecordQuery,
+    red: &Red,
+    fix: &Fix,
+) -> Result<OwnFiles, String> {
+    let Some(pr) = red.pr else {
+        return Ok((None, "red_not_ancestor", None));
+    };
+    if minutes_between(&red.time, &fix.pushed_at)
+        .is_none_or(|minutes| minutes > FORCE_PUSH_WINDOW_HOURS * 60)
+    {
+        return Ok((None, "post_force_push_too_late", None));
+    }
+    let mut commits = Vec::new();
+    for page in 1..=3 {
+        let listed = api(
+            gh,
+            &format!(
+                "repos/{}/pulls/{pr}/commits?per_page=100&page={page}",
+                query.repo
+            ),
+        )?;
+        let more = listed.as_array().cloned().unwrap_or_default();
+        let full = more.len() == 100;
+        commits.extend(more);
+        if !full {
+            break;
+        }
+    }
+    let Some(at) = commits
+        .iter()
+        .position(|commit| commit["sha"].as_str() == Some(fix.head_sha.as_str()))
+    else {
+        return Ok((None, "post_force_push_superseded", None));
+    };
+    let mut own = BTreeSet::new();
+    let mut truncated = false;
+    for commit in &commits[..=at] {
+        if commit["parents"].as_array().map_or(0, Vec::len) != 1 {
+            continue;
+        }
+        let sha = commit["sha"].as_str().unwrap_or_default();
+        let names = file_names(&api(gh, &format!("repos/{}/commits/{sha}", query.repo))?);
+        truncated |= names.len() >= COMPARE_FILE_CAP;
+        own.extend(names);
+    }
+    Ok((
+        Some(own.into_iter().collect()),
+        "post_force_push",
+        Some(truncated),
+    ))
+}
+
 /// The files a fix changed. A rerun changed none; on the base branch the
 /// pull request's own share is undefined; elsewhere it is the first-parent
 /// walk from the fix back to the red.
@@ -745,8 +874,15 @@ fn file_sets(
     let (own, method, own_truncated) = if branch == query.base {
         (None, "branch_is_default", None)
     } else {
-        own_by_first_parent(gh, query, &compare, &red.head_sha, &fix.head_sha)
-            .map_err(|error| format!("own files for run {}: {error}", red.run_id))?
+        match own_by_first_parent(gh, query, &compare, &red.head_sha, &fix.head_sha) {
+            // A recovery read that fails leaves the red unlinked by its own
+            // commits, as it was, rather than failing the whole fix-link.
+            Ok((None, "red_not_ancestor", _)) => {
+                recover_own(gh, query, red, fix).or(Ok((None, "red_not_ancestor", None)))
+            }
+            other => other,
+        }
+        .map_err(|error| format!("own files for run {}: {error}", red.run_id))?
     };
     Ok(FileSets {
         raw,
@@ -783,6 +919,16 @@ fn fix_row(red: &Red, fix: &Fix, branch: &str, files: &FileSets) -> Value {
     scrub(Value::Object(row))
 }
 
+/// Count a red still without a fix, by how long ago it went red.
+fn pending(report: &mut RecordReport, red: &Red, now: &str) {
+    report.reds_pending += 1;
+    match minutes_between(&red.time, now) {
+        Some(minutes) if minutes < 24 * 60 => report.pending_under_24h += 1,
+        Some(minutes) if minutes <= 72 * 60 => report.pending_24h_to_72h += 1,
+        _ => report.pending_over_72h += 1,
+    }
+}
+
 /// Fix-links for every red run attempt in the window that has turned green.
 fn fixlinks(
     gh: &SyncGhReader<'_>,
@@ -809,7 +955,7 @@ fn fixlinks(
         }
         let branch = fix_branch(gh, query, &red, pulls);
         if branch.is_empty() {
-            report.reds_pending += 1;
+            pending(report, &red, &query.now);
             continue;
         }
         let listed = greens.entry(branch.clone()).or_insert_with(|| {
@@ -830,7 +976,7 @@ fn fixlinks(
             .collect();
         let fixes = fixes_for(&red, &later, run_index);
         if fixes.is_empty() {
-            report.reds_pending += 1;
+            pending(report, &red, &query.now);
             continue;
         }
         for fix in &fixes {
