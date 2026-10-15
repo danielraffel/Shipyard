@@ -88,6 +88,12 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 
+mod rebase;
+pub use rebase::{
+    CarryRecord, REBASE_CARRY_ENV, REBASE_CARRY_FILE, REBASE_CARRY_LOG, patch_id, rebase_carry,
+    rebase_carry_enabled,
+};
+
 /// Config table holding the settings this module reads.
 pub const CONFIG_TABLE: &str = "auto_merge";
 /// Key turning the check on.
@@ -307,19 +313,92 @@ pub fn host_review_default() -> bool {
     if std::env::var(HOST_ENABLE_ENV).as_deref() == Ok("1") {
         return true;
     }
-    let dir = std::env::var_os("SHIPYARD_GHAPP_GUARDS_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(".config/shipyard/guards"))
-        });
-    !dir.is_some_and(|dir| {
+    !guards_dir().is_some_and(|dir| {
         matches!(
             read_opt_out(&dir.join(HOST_OPT_OUT_FILE)),
             OptOut::Valid { .. }
         )
     })
+}
+
+/// The guards directory: `$SHIPYARD_GHAPP_GUARDS_DIR`, else
+/// `~/.config/shipyard/guards`.
+pub(crate) fn guards_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("SHIPYARD_GHAPP_GUARDS_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".config/shipyard/guards"))
+        })
+}
+
+/// Guards-directory file naming who may sign the fleet App's APPROVE:
+/// `{"default": ["pulp-review", ...], "repos": {"OWNER/REPO": [...]}}`. The
+/// queue-arm guard reads the same file.
+pub const SIGNERS_FILE: &str = "reviewer-signers.json";
+
+/// The reviewer names that may sign an App APPROVE in `repo` on this host,
+/// or `None` when the host has no signers file (the rule is off). A file
+/// that cannot be read admits nobody.
+#[must_use]
+pub fn reviewer_signers(repo: &str) -> Option<Vec<String>> {
+    let path = guards_dir()?.join(SIGNERS_FILE);
+    if !path.exists() {
+        return None;
+    }
+    Some(
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .map_or_else(Vec::new, |data| signers_from(&data, repo)),
+    )
+}
+
+/// The signers a [`SIGNERS_FILE`]'s contents name for `repo`: its own entry,
+/// else `default`; nobody when neither is a list.
+fn signers_from(data: &Value, repo: &str) -> Vec<String> {
+    data.get("repos")
+        .and_then(Value::as_object)
+        .and_then(|repos| {
+            repos
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(repo))
+                .map(|(_, names)| names)
+        })
+        .or_else(|| data.get("default"))
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// This host's [`reviewer_signers`] for `repo`. Tests read no host state.
+#[cfg(not(test))]
+fn host_signers(repo: &str) -> Option<Vec<String>> {
+    reviewer_signers(repo)
+}
+
+#[cfg(test)]
+const fn host_signers(_repo: &str) -> Option<Vec<String>> {
+    None
+}
+
+/// Whether this evaluation may try the rebase carry: the host switch
+/// ([`rebase_carry_enabled`]). Tests read no host state.
+#[cfg(not(test))]
+fn host_rebase_carry() -> bool {
+    rebase_carry_enabled()
+}
+
+#[cfg(test)]
+const fn host_rebase_carry() -> bool {
+    false
 }
 
 /// Removals of one head after which it needs a fresh approval to re-arm.
@@ -344,6 +423,14 @@ pub struct ApprovalPolicy {
     /// ([`HUMAN_REVIEWERS_KEY`]), lower-cased. Empty by default.
     #[serde(default)]
     pub human_reviewer_logins: Vec<String>,
+    /// Who may sign the fleet App's APPROVE ([`reviewer_signers`]), lower-cased;
+    /// `None` when this host has no signers file.
+    #[serde(default)]
+    pub signers: Option<Vec<String>>,
+    /// Try the rebase carry for this evaluation whatever the host switch
+    /// says (`shipyard review-verdict` sets it; a config never does).
+    #[serde(default)]
+    pub rebase_carry: bool,
 }
 
 impl ApprovalPolicy {
@@ -384,6 +471,8 @@ impl ApprovalPolicy {
                         .collect()
                 })
                 .unwrap_or_default(),
+            signers: None,
+            rebase_carry: false,
         }
     }
 
@@ -436,13 +525,16 @@ pub enum Approval {
         performed_via_github_app_id: Option<u64>,
     },
     /// An approval of an earlier head, carried to this one by merge-only
-    /// updates that left every file the pull request changes at its approved
-    /// blob and mode.
+    /// updates, or across a rebase ([`rebase_carry`]), that left every file
+    /// the pull request changes at its approved blob and mode.
     Carried {
         /// The head the approval names.
         from_head: String,
         /// The approval of that head.
         approval: Box<Approval>,
+        /// Carried across a rebase rather than by merge-only updates.
+        #[serde(default)]
+        rebase: bool,
     },
     /// A `reviewed:<sha>` comment from an allowlisted reviewer.
     Marker {
@@ -493,10 +585,16 @@ impl Approval {
             Self::Carried {
                 from_head,
                 approval,
+                rebase,
             } => format!(
-                "{} of {}, carried by merge-only updates with byte-identical own lines",
+                "{} of {}, carried {} with byte-identical own lines",
                 approval.describe(),
-                short(from_head)
+                short(from_head),
+                if *rebase {
+                    "across a rebase (same patch-id, the base touched none of its files)"
+                } else {
+                    "by merge-only updates"
+                }
             ),
         }
     }
@@ -645,6 +743,11 @@ fn reviewer_allowed(record: &Value, policy: &ApprovalPolicy, author: Option<&str
     let Some(login) = login(record) else {
         return false;
     };
+    if is_fleet_author(login) && record.get("type").and_then(Value::as_str) != Some("Bot") {
+        // Only the App itself is a Bot; a user account named like it is
+        // anyone at all.
+        return false;
+    }
     let reviewer = normalized_login(login);
     if policy.any_reviewer_but_author && policy.reviewer_logins.is_empty() {
         // The repositories are public: only the fleet App and accounts the
@@ -674,12 +777,53 @@ fn approver_allowed(record: &Value, policy: &ApprovalPolicy) -> bool {
         return true;
     }
     login(record).is_some_and(|login| {
-        is_fleet_author(login)
-            || policy
-                .human_reviewer_logins
-                .iter()
-                .any(|human| *human == normalized_login(login))
+        if is_fleet_author(login) {
+            return app_approval_refusal(record, policy).is_none();
+        }
+        policy
+            .human_reviewer_logins
+            .iter()
+            .any(|human| *human == normalized_login(login))
     })
+}
+
+/// Why the fleet App's APPROVE in `record` does not count, or `None`.
+///
+/// Every agent posts as the same App, so the App's identity says nothing
+/// about who reviewed: an APPROVE `ghapp` stamped with an `unattributed`
+/// session never counts, and on a host with a signers file the body must
+/// carry a `reviewer: <name>` line naming an allowed signer.
+fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<String> {
+    let body = record
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if stamped_session(body).as_deref() == Some("unattributed") {
+        return Some("its session stamp is unattributed".to_owned());
+    }
+    let signers = policy.signers.as_ref()?;
+    let pattern = Regex::new(r"(?m)^[ \t]*reviewer:[ \t]*([A-Za-z0-9._-]+)[ \t]*$")
+        .expect("signer pattern compiles");
+    let signed: Vec<String> = pattern
+        .captures_iter(body)
+        .filter_map(|capture| capture.get(1))
+        .map(|name| name.as_str().to_ascii_lowercase())
+        .collect();
+    if signed.is_empty() {
+        return Some("it has no `reviewer: <name>` line".to_owned());
+    }
+    if !signed.iter().any(|name| signers.contains(name)) {
+        return Some(format!(
+            "its signer {} is not one of {}",
+            signed.last().map_or("", String::as_str),
+            if signers.is_empty() {
+                "nobody".to_owned()
+            } else {
+                signers.join(", ")
+            }
+        ));
+    }
+    None
 }
 
 /// Whether `record`'s `verdict` counts under `policy`: a HOLD from any
@@ -722,7 +866,14 @@ pub fn verdict_audit_events(
             && !approver_allowed(record, policy)
             && let Some(login) = login(record)
         {
-            events.push(format!("excluded_human_approval:{login}"));
+            events.push(if is_fleet_author(login) {
+                format!(
+                    "excluded_app_approval:{}",
+                    app_approval_refusal(record, policy).unwrap_or_default()
+                )
+            } else {
+                format!("excluded_human_approval:{login}")
+            });
         }
     }
     for comment in comments {
@@ -1112,7 +1263,9 @@ fn read_policy_inner(
         Err(detail) if detail.contains("404") || detail.contains("Not Found") => {
             let host_default = host_review_default();
             if host_default && requires_review_by_default(repo) {
-                return Ok(ApprovalPolicy::without_config(repo, host_default));
+                let mut policy = ApprovalPolicy::without_config(repo, host_default);
+                policy.signers = host_signers(repo);
+                return Ok(policy);
             }
             if missing_is_error {
                 return Err(format!(
@@ -1126,7 +1279,8 @@ fn read_policy_inner(
     let table = raw
         .parse::<toml::Table>()
         .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
-    let policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_review_default());
+    let mut policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_review_default());
+    policy.signers = host_signers(repo);
     policy.validate().map(|()| policy)
 }
 
@@ -1145,7 +1299,7 @@ pub fn read_policy_required(
 }
 
 /// A review as the gate reads it.
-const REVIEW_RECORD_JQ: &str = ".[] | {login: .user.login, type: .user.type, association: .author_association, at: .submitted_at, state: .state, commit_id: .commit_id, performed_via_github_app_id: .performed_via_github_app.id}";
+const REVIEW_RECORD_JQ: &str = ".[] | {login: .user.login, type: .user.type, association: .author_association, at: .submitted_at, state: .state, commit_id: .commit_id, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 /// A comment as the gate reads it.
 const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 
@@ -1444,14 +1598,25 @@ fn with_carry(run_gh: RunGh<'_>, input: &CarryInput<'_>, gate: HeadGate) -> Head
     ) else {
         return gate;
     };
-    match merge_only_carry(run_gh, input.repo, input.pr, &from, input.head) {
-        Ok(()) => HeadGate::Approved {
-            approval: Approval::Carried {
-                from_head: from,
-                approval: Box::new(approval),
-            },
+    let rebase = match merge_only_carry(run_gh, input.repo, input.pr, &from, input.head) {
+        Ok(()) => false,
+        Err(_) if input.policy.rebase_carry || host_rebase_carry() => {
+            match rebase_carry(run_gh, input.repo, input.pr, &from, input.head) {
+                Ok(record) => {
+                    rebase::log_carry(input.repo, input.pr, &from, input.head, &record);
+                    true
+                }
+                Err(_) => return gate,
+            }
+        }
+        Err(_) => return gate,
+    };
+    HeadGate::Approved {
+        approval: Approval::Carried {
+            from_head: from,
+            approval: Box::new(approval),
+            rebase,
         },
-        Err(_) => gate,
     }
 }
 

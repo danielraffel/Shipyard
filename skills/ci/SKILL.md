@@ -174,7 +174,10 @@ has a `review-before-arm.opt-out` file, written with a reason by
 that written record counts; there,
 with no identity listed, an approval counts only from the fleet App or a
 human the base lists in `[auto_merge] human_reviewers`, empty by default; a
-HOLD from any OWNER/MEMBER/COLLABORATOR still counts; never the PR author's)
+HOLD from any OWNER/MEMBER/COLLABORATOR still counts; never the PR author's;
+an App APPROVE must be signed with a `reviewer: <name>` line from the host's
+`reviewer-signers.json`, where that file exists, and never counts when
+stamped `unattributed`)
 arms or merges only a
 head that carries an
 approval of that exact head from an identity listed in
@@ -224,6 +227,13 @@ example "a.py was changed by both the pull request and the base" on a PR that
 renames `a.py` to `b.py`) is not a false refusal: the base edited the rename's
 source, and a merge that keeps the approved `b.py` drops that edit. Re-review
 the merged head.
+
+A rebased head carries its approval only on a host with the rebase carry on
+(`SHIPYARD_REBASE_CARRY=1` or a `rebase-carry` guards file), and now in
+Shipyard's own arm and steward paths as well as `queue-arm-guard`: the steward
+evidence says `via=rebase` and the carry is a line in `carries.jsonl`. A
+rebase that changed any PR file, or crossed a base edit to one, still needs a
+fresh verdict.
 
 "changes a binary file" means the file's blob has a NUL byte, git's rule; a
 large one-line text file GitHub shows no patch for (tartci's JSON fixtures) is

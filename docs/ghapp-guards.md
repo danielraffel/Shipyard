@@ -168,6 +168,23 @@ blocks an earlier approval. A HOLD whose time cannot be read always blocks.
   repositories are public, and a drive-by account's comment must not land a
   head. A distinguishable PR author never approves their own head, listed or
   not. List `reviewer_identities` to make it strict.
+* The fleet App is recognised by its login **and** its type: a verdict counts
+  as the App's only when the author is a `Bot`. GitHub's GraphQL names the
+  App `shipyard-local`, a login anyone can register as a user, so a user
+  account of that name counts for nothing.
+* The App's identity says nothing about which agent reviewed, since every
+  agent posts as it. So an App APPROVE does not count when `ghapp` stamped it
+  with an `unattributed` session (pulp#10315: a bare APPROVE from a session
+  with no identity armed the pull request). On a host whose guards directory
+  holds `reviewer-signers.json`, an App APPROVE counts only with a
+  `reviewer: <name>` line naming an allowed signer (pulp#10320: an APPROVE
+  with no reviewer of record). The file is
+  `{"default": ["pulp-review", "infra-review2"], "repos": {"OWNER/REPO": [...]}}`;
+  a repository's own list replaces the default, and a file that cannot be
+  read admits nobody. Without the file the signer rule is off on that host;
+  roll it out one host at a time. Each refusal is printed and recorded in
+  `excluded_approvals`, and Shipyard's own paths report
+  `excluded_app_approval:<why>`. A HOLD never needs a signer.
 
 **The request must bind the head.** `gh pr merge` needs
 `--match-head-commit <sha>`, a GraphQL mutation `expectedHeadOid`, and the
@@ -238,6 +255,9 @@ Every carry appends one JSON line (repository, pull request, both heads, both
 merge bases, the patch-id, the file count, argv) to `carries.jsonl` in the
 guards directory and prints a line saying so. A HOLD naming the new head still
 refuses. Roll it out one host at a time; roll back by removing the file.
+Shipyard's own arm paths read the same switch and apply the same four
+conditions (`head_approval::rebase_carry`, the Rust twin); their carries are
+logged to the same file with `"by": "shipyard"`.
 
 The refusal names the head, the exact marker it needs, and the latest verdict
 when it approves a different head. Each refusal is followed by one
