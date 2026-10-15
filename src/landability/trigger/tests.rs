@@ -477,3 +477,98 @@ fn no_tracked_markdown_carries_an_unterminated_liquid_delimiter() {
         offenders.join("\n")
     );
 }
+
+/// The `{{` positions in `text` that no `{% raw %}` ... `{% endraw %}`
+/// region covers. GitHub Pages runs every tracked markdown file through
+/// Liquid, so a GitHub Actions `${{ ... }}` outside one renders as `$` on the
+/// site, or fails the whole build when it contains `{` (`format('{0}')`).
+fn unescaped_liquid(text: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut raw = false;
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        if raw {
+            match rest.find("{% endraw %}") {
+                Some(end) => {
+                    raw = false;
+                    at += end + "{% endraw %}".len();
+                }
+                None => break,
+            }
+            continue;
+        }
+        let open = rest.find("{% raw %}");
+        let liquid = rest.find("{{");
+        match (open, liquid) {
+            (Some(open), Some(liquid)) if open < liquid => {
+                raw = true;
+                at += open + "{% raw %}".len();
+            }
+            (_, Some(liquid)) => {
+                found.push(at + liquid);
+                at += liquid + 2;
+            }
+            (Some(open), None) => {
+                raw = true;
+                at += open + "{% raw %}".len();
+            }
+            (None, None) => break,
+        }
+    }
+    found
+}
+
+#[test]
+fn the_raw_scanner_flags_only_unescaped_delimiters() {
+    assert_eq!(unescaped_liquid("a `${{ x }}` b"), vec![4]);
+    assert!(unescaped_liquid("a {% raw %}`${{ x }}`{% endraw %} b").is_empty());
+    assert!(unescaped_liquid("{% raw %}\n```\n${{ a }}\n${{ b }}\n```\n{% endraw %}").is_empty());
+    assert_eq!(
+        unescaped_liquid("{% raw %}`${{ a }}`{% endraw %} then `${{ b }}`").len(),
+        1
+    );
+}
+
+#[test]
+fn every_liquid_delimiter_in_tracked_markdown_is_inside_a_raw_block() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "*.md"])
+        .output()
+        .expect("git ls-files runs");
+    assert!(listed.status.success(), "git ls-files failed");
+    let files: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        files.len() > 10,
+        "only {} markdown file(s) listed",
+        files.len()
+    );
+    let mut offenders = Vec::new();
+    let mut delimiters = 0usize;
+    for file in &files {
+        let Ok(text) = std::fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        delimiters += text.matches("{{").count();
+        for at in unescaped_liquid(&text) {
+            let line = text[..at].matches('\n').count() + 1;
+            offenders.push(format!("{file}:{line}"));
+        }
+    }
+    assert!(
+        delimiters > 0,
+        "no `{{{{` in any tracked markdown; nothing was checked"
+    );
+    assert!(
+        offenders.is_empty(),
+        "`{{{{` outside a {{% raw %}} block renders wrong on GitHub Pages (or fails its \
+         build):\n{}",
+        offenders.join("\n")
+    );
+}

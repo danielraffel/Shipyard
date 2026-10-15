@@ -849,6 +849,16 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
     reviewers = section.get("reviewer_identities", section.get("reviewer_logins")) or []
     from_default = not isinstance(required, bool) and default
     humans = section.get("human_reviewers") or []
+    # The protected base may name its own signers; otherwise this host's
+    # signers file decides (see reviewer_signers).
+    configured = section.get("reviewer_signers")
+    if configured is not None and not (
+            isinstance(configured, list) and all(isinstance(name, str) for name in configured)):
+        # Never fall back to the host's file on a malformed list.
+        raise GuardError("the base's .shipyard/config.toml [auto_merge] reviewer_signers must "
+                         f"be a list of reviewer names, not {configured!r}")
+    configured_signers = ([name.lower() for name in configured]
+                          if configured is not None else None)
     return {
         "required": required if isinstance(required, bool) else default,
         "reviewers": [str(login).lower() for login in reviewers if isinstance(login, str)],
@@ -859,7 +869,7 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
         "humans": [_normalized_login(login) for login in humans if isinstance(login, str)],
         # Who may sign the fleet App's APPROVE on this host (see
         # reviewer_signers); None when the host has no signers file.
-        "signers": reviewer_signers(repo),
+        "signers": configured_signers if configured_signers is not None else reviewer_signers(repo),
     }
 
 
@@ -870,8 +880,9 @@ _SIGNER_LINE = re.compile(r"^[ \t]*reviewer:[ \t]*([A-Za-z0-9._-]+)[ \t]*$", re.
 
 
 def reviewer_signers(repo: str) -> list[str] | None:
-    """The reviewer names that may sign an App APPROVE in ``repo``, or None
-    when this host has no signers file (the rule is off). A file that cannot
+    """The reviewer names this host's signers file allows for an App APPROVE
+    in ``repo``, or None when the host has no signers file. A base config's
+    ``[auto_merge] reviewer_signers`` takes precedence (see review_policy). A file that cannot
     be read admits nobody: an unreadable allowlist never loosens the rule."""
     path = _guards_dir() / SIGNERS_FILE
     if not path.exists():

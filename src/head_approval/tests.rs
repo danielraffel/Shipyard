@@ -1091,6 +1091,89 @@ fn pulp_10320s_unsigned_approve_needs_an_allowed_signer() {
 }
 
 #[test]
+fn a_missing_signers_file_is_off_and_an_unreadable_one_admits_nobody() {
+    let temp = tempfile::tempdir().expect("temp");
+    let path = temp.path().join(super::SIGNERS_FILE);
+    assert_eq!(super::signers_at(&path, "Generous-Corp/pulp"), None);
+    std::fs::write(&path, "{not json").expect("write");
+    assert_eq!(
+        super::signers_at(&path, "Generous-Corp/pulp"),
+        Some(Vec::new())
+    );
+    std::fs::write(&path, r#"{"default": ["pulp-review"]}"#).expect("write");
+    assert_eq!(
+        super::signers_at(&path, "Generous-Corp/pulp"),
+        Some(vec!["pulp-review".to_owned()])
+    );
+}
+
+#[test]
+fn the_base_config_can_name_its_own_signers() {
+    let table: toml::Table = "[auto_merge]\nreviewer_signers = [\"Pulp-Review\"]\n"
+        .parse()
+        .expect("toml");
+    assert_eq!(
+        ApprovalPolicy::from_table(&table).signers,
+        Some(vec!["pulp-review".to_owned()])
+    );
+    let silent: toml::Table = "[auto_merge]\nqueue = true\n".parse().expect("toml");
+    assert_eq!(ApprovalPolicy::from_table(&silent).signers, None);
+}
+
+/// The base's list wins over this host's file: a signer only the host lists
+/// does not count when the base names its own.
+#[test]
+fn the_base_signer_list_beats_a_permissive_host_file() {
+    let read = |config: &'static str| {
+        let answer = move |_: &[String]| -> Result<String, String> { Ok(config.to_owned()) };
+        super::with_host_signers(&["pulp-review", "codex-g2h"], || {
+            read_policy(&answer, "Generous-Corp/pulp", "main").expect("read")
+        })
+    };
+    // Control: with no list on the base, the host file is what is read.
+    assert_eq!(
+        read("[auto_merge]\nqueue = true\n").signers,
+        Some(vec!["pulp-review".to_owned(), "codex-g2h".to_owned()])
+    );
+    let policy = read("[auto_merge]\nreviewer_signers = [\"pulp-review\"]\n");
+    assert_eq!(policy.signers, Some(vec!["pulp-review".to_owned()]));
+    let comment = record_from("pulp-10320-unsigned-approve.json");
+    let head = marker_head(&comment);
+    let body = comment["body"].as_str().expect("body");
+    let (prose, verdict) = body.trim_end().rsplit_once('\n').expect("two parts");
+    let mut host_only = comment.clone();
+    host_only["body"] = json!(format!("{prose}\nreviewer: codex-g2h\n{verdict}"));
+    let mut base_policy = by_default("Generous-Corp/pulp");
+    base_policy.signers = policy.signers;
+    assert!(!gate_on(&base_policy, &head, &[host_only]).allows());
+}
+
+/// A `reviewer_signers` that is not a list of names is an error, never a
+/// silent fall back to the host's file.
+#[test]
+fn a_signer_list_that_is_not_a_list_of_names_is_an_error() {
+    for config in [
+        "[auto_merge]\nreviewer_signers = \"pulp-review\"\n",
+        "[auto_merge]\nreviewer_signers = [\"pulp-review\", 7]\n",
+        "[auto_merge]\nreviewer_signers = { default = [\"pulp-review\"] }\n",
+    ] {
+        let answer = move |_: &[String]| -> Result<String, String> { Ok(config.to_owned()) };
+        let error = super::with_host_signers(&["pulp-review"], || {
+            read_policy(&answer, "Generous-Corp/pulp", "main")
+        })
+        .expect_err(config);
+        assert!(
+            error.contains("must be a list of reviewer names"),
+            "{error}"
+        );
+    }
+    let empty: toml::Table = "[auto_merge]\nreviewer_signers = []\n"
+        .parse()
+        .expect("toml");
+    assert_eq!(super::signers_shape(&empty), Ok(()));
+}
+
+#[test]
 fn the_signers_file_names_a_list_per_repository() {
     let data = json!({"default": ["pulp-review", "Infra-Review2"],
                       "repos": {"danielraffel/tartci": ["tartci-review"]}});
