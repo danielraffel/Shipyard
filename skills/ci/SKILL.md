@@ -472,6 +472,14 @@ is bound to that job (repo, head, run, attempt, job name) and names the cause
 the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
 <file>` (append-only, one file per month, ids never duplicated).
 
+**"May this head land?" is `shipyard review-verdict --pr N --json`.** It is
+the repository-side review rule with no host switch in it: exit 0 when an
+approval names the head or carries to it (merge-only, or across a rebase that
+kept the patch-id and every file's approved blob), 1 when refused (the JSON
+names excluded human approvals and the fix), 2 when unreadable (treat as
+refused). Pass `--head <sha>` to judge the head a merge group lands rather
+than the pull request's current one.
+
 **"Who armed it?" is `shipyard who --pr N`, not a timeline read.** Every queue
 event shows the fleet App as its actor. `who` joins the arm guard's
 `queue-arms.jsonl` and the removal guard's `queue-removals.jsonl` from every

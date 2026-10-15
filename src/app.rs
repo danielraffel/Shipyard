@@ -65,6 +65,7 @@ mod reroute_cmd;
 mod rescue_cmd;
 mod reuse_cmd;
 mod reuse_rederive;
+mod review_verdict_cmd;
 mod run_cmd;
 mod runner_cmd;
 mod runner_kill_cmd;
@@ -526,6 +527,25 @@ where
                 stdout,
             );
         }
+        Command::ReviewVerdict {
+            pr,
+            repo,
+            head,
+            no_rebase_carry,
+        } => {
+            return review_verdict_cmd::review_verdict_command(
+                cli.mode.into(),
+                &cwd,
+                review_verdict_cmd::ReviewVerdictArgs {
+                    pr,
+                    repo,
+                    head,
+                    rebase_carry: !no_rebase_carry,
+                    json: cli.json,
+                },
+                stdout,
+            );
+        }
         Command::Who { pr, repo } => {
             return who_cmd::who_command(
                 cli.mode.into(),
@@ -877,6 +897,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Landability { .. }
         | Command::Landing { .. }
         | Command::Inspect { .. }
+        | Command::ReviewVerdict { .. }
         | Command::Who { .. }
         | Command::BaseHealth { .. }
         | Command::Diagnose { .. }

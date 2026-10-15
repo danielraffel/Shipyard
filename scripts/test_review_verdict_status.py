@@ -26,6 +26,36 @@ REPO = "danielraffel/Shipyard"
 HEAD = arm.HEAD_784
 
 
+class RepositorySideSwitches(unittest.TestCase):
+    """The status pins the guard's switches to the repository-side rule."""
+
+    def test_the_rebase_carry_and_review_are_on_whatever_the_host_says(self) -> None:
+        import importlib.util
+        import os
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("review_verdict_status", STATUS)
+        assert spec is not None and spec.loader is not None
+        status = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(status)
+        seen: dict[str, str | None] = {}
+
+        class Stop(Exception):
+            pass
+
+        def load_guard() -> None:
+            seen.update({name: os.environ.get(name) for name in
+                         ("SHIPYARD_REBASE_CARRY", "SHIPYARD_REVIEW_BEFORE_ARM")})
+            raise Stop
+
+        event = {"pull_request": {"number": 784, "head": {"sha": "a" * 40}}}
+        with mock.patch.dict(os.environ, {"SHIPYARD_REBASE_CARRY": "0",
+                                          "SHIPYARD_REVIEW_BEFORE_ARM": "0"}), \
+                mock.patch.object(status, "load_guard", load_guard), \
+                self.assertRaises(Stop):
+            status.run("pull_request_target", event, "danielraffel/Shipyard", None)
+        self.assertEqual(seen, {"SHIPYARD_REBASE_CARRY": "1", "SHIPYARD_REVIEW_BEFORE_ARM": "1"})
+
+
 class ReviewVerdictStatus(unittest.TestCase):
     install = arm.ReviewBeforeArm.install
     case = arm.ReviewBeforeArm.case
@@ -76,7 +106,7 @@ class ReviewVerdictStatus(unittest.TestCase):
                        "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": str(event_path),
                        "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "99",
                        # A host's own switches must not reach the status.
-                       "SHIPYARD_REBASE_CARRY": "1", "SHIPYARD_REVIEW_BEFORE_ARM": "0"}
+                       "SHIPYARD_REBASE_CARRY": "0", "SHIPYARD_REVIEW_BEFORE_ARM": "0"}
         return subprocess.run([sys.executable, str(self.scripts / STATUS.name)], env=environment,
                               capture_output=True, text=True, check=False,
                               stdin=subprocess.DEVNULL)

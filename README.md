@@ -158,6 +158,11 @@ project will automatically recover or merge every PR.
   approving agent is refused. A shared session alone (every agent of one
   Claude Code team has the same one) only warns. `hold-disarms`
   is still switched on one host at a time.
+- **May this head land.** `shipyard review-verdict --pr N [--head SHA] --json`
+  answers with the repository-side review rule, with no host switch in it:
+  the approval naming the head, or one carried to it by merge-only updates or
+  across a rebase (same patch-id, the base touched none of its files), or why
+  it is refused. A merge-group check runs it to land only approved heads.
 - **Who landed it.** GitHub attributes every queue mutation to the App, so
   the arm guard records each arm, enqueue and merge it judges in
   `~/.local/state/shipyard/queue-arms.jsonl` (time, host, agent session,

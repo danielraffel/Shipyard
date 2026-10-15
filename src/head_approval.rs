@@ -1138,6 +1138,7 @@ fn read_policy_inner(
     repo: &str,
     base: &str,
     missing_is_error: bool,
+    host_default: bool,
 ) -> Result<ApprovalPolicy, String> {
     let raw = match run_gh(&[
         "api".to_owned(),
@@ -1147,7 +1148,6 @@ fn read_policy_inner(
     ]) {
         Ok(raw) => raw,
         Err(detail) if detail.contains("404") || detail.contains("Not Found") => {
-            let host_default = host_review_default();
             if host_default && requires_review_by_default(repo) {
                 return Ok(ApprovalPolicy::without_config(repo, host_default));
             }
@@ -1163,13 +1163,28 @@ fn read_policy_inner(
     let table = raw
         .parse::<toml::Table>()
         .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
-    let policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_review_default());
+    let policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_default);
     policy.validate().map(|()| policy)
 }
 
 /// Read the policy from `base` on GitHub, treating a missing file as default.
 pub fn read_policy(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<ApprovalPolicy, String> {
-    read_policy_inner(run_gh, repo, base, false)
+    read_policy_inner(run_gh, repo, base, false, host_review_default())
+}
+
+/// Read the policy as the repository-side rule, with no host in it: review
+/// is on for [`REVIEW_REQUIRED_REPOS`] whatever this host's opt-out says
+/// (`shipyard review-verdict`).
+///
+/// # Errors
+///
+/// When the config exists but cannot be read or parsed.
+pub fn read_policy_repository_side(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+) -> Result<ApprovalPolicy, String> {
+    read_policy_inner(run_gh, repo, base, false, true)
 }
 
 /// Read the policy for the steward enqueue gate, where absence is unsafe.
@@ -1178,7 +1193,7 @@ pub fn read_policy_required(
     repo: &str,
     base: &str,
 ) -> Result<ApprovalPolicy, String> {
-    read_policy_inner(run_gh, repo, base, true)
+    read_policy_inner(run_gh, repo, base, true, host_review_default())
 }
 
 /// A review as the gate reads it.

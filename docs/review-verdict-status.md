@@ -29,7 +29,13 @@ disagree:
 - a repository whose base sets `arm_requires_head_approval = false` gets
   `success` with the reason.
 
-The rebase carry is a per-host switch and is always off here.
+The rebase carry is on here, whatever any host's switch says: the status is
+the repository-side rule. An approval of an earlier head carries across a
+rebase only when the diff keeps its `git patch-id --stable`, the files and
+their statuses are the same, the base touched none of them and each keeps its
+approved blob and mode, and no required check on the new head was skipped,
+neutral or reused a receipt. `shipyard review-verdict --pr N --json` gives the
+same answer from the command line (Rust, `crate::review_verdict`).
 
 A status belongs to a commit, but a decision belongs to a pull request, and
 two open pull requests can share a head (one branch opened into two bases, a
