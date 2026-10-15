@@ -26,6 +26,39 @@ assert SPEC is not None and SPEC.loader is not None
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 
+# A case that clears the environment drops HOME, and Path.home() then falls back
+# to the account's real home: the guard appended every such case to the real
+# ~/.local/state/shipyard/queue-arms.jsonl on whatever host ran the suite. Every case
+# must give the guard a HOME; one that does not fails here instead of writing.
+HOMELESS_READS: list[str] = []
+_REAL_HOME = pathlib.Path.home
+
+
+def _home_or_fail(cls: type[pathlib.Path]) -> pathlib.Path:
+    home = os.environ.get("HOME")
+    if not home:
+        HOMELESS_READS.append(os.environ.get("PYTEST_CURRENT_TEST", "a case"))
+        raise AssertionError("a test cleared HOME; the guard would write the real home")
+    return cls(home)
+
+
+def setUpModule() -> None:  # noqa: N802 - unittest's name
+    patcher = mock.patch.object(pathlib.Path, "home", classmethod(_home_or_fail))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
+def tearDownModule() -> None:  # noqa: N802 - unittest's name
+    if HOMELESS_READS:
+        raise AssertionError(f"{len(HOMELESS_READS)} home reads with HOME cleared")
+
+
+def scratch_home(case: unittest.TestCase) -> str:
+    """A throwaway HOME for one case, removed after it."""
+    home = tempfile.mkdtemp()
+    case.addCleanup(shutil.rmtree, home, True)
+    return home
+
 FIXTURES = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "github"
 
 
@@ -336,7 +369,7 @@ class QueueArmGuardTests(unittest.TestCase):
             return value
 
         stderr = io.StringIO()
-        base_env = {"GH_REPO": "Generous-Corp/pulp"}
+        base_env = {"GH_REPO": "Generous-Corp/pulp", "HOME": scratch_home(self)}
         base_env.update(env)
         with (
             mock.patch.dict(os.environ, base_env, clear=True),
@@ -715,7 +748,8 @@ class BatchAttributionTests(unittest.TestCase):
             return value
 
         stderr = io.StringIO()
-        base_env = {"GH_REPO": repo, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        base_env = {"GH_REPO": repo, "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "HOME": scratch_home(self)}
         base_env.update(env)
         with (
             mock.patch.dict(os.environ, base_env, clear=True),
@@ -1034,7 +1068,8 @@ class BatchAttributionTests(unittest.TestCase):
             raise AssertionError(f"unexpected gh call {arguments}")
 
         stderr = io.StringIO()
-        env = {"GH_REPO": "Generous-Corp/pulp", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        env = {"GH_REPO": "Generous-Corp/pulp", "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "HOME": scratch_home(self)}
         with (
             mock.patch.dict(os.environ, env, clear=True),
             mock.patch.object(guard, "run_real_gh", side_effect=fake_gh),

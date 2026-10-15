@@ -21,10 +21,44 @@ if SPEC is None or SPEC.loader is None:
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 
+# A case that clears the environment drops HOME, and Path.home() then falls back
+# to the account's real home: the guard appended every such case to the real
+# ~/.local/state/shipyard/queue-removals.jsonl on whatever host ran the suite. Every case
+# must give the guard a HOME; one that does not fails here instead of writing.
+HOMELESS_READS: list[str] = []
+_REAL_HOME = pathlib.Path.home
+
+
+def _home_or_fail(cls: type[pathlib.Path]) -> pathlib.Path:
+    home = os.environ.get("HOME")
+    if not home:
+        HOMELESS_READS.append(os.environ.get("PYTEST_CURRENT_TEST", "a case"))
+        raise AssertionError("a test cleared HOME; the guard would write the real home")
+    return cls(home)
+
+
+def setUpModule() -> None:  # noqa: N802 - unittest's name
+    patcher = mock.patch.object(pathlib.Path, "home", classmethod(_home_or_fail))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
+def tearDownModule() -> None:  # noqa: N802 - unittest's name
+    if HOMELESS_READS:
+        raise AssertionError(f"{len(HOMELESS_READS)} home reads with HOME cleared")
+
+
+def scratch_home(case: unittest.TestCase) -> str:
+    """A throwaway HOME for one case, removed after it."""
+    home = tempfile.mkdtemp()
+    case.addCleanup(shutil.rmtree, home, True)
+    return home
+
 
 class QueueRemovalGuardTests(unittest.TestCase):
     def run_guard(self, args: list[str], **env: str) -> tuple[int, str]:
         stderr = io.StringIO()
+        env = {"HOME": scratch_home(self), **env}
         with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stderr(stderr):
             return guard.main(args), stderr.getvalue()
 
@@ -174,11 +208,13 @@ class QueueRemovalGuardTests(unittest.TestCase):
 
     def test_internal_marker_is_honoured_only_from_a_shipyard_parent(self) -> None:
         args = ["api", "graphql", "-f", "query=mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }"]
-        installed = str(pathlib.Path.home() / ".local/share/shipyard/auth-generations/abc/shipyard")
+        home = scratch_home(self)
+        installed = str(pathlib.Path(home) / ".local/share/shipyard/auth-generations/abc/shipyard")
         with mock.patch.object(
             guard, "process_ancestry", return_value=[("bash", "/bin/bash"), ("shipyard", installed)]
         ):
-            self.assertEqual(self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1")[0], 0)
+            self.assertEqual(
+                self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1", HOME=home)[0], 0)
         for ancestry in (
             [("bash", "/bin/bash"), ("zsh", "/bin/zsh"), ("codex", "/opt/codex")],
             [("bash", "/bin/bash"), ("node", "/usr/bin/node"), ("shipyard", installed)],
@@ -194,7 +230,8 @@ class QueueRemovalGuardTests(unittest.TestCase):
             with self.subTest(ancestry=ancestry), mock.patch.object(
                 guard, "process_ancestry", return_value=ancestry
             ):
-                code, message = self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
+                code, message = self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1",
+                                               HOME=home)
                 self.assertEqual(code, 1)
                 self.assertIn("not the Shipyard binary", message)
 
@@ -389,7 +426,8 @@ class ReplayClassifiedRemovals(unittest.TestCase):
         refused_avoidable = 0
         for row in rows:
             reason = REASON_FOR_CAUSE[row["cause"]]
-            env = {**OVERRIDE, "GHAPP_QUEUE_REMOVAL_REASON": reason, "GHAPP_QUEUE_REMOVAL_NOTE": row["cause"]}
+            env = {**OVERRIDE, "GHAPP_QUEUE_REMOVAL_REASON": reason,
+                   "GHAPP_QUEUE_REMOVAL_NOTE": row["cause"], "HOME": scratch_home(self)}
             with tempfile.TemporaryDirectory() as directory, mock.patch.object(
                 guard, "read_target",
                 return_value={"repo": "Generous-Corp/pulp", "pr": row["pr"], "head": "a" * 40,
@@ -406,7 +444,8 @@ class ReplayClassifiedRemovals(unittest.TestCase):
                 # The same request as it was actually made: the spoofed marker alone.
                 with mock.patch.object(guard, "process_ancestry",
                                        return_value=[("bash", "/bin/bash"), ("codex", "/opt/codex")]):
-                    with mock.patch.dict(os.environ, {"SHIPYARD_INTERNAL_QUEUE_MUTATION": "1"}, clear=True), \
+                    with mock.patch.dict(os.environ, {"SHIPYARD_INTERNAL_QUEUE_MUTATION": "1",
+                                                          "HOME": scratch_home(self)}, clear=True), \
                             contextlib.redirect_stderr(io.StringIO()):
                         self.assertEqual(guard.main(dequeue(f"PR_{row['pr']}")), 1, row)
         defect_fixes = sorted(row["pr"] for row in rows if row["cause"] == "defect_fix_push")
