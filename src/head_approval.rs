@@ -356,7 +356,7 @@ fn signers_at(path: &std::path::Path, repo: &str) -> Option<Vec<String>> {
         return None;
     }
     Some(
-        std::fs::read_to_string(&path)
+        std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .map_or_else(Vec::new, |data| signers_from(&data, repo)),
