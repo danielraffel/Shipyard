@@ -384,7 +384,7 @@ Reasoning:
 
 - It manages repository secrets and dispatches verification workflows as an operator action.
 - A repo-configured App token may be intentionally narrower and may not have secret-management access.
-- The existing workflow template using `${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}` remains unchanged.
+- The existing workflow template using {% raw %}`${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}`{% endraw %} remains unchanged.
 
 Implementation policy:
 
