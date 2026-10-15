@@ -142,10 +142,15 @@ pub(super) fn inherit_from_summarised(rows: &mut [Value], sources: &[Value]) -> 
             "fix_hint",
             "kind",
             "location",
+            // The evidence is the source job's, so it describes the same log
+            // line as the detail; evidence_job_id names whose log that is.
+            "evidence",
+            "step_failed",
         ] {
             fields.insert(key.to_owned(), source[key].clone());
         }
         fields.insert("inherited_from_job_id".to_owned(), source["job_id"].clone());
+        fields.insert("evidence_job_id".to_owned(), source["job_id"].clone());
         fields.insert("inherited_from_job".to_owned(), source["job"].clone());
         fields.insert("labelled_by".to_owned(), json!("summarised_job"));
         inherited += 1;

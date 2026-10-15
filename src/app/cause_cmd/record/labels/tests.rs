@@ -108,7 +108,9 @@ fn row(job_id: u64, job: &str, format: &str, class: &str, confidence: &str) -> V
         "run_id": 1, "attempt": 1, "job_id": job_id, "job": job,
         "format": format, "failure_class": class, "confidence": confidence,
         "signature": format!("sig-{job_id}"), "detail": format!("detail-{job_id}"),
-        "fix_hint": null, "kind": "k", "location": ""
+        "fix_hint": null, "kind": "k", "location": "",
+        "evidence": {"log_line": job_id, "excerpt": [format!("line of job {job_id}")]},
+        "step_failed": true
     })
 }
 
@@ -127,6 +129,13 @@ fn a_summary_job_takes_the_cause_of_the_job_it_summarises() {
     assert_eq!(summary["inherited_from_job_id"], 11);
     assert_eq!(summary["inherited_from_job"], "Linux (x64) [github-hosted]");
     assert_eq!(summary["labelled_by"], "summarised_job");
+    // Its evidence is the source job's, never its own log beside another
+    // job's detail.
+    assert_eq!(
+        summary["evidence"],
+        json!({"log_line": 11, "excerpt": ["line of job 11"]})
+    );
+    assert_eq!(summary["evidence_job_id"], 11);
 }
 
 #[test]
