@@ -170,9 +170,20 @@ state dir (`~/Library/Application Support/shipyard/` on macOS), flock
 `.sandbox-writer-domain.lock` shared, release the turnstile, write, then
 release the shared lock; poll non-blocking for at most 30s and skip the write
 on timeout. Hold the shared lock only around the write itself. The one
-exception the audit does not count is the agent sessions' hand-back inbox
+exceptions the audit does not count are the agent sessions' hand-back inbox
 (`~/.local/state/shipyard/inbox/<session-uuid>.jsonl` and `.shown.jsonl`),
-which session hooks write without the lease; any other file needs it.
+which session hooks write without the lease, and a pure append of JSON lines
+(same inode, old bytes unchanged, no line naming the sandbox) to a production
+guard log: `holds.jsonl`, `overrides.jsonl`, `switches.jsonl` and
+`carries.jsonl` in the guards directory, and `queue-arms.jsonl` and
+`queue-removals.jsonl` in `~/.local/state/shipyard/`. Every row each of those
+writers appends names its `session` (and `agent` when set), in the Python
+guards and in Rust; a test ties each writer's resolved path to the list. Other agents' HOLDs and arms grow
+those on a shared host while the sandbox runs (#837). Every sandbox process
+runs with a per-run nonce (`sandbox-<uuid>`) as `SHIPYARD_AGENT_ID` and its
+session id, so a guard that leaked out of the sandbox's HOME writes rows
+carrying it, and such a row fails the audit. Any other file, or any other
+change to those, needs the lease.
 
 ## A healthy local funnel is not a reachable daemon
 
@@ -1582,8 +1593,10 @@ assertion never outranks the runner dying. A make or ninja failure ranks
 below every runner and compiler record and is `low`: on its own it names the
 target that broke, not why. A cause is named when its class is
 not `unknown` and its confidence is `high` or `medium`. A generated-file drift check is `generated_drift`
-(class `drift`), named by its generator with the `--write` command as its
-`fix_hint`. `shipyard cause record` is the read-only observer that writes
+(class `drift`), named by its generator; its `fix_hint` is a suggested
+`python3 tools/scripts/<name>.py ... --write` command matching the known
+generator shape, to review and run from a main-branch checkout. Shipyard never
+executes or auto-applies it. `shipyard cause record` is the read-only observer that writes
 live cause rows and fix-links into a labels archive in the backfill's layout. `diagnose` adds only
 GitHub's own record (a runner that never came, a supersede, a timeout) when
 the log names nothing more certain; a log with no recognized line still gets

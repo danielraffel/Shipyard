@@ -495,7 +495,20 @@ pub fn log_carry(repo: &str, pr: u64, from: &str, to: &str, record: &CarryRecord
     let Some(dir) = super::guards_dir() else {
         return;
     };
-    let entry = serde_json::json!({
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(REBASE_CARRY_LOG))
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{}", carry_entry(repo, pr, from, to, record));
+    }
+}
+
+/// One carry-log row, with the writer's identity.
+fn carry_entry(repo: &str, pr: u64, from: &str, to: &str, record: &CarryRecord) -> Value {
+    let mut entry = serde_json::json!({
         "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "kind": "rebase",
         "by": "shipyard",
@@ -508,13 +521,27 @@ pub fn log_carry(repo: &str, pr: u64, from: &str, to: &str, record: &CarryRecord
         "patch_id": record.patch_id,
         "files": record.files,
     });
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(REBASE_CARRY_LOG))
-    {
-        use std::io::Write as _;
-        let _ = writeln!(file, "{entry}");
+    if let Some(map) = entry.as_object_mut() {
+        map.extend(super::writer_identity());
+    }
+    entry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CarryRecord, carry_entry};
+
+    #[test]
+    fn a_carry_row_says_which_process_wrote_it() {
+        let row = carry_entry("o/r", 7, "a", "b", &CarryRecord::default());
+        assert!(
+            row.get("session")
+                .and_then(serde_json::Value::as_str)
+                .is_some(),
+            "{row}"
+        );
+        let identity = crate::head_approval::writer_identity();
+        assert_eq!(row.get("session"), identity.get("session"));
+        assert_eq!(row.get("agent"), identity.get("agent"));
     }
 }

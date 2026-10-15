@@ -2089,13 +2089,16 @@ class ReviewBeforeArm(unittest.TestCase):
 
     def test_the_operator_override_is_loud_and_recorded(self) -> None:
         result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"),
-                          GHAPP_ALLOW_UNREVIEWED_ARM="1")
+                          GHAPP_ALLOW_UNREVIEWED_ARM="1", CLAUDE_CODE_SESSION_ID="sess-o",
+                          SHIPYARD_AGENT_ID="agent-o")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("WARNING: GHAPP_ALLOW_UNREVIEWED_ARM=1 lands an unreviewed head", result.stderr)
         audit = [json.loads(line) for line in
                  (self.guards / "overrides.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(audit), 1)
         self.assertEqual(audit[0]["override"], "GHAPP_ALLOW_UNREVIEWED_ARM")
+        # The row says which process wrote it (the sandbox audit relies on it).
+        self.assertEqual((audit[0]["session"], audit[0]["agent"]), ("sess-o", "agent-o"))
         self.assertIn("no reviewer verdict names head", audit[0]["refusal"])
 
     def test_the_queue_override_never_stands_in_for_a_review(self) -> None:
@@ -2678,6 +2681,24 @@ class HumanApprovalsAndInternalArms(unittest.TestCase):
                                 SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.ledger(), [])
+
+
+class WriterIdentity(unittest.TestCase):
+    """Every guard-log row this guard writes names its session and agent."""
+
+    def test_a_carry_row_and_an_override_row_say_which_process_wrote_them(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.dict(
+                os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": scratch,
+                             "CLAUDE_CODE_SESSION_ID": "sess-c", "SHIPYARD_AGENT_ID": "agent-c"}):
+            guard.log_carry({"repo": "o/r", "approved": "a", "head": "b"})
+            guard.audit_override("refused")
+            for name in (guard.REBASE_CARRY_LOG, guard.OVERRIDES_LOG):
+                rows = [json.loads(line) for line in
+                        (pathlib.Path(scratch) / name).read_text(encoding="utf-8").splitlines()]
+                self.assertEqual([(row["session"], row["agent"]) for row in rows],
+                                 [("sess-c", "agent-c")], name)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(guard.writer_identity(), {"session": "unattributed"})
 
 
 class CarryHistory:

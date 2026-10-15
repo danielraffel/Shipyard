@@ -321,6 +321,33 @@ pub fn host_review_default() -> bool {
     })
 }
 
+/// `session` (and `agent` when set) for every row a guard log gets, so a row
+/// says which process wrote it: [`SESSION_ENVS`], else `unattributed`, and
+/// [`AGENT_ENV`]. The Python guards record the same fields.
+#[must_use]
+pub fn writer_identity() -> serde_json::Map<String, Value> {
+    let env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let mut identity = serde_json::Map::new();
+    identity.insert(
+        "session".to_owned(),
+        Value::String(
+            SESSION_ENVS
+                .iter()
+                .find_map(|name| env(name))
+                .unwrap_or_else(|| "unattributed".to_owned()),
+        ),
+    );
+    if let Some(agent) = env(AGENT_ENV) {
+        identity.insert("agent".to_owned(), Value::String(agent));
+    }
+    identity
+}
+
 /// The guards directory: `$SHIPYARD_GHAPP_GUARDS_DIR`, else
 /// `~/.config/shipyard/guards`.
 pub(crate) fn guards_dir() -> Option<std::path::PathBuf> {
