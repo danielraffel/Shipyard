@@ -2746,6 +2746,23 @@ fn an_alert_any_target_host_prints_with_the_lane_hosts() {
 }
 
 #[test]
+fn an_expected_host_without_alert_any_target_parses_off_and_stays_demoted() {
+    // Every expected host declared before the key existed must keep today's
+    // scoping: parsed off, and an off-lane shortfall does not raise.
+    let config: toml::Table =
+        toml::from_str("[runner.fleet.expected_host.macmini]\nlabels = [\"macOS\", \"X64\"]\n")
+            .expect("config");
+    let expected = parse_expected_hosts(&config).expect("expected hosts");
+    assert!(!expected[0].alert_any_target);
+    let statuses = assess_expected_hosts(&expected, &wedge_inventory(Vec::new()), "macos");
+    assert!(
+        statuses[0].problem.is_some(),
+        "the shortfall is still reported"
+    );
+    assert!(expected_hosts_needing_attention(&statuses).is_empty());
+}
+
+#[test]
 fn alert_any_target_must_be_a_boolean() {
     let config: toml::Table = toml::from_str(
         "[runner.fleet.expected_host.macmini]\nlabels = [\"x\"]\nalert_any_target = \"yes\"\n",
