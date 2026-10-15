@@ -156,6 +156,10 @@ pub(super) struct ExpectedHostConfig {
     pub(super) active: bool,
     pub(super) min_online: u32,
     pub(super) labels: Vec<String>,
+    /// Count this host's problem toward the verdict whatever `--target` is
+    /// (`alert_any_target`). For a host no lane target can name, such as an
+    /// Intel Mac.
+    pub(super) alert_any_target: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -171,7 +175,17 @@ pub(super) struct ExpectedHostStatus {
     /// scoped to. A host that cannot keeps reporting its own problem, but that
     /// problem does not reach the top-level verdict for a lane it never serves.
     pub(super) serves_target: bool,
+    /// The host's `alert_any_target`: its problem counts toward the verdict
+    /// even when it does not serve the target.
+    pub(super) alert_any_target: bool,
     pub(super) problem: Option<String>,
+}
+
+impl ExpectedHostStatus {
+    /// Whether this host's problem belongs in the verdict for the target.
+    pub(super) const fn counts_toward_verdict(&self) -> bool {
+        self.serves_target || self.alert_any_target
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

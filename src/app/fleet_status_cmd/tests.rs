@@ -2655,7 +2655,107 @@ fn expected_host(name: &str, labels: &[&str]) -> ExpectedHostConfig {
         active: true,
         min_online: 1,
         labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+        alert_any_target: false,
     }
+}
+
+/// The Intel Mac as pulp declares it, with the opt-in set.
+fn alerting_macmini() -> Vec<ExpectedHostConfig> {
+    let config: toml::Table = toml::from_str(
+        r#"
+[runner.fleet.expected_host.macmini]
+labels = ["self-hosted", "macOS", "X64", "pulp-intel-native", "pulp-host-macmini"]
+alert_any_target = true
+"#,
+    )
+    .expect("config");
+    parse_expected_hosts(&config).expect("expected hosts")
+}
+
+fn macmini_runner(status: &str) -> RepositoryRunner {
+    wedge_runner(
+        "pulp-intel-macmini",
+        status,
+        false,
+        &[
+            "self-hosted",
+            "X64",
+            "macOS",
+            "pulp-intel-native",
+            "pulp-host-macmini",
+        ],
+    )
+}
+
+#[test]
+fn an_alert_any_target_host_raises_the_verdict_whatever_the_target() {
+    // pulp-intel-macmini sat offline for 16 days unseen: no target serves an
+    // Intel Mac, so only the opt-in can put it in the verdict.
+    let expected = alerting_macmini();
+    for target in ["macos", "linux"] {
+        let offline = assess_expected_hosts(
+            &expected,
+            &wedge_inventory(vec![macmini_runner("offline")]),
+            target,
+        );
+        assert!(!offline[0].serves_target, "{target}");
+        assert_eq!(
+            expected_hosts_needing_attention(&offline).len(),
+            1,
+            "an offline opted-in host must raise target={target}"
+        );
+        let online = assess_expected_hosts(
+            &expected,
+            &wedge_inventory(vec![macmini_runner("online")]),
+            target,
+        );
+        assert!(
+            expected_hosts_needing_attention(&online).is_empty(),
+            "an online opted-in host must not raise target={target}"
+        );
+    }
+    // Control: the same offline runner without the opt-in is demoted.
+    let mut quiet = expected;
+    quiet[0].alert_any_target = false;
+    let demoted = assess_expected_hosts(
+        &quiet,
+        &wedge_inventory(vec![macmini_runner("offline")]),
+        "macos",
+    );
+    assert!(demoted[0].problem.is_some());
+    assert!(expected_hosts_needing_attention(&demoted).is_empty());
+}
+
+#[test]
+fn an_alert_any_target_host_prints_with_the_lane_hosts() {
+    let mut assessment = wedge_assessment(WedgedQueuedJobs::default());
+    assessment.target = "macos".to_owned();
+    assessment.expected_hosts = assess_expected_hosts(
+        &alerting_macmini(),
+        &wedge_inventory(vec![macmini_runner("offline")]),
+        "macos",
+    );
+    let mut text = Vec::new();
+    render_fleet_assessment(&assessment, false, &mut text).expect("text");
+    let text = String::from_utf8(text).expect("utf8");
+    assert!(text.contains("name=macmini"), "{text}");
+    assert!(
+        !text.contains("other targets"),
+        "a counted host must not sit under the demoted heading:\n{text}"
+    );
+}
+
+#[test]
+fn alert_any_target_must_be_a_boolean() {
+    let config: toml::Table = toml::from_str(
+        "[runner.fleet.expected_host.macmini]\nlabels = [\"x\"]\nalert_any_target = \"yes\"\n",
+    )
+    .expect("config");
+    let error = parse_expected_hosts(&config).expect_err("a string is not a boolean");
+    assert!(
+        error.contains("alert_any_target must be a boolean"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -2741,6 +2841,7 @@ fn other_target_hosts_render_in_their_own_section() {
             online: 0,
             idle: 0,
             serves_target: false,
+            alert_any_target: false,
             problem: Some("expected_host_unavailable:online=0 min_online=2".to_owned()),
         },
         ExpectedHostStatus {
@@ -2752,6 +2853,7 @@ fn other_target_hosts_render_in_their_own_section() {
             online: 1,
             idle: 1,
             serves_target: true,
+            alert_any_target: false,
             problem: None,
         },
     ];

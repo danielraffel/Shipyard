@@ -311,13 +311,17 @@ fn write_expected_hosts_text<W: Write>(
     stdout: &mut W,
     view: &FleetAssessment,
 ) -> Result<(), CliFailure> {
-    for host in view.expected_hosts.iter().filter(|host| host.serves_target) {
+    for host in view
+        .expected_hosts
+        .iter()
+        .filter(|host| host.counts_toward_verdict())
+    {
         write_expected_host_line(stdout, host, "expected host")?;
     }
     let mut other_targets = view
         .expected_hosts
         .iter()
-        .filter(|host| !host.serves_target)
+        .filter(|host| !host.counts_toward_verdict())
         .peekable();
     if other_targets.peek().is_some() {
         writeln!(
