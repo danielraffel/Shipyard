@@ -42,7 +42,7 @@ dispatched workflow run to finish — reach for `shipyard wait ...`
 instead of hand-rolling a `gh`-polling loop. Daemon-backed (wakes in
 seconds on real events) with a transparent polling fallback when no
 daemon is running. Always set `--timeout`. See
-[`skills/ci/SKILL.md#waiting-on-conditions-shipyard-wait`](skills/ci/SKILL.md)
+[`skills/ci/SKILL.md#waiting-on-conditions-shipyard-wait`](https://github.com/danielraffel/Shipyard/blob/main/skills/ci/SKILL.md#waiting-on-conditions-shipyard-wait)
 for patterns and exit-code reference.
 
 When the user says "push a PR", "ship this", "ship it", "we're done", "merge this", or similar, invoke `shipyard pr` (or `shipyard ship` if that name is reserved for release today — check `skills/ci/SKILL.md`). It orchestrates:

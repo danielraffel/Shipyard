@@ -32,8 +32,8 @@ A `ci.cause/v1` record holds:
   for example `ctest` or `compiler`), `signature` (the most specific stable
   name for the cause) and `detail`;
 - `evidence`: the log line number and an excerpt;
-- `fix_hint`: set only for a generated-file drift check, where it is the fix
-  command that check printed;
+- `fix_hint`: set only for a generated-file drift check, and only when the
+  command the check printed passes the allowlist below; otherwise null;
 - `confidence` (`high`, `medium` or `low`), `source`, `extractor`,
   `named_at`, `supersedes`, and C2's `kind`, `location` and `step_failed`;
 - `retrospective`: true when the cause was named later from a stored log,
@@ -42,9 +42,23 @@ A `ci.cause/v1` record holds:
 A cause counts as named when its class is not `unknown` and its confidence is
 `high` or `medium`.
 
-**`fix_hint` is never executed.** It is text copied from the job log. Shipyard
-does not run it, and nothing that reads these records should run it either: a
-pull request's code can print any line into its own log.
+**`fix_hint` is never executed.** It comes from the job log, and a pull
+request's code can print any line into its own log. So Shipyard keeps a
+command only when it has exactly one shape:
+
+```
+python3 tools/scripts/<name>.py [--flag [value]]... --write
+```
+
+with no shell metacharacters, quoting or substitution. Every value must be a
+relative path inside the checkout: no leading `/`, `~` or `-`, and no `..`
+segment. Anything else (`bash -c '...'`, a pipe, a redirect) leaves `fix_hint`
+null. The line as logged stays in `detail`, which is never a command.
+
+A `fix_hint` is a suggestion to review. Read it before running it, and run it
+from a checkout of the main branch, never from the pull request's own
+checkout, where `tools/scripts/<name>.py` is the pull request's own script.
+Nothing in Shipyard executes or auto-applies one.
 
 ## Commands
 
@@ -94,8 +108,11 @@ keeps two passes from writing at once.
 
 The observer reads runs, jobs, logs, pull requests and comparisons. It never
 writes to GitHub. Before a row is written, local paths, IP addresses, email
-addresses, credential-like values and private host names are replaced with
-placeholders; run and job URLs are kept.
+addresses, credential-like values, GitHub tokens (`ghp_`, `gho_`, `ghs_`,
+`ghu_`, `ghr_` and `github_pat_`) and private host names are replaced with
+placeholders; run and job URLs are kept. Job logs are read with
+`--allow-escape-sequences`, since logs carry ANSI colour, falling back to a
+plain read on a `gh` without that flag.
 
 It prints one summary line (or, with `--json`, the same counts as JSON): runs
 listed and read, causes written, already recorded, cancelled jobs, fix-links

@@ -91,7 +91,7 @@ shipyard cause archive --dir DIR --input F   # append records (or scorecard case
 shipyard cause record --repo OWNER/REPO --workflow FILE --dir DIR [--since TIME] [--base main]
                                              # read-only observer: a cause row per new red job (DIR/causes/YYYY-MM.jsonl)
                                              #   and a fix-link once its PR or branch goes green (DIR/fixlinks.jsonl);
-                                             #   --since defaults to three days ago. A record's fix_hint is log text, never run
+                                             #   --since defaults to three days ago. fix_hint is an allowlisted suggestion, never run
 
 # ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard, merge-guard,
 #   verdict-hold-hook, verdict-session-stamp); see docs/ghapp-guards.md
@@ -368,7 +368,7 @@ bounded. Each provenance read scans at most four explicit 100-status pages. A
 machine-global file lease permits one model invocation at a time.
 Shipyard accepts only the strict versioned JSON result
 documented in
-[the merge-steward reference](../skills/shipyard/references/merge-steward.md).
+[the merge-steward reference](https://github.com/danielraffel/Shipyard/blob/main/skills/shipyard/references/merge-steward.md).
 Phase 1 is escalation routing only: `bounded_repair`, `no_change`, evidence,
 candidate paths, and focused tests are rejected. Every accepted result
 explicitly escalates; category and confidence are routing metadata only.

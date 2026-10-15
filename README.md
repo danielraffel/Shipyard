@@ -243,8 +243,9 @@ project will automatically recover or merge every PR.
   `shipyard cause record` is a read-only observer: each pass writes a cause
   record for every new red job of one workflow, and a fix-link once a later
   run on the same PR or branch goes green. It reads GitHub and writes only
-  to a local archive. A record's `fix_hint` is text copied from the log (a
-  generated-file drift check's own fix command); Shipyard never runs it. See
+  to a local archive. A record's `fix_hint` is a drift check's regenerate
+  command, kept only when it matches one known generator shape; it is a
+  suggestion to review, and Shipyard never runs it. See
   [cause records](docs/cause-records.md).
 - **Read-only project profile.** `shipyard inspect --profile` lists what a
   repository builds, pins, runs on and tests with, each fact with the file
@@ -417,15 +418,15 @@ You don't need everything — just what matches your setup:
 ## This repo uses Shipyard
 
 Shipyard validates and ships itself. The config is in
-[`.shipyard/config.toml`](.shipyard/config.toml). The CI workflow at
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs tests on
+[`.shipyard/config.toml`](https://github.com/danielraffel/Shipyard/blob/main/.shipyard/config.toml). The CI workflow at
+[`.github/workflows/ci.yml`](https://github.com/danielraffel/Shipyard/blob/main/.github/workflows/ci.yml) runs tests on
 macOS, Linux, and Windows on every push. The release workflow at
-[`.github/workflows/release.yml`](.github/workflows/release.yml) builds
+[`.github/workflows/release.yml`](https://github.com/danielraffel/Shipyard/blob/main/.github/workflows/release.yml) builds
 Linux, Windows, and macOS ARM64 release candidates when a version is
 tagged; the macOS DMG is signed/notarized and published through the
 release runbook. Before a release draft is created, a `live-smoke` job runs
 the built binary's read-only commands against real repositories. The
-[`sandbox-e2e.yml`](.github/workflows/sandbox-e2e.yml) workflow runs Shipyard
+[`sandbox-e2e.yml`](https://github.com/danielraffel/Shipyard/blob/main/.github/workflows/sandbox-e2e.yml) workflow runs Shipyard
 under an isolated HOME and PATH and fails on any write outside them; writes to
 the host's agent-session inbox (`~/.local/state/shipyard/inbox/`) by other
 sessions are listed but not counted. Third-party actions are pinned by commit
