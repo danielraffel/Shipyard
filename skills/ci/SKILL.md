@@ -477,6 +477,16 @@ is bound to that job (repo, head, run, attempt, job name) and names the cause
 the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
 <file>` (append-only, one file per month, ids never duplicated).
 
+**"May this head land?" is `shipyard review-verdict --pr N --json`.** It is
+the repository-side review rule with no host switch in it: exit 0 when an
+approval names the head or carries to it (merge-only, or across a rebase that
+kept the patch-id and every file's approved blob), 1 when refused (the JSON
+names excluded human approvals and the fix), 2 when unreadable (treat as
+refused). Pass `--head <sha>` to judge the head a merge group lands rather
+than the pull request's current one. It takes signers only from the base's
+`[auto_merge] reviewer_signers`: a repository that requires review and lists
+none refuses every App APPROVE, so set the list on the base first.
+
 Every row a guard appends (`holds.jsonl`, `overrides.jsonl`, `carries.jsonl`,
 `switches.jsonl`, `queue-arms.jsonl`, `queue-removals.jsonl`) names its
 `session` and, when set, `agent`; grep those fields to see which process wrote

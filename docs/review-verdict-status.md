@@ -29,12 +29,21 @@ disagree:
 - a repository whose base sets `arm_requires_head_approval = false` gets
   `success` with the reason.
 
-The rebase carry is a per-host switch and is always off here.
+The rebase carry is on here, whatever any host's switch says: the status is
+the repository-side rule. An approval of an earlier head carries across a
+rebase only when the diff keeps its `git patch-id --stable`, the files and
+their statuses are the same, the base touched none of them and each keeps its
+approved blob and mode, and no required check on the new head was skipped,
+neutral or reused a receipt. `shipyard review-verdict --pr N --json` gives the
+same answer from the command line (Rust, `crate::review_verdict`).
 
-Signers: when the base's `.shipyard/config.toml` sets `[auto_merge]
-reviewer_signers`, an App APPROVE counts for the status only with a
-`reviewer: <name>` line naming one of them. The status reads no host's
-`reviewer-signers.json`.
+Signers come only from the base: the status reads no host's
+`reviewer-signers.json`. An App APPROVE counts only with a `reviewer: <name>`
+line naming one of the base's `[auto_merge] reviewer_signers`, and in a
+repository that requires review by default with no list on its base, no App
+APPROVE counts at all ("no signer list is configured on the base branch").
+Every repository that relies on the status, or on `shipyard review-verdict`,
+must set the list on its base branch first.
 
 A status belongs to a commit, but a decision belongs to a pull request, and
 two open pull requests can share a head (one branch opened into two bases, a

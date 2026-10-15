@@ -106,6 +106,11 @@ shipyard guards install --opt-in-review-before-arm               # remove the op
 shipyard who --pr 123 [--repo OWNER/REPO]    # which host/session (and agent, if set) armed, enqueued, merged or removed it; joins every
                                              #   host's queue-arms.jsonl + queue-removals.jsonl to the PR timeline
                                              #   (repo+PR+verb+head; time breaks ties); unexplained = unattributed
+shipyard review-verdict --pr 123 [--repo OWNER/REPO] [--head SHA] [--no-rebase-carry] [--json]
+                                             # may this head land, by the repository-side review rule (no host
+                                             #   switch); merge-only and rebase carries apply; exit 0 allowed,
+                                             #   1 refused, 2 unreadable; JSON names the approval or carry,
+                                             #   excluded human approvals, and the fix
 shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all
 
 # Keep the fleet on the latest release (controller only)

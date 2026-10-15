@@ -504,6 +504,24 @@ pub struct ApprovalPolicy {
     /// says (`shipyard review-verdict` sets it; a config never does).
     #[serde(default)]
     pub rebase_carry: bool,
+    /// Where [`Self::signers`] came from. [`SignerSource::Base`] is the
+    /// repository-side rule ([`read_policy_repository_side`]): only the
+    /// base's `[auto_merge] reviewer_signers`, never a host, and with none
+    /// listed an App APPROVE does not count.
+    #[serde(default)]
+    pub signer_source: SignerSource,
+}
+
+/// Where an [`ApprovalPolicy`]'s signers came from.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignerSource {
+    /// The base's list, else this host's signers file; neither leaves the
+    /// signer rule off.
+    #[default]
+    Host,
+    /// The base's list only; none listed refuses every App APPROVE.
+    Base,
 }
 
 impl ApprovalPolicy {
@@ -555,6 +573,7 @@ impl ApprovalPolicy {
                         .collect()
                 }),
             rebase_carry: false,
+            signer_source: SignerSource::Host,
         }
     }
 
@@ -882,6 +901,11 @@ fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<Strin
         .unwrap_or_default();
     if stamped_session(body).as_deref() == Some("unattributed") {
         return Some("its session stamp is unattributed".to_owned());
+    }
+    if policy.signer_source == SignerSource::Base && policy.signers.is_none() {
+        return Some(format!(
+            "no signer list is configured on the base branch (`[{CONFIG_TABLE}] {SIGNERS_KEY}`)"
+        ));
     }
     let signers = policy.signers.as_ref()?;
     let pattern = Regex::new(r"(?m)^[ \t]*reviewer:[ \t]*([A-Za-z0-9._-]+)[ \t]*$")
@@ -1334,6 +1358,7 @@ fn read_policy_inner(
     repo: &str,
     base: &str,
     missing_is_error: bool,
+    host_default: bool,
 ) -> Result<ApprovalPolicy, String> {
     let raw = match run_gh(&[
         "api".to_owned(),
@@ -1343,7 +1368,6 @@ fn read_policy_inner(
     ]) {
         Ok(raw) => raw,
         Err(detail) if detail.contains("404") || detail.contains("Not Found") => {
-            let host_default = host_review_default();
             if host_default && requires_review_by_default(repo) {
                 let mut policy = ApprovalPolicy::without_config(repo, host_default);
                 policy.signers = policy.signers.or_else(|| host_signers(repo));
@@ -1362,14 +1386,56 @@ fn read_policy_inner(
         .parse::<toml::Table>()
         .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
     signers_shape(&table).map_err(|error| format!("{CONFIG_PATH} on {base}: {error}"))?;
-    let mut policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_review_default());
+    let mut policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_default);
     policy.signers = policy.signers.or_else(|| host_signers(repo));
     policy.validate().map(|()| policy)
 }
 
 /// Read the policy from `base` on GitHub, treating a missing file as default.
 pub fn read_policy(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<ApprovalPolicy, String> {
-    read_policy_inner(run_gh, repo, base, false)
+    read_policy_inner(run_gh, repo, base, false, host_review_default())
+}
+
+/// Read the policy as the repository-side rule, with no host in it: review
+/// is on for [`REVIEW_REQUIRED_REPOS`] whatever this host's opt-out says
+/// (`shipyard review-verdict`).
+///
+/// # Errors
+///
+/// When the config exists but cannot be read or parsed.
+pub fn read_policy_repository_side(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+) -> Result<ApprovalPolicy, String> {
+    let mut policy = read_policy_inner(run_gh, repo, base, false, true)?;
+    // No host's signers file reaches the repository-side rule: only the base
+    // config's list, and with none listed no App APPROVE counts.
+    policy.signers = read_base_signers(run_gh, repo, base)?;
+    policy.signer_source = SignerSource::Base;
+    Ok(policy)
+}
+
+/// The base config's own `[auto_merge] reviewer_signers`, ignoring any host.
+fn read_base_signers(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+) -> Result<Option<Vec<String>>, String> {
+    match run_gh(&[
+        "api".to_owned(),
+        "-H".to_owned(),
+        "Accept: application/vnd.github.raw+json".to_owned(),
+        format!("repos/{repo}/contents/{CONFIG_PATH}?ref={base}"),
+    ]) {
+        Ok(raw) => Ok(ApprovalPolicy::from_table(
+            &raw.parse::<toml::Table>()
+                .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?,
+        )
+        .signers),
+        Err(detail) if detail.contains("404") || detail.contains("Not Found") => Ok(None),
+        Err(detail) => Err(format!("{CONFIG_PATH} on {base} unreadable: {detail}")),
+    }
 }
 
 /// Read the policy for the steward enqueue gate, where absence is unsafe.
@@ -1378,7 +1444,7 @@ pub fn read_policy_required(
     repo: &str,
     base: &str,
 ) -> Result<ApprovalPolicy, String> {
-    read_policy_inner(run_gh, repo, base, true)
+    read_policy_inner(run_gh, repo, base, true, host_review_default())
 }
 
 /// A review as the gate reads it.

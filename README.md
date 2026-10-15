@@ -166,7 +166,8 @@ project will automatically recover or merge every PR.
   the base lists in `[auto_merge] human_reviewers`. A base that lists
   `reviewer_identities` counts only those instead. `ghapp` stamps each
   verdict comment with the posting session, and an App approval stamped
-  `unattributed` never counts. On a host with
+  `unattributed` never counts. When the base lists `[auto_merge]
+  reviewer_signers`, or failing that the host has
   `~/.config/shipyard/guards/reviewer-signers.json`, an App approval also
   needs a `reviewer: <name>` line naming an allowed signer. An arm from the
   agent that posted the approval (same `SHIPYARD_AGENT_ID`) is refused.
@@ -184,6 +185,13 @@ project will automatically recover or merge every PR.
   web UI, another host) are not seen by it. The queue-removal guard refuses
   an agent's own dequeue or disarm unless an operator override names a
   reason class that allows it.
+- **May this head land.** `shipyard review-verdict --pr N [--head SHA] --json`
+  answers with the repository-side review rule, with no host switch in it:
+  the approval naming the head, or one carried to it by merge-only updates or
+  across a rebase (same patch-id, the base touched none of its files), or why
+  it is refused. A merge-group check runs it to land only approved heads.
+  It takes signers only from the base's `[auto_merge] reviewer_signers`: a
+  repository that requires review and lists none refuses every App APPROVE.
 - **Who landed it.** GitHub attributes every queue mutation to the App, so
   the guards record each arm, enqueue, merge and overridden removal in a
   per-host ledger. `shipyard who --pr N` reads those ledgers from every

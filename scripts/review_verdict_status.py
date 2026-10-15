@@ -9,9 +9,12 @@ never pass through it. A required ``review-verdict`` status stops those too.
 The decision is the guard's own: this script calls
 ``ghapp_queue_arm_guard.review_gate`` with the live head bound, so the two
 cannot drift. The newest trusted verdict naming the head decides, a HOLD with
-no readable time always wins, and only an APPROVE naming the head (or one the
-guard's merge-only carry takes to it) is ``success``. The rebase carry is off
-here: it is a per-host switch, not a repository rule.
+no readable time always wins, and only an APPROVE naming the head, or one the
+guard carries to it, is ``success``. Both carries apply here: the merge-only
+carry and the rebase carry (same patch-id, same files, the base touched none
+of them, each keeps its approved blob and mode, no required check skipped or
+receipt-reused). The status is the repository-side rule, so it turns the
+rebase carry on whatever any host's switch says.
 
 It runs from a workflow triggered by ``pull_request_target``,
 ``issue_comment`` and ``workflow_run`` (a review reaches it through a
@@ -111,11 +114,14 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     if number is None and head is None:
         print("review-verdict: not a pull request; nothing to post")
         return 0
-    # The guard's own switches, pinned: review is on (this status is the
-    # repository-side rule), the rebase carry is off, and no host's guards
+    # The guard's own switches, pinned: review is on and the rebase carry is
+    # on (this status is the repository-side rule), and no host's guards
     # directory is read.
     os.environ["SHIPYARD_REVIEW_BEFORE_ARM"] = "1"
-    os.environ["SHIPYARD_REBASE_CARRY"] = "0"
+    os.environ["SHIPYARD_REBASE_CARRY"] = "1"
+    # Signers only from the base config: a runner has no host signers file,
+    # and a required repository that lists none admits no App APPROVE.
+    os.environ["SHIPYARD_SIGNERS_FROM_BASE"] = "1"
     os.environ["SHIPYARD_GHAPP_GUARDS_DIR"] = tempfile.mkdtemp(prefix="review-verdict-guards-")
     os.environ.setdefault("GHAPP_REAL_GH", shutil.which("gh") or "gh")
     guard = load_guard()

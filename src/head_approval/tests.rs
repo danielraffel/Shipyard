@@ -92,6 +92,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         human_reviewer_logins: Vec::new(),
         signers: None,
         rebase_carry: false,
+        signer_source: super::SignerSource::Host,
     }
 }
 
@@ -602,6 +603,7 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             human_reviewer_logins: Vec::new(),
             signers: None,
             rebase_carry: false,
+            signer_source: super::SignerSource::Host,
         }
     );
     let empty: toml::Table = "[project]\nname = \"x\"\n".parse().expect("toml");
@@ -1280,6 +1282,9 @@ struct History {
     blobs_unreadable: bool,
     /// The base requires `macos`, and it concluded `skipped` on every head.
     skipped_required: bool,
+    /// The base's `.shipyard/config.toml`; `None` answers 404. With one, the
+    /// fleet App's approval is signed `reviewer: pulp-review`.
+    config: Option<&'static str>,
 }
 
 impl History {
@@ -1296,6 +1301,7 @@ impl History {
             approved: String::new(),
             blobs_unreadable: false,
             skipped_required: false,
+            config: None,
         };
         history.git(&["init", "-q", "-b", "main"]);
         history.git(&["config", "user.email", "r@r"]);
@@ -1490,23 +1496,50 @@ impl History {
         None
     }
 
+    /// The base config, the pull request as `review-verdict` reads it, and
+    /// the fleet App's approval (signed when there is a config).
+    fn policy_reads(&self, joined: &str) -> Option<Result<String, String>> {
+        if joined.contains("contents/.shipyard/config.toml") {
+            return Some(
+                self.config
+                    .map(str::to_owned)
+                    .ok_or_else(|| "gh: Not Found (HTTP 404)".to_owned()),
+            );
+        }
+        if joined.contains(".commit.committer.date") {
+            // Before the fleet App's approval, so the approval counts.
+            return Some(Ok("2026-10-11T00:00:00Z\n".to_owned()));
+        }
+        if joined.contains("pulls/7 --jq {head") {
+            return Some(Ok(json!({"head": self.approved, "base": "main",
+                                  "author": "shipyard-local[bot]"})
+            .to_string()));
+        }
+        if joined.contains("/comments") {
+            let signer = if self.config.is_some() {
+                "reviewer: pulp-review\n"
+            } else {
+                ""
+            };
+            return Some(Ok(fleet(
+                "2026-10-12T01:00:00Z",
+                &format!("{signer}verdict: APPROVE head:{}", self.approved),
+            )
+            .to_string()));
+        }
+        None
+    }
+
     fn gh(&self, args: &[String]) -> Result<String, String> {
         let joined = args.join(" ");
         if joined.contains(":object(expression:") {
             return Ok(self.trees(&joined));
         }
-        if joined.contains("contents/.shipyard/config.toml") {
-            return Err("gh: Not Found (HTTP 404)".to_owned());
+        if let Some(answer) = self.policy_reads(&joined) {
+            return answer;
         }
         if joined.contains("/reviews") {
             return Ok(String::new());
-        }
-        if joined.contains("/comments") {
-            return Ok(fleet(
-                "2026-10-12T01:00:00Z",
-                &format!("verdict: APPROVE head:{}", self.approved),
-            )
-            .to_string());
         }
         if joined.contains("pulls/7 --jq .user.login") {
             return Ok("shipyard-local[bot]\n".to_owned());
@@ -1698,6 +1731,43 @@ fn a_rebase_that_keeps_every_file_carries_only_when_the_rebase_carry_is_on() {
         },
     };
     assert!(carried.explain().contains("across a rebase"));
+}
+
+/// pulp#10219 through `shipyard review-verdict`: a blob-identical rebase of
+/// an approved head lands only when the caller turns the rebase carry on.
+#[test]
+fn review_verdict_carries_a_clean_rebase_only_with_the_rebase_carry_on() {
+    let mut history = History::new(false);
+    history.config = Some("[auto_merge]\nreviewer_signers = [\"pulp-review\"]\n");
+    let head = history.rebase(|history| history.write("more.txt", b"more base\n"), |_| {});
+    let judge = |carry: bool| {
+        crate::review_verdict::review_verdict(
+            &|args: &[String]| history.gh(args),
+            "danielraffel/tartci",
+            7,
+            Some(&head),
+            carry,
+        )
+        .expect("readable")
+    };
+    let on = judge(true);
+    assert!(on.allowed(), "{on:?}");
+    assert!(
+        matches!(&on.approval, Some(Approval::Carried { rebase: true, .. })),
+        "{on:?}"
+    );
+    let off = judge(false);
+    assert!(!off.allowed(), "{off:?}");
+    // Control: the approved head itself is allowed either way.
+    let approved = crate::review_verdict::review_verdict(
+        &|args: &[String]| history.gh(args),
+        "danielraffel/tartci",
+        7,
+        Some(&history.approved),
+        false,
+    )
+    .expect("readable");
+    assert!(approved.allowed(), "{approved:?}");
 }
 
 #[test]

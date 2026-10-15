@@ -57,7 +57,8 @@ email = "shipyard-release-bot@users.noreply.github.com"
 
 [auto_merge]
 # Who may sign the fleet App's `verdict: APPROVE`: an approval posted through
-# ghapp counts only with a `reviewer: <name>` line naming one of these. The
-# server-side `review-verdict` reads only this list and refuses every App
-# approval when it is missing.
+# ghapp counts only with a `reviewer: <name>` line naming one of these. This
+# list beats any host's reviewer-signers.json. `shipyard review-verdict` and
+# the `review-verdict` status read only this list, never a host file, and
+# refuse every App approval in a review-required repository that has none.
 reviewer_signers = ["pulp-review", "infra-review2"]

@@ -455,6 +455,28 @@ pub(super) enum Command {
         #[arg(long, value_name = "NUMBER")]
         pr: Option<u64>,
     },
+    /// Whether a pull request's head may land, by the repository-side
+    /// review rule. Read-only.
+    ///
+    /// The rule `queue-arm-guard` and Shipyard's own arm paths apply, with
+    /// the host taken out: review is on for the repositories that require it
+    /// by default, and an approval of an earlier head carries by merge-only
+    /// updates or (unless `--no-rebase-carry`) across a rebase. Exits 0 when
+    /// the head is allowed, 1 when refused, 2 when the answer cannot be read.
+    ReviewVerdict {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// The head to judge. Defaults to the pull request's current head.
+        #[arg(long, value_name = "SHA")]
+        head: Option<String>,
+        /// Do not carry an approval across a rebase.
+        #[arg(long)]
+        no_rebase_carry: bool,
+    },
     /// Which host and agent session armed, enqueued, merged or removed a
     /// pull request. Read-only.
     ///
