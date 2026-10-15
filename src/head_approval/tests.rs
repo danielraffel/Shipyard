@@ -1255,6 +1255,38 @@ impl History {
     }
 
     /// GitHub's answer to the carry's reads of this repository.
+    /// The rebase carry's reads: rulesets, classic protection, check runs,
+    /// and a comparison as a diff.
+    fn rebase_reads(&self, joined: &str, args: &[String]) -> Option<Result<String, String>> {
+        if joined.contains("/rules/branches/") {
+            return Some(Ok(if self.skipped_required {
+                r#"[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"macos"}]}}]"#
+            } else {
+                "[]"
+            }
+            .to_owned()));
+        }
+        if joined.contains("/protection/required_status_checks") {
+            return Some(Err("gh: Not Found (HTTP 404)".to_owned()));
+        }
+        if joined.contains("/check-runs") {
+            return Some(Ok(r#"{"total_count":1,"check_runs":[{"id":1,"name":"macos","status":"completed","conclusion":"skipped","output":{"annotations_count":0}}]}"#.to_owned()));
+        }
+        if joined.contains("application/vnd.github.diff") {
+            let range = args
+                .iter()
+                .find_map(|arg| {
+                    arg.split_once("/compare/")
+                        .map(|(_, range)| range.to_owned())
+                })
+                .expect("a compare range");
+            let (x, y) = range.split_once("...").expect("a three-dot range");
+            let base = self.git(&["merge-base", x, y]);
+            return Some(Ok(self.git(&["diff", &base, y]) + "\n"));
+        }
+        None
+    }
+
     fn gh(&self, args: &[String]) -> Result<String, String> {
         let joined = args.join(" ");
         if joined.contains(":object(expression:") {
@@ -1285,31 +1317,8 @@ impl History {
         {
             return self.blob(&sha);
         }
-        if joined.contains("/rules/branches/") {
-            return Ok(if self.skipped_required {
-                r#"[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"macos"}]}}]"#
-            } else {
-                "[]"
-            }
-            .to_owned());
-        }
-        if joined.contains("/protection/required_status_checks") {
-            return Err("gh: Not Found (HTTP 404)".to_owned());
-        }
-        if joined.contains("/check-runs") {
-            return Ok(r#"{"total_count":1,"check_runs":[{"id":1,"name":"macos","status":"completed","conclusion":"skipped","output":{"annotations_count":0}}]}"#.to_owned());
-        }
-        if joined.contains("application/vnd.github.diff") {
-            let range = args
-                .iter()
-                .find_map(|arg| {
-                    arg.split_once("/compare/")
-                        .map(|(_, range)| range.to_owned())
-                })
-                .expect("a compare range");
-            let (x, y) = range.split_once("...").expect("a three-dot range");
-            let base = self.git(&["merge-base", x, y]);
-            return Ok(self.git(&["diff", &base, y]) + "\n");
+        if let Some(answer) = self.rebase_reads(&joined, args) {
+            return answer;
         }
         let range = args
             .iter()
