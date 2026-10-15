@@ -1066,6 +1066,11 @@ fn pulp_10320s_unsigned_approve_needs_an_allowed_signer() {
     let mut signed = by_default("Generous-Corp/pulp");
     signed.signers = Some(vec!["pulp-review".to_owned(), "infra-review2".to_owned()]);
     assert!(!gate_on(&signed, &head, std::slice::from_ref(&comment)).allows());
+    assert_eq!(
+        super::verdict_audit_events(&head, &[], std::slice::from_ref(&comment), &signed, None),
+        vec!["excluded_app_approval:it has no `reviewer: <name>` line".to_owned()],
+        "an unsigned APPROVE is refused for having no signer, not for its signer"
+    );
     let body = comment["body"].as_str().expect("body");
     let (prose, verdict) = body.trim_end().rsplit_once('\n').expect("two parts");
     for (signer, counts) in [
