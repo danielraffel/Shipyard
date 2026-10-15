@@ -170,9 +170,15 @@ state dir (`~/Library/Application Support/shipyard/` on macOS), flock
 `.sandbox-writer-domain.lock` shared, release the turnstile, write, then
 release the shared lock; poll non-blocking for at most 30s and skip the write
 on timeout. Hold the shared lock only around the write itself. The one
-exception the audit does not count is the agent sessions' hand-back inbox
+exceptions the audit does not count are the agent sessions' hand-back inbox
 (`~/.local/state/shipyard/inbox/<session-uuid>.jsonl` and `.shown.jsonl`),
-which session hooks write without the lease; any other file needs it.
+which session hooks write without the lease, and a pure append of JSON lines
+(same inode, old bytes unchanged, no line naming the sandbox) to a production
+guard log: `holds.jsonl`, `overrides.jsonl`, `switches.jsonl`,
+`queue-removals.jsonl` and `carries.jsonl` in the guards directory, and
+`~/.local/state/shipyard/queue-arms.jsonl`. Other agents' HOLDs and arms grow
+those on a shared host while the sandbox runs (#837). Any other file, or any
+other change to those, needs the lease.
 
 ## A healthy local funnel is not a reachable daemon
 

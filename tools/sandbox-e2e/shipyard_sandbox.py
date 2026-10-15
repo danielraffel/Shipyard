@@ -60,6 +60,20 @@ SESSION_INBOX_FILE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\.shown)?\.jsonl"
 )
 
+# The host's production guard logs. Every guard appends one JSON line per
+# decision it makes for any agent on the host (a HOLD, an arm, an override, a
+# removal, a carry, a switch change), without the writer-domain lease, so on a
+# shared gate host they grow while a sandbox runs. The sandbox's own guards
+# write under its own HOME. A change to one of these exact files is
+# attributed to a concurrent writer only when it is a pure append of
+# well-formed JSON lines that do not name the sandbox; a truncation, a
+# rewrite, a replaced or new file, or a line naming the sandbox still counts.
+CONCURRENT_GUARD_LOGS: frozenset[Path] = frozenset({
+    Path.home() / ".config" / "shipyard" / "guards" / name
+    for name in ("holds.jsonl", "overrides.jsonl", "switches.jsonl",
+                 "queue-removals.jsonl", "carries.jsonl")
+} | {Path.home() / ".local" / "state" / "shipyard" / "queue-arms.jsonl"})
+
 DESTRUCTIVE_TOP_LEVEL: frozenset[str] = frozenset({
     "ship",
     "run",
@@ -126,7 +140,8 @@ class ContaminationReport:
         lines = ["sandbox wrote outside its isolated HOME/PATH:"]
         lines.extend(f"  {path}" for path in self.offenders)
         if self.concurrent_sessions:
-            lines.append("not counted (agent sessions' inboxes, written outside the sandbox):")
+            lines.append("not counted (agent sessions' inboxes and production guard-log "
+                         "appends, written outside the sandbox):")
             lines.extend(f"  {path}" for path in self.concurrent_sessions)
         lines.append(f"sentinel_mtime={self.sentinel_mtime}")
         return "\n".join(lines)
@@ -375,18 +390,61 @@ def is_concurrent_session_write(path: Path, inbox_dir: Path = SESSION_INBOX_DIR)
     )
 
 
+def is_concurrent_guard_log_append(
+    path: Path,
+    before: PathFingerprint | None,
+    guard_logs: frozenset[Path] = CONCURRENT_GUARD_LOGS,
+    sandbox_root: Path | None = None,
+) -> bool:
+    """A production guard's append to its log (see CONCURRENT_GUARD_LOGS)."""
+    if path not in guard_logs or before is None or before.digest is None:
+        return False
+    try:
+        metadata = path.lstat()
+        data = path.read_bytes()
+    except OSError:
+        return False
+    if ((metadata.st_dev, metadata.st_ino) != (before.device, before.inode)
+            or len(data) <= before.size
+            or hashlib.sha256(data[:before.size]).hexdigest() != before.digest):
+        return False
+    try:
+        tail = data[before.size:].decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if not tail.endswith("\n") or (sandbox_root is not None and str(sandbox_root) in tail):
+        return False
+    for line in tail.splitlines():
+        if not line.strip():
+            continue
+        try:
+            if not isinstance(json.loads(line), dict):
+                return False
+        except ValueError:
+            return False
+    return True
+
+
 def contamination(
     protected: Sequence[Path],
     pre_existing: Mapping[Path, Mapping[Path, PathFingerprint]],
     sentinel_mtime: float,
     inbox_dir: Path = SESSION_INBOX_DIR,
+    guard_logs: frozenset[Path] = CONCURRENT_GUARD_LOGS,
+    sandbox_root: Path | None = None,
 ) -> ContaminationReport:
     changed = sorted(
         path
         for root in protected
         for path in _find_newer(root, sentinel_mtime, pre_existing.get(root, {}))
     )
-    concurrent = tuple(path for path in changed if is_concurrent_session_write(path, inbox_dir))
+    before = {path: fingerprint for snapshot in pre_existing.values()
+              for path, fingerprint in snapshot.items()}
+    concurrent = tuple(
+        path for path in changed
+        if is_concurrent_session_write(path, inbox_dir)
+        or is_concurrent_guard_log_append(path, before.get(path), guard_logs, sandbox_root)
+    )
     offenders = tuple(path for path in changed if path not in concurrent)
     return ContaminationReport(offenders, sentinel_mtime, concurrent)
 
@@ -608,7 +666,8 @@ class Sandbox:
     def assert_no_contamination(self) -> None:
         if self._sentinel_mtime is None:
             raise RuntimeError("sandbox not set up")
-        report = contamination(PROTECTED_PATHS, self._pre_existing, self._sentinel_mtime)
+        report = contamination(PROTECTED_PATHS, self._pre_existing, self._sentinel_mtime,
+                               sandbox_root=self.root)
         if report.clean and report.concurrent_sessions:
             print(
                 "sandbox isolation: clean; not counted (agent sessions' inboxes): "

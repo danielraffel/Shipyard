@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from shipyard_sandbox import (
+    CONCURRENT_GUARD_LOGS,
     PROTECTED_PATHS,
     SESSION_INBOX_DIR,
     WRITER_DOMAIN_LOCK_NAME,
@@ -569,6 +570,67 @@ def test_a_sandbox_write_to_real_home_is_still_flagged(tmp_path: Path) -> None:
     assert alongside in report.concurrent_sessions
     assert "sandbox wrote outside its isolated HOME/PATH" in report.format()
     assert "not counted (agent sessions' inboxes" in report.format()
+
+
+def _guard_log_world(tmp_path: Path) -> tuple[Path, Path, Path, dict]:
+    """A protected guards root holding a production log with one line."""
+    guards = tmp_path / "config" / "shipyard" / "guards"
+    guards.mkdir(parents=True)
+    log = guards / "holds.jsonl"
+    log.write_text('{"pr": 1, "action": "none"}\n', encoding="utf-8")
+    other = guards / "queue-arm-guard"
+    other.write_text("#!/bin/sh\n", encoding="utf-8")
+    return guards, log, other, {guards: _snapshot_paths(guards)}
+
+
+def test_another_agents_guard_log_append_is_not_contamination(tmp_path: Path) -> None:
+    # Shipyard#837: a HOLD another agent posted on the host appended to the
+    # real holds.jsonl while the sandbox ran; queue-arms.jsonl is the same.
+    guards, log, _, before = _guard_log_world(tmp_path)
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write('{"pr": 10315, "action": "none", "why": "neither armed nor queued"}\n')
+    report = contamination((guards,), before, 0.0, guard_logs=frozenset({log}),
+                           sandbox_root=tmp_path / "sandbox")
+    assert report.clean, report.format()
+    assert log in report.concurrent_sessions
+    assert "production guard-log appends" in report.format() or report.clean
+
+
+def test_a_guard_log_change_that_is_not_a_clean_append_still_counts(tmp_path: Path) -> None:
+    sandbox = tmp_path / "sandbox"
+    cases = {
+        "rewritten": lambda log: log.write_text('{"pr": 2}\n{"pr": 3}\n', encoding="utf-8"),
+        "truncated": lambda log: log.write_text("", encoding="utf-8"),
+        # Longer than before, so only the unchanged-prefix check catches it.
+        "rewritten and grown": lambda log: log.write_text(
+            '{"pr": 9, "action": "edit"}\n{"pr": 7, "action": "more"}\n', encoding="utf-8"),
+        "not json": lambda log: log.open("a", encoding="utf-8").write("not json\n"),
+        "no newline": lambda log: log.open("a", encoding="utf-8").write('{"pr": 4}'),
+        "names the sandbox": lambda log: log.open("a", encoding="utf-8").write(
+            json.dumps({"cwd": str(sandbox / "work")}) + "\n"),
+    }
+    for label, change in cases.items():
+        world = tmp_path / label.replace(" ", "-")
+        guards, log, other, before = _guard_log_world(world)
+        change(log)
+        report = contamination((guards,), before, 0.0, guard_logs=frozenset({log}),
+                               sandbox_root=sandbox)
+        assert log in report.offenders, (label, report.format())
+    # An append to any other file under the guards directory still counts,
+    # and so does a log the list does not name.
+    guards, log, other, before = _guard_log_world(tmp_path / "other")
+    with other.open("a", encoding="utf-8") as handle:
+        handle.write('{"pr": 5}\n')
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write('{"pr": 6}\n')
+    report = contamination((guards,), before, 0.0, guard_logs=frozenset(), sandbox_root=sandbox)
+    assert other in report.offenders and log in report.offenders, report.format()
+
+
+def test_the_guard_logs_are_the_real_home_ones() -> None:
+    home = Path.home()
+    assert home / ".config" / "shipyard" / "guards" / "holds.jsonl" in CONCURRENT_GUARD_LOGS
+    assert home / ".local" / "state" / "shipyard" / "queue-arms.jsonl" in CONCURRENT_GUARD_LOGS
 
 
 def test_the_session_inbox_is_the_real_home_one() -> None:
