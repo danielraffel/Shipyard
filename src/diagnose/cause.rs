@@ -195,16 +195,20 @@ pub fn confidence(record: &Record) -> &'static str {
 
 static FIX_COMMAND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"^python3 tools/scripts/[A-Za-z0-9_]+\.py(?: --[a-z][a-z-]*(?: [A-Za-z0-9_./-]+)?)* --write$",
+        r"^python3 tools/scripts/[A-Za-z0-9_]+\.py(?: --[a-z][a-z-]*(?: [A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*)?)* --write$",
     )
     .expect("fix command pattern compiles")
 });
 
 /// A drift check's regenerate command, only in the one shape a repository
 /// generator prints: `python3 tools/scripts/<name>.py [--flag [value]]...
-/// --write`, with no shell metacharacters, quoting or substitution. A log
-/// line is text the pull request under test controls, so anything else
-/// (`bash -c '...' --write`, a pipe, a redirect) is not a hint.
+/// --write`, with no shell metacharacters, quoting or substitution. Each
+/// value is a relative path whose every segment starts with a word
+/// character, so none is absolute, climbs out with `..`, starts at `~`, or
+/// reads as another flag. A log line is text the pull request under test
+/// controls, so anything else (`bash -c '...' --write`, a pipe, a redirect)
+/// is not a hint. A hint is a suggestion to review, never a command Shipyard
+/// runs: nothing here executes it.
 #[must_use]
 pub fn known_fix_command(message: &str) -> Option<String> {
     FIX_COMMAND

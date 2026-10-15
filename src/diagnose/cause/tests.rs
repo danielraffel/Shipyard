@@ -559,6 +559,8 @@ fn a_drift_fix_hint_is_only_an_allowlisted_generator_command() {
     for good in [
         "python3 tools/scripts/script_test_inputs.py --build-dir build-macos --write",
         "python3 tools/scripts/consumption_census.py --write",
+        // A relative path inside the checkout is a value like any other.
+        "python3 tools/scripts/gen.py --out test/fixtures/v1.0/table.json --write",
     ] {
         assert_eq!(known_fix_command(good).as_deref(), Some(good));
     }
@@ -569,6 +571,13 @@ fn a_drift_fix_hint_is_only_an_allowlisted_generator_command() {
         "python3 tools/scripts/gen.py --out a|sh --write",
         "python3 ../../tmp/gen.py --write",
         "pulp regenerate --write",
+        // A value must stay inside the checkout and must not read as a flag.
+        "python3 tools/scripts/gen.py --out /etc/hosts --write",
+        "python3 tools/scripts/gen.py --out ../../../.ssh/config --write",
+        "python3 tools/scripts/gen.py --out build/../../../.ssh/config --write",
+        "python3 tools/scripts/gen.py --out ~/.ssh/config --write",
+        "python3 tools/scripts/gen.py --out -rf --write",
+        "python3 tools/scripts/gen.py --out ./x --write",
     ] {
         assert_eq!(known_fix_command(planted), None, "{planted}");
     }

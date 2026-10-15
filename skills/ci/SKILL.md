@@ -490,10 +490,16 @@ join. A red with no green yet stays pending and is retried on the next pass.
 A generated-file drift check (`<generator>: N drift problem(s)` or
 `<generator>: the <file> no longer matches <source>`) is C2's
 `generated_drift`, class `drift`, high confidence. Its `signature` is the
-generator. Its `fix_hint` is the `--write` command the check printed only when
-that command is exactly `python3 tools/scripts/<name>.py [--flag [value]]...
---write` with no shell metacharacters; otherwise it is null. The log is text the
-pull request under test controls, so never run a `detail` or an unvetted hint.
+generator. Its `fix_hint` is set only when the command the check printed is
+exactly `python3 tools/scripts/<name>.py [--flag [value]]... --write`, with no
+shell metacharacters and every value a relative path inside the checkout (no
+leading `/`, `~` or `-`, no `..` segment); otherwise it is null. The log is text
+the pull request under test controls, so a `fix_hint` is a suggested command
+matching the known generator shape: review it before running it, and run it from
+a checkout of the main branch, never from the pull request's own checkout, where
+`tools/scripts/<name>.py` is the pull request's own script. Nothing in Shipyard
+executes a `fix_hint` and nothing auto-applies one. A `detail` is log text and
+is never a command.
 It outranks the ctest line that ran the check. Job logs are read through
 `gate_cost::fetch_job_log`, which passes `--allow-escape-sequences` (logs carry
 ANSI colour, and a current `gh` refuses them without it) and falls back to the

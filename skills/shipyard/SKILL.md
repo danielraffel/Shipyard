@@ -1582,8 +1582,10 @@ assertion never outranks the runner dying. A make or ninja failure ranks
 below every runner and compiler record and is `low`: on its own it names the
 target that broke, not why. A cause is named when its class is
 not `unknown` and its confidence is `high` or `medium`. A generated-file drift check is `generated_drift`
-(class `drift`), named by its generator with the `--write` command as its
-`fix_hint`. `shipyard cause record` is the read-only observer that writes
+(class `drift`), named by its generator; its `fix_hint` is a suggested
+`python3 tools/scripts/<name>.py ... --write` command matching the known
+generator shape, to review and run from a main-branch checkout. Shipyard never
+executes or auto-applies it. `shipyard cause record` is the read-only observer that writes
 live cause rows and fix-links into a labels archive in the backfill's layout. `diagnose` adds only
 GitHub's own record (a runner that never came, a supersede, a timeout) when
 the log names nothing more certain; a log with no recognized line still gets
