@@ -3633,8 +3633,10 @@ queue and merge event from the guards' ledgers on every host. `shipyard
 review-verdict --pr N [--head SHA] --json` gives the same decision with the
 host taken out (`read_policy_repository_side`: review on for the default
 repositories whatever a host's opt-out says, the rebase carry on unless
-`--no-rebase-carry`); exit 0 allowed, 1 refused, 2 unreadable, and a caller
-treats 2 as refused. The review-verdict status pins the rebase carry on for
+`--no-rebase-carry`, and signers only from the base's `[auto_merge]
+reviewer_signers`, never a host, refusing every App APPROVE where a
+review-required repository lists none); exit 0 allowed, 1 refused, 2
+unreadable, and a caller treats 2 as refused. The review-verdict status pins the rebase carry on for
 the same reason. A merge-only update carries the approval only when every file the PR
 changes keeps its approved blob and mode (the compare API lists no mode, so
 both twins read the files' directory trees), the base changed none of them

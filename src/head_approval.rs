@@ -148,6 +148,18 @@ thread_local! {
     static HOST_DEFAULT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static AGENT_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AGENT_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static HOST_SIGNERS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `body` as if this host's signers file allowed `signers`, on this thread.
+#[cfg(test)]
+pub(crate) fn with_host_signers<T>(signers: &[&str], body: impl FnOnce() -> T) -> T {
+    HOST_SIGNERS.with(|cell| {
+        *cell.borrow_mut() = signers.iter().map(|name| (*name).to_owned()).collect();
+    });
+    let result = body();
+    HOST_SIGNERS.with(|cell| cell.borrow_mut().clear());
+    result
 }
 
 /// Run `body` with [`arming_agent`] pinned, on this thread.
@@ -393,8 +405,11 @@ fn host_signers(repo: &str) -> Option<Vec<String>> {
 }
 
 #[cfg(test)]
-const fn host_signers(_repo: &str) -> Option<Vec<String>> {
-    None
+fn host_signers(_repo: &str) -> Option<Vec<String>> {
+    HOST_SIGNERS.with(|cell| {
+        let signers = cell.borrow();
+        (!signers.is_empty()).then(|| signers.clone())
+    })
 }
 
 /// Whether this evaluation may try the rebase carry: the host switch
@@ -439,6 +454,11 @@ pub struct ApprovalPolicy {
     /// says (`shipyard review-verdict` sets it; a config never does).
     #[serde(default)]
     pub rebase_carry: bool,
+    /// The repository-side rule ([`read_policy_repository_side`]): signers
+    /// come only from the base's `[auto_merge] reviewer_signers`, never a
+    /// host, and with none listed an App APPROVE does not count.
+    #[serde(default)]
+    pub signers_required: bool,
 }
 
 impl ApprovalPolicy {
@@ -490,6 +510,7 @@ impl ApprovalPolicy {
                         .collect()
                 }),
             rebase_carry: false,
+            signers_required: false,
         }
     }
 
@@ -817,6 +838,11 @@ fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<Strin
         .unwrap_or_default();
     if stamped_session(body).as_deref() == Some("unattributed") {
         return Some("its session stamp is unattributed".to_owned());
+    }
+    if policy.signers_required && policy.signers.is_none() {
+        return Some(format!(
+            "no signer list is configured on the base branch (`[{CONFIG_TABLE}] {SIGNERS_KEY}`)"
+        ));
     }
     let signers = policy.signers.as_ref()?;
     let pattern = Regex::new(r"(?m)^[ \t]*reviewer:[ \t]*([A-Za-z0-9._-]+)[ \t]*$")
@@ -1318,7 +1344,35 @@ pub fn read_policy_repository_side(
     repo: &str,
     base: &str,
 ) -> Result<ApprovalPolicy, String> {
-    read_policy_inner(run_gh, repo, base, false, true)
+    let mut policy = read_policy_inner(run_gh, repo, base, false, true)?;
+    // No host's signers file reaches the repository-side rule: only the base
+    // config's list, and with none listed no App APPROVE counts.
+    policy.signers = read_base_signers(run_gh, repo, base)?;
+    policy.signers_required =
+        policy.required && policy.any_reviewer_but_author && policy.reviewer_logins.is_empty();
+    Ok(policy)
+}
+
+/// The base config's own `[auto_merge] reviewer_signers`, ignoring any host.
+fn read_base_signers(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+) -> Result<Option<Vec<String>>, String> {
+    match run_gh(&[
+        "api".to_owned(),
+        "-H".to_owned(),
+        "Accept: application/vnd.github.raw+json".to_owned(),
+        format!("repos/{repo}/contents/{CONFIG_PATH}?ref={base}"),
+    ]) {
+        Ok(raw) => Ok(ApprovalPolicy::from_table(
+            &raw.parse::<toml::Table>()
+                .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?,
+        )
+        .signers),
+        Err(detail) if detail.contains("404") || detail.contains("Not Found") => Ok(None),
+        Err(detail) => Err(format!("{CONFIG_PATH} on {base} unreadable: {detail}")),
+    }
 }
 
 /// Read the policy for the steward enqueue gate, where absence is unsafe.

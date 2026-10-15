@@ -842,6 +842,7 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
     humans = section.get("human_reviewers") or []
     # The protected base may name its own signers; otherwise this host's
     # signers file decides (see reviewer_signers).
+    from_base_only = os.environ.get(SIGNERS_FROM_BASE_ENV) == "1"
     configured = section.get("reviewer_signers")
     configured_signers = ([str(name).lower() for name in configured if isinstance(name, str)]
                           if isinstance(configured, list) else None)
@@ -855,13 +856,19 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
         "humans": [_normalized_login(login) for login in humans if isinstance(login, str)],
         # Who may sign the fleet App's APPROVE on this host (see
         # reviewer_signers); None when the host has no signers file.
-        "signers": configured_signers if configured_signers is not None else reviewer_signers(repo),
+        "signers": (configured_signers if configured_signers is not None or from_base_only
+                    else reviewer_signers(repo)),
+        # The repository-side rule (review-verdict status): no host's file,
+        # and a default-mode repository with no list admits no App APPROVE.
+        "signers_required": from_base_only and from_default and not reviewers,
     }
 
 
 # Guards-directory file naming who may sign the fleet App's APPROVE:
 # {"default": ["pulp-review", ...], "repos": {"OWNER/REPO": [...]}}.
 SIGNERS_FILE = "reviewer-signers.json"
+# `1`: signers only from the base config (the server-side status pins it).
+SIGNERS_FROM_BASE_ENV = "SHIPYARD_SIGNERS_FROM_BASE"
 _SIGNER_LINE = re.compile(r"^[ \t]*reviewer:[ \t]*([A-Za-z0-9._-]+)[ \t]*$", re.MULTILINE)
 
 
@@ -898,6 +905,9 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
     if stamp and stamp[-1][1] == UNATTRIBUTED:
         return "its session stamp is unattributed"
     signers = policy.get("signers")
+    if signers is None and policy.get("signers_required"):
+        return ("no signer list is configured on the base branch "
+                "(`[auto_merge] reviewer_signers`)")
     if signers is None:
         return None
     signed = [name.lower() for name in _SIGNER_LINE.findall(text)]

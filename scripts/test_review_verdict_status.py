@@ -22,6 +22,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import test_ghapp_queue_arm_guard as arm  # noqa: E402
 
 STATUS = pathlib.Path(__file__).with_name("review_verdict_status.py")
+SIGNERS = '[auto_merge]\nreviewer_signers = ["pulp-review", "infra-review2"]\n'
+SIGNED_APPROVE = f"Reviewed.\nreviewer: pulp-review\nverdict: APPROVE head:{{head}}"
 REPO = "danielraffel/Shipyard"
 HEAD = arm.HEAD_784
 
@@ -75,6 +77,14 @@ class ReviewVerdictStatus(unittest.TestCase):
         shutil.copy(arm.SCRIPT, self.scripts / arm.SCRIPT.name)
         shutil.copy(arm.REMOVAL, self.scripts / arm.REMOVAL.name)
 
+    def permissive_guards(self) -> pathlib.Path:
+        directory = self.root / "host-guards"
+        directory.mkdir(exist_ok=True)
+        (directory / "reviewer-signers.json").write_text(
+            json.dumps({"default": ["codex-g2h", "pulp-review", "infra-review2"]}),
+            encoding="utf-8")
+        return directory
+
     def answers(self, trail: list[dict[str, Any]], config: str | None = None
                 ) -> list[tuple[str, dict[str, Any]]]:
         pull = copy.deepcopy(arm.review_fixture("shipyard-784-pull.json"))
@@ -106,7 +116,9 @@ class ReviewVerdictStatus(unittest.TestCase):
                        "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": str(event_path),
                        "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "99",
                        # A host's own switches must not reach the status.
-                       "SHIPYARD_REBASE_CARRY": "0", "SHIPYARD_REVIEW_BEFORE_ARM": "0"}
+                       "SHIPYARD_REBASE_CARRY": "0", "SHIPYARD_REVIEW_BEFORE_ARM": "0",
+                       # Nor its signers file, which would allow anyone here.
+                       "SHIPYARD_GHAPP_GUARDS_DIR": str(self.permissive_guards())}
         return subprocess.run([sys.executable, str(self.scripts / STATUS.name)], env=environment,
                               capture_output=True, text=True, check=False,
                               stdin=subprocess.DEVNULL)
@@ -129,10 +141,25 @@ class ReviewVerdictStatus(unittest.TestCase):
         self.assertLessEqual(len(posted["description"]), 140)
         self.assertEqual(posted["target_url"], f"https://github.com/{REPO}/actions/runs/99")
         guard = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD],
-                               self.answers(trail, config), REPO)
+                               self.answers(trail, config), REPO,
+                               SHIPYARD_SIGNERS_FROM_BASE="1")
         self.assertEqual(posted["state"] == "success", guard.returncode == 0,
                          f"status {posted['state']} disagrees with the guard: {guard.stderr}")
         return posted["state"]
+
+    def test_signers_come_only_from_the_base_whatever_the_host_lists(self) -> None:
+        # Every case runs beside a host signers file that allows codex-g2h,
+        # pulp-review and infra-review2; the status must not read it.
+        def approve(signer: str | None) -> list[dict[str, Any]]:
+            line = f"reviewer: {signer}\n" if signer else ""
+            return [self.comment(f"Reviewed.\n{line}verdict: APPROVE head:{HEAD}",
+                                 "2026-10-12T15:00:00Z")]
+        self.assertEqual(self.judged(approve(None), SIGNERS), "failure", "unsigned")
+        self.assertEqual(self.judged(approve("codex-g2h"), SIGNERS), "failure", "unlisted")
+        self.assertEqual(self.judged(approve("pulp-review"), SIGNERS), "success", "listed")
+        self.assertEqual(self.judged(approve("pulp-review"), None), "failure", "none listed")
+        result = self.post(self.answers(approve("pulp-review"), None))
+        self.assertIn("no signer list is configured on the base branch", result.stderr)
 
     def test_a_base_signer_list_makes_the_status_require_a_signer(self) -> None:
         # The status reads no host's signers file; the base config's list
@@ -145,8 +172,8 @@ class ReviewVerdictStatus(unittest.TestCase):
         self.assertEqual(self.judged(signed, config), "success")
 
     def test_an_approve_naming_the_head_is_success(self) -> None:
-        trail = [self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
-        self.assertEqual(self.judged(trail), "success")
+        trail = [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z")]
+        self.assertEqual(self.judged(trail, SIGNERS), "success")
         self.assertTrue(self.posted()["description"].startswith("approved: "))
 
     def test_a_hold_after_an_approve_is_failure(self) -> None:
@@ -181,9 +208,9 @@ class ReviewVerdictStatus(unittest.TestCase):
         self.assertFalse((self.root / "calls").exists())
 
     def test_a_review_judges_the_live_head_through_workflow_run(self) -> None:
-        trail = [self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
+        trail = [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z")]
         event = {"workflow_run": {"pull_requests": [{"number": 784}], "head_sha": arm.HOLD_784}}
-        result = self.post(self.answers(trail), "workflow_run", event)
+        result = self.post(self.answers(trail, SIGNERS), "workflow_run", event)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.posted()["url"], f"repos/{REPO}/statuses/{HEAD}")
         self.assertEqual(self.posted()["state"], "success")
@@ -225,8 +252,8 @@ class ReviewVerdictStatus(unittest.TestCase):
                 "|| github.event.workflow_run.head_sha }}"], path)
 
     def test_a_head_two_open_pull_requests_share_needs_both_approved(self) -> None:
-        trail = [self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
-        answers = self.answers(trail)
+        trail = [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z")]
+        answers = self.answers(trail, SIGNERS)
         pull = copy.deepcopy(arm.review_fixture("shipyard-784-pull.json"))
         pull.update(state="open", number=785)
         answers[:0] = [
@@ -244,7 +271,7 @@ class ReviewVerdictStatus(unittest.TestCase):
         self.assertIn("PR #784: allowed", result.stdout)
         self.assertIn("PR #785: refused", result.stdout)
         # Control: with only #784 on the head, the same trail is success.
-        self.assertEqual(self.judged(trail), "success")
+        self.assertEqual(self.judged(trail, SIGNERS), "success")
 
     def test_a_closed_pull_request_posts_nothing(self) -> None:
         answers = self.answers([])

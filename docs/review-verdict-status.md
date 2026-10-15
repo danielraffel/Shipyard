@@ -37,10 +37,13 @@ approved blob and mode, and no required check on the new head was skipped,
 neutral or reused a receipt. `shipyard review-verdict --pr N --json` gives the
 same answer from the command line (Rust, `crate::review_verdict`).
 
-Signers: when the base's `.shipyard/config.toml` sets `[auto_merge]
-reviewer_signers`, an App APPROVE counts for the status only with a
-`reviewer: <name>` line naming one of them. The status reads no host's
-`reviewer-signers.json`.
+Signers come only from the base: the status reads no host's
+`reviewer-signers.json`. An App APPROVE counts only with a `reviewer: <name>`
+line naming one of the base's `[auto_merge] reviewer_signers`, and in a
+repository that requires review by default with no list on its base, no App
+APPROVE counts at all ("no signer list is configured on the base branch").
+Every repository that relies on the status, or on `shipyard review-verdict`,
+must set the list on its base branch first.
 
 A status belongs to a commit, but a decision belongs to a pull request, and
 two open pull requests can share a head (one branch opened into two bases, a

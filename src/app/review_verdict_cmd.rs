@@ -59,17 +59,26 @@ pub(super) fn review_verdict_command<W: Write>(
         args.pr,
         args.head.as_deref(),
         args.rebase_carry,
-    )
-    .map_err(|error| {
+    );
+    finish(&repo, args.pr, verdict, args.json, stdout)
+}
+
+/// Print `verdict` and choose the exit: 0 allowed, 1 refused, 2 when it could
+/// not be judged (a caller treats 2 as refused).
+fn finish<W: Write>(
+    repo: &str,
+    pr: u64,
+    verdict: Result<Verdict, String>,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    let verdict = verdict.map_err(|error| {
         CliFailure::new(
             2,
-            format!(
-                "review-verdict: {repo}#{}: cannot be judged: {error}",
-                args.pr
-            ),
+            format!("review-verdict: {repo}#{pr}: cannot be judged: {error}"),
         )
     })?;
-    if args.json {
+    if json {
         let mut data = BTreeMap::new();
         data.insert(
             "verdict".to_owned(),
@@ -110,4 +119,45 @@ fn render_text<W: Write>(verdict: &Verdict, stdout: &mut W) -> std::io::Result<(
         writeln!(stdout, "  fix: {fix}")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::ExitCode;
+
+    use super::finish;
+    use crate::review_verdict::Verdict;
+
+    fn verdict(allowed: bool) -> Verdict {
+        Verdict {
+            repo: "o/r".to_owned(),
+            pr: 7,
+            head: "a".repeat(40),
+            live_head: None,
+            base: "main".to_owned(),
+            verdict: if allowed { "allowed" } else { "refused" },
+            required: true,
+            reason: "why".to_owned(),
+            approval: None,
+            excluded_approvals: Vec::new(),
+            audit_events: Vec::new(),
+            fix: (!allowed).then(|| "fix".to_owned()),
+        }
+    }
+
+    #[test]
+    fn the_exit_is_0_allowed_1_refused_2_unreadable() {
+        let code = |result| format!("{result:?}");
+        for json in [true, false] {
+            let mut out = Vec::new();
+            let allowed = finish("o/r", 7, Ok(verdict(true)), json, &mut out).expect("judged");
+            assert_eq!(code(allowed), code(ExitCode::SUCCESS));
+            let refused = finish("o/r", 7, Ok(verdict(false)), json, &mut out).expect("judged");
+            assert_eq!(code(refused), code(ExitCode::from(1)));
+            assert!(String::from_utf8_lossy(&out).contains("refused"));
+            let failure = finish("o/r", 7, Err("HTTP 502".to_owned()), json, &mut out)
+                .expect_err("unreadable");
+            assert_eq!(failure.code, 2);
+        }
+    }
 }

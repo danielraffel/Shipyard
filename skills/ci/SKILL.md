@@ -483,7 +483,9 @@ approval names the head or carries to it (merge-only, or across a rebase that
 kept the patch-id and every file's approved blob), 1 when refused (the JSON
 names excluded human approvals and the fix), 2 when unreadable (treat as
 refused). Pass `--head <sha>` to judge the head a merge group lands rather
-than the pull request's current one.
+than the pull request's current one. It takes signers only from the base's
+`[auto_merge] reviewer_signers`: a repository that requires review and lists
+none refuses every App APPROVE, so set the list on the base first.
 
 **To keep a labels archive current as checks go red and green**, run
 `shipyard cause record --repo <OWNER/REPO> --workflow <file> --dir

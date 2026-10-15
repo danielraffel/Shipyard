@@ -119,6 +119,9 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
     # directory is read.
     os.environ["SHIPYARD_REVIEW_BEFORE_ARM"] = "1"
     os.environ["SHIPYARD_REBASE_CARRY"] = "1"
+    # Signers only from the base config: a runner has no host signers file,
+    # and a required repository that lists none admits no App APPROVE.
+    os.environ["SHIPYARD_SIGNERS_FROM_BASE"] = "1"
     os.environ["SHIPYARD_GHAPP_GUARDS_DIR"] = tempfile.mkdtemp(prefix="review-verdict-guards-")
     os.environ.setdefault("GHAPP_REAL_GH", shutil.which("gh") or "gh")
     guard = load_guard()
