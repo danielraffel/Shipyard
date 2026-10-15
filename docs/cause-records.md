@@ -102,6 +102,22 @@ Each pass:
    run, the fixing commit, and the files it changed. A rerun that turned the
    same run green is recorded as `rerun_green`.
 
+A bare exit that C2 cannot name gets one of two labels. A summary job, such
+as `linux` checking the jobs it needs, takes the cause of the named job in
+the same run attempt whose name it begins (`Linux (x64) [github-hosted]`),
+and says so in `inherited_from_job_id`. Any other bare exit is labelled by
+its step and by the last line the step printed after its echoed script, and
+stays low confidence.
+
+A fix-link's `own_files` are the files of the pull request's own commits
+between the red and the fix. Some reds have no own commit chain, and these
+are handled as follows:
+- **Merge-queue red:** its head is the queue's commit, so own files come from
+  the pull request head that the queue merged.
+- **Force-pushed red:** own files come from the fix's place in the pull
+  request's commit list, within 72 hours.
+- **Neither:** `own_files` is null, and `own_files_method` says why.
+
 A red with no green yet stays pending and is looked at again on the next
 pass. Cancelled jobs are counted but get no cause row. A lock file in `--dir`
 keeps two passes from writing at once.
@@ -116,7 +132,8 @@ plain read on a `gh` without that flag.
 
 It prints one summary line (or, with `--json`, the same counts as JSON): runs
 listed and read, causes written, already recorded, cancelled jobs, fix-links
-written, reds pending, and reads that failed. Each failed read is also printed
+written, reds pending (split into those that went red under 24 hours,
+24 to 72 hours, and over 72 hours ago), and reads that failed. Each failed read is also printed
 on stderr. Run it on a schedule you choose; Shipyard does not schedule it.
 
 ## Related
