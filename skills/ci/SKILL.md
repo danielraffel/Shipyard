@@ -2047,8 +2047,10 @@ Fleet liveness also reports every registered runner, Tart disk admission
 headroom, ccache actual versus configured maximum, and merge-group Linux jobs
 left on `ubuntu-latest` while compatible self-hosted capacity is idle. Declare
 metal or planned machines under `[runner.fleet.expected_host.<name>]` with a
-required `labels` array, optional `min_online` (default 1), and `active = false`
-for visible future inventory that should not alert yet. Active absent/offline
+required `labels` array, optional `min_online` (default 1), `active = false`
+for visible future inventory that should not alert yet, and
+`alert_any_target = true` for a host whose loss must alert whatever lane is
+watched (an Intel Mac or Linux pool never serves the default macOS target). Active absent/offline
 machines fail visibly as `expected_host_unavailable`, including machines that
 have not completed runner registration.
 The watcher resolves the repository default branch. For a different merge

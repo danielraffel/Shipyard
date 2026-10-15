@@ -512,11 +512,21 @@ fn parse_expected_hosts(data: &toml::Table) -> Result<Vec<ExpectedHostConfig>, S
                 "runner.fleet.expected_host.{name}.labels must not be empty"
             ));
         }
+        let alert_any_target = match host.get("alert_any_target") {
+            None => false,
+            Some(toml::Value::Boolean(value)) => *value,
+            Some(_) => {
+                return Err(format!(
+                    "runner.fleet.expected_host.{name}.alert_any_target must be a boolean"
+                ));
+            }
+        };
         parsed.push(ExpectedHostConfig {
             name: name.clone(),
             active,
             min_online,
             labels,
+            alert_any_target,
         });
     }
     Ok(parsed)
@@ -575,10 +585,14 @@ fn expected_host_serves_target(labels: &[String], target: &str) -> bool {
 /// the output, but it is not a fault in the macOS lane the reader asked about.
 /// Letting it raise the top-level verdict is what made a healthy fleet read as
 /// needing attention for machines that never serve it.
+///
+/// A host declared with `alert_any_target` is the exception: its problem
+/// always counts. No `--target` names an Intel Mac, so without it a dead one
+/// never reaches any verdict.
 fn expected_hosts_needing_attention(hosts: &[ExpectedHostStatus]) -> Vec<&ExpectedHostStatus> {
     hosts
         .iter()
-        .filter(|host| host.serves_target && host.problem.is_some())
+        .filter(|host| host.counts_toward_verdict() && host.problem.is_some())
         .collect()
 }
 
@@ -634,6 +648,7 @@ fn assess_expected_hosts(
                 online,
                 idle,
                 serves_target: expected_host_serves_target(&host.labels, target),
+                alert_any_target: host.alert_any_target,
                 problem,
             }
         })

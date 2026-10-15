@@ -3068,6 +3068,10 @@ making the command unhealthy. A declared host whose labels cannot serve
 `--target` carries `serves_target: false`, prints under an `other targets`
 heading, and does not raise the top-level verdict — a Linux or Intel-Mac
 shortfall is inventory news, not a fault in the macOS lane you asked about.
+`alert_any_target = true` on an entry counts its problem whatever `--target`
+is (and prints it with the lane hosts). No target names an Intel Mac, so
+without it an offline one never raises anything; a non-boolean value is a
+config error.
 It is read-only and exits non-zero when a host is
 unreadable/unhealthy, a merge-group Linux build requests `ubuntu-latest` while
 an online idle self-hosted Linux x64 runner exists, or queued macOS work is older

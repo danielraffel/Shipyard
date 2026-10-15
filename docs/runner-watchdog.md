@@ -206,8 +206,13 @@ active = false
 labels = ["self-hosted", "Linux", "ARM64", "pulp-host-future"]
 ```
 
-An active missing/offline host makes fleet liveness unhealthy. An inactive
-entry is reported for planning visibility without alerting.
+An active missing/offline host makes fleet liveness unhealthy when its labels
+can serve the lane being watched (`--target`, macOS by default). A Linux or
+Intel host cannot, so its shortfall is printed under `other targets` without
+raising the verdict. Set `alert_any_target = true` on a host whose loss should
+alert whatever the target; no target names an Intel Mac, so this is the only
+way an offline one is ever raised. An inactive entry is reported for planning
+visibility without alerting.
 
 #### `--reap-stale-runs` — repo-wide stale-run reaper
 
