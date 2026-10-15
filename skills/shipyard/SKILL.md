@@ -177,8 +177,11 @@ which session hooks write without the lease, and a pure append of JSON lines
 guard log: `holds.jsonl`, `overrides.jsonl`, `switches.jsonl`,
 `queue-removals.jsonl` and `carries.jsonl` in the guards directory, and
 `~/.local/state/shipyard/queue-arms.jsonl`. Other agents' HOLDs and arms grow
-those on a shared host while the sandbox runs (#837). Any other file, or any
-other change to those, needs the lease.
+those on a shared host while the sandbox runs (#837). Every sandbox process
+runs with a per-run nonce (`sandbox-<uuid>`) as `SHIPYARD_AGENT_ID` and its
+session id, so a guard that leaked out of the sandbox's HOME writes rows
+carrying it, and such a row fails the audit. Any other file, or any other
+change to those, needs the lease.
 
 ## A healthy local funnel is not a reachable daemon
 

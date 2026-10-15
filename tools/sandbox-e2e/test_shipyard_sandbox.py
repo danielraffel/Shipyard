@@ -11,6 +11,8 @@ import pytest
 
 from shipyard_sandbox import (
     CONCURRENT_GUARD_LOGS,
+    SANDBOX_IDENTITY_ENVS,
+    Sandbox,
     PROTECTED_PATHS,
     SESSION_INBOX_DIR,
     WRITER_DOMAIN_LOCK_NAME,
@@ -625,6 +627,42 @@ def test_a_guard_log_change_that_is_not_a_clean_append_still_counts(tmp_path: Pa
         handle.write('{"pr": 6}\n')
     report = contamination((guards,), before, 0.0, guard_logs=frozenset(), sandbox_root=sandbox)
     assert other in report.offenders and log in report.offenders, report.format()
+
+
+def test_a_row_carrying_the_sandboxs_nonce_is_its_own_leak(tmp_path: Path) -> None:
+    # A guard that ran outside the sandbox's HOME writes an ordinary row with
+    # no path in it; only the run's identity in that row gives it away.
+    nonce = "sandbox-00000000-0000-4000-8000-000000000001"
+    guards, log, _, before = _guard_log_world(tmp_path / "leak")
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"at": "2026-10-15T03:00:00Z", "host": "m3", "session": nonce,
+                                 "agent": nonce, "pr": 7, "verb": "arm"}) + "\n")
+    report = contamination((guards,), before, 0.0, guard_logs=frozenset({log}),
+                           sandbox_root=tmp_path / "sandbox", nonce=nonce)
+    assert log in report.offenders, report.format()
+    # Control: the same row from another session is another agent's append.
+    guards, log, _, before = _guard_log_world(tmp_path / "foreign")
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"at": "2026-10-15T03:00:00Z", "host": "m3",
+                                 "session": "08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb",
+                                 "pr": 7, "verb": "arm"}) + "\n")
+    report = contamination((guards,), before, 0.0, guard_logs=frozenset({log}),
+                           sandbox_root=tmp_path / "sandbox", nonce=nonce)
+    assert report.clean and log in report.concurrent_sessions, report.format()
+
+
+def test_every_sandbox_process_runs_with_the_runs_nonce_as_its_identity() -> None:
+    sandbox = Sandbox()
+    sandbox.root = Path("/tmp/shipyard-sandbox-e2e.example")
+    try:
+        env = sandbox._env(None)
+    finally:
+        sandbox.root = None
+    assert sandbox.nonce.startswith("sandbox-")
+    for name in SANDBOX_IDENTITY_ENVS:
+        assert env[name] == sandbox.nonce, name
+    assert {"SHIPYARD_AGENT_ID", "CLAUDE_CODE_SESSION_ID"} <= set(SANDBOX_IDENTITY_ENVS)
+    assert Sandbox().nonce != sandbox.nonce, "a new nonce per run"
 
 
 def test_the_guard_logs_are_the_real_home_ones() -> None:
