@@ -1091,6 +1091,36 @@ fn pulp_10320s_unsigned_approve_needs_an_allowed_signer() {
 }
 
 #[test]
+fn a_missing_signers_file_is_off_and_an_unreadable_one_admits_nobody() {
+    let temp = tempfile::tempdir().expect("temp");
+    let path = temp.path().join(super::SIGNERS_FILE);
+    assert_eq!(super::signers_at(&path, "Generous-Corp/pulp"), None);
+    std::fs::write(&path, "{not json").expect("write");
+    assert_eq!(
+        super::signers_at(&path, "Generous-Corp/pulp"),
+        Some(Vec::new())
+    );
+    std::fs::write(&path, r#"{"default": ["pulp-review"]}"#).expect("write");
+    assert_eq!(
+        super::signers_at(&path, "Generous-Corp/pulp"),
+        Some(vec!["pulp-review".to_owned()])
+    );
+}
+
+#[test]
+fn the_base_config_can_name_its_own_signers() {
+    let table: toml::Table = "[auto_merge]\nreviewer_signers = [\"Pulp-Review\"]\n"
+        .parse()
+        .expect("toml");
+    assert_eq!(
+        ApprovalPolicy::from_table(&table).signers,
+        Some(vec!["pulp-review".to_owned()])
+    );
+    let silent: toml::Table = "[auto_merge]\nqueue = true\n".parse().expect("toml");
+    assert_eq!(ApprovalPolicy::from_table(&silent).signers, None);
+}
+
+#[test]
 fn the_signers_file_names_a_list_per_repository() {
     let data = json!({"default": ["pulp-review", "Infra-Review2"],
                       "repos": {"danielraffel/tartci": ["tartci-review"]}});

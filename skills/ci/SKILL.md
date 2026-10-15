@@ -175,9 +175,9 @@ that written record counts; there,
 with no identity listed, an approval counts only from the fleet App or a
 human the base lists in `[auto_merge] human_reviewers`, empty by default; a
 HOLD from any OWNER/MEMBER/COLLABORATOR still counts; never the PR author's;
-an App APPROVE must be signed with a `reviewer: <name>` line from the host's
-`reviewer-signers.json`, where that file exists, and never counts when
-stamped `unattributed`)
+an App APPROVE must be signed with a `reviewer: <name>` line from the base's
+`[auto_merge] reviewer_signers`, else the host's `reviewer-signers.json`,
+where either exists, and never counts when stamped `unattributed`)
 arms or merges only a
 head that carries an
 approval of that exact head from an identity listed in
@@ -457,6 +457,7 @@ display name, so a record without it never binds. Repeat the job's own
 `macos` for the macos key on pull_request, workflow_dispatch and merge_group
 runs, else `<name> [<provider>]`):
 
+{% raw %}
 ```yaml
 - name: Name the cause
   if: failure()
@@ -464,6 +465,7 @@ runs, else `<name> [<provider>]`):
     JOB_NAME: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && matrix.key == 'macos' && 'macos' || format('{0} [{1}]', matrix.name, matrix.provider) }}
   run: shipyard cause extract --log "$RUNNER_TEMP/ctest-evidence/LastTest.full.log" --job "$JOB_NAME" --notice || true
 ```
+{% endraw %}
 
 The scorecard keeps a record only as proof that the cause was named during the
 job, and dates it by the jobs API's completion of the step that printed it,
@@ -502,6 +504,12 @@ A generated-file drift check (`<generator>: N drift problem(s)` or
 `generated_drift`, class `drift`, high confidence. Its `signature` is the
 generator and its `fix_hint` the `--write` command the check printed. It
 outranks the ctest line that ran the check.
+
+GitHub Pages runs every tracked markdown file through Liquid, so a GitHub
+Actions expression quoted in one must sit inside a Liquid raw block (wrap the
+code span or the fenced block); outside one it renders as `$`, or fails the
+whole site build. `every_liquid_delimiter_in_tracked_markdown_is_inside_a_raw_block`
+enforces it.
 
 **"Who armed it?" is `shipyard who --pr N`, not a timeline read.** Every queue
 event shows the fleet App as its actor. `who` joins the arm guard's
@@ -774,7 +782,7 @@ PRs are gone.
 | Regenerate CHANGELOG.md from tags | `shipyard changelog regenerate` |
 | CI drift gate for CHANGELOG.md | `shipyard changelog check` |
 | Run the post-tag hook locally | `shipyard release-bot hook run --tag v0.9.0` |
-| Audit a generated post-tag hook | The run step must contain literal Bash `tag="${GITHUB_REF#refs/tags/}"`; `${{GITHUB_REF#refs/tags/}}` is invalid GitHub expression syntax. PR pushes from the detached tag checkout must first attach the deterministic local branch, then use Shipyard's supervised push and target `HEAD:refs/heads/<branch>` so repository hooks see both a branch and `SHIPYARD_PR_RUNNING=1`. Repositories requiring signed bot commits set `release.post_tag_hook.ssh_signing_setup_script`; never hand-edit the owned workflow. Consumer workflows install the exact generating CLI by default; a repository that must avoid racing its own draft release may explicitly set `release.post_tag_hook.workflow_shipyard_version = "latest"`. Only exact stable optional-`v` semver or `latest` is accepted, and the CLI override wins lower config. |
+| Audit a generated post-tag hook | The run step must contain literal Bash `tag="${GITHUB_REF#refs/tags/}"`; {% raw %}`${{GITHUB_REF#refs/tags/}}`{% endraw %} is invalid GitHub expression syntax. PR pushes from the detached tag checkout must first attach the deterministic local branch, then use Shipyard's supervised push and target `HEAD:refs/heads/<branch>` so repository hooks see both a branch and `SHIPYARD_PR_RUNNING=1`. Repositories requiring signed bot commits set `release.post_tag_hook.ssh_signing_setup_script`; never hand-edit the owned workflow. Consumer workflows install the exact generating CLI by default; a repository that must avoid racing its own draft release may explicitly set `release.post_tag_hook.workflow_shipyard_version = "latest"`. Only exact stable optional-`v` semver or `latest` is accepted, and the CLI override wins lower config. |
 | Live-probe the release chain | `shipyard doctor --release-chain` (dispatches + waits) |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |
@@ -3286,7 +3294,7 @@ retry only through a later bounded invocation.
 **Gotcha:** anything under `.github/workflows/**`, `.claude-plugin/**`, `commands/**`, `agents/**`, `hooks/**`, `scripts/release.sh`, `scripts/ci_matrix.py`, release packaging scripts, or `src/**` triggers the `ci` skill's path map (`scripts/skill_path_map.json`). Update this SKILL.md in the same PR — or use the `Skill-Update: skip` trailer with a real reason.
 
 Self-hosted CI must not inherit the host's production Shipyard configuration.
-Run Rust tests and coverage with `SHIPYARD_TEST_HOME: ${{ runner.temp }}`; this
+Run Rust tests and coverage with {% raw %}`SHIPYARD_TEST_HOME: ${{ runner.temp }}`{% endraw %}; this
 override is enabled by the CI-only `ci-test-home` Cargo feature for unit tests
 and production-shaped integration binaries, while official release builds
 omit the feature. It leaves the runner-managed HOME, Cargo, and Rustup paths

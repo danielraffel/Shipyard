@@ -105,6 +105,9 @@ pub const REVIEWER_IDENTITIES_KEY: &str = "reviewer_identities";
 /// Human accounts whose approvals count when no reviewer is listed. Empty by
 /// default: then only the fleet App's verdicts approve.
 pub const HUMAN_REVIEWERS_KEY: &str = "human_reviewers";
+/// Who may sign the fleet App's APPROVE, set by the protected base; it takes
+/// precedence over a host's [`SIGNERS_FILE`].
+pub const SIGNERS_KEY: &str = "reviewer_signers";
 /// Tracked config file the setting is read from on the protected base.
 pub const CONFIG_PATH: &str = ".shipyard/config.toml";
 /// Repositories that require an approval of the exact head when their base
@@ -343,7 +346,12 @@ pub const SIGNERS_FILE: &str = "reviewer-signers.json";
 /// that cannot be read admits nobody.
 #[must_use]
 pub fn reviewer_signers(repo: &str) -> Option<Vec<String>> {
-    let path = guards_dir()?.join(SIGNERS_FILE);
+    signers_at(&guards_dir()?.join(SIGNERS_FILE), repo)
+}
+
+/// [`reviewer_signers`] read from `path`: `None` when there is no file,
+/// nobody when it cannot be read or parsed.
+fn signers_at(path: &std::path::Path, repo: &str) -> Option<Vec<String>> {
     if !path.exists() {
         return None;
     }
@@ -471,7 +479,16 @@ impl ApprovalPolicy {
                         .collect()
                 })
                 .unwrap_or_default(),
-            signers: None,
+            signers: section
+                .get(SIGNERS_KEY)
+                .and_then(toml::Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_ascii_lowercase)
+                        .collect()
+                }),
             rebase_carry: false,
         }
     }
@@ -1264,7 +1281,7 @@ fn read_policy_inner(
             let host_default = host_review_default();
             if host_default && requires_review_by_default(repo) {
                 let mut policy = ApprovalPolicy::without_config(repo, host_default);
-                policy.signers = host_signers(repo);
+                policy.signers = policy.signers.or_else(|| host_signers(repo));
                 return Ok(policy);
             }
             if missing_is_error {
@@ -1280,7 +1297,7 @@ fn read_policy_inner(
         .parse::<toml::Table>()
         .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
     let mut policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_review_default());
-    policy.signers = host_signers(repo);
+    policy.signers = policy.signers.or_else(|| host_signers(repo));
     policy.validate().map(|()| policy)
 }
 
