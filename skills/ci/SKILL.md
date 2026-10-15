@@ -472,6 +472,11 @@ is bound to that job (repo, head, run, attempt, job name) and names the cause
 the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
 <file>` (append-only, one file per month, ids never duplicated).
 
+Every row a guard appends (`holds.jsonl`, `overrides.jsonl`, `carries.jsonl`,
+`switches.jsonl`, `queue-arms.jsonl`, `queue-removals.jsonl`) names its
+`session` and, when set, `agent`; grep those fields to see which process wrote
+a row.
+
 **"Who armed it?" is `shipyard who --pr N`, not a timeline read.** Every queue
 event shows the fleet App as its actor. `who` joins the arm guard's
 `queue-arms.jsonl` and the removal guard's `queue-removals.jsonl` from every
