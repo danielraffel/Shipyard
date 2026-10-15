@@ -123,16 +123,22 @@ pub(super) fn record_command<W: Write>(
     } else {
         writeln!(
             stdout,
-            "record: {} run(s) listed, {} read; {} cause(s) written, {} already recorded, \
-             {} cancelled job(s) left to outages; {} fix-link(s) written, {} red(s) pending; \
-             {} unreadable",
+            "record: {} run(s) listed, {} read; {} cause(s) written ({} labelled by step, \
+             {} inherited from the job they summarise), {} already recorded, {} cancelled \
+             job(s) left to outages; {} fix-link(s) written, {} red(s) pending ({} under 24h, \
+             {} 24-72h, {} over 72h); {} unreadable",
             report.runs_listed,
             report.runs_read,
             report.causes_written,
+            report.labelled_by_step,
+            report.inherited,
             report.already_recorded,
             report.cancelled_skipped,
             report.fixlinks_written,
             report.reds_pending,
+            report.pending_under_24h,
+            report.pending_24h_to_72h,
+            report.pending_over_72h,
             report.unreadable.len()
         )
     };

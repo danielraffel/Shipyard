@@ -1596,7 +1596,13 @@ not `unknown` and its confidence is `high` or `medium`. A generated-file drift c
 (class `drift`), named by its generator; its `fix_hint` is a suggested
 `python3 tools/scripts/<name>.py ... --write` command matching the known
 generator shape, to review and run from a main-branch checkout. Shipyard never
-executes or auto-applies it. `shipyard cause record` is the read-only observer that writes
+executes or auto-applies it. A bare exit is either inherited from the job a summary
+job summarises (`labelled_by: summarised_job`, `inherited_from_job_id`; count
+failures, not jobs, by deduplicating on it) or labelled by its step and the last
+line printed after the echoed script (`labelled_by: step`, still `low`). A
+fix-link whose red is not an ancestor of the fix recovers `own_files` from the
+pull request head a merge queue merged (`merge_queue_pr_head`) or, within 72
+hours, from the pull request's commit list (`post_force_push`). `shipyard cause record` is the read-only observer that writes
 live cause rows and fix-links into a labels archive in the backfill's layout. `diagnose` adds only
 GitHub's own record (a runner that never came, a supersede, a timeout) when
 the log names nothing more certain; a log with no recognized line still gets

@@ -496,7 +496,19 @@ files of the non-merge commits on the fix's first-parent chain back to the red
 (a merge of main is a merge commit on that chain and is skipped). Never take a
 merge base against today's main for this: once the pull request has landed,
 both heads are main's ancestors and the subtraction erases every file.
-`own_files` is null when the red is not an ancestor of the fix (a force-push).
+When the red is not an ancestor of the fix, a merge-queue red is walked
+back to the pull request head the queue merged (the queue commit's second
+parent; `merge_queue_pr_head`), and any other red, within 72 hours, takes the
+non-merge commits up to the fix in the pull request's commit list
+(`post_force_push`); otherwise `own_files` is null with the reason
+(`post_force_push_superseded`, `post_force_push_too_late`, `red_not_ancestor`).
+A bare exit C2 cannot name is labelled by its step and the last line the step
+printed after its echoed script (`labelled_by: step`), still `low`; a summary
+job whose name prefixes a named job of the same run attempt (`linux` and
+`Linux (x64) [github-hosted]`) takes that job's cause (`labelled_by:
+summarised_job`, `inherited_from_job_id`). Each pass counts pending reds as
+under 24 h, 24 to 72 h, and over 72 h, which separates young reds from
+unfixed or unlinkable ones.
 It also writes
 `rerun_green` when a rerun of the red head passed.
 Cancelled jobs are counted and skipped; they belong to outage windows, not

@@ -466,3 +466,167 @@ fn scrub_removes_private_hosts_and_paths_but_keeps_urls() {
         "https://github.com/a/b/actions/runs/1"
     );
 }
+
+/// One red run (`red`, with its job 1000 failing on the drift log), then a
+/// later pass in which `fix_runs` are the green runs on `feat/x` and `extra`
+/// answers the rest. Returns the second pass's report, the fix-links, and
+/// every path the second pass asked.
+fn second_pass(
+    red: &Value,
+    fix_runs: Value,
+    extra: Vec<(&'static str, Value)>,
+    now: &str,
+) -> (RecordReport, Vec<Value>, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut routes = red_routes();
+    // A job runs on its run's head: a merge-queue job on the queue's commit.
+    let jobs: Vec<Value> = [job(1000, "failure"), job(1001, "cancelled")]
+        .into_iter()
+        .map(|mut job| {
+            job["head_sha"] = red["head_sha"].clone();
+            job["head_branch"] = red["head_branch"].clone();
+            job
+        })
+        .collect();
+    routes[1] = ("runs/100/jobs", json!({"jobs": jobs}));
+    routes[0] = ("runs?status=completed", json!({"workflow_runs": [red]}));
+    let first = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(dir.path())).expect("red pass");
+    routes.retain(|(needle, _)| !needle.starts_with("runs?branch="));
+    routes.push(("runs?branch=feat%2Fx&status=success", fix_runs));
+    routes.extend(extra);
+    let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    let mut later = query(dir.path());
+    now.clone_into(&mut later.now);
+    let report = record(&gh, &later).expect("second pass");
+    (
+        report,
+        rows(&dir.path().join("fixlinks.jsonl")),
+        second.asked(),
+    )
+}
+
+fn green(created: &str) -> Value {
+    json!({"workflow_runs": [{
+        "id": 200, "conclusion": "success", "head_sha": "def456",
+        "created_at": created, "run_attempt": 1
+    }]})
+}
+
+#[test]
+fn a_merge_queue_red_is_walked_back_to_the_pull_request_head_it_queued() {
+    let mut red = red_run();
+    red["head_sha"] = json!("q1");
+    red["head_branch"] = json!("gh-readonly-queue/main/pr-42-base0");
+    red["pull_requests"] = json!([]);
+    red["event"] = json!("merge_group");
+    let (report, links, asked) = second_pass(
+        &red,
+        green("2026-10-14T11:00:00Z"),
+        vec![
+            ("pulls/42", json!({"number": 42, "head": {"ref": "feat/x"}})),
+            (
+                "compare/q1...def456",
+                json!({"status": "diverged", "files": [{"filename": "a.cpp"}]}),
+            ),
+            (
+                "commits/q1",
+                json!({"parents": [{"sha": "base0"}, {"sha": "prhead"}]}),
+            ),
+            (
+                "compare/prhead...def456",
+                json!({"status": "ahead", "total_commits": 2, "commits": [
+                    {"sha": "c1", "parents": [{"sha": "prhead"}]},
+                    {"sha": "def456", "parents": [{"sha": "c1"}]}
+                ]}),
+            ),
+            ("commits/c1", json!({"files": [{"filename": "a.cpp"}]})),
+            ("commits/def456", json!({"files": [{"filename": "b.cpp"}]})),
+        ],
+        "2026-10-14T12:00:00Z",
+    );
+    let link = links
+        .first()
+        .unwrap_or_else(|| panic!("{report:?} {asked:?}"));
+    assert_eq!(link["own_files_method"], "merge_queue_pr_head");
+    assert_eq!(link["own_files"], json!(["a.cpp", "b.cpp"]));
+    assert_eq!(link["pr"], 42);
+}
+
+fn force_pushed(commits: Value, fix_created: &str) -> (Value, Vec<String>) {
+    let (_, links, asked) = second_pass(
+        &red_run(),
+        green(fix_created),
+        vec![
+            (
+                "compare/abc123...def456",
+                json!({"status": "diverged", "files": [{"filename": "y.cpp"}]}),
+            ),
+            ("pulls/42/commits?per_page=100&page=1", commits),
+            ("commits/p1", json!({"files": [{"filename": "x.cpp"}]})),
+            ("commits/def456", json!({"files": [{"filename": "y.cpp"}]})),
+            ("commits/after", json!({"files": [{"filename": "z.cpp"}]})),
+        ],
+        "2026-10-20T12:00:00Z",
+    );
+    (links[0].clone(), asked)
+}
+
+#[test]
+fn a_force_pushed_red_takes_the_pull_requests_commits_up_to_the_fix() {
+    let (link, asked) = force_pushed(
+        json!([
+            {"sha": "p1", "parents": [{"sha": "base"}]},
+            {"sha": "merge", "parents": [{"sha": "p1"}, {"sha": "main9"}]},
+            {"sha": "def456", "parents": [{"sha": "merge"}]},
+            {"sha": "after", "parents": [{"sha": "def456"}]}
+        ]),
+        "2026-10-14T11:00:00Z",
+    );
+    assert_eq!(link["own_files_method"], "post_force_push");
+    assert_eq!(link["own_files"], json!(["x.cpp", "y.cpp"]));
+    assert!(
+        asked
+            .iter()
+            .all(|path| !path.ends_with("commits/after") && !path.ends_with("commits/merge")),
+        "{asked:?}"
+    );
+}
+
+#[test]
+fn a_force_pushed_red_is_not_matched_after_72_hours_or_once_the_fix_is_gone() {
+    let commits = json!([{"sha": "def456", "parents": [{"sha": "base"}]}]);
+    let (late, _) = force_pushed(commits.clone(), "2026-10-17T11:00:00Z");
+    assert_eq!(late["own_files_method"], "post_force_push_too_late");
+    assert_eq!(late["own_files"], Value::Null);
+    let (gone, _) = force_pushed(
+        json!([{"sha": "other", "parents": [{"sha": "base"}]}]),
+        "2026-10-14T11:00:00Z",
+    );
+    assert_eq!(gone["own_files_method"], "post_force_push_superseded");
+    assert_eq!(gone["own_files"], Value::Null);
+}
+
+#[test]
+fn pending_reds_are_counted_by_how_long_ago_they_went_red() {
+    for (now, expected) in [
+        ("2026-10-14T12:00:00Z", (1, 0, 0)),
+        ("2026-10-16T09:00:00Z", (0, 1, 0)),
+        ("2026-10-18T10:31:00Z", (0, 0, 1)),
+    ] {
+        let (report, links, _) = second_pass(&red_run(), json!({"workflow_runs": []}), vec![], now);
+        assert!(links.is_empty());
+        assert_eq!(report.reds_pending, 1, "{now}");
+        assert_eq!(
+            (
+                report.pending_under_24h,
+                report.pending_24h_to_72h,
+                report.pending_over_72h
+            ),
+            expected,
+            "{now}"
+        );
+    }
+}
