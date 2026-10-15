@@ -29,8 +29,18 @@ use super::evidence::split_lines;
 /// Record schema identifier.
 pub const SCHEMA: &str = "c2.cause.v0";
 
+/// The rule set's version, bumped with every rule change so a record says
+/// which rules named it: 5 ranks make/ninja below the linker and keeps a lone
+/// one unnamed; 6 adds `generated_drift`. EXP-A3 registers each version
+/// before any re-score.
+pub const VERSION: u32 = 6;
+
 /// Every format, in priority order.
-pub const FORMATS: [&str; 24] = [
+pub const FORMATS: [&str; 25] = [
+    // A generated file that no longer matches its generator: the check names
+    // the generator and the command that rewrites the file, so it outranks
+    // the test that ran the check.
+    "generated_drift",
     "ctest_summary",
     "pulp_affected",
     "ctest_inline",
@@ -667,6 +677,55 @@ static NINJA: LazyLock<Regex> = LazyLock::new(|| pattern(r"^FAILED: (?:\[code=\d
 static MAKE: LazyLock<Regex> =
     LazyLock::new(|| pattern(r"^make(?:\[\d+\])?: \*\*\* \[([^\]]+)\] Error (\d+)"));
 
+static DRIFT_COUNT: LazyLock<Regex> =
+    LazyLock::new(|| pattern(r"^([A-Za-z0-9_.-]+): \d+ drift problems?(?:\(s\))?\b(.*)$"));
+static DRIFT_STALE: LazyLock<Regex> =
+    LazyLock::new(|| pattern(r"^([A-Za-z0-9_.-]+): the .+ no longer matches .+$"));
+static REGENERATE: LazyLock<Regex> =
+    LazyLock::new(|| pattern(r"((?:python3?|pulp|bash|cmake|node)\s+\S+[^`]*?--write)\b"));
+static REGENERATE_WITH: LazyLock<Regex> = LazyLock::new(|| pattern(r"(regenerate with[^:;.]*)"));
+
+/// A drift check: `<generator>: N drift problem(s) ...` or `<generator>: the
+/// <file> no longer matches <source>`. The subject is the generator; the
+/// message is the command that rewrites the file, from the lines the check
+/// prints after its header, else the header's own "regenerate with" phrase.
+fn rule_generated_drift(lines: &[String]) -> Vec<Record> {
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let text = line.trim();
+        // A bare "error: the ... no longer matches" is not a generator: a
+        // generator's name carries `_` or `-`.
+        let Some(caps) = DRIFT_COUNT.captures(text).or_else(|| {
+            DRIFT_STALE
+                .captures(text)
+                .filter(|caps| caps[1].contains(['_', '-']))
+        }) else {
+            continue;
+        };
+        let generator = &caps[1];
+        let command = lines
+            .iter()
+            .skip(i + 1)
+            .take(60)
+            .find_map(|next| REGENERATE.captures(next).map(|found| found[1].to_owned()))
+            .or_else(|| {
+                REGENERATE_WITH
+                    .captures(text)
+                    .map(|found| found[1].to_owned())
+            })
+            .unwrap_or_default();
+        out.push(rec(
+            "generated_drift",
+            "generated_file_drift",
+            generator,
+            &command,
+            "",
+            i + 1,
+        ));
+    }
+    out
+}
+
 fn rule_ninja(lines: &[String]) -> Vec<Record> {
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
@@ -991,7 +1050,8 @@ type Rule = fn(&[String]) -> Vec<Record>;
 
 /// The rules, in the order their records are gathered (ties in the sort
 /// keep it).
-const RULES: [Rule; 22] = [
+const RULES: [Rule; 23] = [
+    rule_generated_drift,
     rule_ctest_summary,
     rule_pulp_affected,
     rule_ctest_inline,

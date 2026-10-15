@@ -1581,7 +1581,10 @@ Records from the step that ended in `##[error]` come first, so a retried
 assertion never outranks the runner dying. A make or ninja failure ranks
 below every runner and compiler record and is `low`: on its own it names the
 target that broke, not why. A cause is named when its class is
-not `unknown` and its confidence is `high` or `medium`. `diagnose` adds only
+not `unknown` and its confidence is `high` or `medium`. A generated-file drift check is `generated_drift`
+(class `drift`), named by its generator with the `--write` command as its
+`fix_hint`. `shipyard cause record` is the read-only observer that writes
+live cause rows and fix-links into a labels archive in the backfill's layout. `diagnose` adds only
 GitHub's own record (a runner that never came, a supersede, a timeout) when
 the log names nothing more certain; a log with no recognized line still gets
 a `shell-exit` record, so the miss is counted. A job that named its own cause (`shipyard cause extract --log <captured
