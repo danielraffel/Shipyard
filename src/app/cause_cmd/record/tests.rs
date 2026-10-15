@@ -251,6 +251,53 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
 }
 
 #[test]
+fn a_long_range_is_read_page_by_page() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(dir.path())).expect("red pass");
+    let chain = json!([
+        {"sha": "c1", "parents": [{"sha": "abc123"}]},
+        {"sha": "m1", "parents": [{"sha": "main0"}]},
+        {"sha": "def456", "parents": [{"sha": "c1"}, {"sha": "m1"}]}
+    ]);
+    let mut routes = red_routes();
+    routes.retain(|(needle, _)| !needle.starts_with("runs?branch="));
+    routes.extend([
+        (
+            "runs?branch=feat%2Fx&status=success",
+            json!({"workflow_runs": [{
+                "id": 200, "conclusion": "success", "head_sha": "def456",
+                "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
+            }]}),
+        ),
+        // Paged reads first: the unpaged needle is a prefix of theirs.
+        (
+            "compare/abc123...def456?per_page=100&page=1",
+            json!({"status": "ahead", "total_commits": 3, "commits": chain}),
+        ),
+        (
+            "compare/abc123...def456?per_page=100&page=2",
+            json!({"status": "ahead", "total_commits": 3, "commits": []}),
+        ),
+        // Unpaged, the listing stops short of the range.
+        (
+            "compare/abc123...def456",
+            json!({"status": "ahead", "total_commits": 3,
+                   "files": [{"filename": "a.cpp"}, {"filename": "docs/main-only.md"}],
+                   "commits": [{"sha": "c1", "parents": [{"sha": "abc123"}]}]}),
+        ),
+        ("commits/c1", json!({"files": [{"filename": "a.cpp"}]})),
+    ]);
+    let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    record(&gh, &query(dir.path())).expect("green pass");
+    let link = &rows(&dir.path().join("fixlinks.jsonl"))[0];
+    assert_eq!(link["own_files_method"], "first_parent_non_merge_commits");
+    assert_eq!(link["own_files"], json!(["a.cpp"]));
+}
+
+#[test]
 fn a_force_pushed_fix_has_no_own_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());

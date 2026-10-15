@@ -34,6 +34,8 @@ use crate::gate_cost::SyncGhReader;
 pub(super) const COLLECTOR: &str = "shipyard cause record";
 /// The compare API lists at most this many files.
 const COMPARE_FILE_CAP: usize = 300;
+/// Most pages of 100 commits one compare is read for.
+const COMPARE_COMMIT_PAGES: usize = 10;
 /// Most pages of runs one pass lists.
 const MAX_RUN_PAGES: usize = 10;
 
@@ -41,7 +43,7 @@ pub(super) const OWN_FILES_RULE: &str = "own_files = the union of the files of t
     commits on fix_head's first-parent chain back to red_head (commits and parents from compare \
     red_head...fix_head; files from commits/<sha>); merges of the base branch sit on that chain as \
     merge commits and are skipped. rerun_same_head: []; null when red_head is not an ancestor of \
-    fix_head (red_not_ancestor), the range exceeds the 250 commits compare lists (too_many_commits), \
+    fix_head (red_not_ancestor), the range exceeds 1000 commits (too_many_commits), \
     the chain leaves the listed commits (chain_broken), or the fix is on the default branch \
     (branch_is_default); own_files_truncated when a commit lists 300 or more files";
 const FIXLINK_RULE: &str = "earliest successful run of the same workflow on the red's pull request \
@@ -565,8 +567,30 @@ fn own_by_first_parent(
     if !matches!(compare["status"].as_str(), Some("ahead" | "identical")) {
         return Ok((None, "red_not_ancestor", None));
     }
-    let commits = compare["commits"].as_array().cloned().unwrap_or_default();
-    if compare["total_commits"].as_u64().unwrap_or_default() > commits.len() as u64 {
+    let total = compare["total_commits"].as_u64().unwrap_or_default();
+    let mut commits = compare["commits"].as_array().cloned().unwrap_or_default();
+    if total > commits.len() as u64 {
+        // compare lists 250 commits unpaged; paged, 100 at a time.
+        commits.clear();
+        for page in 1..=COMPARE_COMMIT_PAGES {
+            let listed = api(
+                gh,
+                &format!(
+                    "repos/{}/compare/{red}...{fix}?per_page=100&page={page}",
+                    query.repo
+                ),
+            )?;
+            let more = listed["commits"].as_array().cloned().unwrap_or_default();
+            if more.is_empty() {
+                break;
+            }
+            commits.extend(more);
+            if commits.len() as u64 >= total {
+                break;
+            }
+        }
+    }
+    if total > commits.len() as u64 {
         return Ok((None, "too_many_commits", None));
     }
     let by_sha: BTreeMap<&str, &Value> = commits
