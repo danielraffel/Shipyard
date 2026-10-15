@@ -301,6 +301,8 @@ pub mod webhook;
 
 pub mod webhook_prune;
 pub mod webhook_reconcile;
+/// `shipyard who`: attribute queue and merge events to a host and session.
+pub mod who;
 pub(crate) mod worker_process_custody;
 /// Fail-closed policy for automated workflow-run cancellation.
 pub mod workflow_cancellation;

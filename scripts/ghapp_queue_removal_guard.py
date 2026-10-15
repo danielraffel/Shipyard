@@ -8,6 +8,7 @@ import os
 import pathlib
 import posixpath
 import re
+import socket
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -539,6 +540,13 @@ def judge_override(args: list[str]) -> tuple[bool, str]:
         path = append_removal_log(
             {
                 "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                # Who removed it, for `shipyard who`; a missing session never refuses.
+                "host": socket.gethostname().split(".")[0],
+                "session": next((os.environ[name].strip() for name in
+                                 ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
+                                 if os.environ.get(name, "").strip()), "unattributed"),
+                **({"agent": os.environ["SHIPYARD_AGENT_ID"].strip()}
+                   if os.environ.get("SHIPYARD_AGENT_ID", "").strip() else {}),
                 "reason": reason,
                 "note": note,
                 "fix_pr": os.environ.get(FIX_PR_ENV) or None,

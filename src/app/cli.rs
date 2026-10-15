@@ -455,6 +455,23 @@ pub(super) enum Command {
         #[arg(long, value_name = "NUMBER")]
         pr: Option<u64>,
     },
+    /// Which host and agent session armed, enqueued, merged or removed a
+    /// pull request. Read-only.
+    ///
+    /// Joins the pull request's timeline to the guards' ledgers
+    /// (`queue-arms.jsonl`, `queue-removals.jsonl`) read from every
+    /// configured host class, by repository, pull request, verb and head;
+    /// time only breaks ties. An event no ledger explains (a landing through
+    /// native `gh`) is `unattributed`, never guessed. Prints its own
+    /// time to answer.
+    Who {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
     /// Read the repository's CI and say what to change. Read-only.
     ///
     /// `--profile` prints the facts every check applies to: build systems,
@@ -2794,7 +2811,9 @@ pub(super) enum DaemonLauncherCommand {
 #[derive(Debug, Subcommand)]
 pub(super) enum GuardsCommand {
     /// Report whether each managed guard is installed and identical to this
-    /// build's copy. Exit 1 when any is missing, stale, or not executable.
+    /// build's copy, and whether review-before-arm is on (the default) or
+    /// off under an opt-out. Exit 1 when any guard is missing, stale, or not
+    /// executable.
     Status {
         /// Guards directory. Defaults to `$SHIPYARD_GHAPP_GUARDS_DIR` or
         /// `~/.config/shipyard/guards`, where `ghapp` looks.
@@ -2809,6 +2828,18 @@ pub(super) enum GuardsCommand {
         /// Report what would change without writing.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// Turn review-before-arm off on this host, with the reason recorded
+        /// in `review-before-arm.opt-out` and `switches.jsonl`. Later
+        /// installs leave it off until `--opt-in-review-before-arm`.
+        #[arg(
+            long = "opt-out-review-before-arm",
+            value_name = "REASON",
+            conflicts_with_all = ["opt_in_review", "dry_run"]
+        )]
+        opt_out_review: Option<String>,
+        /// Undo an opt-out (logged): review-before-arm is on again.
+        #[arg(long = "opt-in-review-before-arm", conflicts_with = "dry_run")]
+        opt_in_review: bool,
     },
 }
 

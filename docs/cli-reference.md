@@ -93,8 +93,14 @@ shipyard cause record --repo OWNER/REPO --workflow FILE --dir DIR [--since TIME]
                                              #   and a fix-link once its PR or branch goes green (DIR/fixlinks.jsonl)
 
 # ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard)
-shipyard guards status                       # missing/stale/current vs this build's copies; exit 1 unless all current
+shipyard guards status                       # missing/stale/current vs this build's copies, plus whether
+                                             #   review-before-arm is on (default) or OFF by opt-out; exit 1 unless all current
 shipyard guards install [--dir DIR] [--dry-run]  # install this build's copies atomically
+shipyard guards install --opt-out-review-before-arm "<reason>"  # turn review-before-arm off here (the opt-out file), logged
+shipyard guards install --opt-in-review-before-arm               # remove the opt-out, logged
+shipyard who --pr 123 [--repo OWNER/REPO]    # which host/session (and agent, if set) armed, enqueued, merged or removed it; joins every
+                                             #   host's queue-arms.jsonl + queue-removals.jsonl to the PR timeline
+                                             #   (repo+PR+verb+head; time breaks ties); unexplained = unattributed
 shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all
 
 # Keep the fleet on the latest release (controller only)

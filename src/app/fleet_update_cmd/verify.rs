@@ -293,9 +293,10 @@ fn install_verdict(stdout: &str) -> Result<(), String> {
         .map(|rows| {
             rows.iter()
                 .filter(|row| {
-                    row.get("action").and_then(Value::as_str) != Some("installed")
-                        && row.get("action").and_then(Value::as_str) != Some("replaced")
-                        && row.get("action").and_then(Value::as_str) != Some("unchanged")
+                    !matches!(
+                        row.get("action").and_then(Value::as_str),
+                        Some("installed" | "replaced" | "unchanged")
+                    )
                 })
                 .map(|row| {
                     format!(
@@ -351,9 +352,23 @@ fn guards_verdict(raw: &str) -> Result<(), String> {
         .and_then(Value::as_array)
         .filter(|rows| !rows.is_empty())
         .ok_or_else(|| "guards status listed no guards".to_owned())?;
+    // Review-before-arm is on, or off by a readable opt-out; an unreadable
+    // opt-out is not current. An older release reports no switches.
+    let switches = value
+        .get("switches")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let switch_off = switches.iter().filter(|row| {
+        !matches!(
+            row.get("status").and_then(Value::as_str),
+            Some("current" | "opted_out")
+        )
+    });
     let stale = rows
         .iter()
         .filter(|row| row.get("status").and_then(Value::as_str) != Some("current"))
+        .chain(switch_off)
         .map(|row| {
             format!(
                 "{}={}",

@@ -148,8 +148,25 @@ project will automatically recover or merge every PR.
   merge-group preflight that fails the group when a queued PR's latest
   verdict is a HOLD on its head; in other repositories such a HOLD does not
   stop a head that is already armed or queued, so post HOLDs through `ghapp`.
-  Each behaviour is switched on per host by a file in the guards directory
-  (`review-before-arm`, `hold-disarms`), so it rolls out one host at a time.
+  Review before arm is on by default on every host; the only way off is a
+  `review-before-arm.opt-out` file (written with a reason by
+  `shipyard guards install --opt-out-review-before-arm "<reason>"`, logged;
+  anything else at that path keeps review on and fails `guards status`), and
+  `guards status` shows a host that is off. An approval does not count for
+  the agent that posted it: `ghapp` stamps verdict comments with the session
+  and, when `SHIPYARD_AGENT_ID` is set, the agent, and an arm from the
+  approving agent is refused. A shared session alone (every agent of one
+  Claude Code team has the same one) only warns. `hold-disarms`
+  is still switched on one host at a time.
+- **Who landed it.** GitHub attributes every queue mutation to the App, so
+  the arm guard records each arm, enqueue and merge it judges in
+  `~/.local/state/shipyard/queue-arms.jsonl` (time, host, agent session,
+  agent id when set, repository, PR, head, verb, verdict). `shipyard who
+  --pr N` reads that ledger and the removals ledger from every configured
+  host and names the host and session (and agent, when recorded) behind each
+  queue and merge event on the PR's timeline, or says `unattributed` when no
+  ledger explains it. Without an agent id it names the team session, not
+  which agent within it.
   See [`ghapp` guards](docs/ghapp-guards.md).
 - **Durable cancellation.** `shipyard cancel <job> --reason <why>` records the
   operator reason and terminates an active local or SSH validation process tree

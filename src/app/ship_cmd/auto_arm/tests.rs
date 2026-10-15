@@ -575,7 +575,7 @@ fn reenqueue_8678(comments: &str) -> FakeGh {
 
 #[test]
 fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
-    let approval = r#"{"id":1,"login":"fable-graph","type":"User","association":"COLLABORATOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:f0fb2fb38ef5c900efad7ea0630906f081db53a9"}"#;
+    let approval = r#"{"id":1,"login":"shipyard-local[bot]","type":"Bot","association":"CONTRIBUTOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:f0fb2fb38ef5c900efad7ea0630906f081db53a9"}"#;
     let gh = reenqueue_8678(approval);
     let outcome = crate::head_approval::with_host_review_default(true, || {
         arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None)
@@ -598,11 +598,31 @@ fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
     );
 }
 
+/// The same re-enqueue approved only by a human collaborator the base does not
+/// list in `human_reviewers` is not armed: only the fleet App's verdict, or a
+/// listed human's, approves on ship's own arm path.
+#[test]
+fn ship_does_not_arm_a_head_approved_only_by_an_unlisted_human() {
+    let human = r#"{"id":1,"login":"fable-graph","type":"User","association":"COLLABORATOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:f0fb2fb38ef5c900efad7ea0630906f081db53a9"}"#;
+    let gh = reenqueue_8678(human);
+    let outcome = crate::head_approval::with_host_review_default(true, || {
+        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None)
+    });
+    assert!(!outcome.armed, "{}", outcome.line);
+    assert!(
+        outcome.line.contains("carries no approval")
+            && outcome.line.contains("`[auto_merge] human_reviewers`"),
+        "{}",
+        outcome.line
+    );
+    assert!(!gh.called("enablePullRequestAutoMerge"));
+}
+
 /// The same re-enqueue with no verdict naming the head is not armed: ship's
 /// own arm path refuses an unreviewed head on a review-by-default repository.
 #[test]
 fn ship_does_not_arm_an_unreviewed_head_on_a_listed_repository() {
-    let stale = r#"{"id":1,"login":"fable-graph","type":"User","association":"COLLABORATOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:2410ca497342cfc0264bf5b72713de0b56099a0f"}"#;
+    let stale = r#"{"id":1,"login":"shipyard-local[bot]","type":"Bot","association":"CONTRIBUTOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:2410ca497342cfc0264bf5b72713de0b56099a0f"}"#;
     let gh = reenqueue_8678(stale);
     let outcome = crate::head_approval::with_host_review_default(true, || {
         arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None)

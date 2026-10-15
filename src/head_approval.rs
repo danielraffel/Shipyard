@@ -34,16 +34,29 @@
 //!
 //! ## Repositories that require review by default
 //!
-//! On a host that turns it on ([`host_review_default`]: `SHIPYARD_REVIEW_BEFORE_ARM=1`,
-//! or a `review-before-arm` file in the guards directory),
-//! [`REVIEW_REQUIRED_REPOS`] require a verdict naming the exact head even when
-//! their base config is silent. Updating the binary changes nothing until a
-//! host turns it on, so the rule rolls out one host at a time. A config that
-//! sets `arm_requires_head_approval` itself still decides.
+//! Unless the host opted out ([`host_review_default`]: a
+//! `review-before-arm.opt-out` file in the guards directory, the only way
+//! off), [`REVIEW_REQUIRED_REPOS`] require a verdict naming the exact head
+//! even when their base config is silent. A config that sets
+//! `arm_requires_head_approval` itself still decides.
 //!
-//! With no reviewer listed, such a repository counts a verdict from the fleet
-//! App (`shipyard-local`, which every agent posts as) or from an account whose
-//! `author_association` is `OWNER`, `MEMBER` or `COLLABORATOR`; never from
+//! An approval does not count for the agent that posted it: `ghapp` stamps
+//! verdict comments with `<!-- session: <host>/<session> -->`, plus
+//! `agent: <id>` when [`AGENT_ENV`] is set, and a marker approval stamped
+//! with this process's agent id is [`HeadGate::SelfApproved`]. The session
+//! alone never refuses: every agent of one Claude Code team shares
+//! `CLAUDE_CODE_SESSION_ID`, so it cannot tell the reviewer from the agent
+//! that arms. Unstamped verdicts, and either side without an agent id,
+//! count as before.
+//!
+//! With no reviewer listed, such a repository counts an approval only from
+//! the fleet App (`shipyard-local`, which every agent posts as through
+//! `ghapp`), or from a human account the base lists in `[auto_merge]
+//! human_reviewers` (empty by default) whose `author_association` is `OWNER`,
+//! `MEMBER` or `COLLABORATOR`. A human approval outside that list does not
+//! count, because any agent holding the owner's own `gh` login could post one;
+//! each one excluded is reported (`excluded_human_approval:<login>`). A HOLD
+//! from such an account still counts: it can only stop a landing. Never from
 //! other accounts, because the repositories are public, and never from a
 //! distinguishable pull-request author. Listing `reviewer_identities` restores
 //! the strict rule above. The queue-arm guard
@@ -83,6 +96,9 @@ pub const REQUIRED_KEY: &str = "arm_requires_head_approval";
 pub const REVIEWERS_KEY: &str = "reviewer_logins";
 /// New spelling for the configured reviewer identities.
 pub const REVIEWER_IDENTITIES_KEY: &str = "reviewer_identities";
+/// Human accounts whose approvals count when no reviewer is listed. Empty by
+/// default: then only the fleet App's verdicts approve.
+pub const HUMAN_REVIEWERS_KEY: &str = "human_reviewers";
 /// Tracked config file the setting is read from on the protected base.
 pub const CONFIG_PATH: &str = ".shipyard/config.toml";
 /// Repositories that require an approval of the exact head when their base
@@ -103,10 +119,17 @@ pub fn requires_review_by_default(repo: &str) -> bool {
         .any(|required| required.eq_ignore_ascii_case(repo))
 }
 
-/// Environment switch for [`host_review_default`]: `1` on, `0` off.
+/// Environment switch for [`host_review_default`]: `1` forces it on for one
+/// process. Nothing in the environment turns it off.
 pub const HOST_ENABLE_ENV: &str = "SHIPYARD_REVIEW_BEFORE_ARM";
-/// File in the guards directory that turns [`host_review_default`] on.
-pub const HOST_ENABLE_FILE: &str = "review-before-arm";
+/// File in the guards directory that turns [`host_review_default`] off.
+pub const HOST_OPT_OUT_FILE: &str = "review-before-arm.opt-out";
+/// Per-agent identity the orchestrator sets for each agent. Only it can
+/// refuse a self-approval; see [`HeadGate::SelfApproved`].
+pub const AGENT_ENV: &str = "SHIPYARD_AGENT_ID";
+/// Where an agent session's id is read from, in order. Shared by every agent
+/// of one team, so it attributes but never refuses.
+pub const SESSION_ENVS: [&str; 2] = ["CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID"];
 /// `author_association` values whose verdicts count when no reviewer is
 /// listed (besides the fleet App's).
 pub const TRUSTED_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
@@ -114,6 +137,76 @@ pub const TRUSTED_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
 #[cfg(test)]
 thread_local! {
     static HOST_DEFAULT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static AGENT_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AGENT_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` with [`arming_agent`] pinned, on this thread.
+#[cfg(test)]
+pub(crate) fn with_arming_agent<T>(agent: Option<&str>, body: impl FnOnce() -> T) -> T {
+    AGENT_PINNED.with(|cell| cell.set(true));
+    AGENT_OVERRIDE.with(|cell| *cell.borrow_mut() = agent.map(str::to_owned));
+    let result = body();
+    AGENT_PINNED.with(|cell| cell.set(false));
+    AGENT_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    result
+}
+
+#[cfg(test)]
+fn arming_agent_pinned() -> bool {
+    AGENT_PINNED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn arming_agent_pinned() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn pinned_arming_agent() -> Option<String> {
+    AGENT_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(not(test))]
+const fn pinned_arming_agent() -> Option<String> {
+    None
+}
+
+/// This process's agent id ([`AGENT_ENV`]), when the orchestrator set one.
+#[must_use]
+pub fn arming_agent() -> Option<String> {
+    if arming_agent_pinned() {
+        return pinned_arming_agent();
+    }
+    std::env::var(AGENT_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn stamp_pattern() -> Regex {
+    Regex::new(r"<!--\s*session:\s*([^/\s]+)/(\S+?)(?:\s+agent:\s*(\S+?))?\s*-->")
+        .expect("stamp pattern compiles")
+}
+
+/// The session a verdict comment was stamped with by `ghapp`, if any.
+#[must_use]
+pub fn stamped_session(body: &str) -> Option<String> {
+    stamp_pattern()
+        .captures_iter(body)
+        .last()
+        .and_then(|capture| capture.get(2))
+        .map(|session| session.as_str().to_owned())
+}
+
+/// The agent id a verdict comment was stamped with by `ghapp`, if any.
+#[must_use]
+pub fn stamped_agent(body: &str) -> Option<String> {
+    stamp_pattern()
+        .captures_iter(body)
+        .last()
+        .and_then(|capture| capture.get(3))
+        .map(|agent| agent.as_str().to_owned())
 }
 
 /// Run `body` with [`host_review_default`] pinned, on this thread.
@@ -135,19 +228,84 @@ const fn host_review_override() -> Option<bool> {
     None
 }
 
-/// Whether this host applies [`REVIEW_REQUIRED_REPOS`]: `SHIPYARD_REVIEW_BEFORE_ARM`
-/// (`1` or `0`) decides, else a `review-before-arm` file in the guards
-/// directory (`$SHIPYARD_GHAPP_GUARDS_DIR`, else `~/.config/shipyard/guards`)
-/// turns it on. Off otherwise.
+/// What sits at a [`HOST_OPT_OUT_FILE`] path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OptOut {
+    /// Nothing (a dangling symlink included): review before arm is on.
+    Absent,
+    /// A regular file holding the JSON `shipyard guards install
+    /// --opt-out-review-before-arm` writes, with a non-empty `reason`, `at`
+    /// and `by`: the only thing that turns review before arm off.
+    Valid {
+        /// The recorded reason.
+        reason: String,
+        /// The record as written.
+        record: String,
+    },
+    /// Anything else: a directory, an empty or hand-made file, garbage.
+    /// Review before arm stays on, and `guards status` fails until it is
+    /// fixed or removed.
+    Invalid {
+        /// Why it does not count.
+        detail: String,
+    },
+}
+
+/// Classify the opt-out at `path`. The Python twin
+/// (`ghapp_queue_arm_guard.valid_opt_out`) applies the same rules.
+#[must_use]
+pub fn read_opt_out(path: &std::path::Path) -> OptOut {
+    match std::fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return OptOut::Absent,
+        Err(error) => {
+            return OptOut::Invalid {
+                detail: error.to_string(),
+            };
+        }
+        Ok(meta) if !meta.is_file() => {
+            return OptOut::Invalid {
+                detail: "not a regular file".to_owned(),
+            };
+        }
+        Ok(_) => {}
+    }
+    let record = match std::fs::read_to_string(path) {
+        Ok(record) => record.trim().to_owned(),
+        Err(error) => {
+            return OptOut::Invalid {
+                detail: error.to_string(),
+            };
+        }
+    };
+    let parsed = serde_json::from_str::<Value>(&record).ok();
+    let field = |key: &str| {
+        parsed
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    match (field("reason"), field("at"), field("by")) {
+        (Some(reason), Some(_), Some(_)) => OptOut::Valid { reason, record },
+        _ => OptOut::Invalid {
+            detail: "not an opt-out record (needs JSON with reason, at and by)".to_owned(),
+        },
+    }
+}
+
+/// Whether this host applies [`REVIEW_REQUIRED_REPOS`]: on, unless the
+/// guards directory (`$SHIPYARD_GHAPP_GUARDS_DIR`, else
+/// `~/.config/shipyard/guards`) holds a valid [`HOST_OPT_OUT_FILE`] (see
+/// [`read_opt_out`]). `SHIPYARD_REVIEW_BEFORE_ARM=1` forces it on.
 #[must_use]
 pub fn host_review_default() -> bool {
     if let Some(enabled) = host_review_override() {
         return enabled;
     }
-    match std::env::var(HOST_ENABLE_ENV).as_deref() {
-        Ok("1") => return true,
-        Ok("0") => return false,
-        _ => {}
+    if std::env::var(HOST_ENABLE_ENV).as_deref() == Ok("1") {
+        return true;
     }
     let dir = std::env::var_os("SHIPYARD_GHAPP_GUARDS_DIR")
         .filter(|dir| !dir.is_empty())
@@ -156,7 +314,12 @@ pub fn host_review_default() -> bool {
             std::env::var_os("HOME")
                 .map(|home| std::path::PathBuf::from(home).join(".config/shipyard/guards"))
         });
-    dir.is_some_and(|dir| dir.join(HOST_ENABLE_FILE).is_file())
+    !dir.is_some_and(|dir| {
+        matches!(
+            read_opt_out(&dir.join(HOST_OPT_OUT_FILE)),
+            OptOut::Valid { .. }
+        )
+    })
 }
 
 /// Removals of one head after which it needs a fresh approval to re-arm.
@@ -177,6 +340,10 @@ pub struct ApprovalPolicy {
     /// association counts, never a distinguishable pull-request author.
     #[serde(default)]
     pub any_reviewer_but_author: bool,
+    /// Human logins whose approvals count under `any_reviewer_but_author`
+    /// ([`HUMAN_REVIEWERS_KEY`]), lower-cased. Empty by default.
+    #[serde(default)]
+    pub human_reviewer_logins: Vec<String>,
 }
 
 impl ApprovalPolicy {
@@ -206,6 +373,17 @@ impl ApprovalPolicy {
                 })
                 .unwrap_or_default(),
             any_reviewer_but_author: false,
+            human_reviewer_logins: section
+                .get(HUMAN_REVIEWERS_KEY)
+                .and_then(toml::Value::as_array)
+                .map(|logins| {
+                    logins
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(normalized_login)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -487,6 +665,35 @@ fn reviewer_allowed(record: &Value, policy: &ApprovalPolicy, author: Option<&str
         && author.is_none_or(|author| normalized_login(author) != reviewer)
 }
 
+/// Whether an approval by `record`'s login counts, beyond
+/// [`reviewer_allowed`]: under the default rule (no reviewer listed) only the
+/// fleet App or a listed human reviewer approves. A repository that lists
+/// `reviewer_identities` decides by that list alone.
+fn approver_allowed(record: &Value, policy: &ApprovalPolicy) -> bool {
+    if !(policy.any_reviewer_but_author && policy.reviewer_logins.is_empty()) {
+        return true;
+    }
+    login(record).is_some_and(|login| {
+        is_fleet_author(login)
+            || policy
+                .human_reviewer_logins
+                .iter()
+                .any(|human| *human == normalized_login(login))
+    })
+}
+
+/// Whether `record`'s `verdict` counts under `policy`: a HOLD from any
+/// counting reviewer, an approval only from an allowed approver.
+fn verdict_counts(
+    record: &Value,
+    verdict: Verdict,
+    policy: &ApprovalPolicy,
+    author: Option<&str>,
+) -> bool {
+    reviewer_allowed(record, policy, author)
+        && (verdict == Verdict::Hold || approver_allowed(record, policy))
+}
+
 /// Return audit labels for reviewer text that was deliberately ignored.
 ///
 /// These labels are kept separate from the gate decision so a stale HOLD or
@@ -500,6 +707,24 @@ pub fn verdict_audit_events(
     author: Option<&str>,
 ) -> Vec<String> {
     let mut events = Vec::new();
+    for record in reviews.iter().chain(comments) {
+        let approves = record
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| state.eq_ignore_ascii_case("APPROVED"))
+            || record
+                .get("body")
+                .and_then(Value::as_str)
+                .and_then(marker_verdict)
+                .is_some_and(|(verdict, _)| verdict == Verdict::Approve);
+        if approves
+            && reviewer_allowed(record, policy, author)
+            && !approver_allowed(record, policy)
+            && let Some(login) = login(record)
+        {
+            events.push(format!("excluded_human_approval:{login}"));
+        }
+    }
     for comment in comments {
         if !reviewer_allowed(comment, policy, author) {
             continue;
@@ -567,7 +792,7 @@ fn find_approval_for_author(
         |record: &Value| newer_than.is_none_or(|floor| at(record).is_some_and(|at| at > floor));
     let review = reviews.iter().rev().find(|review| {
         fresh(review)
-            && reviewer_allowed(review, policy, author)
+            && verdict_counts(review, Verdict::Approve, policy, author)
             && review
                 .get("state")
                 .and_then(Value::as_str)
@@ -590,7 +815,7 @@ fn find_approval_for_author(
         .rev()
         .find(|comment| {
             fresh(comment)
-                && reviewer_allowed(comment, policy, author)
+                && verdict_counts(comment, Verdict::Approve, policy, author)
                 && comment
                     .get("body")
                     .and_then(Value::as_str)
@@ -623,6 +848,15 @@ pub enum HeadGate {
         /// The head that needs one.
         head: String,
     },
+    /// The approval deciding this head was posted by the agent now arming
+    /// it (both stamped with the same [`AGENT_ENV`] id): an agent cannot
+    /// approve its own landing.
+    SelfApproved {
+        /// The head.
+        head: String,
+        /// The agent that both approved and armed.
+        agent: String,
+    },
     /// The queue removed this head [`EJECTION_CAP`] or more times and no
     /// approval followed the last removal.
     EjectionCap {
@@ -649,9 +883,17 @@ impl HeadGate {
             Self::NotApproved { head } => format!(
                 "head {} carries no approval: it needs a comment whose last line is \
                  `verdict: APPROVE head:{head}` or `reviewed: {head}`, or an APPROVED review \
-                 on that commit, from a listed reviewer (anyone but the PR author where none \
-                 is listed), with no later HOLD naming it. This repository arms only approved \
+                 on that commit, from a listed reviewer, or where none is listed from the \
+                 fleet App (a `ghapp` verdict comment) or a human the base lists in \
+                 `[auto_merge] human_reviewers`, never the PR author, with no later HOLD \
+                 naming it. This repository arms only approved \
                  heads; left disarmed. Arm deliberately with `--arm`",
+                short(head)
+            ),
+            Self::SelfApproved { head, agent } => format!(
+                "the approval of head {} was posted by this same agent ({agent}); an agent \
+                 cannot approve its own landing. Left disarmed until another agent approves \
+                 it, or someone arms it with `--arm`",
                 short(head)
             ),
             Self::EjectionCap { head, ejections } => format!(
@@ -720,11 +962,10 @@ fn latest_verdict(
     author: Option<&str>,
 ) -> Option<Verdict> {
     let review_events = reviews.iter().filter_map(|review| {
-        if !reviewer_allowed(review, policy, author)
-            || !review
-                .get("commit_id")
-                .and_then(Value::as_str)
-                .is_some_and(|commit| commit.eq_ignore_ascii_case(head))
+        if !review
+            .get("commit_id")
+            .and_then(Value::as_str)
+            .is_some_and(|commit| commit.eq_ignore_ascii_case(head))
         {
             return None;
         }
@@ -736,14 +977,13 @@ fn latest_verdict(
         } else {
             return None;
         };
-        Some((at(review), verdict))
+        verdict_counts(review, verdict, policy, author).then(|| (at(review), verdict))
     });
     let comment_events = comments.iter().filter_map(|comment| {
-        if !reviewer_allowed(comment, policy, author) {
-            return None;
-        }
         let (verdict, marker_head) = marker_verdict(comment.get("body")?.as_str()?)?;
-        if marker_head != head.to_ascii_lowercase() {
+        if marker_head != head.to_ascii_lowercase()
+            || !verdict_counts(comment, verdict, policy, author)
+        {
             return None;
         }
         Some((at(comment), verdict))
@@ -802,12 +1042,52 @@ pub(crate) fn decide_for_author(
             },
         };
     }
-    match find_approval_for_author(head, reviews, comments, policy, None, author) {
+    let gate = match find_approval_for_author(head, reviews, comments, policy, None, author) {
         Some(approval) => HeadGate::Approved { approval },
         None => HeadGate::NotApproved {
             head: head.to_owned(),
         },
+    };
+    refuse_self_approval(gate, head, comments)
+}
+
+/// `gate`, or [`HeadGate::SelfApproved`] when its approval is a marker
+/// comment stamped with this process's agent id. Reviews, markers without an
+/// agent stamp, and an arming process without an agent id pass unchanged; a
+/// shared session id never refuses.
+fn refuse_self_approval(gate: HeadGate, head: &str, comments: &[Value]) -> HeadGate {
+    let HeadGate::Approved { approval } = &gate else {
+        return gate;
+    };
+    let mut approval = approval;
+    while let Approval::Carried {
+        approval: inner, ..
+    } = approval
+    {
+        approval = inner;
     }
+    let Approval::Marker {
+        comment_id: Some(id),
+        ..
+    } = approval
+    else {
+        return gate;
+    };
+    let Some(mine) = arming_agent() else {
+        return gate;
+    };
+    let stamped = comments
+        .iter()
+        .find(|comment| comment.get("id").and_then(Value::as_u64) == Some(*id))
+        .and_then(|comment| comment.get("body").and_then(Value::as_str))
+        .and_then(stamped_agent);
+    if stamped.as_deref() == Some(mine.as_str()) {
+        return HeadGate::SelfApproved {
+            head: head.to_owned(),
+            agent: mine,
+        };
+    }
+    gate
 }
 
 /// Read the policy from `base` on GitHub. A missing file is the default.
@@ -1071,7 +1351,10 @@ pub fn evaluate_with_policy_for_author_with_events(
         policy,
         author,
     };
-    Ok((with_carry(run_gh, &carry, gate), events))
+    Ok((
+        refuse_self_approval(with_carry(run_gh, &carry, gate), head, &comments),
+        events,
+    ))
 }
 
 /// What [`with_carry`] reads about one pull request.
@@ -1089,18 +1372,27 @@ struct CarryInput<'a> {
 fn verdict_heads(input: &CarryInput<'_>) -> Vec<String> {
     let mut named: Vec<(Option<DateTime<Utc>>, String)> = Vec::new();
     for review in input.reviews {
-        if reviewer_allowed(review, input.policy, input.author)
+        let verdict = if review
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| state.eq_ignore_ascii_case("APPROVED"))
+        {
+            Verdict::Approve
+        } else {
+            Verdict::Hold
+        };
+        if verdict_counts(review, verdict, input.policy, input.author)
             && let Some(commit) = review.get("commit_id").and_then(Value::as_str)
         {
             named.push((at(review), commit.to_ascii_lowercase()));
         }
     }
     for comment in input.comments {
-        if reviewer_allowed(comment, input.policy, input.author)
-            && let Some((_, head)) = comment
-                .get("body")
-                .and_then(Value::as_str)
-                .and_then(marker_verdict)
+        if let Some((verdict, head)) = comment
+            .get("body")
+            .and_then(Value::as_str)
+            .and_then(marker_verdict)
+            && verdict_counts(comment, verdict, input.policy, input.author)
         {
             named.push((at(comment), head));
         }

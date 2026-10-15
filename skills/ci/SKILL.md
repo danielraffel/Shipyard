@@ -168,10 +168,14 @@ pull request out permanently. Neither is something to reach for by default.
 
 **Head approval.** A repository whose base branch sets
 `[auto_merge] arm_requires_head_approval = true` (the default for pulp, vellum,
-tartci and Shipyard when their base is silent, on a host that sets
-`SHIPYARD_REVIEW_BEFORE_ARM=1` or has a `review-before-arm` guards file; there,
-with no identity listed, a verdict from the fleet App or an
-OWNER/MEMBER/COLLABORATOR counts, never the PR author's) arms or merges only a
+tartci and Shipyard when their base is silent, on every host unless the host
+has a `review-before-arm.opt-out` file, written with a reason by
+`shipyard guards install --opt-out-review-before-arm "<reason>"`, and only
+that written record counts; there,
+with no identity listed, an approval counts only from the fleet App or a
+human the base lists in `[auto_merge] human_reviewers`, empty by default; a
+HOLD from any OWNER/MEMBER/COLLABORATOR still counts; never the PR author's)
+arms or merges only a
 head that carries an
 approval of that exact head from an identity listed in
 `[auto_merge] reviewer_identities` (empty by default; the older spelling
@@ -428,6 +432,12 @@ guard's own decision posted on the head; it is report-only until a
 repository requires it. A red `review-verdict` means the guard would refuse
 that head; fix the verdict, not the status.
 
+**Shipyard's own CI names its reds.** When any job in a `ci.yml` run fails,
+the advisory `ci-cause` job reads the failed jobs' finished logs and prints one
+`ci.cause/v1` record per job as a `::notice title=ci-cause::` annotation
+(`scripts/ci_cause_notices.sh`, on the pinned and checksum-verified release).
+It never gates. Pulp and tartci run the same script.
+
 **To record a cause when the job fails, not after.** In an `if: failure()`
 step, run `shipyard cause extract --log <captured output> --job "<the job's
 display name>" --notice || true`. Pass `--job`: the default is the job's key
@@ -477,6 +487,17 @@ A generated-file drift check (`<generator>: N drift problem(s)` or
 `generated_drift`, class `drift`, high confidence. Its `signature` is the
 generator and its `fix_hint` the `--write` command the check printed. It
 outranks the ctest line that ran the check.
+
+**"Who armed it?" is `shipyard who --pr N`, not a timeline read.** Every queue
+event shows the fleet App as its actor. `who` joins the arm guard's
+`queue-arms.jsonl` and the removal guard's `queue-removals.jsonl` from every
+host to the timeline and names host and session (and agent, when
+`SHIPYARD_AGENT_ID` was set) per event, with its own time to answer. A
+session alone is the whole team's, not one agent's. `unattributed` means no guard saw it (native `gh`, the web UI, or a
+host whose ledger was unreachable, which it lists); do not guess from timing.
+An arm refused with cause `self_approval` means the approval came from the
+arming agent itself (same `SHIPYARD_AGENT_ID`): get a review from another
+agent. A same-session warning without a refusal is expected inside one team.
 
 **An ejection is a queue removal, not a failed merge-group run.** Count
 `RemovedFromMergeQueueEvent` by `github-merge-queue` with reason

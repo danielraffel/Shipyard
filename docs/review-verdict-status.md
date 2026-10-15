@@ -23,8 +23,9 @@ disagree:
   `verdict: APPROVE head:<sha>` or `reviewed: <sha>`, or an `APPROVED`
   review on it), or one the guard's merge-only carry takes to it;
 - whose verdict counts is the guard's rule: the base's `reviewer_identities`,
-  else the fleet App and OWNER, MEMBER or COLLABORATOR accounts, never a
-  distinguishable author;
+  else an approval only from the fleet App or a human the base lists in
+  `[auto_merge] human_reviewers` (a HOLD from any OWNER, MEMBER or
+  COLLABORATOR still counts), never a distinguishable author;
 - a repository whose base sets `arm_requires_head_approval = false` gets
   `success` with the reason.
 

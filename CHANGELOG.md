@@ -3,6 +3,22 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03271"></a>
+## [0.327.1] - 2026-10-14
+
+- fix/c2 ninja symptom rank ([#835](https://github.com/danielraffel/Shipyard/pull/835))
+
+<a id="v03270"></a>
+## [0.327.0] - 2026-10-14
+
+- feat/review before arm default ([#833](https://github.com/danielraffel/Shipyard/pull/833))
+
+<a id="v03261"></a>
+## [0.326.1] - 2026-10-14
+
+- feat/ci cause notices ([#834](https://github.com/danielraffel/Shipyard/pull/834))
+- docs/ranged read public only ([#832](https://github.com/danielraffel/Shipyard/pull/832))
+
 <a id="v03260"></a>
 ## [0.326.0] - 2026-10-13
 
@@ -2341,6 +2357,9 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.327.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.327.1
+[0.327.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.327.0
+[0.326.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.326.1
 [0.326.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.326.0
 [0.325.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.325.2
 [0.325.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.325.1

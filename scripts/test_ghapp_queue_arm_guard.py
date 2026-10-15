@@ -17,6 +17,8 @@ import unittest
 from typing import Any
 from unittest import mock
 
+OPT_OUT_RECORD = '{"reason": "lab host", "at": "2026-10-14T00:00:00Z", "by": "shipyard test"}'
+
 
 SCRIPT = pathlib.Path(__file__).with_name("ghapp_queue_arm_guard.py")
 SPEC = importlib.util.spec_from_file_location("ghapp_queue_arm_guard", SCRIPT)
@@ -608,7 +610,8 @@ class InstalledLayoutEndToEnd(unittest.TestCase):
             )
             for executable in (fake_gh, guards / "queue-arm-guard"):
                 executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
-            env = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake_gh), "GH_REPO": "Generous-Corp/pulp"}
+            env = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake_gh), "GH_REPO": "Generous-Corp/pulp",
+                   "HOME": str(guards)}
             result = subprocess.run(
                 [sys.executable, str(guards / "queue-arm-guard"), "pr", "merge", "8669", "--auto"],
                 env=env,
@@ -1263,6 +1266,7 @@ class BatchAttributionTests(unittest.TestCase):
                     "GHAPP_REAL_GH": str(fake_gh),
                     "GH_REPO": "Generous-Corp/pulp",
                     "SHIPYARD_REVIEW_BEFORE_ARM": "1",
+                    "HOME": str(guards),
                 },
                 cwd=str(repo),
                 capture_output=True,
@@ -1838,7 +1842,7 @@ class ReviewBeforeArm(unittest.TestCase):
         return fake
 
     def case(self, prefix: str, *, graphql: Any = None, comments: Any = None,
-             config: str | None = None, queue: bool = True,
+             reviews: Any = None, config: str | None = None, queue: bool = True,
              extra: list[tuple[str, dict[str, Any]]] | None = None) -> list[tuple[str, dict[str, Any]]]:
         config_answer = {"error": "gh: Not Found (HTTP 404)"} if config is None else {"text": config}
         return [
@@ -1848,7 +1852,8 @@ class ReviewBeforeArm(unittest.TestCase):
             *(extra or []),
             ("graphql", {"json": graphql if graphql is not None
                          else review_fixture(f"{prefix}-graphql.json")}),
-            ("/reviews", {"pages": review_fixture(f"{prefix}-reviews.json")}),
+            ("/reviews", {"pages": reviews if reviews is not None
+                          else review_fixture(f"{prefix}-reviews.json")}),
             ("/comments", {"pages": comments if comments is not None
                            else review_fixture(f"{prefix}-comments.json")}),
             ("/pulls/", {"json": review_fixture(f"{prefix}-pull.json")}),
@@ -1879,6 +1884,12 @@ class ReviewBeforeArm(unittest.TestCase):
     def calls(self) -> str:
         return (self.root / "calls").read_text(encoding="utf-8")
 
+    def ledger(self) -> list[dict[str, Any]]:
+        path = self.root / ".local" / "state" / "shipyard" / "queue-arms.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
     def approved_784(self, **kwargs: Any) -> list[tuple[str, dict[str, Any]]]:
         return self.case("shipyard-784", graphql=opened(review_fixture("shipyard-784-graphql.json")),
                          **kwargs)
@@ -1889,7 +1900,8 @@ class ReviewBeforeArm(unittest.TestCase):
         head = review_fixture("tartci-513-pull.json")["head"]["sha"]
         self.assertIn(f"no reviewer verdict names head {head[:12]}", result.stderr)
         self.assertIn(f"`verdict: APPROVE head:{head}` or `reviewed: {head}`", result.stderr)
-        self.assertIn("from the fleet App or an OWNER, MEMBER or COLLABORATOR", result.stderr)
+        self.assertIn("from the fleet App (a `ghapp` verdict comment), or a human the base "
+                      "lists in `[auto_merge] human_reviewers`", result.stderr)
 
     def test_a_verdict_on_an_older_head_is_refused(self) -> None:
         result = self.arm(511, "danielraffel/tartci", self.case("tartci-511", extra=[
@@ -1948,12 +1960,18 @@ class ReviewBeforeArm(unittest.TestCase):
         result = self.arm(513, "danielraffel/tartci",
                           self.case("tartci-513", comments=[pages[0] + [drive_by]]))
         self.assertEqual(result.returncode, 1, result.stderr)
-        # Control: the same comment from a collaborator approves.
+        # Control: the same comment from a collaborator the base lists in
+        # human_reviewers approves; unlisted, it does not.
         trusted = comment_like(drive_by, user={"login": "fable-graph", "type": "User"},
                                author_association="COLLABORATOR")
         result = self.arm(513, "danielraffel/tartci",
-                          self.case("tartci-513", comments=[pages[0] + [trusted]]))
+                          self.case("tartci-513", comments=[pages[0] + [trusted]],
+                                    config='[auto_merge]\nhuman_reviewers = ["fable-graph"]\n'))
         self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.arm(513, "danielraffel/tartci",
+                          self.case("tartci-513", comments=[pages[0] + [trusted]]))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("ignored the approval of fable-graph", result.stderr)
 
     def test_the_request_must_bind_the_approved_head(self) -> None:
         unbound = self.run_guard(["pr", "merge", "784", "--auto"], self.approved_784(),
@@ -1999,20 +2017,40 @@ class ReviewBeforeArm(unittest.TestCase):
         self.assertEqual(allowed.returncode, 0, allowed.stderr)
         self.assertEqual(self.fixes(allowed.stderr), [])
 
-    def test_the_host_switch_decides_for_a_silent_repository(self) -> None:
+    def test_review_is_on_by_default_and_off_only_by_the_opt_out_file(self) -> None:
+        # On by default, and nothing in the environment turns it off.
         for host in ("0", None):
             result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=host)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertNotIn("/comments", self.calls())
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("/comments", self.calls())
             (self.root / "calls").unlink()
-        (self.guards / "review-before-arm").write_text("", encoding="utf-8")
+        # Anything but a written opt-out record keeps review on.
+        opt_out = self.guards / "review-before-arm.opt-out"
+        for junk in ("", "lab host", '{"reason": "lab host"}', '["lab host"]'):
+            opt_out.write_text(junk, encoding="utf-8")
+            result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=None)
+            self.assertEqual(result.returncode, 1, (junk, result.stderr))
+            (self.root / "calls").unlink()
+        opt_out.unlink()
+        opt_out.mkdir()
         result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=None)
         self.assertEqual(result.returncode, 1, result.stderr)
+        (self.root / "calls").unlink()
+        opt_out.rmdir()
+        opt_out.write_text(OPT_OUT_RECORD, encoding="utf-8")
+        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), host=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("/comments", self.calls())
+        self.assertIn("review before arm is OFF on this host", result.stderr)
+        self.assertIn("lab host", result.stderr)
+        self.assertEqual([entry["review"] for entry in self.ledger()],
+                         ["on"] * 7 + ["off: lab host"])
 
     def test_off_reads_nothing_even_with_a_config_this_python_cannot_parse(self) -> None:
         # Off must be inert on any Python, including one without tomllib, and
         # whatever the base config says: the review reads nothing at all.
         on = "[auto_merge]\narm_requires_head_approval = true\n[validation\n"
+        (self.guards / "review-before-arm.opt-out").write_text(OPT_OUT_RECORD, encoding="utf-8")
         for host in ("0", None):
             result = self.arm(513, "danielraffel/tartci", self.case("tartci-513", config=on),
                               host=host)
@@ -2455,6 +2493,187 @@ class ReviewBeforeArm(unittest.TestCase):
         self.assertIn("is not a merge", result.stderr)
 
 
+class ArmsLedgerAndSelfApproval(unittest.TestCase):
+    """Every judged landing is recorded with its host, session and agent, and
+    an agent cannot approve its own landing. A shared session only warns."""
+
+    install = ReviewBeforeArm.install
+    case = ReviewBeforeArm.case
+    run_guard = ReviewBeforeArm.run_guard
+    calls = ReviewBeforeArm.calls
+    ledger = ReviewBeforeArm.ledger
+    setUp = ReviewBeforeArm.setUp
+    approved_784 = ReviewBeforeArm.approved_784
+
+    def approval(self, session: str | None,
+                 agent: str | None = None) -> list[list[dict[str, Any]]]:
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        tail = f" agent: {agent}" if agent else ""
+        stamp = f"<!-- session: m5s/{session}{tail} -->\n" if session else ""
+        return [[comment_like(approve, created_at="2026-10-12T15:00:00Z",
+                              body=f"Reviewed.\n{stamp}verdict: APPROVE head:{HEAD_784}")]]
+
+    def merge(self, session: str | None, approver: str | None, agent: str | None = None,
+              approver_agent: str | None = None) -> subprocess.CompletedProcess:
+        env = {"CLAUDE_CODE_SESSION_ID": session} if session else {}
+        if agent:
+            env["SHIPYARD_AGENT_ID"] = agent
+        return self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD_784],
+                              self.approved_784(queue=False,
+                                                comments=self.approval(approver, approver_agent)),
+                              "danielraffel/Shipyard", **env)
+
+    def test_the_approving_agent_cannot_land_its_own_approval(self) -> None:
+        result = self.merge("team-1", "team-1", agent="impl", approver_agent="impl")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("was posted by this same agent", result.stderr)
+        self.assertIn('"cause": "self_approval"', result.stderr)
+
+    def test_a_shared_session_lands_with_a_warning_never_a_refusal(self) -> None:
+        # One Claude Code team: reviewer and lead share the session.
+        for agent, approver_agent in (("lead", "reviewer"), (None, None),
+                                      ("lead", None), (None, "reviewer")):
+            with self.subTest(agent=agent, approver_agent=approver_agent):
+                result = self.merge("team-1", "team-1", agent=agent,
+                                    approver_agent=approver_agent)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("carries this process's session (team-1); allowed", result.stderr)
+        self.assertEqual([entry.get("same_session_approval") for entry in self.ledger()],
+                         [True] * 4)
+
+    def test_another_session_lands_it_without_a_warning(self) -> None:
+        result = self.merge("team-2", "team-1", agent="impl", approver_agent="impl-other")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("warning", result.stderr)
+        self.assertNotIn("same_session_approval", self.ledger()[0])
+
+    def test_an_unstamped_verdict_and_an_unattributed_arm_behave_as_before(self) -> None:
+        self.assertEqual(self.merge("sess-A", None, agent="impl").returncode, 0)
+        self.assertEqual(self.merge(None, "sess-A", approver_agent="impl").returncode, 0)
+        self.assertEqual(self.merge("sess-B", "unattributed").returncode, 0)
+
+    def test_every_judged_landing_is_in_the_ledger_with_its_session_and_agent(self) -> None:
+        self.merge("sess-B", "sess-A", agent="lead", approver_agent="reviewer")
+        self.merge("sess-A", "sess-A", agent="impl", approver_agent="impl")
+        self.merge(None, None)
+        entries = self.ledger()
+        self.assertEqual([(e["session"], e.get("agent"), e["verdict"]) for e in entries],
+                         [("sess-B", "lead", "allowed"), ("sess-A", "impl", "refused"),
+                          ("unattributed", None, "allowed")])
+        for entry in entries:
+            self.assertEqual((entry["repo"], entry["pr"], entry["head"], entry["verb"]),
+                             ("danielraffel/Shipyard", 784, HEAD_784, "merge"))
+            self.assertTrue(entry["host"])
+            self.assertRegex(entry["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+            self.assertEqual(entry["review"], "on")
+
+    def test_codex_session_is_read_when_claude_is_absent(self) -> None:
+        self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD_784],
+                       self.approved_784(queue=False, comments=self.approval(None)),
+                       "danielraffel/Shipyard", CODEX_COMPANION_SESSION_ID="codex-1")
+        self.assertEqual(self.ledger()[0]["session"], "codex-1")
+
+
+class HumanApprovalsAndInternalArms(unittest.TestCase):
+    """Through the installed guard: a human approval needs the base's
+    human_reviewers, every exclusion is recorded, and Shipyard's own landings
+    reach the arms ledger without a GitHub call."""
+
+    install = ReviewBeforeArm.install
+    case = ReviewBeforeArm.case
+    run_guard = ReviewBeforeArm.run_guard
+    calls = ReviewBeforeArm.calls
+    ledger = ReviewBeforeArm.ledger
+    setUp = ReviewBeforeArm.setUp
+    approved_784 = ReviewBeforeArm.approved_784
+
+    def owner_review(self) -> list[list[dict[str, Any]]]:
+        return [[{"id": 9, "user": {"login": "danielraffel", "type": "User"},
+                  "author_association": "OWNER", "state": "APPROVED", "commit_id": HEAD_784,
+                  "submitted_at": "2026-10-14T17:50:05Z", "body": ""}]]
+
+    def merge(self, config: str | None = None, comments: Any = None) -> subprocess.CompletedProcess:
+        return self.run_guard(
+            ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD_784],
+            self.approved_784(queue=False, reviews=self.owner_review(), config=config,
+                              comments=comments if comments is not None else [[]]),
+            "danielraffel/Shipyard")
+
+    def test_an_unlisted_human_review_is_refused_and_recorded(self) -> None:
+        result = self.merge()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("ignored the approval of danielraffel", result.stderr)
+        entry = self.ledger()[-1]
+        self.assertEqual((entry["verdict"], entry["excluded_approvals"]), ("refused", ["danielraffel"]))
+
+    def test_an_unlisted_humans_verdict_comment_is_refused_and_recorded(self) -> None:
+        # pulp#10302: a comment ending `verdict: APPROVE head:<sha>` from the
+        # owner's personal login, not the App.
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        owner = comment_like(approve, created_at="2026-10-14T21:30:00Z",
+                             user={"login": "danielraffel", "type": "User"},
+                             author_association="OWNER",
+                             body=f"Reviewed.\nverdict: APPROVE head:{HEAD_784}")
+        result = self.run_guard(
+            ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD_784],
+            self.approved_784(queue=False, reviews=[[]], comments=[[owner]]),
+            "danielraffel/Shipyard")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("ignored the approval of danielraffel", result.stderr)
+        self.assertEqual(self.ledger()[-1]["excluded_approvals"], ["danielraffel"])
+        listed = self.run_guard(
+            ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD_784],
+            self.approved_784(queue=False, reviews=[[]], comments=[[owner]],
+                              config='[auto_merge]\nhuman_reviewers = ["danielraffel"]\n'),
+            "danielraffel/Shipyard")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+
+    def test_a_listed_human_review_is_allowed(self) -> None:
+        result = self.merge(config='[auto_merge]\nhuman_reviewers = ["danielraffel"]\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("ignored the approval", result.stderr)
+        self.assertNotIn("excluded_approvals", self.ledger()[-1])
+
+    def test_the_fleet_apps_verdict_is_allowed_beside_an_unlisted_review(self) -> None:
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        app = [[comment_like(approve, created_at="2026-10-14T17:00:00Z",
+                             body=f"Reviewed.\nverdict: APPROVE head:{HEAD_784}")]]
+        result = self.merge(comments=app)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.ledger()[-1]["excluded_approvals"], ["danielraffel"],
+                         "the ignored human approval is still recorded")
+
+    def test_shipyards_own_landings_are_recorded_without_a_github_call(self) -> None:
+        head = "e" * 40
+        for argv in (
+            ["pr", "merge", "784", "--auto", "--match-head-commit", head, "--repo",
+             "danielraffel/Shipyard"],
+            ["api", "graphql", "-f",
+             "query=mutation($prId:ID!,$head:GitObjectID!){enablePullRequestAutoMerge(input:"
+             "{pullRequestId:$prId,mergeMethod:MERGE,expectedHeadOid:$head}){pullRequest{id}}}",
+             "-f", "prId=PR_kwDO", "-f", f"head={head}"],
+        ):
+            result = self.run_guard(argv, [], "danielraffel/Shipyard",
+                                    SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "calls").exists(), "no GitHub call was made")
+        first, second = self.ledger()
+        self.assertEqual((first["pr"], first["head"], first["verb"], first["verdict"],
+                          first["review"]),
+                         (784, head, "arm", "allowed", "shipyard internal"))
+        self.assertEqual((second["pr"], second["node"], second["head"], second["repo"]),
+                         (None, "PR_kwDO", head, "danielraffel/Shipyard"))
+
+    def test_an_unparseable_internal_request_still_passes(self) -> None:
+        result = self.run_guard(["api", "graphql", "--input", "-"], [], "danielraffel/Shipyard",
+                                SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.ledger(), [])
+
+
 class CarryHistory:
     """A scratch git repository: a base, a pull request that adds a guard line
     (and optionally changes a binary), its approved head, and a base commit
@@ -2730,8 +2949,10 @@ class ReviewIdentity(unittest.TestCase):
         return {"user": {"login": login}, "created_at": at, "body": body,
                 "author_association": association}
 
-    def policy(self) -> dict[str, Any]:
-        return guard.review_policy(None, "danielraffel/tartci", True)
+    def policy(self, humans: tuple[str, ...] = ()) -> dict[str, Any]:
+        policy = guard.review_policy(None, "danielraffel/tartci", True)
+        policy["humans"] = list(humans)
+        return policy
 
     def test_a_distinguishable_author_cannot_approve_their_own_head(self) -> None:
         mine = [self.comment("danielraffel", f"verdict: APPROVE head:{self.HEAD}", association="OWNER")]
@@ -2739,7 +2960,10 @@ class ReviewIdentity(unittest.TestCase):
         self.assertFalse(allowed, why)
         self.assertIn("other than the PR author danielraffel", why)
         theirs = [self.comment("fable-graph", f"reviewed: {self.HEAD}")]
-        self.assertTrue(guard.review_verdict(self.HEAD, "danielraffel", theirs, [], self.policy())[0])
+        listed = self.policy(("fable-graph", "danielraffel"))
+        self.assertTrue(guard.review_verdict(self.HEAD, "danielraffel", theirs, [], listed)[0])
+        self.assertFalse(guard.review_verdict(self.HEAD, "danielraffel", mine, [], listed)[0],
+                         "listing a human never lets them approve their own pull request")
 
     def test_only_the_fleet_app_and_trusted_accounts_count(self) -> None:
         for association in ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", None):
@@ -2753,9 +2977,43 @@ class ReviewIdentity(unittest.TestCase):
     def test_an_approved_review_on_the_head_counts(self) -> None:
         review = {"user": {"login": "fable-graph"}, "state": "APPROVED", "commit_id": self.HEAD,
                   "submitted_at": "2026-10-12T01:00:00Z", "author_association": "MEMBER"}
-        self.assertTrue(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review], self.policy())[0])
+        listed = self.policy(("fable-graph",))
+        self.assertTrue(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review], listed)[0])
         hold = dict(review, state="CHANGES_REQUESTED", submitted_at="2026-10-12T02:00:00Z")
-        self.assertFalse(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review, hold], self.policy())[0])
+        self.assertFalse(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review, hold], listed)[0])
+
+    def test_a_human_approval_counts_only_when_the_base_lists_that_human(self) -> None:
+        # pulp#10293: the owner's own account approved an App pull request a
+        # minute before an agent armed it.
+        review = {"user": {"login": "DanielRaffel"}, "state": "APPROVED", "commit_id": self.HEAD,
+                  "submitted_at": "2026-10-14T17:50:05Z", "author_association": "OWNER"}
+        marker = self.comment("danielraffel", f"verdict: APPROVE head:{self.HEAD}",
+                              association="OWNER")
+        guard.EXCLUDED_APPROVALS.clear()
+        allowed, why = guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review],
+                                            self.policy())
+        self.assertFalse(allowed, why)
+        self.assertIn("human_reviewers", why)
+        self.assertEqual(guard.EXCLUDED_APPROVALS, ["DanielRaffel"])
+        self.assertFalse(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [marker], [],
+                                              self.policy())[0])
+        listed = self.policy(("danielraffel",))
+        self.assertTrue(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [], [review], listed)[0])
+        self.assertTrue(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [marker], [], listed)[0])
+        fleet = [self.comment("shipyard-local[bot]", f"verdict: APPROVE head:{self.HEAD}",
+                              association="CONTRIBUTOR")]
+        self.assertTrue(guard.review_verdict(self.HEAD, "shipyard-local[bot]", fleet, [],
+                                             self.policy())[0])
+        # An unlisted human's HOLD still stops the landing.
+        hold = dict(review, state="CHANGES_REQUESTED", submitted_at="2026-10-14T18:00:00Z")
+        self.assertFalse(guard.review_verdict(self.HEAD, "shipyard-local[bot]", fleet, [hold],
+                                              self.policy())[0])
+
+    def test_human_reviewers_is_read_from_the_base_config(self) -> None:
+        policy = guard.review_policy('[auto_merge]\nhuman_reviewers = ["DanielRaffel"]\n',
+                                     "Generous-Corp/pulp", True)
+        self.assertEqual(policy["humans"], ["danielraffel"])
+        self.assertEqual(guard.review_policy(None, "Generous-Corp/pulp", True)["humans"], [])
 
     def test_a_hold_with_no_readable_time_refuses_beside_a_newer_approval(self) -> None:
         comments = [

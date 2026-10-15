@@ -63,13 +63,65 @@ current head. The direct merges are `pr merge` on a base with no queue, `pr
 merge --admin`, REST `PUT pulls/<n>/merge` and GraphQL `mergePullRequest`; on
 a queue-less repository (tartci, Shipyard) they are the landing path.
 
-**Which hosts and repositories.** Nothing in this section applies unless the
-host turns it on: `SHIPYARD_REVIEW_BEFORE_ARM=1` (`0` forces it off), or a file
-named `review-before-arm` in the guards directory. With it off the guard reads
-nothing for this rule (no pull request, no config, no comments), so it is
-inert whatever the base config says and on any Python. Updating the binary or
-the guards changes nothing until a host turns it on; roll it out one host at a
-time.
+**Which hosts and repositories.** The rule is on by default, in both twins
+(this guard and Shipyard's own arm paths). An opt-in host switch left most of
+the fleet unguarded: on 2026-10-14 an agent on a host without the switch file
+queued an unapproved pull request and one on HOLD. The only way off is a file,
+`review-before-arm.opt-out` in the guards directory:
+`shipyard guards install --opt-out-review-before-arm "<reason>"` writes it
+with the reason, time and binary and appends to `switches.jsonl`, and
+`--opt-in-review-before-arm` removes it, logged too. Only that record counts:
+a regular file holding JSON with a non-empty `reason`, `at` and `by`. Anything
+else at the path (an empty or hand-made file, a directory) keeps the rule on,
+and `guards status`, `doctor` and fleet-update verification fail on it until
+it is fixed or removed, so a stray file cannot opt a host out. Nothing in the
+environment turns it off (`SHIPYARD_REVIEW_BEFORE_ARM=1` only forces it on).
+While a host is opted out, every landing prints that review is OFF and why,
+and the arms ledger records `review: off: <reason>`; `shipyard guards status`
+and `shipyard doctor` show the host as OFF. Off, the guard reads nothing for
+this rule (no pull request, no config, no comments), so it is inert whatever
+the base config says and on any Python.
+
+**An agent cannot approve its own landing.** `verdict-session-stamp` (run by
+`ghapp` before native `gh`, bounded to 5 seconds) adds
+`<!-- session: <host>/<session> agent: <id> -->` above the marker line of a
+verdict comment. The session is `CLAUDE_CODE_SESSION_ID`, else
+`CODEX_COMPANION_SESSION_ID`, else `unattributed`; `agent: <id>` appears only
+when `SHIPYARD_AGENT_ID` is set. The marker stays the last line, so every
+verdict reader is unchanged. The arm guard, and `head_approval` for Shipyard's
+own paths, refuse an arm only when the deciding approval is stamped with an
+agent id and the arming process carries the same `SHIPYARD_AGENT_ID` (cause
+`self_approval`). The session never refuses on its own: every agent of one
+Claude Code team (implementer, reviewer, lead) shares `CLAUDE_CODE_SESSION_ID`,
+so it cannot tell them apart. When only the session matches, the arm guard
+prints a warning and flags the ledger entry `same_session_approval: true`. An
+unstamped verdict (older comments, the web UI, a review), or either side
+without an agent id, behaves exactly as before. The stamp is not a signature:
+any writer can type one; it stops an agent approving its own work by habit,
+not a determined forger.
+
+**The arms ledger.** Every arm, enqueue or merge the guard judges, allowed or
+refused, appends one line to `queue-arms.jsonl` in
+`${XDG_STATE_HOME:-~/.local/state}/shipyard/` (`SHIPYARD_QUEUE_ARMS_LOG`
+overrides): `at`, `host`, `session`, `repo`, `pr`, `head`, `verb` (`arm` or
+`merge`), `verdict` (`allowed` or `refused`) and `review`, plus `agent` when
+`SHIPYARD_AGENT_ID` is set and `same_session_approval` when the approval
+carried the arming session. Override removals in `queue-removals.jsonl` now
+carry `host`, `session` and `agent` too. A missing session
+is recorded as `unattributed` and never refuses anything; a ledger that cannot
+be written is reported and does not block. Shipyard's own marked mutations
+(`SHIPYARD_INTERNAL_QUEUE_MUTATION=1`) are not judged again, but each is
+recorded with `review: shipyard internal` from what the request itself binds,
+with no GitHub call: repository, pull request (or, for a GraphQL landing, the
+`node` id and no number), head and verb. An entry also records
+`excluded_approvals` when it ignored a human approval (below). `shipyard who --pr N` joins both ledgers,
+read from every `[host_class.*]` host over SSH, to the pull request's
+timeline by repository, pull request, verb and head, with time only breaking
+ties, and prints its own time to answer. It names `host/session`, plus the
+agent when the ledger recorded one; without an agent id that is the team
+session, not which agent within it. An event no ledger explains (a
+landing through native `gh`, which passes no guard) is `unattributed`, never
+guessed.
 
 Off differs in one place between the two twins, deliberately. Shipyard's own
 arming and merge paths (Rust) still honour a repository that sets
@@ -102,12 +154,20 @@ blocks an earlier approval. A HOLD whose time cannot be read always blocks.
 
 * With `reviewer_identities` listed: only those identities, never the PR's
   author and never the fleet App `shipyard-local[bot]`.
-* With none listed (the default for the four repositories): the fleet App,
-  which every agent posts as, and accounts whose `author_association` is
-  `OWNER`, `MEMBER` or `COLLABORATOR`. Nobody else: the repositories are
-  public, and a drive-by account's comment must not land a head. A
-  distinguishable PR author never approves their own head. List
-  `reviewer_identities` to make it strict.
+* With none listed (the default for the four repositories): an approval
+  counts only from the fleet App, which every agent posts as through
+  `ghapp`, or from a human the base lists in `[auto_merge] human_reviewers`
+  (empty by default) whose `author_association` is `OWNER`, `MEMBER` or
+  `COLLABORATOR`. A human approval outside that list does not count: an agent
+  holding the owner's own `gh` login posted `APPROVED` reviews a minute
+  before arming its own pull requests (pulp#10293, #10291). Each one ignored
+  is printed (`ignored the approval of <login>`) and recorded in the arms
+  ledger's `excluded_approvals`, and Shipyard's own paths report it as
+  `excluded_human_approval:<login>`. A HOLD from an `OWNER`, `MEMBER` or
+  `COLLABORATOR` still counts: it can only stop a landing. Nobody else: the
+  repositories are public, and a drive-by account's comment must not land a
+  head. A distinguishable PR author never approves their own head, listed or
+  not. List `reviewer_identities` to make it strict.
 
 **The request must bind the head.** `gh pr merge` needs
 `--match-head-commit <sha>`, a GraphQL mutation `expectedHeadOid`, and the
@@ -188,7 +248,7 @@ request's URL), `cause` (`unreviewed`, `hold`, `approval_does_not_carry`,
 
 ```
 queue-arm-guard: refusing to arm or merge an unreviewed head: PR #511 (danielraffel/tartci): no reviewer verdict names head 52eda5490844 ... Each `queue-arm-guard: fix:` line below says what to do next.
-queue-arm-guard: fix: {"cause": "unreviewed", "command": "a reviewer (the fleet App, or an OWNER, MEMBER or COLLABORATOR who is not the author) reviews head 52eda549... and posts a comment ending `verdict: APPROVE head:52eda549...` on https://github.com/danielraffel/tartci/pull/511", "evidence": "https://github.com/danielraffel/tartci/pull/511", "safe_to_auto_apply": false, ...}
+queue-arm-guard: fix: {"cause": "unreviewed", "command": "a reviewer agent reviews head 52eda549... and posts, through `ghapp` (the fleet App), a comment ending `verdict: APPROVE head:52eda549...` on https://github.com/danielraffel/tartci/pull/511; a human approval counts only for a login the base lists in `[auto_merge] human_reviewers`", "evidence": "https://github.com/danielraffel/tartci/pull/511", "safe_to_auto_apply": false, ...}
 ```
 
 Only a re-read (`head_moved`, `unreadable`) is safe to apply unattended.

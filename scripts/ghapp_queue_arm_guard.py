@@ -41,8 +41,13 @@ and bypasses the guard; an operator override exists and always prints a
 WARNING. Both are documented for humans in docs/ghapp-guards.md and are kept
 out of refusal text.
 
-Actor identity is deliberately not consulted: every queue mutation is
-attributed to the same App actor whether Shipyard or an agent issued it.
+Every queue mutation is attributed on GitHub to the same App actor whether
+Shipyard or an agent issued it, so the guard records each one it judges in
+``queue-arms.jsonl`` (next to the removal guard's ``queue-removals.jsonl``):
+time, host, session (``CLAUDE_CODE_SESSION_ID``, else
+``CODEX_COMPANION_SESSION_ID``, else ``unattributed``), repository, pull
+request, head, verb and verdict. ``shipyard who --pr N`` joins those records
+to the pull request's timeline. A missing session never refuses anything.
 
 Review before arm or merge
 --------------------------
@@ -52,11 +57,23 @@ An arm, an enqueue or a direct merge (``pr merge`` on a queue-less base or with
 needs a reviewer verdict naming the exact head, in the repositories that
 require one. The protected base's ``.shipyard/config.toml`` decides when it
 sets ``[auto_merge] arm_requires_head_approval``. Otherwise the repositories in
-REVIEW_REQUIRED_REPOS require one. None of it applies unless the host turns
-review on: ``SHIPYARD_REVIEW_BEFORE_ARM=1`` (``0`` turns it off), or a
-``review-before-arm`` file in the guards directory. With it off the guard reads
-nothing for this rule, so it is inert whatever the config or Python. With it
-on, a config that cannot be read or parsed refuses rather than loosening. This is the Python twin of
+REVIEW_REQUIRED_REPOS require one. It is on unless the host opted out with a
+``review-before-arm.opt-out`` record in the guards directory, written with a
+reason by ``shipyard guards install --opt-out-review-before-arm`` (anything
+else at that path keeps it on; the opt-out is printed on every landing and
+recorded in the arms ledger). With it
+off the guard reads nothing for this rule, so it is inert whatever the config
+or Python. With it on, a config that cannot be read or parsed refuses rather
+than loosening.
+
+An approval does not count for the agent that posted it: ``ghapp`` stamps
+each verdict comment with ``<!-- session: <host>/<session> -->``, plus
+``agent: <id>`` when ``SHIPYARD_AGENT_ID`` is set, and an arm whose agent id
+equals the deciding approval's is refused. A session alone never refuses:
+every agent of one Claude Code team shares ``CLAUDE_CODE_SESSION_ID``, so an
+arm from the approving session only warns and is flagged in the arms ledger.
+An unstamped verdict, or either side without an agent id, counts exactly as
+before. This is the Python twin of
 src/head_approval.rs; both read the policy from the base branch, never from
 the head being armed.
 
@@ -65,10 +82,14 @@ A verdict is the last non-blank line of a pull-request comment,
 head:<sha>`` holds), or a review in state APPROVED / CHANGES_REQUESTED on the
 head. The latest verdict naming the head decides; a HOLD with no readable time
 always holds. When the base config lists ``reviewer_identities``, only those
-count. Otherwise the fleet App (every agent posts as it) and accounts whose
-``author_association`` is OWNER, MEMBER or COLLABORATOR count, never other
-accounts (the repositories are public) and never a distinguishable pull-request
-author.
+count. Otherwise an approval counts only from the fleet App (every agent posts
+as it through ghapp), or from an account the base lists in ``[auto_merge]
+human_reviewers`` (empty by default) whose ``author_association`` is OWNER,
+MEMBER or COLLABORATOR: any agent holding the owner's own gh login could post
+a human approval. Each human approval excluded this way is printed and recorded
+in the arms ledger (``excluded_approvals``). A HOLD from an OWNER, MEMBER or
+COLLABORATOR still counts. Never other accounts (the repositories are public),
+and never a distinguishable pull-request author.
 
 The request must bind the head it lands: ``--match-head-commit <sha>``,
 ``expectedHeadOid``, or REST ``sha=``, equal to the head the verdict approved.
@@ -145,8 +166,21 @@ REVIEW_REQUIRED_REPOS = (
 )
 FLEET_AUTHOR = "shipyard-local"
 REVIEW_OVERRIDE_ENV = "GHAPP_ALLOW_UNREVIEWED_ARM"
+# `1` forces review on for one process (the review-verdict status uses it);
+# nothing in the environment turns it off.
 HOST_ENABLE_ENV = "SHIPYARD_REVIEW_BEFORE_ARM"
-HOST_ENABLE_FILE = "review-before-arm"
+# The only way off: a file in the guards directory, holding the reason.
+HOST_OPT_OUT_FILE = "review-before-arm.opt-out"
+# The arms ledger, the mirror of the removal guard's queue-removals.jsonl.
+ARMS_LOG_ENV = "SHIPYARD_QUEUE_ARMS_LOG"
+SESSION_ENVS = ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
+# Per-agent identity the orchestrator sets; only it can refuse a self-approval.
+AGENT_ENV = "SHIPYARD_AGENT_ID"
+UNATTRIBUTED = "unattributed"
+# `<!-- session: <host>/<session>[ agent: <id>] -->`, stamped by ghapp on
+# verdict comments.
+_SESSION_STAMP = re.compile(
+    r"<!--\s*session:\s*([^/\s]+)/(\S+?)(?:\s+agent:\s*(\S+?))?\s*-->")
 # The rebase carry (see rebase_carry) is a separate switch, off by default.
 REBASE_CARRY_ENV = "SHIPYARD_REBASE_CARRY"
 REBASE_CARRY_FILE = "rebase-carry"
@@ -661,14 +695,116 @@ def marker_verdict(body: str) -> tuple[str, str] | None:
     return match.group(2), match.group(3)
 
 
+def valid_opt_out() -> str | None:
+    """The reason of this host's opt-out, or ``None`` when there is no valid one.
+
+    Only a regular file holding the JSON ``shipyard guards install
+    --opt-out-review-before-arm`` writes, with a non-empty ``reason``, ``at``
+    and ``by``, counts. A directory, an empty or hand-made file, or garbage
+    leaves review on (and ``guards status`` fails on it). The Rust twin is
+    ``head_approval::read_opt_out``.
+    """
+    path = _guards_dir() / HOST_OPT_OUT_FILE
+    try:
+        if not path.is_file():
+            return None
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    fields = [record.get(key) for key in ("reason", "at", "by")]
+    if not all(isinstance(value, str) and value.strip() for value in fields):
+        return None
+    return fields[0].strip()
+
+
 def host_review_default() -> bool:
-    """Whether this host applies REVIEW_REQUIRED_REPOS (see the module docstring)."""
-    switch = os.environ.get(HOST_ENABLE_ENV)
-    if switch == "1":
+    """Whether this host applies REVIEW_REQUIRED_REPOS: on unless the guards
+    directory holds a valid opt-out (see ``valid_opt_out``)."""
+    if os.environ.get(HOST_ENABLE_ENV) == "1":
         return True
-    if switch == "0":
-        return False
-    return (_guards_dir() / HOST_ENABLE_FILE).is_file()
+    return valid_opt_out() is None
+
+
+def opt_out_reason() -> str:
+    """The recorded reason of this host's opt-out, for messages and the ledger."""
+    return valid_opt_out() or "no valid opt-out"
+
+
+def host_name() -> str:
+    import socket
+    return socket.gethostname().split(".")[0] or "unknown-host"
+
+
+def session_id() -> str:
+    """This process's agent session, or ``unattributed``; never an error."""
+    for name in SESSION_ENVS:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return UNATTRIBUTED
+
+
+def agent_id() -> str | None:
+    """This process's per-agent id (``SHIPYARD_AGENT_ID``), when set."""
+    return os.environ.get(AGENT_ENV, "").strip() or None
+
+
+def stamped_session(body: Any) -> str | None:
+    """The session a verdict comment was stamped with, if any."""
+    if not isinstance(body, str):
+        return None
+    found = _SESSION_STAMP.findall(body)
+    return found[-1][1] if found else None
+
+
+def stamped_agent(body: Any) -> str | None:
+    """The agent id a verdict comment was stamped with, if any."""
+    if not isinstance(body, str):
+        return None
+    found = _SESSION_STAMP.findall(body)
+    return (found[-1][2] or None) if found else None
+
+
+def arms_log_path() -> pathlib.Path:
+    configured = os.environ.get(ARMS_LOG_ENV)
+    if configured:
+        return pathlib.Path(configured)
+    state = os.environ.get("XDG_STATE_HOME") or str(pathlib.Path.home() / ".local" / "state")
+    return pathlib.Path(state) / "shipyard" / "queue-arms.jsonl"
+
+
+def record_arms(targets: list[dict[str, Any]] | None, repo: str | None, verdict: str,
+                review: str) -> None:
+    """Append one ledger entry per judged target. Never raises: the ledger
+    attributes landings, it does not gate them."""
+    if not targets:
+        return
+    try:
+        path = arms_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as log:
+            for target in targets:
+                log.write(json.dumps({
+                    "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "host": host_name(),
+                    "session": session_id(),
+                    "repo": target.get("repo") or repo,
+                    "pr": target.get("pr"),
+                    "head": target.get("head"),
+                    "verb": target.get("action", "arm"),
+                    "verdict": verdict,
+                    "review": review,
+                    **({"agent": agent_id()} if agent_id() else {}),
+                    **({"same_session_approval": True}
+                       if target.get("same_session_approval") else {}),
+                    **({"excluded_approvals": target["excluded_approvals"]}
+                       if target.get("excluded_approvals") else {}),
+                    **({"node": target["node"]} if target.get("node") else {}),
+                }, sort_keys=True) + "\n")
+    except OSError as error:
+        print(f"queue-arm-guard: note: the arms ledger was not written: {error}", file=sys.stderr)
 
 
 def _guards_dir() -> pathlib.Path:
@@ -703,16 +839,26 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
     required = section.get("arm_requires_head_approval")
     reviewers = section.get("reviewer_identities", section.get("reviewer_logins")) or []
     from_default = not isinstance(required, bool) and default
+    humans = section.get("human_reviewers") or []
     return {
         "required": required if isinstance(required, bool) else default,
         "reviewers": [str(login).lower() for login in reviewers if isinstance(login, str)],
         # Required by REVIEW_REQUIRED_REPOS, not by the repository's own key.
         "any_but_author": from_default,
+        # Human accounts whose approvals count under any_but_author; empty by
+        # default, so only the fleet App approves.
+        "humans": [_normalized_login(login) for login in humans if isinstance(login, str)],
     }
 
 
+# Human approvals the default rule refused this run, for the warning and the
+# arms ledger (see review_gate).
+EXCLUDED_APPROVALS: list[str] = []
+
+
 def _reviewer_counts(
-    login: str, association: Any, policy: dict[str, Any], author: str | None
+    login: str, association: Any, policy: dict[str, Any], author: str | None,
+    verdict: str,
 ) -> bool:
     reviewer = _normalized_login(login)
     if policy.get("any_but_author") and not policy["reviewers"]:
@@ -720,9 +866,17 @@ def _reviewer_counts(
         # repository trusts count. Every fleet agent posts as the same App, so
         # that App's verdict on that App's pull request counts.
         trusted = reviewer == FLEET_AUTHOR or association in TRUSTED_ASSOCIATIONS
-        return trusted and (
+        counts = trusted and (
             author is None or _normalized_login(author) != reviewer or reviewer == FLEET_AUTHOR
         )
+        # An approval comes only from the fleet App or a human the base lists
+        # in human_reviewers: any agent holding the owner's own gh login could
+        # post a human one. A HOLD from a trusted human still counts.
+        if (counts and verdict == "APPROVE" and reviewer != FLEET_AUTHOR
+                and reviewer not in policy.get("humans", [])):
+            EXCLUDED_APPROVALS.append(login)
+            return False
+        return counts
     # A repository's own setting: only its listed reviewers, never the fleet
     # App or the author (an empty list admits nobody).
     return (
@@ -746,7 +900,7 @@ def counting_verdicts(
         verdict = {"APPROVED": "APPROVE", "CHANGES_REQUESTED": "HOLD"}.get(state)
         if not isinstance(login, str) or verdict is None:
             continue
-        if _reviewer_counts(login, review.get("author_association"), policy, author):
+        if _reviewer_counts(login, review.get("author_association"), policy, author, verdict):
             named = str(review.get("commit_id") or "").lower()
             verdicts.append((_timestamp(review.get("submitted_at")), verdict, named,
                              f"a {state} review by {login} at {review.get('submitted_at')}"))
@@ -756,7 +910,7 @@ def counting_verdicts(
         found = marker_verdict(body) if isinstance(body, str) else None
         if not isinstance(login, str) or found is None:
             continue
-        if _reviewer_counts(login, comment.get("author_association"), policy, author):
+        if _reviewer_counts(login, comment.get("author_association"), policy, author, found[0]):
             verdict, named = found
             verdicts.append((_timestamp(comment.get("created_at")), verdict, named,
                              f"`{verdict} head:{named[:12]}` by {login} at "
@@ -786,7 +940,10 @@ def wanted_verdict(head: str, author: str | None, policy: dict[str, Any]) -> str
     elif not policy.get("any_but_author"):
         wanted += ", from a reviewer the base config lists (it lists none)"
     else:
-        wanted += ", from the fleet App or an OWNER, MEMBER or COLLABORATOR"
+        wanted += (", from the fleet App (a `ghapp` verdict comment), or a human the base "
+                   "lists in `[auto_merge] human_reviewers`")
+        if policy.get("humans"):
+            wanted += f" ({', '.join(policy['humans'])})"
         if author and _normalized_login(author) != FLEET_AUTHOR:
             wanted += f" other than the PR author {author}"
     return wanted
@@ -820,6 +977,77 @@ def review_verdict(
         _, _, _, what = max(older, key=lambda entry: entry[0])
         stale = f" The latest verdict names another head: {what}."
     return False, f"no reviewer verdict names head {head[:12]}; it needs {wanted}.{stale}"
+
+
+def _deciding_approval_body(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> str | None:
+    """The body of the APPROVE comment deciding ``head``, when one does."""
+    head = head.lower()
+    latest = _latest_on(counting_verdicts(author, comments, reviews, policy), head)
+    if latest is None or latest[1] != "APPROVE" or latest[0] is None:
+        return None
+    for comment in comments:
+        login = (comment.get("user") or {}).get("login")
+        body = comment.get("body")
+        if (isinstance(login, str) and isinstance(body, str)
+                and marker_verdict(body) == ("APPROVE", head)
+                and _timestamp(comment.get("created_at")) == latest[0]
+                and _reviewer_counts(login, comment.get("author_association"), policy, author,
+                                     "APPROVE")):
+            return body
+    return None
+
+
+def self_approval(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> str | None:
+    """Why the approval deciding ``head`` cannot land it from this agent.
+
+    Refused only when the deciding APPROVE comment is stamped with an agent id
+    and this process carries the same ``SHIPYARD_AGENT_ID``. A shared session
+    never refuses (see ``same_session_note``).
+    """
+    mine = agent_id()
+    if mine is None:
+        return None
+    body = _deciding_approval_body(head, author, comments, reviews, policy)
+    if body is not None and stamped_agent(body) == mine:
+        return (f"the approval of head {head.lower()[:12]} was posted by this same agent "
+                f"({host_name()}/{mine}); an agent cannot approve its own landing")
+    return None
+
+
+def same_session_note(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> str | None:
+    """A warning when the deciding approval carries this process's session.
+
+    Every agent of one Claude Code team shares the session, so this cannot
+    tell the reviewer from the agent arming: it warns and flags the ledger,
+    never refuses.
+    """
+    mine = session_id()
+    if mine == UNATTRIBUTED:
+        return None
+    body = _deciding_approval_body(head, author, comments, reviews, policy)
+    if body is None or stamped_session(body) != mine:
+        return None
+    return (f"the approval of head {head.lower()[:12]} carries this process's session "
+            f"({mine}); allowed, because a session is shared by every agent of a team. "
+            f"Set {AGENT_ENV} per agent to have the same agent refused")
 
 
 def approved_earlier_head(
@@ -1367,8 +1595,33 @@ def review_fix(cause: str, what: str, repo: str, number: int, head: str,
     }
 
 
+def _note_same_session(classification: dict[str, Any], label: str, repo: str,
+                       note: str | None) -> None:
+    """Print a same-session warning and flag the target for the arms ledger."""
+    if note is None:
+        return
+    classification["same_session_approval"] = True
+    print(f"queue-arm-guard: warning: {label} ({repo}): {note}", file=sys.stderr)
+
+
 def review_gate(classification: dict[str, Any], repo: str | None
                 ) -> tuple[bool, str, dict[str, Any] | None]:
+    """``(allowed, message, fix)``: the review-before-arm rule for one target,
+    with every human approval it excluded printed and kept on the target for
+    the arms ledger."""
+    EXCLUDED_APPROVALS.clear()
+    result = _review_gate(classification, repo)
+    excluded = sorted(set(EXCLUDED_APPROVALS))
+    if excluded:
+        classification["excluded_approvals"] = excluded
+        print(f"queue-arm-guard: note: PR #{classification.get('pr')}: ignored the approval "
+              f"of {', '.join(excluded)}: only the fleet App's verdict, or a login the base "
+              "lists in `[auto_merge] human_reviewers`, approves", file=sys.stderr)
+    return result
+
+
+def _review_gate(classification: dict[str, Any], repo: str | None
+                 ) -> tuple[bool, str, dict[str, Any] | None]:
     """``(allowed, message, fix)``: the review-before-arm rule for one target.
 
     ``fix`` says, for a refusal it can name, what to do next.
@@ -1381,9 +1634,9 @@ def review_gate(classification: dict[str, Any], repo: str | None
         return False, f"{label}: cannot tell which head would land, so its review cannot be checked", None
     if not host_review_default():
         # Off is inert: nothing is read, so no config, Python version or
-        # GitHub answer can change what an arm does on a host that has not
-        # turned review on.
-        return True, f"review before arm is off on this host ({HOST_ENABLE_ENV} unset, no {HOST_ENABLE_FILE})", None
+        # GitHub answer can change what an arm does on a host that opted out.
+        return True, (f"review before arm is OFF on this host ({HOST_OPT_OUT_FILE}: "
+                      f"{opt_out_reason()})"), None
     read_pull = f"ghapp api repos/{repo}/pulls/{number} --jq .head.sha"
     try:
         pull = run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
@@ -1418,12 +1671,28 @@ def review_gate(classification: dict[str, Any], repo: str | None
             f"`expectedHeadOid: \"{head}\"` (GraphQL) or `sha={head}` (REST)", False)
     allowed, why = review_verdict(head, author, comments, reviews, policy)
     if allowed:
+        own = self_approval(head, author, comments, reviews, policy)
+        if own is not None:
+            return False, f"{label} ({repo}): {own}", review_fix(
+                "self_approval", own, repo, number, head,
+                f"another agent reviews head {head} and posts "
+                f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}", False)
+        _note_same_session(classification, label, repo,
+                           same_session_note(head, author, comments, reviews, policy))
         return True, f"{label} ({repo}): {why}", None
     cause = "hold" if "is HOLD" in why or "HOLD naming" in why else "unreviewed"
     approved = approved_earlier_head(head, author, comments, reviews, policy)
     if approved is not None:
         refusal = merge_only_carry(repo, base, approved, head)
+        own = self_approval(approved, author, comments, reviews, policy)
+        if own is not None:
+            return False, f"{label} ({repo}): {own}", review_fix(
+                "self_approval", own, repo, number, head,
+                f"another agent reviews head {head} and posts "
+                f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}", False)
+        carry_note = same_session_note(approved, author, comments, reviews, policy)
         if refusal is None:
+            _note_same_session(classification, label, repo, carry_note)
             return True, (
                 f"{label} ({repo}): the approval of {approved[:12]} carries to {head[:12]}: "
                 "every commit since is a merge of the base and every file the pull request "
@@ -1436,6 +1705,7 @@ def review_gate(classification: dict[str, Any], repo: str | None
                 log_carry(record)
                 print(f"ghapp: {label} ({repo}): approval of {approved[:12]} carried across a "
                       f"rebase to {head[:12]} (logged to {REBASE_CARRY_LOG})", file=sys.stderr)
+                _note_same_session(classification, label, repo, carry_note)
                 return True, (
                     f"{label} ({repo}): the approval of {approved[:12]} carries across the rebase "
                     f"to {head[:12]}: same patch-id, same files, the base touched none of them "
@@ -1452,9 +1722,10 @@ def review_gate(classification: dict[str, Any], repo: str | None
                                     f"does not carry to head {head[:12]}"),
         "unreviewed": f"no trusted verdict names {label}'s head {head[:12]}",
     }[cause]
-    command = (f"a reviewer (the fleet App, or an OWNER, MEMBER or COLLABORATOR who is not the "
-               f"author) reviews head {head} and posts a comment ending "
-               f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}")
+    command = (f"a reviewer agent reviews head {head} and posts, through `ghapp` (the fleet "
+               f"App), a comment ending `verdict: APPROVE head:{head}` on "
+               f"https://github.com/{repo}/pull/{number}; a human approval counts only for a "
+               "login the base lists in `[auto_merge] human_reviewers`")
     # Approving is the reviewer's act; an agent landing its own head must not do it.
     return False, f"{label} ({repo}): {why}", review_fix(
         cause, what, repo, number, head, command, False)
@@ -2479,6 +2750,52 @@ def arm_request(args: list[str]) -> list[dict[str, Any]] | None:
     return None
 
 
+def internal_targets(args: list[str]) -> list[dict[str, Any]] | None:
+    """What a Shipyard-internal landing binds, read from ``args`` alone.
+
+    Shipyard judged it already, so no GitHub call is spent here: the ledger
+    gets the repository, pull request (or GraphQL node), head and verb the
+    request itself names. ``shipyard who`` matches an entry without a pull
+    request number by its repository and head.
+    """
+    parser = _require_parser()
+    repo_flag = parser.option_values(args, {"--repo", "-R"})
+    repo = repo_flag[-1] if repo_flag else (os.environ.get("GH_REPO") or None)
+    if len(args) >= 2 and args[0] == "pr" and args[1] == "merge":
+        if "--disable-auto" in args:
+            return None
+        selector, flag_repo = pr_merge_target(args)
+        repo = flag_repo or repo
+        number: int | None = None
+        if selector:
+            url = re.search(r"github\.com/([^/]+/[^/]+)/pull/([1-9][0-9]*)", selector)
+            if url:
+                repo, number = url.group(1), int(url.group(2))
+            elif re.fullmatch(r"#?[1-9][0-9]*", selector):
+                number = int(selector.lstrip("#"))
+        bound = parser.option_values(args[2:], {"--match-head-commit"})
+        action = "arm" if "--auto" in args else "merge"
+        return [{"repo": repo, "pr": number, "head": bound[-1].lower() if bound else None,
+                 "action": action}]
+    if args and args[0] == "api":
+        endpoint, query = parser.api_target(args)
+        rest = re.fullmatch(r"repos/([^/]+/[^/]+)/pulls/([1-9][0-9]*)/merge", endpoint)
+        if rest:
+            sha = rest_fields(args).get("sha")
+            return [{"repo": rest.group(1), "pr": int(rest.group(2)),
+                     "head": sha.lower() if isinstance(sha, str) else None, "action": "merge"}]
+        if endpoint != "graphql":
+            return None
+        document = "\n".join([parser.graphql_document(args), *query.get("query", [])])
+        compact = "".join(document.split()).lower()
+        if not any(name in compact for name in (*ARM_MUTATIONS, *MERGE_MUTATIONS)):
+            return None
+        return [{"repo": repo, "pr": None, "node": node,
+                 "head": bound.lower() if isinstance(bound, str) else None, "action": action}
+                for action, node, bound in landing_mutations(document, graphql_variables(args))]
+    return None
+
+
 def rest_merge_request(args: list[str], endpoint: str) -> list[dict[str, Any]] | None:
     """The target of a REST ``PUT repos/<o>/<r>/pulls/<n>/merge``, else ``None``."""
     match = re.fullmatch(r"repos/([^/]+)/([^/]+)/pulls/([1-9][0-9]*)/merge", endpoint)
@@ -2542,10 +2859,32 @@ def review_refusal(targets: list[dict[str, Any]], repo: str | None) -> bool:
 
 def main(args: list[str]) -> int:
     if os.environ.get("SHIPYARD_INTERNAL_QUEUE_MUTATION") == "1":
+        # Shipyard's own arm and merge paths judged this already
+        # (head_approval.rs); record it so `shipyard who` can name them too.
+        # Never refuse here, and never fail: parsing is best effort.
+        try:
+            record_arms(internal_targets(args), os.environ.get("GH_REPO") or None,
+                        "allowed", "shipyard internal")
+        except Exception:  # noqa: BLE001 - the ledger never gates
+            pass
         return 0
+    seen: dict[str, Any] = {}
+    status = judge(args, seen)
+    review = "on" if host_review_default() else f"off: {opt_out_reason()}"
+    if review != "on":
+        print(f"queue-arm-guard: note: review before arm is OFF on this host "
+              f"({HOST_OPT_OUT_FILE}: {opt_out_reason()})", file=sys.stderr)
+    record_arms(seen.get("targets"), os.environ.get("GH_REPO") or None,
+                "allowed" if status == 0 else "refused", review)
+    return status
+
+
+def judge(args: list[str], seen: dict[str, Any]) -> int:
+    """The guard's decision for one request; ``seen["targets"]`` gets what it judged."""
     override = os.environ.get("GHAPP_ALLOW_QUEUE_REARM") == "1"
     try:
         targets = arm_request(args)
+        seen["targets"] = targets
     except GuardError as error:
         message = f"refusing ambiguous queue-arm request: {error}"
         if override and os.environ.get(REVIEW_OVERRIDE_ENV) == "1":

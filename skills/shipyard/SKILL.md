@@ -1601,7 +1601,9 @@ a record is never trusted for its content; a forged one is ignored. Records
 in the log are blanked before C2 reads it, so their quoted lines are not read
 as evidence. On a `pull_request` run the record's head comes from
 `GITHUB_EVENT_PATH` (`GITHUB_SHA` is the test merge commit); pass `--job` with
-the display name when it differs from the job key. `shipyard diagnose
+the display name when it differs from the job key. A workflow that wants every red named without editing its jobs adds a job
+that needs them and runs `scripts/ci_cause_notices.sh` (a job cannot read its
+own log while it runs, so the records come from the finished logs). `shipyard diagnose
 --annotate plan|post` puts every failing required job's record in the check
 run's `output.text`, and `shipyard cause archive --dir <labels
 checkout>/causes --input <cases.jsonl>` appends records to `YYYY-MM.jsonl`
@@ -3615,11 +3617,19 @@ into `ship` passes through — so `shipyard pr`, a bare `ship`, and
 `ship --pr <n>` all arm, and no later route can quietly skip it. `--no-arm`
 opts out. A repository whose base sets `[auto_merge]
 arm_requires_head_approval = true` (the default for pulp, vellum, tartci and
-Shipyard when their base is silent, on a host that sets
-`SHIPYARD_REVIEW_BEFORE_ARM=1` or has a `review-before-arm` guards file) arms
+Shipyard when their base is silent, on every host unless it has a
+`review-before-arm.opt-out` file, written with a reason by
+`guards install --opt-out-review-before-arm "<reason>"` and logged to
+`switches.jsonl`, and only that written record counts; `guards status` shows
+a host that is off and fails on anything else at the path) arms
 and classic-merges only an approved head on every path (`ship`, the validated
 arm, the classic merge, the steward backstop); `--arm` overrides it and names
-who did. A merge-only update carries the approval only when every file the PR
+who did. An approval comment stamped (by `ghapp`) with the arming agent id
+(`SHIPYARD_AGENT_ID`) is `SelfApproved`: an agent cannot approve its own
+landing; a shared session alone never refuses, and unstamped verdicts count
+as before. `shipyard who --pr N` names the host and session (and agent, when
+recorded) behind each
+queue and merge event from the guards' ledgers on every host. A merge-only update carries the approval only when every file the PR
 changes keeps its approved blob and mode (the compare API lists no mode, so
 both twins read the files' directory trees), the base changed none of them
 (a rename counts under both names, so a base edit to a file the PR renames
@@ -3637,8 +3647,10 @@ absence of a skipped, neutral or receipt-reused required check all agree;
 each carry is a line in `carries.jsonl`. Shipyard's own arm paths never carry a rebase.
 `queue-arm-guard` refuses an unreviewed arm or direct merge through
 `ghapp` the same way, requires the request to bind the approved head
-(`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts only the
-fleet App and OWNER/MEMBER/COLLABORATOR verdicts; its override,
+(`--match-head-commit`, `expectedHeadOid`, REST `sha=`), and counts an
+approval only from the fleet App or a login the base lists in `[auto_merge]
+human_reviewers` (each ignored human approval is printed and recorded); its
+override,
 `GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
 `docs/ghapp-guards.md`, Review before arm). A HOLD acts too: on a host with
 `hold-disarms`, `verdict-hold-hook` dequeues or disarms a pull request queued
