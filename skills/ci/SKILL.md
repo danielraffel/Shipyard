@@ -174,7 +174,10 @@ has a `review-before-arm.opt-out` file, written with a reason by
 that written record counts; there,
 with no identity listed, an approval counts only from the fleet App or a
 human the base lists in `[auto_merge] human_reviewers`, empty by default; a
-HOLD from any OWNER/MEMBER/COLLABORATOR still counts; never the PR author's)
+HOLD from any OWNER/MEMBER/COLLABORATOR still counts; never the PR author's;
+an App APPROVE must be signed with a `reviewer: <name>` line from the host's
+`reviewer-signers.json`, where that file exists, and never counts when
+stamped `unattributed`)
 arms or merges only a
 head that carries an
 approval of that exact head from an identity listed in
