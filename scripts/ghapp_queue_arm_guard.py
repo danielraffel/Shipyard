@@ -843,8 +843,13 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
     # The protected base may name its own signers; otherwise this host's
     # signers file decides (see reviewer_signers).
     configured = section.get("reviewer_signers")
-    configured_signers = ([str(name).lower() for name in configured if isinstance(name, str)]
-                          if isinstance(configured, list) else None)
+    if configured is not None and not (
+            isinstance(configured, list) and all(isinstance(name, str) for name in configured)):
+        # Never fall back to the host's file on a malformed list.
+        raise GuardError("the base's .shipyard/config.toml [auto_merge] reviewer_signers must "
+                         f"be a list of reviewer names, not {configured!r}")
+    configured_signers = ([name.lower() for name in configured]
+                          if configured is not None else None)
     return {
         "required": required if isinstance(required, bool) else default,
         "reviewers": [str(login).lower() for login in reviewers if isinstance(login, str)],

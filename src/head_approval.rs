@@ -148,6 +148,18 @@ thread_local! {
     static HOST_DEFAULT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static AGENT_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AGENT_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static HOST_SIGNERS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `body` as if this host's signers file allowed `signers`, on this thread.
+#[cfg(test)]
+pub(crate) fn with_host_signers<T>(signers: &[&str], body: impl FnOnce() -> T) -> T {
+    HOST_SIGNERS.with(|cell| {
+        *cell.borrow_mut() = signers.iter().map(|name| (*name).to_owned()).collect();
+    });
+    let result = body();
+    HOST_SIGNERS.with(|cell| cell.borrow_mut().clear());
+    result
 }
 
 /// Run `body` with [`arming_agent`] pinned, on this thread.
@@ -386,15 +398,41 @@ fn signers_from(data: &Value, repo: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// This host's [`reviewer_signers`] for `repo`. Tests read no host state.
+/// Whether a config's `[auto_merge] reviewer_signers`, when set, is a list of
+/// names. Anything else is an error, never a silent fall back to the host's
+/// signers file.
+///
+/// # Errors
+///
+/// When the key is set to something other than a list of strings.
+pub fn signers_shape(table: &toml::Table) -> Result<(), String> {
+    let Some(value) = table
+        .get(CONFIG_TABLE)
+        .and_then(toml::Value::as_table)
+        .and_then(|section| section.get(SIGNERS_KEY))
+    else {
+        return Ok(());
+    };
+    match value.as_array() {
+        Some(names) if names.iter().all(toml::Value::is_str) => Ok(()),
+        _ => Err(format!(
+            "[{CONFIG_TABLE}] {SIGNERS_KEY} must be a list of reviewer names, not {value}"
+        )),
+    }
+}
+
+/// This host's [`reviewer_signers`] for `repo`. Tests read `with_host_signers`.
 #[cfg(not(test))]
 fn host_signers(repo: &str) -> Option<Vec<String>> {
     reviewer_signers(repo)
 }
 
 #[cfg(test)]
-const fn host_signers(_repo: &str) -> Option<Vec<String>> {
-    None
+fn host_signers(_repo: &str) -> Option<Vec<String>> {
+    HOST_SIGNERS.with(|cell| {
+        let signers = cell.borrow();
+        (!signers.is_empty()).then(|| signers.clone())
+    })
 }
 
 /// Whether this evaluation may try the rebase carry: the host switch
@@ -1296,6 +1334,7 @@ fn read_policy_inner(
     let table = raw
         .parse::<toml::Table>()
         .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
+    signers_shape(&table).map_err(|error| format!("{CONFIG_PATH} on {base}: {error}"))?;
     let mut policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_review_default());
     policy.signers = policy.signers.or_else(|| host_signers(repo));
     policy.validate().map(|()| policy)

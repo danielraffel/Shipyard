@@ -3095,6 +3095,18 @@ class ReviewIdentity(unittest.TestCase):
             self.assertEqual(guard.review_policy(None, "Generous-Corp/pulp", True)["signers"],
                              ["host-reviewer"], "no config list: the host file decides")
 
+    def test_a_signer_list_that_is_not_a_list_of_names_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch, \
+                mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": scratch}):
+            (pathlib.Path(scratch) / guard.SIGNERS_FILE).write_text(
+                json.dumps({"default": ["pulp-review"]}))
+            for value in ('"pulp-review"', '["pulp-review", 7]', '{ default = ["pulp-review"] }'):
+                with self.assertRaisesRegex(guard.GuardError, "must be a list of reviewer names"):
+                    guard.review_policy(f"[auto_merge]\nreviewer_signers = {value}\n",
+                                        "Generous-Corp/pulp", True)
+            self.assertEqual(guard.review_policy("[auto_merge]\nreviewer_signers = []\n",
+                                                 "Generous-Corp/pulp", True)["signers"], [])
+
     def test_the_signers_file_is_read_per_repository_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as scratch, \
                 mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": scratch}):
