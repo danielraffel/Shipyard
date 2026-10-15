@@ -5,11 +5,15 @@ import subprocess
 import sys
 import tempfile
 import time
+from unittest import mock
 from pathlib import Path
 
 import pytest
 
 from shipyard_sandbox import (
+    CONCURRENT_GUARD_LOGS,
+    SANDBOX_IDENTITY_ENVS,
+    Sandbox,
     PROTECTED_PATHS,
     SESSION_INBOX_DIR,
     WRITER_DOMAIN_LOCK_NAME,
@@ -569,6 +573,141 @@ def test_a_sandbox_write_to_real_home_is_still_flagged(tmp_path: Path) -> None:
     assert alongside in report.concurrent_sessions
     assert "sandbox wrote outside its isolated HOME/PATH" in report.format()
     assert "not counted (agent sessions' inboxes" in report.format()
+
+
+def _guard_log_world(tmp_path: Path) -> tuple[Path, Path, Path, dict]:
+    """A protected guards root holding a production log with one line."""
+    guards = tmp_path / "config" / "shipyard" / "guards"
+    guards.mkdir(parents=True)
+    log = guards / "holds.jsonl"
+    log.write_text('{"pr": 1, "action": "none"}\n', encoding="utf-8")
+    other = guards / "queue-arm-guard"
+    other.write_text("#!/bin/sh\n", encoding="utf-8")
+    return guards, log, other, {guards: _snapshot_paths(guards)}
+
+
+def test_another_agents_guard_log_append_is_not_contamination(tmp_path: Path) -> None:
+    # Shipyard#837: a HOLD another agent posted on the host appended to the
+    # real holds.jsonl while the sandbox ran; queue-arms.jsonl is the same.
+    guards, log, _, before = _guard_log_world(tmp_path)
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write('{"pr": 10315, "action": "none", "why": "neither armed nor queued"}\n')
+    report = contamination((guards,), before, 0.0, guard_logs=frozenset({log}),
+                           sandbox_root=tmp_path / "sandbox")
+    assert report.clean, report.format()
+    assert log in report.concurrent_sessions
+    assert "production guard-log appends" in report.format() or report.clean
+
+
+def test_a_guard_log_change_that_is_not_a_clean_append_still_counts(tmp_path: Path) -> None:
+    sandbox = tmp_path / "sandbox"
+    cases = {
+        "rewritten": lambda log: log.write_text('{"pr": 2}\n{"pr": 3}\n', encoding="utf-8"),
+        "truncated": lambda log: log.write_text("", encoding="utf-8"),
+        # Longer than before, so only the unchanged-prefix check catches it.
+        "rewritten and grown": lambda log: log.write_text(
+            '{"pr": 9, "action": "edit"}\n{"pr": 7, "action": "more"}\n', encoding="utf-8"),
+        "not json": lambda log: log.open("a", encoding="utf-8").write("not json\n"),
+        "no newline": lambda log: log.open("a", encoding="utf-8").write('{"pr": 4}'),
+        "names the sandbox": lambda log: log.open("a", encoding="utf-8").write(
+            json.dumps({"cwd": str(sandbox / "work")}) + "\n"),
+    }
+    for label, change in cases.items():
+        world = tmp_path / label.replace(" ", "-")
+        guards, log, other, before = _guard_log_world(world)
+        change(log)
+        report = contamination((guards,), before, 0.0, guard_logs=frozenset({log}),
+                               sandbox_root=sandbox)
+        assert log in report.offenders, (label, report.format())
+    # An append to any other file under the guards directory still counts,
+    # and so does a log the list does not name.
+    guards, log, other, before = _guard_log_world(tmp_path / "other")
+    with other.open("a", encoding="utf-8") as handle:
+        handle.write('{"pr": 5}\n')
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write('{"pr": 6}\n')
+    report = contamination((guards,), before, 0.0, guard_logs=frozenset(), sandbox_root=sandbox)
+    assert other in report.offenders and log in report.offenders, report.format()
+
+
+def test_a_row_carrying_the_sandboxs_nonce_is_its_own_leak(tmp_path: Path) -> None:
+    # A guard that ran outside the sandbox's HOME writes an ordinary row with
+    # no path in it; only the run's identity in that row gives it away.
+    nonce = "sandbox-00000000-0000-4000-8000-000000000001"
+    guards, log, _, before = _guard_log_world(tmp_path / "leak")
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"at": "2026-10-15T03:00:00Z", "host": "m3", "session": nonce,
+                                 "agent": nonce, "pr": 7, "verb": "arm"}) + "\n")
+    report = contamination((guards,), before, 0.0, guard_logs=frozenset({log}),
+                           sandbox_root=tmp_path / "sandbox", nonce=nonce)
+    assert log in report.offenders, report.format()
+    # Control: the same row from another session is another agent's append.
+    guards, log, _, before = _guard_log_world(tmp_path / "foreign")
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"at": "2026-10-15T03:00:00Z", "host": "m3",
+                                 "session": "08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb",
+                                 "pr": 7, "verb": "arm"}) + "\n")
+    report = contamination((guards,), before, 0.0, guard_logs=frozenset({log}),
+                           sandbox_root=tmp_path / "sandbox", nonce=nonce)
+    assert report.clean and log in report.concurrent_sessions, report.format()
+
+
+def test_every_sandbox_process_runs_with_the_runs_nonce_as_its_identity() -> None:
+    sandbox = Sandbox()
+    sandbox.root = Path("/tmp/shipyard-sandbox-e2e.example")
+    try:
+        env = sandbox._env(None)
+    finally:
+        sandbox.root = None
+    assert sandbox.nonce.startswith("sandbox-")
+    for name in SANDBOX_IDENTITY_ENVS:
+        assert env[name] == sandbox.nonce, name
+    assert {"SHIPYARD_AGENT_ID", "CLAUDE_CODE_SESSION_ID"} <= set(SANDBOX_IDENTITY_ENVS)
+    assert Sandbox().nonce != sandbox.nonce, "a new nonce per run"
+
+
+def _load_script(name: str):
+    import importlib.util
+    path = Path(__file__).resolve().parents[2] / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _rust_const(source: str, name: str) -> str:
+    import re
+    text = (Path(__file__).resolve().parents[2] / "src" / source).read_text(encoding="utf-8")
+    match = re.search(rf'pub const {name}: &str = "([^"]+)";', text)
+    assert match, f"{name} in src/{source}"
+    return match.group(1)
+
+
+def test_the_guard_logs_are_exactly_where_every_writer_writes() -> None:
+    # Each writer's own path, resolved as it resolves it on a host with no
+    # overrides: a writer that moves its log fails here, not on a gate host.
+    scrubbed = {name: value for name, value in os.environ.items()
+                if name not in ("XDG_STATE_HOME", "SHIPYARD_GHAPP_GUARDS_DIR",
+                                "SHIPYARD_QUEUE_ARMS_LOG", "SHIPYARD_QUEUE_REMOVALS_LOG")}
+    with mock.patch.dict(os.environ, scrubbed, clear=True):
+        arm = _load_script("ghapp_queue_arm_guard")
+        removal = _load_script("ghapp_queue_removal_guard")
+        hold = _load_script("ghapp_verdict_hold_hook")
+        written = {
+            arm.arms_log_path(),
+            arm._guards_dir() / arm.REBASE_CARRY_LOG,
+            arm._guards_dir() / arm.OVERRIDES_LOG,
+            removal.removal_log_path(),
+            hold._guards_dir() / hold.HOLDS_LOG,
+        }
+    guards = Path.home() / ".config" / "shipyard" / "guards"
+    for source in ("head_approval.rs", "ghapp_guards.rs"):
+        text = (Path(__file__).resolve().parents[2] / "src" / source).read_text(encoding="utf-8")
+        assert '.join(".config/shipyard/guards")' in text, f"the guards directory in {source}"
+    written |= {guards / _rust_const("ghapp_guards.rs", "SWITCH_LOG"),
+                guards / _rust_const("head_approval/rebase.rs", "REBASE_CARRY_LOG")}
+    assert written == set(CONCURRENT_GUARD_LOGS)
 
 
 def test_the_session_inbox_is_the_real_home_one() -> None:

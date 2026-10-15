@@ -92,23 +92,26 @@ shipyard evidence command --list
 ## Fallback when a machine is down
 
 Each target can have a fallback chain. When the primary is unreachable,
-Shipyard tries the next option automatically:
+Shipyard tries the next entry in order:
 
 ```
-1. Try SSH to your VM → unreachable (VM is off)
-2. Boot the VM via UTM → wait for SSH to come up → success
-3. If that also fails → dispatch to Namespace cloud runners
-4. If cloud fails too → dispatch to GitHub-hosted runners (last resort)
+1. Try SSH to your machine → unreachable
+2. Dispatch to Namespace cloud runners
+3. If that fails too → dispatch to GitHub-hosted runners (last resort)
 ```
 
-The chain is configurable per target. You can skip VMs, skip cloud,
-or make cloud the primary. An indie developer just having a play with
-a project might use: local first, VM fallback, cloud last resort.
+The chain is configurable per target. You can skip cloud, or make cloud the
+primary.
+
+Shipyard does not boot virtual machines. A `{ type = "vm", ... }` fallback
+entry is accepted in config but skipped when the chain is built, so start
+the VM yourself (or let a tool such as tartci manage it) and point an SSH
+target at it.
 
 ## Fallback is opt-in
 
 By default, if a target is unreachable, it just reports unreachable. No
-automatic VM booting, no cloud dispatch. You add fallback chains only if
+cloud dispatch. You add fallback chains only if
 you want them:
 
 ```toml
@@ -117,12 +120,11 @@ you want them:
 backend = "ssh"
 host = "ubuntu"
 
-# With fallback — tries VM, then cloud
+# With fallback: SSH first, then cloud
 [targets.ubuntu]
 backend = "ssh"
 host = "ubuntu"
 fallback = [
-    { type = "vm", vm_name = "Ubuntu 24.04" },
     { type = "cloud", provider = "github-hosted" },
 ]
 ```

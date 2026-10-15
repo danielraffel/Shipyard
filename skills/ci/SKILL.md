@@ -1,6 +1,6 @@
 ---
 name: ci
-description: Cross-platform CI coordination with Shipyard: validates, ships, manages queue, and runs cloud workflows. Also audits which Shipyard features a repository already has (shipyard pr flow, required checks, version/skill gates, merge queue, fast tier, receipt reuse, host classes, runner governance) and adopts the missing ones in dependency order.
+description: "Cross-platform CI coordination with Shipyard: validates, ships, manages queue, and runs cloud workflows. Also audits which Shipyard features a repository already has (shipyard pr flow, required checks, version/skill gates, merge queue, fast tier, receipt reuse, host classes, runner governance) and adopts the missing ones in dependency order."
 ---
 
 # CI Operations with Shipyard
@@ -487,6 +487,11 @@ than the pull request's current one. It takes signers only from the base's
 `[auto_merge] reviewer_signers`: a repository that requires review and lists
 none refuses every App APPROVE, so set the list on the base first.
 
+Every row a guard appends (`holds.jsonl`, `overrides.jsonl`, `carries.jsonl`,
+`switches.jsonl`, `queue-arms.jsonl`, `queue-removals.jsonl`) names its
+`session` and, when set, `agent`; grep those fields to see which process wrote
+a row.
+
 **To keep a labels archive current as checks go red and green**, run
 `shipyard cause record --repo <OWNER/REPO> --workflow <file> --dir
 <labels checkout>/data/ci-cause [--since <RFC 3339>]` on a schedule. It is a
@@ -501,7 +506,19 @@ files of the non-merge commits on the fix's first-parent chain back to the red
 (a merge of main is a merge commit on that chain and is skipped). Never take a
 merge base against today's main for this: once the pull request has landed,
 both heads are main's ancestors and the subtraction erases every file.
-`own_files` is null when the red is not an ancestor of the fix (a force-push).
+When the red is not an ancestor of the fix, a merge-queue red is walked
+back to the pull request head the queue merged (the queue commit's second
+parent; `merge_queue_pr_head`), and any other red, within 72 hours, takes the
+non-merge commits up to the fix in the pull request's commit list
+(`post_force_push`); otherwise `own_files` is null with the reason
+(`post_force_push_superseded`, `post_force_push_too_late`, `red_not_ancestor`).
+A bare exit C2 cannot name is labelled by its step and the last line the step
+printed after its echoed script (`labelled_by: step`), still `low`; a summary
+job whose name prefixes a named job of the same run attempt (`linux` and
+`Linux (x64) [github-hosted]`) takes that job's cause (`labelled_by:
+summarised_job`, `inherited_from_job_id`). Each pass counts pending reds as
+under 24 h, 24 to 72 h, and over 72 h, which separates young reds from
+unfixed or unlinkable ones.
 It also writes
 `rerun_green` when a rerun of the red head passed.
 Cancelled jobs are counted and skipped; they belong to outage windows, not
@@ -512,8 +529,21 @@ join. A red with no green yet stays pending and is retried on the next pass.
 A generated-file drift check (`<generator>: N drift problem(s)` or
 `<generator>: the <file> no longer matches <source>`) is C2's
 `generated_drift`, class `drift`, high confidence. Its `signature` is the
-generator and its `fix_hint` the `--write` command the check printed. It
-outranks the ctest line that ran the check.
+generator. Its `fix_hint` is set only when the command the check printed is
+exactly `python3 tools/scripts/<name>.py [--flag [value]]... --write`, with no
+shell metacharacters and every value a relative path inside the checkout (no
+leading `/`, `~` or `-`, no `..` segment); otherwise it is null. The log is text
+the pull request under test controls, so a `fix_hint` is a suggested command
+matching the known generator shape: review it before running it, and run it from
+a checkout of the main branch, never from the pull request's own checkout, where
+`tools/scripts/<name>.py` is the pull request's own script. Nothing in Shipyard
+executes a `fix_hint` and nothing auto-applies one. A `detail` is log text and
+is never a command.
+It outranks the ctest line that ran the check. Job logs are read through
+`gate_cost::fetch_job_log`, which passes `--allow-escape-sequences` (logs carry
+ANSI colour, and a current `gh` refuses them without it) and falls back to the
+bare read for a `gh` that does not know the flag. The recorder's scrub also
+replaces `ghp_`/`gho_`/`ghs_`/`ghu_`/`ghr_` and `github_pat_` tokens.
 
 GitHub Pages runs every tracked markdown file through Liquid, so a GitHub
 Actions expression quoted in one must sit inside a Liquid raw block (wrap the

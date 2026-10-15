@@ -18,9 +18,10 @@ present, or not executable, is skipped.
 | `branch-refresh-guard` | `scripts/ghapp_branch_refresh_guard.py` | `pr update-branch`, REST `pulls/<n>/update-branch`, `updatePullRequestBranch`, only when the base's `[merge] refresh_branch` policy is `"only-if-conflicting"` and the refresh is provably pointless (below) |
 | `merge-guard` | `scripts/ghapp_merge_guard.sh` | `pr merge` on a repository listed in `~/.config/shipyard/merge-guard.json` (one that cannot enforce required checks server-side) until every listed check reads `pass`, and `--auto` there outright; inert for unlisted repositories and when that file is missing or malformed |
 | `verdict-hold-hook` | `scripts/ghapp_verdict_hold_hook.py` | nothing: before a HOLD verdict posts, it dequeues or disarms that pull request when it is queued or armed at exactly the HOLD's head ([A HOLD takes its head out of the landing path](#a-hold-takes-its-head-out-of-the-landing-path)) |
+| `verdict-session-stamp` | `scripts/ghapp_verdict_session_stamp.py` | nothing: it adds a `<!-- session: <host>/<session> -->` stamp to a verdict comment before it posts, so the arm guard can tell who approved ([An agent cannot approve its own landing](#review-before-arm-or-merge)) |
 
 `pr-close-guard` is a mandatory member of the authenticated `ghapp` generation
-and is managed by `shipyard fleet update`, not by this page.
+and is managed by `shipyard runner fleet-update`, not by this page.
 
 ## Install the plain `gh` wrapper
 
@@ -749,8 +750,8 @@ two more variables:
 An allowed removal reads each target PR through the App token and appends one
 JSON line (time, reason, note, fix PR, each target's repository, number, head
 and queue state, and the argv) to `$GHAPP_QUEUE_REMOVAL_LOG`, default
-`~/.local/state/shipyard/queue-removals.jsonl`. The log is per host and nothing reads it yet; collecting it fleet-wide is a
-follow-up. A target that cannot be read, or a log that cannot be written,
+`~/.local/state/shipyard/queue-removals.jsonl`. The log is per host;
+`shipyard who --pr N` reads it from every configured host. A target that cannot be read, or a log that cannot be written,
 refuses the removal: an allowance nobody can
 audit later is not given. A request body read from stdin is refused too,
 because the guard cannot see which PR it removes.
@@ -770,6 +771,17 @@ ones are refused and the 7 defect fixes allowed.
 shipyard guards status    # exit 1 unless every managed guard is installed and matches this build
 shipyard guards install   # atomic; never overwrites a symlink
 ```
+
+Per-host switches, all in the guards directory:
+
+| switch | default | turn it on | turn it off |
+|---|---|---|---|
+| review before arm or merge | on | `shipyard guards install --opt-in-review-before-arm` removes an opt-out | `shipyard guards install --opt-out-review-before-arm "<reason>"` |
+| signer rule for App approvals | off | a `reviewer-signers.json` file | remove the file |
+| rebase carry | off | a `rebase-carry` file, or `SHIPYARD_REBASE_CARRY=1` | remove the file; `SHIPYARD_REBASE_CARRY=0` forces it off |
+| HOLD dequeues or disarms | off | a `hold-disarms` file, or `SHIPYARD_HOLD_DISARMS=1` | remove the file; `SHIPYARD_HOLD_DISARMS=0` forces it off |
+
+Turn the off-by-default switches on one host at a time.
 
 `shipyard doctor` reports the same state under "ghapp guards", and
 `shipyard update` refreshes the guards with the newly verified binary when the

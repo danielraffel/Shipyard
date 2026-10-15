@@ -149,10 +149,10 @@ Writing .shipyard/config.toml... done
 $ shipyard run
   mac     = pass  (local, 2m08s)
   ubuntu  = pass  (ssh, 3m45s)
-  windows → SSH unreachable → booting VM "Windows 11"...
-          = pass  (utm-fallback, 6m30s)    ← Shipyard booted the VM automatically
+  windows → SSH unreachable → falling back to github-hosted...
+          = pass  (cloud, 6m30s)    ← the target's fallback chain
   All green.
 ```
 
-The Windows VM was asleep. Shipyard booted it via UTM, waited for SSH to come
-up, ran the build, and reported the result.
+The Windows VM was off, so Shipyard used the next entry in the target's
+fallback chain and reported the result. Shipyard does not boot VMs itself.

@@ -336,6 +336,33 @@ pub fn host_review_default() -> bool {
     })
 }
 
+/// `session` (and `agent` when set) for every row a guard log gets, so a row
+/// says which process wrote it: [`SESSION_ENVS`], else `unattributed`, and
+/// [`AGENT_ENV`]. The Python guards record the same fields.
+#[must_use]
+pub fn writer_identity() -> serde_json::Map<String, Value> {
+    let env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let mut identity = serde_json::Map::new();
+    identity.insert(
+        "session".to_owned(),
+        Value::String(
+            SESSION_ENVS
+                .iter()
+                .find_map(|name| env(name))
+                .unwrap_or_else(|| "unattributed".to_owned()),
+        ),
+    );
+    if let Some(agent) = env(AGENT_ENV) {
+        identity.insert("agent".to_owned(), Value::String(agent));
+    }
+    identity
+}
+
 /// The guards directory: `$SHIPYARD_GHAPP_GUARDS_DIR`, else
 /// `~/.config/shipyard/guards`.
 pub(crate) fn guards_dir() -> Option<std::path::PathBuf> {
@@ -398,7 +425,30 @@ fn signers_from(data: &Value, repo: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// This host's [`reviewer_signers`] for `repo`. Tests read no host state.
+/// Whether a config's `[auto_merge] reviewer_signers`, when set, is a list of
+/// names. Anything else is an error, never a silent fall back to the host's
+/// signers file.
+///
+/// # Errors
+///
+/// When the key is set to something other than a list of strings.
+pub fn signers_shape(table: &toml::Table) -> Result<(), String> {
+    let Some(value) = table
+        .get(CONFIG_TABLE)
+        .and_then(toml::Value::as_table)
+        .and_then(|section| section.get(SIGNERS_KEY))
+    else {
+        return Ok(());
+    };
+    match value.as_array() {
+        Some(names) if names.iter().all(toml::Value::is_str) => Ok(()),
+        _ => Err(format!(
+            "[{CONFIG_TABLE}] {SIGNERS_KEY} must be a list of reviewer names, not {value}"
+        )),
+    }
+}
+
+/// This host's [`reviewer_signers`] for `repo`. Tests read `with_host_signers`.
 #[cfg(not(test))]
 fn host_signers(repo: &str) -> Option<Vec<String>> {
     reviewer_signers(repo)
@@ -1335,6 +1385,7 @@ fn read_policy_inner(
     let table = raw
         .parse::<toml::Table>()
         .map_err(|error| format!("{CONFIG_PATH} on {base} does not parse: {error}"))?;
+    signers_shape(&table).map_err(|error| format!("{CONFIG_PATH} on {base}: {error}"))?;
     let mut policy = ApprovalPolicy::from_table_for_repo(&table, repo, host_default);
     policy.signers = policy.signers.or_else(|| host_signers(repo));
     policy.validate().map(|()| policy)

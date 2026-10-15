@@ -121,10 +121,7 @@ fn read_cause(
     if job.status.as_deref() != Some("completed") {
         return Err(format!("job {id} has not completed"));
     }
-    let log = match gh(&strings(&[
-        "api",
-        &format!("repos/{repo}/actions/jobs/{id}/logs"),
-    ])) {
+    let log = match super::super::fetch_job_log(gh, repo, id) {
         Ok(text) => Some(text),
         Err(error) if log_absent(&error) => None,
         Err(error) => return Err(format!("log of job {id}: {error}")),
