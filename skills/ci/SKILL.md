@@ -1,6 +1,6 @@
 ---
 name: ci
-description: Cross-platform CI coordination with Shipyard: validates, ships, manages queue, and runs cloud workflows. Also audits which Shipyard features a repository already has (shipyard pr flow, required checks, version/skill gates, merge queue, fast tier, receipt reuse, host classes, runner governance) and adopts the missing ones in dependency order.
+description: "Cross-platform CI coordination with Shipyard: validates, ships, manages queue, and runs cloud workflows. Also audits which Shipyard features a repository already has (shipyard pr flow, required checks, version/skill gates, merge queue, fast tier, receipt reuse, host classes, runner governance) and adopts the missing ones in dependency order."
 ---
 
 # CI Operations with Shipyard

@@ -1,0 +1,30 @@
+# GitHub Pages (Jekyll) site settings. The site serves the README, docs/ and
+# install.sh. Skills, planning notes and source trees are left out: they carry
+# GitHub Actions `${{ }}` expressions that Liquid cannot parse, and one such
+# line fails the whole Pages build.
+#
+# `exclude` replaces Jekyll's default list, so the defaults are repeated here.
+exclude:
+  - .sass-cache/
+  - .jekyll-cache/
+  - gemfiles/
+  - Gemfile
+  - Gemfile.lock
+  - node_modules/
+  - vendor/bundle/
+  - vendor/cache/
+  - vendor/gems/
+  - vendor/ruby/
+  - .github/
+  - target/
+  - agents/
+  - commands/
+  - examples/
+  - hooks/
+  - launchd/
+  - planning/
+  - scripts/
+  - skills/
+  - src/
+  - tests/
+  - tools/
