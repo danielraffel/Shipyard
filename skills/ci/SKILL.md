@@ -475,6 +475,11 @@ is bound to that job (repo, head, run, attempt, job name) and names the cause
 the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
 <file>` (append-only, one file per month, ids never duplicated).
 
+Every row a guard appends (`holds.jsonl`, `overrides.jsonl`, `carries.jsonl`,
+`switches.jsonl`, `queue-arms.jsonl`, `queue-removals.jsonl`) names its
+`session` and, when set, `agent`; grep those fields to see which process wrote
+a row.
+
 **To keep a labels archive current as checks go red and green**, run
 `shipyard cause record --repo <OWNER/REPO> --workflow <file> --dir
 <labels checkout>/data/ci-cause [--since <RFC 3339>]` on a schedule. It is a

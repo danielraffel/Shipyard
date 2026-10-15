@@ -14,9 +14,22 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 HOOK = HERE / "ghapp_verdict_hold_hook.py"
+
+
+def _load_hook():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ghapp_verdict_hold_hook", HOOK)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+hook = _load_hook()
 REMOVAL = HERE / "ghapp_queue_removal_guard.py"
 HEAD = "a" * 40
 OLD = "b" * 40
@@ -101,6 +114,16 @@ class VerdictHoldHook(unittest.TestCase):
         return {"id": "PR_7", "headRefOid": head,
                 "autoMergeRequest": {"enabledAt": "2026-10-12T22:00:00Z"} if armed else None,
                 "mergeQueueEntry": {"id": "MQE_1", "state": "QUEUED"} if queued else None}
+
+    def test_every_hold_row_says_which_process_wrote_it(self) -> None:
+        with mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": str(self.guards),
+                                          "CODEX_COMPANION_SESSION_ID": "codex-h",
+                                          "SHIPYARD_AGENT_ID": "agent-h"}):
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            hook.audit({"pr": 7, "action": "none"})
+        row = self.holds()[-1]
+        self.assertEqual((row["session"], row["agent"], row["pr"]), ("codex-h", "agent-h", 7))
+        self.assertEqual(hook.HOLDS_LOG, "holds.jsonl")
 
     def test_a_hold_on_an_armed_head_disarms_it_before_posting(self) -> None:
         result = self.run_hook(self.comment(f"Delta reviewed.\n\nverdict: HOLD head:{HEAD}"),
