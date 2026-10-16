@@ -48,9 +48,9 @@ Shipyard reports the evidence; GitHub owns merge order
 
 [TartCI](https://github.com/danielraffel/tartci) is the execution layer in
 this pairing. It owns the VM images, host budgets, caches, and GitHub runner
-lifecycle. Shipyard is the coordination layer: it selects the configured
-TartCI target, waits for the job evidence for the exact commit, and uses that
-evidence in the pull request workflow. Shipyard does not manage TartCI's VM
+lifecycle. 
+
+Shipyard is the coordination layer: it selects the configured TartCI target, waits for the job evidence for the exact commit, and uses that evidence in the pull request workflow. Shipyard does not manage TartCI's VM
 images or host budgets.
 
 The boundary is simple:
