@@ -1147,7 +1147,11 @@ fn stop_running_with_status(
     let pid_path = daemon_dir.join("daemon.pid");
     let was_running = status_available(state_dir);
     #[cfg(unix)]
-    let pid = read_pid_file(&pid_path);
+    let pid = read_pid_file(&pid_path).filter(|pid| *pid > 0);
+    #[cfg(unix)]
+    let owned_pid = pid.is_some_and(|pid| {
+        pid == std::process::id() || (pid_alive(pid) && process_looks_like_shipyard_daemon(pid))
+    });
 
     let stop_requested = socket_path.exists() && send_stop_request(&socket_path).is_ok();
 
@@ -1168,8 +1172,9 @@ fn stop_running_with_status(
                     continue;
                 }
                 #[cfg(unix)]
-                if pid.is_none() {
-                    // Socket disappearance alone cannot prove process exit.
+                if !owned_pid {
+                    // Socket disappearance or an unrelated PID exit cannot
+                    // prove termination of the daemon that owned this endpoint.
                     return DaemonStopOutcome::Unconfirmed;
                 }
                 #[cfg(unix)]
@@ -1203,11 +1208,12 @@ fn stop_running_with_status(
     // Do not erase the only ownership/endpoint evidence while a daemon may
     // still be alive. Refresh must refuse ambiguous shutdown rather than
     // interpreting our cleanup as proof that spawning a replacement is safe.
-    if socket_path.exists() {
+    if socket_path.exists() || socket_path.is_symlink() {
         return DaemonStopOutcome::Unconfirmed;
     }
     #[cfg(unix)]
-    if pid.is_some_and(pid_alive) {
+    if (pid.is_none() && (pid_path.exists() || pid_path.is_symlink())) || pid.is_some_and(pid_alive)
+    {
         return DaemonStopOutcome::Unconfirmed;
     }
     if pid_path.exists() {
@@ -4114,7 +4120,9 @@ mod tests {
         use std::os::unix::net::UnixListener;
 
         let _tree_test = lock_process_tree_for_test();
-        for (with_pid, vanish_socket) in [(true, false), (false, false), (false, true)] {
+        for (with_pid, vanish_socket) in
+            [(true, false), (false, false), (false, true), (true, true)]
+        {
             let temp = tempfile::tempdir().expect("tempdir");
             let daemon_dir = temp.path().join("daemon");
             std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
@@ -4130,9 +4138,18 @@ mod tests {
             }
             let (release, wait) = std::sync::mpsc::channel();
             let server_socket = socket.clone();
+            let fixture_pid = child.id();
             let server = std::thread::spawn(move || {
                 let line = read_fixture_stop_request(&listener).expect("stop request");
                 if vanish_socket {
+                    if with_pid {
+                        // The fixture, not stop_running, ends this unrelated
+                        // child after the stop write to test a coincident exit.
+                        assert!(super::signal_pid(fixture_pid, "-TERM"));
+                        assert!(wait_until(Duration::from_secs(2), || !pid_alive(
+                            fixture_pid
+                        )));
+                    }
                     std::fs::remove_file(&server_socket).expect("remove endpoint");
                 }
                 let _ = wait.recv_timeout(Duration::from_secs(10));
@@ -4152,12 +4169,42 @@ mod tests {
                 "stop"
             );
             assert_eq!(stopped, super::DaemonStopOutcome::Unconfirmed);
-            assert!(unowned_alive, "unowned process must not be signaled");
+            if !vanish_socket {
+                assert!(unowned_alive, "unowned process must not be signaled");
+            }
             assert!(
                 endpoint_preserved && pid_preserved,
                 "ambiguous runtime evidence must remain"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_pid_evidence_is_unconfirmed_but_dead_pid_is_absent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let daemon_dir = temp.path().join("daemon");
+        std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
+        let pid_path = daemon_dir.join("daemon.pid");
+        for contents in ["", "invalid", "0", "-1"] {
+            std::fs::write(&pid_path, contents).expect("pid file");
+            assert_eq!(
+                super::stop_running_outcome(temp.path()),
+                super::DaemonStopOutcome::Unconfirmed
+            );
+            assert_eq!(std::fs::read_to_string(&pid_path).unwrap(), contents);
+        }
+        // The Unix kernels supported here cannot allocate a PID this large.
+        std::fs::write(&pid_path, u32::MAX.to_string()).expect("dead pid");
+        assert_eq!(
+            super::stop_running_outcome(temp.path()),
+            super::DaemonStopOutcome::Absent
+        );
+        assert!(!pid_path.exists());
+        assert_eq!(
+            super::stop_running_outcome(temp.path()),
+            super::DaemonStopOutcome::Absent
+        );
     }
 
     #[cfg(unix)]
