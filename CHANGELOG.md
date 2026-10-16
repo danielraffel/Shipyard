@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03430"></a>
+## [0.343.0] - 2026-10-16
+
+- feat(metrics): report baseline compute and coordination cost ([#864](https://github.com/danielraffel/Shipyard/pull/864))
+
 <a id="v03420"></a>
 ## [0.342.0] - 2026-10-16
 
@@ -2459,6 +2464,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.343.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.343.0
 [0.342.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.342.0
 [0.341.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.341.0
 [0.340.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.340.0
