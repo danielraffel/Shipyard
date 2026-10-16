@@ -494,7 +494,13 @@ impl MetricsStore {
             receipt
                 .validate()
                 .map_err(|e| format!("invalid merge receipt: {e}"))?;
-            let repo = receipt.repo.trim().to_ascii_lowercase();
+            // Repository and project are durable ownership keys. Normalize
+            // them before both conflict checks and storage so case/outer
+            // whitespace cannot create a second identity for one PR.
+            let repo = crate::evidence::canonical_repository(&receipt.repo);
+            let project_input = crate::evidence::canonical_repository(&receipt.project);
+            let (project, _) =
+                crate::metrics::project_key::normalize_for_write(&project_input, Some(&repo));
             let existing: Option<ExistingMergeReceipt> = tx.query_row(
                 "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
                 [&receipt.receipt_id],
@@ -508,7 +514,7 @@ impl MetricsStore {
                 let incoming = ExistingMergeReceipt {
                     schema: receipt.schema.clone(),
                     repo: repo.clone(),
-                    project: receipt.project.clone(),
+                    project: project.clone(),
                     base_branch: receipt.base_branch.clone(),
                     pr: receipt.pr,
                     head_sha: receipt.head_sha.clone(),
@@ -530,8 +536,8 @@ impl MetricsStore {
                 continue;
             }
             let semantic_conflict: Option<String> = tx.query_row(
-                "SELECT receipt_id FROM merge_receipts WHERE repo = ?1 AND pr = ?2 AND receipt_id <> ?3 AND (base_branch <> ?4 OR head_sha <> ?5 OR merge_commit_sha <> ?6)",
-                rusqlite::params![repo.clone(), receipt.pr, receipt.receipt_id, receipt.base_branch, receipt.head_sha, receipt.merge_commit_sha],
+                "SELECT receipt_id FROM merge_receipts WHERE lower(trim(repo)) = ?1 AND pr = ?2 AND receipt_id <> ?3 AND (lower(trim(project)) <> ?4 OR base_branch <> ?5 OR head_sha <> ?6 OR merge_commit_sha <> ?7)",
+                rusqlite::params![repo, receipt.pr, receipt.receipt_id, project, receipt.base_branch, receipt.head_sha, receipt.merge_commit_sha],
                 |row| row.get(0),
             ).optional()?;
             if let Some(other) = semantic_conflict {
@@ -541,8 +547,6 @@ impl MetricsStore {
                 )
                 .into());
             }
-            let (project, _) =
-                crate::metrics::project_key::normalize_for_write(&receipt.project, Some(&repo));
             tx.execute("INSERT INTO merge_receipts (receipt_id,schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,?15)", rusqlite::params![receipt.receipt_id, receipt.schema, repo, project, receipt.base_branch, receipt.pr, receipt.head_sha, receipt.validated_head_sha, receipt.merge_commit_sha, receipt.merged_at.to_rfc3339(), receipt.source, serde_json::to_string(&receipt.required_checks)?, receipt.gate_receipt_sha256, receipt.evidence, Utc::now().to_rfc3339()])?;
             imported += 1;
         }
@@ -574,16 +578,20 @@ impl MetricsStore {
         let mut wasted = 0_i64;
         let mut samples = 0_usize;
         for (repo, head, pr) in unique {
-            let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE run.repo = ?1 AND run.sha = ?2 AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
+            let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND run.sha = ?2 AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
             let mut matched = false;
+            let mut invalid_duration = false;
+            let mut head_wasted = 0_i64;
+            let mut head_samples = 0_usize;
             for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
             })? {
                 let (status, ms) = row?;
-                if (crate::metrics::proxy::is_failure(&status)
-                    || crate::metrics::proxy::is_cancelled(&status))
-                    && !ms.is_some_and(|v| v >= 0)
-                {
+                if !ms.is_some_and(|v| v >= 0) {
+                    // A completed row with NULL/negative duration cannot
+                    // substantiate a cost join. Keep the merge unjoined so
+                    // the scorecard cannot report a zero-cost claim.
+                    invalid_duration = true;
                     continue;
                 }
                 matched = true;
@@ -591,12 +599,14 @@ impl MetricsStore {
                     || crate::metrics::proxy::is_cancelled(&status))
                     && ms.is_some_and(|v| v >= 0)
                 {
-                    wasted = wasted.saturating_add(ms.unwrap());
-                    samples += 1;
+                    head_wasted = head_wasted.saturating_add(ms.unwrap());
+                    head_samples += 1;
                 }
             }
-            if matched {
+            if matched && !invalid_duration {
                 joined += 1;
+                wasted = wasted.saturating_add(head_wasted);
+                samples += head_samples;
             }
         }
         Ok((total, joined, wasted, samples))
@@ -2831,6 +2841,98 @@ mod tests {
                 .wasted_compute_per_safely_merged_change
                 .reason
                 .contains("1.000000")
+        );
+    }
+
+    #[test]
+    fn merge_receipts_normalize_keys_and_reject_semantic_project_conflicts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let receipt = crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
+            receipt_id: "merge-canonical-1".to_owned(),
+            repo: " Generous-Corp/Shipyard ".to_owned(),
+            project: " SHIPYARD ".to_owned(),
+            base_branch: "main".to_owned(),
+            pr: 41,
+            head_sha: "a".repeat(40),
+            validated_head_sha: "a".repeat(40),
+            merge_commit_sha: "b".repeat(40),
+            merged_at: Utc::now(),
+            safe_merge: true,
+            source: "shipyard".to_owned(),
+            required_checks: vec!["macos".to_owned()],
+            gate_receipt_sha256: "c".repeat(64),
+            evidence: "sha256:canonical".to_owned(),
+        };
+        assert_eq!(store.import_merge_receipts(&[receipt.clone()]).unwrap(), 1);
+        let conn = store.connect().unwrap();
+        let keys: (String, String) = conn
+            .query_row("SELECT repo, project FROM merge_receipts", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            keys,
+            ("generous-corp/shipyard".to_owned(), "shipyard".to_owned())
+        );
+
+        let mut conflicting = receipt;
+        conflicting.receipt_id = "merge-canonical-2".to_owned();
+        conflicting.project = "other-project".to_owned();
+        assert!(store.import_merge_receipts(&[conflicting]).is_err());
+    }
+
+    #[test]
+    fn safe_merge_summary_rejects_null_or_negative_durations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "failure", 60_000, 1_000, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo = 'generous-corp/shipyard', sha = ?1 WHERE pr = 41",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs SET total_ms = NULL WHERE job = 'job-41-60000'",
+            [],
+        )
+        .unwrap();
+        let receipt = crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
+            receipt_id: "merge-duration-1".to_owned(),
+            repo: "GENEROUS-CORP/SHIPYARD".to_owned(),
+            project: "shipyard".to_owned(),
+            base_branch: "main".to_owned(),
+            pr: 41,
+            head_sha: "a".repeat(40),
+            validated_head_sha: "a".repeat(40),
+            merge_commit_sha: "b".repeat(40),
+            merged_at: Utc::now(),
+            safe_merge: true,
+            source: "shipyard".to_owned(),
+            required_checks: vec!["macos".to_owned()],
+            gate_receipt_sha256: "c".repeat(64),
+            evidence: "sha256:duration".to_owned(),
+        };
+        store.import_merge_receipts(&[receipt]).unwrap();
+        let summary = store
+            .safe_merge_summary("shipyard", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(summary.0, 1);
+        assert_eq!(summary.1, 0);
+        conn.execute(
+            "UPDATE jobs SET total_ms = -1 WHERE job = 'job-41-60000'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .safe_merge_summary("shipyard", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .1,
+            0
         );
     }
 

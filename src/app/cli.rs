@@ -1846,7 +1846,7 @@ pub(crate) enum MetricsImportCommand {
     Tartci(MetricsImportTartciArgs),
     /// Import GitHub Actions jobs for recent workflow runs.
     Github(MetricsImportGithubArgs),
-    /// Import producer-authenticated protected-branch merge receipts (JSON/JSONL).
+    /// Import producer-self-asserted, format-validated protected-branch merge receipts (JSON/JSONL).
     MergeReceipt(MetricsImportMergeReceiptArgs),
 }
 

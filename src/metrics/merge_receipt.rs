@@ -219,4 +219,18 @@ mod tests {
         object["unexpected"] = serde_json::json!(true);
         assert!(parse_reader(Cursor::new(serde_json::to_vec(&object).unwrap())).is_err());
     }
+
+    #[test]
+    fn accepts_single_and_array_and_rejects_empty_or_bad_lines() {
+        let value = serde_json::to_string(&valid()).unwrap();
+        assert_eq!(parse_reader(Cursor::new(value.clone())).unwrap().len(), 1);
+        assert_eq!(
+            parse_reader(Cursor::new(format!("[{value}]")))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(parse_reader(Cursor::new(" ")).is_err());
+        assert!(parse_reader(Cursor::new(format!("{value}\nnot-json"))).is_err());
+    }
 }
