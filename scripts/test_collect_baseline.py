@@ -65,6 +65,11 @@ class BaselineScorecardTests(unittest.TestCase):
 
 
 class CollectorInvocationTests(unittest.TestCase):
+    def test_project_repo_scope_requires_owner_and_matching_short_name(self):
+        for project, repo in [("pulp", "pulp"), ("pulp", "/pulp"), ("pulp", "a/b/pulp"), ("other", "o/pulp")]:
+            with self.assertRaises(ValueError):
+                MOD.validate_project_repo(project, repo)
+
     def test_tartci_export_rejects_duplicate_and_non_string_identity(self):
         duplicate = [{"project": "pulp", "repo": "o/p", "provider": "tart", "external_id": "x"},
                      {"project": "pulp", "repo": "o/p", "provider": "tart", "external_id": "x"}]

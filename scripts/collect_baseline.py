@@ -33,7 +33,8 @@ def state_identity(path: pathlib.Path, project: str, repo: str, db: pathlib.Path
 
 
 def validate_project_repo(project: str, repo: str) -> None:
-    if project.casefold() != repo.rsplit("/", 1)[-1].casefold():
+    parts = repo.split("/")
+    if len(parts) != 2 or not all(parts) or project.casefold() != parts[1].casefold():
         raise ValueError("--project must be the repository short name for exact scorecard scoping")
 
 
