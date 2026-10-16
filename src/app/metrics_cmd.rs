@@ -980,13 +980,31 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
         let run = |file: Option<std::path::PathBuf>| {
             let mut out = Vec::new();
-            metrics_command(MetricsCommand::Import { source: MetricsImportCommand::MergeReceipt(MetricsImportMergeReceiptArgs { file }) }, temp.path(), None, true, &mut out)
+            metrics_command(
+                MetricsCommand::Import {
+                    source: MetricsImportCommand::MergeReceipt(MetricsImportMergeReceiptArgs {
+                        file,
+                    }),
+                },
+                temp.path(),
+                None,
+                true,
+                &mut out,
+            )
         };
-        assert_eq!(run(Some(path.clone())).unwrap(), std::process::ExitCode::SUCCESS);
-        assert_eq!(run(Some(path.clone())).unwrap(), std::process::ExitCode::SUCCESS);
-        let bad = temp.path().join("bad.json"); std::fs::write(&bad, b"not json").unwrap();
+        assert_eq!(
+            run(Some(path.clone())).unwrap(),
+            std::process::ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run(Some(path.clone())).unwrap(),
+            std::process::ExitCode::SUCCESS
+        );
+        let bad = temp.path().join("bad.json");
+        std::fs::write(&bad, b"not json").unwrap();
         assert_eq!(run(Some(bad)).unwrap_err().code, 2);
-        let mut changed = valid; changed["evidence"] = serde_json::json!("sha256:changed");
+        let mut changed = valid;
+        changed["evidence"] = serde_json::json!("sha256:changed");
         std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
         assert_eq!(run(Some(path)).unwrap_err().code, 1);
     }
