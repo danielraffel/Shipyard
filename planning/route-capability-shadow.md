@@ -41,14 +41,25 @@ The focused tests also use a Linux execution environment that advertises a
 macOS artifact capability. This keeps the route schema honest for future
 cross-build hosts without claiming that such a path is currently dispatched.
 
-Every receipt carries `dispatch_mutated = false` and `dispatch_performed =
-false`. A caller must provide the observation; the shadow pass never probes a
-host, acquires a lease, changes queue state, or starts a worker.
+`RouteShadowReceiptStore` is the smallest durable path for this evidence. It
+evaluates a supplied snapshot and writes one crash-safe JSON receipt below the
+Shipyard state directory, keyed by a digest of the request identity. Loading
+the receipt does not recompute or mutate routing. The receipt's
+`control.scope = receipt_only` describes the evaluator's scope; it is not a
+claim about actions taken by the caller that supplied the snapshot.
+
+A caller must provide the observation. The shadow evaluator never probes a
+host, acquires a lease, changes queue state, or starts a worker. The durable
+store therefore records evidence without making the evaluator a dispatch
+authority.
 
 ## Acceptance boundary
 
-This slice proves only deterministic snapshot evaluation and typed
-counterfactual evidence. It does not prove host reachability, lease
-availability, artifact production, queue throughput, or a production reroute.
+This slice proves only deterministic snapshot evaluation, typed
+counterfactual evidence, and crash-safe receipt round-tripping. It does not
+prove host reachability, lease availability, artifact production, queue
+throughput, or a production reroute. A production caller still needs an
+explicit integration point to supply an authoritative observation and decide
+when to persist it.
 Those require separate exact-head and physical gates before any live dispatch
 integration is considered.

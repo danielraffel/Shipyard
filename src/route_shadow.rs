@@ -7,7 +7,11 @@
 //! what each later candidate would have done if earlier candidates were not
 //! available.
 
+use std::fs;
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Schema version for [`RouteCapabilitySnapshot`] and [`RouteShadowReceipt`].
 pub const ROUTE_SHADOW_SCHEMA_VERSION: u32 = 1;
@@ -128,10 +132,17 @@ pub struct RouteCounterfactual {
 pub struct RouteShadowControl {
     /// Authority whose ordering was evaluated.
     pub authority: String,
-    /// Whether this pass changed dispatch state. Always false in this module.
-    pub dispatch_mutated: bool,
-    /// Whether a worker or external route was invoked. Always false here.
-    pub dispatch_performed: bool,
+    /// Scope of this evaluator. This describes the evaluator, not any caller
+    /// that supplied the snapshot.
+    pub scope: RouteShadowScope,
+}
+
+/// Scope marker for a route shadow receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteShadowScope {
+    /// The evaluator records an observation and does not own dispatch.
+    ReceiptOnly,
 }
 
 /// Errors raised when a snapshot cannot be treated as authoritative input.
@@ -181,6 +192,106 @@ impl std::fmt::Display for RouteShadowError {
 }
 
 impl std::error::Error for RouteShadowError {}
+
+/// Durable store for receipt-only route shadow observations.
+///
+/// The store is deliberately separate from queue admission. A caller that
+/// already owns an immutable snapshot can record its typed receipt without
+/// changing queue state or selecting a different route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteShadowReceiptStore {
+    root: PathBuf,
+}
+
+impl RouteShadowReceiptStore {
+    /// Create a store below the supplied Shipyard state directory.
+    #[must_use]
+    pub fn new(state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            root: state_dir.into().join("route_shadow"),
+        }
+    }
+
+    /// Return the durable path for a request identity.
+    #[must_use]
+    pub fn path_for(&self, request_id: &str) -> PathBuf {
+        self.root
+            .join(format!("{}.json", request_id_digest(request_id)))
+    }
+
+    /// Evaluate and durably write one receipt.
+    pub fn record(
+        &self,
+        snapshot: &RouteCapabilitySnapshot,
+    ) -> Result<RouteShadowReceipt, RouteShadowStoreError> {
+        let receipt = evaluate(snapshot)?;
+        let path = self.path_for(&snapshot.request_id);
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
+            .map_err(RouteShadowStoreError::Io)?;
+        crate::durable_file::replace_json(&path, &receipt, true)
+            .map_err(RouteShadowStoreError::Io)?;
+        Ok(receipt)
+    }
+
+    /// Load a previously recorded receipt, if present.
+    pub fn load(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<RouteShadowReceipt>, RouteShadowStoreError> {
+        let path = self.path_for(request_id);
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(RouteShadowStoreError::Io(error)),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(RouteShadowStoreError::Json)
+    }
+}
+
+/// Failure while evaluating or durably storing a route shadow receipt.
+#[derive(Debug)]
+pub enum RouteShadowStoreError {
+    /// Snapshot evaluation failed.
+    Evaluation(RouteShadowError),
+    /// Durable filesystem operation failed.
+    Io(std::io::Error),
+    /// Receipt JSON could not be decoded.
+    Json(serde_json::Error),
+}
+
+impl std::fmt::Display for RouteShadowStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Evaluation(error) => write!(formatter, "route shadow evaluation failed: {error}"),
+            Self::Io(error) => write!(formatter, "route shadow receipt I/O failed: {error}"),
+            Self::Json(error) => write!(formatter, "route shadow receipt JSON failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RouteShadowStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Evaluation(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::Json(error) => Some(error),
+        }
+    }
+}
+
+impl From<RouteShadowError> for RouteShadowStoreError {
+    fn from(error: RouteShadowError) -> Self {
+        Self::Evaluation(error)
+    }
+}
+
+fn request_id_digest(request_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(request_id.as_bytes());
+    hex::encode(digest.finalize())
+}
 
 /// Evaluate an immutable route snapshot without touching dispatch state.
 ///
@@ -242,8 +353,7 @@ pub fn evaluate(
         counterfactuals,
         control: RouteShadowControl {
             authority: "ordered_route_selection".to_owned(),
-            dispatch_mutated: false,
-            dispatch_performed: false,
+            scope: RouteShadowScope::ReceiptOnly,
         },
     })
 }
@@ -370,8 +480,10 @@ mod tests {
             receipt.counterfactuals[1].outcome,
             RouteCounterfactualOutcome::WouldAdmitIfEarlierUnavailable
         ));
-        assert!(!receipt.control.dispatch_mutated);
-        assert!(!receipt.control.dispatch_performed);
+        assert!(matches!(
+            receipt.control.scope,
+            super::RouteShadowScope::ReceiptOnly
+        ));
     }
 
     #[test]
@@ -461,7 +573,7 @@ mod tests {
         ]))
         .expect("receipt");
 
-        assert!(matches!(receipt.authoritative_route, None));
+        assert_eq!(receipt.authoritative_route, None);
         assert!(matches!(
             receipt.counterfactuals[0].outcome,
             RouteCounterfactualOutcome::CapabilityMismatch { .. }
@@ -501,5 +613,28 @@ mod tests {
             evaluate(&invalid),
             Err(RouteShadowError::UnsupportedSchema(99))
         ));
+    }
+
+    #[test]
+    fn receipt_store_evaluates_and_round_trips_durably() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let store = super::RouteShadowReceiptStore::new(temp.path());
+        let receipt = store
+            .record(&snapshot(vec![candidate(
+                "primary",
+                "macos-arm64",
+                "macos-arm64",
+                &["macos", "arm64"],
+                RouteAvailability::Available,
+            )]))
+            .expect("record receipt");
+        let loaded = store
+            .load("job-1")
+            .expect("load receipt")
+            .expect("receipt exists");
+
+        assert_eq!(loaded, receipt);
+        assert!(store.path_for("job-1").is_file());
+        assert!(store.path_for("job-1").starts_with(temp.path()));
     }
 }
