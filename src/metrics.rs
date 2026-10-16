@@ -1514,10 +1514,10 @@ fn scorecard_strata(
             _ => strata.unclassified += 1,
         }
     }
-    strata.status = if strata.unclassified == 0 {
-        "authenticated".to_owned()
-    } else if strata.normal_pr + strata.merge_group + strata.rerun == 0 {
+    strata.status = if strata.normal_pr + strata.merge_group + strata.rerun == 0 {
         "unavailable".to_owned()
+    } else if strata.unclassified == 0 {
+        "observed".to_owned()
     } else {
         "partial".to_owned()
     };
@@ -1908,7 +1908,8 @@ fn refresh_existing_job(
                 routing_decision = COALESCE(?10, routing_decision), status = ?11,
                 event = COALESCE(event, ?12), provider_run_id = COALESCE(provider_run_id, ?13),
                 run_attempt = COALESCE(run_attempt, ?14), head_sha = COALESCE(head_sha, ?15),
-                provenance = COALESCE(provenance, ?16), provenance_verified = MAX(provenance_verified, ?17)
+                provenance = CASE WHEN ?17 THEN COALESCE(?16, provenance) ELSE provenance END,
+                provenance_verified = MAX(provenance_verified, ?17)
           WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
         params![
             job_id,
@@ -3316,6 +3317,23 @@ mod tests {
         assert_eq!(scorecard.provenance.unknown, 3);
         assert_eq!(scorecard.provenance.eligible_samples, 0);
         assert_eq!(scorecard.provenance.status, "unavailable");
+
+        store
+            .record_terminal_observation(&MetricRecordInput {
+                project: "shipyard".to_owned(),
+                job: "verified".to_owned(),
+                status: "success".to_owned(),
+                duration_ms: 100,
+                completed_at: Some(Utc::now()),
+                external_id: Some("test:verified".to_owned()),
+                provenance: Some("production".to_owned()),
+                provenance_verified: true,
+                ..MetricRecordInput::default()
+            })
+            .unwrap();
+        let verified = store.stewardship_scorecard("shipyard", 1).unwrap();
+        assert_eq!(verified.provenance.production, 1);
+        assert_eq!(verified.provenance.eligible_samples, 1);
     }
 
     #[test]
@@ -3438,6 +3456,30 @@ mod tests {
                 Some(7)
             )
         );
+    }
+
+    #[test]
+    fn unverified_label_cannot_be_promoted_by_verified_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let mut input = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            job: "macos".to_owned(),
+            status: "success".to_owned(),
+            duration_ms: 100,
+            completed_at: Some(Utc::now()),
+            external_id: Some("github:8/1/1".to_owned()),
+            provenance: Some("production".to_owned()),
+            ..MetricRecordInput::default()
+        };
+        store.record_terminal_observation(&input).unwrap();
+        input.provenance = Some("synthetic".to_owned());
+        input.provenance_verified = true;
+        store.record_terminal_observation(&input).unwrap();
+        let scorecard = store.stewardship_scorecard("shipyard", 1).unwrap();
+        assert_eq!(scorecard.provenance.production, 0);
+        assert_eq!(scorecard.provenance.synthetic, 1);
+        assert_eq!(scorecard.provenance.eligible_samples, 0);
     }
 
     #[test]

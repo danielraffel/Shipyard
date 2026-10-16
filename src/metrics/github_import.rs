@@ -284,4 +284,73 @@ mod tests {
         let mut gh = |_argv: &[String]| -> Result<Value, String> { Ok(json!({})) };
         assert!(import_github(&store, &request, &mut gh, &|error| error).is_err());
     }
+
+    #[test]
+    fn rejects_missing_jobs_and_contradictory_attempt_or_head() {
+        let request = GithubImportRequest {
+            repo: "acme/pulp".to_owned(),
+            project: None,
+            workflow: None,
+            branch: None,
+            limit: 5,
+        };
+        let run = json!({"workflow_runs": [{"id": 7, "run_attempt": 2,
+            "event": "pull_request", "head_sha": "head", "pull_requests": [{"number": 9}]}]});
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let mut gh = |argv: &[String]| -> Result<Value, String> {
+            if argv[3].ends_with("/runs") {
+                Ok(run.clone())
+            } else {
+                Ok(json!({}))
+            }
+        };
+        assert!(import_github(&store, &request, &mut gh, &|error| error).is_err());
+
+        for (field, value) in [("run_attempt", json!(1)), ("head_sha", json!("other"))] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = MetricsStore::open(dir.path()).unwrap();
+            let mut gh = |argv: &[String]| -> Result<Value, String> {
+                if argv[3].ends_with("/runs") {
+                    Ok(run.clone())
+                } else {
+                    Ok(
+                        json!({"jobs": [{"id": 1, "run_attempt": if field == "run_attempt" { value.clone() } else { json!(2) },
+                        "head_sha": if field == "head_sha" { value.clone() } else { json!("head") },
+                        "name": "macos", "conclusion": "success", "completed_at": "2026-09-30T10:10:00Z"}]}),
+                    )
+                }
+            };
+            assert!(import_github(&store, &request, &mut gh, &|error| error).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_potentially_truncated_jobs_without_pagination_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let request = GithubImportRequest {
+            repo: "acme/pulp".to_owned(),
+            project: None,
+            workflow: None,
+            branch: None,
+            limit: 5,
+        };
+        let mut gh = |argv: &[String]| -> Result<Value, String> {
+            if argv[3].ends_with("/runs") {
+                Ok(json!({"total_count": 999, "workflow_runs": [{"id": 7,
+                    "event": "pull_request", "run_attempt": 1, "head_sha": "head",
+                    "pull_requests": [{"number": 9}]}]}))
+            } else {
+                let jobs = (0..100)
+                    .map(|id| {
+                        json!({"id": id, "name": "job",
+                    "conclusion": "success", "completed_at": "2026-09-30T10:10:00Z"})
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({"jobs": jobs}))
+            }
+        };
+        assert!(import_github(&store, &request, &mut gh, &|error| error).is_err());
+    }
 }
