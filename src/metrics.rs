@@ -85,7 +85,7 @@ pub struct MetricRecordInput {
     pub labels: Option<Vec<String>>,
     /// GitHub workflow event that produced the run, when authoritative.
     pub event: Option<String>,
-    /// Provider-owned workflow run identity, distinct from the local SQLite
+    /// Provider-owned workflow run identity, distinct from the local `SQLite`
     /// run row id.
     pub provider_run_id: Option<i64>,
     /// Provider-owned attempt number for the workflow run.
@@ -769,6 +769,7 @@ impl MetricsStore {
 
     /// Record a terminal external observation, refreshing a prior partial row
     /// with the same provider identity when necessary.
+    #[allow(dead_code)]
     pub(crate) fn record_terminal_observation(
         &self,
         input: &MetricRecordInput,
@@ -785,7 +786,7 @@ impl MetricsStore {
     ) -> Result<usize, Box<dyn std::error::Error>> {
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for input in inputs {
             if input.completed_at.is_none() {
                 return Err("terminal metrics observation requires completed_at".into());
@@ -835,14 +836,14 @@ impl MetricsStore {
             .filter(|value| *value >= 0);
         if let Some(provider) = input.provider.as_deref()
             && let Some(existing) =
-                existing_job_id(&conn, provider, input.external_id.as_deref())?.or(
-                    existing_unknown_attempt_id(&conn, provider, input.external_id.as_deref())?,
+                existing_job_id(conn, provider, input.external_id.as_deref())?.or(
+                    existing_unknown_attempt_id(conn, provider, input.external_id.as_deref())?,
                 )
         {
             if refresh_existing {
-                ensure_refresh_identity_compatible(&conn, existing, input)?;
+                ensure_refresh_identity_compatible(conn, existing, input)?;
                 let machine_id = upsert_machine(
-                    &conn,
+                    conn,
                     input
                         .host
                         .as_deref()
@@ -854,7 +855,7 @@ impl MetricsStore {
                     input.runner.as_deref(),
                 )?;
                 refresh_existing_job(
-                    &conn,
+                    conn,
                     existing,
                     machine_id,
                     input,
@@ -869,7 +870,7 @@ impl MetricsStore {
             return Ok(existing);
         }
         let machine_id = upsert_machine(
-            &conn,
+            conn,
             input
                 .host
                 .as_deref()
@@ -881,7 +882,7 @@ impl MetricsStore {
             input.runner.as_deref(),
         )?;
         let run_id = insert_run(
-            &conn,
+            conn,
             &RunInsert {
                 ts: completed_at.to_rfc3339(),
                 project: input.project.clone(),
@@ -902,7 +903,7 @@ impl MetricsStore {
             },
         )?;
         let job_id = insert_job(
-            &conn,
+            conn,
             &JobInsert {
                 run_id,
                 machine_id: Some(machine_id),
@@ -931,7 +932,7 @@ impl MetricsStore {
         let started_at_text = started_at.to_rfc3339();
         let completed_at_text = completed_at.to_rfc3339();
         insert_step(
-            &conn,
+            conn,
             job_id,
             input.step.as_deref().unwrap_or("total"),
             Some(&started_at_text),
@@ -2734,6 +2735,7 @@ pub struct GithubRunMetadata {
 }
 
 /// Import one GitHub Actions job object as returned by `/actions/runs/{id}/jobs`.
+#[must_use]
 pub fn github_job_to_record(
     repo: &str,
     workflow: Option<&str>,
@@ -3489,6 +3491,7 @@ mod tests {
         assert_eq!(scorecard.strata.status, "partial");
     }
 
+    #[allow(clippy::type_complexity)]
     #[test]
     fn duplicate_job_does_not_relabel_first_seen_run_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -4272,10 +4275,12 @@ mod tests {
         second.job = "trigger-sql-failure".to_owned();
         second.head_sha = Some("failed-head".to_owned());
 
+        let error = store
+            .record_terminal_observations(&[first, second])
+            .expect_err("the trigger must abort the second write");
         assert!(
-            store
-                .record_terminal_observations(&[first, second])
-                .is_err()
+            error.to_string().contains("injected metrics write failure"),
+            "unexpected injected failure: {error}"
         );
 
         let conn = Connection::open(store.path()).unwrap();
@@ -4284,6 +4289,18 @@ mod tests {
                 .unwrap(),
             1,
             "the first batch row must be rolled back"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the first batch run must be rolled back"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM steps", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the first batch step must be rolled back"
         );
         let (external_id, head_sha): (String, String) = conn
             .query_row(
