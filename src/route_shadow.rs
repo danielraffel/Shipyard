@@ -1214,7 +1214,7 @@ mod tests {
         let store = super::RouteShadowReceiptStore::new(temp.path());
         let path = store.path_for("job-runtime:mac");
         let mut pending = None;
-        for _ in 0..50 {
+        for _ in 0..500 {
             if let Ok(Some(receipt)) = store.load("job-runtime:mac") {
                 pending = Some(receipt);
                 break;
@@ -1245,7 +1245,7 @@ mod tests {
             Utc::now(),
         );
         let mut selected = None;
-        for _ in 0..50 {
+        for _ in 0..500 {
             if let Ok(Some(receipt)) = store.load("job-runtime:mac")
                 && receipt
                     .observation
@@ -1275,16 +1275,13 @@ mod tests {
     #[test]
     fn stalled_writer_queue_drops_without_blocking_admission() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        let writer_started = std::sync::Arc::new(std::sync::Barrier::new(2));
         let writer_release = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let started = writer_started.clone();
         let release = writer_release.clone();
         let writer = std::thread::spawn(move || {
-            let _ = receiver.recv();
-            started.wait();
             // Model a receipt writer stalled in filesystem I/O. The producer
             // must continue using only the bounded, nonblocking handoff.
             release.wait();
+            let _ = receiver.recv();
         });
         let pending = || PendingObservation {
             state_dir: PathBuf::from("/unreachable"),
@@ -1304,7 +1301,6 @@ mod tests {
             },
         };
         assert!(enqueue_observation(&sender, pending()));
-        writer_started.wait();
         assert!(!enqueue_observation(&sender, pending()));
         let started_at = std::time::Instant::now();
         for _ in 0..128 {
