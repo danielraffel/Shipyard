@@ -532,6 +532,13 @@ restore-production holder inspections timing out on the production
 writer-domain lock (`lsof` on a loaded host), and a fenced lease whose
 production daemon was replaced afterwards, which binds to the current daemon.
 Anything else still needs a guardian change; do not delete the lease by hand.
+
+"Actions owner ended before canary completion" with `sandbox_passed: true` in
+the canary's `sandbox-proof.json` and a `done` file present was a race, not a
+failure: the step touches `done` as its last command and exits, and the
+guardian could see the owner gone before it saw `done`. The guardian now
+re-checks `done` when the owner ends. The lease is removed either way, so this
+never wedges later runs.
 ## Release publication waits for attestation
 
 `release.yml` keeps the release a draft until the macOS DMG is attested:

@@ -2562,6 +2562,12 @@ class Guardian:
             if self.stop_requested:
                 raise OwnerEnded("guardian received termination signal")
             if _process_start(self.args.owner_pid) != self.owner_start:
+                # The owner step touches the done file as its last command and
+                # exits at once, which can land between the done check above
+                # and this owner check. Done written means the canary
+                # completed; only an owner that ended without it is a failure.
+                if self.done_file.exists():
+                    return
                 raise OwnerEnded("Actions owner ended before canary completion")
             if (
                 self.transition_path == CORRECTED_TRANSITION
