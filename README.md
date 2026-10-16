@@ -53,7 +53,7 @@ lifecycle.
 Shipyard is the coordination layer: it selects the configured TartCI target, waits for the job evidence for the exact commit, and uses that evidence in the pull request workflow. Shipyard does not manage TartCI's VM
 images or host budgets.
 
-The boundary is simple:
+The boundaries:
 
 - **Shipyard** coordinates commits, targets, evidence, pull requests, review,
   queue handoff, and recovery.
