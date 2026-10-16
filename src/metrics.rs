@@ -779,6 +779,23 @@ impl MetricsStore {
         self.record_with_refresh(input, true)
     }
 
+    pub(crate) fn record_terminal_observations(
+        &self,
+        inputs: &[MetricRecordInput],
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        for input in inputs {
+            if input.completed_at.is_none() {
+                return Err("terminal metrics observation requires completed_at".into());
+            }
+            record_with_conn(&tx, input, true)?;
+        }
+        tx.commit()?;
+        Ok(inputs.len())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn record_with_refresh(
         &self,
@@ -787,6 +804,15 @@ impl MetricsStore {
     ) -> Result<i64, Box<dyn std::error::Error>> {
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let conn = self.connect()?;
+        record_with_conn(&conn, input, refresh_existing)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn record_with_conn(
+        conn: &Connection,
+        input: &MetricRecordInput,
+        refresh_existing: bool,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
         let (project, repo) =
             project_key::normalize_for_write(&input.project, input.repo.as_deref());
         let normalized = MetricRecordInput {
