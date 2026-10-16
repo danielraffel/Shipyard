@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::job::{CancellationProof, Job, JobKind, JobStatus, TargetResult, TargetStatus};
+use crate::metrics::{MetricsStore, RepeatedWorkKind, RepeatedWorkShadowInput};
 use crate::queue_request::{
     QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest,
 };
@@ -188,12 +189,23 @@ impl Queue {
     /// target list, and mode.
     pub fn enqueue(&mut self, job: Job) -> QueueResult<Job> {
         let request_store = QueueRequestStore::new(&self.state_dir).ok();
-        self.with_jobs_locked(|jobs| {
+        let observations = self.with_jobs_locked(|jobs| {
             backfill_pending_workload_scopes(jobs, request_store.as_ref());
+            let observations = repeated_work_observations(jobs, &job);
             cancel_superseded_pending(jobs, &job);
             jobs.push(job.clone());
-            Ok(())
+            Ok(observations)
         })?;
+        // Shadow accounting is deliberately best effort. A metrics-store
+        // failure must never reject an enqueue or change dispatch authority.
+        if !observations.is_empty() {
+            for observation in observations {
+                let _ = MetricsStore::record_repeated_work_shadow_best_effort(
+                    &self.state_dir,
+                    &observation,
+                );
+            }
+        }
         Ok(job)
     }
 
@@ -976,6 +988,47 @@ fn cancel_superseded_pending(jobs: &mut [Job], job: &Job) {
     }
 }
 
+fn repeated_work_observations(jobs: &[Job], job: &Job) -> Vec<RepeatedWorkShadowInput> {
+    let target_config = serde_json::json!({
+        "targets": &job.target_names,
+        "mode": match job.mode {
+            crate::job::ValidationMode::Full => "full",
+            crate::job::ValidationMode::Smoke => "smoke",
+        },
+        "kind": job.kind,
+        "workload_scope": &job.workload_scope,
+    })
+    .to_string();
+    let mode = match job.mode {
+        crate::job::ValidationMode::Full => "full",
+        crate::job::ValidationMode::Smoke => "smoke",
+    }
+    .to_owned();
+    jobs.iter()
+        .filter(|queued| {
+            same_workload_scope(queued, job)
+                && queued.branch == job.branch
+                && queued.status == JobStatus::Pending
+                && queued.target_names == job.target_names
+                && queued.mode == job.mode
+        })
+        .map(|queued| RepeatedWorkShadowInput {
+            kind: if queued.sha == job.sha {
+                RepeatedWorkKind::DuplicateExactHeadConfig
+            } else {
+                RepeatedWorkKind::SupersededExactHead
+            },
+            branch: job.branch.clone(),
+            sha: job.sha.clone(),
+            target_config: target_config.clone(),
+            mode: mode.clone(),
+            job_id: job.id.clone(),
+            superseded_job_id: queued.id.clone(),
+            superseded_sha: queued.sha.clone(),
+        })
+        .collect()
+}
+
 fn same_workload_scope(left: &Job, right: &Job) -> bool {
     match (&left.workload_scope, &right.workload_scope) {
         (Some(left), Some(right)) => left == right,
@@ -1374,6 +1427,7 @@ mod tests {
         CancellationCause, CancellationProof, Job, JobStatus, Priority, TargetResult, TargetStatus,
         ValidationMode,
     };
+    use crate::metrics::MetricsStore;
     use crate::queue_request::{QueueRequestStore, QueuedExecutionEnvelope, run_workload_scope};
     use crate::ship::RunExecutionRequest;
 
@@ -1609,6 +1663,70 @@ mod tests {
 
         assert_eq!(queue.pending_count().expect("pending"), 1);
         assert_eq!(queue.get(&id).expect("get").expect("job").sha, "abc");
+    }
+
+    #[test]
+    fn enqueue_records_shadow_repeated_work_without_changing_queue_authority() {
+        let temp = queue_dir();
+        let state_dir = temp.path().to_path_buf();
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let first = job("feat/repeat", "old", &["mac"]);
+        queue.enqueue(first).expect("first enqueue");
+        let second = job("feat/repeat", "new", &["mac"]);
+        queue.enqueue(second).expect("second enqueue");
+        let duplicate = job("feat/repeat", "new", &["mac"]);
+        queue.enqueue(duplicate).expect("duplicate enqueue");
+
+        let metrics = MetricsStore::open(&state_dir).expect("metrics");
+        let rows = metrics.repeated_work_shadow(10).expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.kind == "superseded_exact_head" && row.sha == "new" && row.superseded_sha == "old"
+        }));
+        assert!(rows.iter().any(|row| {
+            row.kind == "duplicate_exact_head_config"
+                && row.sha == "new"
+                && row.superseded_sha == "new"
+        }));
+        // Existing supersedence remains authoritative: one pending job and
+        // terminal cancelled history are still present as before.
+        assert_eq!(queue.pending_count().expect("pending"), 1);
+        assert_eq!(queue.get_recent(10).expect("recent").len(), 2);
+    }
+
+    #[test]
+    fn enqueue_ignores_repeated_work_shadow_metrics_failure() {
+        let temp = queue_dir();
+        let state_dir = temp.path().to_path_buf();
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let first = job("feat/repeat", "old", &["mac"]);
+        let first_id = first.id.clone();
+        queue.enqueue(first).expect("first enqueue");
+
+        // Make the advisory metrics path unusable. The queue mutation must
+        // still commit exactly as it does when shadow persistence is healthy.
+        fs::write(
+            state_dir.join("metrics"),
+            b"metrics path intentionally blocked",
+        )
+        .expect("block metrics path");
+
+        let second = job("feat/repeat", "new", &["mac"]);
+        let second_id = second.id.clone();
+        queue
+            .enqueue(second)
+            .expect("metrics failure must not reject enqueue");
+
+        assert_eq!(queue.pending_count().expect("pending"), 1);
+        assert_eq!(
+            queue.get(&first_id).expect("first").expect("job").status,
+            JobStatus::Cancelled
+        );
+        assert_eq!(
+            queue.get(&second_id).expect("second").expect("job").status,
+            JobStatus::Pending
+        );
+        assert_eq!(queue.get_all().expect("all jobs").len(), 2);
     }
 
     #[test]

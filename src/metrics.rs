@@ -11,9 +11,10 @@ mod proxy_store;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -64,6 +65,55 @@ pub struct MetricRecordInput {
     pub runner_assigned: Option<bool>,
     /// Runner labels the job requested, when known.
     pub labels: Option<Vec<String>>,
+}
+
+/// Shadow-only classification for queue work that the current enqueue policy
+/// would supersede or repeat.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepeatedWorkKind {
+    /// A pending job for the same queue scope has an older exact head.
+    SupersededExactHead,
+    /// A pending job already has the same exact head and queue scope.
+    DuplicateExactHeadConfig,
+}
+
+impl RepeatedWorkKind {
+    /// Stable storage label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SupersededExactHead => "superseded_exact_head",
+            Self::DuplicateExactHeadConfig => "duplicate_exact_head_config",
+        }
+    }
+}
+
+/// One queue repeated-work observation. This is accounting only; it does not
+/// authorize skipping or alter queue state transitions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepeatedWorkShadowInput {
+    pub kind: RepeatedWorkKind,
+    pub branch: String,
+    pub sha: String,
+    pub target_config: String,
+    pub mode: String,
+    pub job_id: String,
+    pub superseded_job_id: String,
+    pub superseded_sha: String,
+}
+
+/// Persisted repeated-work observation returned by the read-side query.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepeatedWorkShadowRow {
+    pub observed_at: String,
+    pub kind: String,
+    pub branch: String,
+    pub sha: String,
+    pub target_config: String,
+    pub mode: String,
+    pub job_id: String,
+    pub superseded_job_id: String,
+    pub superseded_sha: String,
 }
 
 /// One grouped timing summary row.
@@ -319,6 +369,20 @@ impl MetricsStore {
               cache_hit INTEGER,
               artifact_path TEXT
             );
+            CREATE TABLE IF NOT EXISTS repeated_work_shadow (
+              id INTEGER PRIMARY KEY,
+              observed_at TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              branch TEXT NOT NULL,
+              sha TEXT NOT NULL,
+              target_config TEXT NOT NULL,
+              mode TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              superseded_job_id TEXT NOT NULL,
+              superseded_sha TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
+              ON repeated_work_shadow(observed_at DESC);
             ",
         )?;
         add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
@@ -335,6 +399,103 @@ impl MetricsStore {
             [],
         )?;
         Ok(())
+    }
+
+    /// Record a queue repeated-work observation without affecting queue
+    /// admission, dispatch, or required-check authority.
+    pub fn record_repeated_work_shadow(
+        &self,
+        input: &RepeatedWorkShadowInput,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let conn = self.connect()?;
+        Ok(Self::insert_repeated_work_shadow(&conn, input)?)
+    }
+
+    /// Record one shadow observation without waiting for a sandbox writer
+    /// lease. Returns `false` when `SQLite` reports a busy/locked database;
+    /// writer-domain lease contention is returned as an error, which callers
+    /// may also safely drop for this advisory observation.
+    pub(crate) fn record_repeated_work_shadow_best_effort(
+        state_dir: &Path,
+        input: &RepeatedWorkShadowInput,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let dir = state_dir.join("metrics");
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path_with_timeout(
+            &dir,
+            StdDuration::ZERO,
+        )?;
+        fs::create_dir_all(&dir)?;
+        let conn = Connection::open(dir.join("metrics.db"))?;
+        conn.busy_timeout(StdDuration::ZERO)?;
+        if let Err(error) = migrate_repeated_work_shadow(&conn) {
+            if sqlite_is_busy(&error) {
+                return Ok(false);
+            }
+            return Err(error.into());
+        }
+        if let Err(error) = Self::insert_repeated_work_shadow(&conn, input) {
+            if sqlite_is_busy(&error) {
+                return Ok(false);
+            }
+            return Err(error.into());
+        }
+        Ok(true)
+    }
+
+    /// Insert one observation on an already-fenced connection.
+    fn insert_repeated_work_shadow(
+        conn: &Connection,
+        input: &RepeatedWorkShadowInput,
+    ) -> Result<(), rusqlite::Error> {
+        conn.execute(
+            "INSERT INTO repeated_work_shadow
+             (observed_at, kind, branch, sha, target_config, mode, job_id,
+              superseded_job_id, superseded_sha)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                Utc::now().to_rfc3339(),
+                input.kind.as_str(),
+                input.branch,
+                input.sha,
+                input.target_config,
+                input.mode,
+                input.job_id,
+                input.superseded_job_id,
+                input.superseded_sha,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Return recent shadow repeated-work observations, newest first.
+    pub fn repeated_work_shadow(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RepeatedWorkShadowRow>, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            "SELECT observed_at, kind, branch, sha, target_config, mode, job_id,
+                    superseded_job_id, superseded_sha
+             FROM repeated_work_shadow
+             ORDER BY observed_at DESC, id DESC
+             LIMIT ?1",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![limit], |row| {
+            Ok(RepeatedWorkShadowRow {
+                observed_at: row.get(0)?,
+                kind: row.get(1)?,
+                branch: row.get(2)?,
+                sha: row.get(3)?,
+                target_config: row.get(4)?,
+                mode: row.get(5)?,
+                job_id: row.get(6)?,
+                superseded_job_id: row.get(7)?,
+                superseded_sha: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Record one low-friction timing row.
@@ -975,6 +1136,33 @@ fn coverage_for_samples(measured: usize, total: usize, description: &str) -> Sco
         status: status.to_owned(),
         reason: format!("{measured} of {total} {description}"),
     }
+}
+
+fn migrate_repeated_work_shadow(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS repeated_work_shadow (
+           id INTEGER PRIMARY KEY,
+           observed_at TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           branch TEXT NOT NULL,
+           sha TEXT NOT NULL,
+           target_config TEXT NOT NULL,
+           mode TEXT NOT NULL,
+           job_id TEXT NOT NULL,
+           superseded_job_id TEXT NOT NULL,
+           superseded_sha TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
+           ON repeated_work_shadow(observed_at DESC);",
+    )
+}
+
+fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(inner.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
 }
 
 #[derive(Debug)]
@@ -2012,6 +2200,8 @@ mod instrument_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     fn insert_scorecard_sample(
@@ -2616,5 +2806,32 @@ mod tests {
 
         assert!(scorecard.worker_minutes.is_finite());
         assert!(scorecard.worker_minutes > worker_minutes(&[i64::MAX]));
+    }
+
+    #[test]
+    fn best_effort_shadow_write_drops_busy_sqlite_without_waiting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let lock = Connection::open(store.path()).expect("lock connection");
+        lock.execute_batch("BEGIN EXCLUSIVE")
+            .expect("exclusive lock");
+        let input = RepeatedWorkShadowInput {
+            kind: RepeatedWorkKind::DuplicateExactHeadConfig,
+            branch: "main".to_owned(),
+            sha: "head".to_owned(),
+            target_config: "{}".to_owned(),
+            mode: "full".to_owned(),
+            job_id: "new".to_owned(),
+            superseded_job_id: "old".to_owned(),
+            superseded_sha: "head".to_owned(),
+        };
+
+        let started = Instant::now();
+        assert!(
+            !MetricsStore::record_repeated_work_shadow_best_effort(temp.path(), &input,)
+                .expect("busy shadow write should be classified as dropped")
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        lock.execute_batch("ROLLBACK").expect("release lock");
     }
 }
