@@ -808,9 +808,11 @@ impl MetricsStore {
             .map(|(queued, started)| (started - queued).num_milliseconds())
             .filter(|value| *value >= 0);
         if let Some(provider) = input.provider.as_deref()
-            && let Some(existing) = existing_job_id(&conn, provider, input.external_id.as_deref())?
+            && let Some(existing) = existing_job_id(&conn, provider, input.external_id.as_deref())
+                .or(existing_unknown_attempt_id(&conn, provider, input.external_id.as_deref())?)
         {
             if refresh_existing {
+                ensure_refresh_identity_compatible(&conn, existing, input)?;
                 let machine_id = upsert_machine(
                     &conn,
                     input
@@ -1392,6 +1394,51 @@ impl MetricsStore {
             strata,
         })
     }
+}
+
+fn ensure_refresh_identity_compatible(
+    conn: &Connection,
+    job_id: i64,
+    input: &MetricRecordInput,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stored: (Option<String>, Option<i64>, Option<i64>, Option<String>) = conn.query_row(
+        "SELECT event, run_attempt, provider_run_id, head_sha FROM runs WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
+        [job_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    for (name, old, new) in [
+        ("event", stored.0, input.event.clone()),
+        ("run_attempt", stored.1.map(|v| v.to_string()), input.run_attempt.map(|v| v.to_string())),
+        ("provider_run_id", stored.2.map(|v| v.to_string()), input.provider_run_id.map(|v| v.to_string())),
+        ("head_sha", stored.3, input.head_sha.clone()),
+    ] {
+        if let (Some(old), Some(new)) = (old, new) && old != new {
+            return Err(format!("existing job identity conflict in {name}").into());
+        }
+    }
+    Ok(())
+}
+
+fn existing_unknown_attempt_id(
+    conn: &Connection,
+    provider: &str,
+    external_id: Option<&str>,
+) -> Result<Option<i64>, rusqlite::Error> {
+    if provider != "github" {
+        return Ok(None);
+    }
+    let Some(value) = external_id else { return Ok(None) };
+    let parts = value.split('/').collect::<Vec<_>>();
+    if parts.len() != 3 || !parts[0].starts_with("github:") || parts[2] == "unknown" {
+        return Ok(None);
+    }
+    let unknown = format!("{}/{}/unknown", parts[0], parts[1]);
+    conn.query_row(
+        "SELECT id FROM jobs WHERE provider = ?1 AND external_id = ?2",
+        params![provider, unknown],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 fn validate_scorecard_scope(
@@ -3391,7 +3438,7 @@ mod tests {
         input.run_attempt = Some(2);
         input.pr = None;
         input.head_sha = Some("second".to_owned());
-        store.record_terminal_observation(&input).unwrap();
+        assert!(store.record_terminal_observation(&input).is_err());
         let conn = rusqlite::Connection::open(store.path()).unwrap();
         let identity: (
             Option<String>,
@@ -3424,6 +3471,36 @@ mod tests {
                 Some(7)
             )
         );
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn unknown_attempt_identity_refreshes_without_duplicate_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let mut input = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            job: "macos".to_owned(),
+            status: "success".to_owned(),
+            duration_ms: 100,
+            completed_at: Some(Utc::now()),
+            provider: Some("github".to_owned()),
+            external_id: Some("github:7/1/unknown".to_owned()),
+            event: Some("pull_request".to_owned()),
+            ..MetricRecordInput::default()
+        };
+        store.record_terminal_observation(&input).unwrap();
+        input.external_id = Some("github:7/1/2".to_owned());
+        input.run_attempt = Some(2);
+        assert!(store.record_terminal_observation(&input).is_ok());
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
