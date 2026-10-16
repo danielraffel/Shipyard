@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03400"></a>
+## [0.340.0] - 2026-10-16
+
+- feat(metrics): persist correlation ids and phase rows ([#859](https://github.com/danielraffel/Shipyard/pull/859))
+- fix/guardian done before owner exit ([#860](https://github.com/danielraffel/Shipyard/pull/860))
+
 <a id="v03390"></a>
 ## [0.339.0] - 2026-10-16
 
@@ -2442,6 +2448,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.340.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.340.0
 [0.339.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.339.0
 [0.338.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.338.1
 [0.338.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.338.0
