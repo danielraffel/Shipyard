@@ -2530,6 +2530,69 @@ mod tests {
         );
     }
 
+    fn test_receipt(id: &str, repo: &str, project: &str, pr: i64, head: char) -> crate::metrics::merge_receipt::MergeReceipt {
+        crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(), receipt_id: id.to_owned(),
+            repo: repo.to_owned(), project: project.to_owned(), base_branch: "main".to_owned(), pr,
+            head_sha: head.to_string().repeat(40), validated_head_sha: head.to_string().repeat(40),
+            merge_commit_sha: "b".repeat(40), merged_at: Utc::now(), safe_merge: true,
+            source: "shipyard".to_owned(), required_checks: vec!["macos".to_owned()],
+            gate_receipt_sha256: "c".repeat(64), evidence: format!("sha256:{id}"),
+        }
+    }
+
+    #[test]
+    fn merge_receipt_import_is_atomic_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap(); let store = MetricsStore::open(temp.path()).unwrap();
+        let first = test_receipt("atomic-1", "owner/repo", "repo", 1, 'a');
+        let mut bad = test_receipt("atomic-2", "owner/repo", "repo", 2, 'd'); bad.head_sha = "BAD".into();
+        assert!(store.import_merge_receipts(&[first.clone(), bad]).is_err());
+        let count: i64 = store.connect().unwrap().query_row("SELECT count(*) FROM merge_receipts", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(store.import_merge_receipts(&[first.clone()]).unwrap(), 1);
+        assert_eq!(store.import_merge_receipts(&[first.clone()]).unwrap(), 0);
+        let mut changed = first; changed.evidence = "sha256:changed".into();
+        assert!(store.import_merge_receipts(&[changed]).is_err());
+    }
+
+    #[test]
+    fn merge_receipt_semantic_conflicts_cover_base_head_and_merge() {
+        let temp = tempfile::tempdir().unwrap(); let store = MetricsStore::open(temp.path()).unwrap();
+        let base = test_receipt("semantic-1", "owner/repo", "repo", 7, 'a'); store.import_merge_receipts(&[base.clone()]).unwrap();
+        for (id, mutate) in [("semantic-base", 0), ("semantic-head", 1), ("semantic-merge", 2)] {
+            let mut r = base.clone(); r.receipt_id = id.into();
+            if mutate == 0 { r.base_branch = "release".into(); }
+            if mutate == 1 { r.head_sha = "d".repeat(40); r.validated_head_sha = r.head_sha.clone(); }
+            if mutate == 2 { r.merge_commit_sha = "e".repeat(40); }
+            assert!(store.import_merge_receipts(&[r]).is_err(), "{id}");
+        }
+    }
+
+    #[test]
+    fn safe_merge_summary_is_windowed_and_join_isolated() {
+        let temp = tempfile::tempdir().unwrap(); let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 10, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute("UPDATE runs SET repo='owner/repo', sha=?1 WHERE pr=10", [&"a".repeat(40)]).unwrap();
+        let mut inside = test_receipt("window-in", "OWNER/REPO", "repo", 10, 'a'); inside.merged_at = Utc::now();
+        let mut old = test_receipt("window-old", "owner/repo", "repo", 11, 'd'); old.merged_at = Utc::now() - Duration::days(10);
+        store.import_merge_receipts(&[inside, old]).unwrap();
+        let (total, joined, wasted, samples) = store.safe_merge_summary("repo", (Utc::now()-Duration::days(2)).to_rfc3339().as_str()).unwrap();
+        assert_eq!((total, joined, wasted, samples), (1, 1, 1000, 1));
+        let mut wrong_pr = test_receipt("wrong-pr", "owner/repo", "repo", 99, 'a'); store.import_merge_receipts(&[wrong_pr.clone()]).unwrap();
+        assert_eq!(store.safe_merge_summary("repo", "1970-01-01T00:00:00Z").unwrap().1, 1);
+        wrong_pr.repo = "other/repo".into(); wrong_pr.receipt_id = "wrong-repo".into();
+        assert!(store.import_merge_receipts(&[wrong_pr]).is_err() || store.safe_merge_summary("repo", "1970-01-01T00:00:00Z").unwrap().1 == 1);
+    }
+
+    #[test]
+    fn safe_merge_summary_accepts_owner_and_short_project_aliases() {
+        let temp = tempfile::tempdir().unwrap(); let store = MetricsStore::open(temp.path()).unwrap();
+        let receipt = test_receipt("alias-1", "owner/repo", "repo", 2, 'a'); store.import_merge_receipts(&[receipt]).unwrap();
+        assert_eq!(store.safe_merge_summary("repo", "1970-01-01T00:00:00Z").unwrap().0, 1);
+        assert_eq!(store.safe_merge_summary("owner/repo", "1970-01-01T00:00:00Z").unwrap().0, 1);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn insert_scorecard_sample_at(
         store: &MetricsStore,
