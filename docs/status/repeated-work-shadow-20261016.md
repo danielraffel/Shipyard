@@ -35,8 +35,11 @@ so an additive table there is the smallest auditable surface.
 ## Validation
 
 Focused queue and metrics tests cover both classifications, persistence, and
-the no-authority-change behavior. Local clippy passes with the repository's
-pre-existing unknown-lint warning. A live FLEET-BASELINE receipt is not
-required for this shadow-only accounting change.
+the no-authority-change behavior. The shadow write takes a zero-timeout
+writer-domain probe; a contended metrics store drops the advisory observation
+instead of delaying enqueue. The contention probe and local clippy pass, with
+clippy reporting only the repository's pre-existing unknown-lint warning. A
+live FLEET-BASELINE receipt is not required for this shadow-only accounting
+change.
 
 PR: https://github.com/danielraffel/Shipyard/pull/863

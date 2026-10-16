@@ -198,11 +198,12 @@ impl Queue {
         })?;
         // Shadow accounting is deliberately best effort. A metrics-store
         // failure must never reject an enqueue or change dispatch authority.
-        if !observations.is_empty()
-            && let Ok(store) = MetricsStore::open(&self.state_dir)
-        {
+        if !observations.is_empty() {
             for observation in observations {
-                let _ = store.record_repeated_work_shadow(&observation);
+                let _ = MetricsStore::record_repeated_work_shadow_best_effort(
+                    &self.state_dir,
+                    &observation,
+                );
             }
         }
         Ok(job)

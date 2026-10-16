@@ -11,6 +11,7 @@ mod proxy_store;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -408,6 +409,37 @@ impl MetricsStore {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let conn = self.connect()?;
+        self.insert_repeated_work_shadow(&conn, input)
+    }
+
+    /// Record one shadow observation without waiting for a sandbox writer
+    /// lease. Returns `false` when the protected metrics domain is contended;
+    /// callers may safely drop that advisory observation.
+    pub(crate) fn record_repeated_work_shadow_best_effort(
+        state_dir: &Path,
+        input: &RepeatedWorkShadowInput,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let dir = state_dir.join("metrics");
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path_with_timeout(
+            &dir,
+            StdDuration::ZERO,
+        )?;
+        fs::create_dir_all(&dir)?;
+        let store = Self {
+            path: dir.join("metrics.db"),
+        };
+        store.migrate()?;
+        let conn = store.connect()?;
+        store.insert_repeated_work_shadow(&conn, input)?;
+        Ok(true)
+    }
+
+    /// Insert one observation on an already-fenced connection.
+    fn insert_repeated_work_shadow(
+        &self,
+        conn: &Connection,
+        input: &RepeatedWorkShadowInput,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         conn.execute(
             "INSERT INTO repeated_work_shadow
              (observed_at, kind, branch, sha, target_config, mode, job_id,

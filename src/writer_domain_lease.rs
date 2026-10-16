@@ -89,11 +89,21 @@ impl Drop for ProductionWriterDomainLease {
 pub(crate) fn acquire_for_protected_path(
     path: &Path,
 ) -> io::Result<Option<ProductionWriterDomainLease>> {
+    acquire_for_protected_path_with_timeout(path, DEFAULT_ACQUIRE_TIMEOUT)
+}
+
+/// Try to acquire the production writer domain with a caller-supplied bound.
+/// A zero timeout performs one nonblocking lock attempt, which is useful for
+/// advisory persistence that must never stall its authoritative operation.
+pub(crate) fn acquire_for_protected_path_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> io::Result<Option<ProductionWriterDomainLease>> {
     if !is_current_protected_path(path)? {
         return Ok(None);
     }
     let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
-    acquire_thread_lease_at(&runtime_paths.state_dir, DEFAULT_ACQUIRE_TIMEOUT).map(Some)
+    acquire_thread_lease_at(&runtime_paths.state_dir, timeout).map(Some)
 }
 
 pub(crate) fn is_current_protected_path(path: &Path) -> io::Result<bool> {
@@ -687,6 +697,22 @@ mod tests {
             .expect_err("production mutation must not bypass audit");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(is_writer_domain_overlap(&error.to_string()));
+        FileExt::unlock(&exclusive).expect("unlock exclusive");
+    }
+
+    #[test]
+    fn zero_timeout_writer_probe_fails_fast_when_domain_is_contended() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let domain_path = temp.path().join(WRITER_DOMAIN_LOCK_NAME);
+        let exclusive = open_lock_file(&domain_path).expect("exclusive handle");
+        FileExt::lock_exclusive(&exclusive).expect("exclusive lock");
+
+        let started = Instant::now();
+        let error = acquire_at(temp.path(), Duration::ZERO)
+            .expect_err("nonblocking writer probe must report contention");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
         FileExt::unlock(&exclusive).expect("unlock exclusive");
     }
 
