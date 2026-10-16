@@ -1695,6 +1695,38 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_ignores_repeated_work_shadow_metrics_failure() {
+        let temp = queue_dir();
+        let state_dir = temp.path().to_path_buf();
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let first = job("feat/repeat", "old", &["mac"]);
+        let first_id = first.id.clone();
+        queue.enqueue(first).expect("first enqueue");
+
+        // Make the advisory metrics path unusable. The queue mutation must
+        // still commit exactly as it does when shadow persistence is healthy.
+        fs::write(state_dir.join("metrics"), b"metrics path intentionally blocked")
+            .expect("block metrics path");
+
+        let second = job("feat/repeat", "new", &["mac"]);
+        let second_id = second.id.clone();
+        queue
+            .enqueue(second)
+            .expect("metrics failure must not reject enqueue");
+
+        assert_eq!(queue.pending_count().expect("pending"), 1);
+        assert_eq!(
+            queue.get(&first_id).expect("first").expect("job").status,
+            JobStatus::Cancelled
+        );
+        assert_eq!(
+            queue.get(&second_id).expect("second").expect("job").status,
+            JobStatus::Pending
+        );
+        assert_eq!(queue.get_all().expect("all jobs").len(), 2);
+    }
+
+    #[test]
     fn next_pending_prefers_priority_then_fifo() {
         let temp = queue_dir();
         let mut queue = Queue::new(temp.path()).expect("queue");

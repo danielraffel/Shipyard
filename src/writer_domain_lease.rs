@@ -717,6 +717,26 @@ mod tests {
     }
 
     #[test]
+    fn protected_path_zero_timeout_writer_probe_fails_fast_when_contended() {
+        let runtime_paths = RuntimePaths::current(RuntimeMode::Shipyard);
+        fs::create_dir_all(&runtime_paths.state_dir).expect("test state directory");
+        let domain_path = runtime_paths.state_dir.join(WRITER_DOMAIN_LOCK_NAME);
+        let exclusive = open_lock_file(&domain_path).expect("exclusive handle");
+        FileExt::lock_exclusive(&exclusive).expect("exclusive lock");
+
+        let started = Instant::now();
+        let error = acquire_for_protected_path_with_timeout(
+            &runtime_paths.state_dir.join("metrics"),
+            Duration::ZERO,
+        )
+        .expect_err("protected nonblocking writer probe must report contention");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        FileExt::unlock(&exclusive).expect("unlock exclusive");
+    }
+
+    #[test]
     fn mutation_lease_is_released_at_critical_section_end() {
         let temp = tempfile::tempdir().expect("tempdir");
         let first = acquire_at(temp.path(), Duration::from_millis(50)).expect("writer");
