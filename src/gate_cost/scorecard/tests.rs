@@ -1188,6 +1188,7 @@ fn the_captured_window_exports_its_failed_gates() {
             at(row.label_not_before.as_deref().expect("label time")),
             created + Duration::hours(24)
         );
+        assert!(row.unread.contains(&"cause"));
         assert!(row.unread.contains(&"rule_verdict"));
     }
     assert!(rows[0].created_at <= rows[1].created_at, "oldest first");
@@ -1284,6 +1285,7 @@ fn the_receipt_counts_the_rows_and_hashes_the_bytes() {
         assert_eq!(
             unread,
             [
+                "cause",
                 "evidence",
                 "rule_verdict",
                 "cancel_cause",

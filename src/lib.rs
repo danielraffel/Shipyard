@@ -171,6 +171,9 @@ pub mod metrics;
 mod native_executable;
 /// Opt-in targets (`default = false`) as a reported fact on every surface.
 pub mod opt_in_targets;
+/// Private outage-window membership and provenance validation.
+#[allow(dead_code)]
+pub(crate) mod outage;
 /// Structured JSON output helpers.
 pub mod output;
 /// Shadow-only build-once and sharded-test proof invariants.

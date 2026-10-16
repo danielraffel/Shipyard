@@ -21,6 +21,8 @@ use fs2::FileExt;
 use serde::Serialize;
 use serde_json::Value;
 
+mod advice;
+mod audit;
 mod record;
 
 use super::CliFailure;
@@ -65,6 +67,7 @@ pub(super) fn cause_command<W: Write>(
                 ),
             ));
         }
+        CauseCommand::Advise(args) => return advice::command(&args, json, stdout),
         CauseCommand::Archive(args) => {
             let report = archive_inputs(&args)?;
             let written = if json {
@@ -82,6 +85,7 @@ pub(super) fn cause_command<W: Write>(
             };
             written.map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
+        CauseCommand::Audit(args) => return audit::command(&args, json, stdout),
     }
     Ok(std::process::ExitCode::SUCCESS)
 }

@@ -79,6 +79,10 @@ shipyard cause archive --dir causes/ --input records.jsonl
 
 # One observer pass over a workflow's recent runs.
 shipyard cause record --repo OWNER/REPO --workflow build.yml --dir data/ci-cause
+
+# Read-only historical lexical advice for one exact current head.
+shipyard cause advise --dir data/ci-cause --repo OWNER/REPO \
+  --head-sha <40-hex-head> --query "failing test" --pr 123
 ```
 
 `cause extract` takes where the job ran from its flags, else from the
@@ -89,6 +93,13 @@ step it runs in; only a missing or unreadable log exits non-zero.
 
 `cause archive` is append-only. A record whose id is already archived is
 skipped, and nothing is rewritten.
+
+For a local integrity check, run `shipyard cause audit --dir DIR`. It reads
+the cause month files and `fixlinks.jsonl`, reports malformed rows, duplicate
+cause IDs, duplicate red run attempts, and fix-links with no archived cause,
+and exits nonzero when it finds one. Findings are sorted by archive path and
+line. It never rewrites the archive, contacts GitHub, or exposes invalid line
+contents.
 
 ## The observer: `shipyard cause record`
 
@@ -151,6 +162,16 @@ written, reds pending (split into those that went red under 24 hours,
 on stderr. Run it on a schedule you choose; Shipyard does not schedule it.
 
 ## Related
+
+`cause advise` reads only the local archive. It requires a full current head
+SHA, excludes that head and the current pull request, ignores unnamed/unknown
+rows, and uses case-insensitive lexical token overlap with stable tie breaks.
+It can take newline-delimited outage windows (`start`, `end`, optional
+`reason`) and suppresses rows completed inside a declared window. It never
+contacts GitHub, executes `fix_hint`, or writes the archive. Rows containing
+unscrubbed paths, addresses, private hosts, or credential-like values are
+discarded. JSON output uses `shipyard.cause-advice/v1`; human output is a
+stable table intended for review, not an automatic decision.
 
 - [CLI reference](cli-reference.md): every flag of `diagnose` and `cause`.
 - The scorecard's `--export-cases` rows carry the same record in their

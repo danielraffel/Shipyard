@@ -1,0 +1,385 @@
+//! Read-only integrity checks for the local cause archive.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+use serde_json::Value;
+
+use super::super::CliFailure;
+use super::super::cli::CauseAuditArgs;
+use crate::diagnose::cause::{self, CiCause};
+
+const SCHEMA: &str = "shipyard.cause-audit/v1";
+
+#[derive(Debug, Serialize)]
+struct AuditReport {
+    schema: &'static str,
+    dir: String,
+    files_scanned: usize,
+    cause_rows: usize,
+    fixlink_rows: usize,
+    findings: Vec<Finding>,
+    ok: bool,
+}
+
+#[derive(Debug, Serialize, Eq, PartialEq, Ord, PartialOrd)]
+struct Finding {
+    file: String,
+    line: usize,
+    kind: &'static str,
+    detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct RedKey {
+    repo: String,
+    run_id: u64,
+    attempt: u64,
+}
+
+fn finding(
+    path: &Path,
+    dir: &Path,
+    line: usize,
+    kind: &'static str,
+    detail: impl Into<String>,
+) -> Finding {
+    Finding {
+        file: path
+            .strip_prefix(dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned(),
+        line,
+        kind,
+        detail: detail.into(),
+    }
+}
+
+fn jsonl_files(dir: &Path) -> Result<Vec<PathBuf>, CliFailure> {
+    let mut paths = Vec::new();
+    let causes = dir.join("causes");
+    if causes.exists() {
+        for entry in fs::read_dir(&causes).map_err(|error| {
+            CliFailure::new(2, format!("cannot read {}: {error}", causes.display()))
+        })? {
+            let path = entry
+                .map_err(|error| CliFailure::new(2, error.to_string()))?
+                .path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                paths.push(path);
+            }
+        }
+    }
+    let fixlinks = dir.join("fixlinks.jsonl");
+    if fixlinks.exists() {
+        paths.push(fixlinks);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn cause_row(value: Value) -> Option<CiCause> {
+    let candidate = if value.get("schema").and_then(Value::as_str) == Some(cause::SCHEMA) {
+        value
+    } else {
+        value.get("cause").filter(|cause| !cause.is_null())?.clone()
+    };
+    let record: CiCause = serde_json::from_value(candidate).ok()?;
+    (record.schema == cause::SCHEMA).then_some(record)
+}
+
+#[derive(Default)]
+struct ArchiveRows {
+    files_scanned: usize,
+    causes: Vec<(CiCause, PathBuf, usize)>,
+    fixlinks: Vec<(RedKey, PathBuf, usize)>,
+    findings: Vec<Finding>,
+}
+
+fn read_archive(dir: &Path) -> Result<ArchiveRows, CliFailure> {
+    if !dir.is_dir() {
+        return Err(CliFailure::new(
+            2,
+            format!("cause archive directory does not exist: {}", dir.display()),
+        ));
+    }
+    let paths = jsonl_files(dir)?;
+    let mut findings = Vec::new();
+    let mut causes = Vec::new();
+    let mut fixlinks = Vec::new();
+    let mut files_scanned = 0;
+    for path in paths {
+        files_scanned += 1;
+        let text = fs::read_to_string(&path).map_err(|error| {
+            CliFailure::new(2, format!("cannot read {}: {error}", path.display()))
+        })?;
+        let is_fixlinks = path.file_name().and_then(|name| name.to_str()) == Some("fixlinks.jsonl");
+        for (index, line) in text.lines().enumerate() {
+            let line_number = index + 1;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                findings.push(finding(
+                    &path,
+                    dir,
+                    line_number,
+                    "invalid_json",
+                    "line is not valid JSON",
+                ));
+                continue;
+            };
+            if is_fixlinks {
+                if value["schema"] != cause::SCHEMA || value["source"] != "fix-link" {
+                    findings.push(finding(
+                        &path,
+                        dir,
+                        line_number,
+                        "invalid_fixlink",
+                        "row is not a ci.cause/v1 fix-link",
+                    ));
+                    continue;
+                }
+                let (Some(repo), Some(run_id), Some(attempt)) = (
+                    value["repo"].as_str(),
+                    value["red_run_id"].as_u64(),
+                    value["red_attempt"].as_u64(),
+                ) else {
+                    findings.push(finding(
+                        &path,
+                        dir,
+                        line_number,
+                        "invalid_fixlink",
+                        "fix-link lacks repo, red_run_id, or red_attempt",
+                    ));
+                    continue;
+                };
+                fixlinks.push((
+                    RedKey {
+                        repo: repo.to_owned(),
+                        run_id,
+                        attempt,
+                    },
+                    path.clone(),
+                    line_number,
+                ));
+            } else if let Some(record) = cause_row(value) {
+                causes.push((record, path.clone(), line_number));
+            } else {
+                findings.push(finding(
+                    &path,
+                    dir,
+                    line_number,
+                    "invalid_cause",
+                    "row is not a valid ci.cause/v1 record",
+                ));
+            }
+        }
+    }
+
+    Ok(ArchiveRows {
+        files_scanned,
+        causes,
+        fixlinks,
+        findings,
+    })
+}
+
+fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
+    let ArchiveRows {
+        files_scanned,
+        causes,
+        fixlinks,
+        mut findings,
+    } = read_archive(&args.dir)?;
+    let mut seen = BTreeMap::<String, (PathBuf, usize)>::new();
+    let mut red_keys = BTreeSet::new();
+    for (record, path, line) in &causes {
+        let id = record.id();
+        if let Some((previous_path, previous_line)) = seen.insert(id.clone(), (path.clone(), *line))
+        {
+            findings.push(finding(
+                path,
+                &args.dir,
+                *line,
+                "duplicate_cause",
+                format!(
+                    "same cause id as {}:{}",
+                    previous_path
+                        .strip_prefix(&args.dir)
+                        .unwrap_or(&previous_path)
+                        .display(),
+                    previous_line
+                ),
+            ));
+        }
+        if let (Some(run_id), Some(attempt)) = (record.run_id, record.attempt) {
+            red_keys.insert(RedKey {
+                repo: record.repo.clone(),
+                run_id,
+                attempt,
+            });
+        }
+    }
+    let mut seen_fixlinks = BTreeMap::<RedKey, (PathBuf, usize)>::new();
+    for (key, path, line) in fixlinks {
+        if let Some((previous_path, previous_line)) =
+            seen_fixlinks.insert(key.clone(), (path.clone(), line))
+        {
+            findings.push(finding(
+                &path,
+                &args.dir,
+                line,
+                "duplicate_fixlink",
+                format!(
+                    "same red run as {}:{}",
+                    previous_path
+                        .strip_prefix(&args.dir)
+                        .unwrap_or(&previous_path)
+                        .display(),
+                    previous_line
+                ),
+            ));
+        }
+        if !red_keys.contains(&key) {
+            findings.push(finding(
+                &path,
+                &args.dir,
+                line,
+                "orphan_fixlink",
+                "no archived cause has this red run and attempt",
+            ));
+        }
+    }
+    findings.sort();
+    Ok(AuditReport {
+        schema: SCHEMA,
+        dir: args.dir.display().to_string(),
+        files_scanned,
+        cause_rows: causes.len(),
+        fixlink_rows: seen_fixlinks.len(),
+        ok: findings.is_empty(),
+        findings,
+    })
+}
+
+pub(super) fn command<W: Write>(
+    args: &CauseAuditArgs,
+    json: bool,
+    out: &mut W,
+) -> Result<std::process::ExitCode, CliFailure> {
+    let report = audit(args)?;
+    if json {
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string(&report).unwrap_or_default()
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else {
+        writeln!(
+            out,
+            "audit: {} file(s), {} cause row(s), {} fix-link(s), {} finding(s)",
+            report.files_scanned,
+            report.cause_rows,
+            report.fixlink_rows,
+            report.findings.len()
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        for item in &report.findings {
+            writeln!(
+                out,
+                "{}:{} {}: {}",
+                item.file, item.line, item.kind, item.detail
+            )
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
+    Ok(std::process::ExitCode::from(u8::from(!report.ok)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn cause(id: u64) -> String {
+        serde_json::json!({
+            "schema": cause::SCHEMA, "repo": "o/r", "run_id": id, "attempt": 1,
+            "job_id": id + 100, "job": "linux", "failure_class": "test", "format": "ctest",
+            "signature": "test_x", "confidence": "high", "source": "extractor", "extractor": "test",
+            "retrospective": true, "kind": "test", "location": "", "evidence": {"log_line": 1, "excerpt": []}
+        }).to_string()
+    }
+
+    #[test]
+    fn reports_malformed_duplicate_and_orphan_rows_without_writing() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("causes")).expect("causes");
+        fs::write(
+            dir.path().join("causes/2026-10.jsonl"),
+            format!("{}\n{}\nnot-json\n", cause(1), cause(1)),
+        )
+        .expect("causes file");
+        fs::write(dir.path().join("fixlinks.jsonl"), r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1}
+{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1}
+"#).expect("fixlinks");
+        let before = fs::read_dir(dir.path()).expect("before").count();
+        let report = audit(&CauseAuditArgs {
+            dir: dir.path().to_path_buf(),
+        })
+        .expect("audit");
+        assert!(!report.ok);
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.kind == "invalid_json")
+                .count(),
+            1
+        );
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.kind == "duplicate_cause")
+                .count(),
+            1
+        );
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.kind == "duplicate_fixlink")
+                .count(),
+            1
+        );
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.kind == "orphan_fixlink")
+                .count(),
+            2
+        );
+        assert_eq!(fs::read_dir(dir.path()).expect("after").count(), before);
+    }
+
+    #[test]
+    fn clean_archive_is_stable_and_passes() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("causes")).expect("causes");
+        fs::write(dir.path().join("causes/2026-10.jsonl"), cause(1)).expect("causes file");
+        let report = audit(&CauseAuditArgs {
+            dir: dir.path().to_path_buf(),
+        })
+        .expect("audit");
+        assert!(report.ok);
+        assert!(report.findings.is_empty());
+        assert_eq!((report.cause_rows, report.fixlink_rows), (1, 0));
+    }
+}
