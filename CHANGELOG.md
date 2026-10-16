@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03420"></a>
+## [0.342.0] - 2026-10-16
+
+- feat(metrics): shadow repeated queue work ([#863](https://github.com/danielraffel/Shipyard/pull/863))
+
 <a id="v03410"></a>
 ## [0.341.0] - 2026-10-16
 
@@ -2454,6 +2459,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.342.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.342.0
 [0.341.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.341.0
 [0.340.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.340.0
 [0.339.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.339.0
