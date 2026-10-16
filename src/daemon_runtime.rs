@@ -4186,26 +4186,59 @@ mod tests {
     fn read_fixture_stop_request(
         listener: &std::os::unix::net::UnixListener,
     ) -> std::io::Result<String> {
-        use std::io::BufRead as _;
+        use std::io::Read as _;
 
         listener.set_nonblocking(true)?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let stream = loop {
+        let accept_deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
+                        && Instant::now() < accept_deadline =>
                 {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => return Err(error),
             }
         };
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        let mut line = String::new();
-        std::io::BufReader::new(stream).read_line(&mut line)?;
-        Ok(line)
+        // This accepted fixture stream rejects `set_read_timeout` with EINVAL
+        // on macOS. Keep the same two-second bound with a nonblocking deadline.
+        stream.set_nonblocking(true)?;
+        let read_deadline = Instant::now() + Duration::from_secs(2);
+        let mut bytes = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => break,
+                Ok(1) => {
+                    bytes.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                }
+                Ok(_) => unreachable!("single-byte read returned more than one byte"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= read_deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "fixture stop request read timed out",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= read_deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "fixture stop request read timed out",
+                ));
+            }
+        }
+        String::from_utf8(bytes).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+        })
     }
 
     #[cfg(unix)]
