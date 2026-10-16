@@ -1702,7 +1702,9 @@ impl MetricsStore {
         validate_scorecard_scope(project, since_days)?;
         let until = Utc::now();
         let since = until
-            .checked_sub_signed(Duration::days(since_days))
+            .checked_sub_signed(
+                Duration::try_days(since_days).ok_or("strata day window is too large")?,
+            )
             .ok_or("strata day window is outside the timestamp range")?;
         let reason = reason.into();
         let unavailable = || AuthenticatedStratum {
@@ -1714,7 +1716,7 @@ impl MetricsStore {
         };
         Ok(AuthenticatedStrataReceipt {
             schema: AUTHENTICATED_STRATA_SCHEMA.to_owned(),
-            repo: project.to_owned(),
+            repo: "unavailable".to_owned(),
             window_since: since.to_rfc3339(),
             window_until: until.to_rfc3339(),
             source_head: "unavailable".to_owned(),
@@ -4024,6 +4026,87 @@ mod tests {
         );
         assert_eq!(receipt.aggregate.observed_jobs, 3);
         assert_eq!(receipt.aggregate.qualified_jobs, 1);
+    }
+
+    #[test]
+    fn strata_nonproduction_and_unverified_populations_never_qualify() {
+        for (label, verified, expected) in [
+            (Some("synthetic"), true, "authenticated"),
+            (Some("production"), false, "unverified"),
+            (None, true, "unknown"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = MetricsStore::open(dir.path()).unwrap();
+            store
+                .record_terminal_observation(&MetricRecordInput {
+                    project: "shipyard".into(),
+                    repo: Some("owner/shipyard".into()),
+                    job: "control".into(),
+                    provider: Some("github-hosted".into()),
+                    status: "success".into(),
+                    completed_at: Some(Utc::now()),
+                    duration_ms: 100,
+                    event: Some("pull_request".into()),
+                    run_attempt: Some(1),
+                    provider_run_id: Some(1),
+                    pr: Some(1),
+                    head_sha: Some("a".repeat(40)),
+                    provenance: label.map(str::to_owned),
+                    provenance_verified: verified,
+                    ..MetricRecordInput::default()
+                })
+                .unwrap();
+            let receipt = store
+                .authenticated_strata_receipt("shipyard", 1, &"b".repeat(40))
+                .unwrap();
+            assert_eq!(receipt.strata.normal_pr.provenance, expected);
+            assert_eq!(receipt.strata.normal_pr.observed_jobs, 1);
+            assert_eq!(receipt.strata.normal_pr.qualified_jobs, 0);
+        }
+    }
+
+    #[test]
+    fn strata_missing_pr_is_invalid_and_unavailable_repo_is_not_a_project_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        store
+            .record_terminal_observation(&MetricRecordInput {
+                project: "shipyard".into(),
+                repo: Some("owner/shipyard".into()),
+                job: "control".into(),
+                provider: Some("github-hosted".into()),
+                status: "success".into(),
+                completed_at: Some(Utc::now()),
+                duration_ms: 100,
+                event: Some("pull_request".into()),
+                run_attempt: Some(1),
+                provider_run_id: Some(1),
+                head_sha: Some("a".repeat(40)),
+                provenance: Some("production".into()),
+                provenance_verified: true,
+                ..MetricRecordInput::default()
+            })
+            .unwrap();
+        let receipt = store
+            .authenticated_strata_receipt("shipyard", 1, &"b".repeat(40))
+            .unwrap();
+        assert_eq!(receipt.strata.normal_pr.qualified_jobs, 0);
+        assert!(
+            receipt
+                .strata
+                .normal_pr
+                .reason
+                .contains("required pull-request identity")
+        );
+        let unavailable = MetricsStore::unavailable_authenticated_strata_receipt(
+            "shipyard",
+            1,
+            "missing repository",
+        )
+        .unwrap();
+        assert_eq!(unavailable.repo, "unavailable");
+        assert_eq!(unavailable.strata.normal_pr.coverage, "unavailable");
+        assert_eq!(unavailable.strata.normal_pr.reason, "missing repository");
     }
 
     #[allow(clippy::type_complexity)]
