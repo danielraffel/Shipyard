@@ -14,7 +14,7 @@ SPEC.loader.exec_module(MOD)
 class BaselineScorecardTests(unittest.TestCase):
     def test_scorecard_delegates_to_rust_and_keeps_strata_unavailable(self):
         with tempfile.TemporaryDirectory() as directory:
-            args = type("Args", (), {"db": Path(directory) / "metrics" / "metrics.db", "project": "pulp",
+            args = type("Args", (), {"db": Path(directory) / "metrics" / "metrics.db", "project": "pulp", "repo": "Generous-Corp/pulp",
                                       "shipyard": "shipyard", "since_days": 5, "timeout_seconds": 300})()
             original = MOD.run
             MOD.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 0, json.dumps({"job_samples": 4}), "")
@@ -73,7 +73,7 @@ class CollectorInvocationTests(unittest.TestCase):
             conn.commit(); conn.close()
             shipyard = root / "shipyard"; tartci = root / "tartci"
             shipyard.write_text("#!/bin/sh\ncase \"$*\" in *metrics*import*) echo '{\"imported\": 1}';; *) echo '{\"job_samples\": 1}';; esac\n")
-            tartci.write_text("#!/bin/sh\necho '{\"repo\":\"o/p\",\"external_id\":\"fixture-1\"}'\n")
+            tartci.write_text("#!/bin/sh\necho '{\"project\":\"pulp\",\"repo\":\"o/p\",\"provider\":\"tart\",\"external_id\":\"fixture-1\"}'\n")
             shipyard.chmod(0o755); tartci.chmod(0o755)
             args = type("Args", (), {"db": db, "state": root / "state.json", "project": "pulp", "repo": "o/p", "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5, "timeout_seconds": 5})()
             args.state.write_text("{}")
