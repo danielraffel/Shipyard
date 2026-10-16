@@ -830,7 +830,8 @@ mod tests {
     use super::{
         PendingObservation, ROUTE_SHADOW_SCHEMA_VERSION, RouteAvailability, RouteCandidateSnapshot,
         RouteCapabilitySnapshot, RouteCounterfactualOutcome, RouteShadowError,
-        RouteShadowObservation, enqueue_observation, evaluate, scheduler_snapshot,
+        RouteShadowObservation, RouteShadowReceiptStore, enqueue_observation, evaluate,
+        record_dispatch_observation_best_effort, scheduler_snapshot,
     };
     use crate::executor::dispatch::{
         FallbackBackend, FallbackTargetConfig, ResolvedBackend, ResolvedHostPoolConfig,
