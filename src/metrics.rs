@@ -83,6 +83,20 @@ pub struct MetricRecordInput {
     pub runner_assigned: Option<bool>,
     /// Runner labels the job requested, when known.
     pub labels: Option<Vec<String>>,
+    /// GitHub workflow event that produced the run, when authoritative.
+    pub event: Option<String>,
+    /// Provider-owned workflow run identity, distinct from the local SQLite
+    /// run row id.
+    pub provider_run_id: Option<i64>,
+    /// Provider-owned attempt number for the workflow run.
+    pub run_attempt: Option<i64>,
+    /// Authoritative commit built by the provider. This is kept separately
+    /// from the caller's generic `sha` so a missing provider field stays
+    /// unknown rather than being guessed from a branch or PR.
+    pub head_sha: Option<String>,
+    /// Authenticated provenance label. Absent means unknown and is excluded
+    /// from promotion-oriented scorecard populations.
+    pub provenance: Option<String>,
 }
 
 /// Shadow-only classification for queue work that the current enqueue policy
@@ -309,6 +323,29 @@ pub struct StewardshipScorecard {
     /// This window against the equal-length window before it. Duration
     /// fields above are wall-clock and load-dependent; they are context.
     pub comparison: proxy::Comparison,
+    /// Counts of completed samples by authenticated provenance. Unknown rows
+    /// are retained for audit but never promoted into a provenance-qualified
+    /// population.
+    pub provenance: ScorecardProvenance,
+    pub strata: ScorecardStrata,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ScorecardProvenance {
+    pub production: usize,
+    pub synthetic: usize,
+    pub unknown: usize,
+    pub eligible_samples: usize,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ScorecardStrata {
+    pub normal_pr: usize,
+    pub merge_group: usize,
+    pub rerun: usize,
+    pub unclassified: usize,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -378,7 +415,12 @@ impl MetricsStore {
               workflow TEXT,
               profile TEXT,
               routing_decision TEXT,
-              status TEXT NOT NULL
+              status TEXT NOT NULL,
+              event TEXT,
+              provider_run_id INTEGER,
+              run_attempt INTEGER,
+              head_sha TEXT,
+              provenance TEXT
             );
             CREATE TABLE IF NOT EXISTS jobs (
               id INTEGER PRIMARY KEY,
@@ -455,6 +497,11 @@ impl MetricsStore {
         add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
         add_column_if_missing(&conn, "jobs", "labels_json", "TEXT")?;
         add_column_if_missing(&conn, "jobs", "correlation_id", "TEXT")?;
+        add_column_if_missing(&conn, "runs", "event", "TEXT")?;
+        add_column_if_missing(&conn, "runs", "provider_run_id", "INTEGER")?;
+        add_column_if_missing(&conn, "runs", "run_attempt", "INTEGER")?;
+        add_column_if_missing(&conn, "runs", "head_sha", "TEXT")?;
+        add_column_if_missing(&conn, "runs", "provenance", "TEXT")?;
         add_column_if_missing(
             &conn,
             "merge_receipts",
@@ -805,6 +852,11 @@ impl MetricsStore {
                 profile: input.profile.clone(),
                 routing_decision: input.routing_decision.clone(),
                 status: input.status.clone(),
+                event: input.event.clone(),
+                provider_run_id: input.provider_run_id,
+                run_attempt: input.run_attempt,
+                head_sha: input.head_sha.clone(),
+                provenance: input.provenance.clone(),
             },
         )?;
         let job_id = insert_job(
@@ -906,6 +958,11 @@ impl MetricsStore {
                 profile: value_str(value, "profile").map(str::to_owned),
                 routing_decision: value_str(value, "routing_decision").map(str::to_owned),
                 status: status.clone(),
+                event: value_str(value, "event").map(str::to_owned),
+                provider_run_id: value_i64(value, "provider_run_id"),
+                run_attempt: value_i64(value, "run_attempt"),
+                head_sha: value_str(value, "head_sha").map(str::to_owned),
+                provenance: value_str(value, "provenance").map(str::to_owned),
             },
         )?;
         let job_id = insert_job(
@@ -1135,6 +1192,8 @@ impl MetricsStore {
             .ok_or("scorecard day window is outside the timestamp range")?
             .to_rfc3339();
         let samples = load_scorecard_samples(&conn, project, &cutoff)?;
+        let provenance = scorecard_provenance(&conn, project, &cutoff)?;
+        let strata = scorecard_strata(&conn, project, &cutoff)?;
         let successful_jobs = samples
             .iter()
             .filter(|(status, _, _, _, _)| is_success_status(status))
@@ -1316,6 +1375,8 @@ impl MetricsStore {
             basis: basis.as_str(),
             proxies,
             comparison,
+            provenance,
+            strata,
         })
     }
 }
@@ -1364,6 +1425,89 @@ fn load_scorecard_samples(
             ))
         })?
         .collect()
+}
+
+fn scorecard_provenance(
+    conn: &Connection,
+    project: &str,
+    cutoff: &str,
+) -> Result<ScorecardProvenance, rusqlite::Error> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT run.provenance FROM jobs job JOIN runs run ON run.id = job.run_id
+          WHERE {} AND job.completed_at IS NOT NULL
+            AND julianday(job.completed_at) >= julianday(?4)",
+        project_key::sql_filter("run.project", "run.repo")
+    ))?;
+    let key = ProjectKey::parse(project);
+    let (any, short, full) = project_key::sql_params(key.as_ref());
+    let mut counts = ScorecardProvenance::default();
+    for row in statement.query_map(params![any, short, full, cutoff], |row| {
+        row.get::<_, Option<String>>(0)
+    })? {
+        match row?.as_deref() {
+            Some("production") => counts.production += 1,
+            Some("synthetic") => counts.synthetic += 1,
+            _ => counts.unknown += 1,
+        }
+    }
+    // Promotion baselines use authenticated production rows only. Synthetic
+    // rows remain a separate control population and unknown rows remain
+    // visible, but neither can increase the production denominator.
+    counts.eligible_samples = counts.production;
+    counts.status = if counts.production == 0 {
+        "unavailable".to_owned()
+    } else if counts.synthetic == 0 && counts.unknown == 0 {
+        "production_authenticated".to_owned()
+    } else {
+        "partial".to_owned()
+    };
+    Ok(counts)
+}
+
+fn scorecard_strata(
+    conn: &Connection,
+    project: &str,
+    cutoff: &str,
+) -> Result<ScorecardStrata, rusqlite::Error> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT run.event, run.run_attempt, run.pr, run.provider_run_id, run.head_sha
+           FROM jobs job JOIN runs run ON run.id = job.run_id
+          WHERE {} AND job.completed_at IS NOT NULL
+            AND julianday(job.completed_at) >= julianday(?4)",
+        project_key::sql_filter("run.project", "run.repo")
+    ))?;
+    let key = ProjectKey::parse(project);
+    let (any, short, full) = project_key::sql_params(key.as_ref());
+    let mut strata = ScorecardStrata::default();
+    for row in statement.query_map(params![any, short, full, cutoff], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })? {
+        let (event, attempt, pr, run_id, head_sha) = row?;
+        match (event.as_deref(), attempt, pr, run_id, head_sha.as_deref()) {
+            (Some("pull_request"), Some(1), Some(_), _, _) => strata.normal_pr += 1,
+            (Some("pull_request"), Some(attempt), Some(_), _, _) if attempt > 1 => {
+                strata.rerun += 1;
+            }
+            (Some("merge_group"), _, _, Some(_), Some(head)) if !head.is_empty() => {
+                strata.merge_group += 1;
+            }
+            _ => strata.unclassified += 1,
+        }
+    }
+    strata.status = if strata.unclassified == 0 {
+        "authenticated".to_owned()
+    } else if strata.normal_pr + strata.merge_group + strata.rerun == 0 {
+        "unavailable".to_owned()
+    } else {
+        "partial".to_owned()
+    };
+    Ok(strata)
 }
 
 fn load_scorecard_cache_samples(
@@ -1511,6 +1655,11 @@ struct RunInsert {
     profile: Option<String>,
     routing_decision: Option<String>,
     status: String,
+    event: Option<String>,
+    provider_run_id: Option<i64>,
+    run_attempt: Option<i64>,
+    head_sha: Option<String>,
+    provenance: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1574,8 +1723,8 @@ fn upsert_machine(
 
 fn insert_run(conn: &Connection, run: &RunInsert) -> Result<i64, rusqlite::Error> {
     conn.execute(
-        "INSERT INTO runs (ts, project, repo, branch, sha, pr, workflow, profile, routing_decision, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO runs (ts, project, repo, branch, sha, pr, workflow, profile, routing_decision, status, event, provider_run_id, run_attempt, head_sha, provenance)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             run.ts,
             run.project,
@@ -1586,7 +1735,12 @@ fn insert_run(conn: &Connection, run: &RunInsert) -> Result<i64, rusqlite::Error
             run.workflow,
             run.profile,
             run.routing_decision,
-            run.status
+            run.status,
+            run.event,
+            run.provider_run_id,
+            run.run_attempt,
+            run.head_sha,
+            run.provenance
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1733,7 +1887,10 @@ fn refresh_existing_job(
                 branch = COALESCE(?5, branch), sha = COALESCE(?6, sha),
                 pr = COALESCE(?7, pr), workflow = COALESCE(?8, workflow),
                 profile = COALESCE(?9, profile),
-                routing_decision = COALESCE(?10, routing_decision), status = ?11
+                routing_decision = COALESCE(?10, routing_decision), status = ?11,
+                event = COALESCE(event, ?12), provider_run_id = COALESCE(provider_run_id, ?13),
+                run_attempt = COALESCE(run_attempt, ?14), head_sha = COALESCE(head_sha, ?15),
+                provenance = COALESCE(provenance, ?16)
           WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
         params![
             job_id,
@@ -1747,6 +1904,11 @@ fn refresh_existing_job(
             input.profile,
             input.routing_decision,
             input.status,
+            input.event,
+            input.provider_run_id,
+            input.run_attempt,
+            input.head_sha,
+            input.provenance,
         ],
     )?;
     let updated_steps = conn.execute(
@@ -2449,6 +2611,18 @@ pub struct GitHubRunJob {
     pub completed_at: Option<String>,
 }
 
+/// Provider-owned workflow run identity returned by GitHub's runs endpoint.
+/// Missing fields remain unknown; callers must not infer them from event names
+/// or pull-request shape.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GithubRunMetadata {
+    pub id: Option<i64>,
+    pub run_attempt: Option<i64>,
+    pub event: Option<String>,
+    pub head_sha: Option<String>,
+    pub head_branch: Option<String>,
+}
+
 /// Import one GitHub Actions job object as returned by `/actions/runs/{id}/jobs`.
 pub fn github_job_to_record(
     repo: &str,
@@ -2456,6 +2630,24 @@ pub fn github_job_to_record(
     project: &str,
     pr: Option<i64>,
     job: &GitHubRunJob,
+) -> MetricRecordInput {
+    let metadata = GithubRunMetadata {
+        id: job.run_id,
+        run_attempt: job.run_attempt,
+        ..GithubRunMetadata::default()
+    };
+    github_job_to_record_with_run(repo, workflow, project, pr, job, &metadata)
+}
+
+/// Convert a GitHub job while retaining the authoritative workflow-run
+/// identity that the jobs endpoint alone does not carry.
+pub fn github_job_to_record_with_run(
+    repo: &str,
+    workflow: Option<&str>,
+    project: &str,
+    pr: Option<i64>,
+    job: &GitHubRunJob,
+    run: &GithubRunMetadata,
 ) -> MetricRecordInput {
     let started_at = job
         .started_at
@@ -2488,6 +2680,8 @@ pub fn github_job_to_record(
     MetricRecordInput {
         project: project.to_owned(),
         repo: Some(repo.to_owned()),
+        sha: run.head_sha.clone(),
+        branch: run.head_branch.clone(),
         pr,
         workflow: workflow.map(str::to_owned),
         job: job.name.clone(),
@@ -2525,6 +2719,13 @@ pub fn github_job_to_record(
                 .is_some_and(|name| !name.trim().is_empty()),
         ),
         labels: job.labels.clone(),
+        event: run.event.clone(),
+        provider_run_id: run.id.or(job.run_id),
+        run_attempt: run.run_attempt.or(job.run_attempt),
+        head_sha: run.head_sha.clone(),
+        // GitHub's event field is descriptive identity only. Organic or
+        // synthetic provenance requires an authenticated producer label.
+        provenance: None,
         ..MetricRecordInput::default()
     }
 }
@@ -2841,6 +3042,11 @@ mod tests {
                 profile: None,
                 routing_decision: None,
                 status: status.to_owned(),
+                event: None,
+                provider_run_id: None,
+                run_attempt: None,
+                head_sha: None,
+                provenance: None,
             },
         )
         .expect("insert run");
@@ -3026,6 +3232,159 @@ mod tests {
         assert_eq!(scorecard.pull_request_throughput.status, "unavailable");
         assert_eq!(scorecard.submit_to_receipt.status, "unavailable");
         assert_eq!(scorecard.model_token_use.status, "unavailable");
+        assert_eq!(scorecard.provenance.status, "unavailable");
+    }
+
+    #[test]
+    fn scorecard_reports_authenticated_and_unknown_provenance_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        for (id, provenance) in [
+            ("production", Some("production")),
+            ("synthetic", Some("synthetic")),
+            ("unknown", None),
+        ] {
+            store
+                .record_terminal_observation(&MetricRecordInput {
+                    project: "shipyard".to_owned(),
+                    job: id.to_owned(),
+                    status: "success".to_owned(),
+                    duration_ms: 100,
+                    completed_at: Some(Utc::now()),
+                    external_id: Some(format!("test:{id}")),
+                    provenance: provenance.map(str::to_owned),
+                    ..MetricRecordInput::default()
+                })
+                .unwrap();
+        }
+        let scorecard = store.stewardship_scorecard("shipyard", 1).unwrap();
+        assert_eq!(scorecard.provenance.production, 1);
+        assert_eq!(scorecard.provenance.synthetic, 1);
+        assert_eq!(scorecard.provenance.unknown, 1);
+        assert_eq!(scorecard.provenance.eligible_samples, 1);
+        assert_eq!(scorecard.provenance.status, "partial");
+    }
+
+    #[test]
+    fn scorecard_classifies_event_attempt_and_excludes_unknown_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let rows = [
+            (
+                "pr",
+                Some("pull_request"),
+                Some(1),
+                Some(9),
+                None,
+                Some("h1"),
+            ),
+            (
+                "rerun",
+                Some("pull_request"),
+                Some(2),
+                Some(9),
+                None,
+                Some("h1"),
+            ),
+            (
+                "merge",
+                Some("merge_group"),
+                Some(1),
+                None,
+                Some(77),
+                Some("h2"),
+            ),
+            (
+                "manual",
+                Some("workflow_dispatch"),
+                Some(1),
+                Some(9),
+                None,
+                Some("h3"),
+            ),
+        ];
+        for (id, event, attempt, pr, provider_run_id, head_sha) in rows {
+            store
+                .record_terminal_observation(&MetricRecordInput {
+                    project: "shipyard".to_owned(),
+                    job: id.to_owned(),
+                    status: "success".to_owned(),
+                    duration_ms: 100,
+                    completed_at: Some(Utc::now()),
+                    external_id: Some(format!("test:{id}")),
+                    event: event.map(str::to_owned),
+                    run_attempt: attempt,
+                    pr,
+                    provider_run_id,
+                    head_sha: head_sha.map(str::to_owned),
+                    ..MetricRecordInput::default()
+                })
+                .unwrap();
+        }
+        let scorecard = store.stewardship_scorecard("shipyard", 1).unwrap();
+        assert_eq!(scorecard.strata.normal_pr, 1);
+        assert_eq!(scorecard.strata.rerun, 1);
+        assert_eq!(scorecard.strata.merge_group, 1);
+        assert_eq!(scorecard.strata.unclassified, 1);
+        assert_eq!(scorecard.strata.status, "partial");
+    }
+
+    #[test]
+    fn duplicate_job_does_not_relabel_first_seen_run_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let mut input = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            job: "macos".to_owned(),
+            status: "success".to_owned(),
+            duration_ms: 100,
+            completed_at: Some(Utc::now()),
+            external_id: Some("github:7/1/1".to_owned()),
+            event: Some("pull_request".to_owned()),
+            run_attempt: Some(1),
+            pr: Some(9),
+            provider_run_id: Some(7),
+            head_sha: Some("first".to_owned()),
+            ..MetricRecordInput::default()
+        };
+        store.record_terminal_observation(&input).unwrap();
+        input.event = Some("merge_group".to_owned());
+        input.run_attempt = Some(2);
+        input.pr = None;
+        input.head_sha = Some("second".to_owned());
+        store.record_terminal_observation(&input).unwrap();
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        let identity: (
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT event, run_attempt, pr, head_sha, provider_run_id FROM runs",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            identity,
+            (
+                Some("pull_request".to_owned()),
+                Some(1),
+                Some(9),
+                Some("first".to_owned()),
+                Some(7)
+            )
+        );
     }
 
     #[test]
