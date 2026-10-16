@@ -1219,7 +1219,7 @@ mod tests {
                 pending = Some(receipt);
                 break;
             }
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let pending = pending.expect("background sink receipt");
         assert!(
@@ -1256,7 +1256,7 @@ mod tests {
                 selected = Some(receipt);
                 break;
             }
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let selected = selected.expect("selected route receipt");
         let metadata = selected.observation.expect("metadata");
@@ -1310,7 +1310,7 @@ mod tests {
         for _ in 0..128 {
             assert!(!enqueue_observation(&sender, pending()));
         }
-        assert!(started_at.elapsed() < StdDuration::from_millis(100));
+        assert!(started_at.elapsed() < std::time::Duration::from_millis(100));
         writer_release.wait();
         writer.join().expect("stalled writer exits");
         assert!(!enqueue_observation(&sender, pending()));
