@@ -3,6 +3,7 @@
 #![cfg(target_os = "macos")]
 
 use std::fs;
+use std::io::Read;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -55,6 +56,15 @@ fn wait_for_file(path: &Path) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn read_fifo_signal(path: &Path) {
+    let mut signal = String::new();
+    fs::File::open(path)
+        .expect("open fifo signal")
+        .read_to_string(&mut signal)
+        .expect("read fifo signal");
+    assert!(!signal.is_empty(), "fifo signal must not be empty");
 }
 
 fn make_fifo(path: &Path) {
@@ -156,8 +166,10 @@ fn descendant_holding_inherited_lock_blocks_after_owner_death() {
     let owner_release = temp.path().join("owner-release");
     let descendant_release = temp.path().join("descendant-release");
     let descendant_done = temp.path().join("descendant-done");
+    make_fifo(&ready);
     make_fifo(&owner_release);
     make_fifo(&descendant_release);
+    make_fifo(&descendant_done);
     let child = vec![
         "/bin/sh".to_owned(),
         "-c".to_owned(),
@@ -179,8 +191,8 @@ fn descendant_holding_inherited_lock_blocks_after_owner_death() {
             "\"$SHIPYARD_QUEUE_HOLD_OWNER_PID\" ",
             "\"$SHIPYARD_QUEUE_HOLD_OWNER_PROCESS_START\" ",
             "\"$SHIPYARD_QUEUE_HOLD_FD\" > \"$3\"; ",
-            "(read _ < \"$6\"; eval \"exec ${SHIPYARD_QUEUE_HOLD_FD}>&-\"; : > \"$7\") & ",
-            ": > \"$4\"; read _ < \"$5\""
+            "(read _ < \"$6\"; eval \"exec ${SHIPYARD_QUEUE_HOLD_FD}>&-\"; printf 'done\\n' > \"$7\") & ",
+            "printf 'ready\\n' > \"$4\"; read _ < \"$5\""
         )
         .to_owned(),
         "queue-hold-child".to_owned(),
@@ -196,9 +208,14 @@ fn descendant_holding_inherited_lock_blocks_after_owner_death() {
     let mut wrapper = hold_command(&state_dir, &child_refs)
         .spawn()
         .expect("spawn hold");
-    wait_for_file(&ready);
+    read_fifo_signal(&ready);
     let env = read_env(&environment);
     let owner_pid = env[4].parse::<u32>().expect("owner pid");
+    assert_eq!(
+        owner_pid,
+        wrapper.id(),
+        "queue-hold must exec the owner in place"
+    );
 
     assert_eq!(
         Command::new("/bin/kill")
@@ -219,7 +236,7 @@ fn descendant_holding_inherited_lock_blocks_after_owner_death() {
     );
 
     fs::write(&descendant_release, b"release\n").expect("release descendant");
-    wait_for_file(&descendant_done);
+    read_fifo_signal(&descendant_done);
     assert!(
         Queue::new(&state_dir)
             .expect("queue")
