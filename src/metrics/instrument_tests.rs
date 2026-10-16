@@ -33,6 +33,7 @@ fn github_job(
         created_at: Some((started - Duration::minutes(1)).to_rfc3339()),
         started_at: Some(started.to_rfc3339()),
         completed_at: Some((started + Duration::minutes(minutes)).to_rfc3339()),
+        head_sha: None,
     }
 }
 

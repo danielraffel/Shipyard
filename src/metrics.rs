@@ -97,6 +97,10 @@ pub struct MetricRecordInput {
     /// Authenticated provenance label. Absent means unknown and is excluded
     /// from promotion-oriented scorecard populations.
     pub provenance: Option<String>,
+    /// Internal qualification bit; caller-provided provenance text is never
+    /// eligible for scorecard promotion unless an authenticated importer sets
+    /// this explicitly.
+    pub provenance_verified: bool,
 }
 
 /// Shadow-only classification for queue work that the current enqueue policy
@@ -420,7 +424,8 @@ impl MetricsStore {
               provider_run_id INTEGER,
               run_attempt INTEGER,
               head_sha TEXT,
-              provenance TEXT
+              provenance TEXT,
+              provenance_verified INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS jobs (
               id INTEGER PRIMARY KEY,
@@ -502,6 +507,12 @@ impl MetricsStore {
         add_column_if_missing(&conn, "runs", "run_attempt", "INTEGER")?;
         add_column_if_missing(&conn, "runs", "head_sha", "TEXT")?;
         add_column_if_missing(&conn, "runs", "provenance", "TEXT")?;
+        add_column_if_missing(
+            &conn,
+            "runs",
+            "provenance_verified",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         add_column_if_missing(
             &conn,
             "merge_receipts",
@@ -857,6 +868,7 @@ impl MetricsStore {
                 run_attempt: input.run_attempt,
                 head_sha: input.head_sha.clone(),
                 provenance: input.provenance.clone(),
+                provenance_verified: input.provenance_verified,
             },
         )?;
         let job_id = insert_job(
@@ -963,6 +975,7 @@ impl MetricsStore {
                 run_attempt: value_i64(value, "run_attempt"),
                 head_sha: value_str(value, "head_sha").map(str::to_owned),
                 provenance: value_str(value, "provenance").map(str::to_owned),
+                provenance_verified: false,
             },
         )?;
         let job_id = insert_job(
@@ -1433,7 +1446,7 @@ fn scorecard_provenance(
     cutoff: &str,
 ) -> Result<ScorecardProvenance, rusqlite::Error> {
     let mut statement = conn.prepare(&format!(
-        "SELECT run.provenance FROM jobs job JOIN runs run ON run.id = job.run_id
+        "SELECT run.provenance, run.provenance_verified FROM jobs job JOIN runs run ON run.id = job.run_id
           WHERE {} AND job.completed_at IS NOT NULL
             AND julianday(job.completed_at) >= julianday(?4)",
         project_key::sql_filter("run.project", "run.repo")
@@ -1442,11 +1455,12 @@ fn scorecard_provenance(
     let (any, short, full) = project_key::sql_params(key.as_ref());
     let mut counts = ScorecardProvenance::default();
     for row in statement.query_map(params![any, short, full, cutoff], |row| {
-        row.get::<_, Option<String>>(0)
+        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?))
     })? {
-        match row?.as_deref() {
-            Some("production") => counts.production += 1,
-            Some("synthetic") => counts.synthetic += 1,
+        let (provenance, verified) = row?;
+        match (provenance.as_deref(), verified) {
+            (Some("production"), true) => counts.production += 1,
+            (Some("synthetic"), true) => counts.synthetic += 1,
             _ => counts.unknown += 1,
         }
     }
@@ -1660,6 +1674,7 @@ struct RunInsert {
     run_attempt: Option<i64>,
     head_sha: Option<String>,
     provenance: Option<String>,
+    provenance_verified: bool,
 }
 
 #[derive(Debug)]
@@ -1723,8 +1738,8 @@ fn upsert_machine(
 
 fn insert_run(conn: &Connection, run: &RunInsert) -> Result<i64, rusqlite::Error> {
     conn.execute(
-        "INSERT INTO runs (ts, project, repo, branch, sha, pr, workflow, profile, routing_decision, status, event, provider_run_id, run_attempt, head_sha, provenance)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT INTO runs (ts, project, repo, branch, sha, pr, workflow, profile, routing_decision, status, event, provider_run_id, run_attempt, head_sha, provenance, provenance_verified)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             run.ts,
             run.project,
@@ -1740,7 +1755,8 @@ fn insert_run(conn: &Connection, run: &RunInsert) -> Result<i64, rusqlite::Error
             run.provider_run_id,
             run.run_attempt,
             run.head_sha,
-            run.provenance
+            run.provenance,
+            run.provenance_verified,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1890,7 +1906,7 @@ fn refresh_existing_job(
                 routing_decision = COALESCE(?10, routing_decision), status = ?11,
                 event = COALESCE(event, ?12), provider_run_id = COALESCE(provider_run_id, ?13),
                 run_attempt = COALESCE(run_attempt, ?14), head_sha = COALESCE(head_sha, ?15),
-                provenance = COALESCE(provenance, ?16)
+                provenance = COALESCE(provenance, ?16), provenance_verified = MAX(provenance_verified, ?17)
           WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
         params![
             job_id,
@@ -1909,6 +1925,7 @@ fn refresh_existing_job(
             input.run_attempt,
             input.head_sha,
             input.provenance,
+            input.provenance_verified,
         ],
     )?;
     let updated_steps = conn.execute(
@@ -2609,6 +2626,7 @@ pub struct GitHubRunJob {
     pub created_at: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    pub head_sha: Option<String>,
 }
 
 /// Provider-owned workflow run identity returned by GitHub's runs endpoint.
@@ -2708,7 +2726,8 @@ pub fn github_job_to_record_with_run(
             "github:{}/{}/{}",
             job.run_id.unwrap_or_default(),
             job.id,
-            job.run_attempt.unwrap_or(1)
+            job.run_attempt
+                .map_or_else(|| "unknown".to_owned(), |attempt| attempt.to_string())
         )),
         started_at,
         queued_at,
@@ -2721,7 +2740,7 @@ pub fn github_job_to_record_with_run(
         labels: job.labels.clone(),
         event: run.event.clone(),
         provider_run_id: run.id.or(job.run_id),
-        run_attempt: run.run_attempt.or(job.run_attempt),
+        run_attempt: job.run_attempt,
         head_sha: run.head_sha.clone(),
         // GitHub's event field is descriptive identity only. Organic or
         // synthetic provenance requires an authenticated producer label.
@@ -3047,6 +3066,7 @@ mod tests {
                 run_attempt: None,
                 head_sha: None,
                 provenance: None,
+                provenance_verified: false,
             },
         )
         .expect("insert run");
@@ -3253,16 +3273,17 @@ mod tests {
                     completed_at: Some(Utc::now()),
                     external_id: Some(format!("test:{id}")),
                     provenance: provenance.map(str::to_owned),
+                    provenance_verified: false,
                     ..MetricRecordInput::default()
                 })
                 .unwrap();
         }
         let scorecard = store.stewardship_scorecard("shipyard", 1).unwrap();
-        assert_eq!(scorecard.provenance.production, 1);
-        assert_eq!(scorecard.provenance.synthetic, 1);
-        assert_eq!(scorecard.provenance.unknown, 1);
-        assert_eq!(scorecard.provenance.eligible_samples, 1);
-        assert_eq!(scorecard.provenance.status, "partial");
+        assert_eq!(scorecard.provenance.production, 0);
+        assert_eq!(scorecard.provenance.synthetic, 0);
+        assert_eq!(scorecard.provenance.unknown, 3);
+        assert_eq!(scorecard.provenance.eligible_samples, 0);
+        assert_eq!(scorecard.provenance.status, "unavailable");
     }
 
     #[test]
@@ -3689,6 +3710,7 @@ mod tests {
             created_at: Some("2026-09-01T11:59:30Z".to_owned()),
             started_at: Some("2026-09-01T12:00:00Z".to_owned()),
             completed_at: Some("2026-09-01T12:01:00Z".to_owned()),
+            head_sha: None,
         };
 
         let record = github_job_to_record(
@@ -3727,6 +3749,7 @@ mod tests {
             created_at: Some("2026-09-01T11:59:30Z".to_owned()),
             started_at: Some("2026-09-01T12:00:00Z".to_owned()),
             completed_at: Some("2026-09-01T12:01:00Z".to_owned()),
+            head_sha: None,
         };
         let record = github_job_to_record("owner/repo", None, "repo", None, &job);
         store.record(&record).expect("record");
