@@ -9,6 +9,10 @@ pub mod project_key;
 pub mod proxy;
 mod proxy_store;
 
+// Total receipts, joined receipts, wasted milliseconds, measured samples,
+// and samples with missing or invalid durations, respectively.
+type SafeMergeSummary = (usize, usize, i64, usize, usize);
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -746,7 +750,7 @@ impl MetricsStore {
         &self,
         project: &str,
         cutoff: &str,
-    ) -> Result<(usize, usize, i64, usize, usize), Box<dyn std::error::Error>> {
+    ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
         let key = crate::metrics::project_key::ProjectKey::parse(project);
         let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
@@ -1540,9 +1544,7 @@ impl MetricsStore {
                     // a missing/negative duration. Keep the value for the
                     // measured rows, but do not present it as a complete cost
                     // claim for the whole receipt population.
-                    status: if wasted_duration_gaps > 0 {
-                        "partial".to_owned()
-                    } else if joined_merge_count < safe_merge_count {
+                    status: if wasted_duration_gaps > 0 || joined_merge_count < safe_merge_count {
                         "partial".to_owned()
                     } else {
                         "available".to_owned()
@@ -1635,8 +1637,7 @@ impl MetricsStore {
             match (provenance.as_deref(), verified) {
                 (Some("production"), true) => accumulator.authenticated += 1,
                 (Some("synthetic"), true) => accumulator.verified_nonproduction += 1,
-                (Some(_), true) => accumulator.unverified += 1,
-                (Some(_), false) => accumulator.unverified += 1,
+                (Some(_), _) => accumulator.unverified += 1,
                 (None, _) => accumulator.unknown += 1,
             }
             let event_identity_valid = match event.as_deref() {
