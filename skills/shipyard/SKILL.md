@@ -4993,3 +4993,13 @@ populations cannot qualify as production. Source metadata identifies the clean
 Git checkout compiled by the producer, not its dependency or toolchain trust.
 Dirty or unverifiable builds report source metadata unavailable. Merge receipts
 remain necessary for safe-merge throughput and per-change cost claims.
+
+### Unconfirmed daemon shutdown
+
+Daemon refresh distinguishes confirmed shutdown, observed absence, and unconfirmed
+process liveness. An unavailable status response is not proof that the daemon is
+gone. After delivering an IPC stop, Shipyard observes shutdown before allowing a
+replacement; a missing PID cannot turn socket disappearance into a process-exit
+claim. Unknown live PIDs are never signaled or erased as stale evidence. When
+shutdown remains unconfirmed, `daemon stop` and `daemon refresh` fail and preserve
+remaining runtime evidence instead of reporting success or spawning a replacement.

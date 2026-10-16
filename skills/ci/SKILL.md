@@ -3884,3 +3884,10 @@ populations cannot qualify as production. Source metadata identifies the clean
 Git checkout compiled by the producer, not its dependency or toolchain trust.
 Dirty or unverifiable builds report source metadata unavailable. Merge receipts
 remain necessary for safe-merge throughput and per-change cost claims.
+
+Daemon refresh requires confirmed prior shutdown before replacing a daemon.
+Unavailable status plus a reachable endpoint or an unowned live PID is an
+unconfirmed state, not an absent daemon. `daemon stop` and `daemon refresh` fail
+in that state, preserving runtime evidence; do not treat an IPC write or vanished
+socket alone as proof of process exit. A stale PID whose process is gone remains
+ordinary absence, while an unknown live PID must never be signaled.

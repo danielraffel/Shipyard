@@ -11,8 +11,9 @@ use super::{
 };
 use crate::daemon_ipc::read_daemon_status;
 use crate::daemon_runtime::{
-    DaemonRunConfig, DaemonRunError, DaemonSpawnFailedError, SpawnRequest, normalize_repos,
-    resolve_repos, run_blocking, spawn_detached, stop_running,
+    DaemonRunConfig, DaemonRunError, DaemonSpawnFailedError, DaemonStopOutcome, SpawnRequest,
+    normalize_repos, resolve_repos, run_blocking, spawn_detached, stop_running,
+    stop_running_outcome,
 };
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
@@ -158,8 +159,14 @@ pub(super) fn daemon_command<W: Write>(
         ),
         DaemonCommand::Run { repos } => daemon_run(mode, runtime_paths, &repos),
         DaemonCommand::Stop => {
-            let stopped = stop_running(&runtime_paths.state_dir);
-            render_daemon_stop(stdout, json, stopped)
+            let outcome = stop_running_outcome(&runtime_paths.state_dir);
+            if outcome == DaemonStopOutcome::Unconfirmed {
+                return Err(CliFailure::new(
+                    3,
+                    "daemon shutdown is unconfirmed; runtime evidence was preserved",
+                ));
+            }
+            render_daemon_stop(stdout, json, outcome == DaemonStopOutcome::Stopped)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
             Ok(ExitCode::SUCCESS)
         }
@@ -941,8 +948,9 @@ where
     } else {
         Vec::new()
     };
-    let stopped_prior = stop_running(&runtime_paths.state_dir);
-    if had_prior && !stopped_prior && read_daemon_status(&runtime_paths.state_dir).is_some() {
+    let stop_outcome = stop_running_outcome(&runtime_paths.state_dir);
+    let stopped_prior = stop_outcome == DaemonStopOutcome::Stopped;
+    if stop_outcome == DaemonStopOutcome::Unconfirmed || (had_prior && !stopped_prior) {
         return Err(DaemonRefreshError {
             stopped_prior: false,
             repos: prior_repos,
@@ -1773,6 +1781,48 @@ mod tests {
 
         assert!(!outcome.stopped_prior);
         assert!(outcome.repos.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_refuses_replacement_when_unavailable_endpoint_remains() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let daemon_dir = temp.path().join("daemon");
+        std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
+        let socket = daemon_dir.join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        drop(listener);
+        let error = execute_daemon_refresh(
+            RuntimeMode::Isolated,
+            None,
+            Some(temp.path().to_path_buf()),
+            &runtime_paths(temp.path()),
+            &["owner/repo".to_owned()],
+            None,
+            |repos| repos,
+            |_request: &SpawnRequest| panic!("ambiguous prior daemon must prevent spawn"),
+        )
+        .expect_err("unconfirmed shutdown");
+        assert!(!error.stopped_prior);
+        assert!(socket.exists(), "uncertain runtime evidence is retained");
+
+        let mut out = Vec::new();
+        assert!(
+            daemon_command(
+                DaemonCommand::Stop,
+                RuntimeMode::Isolated,
+                None,
+                Some(temp.path().to_path_buf()),
+                &runtime_paths(temp.path()),
+                true,
+                &mut out,
+            )
+            .is_err()
+        );
+        assert!(
+            out.is_empty(),
+            "must not print a successful not-running result"
+        );
     }
 
     #[test]
