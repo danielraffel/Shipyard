@@ -3082,8 +3082,7 @@ backend = "local"
             pool = "local_macs"
             platform = "macos-arm64"
             requires = ["macos", "arm64"]
-            "#,
-            toml_string(repo.display().to_string())
+            "#
         ));
         let target = resolve_targets_from_table(&config, ValidationMode::Full)
             .expect("targets")
