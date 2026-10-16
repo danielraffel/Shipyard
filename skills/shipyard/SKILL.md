@@ -4982,3 +4982,14 @@ compute from those receipts and exact repo/PR joins; PR counts and GitHub
 has no value. Wasted compute per change counts every failed or cancelled job of
 the merged pull request, earlier pushes included; duplicate receipts for one
 head count once.
+
+## Authenticated CI strata observations
+
+`shipyard metrics scorecard --json` emits `strata` with schema
+`shipyard-metrics-strata/v1`, job units, and explicit provenance and coverage.
+Recent-N imports remain partial even when every observed job is authenticated;
+minimum-sample policy belongs to consumers. Unknown, unverified, and synthetic
+populations cannot qualify as production. Source metadata identifies the clean
+Git checkout compiled by the producer, not its dependency or toolchain trust.
+Dirty or unverifiable builds report source metadata unavailable. Merge receipts
+remain necessary for safe-merge throughput and per-change cost claims.
