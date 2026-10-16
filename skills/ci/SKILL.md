@@ -3891,3 +3891,7 @@ unconfirmed state, not an absent daemon. `daemon stop` and `daemon refresh` fail
 in that state, preserving runtime evidence; do not treat an IPC write or vanished
 socket alone as proof of process exit. A stale PID whose process is gone remains
 ordinary absence, while an unknown live PID must never be signaled.
+Inspect the preserved PID and daemon status to establish ownership and exit, then
+retry refresh; do not delete runtime files merely because status is unavailable.
+Refused stale sockets with no valid live PID are recovered automatically, while
+invalid PID contents remain explicit uncertainty.

@@ -1153,7 +1153,12 @@ fn stop_running_with_status(
         pid == std::process::id() || (pid_alive(pid) && process_looks_like_shipyard_daemon(pid))
     });
 
-    let stop_requested = socket_path.exists() && send_stop_request(&socket_path).is_ok();
+    let stop_attempt = socket_path
+        .exists()
+        .then(|| send_stop_request(&socket_path));
+    let stop_requested = matches!(stop_attempt, Some(Ok(())));
+    let endpoint_unreachable = matches!(stop_attempt, Some(Err(ref error))
+        if matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound));
 
     // Status is an observation, not proof of absence. A reachable IPC endpoint
     // still needs its shutdown observed when the initial status request failed.
@@ -1182,6 +1187,10 @@ fn stop_running_with_status(
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
+                #[cfg(unix)]
+                if pid_path.exists() && read_pid_file(&pid_path) != pid {
+                    return DaemonStopOutcome::Unconfirmed;
+                }
                 let _ = remove_protected_file(&pid_path);
                 return DaemonStopOutcome::Stopped;
             }
@@ -1196,6 +1205,9 @@ fn stop_running_with_status(
     {
         let stopped = terminate_daemon_pid(pid, Duration::from_secs(3));
         if stopped {
+            if pid_path.exists() && read_pid_file(&pid_path) != Some(pid) {
+                return DaemonStopOutcome::Unconfirmed;
+            }
             let _ = cleanup_stale_runtime_files(&daemon_dir);
         }
         return if stopped {
@@ -1205,18 +1217,21 @@ fn stop_running_with_status(
         };
     }
 
-    // Do not erase the only ownership/endpoint evidence while a daemon may
-    // still be alive. Refresh must refuse ambiguous shutdown rather than
-    // interpreting our cleanup as proof that spawning a replacement is safe.
-    if socket_path.exists() || socket_path.is_symlink() {
-        return DaemonStopOutcome::Unconfirmed;
-    }
+    // Preserve uncertain ownership; a refused endpoint with absent/dead PID
+    // is ordinary crash residue and remains recoverable.
     #[cfg(unix)]
-    if (pid.is_none() && (pid_path.exists() || pid_path.is_symlink())) || pid.is_some_and(pid_alive)
+    if (pid.is_none() && (pid_path.exists() || pid_path.is_symlink()))
+        || pid.is_some_and(pid_alive)
+        || read_pid_file(&pid_path).filter(|pid| *pid > 0) != pid
     {
         return DaemonStopOutcome::Unconfirmed;
     }
-    if pid_path.exists() {
+    if socket_path.exists() || socket_path.is_symlink() {
+        if was_running || stop_requested || !endpoint_unreachable {
+            return DaemonStopOutcome::Unconfirmed;
+        }
+        let _ = cleanup_stale_runtime_files(&daemon_dir);
+    } else if pid_path.exists() {
         let _ = cleanup_stale_runtime_files(&daemon_dir);
     }
     DaemonStopOutcome::Absent
@@ -4050,6 +4065,80 @@ mod tests {
             wait_for_exit(pid, Duration::from_secs(5)),
             "stub {pid} kept looping after its owner exited"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_run_stop_subprocess_fixture() {
+        let Some(state_dir) = std::env::var_os("SHIPYARD_STOP_TEST_STATE") else {
+            return;
+        };
+        // A killed parent cannot leave this fixture running indefinitely.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(30));
+            std::process::exit(124);
+        });
+        let state_dir = std::path::PathBuf::from(state_dir);
+        run_blocking(DaemonRunConfig {
+            mode: RuntimeMode::Isolated,
+            global_dir: state_dir.clone(),
+            state_dir,
+            repos: Vec::new(),
+        })
+        .expect("fixture runtime");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_initial_status_still_observes_owned_process_exit() {
+        use std::os::unix::process::CommandExt as _;
+
+        let _tree_test = lock_process_tree_for_test();
+        for replacement_pid in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "daemon_runtime::tests::daemon_run_stop_subprocess_fixture",
+                    "--nocapture",
+                ])
+                .env("SHIPYARD_STOP_TEST_STATE", temp.path())
+                .process_group(0)
+                .spawn()
+                .expect("fixture child");
+            let mut owned = DaemonStub { child };
+            await_daemon_serving(temp.path());
+            let child_pid = owned.child.id();
+            let pid_path = temp.path().join("daemon/daemon.pid");
+            let mut first = true;
+            let outcome = super::stop_running_with_status(temp.path(), |state| {
+                if std::mem::take(&mut first) {
+                    false
+                } else if replacement_pid {
+                    assert!(wait_until(Duration::from_secs(5), || !pid_alive(child_pid)));
+                    std::fs::write(&pid_path, std::process::id().to_string())
+                        .expect("replacement pid");
+                    false
+                } else {
+                    read_daemon_status(state).is_some()
+                }
+            });
+            let exit = owned
+                .child
+                .wait_timeout(Duration::from_secs(10))
+                .expect("child wait");
+            assert_eq!(
+                outcome,
+                if replacement_pid {
+                    super::DaemonStopOutcome::Unconfirmed
+                } else {
+                    super::DaemonStopOutcome::Stopped
+                }
+            );
+            assert!(exit.is_some_and(|result| result.success()));
+            assert_eq!(pid_path.exists(), replacement_pid);
+            assert!(!temp.path().join("daemon/daemon.sock").exists());
+        }
     }
 
     #[cfg(unix)]

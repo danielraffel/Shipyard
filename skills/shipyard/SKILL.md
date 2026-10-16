@@ -5003,3 +5003,7 @@ replacement; a missing PID cannot turn socket disappearance into a process-exit
 claim. Unknown live PIDs are never signaled or erased as stale evidence. When
 shutdown remains unconfirmed, `daemon stop` and `daemon refresh` fail and preserve
 remaining runtime evidence instead of reporting success or spawning a replacement.
+Inspect the recorded PID and daemon status to establish ownership and exit before
+retrying refresh. Refused stale endpoints with an absent/dead PID recover normally;
+invalid PID files remain unconfirmed. Do not erase runtime evidence merely because
+a status probe failed.
