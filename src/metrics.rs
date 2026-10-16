@@ -4,6 +4,7 @@ pub mod freshness;
 pub mod github_import;
 pub mod import_schedule;
 pub mod job_name;
+pub mod merge_receipt;
 pub mod project_key;
 pub mod proxy;
 mod proxy_store;
@@ -24,6 +25,23 @@ pub use project_key::ProjectKey;
 #[derive(Debug)]
 pub struct MetricsStore {
     path: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ExistingMergeReceipt {
+    schema: String,
+    repo: String,
+    project: String,
+    base_branch: String,
+    pr: i64,
+    head_sha: String,
+    validated_head_sha: String,
+    merge_commit_sha: String,
+    merged_at: String,
+    source: String,
+    required_checks_json: String,
+    gate_receipt_sha256: String,
+    evidence: String,
 }
 
 /// Input for a low-friction `shipyard metrics record` call.
@@ -293,10 +311,12 @@ pub struct StewardshipScorecard {
     pub comparison: proxy::Comparison,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ScorecardCoverage {
     pub status: String,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
 }
 
 type ScorecardSample = (
@@ -330,6 +350,7 @@ impl MetricsStore {
         Connection::open(&self.path)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn migrate(&self) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.connect()?;
         conn.execute_batch(
@@ -395,6 +416,26 @@ impl MetricsStore {
               cache_hit INTEGER,
               artifact_path TEXT
             );
+            CREATE TABLE IF NOT EXISTS merge_receipts (
+              receipt_id TEXT PRIMARY KEY,
+              schema TEXT NOT NULL,
+              repo TEXT NOT NULL,
+              project TEXT NOT NULL,
+              base_branch TEXT NOT NULL,
+              pr INTEGER NOT NULL,
+              head_sha TEXT NOT NULL,
+              validated_head_sha TEXT NOT NULL,
+              merge_commit_sha TEXT NOT NULL,
+              merged_at TEXT NOT NULL,
+              safe_merge INTEGER NOT NULL,
+              source TEXT NOT NULL,
+              required_checks_json TEXT NOT NULL,
+              gate_receipt_sha256 TEXT NOT NULL,
+              evidence TEXT NOT NULL,
+              imported_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS merge_receipts_project_merged
+              ON merge_receipts(project, merged_at);
             CREATE TABLE IF NOT EXISTS repeated_work_shadow (
               id INTEGER PRIMARY KEY,
               observed_at TEXT NOT NULL,
@@ -414,6 +455,18 @@ impl MetricsStore {
         add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
         add_column_if_missing(&conn, "jobs", "labels_json", "TEXT")?;
         add_column_if_missing(&conn, "jobs", "correlation_id", "TEXT")?;
+        add_column_if_missing(
+            &conn,
+            "merge_receipts",
+            "required_checks_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "merge_receipts",
+            "gate_receipt_sha256",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
         // Older stores only had the provider/external-id identity. Backfill
         // the new stable correlation key without changing any row identity.
         conn.execute(
@@ -425,6 +478,137 @@ impl MetricsStore {
             [],
         )?;
         Ok(())
+    }
+
+    /// Import validated merge receipts atomically. Duplicate receipt IDs are
+    /// idempotent only when the payload is byte-for-byte equivalent.
+    pub fn import_merge_receipts(
+        &self,
+        receipts: &[crate::metrics::merge_receipt::MergeReceipt],
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let mut imported = 0;
+        for receipt in receipts {
+            receipt
+                .validate()
+                .map_err(|e| format!("invalid merge receipt: {e}"))?;
+            // Repository and project are durable ownership keys. Normalize
+            // them before both conflict checks and storage so case/outer
+            // whitespace cannot create a second identity for one PR.
+            let repo = crate::evidence::canonical_repository(&receipt.repo);
+            let project_input = crate::evidence::canonical_repository(&receipt.project);
+            let (project, _) =
+                crate::metrics::project_key::normalize_for_write(&project_input, Some(&repo));
+            let existing: Option<ExistingMergeReceipt> = tx.query_row(
+                "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
+                [&receipt.receipt_id],
+                |row| Ok(ExistingMergeReceipt {
+                    schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?, pr: row.get(4)?,
+                    head_sha: row.get(5)?, validated_head_sha: row.get(6)?, merge_commit_sha: row.get(7)?, merged_at: row.get(8)?,
+                    source: row.get(9)?, required_checks_json: row.get(10)?, gate_receipt_sha256: row.get(11)?, evidence: row.get(12)?,
+                }),
+            ).optional()?;
+            if let Some(existing) = existing {
+                let incoming = ExistingMergeReceipt {
+                    schema: receipt.schema.clone(),
+                    repo: repo.clone(),
+                    project: project.clone(),
+                    base_branch: receipt.base_branch.clone(),
+                    pr: receipt.pr,
+                    head_sha: receipt.head_sha.clone(),
+                    validated_head_sha: receipt.validated_head_sha.clone(),
+                    merge_commit_sha: receipt.merge_commit_sha.clone(),
+                    merged_at: receipt.merged_at.to_rfc3339(),
+                    source: receipt.source.clone(),
+                    required_checks_json: serde_json::to_string(&receipt.required_checks)?,
+                    gate_receipt_sha256: receipt.gate_receipt_sha256.clone(),
+                    evidence: receipt.evidence.clone(),
+                };
+                if existing != incoming {
+                    return Err(format!(
+                        "merge receipt {} conflicts with existing payload",
+                        receipt.receipt_id
+                    )
+                    .into());
+                }
+                continue;
+            }
+            let semantic_conflict: Option<String> = tx.query_row(
+                "SELECT receipt_id FROM merge_receipts WHERE lower(trim(repo)) = ?1 AND pr = ?2 AND receipt_id <> ?3 AND (lower(trim(project)) <> ?4 OR base_branch <> ?5 OR head_sha <> ?6 OR merge_commit_sha <> ?7)",
+                rusqlite::params![repo, receipt.pr, receipt.receipt_id, project, receipt.base_branch, receipt.head_sha, receipt.merge_commit_sha],
+                |row| row.get(0),
+            ).optional()?;
+            if let Some(other) = semantic_conflict {
+                return Err(format!(
+                    "merge receipt {} conflicts with semantic receipt {other}",
+                    receipt.receipt_id
+                )
+                .into());
+            }
+            tx.execute("INSERT INTO merge_receipts (receipt_id,schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,?15)", rusqlite::params![receipt.receipt_id, receipt.schema, repo, project, receipt.base_branch, receipt.pr, receipt.head_sha, receipt.validated_head_sha, receipt.merge_commit_sha, receipt.merged_at.to_rfc3339(), receipt.source, serde_json::to_string(&receipt.required_checks)?, receipt.gate_receipt_sha256, receipt.evidence, Utc::now().to_rfc3339()])?;
+            imported += 1;
+        }
+        tx.commit()?;
+        Ok(imported)
+    }
+
+    /// Count safe merged heads and the failed/cancelled compute attached to
+    /// those exact PR identities in the scorecard window.
+    pub(crate) fn safe_merge_summary(
+        &self,
+        project: &str,
+        cutoff: &str,
+    ) -> Result<(usize, usize, i64, usize), Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        let key = crate::metrics::project_key::ProjectKey::parse(project);
+        let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
+        let project_filter = crate::metrics::project_key::sql_filter("project", "repo");
+        let safe: Vec<(String, String, i64)> = {
+            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4)"))?;
+            q.query_map(rusqlite::params![any, short, full, cutoff], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        let unique = safe.into_iter().collect::<std::collections::BTreeSet<_>>();
+        let total = unique.len();
+        let mut joined = 0_usize;
+        let mut wasted = 0_i64;
+        let mut samples = 0_usize;
+        for (repo, head, pr) in unique {
+            let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND run.sha = ?2 AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
+            let mut matched = false;
+            let mut invalid_duration = false;
+            let mut head_wasted = 0_i64;
+            let mut head_samples = 0_usize;
+            for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+            })? {
+                let (status, ms) = row?;
+                if ms.is_none_or(|v| v < 0) {
+                    // A completed row with NULL/negative duration cannot
+                    // substantiate a cost join. Keep the merge unjoined so
+                    // the scorecard cannot report a zero-cost claim.
+                    invalid_duration = true;
+                    continue;
+                }
+                matched = true;
+                if crate::metrics::proxy::is_failure(&status)
+                    || crate::metrics::proxy::is_cancelled(&status)
+                {
+                    head_wasted = head_wasted.saturating_add(ms.unwrap());
+                    head_samples += 1;
+                }
+            }
+            if matched && !invalid_duration {
+                joined += 1;
+                wasted = wasted.saturating_add(head_wasted);
+                samples += head_samples;
+            }
+        }
+        Ok((total, joined, wasted, samples))
     }
 
     /// Record a queue repeated-work observation without affecting queue
@@ -1026,11 +1210,13 @@ impl MetricsStore {
             ScorecardCoverage {
                 status: "unavailable".to_owned(),
                 reason: "no completed job samples include pull-request identity".to_owned(),
+                value: None,
             }
         } else if identified_pull_request_samples == samples.len() {
             ScorecardCoverage {
                 status: "available".to_owned(),
                 reason: "every completed job sample includes pull-request identity".to_owned(),
+                value: None,
             }
         } else {
             ScorecardCoverage {
@@ -1039,10 +1225,13 @@ impl MetricsStore {
                     "{identified_pull_request_samples} of {} completed job samples include pull-request identity",
                     samples.len()
                 ),
+                value: None,
             }
         };
         let cache = load_scorecard_cache_samples(&conn, project, &cutoff)?;
         let cache_hits = cache.iter().filter(|hit| **hit).count();
+        let (safe_merge_count, joined_merge_count, wasted_merge_ms, wasted_merge_samples) =
+            self.safe_merge_summary(project, &cutoff)?;
         let now = Utc::now();
         let (proxies, comparison) = proxy_store::scorecard_window(
             &proxy_store::load_samples(&conn, Some(project))?,
@@ -1077,8 +1266,38 @@ impl MetricsStore {
             coordination_rework_minutes: millis_to_minutes(
                 rework_compute_ms.saturating_add(coordination_ms),
             ),
-            safely_merged_changes: unavailable_merge_coverage(),
-            wasted_compute_per_safely_merged_change: unavailable_merge_coverage(),
+            safely_merged_changes: ScorecardCoverage {
+                status: if joined_merge_count == 0 {
+                    "unavailable"
+                } else if joined_merge_count < safe_merge_count {
+                    "partial"
+                } else {
+                    "available"
+                }
+                .to_owned(),
+                reason: format!(
+                    "{safe_merge_count} distinct safe receipt heads; {joined_merge_count} have matched completed job evidence"
+                ),
+                #[allow(clippy::cast_precision_loss)]
+                value: (safe_merge_count > 0).then_some(safe_merge_count as f64),
+            },
+            wasted_compute_per_safely_merged_change: if joined_merge_count == 0 {
+                unavailable_merge_coverage()
+            } else {
+                ScorecardCoverage {
+                    status: if joined_merge_count < safe_merge_count {
+                        "partial".to_owned()
+                    } else {
+                        "available".to_owned()
+                    },
+                    reason: format!(
+                        "{:.6} wasted compute minutes per safely merged change from {} failed/cancelled job samples",
+                        wasted_merge_per_change(wasted_merge_ms, joined_merge_count),
+                        wasted_merge_samples
+                    ),
+                    value: Some(wasted_merge_per_change(wasted_merge_ms, joined_merge_count)),
+                }
+            },
             distinct_pull_requests,
             pull_requests_per_day: pull_requests_per_day(distinct_pull_requests, since_days),
             pull_request_throughput,
@@ -1089,10 +1308,12 @@ impl MetricsStore {
                 status: "unavailable".to_owned(),
                 reason: "job metrics do not store durable submission and receipt timestamps"
                     .to_owned(),
+                value: None,
             },
             model_token_use: ScorecardCoverage {
                 status: "unavailable".to_owned(),
                 reason: "job metrics do not store model call or token counters".to_owned(),
+                value: None,
             },
             basis: basis.as_str(),
             proxies,
@@ -1183,10 +1404,17 @@ fn millis_to_minutes(milliseconds: i64) -> f64 {
     milliseconds as f64 / 60_000.0
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn wasted_merge_per_change(milliseconds: i64, changes: usize) -> f64 {
+    milliseconds as f64 / 60_000.0 / changes as f64
+}
+
+#[allow(clippy::cast_precision_loss)]
 fn unavailable_merge_coverage() -> ScorecardCoverage {
     ScorecardCoverage {
         status: "unavailable".to_owned(),
         reason: "no durable merge receipt joins a PR head to a safely merged change".to_owned(),
+        value: None,
     }
 }
 
@@ -1211,6 +1439,7 @@ fn coverage_for_samples(measured: usize, total: usize, description: &str) -> Sco
     ScorecardCoverage {
         status: status.to_owned(),
         reason: format!("{measured} of {total} {description}"),
+        value: None,
     }
 }
 
@@ -2301,6 +2530,183 @@ mod tests {
         );
     }
 
+    fn test_receipt(
+        id: &str,
+        repo: &str,
+        project: &str,
+        pr: i64,
+        head: char,
+    ) -> crate::metrics::merge_receipt::MergeReceipt {
+        crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
+            receipt_id: id.to_owned(),
+            repo: repo.to_owned(),
+            project: project.to_owned(),
+            base_branch: "main".to_owned(),
+            pr,
+            head_sha: head.to_string().repeat(40),
+            validated_head_sha: head.to_string().repeat(40),
+            merge_commit_sha: "b".repeat(40),
+            merged_at: Utc::now(),
+            safe_merge: true,
+            source: "shipyard".to_owned(),
+            required_checks: vec!["macos".to_owned()],
+            gate_receipt_sha256: "c".repeat(64),
+            evidence: format!("sha256:{id}"),
+        }
+    }
+
+    #[test]
+    fn merge_receipt_import_is_atomic_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let first = test_receipt("atomic-1", "owner/repo", "repo", 1, 'a');
+        let mut bad = test_receipt("atomic-2", "owner/repo", "repo", 2, 'd');
+        bad.head_sha = "BAD".into();
+        assert!(store.import_merge_receipts(&[first.clone(), bad]).is_err());
+        let count: i64 = store
+            .connect()
+            .unwrap()
+            .query_row("SELECT count(*) FROM merge_receipts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(
+            store
+                .import_merge_receipts(std::slice::from_ref(&first))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .import_merge_receipts(std::slice::from_ref(&first))
+                .unwrap(),
+            0
+        );
+        let mut changed = first;
+        changed.evidence = "sha256:changed".into();
+        assert!(store.import_merge_receipts(&[changed]).is_err());
+    }
+
+    #[test]
+    fn merge_receipt_semantic_conflicts_cover_base_head_and_merge() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let base = test_receipt("semantic-1", "owner/repo", "repo", 7, 'a');
+        store
+            .import_merge_receipts(std::slice::from_ref(&base))
+            .unwrap();
+        for (id, mutate) in [
+            ("semantic-base", 0),
+            ("semantic-head", 1),
+            ("semantic-merge", 2),
+        ] {
+            let mut r = base.clone();
+            r.receipt_id = id.into();
+            if mutate == 0 {
+                r.base_branch = "release".into();
+            }
+            if mutate == 1 {
+                r.head_sha = "d".repeat(40);
+                r.validated_head_sha = r.head_sha.clone();
+            }
+            if mutate == 2 {
+                r.merge_commit_sha = "e".repeat(40);
+            }
+            assert!(store.import_merge_receipts(&[r]).is_err(), "{id}");
+        }
+    }
+
+    #[test]
+    fn safe_merge_summary_is_windowed_and_join_isolated() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 10, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=?1 WHERE pr=10",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        let mut inside = test_receipt("window-in", "OWNER/REPO", "repo", 10, 'a');
+        inside.merged_at = Utc::now();
+        let mut old = test_receipt("window-old", "owner/repo", "repo", 11, 'd');
+        old.merged_at = Utc::now() - Duration::days(10);
+        store.import_merge_receipts(&[inside, old]).unwrap();
+        let (total, joined, wasted, samples) = store
+            .safe_merge_summary(
+                "repo",
+                (Utc::now() - Duration::days(2)).to_rfc3339().as_str(),
+            )
+            .unwrap();
+        assert_eq!((total, joined, wasted, samples), (1, 1, 1000, 1));
+        let mut wrong_pr = test_receipt("wrong-pr", "owner/repo", "repo", 99, 'a');
+        store.import_merge_receipts(&[wrong_pr.clone()]).unwrap();
+        assert_eq!(
+            store
+                .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .1,
+            1
+        );
+        wrong_pr.repo = "other/repo".into();
+        wrong_pr.receipt_id = "wrong-repo".into();
+        assert!(
+            store.import_merge_receipts(&[wrong_pr]).is_err()
+                || store
+                    .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                    .unwrap()
+                    .1
+                    == 1
+        );
+    }
+
+    #[test]
+    fn safe_merge_summary_accepts_owner_and_short_project_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let receipt = test_receipt("alias-1", "owner/repo", "repo", 2, 'a');
+        store.import_merge_receipts(&[receipt]).unwrap();
+        assert_eq!(
+            store
+                .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            1
+        );
+        assert_eq!(
+            store
+                .safe_merge_summary("owner/repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            1
+        );
+    }
+
+    #[test]
+    fn safe_merge_summary_rejects_wrong_repo_pr_and_sha_joins() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 20, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=?1 WHERE pr=20",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        let mut wrong_sha = test_receipt("isolation-sha", "owner/repo", "repo", 20, 'd');
+        wrong_sha.merged_at = Utc::now();
+        let wrong_pr = test_receipt("isolation-pr", "owner/repo", "repo", 21, 'a');
+        let wrong_repo = test_receipt("isolation-repo", "other/repo", "repo", 20, 'a');
+        store
+            .import_merge_receipts(&[wrong_sha, wrong_pr, wrong_repo])
+            .unwrap();
+        let summary = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(summary.0, 3);
+        assert_eq!(summary.1, 0);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn insert_scorecard_sample_at(
         store: &MetricsStore,
@@ -2559,6 +2965,161 @@ mod tests {
         assert_eq!(scorecard.cache_samples, 3);
         assert_eq!(scorecard.cache_hits, 2);
         assert_eq!(scorecard.cache_hit_rate, Some(2.0 / 3.0));
+    }
+
+    #[test]
+    fn stewardship_scorecard_uses_only_imported_safe_merge_receipts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "failure", 60_000, 1_000, false);
+        let conn = store.connect().expect("metrics connection");
+        conn.execute(
+            "UPDATE runs SET repo = 'generous-corp/shipyard' WHERE pr = 41",
+            [],
+        )
+        .expect("repo identity");
+        conn.execute("UPDATE runs SET sha = ?1 WHERE pr = 41", [&"a".repeat(40)])
+            .expect("head identity");
+        let receipt = crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
+            receipt_id: "merge-41".to_owned(),
+            repo: "Generous-Corp/Shipyard".to_owned(),
+            project: "shipyard".to_owned(),
+            base_branch: "main".to_owned(),
+            pr: 41,
+            head_sha: "a".repeat(40),
+            validated_head_sha: "a".repeat(40),
+            merge_commit_sha: "b".repeat(40),
+            merged_at: Utc::now(),
+            safe_merge: true,
+            source: "shipyard".to_owned(),
+            required_checks: vec!["macos".to_owned()],
+            gate_receipt_sha256: "c".repeat(64),
+            evidence: "sha256:test".to_owned(),
+        };
+        let mut unmatched = receipt.clone();
+        unmatched.receipt_id = "merge-42".to_owned();
+        unmatched.pr = 42;
+        unmatched.head_sha = "d".repeat(40);
+        unmatched.validated_head_sha = unmatched.head_sha.clone();
+        assert_eq!(
+            store
+                .import_merge_receipts(&[receipt, unmatched])
+                .expect("import"),
+            2
+        );
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+        assert_eq!(scorecard.safely_merged_changes.status, "partial");
+        assert_eq!(scorecard.safely_merged_changes.value, Some(2.0));
+        assert!(
+            scorecard
+                .wasted_compute_per_safely_merged_change
+                .reason
+                .contains("1.000000")
+        );
+    }
+
+    #[test]
+    fn merge_receipts_normalize_keys_and_reject_semantic_project_conflicts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let receipt = crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
+            receipt_id: "merge-canonical-1".to_owned(),
+            repo: " Generous-Corp/Shipyard ".to_owned(),
+            project: " SHIPYARD ".to_owned(),
+            base_branch: "main".to_owned(),
+            pr: 41,
+            head_sha: "a".repeat(40),
+            validated_head_sha: "a".repeat(40),
+            merge_commit_sha: "b".repeat(40),
+            merged_at: Utc::now(),
+            safe_merge: true,
+            source: "shipyard".to_owned(),
+            required_checks: vec!["macos".to_owned()],
+            gate_receipt_sha256: "c".repeat(64),
+            evidence: "sha256:canonical".to_owned(),
+        };
+        assert_eq!(
+            store
+                .import_merge_receipts(std::slice::from_ref(&receipt))
+                .unwrap(),
+            1
+        );
+        let conn = store.connect().unwrap();
+        let keys: (String, String) = conn
+            .query_row("SELECT repo, project FROM merge_receipts", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            keys,
+            ("generous-corp/shipyard".to_owned(), "shipyard".to_owned())
+        );
+
+        let mut conflicting = receipt;
+        conflicting.receipt_id = "merge-canonical-2".to_owned();
+        conflicting.project = "other-project".to_owned();
+        assert!(store.import_merge_receipts(&[conflicting]).is_err());
+    }
+
+    #[test]
+    fn safe_merge_summary_rejects_null_or_negative_durations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "failure", 60_000, 1_000, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo = 'generous-corp/shipyard', sha = ?1 WHERE pr = 41",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs SET total_ms = NULL WHERE job = 'job-41-60000'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (run_id, job, completed_at, total_ms, status) SELECT run_id, 'job-41-valid', completed_at, 500, 'failure' FROM jobs WHERE job = 'job-41-60000'",
+            [],
+        ).unwrap();
+        let receipt = crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
+            receipt_id: "merge-duration-1".to_owned(),
+            repo: "GENEROUS-CORP/SHIPYARD".to_owned(),
+            project: "shipyard".to_owned(),
+            base_branch: "main".to_owned(),
+            pr: 41,
+            head_sha: "a".repeat(40),
+            validated_head_sha: "a".repeat(40),
+            merge_commit_sha: "b".repeat(40),
+            merged_at: Utc::now(),
+            safe_merge: true,
+            source: "shipyard".to_owned(),
+            required_checks: vec!["macos".to_owned()],
+            gate_receipt_sha256: "c".repeat(64),
+            evidence: "sha256:duration".to_owned(),
+        };
+        store.import_merge_receipts(&[receipt]).unwrap();
+        let summary = store
+            .safe_merge_summary("shipyard", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(summary.0, 1);
+        assert_eq!(summary.1, 0);
+        conn.execute(
+            "UPDATE jobs SET total_ms = -1 WHERE job = 'job-41-60000'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .safe_merge_summary("shipyard", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .1,
+            0
+        );
     }
 
     #[test]

@@ -4970,3 +4970,12 @@ is the endpoint everybody reaches for first. The real-world fixture asserts
 both that `determine_queue` reports the queue **and** that the shortcut,
 handed the identical payload, answers `absent`. A test that has never been run
 against a wrong implementation has not been shown to be capable of failing.
+
+### Durable safe-merge accounting
+
+`metrics import merge-receipt` accepts only `shipyard-merge-receipt/v1` records
+with an exact validated head, non-empty required-check provenance, and a
+format-validated gate-receipt SHA-256. Scorecards derive safe-merge counts and wasted
+compute from those receipts and exact repo/PR joins; PR counts and GitHub
+`merged_at` fields are not substitutes. Missing joined job evidence is
+`partial` or `unavailable`, never a zero-cost merge.

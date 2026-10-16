@@ -3863,3 +3863,10 @@ also rejects missing or malformed GraphQL connection `nodes`/`pageInfo`, and
 the digest rejects a PR URL whose repository path does not match its census.
 Malformed top-level GraphQL errors, required policy values, or label/assignee
 nodes are also fatal; they must not be filtered into an empty result.
+
+### Merge receipt import provenance
+
+The metrics merge-receipt importer is telemetry only. It requires a
+`shipyard-merge-receipt/v1` record with the exact validated head, required-check
+list, and gate receipt hash; GitHub merged PR counts cannot authorize a safe
+merge denominator or replace gate evidence.

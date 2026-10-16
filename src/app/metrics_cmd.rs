@@ -250,6 +250,23 @@ pub(super) fn metrics_command<W: Write>(
                     format!("imported {imported} tartci metric rows")
                 })?;
             }
+            MetricsImportCommand::MergeReceipt(args) => {
+                let receipts = crate::metrics::merge_receipt::parse_path(args.file.as_deref())
+                    .map_err(|error| {
+                        CliFailure::new(2, format!("merge receipt import failed: {error}"))
+                    })?;
+                let imported = store.import_merge_receipts(&receipts).map_err(|error| {
+                    CliFailure::new(1, format!("merge receipt import failed: {error}"))
+                })?;
+                let output = MetricsImportOutput {
+                    database: store.path().display().to_string(),
+                    source: "merge-receipt".to_owned(),
+                    imported,
+                };
+                write_output(stdout, json_output, &output, || {
+                    format!("imported {imported} merge receipts")
+                })?;
+            }
             MetricsImportCommand::Github(args) => {
                 let imported = import_github(&store, &args)?;
                 let output = MetricsImportOutput {
@@ -851,6 +868,7 @@ fn _json_debug(value: &impl Serialize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::cli::MetricsImportMergeReceiptArgs;
 
     fn no_freshness_flags() -> MetricsFreshnessArgs {
         MetricsFreshnessArgs {
@@ -952,6 +970,43 @@ mod tests {
         assert!(trend["rows"].is_array());
         assert!(trend["trend"].is_array());
         assert_eq!(trend["basis"], "wall_time");
+    }
+
+    #[test]
+    fn merge_receipt_cli_reports_parse_and_conflict_exit_codes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("receipt.json");
+        let valid = serde_json::json!({"schema":"shipyard-merge-receipt/v1","receipt_id":"cli-1","repo":"owner/repo","project":"repo","base_branch":"main","pr":1,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","validated_head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","merge_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","merged_at":"2026-10-16T00:00:00Z","safe_merge":true,"source":"shipyard","required_checks":["macos"],"gate_receipt_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","evidence":"sha256:cli"});
+        std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
+        let run = |file: Option<std::path::PathBuf>| {
+            let mut out = Vec::new();
+            metrics_command(
+                MetricsCommand::Import {
+                    source: MetricsImportCommand::MergeReceipt(MetricsImportMergeReceiptArgs {
+                        file,
+                    }),
+                },
+                temp.path(),
+                None,
+                true,
+                &mut out,
+            )
+        };
+        assert_eq!(
+            run(Some(path.clone())).unwrap(),
+            std::process::ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run(Some(path.clone())).unwrap(),
+            std::process::ExitCode::SUCCESS
+        );
+        let bad = temp.path().join("bad.json");
+        std::fs::write(&bad, b"not json").unwrap();
+        assert_eq!(run(Some(bad)).unwrap_err().code, 2);
+        let mut changed = valid;
+        changed["evidence"] = serde_json::json!("sha256:changed");
+        std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_eq!(run(Some(path)).unwrap_err().code, 1);
     }
 
     #[test]
