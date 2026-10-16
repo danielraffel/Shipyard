@@ -994,6 +994,7 @@ fn repeated_work_observations(jobs: &[Job], job: &Job) -> Vec<RepeatedWorkShadow
             crate::job::ValidationMode::Full => "full",
             crate::job::ValidationMode::Smoke => "smoke",
         },
+        "kind": job.kind,
         "workload_scope": &job.workload_scope,
     })
     .to_string();
