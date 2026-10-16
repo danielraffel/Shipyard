@@ -1,8 +1,9 @@
 # Repeated-work elimination shadow slice
 
-Status: implementation in progress on `feat/repeated-work-shadow-20261016` (2026-10-16).
+Status: implementation complete; PR 863 is open and intentionally unarmed on
+`feat/repeated-work-shadow-20261016` (2026-10-16).
 
-Base: `origin/main` at `79c1399da1203ea94f68db4fb78fd53d7f6b2724`.
+Base: `origin/main` at `ecec8359223d981751e51a943371471b441a6fe0`.
 
 Dependency: `FLEET-BASELINE` (fleet readiness is an input to later rollout
 decisions; this slice does not modify fleet configuration or require a fleet
@@ -33,6 +34,9 @@ so an additive table there is the smallest auditable surface.
 
 ## Validation
 
-Focused queue and metrics tests will cover both classifications, persistence,
-and the no-authority-change behavior. A live FLEET-BASELINE receipt is not
+Focused queue and metrics tests cover both classifications, persistence, and
+the no-authority-change behavior. Local clippy passes with the repository's
+pre-existing unknown-lint warning. A live FLEET-BASELINE receipt is not
 required for this shadow-only accounting change.
+
+PR: https://github.com/danielraffel/Shipyard/pull/863
