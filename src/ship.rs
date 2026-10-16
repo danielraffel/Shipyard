@@ -2022,41 +2022,48 @@ fn recover_foreground_running_jobs_for_drain(
 }
 
 fn envelope_matches_foreground_job(job: &Job, envelope: &QueuedExecutionEnvelope) -> bool {
-    let (kind, target_names, local_only, expected_plan, workload_scope) = match &envelope.request {
-        QueuedExecutionRequest::Run(request) => (
-            JobKind::Run,
-            request
-                .targets
-                .iter()
-                .map(|target| target.name.clone())
-                .collect::<Vec<_>>(),
-            targets_are_typed_local(&request.targets),
-            request
-                .to_execution_request()
-                .ok()
-                .map(|request| JobResourcePlan::from_run_request(&envelope.cwd, &request)),
-            crate::queue_request::run_workload_scope(&envelope.cwd),
-        ),
-        QueuedExecutionRequest::Ship(request) => (
-            JobKind::Ship,
-            request
-                .targets
-                .iter()
-                .map(|target| target.name.clone())
-                .collect::<Vec<_>>(),
-            targets_are_typed_local(&request.targets),
-            request
-                .to_execution_request()
-                .ok()
-                .map(|request| JobResourcePlan::from_ship_request(&envelope.cwd, &request)),
-            format!(
-                "ship:{}:pr-{}",
-                canonical_repository(&request.repo),
-                request.pr
+    let (kind, branch, mode, target_names, local_only, expected_plan, workload_scope) =
+        match &envelope.request {
+            QueuedExecutionRequest::Run(request) => (
+                JobKind::Run,
+                request.branch.as_str(),
+                request.mode,
+                request
+                    .targets
+                    .iter()
+                    .map(|target| target.name.clone())
+                    .collect::<Vec<_>>(),
+                targets_are_typed_local(&request.targets),
+                request
+                    .to_execution_request()
+                    .ok()
+                    .map(|request| JobResourcePlan::from_run_request(&envelope.cwd, &request)),
+                crate::queue_request::run_workload_scope(&envelope.cwd),
             ),
-        ),
-    };
+            QueuedExecutionRequest::Ship(request) => (
+                JobKind::Ship,
+                request.branch.as_str(),
+                request.mode,
+                request
+                    .targets
+                    .iter()
+                    .map(|target| target.name.clone())
+                    .collect::<Vec<_>>(),
+                targets_are_typed_local(&request.targets),
+                request
+                    .to_execution_request()
+                    .ok()
+                    .map(|request| JobResourcePlan::from_ship_request(&envelope.cwd, &request)),
+                format!(
+                    "ship:{}:pr-{}",
+                    canonical_repository(&request.repo),
+                    request.pr
+                ),
+            ),
+        };
     job.kind == Some(kind)
+        && job.branch == branch
+        && job.mode == mode
         && job.sha
             == match &envelope.request {
                 QueuedExecutionRequest::Run(request) => request.sha.as_str(),
@@ -4366,6 +4373,18 @@ mod tests {
         wrong_targets.target_names = vec!["different-target".to_owned()];
         assert!(!envelope_matches_foreground_job(
             &wrong_targets,
+            &foreground_envelope
+        ));
+        let mut wrong_mode = foreground_job.clone();
+        wrong_mode.mode = ValidationMode::Smoke;
+        assert!(!envelope_matches_foreground_job(
+            &wrong_mode,
+            &foreground_envelope
+        ));
+        let mut wrong_branch = foreground_job.clone();
+        wrong_branch.branch = "feature/other-branch".to_owned();
+        assert!(!envelope_matches_foreground_job(
+            &wrong_branch,
             &foreground_envelope
         ));
         let mut wrong_plan = foreground_envelope.clone();
