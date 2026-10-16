@@ -2031,7 +2031,10 @@ fn envelope_matches_foreground_job(job: &Job, envelope: &QueuedExecutionEnvelope
                 .map(|target| target.name.clone())
                 .collect::<Vec<_>>(),
             targets_are_typed_local(&request.targets),
-            JobResourcePlan::from_run_request(&envelope.cwd, request),
+            request
+                .to_execution_request()
+                .ok()
+                .map(|request| JobResourcePlan::from_run_request(&envelope.cwd, &request)),
             crate::queue_request::run_workload_scope(&envelope.cwd),
         ),
         QueuedExecutionRequest::Ship(request) => (
@@ -2042,7 +2045,10 @@ fn envelope_matches_foreground_job(job: &Job, envelope: &QueuedExecutionEnvelope
                 .map(|target| target.name.clone())
                 .collect::<Vec<_>>(),
             targets_are_typed_local(&request.targets),
-            JobResourcePlan::from_ship_request(&envelope.cwd, request),
+            request
+                .to_execution_request()
+                .ok()
+                .map(|request| JobResourcePlan::from_ship_request(&envelope.cwd, &request)),
             format!(
                 "ship:{}:pr-{}",
                 canonical_repository(&request.repo),
@@ -2058,7 +2064,7 @@ fn envelope_matches_foreground_job(job: &Job, envelope: &QueuedExecutionEnvelope
             }
         && job.target_names == target_names
         && job.workload_scope.as_deref() == Some(workload_scope.as_str())
-        && envelope.resource_plan == expected_plan
+        && expected_plan.as_ref() == Some(&envelope.resource_plan)
         && local_only
 }
 
