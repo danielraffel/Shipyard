@@ -5,6 +5,13 @@ Last updated: 2026-05-27
 Primary handoff: `planning/phase-handoff-status.md`
 Supporting plan: `planning/local-mac-pool.md`
 
+Historical scope: the implementation notes below describe the P2b foreground
+cooperative scheduler as of that date. Current Unix local submissions also
+have a separate daemon-owned execution supervisor; statements below calling
+that migration future work are historical, not the current runtime contract.
+See [Queue reliability control](../docs/queue-reliability-control.md) for the
+current ownership boundary, restart/orphan controls, and kill switches.
+
 This document records the Phase P2b design and implementation status for
 concurrent execution of non-conflicting queued jobs. P2b is the step between
 Phase P2a host-pool leases/status and future Phase P3a adaptive Mac routing.
