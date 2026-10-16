@@ -20,7 +20,7 @@
  {
   "format": "shell_exit",
   "kind": "exit_code",
-  "subject": "tools/ci/pr_fast_tier.sh",
+  "subject": "1/1 Test #9113: wide-non-native-selftest ...........***Failed <dur>",
   "message": "exit code 1: 1/1 Test #9113: wide-non-native-selftest ...........***Failed <dur>",
   "location": "",
   "line": 4,

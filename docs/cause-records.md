@@ -36,8 +36,10 @@ A `ci.cause/v1` record holds:
   command the check printed passes the allowlist below; otherwise null;
 - `confidence` (`high`, `medium` or `low`), `source`, `extractor`,
   `named_at`, `supersedes`, and C2's `kind`, `location` and `step_failed`;
-- `retrospective`: true when the cause was named later from a stored log,
-  rather than while the job ran.
+- `retrospective`: true when the cause was named after the fact from a
+  stored log (a backfill or a scorecard read); false when it was named while
+  it was being watched, by the job itself or by `cause record` within one
+  pass of the job ending.
 
 A cause counts as named when its class is not `unknown` and its confidence is
 `high` or `medium`.
@@ -117,9 +119,15 @@ A bare exit that C2 cannot name gets one of two labels. A summary job, such
 as `linux` checking the jobs it needs, takes the cause of the named job in
 the same run attempt whose name it begins (`Linux (x64) [github-hosted]`),
 and says so in `inherited_from_job_id`; its evidence is that job's log line
-too, named by `evidence_job_id`, and so are its failing step and `step_failed`. Any other bare exit is labelled by
-its step and by the last line the step printed after its echoed script, and
-stays low confidence.
+too, named by `evidence_job_id`, and so are its failing step and `step_failed`.
+Any other bare exit is named by the last line the step printed after its
+echoed script (the step itself stays in `failed_step`), and stays low
+confidence.
+
+Since C2 v7 a CMake error is named by its call site and the first clause of
+its error, not by the bare command in parentheses (which named every
+`string(JSON ...)` error "string"), and a bare exit is named by the last line
+the step printed rather than the step's script line.
 
 A fix-link's `own_files` are the files of the pull request's own commits
 between the red and the fix. Some reds have no own commit chain, and these
@@ -129,6 +137,11 @@ are handled as follows:
 - **Force-pushed red:** own files come from the fix's place in the pull
   request's commit list, within 72 hours.
 - **Neither:** `own_files` is null, and `own_files_method` says why.
+
+A cause row is written live: `named_at` is the pass that named it (or the
+earlier time the job printed its own record), `retrospective` is false, and
+`named_at` minus `completed_at` is the time to cause. A red the first pass
+finds from before the observer started is still named at that pass.
 
 A red with no green yet stays pending and is looked at again on the next
 pass. Cancelled jobs are counted but get no cause row. A lock file in `--dir`

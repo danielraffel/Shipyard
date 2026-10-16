@@ -488,7 +488,10 @@ fn cause_row(
         pr: owner.pr,
         ..Place::default()
     };
-    let Some(mut cause) = cause::build(job, log.as_deref(), &place, job.completed_at.clone(), true)
+    // The observer names a red while it watches, so the cause is named at
+    // this pass, not after the fact: `named_at` minus `completed_at` is the
+    // time to cause. A record the job printed itself can only move it earlier.
+    let Some(mut cause) = cause::build(job, log.as_deref(), &place, Some(query.now.clone()), false)
     else {
         return Ok(None);
     };

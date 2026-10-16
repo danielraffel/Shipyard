@@ -1,5 +1,5 @@
-//! The fixture set in `tests/fixtures/c2/` is C2's contract, shared verbatim
-//! with EXP-A3's `c2_extract.py`; these tests mirror its own.
+//! The fixture set in `tests/fixtures/c2/` is C2's contract: every rule has a
+//! fixture, and `v6_signatures.json` pins what v7 left unchanged.
 use serde_json::Value;
 
 use super::*;
@@ -127,7 +127,7 @@ fn the_regressions_yield_their_expected_records() {
             "{name}"
         );
     }
-    assert_eq!(names.len(), 9);
+    assert_eq!(names.len(), 11);
 }
 
 fn gate_records(name: &str) -> Vec<Record> {
@@ -171,9 +171,13 @@ fn skill_sync_detail_drops_the_period() {
 }
 
 #[test]
-fn an_exits_tail_walks_past_step_settings() {
+fn an_exits_tail_never_names_a_step_setting_or_the_echoed_script() {
+    // The step printed nothing after its echoed script and settings: no
+    // `env:` value and no script line is taken as its output, and the step's
+    // script line names it.
     let records = extract(&read("regressions/exit_tail_env.log"));
-    assert_eq!(records[0].message, "exit code 1: ./guard.sh");
+    assert_eq!(records[0].message, "exit code 1");
+    assert_eq!(records[0].subject, "./guard.sh");
 }
 
 #[test]
@@ -281,12 +285,14 @@ fn an_infra_subject_has_its_class() {
 fn an_exits_tail_skips_step_settings() {
     let log = [
         "##[group]Run ./guard.sh",
-        "refusing: the head is stale",
+        "./guard.sh",
         "shell: /usr/bin/bash -e {0}",
         "env:",
         "  CARGO_HOME: /opt/cargo",
         "CCACHE_DIR: /tmp/cache",
         "##[endgroup]",
+        "refusing: the head is stale",
+        "CCACHE_DIR: /tmp/cache",
         "##[error]Process completed with exit code 1.",
     ]
     .join("\n");
@@ -295,4 +301,72 @@ fn an_exits_tail_skips_step_settings() {
         records[0].message,
         "exit code 1: refusing: the head is stale"
     );
+    assert_eq!(records[0].subject, "refusing: the head is stale");
+}
+
+#[test]
+fn a_cmake_error_is_named_by_its_call_site_not_its_command() {
+    let records: Vec<Record> = extract(&read("regressions/cmake_string_json.log"))
+        .into_iter()
+        .filter(|record| record.format == "cmake")
+        .collect();
+    let subjects: Vec<&str> = records
+        .iter()
+        .map(|record| record.subject.as_str())
+        .collect();
+    assert_eq!(
+        subjects,
+        [
+            "PulpConsumptionCensus.cmake:211 string sub-command JSON member 'units 1 targets' not found",
+            "PulpLinkFloor.cmake:463 string sub-command JSON failed parsing json string: * Line 1, Column 1",
+        ]
+    );
+    assert!(subjects.iter().all(|subject| *subject != "string"));
+}
+
+#[test]
+fn a_bare_exit_is_named_by_the_last_line_it_printed() {
+    let records = extract(&read("regressions/shell_exit_tail.log"));
+    let exit = records
+        .iter()
+        .find(|record| record.format == "shell_exit")
+        .expect("exit record");
+    assert_eq!(
+        exit.subject,
+        "ledger order check: 2 rows out of order in data/ledger.json"
+    );
+    // With nothing printed after the script, the step's script line stays.
+    let quiet = "##[group]Run python3 tools/scripts/test_gates.py\n##[endgroup]\n##[error]Process completed with exit code 1.\n";
+    let record = extract(quiet)
+        .into_iter()
+        .find(|record| record.format == "shell_exit")
+        .expect("exit record");
+    assert_eq!(record.subject, "python3 tools/scripts/test_gates.py");
+}
+
+#[test]
+fn v7_leaves_every_other_rules_signatures_as_v6_recorded_them() {
+    // v6_signatures.json is every fixture's records as the v6 extractor named
+    // them. v7 changes only cmake and shell_exit subjects, so every other
+    // record must keep its format, subject and line, and the backfill named
+    // by v4..v6 stays comparable for those rules.
+    let v6: std::collections::BTreeMap<String, Vec<(String, String, usize)>> =
+        serde_json::from_str(&read("v6_signatures.json")).expect("v6 snapshot");
+    let changed = ["cmake", "shell_exit"];
+    let mut compared = 0;
+    for (fixture, recorded) in &v6 {
+        let now: Vec<(String, String, usize)> = extract(&read(fixture))
+            .into_iter()
+            .filter(|record| !changed.contains(&record.format.as_str()))
+            .map(|record| (record.format, record.subject, record.line))
+            .collect();
+        let then: Vec<(String, String, usize)> = recorded
+            .iter()
+            .filter(|(format, _, _)| !changed.contains(&format.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(now, then, "{fixture}");
+        compared += then.len();
+    }
+    assert!(compared > 50, "compared {compared}");
 }

@@ -2,7 +2,7 @@
  {
   "format": "cmake",
   "kind": "config_error",
-  "subject": "message",
+  "subject": "PulpSkia.cmake:142 Skia prebuilt not found under external/skia-build/mac-gpu/lib/Release",
   "message": "Skia prebuilt not found under external/skia-build/mac-gpu/lib/Release",
   "location": "PulpSkia.cmake:142",
   "line": 2,

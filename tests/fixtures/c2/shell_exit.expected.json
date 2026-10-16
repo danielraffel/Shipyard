@@ -2,7 +2,7 @@
  {
   "format": "shell_exit",
   "kind": "exit_code",
-  "subject": "tools/scripts/gates.sh origin/main",
+  "subject": "skill-sync: FAIL",
   "message": "exit code 8: skill-sync: FAIL",
   "location": "",
   "line": 5,

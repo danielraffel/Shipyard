@@ -1,0 +1,20 @@
+[
+ {
+  "format": "cmake",
+  "kind": "config_error",
+  "subject": "PulpConsumptionCensus.cmake:211 string sub-command JSON member 'units 1 targets' not found",
+  "message": "string sub-command JSON member 'units 1 targets' not found.",
+  "location": "PulpConsumptionCensus.cmake:211",
+  "line": 1,
+  "step_failed": true
+ },
+ {
+  "format": "cmake",
+  "kind": "config_error",
+  "subject": "PulpLinkFloor.cmake:463 string sub-command JSON failed parsing json string: * Line 1, Column 1",
+  "message": "string sub-command JSON failed parsing json string: * Line 1, Column 1. Syntax error: value, object or array expected.",
+  "location": "PulpLinkFloor.cmake:463",
+  "line": 6,
+  "step_failed": true
+ }
+]

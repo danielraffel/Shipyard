@@ -521,6 +521,17 @@ line in the receipt (`foreign_writers`, printed by the workflow on failure)
 and on stderr. The failure string itself is unchanged because retained-lease
 recovery parses it. Do not run `flock`/`lsof` probes against that lock on a
 host while a sandbox canary is running: the probe itself is a foreign holder.
+
+## "Prior retained-lease receipt is not safely reconcilable"
+
+Every later Sandbox macOS run fails this way when an earlier run retained the
+host lease with a failure shape the guardian does not recognize. Read that
+run's `guardian-receipt.json` under `/tmp/shipyard-sandbox-m3-<run>-<attempt>`:
+its `failure` names the cause. Two shapes reconcile on the next run: both
+restore-production holder inspections timing out on the production
+writer-domain lock (`lsof` on a loaded host), and a fenced lease whose
+production daemon was replaced afterwards, which binds to the current daemon.
+Anything else still needs a guardian change; do not delete the lease by hand.
 ## Release publication waits for attestation
 
 `release.yml` keeps the release a draft until the macOS DMG is attested:
@@ -1585,15 +1596,19 @@ The record is EXP-A3's `to_ci_cause_v1` mapping of C2's first record:
 `failed_step`, `failure_class`, `format`, `signature`, `detail`, `evidence`
 (`log_line`, `excerpt`), `fix_hint`, `confidence`, `source`, `extractor`,
 `named_at`, `supersedes`, plus C2's `kind`, `location` and `step_failed` and
-`retrospective`. C2 (`src/diagnose/c2.rs`) is a port of EXP-A3's
-`c2_extract.py`; the fixture set in `tests/fixtures/c2/` is shared verbatim
-and is the contract, so a rule change lands in both with its fixture.
+`retrospective`. C2 (`src/diagnose/c2.rs`) is the fleet's one cause
+extractor; the fixture set in `tests/fixtures/c2/` is its contract, so a rule
+change lands with its fixture and a `c2::VERSION` bump. It began as a port of
+EXP-A3's `c2_extract.py`, which is frozen at version 5 as the reference behind
+EXP-A3's registered results and is not kept in step: do not port rule changes
+to it.
 Records from the step that ended in `##[error]` come first, so a retried
 assertion never outranks the runner dying. A make or ninja failure ranks
 below every runner and compiler record and is `low`: on its own it names the
 target that broke, not why. A cause is named when its class is
 not `unknown` and its confidence is `high` or `medium`. A generated-file drift check is `generated_drift`
-(class `drift`), named by its generator; its `fix_hint` is a suggested
+(class `drift`), named by its generator; (C2 v7 also names a CMake error by its call site and a bare exit by its last
+printed line); its `fix_hint` is a suggested
 `python3 tools/scripts/<name>.py ... --write` command matching the known
 generator shape, to review and run from a main-branch checkout. Shipyard never
 executes or auto-applies it. A bare exit is either inherited from the job a summary
@@ -1604,7 +1619,8 @@ line printed after the echoed script (`labelled_by: step`, still `low`). A
 fix-link whose red is not an ancestor of the fix recovers `own_files` from the
 pull request head a merge queue merged (`merge_queue_pr_head`) or, within 72
 hours, from the pull request's commit list (`post_force_push`). `shipyard cause record` is the read-only observer that writes
-live cause rows and fix-links into a labels archive in the backfill's layout. `diagnose` adds only
+live cause rows and fix-links into a labels archive in the backfill's layout. Its rows are
+live: `named_at` is the pass that named the red and `retrospective` is false. `diagnose` adds only
 GitHub's own record (a runner that never came, a supersede, a timeout) when
 the log names nothing more certain; a log with no recognized line still gets
 a `shell-exit` record, so the miss is counted. A job that named its own cause (`shipyard cause extract --log <captured

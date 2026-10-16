@@ -35,7 +35,7 @@ pub const DEFAULT_MAX_JOBS: usize = 200;
 /// Why a job over that budget was not read.
 pub const OVER_BUDGET: &str = "skipped: over the --causes-max-jobs budget";
 /// Cache key version: bump when a cause's shape or meaning changes.
-const EXTRACT_VERSION: u32 = 6;
+const EXTRACT_VERSION: u32 = 7;
 
 /// A red job whose cause could not be read, and why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

@@ -29,7 +29,7 @@
  {
   "format": "shell_exit",
   "kind": "exit_code",
-  "subject": "ctest --test-dir build --output-on-failure",
+  "subject": "12 - EqCurveView draws a low-pass as a shelf (Failed)",
   "message": "exit code 8: 12 - EqCurveView draws a low-pass as a shelf (Failed)",
   "location": "",
   "line": 21,

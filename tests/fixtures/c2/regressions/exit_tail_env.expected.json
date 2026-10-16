@@ -3,7 +3,7 @@
   "format": "shell_exit",
   "kind": "exit_code",
   "subject": "./guard.sh",
-  "message": "exit code 1: ./guard.sh",
+  "message": "exit code 1",
   "location": "",
   "line": 8,
   "step_failed": true
