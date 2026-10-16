@@ -356,6 +356,35 @@ class GuardianLifecycleTests(unittest.TestCase):
             active.production_identity_verified = True
             active.release()
 
+    def test_an_owner_that_wrote_done_and_exited_is_completion(self) -> None:
+        # m3, runs 38868946976 and 38876908735: the step touched done and
+        # exited between the guardian's done check and its owner check.
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            checks = []
+
+            def owner_exits_after_writing_done(pid: int, **_: object) -> str:
+                checks.append(pid)
+                active.done_file.touch()
+                return "ended"
+
+            with mock.patch.object(
+                guardian, "_process_start", side_effect=owner_exits_after_writing_done
+            ), mock.patch.object(guardian.time, "sleep"):
+                active.wait_for_owner()
+            self.assertEqual(len(checks), 1)
+
+    def test_an_owner_that_exited_without_done_is_still_owner_ended(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            with mock.patch.object(
+                guardian, "_process_start", return_value="ended"
+            ), mock.patch.object(guardian.time, "sleep"), self.assertRaisesRegex(
+                guardian.OwnerEnded, "Actions owner ended before canary completion"
+            ):
+                active.wait_for_owner()
+            self.assertFalse(active.done_file.exists())
+
     def test_reconciliation_lock_symlink_and_unsafe_mode_refuse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
