@@ -250,6 +250,23 @@ pub(super) fn metrics_command<W: Write>(
                     format!("imported {imported} tartci metric rows")
                 })?;
             }
+            MetricsImportCommand::MergeReceipt(args) => {
+                let receipts = crate::metrics::merge_receipt::parse_path(args.file.as_deref())
+                    .map_err(|error| {
+                        CliFailure::new(2, format!("merge receipt import failed: {error}"))
+                    })?;
+                let imported = store.import_merge_receipts(&receipts).map_err(|error| {
+                    CliFailure::new(1, format!("merge receipt import failed: {error}"))
+                })?;
+                let output = MetricsImportOutput {
+                    database: store.path().display().to_string(),
+                    source: "merge-receipt".to_owned(),
+                    imported,
+                };
+                write_output(stdout, json_output, &output, || {
+                    format!("imported {imported} merge receipts")
+                })?;
+            }
             MetricsImportCommand::Github(args) => {
                 let imported = import_github(&store, &args)?;
                 let output = MetricsImportOutput {

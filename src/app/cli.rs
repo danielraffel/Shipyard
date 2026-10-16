@@ -1846,6 +1846,8 @@ pub(crate) enum MetricsImportCommand {
     Tartci(MetricsImportTartciArgs),
     /// Import GitHub Actions jobs for recent workflow runs.
     Github(MetricsImportGithubArgs),
+    /// Import producer-authenticated protected-branch merge receipts (JSON/JSONL).
+    MergeReceipt(MetricsImportMergeReceiptArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1942,6 +1944,13 @@ pub(crate) struct MetricsRecordArgs {
 #[derive(Debug, Args)]
 pub(crate) struct MetricsImportTartciArgs {
     /// Read tartci runtime export JSON/JSONL from this file. Omit or pass `-` for stdin.
+    #[arg(long)]
+    pub(crate) file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsImportMergeReceiptArgs {
+    /// JSON array, one object, or JSONL file. Omit or pass `-` for stdin.
     #[arg(long)]
     pub(crate) file: Option<PathBuf>,
 }
