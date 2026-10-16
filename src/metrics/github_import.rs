@@ -207,62 +207,13 @@ pub fn import_github<E>(
             page = page.saturating_add(1);
         }
     }
-    // Validate the complete batch against persisted identities before the first
-    // write. The writer lease prevents another metrics writer from changing the
-    // database between this check and the sequential refreshes below.
-    let conn = Connection::open(store.path())
-        .map_err(|error| store_error(format!("GitHub metrics validation failed: {error}")))?;
-    let mut batch_identities = std::collections::HashMap::new();
-    for input in &pending_inputs {
-        if let Some(provider) = input.provider.as_deref() {
-            if let Some(existing) =
-                super::existing_job_id(&conn, provider, input.external_id.as_deref()).map_err(
-                    |error| store_error(format!("GitHub metrics validation failed: {error}")),
-                )?
-            {
-                super::ensure_refresh_identity_compatible(&conn, existing, input).map_err(
-                    |error| store_error(format!("GitHub metrics validation failed: {error}")),
-                )?;
-            }
-        }
-        if let (Some(provider), Some(external_id)) =
-            (input.provider.as_deref(), input.external_id.as_deref())
-        {
-            let key = format!("{provider}:{external_id}");
-            if let Some(previous) = batch_identities.insert(key, input) {
-                for (name, old, new) in [
-                    ("event", previous.event.as_deref(), input.event.as_deref()),
-                    (
-                        "head_sha",
-                        previous.head_sha.as_deref(),
-                        input.head_sha.as_deref(),
-                    ),
-                ] {
-                    if let (Some(old), Some(new)) = (old, new)
-                        && old != new
-                    {
-                        return Err(store_error(format!(
-                            "GitHub metrics batch identity conflict in {name}"
-                        )));
-                    }
-                }
-                if let (Some(old), Some(new)) = (previous.run_attempt, input.run_attempt)
-                    && old != new
-                {
-                    return Err(store_error(
-                        "GitHub metrics batch identity conflict in run_attempt".to_owned(),
-                    ));
-                }
-            }
-        }
+    if pending_inputs.is_empty() {
+        return Ok(0);
     }
-    drop(conn);
-    for input in pending_inputs {
-        store
-            .record_terminal_observation(&input)
-            .map_err(|error| store_error(format!("GitHub metrics record failed: {error}")))?;
-        imported += 1;
-    }
+    store
+        .record_terminal_observations(&pending_inputs)
+        .map_err(|error| store_error(format!("GitHub metrics record failed: {error}")))?;
+    imported = pending_inputs.len();
     Ok(imported)
 }
 
