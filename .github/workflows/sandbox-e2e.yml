@@ -425,7 +425,13 @@ jobs:
             esac
             exit 0
           fi
-          jq -e '.candidate_stopped == true and .production_identity_verified == true and .lease_removed == true and .mode == "shipyard" and (.active_runs == []) and .failure == null' "$canary_root/guardian-receipt.json"
+          if ! jq -e '.candidate_stopped == true and .production_identity_verified == true and .lease_removed == true and .mode == "shipyard" and (.active_runs == []) and .failure == null' "$canary_root/guardian-receipt.json"; then
+            # Name the cause: a bare "false" here hid an lsof timeout that left
+            # the host lease retained for the next run to reconcile.
+            jq -r '"guardian failure: \(.failure // "none") (lease_retained=\(.lease_retained), lease_removed=\(.lease_removed), production_quiesced=\(.production_quiesced))"' \
+              "$canary_root/guardian-receipt.json" >&2 || true
+            exit 1
+          fi
           jq -e '.sandbox_passed == true and .real_home == env.HOME' "$canary_root/sandbox-proof.json"
           test "$(jq -r .candidate_sha256 "$canary_root/sandbox-proof.json")" = "$(jq -r .candidate_sha256 "$canary_root/ready.json")"
           test "$(shasum -a 256 "$installed" | awk '{print $1}')" = "$(jq -r .installed_sha256 "$canary_root/guardian-receipt.json")"

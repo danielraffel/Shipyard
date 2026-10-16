@@ -497,6 +497,26 @@ def _is_reconcilable_retained_failure(
 
     if expected_lock_path is None or expected_production_pid is None:
         return False
+    # Both restore attempts timed out inspecting the writer-domain lock's
+    # holders (lsof on a loaded host). Production was never quiesced, so the
+    # retained lease is reconcilable like the deadline case below: the
+    # reconciliation proves stable idle again before removing anything.
+    holder_timeout = (
+        r"restore production: GuardianError: timed out inspecting writer-domain "
+        r"holders for (?P<{name}>.+) after 2 attempt\(s\)"
+    )
+    inspection_exhaustion = re.fullmatch(
+        "GuardianError: "
+        + holder_timeout.format(name="first")
+        + "; "
+        + holder_timeout.format(name="second"),
+        failure,
+    )
+    if inspection_exhaustion is not None:
+        return (
+            Path(inspection_exhaustion.group("first")) == expected_lock_path
+            and Path(inspection_exhaustion.group("second")) == expected_lock_path
+        )
     deadline_exhaustion = re.fullmatch(
         r"GuardianError: restore production: GuardianError: timed out inspecting writer-domain "
         r"holders for (?P<lock>.+) after 2 attempt\(s\); restore production: "
@@ -1898,6 +1918,19 @@ class Guardian:
             "production_start_time"
         ) != receipt.get("old_production_start_time"):
             raise GuardianError("prior retained-lease mutation identity disagrees")
+        try:
+            superseded = self.prior_production_superseded(receipt)
+        except OSError:
+            # Unreadable installed binary: keep the fenced basis, whose exact
+            # identity checks then decide.
+            superseded = False
+        if superseded:
+            # The fence was proved against a production daemon that has since
+            # been replaced out of band (restart or install). The canary never
+            # quiesced or restored it, so bind the reconciliation to the
+            # current production, as for a fence-less superseded lease, rather
+            # than requiring an identity that can no longer exist.
+            self.reconciliation_basis = RECONCILIATION_BASIS_SUPERSEDED
         return prior_root, receipt, ready
 
     @staticmethod

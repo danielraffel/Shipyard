@@ -521,6 +521,17 @@ line in the receipt (`foreign_writers`, printed by the workflow on failure)
 and on stderr. The failure string itself is unchanged because retained-lease
 recovery parses it. Do not run `flock`/`lsof` probes against that lock on a
 host while a sandbox canary is running: the probe itself is a foreign holder.
+
+## "Prior retained-lease receipt is not safely reconcilable"
+
+Every later Sandbox macOS run fails this way when an earlier run retained the
+host lease with a failure shape the guardian does not recognize. Read that
+run's `guardian-receipt.json` under `/tmp/shipyard-sandbox-m3-<run>-<attempt>`:
+its `failure` names the cause. Two shapes reconcile on the next run: both
+restore-production holder inspections timing out on the production
+writer-domain lock (`lsof` on a loaded host), and a fenced lease whose
+production daemon was replaced afterwards, which binds to the current daemon.
+Anything else still needs a guardian change; do not delete the lease by hand.
 ## Release publication waits for attestation
 
 `release.yml` keeps the release a draft until the macOS DMG is attested:

@@ -90,12 +90,13 @@ class GuardianLifecycleTests(unittest.TestCase):
         ready_production_pid: int = 222,
         active_runs: tuple[str, ...] = (),
         receipt_generation: str | None = None,
+        failure: str | None = None,
     ) -> tuple[Path, str]:
         lease_stat, generation = self.create_generation_lease(active)
         prior = active.lease_dir.with_name(f"{active.lease_dir.name}-1-1")
         prior.mkdir(mode=0o700)
         expected_lock = active.production_state_dir / ".sandbox-writer-domain.lock"
-        failure = (
+        failure = failure or (
             "GuardianError: restore production: GuardianError: timed out inspecting "
             "writer-domain "
             f"holders for {expected_lock} after 2 attempt(s); restore production: "
@@ -739,6 +740,62 @@ class GuardianLifecycleTests(unittest.TestCase):
                         expected_production_pid=expected_pid,
                     )
                 )
+
+    @staticmethod
+    def double_holder_timeout(lock: Path, other: Path | None = None) -> str:
+        clause = (
+            "restore production: GuardianError: timed out inspecting writer-domain "
+            "holders for {} after 2 attempt(s)"
+        )
+        return f"GuardianError: {clause.format(lock)}; {clause.format(other or lock)}"
+
+    def test_two_holder_inspection_timeouts_on_the_production_lock_are_reconcilable(
+        self,
+    ) -> None:
+        # m3, 2026-10-16: lsof timed out on both restore attempts.
+        lock = Path("/tmp/state/.sandbox-writer-domain.lock")
+        failure = self.double_holder_timeout(lock)
+        self.assertTrue(
+            guardian._is_reconcilable_retained_failure(
+                failure, expected_lock_path=lock, expected_production_pid=1896
+            )
+        )
+        for candidate, expected_lock, expected_pid in (
+            (failure, Path("/tmp/other.lock"), 1896),
+            (failure, lock, None),
+            (self.double_holder_timeout(lock, Path("/tmp/other.lock")), lock, 1896),
+            (failure.replace("after 2 attempt(s)", "after 1 attempt(s)", 1), lock, 1896),
+            (failure + "; unrelated cleanup failure", lock, 1896),
+            (failure.split("; ")[0], lock, 1896),
+        ):
+            with self.subTest(candidate=candidate, lock=expected_lock, pid=expected_pid):
+                self.assertFalse(
+                    guardian._is_reconcilable_retained_failure(
+                        candidate,
+                        expected_lock_path=expected_lock,
+                        expected_production_pid=expected_pid,
+                    )
+                )
+
+    def test_a_fenced_receipt_binds_to_a_replaced_production(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            lock = active.production_state_dir / ".sandbox-writer-domain.lock"
+            prior, _ = self.write_retained_deadline_evidence(
+                active, failure=self.double_holder_timeout(lock)
+            )
+            for superseded, basis in (
+                (False, guardian.RECONCILIATION_BASIS_FENCED),
+                (True, guardian.RECONCILIATION_BASIS_SUPERSEDED),
+            ):
+                with self.subTest(superseded=superseded), mock.patch.object(
+                    guardian, "_pid_alive", return_value=False
+                ), mock.patch.object(
+                    active, "prior_production_superseded", return_value=superseded
+                ):
+                    selected, _, _ = active.retained_legacy_evidence()
+                    self.assertEqual(selected, prior)
+                    self.assertEqual(active.reconciliation_basis, basis)
 
     def test_exact_deadline_receipt_is_eligible_only_with_bound_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
