@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
@@ -400,6 +401,19 @@ pub(super) fn metrics_command<W: Write>(
                     scorecard.model_token_use.reason,
                 );
                 text.push_str(&coverage);
+                let _ = write!(
+                    text,
+                    "\n  cost: {:.2} wasted compute minutes ({} failure/cancelled jobs), {:.2} coordination minutes ({} queued jobs), {:.2} rework compute minutes ({} failed attempts), {:.2} coordination+rework minutes; wasted/safely-merged={} ({})",
+                    scorecard.wasted_compute_minutes,
+                    scorecard.wasted_compute_samples,
+                    scorecard.coordination_minutes,
+                    scorecard.coordination_samples,
+                    scorecard.rework_compute_minutes,
+                    scorecard.rework_compute_samples,
+                    scorecard.coordination_rework_minutes,
+                    scorecard.wasted_compute_per_safely_merged_change.status,
+                    scorecard.wasted_compute_per_safely_merged_change.reason,
+                );
                 text
             })?;
             return Ok(exit);

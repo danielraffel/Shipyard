@@ -89,6 +89,12 @@ parse successfully; never infer submit-to-receipt, cache reuse, or model-token
 counts from wall-clock duration or logs. Those scorecard dimensions must remain
 explicitly unavailable until authenticated event fields exist.
 
+The fleet baseline scorecard also reports failed/cancelled compute waste,
+authoritative queue-wait coordination minutes, and failed-attempt rework
+minutes. Treat these as cost proxies only. A safely-merged-change denominator
+requires a durable merge receipt and remains unavailable when the local metrics
+store has only PR/job observations; never substitute distinct PR count.
+
 ## Version-only release bumps
 
 The CLI version is part of the CI surface map. Even a release-only
