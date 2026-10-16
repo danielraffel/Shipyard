@@ -597,6 +597,7 @@ impl ExecutorDispatcher {
         };
         let primary_label = primary.label.clone();
         let mut last_result = None;
+        let mut attempt_history = Vec::new();
 
         for (attempt, backend) in filtered.into_iter().enumerate() {
             let attempt_log = attempt_log_path(&request.log_path, attempt);
@@ -609,6 +610,7 @@ impl ExecutorDispatcher {
                 continue;
             }
 
+            let attempted_at = Utc::now();
             let result = self.validate(DispatchValidationRequest {
                 job_id: request.job_id.clone(),
                 defer_host_pool_lease_unavailable: request.defer_host_pool_lease_unavailable,
@@ -628,15 +630,16 @@ impl ExecutorDispatcher {
             });
             let result = demote_stale_result(result, chain.heartbeat_stale_secs);
             let mut result = result;
-            let route_id = format!("fallback:{}:{attempt}", backend.label);
-            result
-                .route_attempts
-                .get_or_insert_with(Vec::new)
-                .push(crate::job::RouteAttempt {
-                    route_id,
-                    outcome: result.status,
-                    attempted_at: Utc::now(),
-                });
+            let nested_attempts = result.route_attempts.take().unwrap_or_default();
+            let outcome = result.status;
+            attempt_history.push(crate::job::RouteAttempt {
+                route_id: format!("fallback:{}:{attempt}", backend.label),
+                position: attempt,
+                outcome,
+                attempted_at,
+            });
+            attempt_history.extend(nested_attempts);
+            result.route_attempts = Some(attempt_history.clone());
 
             if matches!(
                 result.status,
@@ -736,6 +739,7 @@ impl ExecutorDispatcher {
                 pool.lease_stale_seconds.max(1),
             );
 
+            let attempted_at = Utc::now();
             let mut result = self.validate(DispatchValidationRequest {
                 job_id: request.job_id.clone(),
                 defer_host_pool_lease_unavailable: request.defer_host_pool_lease_unavailable,
@@ -757,13 +761,15 @@ impl ExecutorDispatcher {
             // the attempted member even when validation fails or is
             // cancelled; busy, deferred, and probe-only paths never reach
             // this point and remain unattributed.
+            let outcome = result.status;
             result
                 .route_attempts
                 .get_or_insert_with(Vec::new)
                 .push(crate::job::RouteAttempt {
                     route_id: format!("host-pool:{}:{}", pool.pool_name, member.id),
-                    outcome: result.status,
-                    attempted_at: Utc::now(),
+                    position: attempt,
+                    outcome,
+                    attempted_at,
                 });
 
             if matches!(
@@ -3135,7 +3141,7 @@ backend = "local"
         assert_eq!(result.backend, "host-pool:local_macs/local");
         assert_eq!(
             result.route_attempts.as_ref().unwrap()[0].route_id,
-            "host-pool:local_macs/local"
+            "host-pool:local_macs:local"
         );
         assert!(observed_job_id.get());
         let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
@@ -3187,7 +3193,7 @@ backend = "local"
         assert_ne!(result.status, TargetStatus::Pass);
         assert_eq!(
             result.route_attempts.as_ref().unwrap()[0].route_id,
-            "host-pool:local_macs/local"
+            "host-pool:local_macs:local"
         );
     }
 
@@ -3266,7 +3272,7 @@ backend = "local"
         );
         assert_eq!(
             result.route_attempts.as_ref().unwrap()[0].route_id,
-            "host-pool:local_macs/local"
+            "host-pool:local_macs:local"
         );
         let leases = store.leases().expect("leases");
         assert_eq!(leases.len(), 1);

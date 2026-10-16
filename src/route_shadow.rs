@@ -604,17 +604,12 @@ pub fn record_dispatch_observation_best_effort(
     let Some(attempt) = route_attempts.last() else {
         return;
     };
-    let Some((position, candidate)) = snapshot
+    let Some(candidate) = snapshot
         .candidates
         .iter()
-        .enumerate()
-        .find(|(_, candidate)| candidate.route_id == attempt.route_id)
+        .find(|candidate| candidate.route_id == attempt.route_id)
     else {
         return;
-    };
-    let selected_route = RouteSelection {
-        route_id: candidate.route_id.clone(),
-        position,
     };
     let observation = RouteShadowObservation {
         correlation_id: snapshot.request_id.clone(),
@@ -1247,6 +1242,7 @@ mod tests {
             &target,
             &[RouteAttempt {
                 route_id: "host-pool:macs:m1".to_owned(),
+                position: 0,
                 outcome: crate::job::TargetStatus::Pass,
                 attempted_at: Utc::now(),
             }],

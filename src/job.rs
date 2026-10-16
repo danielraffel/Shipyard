@@ -311,6 +311,8 @@ impl TargetResult {
 pub struct RouteAttempt {
     /// Canonical route identity, never a parsed display label.
     pub route_id: String,
+    /// Position in the authoritative backend order.
+    pub position: usize,
     /// Result of the attempted backend.
     pub outcome: TargetStatus,
     /// Time at which dispatch entered the backend.
