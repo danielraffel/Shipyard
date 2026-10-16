@@ -66,6 +66,55 @@ pub struct MetricRecordInput {
     pub labels: Option<Vec<String>>,
 }
 
+/// Shadow-only classification for queue work that the current enqueue policy
+/// would supersede or repeat.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepeatedWorkKind {
+    /// A pending job for the same queue scope has an older exact head.
+    SupersededExactHead,
+    /// A pending job already has the same exact head and queue scope.
+    DuplicateExactHeadConfig,
+}
+
+impl RepeatedWorkKind {
+    /// Stable storage label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SupersededExactHead => "superseded_exact_head",
+            Self::DuplicateExactHeadConfig => "duplicate_exact_head_config",
+        }
+    }
+}
+
+/// One queue repeated-work observation. This is accounting only; it does not
+/// authorize skipping or alter queue state transitions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepeatedWorkShadowInput {
+    pub kind: RepeatedWorkKind,
+    pub branch: String,
+    pub sha: String,
+    pub target_config: String,
+    pub mode: String,
+    pub job_id: String,
+    pub superseded_job_id: String,
+    pub superseded_sha: String,
+}
+
+/// Persisted repeated-work observation returned by the read-side query.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepeatedWorkShadowRow {
+    pub observed_at: String,
+    pub kind: String,
+    pub branch: String,
+    pub sha: String,
+    pub target_config: String,
+    pub mode: String,
+    pub job_id: String,
+    pub superseded_job_id: String,
+    pub superseded_sha: String,
+}
+
 /// One grouped timing summary row.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MetricsSummaryRow {
@@ -319,6 +368,20 @@ impl MetricsStore {
               cache_hit INTEGER,
               artifact_path TEXT
             );
+            CREATE TABLE IF NOT EXISTS repeated_work_shadow (
+              id INTEGER PRIMARY KEY,
+              observed_at TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              branch TEXT NOT NULL,
+              sha TEXT NOT NULL,
+              target_config TEXT NOT NULL,
+              mode TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              superseded_job_id TEXT NOT NULL,
+              superseded_sha TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
+              ON repeated_work_shadow(observed_at DESC);
             ",
         )?;
         add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
@@ -335,6 +398,63 @@ impl MetricsStore {
             [],
         )?;
         Ok(())
+    }
+
+    /// Record a queue repeated-work observation without affecting queue
+    /// admission, dispatch, or required-check authority.
+    pub fn record_repeated_work_shadow(
+        &self,
+        input: &RepeatedWorkShadowInput,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO repeated_work_shadow
+             (observed_at, kind, branch, sha, target_config, mode, job_id,
+              superseded_job_id, superseded_sha)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                Utc::now().to_rfc3339(),
+                input.kind.as_str(),
+                input.branch,
+                input.sha,
+                input.target_config,
+                input.mode,
+                input.job_id,
+                input.superseded_job_id,
+                input.superseded_sha,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Return recent shadow repeated-work observations, newest first.
+    pub fn repeated_work_shadow(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RepeatedWorkShadowRow>, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            "SELECT observed_at, kind, branch, sha, target_config, mode, job_id,
+                    superseded_job_id, superseded_sha
+             FROM repeated_work_shadow
+             ORDER BY observed_at DESC, id DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(RepeatedWorkShadowRow {
+                observed_at: row.get(0)?,
+                kind: row.get(1)?,
+                branch: row.get(2)?,
+                sha: row.get(3)?,
+                target_config: row.get(4)?,
+                mode: row.get(5)?,
+                job_id: row.get(6)?,
+                superseded_job_id: row.get(7)?,
+                superseded_sha: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Record one low-friction timing row.
