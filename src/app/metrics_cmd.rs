@@ -89,7 +89,7 @@ struct MetricsScorecardOutput<'a> {
     scorecard: &'a StewardshipScorecard,
     freshness: &'a Freshness,
     #[serde(skip_serializing_if = "Option::is_none")]
-    strata_receipt: Option<AuthenticatedStrataReceipt>,
+    strata: Option<AuthenticatedStrataReceipt>,
 }
 
 /// `--stale-after` wins; otherwise `[metrics] stale_after`; otherwise 24h.
@@ -392,13 +392,13 @@ pub(super) fn metrics_command<W: Write>(
             let freshness =
                 freshness_for(&store, Some(&args.project), &args.freshness, config_cwd)?;
             let exit = stale_exit(&freshness, args.freshness.fail_on_stale);
-            let strata_receipt = store
+            let strata = store
                 .authenticated_strata_receipt_from_metadata(&args.project, since_days)
                 .ok();
             let output = MetricsScorecardOutput {
                 scorecard: &scorecard,
                 freshness: &freshness,
-                strata_receipt,
+                strata,
             };
             write_output(stdout, json_output, &output, || {
                 let mut text = if freshness.is_degraded() {
@@ -1024,14 +1024,11 @@ mod tests {
         )
         .expect("scorecard command");
         let json: Value = serde_json::from_slice(&output).expect("json");
-        assert_eq!(
-            json["strata_receipt"]["schema"],
-            "shipyard-metrics-strata/v1"
-        );
-        assert_eq!(json["strata_receipt"]["unit"], "job");
-        assert_eq!(json["strata_receipt"]["normal_pr"]["observed_jobs"], 1);
-        assert_eq!(json["strata_receipt"]["normal_pr"]["qualified_jobs"], 1);
-        assert_eq!(json["strata_receipt"]["normal_pr"]["coverage"], "partial");
+        assert_eq!(json["strata"]["schema"], "shipyard-metrics-strata/v1");
+        assert_eq!(json["strata"]["unit"], "job");
+        assert_eq!(json["strata"]["strata"]["normal_pr"]["observed_jobs"], 1);
+        assert_eq!(json["strata"]["strata"]["normal_pr"]["qualified_jobs"], 1);
+        assert_eq!(json["strata"]["strata"]["normal_pr"]["coverage"], "partial");
     }
 
     #[test]
