@@ -4311,6 +4311,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn foreground_recovery_preserves_daemon_owned_running_jobs() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state_dir = temp.path().join("state");
