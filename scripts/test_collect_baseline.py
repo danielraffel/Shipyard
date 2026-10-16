@@ -66,9 +66,13 @@ class CollectorInvocationTests(unittest.TestCase):
     def test_collect_uses_selected_db_and_counts_only_new_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
-            conn = __import__("sqlite3").connect(db); conn.execute("create table jobs(id integer)"); conn.execute("insert into jobs values (1)"); conn.commit(); conn.close()
+            conn = __import__("sqlite3").connect(db)
+            conn.executescript("create table runs(id integer primary key, project text, repo text, ts text, status text); create table jobs(id integer primary key, run_id integer, job text, started_at text, completed_at text, status text);")
+            conn.execute("insert into runs values (1, 'pulp', 'o/p', '2026-10-16T12:00:00Z', 'success')")
+            conn.execute("insert into jobs values (1, 1, 'job', '2026-10-16T12:00:00Z', '2026-10-16T12:30:00Z', 'success')")
+            conn.commit(); conn.close()
             shipyard = root / "shipyard"; tartci = root / "tartci"
-            shipyard.write_text("#!/bin/sh\nif [ \"$6\" = import ]; then echo '{\"imported\": 1}'; else echo '{\"job_samples\": 1}'; fi\n")
+            shipyard.write_text("#!/bin/sh\ncase \"$*\" in *metrics*import*) echo '{\"imported\": 1}';; *) echo '{\"job_samples\": 1}';; esac\n")
             tartci.write_text("#!/bin/sh\necho '{}'\n")
             shipyard.chmod(0o755); tartci.chmod(0o755)
             args = type("Args", (), {"db": db, "state": root / "state.json", "project": "pulp", "repo": "o/p", "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "timeout_seconds": 5})()
