@@ -132,6 +132,9 @@ fn a_red_drift_job_gets_one_record_naming_its_generator() {
     );
     assert_eq!(row["attempt"], 1);
     assert_eq!(row["completed_at"], "2026-10-14T10:30:00Z");
+    // Named live, at this pass: time to cause is named_at minus completed_at.
+    assert_eq!(row["named_at"], "2026-10-14T12:00:00Z");
+    assert_eq!(row["retrospective"], false);
     assert_eq!(
         (row["pr"].clone(), row["owner"].clone()),
         (json!(42), json!("pr:42"))
