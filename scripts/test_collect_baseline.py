@@ -75,7 +75,7 @@ class CollectorInvocationTests(unittest.TestCase):
             shipyard.write_text("#!/bin/sh\ncase \"$*\" in *metrics*import*) echo '{\"imported\": 1}';; *) echo '{\"job_samples\": 1}';; esac\n")
             tartci.write_text("#!/bin/sh\necho '{\"repo\":\"o/p\",\"external_id\":\"fixture-1\"}'\n")
             shipyard.chmod(0o755); tartci.chmod(0o755)
-            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "pulp", "repo": "o/p", "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "timeout_seconds": 5})()
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "pulp", "repo": "o/p", "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5, "timeout_seconds": 5})()
             args.state.write_text("{}")
             original = MOD.count_jobs
             try:

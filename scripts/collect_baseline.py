@@ -59,7 +59,7 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     if github.returncode:
         raise RuntimeError(f"GitHub import failed: {github.stderr.strip()}")
     events.append(summarize_import("github", github.stdout))
-    tartci = run([args.tartci, "runtime", "export", "--repo", args.repo, "--since-days", str(args.limit)], timeout=args.timeout_seconds)
+    tartci = run([args.tartci, "runtime", "export", "--repo", args.repo, "--since-days", str(args.since_days)], timeout=args.timeout_seconds)
     if tartci.returncode:
         raise RuntimeError(f"TartCI export failed: {tartci.stderr.strip()}")
     validate_tartci_export(tartci.stdout, args.repo)
