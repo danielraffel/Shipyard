@@ -71,13 +71,15 @@ class CollectorInvocationTests(unittest.TestCase):
             shipyard.write_text("#!/bin/sh\nif [ \"$6\" = import ]; then echo '{\"imported\": 1}'; else echo '{\"job_samples\": 1}'; fi\n")
             tartci.write_text("#!/bin/sh\necho '{}'\n")
             shipyard.chmod(0o755); tartci.chmod(0o755)
-            args = type("Args", (), {"db": db, "project": "pulp", "repo": "o/p", "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "timeout_seconds": 5})()
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "pulp", "repo": "o/p", "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "timeout_seconds": 5})()
+            args.state.write_text("{}")
             original = MOD.count_jobs
             try:
                 events = MOD.import_organic(args)
             finally:
                 MOD.count_jobs = original
             self.assertEqual(events[-1]["new_rows"], 0)
+            self.assertEqual(events[-1]["source_activity_dates"], ["2026-10-16"])
 
 
 
