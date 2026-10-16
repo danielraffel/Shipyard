@@ -150,6 +150,11 @@ static SCRUB: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     .collect()
 });
 
+/// Whether text contains anything the archive recorder would redact.
+pub(super) fn needs_scrub(text: &str) -> bool {
+    SCRUB.iter().any(|(pattern, _)| pattern.is_match(text))
+}
+
 /// Local paths, addresses, credentials and private host names out of every
 /// string; run and job URLs are kept.
 pub(super) fn scrub(value: Value) -> Value {
