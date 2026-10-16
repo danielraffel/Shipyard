@@ -1460,9 +1460,12 @@ fn ensure_refresh_identity_compatible(
 
 fn existing_unknown_attempt_id(
     conn: &Connection,
-    _provider: &str,
+    provider: &str,
     external_id: Option<&str>,
 ) -> Result<Option<i64>, rusqlite::Error> {
+    if !matches!(provider, "github" | "self-hosted" | "github-hosted") {
+        return Ok(None);
+    }
     let Some(value) = external_id else {
         return Ok(None);
     };
@@ -1473,7 +1476,7 @@ fn existing_unknown_attempt_id(
     let prefix = format!("{}/{}/", parts[0], parts[1]);
     conn.query_row(
         "SELECT id FROM jobs
-           WHERE provider IN ('self-hosted', 'github-hosted')
+           WHERE provider IN ('github', 'self-hosted', 'github-hosted')
              AND external_id LIKE ?1 || '%'
            ORDER BY id DESC LIMIT 1",
         params![prefix],
@@ -3545,6 +3548,34 @@ mod tests {
             .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn unknown_attempt_alias_does_not_cross_provider_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let base = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            job: "macos".to_owned(),
+            status: "success".to_owned(),
+            duration_ms: 100,
+            completed_at: Some(Utc::now()),
+            provider: Some("github-hosted".to_owned()),
+            external_id: Some("github:7/1/unknown".to_owned()),
+            event: Some("pull_request".to_owned()),
+            ..MetricRecordInput::default()
+        };
+        store.record_terminal_observation(&base).unwrap();
+        let mut other = base.clone();
+        other.provider = Some("tart-macos".to_owned());
+        other.external_id = Some("github:7/1/2".to_owned());
+        store.record_terminal_observation(&other).unwrap();
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
