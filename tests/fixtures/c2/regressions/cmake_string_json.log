@@ -1,0 +1,8 @@
+CMake Error at tools/cmake/PulpConsumptionCensus.cmake:211 (string):
+  string sub-command JSON member 'units 1 targets' not found.
+Call Stack (most recent call first):
+  CMakeLists.txt:88 (include)
+
+CMake Error at tools/cmake/PulpLinkFloor.cmake:463 (string):
+  string sub-command JSON failed parsing json string: * Line 1, Column 1. Syntax error: value, object or array expected.
+-- Configuring incomplete, errors occurred!

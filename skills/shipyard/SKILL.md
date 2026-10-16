@@ -1593,7 +1593,8 @@ assertion never outranks the runner dying. A make or ninja failure ranks
 below every runner and compiler record and is `low`: on its own it names the
 target that broke, not why. A cause is named when its class is
 not `unknown` and its confidence is `high` or `medium`. A generated-file drift check is `generated_drift`
-(class `drift`), named by its generator; its `fix_hint` is a suggested
+(class `drift`), named by its generator; (C2 v7 also names a CMake error by its call site and a bare exit by its last
+printed line); its `fix_hint` is a suggested
 `python3 tools/scripts/<name>.py ... --write` command matching the known
 generator shape, to review and run from a main-branch checkout. Shipyard never
 executes or auto-applies it. A bare exit is either inherited from the job a summary

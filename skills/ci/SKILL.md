@@ -512,8 +512,9 @@ parent; `merge_queue_pr_head`), and any other red, within 72 hours, takes the
 non-merge commits up to the fix in the pull request's commit list
 (`post_force_push`); otherwise `own_files` is null with the reason
 (`post_force_push_superseded`, `post_force_push_too_late`, `red_not_ancestor`).
-A bare exit C2 cannot name is labelled by its step and the last line the step
-printed after its echoed script (`labelled_by: step`), still `low`; a summary
+A bare exit C2 cannot name is labelled by the last line the step printed
+after its echoed script (`labelled_by: step`; the step stays in
+`failed_step`), still `low`; a summary
 job whose name prefixes a named job of the same run attempt (`linux` and
 `Linux (x64) [github-hosted]`) takes that job's cause (`labelled_by:
 summarised_job`, `inherited_from_job_id`), evidence included
@@ -540,7 +541,14 @@ a checkout of the main branch, never from the pull request's own checkout, where
 `tools/scripts/<name>.py` is the pull request's own script. Nothing in Shipyard
 executes a `fix_hint` and nothing auto-applies one. A `detail` is log text and
 is never a command.
-It outranks the ctest line that ran the check. Job logs are read through
+It outranks the ctest line that ran the check. Since C2 v7 a CMake error is named
+by its call site and its error's first clause (`PulpLinkFloor.cmake:463 string
+sub-command JSON failed parsing ...`), not by the bare command in parentheses,
+which named every `string(JSON ...)` error "string"; and a bare exit is named by
+the last line the step printed, falling back to the step's script line only
+when it printed nothing. Every other rule's signatures are pinned against v6
+by `tests/fixtures/c2/v6_signatures.json`, so v4-v6 rows stay comparable for
+them. Job logs are read through
 `gate_cost::fetch_job_log`, which passes `--allow-escape-sequences` (logs carry
 ANSI colour, and a current `gh` refuses them without it) and falls back to the
 bare read for a `gh` that does not know the flag. The recorder's scrub also

@@ -11,7 +11,7 @@
  {
   "format": "shell_exit",
   "kind": "exit_code",
-  "subject": "set -euo pipefail",
+  "subject": "provider resolution did not succeed \u2014 failing macos gate closed",
   "message": "exit code 1: provider resolution did not succeed \u2014 failing macos gate closed",
   "location": "",
   "line": 6,

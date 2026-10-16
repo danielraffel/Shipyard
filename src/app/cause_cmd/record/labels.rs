@@ -3,8 +3,9 @@
 //! A summary job (Pulp's `linux` or `macos`, whose one step checks the
 //! results of the jobs it needs) fails only because a job it summarises
 //! failed, so it takes that job's cause and says where it came from. Any
-//! other bare exit is labelled by its step and by the last line the step
-//! printed, read only between the step's `##[endgroup]` and its `##[error]`:
+//! other bare exit is labelled by the last line its step printed (the
+//! signature; the step stays in `failed_step`), read only
+//! between the step's `##[endgroup]` and its `##[error]`:
 //! the lines before that are the step's script, echoed by the runner, and
 //! name nothing. A label is never more than `low` confidence.
 
@@ -54,9 +55,6 @@ pub(super) fn label_bare_exit(cause: &mut CiCause, log: Option<&str>) -> Option<
                 .iter()
                 .position(|line| line.trim().starts_with(EXIT_LINE))
         })?;
-    if let Some(step) = cause.failed_step.clone() {
-        cause.signature = step;
-    }
     // The step's output: from its exit back to the end of its echoed script.
     let output: Vec<usize> = (exit.saturating_sub(LABEL_REACH)..exit)
         .rev()
@@ -77,6 +75,8 @@ pub(super) fn label_bare_exit(cause: &mut CiCause, log: Option<&str>) -> Option<
         cause.evidence.excerpt.clear();
         return Some("step_no_output");
     };
+    // The step stays in `failed_step`; the line it printed names the failure.
+    cause.signature = c2::norm(lines[at].trim(), 160);
     cause.detail = Some(c2::norm(lines[at].trim(), 200));
     cause.evidence.log_line = at + 1;
     let mut excerpt: Vec<String> = output
