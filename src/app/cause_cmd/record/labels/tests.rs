@@ -51,7 +51,17 @@ fn a_bare_exit_is_labelled_by_its_step_and_its_last_error_line_not_its_script() 
     let mut cause = cause_of(NOTRUN_LOG, "Test what this pull request reaches");
     assert_eq!(cause.format, "shell-exit");
     assert_eq!(label_bare_exit(&mut cause, Some(NOTRUN_LOG)), Some("step"));
-    assert_eq!(cause.signature, "Test what this pull request reaches");
+    assert_eq!(
+        cause.failed_step.as_deref(),
+        Some("Test what this pull request reaches")
+    );
+    assert!(
+        cause
+            .signature
+            .starts_with("pr-head-affected-tests: NOTRUN"),
+        "{}",
+        cause.signature
+    );
     let detail = cause.detail.as_deref().expect("detail");
     assert!(
         detail.starts_with("pr-head-affected-tests: NOTRUN"),
@@ -84,7 +94,10 @@ fn a_step_that_printed_nothing_after_its_script_has_no_label_line() {
         label_bare_exit(&mut cause, Some(log)),
         Some("step_no_output")
     );
-    assert_eq!(cause.signature, "Guard");
+    // Nothing printed: C2's own name for it (the step's script line) stays,
+    // and the step is the failed step.
+    assert_eq!(cause.signature, "exit 3 # a failed error check");
+    assert_eq!(cause.failed_step.as_deref(), Some("Guard"));
     assert_eq!(cause.detail, before);
     assert!(cause.evidence.excerpt.is_empty());
     assert_eq!(cause.confidence, "low");

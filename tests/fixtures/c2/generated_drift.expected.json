@@ -38,7 +38,7 @@
  {
   "format": "shell_exit",
   "kind": "exit_code",
-  "subject": "ctest --test-dir build-macos --output-on-failure",
+  "subject": "Errors while running CTest",
   "message": "exit code 8: Errors while running CTest",
   "location": "",
   "line": 15,

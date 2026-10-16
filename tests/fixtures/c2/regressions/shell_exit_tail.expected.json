@@ -1,0 +1,11 @@
+[
+ {
+  "format": "shell_exit",
+  "kind": "exit_code",
+  "subject": "ledger order check: 2 rows out of order in data/ledger.json",
+  "message": "exit code 1: ledger order check: 2 rows out of order in data/ledger.json",
+  "location": "",
+  "line": 7,
+  "step_failed": true
+ }
+]

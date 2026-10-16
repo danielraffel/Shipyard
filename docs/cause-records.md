@@ -106,9 +106,14 @@ A bare exit that C2 cannot name gets one of two labels. A summary job, such
 as `linux` checking the jobs it needs, takes the cause of the named job in
 the same run attempt whose name it begins (`Linux (x64) [github-hosted]`),
 and says so in `inherited_from_job_id`; its evidence is that job's log line
-too, named by `evidence_job_id`. Any other bare exit is labelled by
-its step and by the last line the step printed after its echoed script, and
-stays low confidence.
+too, named by `evidence_job_id`. Any other bare exit is named by
+the last line the step printed after its echoed script (the step itself stays
+in `failed_step`), and stays low confidence.
+
+Since C2 v7 a CMake error is named by its call site and the first clause of
+its error, not by the bare command in parentheses (which named every
+`string(JSON ...)` error "string"), and a bare exit is named by the last line
+the step printed rather than the step's script line.
 
 A fix-link's `own_files` are the files of the pull request's own commits
 between the red and the fix. Some reds have no own commit chain, and these

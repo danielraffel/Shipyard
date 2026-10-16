@@ -31,9 +31,11 @@ pub const SCHEMA: &str = "c2.cause.v0";
 
 /// The rule set's version, bumped with every rule change so a record says
 /// which rules named it: 5 ranks make/ninja below the linker and keeps a lone
-/// one unnamed; 6 adds `generated_drift`. EXP-A3 registers each version
-/// before any re-score.
-pub const VERSION: u32 = 6;
+/// one unnamed; 6 adds `generated_drift`; 7 names a `CMake` error by its call
+/// site and error rather than the bare command name, and a bare exit by the
+/// last line it printed rather than the step's script line. EXP-A3 registers
+/// each version before any re-score.
+pub const VERSION: u32 = 7;
 
 /// Every format, in priority order.
 pub const FORMATS: [&str; 25] = [
@@ -582,6 +584,15 @@ fn rule_python_traceback(lines: &[String]) -> Vec<Record> {
 static CMAKE: LazyLock<Regex> =
     LazyLock::new(|| pattern(r"^CMake Error(?: at ([^\s:]+):(\d+))?(?: \(([^)]*)\))?:?\s*(.*)$"));
 
+/// An error message up to its first sentence or clause end.
+fn first_clause(message: &str) -> &str {
+    let end = message
+        .find(". ")
+        .or_else(|| message.find("; "))
+        .unwrap_or(message.len());
+    message[..end].trim().trim_end_matches('.')
+}
+
 fn rule_cmake(lines: &[String]) -> Vec<Record> {
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate() {
@@ -596,11 +607,18 @@ fn rule_cmake(lines: &[String]) -> Vec<Record> {
         let location = caps.get(1).map_or_else(String::new, |path| {
             format!("{}:{}", basename(path.as_str()), &caps[2])
         });
-        let subject = caps.get(3).map_or("cmake", |command| command.as_str());
+        // The command in parentheses (`string`, `message`) is the CMake
+        // command that failed, the same for every error it raises: the call
+        // site and the error's first clause say which failure this is.
+        let subject = match (location.is_empty(), caps.get(3)) {
+            (false, _) => format!("{location} {}", first_clause(&message)),
+            (true, Some(command)) => format!("{}: {}", command.as_str(), first_clause(&message)),
+            (true, None) => "cmake".to_owned(),
+        };
         out.push(rec(
             "cmake",
             "config_error",
-            subject,
+            &subject,
             &message,
             &location,
             i + 1,
@@ -986,10 +1004,15 @@ fn current_step(lines: &[String], i: usize) -> String {
         .map_or_else(String::new, |caps| caps[1].trim().to_owned())
 }
 
-/// The last meaningful output line before an exit annotation.
+/// The last meaningful output line before an exit annotation, read back
+/// only to the step's own `##[endgroup]`: the lines before it are the step's
+/// script, echoed by the runner, and name nothing.
 fn tail(lines: &[String], i: usize) -> String {
     for j in (i.saturating_sub(39)..i).rev() {
         let text = lines[j].trim();
+        if text.starts_with("##[endgroup]") || text.starts_with("##[group]") {
+            break;
+        }
         if text.is_empty() || text.starts_with("##[") || RULER.is_match(text) {
             continue;
         }
@@ -1013,10 +1036,17 @@ fn rule_shell_exit(lines: &[String]) -> Vec<Record> {
                 message.push_str(": ");
                 message.push_str(&last);
             }
+            // The step's script line is the same for every way the step can
+            // fail; the last line it printed is the failure.
+            let subject = if last.is_empty() {
+                current_step(lines, i)
+            } else {
+                last.clone()
+            };
             Some(rec(
                 "shell_exit",
                 "exit_code",
-                &current_step(lines, i),
+                &subject,
                 &message,
                 "",
                 i + 1,

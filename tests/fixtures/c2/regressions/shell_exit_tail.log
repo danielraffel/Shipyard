@@ -1,0 +1,7 @@
+##[group]Run python3 tools/scripts/test_gates.py
+python3 tools/scripts/test_gates.py
+shell: /bin/bash -e {0}
+##[endgroup]
+ran 41 gate checks
+ledger order check: 2 rows out of order in data/ledger.json
+##[error]Process completed with exit code 1.

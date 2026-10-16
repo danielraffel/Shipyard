@@ -20,7 +20,7 @@
  {
   "format": "shell_exit",
   "kind": "exit_code",
-  "subject": "python3 scripts/doc_sync_check.py --mode report",
+  "subject": "\u2717 doc: mapped paths changed without their guide (.shipyard/config.toml -> docs/guides/local-ci.md)",
   "message": "exit code 1: \u2717 doc: mapped paths changed without their guide (.shipyard/config.toml -> docs/guides/local-ci.md)",
   "location": "",
   "line": 7,
