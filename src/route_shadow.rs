@@ -600,7 +600,7 @@ pub fn record_dispatch_observation_best_effort(
     let Some(snapshot) = scheduler_snapshot(job_id, target, &[], observed_at) else {
         return;
     };
-    let selected_route_id = match &target.backend {
+    let Some(selected_route_id) = (match &target.backend {
         ResolvedBackend::HostPool(pool) => pool
             .members
             .iter()
@@ -616,7 +616,9 @@ pub fn record_dispatch_observation_best_effort(
         | ResolvedBackend::Ssh(_)
         | ResolvedBackend::Windows(_)
         | ResolvedBackend::Cloud(_) => None,
-    }?;
+    }) else {
+        return;
+    };
     let Some((position, candidate)) = snapshot
         .candidates
         .iter()
