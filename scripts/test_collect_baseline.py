@@ -17,7 +17,8 @@ class BaselineScorecardTests(unittest.TestCase):
             args = type("Args", (), {"db": Path(directory) / "metrics" / "metrics.db", "project": "pulp", "repo": "Generous-Corp/pulp",
                                       "shipyard": "shipyard", "since_days": 5, "timeout_seconds": 300})()
             original = MOD.run
-            MOD.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 0, json.dumps({"job_samples": 4}), "")
+            commands = []
+            MOD.run = lambda *a, **k: (commands.append(a[0]) or subprocess.CompletedProcess(a[0], 0, json.dumps({"job_samples": 4}), ""))
             try:
                 result = MOD.authoritative_scorecard(args)
             finally:
@@ -25,6 +26,7 @@ class BaselineScorecardTests(unittest.TestCase):
             self.assertTrue(result["provenance_status"])
             self.assertEqual(result["collector_safe_merge_denominator"]["status"], "unavailable")
             self.assertEqual(result["strata"]["rerun"]["status"], "unavailable")
+            self.assertEqual(commands[0][commands[0].index("--project") + 1], "Generous-Corp/pulp")
 
     def test_unavailable_delta_does_not_record_observation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -63,6 +65,15 @@ class BaselineScorecardTests(unittest.TestCase):
 
 
 class CollectorInvocationTests(unittest.TestCase):
+    def test_tartci_export_rejects_duplicate_and_non_string_identity(self):
+        duplicate = [{"project": "pulp", "repo": "o/p", "provider": "tart", "external_id": "x"},
+                     {"project": "pulp", "repo": "o/p", "provider": "tart", "external_id": "x"}]
+        with self.assertRaises(RuntimeError):
+            MOD.validate_tartci_export(json.dumps(duplicate), "o/p", "pulp")
+        bad = {"project": "pulp", "repo": "o/p", "provider": "tart", "external_id": 1}
+        with self.assertRaises(RuntimeError):
+            MOD.validate_tartci_export(json.dumps(bad), "o/p", "pulp")
+
     def test_collect_uses_selected_db_and_counts_only_new_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()

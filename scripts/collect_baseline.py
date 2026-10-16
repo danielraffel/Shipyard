@@ -32,6 +32,11 @@ def state_identity(path: pathlib.Path, project: str, repo: str, db: pathlib.Path
     return {"project": project, "repo": repo, "database": str(db.expanduser().resolve(strict=False))}
 
 
+def validate_project_repo(project: str, repo: str) -> None:
+    if project.casefold() != repo.rsplit("/", 1)[-1].casefold():
+        raise ValueError("--project must be the repository short name for exact scorecard scoping")
+
+
 def validate_state_identity(path: pathlib.Path, project: str, repo: str, db: pathlib.Path) -> None:
     if not path.exists():
         return
@@ -51,6 +56,7 @@ def validate_state_identity(path: pathlib.Path, project: str, repo: str, db: pat
 
 def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
+    validate_project_repo(args.project, args.repo)
     validate_state_identity(args.state, args.project, args.repo, args.db)
     state_dir = str(validate_state_layout(args.db))
     before = count_jobs(args.db, args.project, args.repo)
@@ -129,7 +135,8 @@ def validate_tartci_export(text: str, repo: str, project: str) -> None:
     if not records or any(not isinstance(record, dict) for record in records):
         raise RuntimeError("TartCI export must contain JSON objects")
     missing = [record for record in records if record.get("repo") != repo or record.get("project") != project
-               or not record.get("provider") or not record.get("external_id")]
+               or not isinstance(record.get("provider"), str) or not record["provider"].strip()
+               or not isinstance(record.get("external_id"), str) or not record["external_id"].strip()]
     if missing:
         raise RuntimeError("TartCI export record lacks exact project/repo or non-empty provider/external_id")
     keys = [(record["provider"], record["external_id"]) for record in records]
@@ -158,6 +165,7 @@ def validate_state_layout(db: pathlib.Path) -> pathlib.Path:
 
 
 def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
+    validate_project_repo(args.project, args.repo)
     state_dir = validate_state_layout(args.db)
     scorecard_project = args.repo if args.project.casefold() == args.repo.rsplit("/", 1)[-1].casefold() else args.project
     result = run([args.shipyard, "--state-dir", str(state_dir), "metrics", "scorecard",
