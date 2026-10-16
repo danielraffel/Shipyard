@@ -638,6 +638,16 @@ a deadline for the content the code reads (`read_pid_file(path) == Some(pid)`).
 To prove a fix, widen the window rather than loop on luck: delaying the stub's
 write by 0.5 s failed the old test on every run.
 
+## A green test job must have printed its summary
+
+`python3 -m unittest discover` exits 0 whenever its process ends with status
+0, including mid-suite, with no "Ran N tests" line and every later test
+unrun. The "Python helper tests" job once stayed green that way for days: a
+module under test left a SIGALRM pending whose handler calls `os._exit(0)`.
+The job runs `scripts/run_unittest_strict.py`, which passes only when
+unittest exited 0 and printed its own "Ran N tests" line ending in OK. When a
+test job's log has no summary, treat it as red whatever its conclusion says.
+
 ## A unit test must not see the host's GitHub auth
 
 CI runs every test with `SHIPYARD_TEST_HOME` set to the runner's temp

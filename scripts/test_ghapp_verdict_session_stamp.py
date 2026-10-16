@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import tempfile
@@ -140,6 +141,37 @@ class Stamp(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b"")
+
+    @unittest.skipUnless(hasattr(signal, "SIGALRM"), "no SIGALRM on this platform")
+    def test_main_leaves_no_alarm_and_restores_the_handler(self) -> None:
+        # A pending alarm left by main() ends the importing process, with
+        # status 0, seconds later: it once ended this very test run mid-suite.
+        def mine(_signum: int, _frame: object) -> None:
+            raise AssertionError("the caller's handler must be kept")
+
+        previous = signal.signal(signal.SIGALRM, mine)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        with mock.patch("sys.stdout"):
+            self.assertEqual(stamp.main(["pr", "comment", "--body", VERDICT]), 0)
+        with mock.patch.object(stamp, "rewrite", side_effect=RuntimeError("boom")):
+            self.assertEqual(stamp.main(["pr", "comment"]), 0)
+        self.assertEqual(signal.alarm(0), 0)
+        self.assertIs(signal.getsignal(signal.SIGALRM), mine)
+
+    @unittest.skipUnless(hasattr(signal, "SIGALRM"), "no SIGALRM on this platform")
+    def test_a_process_that_called_main_outlives_the_deadline(self) -> None:
+        code = (
+            "import importlib.util, sys, time\n"
+            f"spec = importlib.util.spec_from_file_location('s', {str(SCRIPT)!r})\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "m.main(['pr', 'comment'])\n"
+            "time.sleep(m.DEADLINE_SECONDS + 1)\n"
+            "sys.stderr.write('survived')\n"
+            "sys.exit(3)\n"
+        )
+        result = subprocess.run([sys.executable, "-I", "-c", code],
+                                capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual((result.returncode, result.stderr), (3, "survived"))
 
     def test_the_marker_pattern_is_the_arm_guards(self) -> None:
         self.assertEqual(stamp._MARKER.pattern, guard._MARKER.pattern)

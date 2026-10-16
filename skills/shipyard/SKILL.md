@@ -4097,11 +4097,19 @@ Other non-mutating checks:
 
 ```sh
 cargo test --all-targets --locked
-python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 scripts/run_unittest_strict.py -s scripts -p 'test_*.py'  # fails unless unittest summarised OK
 python3 scripts/update_drift_tracker.py
 python3 scripts/compare_cli_surface.py --allow-rust-only paths
 scripts/validate_webhook_tunnel_live.py --json
 ```
+
+A bare `unittest discover` exits 0 whenever its process ends with status 0,
+even mid-suite: a module that leaves a SIGALRM pending with an `os._exit(0)`
+handler once ended the helper suite about 380 tests in, green, with every
+later test unrun. Never leave a signal handler or alarm installed after a
+function returns (cancel it in a `finally`), and run the suite through
+`scripts/run_unittest_strict.py`, which requires unittest's own "Ran N tests"
+and "OK" lines.
 
 The live webhook gate is intentionally dangerous because it resets the local
 Funnel config:

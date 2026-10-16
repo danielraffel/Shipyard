@@ -134,16 +134,25 @@ def _give_up(_signum: int, _frame: object) -> None:
 
 
 def main(args: list[str]) -> int:
-    if hasattr(signal, "SIGALRM"):
-        signal.signal(signal.SIGALRM, _give_up)
+    # The deadline covers this call only. It is cancelled, and the previous
+    # handler put back, however the call ends: an alarm left pending would
+    # end whatever process imported this module, with status 0, seconds later.
+    alarm = hasattr(signal, "SIGALRM")
+    previous = signal.signal(signal.SIGALRM, _give_up) if alarm else None
+    if alarm:
         signal.alarm(DEADLINE_SECONDS)
     try:
-        result = rewrite(args)
-    except Exception:  # noqa: BLE001 - never block a comment over a stamp
+        try:
+            result = rewrite(args)
+        except Exception:  # noqa: BLE001 - never block a comment over a stamp
+            return 0
+        sys.stdout.buffer.write(
+            b"".join(item.encode() + b"\0" for item in [SENTINEL, *result, END]))
         return 0
-    sys.stdout.buffer.write(
-        b"".join(item.encode() + b"\0" for item in [SENTINEL, *result, END]))
-    return 0
+    finally:
+        if alarm:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
 
 
 if __name__ == "__main__":
