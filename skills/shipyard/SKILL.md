@@ -4978,4 +4978,7 @@ with an exact validated head, non-empty required-check provenance, and a
 format-validated gate-receipt SHA-256. Scorecards derive safe-merge counts and wasted
 compute from those receipts and exact repo/PR joins; PR counts and GitHub
 `merged_at` fields are not substitutes. Missing joined job evidence is
-`partial` or `unavailable`, never a zero-cost merge.
+`partial` or `unavailable`, never a zero-cost merge, and an `unavailable` row
+has no value. Wasted compute per change counts every failed or cancelled job of
+the merged pull request, earlier pushes included; duplicate receipts for one
+head count once.

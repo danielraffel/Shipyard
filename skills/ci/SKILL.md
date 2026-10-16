@@ -3869,4 +3869,7 @@ nodes are also fatal; they must not be filtered into an empty result.
 The metrics merge-receipt importer is telemetry only. It requires a
 `shipyard-merge-receipt/v1` record with the exact validated head, required-check
 list, and gate receipt hash; GitHub merged PR counts cannot authorize a safe
-merge denominator or replace gate evidence.
+merge denominator or replace gate evidence. Wasted compute per safely merged change covers every
+failed or cancelled job of the merged pull request, earlier pushes included;
+duplicate receipts for one head count once, and an `unavailable` row has no
+value.
