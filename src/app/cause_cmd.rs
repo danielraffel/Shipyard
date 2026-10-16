@@ -21,6 +21,7 @@ use fs2::FileExt;
 use serde::Serialize;
 use serde_json::Value;
 
+mod advice;
 mod record;
 
 use super::CliFailure;
@@ -65,6 +66,7 @@ pub(super) fn cause_command<W: Write>(
                 ),
             ));
         }
+        CauseCommand::Advise(args) => return advice::command(&args, json, stdout),
         CauseCommand::Archive(args) => {
             let report = archive_inputs(&args)?;
             let written = if json {

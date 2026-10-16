@@ -77,6 +77,10 @@ shipyard cause archive --dir causes/ --input records.jsonl
 
 # One observer pass over a workflow's recent runs.
 shipyard cause record --repo OWNER/REPO --workflow build.yml --dir data/ci-cause
+
+# Read-only historical lexical advice for one exact current head.
+shipyard cause advise --dir data/ci-cause --repo OWNER/REPO \
+  --head-sha <40-hex-head> --query "failing test" --pr 123
 ```
 
 `cause extract` takes where the job ran from its flags, else from the
@@ -138,6 +142,16 @@ written, reds pending (split into those that went red under 24 hours,
 on stderr. Run it on a schedule you choose; Shipyard does not schedule it.
 
 ## Related
+
+`cause advise` reads only the local archive. It requires a full current head
+SHA, excludes that head and the current pull request, ignores unnamed/unknown
+rows, and uses case-insensitive lexical token overlap with stable tie breaks.
+It can take newline-delimited outage windows (`start`, `end`, optional
+`reason`) and suppresses rows completed inside a declared window. It never
+contacts GitHub, executes `fix_hint`, or writes the archive. Rows containing
+unscrubbed paths, addresses, private hosts, or credential-like values are
+discarded. JSON output uses `shipyard.cause-advice/v1`; human output is a
+stable table intended for review, not an automatic decision.
 
 - [CLI reference](cli-reference.md): every flag of `diagnose` and `cause`.
 - The scorecard's `--export-cases` rows carry the same record in their

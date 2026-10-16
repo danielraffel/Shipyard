@@ -1402,6 +1402,8 @@ pub(crate) enum CauseCommand {
     /// request or branch turned green. Read-only toward GitHub; never part of
     /// `ship`, `pr` or `run`.
     Record(CauseRecordArgs),
+    /// Search the local cause archive for deterministic historical advice.
+    Advise(CauseAdviseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1473,6 +1475,31 @@ pub(crate) struct CauseArchiveArgs {
     /// `cause` is taken). Repeatable.
     #[arg(long = "input", value_name = "FILE", required = true)]
     pub(crate) inputs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CauseAdviseArgs {
+    /// Cause archive directory (the directory containing causes/ and fixlinks.jsonl).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) dir: PathBuf,
+    /// OWNER/REPO for the current failure.
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub(crate) repo: String,
+    /// Full 40-hex SHA of the current PR head.
+    #[arg(long, value_name = "SHA")]
+    pub(crate) head_sha: String,
+    /// Case-insensitive lexical query (signature, failed step, job, or detail).
+    #[arg(long)]
+    pub(crate) query: String,
+    /// Current pull request; historical rows from this PR are excluded.
+    #[arg(long)]
+    pub(crate) pr: Option<u64>,
+    /// JSONL outage windows with `start`, `end`, and optional `reason`.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) outage_windows: Option<PathBuf>,
+    /// Maximum historical candidates to return.
+    #[arg(long, default_value_t = 5)]
+    pub(crate) limit: usize,
 }
 
 #[derive(Debug, Subcommand)]

@@ -91,6 +91,8 @@ shipyard cause archive --dir DIR --input F   # append records (or scorecard case
 shipyard cause record --repo OWNER/REPO --workflow FILE --dir DIR [--since TIME] [--base main]
                                              # read-only observer: a cause row per new red job (DIR/causes/YYYY-MM.jsonl)
                                              #   and a fix-link once its PR or branch goes green (DIR/fixlinks.jsonl);
+shipyard cause advise --dir DIR --repo OWNER/REPO --head-sha SHA --query TEXT [--pr N]
+                                             #   read-only lexical historical causes; exact-head/privacy guarded
                                              #   --since defaults to three days ago. fix_hint is an allowlisted suggestion, never run
 
 # ghapp guards (queue-removal-guard, queue-arm-guard, branch-refresh-guard, merge-guard,
