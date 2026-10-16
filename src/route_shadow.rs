@@ -600,15 +600,28 @@ pub fn record_dispatch_observation_best_effort(
     let Some(snapshot) = scheduler_snapshot(job_id, target, &[], observed_at) else {
         return;
     };
-    let Some((position, candidate)) =
-        snapshot
-            .candidates
+    let selected_route_id = match &target.backend {
+        ResolvedBackend::HostPool(pool) => pool
+            .members
+            .iter()
+            .find(|member| member.label == selected_label || member.id == selected_label)
+            .map(|member| format!("host-pool:{}:{}", pool.pool_name, member.id)),
+        ResolvedBackend::Fallback(chain) => chain
+            .backends
             .iter()
             .enumerate()
-            .find(|(_, candidate)| {
-                candidate.route_id.ends_with(&format!(":{selected_label}"))
-                    || candidate.route_id == selected_label
-            })
+            .find(|(_, backend)| backend.label == selected_label)
+            .map(|(position, _)| format!("fallback:{selected_label}:{position}")),
+        ResolvedBackend::Local(_)
+        | ResolvedBackend::Ssh(_)
+        | ResolvedBackend::Windows(_)
+        | ResolvedBackend::Cloud(_) => None,
+    }?;
+    let Some((position, candidate)) = snapshot
+        .candidates
+        .iter()
+        .enumerate()
+        .find(|(_, candidate)| candidate.route_id == selected_route_id)
     else {
         return;
     };
@@ -1262,7 +1275,7 @@ mod tests {
         let metadata = selected.observation.expect("metadata");
         assert_eq!(
             metadata.selected_route.expect("selected route").route_id,
-            "host-pool:mac:M1"
+            "host-pool:macs:m1"
         );
         assert!(matches!(
             selected.counterfactuals[0].outcome,
