@@ -3459,6 +3459,7 @@ mod tests {
             status: "success".to_owned(),
             duration_ms: 100,
             completed_at: Some(Utc::now()),
+            provider: Some("github".to_owned()),
             external_id: Some("github:7/1/1".to_owned()),
             event: Some("pull_request".to_owned()),
             run_attempt: Some(1),
