@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -409,7 +409,7 @@ impl MetricsStore {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let conn = self.connect()?;
-        Self::insert_repeated_work_shadow(&conn, input)
+        Ok(Self::insert_repeated_work_shadow(&conn, input)?)
     }
 
     /// Record one shadow observation without waiting for a sandbox writer
@@ -425,12 +425,20 @@ impl MetricsStore {
             StdDuration::ZERO,
         )?;
         fs::create_dir_all(&dir)?;
-        let store = Self {
-            path: dir.join("metrics.db"),
-        };
-        store.migrate()?;
-        let conn = store.connect()?;
-        Self::insert_repeated_work_shadow(&conn, input)?;
+        let conn = Connection::open(dir.join("metrics.db"))?;
+        conn.busy_timeout(StdDuration::ZERO)?;
+        if let Err(error) = migrate_repeated_work_shadow(&conn) {
+            if sqlite_is_busy(&error) {
+                return Ok(false);
+            }
+            return Err(error.into());
+        }
+        if let Err(error) = Self::insert_repeated_work_shadow(&conn, input) {
+            if sqlite_is_busy(&error) {
+                return Ok(false);
+            }
+            return Err(error.into());
+        }
         Ok(true)
     }
 
@@ -438,7 +446,7 @@ impl MetricsStore {
     fn insert_repeated_work_shadow(
         conn: &Connection,
         input: &RepeatedWorkShadowInput,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), rusqlite::Error> {
         conn.execute(
             "INSERT INTO repeated_work_shadow
              (observed_at, kind, branch, sha, target_config, mode, job_id,
@@ -1127,6 +1135,33 @@ fn coverage_for_samples(measured: usize, total: usize, description: &str) -> Sco
         status: status.to_owned(),
         reason: format!("{measured} of {total} {description}"),
     }
+}
+
+fn migrate_repeated_work_shadow(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS repeated_work_shadow (
+           id INTEGER PRIMARY KEY,
+           observed_at TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           branch TEXT NOT NULL,
+           sha TEXT NOT NULL,
+           target_config TEXT NOT NULL,
+           mode TEXT NOT NULL,
+           job_id TEXT NOT NULL,
+           superseded_job_id TEXT NOT NULL,
+           superseded_sha TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
+           ON repeated_work_shadow(observed_at DESC);",
+    )
+}
+
+fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(inner.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
 }
 
 #[derive(Debug)]
@@ -2164,6 +2199,8 @@ mod instrument_tests;
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     fn insert_scorecard_sample(
@@ -2768,5 +2805,32 @@ mod tests {
 
         assert!(scorecard.worker_minutes.is_finite());
         assert!(scorecard.worker_minutes > worker_minutes(&[i64::MAX]));
+    }
+
+    #[test]
+    fn best_effort_shadow_write_drops_busy_sqlite_without_waiting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let lock = Connection::open(store.path()).expect("lock connection");
+        lock.execute_batch("BEGIN EXCLUSIVE")
+            .expect("exclusive lock");
+        let input = RepeatedWorkShadowInput {
+            kind: RepeatedWorkKind::DuplicateExactHeadConfig,
+            branch: "main".to_owned(),
+            sha: "head".to_owned(),
+            target_config: "{}".to_owned(),
+            mode: "full".to_owned(),
+            job_id: "new".to_owned(),
+            superseded_job_id: "old".to_owned(),
+            superseded_sha: "head".to_owned(),
+        };
+
+        let started = Instant::now();
+        assert!(
+            !MetricsStore::record_repeated_work_shadow_best_effort(temp.path(), &input,)
+                .expect("busy shadow write should be classified as dropped")
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        lock.execute_batch("ROLLBACK").expect("release lock");
     }
 }
