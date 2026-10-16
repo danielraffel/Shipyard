@@ -215,8 +215,8 @@ configuration.
 ## This repository uses Shipyard
 
 Shipyard validates itself on macOS, Linux, and Windows. The workflows and
-project configuration are in [`.shipyard/config.toml`](.shipyard/config.toml)
-and [`.github/workflows/`](.github/workflows/). Release details are in
+project configuration are in [`.shipyard/config.toml`](https://github.com/danielraffel/Shipyard/blob/main/.shipyard/config.toml)
+and [`.github/workflows/`](https://github.com/danielraffel/Shipyard/tree/main/.github/workflows). Release details are in
 [RELEASING.md](RELEASING.md).
 
 ## Contributing
