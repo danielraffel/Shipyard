@@ -63,7 +63,7 @@ infer performance from fixture duration.
 
 | Scope | Existing control | Limitation |
 | --- | --- | --- |
-| New interactive submission | `--foreground` on `run`, `ship`, or `pr` | Selects cooperative execution for that submission; does not transfer an existing daemon job. |
+| New interactive submission | `--foreground` on `run` or `ship` | Selects cooperative execution for that submission; does not transfer an existing daemon job. The `pr` command has no foreground flag. |
 | Reboot requeue | Machine-global `[queue.boot_requeue] enabled = false` (default) | Read on the supervisor's startup boot pass. It prevents the optional replay path; it cannot undo an already completed requeue. |
 | Queue-absence recovery | Machine-global `[ship_state] queue_absent_recovery = false` (default) | Prevents subsequent recovery sweeps. It does not revoke a replacement already committed or an in-flight sweep holding its loaded configuration. |
 | Orphan abandonment | `[ship_state] auto_resume = false` (default) | Disables abandonment; it is independent of queue-absence replacement and is not a general queue replay switch. |
