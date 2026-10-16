@@ -4236,9 +4236,8 @@ mod tests {
                 ));
             }
         }
-        String::from_utf8(bytes).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-        })
+        String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
     #[cfg(unix)]
