@@ -4180,4 +4180,40 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         lock.execute_batch("ROLLBACK").expect("release lock");
     }
+
+    #[test]
+    fn terminal_batch_rolls_back_when_later_identity_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let base = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            job: "macos".to_owned(),
+            provider: Some("github".to_owned()),
+            external_id: Some("github:9/1/1".to_owned()),
+            status: "success".to_owned(),
+            duration_ms: 1,
+            completed_at: Some(Utc::now()),
+            event: Some("pull_request".to_owned()),
+            run_attempt: Some(1),
+            provider_run_id: Some(9),
+            head_sha: Some("head".to_owned()),
+            ..Default::default()
+        };
+        store.record_terminal_observation(&base).unwrap();
+        let mut fresh = base.clone();
+        fresh.external_id = Some("github:9/2/1".to_owned());
+        let mut conflict = base.clone();
+        conflict.event = Some("merge_group".to_owned());
+        assert!(
+            store
+                .record_terminal_observations(&[fresh, conflict])
+                .is_err()
+        );
+        let conn = Connection::open(store.path()).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM jobs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
 }
