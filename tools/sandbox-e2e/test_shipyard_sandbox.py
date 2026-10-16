@@ -351,7 +351,12 @@ def test_guarded_external_writer_retains_lease_after_parent_death(
                 env=env,
                 start_new_session=True,
             )
-            guardian_pid.write_text(str(guardian_process.pid), encoding="utf-8")
+            # Publish readiness atomically.  The parent treats the marker's
+            # presence as the point at which it may signal the owner; a direct
+            # write briefly creates an empty file and loses that handshake.
+            guardian_pid_tmp = guardian_pid.with_suffix(".tmp")
+            guardian_pid_tmp.write_text(str(guardian_process.pid), encoding="utf-8")
+            guardian_pid_tmp.replace(guardian_pid)
             return_code = guardian_process.wait()
         except BaseException:
             return_code = 1
