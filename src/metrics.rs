@@ -409,7 +409,7 @@ impl MetricsStore {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let conn = self.connect()?;
-        self.insert_repeated_work_shadow(&conn, input)
+        Self::insert_repeated_work_shadow(&conn, input)
     }
 
     /// Record one shadow observation without waiting for a sandbox writer
@@ -430,13 +430,12 @@ impl MetricsStore {
         };
         store.migrate()?;
         let conn = store.connect()?;
-        store.insert_repeated_work_shadow(&conn, input)?;
+        Self::insert_repeated_work_shadow(&conn, input)?;
         Ok(true)
     }
 
     /// Insert one observation on an already-fenced connection.
     fn insert_repeated_work_shadow(
-        &self,
         conn: &Connection,
         input: &RepeatedWorkShadowInput,
     ) -> Result<(), Box<dyn std::error::Error>> {
