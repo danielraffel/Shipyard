@@ -5,7 +5,6 @@
 //! subprocess (and its exit-code mapping) while the daemon uses its configured
 //! GitHub client.
 
-use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -120,7 +119,6 @@ pub fn import_github<E>(
         run_ids.push((run_id, workflow_run_single_pr(run), metadata));
     }
     let project = request.project_key();
-    let mut imported = 0;
     let mut pending_inputs = Vec::new();
     for (run_id, pr, metadata) in run_ids {
         let mut page = 1u32;
@@ -213,8 +211,7 @@ pub fn import_github<E>(
     store
         .record_terminal_observations(&pending_inputs)
         .map_err(|error| store_error(format!("GitHub metrics record failed: {error}")))?;
-    imported = pending_inputs.len();
-    Ok(imported)
+    Ok(pending_inputs.len())
 }
 
 #[cfg(test)]
