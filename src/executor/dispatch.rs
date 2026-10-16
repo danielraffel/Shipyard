@@ -3142,6 +3142,82 @@ backend = "local"
     }
 
     #[test]
+    fn nested_host_pool_fallback_dispatch_persists_outer_and_nested_attempts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let config = table(&format!(
+            r#"
+            [host_pools.local_macs]
+            [[host_pools.local_macs.members]]
+            id = "local"
+            type = "local"
+            cwd = {}
+            capabilities = ["macos", "arm64"]
+
+            [targets.mac]
+            backend = "local"
+            platform = "macos-arm64"
+            fallback = [{{ type = "host-pool", pool = "local_macs" }}]
+            "#,
+            toml_string(repo.display().to_string())
+        ));
+        let target = resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0);
+        let result = super::ExecutorDispatcher::new_with_state_dir(None, temp.path()).validate(
+            super::DispatchValidationRequest {
+                job_id: Some("nested-receipt".to_owned()),
+                defer_host_pool_lease_unavailable: false,
+                sha: "abc1234".to_owned(),
+                branch: "main".to_owned(),
+                target: &target,
+                log_path: temp.path().join("nested.log"),
+                resume_from: None,
+                mode: ValidationMode::Full,
+                progress_callback: None,
+            },
+        );
+        let attempts = result.route_attempts.clone().expect("attempt history");
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| attempt.route_id.starts_with("fallback:"))
+        );
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| attempt.route_id == "host-pool:local_macs:local")
+        );
+        crate::route_shadow::record_dispatch_observation_best_effort(
+            temp.path(),
+            "nested-receipt",
+            &target,
+            &attempts,
+            Utc::now(),
+        );
+        let store = crate::route_shadow::RouteShadowReceiptStore::new(temp.path());
+        for _ in 0..100 {
+            if let Ok(Some(receipt)) = store.load("nested-receipt:mac") {
+                let stored = receipt
+                    .observation
+                    .expect("metadata")
+                    .dispatch_attempts
+                    .unwrap();
+                assert_eq!(stored.len(), attempts.len());
+                assert!(
+                    stored
+                        .iter()
+                        .any(|attempt| attempt.route_id == "host-pool:local_macs:local")
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("nested dispatch receipt");
+    }
+
+    #[test]
     fn host_pool_dispatch_acquires_and_releases_local_lease() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
