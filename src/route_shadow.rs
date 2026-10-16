@@ -1185,7 +1185,7 @@ mod tests {
         std::fs::create_dir_all(&runtime_paths.state_dir).expect("state directory");
         let lock_path = runtime_paths.state_dir.join(".sandbox-writer-domain.lock");
         let lock = File::create(&lock_path).expect("writer lock");
-        lock.lock_exclusive().expect("hold writer lock");
+        lock.try_lock_exclusive().expect("hold writer lock");
 
         let store = RouteShadowReceiptStore::new(runtime_paths.state_dir.clone());
         let observation = RouteShadowObservation {
@@ -1203,14 +1203,14 @@ mod tests {
             route_attempts: None,
         };
         let (done_tx, done_rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             let _ = done_tx.send(store.record_observation_best_effort(&observation));
         });
-        let result = done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("zero-timeout writer must return promptly");
-        assert_eq!(result, Ok(false));
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(1));
         lock.unlock().expect("release writer lock");
+        worker.join().expect("writer worker exits");
+        let result = result.expect("zero-timeout writer must return promptly");
+        assert_eq!(result, Ok(false));
     }
 
     #[test]
