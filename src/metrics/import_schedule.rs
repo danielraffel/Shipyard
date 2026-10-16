@@ -345,7 +345,10 @@ mod tests {
         move |repo, argv| {
             calls.push(format!("{repo} {}", argv[3]));
             if argv[3].ends_with("/runs") {
-                Ok(json!({"workflow_runs": [{"id": 7, "pull_requests": []}]}))
+                Ok(
+                    json!({"workflow_runs": [{"id": 7, "event": "merge_group", "run_attempt": 1,
+                    "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "pull_requests": []}]}),
+                )
             } else {
                 Ok(
                     json!({"jobs": [{"id": 1, "name": "macos", "conclusion": "success",
