@@ -1,7 +1,7 @@
 # Queue reliability control
 
 This audit covers the queue implementation at
-[`79c1399da1203ea94f68db4fb78fd53d7f6b2724`](https://github.com/danielraffel/Shipyard/commit/79c1399da1203ea94f68db4fb78fd53d7f6b2724).
+[`ecec8359223d981751e51a943371471b441a6fe0`](https://github.com/danielraffel/Shipyard/commit/ecec8359223d981751e51a943371471b441a6fe0).
 It changes documentation only. It grants no host permission, enables no recovery
 policy, and does not graduate a daemon execution or routing canary.
 
