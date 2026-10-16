@@ -447,7 +447,14 @@ impl From<StratumAccumulator> for AuthenticatedStratum {
             // receipt; this is an observed recent-N workflow-run window.
             "partial"
         };
-        let reason = if value.observed_jobs > 0 && value.qualified_jobs == value.observed_jobs {
+        let qualified_jobs = if provenance == "authenticated" {
+            value.qualified_jobs
+        } else {
+            // Mixed or unverified provenance may remain visible as observed,
+            // but cannot contribute any qualified population.
+            0
+        };
+        let reason = if value.observed_jobs > 0 {
             format!(
                 "{reason}; workflow-run import window completeness unproven; recent-N runs only"
             )
@@ -456,7 +463,7 @@ impl From<StratumAccumulator> for AuthenticatedStratum {
         };
         AuthenticatedStratum {
             observed_jobs: value.observed_jobs,
-            qualified_jobs: value.qualified_jobs,
+            qualified_jobs,
             provenance: provenance.to_owned(),
             coverage: coverage.to_owned(),
             reason,
@@ -1613,16 +1620,20 @@ impl MetricsStore {
             let identity_valid = provider
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty())
-                && attempt.is_some()
-                && pr.is_some()
-                && provider_run_id.is_some()
+                && attempt.is_some_and(|value| value > 0)
+                && provider_run_id.is_some_and(|value| value > 0)
                 && head_sha.as_deref().is_some_and(is_exact_sha);
             match (provenance.as_deref(), verified) {
                 (Some("production"), true) => accumulator.authenticated += 1,
                 (Some(_), true) => accumulator.unverified += 1,
-                (_, false) => accumulator.unknown += 1,
+                (Some(_), false) | (None, _) => accumulator.unknown += 1,
             }
+            let event_identity_valid = match event.as_deref() {
+                Some("merge_group") => true,
+                _ => pr.is_some(),
+            };
             if identity_valid
+                && event_identity_valid
                 && matches!(
                     (provenance.as_deref(), verified),
                     (Some("production"), true)
@@ -3869,16 +3880,56 @@ mod tests {
                 ..MetricRecordInput::default()
             })
             .unwrap();
+        store
+            .record_terminal_observation(&MetricRecordInput {
+                project: "shipyard".to_owned(),
+                repo: Some("Owner/Shipyard".to_owned()),
+                job: "merge-group".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                status: "success".to_owned(),
+                duration_ms: 100,
+                completed_at: Some(Utc::now()),
+                external_id: Some("github:9/3/1".to_owned()),
+                event: Some("merge_group".to_owned()),
+                run_attempt: Some(1),
+                provider_run_id: Some(3),
+                head_sha: Some("d".repeat(40)),
+                provenance: Some("production".to_owned()),
+                provenance_verified: true,
+                ..MetricRecordInput::default()
+            })
+            .unwrap();
+        store
+            .record_terminal_observation(&MetricRecordInput {
+                project: "shipyard".to_owned(),
+                repo: Some("Owner/Shipyard".to_owned()),
+                job: "unverified".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                status: "success".to_owned(),
+                duration_ms: 100,
+                completed_at: Some(Utc::now()),
+                external_id: Some("github:9/4/1".to_owned()),
+                event: Some("pull_request".to_owned()),
+                run_attempt: Some(1),
+                pr: Some(11),
+                provider_run_id: Some(4),
+                head_sha: Some("e".repeat(40)),
+                provenance: None,
+                provenance_verified: false,
+                ..MetricRecordInput::default()
+            })
+            .unwrap();
         let receipt = store
             .authenticated_strata_receipt("shipyard", 1, &"b".repeat(40))
             .unwrap();
         assert_eq!(receipt.schema, AUTHENTICATED_STRATA_SCHEMA);
         assert_eq!(receipt.unit, "job");
         assert_eq!(receipt.repo, "owner/shipyard");
-        assert_eq!(receipt.strata.normal_pr.observed_jobs, 1);
-        assert_eq!(receipt.strata.normal_pr.qualified_jobs, 1);
-        assert_eq!(receipt.strata.normal_pr.provenance, "authenticated");
+        assert_eq!(receipt.strata.normal_pr.observed_jobs, 2);
+        assert_eq!(receipt.strata.normal_pr.qualified_jobs, 0);
+        assert_eq!(receipt.strata.normal_pr.provenance, "unknown");
         assert_eq!(receipt.strata.normal_pr.coverage, "partial");
+        assert_eq!(receipt.strata.merge_group.qualified_jobs, 1);
         assert!(
             receipt
                 .strata
@@ -3886,7 +3937,7 @@ mod tests {
                 .reason
                 .contains("recent-N runs only")
         );
-        assert_eq!(receipt.aggregate.observed_jobs, 1);
+        assert_eq!(receipt.aggregate.observed_jobs, 3);
         assert_eq!(receipt.aggregate.qualified_jobs, 1);
     }
 
