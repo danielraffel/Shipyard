@@ -3211,7 +3211,8 @@ mod tests {
     };
     use crate::queue::Queue;
     use crate::queue_request::{
-        QueueOutcomeStore, QueueRequestStore, QueuedExecutionOutcome, QueuedExecutionRequest,
+        ExecutionProvenance, QueueOutcomeStore, QueueRequestStore, QueuedExecutionKind,
+        QueuedExecutionOutcome, QueuedExecutionRequest,
     };
     use crate::queue_scheduler::{AdmitPassPlan, RequestBackedAdmitPass, SamePrShipAdmission};
     use crate::ship_state::{AbandonRecord, ShipState, ShipStateStore};
@@ -4599,6 +4600,17 @@ mod tests {
             request.repo = "other/repository".to_owned();
         }
         assert!(!envelope_matches_foreground_job(&job, &wrong_repo));
+
+        let mut wrong_provenance = envelope.clone();
+        wrong_provenance.provenance = Some(ExecutionProvenance {
+            canonical_cwd: temp.path().to_owned(),
+            repo_root: temp.path().to_owned(),
+            repo_slug: Some("other/repository".to_owned()),
+            head_sha: request.sha.clone(),
+            tree_signature: "fixture-tree".to_owned(),
+            config_signature: None,
+        });
+        assert!(!envelope_matches_foreground_job(&job, &wrong_provenance));
     }
 
     #[test]
