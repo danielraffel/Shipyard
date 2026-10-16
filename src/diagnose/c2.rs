@@ -8,10 +8,12 @@
 //! that line sits in a step that ended in `##[error]`. No network and no
 //! model.
 //!
-//! This is a port of EXP-A3's `c2_extract.py`, and the two are one extractor:
-//! their contract is the fixture set in `tests/fixtures/c2/` (one input per
-//! format with its expected records, plus `regressions/`), shared verbatim.
-//! A change to a rule lands in both, with its fixture.
+//! This is the fleet's one cause extractor. Its contract is the fixture set in
+//! `tests/fixtures/c2/` (one input per format with its expected records, plus
+//! `regressions/`): a change to a rule lands with its fixture and a bump of
+//! [`VERSION`]. It began as a port of EXP-A3's `c2_extract.py`, which stays
+//! frozen at version 5 as the reference behind EXP-A3's registered results
+//! and is not kept in step.
 //!
 //! Records from a step that ended in `##[error]` sort first, then by format
 //! priority (the order of [`FORMATS`]), then by line, so the first record is

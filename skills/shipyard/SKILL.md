@@ -1585,9 +1585,12 @@ The record is EXP-A3's `to_ci_cause_v1` mapping of C2's first record:
 `failed_step`, `failure_class`, `format`, `signature`, `detail`, `evidence`
 (`log_line`, `excerpt`), `fix_hint`, `confidence`, `source`, `extractor`,
 `named_at`, `supersedes`, plus C2's `kind`, `location` and `step_failed` and
-`retrospective`. C2 (`src/diagnose/c2.rs`) is a port of EXP-A3's
-`c2_extract.py`; the fixture set in `tests/fixtures/c2/` is shared verbatim
-and is the contract, so a rule change lands in both with its fixture.
+`retrospective`. C2 (`src/diagnose/c2.rs`) is the fleet's one cause
+extractor; the fixture set in `tests/fixtures/c2/` is its contract, so a rule
+change lands with its fixture and a `c2::VERSION` bump. It began as a port of
+EXP-A3's `c2_extract.py`, which is frozen at version 5 as the reference behind
+EXP-A3's registered results and is not kept in step: do not port rule changes
+to it.
 Records from the step that ended in `##[error]` come first, so a retried
 assertion never outranks the runner dying. A make or ninja failure ranks
 below every runner and compiler record and is `low`: on its own it names the
