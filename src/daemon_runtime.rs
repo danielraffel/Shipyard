@@ -1123,25 +1123,54 @@ fn prepare_daemon_temp_dir(daemon_dir: &Path) -> io::Result<PathBuf> {
 /// Best-effort daemon shutdown via IPC stop request.
 #[must_use]
 pub fn stop_running(state_dir: &Path) -> bool {
+    stop_running_outcome(state_dir) == DaemonStopOutcome::Stopped
+}
+
+/// Shutdown distinguishes observed absence from unconfirmed process liveness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DaemonStopOutcome {
+    Absent,
+    Stopped,
+    Unconfirmed,
+}
+
+pub(crate) fn stop_running_outcome(state_dir: &Path) -> DaemonStopOutcome {
+    stop_running_with_status(state_dir, |path| read_daemon_status(path).is_some())
+}
+
+fn stop_running_with_status(
+    state_dir: &Path,
+    mut status_available: impl FnMut(&Path) -> bool,
+) -> DaemonStopOutcome {
     let daemon_dir = state_dir.join("daemon");
     let socket_path = daemon_dir.join("daemon.sock");
     let pid_path = daemon_dir.join("daemon.pid");
-    let was_running = read_daemon_status(state_dir).is_some();
+    let was_running = status_available(state_dir);
     #[cfg(unix)]
     let pid = read_pid_file(&pid_path);
 
-    if socket_path.exists() {
-        let _ = send_stop_request(&socket_path);
-    }
+    let stop_requested = socket_path.exists() && send_stop_request(&socket_path).is_ok();
 
-    if was_running {
+    // Status is an observation, not proof of absence. A reachable IPC endpoint
+    // still needs its shutdown observed when the initial status request failed.
+    if was_running || stop_requested {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            if read_daemon_status(state_dir).is_none() && !socket_path.exists() {
+            if !status_available(state_dir) && !socket_path.exists() {
                 #[cfg(unix)]
                 if pid == Some(std::process::id()) {
-                    let _ = remove_protected_file(&pid_path);
-                    return true;
+                    // The in-process daemon's guard is dropped only after its
+                    // runtime returns. Do not manufacture that exit evidence.
+                    if !pid_path.exists() {
+                        return DaemonStopOutcome::Stopped;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                #[cfg(unix)]
+                if pid.is_none() {
+                    // Socket disappearance alone cannot prove process exit.
+                    return DaemonStopOutcome::Unconfirmed;
                 }
                 #[cfg(unix)]
                 if pid.is_some_and(pid_alive) {
@@ -1149,34 +1178,14 @@ pub fn stop_running(state_dir: &Path) -> bool {
                     continue;
                 }
                 let _ = remove_protected_file(&pid_path);
-                return true;
+                return DaemonStopOutcome::Stopped;
             }
             thread::sleep(Duration::from_millis(100));
-        }
-        if read_daemon_status(state_dir).is_none() {
-            #[cfg(unix)]
-            if pid == Some(std::process::id()) {
-                let _ = cleanup_stale_runtime_files(&daemon_dir);
-                return true;
-            }
-            #[cfg(unix)]
-            if pid.is_some_and(pid_alive) {
-                // Fall through to pid-based termination below. A daemon whose
-                // socket disappeared while its process survived is not stopped.
-            } else {
-                let _ = cleanup_stale_runtime_files(&daemon_dir);
-                return true;
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = cleanup_stale_runtime_files(&daemon_dir);
-                return true;
-            }
         }
     }
 
     #[cfg(unix)]
-    if let Some(pid) = pid.filter(|pid| *pid > 0)
+    if let Some(pid) = pid.filter(|pid| *pid > 0 && *pid != std::process::id())
         && pid_alive(pid)
         && process_looks_like_shipyard_daemon(pid)
     {
@@ -1184,13 +1193,27 @@ pub fn stop_running(state_dir: &Path) -> bool {
         if stopped {
             let _ = cleanup_stale_runtime_files(&daemon_dir);
         }
-        return stopped;
+        return if stopped {
+            DaemonStopOutcome::Stopped
+        } else {
+            DaemonStopOutcome::Unconfirmed
+        };
     }
 
-    if pid_path.exists() || socket_path.exists() {
+    // Do not erase the only ownership/endpoint evidence while a daemon may
+    // still be alive. Refresh must refuse ambiguous shutdown rather than
+    // interpreting our cleanup as proof that spawning a replacement is safe.
+    if socket_path.exists() {
+        return DaemonStopOutcome::Unconfirmed;
+    }
+    #[cfg(unix)]
+    if pid.is_some_and(pid_alive) {
+        return DaemonStopOutcome::Unconfirmed;
+    }
+    if pid_path.exists() {
         let _ = cleanup_stale_runtime_files(&daemon_dir);
     }
-    false
+    DaemonStopOutcome::Absent
 }
 
 #[cfg(unix)]
@@ -4025,6 +4048,120 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn stop_running_observes_ipc_shutdown_after_unavailable_initial_status() {
+        let _tree_test = lock_process_tree_for_test();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().to_path_buf();
+        let (exited, observed_exit) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run_blocking(DaemonRunConfig {
+                mode: RuntimeMode::Isolated,
+                global_dir: state_dir.clone(),
+                state_dir,
+                repos: Vec::new(),
+            })
+            .expect("daemon runtime");
+            exited.send(()).expect("report runtime exit");
+        });
+        await_daemon_serving(temp.path());
+        let mut first_probe = true;
+        let stopped = super::stop_running_with_status(temp.path(), |state| {
+            if std::mem::take(&mut first_probe) {
+                false
+            } else {
+                read_daemon_status(state).is_some()
+            }
+        });
+        // Join before asserting so a failing assertion does not leave a fixture
+        // thread behind after the successful IPC stop request.
+        observed_exit
+            .recv_timeout(Duration::from_secs(10))
+            .expect("owned runtime exited");
+        worker.join().expect("daemon exit");
+        assert_eq!(stopped, super::DaemonStopOutcome::Stopped);
+        assert!(!temp.path().join("daemon/daemon.sock").exists());
+    }
+
+    #[cfg(unix)]
+    fn read_fixture_stop_request(
+        listener: &std::os::unix::net::UnixListener,
+    ) -> std::io::Result<String> {
+        use std::io::BufRead as _;
+
+        listener.set_nonblocking(true)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut line = String::new();
+        std::io::BufReader::new(stream).read_line(&mut line)?;
+        Ok(line)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_status_never_claims_unowned_or_untracked_process_exit() {
+        use std::os::unix::net::UnixListener;
+
+        let _tree_test = lock_process_tree_for_test();
+        for (with_pid, vanish_socket) in [(true, false), (false, false), (false, true)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let daemon_dir = temp.path().join("daemon");
+            std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
+            let socket = daemon_dir.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).expect("listener");
+            let mut child = Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("unowned child");
+            let pid_path = daemon_dir.join("daemon.pid");
+            if with_pid {
+                std::fs::write(&pid_path, child.id().to_string()).expect("pid file");
+            }
+            let (release, wait) = std::sync::mpsc::channel();
+            let server_socket = socket.clone();
+            let server = std::thread::spawn(move || {
+                let line = read_fixture_stop_request(&listener).expect("stop request");
+                if vanish_socket {
+                    std::fs::remove_file(&server_socket).expect("remove endpoint");
+                }
+                let _ = wait.recv_timeout(Duration::from_secs(10));
+                line
+            });
+            let stopped = super::stop_running_with_status(temp.path(), |_| false);
+            let unowned_alive = pid_alive(child.id());
+            let endpoint_preserved = vanish_socket || socket.exists();
+            let pid_preserved = !with_pid || pid_path.exists();
+            let _ = release.send(());
+            let request = server.join();
+            let _ = child.kill();
+            let _ = child.wait();
+            let request = request.expect("server exit");
+            assert_eq!(
+                serde_json::from_str::<Value>(&request).unwrap()["type"],
+                "stop"
+            );
+            assert_eq!(stopped, super::DaemonStopOutcome::Unconfirmed);
+            assert!(unowned_alive, "unowned process must not be signaled");
+            assert!(
+                endpoint_preserved && pid_preserved,
+                "ambiguous runtime evidence must remain"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stop_running_terminates_pid_when_ipc_is_unavailable() {
         let _tree_test = lock_process_tree_for_test();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -4154,7 +4291,10 @@ mod tests {
 
         assert!(!stop_running(temp.path()));
         assert!(pid_alive(child.id()));
-        assert!(!pid_path.exists());
+        assert!(
+            pid_path.exists(),
+            "unowned live process evidence is retained"
+        );
 
         let _ = child.kill();
         let _ = child.wait();
