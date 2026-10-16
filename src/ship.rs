@@ -1697,6 +1697,33 @@ fn admit_drain_worker_inputs(
     let leases = scheduler_host_pool_leases(&jobs, request_store, &pools, leases);
     let vm_slots = scheduler_vm_slots(config, &jobs, request_store)?;
     let now = Utc::now();
+    // Capture only immutable scheduler facts. Receipt serialization is
+    // deliberately best-effort and cannot influence the admit plan, leases,
+    // route ordering, or dispatch when the state directory is unavailable.
+    for job in &jobs {
+        if !matches!(job.status, JobStatus::Pending | JobStatus::Running) {
+            continue;
+        }
+        let Ok(Some(envelope)) = request_store.load(&job.id) else {
+            continue;
+        };
+        let targets = match &envelope.request {
+            crate::queue_request::QueuedExecutionRequest::Run(request) => request
+                .to_execution_request()
+                .map(|request| request.targets),
+            crate::queue_request::QueuedExecutionRequest::Ship(request) => request
+                .to_execution_request()
+                .map(|request| request.targets),
+        };
+        let Ok(targets) = targets else {
+            continue;
+        };
+        for target in &targets {
+            crate::route_shadow::record_scheduler_observation_best_effort(
+                state_dir, &job.id, target, &leases, now,
+            );
+        }
+    }
     let mut scheduling_jobs = jobs.clone();
     scheduling_jobs.retain(|job| {
         job.status != JobStatus::Pending
