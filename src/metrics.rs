@@ -250,6 +250,32 @@ pub struct StewardshipScorecard {
     pub queue_samples: usize,
     pub queue_p50_ms: Option<i64>,
     pub queue_p90_ms: Option<i64>,
+    /// Wall-clock compute minutes spent on failed or cancelled jobs. This is a
+    /// cost proxy: a cancelled or failed attempt may be retried.
+    pub wasted_compute_minutes: f64,
+    /// Number of failed or cancelled jobs contributing to
+    /// [`Self::wasted_compute_minutes`].
+    pub wasted_compute_samples: usize,
+    /// Queue wait minutes with an authoritative queued timestamp.
+    /// This is the coordination-cost proxy.
+    pub coordination_minutes: f64,
+    /// Number of jobs contributing to [`Self::coordination_minutes`].
+    pub coordination_samples: usize,
+    /// Failed-attempt compute minutes. Cancellations are kept in
+    /// `wasted_compute_minutes` but are not called rework without evidence
+    /// that a replacement attempt ran.
+    pub rework_compute_minutes: f64,
+    /// Number of failed attempts contributing to rework compute.
+    pub rework_compute_samples: usize,
+    /// Sum of measured queue and failed-attempt compute minutes.
+    pub coordination_rework_minutes: f64,
+    /// Merge receipts are not currently part of the local metrics schema.
+    /// Keep this explicit instead of dividing by distinct PRs and calling
+    /// those changes safely merged.
+    pub safely_merged_changes: ScorecardCoverage,
+    /// Wasted compute per safely merged change; unavailable until merge
+    /// receipts are imported.
+    pub wasted_compute_per_safely_merged_change: ScorecardCoverage,
     pub distinct_pull_requests: usize,
     pub pull_requests_per_day: f64,
     pub pull_request_throughput: ScorecardCoverage,
@@ -956,6 +982,36 @@ impl MetricsStore {
             .filter(|value| *value >= 0)
             .collect::<Vec<_>>();
         queues.sort_unstable();
+        let wasted_samples = samples
+            .iter()
+            .filter(|(status, duration, _, _, _)| {
+                duration.is_some_and(|value| value >= 0)
+                    && (proxy::is_failure(status) || proxy::is_cancelled(status))
+            })
+            .count();
+        let wasted_compute_ms = samples
+            .iter()
+            .filter(|(status, _, _, _, _)| proxy::is_failure(status) || proxy::is_cancelled(status))
+            .filter_map(|(_, duration, _, _, _)| *duration)
+            .filter(|value| *value >= 0)
+            .fold(0_i64, i64::saturating_add);
+        let rework_samples = samples
+            .iter()
+            .filter(|(status, duration, _, _, _)| {
+                duration.is_some_and(|value| value >= 0) && is_failure_status(status)
+            })
+            .count();
+        let rework_compute_ms = samples
+            .iter()
+            .filter(|(status, _, _, _, _)| is_failure_status(status))
+            .filter_map(|(_, duration, _, _, _)| *duration)
+            .filter(|value| *value >= 0)
+            .fold(0_i64, i64::saturating_add);
+        let coordination_ms = samples
+            .iter()
+            .filter_map(|(_, _, queue, _, _)| *queue)
+            .filter(|value| *value >= 0)
+            .fold(0_i64, i64::saturating_add);
         let distinct_pull_requests = samples
             .iter()
             .filter_map(|(_, _, _, repo, pr)| Some((repo.as_deref()?, (*pr)?)))
@@ -1012,6 +1068,17 @@ impl MetricsStore {
             queue_samples: queues.len(),
             queue_p50_ms: percentile(&queues, 50),
             queue_p90_ms: percentile(&queues, 90),
+            wasted_compute_minutes: millis_to_minutes(wasted_compute_ms),
+            wasted_compute_samples: wasted_samples,
+            coordination_minutes: millis_to_minutes(coordination_ms),
+            coordination_samples: queues.len(),
+            rework_compute_minutes: millis_to_minutes(rework_compute_ms),
+            rework_compute_samples: rework_samples,
+            coordination_rework_minutes: millis_to_minutes(
+                rework_compute_ms.saturating_add(coordination_ms),
+            ),
+            safely_merged_changes: unavailable_merge_coverage(),
+            wasted_compute_per_safely_merged_change: unavailable_merge_coverage(),
             distinct_pull_requests,
             pull_requests_per_day: pull_requests_per_day(distinct_pull_requests, since_days),
             pull_request_throughput,
@@ -1049,10 +1116,7 @@ fn is_success_status(status: &str) -> bool {
 }
 
 fn is_failure_status(status: &str) -> bool {
-    matches!(
-        status,
-        "failure" | "failed" | "timed_out" | "action_required" | "startup_failure"
-    )
+    proxy::is_failure(status)
 }
 
 fn load_scorecard_samples(
@@ -1112,6 +1176,18 @@ fn worker_minutes(durations: &[i64]) -> f64 {
         .map(|duration| *duration as f64)
         .sum::<f64>()
         / 60_000.0
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn millis_to_minutes(milliseconds: i64) -> f64 {
+    milliseconds as f64 / 60_000.0
+}
+
+fn unavailable_merge_coverage() -> ScorecardCoverage {
+    ScorecardCoverage {
+        status: "unavailable".to_owned(),
+        reason: "no durable merge receipt joins a PR head to a safely merged change".to_owned(),
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -2465,6 +2541,18 @@ mod tests {
         assert_eq!(scorecard.queue_samples, 3);
         assert_eq!(scorecard.queue_p50_ms, Some(2_000));
         assert_eq!(scorecard.queue_p90_ms, Some(3_000));
+        assert!((scorecard.wasted_compute_minutes - 2.0).abs() < f64::EPSILON);
+        assert_eq!(scorecard.wasted_compute_samples, 1);
+        assert!((scorecard.coordination_minutes - 0.1).abs() < f64::EPSILON);
+        assert_eq!(scorecard.coordination_samples, 3);
+        assert!((scorecard.rework_compute_minutes - 2.0).abs() < f64::EPSILON);
+        assert_eq!(scorecard.rework_compute_samples, 1);
+        assert!((scorecard.coordination_rework_minutes - 2.1).abs() < f64::EPSILON);
+        assert_eq!(scorecard.safely_merged_changes.status, "unavailable");
+        assert_eq!(
+            scorecard.wasted_compute_per_safely_merged_change.status,
+            "unavailable"
+        );
         assert_eq!(scorecard.distinct_pull_requests, 2);
         assert!((scorecard.pull_requests_per_day - 1.0).abs() < f64::EPSILON);
         assert_eq!(scorecard.pull_request_throughput.status, "available");
@@ -2482,16 +2570,19 @@ mod tests {
         insert_scorecard_sample(&store, "shipyard", 43, "cancelled", 60_000, 1_000, false);
         insert_scorecard_sample(&store, "shipyard", 44, "skipped", 60_000, 1_000, false);
         insert_scorecard_sample(&store, "shipyard", 45, "neutral", 60_000, 1_000, false);
+        insert_scorecard_sample(&store, "shipyard", 46, "fail", 60_000, 1_000, false);
 
         let scorecard = store
             .stewardship_scorecard("shipyard", 2)
             .expect("scorecard");
 
-        assert_eq!(scorecard.job_samples, 5);
+        assert_eq!(scorecard.job_samples, 6);
         assert_eq!(scorecard.successful_jobs, 1);
-        assert_eq!(scorecard.failed_jobs, 1);
+        assert_eq!(scorecard.failed_jobs, 2);
         assert_eq!(scorecard.other_jobs, 3);
-        assert_eq!(scorecard.failure_rate, Some(0.5));
+        assert_eq!(scorecard.failure_rate, Some(2.0 / 3.0));
+        assert_eq!(scorecard.wasted_compute_samples, 3);
+        assert_eq!(scorecard.rework_compute_samples, 2);
     }
 
     #[test]

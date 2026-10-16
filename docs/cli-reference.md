@@ -518,6 +518,17 @@ infers them from job duration. Human output is available by default; `--json`
 returns structured rows, findings, or the scorecard for plugins, MCP tools, and
 monitoring agents.
 
+The scorecard also reports cost proxies needed for the fleet baseline:
+`wasted_compute_minutes` sums measured duration for failed or cancelled jobs,
+`coordination_minutes` sums authoritative queue wait, and
+`rework_compute_minutes` counts failed attempts only. The combined
+`coordination_rework_minutes` is queue wait plus failed-attempt compute. These
+values are costs, not promotion decisions. `wasted_compute_per_safely_merged_change`
+is explicitly `unavailable` until a durable merge receipt joins a PR head to a
+successfully merged change; distinct PR count is never treated as a safe-merge
+denominator. A baseline receipt must therefore carry that merge join before
+reporting the per-change value.
+
 ### Project keys
 
 `--project` accepts either the GitHub slug (`Generous-Corp/pulp`) or the short
