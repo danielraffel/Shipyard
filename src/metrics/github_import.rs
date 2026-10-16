@@ -121,72 +121,68 @@ pub fn import_github<E>(
     let mut imported = 0;
     let mut pending_inputs = Vec::new();
     for (run_id, pr, metadata) in run_ids {
-        let jobs = gh(&[
-            "api".to_owned(),
-            "-X".to_owned(),
-            "GET".to_owned(),
-            github_jobs_api_path(&request.repo, run_id),
-            "-f".to_owned(),
-            "per_page=100".to_owned(),
-        ])?;
-        let Some(job_values) = jobs.get("jobs").and_then(Value::as_array) else {
-            return Err(store_error(format!(
-                "GitHub jobs array is missing or malformed for run {run_id}"
-            )));
-        };
-        if jobs
-            .get("total_count")
-            .and_then(Value::as_u64)
-            .is_some_and(|total| total > job_values.len() as u64)
-        {
-            return Err(store_error(format!(
-                "GitHub jobs response is truncated for run {run_id}"
-            )));
-        }
-        if jobs.get("total_count").is_none() && job_values.len() >= 100 {
-            return Err(store_error(format!(
-                "GitHub jobs response may be truncated for run {run_id}"
-            )));
-        }
-        for value in job_values {
-            let mut job: GitHubRunJob = serde_json::from_value(value.clone())
-                .map_err(|error| store_error(format!("GitHub job parse failed: {error}")))?;
-            job.run_id.get_or_insert(run_id);
-            if job.run_id != Some(run_id) {
+        let mut page = 1u32;
+        loop {
+            let jobs = gh(&[
+                "api".to_owned(),
+                "-X".to_owned(),
+                "GET".to_owned(),
+                github_jobs_api_path(&request.repo, run_id),
+                "-f".to_owned(),
+                "per_page=100".to_owned(),
+                "-f".to_owned(),
+                "filter=all".to_owned(),
+                "-f".to_owned(),
+                format!("page={page}"),
+            ])?;
+            let Some(job_values) = jobs.get("jobs").and_then(Value::as_array) else {
                 return Err(store_error(format!(
-                    "GitHub job {} is bound to contradictory run id",
-                    job.id
+                    "GitHub jobs array is missing or malformed for run {run_id}"
+                )));
+            };
+            let total = jobs.get("total_count").and_then(Value::as_u64);
+            if total.is_none() && job_values.len() >= 100 {
+                return Err(store_error(format!(
+                    "GitHub jobs response may be truncated for run {run_id}"
                 )));
             }
-            if let (Some(run_attempt), Some(job_attempt)) = (metadata.run_attempt, job.run_attempt)
-                && run_attempt != job_attempt
-            {
-                return Err(store_error(format!(
-                    "GitHub job {} is bound to contradictory run attempt",
-                    job.id
-                )));
+            for value in job_values {
+                let mut job: GitHubRunJob = serde_json::from_value(value.clone())
+                    .map_err(|error| store_error(format!("GitHub job parse failed: {error}")))?;
+                job.run_id.get_or_insert(run_id);
+                if job.run_id != Some(run_id) {
+                    return Err(store_error(format!(
+                        "GitHub job {} is bound to contradictory run id",
+                        job.id
+                    )));
+                }
+                if let (Some(run_head), Some(job_head)) =
+                    (metadata.head_sha.as_deref(), job.head_sha.as_deref())
+                    && run_head != job_head
+                {
+                    return Err(store_error(format!(
+                        "GitHub job {} is bound to contradictory head sha",
+                        job.id
+                    )));
+                }
+                if job.completed_at.is_none() {
+                    continue;
+                }
+                let input = github_job_to_record_with_run(
+                    &request.repo,
+                    request.workflow.as_deref(),
+                    &project,
+                    pr,
+                    &job,
+                    &metadata,
+                );
+                pending_inputs.push(input);
             }
-            if let (Some(run_head), Some(job_head)) =
-                (metadata.head_sha.as_deref(), job.head_sha.as_deref())
-                && run_head != job_head
-            {
-                return Err(store_error(format!(
-                    "GitHub job {} is bound to contradictory head sha",
-                    job.id
-                )));
+            let seen = u64::from(page) * 100;
+            if job_values.len() < 100 && total.is_none_or(|total| total <= seen) {
+                break;
             }
-            if job.completed_at.is_none() {
-                continue;
-            }
-            let input = github_job_to_record_with_run(
-                &request.repo,
-                request.workflow.as_deref(),
-                &project,
-                pr,
-                &job,
-                &metadata,
-            );
-            pending_inputs.push(input);
+            page = page.saturating_add(1);
         }
     }
     for input in pending_inputs {
