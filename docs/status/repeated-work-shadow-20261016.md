@@ -3,7 +3,7 @@
 Status: implementation complete; PR 863 is open and intentionally unarmed on
 `feat/repeated-work-shadow-20261016` (2026-10-16).
 
-Base: `origin/main` at `ecec8359223d981751e51a943371471b441a6fe0`.
+Base: `origin/main` at `c0be67d5acf4e8d42fa40c5c22b0e52936102ca7`.
 
 Dependency: `FLEET-BASELINE` (fleet readiness is an input to later rollout
 decisions; this slice does not modify fleet configuration or require a fleet

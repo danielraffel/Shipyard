@@ -413,8 +413,9 @@ impl MetricsStore {
     }
 
     /// Record one shadow observation without waiting for a sandbox writer
-    /// lease. Returns `false` when the protected metrics domain is contended;
-    /// callers may safely drop that advisory observation.
+    /// lease. Returns `false` when SQLite reports a busy/locked database;
+    /// writer-domain lease contention is returned as an error, which callers
+    /// may also safely drop for this advisory observation.
     pub(crate) fn record_repeated_work_shadow_best_effort(
         state_dir: &Path,
         input: &RepeatedWorkShadowInput,
