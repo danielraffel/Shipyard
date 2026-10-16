@@ -1397,21 +1397,22 @@ impl MetricsStore {
                 ScorecardCoverage {
                     reason: if wasted_duration_gaps > 0 {
                         format!(
-                            "{:.6} lower-bound wasted compute minutes per safely merged change from {} failed/cancelled job samples; {wasted_duration_gaps} job durations were unavailable",
+                            "{:.6} lower-bound wasted compute minutes among joined changes from {} failed/cancelled job samples; {wasted_duration_gaps} job durations were unavailable",
                             wasted_merge_per_change(wasted_merge_ms, joined_merge_count),
                             wasted_merge_samples
                         )
                     } else {
                         format!(
-                            "{:.6} wasted compute minutes per safely merged change from {} failed/cancelled job samples",
+                            "{:.6} wasted compute minutes per safely merged change among joined changes from {} failed/cancelled job samples",
                             wasted_merge_per_change(wasted_merge_ms, joined_merge_count),
                             wasted_merge_samples
                         )
                     },
-                    // An observed valid duration is a lower bound when any
-                    // job attached to the same PR has a missing/negative
-                    // duration. Keep the value for the measured rows, but do
-                    // not present it as a complete cost claim.
+                    // An observed valid duration is a lower bound among the
+                    // joined changes when any job attached to the same PR has
+                    // a missing/negative duration. Keep the value for the
+                    // measured rows, but do not present it as a complete cost
+                    // claim for the whole receipt population.
                     status: if wasted_duration_gaps > 0 {
                         "partial".to_owned()
                     } else if joined_merge_count < safe_merge_count {
@@ -3133,6 +3134,18 @@ mod tests {
         assert_eq!(
             scorecard.wasted_compute_per_safely_merged_change.value,
             Some(0.0)
+        );
+
+        conn.execute(
+            "UPDATE jobs SET total_ms = -1 WHERE job = 'job-34-5000'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap(),
+            (1, 1, 0, 0, 1)
         );
     }
 

@@ -39,9 +39,10 @@ conflicting records for one repository and PR are rejected. Receipts
 without a matching completed job identity produce `partial` or `unavailable`
 coverage rather than a zero-cost claim, and an `unavailable` row carries no
 value. If any completed job for a joined PR has a missing or negative duration,
-the reported cost remains a measured lower bound and its coverage is `partial`;
-the missing duration is named in the reason. Distinct PR throughput is never
-used as a substitute.
+the reported cost among joined changes remains a measured lower bound and its
+coverage is `partial`; the missing duration is named in the reason. When only
+some receipts join, the value is scoped to those joined changes. Distinct PR
+throughput is never used as a substitute.
 
 The current GitHub API importer does not produce these receipts because it has
 no Shipyard gate-evidence provenance. A future producer must emit this schema
