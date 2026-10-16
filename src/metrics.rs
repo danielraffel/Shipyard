@@ -401,6 +401,7 @@ struct StratumAccumulator {
     unverified: usize,
     unknown: usize,
     invalid_identity: usize,
+    verified_nonproduction: usize,
 }
 
 impl From<StratumAccumulator> for AuthenticatedStratum {
@@ -416,6 +417,14 @@ impl From<StratumAccumulator> for AuthenticatedStratum {
                 format!(
                     "{} of {} jobs lack authenticated provenance",
                     value.unknown, value.observed_jobs
+                ),
+            )
+        } else if value.verified_nonproduction > 0 {
+            (
+                "unverified",
+                format!(
+                    "{} jobs have verified non-production provenance",
+                    value.verified_nonproduction
                 ),
             )
         } else if value.unverified > 0 {
@@ -1625,6 +1634,7 @@ impl MetricsStore {
                 && head_sha.as_deref().is_some_and(is_exact_sha);
             match (provenance.as_deref(), verified) {
                 (Some("production"), true) => accumulator.authenticated += 1,
+                (Some("synthetic"), true) => accumulator.verified_nonproduction += 1,
                 (Some(_), true) => accumulator.unverified += 1,
                 (Some(_), false) | (None, _) => accumulator.unknown += 1,
             }
@@ -1640,7 +1650,7 @@ impl MetricsStore {
                 )
             {
                 accumulator.qualified_jobs += 1;
-            } else if !identity_valid {
+            } else if !(identity_valid && event_identity_valid) {
                 accumulator.invalid_identity += 1;
             }
         }
@@ -1678,6 +1688,47 @@ impl MetricsStore {
             .filter(|value| is_exact_sha(value))
             .unwrap_or("unavailable");
         self.authenticated_strata_receipt(project, since_days, source_head)
+    }
+
+    /// Produce an explicit unavailable envelope when a scorecard cannot bind
+    /// its window to one repository, rather than silently omitting the field.
+    pub fn unavailable_authenticated_strata_receipt(
+        project: &str,
+        since_days: i64,
+        reason: impl Into<String>,
+    ) -> Result<AuthenticatedStrataReceipt, Box<dyn std::error::Error>> {
+        validate_scorecard_scope(project, since_days)?;
+        let until = Utc::now();
+        let since = until
+            .checked_sub_signed(Duration::days(since_days))
+            .ok_or("strata day window is outside the timestamp range")?;
+        let reason = reason.into();
+        let unavailable = || AuthenticatedStratum {
+            observed_jobs: 0,
+            qualified_jobs: 0,
+            provenance: "unknown".to_owned(),
+            coverage: "unavailable".to_owned(),
+            reason: reason.clone(),
+        };
+        Ok(AuthenticatedStrataReceipt {
+            schema: AUTHENTICATED_STRATA_SCHEMA.to_owned(),
+            repo: project.to_owned(),
+            window_since: since.to_rfc3339(),
+            window_until: until.to_rfc3339(),
+            source_head: "unavailable".to_owned(),
+            generated_at: until.to_rfc3339(),
+            unit: "job".to_owned(),
+            strata: AuthenticatedStrata {
+                normal_pr: unavailable(),
+                merge_group: unavailable(),
+                rerun: unavailable(),
+                unclassified: unavailable(),
+            },
+            aggregate: AuthenticatedStrataAggregate {
+                observed_jobs: 0,
+                qualified_jobs: 0,
+            },
+        })
     }
 }
 
