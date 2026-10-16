@@ -2510,13 +2510,6 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
             if let Some(cancelled) = durable_cancelled_job(queue, &job)? {
                 return Ok(TargetExecutionOutcome::Completed(cancelled));
             }
-            crate::route_shadow::record_dispatch_observation_best_effort(
-                state_dir,
-                &job.id,
-                &decision.target,
-                &result.backend,
-                Utc::now(),
-            );
             // A scheduler-deferred result is never terminal — it must not be
             // retried or persisted as a failure; hand it back on the defer path.
             if result.is_scheduler_deferred() {
@@ -2525,6 +2518,15 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
                     .clone()
                     .unwrap_or_else(|| "scheduler_deferred".to_owned());
                 return Ok(TargetExecutionOutcome::Deferred { job, reason });
+            }
+            if let Some(selected_route) = result.selected_route.as_deref() {
+                crate::route_shadow::record_dispatch_observation_best_effort(
+                    state_dir,
+                    &job.id,
+                    &decision.target,
+                    selected_route,
+                    Utc::now(),
+                );
             }
             maybe_reclassify_on_host_incident(&mut result, options.reclassify_vitals_path);
 

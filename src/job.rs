@@ -227,6 +227,11 @@ pub struct TargetResult {
     /// treated as a terminal validation outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler_defer_reason: Option<String>,
+    /// Host-pool member selected after a lease was acquired and validation
+    /// completed successfully. This is intentionally absent for lease
+    /// attempts, deferred results, and exhausted/failover summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_route: Option<String>,
 }
 
 impl TargetResult {
@@ -273,6 +278,7 @@ impl TargetResult {
             cloud_failed_step: None,
             failure_parser: None,
             scheduler_defer_reason: None,
+            selected_route: None,
         }
     }
 

@@ -752,6 +752,7 @@ impl ExecutorDispatcher {
                 return result;
             }
             if result.status == crate::job::TargetStatus::Pass {
+                result.selected_route = Some(member.label.clone());
                 if attempt == 0 {
                     result.backend.clone_from(&member.label);
                     return result;
