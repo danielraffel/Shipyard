@@ -1,12 +1,18 @@
+//! Bind producer metadata to the clean Git source used for this build.
+
 use std::path::Path;
 use std::process::Command;
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    command.args(args).current_dir(root);
+    // A caller's Git context must not redirect the provenance lookup.
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    let output = command.output().ok()?;
     output
         .status
         .success()
@@ -15,18 +21,32 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 
 fn main() {
     let root = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    // Watch checkout contents and worktree-specific Git state. Never accept a
-    // caller-supplied SHA: metadata identifies the clean tree being compiled.
-    println!("cargo:rerun-if-changed=.");
+    // Watch source inputs and Git state, never target/ or the package root:
+    // compiler output must not cause perpetual build-script invalidation.
+    for path in [
+        "src",
+        "tests",
+        "examples",
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.rs",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    if let Some(files) = git(&root, &["ls-files"]) {
+        for path in files.lines() {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
     for name in ["HEAD", "index", "packed-refs"] {
         if let Some(path) = git(&root, &["rev-parse", "--git-path", name]) {
             println!("cargo:rerun-if-changed={path}");
         }
     }
-    if let Some(reference) = git(&root, &["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(path) = git(&root, &["rev-parse", "--git-path", &reference]) {
-            println!("cargo:rerun-if-changed={path}");
-        }
+    if let Some(reference) = git(&root, &["symbolic-ref", "-q", "HEAD"])
+        && let Some(path) = git(&root, &["rev-parse", "--git-path", &reference])
+    {
+        println!("cargo:rerun-if-changed={path}");
     }
     let head = git(&root, &["rev-parse", "HEAD"]);
     let clean = git(
@@ -34,10 +54,26 @@ fn main() {
         &["status", "--porcelain", "--untracked-files=normal"],
     )
     .is_some_and(|status| status.is_empty());
-    let source = head
-        .filter(|head| clean && head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit()));
-    // Explicitly override ambient build variables even when provenance cannot
-    // be established (source archives and dirty checkouts remain unavailable).
+    // Ignored Rust inputs can alter compilation without appearing in status.
+    let ignored_inputs = git(
+        &root,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--",
+            "src",
+            "tests",
+            "examples",
+        ],
+    )
+    .is_some_and(|files| !files.is_empty());
+    let source = head.filter(|head| {
+        clean && !ignored_inputs && head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit())
+    });
+    // This identifies checkout source, not dependency/toolchain authenticity.
+    // Override ambient assertions; archives and dirty source are unavailable.
     println!(
         "cargo:rustc-env=SHIPYARD_SOURCE_HEAD={}",
         source.as_deref().unwrap_or("unavailable")
