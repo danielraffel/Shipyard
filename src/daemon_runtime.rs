@@ -2249,7 +2249,12 @@ pub(crate) fn normalize_repos(mut repos: Vec<String>) -> Vec<String> {
 }
 
 fn read_pid_file(path: &Path) -> Option<u32> {
-    fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
+    fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| (1..=i32::MAX as u32).contains(pid))
 }
 
 #[cfg(unix)]
@@ -4275,7 +4280,7 @@ mod tests {
         let daemon_dir = temp.path().join("daemon");
         std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
         let pid_path = daemon_dir.join("daemon.pid");
-        for contents in ["", "invalid", "0", "-1"] {
+        for contents in ["", "invalid", "0", "-1", "2147483648", "4294967295"] {
             std::fs::write(&pid_path, contents).expect("pid file");
             assert_eq!(
                 super::stop_running_outcome(temp.path()),
@@ -4284,7 +4289,7 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&pid_path).unwrap(), contents);
         }
         // The Unix kernels supported here cannot allocate a PID this large.
-        std::fs::write(&pid_path, u32::MAX.to_string()).expect("dead pid");
+        std::fs::write(&pid_path, i32::MAX.to_string()).expect("dead pid");
         assert_eq!(
             super::stop_running_outcome(temp.path()),
             super::DaemonStopOutcome::Absent
