@@ -184,8 +184,9 @@ pub fn gather(
     read
 }
 
-/// Put each read cause on its case: `cause` and `evidence` are set, and
-/// `evidence` leaves the row's `unread` list.
+/// Put each read cause on its case: `cause` and `evidence` are set, and both
+/// fields leave the row's `unread` list. An unreadable or unrequested job
+/// remains explicitly unread rather than looking like a known empty cause.
 pub fn attach(rows: &mut [Case], read: &CausesRead) {
     for row in rows {
         let Some(cause) = row.job_id.and_then(|id| read.by_job.get(&id)) else {
@@ -196,7 +197,8 @@ pub fn attach(rows: &mut [Case], read: &CausesRead) {
         row.evidence =
             (!cause.evidence.excerpt.is_empty()).then(|| cause.evidence.excerpt.join("\n"));
         row.cause = Some(cause);
-        row.unread.retain(|field| *field != "evidence");
+        row.unread
+            .retain(|field| *field != "cause" && *field != "evidence");
     }
 }
 

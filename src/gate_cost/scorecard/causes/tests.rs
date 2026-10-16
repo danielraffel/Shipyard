@@ -316,6 +316,7 @@ fn attached_causes_fill_evidence_and_are_counted_as_named() {
     // The record takes the pull request from its case.
     assert_eq!(gate.cause.as_ref().and_then(|cause| cause.pr), Some(10_154));
     assert!(gate.evidence.is_some());
+    assert!(!gate.unread.contains(&"cause"));
     assert!(!gate.unread.contains(&"evidence"));
     assert_eq!(
         gate.cause.as_ref().map(|cause| cause.signature.as_str()),
@@ -356,10 +357,9 @@ fn attached_causes_fill_evidence_and_are_counted_as_named() {
 #[test]
 fn rows_without_causes_keep_evidence_unread() {
     let rows = cases(&observation());
-    assert!(
-        rows.iter()
-            .all(|row| row.cause.is_none() && row.unread.contains(&"evidence"))
-    );
+    assert!(rows.iter().all(|row| {
+        row.cause.is_none() && row.unread.contains(&"cause") && row.unread.contains(&"evidence")
+    }));
     let naming = compute(&rows, &CausesRead::default());
     assert_eq!(naming.named, 0);
     assert_eq!(naming.time_to_named_median_minutes, None);

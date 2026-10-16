@@ -15,8 +15,8 @@
 //! merge-queue removals with reason and actor, and the merge-head verdict.
 //! When causes are read (see [`super::causes`]), a red case with a job also
 //! carries `cause` and `evidence` from its job log. Every corpus field that
-//! was not read (`evidence` when causes were not, `rule_verdict`,
-//! `cancel_cause`, `receipt_same_tree`, `outage_window`) is present and
+//! was not read (`cause` and `evidence` when causes were not,
+//! `rule_verdict`, `cancel_cause`, `receipt_same_tree`, `outage_window`) is present and
 //! `null`, and named in `unread`, rather than guessed.
 //!
 //! The export carries a receipt: the row count and the SHA-256 of the bytes
@@ -49,7 +49,8 @@ pub const RECEIPT_SCHEMA: &str = "shipyard-gate-cost-cases-receipt/v1";
 /// How long after a case its hindsight label may be assigned.
 const LABEL_DELAY_HOURS: i64 = 24;
 /// Fields the plan's corpus carries that the scorecard does not read yet.
-const UNREAD: [&str; 5] = [
+const UNREAD: [&str; 6] = [
+    "cause",
     "evidence",
     "rule_verdict",
     "cancel_cause",
@@ -95,8 +96,9 @@ pub struct Case {
     /// The decisive lines of the case's job log, when its cause was read
     /// (`--causes` or `--export-cases`); else `null` and named in `unread`.
     pub evidence: Option<String>,
-    /// The case's `ci.cause/v1` record, read from its job log, when it was
-    /// read.
+    /// The case's `ci.cause/v1` record, read from its job log, when causes
+    /// were requested and the job was readable; otherwise `null` and named
+    /// in `unread`.
     pub cause: Option<crate::diagnose::cause::CiCause>,
     /// What a rule would have decided: not read in v1.
     pub rule_verdict: Option<String>,
