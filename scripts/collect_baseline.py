@@ -59,7 +59,7 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     if github.returncode:
         raise RuntimeError(f"GitHub import failed: {github.stderr.strip()}")
     events.append(summarize_import("github", github.stdout))
-    tartci = run([args.tartci, "runtime", "export", "--repo", args.repo], timeout=args.timeout_seconds)
+    tartci = run([args.tartci, "runtime", "export", "--repo", args.repo, "--since-days", str(args.limit)], timeout=args.timeout_seconds)
     if tartci.returncode:
         raise RuntimeError(f"TartCI export failed: {tartci.stderr.strip()}")
     validate_tartci_export(tartci.stdout, args.repo)
@@ -128,7 +128,10 @@ def validate_tartci_export(text: str, repo: str) -> None:
                     raise RuntimeError("TartCI export contained malformed JSON") from exc
     if not records or any(not isinstance(record, dict) for record in records):
         raise RuntimeError("TartCI export must contain JSON objects")
-    mismatched = [record.get("repo") for record in records if record.get("repo") not in (None, repo)]
+    missing = [record for record in records if record.get("repo") != repo or not record.get("external_id")]
+    if missing:
+        raise RuntimeError("TartCI export record lacks exact repo or non-empty external_id")
+    mismatched = [record.get("repo") for record in records if record.get("repo") != repo]
     if mismatched:
         raise RuntimeError(f"TartCI export contains another repository: {mismatched[0]}")
 
@@ -156,7 +159,7 @@ def validate_state_layout(db: pathlib.Path) -> pathlib.Path:
 def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
     state_dir = validate_state_layout(args.db)
     result = run([args.shipyard, "--state-dir", str(state_dir), "metrics", "scorecard",
-                  "--project", args.project, "--since", f"{args.since_days}d", "--json"], timeout=args.timeout_seconds)
+                  "--project", args.repo, "--since", f"{args.since_days}d", "--json"], timeout=args.timeout_seconds)
     if result.returncode:
         raise RuntimeError(f"authoritative scorecard failed: {result.stderr.strip()}")
     try:
