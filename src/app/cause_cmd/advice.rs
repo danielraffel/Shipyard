@@ -229,10 +229,15 @@ fn advise(
             fix_link: fixlinks
                 .iter()
                 .find(|f| {
+                    let red_run_id = f["red_run_id"].as_u64();
+                    let cause_run_id = row["run_id"].as_u64();
+                    let red_attempt = f["red_attempt"].as_u64();
+                    let cause_attempt = row["attempt"].as_u64();
                     f["repo"] == args.repo
-                        && f["red_run_id"] == row["run_id"]
-                        && f["red_attempt"].as_u64().unwrap_or(1)
-                            == row["attempt"].as_u64().unwrap_or(1)
+                        && red_run_id.is_some()
+                        && red_run_id == cause_run_id
+                        && red_attempt.is_some()
+                        && red_attempt == cause_attempt
                 })
                 .cloned(),
             cause: row,
@@ -499,6 +504,26 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn fixlinks_without_explicit_run_identity_are_not_attached() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        let mut cause: Value = serde_json::from_str(&row(&"b".repeat(40), 8)).unwrap();
+        cause["run_id"] = Value::Null;
+        cause["attempt"] = Value::Null;
+        fs::write(dir.path().join("causes/archive.jsonl"), cause.to_string()).unwrap();
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            serde_json::json!({"repo":"o/r"}).to_string(),
+        )
+        .unwrap();
+
+        let candidates = advise(&args(dir.path()), &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].fix_link.is_none());
+    }
+
     #[test]
     fn malformed_head_is_rejected() {
         let mut a = args(Path::new("."));

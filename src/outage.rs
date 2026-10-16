@@ -117,10 +117,14 @@ pub(crate) fn validate(record: &OutageRecord) -> Result<(), String> {
         }
         previous = Some(key.as_str());
     }
-    if DateTime::parse_from_rfc3339(&record.started_at).is_err()
-        || DateTime::parse_from_rfc3339(&record.ended_at).is_err()
-    {
+    let (Ok(started_at), Ok(ended_at)) = (
+        DateTime::parse_from_rfc3339(&record.started_at),
+        DateTime::parse_from_rfc3339(&record.ended_at),
+    ) else {
         return Err("started_at and ended_at must be RFC3339".to_owned());
+    };
+    if ended_at < started_at {
+        return Err("ended_at precedes started_at".to_owned());
     }
     if record.provenance.collector.trim().is_empty()
         || record.provenance.collector_version.trim().is_empty()
@@ -210,6 +214,12 @@ mod tests {
             "owner/repo|2|1|1".to_owned(),
             "owner/repo|1|1|1".to_owned(),
         ]);
+        assert!(matches!(
+            parse(value),
+            Availability::Unavailable(UnavailableReason::Invalid(_))
+        ));
+        let mut value = row(vec!["owner/repo|1|1|1".to_owned()]);
+        value["ended_at"] = json!("2026-10-14T23:59:59Z");
         assert!(matches!(
             parse(value),
             Availability::Unavailable(UnavailableReason::Invalid(_))
