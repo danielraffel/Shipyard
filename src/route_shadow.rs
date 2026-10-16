@@ -1244,7 +1244,11 @@ mod tests {
             temp.path(),
             "job-runtime",
             &target,
-            "M1",
+            &[RouteAttempt {
+                route_id: "host-pool:macs:m1".to_owned(),
+                outcome: crate::job::TargetStatus::Pass,
+                attempted_at: Utc::now(),
+            }],
             Utc::now(),
         );
         let mut selected = None;
