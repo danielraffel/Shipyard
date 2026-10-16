@@ -2592,7 +2592,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(temp.path()).unwrap();
         let base = test_receipt("semantic-1", "owner/repo", "repo", 7, 'a');
-        store.import_merge_receipts(&[base.clone()]).unwrap();
+        store
+            .import_merge_receipts(std::slice::from_ref(&base))
+            .unwrap();
         for (id, mutate) in [
             ("semantic-base", 0),
             ("semantic-head", 1),
@@ -3040,7 +3042,12 @@ mod tests {
             gate_receipt_sha256: "c".repeat(64),
             evidence: "sha256:canonical".to_owned(),
         };
-        assert_eq!(store.import_merge_receipts(&[receipt.clone()]).unwrap(), 1);
+        assert_eq!(
+            store
+                .import_merge_receipts(std::slice::from_ref(&receipt))
+                .unwrap(),
+            1
+        );
         let conn = store.connect().unwrap();
         let keys: (String, String) = conn
             .query_row("SELECT repo, project FROM merge_receipts", [], |row| {
