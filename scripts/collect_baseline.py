@@ -60,42 +60,46 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
         raise RuntimeError(f"GitHub import failed: {github.stderr.strip()}")
     events.append(summarize_import("github", github.stdout))
     tartci = run([args.tartci, "runtime", "export", "--repo", args.repo], timeout=args.timeout_seconds)
-    validate_tartci_export(tartci.stdout, args.repo)
     if tartci.returncode:
         raise RuntimeError(f"TartCI export failed: {tartci.stderr.strip()}")
+    validate_tartci_export(tartci.stdout, args.repo)
     imported = run([args.shipyard, "--state-dir", state_dir, "metrics", "import", "tartci", "--json"], stdin=tartci.stdout, timeout=args.timeout_seconds)
     if imported.returncode:
         raise RuntimeError(f"TartCI import failed: {imported.stderr.strip()}")
     events.append(summarize_import("tartci", imported.stdout))
     after = count_jobs(args.db, args.project, args.repo)
+    activity_dates = source_activity_dates(args.db, args.project, args.repo)
     if before is not None and after is not None:
         events.append({"source": "collection", "status": "completed", "new_rows": max(after - before, 0),
-                       "source_activity_dates": sorted(source_activity_dates(args.db, args.project, args.repo) or [])})
+                       "source_activity_dates": sorted(activity_dates or []),
+                       "source_activity_status": "available" if activity_dates is not None else "unavailable"})
     else:
         events.append({"source": "collection", "status": "unavailable", "new_rows": None,
-                       "source_activity_dates": []})
+                       "source_activity_dates": [], "source_activity_status": "unavailable"})
     return events
 
 def count_jobs(db: pathlib.Path, project: str, repo: str) -> int | None:
     try:
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
             return int(connection.execute("""select count(*) from jobs j join runs r on r.id=j.run_id
-                where r.project=? and (r.repo=? or r.repo is null)""", (project, repo)).fetchone()[0])
+                where r.project=? and r.repo=?""", (project, repo)).fetchone()[0])
     except sqlite3.Error:
         return None
 
 
 def source_activity_dates(db: pathlib.Path, project: str, repo: str) -> set[str] | None:
-    """Read producer timestamps without creating or mutating the metrics store."""
+    """Read provider job timestamps without using the run ingestion timestamp."""
     try:
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
-            columns = {row[1] for row in connection.execute("pragma table_info(runs)")}
-            timestamp = next((name for name in ("created_at", "started_at", "completed_at") if name in columns), None)
-            if timestamp is None or "project" not in columns:
+            run_columns = {row[1] for row in connection.execute("pragma table_info(runs)")}
+            job_columns = {row[1] for row in connection.execute("pragma table_info(jobs)")}
+            timestamps = [name for name in ("completed_at", "started_at") if name in job_columns]
+            if not timestamps or "project" not in run_columns or "repo" not in run_columns or "run_id" not in job_columns:
                 return None
-            repo_clause = "repo=?" if "repo" in columns else "1=1"
-            params: tuple[Any, ...] = (project, repo) if "repo" in columns else (project,)
-            rows = connection.execute(f"select {timestamp} from runs where project=? and {repo_clause}", params)
+            timestamp_sql = "coalesce(" + ",".join("j." + name for name in timestamps) + ")"
+            rows = connection.execute(
+                f"select {timestamp_sql} from jobs j join runs r on r.id=j.run_id "
+                "where r.project=? and r.repo=?", (project, repo))
             dates = set()
             for (value,) in rows:
                 if isinstance(value, str):
