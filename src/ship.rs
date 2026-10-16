@@ -1676,6 +1676,43 @@ fn awaited_job_allows_refill(
     }
 }
 
+fn record_pending_scheduler_observations(
+    jobs: &[Job],
+    request_store: &QueueRequestStore,
+    state_dir: &Path,
+    leases: &[crate::host_pool::HostPoolLease],
+    observed_at: DateTime<Utc>,
+) {
+    for job in jobs {
+        if job.status != JobStatus::Pending {
+            continue;
+        }
+        let Ok(Some(envelope)) = request_store.load(&job.id) else {
+            continue;
+        };
+        let targets = match &envelope.request {
+            crate::queue_request::QueuedExecutionRequest::Run(request) => request
+                .to_execution_request()
+                .map(|request| request.targets),
+            crate::queue_request::QueuedExecutionRequest::Ship(request) => request
+                .to_execution_request()
+                .map(|request| request.targets),
+        };
+        let Ok(targets) = targets else {
+            continue;
+        };
+        for target in &targets {
+            crate::route_shadow::record_scheduler_observation_best_effort(
+                state_dir,
+                &job.id,
+                target,
+                leases,
+                observed_at,
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Scheduler state is passed explicitly at the drain boundary.
 fn admit_drain_worker_inputs(
     queue: &mut Queue,
@@ -1700,30 +1737,7 @@ fn admit_drain_worker_inputs(
     // Capture only immutable scheduler facts. Receipt serialization is
     // deliberately best-effort and cannot influence the admit plan, leases,
     // route ordering, or dispatch when the state directory is unavailable.
-    for job in &jobs {
-        if job.status != JobStatus::Pending {
-            continue;
-        }
-        let Ok(Some(envelope)) = request_store.load(&job.id) else {
-            continue;
-        };
-        let targets = match &envelope.request {
-            crate::queue_request::QueuedExecutionRequest::Run(request) => request
-                .to_execution_request()
-                .map(|request| request.targets),
-            crate::queue_request::QueuedExecutionRequest::Ship(request) => request
-                .to_execution_request()
-                .map(|request| request.targets),
-        };
-        let Ok(targets) = targets else {
-            continue;
-        };
-        for target in &targets {
-            crate::route_shadow::record_scheduler_observation_best_effort(
-                state_dir, &job.id, target, &leases, now,
-            );
-        }
-    }
+    record_pending_scheduler_observations(&jobs, request_store, state_dir, &leases, now);
     let mut scheduling_jobs = jobs.clone();
     scheduling_jobs.retain(|job| {
         job.status != JobStatus::Pending

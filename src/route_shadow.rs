@@ -391,7 +391,9 @@ impl RouteShadowReceiptStore {
         if metadata.correlation_id != observation.correlation_id {
             return Ok(None);
         }
-        metadata.dispatch_attempts = observation.route_attempts.clone();
+        metadata
+            .dispatch_attempts
+            .clone_from(&observation.route_attempts);
         let path = self.path_for(&observation.snapshot.request_id);
         let _writer_domain =
             match crate::writer_domain_lease::acquire_for_protected_path_with_timeout(
@@ -709,7 +711,9 @@ fn scheduler_snapshot(
                                 && lease.member_id == member.id
                                 && !lease.is_stale(observed_at)
                         })
-                        .count() as u32;
+                        .count()
+                        .try_into()
+                        .unwrap_or(u32::MAX);
                     let availability = if active >= member.max_concurrency {
                         RouteAvailability::Busy
                     } else {
@@ -765,7 +769,7 @@ fn scheduler_provenance(target: &ResolvedTarget) -> String {
         ResolvedBackend::Local(_)
         | ResolvedBackend::Ssh(_)
         | ResolvedBackend::Windows(_)
-        | ResolvedBackend::Cloud(_) => "".to_owned(),
+        | ResolvedBackend::Cloud(_) => String::new(),
     }
 }
 
@@ -837,7 +841,7 @@ mod tests {
         FallbackBackend, FallbackTargetConfig, ResolvedBackend, ResolvedHostPoolConfig,
         ResolvedHostPoolMember, ResolvedTarget, ResolvedValidation,
     };
-    use crate::executor::local::LocalTargetConfig;
+    use crate::executor::local::{LocalTargetConfig, LocalValidationConfig};
     use crate::host_pool::HostPoolLease;
     use crate::job::RouteAttempt;
 
@@ -1140,7 +1144,7 @@ mod tests {
             warm_keepalive_seconds: 0,
             host: None,
             backend: ResolvedBackend::Local(LocalTargetConfig::default()),
-            validation: ResolvedValidation::Local(Default::default()),
+            validation: ResolvedValidation::Local(LocalValidationConfig::default()),
             failure_parser: None,
         };
         ResolvedTarget {
