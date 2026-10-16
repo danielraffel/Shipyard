@@ -421,9 +421,9 @@ impl From<StratumAccumulator> for AuthenticatedStratum {
             )
         } else if value.verified_nonproduction > 0 {
             (
-                "unverified",
+                "authenticated",
                 format!(
-                    "{} jobs have verified non-production provenance",
+                    "{} jobs have verified non-production provenance; excluded from production qualification",
                     value.verified_nonproduction
                 ),
             )
@@ -439,7 +439,7 @@ impl From<StratumAccumulator> for AuthenticatedStratum {
             (
                 "authenticated",
                 format!(
-                    "{} jobs lack a valid provider/run/head/attempt identity",
+                    "{} jobs lack a valid provider/run/head/attempt identity or required pull-request identity",
                     value.invalid_identity
                 ),
             )
@@ -456,7 +456,7 @@ impl From<StratumAccumulator> for AuthenticatedStratum {
             // receipt; this is an observed recent-N workflow-run window.
             "partial"
         };
-        let qualified_jobs = if provenance == "authenticated" {
+        let qualified_jobs = if provenance == "authenticated" && value.verified_nonproduction == 0 {
             value.qualified_jobs
         } else {
             // Mixed or unverified provenance may remain visible as observed,
@@ -1636,11 +1636,13 @@ impl MetricsStore {
                 (Some("production"), true) => accumulator.authenticated += 1,
                 (Some("synthetic"), true) => accumulator.verified_nonproduction += 1,
                 (Some(_), true) => accumulator.unverified += 1,
-                (Some(_), false) | (None, _) => accumulator.unknown += 1,
+                (Some(_), false) => accumulator.unverified += 1,
+                (None, _) => accumulator.unknown += 1,
             }
             let event_identity_valid = match event.as_deref() {
                 Some("merge_group") => true,
-                _ => pr.is_some(),
+                Some("pull_request") => pr.is_some_and(|value| value > 0),
+                _ => false,
             };
             if identity_valid
                 && event_identity_valid
