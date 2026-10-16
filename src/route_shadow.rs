@@ -609,7 +609,7 @@ pub fn record_dispatch_observation_best_effort(
     let Some(snapshot) = scheduler_snapshot(job_id, target, &[], observed_at) else {
         return;
     };
-    let Some(attempt) = route_attempts.iter().rev().find(|attempt| {
+    let Some(_attempt) = route_attempts.iter().rev().find(|attempt| {
         snapshot
             .candidates
             .iter()
@@ -1271,7 +1271,7 @@ mod tests {
         }
         let selected = selected.expect("selected route receipt");
         let metadata = selected.observation.expect("metadata");
-        assert!(metadata.snapshot_rebuilt_at_dispatch);
+        assert!(!metadata.snapshot_rebuilt_at_dispatch);
         assert_eq!(
             metadata
                 .dispatch_attempts
@@ -1332,6 +1332,13 @@ mod tests {
         for _ in 0..100 {
             if let Ok(Some(receipt)) = store.load("job-nested:nested") {
                 assert!(receipt.observation.is_some());
+                assert!(
+                    receipt
+                        .observation
+                        .as_ref()
+                        .expect("metadata")
+                        .snapshot_rebuilt_at_dispatch
+                );
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
