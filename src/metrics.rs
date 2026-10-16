@@ -1563,7 +1563,7 @@ impl MetricsStore {
         source_head: &str,
     ) -> Result<AuthenticatedStrataReceipt, Box<dyn std::error::Error>> {
         validate_scorecard_scope(project, since_days)?;
-        if !is_exact_sha(source_head) {
+        if source_head != "unavailable" && !is_exact_sha(source_head) {
             return Err("authenticated strata source_head must be a 40-character SHA".into());
         }
         let conn = self.connect()?;
@@ -1644,6 +1644,19 @@ impl MetricsStore {
             unclassified: strata[3].clone(),
             aggregate,
         })
+    }
+
+    /// Export strata using the executing binary's build metadata. A binary
+    /// without an embedded source head remains explicitly unauthenticated.
+    pub fn authenticated_strata_receipt_from_metadata(
+        &self,
+        project: &str,
+        since_days: i64,
+    ) -> Result<AuthenticatedStrataReceipt, Box<dyn std::error::Error>> {
+        let source_head = option_env!("SHIPYARD_SOURCE_HEAD")
+            .filter(|value| is_exact_sha(value))
+            .unwrap_or("unavailable");
+        self.authenticated_strata_receipt(project, since_days, source_head)
     }
 }
 
