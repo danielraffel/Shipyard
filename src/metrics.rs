@@ -408,7 +408,7 @@ impl MetricsStore {
                     measured_total_ms,
                     queued_at.as_deref(),
                     queue_ms,
-                    input.correlation_id.clone(),
+                    input.correlation_id.as_deref(),
                 )?;
             }
             return Ok(existing);
@@ -1158,7 +1158,7 @@ fn existing_job_id(
     .optional()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn refresh_existing_job(
     conn: &Connection,
     job_id: i64,
@@ -1169,7 +1169,7 @@ fn refresh_existing_job(
     measured_total_ms: Option<i64>,
     queued_at: Option<&str>,
     queue_ms: Option<i64>,
-    correlation_id: Option<String>,
+    correlation_id: Option<&str>,
 ) -> Result<(), rusqlite::Error> {
     let started_at = started_at.to_rfc3339();
     let completed_at = completed_at.to_rfc3339();
