@@ -3111,7 +3111,7 @@ backend = "local"
             [targets.mac]
             backend = "local"
             platform = "macos-arm64"
-            fallback = [{ type = "local" }, { type = "local" }]
+            fallback = [{ type = "local" }]
             "#,
         );
         let target = resolve_targets_from_table(&config, ValidationMode::Full)
