@@ -517,7 +517,7 @@ printed after its echoed script (`labelled_by: step`), still `low`; a summary
 job whose name prefixes a named job of the same run attempt (`linux` and
 `Linux (x64) [github-hosted]`) takes that job's cause (`labelled_by:
 summarised_job`, `inherited_from_job_id`), evidence included
-(`evidence_job_id`). Each pass counts pending reds as
+(`evidence_job_id`), failing step and `step_failed` included. Each pass counts pending reds as
 under 24 h, 24 to 72 h, and over 72 h, which separates young reds from
 unfixed or unlinkable ones.
 It also writes
