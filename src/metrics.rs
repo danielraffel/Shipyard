@@ -2593,6 +2593,22 @@ mod tests {
         assert_eq!(store.safe_merge_summary("owner/repo", "1970-01-01T00:00:00Z").unwrap().0, 1);
     }
 
+    #[test]
+    fn safe_merge_summary_rejects_wrong_repo_pr_and_sha_joins() {
+        let temp = tempfile::tempdir().unwrap(); let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 20, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute("UPDATE runs SET repo='owner/repo', sha=?1 WHERE pr=20", [&"a".repeat(40)]).unwrap();
+        let mut wrong_sha = test_receipt("isolation-sha", "owner/repo", "repo", 20, 'd');
+        wrong_sha.merged_at = Utc::now();
+        let wrong_pr = test_receipt("isolation-pr", "owner/repo", "repo", 21, 'a');
+        let wrong_repo = test_receipt("isolation-repo", "other/repo", "repo", 20, 'a');
+        store.import_merge_receipts(&[wrong_sha, wrong_pr, wrong_repo]).unwrap();
+        let summary = store.safe_merge_summary("repo", "1970-01-01T00:00:00Z").unwrap();
+        assert_eq!(summary.0, 3);
+        assert_eq!(summary.1, 0);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn insert_scorecard_sample_at(
         store: &MetricsStore,
