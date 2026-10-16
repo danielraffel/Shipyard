@@ -618,7 +618,7 @@ impl MetricsStore {
         &self,
         project: &str,
         cutoff: &str,
-    ) -> Result<(usize, usize, i64, usize), Box<dyn std::error::Error>> {
+    ) -> Result<(usize, usize, i64, usize, usize), Box<dyn std::error::Error>> {
         let conn = self.connect()?;
         let key = crate::metrics::project_key::ProjectKey::parse(project);
         let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
@@ -635,6 +635,7 @@ impl MetricsStore {
         let mut joined = 0_usize;
         let mut wasted = 0_i64;
         let mut samples = 0_usize;
+        let mut duration_gaps = 0_usize;
         for (repo, head, pr) in unique {
             let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND run.sha = ?2 AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
             let mut matched = false;
@@ -656,13 +657,15 @@ impl MetricsStore {
                 // The merged head proved the join; the change's waste is every
                 // failed or cancelled job of its pull request, earlier pushes
                 // included, not only the jobs on the head that merged.
-                let (pr_wasted, pr_samples) = pull_request_waste(&conn, &repo, pr)?;
+                let (pr_wasted, pr_samples, pr_duration_gaps) =
+                    pull_request_waste(&conn, &repo, pr)?;
                 joined += 1;
                 wasted = wasted.saturating_add(pr_wasted);
                 samples += pr_samples;
+                duration_gaps = duration_gaps.saturating_add(pr_duration_gaps);
             }
         }
-        Ok((total, joined, wasted, samples))
+        Ok((total, joined, wasted, samples, duration_gaps))
     }
 
     /// Record a queue repeated-work observation without affecting queue
@@ -1329,7 +1332,13 @@ impl MetricsStore {
         };
         let cache = load_scorecard_cache_samples(&conn, project, &cutoff)?;
         let cache_hits = cache.iter().filter(|hit| **hit).count();
-        let (safe_merge_count, joined_merge_count, wasted_merge_ms, wasted_merge_samples) =
+        let (
+            safe_merge_count,
+            joined_merge_count,
+            wasted_merge_ms,
+            wasted_merge_samples,
+            wasted_duration_gaps,
+        ) =
             self.safe_merge_summary(project, &cutoff)?;
         let now = Utc::now();
         let (proxies, comparison) = proxy_store::scorecard_window(
@@ -1386,16 +1395,30 @@ impl MetricsStore {
                 unavailable_merge_coverage()
             } else {
                 ScorecardCoverage {
-                    status: if joined_merge_count < safe_merge_count {
+                    reason: if wasted_duration_gaps > 0 {
+                        format!(
+                            "{:.6} lower-bound wasted compute minutes per safely merged change from {} failed/cancelled job samples; {wasted_duration_gaps} job durations were unavailable",
+                            wasted_merge_per_change(wasted_merge_ms, joined_merge_count),
+                            wasted_merge_samples
+                        )
+                    } else {
+                        format!(
+                            "{:.6} wasted compute minutes per safely merged change from {} failed/cancelled job samples",
+                            wasted_merge_per_change(wasted_merge_ms, joined_merge_count),
+                            wasted_merge_samples
+                        )
+                    },
+                    // An observed valid duration is a lower bound when any
+                    // job attached to the same PR has a missing/negative
+                    // duration. Keep the value for the measured rows, but do
+                    // not present it as a complete cost claim.
+                    status: if wasted_duration_gaps > 0 {
+                        "partial".to_owned()
+                    } else if joined_merge_count < safe_merge_count {
                         "partial".to_owned()
                     } else {
                         "available".to_owned()
                     },
-                    reason: format!(
-                        "{:.6} wasted compute minutes per safely merged change from {} failed/cancelled job samples",
-                        wasted_merge_per_change(wasted_merge_ms, joined_merge_count),
-                        wasted_merge_samples
-                    ),
                     value: Some(wasted_merge_per_change(wasted_merge_ms, joined_merge_count)),
                 }
             },
@@ -1664,18 +1687,20 @@ fn pull_request_waste(
     conn: &rusqlite::Connection,
     repo: &str,
     pr: i64,
-) -> Result<(i64, usize), rusqlite::Error> {
+) -> Result<(i64, usize, usize), rusqlite::Error> {
     let mut q = conn.prepare(
         "SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id \
          WHERE lower(trim(run.repo)) = ?1 AND run.pr = ?2 AND job.completed_at IS NOT NULL",
     )?;
     let mut wasted = 0_i64;
     let mut samples = 0_usize;
+    let mut duration_gaps = 0_usize;
     for row in q.query_map(rusqlite::params![repo, pr], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
     })? {
         let (status, ms) = row?;
         let Some(ms) = ms.filter(|value| *value >= 0) else {
+            duration_gaps += 1;
             continue;
         };
         if crate::metrics::proxy::is_failure(&status)
@@ -1685,7 +1710,7 @@ fn pull_request_waste(
             samples += 1;
         }
     }
-    Ok((wasted, samples))
+    Ok((wasted, samples, duration_gaps))
 }
 
 fn unavailable_merge_coverage() -> ScorecardCoverage {
@@ -2974,13 +2999,13 @@ mod tests {
         let mut old = test_receipt("window-old", "owner/repo", "repo", 11, 'd');
         old.merged_at = Utc::now() - Duration::days(10);
         store.import_merge_receipts(&[inside, old]).unwrap();
-        let (total, joined, wasted, samples) = store
+        let (total, joined, wasted, samples, gaps) = store
             .safe_merge_summary(
                 "repo",
                 (Utc::now() - Duration::days(2)).to_rfc3339().as_str(),
             )
             .unwrap();
-        assert_eq!((total, joined, wasted, samples), (1, 1, 1000, 1));
+        assert_eq!((total, joined, wasted, samples, gaps), (1, 1, 1000, 1, 0));
         let mut wrong_pr = test_receipt("wrong-pr", "owner/repo", "repo", 99, 'a');
         store.import_merge_receipts(&[wrong_pr.clone()]).unwrap();
         assert_eq!(
@@ -3019,7 +3044,7 @@ mod tests {
         let mut second = first.clone();
         second.receipt_id = "dup-2".into();
         assert_eq!(store.import_merge_receipts(&[first, second]).unwrap(), 2);
-        let (total, joined, _, _) = store
+        let (total, joined, _, _, _) = store
             .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
             .unwrap();
         assert_eq!(
@@ -3061,7 +3086,54 @@ mod tests {
         let summary = store
             .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
             .unwrap();
-        assert_eq!(summary, (1, 1, 5000, 1));
+        assert_eq!(summary, (1, 1, 5000, 1, 0));
+    }
+
+    #[test]
+    fn earlier_invalid_duration_keeps_waste_per_change_as_a_lower_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 34, "failure", 5000, 0, false);
+        insert_scorecard_sample(&store, "repo", 34, "success", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute("UPDATE runs SET repo='owner/repo' WHERE pr=34", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE runs SET sha=?1 WHERE pr=34 AND status='failure'",
+            [&"e".repeat(40)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE runs SET sha=?1 WHERE pr=34 AND status='success'",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs SET total_ms = NULL WHERE job = 'job-34-5000'",
+            [],
+        )
+        .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt("pr-34", "owner/repo", "repo", 34, 'a')])
+            .unwrap();
+
+        let summary = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(summary, (1, 1, 0, 0, 1));
+        let scorecard = store.stewardship_scorecard("repo", 2).unwrap();
+        assert_eq!(
+            scorecard.wasted_compute_per_safely_merged_change.status,
+            "partial"
+        );
+        assert!(scorecard
+            .wasted_compute_per_safely_merged_change
+            .reason
+            .contains("lower-bound"));
+        assert_eq!(
+            scorecard.wasted_compute_per_safely_merged_change.value,
+            Some(0.0)
+        );
     }
 
     #[test]
