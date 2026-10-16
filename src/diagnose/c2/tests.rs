@@ -1,5 +1,5 @@
-//! The fixture set in `tests/fixtures/c2/` is C2's contract, shared verbatim
-//! with EXP-A3's `c2_extract.py`; these tests mirror its own.
+//! The fixture set in `tests/fixtures/c2/` is C2's contract: every rule has a
+//! fixture, and `v6_signatures.json` pins what v7 left unchanged.
 use serde_json::Value;
 
 use super::*;

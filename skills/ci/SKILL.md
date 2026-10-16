@@ -407,7 +407,7 @@ plus a receipt with the row count and SHA-256. Label a row only after its
 `label_not_before` (24 h on), when hindsight says whether it was real. Each red
 case with a job also carries `cause` (its `ci.cause/v1` record) and
 `evidence`, read from its job log by C2, the rules-only extractor in
-`src/diagnose/c2.rs` (a port of EXP-A3's, sharing its fixtures); `--causes`
+`src/diagnose/c2.rs` (the fleet's one cause extractor; EXP-A3's Python copy is a frozen v5 reference, not kept in step); `--causes`
 alone prints the "named causes" share without exporting. Each uncached red job
 costs two API calls, capped per run by `--causes-max-jobs` (default 200, newest
 first); the rest count as unread. A cause is named when its class is not
