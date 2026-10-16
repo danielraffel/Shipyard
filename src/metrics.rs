@@ -1908,8 +1908,8 @@ fn refresh_existing_job(
                 routing_decision = COALESCE(?10, routing_decision), status = ?11,
                 event = COALESCE(event, ?12), provider_run_id = COALESCE(provider_run_id, ?13),
                 run_attempt = COALESCE(run_attempt, ?14), head_sha = COALESCE(head_sha, ?15),
-                provenance = CASE WHEN ?17 THEN COALESCE(?16, provenance) ELSE provenance END,
-                provenance_verified = MAX(provenance_verified, ?17)
+                provenance = CASE WHEN ?17 AND ?16 IS NOT NULL THEN ?16 ELSE provenance END,
+                provenance_verified = MAX(provenance_verified, (?17 AND ?16 IS NOT NULL))
           WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
         params![
             job_id,
@@ -3469,6 +3469,7 @@ mod tests {
             duration_ms: 100,
             completed_at: Some(Utc::now()),
             external_id: Some("github:8/1/1".to_owned()),
+            provider: Some("github".to_owned()),
             provenance: Some("production".to_owned()),
             ..MetricRecordInput::default()
         };
@@ -3476,9 +3477,17 @@ mod tests {
         input.provenance = Some("synthetic".to_owned());
         input.provenance_verified = true;
         store.record_terminal_observation(&input).unwrap();
+        input.external_id = Some("github:8/2/1".to_owned());
+        input.provenance = Some("production".to_owned());
+        input.provenance_verified = false;
+        store.record_terminal_observation(&input).unwrap();
+        input.provenance = None;
+        input.provenance_verified = true;
+        store.record_terminal_observation(&input).unwrap();
         let scorecard = store.stewardship_scorecard("shipyard", 1).unwrap();
         assert_eq!(scorecard.provenance.production, 0);
         assert_eq!(scorecard.provenance.synthetic, 1);
+        assert_eq!(scorecard.provenance.unknown, 1);
         assert_eq!(scorecard.provenance.eligible_samples, 0);
     }
 

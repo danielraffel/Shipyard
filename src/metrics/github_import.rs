@@ -119,6 +119,7 @@ pub fn import_github<E>(
     }
     let project = request.project_key();
     let mut imported = 0;
+    let mut pending_inputs = Vec::new();
     for (run_id, pr, metadata) in run_ids {
         let jobs = gh(&[
             "api".to_owned(),
@@ -185,11 +186,14 @@ pub fn import_github<E>(
                 &job,
                 &metadata,
             );
-            store
-                .record_terminal_observation(&input)
-                .map_err(|error| store_error(format!("GitHub metrics record failed: {error}")))?;
-            imported += 1;
+            pending_inputs.push(input);
         }
+    }
+    for input in pending_inputs {
+        store
+            .record_terminal_observation(&input)
+            .map_err(|error| store_error(format!("GitHub metrics record failed: {error}")))?;
+        imported += 1;
     }
     Ok(imported)
 }
