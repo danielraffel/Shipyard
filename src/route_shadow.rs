@@ -837,6 +837,7 @@ mod tests {
     };
     use crate::executor::local::LocalTargetConfig;
     use crate::host_pool::HostPoolLease;
+    use crate::job::RouteAttempt;
 
     fn candidate(
         route_id: &str,
