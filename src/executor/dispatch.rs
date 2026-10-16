@@ -638,7 +638,7 @@ impl ExecutorDispatcher {
                 .position(|candidate| std::ptr::eq(candidate, backend))
                 .unwrap_or(attempt);
             attempt_history.push(crate::job::RouteAttempt {
-                route_id: format!("fallback:{}:{attempt}", backend.label),
+                route_id: format!("fallback:{}:{configured_position}", backend.label),
                 position: configured_position,
                 outcome,
                 attempted_at,
@@ -3108,9 +3108,6 @@ backend = "local"
     fn fallback_records_two_dispatched_attempts_before_exhaustion() {
         let config = table(
             r#"
-            [validation.default]
-            command = "false"
-
             [targets.mac]
             backend = "local"
             platform = "macos-arm64"

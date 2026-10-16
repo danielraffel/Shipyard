@@ -604,13 +604,13 @@ pub fn record_dispatch_observation_best_effort(
     let Some(attempt) = route_attempts.last() else {
         return;
     };
-    let Some(_candidate) = snapshot
+    if !snapshot
         .candidates
         .iter()
-        .find(|candidate| candidate.route_id == attempt.route_id)
-    else {
+        .any(|candidate| candidate.route_id == attempt.route_id)
+    {
         return;
-    };
+    }
     let observation = RouteShadowObservation {
         correlation_id: snapshot.request_id.clone(),
         snapshot: {
