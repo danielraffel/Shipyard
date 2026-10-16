@@ -604,7 +604,7 @@ pub fn record_dispatch_observation_best_effort(
     let Some(attempt) = route_attempts.last() else {
         return;
     };
-    let Some(candidate) = snapshot
+    let Some(_candidate) = snapshot
         .candidates
         .iter()
         .find(|candidate| candidate.route_id == attempt.route_id)
@@ -619,7 +619,7 @@ pub fn record_dispatch_observation_best_effort(
         },
         observed_at,
         freshness: Duration::seconds(30),
-        capability_provenance: "shipyard.dispatch.selected_route".to_owned(),
+        capability_provenance: "shipyard.dispatch.attempts".to_owned(),
         route_attempts: Some(route_attempts.to_vec()),
     };
     let Some(sender) = observation_sender() else {
