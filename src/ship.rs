@@ -39,7 +39,7 @@ use crate::queue::{Queue, QueueDeferredRequeue, QueueError, STALE_RUNNING_CANCEL
 use crate::queue_request::{
     QueueOutcomeStore, QueueRequestError, QueueRequestResult, QueueRequestStore,
     QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner,
-    QueuedShipDisposition,
+    QueuedExecutionRequest, QueuedShipDisposition,
 };
 use crate::queue_scheduler::{
     VmSlotCapacity, apply_admit_pass_for_drain, plan_admit_pass_from_jobs_with_vm_slots,
@@ -2002,7 +2002,11 @@ fn recover_foreground_running_jobs_for_drain(
         .get_running()?
         .into_iter()
         .filter_map(|job| match request_store.load(&job.id) {
-            Ok(Some(envelope)) if envelope.job_id == job.id && envelope.is_foreground_owned() => {
+            Ok(Some(envelope))
+                if envelope.job_id == job.id
+                    && envelope.is_foreground_owned()
+                    && envelope_matches_foreground_job(&job, &envelope) =>
+            {
                 Some(job.id)
             }
             // Missing, corrupt, or daemon-owned envelopes are unknown or
@@ -2015,6 +2019,47 @@ fn recover_foreground_running_jobs_for_drain(
     queue
         .recover_selected_running_jobs_for_drain(drain_lock, &recoverable)
         .map_err(ShipExecutionError::from)
+}
+
+fn envelope_matches_foreground_job(job: &Job, envelope: &QueuedExecutionEnvelope) -> bool {
+    let (kind, target_names, local_only) = match &envelope.request {
+        QueuedExecutionRequest::Run(request) => (
+            JobKind::Run,
+            request
+                .targets
+                .iter()
+                .map(|target| target.name.clone())
+                .collect::<Vec<_>>(),
+            request
+                .targets
+                .iter()
+                .all(|target| target.backend_name == "local"),
+        ),
+        QueuedExecutionRequest::Ship(request) => (
+            JobKind::Ship,
+            request
+                .targets
+                .iter()
+                .map(|target| target.name.clone())
+                .collect::<Vec<_>>(),
+            request
+                .targets
+                .iter()
+                .all(|target| target.backend_name == "local"),
+        ),
+    };
+    job.kind == Some(kind)
+        && job.sha
+            == match &envelope.request {
+                QueuedExecutionRequest::Run(request) => request.sha.as_str(),
+                QueuedExecutionRequest::Ship(request) => request.sha.as_str(),
+            }
+        && job.target_names == target_names
+        && envelope.resource_plan.targets == target_names
+        && envelope.resource_plan.cloud_targets.is_empty()
+        && envelope.resource_plan.host_pools.is_empty()
+        && envelope.resource_plan.vm_slots.is_empty()
+        && local_only
 }
 
 fn scheduler_host_pools(
@@ -4255,7 +4300,7 @@ mod tests {
             warm_disabled: false,
             fail_fast: false,
             resume_from: None,
-            targets: vec![ssh_target()],
+            targets: vec![local_target_without_cwd("local", "linux")],
         };
         let daemon_job =
             submit_run(&request, &mut queue, temp.path(), &state_dir).expect("daemon submit");
@@ -4267,6 +4312,11 @@ mod tests {
         mismatched_request.branch = "feature/mismatched".to_owned();
         let mismatched_job = submit_run(&mismatched_request, &mut queue, temp.path(), &state_dir)
             .expect("mismatched submit");
+        let mut remote_request = request.clone();
+        remote_request.branch = "feature/remote".to_owned();
+        remote_request.targets = vec![ssh_target()];
+        let remote_job = submit_run(&remote_request, &mut queue, temp.path(), &state_dir)
+            .expect("remote submit");
         let store = QueueRequestStore::new(&state_dir).expect("store");
         let mut daemon_envelope = store
             .load(&daemon_job.id)
@@ -4292,6 +4342,7 @@ mod tests {
                     daemon_job.id.clone(),
                     foreground_job.id.clone(),
                     mismatched_job.id.clone(),
+                    remote_job.id.clone(),
                 ],
             )
             .expect("start jobs");
@@ -4329,6 +4380,15 @@ mod tests {
                 .expect("mismatched job")
                 .status,
             JobStatus::Running
+        );
+        assert_eq!(
+            queue
+                .get(&remote_job.id)
+                .expect("read")
+                .expect("remote job")
+                .status,
+            JobStatus::Running,
+            "foreground recovery must not claim absence of remote workers"
         );
     }
 
