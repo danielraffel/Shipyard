@@ -293,6 +293,49 @@ mod tests {
     }
 
     #[test]
+    fn rerun_import_refreshes_unknown_attempt_from_production_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let request = GithubImportRequest {
+            repo: "acme/pulp".to_owned(),
+            project: None,
+            workflow: Some("build.yml".to_owned()),
+            branch: None,
+            limit: 5,
+        };
+        let run = json!({"id": 7, "event": "pull_request", "run_attempt": 2,
+            "head_sha": "head", "head_branch": "feature/test",
+            "pull_requests": [{"number": 9}]});
+        let mut first = true;
+        let mut gh = |argv: &[String]| -> Result<Value, String> {
+            if argv[3].ends_with("/runs") {
+                return Ok(json!({"workflow_runs": [run.clone()]}));
+            }
+            if first {
+                first = false;
+                Ok(json!({"jobs": [{"id": 1, "name": "macos",
+                    "conclusion": "success", "completed_at": "2026-09-30T10:10:00Z"}]}))
+            } else {
+                Ok(json!({"jobs": [{"id": 1, "run_attempt": 2, "name": "macos",
+                    "conclusion": "success", "completed_at": "2026-09-30T10:11:00Z"}]}))
+            }
+        };
+        import_github(&store, &request, &mut gh, &|error| error).unwrap();
+        import_github(&store, &request, &mut gh, &|error| error).unwrap();
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT run_attempt FROM runs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn missing_run_array_is_rejected_without_inventing_provenance() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
@@ -375,5 +418,95 @@ mod tests {
             }
         };
         assert!(import_github(&store, &request, &mut gh, &|error| error).is_err());
+    }
+
+    #[test]
+    fn imports_all_jobs_across_multiple_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let request = GithubImportRequest {
+            repo: "acme/pulp".to_owned(),
+            project: None,
+            workflow: None,
+            branch: None,
+            limit: 5,
+        };
+        let mut pages = Vec::new();
+        let mut gh = |argv: &[String]| -> Result<Value, String> {
+            if argv[3].ends_with("/runs") {
+                return Ok(json!({"workflow_runs": [{"id": 7, "event": "pull_request",
+                    "run_attempt": 2, "head_sha": "head",
+                    "pull_requests": [{"number": 9}]}]}));
+            }
+            let page = if argv.iter().any(|arg| arg == "page=2") { 2 } else { 1 };
+            pages.push(page);
+            let start = if page == 1 { 0 } else { 100 };
+            let end = if page == 1 { 100 } else { 150 };
+            let jobs = (start..end)
+                .map(|id| json!({"id": id, "name": format!("job-{id}"),
+                    "run_attempt": 2, "conclusion": "success",
+                    "completed_at": "2026-09-30T10:10:00Z"}))
+                .collect::<Vec<_>>();
+            Ok(json!({"total_count": 150, "jobs": jobs}))
+        };
+        assert_eq!(import_github(&store, &request, &mut gh, &|error| error).unwrap(), 150);
+        assert_eq!(pages, vec![1, 2]);
+        assert_eq!(store.list(Some("acme/pulp"), 200).unwrap().len(), 150);
+    }
+
+    #[test]
+    fn rejects_short_page_before_total_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let request = GithubImportRequest {
+            repo: "acme/pulp".to_owned(),
+            project: None,
+            workflow: None,
+            branch: None,
+            limit: 5,
+        };
+        let mut gh = |argv: &[String]| -> Result<Value, String> {
+            if argv[3].ends_with("/runs") {
+                return Ok(json!({"workflow_runs": [{"id": 7, "event": "pull_request",
+                    "run_attempt": 2, "head_sha": "head",
+                    "pull_requests": [{"number": 9}]}]}));
+            }
+            let jobs = (0..50)
+                .map(|id| json!({"id": id, "name": "job", "run_attempt": 2,
+                    "conclusion": "success", "completed_at": "2026-09-30T10:10:00Z"}))
+                .collect::<Vec<_>>();
+            Ok(json!({"total_count": 150, "jobs": jobs}))
+        };
+        assert!(import_github(&store, &request, &mut gh, &|error| error).is_err());
+        assert!(store.list(Some("acme/pulp"), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn keeps_job_attempt_from_job_object_on_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let request = GithubImportRequest {
+            repo: "acme/pulp".to_owned(),
+            project: None,
+            workflow: None,
+            branch: None,
+            limit: 5,
+        };
+        let mut gh = |argv: &[String]| -> Result<Value, String> {
+            if argv[3].ends_with("/runs") {
+                return Ok(json!({"workflow_runs": [{"id": 7, "event": "pull_request",
+                    "run_attempt": 2, "head_sha": "head",
+                    "pull_requests": [{"number": 9}]}]}));
+            }
+            Ok(json!({"jobs": [{"id": 1, "run_attempt": 1, "name": "macos",
+                "conclusion": "success", "completed_at": "2026-09-30T10:10:00Z"}]}))
+        };
+        assert_eq!(import_github(&store, &request, &mut gh, &|error| error).unwrap(), 1);
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT run_attempt FROM runs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 }
