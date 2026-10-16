@@ -352,6 +352,112 @@ pub struct ScorecardStrata {
     pub status: String,
 }
 
+/// Authenticated producer receipt for the CI strata contract. Counts are
+/// jobs, never runs; consumers own any minimum-sample policy.
+pub const AUTHENTICATED_STRATA_SCHEMA: &str = "shipyard-metrics-strata/v1";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AuthenticatedStratum {
+    pub observed_jobs: usize,
+    pub qualified_jobs: usize,
+    pub provenance: String,
+    pub coverage: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AuthenticatedStrataAggregate {
+    pub observed_jobs: usize,
+    pub qualified_jobs: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AuthenticatedStrataReceipt {
+    pub schema: String,
+    pub repo: String,
+    pub window_since: String,
+    pub window_until: String,
+    pub source_head: String,
+    pub generated_at: String,
+    pub unit: String,
+    pub normal_pr: AuthenticatedStratum,
+    pub merge_group: AuthenticatedStratum,
+    pub rerun: AuthenticatedStratum,
+    pub unclassified: AuthenticatedStratum,
+    pub aggregate: AuthenticatedStrataAggregate,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StratumAccumulator {
+    observed_jobs: usize,
+    qualified_jobs: usize,
+    authenticated: usize,
+    unverified: usize,
+    unknown: usize,
+    invalid_identity: usize,
+}
+
+impl From<StratumAccumulator> for AuthenticatedStratum {
+    fn from(value: StratumAccumulator) -> Self {
+        let (provenance, reason) = if value.observed_jobs == 0 {
+            (
+                "unknown",
+                "no completed jobs observed in this stratum".to_owned(),
+            )
+        } else if value.unknown > 0 {
+            (
+                "unknown",
+                format!(
+                    "{} of {} jobs lack authenticated provenance",
+                    value.unknown, value.observed_jobs
+                ),
+            )
+        } else if value.unverified > 0 {
+            (
+                "unverified",
+                format!(
+                    "{} of {} jobs have unverified provenance",
+                    value.unverified, value.observed_jobs
+                ),
+            )
+        } else if value.invalid_identity > 0 {
+            (
+                "authenticated",
+                format!(
+                    "{} jobs lack a valid provider/run/head/attempt identity",
+                    value.invalid_identity
+                ),
+            )
+        } else {
+            (
+                "authenticated",
+                "all observed jobs have authenticated identity".to_owned(),
+            )
+        };
+        let coverage = if value.observed_jobs == 0 {
+            "unavailable"
+        } else {
+            // The current importer does not publish a window-completeness
+            // receipt; this is an observed recent-N workflow-run window.
+            "partial"
+        };
+        let reason = if value.observed_jobs > 0 && value.qualified_jobs == value.observed_jobs {
+            format!(
+                "{reason}; workflow-run import window completeness unproven; recent-N runs only"
+            )
+        } else {
+            reason
+        };
+        AuthenticatedStratum {
+            observed_jobs: value.observed_jobs,
+            qualified_jobs: value.qualified_jobs,
+            provenance: provenance.to_owned(),
+            coverage: coverage.to_owned(),
+            reason,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ScorecardCoverage {
     pub status: String,
@@ -1446,6 +1552,99 @@ impl MetricsStore {
             strata,
         })
     }
+
+    /// Export authenticated CI strata observations for consumers that apply a
+    /// preregistered sufficiency policy. The producer emits job units and
+    /// never invents a minimum sample threshold.
+    pub fn authenticated_strata_receipt(
+        &self,
+        project: &str,
+        since_days: i64,
+        source_head: &str,
+    ) -> Result<AuthenticatedStrataReceipt, Box<dyn std::error::Error>> {
+        validate_scorecard_scope(project, since_days)?;
+        if !is_exact_sha(source_head) {
+            return Err("authenticated strata source_head must be a 40-character SHA".into());
+        }
+        let conn = self.connect()?;
+        let window = Duration::try_days(since_days).ok_or("strata day window is too large")?;
+        let generated_at = Utc::now();
+        let window_since = generated_at
+            .checked_sub_signed(window)
+            .ok_or("strata day window is outside the timestamp range")?;
+        let cutoff = window_since.to_rfc3339();
+        let repo = unique_scorecard_repo(&conn, project, &cutoff)?;
+        let mut accumulators = [StratumAccumulator::default(); 4];
+        let mut statement = conn.prepare(&format!(
+            "SELECT run.event, run.run_attempt, run.pr, run.provider_run_id,
+                    run.head_sha, job.provider, run.provenance, run.provenance_verified
+               FROM jobs job JOIN runs run ON run.id = job.run_id
+              WHERE {} AND job.completed_at IS NOT NULL
+                AND julianday(job.completed_at) >= julianday(?4)",
+            project_key::sql_filter("run.project", "run.repo")
+        ))?;
+        let key = ProjectKey::parse(project);
+        let (any, short, full) = project_key::sql_params(key.as_ref());
+        for row in statement.query_map(params![any, short, full, cutoff], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, bool>(7)?,
+            ))
+        })? {
+            let (event, attempt, pr, provider_run_id, head_sha, provider, provenance, verified) =
+                row?;
+            let index = strata_index(event.as_deref(), attempt);
+            let accumulator = &mut accumulators[index];
+            accumulator.observed_jobs += 1;
+            let identity_valid = provider
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && attempt.is_some()
+                && pr.is_some()
+                && provider_run_id.is_some()
+                && head_sha.as_deref().is_some_and(is_exact_sha);
+            match (provenance.as_deref(), verified) {
+                (Some("production"), true) => accumulator.authenticated += 1,
+                (Some(_), true) => accumulator.unverified += 1,
+                (_, false) => accumulator.unknown += 1,
+            }
+            if identity_valid
+                && matches!(
+                    (provenance.as_deref(), verified),
+                    (Some("production"), true)
+                )
+            {
+                accumulator.qualified_jobs += 1;
+            } else if !identity_valid {
+                accumulator.invalid_identity += 1;
+            }
+        }
+        let strata = accumulators.map(AuthenticatedStratum::from);
+        let aggregate = AuthenticatedStrataAggregate {
+            observed_jobs: strata.iter().map(|stratum| stratum.observed_jobs).sum(),
+            qualified_jobs: strata.iter().map(|stratum| stratum.qualified_jobs).sum(),
+        };
+        Ok(AuthenticatedStrataReceipt {
+            schema: AUTHENTICATED_STRATA_SCHEMA.to_owned(),
+            repo,
+            window_since: window_since.to_rfc3339(),
+            window_until: generated_at.to_rfc3339(),
+            source_head: source_head.to_owned(),
+            generated_at: generated_at.to_rfc3339(),
+            unit: "job".to_owned(),
+            normal_pr: strata[0].clone(),
+            merge_group: strata[1].clone(),
+            rerun: strata[2].clone(),
+            unclassified: strata[3].clone(),
+            aggregate,
+        })
+    }
 }
 
 fn ensure_refresh_identity_compatible(
@@ -1516,6 +1715,46 @@ fn validate_scorecard_scope(
         return Err("scorecard requires a project and positive day window".into());
     }
     Ok(())
+}
+
+fn is_exact_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn strata_index(event: Option<&str>, attempt: Option<i64>) -> usize {
+    match (event, attempt) {
+        (Some("pull_request"), Some(1)) => 0,
+        (Some("merge_group"), _) => 1,
+        (Some("pull_request"), Some(value)) if value > 1 => 2,
+        _ => 3,
+    }
+}
+
+fn unique_scorecard_repo(
+    conn: &Connection,
+    project: &str,
+    cutoff: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT DISTINCT lower(trim(run.repo))
+           FROM jobs job JOIN runs run ON run.id = job.run_id
+          WHERE {} AND run.repo IS NOT NULL
+            AND trim(run.repo) <> '' AND job.completed_at IS NOT NULL
+            AND julianday(job.completed_at) >= julianday(?4)",
+        project_key::sql_filter("run.project", "run.repo")
+    ))?;
+    let key = ProjectKey::parse(project);
+    let (any, short, full) = project_key::sql_params(key.as_ref());
+    let repos = statement
+        .query_map(params![any, short, full, cutoff], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    match repos.as_slice() {
+        [repo] => Ok(repo.clone()),
+        [] => Err("authenticated strata requires one observed repository".into()),
+        _ => Err("authenticated strata window spans multiple repositories".into()),
+    }
 }
 
 fn is_success_status(status: &str) -> bool {
@@ -3591,6 +3830,45 @@ mod tests {
         assert_eq!(scorecard.strata.merge_group, 1);
         assert_eq!(scorecard.strata.unclassified, 1);
         assert_eq!(scorecard.strata.status, "partial");
+    }
+
+    #[test]
+    fn authenticated_strata_receipt_is_job_scoped_and_provenance_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        store
+            .record_terminal_observation(&MetricRecordInput {
+                project: "shipyard".to_owned(),
+                repo: Some("Owner/Shipyard".to_owned()),
+                job: "linux".to_owned(),
+                status: "success".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                duration_ms: 100,
+                completed_at: Some(Utc::now()),
+                external_id: Some("github:9/1/1".to_owned()),
+                event: Some("pull_request".to_owned()),
+                run_attempt: Some(1),
+                pr: Some(9),
+                provider_run_id: Some(1),
+                head_sha: Some("a".repeat(40)),
+                provenance: Some("production".to_owned()),
+                provenance_verified: true,
+                ..MetricRecordInput::default()
+            })
+            .unwrap();
+        let receipt = store
+            .authenticated_strata_receipt("shipyard", 1, &"b".repeat(40))
+            .unwrap();
+        assert_eq!(receipt.schema, AUTHENTICATED_STRATA_SCHEMA);
+        assert_eq!(receipt.unit, "job");
+        assert_eq!(receipt.repo, "owner/shipyard");
+        assert_eq!(receipt.normal_pr.observed_jobs, 1);
+        assert_eq!(receipt.normal_pr.qualified_jobs, 1);
+        assert_eq!(receipt.normal_pr.provenance, "authenticated");
+        assert_eq!(receipt.normal_pr.coverage, "partial");
+        assert!(receipt.normal_pr.reason.contains("recent-N runs only"));
+        assert_eq!(receipt.aggregate.observed_jobs, 1);
+        assert_eq!(receipt.aggregate.qualified_jobs, 1);
     }
 
     #[allow(clippy::type_complexity)]
