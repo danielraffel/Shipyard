@@ -507,6 +507,15 @@ and provider-neutral:
   `tartci runtime export` when a project uses tartci VM lanes.
 - `shipyard metrics import merge-receipt --file <path>` imports validated `shipyard-merge-receipt/v1` JSON/JSONL; invalid or unavailable provenance stays fail-closed.
 
+GitHub imports retain the workflow event, provider run ID, run attempt, and
+authoritative head SHA on the SQLite run row. These dimensions are independent:
+an event can have multiple attempts, and an attempt can be observed alongside
+other event dimensions. Missing provider fields remain `NULL`. The importer
+does not infer organic or synthetic provenance from event names or pull-request
+shape. Only an authenticated `production` or `synthetic` label is eligible for
+provenance-qualified scorecard populations; unknown rows remain visible in the
+`scorecard.provenance` counts and are excluded from promotion decisions.
+
 The agent-facing queries are `summary`, `scorecard`, `slowest`, `watch`,
 `advise`, and `compare`. `scorecard` returns one bounded project-level view of
 job outcomes (success, failure, and other terminal outcomes), worker-minutes,

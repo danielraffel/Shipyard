@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use super::{GitHubRunJob, MetricsStore, github_job_to_record};
+use super::{GitHubRunJob, GithubRunMetadata, MetricsStore, github_job_to_record_with_run};
 
 /// What to import.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,19 +88,38 @@ pub fn import_github<E>(
         run_args.push(format!("branch={branch}"));
     }
     let runs = gh(&run_args)?;
-    let run_ids = runs
-        .get("workflow_runs")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|run| {
-            let run_id = run.get("id").and_then(Value::as_i64)?;
-            Some((run_id, workflow_run_single_pr(run)))
-        })
-        .collect::<Vec<_>>();
+    let Some(run_values) = runs.get("workflow_runs").and_then(Value::as_array) else {
+        return Err(store_error(
+            "GitHub workflow_runs array is missing or malformed".to_owned(),
+        ));
+    };
+    // `limit` is an intentional bounded sample. A larger provider
+    // `total_count` therefore does not make this response malformed; the
+    // caller's imported count remains a bounded sample rather than a census.
+    let mut run_ids = Vec::with_capacity(run_values.len());
+    for run in run_values {
+        let metadata = serde_json::from_value::<GithubRunMetadata>(run.clone())
+            .map_err(|error| store_error(format!("GitHub workflow run parse failed: {error}")))?;
+        let Some(run_id) = metadata.id else {
+            return Err(store_error(
+                "GitHub workflow run has no numeric id".to_owned(),
+            ));
+        };
+        let Some(event) = metadata.event.as_deref().filter(|event| !event.is_empty()) else {
+            return Err(store_error(format!(
+                "GitHub workflow run {run_id} has no event"
+            )));
+        };
+        if event == "merge_group" && metadata.head_sha.as_deref().is_none_or(str::is_empty) {
+            return Err(store_error(format!(
+                "GitHub merge_group run {run_id} has no head_sha"
+            )));
+        }
+        run_ids.push((run_id, workflow_run_single_pr(run), metadata));
+    }
     let project = request.project_key();
     let mut imported = 0;
-    for (run_id, pr) in run_ids {
+    for (run_id, pr, metadata) in run_ids {
         let jobs = gh(&[
             "api".to_owned(),
             "-X".to_owned(),
@@ -110,21 +129,52 @@ pub fn import_github<E>(
             "per_page=100".to_owned(),
         ])?;
         let Some(job_values) = jobs.get("jobs").and_then(Value::as_array) else {
-            continue;
+            return Err(store_error(format!(
+                "GitHub jobs array is missing or malformed for run {run_id}"
+            )));
         };
+        if jobs
+            .get("total_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|total| total > job_values.len() as u64)
+        {
+            return Err(store_error(format!(
+                "GitHub jobs response is truncated for run {run_id}"
+            )));
+        }
+        if jobs.get("total_count").is_none() && job_values.len() >= 100 {
+            return Err(store_error(format!(
+                "GitHub jobs response may be truncated for run {run_id}"
+            )));
+        }
         for value in job_values {
             let mut job: GitHubRunJob = serde_json::from_value(value.clone())
                 .map_err(|error| store_error(format!("GitHub job parse failed: {error}")))?;
             job.run_id.get_or_insert(run_id);
+            if job.run_id != Some(run_id) {
+                return Err(store_error(format!(
+                    "GitHub job {} is bound to contradictory run id",
+                    job.id
+                )));
+            }
+            if let (Some(run_attempt), Some(job_attempt)) = (metadata.run_attempt, job.run_attempt)
+                && run_attempt != job_attempt
+            {
+                return Err(store_error(format!(
+                    "GitHub job {} is bound to contradictory run attempt",
+                    job.id
+                )));
+            }
             if job.completed_at.is_none() {
                 continue;
             }
-            let input = github_job_to_record(
+            let input = github_job_to_record_with_run(
                 &request.repo,
                 request.workflow.as_deref(),
                 &project,
                 pr,
                 &job,
+                &metadata,
             );
             store
                 .record_terminal_observation(&input)
@@ -155,7 +205,9 @@ mod tests {
         let mut gh = |argv: &[String]| -> Result<Value, String> {
             calls.push(argv[3].clone());
             if argv[3].ends_with("/runs") {
-                Ok(json!({"workflow_runs": [{"id": 7, "pull_requests": [{"number": 9}]}]}))
+                Ok(json!({"workflow_runs": [{"id": 7, "run_attempt": 2,
+                    "event": "pull_request", "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "head_branch": "feature/test", "pull_requests": [{"number": 9}]}]}))
             } else {
                 Ok(json!({"jobs": [
                     {"id": 1, "name": "macos", "conclusion": "success",
@@ -177,5 +229,50 @@ mod tests {
         let rows = store.list(Some("Generous-Corp/pulp"), 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].project, "pulp");
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        let identity: (
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT event, provider_run_id, run_attempt, head_sha, provenance FROM runs",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(identity.0.as_deref(), Some("pull_request"));
+        assert_eq!(identity.1, Some(7));
+        assert_eq!(identity.2, Some(2));
+        assert_eq!(
+            identity.3.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(identity.4, None);
+    }
+
+    #[test]
+    fn missing_run_array_is_rejected_without_inventing_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let request = GithubImportRequest {
+            repo: "acme/pulp".to_owned(),
+            project: None,
+            workflow: None,
+            branch: None,
+            limit: 5,
+        };
+        let mut gh = |_argv: &[String]| -> Result<Value, String> { Ok(json!({})) };
+        assert!(import_github(&store, &request, &mut gh, &|error| error).is_err());
     }
 }
