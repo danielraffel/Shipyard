@@ -70,6 +70,7 @@ pub fn workflow_run_single_pr(run: &Value) -> Option<i64> {
 ///
 /// # Errors
 /// Whatever `gh` returns, or a store/parse failure.
+#[allow(clippy::too_many_lines)]
 pub fn import_github<E>(
     store: &MetricsStore,
     request: &GithubImportRequest,
@@ -219,6 +220,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[allow(clippy::type_complexity)]
     #[test]
     fn imports_completed_jobs_through_the_supplied_runner() {
         let dir = tempfile::tempdir().unwrap();
@@ -305,6 +307,7 @@ mod tests {
         assert!(import_github(&store, &request, &mut gh, &|error| error).is_err());
     }
 
+    #[allow(clippy::single_element_loop)]
     #[test]
     fn rejects_missing_jobs_and_contradictory_head() {
         let request = GithubImportRequest {
