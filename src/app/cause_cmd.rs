@@ -22,6 +22,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 mod advice;
+mod audit;
 mod record;
 
 use super::CliFailure;
@@ -84,6 +85,7 @@ pub(super) fn cause_command<W: Write>(
             };
             written.map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
+        CauseCommand::Audit(args) => return audit::command(&args, json, stdout),
     }
     Ok(std::process::ExitCode::SUCCESS)
 }

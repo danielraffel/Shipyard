@@ -92,6 +92,13 @@ step it runs in; only a missing or unreadable log exits non-zero.
 `cause archive` is append-only. A record whose id is already archived is
 skipped, and nothing is rewritten.
 
+For a local integrity check, run `shipyard cause audit --dir DIR`. It reads
+the cause month files and `fixlinks.jsonl`, reports malformed rows, duplicate
+cause IDs, duplicate red run attempts, and fix-links with no archived cause,
+and exits nonzero when it finds one. Findings are sorted by archive path and
+line. It never rewrites the archive, contacts GitHub, or exposes invalid line
+contents.
+
 ## The observer: `shipyard cause record`
 
 Each pass:

@@ -1404,6 +1404,8 @@ pub(crate) enum CauseCommand {
     Record(CauseRecordArgs),
     /// Search the local cause archive for deterministic historical advice.
     Advise(CauseAdviseArgs),
+    /// Audit the local cause archive without contacting GitHub or rewriting it.
+    Audit(CauseAuditArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1500,6 +1502,13 @@ pub(crate) struct CauseAdviseArgs {
     /// Maximum historical candidates to return.
     #[arg(long, default_value_t = 5)]
     pub(crate) limit: usize,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CauseAuditArgs {
+    /// Archive directory (for example `data/ci-cause`).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) dir: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
