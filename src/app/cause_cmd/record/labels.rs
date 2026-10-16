@@ -146,6 +146,8 @@ pub(super) fn inherit_from_summarised(rows: &mut [Value], sources: &[Value]) -> 
             // line as the detail; evidence_job_id names whose log that is.
             "evidence",
             "step_failed",
+            // The step named is the source job's, the step the cause is in.
+            "failed_step",
         ] {
             fields.insert(key.to_owned(), source[key].clone());
         }

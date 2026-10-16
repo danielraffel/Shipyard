@@ -1598,7 +1598,7 @@ not `unknown` and its confidence is `high` or `medium`. A generated-file drift c
 generator shape, to review and run from a main-branch checkout. Shipyard never
 executes or auto-applies it. A bare exit is either inherited from the job a summary
 job summarises (`labelled_by: summarised_job`, `inherited_from_job_id`, with
-that job's evidence and `evidence_job_id`; count
+that job's evidence, failing step and `evidence_job_id`; count
 failures, not jobs, by deduplicating on it) or labelled by its step and the last
 line printed after the echoed script (`labelled_by: step`, still `low`). A
 fix-link whose red is not an ancestor of the fix recovers `own_files` from the

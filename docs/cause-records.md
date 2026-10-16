@@ -106,7 +106,7 @@ A bare exit that C2 cannot name gets one of two labels. A summary job, such
 as `linux` checking the jobs it needs, takes the cause of the named job in
 the same run attempt whose name it begins (`Linux (x64) [github-hosted]`),
 and says so in `inherited_from_job_id`; its evidence is that job's log line
-too, named by `evidence_job_id`. Any other bare exit is labelled by
+too, named by `evidence_job_id`, and so are its failing step and `step_failed`. Any other bare exit is labelled by
 its step and by the last line the step printed after its echoed script, and
 stays low confidence.
 
