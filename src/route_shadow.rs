@@ -335,6 +335,17 @@ impl RouteShadowReceiptStore {
         &self,
         observation: &RouteShadowObservation,
     ) -> Result<bool, RouteShadowStoreError> {
+        self.record_observation_best_effort_with_retention_limit(
+            observation,
+            RECEIPT_RETENTION_LIMIT,
+        )
+    }
+
+    fn record_observation_best_effort_with_retention_limit(
+        &self,
+        observation: &RouteShadowObservation,
+        retention_limit: usize,
+    ) -> Result<bool, RouteShadowStoreError> {
         if observation.correlation_id.trim().is_empty()
             || observation.correlation_id != observation.snapshot.request_id
         {
@@ -376,7 +387,7 @@ impl RouteShadowReceiptStore {
             };
         crate::durable_file::replace_json(&path, &receipt, false)
             .map_err(RouteShadowStoreError::Io)?;
-        let _ = self.prune_receipts(RECEIPT_RETENTION_LIMIT);
+        let _ = self.prune_receipts(retention_limit);
         Ok(true)
     }
 
@@ -863,10 +874,12 @@ fn missing_capabilities(candidate: &RouteCandidateSnapshot, required: &[String])
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::path::PathBuf;
     use std::sync::mpsc;
 
     use chrono::{Duration, Utc};
+    use fs2::FileExt;
 
     use super::{
         PendingObservation, ROUTE_SHADOW_SCHEMA_VERSION, RouteAvailability, RouteCandidateSnapshot,
@@ -1108,17 +1121,34 @@ mod tests {
     fn receipt_retention_prunes_oldest_json_files_by_count() {
         let temp = tempfile::tempdir().expect("state directory");
         let store = super::RouteShadowReceiptStore::new(temp.path());
-        std::fs::create_dir_all(&store.root).expect("receipt directory");
-        for request_id in ["old-a", "old-b", "new"] {
-            std::fs::write(store.path_for(request_id), b"{}").expect("receipt fixture");
+        for request_id in ["old-a", "middle", "new"] {
+            let mut snapshot = snapshot(vec![candidate(
+                "primary",
+                "macos-arm64",
+                "macos-arm64",
+                &["macos", "arm64"],
+                RouteAvailability::Available,
+            )]);
+            snapshot.request_id = request_id.to_owned();
+            store
+                .record_observation_best_effort_with_retention_limit(
+                    &RouteShadowObservation {
+                        correlation_id: request_id.to_owned(),
+                        snapshot,
+                        observed_at: Utc::now(),
+                        freshness: Duration::seconds(30),
+                        capability_provenance: "test".to_owned(),
+                        route_attempts: None,
+                    },
+                    2,
+                )
+                .expect("record receipt");
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        store.prune_receipts(2).expect("prune receipts");
-        let retained = std::fs::read_dir(&store.root)
-            .expect("receipt directory entries")
-            .filter_map(Result::ok)
-            .count();
-        assert_eq!(retained, 2);
+        assert!(!store.path_for("old-a").exists());
+        assert!(store.path_for("middle").exists());
+        assert!(store.path_for("new").exists());
     }
 
     #[test]
@@ -1146,6 +1176,41 @@ mod tests {
         assert_eq!(metadata.correlation_id, "job-1");
         assert_eq!(metadata.observed_at, observed_at);
         assert_eq!(metadata.capability_provenance, "shipyard.scheduler.test");
+    }
+
+    #[test]
+    fn organic_writer_uses_zero_timeout_on_protected_state() {
+        let runtime_paths =
+            crate::paths::RuntimePaths::current(crate::identity::RuntimeMode::Shipyard);
+        std::fs::create_dir_all(&runtime_paths.state_dir).expect("state directory");
+        let lock_path = runtime_paths.state_dir.join(".sandbox-writer-domain.lock");
+        let lock = File::create(&lock_path).expect("writer lock");
+        lock.lock_exclusive().expect("hold writer lock");
+
+        let store = RouteShadowReceiptStore::new(&runtime_paths.state_dir);
+        let observation = RouteShadowObservation {
+            snapshot: snapshot(vec![candidate(
+                "primary",
+                "macos-arm64",
+                "macos-arm64",
+                &["macos", "arm64"],
+                RouteAvailability::Available,
+            )]),
+            correlation_id: "job-1".to_owned(),
+            observed_at: Utc::now(),
+            freshness: Duration::seconds(30),
+            capability_provenance: "test".to_owned(),
+            route_attempts: None,
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(store.record_observation_best_effort(&observation));
+        });
+        let result = done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("zero-timeout writer must return promptly");
+        assert_eq!(result, Ok(false));
+        lock.unlock().expect("release writer lock");
     }
 
     #[test]

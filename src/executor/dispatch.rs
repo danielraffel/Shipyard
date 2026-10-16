@@ -2427,18 +2427,6 @@ mod tests {
         input.parse::<Table>().expect("valid TOML")
     }
 
-    fn assert_route_attempt_metadata_preserves_decision(result: &TargetResult) {
-        let mut with_attempts = serde_json::to_value(result).expect("serialize result");
-        let mut decision_only = result.clone();
-        decision_only.route_attempts = None;
-        let without_attempts = serde_json::to_value(decision_only).expect("serialize result");
-        with_attempts
-            .as_object_mut()
-            .expect("result object")
-            .remove("route_attempts");
-        assert_eq!(with_attempts, without_attempts);
-    }
-
     fn initialize_repository(root: &std::path::Path, remote: &str) {
         let status = std::process::Command::new("git")
             .args(["init", "--quiet"])
@@ -3111,6 +3099,9 @@ backend = "local"
         };
 
         assert_eq!(result.status, TargetStatus::Pass);
+        assert_eq!(result.backend, "local");
+        assert_eq!(result.primary_backend, None);
+        assert_eq!(result.failover_reason, None);
         assert_eq!(
             result.route_attempts.as_ref().unwrap()[0].route_id,
             "fallback:local:0"
@@ -3119,7 +3110,6 @@ backend = "local"
             result.route_attempts.as_ref().unwrap()[0].outcome,
             TargetStatus::Pass
         );
-        assert_route_attempt_metadata_preserves_decision(&result);
         assert!(phases.iter().any(|phase| phase == "build"));
     }
 
@@ -3292,7 +3282,8 @@ backend = "local"
 
         assert_eq!(result.status, TargetStatus::Pass);
         assert_eq!(result.backend, "host-pool:local_macs/local");
-        assert_route_attempt_metadata_preserves_decision(&result);
+        assert_eq!(result.primary_backend, None);
+        assert_eq!(result.failover_reason, None);
         assert_eq!(
             result.route_attempts.as_ref().unwrap()[0].route_id,
             "host-pool:local_macs:local"
