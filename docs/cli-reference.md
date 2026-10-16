@@ -528,6 +528,19 @@ infers them from job duration. Human output is available by default; `--json`
 returns structured rows, findings, or the scorecard for plugins, MCP tools, and
 monitoring agents.
 
+Scorecard JSON includes an authenticated strata receipt under `strata` using
+schema `shipyard-metrics-strata/v1`. It counts jobs and includes `repo`,
+`window_since`, `window_until`, `source_head`, `generated_at`, `unit`, the
+`normal_pr`, `merge_group`, `rerun`, and `unclassified` strata, and an
+`aggregate`. Each stratum has `observed_jobs`, `qualified_jobs`, `provenance`,
+`coverage`, and `reason`. Only verified production rows with valid
+provider/run/head/attempt identity qualify; merge-group rows do not require a
+pull-request number. Unknown, synthetic, and unverified rows remain visible
+with zero qualified jobs. Observed windows are `partial` because recent-N
+import completeness is unproven. The receipt does not set a minimum sample
+threshold or establish safe-merge authority. When repository binding is
+unavailable, an explicit unavailable envelope is emitted.
+
 The scorecard also reports cost proxies needed for the fleet baseline:
 `wasted_compute_minutes` sums measured duration for failed or cancelled jobs,
 `coordination_minutes` sums authoritative queue wait, and

@@ -392,13 +392,22 @@ pub(super) fn metrics_command<W: Write>(
             let freshness =
                 freshness_for(&store, Some(&args.project), &args.freshness, config_cwd)?;
             let exit = stale_exit(&freshness, args.freshness.fail_on_stale);
-            let strata = store
-                .authenticated_strata_receipt_from_metadata(&args.project, since_days)
-                .ok();
+            let strata =
+                match store.authenticated_strata_receipt_from_metadata(&args.project, since_days) {
+                    Ok(receipt) => receipt,
+                    Err(error) => MetricsStore::unavailable_authenticated_strata_receipt(
+                        &args.project,
+                        since_days,
+                        format!("strata receipt unavailable: {error}"),
+                    )
+                    .map_err(|fallback| {
+                        CliFailure::new(1, format!("metrics strata receipt failed: {fallback}"))
+                    })?,
+                };
             let output = MetricsScorecardOutput {
                 scorecard: &scorecard,
                 freshness: &freshness,
-                strata,
+                strata: Some(strata),
             };
             write_output(stdout, json_output, &output, || {
                 let mut text = if freshness.is_degraded() {
