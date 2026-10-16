@@ -133,8 +133,13 @@ pub struct RouteShadowObservationMetadata {
     pub observed_at: DateTime<Utc>,
     /// Latest time at which those facts may be consumed as fresh.
     pub expires_at: DateTime<Utc>,
-    /// Authenticated source of capability and admission facts.
+    /// Source label for capability and admission facts. This is provenance
+    /// context, not an authentication claim.
     pub capability_provenance: String,
+    /// Actual route selected by the authoritative dispatcher, when the
+    /// observation was emitted after lease/dispatch selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_route: Option<RouteSelection>,
 }
 
 /// Selected route identity and its position in the ordered snapshot.
@@ -302,6 +307,7 @@ impl RouteShadowReceiptStore {
             observed_at: observation.observed_at,
             expires_at,
             capability_provenance: observation.capability_provenance.clone(),
+            selected_route: observation.selected_route.clone(),
         });
         let path = self.path_for(&observation.snapshot.request_id);
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
@@ -311,9 +317,9 @@ impl RouteShadowReceiptStore {
         Ok(receipt)
     }
 
-    /// Best-effort organic writer with no wait on the shared writer domain and
-    /// no directory fsync. Scheduler admission uses this path so a dropped
-    /// observation can never delay a job.
+    /// Best-effort organic writer with no wait on the shared writer domain.
+    /// Scheduler admission uses this only from its background sink, so a
+    /// dropped or stalled observation can never delay a job.
     pub fn record_observation_best_effort(
         &self,
         observation: &RouteShadowObservation,
@@ -336,6 +342,7 @@ impl RouteShadowReceiptStore {
             observed_at: observation.observed_at,
             expires_at,
             capability_provenance: observation.capability_provenance.clone(),
+            selected_route: observation.selected_route.clone(),
         });
         let path = self.path_for(&observation.snapshot.request_id);
         let _writer_domain =
@@ -344,12 +351,58 @@ impl RouteShadowReceiptStore {
                 StdDuration::ZERO,
             ) {
                 Ok(lease) => lease,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(false);
+                }
                 Err(error) => return Err(RouteShadowStoreError::Io(error)),
             };
         crate::durable_file::replace_json(&path, &receipt, false)
             .map_err(RouteShadowStoreError::Io)?;
         Ok(true)
+    }
+
+    /// Attach the authoritative dispatch decision to an existing admission
+    /// receipt without rebuilding or replacing its scheduler snapshot.
+    /// Returns `Ok(None)` when no pending admission receipt exists yet.
+    fn attach_selected_route_best_effort(
+        &self,
+        observation: &RouteShadowObservation,
+    ) -> Result<Option<bool>, RouteShadowStoreError> {
+        let Some(mut receipt) = self.load(&observation.snapshot.request_id)? else {
+            return Ok(None);
+        };
+        let Some(metadata) = receipt.observation.as_mut() else {
+            return Ok(None);
+        };
+        if metadata.correlation_id != observation.correlation_id {
+            return Ok(None);
+        }
+        metadata.selected_route = observation.selected_route.clone();
+        let path = self.path_for(&observation.snapshot.request_id);
+        let _writer_domain =
+            match crate::writer_domain_lease::acquire_for_protected_path_with_timeout(
+                &path,
+                StdDuration::ZERO,
+            ) {
+                Ok(lease) => lease,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(Some(false));
+                }
+                Err(error) => return Err(RouteShadowStoreError::Io(error)),
+            };
+        crate::durable_file::replace_json(&path, &receipt, false)
+            .map_err(RouteShadowStoreError::Io)?;
+        Ok(Some(true))
     }
 
     /// Load a previously recorded receipt, if present.
@@ -489,8 +542,10 @@ pub struct RouteShadowObservation {
     pub observed_at: DateTime<Utc>,
     /// Maximum age of the scheduler facts.
     pub freshness: Duration,
-    /// Source of capability and admission facts.
+    /// Source label for capability and admission facts.
     pub capability_provenance: String,
+    /// Actual route selected by the authoritative dispatcher, when known.
+    pub selected_route: Option<RouteSelection>,
 }
 
 impl RouteShadowObservation {
@@ -518,6 +573,59 @@ pub fn record_scheduler_observation_best_effort(
         observed_at,
         freshness: Duration::seconds(30),
         capability_provenance: scheduler_provenance(target),
+        selected_route: None,
+    };
+    let Some(sender) = observation_sender() else {
+        return;
+    };
+    let _ = enqueue_observation(
+        sender,
+        PendingObservation {
+            state_dir: state_dir.to_path_buf(),
+            observation,
+        },
+    );
+}
+
+/// Emit a post-dispatch observation bound to the route label returned by the
+/// authoritative dispatcher. The route choice is copied into metadata; it is
+/// never used to reroute, reacquire, or release a lease.
+pub fn record_dispatch_observation_best_effort(
+    state_dir: &std::path::Path,
+    job_id: &str,
+    target: &ResolvedTarget,
+    selected_label: &str,
+    observed_at: DateTime<Utc>,
+) {
+    let Some(snapshot) = scheduler_snapshot(job_id, target, &[], observed_at) else {
+        return;
+    };
+    let Some((position, candidate)) =
+        snapshot
+            .candidates
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| {
+                candidate.route_id.ends_with(&format!(":{selected_label}"))
+                    || candidate.route_id == selected_label
+            })
+    else {
+        return;
+    };
+    let selected_route = RouteSelection {
+        route_id: candidate.route_id.clone(),
+        position,
+    };
+    let observation = RouteShadowObservation {
+        correlation_id: snapshot.request_id.clone(),
+        snapshot: {
+            // Preserve the immutable scheduler snapshot exactly as observed.
+            snapshot
+        },
+        observed_at,
+        freshness: Duration::seconds(30),
+        capability_provenance: "shipyard.dispatch.selected_route".to_owned(),
+        selected_route: Some(selected_route),
     };
     let Some(sender) = observation_sender() else {
         return;
@@ -541,6 +649,14 @@ fn observation_sender() -> Option<&'static SyncSender<PendingObservation>> {
                 .spawn(move || {
                     while let Ok(pending) = receiver.recv() {
                         let store = RouteShadowReceiptStore::new(pending.state_dir);
+                        if pending.observation.selected_route.is_some()
+                            && matches!(
+                                store.attach_selected_route_best_effort(&pending.observation),
+                                Ok(Some(true))
+                            )
+                        {
+                            continue;
+                        }
                         if store
                             .load(&pending.observation.snapshot.request_id)
                             .ok()
@@ -548,6 +664,7 @@ fn observation_sender() -> Option<&'static SyncSender<PendingObservation>> {
                             .and_then(|receipt| receipt.observation)
                             .is_some_and(|metadata| {
                                 metadata.expires_at > pending.observation.observed_at
+                                    && pending.observation.selected_route.is_none()
                             })
                         {
                             continue;
@@ -958,6 +1075,7 @@ mod tests {
                 observed_at,
                 freshness: Duration::seconds(30),
                 capability_provenance: "shipyard.scheduler.test".to_owned(),
+                selected_route: None,
             })
             .expect("record organic observation");
         let metadata = receipt.observation.expect("observation metadata");
@@ -983,6 +1101,7 @@ mod tests {
             observed_at: Utc::now() - Duration::minutes(2),
             freshness: Duration::seconds(1),
             capability_provenance: "shipyard.scheduler.test".to_owned(),
+            selected_route: None,
         };
         assert!(matches!(
             store.record_observation(&stale),
@@ -996,6 +1115,7 @@ mod tests {
             observed_at: Utc::now(),
             freshness: Duration::seconds(30),
             capability_provenance: "shipyard.scheduler.test".to_owned(),
+            selected_route: None,
         };
         assert!(matches!(
             store.record_observation(&mismatch),
@@ -1080,8 +1200,92 @@ mod tests {
     }
 
     #[test]
-    fn full_observation_queue_drops_without_blocking() {
+    fn runtime_sink_emits_pending_then_selected_route_receipt() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let target = host_pool_target();
+        let observed_at = Utc::now();
+        super::record_scheduler_observation_best_effort(
+            temp.path(),
+            "job-runtime",
+            &target,
+            &[],
+            observed_at,
+        );
+        let store = super::RouteShadowReceiptStore::new(temp.path());
+        let path = store.path_for("job-runtime:mac");
+        let mut pending = None;
+        for _ in 0..50 {
+            if let Ok(Some(receipt)) = store.load("job-runtime:mac") {
+                pending = Some(receipt);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let pending = pending.expect("background sink receipt");
+        assert!(
+            pending
+                .observation
+                .expect("metadata")
+                .selected_route
+                .is_none()
+        );
+        assert!(matches!(
+            pending.counterfactuals[0].outcome,
+            RouteCounterfactualOutcome::Unavailable {
+                availability: RouteAvailability::Unknown
+            }
+        ));
+        assert!(path.is_file());
+
+        super::record_dispatch_observation_best_effort(
+            temp.path(),
+            "job-runtime",
+            &target,
+            "M1",
+            Utc::now(),
+        );
+        let mut selected = None;
+        for _ in 0..50 {
+            if let Ok(Some(receipt)) = store.load("job-runtime:mac")
+                && receipt
+                    .observation
+                    .as_ref()
+                    .and_then(|metadata| metadata.selected_route.as_ref())
+                    .is_some()
+            {
+                selected = Some(receipt);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let selected = selected.expect("selected route receipt");
+        let metadata = selected.observation.expect("metadata");
+        assert_eq!(
+            metadata.selected_route.expect("selected route").route_id,
+            "host-pool:mac:M1"
+        );
+        assert!(matches!(
+            selected.counterfactuals[0].outcome,
+            RouteCounterfactualOutcome::Unavailable {
+                availability: RouteAvailability::Unknown
+            }
+        ));
+    }
+
+    #[test]
+    fn stalled_writer_queue_drops_without_blocking_admission() {
         let (sender, receiver) = mpsc::sync_channel(1);
+        let writer_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let started = writer_started.clone();
+        let release = writer_release.clone();
+        let writer = std::thread::spawn(move || {
+            let _ = receiver.recv();
+            started.wait();
+            // Model a receipt writer stalled in filesystem I/O. The producer
+            // must continue using only the bounded, nonblocking handoff.
+            release.wait();
+        });
         let pending = || PendingObservation {
             state_dir: PathBuf::from("/unreachable"),
             observation: RouteShadowObservation {
@@ -1096,11 +1300,19 @@ mod tests {
                 observed_at: Utc::now(),
                 freshness: Duration::seconds(30),
                 capability_provenance: "test".to_owned(),
+                selected_route: None,
             },
         };
         assert!(enqueue_observation(&sender, pending()));
+        writer_started.wait();
         assert!(!enqueue_observation(&sender, pending()));
-        drop(receiver);
+        let started_at = std::time::Instant::now();
+        for _ in 0..128 {
+            assert!(!enqueue_observation(&sender, pending()));
+        }
+        assert!(started_at.elapsed() < StdDuration::from_millis(100));
+        writer_release.wait();
+        writer.join().expect("stalled writer exits");
         assert!(!enqueue_observation(&sender, pending()));
     }
 }
