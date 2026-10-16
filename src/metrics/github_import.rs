@@ -438,18 +438,27 @@ mod tests {
                     "run_attempt": 2, "head_sha": "head",
                     "pull_requests": [{"number": 9}]}]}));
             }
-            let page = if argv.iter().any(|arg| arg == "page=2") { 2 } else { 1 };
+            let page = if argv.iter().any(|arg| arg == "page=2") {
+                2
+            } else {
+                1
+            };
             pages.push(page);
             let start = if page == 1 { 0 } else { 100 };
             let end = if page == 1 { 100 } else { 150 };
             let jobs = (start..end)
-                .map(|id| json!({"id": id, "name": format!("job-{id}"),
+                .map(|id| {
+                    json!({"id": id, "name": format!("job-{id}"),
                     "run_attempt": 2, "conclusion": "success",
-                    "completed_at": "2026-09-30T10:10:00Z"}))
+                    "completed_at": "2026-09-30T10:10:00Z"})
+                })
                 .collect::<Vec<_>>();
             Ok(json!({"total_count": 150, "jobs": jobs}))
         };
-        assert_eq!(import_github(&store, &request, &mut gh, &|error| error).unwrap(), 150);
+        assert_eq!(
+            import_github(&store, &request, &mut gh, &|error| error).unwrap(),
+            150
+        );
         assert_eq!(pages, vec![1, 2]);
         assert_eq!(store.list(Some("acme/pulp"), 200).unwrap().len(), 150);
     }
@@ -472,8 +481,10 @@ mod tests {
                     "pull_requests": [{"number": 9}]}]}));
             }
             let jobs = (0..50)
-                .map(|id| json!({"id": id, "name": "job", "run_attempt": 2,
-                    "conclusion": "success", "completed_at": "2026-09-30T10:10:00Z"}))
+                .map(|id| {
+                    json!({"id": id, "name": "job", "run_attempt": 2,
+                    "conclusion": "success", "completed_at": "2026-09-30T10:10:00Z"})
+                })
                 .collect::<Vec<_>>();
             Ok(json!({"total_count": 150, "jobs": jobs}))
         };
@@ -501,7 +512,10 @@ mod tests {
             Ok(json!({"jobs": [{"id": 1, "run_attempt": 1, "name": "macos",
                 "conclusion": "success", "completed_at": "2026-09-30T10:10:00Z"}]}))
         };
-        assert_eq!(import_github(&store, &request, &mut gh, &|error| error).unwrap(), 1);
+        assert_eq!(
+            import_github(&store, &request, &mut gh, &|error| error).unwrap(),
+            1
+        );
         let conn = rusqlite::Connection::open(store.path()).unwrap();
         assert_eq!(
             conn.query_row("SELECT run_attempt FROM runs", [], |row| row.get::<_, i64>(0))
