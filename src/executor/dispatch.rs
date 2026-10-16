@@ -3115,7 +3115,10 @@ backend = "local"
 
         assert_eq!(result.status, TargetStatus::Pass);
         assert_eq!(result.backend, "host-pool:local_macs/local");
-        assert_eq!(result.selected_route.as_deref(), Some("local"));
+        assert_eq!(
+            result.selected_route.as_deref(),
+            Some("host-pool:local_macs/local")
+        );
         assert!(observed_job_id.get());
         let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
         assert!(store.leases().expect("leases").is_empty());
@@ -3164,7 +3167,10 @@ backend = "local"
         });
 
         assert_ne!(result.status, TargetStatus::Pass);
-        assert_eq!(result.selected_route.as_deref(), Some("local"));
+        assert_eq!(
+            result.selected_route.as_deref(),
+            Some("host-pool:local_macs/local")
+        );
     }
 
     #[test]
@@ -3240,7 +3246,10 @@ backend = "local"
             result.primary_backend.as_deref(),
             Some("host-pool:local_macs/mac-studio")
         );
-        assert_eq!(result.selected_route.as_deref(), Some("local"));
+        assert_eq!(
+            result.selected_route.as_deref(),
+            Some("host-pool:local_macs/local")
+        );
         let leases = store.leases().expect("leases");
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].lease_id, busy.lease_id);
