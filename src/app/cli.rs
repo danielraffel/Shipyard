@@ -1880,6 +1880,10 @@ pub(crate) struct MetricsRecordArgs {
     /// External dedupe key, for example github:run/job/attempt.
     #[arg(long = "external-id")]
     pub(crate) external_id: Option<String>,
+    /// Stable correlation key shared by all observations and phase rows for
+    /// one job. Defaults to provider plus external-id when both are present.
+    #[arg(long = "correlation-id")]
+    pub(crate) correlation_id: Option<String>,
     /// RFC3339 time the provider queued the job. Enables the
     /// queue-wait-per-job-ahead proxy for this row.
     #[arg(long = "queued-at")]

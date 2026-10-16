@@ -49,6 +49,10 @@ pub struct MetricRecordInput {
     pub exit_code: Option<i64>,
     pub failure_class: Option<String>,
     pub external_id: Option<String>,
+    /// Stable identity shared by all observations and phase rows for one job.
+    /// When omitted, a provider/external-id pair supplies a deterministic
+    /// fallback; observations without either identity remain uncorrelated.
+    pub correlation_id: Option<String>,
     /// Time the provider placed the job in its queue, when authoritative.
     pub queued_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
@@ -95,6 +99,18 @@ pub struct MetricsJobRow {
     pub total_ms: Option<i64>,
     pub completed_at: Option<String>,
     pub external_id: Option<String>,
+    pub correlation_id: Option<String>,
+}
+
+/// One persisted phase measurement for a correlated job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MetricPhaseRow {
+    pub correlation_id: Option<String>,
+    pub phase: String,
+    pub status: String,
+    pub duration_ms: i64,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
 }
 
 /// Agent-facing finding emitted by watch/advise.
@@ -288,6 +304,7 @@ impl MetricsStore {
               exit_code INTEGER,
               failure_class TEXT,
               external_id TEXT,
+              correlation_id TEXT,
               UNIQUE(provider, external_id)
             );
             CREATE TABLE IF NOT EXISTS steps (
@@ -306,6 +323,17 @@ impl MetricsStore {
         )?;
         add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
         add_column_if_missing(&conn, "jobs", "labels_json", "TEXT")?;
+        add_column_if_missing(&conn, "jobs", "correlation_id", "TEXT")?;
+        // Older stores only had the provider/external-id identity. Backfill
+        // the new stable correlation key without changing any row identity.
+        conn.execute(
+            "UPDATE jobs
+                SET correlation_id = provider || ':' || external_id
+              WHERE correlation_id IS NULL
+                AND provider IS NOT NULL AND external_id IS NOT NULL
+                AND provider <> '' AND external_id <> ''",
+            [],
+        )?;
         Ok(())
     }
 
@@ -342,6 +370,7 @@ impl MetricsStore {
             ..input.clone()
         };
         let input = &normalized;
+        let correlation_id = correlation_id_for(input);
         let completed_at = input.completed_at.unwrap_or_else(Utc::now);
         let started_at = input
             .started_at
@@ -379,6 +408,7 @@ impl MetricsStore {
                     measured_total_ms,
                     queued_at.as_deref(),
                     queue_ms,
+                    input.correlation_id.clone(),
                 )?;
             }
             return Ok(existing);
@@ -432,6 +462,7 @@ impl MetricsStore {
                 exit_code: input.exit_code,
                 failure_class: input.failure_class.clone(),
                 external_id: nonempty(input.external_id.clone()),
+                correlation_id,
                 runner_assigned: input.runner_assigned,
                 labels_json: labels_json(input),
             },
@@ -485,6 +516,9 @@ impl MetricsStore {
             value.get("labels").map(Value::to_string).as_deref(),
         )?;
         let status = value_str(value, "status").unwrap_or("unknown").to_owned();
+        let correlation_id = value_str(value, "correlation_id")
+            .map(str::to_owned)
+            .or_else(|| correlation_id_for_parts(Some(&provider), external_id.as_deref()));
         let ts = value_str(value, "completed_at")
             .or_else(|| value_str(value, "started_at"))
             .map_or_else(|| Utc::now().to_rfc3339(), str::to_owned);
@@ -529,6 +563,7 @@ impl MetricsStore {
                 exit_code: value_i64(value, "exit_code"),
                 failure_class: value_str(value, "failure_class").map(str::to_owned),
                 external_id,
+                correlation_id,
                 runner_assigned: value.get("runner_assigned").and_then(Value::as_bool),
                 labels_json: value.get("labels").map(Value::to_string),
             },
@@ -548,6 +583,38 @@ impl MetricsStore {
         rows.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
         rows.truncate(limit);
         Ok(rows)
+    }
+
+    /// Return persisted phase rows, optionally scoped to one stable
+    /// correlation id. A phase is a row in the steps table; no phase is
+    /// inferred from the job's total duration.
+    pub fn phase_rows(
+        &self,
+        correlation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MetricPhaseRow>, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            "SELECT jobs.correlation_id, steps.step, steps.status, steps.duration_ms,
+                    steps.started_at, steps.completed_at
+               FROM steps
+               JOIN jobs ON jobs.id = steps.job_id
+              WHERE (?1 IS NULL OR jobs.correlation_id = ?1)
+              ORDER BY steps.id
+              LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![correlation_id, limit], |row| {
+            Ok(MetricPhaseRow {
+                correlation_id: row.get(0)?,
+                phase: row.get(1)?,
+                status: row.get(2)?,
+                duration_ms: row.get(3)?,
+                started_at: row.get(4)?,
+                completed_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Group by project/target/backend/host/provider and compute basic stats.
@@ -945,6 +1012,7 @@ struct JobInsert {
     exit_code: Option<i64>,
     failure_class: Option<String>,
     external_id: Option<String>,
+    correlation_id: Option<String>,
     runner_assigned: Option<bool>,
     labels_json: Option<String>,
 }
@@ -1008,8 +1076,8 @@ fn insert_job(conn: &Connection, job: &JobInsert) -> Result<i64, rusqlite::Error
           run_id, machine_id, job, target, platform, backend, provider,
           queued_at, started_at, completed_at, queue_ms, boot_ms, setup_ms,
           run_ms, total_ms, status, exit_code, failure_class, external_id,
-          runner_assigned, labels_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+          correlation_id, runner_assigned, labels_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
         params![
             job.run_id,
             job.machine_id,
@@ -1030,6 +1098,7 @@ fn insert_job(conn: &Connection, job: &JobInsert) -> Result<i64, rusqlite::Error
             job.exit_code,
             job.failure_class,
             job.external_id,
+            job.correlation_id,
             job.runner_assigned,
             job.labels_json
         ],
@@ -1100,9 +1169,11 @@ fn refresh_existing_job(
     measured_total_ms: Option<i64>,
     queued_at: Option<&str>,
     queue_ms: Option<i64>,
+    correlation_id: Option<String>,
 ) -> Result<(), rusqlite::Error> {
     let started_at = started_at.to_rfc3339();
     let completed_at = completed_at.to_rfc3339();
+    let step = input.step.as_deref().unwrap_or("total");
     conn.execute(
         "UPDATE jobs
             SET queued_at = COALESCE(?2, queued_at), started_at = ?3, completed_at = ?4, run_ms = ?5, total_ms = ?5,
@@ -1110,8 +1181,9 @@ fn refresh_existing_job(
                 failure_class = COALESCE(?9, failure_class), machine_id = ?10,
                 target = COALESCE(?11, target), platform = COALESCE(?12, platform),
                 backend = COALESCE(?13, backend), provider = COALESCE(?14, provider),
-                runner_assigned = COALESCE(?15, runner_assigned),
-                labels_json = COALESCE(?16, labels_json)
+                correlation_id = COALESCE(?15, correlation_id),
+                runner_assigned = COALESCE(?16, runner_assigned),
+                labels_json = COALESCE(?17, labels_json)
           WHERE id = ?1",
         params![
             job_id,
@@ -1128,6 +1200,7 @@ fn refresh_existing_job(
             input.platform,
             input.backend,
             input.provider,
+            correlation_id,
             input.runner_assigned,
             labels_json(input),
         ],
@@ -1158,21 +1231,39 @@ fn refresh_existing_job(
         "UPDATE steps
             SET step = ?2, started_at = ?3, completed_at = ?4,
                 duration_ms = ?5, status = ?6
-          WHERE job_id = ?1",
+          WHERE job_id = ?1 AND step = ?2",
         params![
             job_id,
-            input.step.as_deref().unwrap_or("total"),
+            step,
             started_at,
             completed_at,
             input.duration_ms,
             input.status,
         ],
     )?;
+    let updated_steps = if updated_steps == 0 && step != "total" {
+        conn.execute(
+            "UPDATE steps
+                SET step = ?2, started_at = ?3, completed_at = ?4,
+                    duration_ms = ?5, status = ?6
+              WHERE job_id = ?1 AND step = 'total'",
+            params![
+                job_id,
+                step,
+                started_at,
+                completed_at,
+                input.duration_ms,
+                input.status,
+            ],
+        )?
+    } else {
+        updated_steps
+    };
     if updated_steps == 0 {
         insert_step(
             conn,
             job_id,
-            input.step.as_deref().unwrap_or("total"),
+            step,
             Some(&started_at),
             Some(&completed_at),
             input.duration_ms,
@@ -1188,6 +1279,20 @@ fn labels_json(input: &MetricRecordInput) -> Option<String> {
         .labels
         .as_ref()
         .and_then(|labels| serde_json::to_string(labels).ok())
+}
+
+fn correlation_id_for(input: &MetricRecordInput) -> Option<String> {
+    nonempty(input.correlation_id.clone()).or_else(|| {
+        correlation_id_for_parts(input.provider.as_deref(), input.external_id.as_deref())
+    })
+}
+
+fn correlation_id_for_parts(provider: Option<&str>, external_id: Option<&str>) -> Option<String> {
+    nonempty(
+        provider
+            .zip(external_id)
+            .map(|(provider, external_id)| format!("{provider}:{external_id}")),
+    )
 }
 
 fn add_column_if_missing(
@@ -1227,16 +1332,31 @@ fn import_phases(
     };
     for (phase, duration) in phases {
         if let Some(ms) = duration.as_i64() {
-            insert_step(
-                conn,
-                job_id,
-                phase,
-                None,
-                None,
-                ms,
-                value_str(value, "status").unwrap_or("unknown"),
-                value.get("cache_hit").and_then(Value::as_bool),
+            let status = value_str(value, "status").unwrap_or("unknown");
+            let updated = conn.execute(
+                "UPDATE steps
+                    SET duration_ms = ?3, status = ?4, cache_hit = ?5
+                  WHERE job_id = ?1 AND step = ?2",
+                params![
+                    job_id,
+                    phase,
+                    ms,
+                    status,
+                    value.get("cache_hit").and_then(Value::as_bool),
+                ],
             )?;
+            if updated == 0 {
+                insert_step(
+                    conn,
+                    job_id,
+                    phase,
+                    None,
+                    None,
+                    ms,
+                    status,
+                    value.get("cache_hit").and_then(Value::as_bool),
+                )?;
+            }
         }
     }
     Ok(())
@@ -1268,7 +1388,7 @@ fn load_jobs(
     let mut stmt = conn.prepare(&format!(
         "SELECT runs.project, runs.repo, runs.workflow, jobs.job, jobs.target, jobs.backend,
                 jobs.provider, machines.name, jobs.status, jobs.total_ms, jobs.completed_at,
-                jobs.external_id
+                jobs.external_id, jobs.correlation_id
          FROM jobs
          JOIN runs ON runs.id = jobs.run_id
          LEFT JOIN machines ON machines.id = jobs.machine_id
@@ -1291,6 +1411,7 @@ fn load_jobs(
             total_ms: row.get(9)?,
             completed_at: row.get(10)?,
             external_id: row.get(11)?,
+            correlation_id: row.get(12)?,
         })
     })?;
     Ok(rows.filter_map(Result::ok).collect())
@@ -1964,6 +2085,7 @@ mod tests {
                 exit_code: None,
                 failure_class: None,
                 external_id: None,
+                correlation_id: None,
                 runner_assigned: None,
                 labels_json: None,
             },
@@ -2010,6 +2132,64 @@ mod tests {
         let rows = store.list(Some("pulp"), 10).expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].provider.as_deref(), Some("tart-macos"));
+        assert_eq!(
+            rows[0].correlation_id.as_deref(),
+            Some("tart-macos:github:1/2/1")
+        );
+        assert_eq!(
+            store
+                .phase_rows(Some("tart-macos:github:1/2/1"), 10)
+                .expect("phase rows")
+                .iter()
+                .map(|row| row.phase.as_str())
+                .collect::<Vec<_>>(),
+            vec!["boot_to_ssh", "runner_process"]
+        );
+    }
+
+    #[test]
+    fn explicit_correlation_id_survives_terminal_refresh_and_scopes_phases() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let external_id = Some("github:9/4/1".to_owned());
+        let correlation_id = Some("pulp-run-9-4".to_owned());
+        store
+            .record(&MetricRecordInput {
+                project: "pulp".to_owned(),
+                job: "Build".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                external_id: external_id.clone(),
+                correlation_id: correlation_id.clone(),
+                step: Some("queue".to_owned()),
+                duration_ms: 12,
+                status: "in_progress".to_owned(),
+                ..MetricRecordInput::default()
+            })
+            .expect("initial observation");
+        store
+            .record_terminal_observation(&MetricRecordInput {
+                project: "pulp".to_owned(),
+                job: "Build".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                external_id,
+                correlation_id: None,
+                step: Some("run".to_owned()),
+                duration_ms: 34,
+                status: "success".to_owned(),
+                completed_at: Some(Utc::now()),
+                ..MetricRecordInput::default()
+            })
+            .expect("terminal observation");
+        let rows = store.list(Some("pulp"), 10).expect("list");
+        assert_eq!(rows[0].correlation_id, correlation_id);
+        let phases = store
+            .phase_rows(Some("pulp-run-9-4"), 10)
+            .expect("phase rows");
+        assert_eq!(phases.len(), 2);
+        assert_eq!(phases[0].phase, "queue");
+        assert_eq!(phases[0].status, "in_progress");
+        assert_eq!(phases[1].phase, "run");
+        assert_eq!(phases[1].status, "success");
     }
 
     #[test]

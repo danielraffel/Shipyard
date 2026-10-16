@@ -450,6 +450,7 @@ fn record_input(args: MetricsRecordArgs) -> Result<MetricRecordInput, CliFailure
         exit_code: args.exit_code,
         failure_class: args.failure_class,
         external_id: args.external_id,
+        correlation_id: args.correlation_id,
         queued_at: parse_rfc3339(args.queued_at.as_deref())?,
         cache_hit: None,
         runner_assigned: args.runner_assigned,

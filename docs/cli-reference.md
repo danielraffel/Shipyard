@@ -688,3 +688,29 @@ Shipyard refuses to guess which installation a `{repo_slug}` token helper
 should use. Pass `--repo OWNER/REPO` to either doctor surface to select the
 exact repository for that diagnostic. The value must be a canonical slug;
 invalid values fail closed. Without `--repo`, ambiguity remains an error.
+
+### Baseline telemetry identity and phases
+
+Metric observations may carry `--correlation-id` to bind partial, terminal, and
+phase observations for one job. When it is omitted, Shipyard derives a stable
+fallback from `provider` and `external-id` (`<provider>:<external-id>`). The
+identity is stored on the job row and is returned by `metrics list` JSON.
+
+Phase measurements are rows in `steps`: each row names a measured `step` (the
+phase), its duration and status, and optional start/completion timestamps. A
+terminal refresh updates the existing row only when the phase name matches;
+new phase names append rows under the same correlation ID. No phase duration is
+inferred from a job total.
+
+### Baseline telemetry identity and phases
+
+Metric observations may carry `--correlation-id` to bind partial, terminal, and
+phase observations for one job. When it is omitted, Shipyard derives a stable
+fallback from `provider` and `external-id` (`<provider>:<external-id>`). The
+identity is stored on the job row and is returned by `metrics list` JSON.
+
+Phase measurements are rows in `steps`: each row names a measured `step` (the
+phase), its duration and status, and optional start/completion timestamps. A
+terminal refresh updates the existing row only when the phase name matches;
+new phase names append rows under the same correlation ID. No phase duration is
+inferred from a job total.
