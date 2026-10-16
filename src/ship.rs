@@ -2061,7 +2061,21 @@ fn envelope_matches_foreground_job(job: &Job, envelope: &QueuedExecutionEnvelope
                 ),
             ),
         };
-    job.kind == Some(kind)
+    let envelope_kind_matches = matches!(
+        (&envelope.kind, kind),
+        (QueuedExecutionKind::Run, JobKind::Run) | (QueuedExecutionKind::Ship, JobKind::Ship)
+    );
+    let provenance_matches = match &envelope.request {
+        QueuedExecutionRequest::Run(_) => true,
+        QueuedExecutionRequest::Ship(request) => envelope
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.repo_slug.as_deref())
+            .is_none_or(|repo| canonical_repository(repo) == canonical_repository(&request.repo)),
+    };
+    envelope_kind_matches
+        && provenance_matches
+        && job.kind == Some(kind)
         && job.branch == branch
         && job.mode == mode
         && job.sha
@@ -4362,6 +4376,12 @@ mod tests {
         assert!(!envelope_matches_foreground_job(
             &wrong_kind,
             &foreground_envelope
+        ));
+        let mut wrong_envelope_kind = foreground_envelope.clone();
+        wrong_envelope_kind.kind = QueuedExecutionKind::Ship;
+        assert!(!envelope_matches_foreground_job(
+            &foreground_job,
+            &wrong_envelope_kind
         ));
         let mut wrong_sha = foreground_job.clone();
         wrong_sha.sha = "different-sha".to_owned();
