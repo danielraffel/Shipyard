@@ -556,7 +556,7 @@ class PassHistory:
             None,
         )
         following = next(
-            (item for item in ordered if _parse_timestamp(item.observed_at) >= until),
+            (item for item in ordered if _parse_timestamp(item.observed_at) > until),
             None,
         )
         trailing_interval_unobserved = following is None
@@ -587,7 +587,8 @@ class PassHistory:
         if following is None:
             uncertainty.append("history does not extend through the requested window")
             last = in_window[-1] if in_window else None
-            add_missing(_parse_timestamp(last.observed_at) if last else since, until, "history_ends_before_window")
+            if last is None or _parse_timestamp(last.observed_at) < until:
+                add_missing(_parse_timestamp(last.observed_at) if last else since, until, "history_ends_before_window")
         elif (until - _parse_timestamp(following.observed_at)).total_seconds() < 0:
             # Defensive branch; ``following`` is selected at or after ``until``.
             add_missing(until, _parse_timestamp(following.observed_at), "history_ends_before_window")
@@ -628,10 +629,8 @@ class PassHistory:
         full_window_coverage = bool(in_window) and not missing and not failures
         if not in_window:
             uncertainty.append("no prospective observation exists in the requested window")
-        if not failures and not missing and in_window and (prior is None or following is None):
-            # Boundary checks above normally add a missing interval, but keep
-            # this explicit if a future format changes those intervals.
-            full_window_coverage = False
+        if not failures and not missing and in_window:
+            full_window_coverage = True
         return {
             "repository": self.repository,
             "source_identity": self.source_identity,
@@ -716,6 +715,8 @@ def append_observation(
             and expected_interval_secs != history.expected_interval_secs
         ):
             raise HistoryValidationError("requested expected cadence does not match history")
+        if cadence_slack_secs != history.cadence_slack_secs:
+            raise HistoryValidationError("requested cadence slack does not match history")
         history.append(observation, now=now, clock_skew_secs=clock_skew_secs)
         history._write_atomic_unlocked(destination)
         return history

@@ -12,6 +12,80 @@ SPEC.loader.exec_module(MOD)
 
 
 class BaselineScorecardTests(unittest.TestCase):
+    def test_readiness_rejects_nonfinite_instrumentation_and_separates_lane_eligibility(self):
+        started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        observed = started + dt.timedelta(days=5)
+        record = {"observed_jobs": 1, "qualified_jobs": 1, "provenance": "authenticated",
+                  "coverage": "complete", "reason": "validated"}
+        payload = {"schema": MOD.STRATA_CONTRACT, "repo": "o/p", "unit": "job",
+                   "window_since": "2026-10-01T00:00:00+00:00",
+                   "window_until": "2026-10-06T00:00:00+00:00", "source_head": "a" * 40,
+                   "generated_at": "2026-10-06T00:00:00+00:00",
+                   "strata": {"normal_pr": record, "merge_group": record,
+                              "rerun": record, "unclassified": {**record, "qualified_jobs": 0}},
+                   "aggregate": {"observed_jobs": 4, "qualified_jobs": 3}}
+        card = {
+            "instrumentation_coverage": {"status": "available", "continuous": True,
+                                          "continuous_days": float("nan")},
+            "important_lanes": {"lane-a": {"status": "insufficient", "completed_jobs": 2}},
+            "host_generations": {"host-a": {"status": "insufficient", "completed_jobs": 2}},
+            "strata": payload,
+        }
+        pass_history = {"five_continuous_24h_days": True, "missing_intervals": [], "failing_intervals": []}
+        card = MOD.consume_authenticated_strata(card, repo="o/p", since_days=5, reference_at=observed)
+        readiness = MOD.baseline_readiness(card, started, observed, pass_history)
+        self.assertFalse(readiness["report_complete"])
+        self.assertFalse(readiness["optimization_eligible"])
+        self.assertEqual(card["strata_sufficiency"]["normal_pr"]["status"], "sufficient")
+        self.assertIn("outage", card["missing_strata"])
+
+        complete_card = {
+            "instrumentation_coverage": {"status": "available", "continuous": True,
+                                          "continuous_days": 5.0},
+            "important_lanes": {"lane-a": {"status": "insufficient", "completed_jobs": 2}},
+            "host_generations": {"host-a": {"status": "insufficient", "completed_jobs": 2}},
+            "strata": {name: {"provenance": "authenticated", "coverage": "complete", "qualified_jobs": 1}
+                       for name in MOD.REQUIRED_STRATA},
+            "missing_strata": [],
+            "strata_sufficiency": {name: {"status": "sufficient"} for name in MOD.REQUIRED_STRATA},
+        }
+        readiness = MOD.baseline_readiness(complete_card, started, observed, pass_history)
+        self.assertTrue(readiness["report_complete"])
+        self.assertTrue(readiness["exit"])
+        self.assertFalse(readiness["optimization_eligible"])
+        self.assertEqual(readiness["status"], "complete_insufficient")
+
+    def test_pass_history_records_empty_success_at_controller_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observed_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            args = type("Args", (), {
+                "repo": "o/p", "state": root / "state.json",
+                "pass_history_path": root / "pass-history.json",
+                "source_identity": "collector:test:v1", "config_identity": "policy:test:v1",
+                "expected_interval_secs": 3600, "cadence_slack_secs": 0,
+            })()
+            report = MOD.record_pass_observation(args, "success", observed_at)
+            payload = json.loads(args.pass_history_path.read_text())
+            self.assertEqual(payload["observations"][0]["observed_at"], observed_at.isoformat().replace("+00:00", "Z"))
+            self.assertEqual(payload["observations"][0]["status"], "empty")
+            self.assertTrue(report["trailing_interval_unobserved"])
+
+    def test_pass_history_records_failed_completion_with_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observed_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            args = type("Args", (), {
+                "repo": "o/p", "state": root / "state.json",
+                "pass_history_path": root / "pass-history.json",
+                "source_identity": "collector:test:v1", "config_identity": "policy:test:v1",
+                "expected_interval_secs": 3600, "cadence_slack_secs": 0,
+            })()
+            MOD.record_pass_observation(args, "failed", observed_at, error="provider timeout")
+            payload = json.loads(args.pass_history_path.read_text())
+            self.assertEqual(payload["observations"][0]["status"], "failed")
+            self.assertEqual(payload["observations"][0]["error"], "provider timeout")
+
     def test_scorecard_delegates_to_rust_and_keeps_strata_unavailable(self):
         with tempfile.TemporaryDirectory() as directory:
             args = type("Args", (), {"db": Path(directory) / "metrics" / "metrics.db", "project": "pulp", "repo": "Generous-Corp/pulp",
@@ -27,6 +101,54 @@ class BaselineScorecardTests(unittest.TestCase):
             self.assertEqual(result["collector_safe_merge_denominator"]["status"], "unavailable")
             self.assertEqual(result["strata"]["rerun"]["status"], "unavailable")
             self.assertEqual(commands[0][commands[0].index("--project") + 1], "Generous-Corp/pulp")
+
+    def test_unknown_contract_keeps_all_strata_unavailable(self):
+        card = {"strata": {"schema": "shipyard-metrics-strata/v0"}}
+        result = MOD.consume_authenticated_strata(card)
+        self.assertEqual(result["missing_strata"], list(MOD.REQUIRED_STRATA))
+        self.assertEqual(result["provenance_status"], "unverified_organic_input")
+
+    def test_authenticated_partial_contract_preserves_only_qualified_records(self):
+        record = {"observed_jobs": 3, "qualified_jobs": 3, "provenance": "authenticated",
+                  "coverage": "complete", "reason": "validated"}
+        unavailable = {"observed_jobs": 0, "qualified_jobs": 0, "provenance": "unknown",
+                       "coverage": "unavailable", "reason": "unknown"}
+        card = {"strata": {"schema": MOD.STRATA_CONTRACT, "repo": "o/p",
+            "window_since": "2026-10-11T00:00:00+00:00", "window_until": "2026-10-16T00:00:00+00:00",
+            "source_head": "a" * 40, "generated_at": "2026-10-16T00:00:00+00:00", "unit": "job",
+            "strata": {"normal_pr": record, "merge_group": {**record, "coverage": "partial"},
+                        "rerun": unavailable, "unclassified": unavailable},
+            "aggregate": {"observed_jobs": 6, "qualified_jobs": 6}}}
+        result = MOD.consume_authenticated_strata(card, repo="o/p", since_days=5,
+                                                  reference_at=dt.datetime(2026, 10, 16, tzinfo=dt.timezone.utc))
+        self.assertEqual(result["strata"]["normal_pr"], record)
+        self.assertEqual(result["strata"]["merge_group"]["coverage"], "partial")
+        self.assertEqual(result["strata"]["outage"]["status"], "unavailable")
+        self.assertNotIn("normal_pr", result["missing_strata"])
+        self.assertIn("merge_group", result["missing_strata"])
+
+    def test_zero_count_is_preserved_but_not_sufficient(self):
+        record = {"observed_jobs": 0, "qualified_jobs": 0, "provenance": "authenticated",
+                  "coverage": "complete", "reason": "measured empty"}
+        unavailable = {"observed_jobs": 0, "qualified_jobs": 0, "provenance": "unknown",
+                       "coverage": "unavailable", "reason": "unknown"}
+        result = MOD.consume_authenticated_strata({"strata": {"schema": MOD.STRATA_CONTRACT,
+            "repo": "o/p", "window_since": "2026-10-11T00:00:00+00:00",
+            "window_until": "2026-10-16T00:00:00+00:00", "source_head": "a" * 40,
+            "generated_at": "2026-10-16T00:00:00+00:00", "unit": "job",
+            "strata": {"normal_pr": record, "merge_group": unavailable, "rerun": unavailable,
+                        "unclassified": unavailable}, "aggregate": {"observed_jobs": 0, "qualified_jobs": 0}}},
+            repo="o/p", since_days=5,
+            reference_at=dt.datetime(2026, 10, 16, tzinfo=dt.timezone.utc))
+        self.assertEqual(result["strata"]["normal_pr"]["qualified_jobs"], 0)
+        self.assertIn("normal_pr", result["missing_strata"])
+
+    def test_raw_event_labels_and_unverified_records_are_rejected(self):
+        card = {"strata": {"contract": MOD.STRATA_CONTRACT, "authenticated": False,
+                            "records": {"normal_pr": {"event": "pull_request", "count": 99}}}}
+        result = MOD.consume_authenticated_strata(card)
+        self.assertEqual(result["strata"]["normal_pr"]["status"], "unavailable")
+        self.assertEqual(result["missing_strata"], list(MOD.REQUIRED_STRATA))
 
     def test_unavailable_delta_does_not_record_observation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -54,6 +176,19 @@ class BaselineScorecardTests(unittest.TestCase):
                                      [{"new_rows": 2, "source_activity_dates": ["2026-09-01"]}], started)
             self.assertEqual(state["weekday_days_observed"], 0)
             self.assertEqual(state["collection_weekday_days"], 1)
+
+    def test_historical_activity_cannot_exit_without_prospective_readiness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+            state = MOD.update_state(path, "pulp", started, {"missing_strata": [],
+                "strata": {name: {"provenance": "authenticated", "coverage": "complete",
+                                  "qualified_jobs": 1} for name in MOD.REQUIRED_STRATA}},
+                [{"new_rows": 1, "source_activity_dates": ["2026-10-01", "2026-10-02", "2026-10-05",
+                                                               "2026-10-06", "2026-10-07"]}],
+                dt.datetime(2026, 10, 7, tzinfo=dt.timezone.utc))
+            self.assertFalse(state["baseline_exit"])
+            self.assertEqual(state["baseline_readiness"]["status"], "unavailable")
 
     def test_mismatched_identity_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
