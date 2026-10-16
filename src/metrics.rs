@@ -4228,4 +4228,83 @@ mod tests {
             .unwrap();
         assert_eq!(event, "pull_request");
     }
+
+    #[test]
+    fn terminal_batch_rolls_back_when_sql_fails_after_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let base = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            job: "macos".to_owned(),
+            provider: Some("github".to_owned()),
+            external_id: Some("github:11/1/1".to_owned()),
+            status: "success".to_owned(),
+            duration_ms: 10,
+            completed_at: Some(Utc::now()),
+            event: Some("pull_request".to_owned()),
+            run_attempt: Some(1),
+            provider_run_id: Some(11),
+            head_sha: Some("original-head".to_owned()),
+            ..Default::default()
+        };
+        store.record_terminal_observation(&base).unwrap();
+
+        // Force the second insert to fail after the first batch item has
+        // already written its run/job/step rows. This exercises the actual
+        // SQLite transaction boundary rather than only prevalidation errors.
+        let conn = Connection::open(store.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_metrics_batch_after_first_write
+             BEFORE INSERT ON jobs
+             WHEN NEW.job = 'trigger-sql-failure'
+             BEGIN
+               SELECT RAISE(ABORT, 'injected metrics write failure');
+             END;",
+        )
+        .unwrap();
+
+        let mut first = base.clone();
+        first.external_id = Some("github:11/2/1".to_owned());
+        first.job = "linux".to_owned();
+        first.head_sha = Some("new-head".to_owned());
+        let mut second = base.clone();
+        second.external_id = Some("github:11/3/1".to_owned());
+        second.job = "trigger-sql-failure".to_owned();
+        second.head_sha = Some("failed-head".to_owned());
+
+        assert!(
+            store
+                .record_terminal_observations(&[first, second])
+                .is_err()
+        );
+
+        let conn = Connection::open(store.path()).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the first batch row must be rolled back"
+        );
+        let (external_id, head_sha): (String, String) = conn
+            .query_row(
+                "SELECT jobs.external_id, runs.head_sha
+                 FROM jobs JOIN runs ON runs.id = jobs.run_id
+                 WHERE jobs.external_id = 'github:11/1/1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(external_id, "github:11/1/1");
+        assert_eq!(head_sha, "original-head");
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM jobs WHERE external_id IN ('github:11/2/1', 'github:11/3/1')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "neither new row may survive the failed batch"
+        );
+    }
 }
