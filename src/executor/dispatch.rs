@@ -3253,7 +3253,6 @@ backend = "local"
             result.route_attempts.as_ref().unwrap()[0].route_id,
             "host-pool:local_macs:local"
         );
-        assert_eq!(result.route_attempts.as_ref().unwrap()[0].position, 1);
     }
 
     #[test]
@@ -3333,6 +3332,7 @@ backend = "local"
             result.route_attempts.as_ref().unwrap()[0].route_id,
             "host-pool:local_macs:local"
         );
+        assert_eq!(result.route_attempts.as_ref().unwrap()[0].position, 1);
         let leases = store.leases().expect("leases");
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].lease_id, busy.lease_id);
