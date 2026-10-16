@@ -132,6 +132,9 @@ fn a_red_drift_job_gets_one_record_naming_its_generator() {
     );
     assert_eq!(row["attempt"], 1);
     assert_eq!(row["completed_at"], "2026-10-14T10:30:00Z");
+    // Named live, at this pass: time to cause is named_at minus completed_at.
+    assert_eq!(row["named_at"], "2026-10-14T12:00:00Z");
+    assert_eq!(row["retrospective"], false);
     assert_eq!(
         (row["pr"].clone(), row["owner"].clone()),
         (json!(42), json!("pr:42"))
@@ -629,4 +632,39 @@ fn pending_reds_are_counted_by_how_long_ago_they_went_red() {
             "{now}"
         );
     }
+}
+
+#[test]
+fn a_record_the_job_printed_names_the_cause_earlier_than_the_pass() {
+    // The job ran `cause extract --notice` in a step after its failing one;
+    // that step's completion, by GitHub's clock, is when the cause was named.
+    let mut payload = job(1000, "failure");
+    payload["steps"] = json!([
+        {"name": "Run ctest", "conclusion": "failure", "number": 5,
+         "started_at": "2026-10-14T10:10:00Z", "completed_at": "2026-10-14T10:30:00Z"},
+        {"name": "Name the cause", "conclusion": "success", "number": 6,
+         "started_at": "2026-10-14T10:30:05Z", "completed_at": "2026-10-14T10:30:20Z"}
+    ]);
+    let parsed: Job = serde_json::from_value(payload.clone()).expect("job");
+    let place = Place {
+        repo: "Generous-Corp/pulp".to_owned(),
+        ..Place::default()
+    };
+    let printed = cause::build(&parsed, Some(&drift_log()), &place, None, false).expect("cause");
+    let log = format!(
+        "{}2026-10-14T10:30:10.0000000Z ##[notice]{}\n",
+        drift_log(),
+        serde_json::to_string(&printed).expect("record")
+    );
+    let mut routes = red_routes();
+    routes[1] = ("runs/100/jobs", json!({"jobs": [payload]}));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = Fake::new(&routes).with_log("jobs/1000/logs", &log);
+    let gh = |args: &[String]| fake.read(args);
+    record(&gh, &query(dir.path())).expect("pass");
+    let row = &rows(&dir.path().join("causes/2026-10.jsonl"))[0];
+    assert_eq!(row["format"], "generated-drift");
+    assert_eq!(row["named_at"], "2026-10-14T10:30:20Z");
+    assert_eq!(row["retrospective"], false);
+    assert_eq!(row["completed_at"], "2026-10-14T10:30:00Z");
 }

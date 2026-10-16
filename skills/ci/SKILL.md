@@ -527,7 +527,9 @@ Cancelled jobs are counted and skipped; they belong to outage windows, not
 causes. Strings are scrubbed of local paths, addresses, credentials and private
 host names; run and job URLs are kept.
 The layout and fields are the 90-day backfill's, so live and backfilled rows
-join. A red with no green yet stays pending and is retried on the next pass.
+join. Its rows are live: `named_at` is the pass that named the red and
+`retrospective` is false, so `named_at - completed_at` is the time to cause.
+A red with no green yet stays pending and is retried on the next pass.
 A generated-file drift check (`<generator>: N drift problem(s)` or
 `<generator>: the <file> no longer matches <source>`) is C2's
 `generated_drift`, class `drift`, high confidence. Its `signature` is the
