@@ -1705,8 +1705,11 @@ mod tests {
 
         // Make the advisory metrics path unusable. The queue mutation must
         // still commit exactly as it does when shadow persistence is healthy.
-        fs::write(state_dir.join("metrics"), b"metrics path intentionally blocked")
-            .expect("block metrics path");
+        fs::write(
+            state_dir.join("metrics"),
+            b"metrics path intentionally blocked",
+        )
+        .expect("block metrics path");
 
         let second = job("feat/repeat", "new", &["mac"]);
         let second_id = second.id.clone();
