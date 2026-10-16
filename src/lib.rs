@@ -257,6 +257,8 @@ pub mod reuse_record_store;
 /// `shipyard review-verdict`: whether a pull request's head may land, by the
 /// repository-side rule.
 pub mod review_verdict;
+/// Shadow-only ordered route and capability receipts.
+pub mod route_shadow;
 /// Self-hosted runner provisioning (register/list/remove) pure logic.
 pub mod runner_provision;
 /// Self-hosted runner watchdog detection logic.
