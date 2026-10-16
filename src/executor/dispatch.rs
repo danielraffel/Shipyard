@@ -632,6 +632,9 @@ impl ExecutorDispatcher {
             let mut result = result;
             let nested_attempts = result.route_attempts.take().unwrap_or_default();
             let outcome = result.status;
+            // `backend` is a filtered view borrowed from `chain.backends`.
+            // Pointer identity recovers the original configured position
+            // without parsing display labels or changing fallback authority.
             let configured_position = chain
                 .backends
                 .iter()
@@ -772,6 +775,9 @@ impl ExecutorDispatcher {
             // cancelled; busy, deferred, and probe-only paths never reach
             // this point and remain unattributed.
             let outcome = result.status;
+            // `member` is a filtered view borrowed from `pool.members`.
+            // Pointer identity recovers the original configured position
+            // without parsing member labels or changing host-pool authority.
             let configured_position = pool
                 .members
                 .iter()
@@ -2421,6 +2427,18 @@ mod tests {
         input.parse::<Table>().expect("valid TOML")
     }
 
+    fn assert_route_attempt_metadata_preserves_decision(result: &TargetResult) {
+        let mut with_attempts = serde_json::to_value(result).expect("serialize result");
+        let mut decision_only = result.clone();
+        decision_only.route_attempts = None;
+        let without_attempts = serde_json::to_value(decision_only).expect("serialize result");
+        with_attempts
+            .as_object_mut()
+            .expect("result object")
+            .remove("route_attempts");
+        assert_eq!(with_attempts, without_attempts);
+    }
+
     fn initialize_repository(root: &std::path::Path, remote: &str) {
         let status = std::process::Command::new("git")
             .args(["init", "--quiet"])
@@ -3101,6 +3119,7 @@ backend = "local"
             result.route_attempts.as_ref().unwrap()[0].outcome,
             TargetStatus::Pass
         );
+        assert_route_attempt_metadata_preserves_decision(&result);
         assert!(phases.iter().any(|phase| phase == "build"));
     }
 
@@ -3273,6 +3292,7 @@ backend = "local"
 
         assert_eq!(result.status, TargetStatus::Pass);
         assert_eq!(result.backend, "host-pool:local_macs/local");
+        assert_route_attempt_metadata_preserves_decision(&result);
         assert_eq!(
             result.route_attempts.as_ref().unwrap()[0].route_id,
             "host-pool:local_macs:local"

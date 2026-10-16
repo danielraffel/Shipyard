@@ -25,6 +25,10 @@ use crate::job::RouteAttempt;
 /// Schema version for [`RouteCapabilitySnapshot`] and [`RouteShadowReceipt`].
 pub const ROUTE_SHADOW_SCHEMA_VERSION: u32 = 1;
 const OBSERVATION_QUEUE_CAPACITY: usize = 64;
+/// Bound the number of per-request receipts retained by the shadow sink.
+/// Retention runs only on the background writer, so admission never scans or
+/// deletes receipt files.
+const RECEIPT_RETENTION_LIMIT: usize = 256;
 
 struct PendingObservation {
     state_dir: PathBuf,
@@ -372,6 +376,7 @@ impl RouteShadowReceiptStore {
             };
         crate::durable_file::replace_json(&path, &receipt, false)
             .map_err(RouteShadowStoreError::Io)?;
+        let _ = self.prune_receipts(RECEIPT_RETENTION_LIMIT);
         Ok(true)
     }
 
@@ -413,7 +418,39 @@ impl RouteShadowReceiptStore {
             };
         crate::durable_file::replace_json(&path, &receipt, false)
             .map_err(RouteShadowStoreError::Io)?;
+        let _ = self.prune_receipts(RECEIPT_RETENTION_LIMIT);
         Ok(Some(true))
+    }
+
+    /// Keep receipt storage bounded without making retention failures affect
+    /// the observation result. The newest files by filesystem modification
+    /// time are retained; ties are resolved by path for deterministic tests.
+    fn prune_receipts(&self, limit: usize) -> std::io::Result<()> {
+        let mut entries = fs::read_dir(&self.root)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .map(|entry| {
+                let path = entry.path();
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                (modified, path)
+            })
+            .collect::<Vec<_>>();
+        if entries.len() <= limit {
+            return Ok(());
+        }
+        entries.sort_by(|(left_time, left_path), (right_time, right_path)| {
+            left_time
+                .cmp(right_time)
+                .then_with(|| left_path.cmp(right_path))
+        });
+        let excess = entries.len() - limit;
+        for (_, path) in entries.into_iter().take(excess) {
+            let _ = fs::remove_file(path);
+        }
+        Ok(())
     }
 
     /// Load a previously recorded receipt, if present.
@@ -1068,6 +1105,23 @@ mod tests {
     }
 
     #[test]
+    fn receipt_retention_prunes_oldest_json_files_by_count() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let store = super::RouteShadowReceiptStore::new(temp.path());
+        std::fs::create_dir_all(&store.root).expect("receipt directory");
+        for request_id in ["old-a", "old-b", "new"] {
+            std::fs::write(store.path_for(request_id), b"{}").expect("receipt fixture");
+        }
+
+        store.prune_receipts(2).expect("prune receipts");
+        let retained = std::fs::read_dir(&store.root)
+            .expect("receipt directory entries")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(retained, 2);
+    }
+
+    #[test]
     fn organic_observation_binds_correlation_and_provenance() {
         let temp = tempfile::tempdir().expect("state directory");
         let store = super::RouteShadowReceiptStore::new(temp.path());
@@ -1388,5 +1442,29 @@ mod tests {
         writer_release.wait();
         writer.join().expect("stalled writer exits");
         assert!(!enqueue_observation(&sender, pending()));
+    }
+
+    #[test]
+    fn enqueue_observation_rejects_disconnected_receiver() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let pending = PendingObservation {
+            state_dir: PathBuf::from("/unreachable"),
+            observation: RouteShadowObservation {
+                snapshot: snapshot(vec![candidate(
+                    "primary",
+                    "macos-arm64",
+                    "macos-arm64",
+                    &["macos", "arm64"],
+                    RouteAvailability::Unknown,
+                )]),
+                correlation_id: "job-1".to_owned(),
+                observed_at: Utc::now(),
+                freshness: Duration::seconds(30),
+                capability_provenance: "test".to_owned(),
+                route_attempts: None,
+            },
+        };
+        assert!(!enqueue_observation(&sender, pending));
     }
 }
