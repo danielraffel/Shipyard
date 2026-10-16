@@ -19,6 +19,18 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+// Cargo treats a missing watched path as changed on every invocation. Watch
+// its nearest existing ancestor so creation is detected without forced rebuilds.
+fn watch_git_path(root: &Path, path: &str) {
+    let mut watched = root.join(path);
+    while !watched.exists() {
+        if !watched.pop() {
+            return;
+        }
+    }
+    println!("cargo:rerun-if-changed={}", watched.display());
+}
+
 fn main() {
     let root = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     // Watch source inputs and Git state, never target/ or the package root:
@@ -40,14 +52,19 @@ fn main() {
     }
     for name in ["HEAD", "index", "packed-refs"] {
         if let Some(path) = git(&root, &["rev-parse", "--git-path", name]) {
-            println!("cargo:rerun-if-changed={path}");
+            watch_git_path(&root, &path);
         }
     }
     if let Some(reference) = git(&root, &["symbolic-ref", "-q", "HEAD"])
         && let Some(path) = git(&root, &["rev-parse", "--git-path", &reference])
     {
-        println!("cargo:rerun-if-changed={path}");
+        watch_git_path(&root, &path);
     }
+    // An archive nested inside another checkout must not inherit its identity.
+    let own_checkout = git(&root, &["rev-parse", "--show-toplevel"])
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .zip(std::fs::canonicalize(&root).ok())
+        .is_some_and(|(top, manifest)| top == manifest);
     let head = git(&root, &["rev-parse", "HEAD"]);
     let clean = git(
         &root,
@@ -70,7 +87,11 @@ fn main() {
     )
     .is_some_and(|files| !files.is_empty());
     let source = head.filter(|head| {
-        clean && !ignored_inputs && head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit())
+        own_checkout
+            && clean
+            && !ignored_inputs
+            && head.len() == 40
+            && head.bytes().all(|b| b.is_ascii_hexdigit())
     });
     // This identifies checkout source, not dependency/toolchain authenticity.
     // Override ambient assertions; archives and dirty source are unavailable.
