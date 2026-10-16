@@ -852,6 +852,118 @@ class GuardianLifecycleTests(unittest.TestCase):
             active.production_identity_verified = True
             active.release()
 
+    def hold_writer_domain_lock(self, lock: Path) -> None:
+        """Hold `lock` exclusively from another process until the test ends."""
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(
+            [
+                sys.executable, "-c",
+                "import fcntl, os, sys, time\n"
+                "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                "print('held', flush=True)\n"
+                "time.sleep(120)\n",
+                str(lock),
+            ],
+            stdout=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+
+    def test_a_held_writer_domain_lock_keeps_the_retained_lease(self) -> None:
+        # A double holder-inspection timeout never saw the holders, so the
+        # final writer-domain flock is the only proof production is not writing.
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            lock = active.production_state_dir / ".sandbox-writer-domain.lock"
+            self.write_retained_deadline_evidence(
+                active, failure=self.double_holder_timeout(lock)
+            )
+            self.hold_writer_domain_lock(lock)
+            snapshot = mock.Mock(pid=222, start_time="new")
+            active.snapshot = snapshot
+            active.installed_hash = "b" * 64
+            active.configured_repos = ()
+            active.lock_path = lock
+            clock = iter(range(0, 100000, 5))
+            with mock.patch.object(
+                guardian, "_live_guardians_for_lease", return_value=()
+            ), mock.patch.object(
+                guardian, "_pid_alive", return_value=False
+            ), mock.patch.object(
+                active, "snapshot_reconciliation_production", return_value=(snapshot, ()),
+            ), mock.patch.object(
+                active, "verify_reconciliation_production", return_value=(),
+            ), mock.patch.object(guardian.time, "sleep"), mock.patch.object(
+                guardian.time, "monotonic", side_effect=lambda: float(next(clock))
+            ), mock.patch.object(
+                guardian, "_process_start", return_value=active.owner_start
+            ), self.assertRaisesRegex(
+                guardian.GuardianError, "retained reconciliation writer domain"
+            ):
+                active.acquire()
+            self.assertTrue(active.lease_dir.is_dir(), "the retained lease survives")
+            self.assertFalse(active.lease_owned)
+
+    def superseded_snapshot_refusal(self, *, executable_ok: bool, argv_ok: bool) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            lock = active.production_state_dir / ".sandbox-writer-domain.lock"
+            prior, _ = self.write_retained_deadline_evidence(
+                active, failure=self.double_holder_timeout(lock)
+            )
+            installed = Path(active.installed)
+            installed.write_text("installed", encoding="utf-8")
+            Path(active.candidate).write_text("candidate", encoding="utf-8")
+            active.production_pid_file.write_text("4242\n", encoding="utf-8")
+            argv = ("shipyard", "--mode", "shipyard", "daemon", "run")
+            snapshot = guardian.ProcessSnapshot(
+                pid=4242,
+                executable=str(installed) if executable_ok else "/usr/local/bin/impostor",
+                argv=argv if argv_ok else ("shipyard", "--mode", "shipyard", "status"),
+                environment={}, cwd="/", stdin_path="", stdout_path="", stderr_path="",
+                start_time="later",
+            )
+            active.reconciliation_basis = guardian.RECONCILIATION_BASIS_SUPERSEDED
+            prior_receipt = json.loads(
+                (prior / "guardian-receipt.json").read_text(encoding="utf-8")
+            )
+            with mock.patch.object(
+                guardian, "snapshot_process", return_value=snapshot
+            ), mock.patch.object(guardian, "_configured_repos", return_value=()):
+                if executable_ok and argv_ok:
+                    active.snapshot_reconciliation_production(prior_receipt)  # control
+                    self.assertIs(active.snapshot, snapshot)
+                else:
+                    with self.assertRaises(guardian.GuardianError):
+                        active.snapshot_reconciliation_production(prior_receipt)
+                    self.assertIsNone(active.snapshot)
+            self.assertTrue(active.lease_dir.is_dir(), "the retained lease survives")
+
+    def test_a_superseded_binding_accepts_the_real_daemon(self) -> None:
+        self.superseded_snapshot_refusal(executable_ok=True, argv_ok=True)
+
+    def test_a_superseded_binding_refuses_a_foreign_executable(self) -> None:
+        self.superseded_snapshot_refusal(executable_ok=False, argv_ok=True)
+
+    def test_a_superseded_binding_refuses_a_non_daemon_argv(self) -> None:
+        self.superseded_snapshot_refusal(executable_ok=True, argv_ok=False)
+
+    def test_an_unreadable_installed_binary_keeps_the_fenced_basis(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            lock = active.production_state_dir / ".sandbox-writer-domain.lock"
+            self.write_retained_deadline_evidence(
+                active, failure=self.double_holder_timeout(lock)
+            )
+            self.assertFalse(Path(active.installed).exists())
+            with mock.patch.object(guardian, "_pid_alive", return_value=False):
+                active.retained_legacy_evidence()
+            self.assertEqual(
+                active.reconciliation_basis, guardian.RECONCILIATION_BASIS_FENCED
+            )
+
     def test_exact_deadline_receipt_wrong_generation_refuses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             active = self.make_guardian(Path(directory))
