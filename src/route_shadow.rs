@@ -1187,7 +1187,7 @@ mod tests {
         let lock = File::create(&lock_path).expect("writer lock");
         lock.lock_exclusive().expect("hold writer lock");
 
-        let store = RouteShadowReceiptStore::new(&runtime_paths.state_dir);
+        let store = RouteShadowReceiptStore::new(runtime_paths.state_dir.clone());
         let observation = RouteShadowObservation {
             snapshot: snapshot(vec![candidate(
                 "primary",
