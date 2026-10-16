@@ -1210,7 +1210,7 @@ mod tests {
         lock.unlock().expect("release writer lock");
         worker.join().expect("writer worker exits");
         let result = result.expect("zero-timeout writer must return promptly");
-        assert_eq!(result, Ok(false));
+        assert!(matches!(result, Ok(false)));
     }
 
     #[test]
