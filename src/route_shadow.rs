@@ -99,7 +99,8 @@ pub struct RouteShadowReceipt {
     pub authoritative_route: Option<RouteSelection>,
     /// One typed outcome for every candidate, preserving configured order.
     pub counterfactuals: Vec<RouteCounterfactual>,
-    /// Explicit proof that this receipt did not mutate dispatch state.
+    /// Evaluator scope and ordering authority; this is not a claim about
+    /// actions taken by the caller that supplied the snapshot.
     pub control: RouteShadowControl,
 }
 
