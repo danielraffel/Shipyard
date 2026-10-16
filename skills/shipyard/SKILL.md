@@ -1604,7 +1604,8 @@ line printed after the echoed script (`labelled_by: step`, still `low`). A
 fix-link whose red is not an ancestor of the fix recovers `own_files` from the
 pull request head a merge queue merged (`merge_queue_pr_head`) or, within 72
 hours, from the pull request's commit list (`post_force_push`). `shipyard cause record` is the read-only observer that writes
-live cause rows and fix-links into a labels archive in the backfill's layout. `diagnose` adds only
+live cause rows and fix-links into a labels archive in the backfill's layout. Its rows are
+live: `named_at` is the pass that named the red and `retrospective` is false. `diagnose` adds only
 GitHub's own record (a runner that never came, a supersede, a timeout) when
 the log names nothing more certain; a log with no recognized line still gets
 a `shell-exit` record, so the miss is counted. A job that named its own cause (`shipyard cause extract --log <captured
