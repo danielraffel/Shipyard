@@ -4200,9 +4200,13 @@ mod tests {
             ..Default::default()
         };
         store.record_terminal_observation(&base).unwrap();
+        let mut unknown = base.clone();
+        unknown.external_id = Some("github:9/3/unknown".to_owned());
+        store.record_terminal_observation(&unknown).unwrap();
         let mut fresh = base.clone();
         fresh.external_id = Some("github:9/2/1".to_owned());
         let mut conflict = base.clone();
+        conflict.external_id = Some("github:9/3/2".to_owned());
         conflict.event = Some("merge_group".to_owned());
         assert!(
             store
@@ -4213,7 +4217,7 @@ mod tests {
         assert_eq!(
             conn.query_row("SELECT count(*) FROM jobs", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            1
+            2
         );
     }
 }
