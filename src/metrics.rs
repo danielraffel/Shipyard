@@ -4187,5 +4187,13 @@ mod tests {
                 .unwrap(),
             2
         );
+        let event: String = conn
+            .query_row(
+                "SELECT event FROM runs WHERE provider_run_id = 9 ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(event, "pull_request");
     }
 }
