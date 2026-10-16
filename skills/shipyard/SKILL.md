@@ -2571,6 +2571,12 @@ would register webhooks on them. Keep any new default list behind
 
 ## Durable Queue: daemon-owned execution
 
+For an ownership-preserving reliability audit, use
+[`docs/queue-reliability-control.md`](../../docs/queue-reliability-control.md).
+It maps the foreground control, restart/orphan scenario battery, and existing
+kill switches. The older P2b concurrency plan is historical; never use its
+future-daemon wording as authority to change current request ownership.
+
 The detached daemon must own a trusted temporary root independent of the
 launching shell. `shipyard daemon start` creates a real owner-private
 `<state>/daemon/tmp` directory, rejects a symlink at that path, sets mode 0700
