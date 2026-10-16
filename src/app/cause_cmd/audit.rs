@@ -92,17 +92,22 @@ fn cause_row(value: Value) -> Option<CiCause> {
     (record.schema == cause::SCHEMA).then_some(record)
 }
 
-fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
-    if !args.dir.is_dir() {
+#[derive(Default)]
+struct ArchiveRows {
+    files_scanned: usize,
+    causes: Vec<(CiCause, PathBuf, usize)>,
+    fixlinks: Vec<(RedKey, PathBuf, usize)>,
+    findings: Vec<Finding>,
+}
+
+fn read_archive(dir: &Path) -> Result<ArchiveRows, CliFailure> {
+    if !dir.is_dir() {
         return Err(CliFailure::new(
             2,
-            format!(
-                "cause archive directory does not exist: {}",
-                args.dir.display()
-            ),
+            format!("cause archive directory does not exist: {}", dir.display()),
         ));
     }
-    let paths = jsonl_files(&args.dir)?;
+    let paths = jsonl_files(dir)?;
     let mut findings = Vec::new();
     let mut causes = Vec::new();
     let mut fixlinks = Vec::new();
@@ -118,24 +123,21 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
             if line.trim().is_empty() {
                 continue;
             }
-            let value: Value = match serde_json::from_str(line) {
-                Ok(value) => value,
-                Err(_) => {
-                    findings.push(finding(
-                        &path,
-                        &args.dir,
-                        line_number,
-                        "invalid_json",
-                        "line is not valid JSON",
-                    ));
-                    continue;
-                }
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                findings.push(finding(
+                    &path,
+                    dir,
+                    line_number,
+                    "invalid_json",
+                    "line is not valid JSON",
+                ));
+                continue;
             };
             if is_fixlinks {
                 if value["schema"] != cause::SCHEMA || value["source"] != "fix-link" {
                     findings.push(finding(
                         &path,
-                        &args.dir,
+                        dir,
                         line_number,
                         "invalid_fixlink",
                         "row is not a ci.cause/v1 fix-link",
@@ -149,7 +151,7 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
                 ) else {
                     findings.push(finding(
                         &path,
-                        &args.dir,
+                        dir,
                         line_number,
                         "invalid_fixlink",
                         "fix-link lacks repo, red_run_id, or red_attempt",
@@ -170,7 +172,7 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
             } else {
                 findings.push(finding(
                     &path,
-                    &args.dir,
+                    dir,
                     line_number,
                     "invalid_cause",
                     "row is not a valid ci.cause/v1 record",
@@ -179,6 +181,21 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
         }
     }
 
+    Ok(ArchiveRows {
+        files_scanned,
+        causes,
+        fixlinks,
+        findings,
+    })
+}
+
+fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
+    let ArchiveRows {
+        files_scanned,
+        causes,
+        fixlinks,
+        mut findings,
+    } = read_archive(&args.dir)?;
     let mut seen = BTreeMap::<String, (PathBuf, usize)>::new();
     let mut red_keys = BTreeSet::new();
     for (record, path, line) in &causes {

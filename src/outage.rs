@@ -64,7 +64,7 @@ pub(crate) enum UnavailableReason {
 /// A row read from the private archive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Availability {
-    Available(OutageRecord),
+    Available(Box<OutageRecord>),
     Unavailable(UnavailableReason),
 }
 
@@ -91,7 +91,7 @@ pub(crate) fn parse(value: Value) -> Availability {
     if let Err(error) = validate(&record) {
         return Availability::Unavailable(UnavailableReason::Invalid(error));
     }
-    Availability::Available(record)
+    Availability::Available(Box::new(record))
 }
 
 /// Validate v1 invariants without changing the record.
@@ -161,7 +161,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn row(keys: Vec<String>) -> Value {
+    fn row(keys: &[String]) -> Value {
         json!({
             "schema": SCHEMA,
             "id": "outage:abc",
@@ -181,13 +181,13 @@ mod tests {
     fn member_key_is_canonical_and_joins_only_on_exact_job_identity() {
         let key = member_key(" Owner/Repo ", 42, 2, 7).expect("key");
         assert_eq!(key, "owner/repo|42|2|7");
-        let a = match parse(row(vec![key])) {
+        let a = match parse(row(&[key])) {
             Availability::Available(row) => row,
-            other => panic!("{other:?}"),
+            other @ Availability::Unavailable(_) => panic!("{other:?}"),
         };
-        let b = match parse(row(vec!["owner/repo|42|2|8".to_owned()])) {
+        let b = match parse(row(&["owner/repo|42|2|8".to_owned()])) {
             Availability::Available(row) => row,
-            other => panic!("{other:?}"),
+            other @ Availability::Unavailable(_) => panic!("{other:?}"),
         };
         assert!(!joins(&a, &b));
     }
@@ -204,21 +204,18 @@ mod tests {
 
     #[test]
     fn malformed_membership_and_provenance_fail_closed() {
-        let mut value = row(vec!["owner/repo|1|1|1".to_owned()]);
+        let mut value = row(&["owner/repo|1|1|1".to_owned()]);
         value["member_keys"] = json!(["owner/repo|1|1|1", "owner/repo|1|1|1"]);
         assert!(matches!(
             parse(value),
             Availability::Unavailable(UnavailableReason::Invalid(_))
         ));
-        let value = row(vec![
-            "owner/repo|2|1|1".to_owned(),
-            "owner/repo|1|1|1".to_owned(),
-        ]);
+        let value = row(&["owner/repo|2|1|1".to_owned(), "owner/repo|1|1|1".to_owned()]);
         assert!(matches!(
             parse(value),
             Availability::Unavailable(UnavailableReason::Invalid(_))
         ));
-        let mut value = row(vec!["owner/repo|1|1|1".to_owned()]);
+        let mut value = row(&["owner/repo|1|1|1".to_owned()]);
         value["ended_at"] = json!("2026-10-14T23:59:59Z");
         assert!(matches!(
             parse(value),
@@ -226,10 +223,10 @@ mod tests {
         ));
         assert!(member_key("Owner/Repo", 1, 1, 1).is_some());
         assert!(matches!(
-            parse(row(vec!["Owner/Repo|1|1|1".to_owned()])),
+            parse(row(&["Owner/Repo|1|1|1".to_owned()])),
             Availability::Unavailable(UnavailableReason::Invalid(_))
         ));
-        let mut value = row(vec!["owner/repo|1|1|1".to_owned()]);
+        let mut value = row(&["owner/repo|1|1|1".to_owned()]);
         value["provenance"]["collected_at"] = json!("unknown");
         assert!(matches!(
             parse(value),
