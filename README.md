@@ -2,13 +2,20 @@
 
 [![CI](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml/badge.svg)](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml)
 
-Shipyard coordinates builds, tests, and pull requests across the machines you
-already use. It sends the exact commit to each configured target, records what
-passed, and stops when a person or a review is needed.
+Shipyard and [TartCI](https://github.com/danielraffel/tartci) solve different
+parts of CI:
 
-It works with local Macs, SSH hosts, GitHub-hosted runners, and [TartCI](https://github.com/danielraffel/tartci).
-GitHub remains the authority for pull requests and merge order. Your existing
-build system remains the authority for how code is built and tested.
+- **Shipyard coordinates the work.** It sends an exact commit to the targets
+  you choose, records the results, watches pull requests, and hands a verified
+  head to GitHub for landing.
+- **TartCI runs the work in disposable VMs.** It turns Apple Silicon Macs into
+  GitHub Actions capacity by booting clean macOS, Linux, or Windows VMs for
+  jobs and removing them afterward.
+
+Use Shipyard without TartCI for local, SSH, or hosted checks. Add TartCI when
+those checks need isolated Mac VM capacity. GitHub remains the authority for
+pull requests and merge order, and your existing build system remains the
+authority for how code is built and tested.
 
 ## Who it's for
 
@@ -23,27 +30,28 @@ Use Shipyard if you:
 Shipyard is useful for people and coding tools. It does not choose what your
 product should do or edit code on its own.
 
-## How it fits with TartCI
+## How Shipyard and TartCI work together
 
 ```text
 person or coding tool
         |
         v
-Shipyard records the exact commit and required checks
+Shipyard chooses targets and records exact-head evidence
         |
-        +--> GitHub-hosted jobs
-        +--> SSH hosts and private VMs
-        +--> TartCI disposable Mac VMs
+        +--> local Mac, SSH host, or GitHub-hosted job
+        |
+        +--> TartCI -> disposable macOS/Linux/Windows VM
         |
         v
-Shipyard reports the evidence and hands merge order back to GitHub
+Shipyard reports the evidence; GitHub owns merge order
 ```
 
-[TartCI](https://github.com/danielraffel/tartci) supplies disposable CI
-machines on Apple Silicon. TartCI boots a clean macOS, Linux, or Windows VM,
-serves a GitHub Actions job, and removes the VM afterward. Shipyard can select
-TartCI capacity when a project is configured to use it; it does not manage
-TartCI's VM images or host budgets.
+[TartCI](https://github.com/danielraffel/tartci) is the execution layer in
+this pairing. It owns the VM images, host budgets, caches, and GitHub runner
+lifecycle. Shipyard is the coordination layer: it selects the configured
+TartCI target, waits for the job evidence for the exact commit, and uses that
+evidence in the pull request workflow. Shipyard does not manage TartCI's VM
+images or host budgets.
 
 The boundary is simple:
 
@@ -127,9 +135,9 @@ shipyard pr
 
 ### Mac fleet with TartCI
 
-Keep VM images, caches, and host capacity in TartCI. Configure Shipyard to
-send the relevant target to TartCI, while other targets can remain local or
-SSH based. See [targets and fallback chains](docs/targets.md) and the
+TartCI owns the Apple Silicon VM fleet. Shipyard points a project target at
+that capacity and combines its result with local, SSH, or hosted checks. See
+[targets and fallback chains](docs/targets.md) and the
 [TartCI documentation](https://github.com/danielraffel/tartci).
 
 ### SSH hosts or private VMs
