@@ -137,10 +137,14 @@ pub struct RouteShadowObservationMetadata {
     /// Source label for capability and admission facts. This is provenance
     /// context, not an authentication claim.
     pub capability_provenance: String,
-    /// Actual route selected by the authoritative dispatcher, when the
-    /// observation was emitted after lease/dispatch selection.
+    /// Dispatch attempt history after a probe/lease boundary. Probe-only,
+    /// busy, deferred, and ship-side cancellation populations are absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_attempts: Option<Vec<RouteAttempt>>,
+    /// Whether the snapshot was rebuilt from dispatch-time target data rather
+    /// than carried from the admission observation.
+    #[serde(default)]
+    pub snapshot_rebuilt_at_dispatch: bool,
 }
 
 /// Selected route identity and its position in the ordered snapshot.
@@ -309,6 +313,8 @@ impl RouteShadowReceiptStore {
             expires_at,
             capability_provenance: observation.capability_provenance.clone(),
             dispatch_attempts: observation.route_attempts.clone(),
+            snapshot_rebuilt_at_dispatch: observation.capability_provenance
+                == "shipyard.dispatch.attempts",
         });
         let path = self.path_for(&observation.snapshot.request_id);
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
@@ -344,6 +350,8 @@ impl RouteShadowReceiptStore {
             expires_at,
             capability_provenance: observation.capability_provenance.clone(),
             dispatch_attempts: observation.route_attempts.clone(),
+            snapshot_rebuilt_at_dispatch: observation.capability_provenance
+                == "shipyard.dispatch.attempts",
         });
         let path = self.path_for(&observation.snapshot.request_id);
         let _writer_domain =
@@ -601,16 +609,14 @@ pub fn record_dispatch_observation_best_effort(
     let Some(snapshot) = scheduler_snapshot(job_id, target, &[], observed_at) else {
         return;
     };
-    let Some(attempt) = route_attempts.last() else {
+    let Some(attempt) = route_attempts.iter().rev().find(|attempt| {
+        snapshot
+            .candidates
+            .iter()
+            .any(|candidate| candidate.route_id == attempt.route_id)
+    }) else {
         return;
     };
-    if !snapshot
-        .candidates
-        .iter()
-        .any(|candidate| candidate.route_id == attempt.route_id)
-    {
-        return;
-    }
     let observation = RouteShadowObservation {
         correlation_id: snapshot.request_id.clone(),
         snapshot: {
@@ -827,8 +833,8 @@ mod tests {
         RouteShadowObservation, enqueue_observation, evaluate, scheduler_snapshot,
     };
     use crate::executor::dispatch::{
-        ResolvedBackend, ResolvedHostPoolConfig, ResolvedHostPoolMember, ResolvedTarget,
-        ResolvedValidation,
+        FallbackBackend, FallbackTargetConfig, ResolvedBackend, ResolvedHostPoolConfig,
+        ResolvedHostPoolMember, ResolvedTarget, ResolvedValidation,
     };
     use crate::executor::local::LocalTargetConfig;
     use crate::host_pool::HostPoolLease;
@@ -1264,6 +1270,7 @@ mod tests {
         }
         let selected = selected.expect("selected route receipt");
         let metadata = selected.observation.expect("metadata");
+        assert!(metadata.snapshot_rebuilt_at_dispatch);
         assert_eq!(
             metadata
                 .dispatch_attempts
@@ -1279,6 +1286,56 @@ mod tests {
                 availability: RouteAvailability::Unknown
             }
         ));
+    }
+
+    #[test]
+    fn nested_host_pool_attempt_keeps_outer_fallback_receipt() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let pool_target = host_pool_target();
+        let target = ResolvedTarget {
+            name: "nested".to_owned(),
+            backend_name: "fallback".to_owned(),
+            backend: ResolvedBackend::Fallback(FallbackTargetConfig {
+                backends: vec![FallbackBackend {
+                    target: Box::new(pool_target),
+                    label: "host-pool:macs".to_owned(),
+                    profile_label: "macs".to_owned(),
+                    capabilities: vec!["macos".to_owned(), "arm64".to_owned()],
+                }],
+                requires: Vec::new(),
+                heartbeat_stale_secs: 60,
+            }),
+            ..host_pool_target()
+        };
+        record_dispatch_observation_best_effort(
+            temp.path(),
+            "job-nested",
+            &target,
+            &[
+                RouteAttempt {
+                    route_id: "fallback:host-pool:macs:0".to_owned(),
+                    position: 0,
+                    outcome: crate::job::TargetStatus::Pass,
+                    attempted_at: Utc::now(),
+                },
+                RouteAttempt {
+                    route_id: "host-pool:macs:m1".to_owned(),
+                    position: 0,
+                    outcome: crate::job::TargetStatus::Pass,
+                    attempted_at: Utc::now(),
+                },
+            ],
+            Utc::now(),
+        );
+        let store = RouteShadowReceiptStore::new(temp.path());
+        for _ in 0..100 {
+            if let Ok(Some(receipt)) = store.load("job-nested:nested") {
+                assert!(receipt.observation.is_some());
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("nested fallback receipt");
     }
 
     #[test]
