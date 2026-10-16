@@ -6,6 +6,7 @@
 //! GitHub client.
 
 use serde_json::Value;
+use std::collections::HashSet;
 
 use super::{GitHubRunJob, GithubRunMetadata, MetricsStore, github_job_to_record_with_run};
 
@@ -122,7 +123,14 @@ pub fn import_github<E>(
     let mut pending_inputs = Vec::new();
     for (run_id, pr, metadata) in run_ids {
         let mut page = 1u32;
+        let mut observed = 0u64;
+        let mut seen_job_ids = HashSet::new();
         loop {
+            if page > 100 {
+                return Err(store_error(format!(
+                    "GitHub jobs pagination exceeded 100 pages for run {run_id}"
+                )));
+            }
             let jobs = gh(&[
                 "api".to_owned(),
                 "-X".to_owned(),
@@ -149,6 +157,12 @@ pub fn import_github<E>(
             for value in job_values {
                 let mut job: GitHubRunJob = serde_json::from_value(value.clone())
                     .map_err(|error| store_error(format!("GitHub job parse failed: {error}")))?;
+                if !seen_job_ids.insert(job.id) {
+                    return Err(store_error(format!(
+                        "GitHub jobs response repeated job {} for run {run_id}",
+                        job.id
+                    )));
+                }
                 job.run_id.get_or_insert(run_id);
                 if job.run_id != Some(run_id) {
                     return Err(store_error(format!(
@@ -178,9 +192,16 @@ pub fn import_github<E>(
                 );
                 pending_inputs.push(input);
             }
-            let seen = u64::from(page) * 100;
-            if job_values.len() < 100 && total.is_none_or(|total| total <= seen) {
-                break;
+            observed = observed.saturating_add(job_values.len() as u64);
+            match total {
+                None if job_values.len() < 100 => break,
+                Some(total) if observed >= total => break,
+                Some(total) if job_values.len() < 100 => {
+                    return Err(store_error(format!(
+                        "GitHub jobs response ended at {observed} of {total} for run {run_id}"
+                    )));
+                }
+                _ => {}
             }
             page = page.saturating_add(1);
         }
