@@ -441,7 +441,8 @@ impl MetricsStore {
              ORDER BY observed_at DESC, id DESC
              LIMIT ?1",
         )?;
-        let rows = statement.query_map(params![limit as i64], |row| {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![limit], |row| {
             Ok(RepeatedWorkShadowRow {
                 observed_at: row.get(0)?,
                 kind: row.get(1)?,
