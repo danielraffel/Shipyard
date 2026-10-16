@@ -165,6 +165,15 @@ pub fn import_github<E>(
                     job.id
                 )));
             }
+            if let (Some(run_head), Some(job_head)) =
+                (metadata.head_sha.as_deref(), job.head_sha.as_deref())
+                && run_head != job_head
+            {
+                return Err(store_error(format!(
+                    "GitHub job {} is bound to contradictory head sha",
+                    job.id
+                )));
+            }
             if job.completed_at.is_none() {
                 continue;
             }
@@ -210,7 +219,7 @@ mod tests {
                     "head_branch": "feature/test", "pull_requests": [{"number": 9}]}]}))
             } else {
                 Ok(json!({"jobs": [
-                    {"id": 1, "name": "macos", "conclusion": "success",
+                    {"id": 1, "run_attempt": 2, "name": "macos", "conclusion": "success",
                      "started_at": "2026-09-30T10:00:00Z", "completed_at": "2026-09-30T10:10:00Z",
                      "labels": ["self-hosted"]},
                     {"id": 2, "name": "linux", "status": "in_progress"}

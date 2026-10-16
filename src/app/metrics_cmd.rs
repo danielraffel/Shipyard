@@ -491,6 +491,7 @@ fn record_input(args: MetricsRecordArgs) -> Result<MetricRecordInput, CliFailure
         run_attempt: None,
         head_sha: None,
         provenance: None,
+        provenance_verified: false,
         started_at: parse_rfc3339(args.started_at.as_deref())?,
         completed_at: parse_rfc3339(args.completed_at.as_deref())?,
     })
