@@ -1,624 +1,235 @@
 # Shipyard
 
-**Shipyard handles the waiting so people and coding tools can focus on the
-work.** For work you hand it, Shipyard watches tests and code changes, remembers
-the exact state, handles supported routine steps automatically, and stops with
-a clear reason when a decision or code change is needed.
+[![CI](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml/badge.svg)](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml)
 
-Under the hood, Shipyard tracks the exact code and workflow state, checks each
-configured machine, and moves forward only when the required evidence is
-green. GitHub retains merge-order authority; when configured, TartCI supplies
-isolated Mac execution capacity.
+Shipyard and [TartCI](https://github.com/danielraffel/tartci) solve different
+parts of CI:
+
+- **Shipyard coordinates the work.** It sends an exact commit to the targets
+  you choose, records the results, watches pull requests, and hands a verified
+  head to GitHub for landing.
+- **TartCI runs the work in disposable VMs.** It turns Apple Silicon Macs into
+  GitHub Actions capacity by booting clean macOS, Linux, or Windows VMs for
+  jobs and removing them afterward.
+
+Use Shipyard without TartCI for local, SSH, or hosted checks. Add TartCI when
+those checks need isolated Mac VM capacity. GitHub remains the authority for
+pull requests and merge order, and your existing build system remains the
+authority for how code is built and tested.
+
+## Who it's for
+
+Use Shipyard if you:
+
+- work across several worktrees or machines and need one view of validation;
+- want a pull request to land only after the exact head passes every required
+  platform;
+- run local Macs or private VMs alongside GitHub-hosted runners;
+- want unattended monitoring that records a clear reason when it must stop.
+
+Shipyard is useful for people and coding tools. It does not choose what your
+product should do or edit code on its own.
+
+## How Shipyard and TartCI work together
+
+```text
+person or coding tool
+        |
+        v
+Shipyard chooses targets and records exact-head evidence
+        |
+        +--> local Mac, SSH host, or GitHub-hosted job
+        |
+        +--> TartCI -> disposable macOS/Linux/Windows VM
+        |
+        v
+Shipyard reports the evidence; GitHub owns merge order
+```
+
+[TartCI](https://github.com/danielraffel/tartci) is the execution layer in
+this pairing. It owns the VM images, host budgets, caches, and GitHub runner
+lifecycle. Shipyard is the coordination layer: it selects the configured
+TartCI target, waits for the job evidence for the exact commit, and uses that
+evidence in the pull request workflow. Shipyard does not manage TartCI's VM
+images or host budgets.
+
+The boundary is simple:
+
+- **Shipyard** coordinates commits, targets, evidence, pull requests, review,
+  queue handoff, and recovery.
+- **TartCI** supplies isolated VM execution capacity.
+- **GitHub** owns pull requests, checks, runner assignment, and merge order.
+
+## Quick start
+
+Install the CLI:
 
 ```bash
 curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
-cd my-project
-shipyard init              # detects your project and writes a starting config
-shipyard run               # validates on every platform you configured
-shipyard ship              # validate, open PR, merge on green
-shipyard status            # show the current queue, targets, and evidence
 ```
 
-`shipyard init` detects the project and writes a starting configuration; it
-does not probe or enroll machines. Review the generated targets and configure
-only the machines and services you intend to use. See the
-[CLI reference](docs/cli-reference.md) for monitoring, recovery, fleet,
-governance, and release commands.
+Then initialize a project and run its configured checks:
 
-## What Shipyard does
+```bash
+cd my-project
+shipyard init
+shipyard run
+shipyard status
+```
 
-- **Validates the exact commit.** `shipyard run` sends one commit to every
-  target you configured (this Mac, SSH machines, cloud runners) and records
-  pass or fail for that SHA.
-- **Ships on evidence.** `shipyard pr` and `shipyard ship` open the pull
-  request and land it only when every required platform passed on the exact
-  head.
-- **Hands landing to GitHub's merge queue** where a branch has one, and
-  limits who may write to it.
-- **Guards the landing path.** With the optional `ghapp` guards installed, an
-  arm, enqueue or merge needs a reviewer approval naming the exact head, and
-  a dequeue or disarm is refused unless an operator gives a reason. On hosts
-  that turn it on, posting a HOLD dequeues or disarms its head.
-- **Explains red checks.** `shipyard diagnose` and `shipyard cause` name a
-  failed job's cause from its log, as a small record instead of a 10 MB log.
-- **Watches, and stops to ask.** It keeps state across restarts, retries the
-  routine cases it supports, and stops with a reason when a person or model
-  must decide.
+When the checks are green, `shipyard ship` can open the pull request and follow
+it through the configured landing path:
 
-## How it fits
+```bash
+shipyard ship
+```
 
-Shipyard sits between the work and the machines that run it:
+`shipyard init` writes a starting project configuration. It does not enroll
+machines or change GitHub settings. Review the generated targets before using
+unattended commands.
 
-1. **Work.** A person or coding tool decides what to change and writes the
-   code. Shipyard does not invent a product decision or silently edit code.
-2. **Coordination.** Shipyard records the exact change, its checks, handoff,
-   and allowed next steps. With the optional daemon enabled, verified GitHub
-   webhooks provide quick updates and periodic GitHub reconciliation repairs a
-   missed update or restart. Routine observation does not need a model; a
-   decision, ambiguous failure, or code repair is surfaced for one.
-3. **Execution.** GitHub remains the authority for merge order and hosted-job
-   assignment. Shipyard can ask configured machines to validate a change.
-   [TartCI](https://github.com/danielraffel/tartci) supplies isolated Mac VM
-   capacity; SSH targets, including independently managed Proxmox Linux VMs,
-   remain separate executors under the same evidence rules.
-
-Shipyard coordinates these systems; it does not replace GitHub or your build
-system.
-
-All three layers are available now when their executors are configured. Durable
-stewardship within the coordination layer is deliberately opt-in and
-policy-gated: it records a specific handoff and refuses when the record or the
-current head no longer agrees. It is not a promise that an unconfigured
-project will automatically recover or merge every PR.
-
-## Common uses
-
-- Check the same code change on local Macs, TartCI Mac VMs, Linux machines or
-  Proxmox-hosted VMs over SSH, Windows, and hosted runners.
-- Submit a change and, when stewardship is enabled, let Shipyard watch the
-  required tests and merge progress until the work finishes or needs help.
-- Keep long-running work understandable across terminal and daemon restarts
-  without reconstructing its local state from scratch.
-- Use the `ghapp` wrapper for scoped GitHub App authentication without putting
-  short-lived credentials into unattended command lines.
-- Keep terminal delivery and model-provider routing separate. `cmux` is the
-  physically implemented terminal adapter today; HerdR has a registered request
-  shape but every capability check refuses, and a recorded provider route is
-  never treated as proof a provider accepted anything. See [terminal and
-  provider adapters](docs/terminal-adapters.md).
-
-## Features
-
-- **Built for bounded unattended delivery.** With an explicit, authorized
-  handoff, Shipyard preserves exact state, watches the required systems, and
-  takes only its next allowed action. It records uncertainty rather than
-  guessing, and it never puts notarization keys or publishing accounts in a
-  command line.
-- **Evidence-based merge gate.** `shipyard ship` refuses to merge unless
-  every required platform has passing evidence **for the exact HEAD SHA** —
-  not the most-recent run, not the branch tip, the SHA.
-- **Fail-closed test-selection shadowing.** A target can declare mandatory
-  baseline smoke plus complete changed-surface families and their reviewed
-  build targets. Shipyard authenticates PR/protected-base provenance and emits
-  an exact-head receipt while the full build/test path remains authoritative;
-  ambiguity always falls back to full.
-- **Parallel-work-aware queue.** Multiple worktrees and clients share one
-  machine-global queue with priorities, FIFO scheduling, and
-  automatic deduplication.
-- **Durable stewardship handoff.** `shipyard runner steward-handoff` records an
-  exact PR/head handoff on GitHub itself: a successful
-  `shipyard/steward-handoff` commit status on that immutable head, the
-  `shipyard:managed` label, and a private crash-consistent JSON receipt beside
-  it. Only heads carrying both management signals may be queued, rerun,
-  cancelled, or recovery-signalled, and the receipt is revalidated against the
-  live PR head before any steward mutation.
-- **Declarative security & governance.** One TOML line picks a profile
-  (`solo` or `multi`); one CLI command makes GitHub branch protection,
-  tag protection, and workflow token permissions match.
-- **Native merge-queue handoff.** On queue-governed branches Shipyard
-  validates the exact head, admits that exact SHA, and lets GitHub own the
-  merge. Configure one fleet authority with
-  `merge_queue.mutation_machine`, pause it instantly with
-  `shipyard merge-queue hold --reason "..."`, and audit every attempted
-  queue write in machine-global state. Other machines fail before GitHub is
-  contacted.
-- **Qualified immutable dependency pins.** Opted-in first-party repositories
-  can follow the latest qualified Pulp release, while production and frozen
-  repositories select explicit stable or fixed identities. Shipyard verifies
-  release and build attestations, materializes exact digests, and opens the pin
-  PR with GitHub App authority. See
-  [Pulp dependency channels](docs/dependency-channels.md).
-- **Ecosystem detection.** `shipyard init` recognises CMake, Swift, Xcode,
-  Rust, Go, Node (pnpm, bun, yarn, npm), Python (uv, poetry, pipenv, pip,
-  setuptools), Gradle, Maven, .NET, Flutter, Dart, Deno, Ruby, Elixir and
-  PHP.
-- **Self-hosted runner watchdog.** `shipyard runner status` /
-  `cleanup --fix` / `watch --fix` / `watch --kill-hung-workers` detect
-  and auto-recover the stuck-runner failure mode (orphaned busy state,
-  hung worker, stale queued runs). `runner kill --pid <pid>` is the
-  explicit one-shot equivalent. See [docs/runner-watchdog.md](docs/runner-watchdog.md).
-- **One-shot PR rescue.** `shipyard rescue <pr>` cancels and
-  redispatches every stuck queued workflow run on a PR onto
-  `github-hosted` (or any provider via `--to`). `--rerun-failed` also
-  recovers terminal failed, cancelled, and timed-out runs: a `pull_request`
-  run is re-run in place (`gh run rerun --failed`), so its checks still prove
-  the PR's merge ref, and only the latest run of each workflow on the branch's
-  current head is touched; a run of any other event gets a dispatched
-  replacement. `--all-stuck` is the
-  repo-wide variant. `--superseded-merge-group` instead reaps merge_group
-  runs whose `gh-readonly-queue/*` ref GitHub already deleted (audit-only
-  unless `--apply`). It complements the watchdog for explicitly supported
-  recovery cases.
-- **Review before arm or merge.** With the optional `ghapp` guards installed
-  (`shipyard guards install`), an arm, enqueue or direct merge needs a
-  reviewer verdict naming the PR's exact head, and the request must bind that
-  head (`--match-head-commit`). A verdict is a comment whose last line is
-  `verdict: APPROVE head:<sha>` or `reviewed: <sha>`, or an `APPROVED`
-  review. It applies to repositories whose base sets `[auto_merge]
-  arm_requires_head_approval` in `.shipyard/config.toml`, and by default to
-  pulp, vellum, tartci and Shipyard. It is on for every host; the only way off
-  is an opt-out file written with a reason by
-  `shipyard guards install --opt-out-review-before-arm "<reason>"`.
-  See [`ghapp` guards](docs/ghapp-guards.md#review-before-arm-or-merge).
-- **Whose approval counts.** Every agent posts through `ghapp` as the same
-  GitHub App, so an approval counts only when its author is the App's `Bot`
-  account (a user account with the same name counts for nothing), or a human
-  the base lists in `[auto_merge] human_reviewers`. A base that lists
-  `reviewer_identities` counts only those instead. `ghapp` stamps each
-  verdict comment with the posting session, and an App approval stamped
-  `unattributed` never counts. When the base lists `[auto_merge]
-  reviewer_signers`, or failing that the host has
-  `~/.config/shipyard/guards/reviewer-signers.json`, an App approval also
-  needs a `reviewer: <name>` line naming an allowed signer. An arm from the
-  agent that posted the approval (same `SHIPYARD_AGENT_ID`) is refused.
-- **Approvals that carry.** An approval carries to a new head after a
-  merge-only update from the base when every file the PR changes keeps its
-  content and mode, the base changed none of them, and the PR changes no
-  binary file. A rebase that leaves the PR's diff, files and file contents
-  unchanged carries it only on a host that turns the rebase carry on
-  (`SHIPYARD_REBASE_CARRY=1`, or a `rebase-carry` file in the guards
-  directory); it is off by default. Anything else needs a new verdict.
-- **A HOLD that acts, and removals that need a reason.** On a host that turns
-  on `hold-disarms`, posting `verdict: HOLD head:<sha>` through `ghapp`
-  dequeues or disarms the PR at exactly that head; if that fails, it posts a
-  note on the PR saying the HOLD may still land. HOLDs posted another way (the
-  web UI, another host) are not seen by it. The queue-removal guard refuses
-  an agent's own dequeue or disarm unless an operator override names a
-  reason class that allows it.
-- **May this head land.** `shipyard review-verdict --pr N [--head SHA] --json`
-  answers with the repository-side review rule, with no host switch in it:
-  the approval naming the head, or one carried to it by merge-only updates or
-  across a rebase (same patch-id, the base touched none of its files), or why
-  it is refused. A merge-group check runs it to land only approved heads.
-  It takes signers only from the base's `[auto_merge] reviewer_signers`: a
-  repository that requires review and lists none refuses every App APPROVE.
-- **Who landed it.** GitHub attributes every queue mutation to the App, so
-  the guards record each arm, enqueue, merge and overridden removal in a
-  per-host ledger. `shipyard who --pr N` reads those ledgers from every
-  configured host and names the host and session (and agent, when recorded)
-  behind each queue and merge event, or says `unattributed` when no ledger
-  explains it.
-- **A `review-verdict` status.** The `review-verdict` workflow posts the
-  guard's decision on each PR head as a commit status, so a repository that
-  makes it a required check also stops merges that never pass through
-  `ghapp`. See
-  [the `review-verdict` status](docs/review-verdict-status.md).
-- **Durable cancellation.** `shipyard cancel <job> --reason <why>` records the
-  operator reason and terminates an active local or SSH validation process tree
-  on its next progress event, including descendant build processes.
-- **In-tool self-update.** `shipyard update` is the discoverable
-  upgrade path (no curl-pipe to remember); it uses the trusted machine-global
-  GitHub auth helper and a tag-matched installer, and `--check` reports
-  installed-vs-available, `--to v0.55.0` pins a specific tag for
-  rollback. `shipyard runner fleet-update --to vX.Y.Z` plans one governed
-  rollout; add `--apply` to publish one immutable, content-addressed auth
-  generation and refresh every configured daemon. The public wrapper selector
-  changes only after the complete release-matched generation validates, and
-  each host returns an exact generation and release receipt.
-- **Graceful GraphQL rate-limit degradation.** `shipyard auto-merge`
-  and `shipyard wait pr` fall back to REST automatically when
-  GraphQL exhausts (separate 5000/hr bucket). `shipyard doctor
-  --rate-limit` shows both buckets so you can see which one is hot.
-- **Optional tartci VM integration.** Projects with Apple Silicon VM fleets can
-  keep local VM images, caches, and per-host capacity in
-  [tartci](https://github.com/danielraffel/tartci), then let Shipyard resolve
-  the active profile into one concrete GitHub runner selector before each
-  dispatch.
-- **Agent-readable runner metrics.** `shipyard metrics` records local command
-  timings, imports GitHub Actions jobs, and imports optional tartci VM timing
-  exports into a small SQLite store. Agents can ask for summaries, drift
-  findings, placement advice, or one compact stewardship scorecard without
-  requiring tartci or any observability service. The scorecard labels missing
-  submit-to-receipt and model-token telemetry as unavailable rather than
-  estimating it. `shipyard metrics gate-cost --scorecard` reports success
-  rates per ISO week read from GitHub (open-to-merge time, merge-queue
-  ejections, red required checks), plus each merged PR's merge-head verdict,
-  naming PRs that merged with a HOLD on their head. `--export-cases FILE`
-  writes the cases it read as unlabelled JSONL with a SHA-256 receipt, for
-  labelling later. `--causes` (implied by `--export-cases`) reads each red
-  case's job log through C2, the rules-only failing-line extractor behind
-  `shipyard diagnose` (`src/diagnose/c2.rs`, one fixture per log format),
-  puts its `ci.cause/v1` record and evidence lines on the row (a record the
-  job printed with `shipyard cause extract --notice` lends its time only when
-  it is bound to that job and names the same cause), and
-  reports the share of red cases with a named cause and the time to it.
-  `--causes-max-jobs` (default 200) caps the job logs one run reads; the rest
-  are reported as skipped.
-- **Named causes for red checks.** `shipyard diagnose <pr>` reports each
-  failing required check's step, tests and a few evidence lines, never more
-  than 16 KB. `shipyard cause extract` names one job log's cause as a
-  `ci.cause/v1` record, using C2, a rules-only failing-line extractor.
-  `shipyard cause record` is a read-only observer: each pass writes a cause
-  record for every new red job of one workflow, and a fix-link once a later
-  run on the same PR or branch goes green. It reads GitHub and writes only
-  to a local archive. A record's `fix_hint` is a drift check's regenerate
-  command, kept only when it matches one known generator shape; it is a
-  suggestion to review, and Shipyard never runs it. See
-  [cause records](docs/cause-records.md).
-- **Read-only project profile.** `shipyard inspect --profile` lists what a
-  repository builds, pins, runs on and tests with, each fact with the file
-  line or API row it came from. See
-  [CLI reference](docs/cli-reference.md#inspect).
-- **Rules-first PR watching.** `shipyard pr-watch scan` flags open PRs stuck
-  in a way a person should look at, read-only by default.
-  `shipyard pr-watch rules` wakes an agent only when something changed (a
-  READY head nobody reviewed, a verdict posted, a red required check, a queue
-  removal), printing each event once as JSON with the fix to apply.
-  `scripts/watch_inputs.py` adds events GitHub does not hold, such as Codex
-  session states and tartci host health, and can replay a host's tartci
-  pool-log as host events, keying each problem without its changing numbers
-  so a condition the log repeats fires once. See [PR watch](docs/pr-watch.md).
-
-See [exact-head changed-surface selection](docs/changed-surface-selection.md)
-for the base-owned schema, receipt fields, and hard-fail/fallback boundary.
-
-## Installation
-
-### Claude Code plugin
-
-Two commands to register the marketplace and install the plugin:
+For Claude Code, install the plugin separately:
 
 ```bash
 claude plugin marketplace add danielraffel/Shipyard
 claude plugin install shipyard
 ```
 
-Then set up your project:
+The plugin uses the same CLI. If `shipyard` is already on `PATH`, it uses that
+installation.
 
-```
-/shipyard:init
-```
+## What it does
 
-The plugin uses the CLI under the hood. On first session start it
-auto-installs the binary if it can't find `shipyard` on PATH — and
-skips the install if it can. If you've already installed the CLI
-(via `install.sh` or a project pinner like pulp's
-`tools/install-shipyard.sh`), make sure its bin directory is on
-PATH before you install the plugin; that way the plugin respects
-your existing pin instead of installing its own copy alongside it.
+- **Runs the exact commit.** Each target receives one known commit, and the
+  result is recorded against that SHA.
+- **Coordinates several targets.** Run local, SSH, cloud, and TartCI-backed
+  checks from one project configuration.
+- **Protects the landing path.** `shipyard ship` refuses to land a change
+  without the required exact-head evidence. Optional `ghapp` guards require a
+  signed reviewer verdict before arming, enqueueing, or merging.
+- **Works with GitHub's merge queue.** Shipyard validates the head, hands the
+  exact SHA to GitHub, and records the queue action.
+- **Explains failures.** `shipyard diagnose` and `shipyard cause` reduce a red
+  job to its failing step and a few useful evidence lines.
+- **Recovers supported stuck work.** Runner watchdogs, PR rescue, queue
+  observation, and bounded retries handle routine failures without guessing.
+- **Keeps state across restarts.** A stopped terminal or daemon does not erase
+  the known commit, checks, handoff, or reason for waiting.
+- **Supports read-only inspection.** `shipyard inspect --profile` shows what a
+  repository builds, pins, runs on, and tests, with the source of each fact.
 
-Plugin + CLI are independently versioned; the plugin's version
-covers slash commands / skills / hooks, while the CLI's version
-covers the binary. It's safe to have both.
+Read the detailed behavior in the [CLI reference](docs/cli-reference.md),
+[landing model](docs/landing-model.md), and [governance guide](docs/governance.md).
 
-### CLI (including Codex)
+## Common setups
+
+### One Mac
+
+Run checks locally and use GitHub for the pull request:
 
 ```bash
-curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
 shipyard init
+shipyard run
+shipyard pr
 ```
 
-Downloads a standalone binary for your platform. No runtime needed. See
-[install details](docs/install.md) for binary table and build-from-source.
+### Mac fleet with TartCI
 
-## How it works
+TartCI owns the Apple Silicon VM fleet. Shipyard points a project target at
+that capacity and combines its result with local, SSH, or hosted checks. See
+[targets and fallback chains](docs/targets.md) and the
+[TartCI documentation](https://github.com/danielraffel/tartci).
 
-- **Local builds** run on your host machine — fast, no network.
-- **Remote builds** run on machines you control via SSH — VMs, containers,
-  or hosts on your network.
-- **Cloud builds** run on managed infrastructure (GitHub Actions by default,
-  Namespace where available) for neutral or on-demand capacity.
+### SSH hosts or private VMs
 
-`shipyard run` delivers the exact commit to each machine, runs your build
-and test commands, and reports what passed. `shipyard ship` does the same,
-then opens a PR and merges when every required platform is green.
+Declare an SSH target and its build commands. Shipyard copies the exact
+commit, runs the commands, and records the result. The target can be a Mac,
+Linux VM, Windows host, or an independently managed Proxmox machine.
 
-Repositories may make submitting-session provenance an atomic PR precondition:
+### GitHub-hosted validation
 
-```toml
-[pr.provenance]
-command = ["whence", "--pr", "{pr}", "--auto"]
-required = true
-```
+Use hosted Actions when you need neutral or on-demand capacity. Shipyard can
+watch the jobs, diagnose failures, and keep the result tied to the pull
+request's exact head.
 
-`shipyard pr` executes this argv directly after the exact PR/head is known and
-before any steward receipt or validation dispatch. Supported placeholders are
-`{pr}`, `{repo}`, `{head}`, `{branch}`, `{base}`, and `{url}`; the same values
-are also passed as `SHIPYARD_PR_*` environment variables. The hook inherits the
-agent's cmux/provider environment. A configured hook is required by default and
-fails closed, so interrupting the later CI watcher cannot leave a managed PR
-without its provenance. Explicit `shipyard ship --pr` recovery never runs the
-hook and therefore cannot overwrite the original submitting context.
+See [examples and scenarios](docs/examples.md) for complete configurations.
 
-For a multi-Mac fleet, store a stable tag on each host with
-`shipyard runner tag --set <name>` and select exactly one queue
-writer in the trusted machine-global `config.toml` reported by
-`shipyard paths`:
+## What it does not do
 
-```toml
-[merge_queue]
-mutation_machine = "mac-a"
-```
+- It does not replace GitHub's pull request or merge-queue authority.
+- It does not replace CMake, Xcode, Cargo, npm, or another build system.
+- It does not provide VM images or host capacity; TartCI does that for its
+  supported Apple Silicon setup.
+- It does not silently edit code, change a product decision, or guess when
+  evidence is missing.
+- It does not require a daemon for foreground commands. Polling works without
+  live webhooks; the daemon adds faster updates and reconciliation.
 
-Validation may run anywhere. Only the selected machine can enqueue, disable
-auto-merge, or dequeue through Shipyard, and queue writes for one repo/base
-are serialized across local processes. During an incident,
-`shipyard merge-queue hold --reason "incident"` blocks before GitHub contact;
-`shipyard merge-queue resume` removes the hold while retaining the machine
-authority check.
+## About the name
 
-Shipyard does not replace GitHub or your build system. It calls the build and
-test commands you already use, coordinates where they run, and records what
-passed for the exact change.
+This project is independent of Shipyard CI and other companies or products
+using the Shipyard name.
 
 ## Documentation
 
-- [PR watch](docs/pr-watch.md): stuck-PR flags, the rules watcher, input
-  readers, and replay.
-- [`ghapp` guards](docs/ghapp-guards.md): operator reference for the queue,
-  review-before-arm, and HOLD guards, including how to switch each on.
-- [Queue observer](docs/queue-observer.md): one-query queue snapshots,
-  persisted state hashes, delta-only output, replay, and adaptive backoff.
-- [The `review-verdict` status](docs/review-verdict-status.md): the
-  review-before-arm decision as a commit status a repository can require.
-- [Cause records](docs/cause-records.md): `ci.cause/v1` records,
-  `shipyard cause extract`, `archive` and `record`, and fix-links.
-- [Landing model](docs/landing-model.md): how `shipyard landing` reads a
-  repository's merge queue, required checks and PR queue state.
-- [Examples & Scenarios](docs/examples.md) — real-world setups for Xcode,
-  CMake, Swift, Tauri, etc.
-- [Targets & Fallback Chains](docs/targets.md) — how local/SSH/cloud
-  targets work and how to chain them.
-- [Agent Integration](docs/agent-integration.md) — Claude Code / Codex
-  setup, merge strategies.
-- [Security & Governance](docs/governance.md) — `solo` vs `multi`
-  profiles, branch protection, tag protection.
-- [Profiles & Configuration](docs/profiles.md) — switch between local /
-  cloud / full setups with one command, plus repo-owned CI routing profiles
-  and optional tartci-backed local VM routing.
-- [CLI Reference](docs/cli-reference.md#runner-metrics) — record/import/query
-  runner performance metrics for fleet monitoring.
-- [Manual CLI Workflows](docs/workflows.md) — debugging failed runs,
-  managing the queue, partial reruns.
-- [Resuming an interrupted ship](docs/ship-resume.md) — how `shipyard ship`
-  recovers across closed laptops and restarted sessions.
-- [Terminal and provider adapters](docs/terminal-adapters.md) — why terminal
-  transport is separate from provider routing, including the current cmux
-  boundary and the fail-closed HerdR adapter.
-- [Release automation](RELEASING.md) — `shipyard release-bot setup`,
-  `doctor --release-chain`, and the PAT + secret setup for the auto-
-  release tag → binaries chain.
-- [Rust release and rollback](docs/cutover.md) — post-cutover release
-  validation, signed macOS packaging, webhook/Funnel validation, GUI and
-  consumer notes, and rollback steps.
-- [Mid-flight runner retargeting](docs/cloud-retarget.md) — switch one
-  target's runner provider on an open PR without tearing down the
-  other targets' jobs.
-- [CLI Reference](docs/cli-reference.md) — every command and flag.
-- [Install details](docs/install.md) — binaries, build from source,
-  optional dependencies.
+Start here:
+
+- [Installation](docs/install.md): binaries, source builds, and first-run auth.
+- [Examples](docs/examples.md): common project and target configurations.
+- [Targets](docs/targets.md): local, SSH, cloud, and fallback targets.
+- [CLI reference](docs/cli-reference.md): every command and option.
+
+For specific workflows:
+
+- [Agent integration](docs/agent-integration.md): Claude Code, Codex, and
+  handoff patterns.
+- [Landing model](docs/landing-model.md): exact-head evidence and merge-queue
+  behavior.
+- [Governance](docs/governance.md): branch protection, tags, and `solo` or
+  `multi` profiles.
+- [PR watch](docs/pr-watch.md): stuck pull requests and change-driven events.
+- [Runner watchdog](docs/runner-watchdog.md): stale runners and recovery.
+- [Cause records](docs/cause-records.md): named causes for red checks.
+- [Workflows](docs/workflows.md): manual recovery and partial reruns.
+- [Ship resume](docs/ship-resume.md): continuing after a terminal or daemon
+  restart.
+- [Terminal adapters](docs/terminal-adapters.md): terminal and provider
+  boundaries.
+- [Release automation](RELEASING.md): release setup and rollback.
 
 ## Requirements
 
-You don't need everything — just what matches your setup:
+You need only the tools used by your setup:
 
-| Tool | Required? | What it's for | Install |
-|------|-----------|---------------|---------|
-| [git](https://github.com/git-guides/install-git) | Yes | Version control | Pre-installed on macOS |
-| [gh](https://github.com/cli/cli) | Yes (for PRs) | GitHub integration[^gh-scope] | `brew install gh` |
-| `ssh` | For remote targets | Connect to VMs | Pre-installed on macOS / [Ubuntu](https://ubuntu.com/server/docs/how-to/security/openssh-server/) / [Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse?tabs=gui&pivots=windows-11) |
-| [nsc](https://namespace.so/docs/reference/cli/installation) | Optional | Namespace runner visibility when your account has access | `brew install namespace-cli` |
+| Tool | Needed for |
+| --- | --- |
+| [Git](https://git-scm.com/) | Every project |
+| [GitHub CLI](https://cli.github.com/) | Pull requests and GitHub Actions |
+| [SSH](https://www.openssh.com/) | Remote targets |
+| [Namespace CLI](https://namespace.so/docs/reference/cli/installation) | Optional Namespace runner visibility |
+| [TartCI](https://github.com/danielraffel/tartci) | Optional disposable Apple Silicon VMs |
 
-`shipyard doctor` checks all of this and tells you what's missing.
+Run `shipyard doctor` to check the tools and credentials for the current
+configuration.
 
-[^gh-scope]: `gh` needs the **`workflow`** scope (classic PAT) or **Actions: Read and write** (fine-grained) for `shipyard cloud retarget`, `cloud handoff`, and any command that cancels + re-dispatches workflow runs. Quick fix: `gh auth refresh -h github.com -s workflow`. Full setup in [docs/install.md § First-run auth](docs/install.md#first-run-auth).
+## This repository uses Shipyard
 
-## This repo uses Shipyard
+Shipyard validates itself on macOS, Linux, and Windows. The workflows and
+project configuration are in [`.shipyard/config.toml`](https://github.com/danielraffel/Shipyard/blob/main/.shipyard/config.toml)
+and [`.github/workflows/`](https://github.com/danielraffel/Shipyard/tree/main/.github/workflows). Release details are in
+[RELEASING.md](RELEASING.md).
 
-Shipyard validates and ships itself. The config is in
-[`.shipyard/config.toml`](https://github.com/danielraffel/Shipyard/blob/main/.shipyard/config.toml). The CI workflow at
-[`.github/workflows/ci.yml`](https://github.com/danielraffel/Shipyard/blob/main/.github/workflows/ci.yml) runs tests on
-macOS, Linux, and Windows on every push. The release workflow at
-[`.github/workflows/release.yml`](https://github.com/danielraffel/Shipyard/blob/main/.github/workflows/release.yml) builds
-Linux, Windows, and macOS ARM64 release candidates when a version is
-tagged; the macOS DMG is signed/notarized and published through the
-release runbook. Before a release draft is created, a `live-smoke` job runs
-the built binary's read-only commands against real repositories. The
-[`sandbox-e2e.yml`](https://github.com/danielraffel/Shipyard/blob/main/.github/workflows/sandbox-e2e.yml) workflow runs Shipyard
-under an isolated HOME and PATH and fails on any write outside them; writes to
-the host's agent-session inbox (`~/.local/state/shipyard/inbox/`) by other
-sessions are listed but not counted. Third-party actions are pinned by commit
-SHA, and cargo caches are saved only from `main` on GitHub-hosted Linux and
-Windows runners; nothing is ever saved on macOS, whose cache save hook can
-stall a runner.
+## Contributing
 
-## Planned
-
-**More `shipyard inspect` checks.** Today `shipyard inspect` answers only
-`--profile`. Checks that say what to change in a repository's CI ("why is CI
-slow?") are planned. Like `--profile`, they will only read, and run only when
-asked.
-
-## FAQ
-
-### Where does each install method put the Shipyard binaries?
-
-All three user-facing install paths write the CLI and its workstream-provider
-companion to the same directory:
-
-| Method | Target |
-|---|---|
-| `curl … install.sh` (manual) | `~/.local/bin/shipyard` and `~/.local/bin/shipyard-workstream-provider` |
-| Claude Code plugin (auto-installs via `SessionStart` hook if needed) | same pair |
-| Codex one-liner (same `install.sh`) | same pair |
-
-`~/.local/bin` is the canonical location. Make sure it's on your
-`PATH` and every install method reaches the same binary. `sy` is a
-symlink that resolves to the same `shipyard` binary.
-
-Contributors building from source can run
-`cargo build --release --locked` for an isolated checkout build, or
-intentionally copy `target/release/shipyard` to `~/.local/bin/shipyard`
-when they want the source build to become the system install. See
-[`docs/install.md`](docs/install.md).
-
-Project pinners that want a specific version should use
-`SHIPYARD_VERSION="v0.22.1" bash install.sh` — it lands at the same
-`~/.local/bin/shipyard`, no private toolchain dir required.
-
-### Can I install the Claude Code plugin after installing the CLI via the Codex one-liner?
-
-Yes, and you're meant to. The plugin deliberately defers to an
-existing CLI install: on first session its `check-cli.sh` hook runs
-`command -v shipyard` before doing anything else. If it finds a
-binary on `PATH` it skips the auto-install entirely. If it doesn't,
-it runs the same `install.sh` you'd have run by hand and lands at
-`~/.local/bin/shipyard`.
-
-Order doesn't matter. CLI first, then plugin → plugin detects the
-CLI, no duplicate. Plugin first, then CLI → the auto-installer did
-the work already. Both lead to one binary at the canonical location.
-
-### Will installing a newer shipyard via `install.sh` clobber a plugin-installed one (or vice versa)?
-
-Yes, by design. Both land at `~/.local/bin/shipyard` and the later
-install wins. The plugin's `SessionStart` hook doesn't re-install
-when it sees any `shipyard` on `PATH`, so a fresh manual install
-sticks until you explicitly run `install.sh` again. To check which
-version you're on at any moment: `shipyard --version`.
-
-### Do I need to run `shipyard daemon` / enable live mode?
-
-Not for foreground CI. Without the daemon, `shipyard run`, `ship`, `watch`,
-`auto-merge`, and the macOS app retain their polling fallback. The daemon adds
-push-instant webhook delivery, ship-state reconciliation, and the orphan sweep;
-it does not take over a foreground command's validation loop.
-
-### Does it hurt if I don't enable live mode?
-
-Foreground commands still reach the same evidence verdicts; updates arrive on
-a poll cadence (60 s worst case) rather than push-instant. Webhooks aren't
-registered and no Tailscale Funnel is created unless the daemon is running.
-
-### I pushed to a repo without running `shipyard ship`. Will it appear in the macOS app?
-
-Depends on whether you've ever shipped from that repo on this machine:
-
-- **Never shipped from that repo before** → nothing appears. The app only tracks repos it knows about via local ship-state.
-- **You've shipped at least one PR from that repo before** → pushes show up in the "GitHub Actions" section of the app (polled via `gh run list` for known repos), but not as a tracked PR card. Tracked PR cards only appear for PRs that have ship-state — i.e. PRs you invoked `shipyard ship` or `shipyard pr` on.
-
-If live mode is on, the daemon will deliver webhook events for those pushes too, so the "GitHub Actions" section updates in realtime — but it still won't promote an un-shipped PR into a tracked card.
-
-### How do I turn off live mode?
-
-- **From the macOS app**: Settings → Live updates → **Off**. The app sends a stop command to the daemon, which unregisters webhooks and resets the Tailscale Funnel config. Nothing persists after that.
-- **From the CLI**: `shipyard daemon stop` does the same teardown.
-
-Stopping the daemon returns every command to its polling fallback. Ship-state
-and evidence stay on disk; nothing is discarded by stopping it.
-
-### How do I remove everything shipyard installed?
-
-Shipyard doesn't leave much footprint, but here's the complete list:
+Build and test from a checkout:
 
 ```bash
-# 1. Stop + unregister the daemon (if running)
-shipyard daemon stop
-
-# 2. Uninstall the public CLI/provider/auth projections and CLI alias.
-#    If your host profile uses different paths, remove its exact configured
-#    github_cli/github_token_helper paths and the context beside github_cli.
-rm -f ~/.local/bin/shipyard ~/.local/bin/shipyard-workstream-provider ~/.local/bin/ghapp ~/.local/bin/ghapp.shipyard-context.json ~/.local/bin/sy
-rm -f ~/.config/shipyard/bin/shipyard-github-app-token
-
-# 3. After the daemon and every ghapp reader have stopped, remove immutable
-#    fleet auth generations. Never remove this while a wrapper is running.
-rm -rf ~/.local/share/shipyard/auth-generations
-
-# 4. Remove state directory (ship-state, daemon config, webhook secret)
-#    macOS:
-rm -rf ~/Library/Application\ Support/shipyard
-#    Linux:
-rm -rf ~/.local/state/shipyard
-
-# 5. (macOS only) Keychain entry for the webhook secret
-security delete-generic-password -s com.danielraffel.shipyard.webhook
+cargo build --release --locked
+cargo test --locked
 ```
 
-The macOS menu-bar app (`shipyard-macos-gui`) is separate: drag it out of `/Applications` to uninstall.
+Run the repository's configured checks before opening a pull request.
 
-### I don't have Tailscale. Is live mode usable?
+## License
 
-Not in v1. Tailscale Funnel is the only tunnel backend shipped currently; others (Cloudflare Tunnel, ngrok, user-supplied reverse proxy) are tracked in [issue #126](https://github.com/danielraffel/Shipyard/issues/126). Until those land, live mode requires Tailscale + Funnel. The rest of shipyard (polling path) works fine without either.
-
-### Does shipyard read or store any secrets besides the webhook HMAC?
-
-- The webhook HMAC is generated locally and stored in macOS Keychain or a
-  `600`-permission file on Linux. It is sent only to GitHub during webhook
-  registration and verifies incoming deliveries.
-- With ambient `gh` authentication, Shipyard reads the CLI's existing token
-  storage and does not duplicate it.
-- Optional GitHub App authentication uses an operator-provisioned `0600` PEM
-  private key and may keep short-lived installation tokens in an owner-only
-  `0700` cache directory with `0600` entries. The immutable fleet auth
-  generation contains the release-matched helper, wrapper, binaries, manifest,
-  and non-secret resolver context; it never embeds a token or private key.
-- SSH keys for remote targets are whatever's already in your `~/.ssh/`.
-
-### My macOS app says "shipyard CLI not found on PATH"
-
-Live mode requires the `shipyard` CLI to be installed on the Mac running the app. Install it with `curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh`. If you don't want live mode, you can ignore this — the app will keep working in polling mode.
-
-### Will pushing without `shipyard ship` break anything I've already shipped?
-
-No. A branch force-push or one-off commit on a tracked PR leaves the existing ship-state entry as-is (still scoped to the old SHA) until you explicitly re-ship or archive it. The app may show stale evidence for that PR until then. [Issue #128](https://github.com/danielraffel/Shipyard/issues/128) tracks improving this with passive observer mode.
-
-### Can Shipyard use a larger GitHub API quota?
-
-Yes. Shipyard can authenticate its GitHub calls with a GitHub App installation
-token instead of your normal `gh` user token. For non-Enterprise GitHub App
-installations, GitHub starts at 5,000 REST requests/hour and scales by
-repository count after 20 repositories, up to 12,500 requests/hour. In practice,
-an installation with access to 170+ repositories reaches the cap. GitHub Pro is
-not the important factor; using an installation access token is.
-
-See [`docs/github-app-quota.md`](docs/github-app-quota.md) for the setup fields,
-permissions, Shipyard config, and quota validation commands.
-
-Runner inventory is a separate permission surface from workflow runs. `Actions:
-Read-only` lets Shipyard inspect workflows, runs, and jobs; it does not authorize
-`/repos/{owner}/{repo}/actions/runners`. Fleet admission, runner inventory, and
-stale-runner proof need repository `Administration: Read-only` so Shipyard can
-observe registered runners and their online/busy state, and defer when that
-state cannot be read. Grant `Administration: Read & write` to any Shipyard
-credential that must mint or delete runner registrations, including interactive
-`shipyard runner register` or `shipyard runner remove` use. Organization
-runner-group verification separately needs organization `Self-hosted runners:
-Read-only`. These reads are what let Shipyard preserve healthy work and fail
-closed instead of treating an unreadable pool as idle.
-
-The App can also give a Shipyard deployment's external policy verifier read-only
-visibility into organization runner groups. That permission is separate from
-repository `Actions` access and lets the integration verify repository, workflow,
-and runner-membership boundaries while Shipyard coordinates heterogeneous local
-capacity. This is not currently a built-in `shipyard runner` check. TartCI VMs, a separate Proxmox pool,
-and native machines remain distinct execution providers; Shipyard supplies the
-shared policy and exact-head view. Approve the installation update and refresh
-cached tokens after adding the permission.
-
-## Learn more
-
-- [Blog post: Shipyard is a cross-platform CI orchestration layer](https://danielraffel.me/2026/04/09/shipyard-is-a-cross-platform-ci-orchestration-layer-that-coordinates-validation-for-ai-agents-working-across-parallel-worktrees/)
-- [Pulp](https://github.com/Generous-Corp/pulp) — the audio plugin
-  Shipyard was extracted from, and the first project to adopt it.
-- [Shipyard MenuBar for macOS](https://github.com/danielraffel/shipyard-macos-gui) - Shipyard itself runs in the terminal, and that's still the preferred way to drive it. This app is a quick glance at what's happening without dropping into a shell. It's a lightweight menu bar app for quickly viewing and managing CI without using the shell. See per-PR, per-platform status at a glance and jump directly to runs, PRs, or logs. It also lets you retarget jobs, add lanes to in-flight PRs, and access diagnostics (shipyard doctor) in one place.
+See [LICENSE](LICENSE).
