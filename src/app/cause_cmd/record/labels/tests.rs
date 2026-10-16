@@ -123,14 +123,19 @@ fn row(job_id: u64, job: &str, format: &str, class: &str, confidence: &str) -> V
         "signature": format!("sig-{job_id}"), "detail": format!("detail-{job_id}"),
         "fix_hint": null, "kind": "k", "location": "",
         "evidence": {"log_line": job_id, "excerpt": [format!("line of job {job_id}")]},
-        "step_failed": true
+        "step_failed": true,
+        "failed_step": format!("step of job {job_id}")
     })
 }
 
 #[test]
 fn a_summary_job_takes_the_cause_of_the_job_it_summarises() {
+    // The summary's own values differ from the source's, so a copy that
+    // skips a field shows.
+    let mut summary_row = row(10, "linux", "shell-exit", "unknown", "low");
+    summary_row["step_failed"] = json!(false);
     let mut rows = vec![
-        row(10, "linux", "shell-exit", "unknown", "low"),
+        summary_row,
         row(11, "Linux (x64) [github-hosted]", "ctest", "test", "high"),
         row(12, "macos-merge-group", "cargo-test", "test", "high"),
     ];
@@ -149,6 +154,8 @@ fn a_summary_job_takes_the_cause_of_the_job_it_summarises() {
         json!({"log_line": 11, "excerpt": ["line of job 11"]})
     );
     assert_eq!(summary["evidence_job_id"], 11);
+    assert_eq!(summary["step_failed"], true);
+    assert_eq!(summary["failed_step"], "step of job 11");
 }
 
 #[test]

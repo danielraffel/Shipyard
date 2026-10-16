@@ -3,8 +3,8 @@
 //! A summary job (Pulp's `linux` or `macos`, whose one step checks the
 //! results of the jobs it needs) fails only because a job it summarises
 //! failed, so it takes that job's cause and says where it came from. Any
-//! other bare exit is labelled by its step and by the last line the step
-//! printed (the signature; the step stays in `failed_step`), read only
+//! other bare exit is labelled by the last line its step printed (the
+//! signature; the step stays in `failed_step`), read only
 //! between the step's `##[endgroup]` and its `##[error]`:
 //! the lines before that are the step's script, echoed by the runner, and
 //! name nothing. A label is never more than `low` confidence.
@@ -146,6 +146,8 @@ pub(super) fn inherit_from_summarised(rows: &mut [Value], sources: &[Value]) -> 
             // line as the detail; evidence_job_id names whose log that is.
             "evidence",
             "step_failed",
+            // The step named is the source job's, the step the cause is in.
+            "failed_step",
         ] {
             fields.insert(key.to_owned(), source[key].clone());
         }
