@@ -165,6 +165,11 @@ See [examples and scenarios](docs/examples.md) for complete configurations.
 - It does not require a daemon for foreground commands. Polling works without
   live webhooks; the daemon adds faster updates and reconciliation.
 
+## About the name
+
+This project is independent of Shipyard CI and other companies or products
+using the Shipyard name.
+
 ## Documentation
 
 Start here:
