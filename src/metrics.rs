@@ -808,7 +808,7 @@ impl MetricsStore {
             .map(|(queued, started)| (started - queued).num_milliseconds())
             .filter(|value| *value >= 0);
         if let Some(provider) = input.provider.as_deref()
-            && let Some(existing) = existing_job_id(&conn, provider, input.external_id.as_deref())
+            && let Some(existing) = existing_job_id(&conn, provider, input.external_id.as_deref())?
                 .or(existing_unknown_attempt_id(&conn, provider, input.external_id.as_deref())?)
         {
             if refresh_existing {
@@ -1429,13 +1429,15 @@ fn existing_unknown_attempt_id(
     }
     let Some(value) = external_id else { return Ok(None) };
     let parts = value.split('/').collect::<Vec<_>>();
-    if parts.len() != 3 || !parts[0].starts_with("github:") || parts[2] == "unknown" {
+    if parts.len() != 3 || !parts[0].starts_with("github:") {
         return Ok(None);
     }
-    let unknown = format!("{}/{}/unknown", parts[0], parts[1]);
+    let prefix = format!("{}/{}/", parts[0], parts[1]);
     conn.query_row(
-        "SELECT id FROM jobs WHERE provider = ?1 AND external_id = ?2",
-        params![provider, unknown],
+        "SELECT id FROM jobs
+           WHERE provider = ?1 AND external_id LIKE ?2 || '%'
+           ORDER BY id DESC LIMIT 1",
+        params![provider, prefix],
         |row| row.get(0),
     )
     .optional()
