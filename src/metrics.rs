@@ -3896,83 +3896,61 @@ mod tests {
     fn authenticated_strata_receipt_is_job_scoped_and_provenance_bound() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
+        let production = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            repo: Some("Owner/Shipyard".to_owned()),
+            job: "linux".to_owned(),
+            status: "success".to_owned(),
+            provider: Some("github-hosted".to_owned()),
+            duration_ms: 100,
+            completed_at: Some(Utc::now()),
+            external_id: Some("github:9/1/1".to_owned()),
+            event: Some("pull_request".to_owned()),
+            run_attempt: Some(1),
+            pr: Some(9),
+            provider_run_id: Some(1),
+            head_sha: Some("a".repeat(40)),
+            provenance: Some("production".to_owned()),
+            provenance_verified: true,
+            ..MetricRecordInput::default()
+        };
+        store.record_terminal_observation(&production).unwrap();
         store
             .record_terminal_observation(&MetricRecordInput {
-                project: "shipyard".to_owned(),
-                repo: Some("Owner/Shipyard".to_owned()),
-                job: "linux".to_owned(),
-                status: "success".to_owned(),
-                provider: Some("github-hosted".to_owned()),
-                duration_ms: 100,
-                completed_at: Some(Utc::now()),
-                external_id: Some("github:9/1/1".to_owned()),
-                event: Some("pull_request".to_owned()),
-                run_attempt: Some(1),
-                pr: Some(9),
-                provider_run_id: Some(1),
-                head_sha: Some("a".repeat(40)),
-                provenance: Some("production".to_owned()),
-                provenance_verified: true,
-                ..MetricRecordInput::default()
-            })
-            .unwrap();
-        store
-            .record_terminal_observation(&MetricRecordInput {
-                project: "shipyard".to_owned(),
-                repo: Some("Owner/Shipyard".to_owned()),
                 job: "future".to_owned(),
-                provider: Some("github-hosted".to_owned()),
-                status: "success".to_owned(),
-                duration_ms: 100,
                 completed_at: Some(Utc::now() + Duration::days(1)),
                 external_id: Some("github:9/2/1".to_owned()),
                 event: Some("pull_request".to_owned()),
-                run_attempt: Some(1),
                 pr: Some(10),
                 provider_run_id: Some(2),
                 head_sha: Some("c".repeat(40)),
-                provenance: Some("production".to_owned()),
-                provenance_verified: true,
-                ..MetricRecordInput::default()
+                ..production.clone()
             })
             .unwrap();
         store
             .record_terminal_observation(&MetricRecordInput {
-                project: "shipyard".to_owned(),
-                repo: Some("Owner/Shipyard".to_owned()),
                 job: "merge-group".to_owned(),
-                provider: Some("github-hosted".to_owned()),
-                status: "success".to_owned(),
-                duration_ms: 100,
                 completed_at: Some(Utc::now()),
                 external_id: Some("github:9/3/1".to_owned()),
                 event: Some("merge_group".to_owned()),
-                run_attempt: Some(1),
+                pr: None,
                 provider_run_id: Some(3),
                 head_sha: Some("d".repeat(40)),
-                provenance: Some("production".to_owned()),
-                provenance_verified: true,
-                ..MetricRecordInput::default()
+                ..production.clone()
             })
             .unwrap();
         store
             .record_terminal_observation(&MetricRecordInput {
-                project: "shipyard".to_owned(),
-                repo: Some("Owner/Shipyard".to_owned()),
                 job: "unverified".to_owned(),
-                provider: Some("github-hosted".to_owned()),
-                status: "success".to_owned(),
-                duration_ms: 100,
                 completed_at: Some(Utc::now()),
                 external_id: Some("github:9/4/1".to_owned()),
                 event: Some("pull_request".to_owned()),
-                run_attempt: Some(1),
                 pr: Some(11),
                 provider_run_id: Some(4),
                 head_sha: Some("e".repeat(40)),
                 provenance: None,
                 provenance_verified: false,
-                ..MetricRecordInput::default()
+                ..production.clone()
             })
             .unwrap();
         let receipt = store
