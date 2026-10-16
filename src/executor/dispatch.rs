@@ -3082,7 +3082,8 @@ backend = "local"
             pool = "local_macs"
             platform = "macos-arm64"
             requires = ["macos", "arm64"]
-            "#
+            "#,
+            toml_string(repo.display().to_string())
         ));
         let target = resolve_targets_from_table(&config, ValidationMode::Full)
             .expect("targets")
@@ -3125,7 +3126,7 @@ backend = "local"
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo");
-        let config = table(&format!(
+        let config = table(
             r#"
             [validation.default]
             command = "false"
@@ -3135,7 +3136,7 @@ backend = "local"
             [[host_pools.local_macs.members]]
             id = "local"
             type = "local"
-            cwd = {{}}
+            cwd = {}
             capabilities = ["macos", "arm64"]
 
             [targets.mac]
@@ -3144,8 +3145,7 @@ backend = "local"
             platform = "macos-arm64"
             requires = ["macos", "arm64"]
             "#,
-            toml_string(repo.display().to_string())
-        ));
+        );
         let target = resolve_targets_from_table(&config, ValidationMode::Full)
             .expect("targets")
             .remove(0);
