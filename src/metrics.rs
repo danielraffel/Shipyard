@@ -1338,8 +1338,7 @@ impl MetricsStore {
             wasted_merge_ms,
             wasted_merge_samples,
             wasted_duration_gaps,
-        ) =
-            self.safe_merge_summary(project, &cutoff)?;
+        ) = self.safe_merge_summary(project, &cutoff)?;
         let now = Utc::now();
         let (proxies, comparison) = proxy_store::scorecard_window(
             &proxy_store::load_samples(&conn, Some(project))?,
@@ -3088,6 +3087,21 @@ mod tests {
             .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
             .unwrap();
         assert_eq!(summary, (1, 1, 5000, 1, 0));
+        let scorecard = store.stewardship_scorecard("repo", 2).unwrap();
+        assert_eq!(
+            scorecard.wasted_compute_per_safely_merged_change.status,
+            "available"
+        );
+        assert!(
+            !scorecard
+                .wasted_compute_per_safely_merged_change
+                .reason
+                .contains("lower-bound")
+        );
+        assert_eq!(
+            scorecard.wasted_compute_per_safely_merged_change.value,
+            Some(5000.0 / 60_000.0)
+        );
     }
 
     #[test]
@@ -3127,10 +3141,12 @@ mod tests {
             scorecard.wasted_compute_per_safely_merged_change.status,
             "partial"
         );
-        assert!(scorecard
-            .wasted_compute_per_safely_merged_change
-            .reason
-            .contains("lower-bound"));
+        assert!(
+            scorecard
+                .wasted_compute_per_safely_merged_change
+                .reason
+                .contains("lower-bound")
+        );
         assert_eq!(
             scorecard.wasted_compute_per_safely_merged_change.value,
             Some(0.0)
