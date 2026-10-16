@@ -808,8 +808,10 @@ impl MetricsStore {
             .map(|(queued, started)| (started - queued).num_milliseconds())
             .filter(|value| *value >= 0);
         if let Some(provider) = input.provider.as_deref()
-            && let Some(existing) = existing_job_id(&conn, provider, input.external_id.as_deref())?
-                .or(existing_unknown_attempt_id(&conn, provider, input.external_id.as_deref())?)
+            && let Some(existing) =
+                existing_job_id(&conn, provider, input.external_id.as_deref())?.or(
+                    existing_unknown_attempt_id(&conn, provider, input.external_id.as_deref())?,
+                )
         {
             if refresh_existing {
                 ensure_refresh_identity_compatible(&conn, existing, input)?;
@@ -1408,11 +1410,21 @@ fn ensure_refresh_identity_compatible(
     )?;
     for (name, old, new) in [
         ("event", stored.0, input.event.clone()),
-        ("run_attempt", stored.1.map(|v| v.to_string()), input.run_attempt.map(|v| v.to_string())),
-        ("provider_run_id", stored.2.map(|v| v.to_string()), input.provider_run_id.map(|v| v.to_string())),
+        (
+            "run_attempt",
+            stored.1.map(|v| v.to_string()),
+            input.run_attempt.map(|v| v.to_string()),
+        ),
+        (
+            "provider_run_id",
+            stored.2.map(|v| v.to_string()),
+            input.provider_run_id.map(|v| v.to_string()),
+        ),
         ("head_sha", stored.3, input.head_sha.clone()),
     ] {
-        if let (Some(old), Some(new)) = (old, new) && old != new {
+        if let (Some(old), Some(new)) = (old, new)
+            && old != new
+        {
             return Err(format!("existing job identity conflict in {name}").into());
         }
     }
@@ -1427,7 +1439,9 @@ fn existing_unknown_attempt_id(
     if provider != "github" {
         return Ok(None);
     }
-    let Some(value) = external_id else { return Ok(None) };
+    let Some(value) = external_id else {
+        return Ok(None);
+    };
     let parts = value.split('/').collect::<Vec<_>>();
     if parts.len() != 3 || !parts[0].starts_with("github:") {
         return Ok(None);
