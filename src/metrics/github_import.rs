@@ -214,15 +214,16 @@ pub fn import_github<E>(
         .map_err(|error| store_error(format!("GitHub metrics validation failed: {error}")))?;
     let mut batch_identities = std::collections::HashMap::new();
     for input in &pending_inputs {
-        if let (Some(provider), Some(existing)) = (
-            input.provider.as_deref(),
-            super::existing_job_id(&conn, provider, input.external_id.as_deref()).map_err(
-                |error| store_error(format!("GitHub metrics validation failed: {error}")),
-            )?,
-        ) {
-            super::ensure_refresh_identity_compatible(&conn, existing, input).map_err(|error| {
-                store_error(format!("GitHub metrics validation failed: {error}"))
-            })?;
+        if let Some(provider) = input.provider.as_deref() {
+            if let Some(existing) =
+                super::existing_job_id(&conn, provider, input.external_id.as_deref()).map_err(
+                    |error| store_error(format!("GitHub metrics validation failed: {error}")),
+                )?
+            {
+                super::ensure_refresh_identity_compatible(&conn, existing, input).map_err(
+                    |error| store_error(format!("GitHub metrics validation failed: {error}")),
+                )?;
+            }
         }
         if let (Some(provider), Some(external_id)) =
             (input.provider.as_deref(), input.external_id.as_deref())
