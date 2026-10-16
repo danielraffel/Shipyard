@@ -331,6 +331,7 @@ pub struct StewardshipScorecard {
     /// are retained for audit but never promoted into a provenance-qualified
     /// population.
     pub provenance: ScorecardProvenance,
+    #[serde(skip_serializing)]
     pub strata: ScorecardStrata,
 }
 
@@ -380,11 +381,16 @@ pub struct AuthenticatedStrataReceipt {
     pub source_head: String,
     pub generated_at: String,
     pub unit: String,
+    pub strata: AuthenticatedStrata,
+    pub aggregate: AuthenticatedStrataAggregate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AuthenticatedStrata {
     pub normal_pr: AuthenticatedStratum,
     pub merge_group: AuthenticatedStratum,
     pub rerun: AuthenticatedStratum,
     pub unclassified: AuthenticatedStratum,
-    pub aggregate: AuthenticatedStrataAggregate,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1573,19 +1579,21 @@ impl MetricsStore {
             .checked_sub_signed(window)
             .ok_or("strata day window is outside the timestamp range")?;
         let cutoff = window_since.to_rfc3339();
-        let repo = unique_scorecard_repo(&conn, project, &cutoff)?;
+        let window_until = generated_at.to_rfc3339();
+        let repo = unique_scorecard_repo(&conn, project, &cutoff, &window_until)?;
         let mut accumulators = [StratumAccumulator::default(); 4];
         let mut statement = conn.prepare(&format!(
             "SELECT run.event, run.run_attempt, run.pr, run.provider_run_id,
                     run.head_sha, job.provider, run.provenance, run.provenance_verified
                FROM jobs job JOIN runs run ON run.id = job.run_id
               WHERE {} AND job.completed_at IS NOT NULL
-                AND julianday(job.completed_at) >= julianday(?4)",
+                AND julianday(job.completed_at) >= julianday(?4)
+                AND julianday(job.completed_at) <= julianday(?5)",
             project_key::sql_filter("run.project", "run.repo")
         ))?;
         let key = ProjectKey::parse(project);
         let (any, short, full) = project_key::sql_params(key.as_ref());
-        for row in statement.query_map(params![any, short, full, cutoff], |row| {
+        for row in statement.query_map(params![any, short, full, cutoff, window_until], |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?,
                 row.get::<_, Option<i64>>(1)?,
@@ -1634,14 +1642,16 @@ impl MetricsStore {
             schema: AUTHENTICATED_STRATA_SCHEMA.to_owned(),
             repo,
             window_since: window_since.to_rfc3339(),
-            window_until: generated_at.to_rfc3339(),
+            window_until,
             source_head: source_head.to_owned(),
             generated_at: generated_at.to_rfc3339(),
             unit: "job".to_owned(),
-            normal_pr: strata[0].clone(),
-            merge_group: strata[1].clone(),
-            rerun: strata[2].clone(),
-            unclassified: strata[3].clone(),
+            strata: AuthenticatedStrata {
+                normal_pr: strata[0].clone(),
+                merge_group: strata[1].clone(),
+                rerun: strata[2].clone(),
+                unclassified: strata[3].clone(),
+            },
             aggregate,
         })
     }
@@ -1747,19 +1757,21 @@ fn unique_scorecard_repo(
     conn: &Connection,
     project: &str,
     cutoff: &str,
+    window_until: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut statement = conn.prepare(&format!(
         "SELECT DISTINCT lower(trim(run.repo))
            FROM jobs job JOIN runs run ON run.id = job.run_id
           WHERE {} AND run.repo IS NOT NULL
             AND trim(run.repo) <> '' AND job.completed_at IS NOT NULL
-            AND julianday(job.completed_at) >= julianday(?4)",
+            AND julianday(job.completed_at) >= julianday(?4)
+            AND julianday(job.completed_at) <= julianday(?5)",
         project_key::sql_filter("run.project", "run.repo")
     ))?;
     let key = ProjectKey::parse(project);
     let (any, short, full) = project_key::sql_params(key.as_ref());
     let repos = statement
-        .query_map(params![any, short, full, cutoff], |row| {
+        .query_map(params![any, short, full, cutoff, window_until], |row| {
             row.get::<_, String>(0)
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -3869,17 +3881,43 @@ mod tests {
                 ..MetricRecordInput::default()
             })
             .unwrap();
+        store
+            .record_terminal_observation(&MetricRecordInput {
+                project: "shipyard".to_owned(),
+                repo: Some("Owner/Shipyard".to_owned()),
+                job: "future".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                status: "success".to_owned(),
+                duration_ms: 100,
+                completed_at: Some(Utc::now() + Duration::days(1)),
+                external_id: Some("github:9/2/1".to_owned()),
+                event: Some("pull_request".to_owned()),
+                run_attempt: Some(1),
+                pr: Some(10),
+                provider_run_id: Some(2),
+                head_sha: Some("c".repeat(40)),
+                provenance: Some("production".to_owned()),
+                provenance_verified: true,
+                ..MetricRecordInput::default()
+            })
+            .unwrap();
         let receipt = store
             .authenticated_strata_receipt("shipyard", 1, &"b".repeat(40))
             .unwrap();
         assert_eq!(receipt.schema, AUTHENTICATED_STRATA_SCHEMA);
         assert_eq!(receipt.unit, "job");
         assert_eq!(receipt.repo, "owner/shipyard");
-        assert_eq!(receipt.normal_pr.observed_jobs, 1);
-        assert_eq!(receipt.normal_pr.qualified_jobs, 1);
-        assert_eq!(receipt.normal_pr.provenance, "authenticated");
-        assert_eq!(receipt.normal_pr.coverage, "partial");
-        assert!(receipt.normal_pr.reason.contains("recent-N runs only"));
+        assert_eq!(receipt.strata.normal_pr.observed_jobs, 1);
+        assert_eq!(receipt.strata.normal_pr.qualified_jobs, 1);
+        assert_eq!(receipt.strata.normal_pr.provenance, "authenticated");
+        assert_eq!(receipt.strata.normal_pr.coverage, "partial");
+        assert!(
+            receipt
+                .strata
+                .normal_pr
+                .reason
+                .contains("recent-N runs only")
+        );
         assert_eq!(receipt.aggregate.observed_jobs, 1);
         assert_eq!(receipt.aggregate.qualified_jobs, 1);
     }
