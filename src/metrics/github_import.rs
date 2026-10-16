@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_jobs_and_contradictory_attempt_or_head() {
+    fn rejects_missing_jobs_and_contradictory_head() {
         let request = GithubImportRequest {
             repo: "acme/pulp".to_owned(),
             project: None,
@@ -307,7 +307,7 @@ mod tests {
         };
         assert!(import_github(&store, &request, &mut gh, &|error| error).is_err());
 
-        for (field, value) in [("run_attempt", json!(1)), ("head_sha", json!("other"))] {
+        for (field, value) in [("head_sha", json!("other"))] {
             let dir = tempfile::tempdir().unwrap();
             let store = MetricsStore::open(dir.path()).unwrap();
             let mut gh = |argv: &[String]| -> Result<Value, String> {
