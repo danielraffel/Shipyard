@@ -2519,12 +2519,12 @@ fn execute_targets_with_options<D: ShipTargetDispatcher>(
                     .unwrap_or_else(|| "scheduler_deferred".to_owned());
                 return Ok(TargetExecutionOutcome::Deferred { job, reason });
             }
-            if let Some(selected_route) = result.selected_route.as_deref() {
+            if let Some(route_attempts) = result.route_attempts.as_deref() {
                 crate::route_shadow::record_dispatch_observation_best_effort(
                     state_dir,
                     &job.id,
                     &decision.target,
-                    selected_route,
+                    route_attempts,
                     Utc::now(),
                 );
             }

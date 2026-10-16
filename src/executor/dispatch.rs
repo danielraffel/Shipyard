@@ -627,6 +627,16 @@ impl ExecutorDispatcher {
                 }),
             });
             let result = demote_stale_result(result, chain.heartbeat_stale_secs);
+            let mut result = result;
+            let route_id = format!("fallback:{}:{attempt}", backend.label);
+            result
+                .route_attempts
+                .get_or_insert_with(Vec::new)
+                .push(crate::job::RouteAttempt {
+                    route_id,
+                    outcome: result.status,
+                    attempted_at: Utc::now(),
+                });
 
             if matches!(
                 result.status,
@@ -747,7 +757,14 @@ impl ExecutorDispatcher {
             // the attempted member even when validation fails or is
             // cancelled; busy, deferred, and probe-only paths never reach
             // this point and remain unattributed.
-            result.selected_route = Some(member.label.clone());
+            result
+                .route_attempts
+                .get_or_insert_with(Vec::new)
+                .push(crate::job::RouteAttempt {
+                    route_id: format!("host-pool:{}:{}", pool.pool_name, member.id),
+                    outcome: result.status,
+                    attempted_at: Utc::now(),
+                });
 
             if matches!(
                 result.status,
@@ -757,7 +774,6 @@ impl ExecutorDispatcher {
                 return result;
             }
             if result.status == crate::job::TargetStatus::Pass {
-                result.selected_route = Some(member.label.clone());
                 if attempt == 0 {
                     result.backend.clone_from(&member.label);
                     return result;
@@ -3033,29 +3049,31 @@ backend = "local"
             .remove(0);
         let temp = tempfile::tempdir().expect("tempdir");
         let mut phases = Vec::new();
-        let status = {
+        let result = {
             let mut callback = |event: crate::executor::streaming::ProgressEvent| {
                 if let Some(phase) = event.phase {
                     phases.push(phase);
                 }
                 crate::executor::streaming::ProgressAction::Continue
             };
-            super::ExecutorDispatcher::new(None)
-                .validate(super::DispatchValidationRequest {
-                    job_id: None,
-                    defer_host_pool_lease_unavailable: false,
-                    sha: "abc1234".to_owned(),
-                    branch: "main".to_owned(),
-                    target: &target,
-                    log_path: temp.path().join("fallback.log"),
-                    resume_from: None,
-                    mode: ValidationMode::Full,
-                    progress_callback: Some(&mut callback),
-                })
-                .status
+            super::ExecutorDispatcher::new(None).validate(super::DispatchValidationRequest {
+                job_id: None,
+                defer_host_pool_lease_unavailable: false,
+                sha: "abc1234".to_owned(),
+                branch: "main".to_owned(),
+                target: &target,
+                log_path: temp.path().join("fallback.log"),
+                resume_from: None,
+                mode: ValidationMode::Full,
+                progress_callback: Some(&mut callback),
+            })
         };
 
-        assert_eq!(status, TargetStatus::Pass);
+        assert_eq!(result.status, TargetStatus::Pass);
+        assert_eq!(
+            result.route_attempts.as_ref().unwrap()[0].route_id,
+            "fallback:local:0"
+        );
         assert!(phases.iter().any(|phase| phase == "build"));
     }
 
@@ -3116,8 +3134,8 @@ backend = "local"
         assert_eq!(result.status, TargetStatus::Pass);
         assert_eq!(result.backend, "host-pool:local_macs/local");
         assert_eq!(
-            result.selected_route.as_deref(),
-            Some("host-pool:local_macs/local")
+            result.route_attempts.as_ref().unwrap()[0].route_id,
+            "host-pool:local_macs/local"
         );
         assert!(observed_job_id.get());
         let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
@@ -3168,8 +3186,8 @@ backend = "local"
 
         assert_ne!(result.status, TargetStatus::Pass);
         assert_eq!(
-            result.selected_route.as_deref(),
-            Some("host-pool:local_macs/local")
+            result.route_attempts.as_ref().unwrap()[0].route_id,
+            "host-pool:local_macs/local"
         );
     }
 
@@ -3247,8 +3265,8 @@ backend = "local"
             Some("host-pool:local_macs/mac-studio")
         );
         assert_eq!(
-            result.selected_route.as_deref(),
-            Some("host-pool:local_macs/local")
+            result.route_attempts.as_ref().unwrap()[0].route_id,
+            "host-pool:local_macs/local"
         );
         let leases = store.leases().expect("leases");
         assert_eq!(leases.len(), 1);
@@ -3323,7 +3341,7 @@ backend = "local"
         );
         assert!(!result.is_terminal());
         assert!(result.failure_class.is_none());
-        assert_eq!(result.selected_route, None);
+        assert_eq!(result.route_attempts, None);
         assert_eq!(store.leases().expect("leases")[0].lease_id, busy.lease_id);
         store.release(&busy.lease_id).expect("release busy");
     }

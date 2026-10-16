@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::executor::dispatch::{ResolvedBackend, ResolvedTarget};
 use crate::host_pool::HostPoolLease;
+use crate::job::RouteAttempt;
 
 /// Schema version for [`RouteCapabilitySnapshot`] and [`RouteShadowReceipt`].
 pub const ROUTE_SHADOW_SCHEMA_VERSION: u32 = 1;
@@ -139,7 +140,7 @@ pub struct RouteShadowObservationMetadata {
     /// Actual route selected by the authoritative dispatcher, when the
     /// observation was emitted after lease/dispatch selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_route: Option<RouteSelection>,
+    pub dispatch_attempts: Option<Vec<RouteAttempt>>,
 }
 
 /// Selected route identity and its position in the ordered snapshot.
@@ -307,7 +308,7 @@ impl RouteShadowReceiptStore {
             observed_at: observation.observed_at,
             expires_at,
             capability_provenance: observation.capability_provenance.clone(),
-            selected_route: observation.selected_route.clone(),
+            dispatch_attempts: observation.route_attempts.clone(),
         });
         let path = self.path_for(&observation.snapshot.request_id);
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)
@@ -342,7 +343,7 @@ impl RouteShadowReceiptStore {
             observed_at: observation.observed_at,
             expires_at,
             capability_provenance: observation.capability_provenance.clone(),
-            selected_route: observation.selected_route.clone(),
+            dispatch_attempts: observation.route_attempts.clone(),
         });
         let path = self.path_for(&observation.snapshot.request_id);
         let _writer_domain =
@@ -382,7 +383,7 @@ impl RouteShadowReceiptStore {
         if metadata.correlation_id != observation.correlation_id {
             return Ok(None);
         }
-        metadata.selected_route = observation.selected_route.clone();
+        metadata.dispatch_attempts = observation.route_attempts.clone();
         let path = self.path_for(&observation.snapshot.request_id);
         let _writer_domain =
             match crate::writer_domain_lease::acquire_for_protected_path_with_timeout(
@@ -545,7 +546,7 @@ pub struct RouteShadowObservation {
     /// Source label for capability and admission facts.
     pub capability_provenance: String,
     /// Actual route selected by the authoritative dispatcher, when known.
-    pub selected_route: Option<RouteSelection>,
+    pub route_attempts: Option<Vec<RouteAttempt>>,
 }
 
 impl RouteShadowObservation {
@@ -573,7 +574,7 @@ pub fn record_scheduler_observation_best_effort(
         observed_at,
         freshness: Duration::seconds(30),
         capability_provenance: scheduler_provenance(target),
-        selected_route: None,
+        route_attempts: None,
     };
     let Some(sender) = observation_sender() else {
         return;
@@ -594,36 +595,20 @@ pub fn record_dispatch_observation_best_effort(
     state_dir: &std::path::Path,
     job_id: &str,
     target: &ResolvedTarget,
-    selected_label: &str,
+    route_attempts: &[RouteAttempt],
     observed_at: DateTime<Utc>,
 ) {
     let Some(snapshot) = scheduler_snapshot(job_id, target, &[], observed_at) else {
         return;
     };
-    let Some(selected_route_id) = (match &target.backend {
-        ResolvedBackend::HostPool(pool) => pool
-            .members
-            .iter()
-            .find(|member| member.label == selected_label || member.id == selected_label)
-            .map(|member| format!("host-pool:{}:{}", pool.pool_name, member.id)),
-        ResolvedBackend::Fallback(chain) => chain
-            .backends
-            .iter()
-            .enumerate()
-            .find(|(_, backend)| backend.label == selected_label)
-            .map(|(position, _)| format!("fallback:{selected_label}:{position}")),
-        ResolvedBackend::Local(_)
-        | ResolvedBackend::Ssh(_)
-        | ResolvedBackend::Windows(_)
-        | ResolvedBackend::Cloud(_) => None,
-    }) else {
+    let Some(attempt) = route_attempts.last() else {
         return;
     };
     let Some((position, candidate)) = snapshot
         .candidates
         .iter()
         .enumerate()
-        .find(|(_, candidate)| candidate.route_id == selected_route_id)
+        .find(|(_, candidate)| candidate.route_id == attempt.route_id)
     else {
         return;
     };
@@ -640,7 +625,7 @@ pub fn record_dispatch_observation_best_effort(
         observed_at,
         freshness: Duration::seconds(30),
         capability_provenance: "shipyard.dispatch.selected_route".to_owned(),
-        selected_route: Some(selected_route),
+        route_attempts: Some(route_attempts.to_vec()),
     };
     let Some(sender) = observation_sender() else {
         return;
@@ -664,13 +649,16 @@ fn observation_sender() -> Option<&'static SyncSender<PendingObservation>> {
                 .spawn(move || {
                     while let Ok(pending) = receiver.recv() {
                         let store = RouteShadowReceiptStore::new(pending.state_dir);
-                        if pending.observation.selected_route.is_some()
-                            && matches!(
-                                store.attach_selected_route_best_effort(&pending.observation),
-                                Ok(Some(true))
-                            )
+                        if pending
+                            .observation
+                            .route_attempts
+                            .as_ref()
+                            .is_some_and(|a| !a.is_empty())
                         {
-                            continue;
+                            match store.attach_selected_route_best_effort(&pending.observation) {
+                                Ok(Some(_)) | Err(_) => continue,
+                                Ok(None) => {}
+                            }
                         }
                         if store
                             .load(&pending.observation.snapshot.request_id)
@@ -679,7 +667,7 @@ fn observation_sender() -> Option<&'static SyncSender<PendingObservation>> {
                             .and_then(|receipt| receipt.observation)
                             .is_some_and(|metadata| {
                                 metadata.expires_at > pending.observation.observed_at
-                                    && pending.observation.selected_route.is_none()
+                                    && pending.observation.route_attempts.is_none()
                             })
                         {
                             continue;
@@ -1090,7 +1078,7 @@ mod tests {
                 observed_at,
                 freshness: Duration::seconds(30),
                 capability_provenance: "shipyard.scheduler.test".to_owned(),
-                selected_route: None,
+                route_attempts: None,
             })
             .expect("record organic observation");
         let metadata = receipt.observation.expect("observation metadata");
@@ -1116,7 +1104,7 @@ mod tests {
             observed_at: Utc::now() - Duration::minutes(2),
             freshness: Duration::seconds(1),
             capability_provenance: "shipyard.scheduler.test".to_owned(),
-            selected_route: None,
+            route_attempts: None,
         };
         assert!(matches!(
             store.record_observation(&stale),
@@ -1130,7 +1118,7 @@ mod tests {
             observed_at: Utc::now(),
             freshness: Duration::seconds(30),
             capability_provenance: "shipyard.scheduler.test".to_owned(),
-            selected_route: None,
+            route_attempts: None,
         };
         assert!(matches!(
             store.record_observation(&mismatch),
@@ -1241,7 +1229,7 @@ mod tests {
             pending
                 .observation
                 .expect("metadata")
-                .selected_route
+                .dispatch_attempts
                 .is_none()
         );
         assert!(matches!(
@@ -1265,7 +1253,7 @@ mod tests {
                 && receipt
                     .observation
                     .as_ref()
-                    .and_then(|metadata| metadata.selected_route.as_ref())
+                    .and_then(|metadata| metadata.dispatch_attempts.as_ref())
                     .is_some()
             {
                 selected = Some(receipt);
@@ -1276,7 +1264,12 @@ mod tests {
         let selected = selected.expect("selected route receipt");
         let metadata = selected.observation.expect("metadata");
         assert_eq!(
-            metadata.selected_route.expect("selected route").route_id,
+            metadata
+                .dispatch_attempts
+                .expect("dispatch attempts")
+                .last()
+                .expect("attempt")
+                .route_id,
             "host-pool:macs:m1"
         );
         assert!(matches!(
@@ -1312,7 +1305,7 @@ mod tests {
                 observed_at: Utc::now(),
                 freshness: Duration::seconds(30),
                 capability_provenance: "test".to_owned(),
-                selected_route: None,
+                route_attempts: None,
             },
         };
         assert!(enqueue_observation(&sender, pending()));
