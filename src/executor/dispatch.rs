@@ -597,6 +597,7 @@ impl ExecutorDispatcher {
         };
         let primary_label = primary.label.clone();
         let mut last_result = None;
+        let mut attempt_history = Vec::new();
 
         for (attempt, backend) in filtered.into_iter().enumerate() {
             let attempt_log = attempt_log_path(&request.log_path, attempt);
@@ -609,6 +610,7 @@ impl ExecutorDispatcher {
                 continue;
             }
 
+            let attempted_at = Utc::now();
             let result = self.validate(DispatchValidationRequest {
                 job_id: request.job_id.clone(),
                 defer_host_pool_lease_unavailable: request.defer_host_pool_lease_unavailable,
@@ -627,6 +629,25 @@ impl ExecutorDispatcher {
                 }),
             });
             let result = demote_stale_result(result, chain.heartbeat_stale_secs);
+            let mut result = result;
+            let nested_attempts = result.route_attempts.take().unwrap_or_default();
+            let outcome = result.status;
+            // `backend` is a filtered view borrowed from `chain.backends`.
+            // Pointer identity recovers the original configured position
+            // without parsing display labels or changing fallback authority.
+            let configured_position = chain
+                .backends
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, backend))
+                .unwrap_or(attempt);
+            attempt_history.push(crate::job::RouteAttempt {
+                route_id: format!("fallback:{}:{configured_position}", backend.label),
+                position: configured_position,
+                outcome,
+                attempted_at,
+            });
+            attempt_history.extend(nested_attempts);
+            result.route_attempts = Some(attempt_history.clone());
 
             if matches!(
                 result.status,
@@ -648,7 +669,11 @@ impl ExecutorDispatcher {
             last_result = Some(result);
         }
 
-        exhausted_result(request.target, &primary_label, last_result)
+        let mut exhausted = exhausted_result(request.target, &primary_label, last_result);
+        if !attempt_history.is_empty() {
+            exhausted.route_attempts = Some(attempt_history);
+        }
+        exhausted
     }
 
     #[allow(clippy::too_many_lines)]
@@ -671,6 +696,7 @@ impl ExecutorDispatcher {
         };
         let primary_label = primary.label.clone();
         let mut last_result = None;
+        let mut attempt_history = Vec::new();
 
         for (attempt, member) in filtered.into_iter().enumerate() {
             let attempt_log = attempt_log_path(&request.log_path, attempt);
@@ -726,6 +752,7 @@ impl ExecutorDispatcher {
                 pool.lease_stale_seconds.max(1),
             );
 
+            let attempted_at = Utc::now();
             let mut result = self.validate(DispatchValidationRequest {
                 job_id: request.job_id.clone(),
                 defer_host_pool_lease_unavailable: request.defer_host_pool_lease_unavailable,
@@ -743,6 +770,26 @@ impl ExecutorDispatcher {
                             -> crate::executor::streaming::ProgressAction
                 }),
             });
+            // Lease acquisition is the unambiguous dispatch boundary. Keep
+            // the attempted member even when validation fails or is
+            // cancelled; busy, deferred, and probe-only paths never reach
+            // this point and remain unattributed.
+            let outcome = result.status;
+            // `member` is a filtered view borrowed from `pool.members`.
+            // Pointer identity recovers the original configured position
+            // without parsing member labels or changing host-pool authority.
+            let configured_position = pool
+                .members
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, member))
+                .unwrap_or(attempt);
+            attempt_history.push(crate::job::RouteAttempt {
+                route_id: format!("host-pool:{}:{}", pool.pool_name, member.id),
+                position: configured_position,
+                outcome,
+                attempted_at,
+            });
+            result.route_attempts = Some(attempt_history.clone());
 
             if matches!(
                 result.status,
@@ -774,7 +821,11 @@ impl ExecutorDispatcher {
             return last_result.expect("checked present");
         }
 
-        exhausted_result(request.target, &primary_label, last_result)
+        let mut exhausted = exhausted_result(request.target, &primary_label, last_result);
+        if !attempt_history.is_empty() {
+            exhausted.route_attempts = Some(attempt_history);
+        }
+        exhausted
     }
 
     fn diagnose_host_pool(&self, pool: &ResolvedHostPoolConfig) -> ReachabilityDiagnostic {
@@ -3027,30 +3078,152 @@ backend = "local"
             .remove(0);
         let temp = tempfile::tempdir().expect("tempdir");
         let mut phases = Vec::new();
-        let status = {
+        let result = {
             let mut callback = |event: crate::executor::streaming::ProgressEvent| {
                 if let Some(phase) = event.phase {
                     phases.push(phase);
                 }
                 crate::executor::streaming::ProgressAction::Continue
             };
-            super::ExecutorDispatcher::new(None)
-                .validate(super::DispatchValidationRequest {
-                    job_id: None,
-                    defer_host_pool_lease_unavailable: false,
-                    sha: "abc1234".to_owned(),
-                    branch: "main".to_owned(),
-                    target: &target,
-                    log_path: temp.path().join("fallback.log"),
-                    resume_from: None,
-                    mode: ValidationMode::Full,
-                    progress_callback: Some(&mut callback),
-                })
-                .status
+            super::ExecutorDispatcher::new(None).validate(super::DispatchValidationRequest {
+                job_id: None,
+                defer_host_pool_lease_unavailable: false,
+                sha: "abc1234".to_owned(),
+                branch: "main".to_owned(),
+                target: &target,
+                log_path: temp.path().join("fallback.log"),
+                resume_from: None,
+                mode: ValidationMode::Full,
+                progress_callback: Some(&mut callback),
+            })
         };
 
-        assert_eq!(status, TargetStatus::Pass);
+        assert_eq!(result.status, TargetStatus::Pass);
+        assert_eq!(result.backend, "local");
+        assert_eq!(result.primary_backend, None);
+        assert_eq!(result.failover_reason, None);
+        assert_eq!(
+            result.route_attempts.as_ref().unwrap()[0].route_id,
+            "fallback:local:0"
+        );
+        assert_eq!(
+            result.route_attempts.as_ref().unwrap()[0].outcome,
+            TargetStatus::Pass
+        );
         assert!(phases.iter().any(|phase| phase == "build"));
+    }
+
+    #[test]
+    fn fallback_records_two_dispatched_attempts_before_exhaustion() {
+        let config = table(
+            r#"
+            [targets.mac]
+            backend = "local"
+            platform = "macos-arm64"
+            fallback = [{ type = "local" }]
+            "#,
+        );
+        let target = resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let result =
+            super::ExecutorDispatcher::new(None).validate(super::DispatchValidationRequest {
+                job_id: None,
+                defer_host_pool_lease_unavailable: false,
+                sha: "abc1234".to_owned(),
+                branch: "main".to_owned(),
+                target: &target,
+                log_path: temp.path().join("fallback-exhausted.log"),
+                resume_from: None,
+                mode: ValidationMode::Full,
+                progress_callback: None,
+            });
+        let attempts = result.route_attempts.expect("attempt history");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].position, 0);
+        assert_eq!(attempts[1].position, 1);
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| attempt.outcome != TargetStatus::Pass)
+        );
+    }
+
+    #[test]
+    fn nested_host_pool_fallback_dispatch_persists_outer_and_nested_attempts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let config = table(&format!(
+            r#"
+            [host_pools.local_macs]
+            [[host_pools.local_macs.members]]
+            id = "local"
+            type = "local"
+            cwd = {}
+            capabilities = ["macos", "arm64"]
+
+            [targets.mac]
+            backend = "local"
+            platform = "macos-arm64"
+            fallback = [{{ type = "host-pool", pool = "local_macs" }}]
+            "#,
+            toml_string(repo.display().to_string())
+        ));
+        let target = resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0);
+        let result = super::ExecutorDispatcher::new_with_state_dir(None, temp.path()).validate(
+            super::DispatchValidationRequest {
+                job_id: Some("nested-receipt".to_owned()),
+                defer_host_pool_lease_unavailable: false,
+                sha: "abc1234".to_owned(),
+                branch: "main".to_owned(),
+                target: &target,
+                log_path: temp.path().join("nested.log"),
+                resume_from: None,
+                mode: ValidationMode::Full,
+                progress_callback: None,
+            },
+        );
+        let attempts = result.route_attempts.clone().expect("attempt history");
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| attempt.route_id.starts_with("fallback:"))
+        );
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| attempt.route_id == "host-pool:local_macs:local")
+        );
+        crate::route_shadow::record_dispatch_observation_best_effort(
+            temp.path(),
+            "nested-receipt",
+            &target,
+            &attempts,
+            Utc::now(),
+        );
+        let store = crate::route_shadow::RouteShadowReceiptStore::new(temp.path());
+        for _ in 0..100 {
+            if let Ok(Some(receipt)) = store.load("nested-receipt:mac") {
+                let stored = receipt
+                    .observation
+                    .expect("metadata")
+                    .dispatch_attempts
+                    .unwrap();
+                assert_eq!(stored.len(), attempts.len());
+                assert!(
+                    stored
+                        .iter()
+                        .any(|attempt| attempt.route_id == "host-pool:local_macs:local")
+                );
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("nested dispatch receipt");
     }
 
     #[test]
@@ -3109,9 +3282,64 @@ backend = "local"
 
         assert_eq!(result.status, TargetStatus::Pass);
         assert_eq!(result.backend, "host-pool:local_macs/local");
+        assert_eq!(result.primary_backend, None);
+        assert_eq!(result.failover_reason, None);
+        assert_eq!(
+            result.route_attempts.as_ref().unwrap()[0].route_id,
+            "host-pool:local_macs:local"
+        );
         assert!(observed_job_id.get());
         let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
         assert!(store.leases().expect("leases").is_empty());
+    }
+
+    #[test]
+    fn host_pool_dispatch_attributes_member_when_validation_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let config = table(
+            r#"
+            [validation.default]
+            command = "false"
+
+            [host_pools.local_macs]
+
+            [[host_pools.local_macs.members]]
+            id = "local"
+            type = "local"
+            cwd = {}
+            capabilities = ["macos", "arm64"]
+
+            [targets.mac]
+            backend = "host-pool"
+            pool = "local_macs"
+            platform = "macos-arm64"
+            requires = ["macos", "arm64"]
+            "#,
+        );
+        let target = resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0);
+        let dispatcher = super::ExecutorDispatcher::new_with_state_dir(None, temp.path());
+
+        let result = dispatcher.validate(super::DispatchValidationRequest {
+            job_id: Some("job-host-pool-fail".to_owned()),
+            defer_host_pool_lease_unavailable: false,
+            sha: "abc1234".to_owned(),
+            branch: "main".to_owned(),
+            target: &target,
+            log_path: temp.path().join("host-pool-fail.log"),
+            resume_from: None,
+            mode: ValidationMode::Full,
+            progress_callback: None,
+        });
+
+        assert_ne!(result.status, TargetStatus::Pass);
+        assert_eq!(
+            result.route_attempts.as_ref().unwrap()[0].route_id,
+            "host-pool:local_macs:local"
+        );
     }
 
     #[test]
@@ -3187,6 +3415,11 @@ backend = "local"
             result.primary_backend.as_deref(),
             Some("host-pool:local_macs/mac-studio")
         );
+        assert_eq!(
+            result.route_attempts.as_ref().unwrap()[0].route_id,
+            "host-pool:local_macs:local"
+        );
+        assert_eq!(result.route_attempts.as_ref().unwrap()[0].position, 1);
         let leases = store.leases().expect("leases");
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].lease_id, busy.lease_id);
@@ -3260,6 +3493,7 @@ backend = "local"
         );
         assert!(!result.is_terminal());
         assert!(result.failure_class.is_none());
+        assert_eq!(result.route_attempts, None);
         assert_eq!(store.leases().expect("leases")[0].lease_id, busy.lease_id);
         store.release(&busy.lease_id).expect("release busy");
     }
