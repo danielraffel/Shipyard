@@ -28,8 +28,30 @@ def run(command: Sequence[str], *, stdin: str | None = None, timeout: int = 300)
         raise RuntimeError(f"command timed out after {timeout}s: {command[0]}") from exc
 
 
+def state_identity(path: pathlib.Path, project: str, repo: str, db: pathlib.Path) -> dict[str, str]:
+    return {"project": project, "repo": repo, "database": str(db.expanduser().resolve(strict=False))}
+
+
+def validate_state_identity(path: pathlib.Path, project: str, repo: str, db: pathlib.Path) -> None:
+    if not path.exists():
+        return
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"baseline state is unreadable: {exc}") from exc
+    expected = state_identity(path, project, repo, db)
+    stored = state.get("identity")
+    if stored is None:
+        if state.get("observations"):
+            raise RuntimeError("baseline state has observations but no identity; refusing cross-project reuse")
+        return
+    if any(stored.get(key) != value for key, value in expected.items()):
+        raise RuntimeError(f"baseline state identity mismatch: stored={stored!r} requested={expected!r}")
+
+
 def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
+    validate_state_identity(args.state, args.project, args.repo, args.db)
     state_dir = str(validate_state_layout(args.db))
     before = count_jobs(args.db, args.project, args.repo)
     github = run([args.shipyard, "--state-dir", state_dir, "metrics", "import", "github", "--repo", args.repo,
@@ -47,9 +69,11 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     events.append(summarize_import("tartci", imported.stdout))
     after = count_jobs(args.db, args.project, args.repo)
     if before is not None and after is not None:
-        events.append({"source": "collection", "status": "completed", "new_rows": max(after - before, 0)})
+        events.append({"source": "collection", "status": "completed", "new_rows": max(after - before, 0),
+                       "source_activity_dates": sorted(source_activity_dates(args.db, args.project, args.repo) or [])})
     else:
-        events.append({"source": "collection", "status": "unavailable", "new_rows": None})
+        events.append({"source": "collection", "status": "unavailable", "new_rows": None,
+                       "source_activity_dates": []})
     return events
 
 def count_jobs(db: pathlib.Path, project: str, repo: str) -> int | None:
@@ -57,6 +81,29 @@ def count_jobs(db: pathlib.Path, project: str, repo: str) -> int | None:
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
             return int(connection.execute("""select count(*) from jobs j join runs r on r.id=j.run_id
                 where r.project=? and (r.repo=? or r.repo is null)""", (project, repo)).fetchone()[0])
+    except sqlite3.Error:
+        return None
+
+
+def source_activity_dates(db: pathlib.Path, project: str, repo: str) -> set[str] | None:
+    """Read producer timestamps without creating or mutating the metrics store."""
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
+            columns = {row[1] for row in connection.execute("pragma table_info(runs)")}
+            timestamp = next((name for name in ("created_at", "started_at", "completed_at") if name in columns), None)
+            if timestamp is None or "project" not in columns:
+                return None
+            repo_clause = "repo=?" if "repo" in columns else "1=1"
+            params: tuple[Any, ...] = (project, repo) if "repo" in columns else (project,)
+            rows = connection.execute(f"select {timestamp} from runs where project=? and {repo_clause}", params)
+            dates = set()
+            for (value,) in rows:
+                if isinstance(value, str):
+                    try:
+                        dates.add(dt.datetime.fromisoformat(value.replace("Z", "+00:00")).date().isoformat())
+                    except ValueError:
+                        continue
+            return dates
     except sqlite3.Error:
         return None
 
@@ -128,18 +175,30 @@ def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
 
 def update_state(path: pathlib.Path, project: str, started: dt.datetime,
                  card: dict[str, Any], events: list[dict[str, Any]],
-                 observed_at: dt.datetime | None = None) -> dict[str, Any]:
+                 observed_at: dt.datetime | None = None, repo: str | None = None,
+                 db: pathlib.Path | None = None) -> dict[str, Any]:
     state = json.loads(path.read_text()) if path.exists() else {}
     state.setdefault("started_at", started.isoformat())
     state.setdefault("observations", [])
     observed_at = observed_at or dt.datetime.now(dt.timezone.utc)
+    if repo is not None and db is not None:
+        validate_state_identity(path, project, repo, db)
+        state["identity"] = state_identity(path, project, repo, db)
     state["project"] = project
     state["last_observed_at"] = observed_at.isoformat()
     imported = any((event.get("new_rows") or 0) > 0 for event in events)
+    activity_dates = set()
+    for event in events:
+        activity_dates.update(value for value in event.get("source_activity_dates", []) if isinstance(value, str))
+    baseline_start = dt.datetime.fromisoformat(state["started_at"].replace("Z", "+00:00")).date()
     if imported:
-        state["observations"].append({"at": state["last_observed_at"], "events": events, "scorecard": card})
-    observed_days = {item["at"][:10] for item in state["observations"]
-                     if dt.date.fromisoformat(item["at"][:10]).weekday() < 5}
+        state["observations"].append({"at": state["last_observed_at"], "events": events,
+                                       "source_activity_dates": sorted(activity_dates), "scorecard": card})
+    observed_days = {value for item in state["observations"] for value in item.get("source_activity_dates", [])
+                     if value >= baseline_start.isoformat() and dt.date.fromisoformat(value).weekday() < 5}
+    collection_days = {item["at"][:10] for item in state["observations"]
+                       if dt.date.fromisoformat(item["at"][:10]).weekday() < 5}
+    state["collection_weekday_days"] = len(collection_days)
     state["weekday_days_observed"] = len(observed_days)
     state["baseline_exit"] = len(observed_days) >= 5 and not card.get("missing_strata")
     payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
@@ -172,12 +231,13 @@ def main() -> int:
     try:
         events = import_organic(args) if args.collect else []
         card = authoritative_scorecard(args)
-        state = update_state(args.state, args.project, dt.datetime.now(dt.timezone.utc), card, events)
+        state = update_state(args.state, args.project, dt.datetime.now(dt.timezone.utc), card, events, repo=args.repo, db=args.db)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"baseline collection failed: {exc}", file=sys.stderr)
         return 1
     output = {"project": args.project, "database": "configured metrics store", "scorecard": card,
               "baseline": {"weekday_days_observed": state["weekday_days_observed"],
+                           "collection_weekday_days": state.get("collection_weekday_days", 0),
                            "exit": state["baseline_exit"]}, "events": events}
     if args.status_markdown:
         args.status_markdown.write_text(

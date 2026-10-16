@@ -38,10 +38,28 @@ class BaselineScorecardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             started = dt.datetime(2026, 10, 12, tzinfo=dt.timezone.utc)
-            state = MOD.update_state(path, "pulp", started, {"missing_strata": ["rerun"]}, [{"new_rows": 1}], started)
+            state = MOD.update_state(path, "pulp", started, {"missing_strata": ["rerun"]},
+                                     [{"new_rows": 1, "source_activity_dates": ["2026-10-12"]}], started)
             self.assertEqual(state["weekday_days_observed"], 1)
             self.assertFalse(state["baseline_exit"])
             self.assertEqual(len(json.loads(path.read_text())["observations"]), 1)
+
+    def test_historical_import_does_not_count_collection_day(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            started = dt.datetime(2026, 10, 16, tzinfo=dt.timezone.utc)
+            state = MOD.update_state(path, "pulp", started, {"missing_strata": ["rerun"]},
+                                     [{"new_rows": 2, "source_activity_dates": ["2026-09-01"]}], started)
+            self.assertEqual(state["weekday_days_observed"], 0)
+            self.assertEqual(state["collection_weekday_days"], 1)
+
+    def test_mismatched_identity_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); path = root / "state.json"; db = root / "metrics" / "metrics.db"
+            db.parent.mkdir(); path.write_text(json.dumps({"identity": {"project": "old", "repo": "o/r",
+                "database": str(db.resolve())}, "observations": [{"at": "2026-10-12T00:00:00+00:00"}]}))
+            with self.assertRaises(RuntimeError):
+                MOD.validate_state_identity(path, "demo", "o/r", db)
 
 
 class CollectorInvocationTests(unittest.TestCase):
