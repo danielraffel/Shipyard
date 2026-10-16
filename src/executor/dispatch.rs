@@ -743,6 +743,11 @@ impl ExecutorDispatcher {
                             -> crate::executor::streaming::ProgressAction
                 }),
             });
+            // Lease acquisition is the unambiguous dispatch boundary. Keep
+            // the attempted member even when validation fails or is
+            // cancelled; busy, deferred, and probe-only paths never reach
+            // this point and remain unattributed.
+            result.selected_route = Some(member.label.clone());
 
             if matches!(
                 result.status,
@@ -3110,9 +3115,57 @@ backend = "local"
 
         assert_eq!(result.status, TargetStatus::Pass);
         assert_eq!(result.backend, "host-pool:local_macs/local");
+        assert_eq!(result.selected_route.as_deref(), Some("local"));
         assert!(observed_job_id.get());
         let store = HostPoolLeaseStore::new(default_lease_path(temp.path()));
         assert!(store.leases().expect("leases").is_empty());
+    }
+
+    #[test]
+    fn host_pool_dispatch_attributes_member_when_validation_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let config = table(&format!(
+            r#"
+            [validation.default]
+            command = "false"
+
+            [host_pools.local_macs]
+
+            [[host_pools.local_macs.members]]
+            id = "local"
+            type = "local"
+            cwd = {{}}
+            capabilities = ["macos", "arm64"]
+
+            [targets.mac]
+            backend = "host-pool"
+            pool = "local_macs"
+            platform = "macos-arm64"
+            requires = ["macos", "arm64"]
+            "#,
+            toml_string(repo.display().to_string())
+        ));
+        let target = resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0);
+        let dispatcher = super::ExecutorDispatcher::new_with_state_dir(None, temp.path());
+
+        let result = dispatcher.validate(super::DispatchValidationRequest {
+            job_id: Some("job-host-pool-fail".to_owned()),
+            defer_host_pool_lease_unavailable: false,
+            sha: "abc1234".to_owned(),
+            branch: "main".to_owned(),
+            target: &target,
+            log_path: temp.path().join("host-pool-fail.log"),
+            resume_from: None,
+            mode: ValidationMode::Full,
+            progress_callback: None,
+        });
+
+        assert_ne!(result.status, TargetStatus::Pass);
+        assert_eq!(result.selected_route.as_deref(), Some("local"));
     }
 
     #[test]
@@ -3188,6 +3241,7 @@ backend = "local"
             result.primary_backend.as_deref(),
             Some("host-pool:local_macs/mac-studio")
         );
+        assert_eq!(result.selected_route.as_deref(), Some("local"));
         let leases = store.leases().expect("leases");
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].lease_id, busy.lease_id);
@@ -3261,6 +3315,7 @@ backend = "local"
         );
         assert!(!result.is_terminal());
         assert!(result.failure_class.is_none());
+        assert_eq!(result.selected_route, None);
         assert_eq!(store.leases().expect("leases")[0].lease_id, busy.lease_id);
         store.release(&busy.lease_id).expect("release busy");
     }
