@@ -329,7 +329,8 @@ mod tests {
             1
         );
         assert_eq!(
-            conn.query_row("SELECT run_attempt FROM runs", [], |row| row.get::<_, i64>(0))
+            conn.query_row("SELECT run_attempt FROM runs", [], |row| row
+                .get::<_, i64>(0))
                 .unwrap(),
             2
         );
@@ -518,7 +519,8 @@ mod tests {
         );
         let conn = rusqlite::Connection::open(store.path()).unwrap();
         assert_eq!(
-            conn.query_row("SELECT run_attempt FROM runs", [], |row| row.get::<_, i64>(0))
+            conn.query_row("SELECT run_attempt FROM runs", [], |row| row
+                .get::<_, i64>(0))
                 .unwrap(),
             1
         );
