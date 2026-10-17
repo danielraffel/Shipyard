@@ -638,6 +638,20 @@ a deadline for the content the code reads (`read_pid_file(path) == Some(pid)`).
 To prove a fix, widen the window rather than loop on luck: delaying the stub's
 write by 0.5 s failed the old test on every run.
 
+### Recovering daemon PID evidence
+
+`daemon stop` and `daemon refresh` fail closed when a live PID cannot be
+authenticated as Shipyard-owned, or when an empty/invalid `daemon/daemon.pid`
+is too new to distinguish from a writer that is still starting. They preserve
+the file and endpoint in that case. First confirm that no Shipyard daemon is
+running for the state directory. Then remove **only** that exact
+`daemon/daemon.pid` (and a non-answering `daemon/daemon.sock` if present) and
+retry `shipyard daemon refresh`; never remove a PID file while its process or
+IPC endpoint is still attributable to Shipyard. A PID whose process started
+after the PID file was last modified, or an invalid file older than five
+seconds with no answering endpoint, is recognized as crash/reuse residue and
+cleaned automatically.
+
 ## A unit test must not see the host's GitHub auth
 
 CI runs every test with `SHIPYARD_TEST_HOME` set to the runner's temp
