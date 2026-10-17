@@ -581,12 +581,10 @@ impl MetricsStore {
             let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND run.sha = ?2 AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
             let mut matched = false;
             let mut invalid_duration = false;
-            let mut head_wasted = 0_i64;
-            let mut head_samples = 0_usize;
             for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
             })? {
-                let (status, ms) = row?;
+                let (_, ms) = row?;
                 if ms.is_none_or(|v| v < 0) {
                     // A completed row with NULL/negative duration cannot
                     // substantiate a cost join. Keep the merge unjoined so
@@ -595,17 +593,15 @@ impl MetricsStore {
                     continue;
                 }
                 matched = true;
-                if crate::metrics::proxy::is_failure(&status)
-                    || crate::metrics::proxy::is_cancelled(&status)
-                {
-                    head_wasted = head_wasted.saturating_add(ms.unwrap());
-                    head_samples += 1;
-                }
             }
             if matched && !invalid_duration {
+                // The merged head proved the join; the change's waste is every
+                // failed or cancelled job of its pull request, earlier pushes
+                // included, not only the jobs on the head that merged.
+                let (pr_wasted, pr_samples) = pull_request_waste(&conn, &repo, pr)?;
                 joined += 1;
-                wasted = wasted.saturating_add(head_wasted);
-                samples += head_samples;
+                wasted = wasted.saturating_add(pr_wasted);
+                samples += pr_samples;
             }
         }
         Ok((total, joined, wasted, samples))
@@ -1278,8 +1274,10 @@ impl MetricsStore {
                 reason: format!(
                     "{safe_merge_count} distinct safe receipt heads; {joined_merge_count} have matched completed job evidence"
                 ),
+                // No value under "unavailable": a count with no joined job
+                // evidence is not a measured safely merged change.
                 #[allow(clippy::cast_precision_loss)]
-                value: (safe_merge_count > 0).then_some(safe_merge_count as f64),
+                value: (joined_merge_count > 0).then_some(safe_merge_count as f64),
             },
             wasted_compute_per_safely_merged_change: if joined_merge_count == 0 {
                 unavailable_merge_coverage()
@@ -1410,6 +1408,37 @@ fn wasted_merge_per_change(milliseconds: i64, changes: usize) -> f64 {
 }
 
 #[allow(clippy::cast_precision_loss)]
+/// Failed and cancelled compute across every head of `repo`'s pull request
+/// `pr`: (milliseconds, job samples). A row with no or a negative duration
+/// is not counted.
+fn pull_request_waste(
+    conn: &rusqlite::Connection,
+    repo: &str,
+    pr: i64,
+) -> Result<(i64, usize), rusqlite::Error> {
+    let mut q = conn.prepare(
+        "SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id \
+         WHERE lower(trim(run.repo)) = ?1 AND run.pr = ?2 AND job.completed_at IS NOT NULL",
+    )?;
+    let mut wasted = 0_i64;
+    let mut samples = 0_usize;
+    for row in q.query_map(rusqlite::params![repo, pr], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+    })? {
+        let (status, ms) = row?;
+        let Some(ms) = ms.filter(|value| *value >= 0) else {
+            continue;
+        };
+        if crate::metrics::proxy::is_failure(&status)
+            || crate::metrics::proxy::is_cancelled(&status)
+        {
+            wasted = wasted.saturating_add(ms);
+            samples += 1;
+        }
+    }
+    Ok((wasted, samples))
+}
+
 fn unavailable_merge_coverage() -> ScorecardCoverage {
     ScorecardCoverage {
         status: "unavailable".to_owned(),
@@ -2657,6 +2686,86 @@ mod tests {
                     .unwrap()
                     .1
                     == 1
+        );
+    }
+
+    #[test]
+    fn duplicate_receipts_for_one_head_count_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 30, "success", 1000, 0, false);
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET repo='owner/repo', sha=?1 WHERE pr=30",
+                [&"a".repeat(40)],
+            )
+            .unwrap();
+        let first = test_receipt("dup-1", "owner/repo", "repo", 30, 'a');
+        let mut second = first.clone();
+        second.receipt_id = "dup-2".into();
+        assert_eq!(store.import_merge_receipts(&[first, second]).unwrap(), 2);
+        let (total, joined, _, _) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            (total, joined),
+            (1, 1),
+            "two receipt ids, one head, one change"
+        );
+        let scorecard = store.stewardship_scorecard("repo", 2).unwrap();
+        assert_eq!(scorecard.safely_merged_changes.value, Some(1.0));
+    }
+
+    #[test]
+    fn waste_per_change_counts_every_head_of_the_pull_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        // An earlier push failed for 5 s; the merged head passed in 1 s.
+        insert_scorecard_sample(&store, "repo", 31, "failure", 5000, 0, false);
+        insert_scorecard_sample(&store, "repo", 31, "success", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute("UPDATE runs SET repo='owner/repo' WHERE pr=31", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE runs SET sha=?1 WHERE pr=31 AND status='failure'",
+            [&"e".repeat(40)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE runs SET sha=?1 WHERE pr=31 AND status='success'",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        // Control: another pull request's failure never counts.
+        insert_scorecard_sample(&store, "repo", 32, "failure", 9000, 0, false);
+        conn.execute("UPDATE runs SET repo='owner/repo' WHERE pr=32", [])
+            .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt("pr-31", "owner/repo", "repo", 31, 'a')])
+            .unwrap();
+        let summary = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(summary, (1, 1, 5000, 1));
+    }
+
+    #[test]
+    fn an_unjoined_safe_merge_count_carries_no_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        store
+            .import_merge_receipts(&[test_receipt("unjoined", "owner/repo", "repo", 33, 'a')])
+            .unwrap();
+        let scorecard = store.stewardship_scorecard("repo", 2).unwrap();
+        assert_eq!(scorecard.safely_merged_changes.status, "unavailable");
+        assert_eq!(scorecard.safely_merged_changes.value, None);
+        assert!(
+            scorecard
+                .safely_merged_changes
+                .reason
+                .contains("1 distinct safe receipt heads")
         );
     }
 

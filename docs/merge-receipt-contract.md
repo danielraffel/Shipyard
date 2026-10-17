@@ -30,11 +30,15 @@ fails closed. `-` or an omitted file reads stdin.
 
 The SQLite store keeps receipts in `merge_receipts`, keyed by `receipt_id`.
 Scorecards count distinct imported safe `head_sha` values in the requested
-window and join failed/cancelled job compute only by the receipt's exact
-`repo`, exact `head_sha`, and PR number. Duplicate receipts for a head are deduplicated;
+window. A receipt joins only when completed jobs exist for its exact `repo`,
+exact `head_sha`, and PR number. A joined change's wasted compute is every
+failed or cancelled job of that pull request, earlier pushes included, so
+`wasted_compute_per_safely_merged_change` is per change, not per merged head.
+Duplicate receipts for a head (different `receipt_id`s) count once;
 conflicting records for one repository and PR are rejected. Receipts
 without a matching completed job identity produce `partial` or `unavailable`
-coverage rather than a zero-cost claim. Distinct PR throughput is never used
+coverage rather than a zero-cost claim, and an `unavailable` row carries no
+value. Distinct PR throughput is never used
 as a substitute.
 
 The current GitHub API importer does not produce these receipts because it has

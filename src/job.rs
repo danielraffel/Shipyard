@@ -227,6 +227,9 @@ pub struct TargetResult {
     /// treated as a terminal validation outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler_defer_reason: Option<String>,
+    /// Dispatch attempts attributed at the authoritative backend boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_attempts: Option<Vec<RouteAttempt>>,
 }
 
 impl TargetResult {
@@ -273,6 +276,7 @@ impl TargetResult {
             cloud_failed_step: None,
             failure_parser: None,
             scheduler_defer_reason: None,
+            route_attempts: None,
         }
     }
 
@@ -300,6 +304,19 @@ impl TargetResult {
     pub fn to_json_value(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("TargetResult must serialize")
     }
+}
+
+/// One backend attempt observed after probe/lease admission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RouteAttempt {
+    /// Canonical route identity, never a parsed display label.
+    pub route_id: String,
+    /// Position in the authoritative backend order.
+    pub position: usize,
+    /// Result of the attempted backend.
+    pub outcome: TargetStatus,
+    /// Time at which dispatch entered the backend.
+    pub attempted_at: DateTime<Utc>,
 }
 
 /// Validation job across one or more targets.
