@@ -37,9 +37,9 @@ use crate::job::{
 };
 use crate::queue::{Queue, QueueDeferredRequeue, QueueError, STALE_RUNNING_CANCEL_REASON};
 use crate::queue_request::{
-    QueueOutcomeStore, QueueRequestError, QueueRequestResult, QueueRequestStore,
-    QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner,
-    QueuedShipDisposition,
+    JobResourcePlan, QueueOutcomeStore, QueueRequestError, QueueRequestResult, QueueRequestStore,
+    QueuedBackendSnapshot, QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionOutcome,
+    QueuedExecutionOwner, QueuedExecutionRequest, QueuedShipDisposition,
 };
 use crate::queue_scheduler::{
     VmSlotCapacity, apply_admit_pass_for_drain, plan_admit_pass_from_jobs_with_vm_slots,
@@ -2043,7 +2043,11 @@ fn recover_foreground_running_jobs_for_drain(
         .get_running()?
         .into_iter()
         .filter_map(|job| match request_store.load(&job.id) {
-            Ok(Some(envelope)) if envelope.job_id == job.id && envelope.is_foreground_owned() => {
+            Ok(Some(envelope))
+                if envelope.job_id == job.id
+                    && envelope.is_foreground_owned()
+                    && envelope_matches_foreground_job(&job, &envelope) =>
+            {
                 Some(job.id)
             }
             // Missing, corrupt, or daemon-owned envelopes are unknown or
@@ -2056,6 +2060,89 @@ fn recover_foreground_running_jobs_for_drain(
     queue
         .recover_selected_running_jobs_for_drain(drain_lock, &recoverable)
         .map_err(ShipExecutionError::from)
+}
+
+fn envelope_matches_foreground_job(job: &Job, envelope: &QueuedExecutionEnvelope) -> bool {
+    let (kind, branch, mode, target_names, local_only, expected_plan, workload_scope) =
+        match &envelope.request {
+            QueuedExecutionRequest::Run(request) => (
+                JobKind::Run,
+                request.branch.as_str(),
+                request.mode,
+                request
+                    .targets
+                    .iter()
+                    .map(|target| target.name.clone())
+                    .collect::<Vec<_>>(),
+                targets_are_typed_local(&request.targets),
+                request
+                    .to_execution_request()
+                    .ok()
+                    .map(|request| JobResourcePlan::from_run_request(&envelope.cwd, &request)),
+                crate::queue_request::run_workload_scope(&envelope.cwd),
+            ),
+            QueuedExecutionRequest::Ship(request) => (
+                JobKind::Ship,
+                request.branch.as_str(),
+                request.mode,
+                request
+                    .targets
+                    .iter()
+                    .map(|target| target.name.clone())
+                    .collect::<Vec<_>>(),
+                targets_are_typed_local(&request.targets),
+                request
+                    .to_execution_request()
+                    .ok()
+                    .map(|request| JobResourcePlan::from_ship_request(&envelope.cwd, &request)),
+                format!(
+                    "ship:{}:pr-{}",
+                    canonical_repository(&request.repo),
+                    request.pr
+                ),
+            ),
+        };
+    let envelope_kind_matches = matches!(
+        (&envelope.kind, kind),
+        (QueuedExecutionKind::Run, JobKind::Run) | (QueuedExecutionKind::Ship, JobKind::Ship)
+    );
+    let provenance_matches = match &envelope.request {
+        QueuedExecutionRequest::Run(_) => true,
+        QueuedExecutionRequest::Ship(request) => envelope
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.repo_slug.as_deref())
+            .is_none_or(|repo| canonical_repository(repo) == canonical_repository(&request.repo)),
+    };
+    envelope_kind_matches
+        && provenance_matches
+        && job.kind == Some(kind)
+        && job.branch == branch
+        && job.mode == mode
+        && job.sha
+            == match &envelope.request {
+                QueuedExecutionRequest::Run(request) => request.sha.as_str(),
+                QueuedExecutionRequest::Ship(request) => request.sha.as_str(),
+            }
+        && job.target_names == target_names
+        && job.workload_scope.as_deref() == Some(workload_scope.as_str())
+        && expected_plan.as_ref() == Some(&envelope.resource_plan)
+        && local_only
+}
+
+fn targets_are_typed_local(targets: &[crate::queue_request::QueuedResolvedTarget]) -> bool {
+    !targets.is_empty()
+        && targets.iter().all(|target| {
+            target.backend_name == "local"
+                && target.host.is_none()
+                && matches!(
+                    (&target.backend, &target.validation),
+                    (
+                        QueuedBackendSnapshot::Local(backend),
+                        crate::queue_request::QueuedValidationSnapshot::Local(_)
+                    ) if backend.name == target.name && backend.platform == target.platform
+                )
+        })
 }
 
 fn scheduler_host_pools(
@@ -3156,8 +3243,8 @@ mod tests {
         ShipTargetDispatcher, TargetExecOptions, TargetExecutionOutcome, WarmPoolUpdate,
         apply_warm_reuse, cap_admit_pass_workers, drain_or_wait_run,
         drain_or_wait_run_with_options, drain_or_wait_ship_awaited_only,
-        drain_or_wait_ship_with_scope, execute_run, execute_run_worker, execute_ship,
-        execute_ship_worker, execute_targets_with_options,
+        drain_or_wait_ship_with_scope, envelope_matches_foreground_job, execute_run,
+        execute_run_worker, execute_ship, execute_ship_worker, execute_targets_with_options,
         leases_not_covered_by_running_reservations, load_run_outcome, load_ship_outcome,
         recover_foreground_running_jobs_for_drain, retry_attempt_log_path, run_drain_worker_cycle,
         stale_head_reason, submit_run, submit_ship, target_log_path, update_warm_pool_after_run,
@@ -3169,10 +3256,13 @@ mod tests {
     };
     use crate::executor::streaming::{ProgressAction, ProgressEvent};
     use crate::host_pool::HostPoolLease;
-    use crate::job::{Job, JobStatus, Priority, TargetResult, TargetStatus, ValidationMode};
+    use crate::job::{
+        Job, JobKind, JobStatus, Priority, TargetResult, TargetStatus, ValidationMode,
+    };
     use crate::queue::Queue;
     use crate::queue_request::{
-        QueueOutcomeStore, QueueRequestStore, QueuedExecutionOutcome, QueuedExecutionRequest,
+        ExecutionProvenance, QueueOutcomeStore, QueueRequestStore, QueuedExecutionKind,
+        QueuedExecutionOutcome, QueuedExecutionRequest,
     };
     use crate::queue_scheduler::{AdmitPassPlan, RequestBackedAdmitPass, SamePrShipAdmission};
     use crate::ship_state::{AbandonRecord, ShipState, ShipStateStore};
@@ -4293,6 +4383,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn foreground_recovery_preserves_daemon_owned_running_jobs() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state_dir = temp.path().join("state");
@@ -4305,7 +4396,7 @@ mod tests {
             warm_disabled: false,
             fail_fast: false,
             resume_from: None,
-            targets: vec![ssh_target()],
+            targets: vec![local_target_without_cwd("local", "linux")],
         };
         let daemon_job =
             submit_run(&request, &mut queue, temp.path(), &state_dir).expect("daemon submit");
@@ -4317,7 +4408,74 @@ mod tests {
         mismatched_request.branch = "feature/mismatched".to_owned();
         let mismatched_job = submit_run(&mismatched_request, &mut queue, temp.path(), &state_dir)
             .expect("mismatched submit");
+        let mut remote_request = request.clone();
+        remote_request.branch = "feature/remote".to_owned();
+        remote_request.targets = vec![ssh_target()];
+        let remote_job = submit_run(&remote_request, &mut queue, temp.path(), &state_dir)
+            .expect("remote submit");
         let store = QueueRequestStore::new(&state_dir).expect("store");
+        let foreground_envelope = store
+            .load(&foreground_job.id)
+            .expect("load")
+            .expect("foreground envelope");
+        assert!(envelope_matches_foreground_job(
+            &foreground_job,
+            &foreground_envelope
+        ));
+        let mut wrong_kind = foreground_job.clone();
+        wrong_kind.kind = Some(JobKind::Ship);
+        assert!(!envelope_matches_foreground_job(
+            &wrong_kind,
+            &foreground_envelope
+        ));
+        let mut wrong_envelope_kind = foreground_envelope.clone();
+        wrong_envelope_kind.kind = QueuedExecutionKind::Ship;
+        assert!(!envelope_matches_foreground_job(
+            &foreground_job,
+            &wrong_envelope_kind
+        ));
+        let mut wrong_sha = foreground_job.clone();
+        wrong_sha.sha = "different-sha".to_owned();
+        assert!(!envelope_matches_foreground_job(
+            &wrong_sha,
+            &foreground_envelope
+        ));
+        let mut wrong_targets = foreground_job.clone();
+        wrong_targets.target_names = vec!["different-target".to_owned()];
+        assert!(!envelope_matches_foreground_job(
+            &wrong_targets,
+            &foreground_envelope
+        ));
+        let mut wrong_mode = foreground_job.clone();
+        wrong_mode.mode = ValidationMode::Smoke;
+        assert!(!envelope_matches_foreground_job(
+            &wrong_mode,
+            &foreground_envelope
+        ));
+        let mut wrong_branch = foreground_job.clone();
+        wrong_branch.branch = "feature/other-branch".to_owned();
+        assert!(!envelope_matches_foreground_job(
+            &wrong_branch,
+            &foreground_envelope
+        ));
+        let mut wrong_plan = foreground_envelope.clone();
+        wrong_plan
+            .resource_plan
+            .exclusive_claims
+            .push("tampered-claim".to_owned());
+        assert!(!envelope_matches_foreground_job(
+            &foreground_job,
+            &wrong_plan
+        ));
+        let mut empty_targets = foreground_envelope.clone();
+        if let QueuedExecutionRequest::Run(request) = &mut empty_targets.request {
+            request.targets.clear();
+        }
+        empty_targets.resource_plan = crate::queue_request::JobResourcePlan::default();
+        assert!(!envelope_matches_foreground_job(
+            &foreground_job,
+            &empty_targets
+        ));
         let mut daemon_envelope = store
             .load(&daemon_job.id)
             .expect("load")
@@ -4334,6 +4492,22 @@ mod tests {
             serde_json::to_vec(&mismatched_envelope).expect("serialize"),
         )
         .expect("swap mismatched envelope");
+        let remote_envelope = store
+            .load(&remote_job.id)
+            .expect("load")
+            .expect("remote envelope");
+        let mut mislabeled_local = foreground_envelope.clone();
+        if let (
+            QueuedExecutionRequest::Run(local_request),
+            QueuedExecutionRequest::Run(remote_request),
+        ) = (&mut mislabeled_local.request, &remote_envelope.request)
+        {
+            local_request.targets[0].backend = remote_request.targets[0].backend.clone();
+        }
+        assert!(!envelope_matches_foreground_job(
+            &foreground_job,
+            &mislabeled_local
+        ));
         let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
         queue
             .start_pending_jobs_for_drain(
@@ -4342,6 +4516,7 @@ mod tests {
                     daemon_job.id.clone(),
                     foreground_job.id.clone(),
                     mismatched_job.id.clone(),
+                    remote_job.id.clone(),
                 ],
             )
             .expect("start jobs");
@@ -4379,6 +4554,15 @@ mod tests {
                 .expect("mismatched job")
                 .status,
             JobStatus::Running
+        );
+        assert_eq!(
+            queue
+                .get(&remote_job.id)
+                .expect("read")
+                .expect("remote job")
+                .status,
+            JobStatus::Running,
+            "foreground recovery must not claim absence of remote workers"
         );
     }
 
@@ -4441,6 +4625,42 @@ mod tests {
                 .status,
             JobStatus::Pending
         );
+    }
+
+    #[test]
+    fn foreground_ship_recovery_binds_repo_pr_and_local_macos_vm_plan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let mut queue = Queue::new(&state_dir).expect("queue");
+        let request = ship_request(vec![local_target_without_cwd("mac", "macos-arm64")]);
+        let job = submit_ship(&request, &mut queue, temp.path(), &state_dir).expect("ship submit");
+        let store = QueueRequestStore::new(&state_dir).expect("store");
+        let envelope = store.load(&job.id).expect("load").expect("envelope");
+        assert!(envelope_matches_foreground_job(&job, &envelope));
+        assert_eq!(
+            envelope.resource_plan.vm_slots,
+            vec![crate::queue_request::VmSlotDemand {
+                key: "macos".to_owned(),
+                slots: 1,
+            }]
+        );
+
+        let mut wrong_repo = envelope.clone();
+        if let QueuedExecutionRequest::Ship(request) = &mut wrong_repo.request {
+            request.repo = "other/repository".to_owned();
+        }
+        assert!(!envelope_matches_foreground_job(&job, &wrong_repo));
+
+        let mut wrong_provenance = envelope.clone();
+        wrong_provenance.provenance = Some(ExecutionProvenance {
+            canonical_cwd: temp.path().to_owned(),
+            repo_root: temp.path().to_owned(),
+            repo_slug: Some("other/repository".to_owned()),
+            head_sha: request.sha.clone(),
+            tree_signature: "fixture-tree".to_owned(),
+            config_signature: None,
+        });
+        assert!(!envelope_matches_foreground_job(&job, &wrong_provenance));
     }
 
     #[test]

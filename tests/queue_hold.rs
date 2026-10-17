@@ -3,6 +3,7 @@
 #![cfg(target_os = "macos")]
 
 use std::fs;
+use std::io::Read;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -55,6 +56,15 @@ fn wait_for_file(path: &Path) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn read_fifo_signal(path: &Path) {
+    let mut signal = String::new();
+    fs::File::open(path)
+        .expect("open fifo signal")
+        .read_to_string(&mut signal)
+        .expect("read fifo signal");
+    assert!(!signal.is_empty(), "fifo signal must not be empty");
 }
 
 fn make_fifo(path: &Path) {
@@ -134,7 +144,7 @@ fn env_reporting_child(
             "\"$SHIPYARD_QUEUE_HOLD_OWNER_PID\" ",
             "\"$SHIPYARD_QUEUE_HOLD_OWNER_PROCESS_START\" ",
             "\"$SHIPYARD_QUEUE_HOLD_FD\" > \"$3\"; ",
-            "touch \"$4\"; read _ < \"$5\""
+            ": > \"$4\"; read _ < \"$5\""
         )
         .to_owned(),
         "queue-hold-child".to_owned(),
@@ -144,6 +154,97 @@ fn env_reporting_child(
         ready.display().to_string(),
         release.display().to_string(),
     ]
+}
+
+#[test]
+fn descendant_holding_inherited_lock_blocks_after_owner_death() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("state");
+    let verified = temp.path().join("verified.json");
+    let environment = temp.path().join("environment");
+    let ready = temp.path().join("ready");
+    let owner_release = temp.path().join("owner-release");
+    let descendant_release = temp.path().join("descendant-release");
+    let descendant_done = temp.path().join("descendant-done");
+    make_fifo(&ready);
+    make_fifo(&owner_release);
+    make_fifo(&descendant_release);
+    make_fifo(&descendant_done);
+    let child = vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        concat!(
+            "\"$1\" --state-dir \"$SHIPYARD_QUEUE_HOLD_STATE_DIR\" --json ",
+            "queue-hold verify ",
+            "--hold-id \"$SHIPYARD_QUEUE_HOLD_ID\" ",
+            "--generation \"$SHIPYARD_QUEUE_HOLD_GENERATION\" ",
+            "--host-id \"$SHIPYARD_QUEUE_HOLD_HOST_ID\" ",
+            "--scope-digest \"$SHIPYARD_QUEUE_HOLD_SCOPE_DIGEST\" ",
+            "--owner-pid \"$SHIPYARD_QUEUE_HOLD_OWNER_PID\" ",
+            "--owner-process-start \"$SHIPYARD_QUEUE_HOLD_OWNER_PROCESS_START\" ",
+            "--fd \"$SHIPYARD_QUEUE_HOLD_FD\" > \"$2\" || exit $?; ",
+            "printf '%s\\n' ",
+            "\"$SHIPYARD_QUEUE_HOLD_ID\" ",
+            "\"$SHIPYARD_QUEUE_HOLD_GENERATION\" ",
+            "\"$SHIPYARD_QUEUE_HOLD_HOST_ID\" ",
+            "\"$SHIPYARD_QUEUE_HOLD_SCOPE_DIGEST\" ",
+            "\"$SHIPYARD_QUEUE_HOLD_OWNER_PID\" ",
+            "\"$SHIPYARD_QUEUE_HOLD_OWNER_PROCESS_START\" ",
+            "\"$SHIPYARD_QUEUE_HOLD_FD\" > \"$3\"; ",
+            "(read _ < \"$6\"; eval \"exec ${SHIPYARD_QUEUE_HOLD_FD}>&-\"; printf 'done\\n' > \"$7\") & ",
+            "printf 'ready\\n' > \"$4\"; read _ < \"$5\""
+        )
+        .to_owned(),
+        "queue-hold-child".to_owned(),
+        binary().to_owned(),
+        verified.display().to_string(),
+        environment.display().to_string(),
+        ready.display().to_string(),
+        owner_release.display().to_string(),
+        descendant_release.display().to_string(),
+        descendant_done.display().to_string(),
+    ];
+    let child_refs = child.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut wrapper = hold_command(&state_dir, &child_refs)
+        .spawn()
+        .expect("spawn hold");
+    read_fifo_signal(&ready);
+    let env = read_env(&environment);
+    let owner_pid = env[4].parse::<u32>().expect("owner pid");
+    assert_eq!(
+        owner_pid,
+        wrapper.id(),
+        "queue-hold must exec the owner in place"
+    );
+
+    assert_eq!(
+        Command::new("/bin/kill")
+            .args(["-KILL", &owner_pid.to_string()])
+            .status()
+            .expect("kill owner")
+            .code(),
+        Some(0)
+    );
+    assert_eq!(wrapper.wait().expect("wait wrapper").signal(), Some(9));
+    assert!(
+        Queue::new(&state_dir)
+            .expect("queue")
+            .acquire_drain_lock()
+            .expect("lock observation")
+            .is_none(),
+        "a live descendant holding the inherited descriptor must retain the lock"
+    );
+
+    fs::write(&descendant_release, b"release\n").expect("release descendant");
+    read_fifo_signal(&descendant_done);
+    assert!(
+        Queue::new(&state_dir)
+            .expect("queue")
+            .acquire_drain_lock()
+            .expect("lock after descendant release")
+            .is_some(),
+        "the lock must become available after the descendant closes its descriptor"
+    );
 }
 
 #[test]
