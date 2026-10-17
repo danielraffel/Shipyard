@@ -3872,4 +3872,5 @@ list, and gate receipt hash; GitHub merged PR counts cannot authorize a safe
 merge denominator or replace gate evidence. Wasted compute per safely merged change covers every
 failed or cancelled job of the merged pull request, earlier pushes included;
 duplicate receipts for one head count once, and an `unavailable` row has no
-value.
+value. Merge-group runs carry no PR number and are not counted, and the
+waste is not limited to the scorecard window.
