@@ -644,9 +644,12 @@ write by 0.5 s failed the old test on every run.
 0, including mid-suite, with no "Ran N tests" line and every later test
 unrun. The "Python helper tests" job once stayed green that way for days: a
 module under test left a SIGALRM pending whose handler calls `os._exit(0)`.
-The job runs `scripts/run_unittest_strict.py`, which passes only when
-unittest exited 0 and printed its own "Ran N tests" line ending in OK. When a
-test job's log has no summary, treat it as red whatever its conclusion says.
+The job runs `scripts/run_unittest_strict.py`, which counts the discovered
+tests first and passes only when unittest exited 0 and its last "Ran N tests"
+line equals that count and ends in OK. A count is needed because a test that
+runs a child unittest puts the child's "Ran 1 test ... OK" in the same log.
+When a test job's log has no summary, or its count is short of what discovery
+finds, treat it as red whatever its conclusion says.
 
 ## A unit test must not see the host's GitHub auth
 

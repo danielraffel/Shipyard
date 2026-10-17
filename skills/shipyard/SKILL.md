@@ -4108,8 +4108,8 @@ even mid-suite: a module that leaves a SIGALRM pending with an `os._exit(0)`
 handler once ended the helper suite about 380 tests in, green, with every
 later test unrun. Never leave a signal handler or alarm installed after a
 function returns (cancel it in a `finally`), and run the suite through
-`scripts/run_unittest_strict.py`, which requires unittest's own "Ran N tests"
-and "OK" lines.
+`scripts/run_unittest_strict.py`, which requires the last "Ran N tests" line
+to count every discovered test and to end in "OK".
 
 The live webhook gate is intentionally dangerous because it resets the local
 Funnel config:

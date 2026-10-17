@@ -1,5 +1,6 @@
 """Positive controls for run_unittest_strict.py: a planted failure, a suite
-ended mid-run with status 0, and a leaked alarm each make it fail."""
+ended mid-run with status 0, a leaked alarm, and a child unittest's summary
+printed before the suite ends with status 0 each make it fail."""
 import pathlib
 import subprocess
 import sys
@@ -60,14 +61,36 @@ class StrictRunner(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("no 'Ran N tests' line", result.stdout)
 
+    def test_a_child_summary_then_exit_0_fails(self) -> None:
+        # A test runs a child unittest whose "Ran 1 test ... OK" reaches the
+        # same output, then the suite ends with status 0 before summarising.
+        result = self.run_suite("""
+            import os, subprocess, sys, tempfile, textwrap, unittest
+            CHILD = "import unittest\\nclass C(unittest.TestCase):\\n    def test_c(self): pass\\n"
+            class T(unittest.TestCase):
+                def test_a(self): pass
+                def test_b_child_then_exit(self):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        open(os.path.join(tmp, "test_child.py"), "w").write(CHILD)
+                        out = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", tmp],
+                                             capture_output=True, text=True).stderr
+                    sys.stderr.write(out); sys.stderr.flush()
+                    os._exit(0)
+                def test_c_never_runs(self): pass
+        """)
+        self.assertIn("Ran 1 test in", result.stdout, "control: the child's summary is in the output")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("the last summary ran 1 tests but discovery found 3", result.stdout)
+
     def test_verdict_needs_ok_after_the_last_summary(self) -> None:
         import importlib.util
         spec = importlib.util.spec_from_file_location("strict", RUNNER)
         strict = importlib.util.module_from_spec(spec); spec.loader.exec_module(strict)
-        self.assertEqual(strict.verdict(0, "...\nRan 3 tests in 0.1s\n\nOK\n")[0], True)
-        self.assertEqual(strict.verdict(0, "...\nRan 3 tests in 0.1s\n\nOK (skipped=1)\n")[0], True)
-        self.assertEqual(strict.verdict(0, "...\nRan 3 tests in 0.1s\n\nFAILED (errors=1)\n")[0], False)
-        self.assertEqual(strict.verdict(0, "test_a ... ok\n")[0], False)
+        self.assertEqual(strict.verdict(0, "...\nRan 3 tests in 0.1s\n\nOK\n", 3)[0], True)
+        self.assertEqual(strict.verdict(0, "...\nRan 3 tests in 0.1s\n\nOK (skipped=1)\n", 3)[0], True)
+        self.assertEqual(strict.verdict(0, "...\nRan 3 tests in 0.1s\n\nFAILED (errors=1)\n", 3)[0], False)
+        self.assertEqual(strict.verdict(0, "test_a ... ok\n", 3)[0], False)
+        self.assertEqual(strict.verdict(0, "...\nRan 1 test in 0.1s\n\nOK\n", 3)[0], False)
 
 
 if __name__ == "__main__":
