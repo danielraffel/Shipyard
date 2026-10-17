@@ -52,7 +52,7 @@ Before publishing a new Shipyard CLI release, run the local gates that
 match the change:
 
 ```sh
-python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 scripts/run_unittest_strict.py -s scripts -p 'test_*.py'
 cargo fmt -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked

@@ -565,7 +565,7 @@ Run the main local gates before relying on a source build:
 ```bash
 cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
-python3 -m unittest discover -s scripts -p 'test_*.py'
+python3 scripts/run_unittest_strict.py -s scripts -p 'test_*.py'
 ```
 
 ### Make a source build your system `shipyard`

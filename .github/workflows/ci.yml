@@ -183,7 +183,9 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Run packaging helper tests
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+        # Passes only when unittest printed its own summary and it reads OK: a
+        # bare `unittest discover` exits 0 when the process is ended mid-suite.
+        run: python3 scripts/run_unittest_strict.py -s scripts -p 'test_*.py'
 
   # Names the cause of each failed job in this run as a `ci.cause/v1` record,
   # printed as a `::notice title=ci-cause::` annotation. A job's own log can be

@@ -652,6 +652,19 @@ after the PID file was last modified, or an invalid file older than five
 seconds with no answering endpoint, is recognized as crash/reuse residue and
 cleaned automatically.
 
+## A green test job must have printed its summary
+
+`python3 -m unittest discover` exits 0 whenever its process ends with status
+0, including mid-suite, with no "Ran N tests" line and every later test
+unrun. The "Python helper tests" job once stayed green that way for days: a
+module under test left a SIGALRM pending whose handler calls `os._exit(0)`.
+The job runs `scripts/run_unittest_strict.py`, which counts the discovered
+tests first and passes only when unittest exited 0 and its last "Ran N tests"
+line equals that count and ends in OK. A count is needed because a test that
+runs a child unittest puts the child's "Ran 1 test ... OK" in the same log.
+When a test job's log has no summary, or its count is short of what discovery
+finds, treat it as red whatever its conclusion says.
+
 ## A unit test must not see the host's GitHub auth
 
 CI runs every test with `SHIPYARD_TEST_HOME` set to the runner's temp
