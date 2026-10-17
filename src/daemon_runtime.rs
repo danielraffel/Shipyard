@@ -1176,8 +1176,11 @@ fn stop_running_with_status(
     });
 
     #[cfg(unix)]
-    let pid_was_reused =
-        pid.is_some_and(|pid| pid_alive(pid) && process_started_after_pid_file(pid, &pid_path));
+    let pid_was_reused = pid.is_some_and(|pid| {
+        pid_alive(pid)
+            && !process_looks_like_shipyard_daemon(pid)
+            && process_started_after_pid_file(pid, &pid_path)
+    });
     #[cfg(not(unix))]
     let pid_was_reused = false;
     let stop_attempt =
@@ -4533,6 +4536,40 @@ mod tests {
             .expect("child exited");
         assert!(status.success());
         assert!(!pid_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backdated_pid_file_does_not_reclassify_a_shipyard_daemon_as_reused() {
+        let _tree_test = lock_process_tree_for_test();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let daemon_dir = temp.path().join("daemon");
+        std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
+        let pid_path = daemon_dir.join("daemon.pid");
+        let mut stub = DaemonStub::spawn(
+            &temp.path().join("shipyard-daemon-run-backdated.sh"),
+            &pid_path,
+            "rm -f \"$pid_file\"; exit 0",
+        );
+        let child = &mut stub.child;
+        await_stub_ready(&pid_path, child.id());
+        let touched = Command::new("touch")
+            .args(["-t", "200001010000", pid_path.to_str().unwrap()])
+            .status()
+            .expect("touch available");
+        assert!(touched.success());
+
+        assert!(process_started_after_pid_file(child.id(), &pid_path));
+        assert!(stop_running(temp.path()));
+        let status = child
+            .wait_timeout(Duration::from_secs(15))
+            .expect("wait")
+            .or_else(|| {
+                let _ = child.kill();
+                child.wait().ok()
+            })
+            .expect("child exited");
+        assert!(status.success());
     }
 
     #[cfg(unix)]
