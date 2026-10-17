@@ -4439,10 +4439,20 @@ filter typo cannot pass vacuously); `lease_tests.rs` has the helper. Do not
 "fix" it with a poll-until-acquirable loop, which hides a real leak too.
 
 **Running a different command than CI does.** Before concluding the repo is
-broken, read the workflow's own command and env. `cargo test --lib` aborts on a
-stack overflow that CI never sees, because every lane sets
-`RUST_MIN_STACK: 8388608` for the CLI dispatch enum. A control proves your
-instrument works; it does not prove you aimed it at the right thing.
+broken, read the workflow's own command and env: every lane sets
+`RUST_MIN_STACK: 8388608`, so a stack overflow can abort a plain local
+`cargo test --lib` that CI never sees. A control proves your instrument works;
+it does not prove you aimed it at the right thing.
+
+**Tests parse the CLI through `Cli::parse_from` / `Cli::try_parse_from`.** In a
+debug build the derived Clap builder for the top-level `Command` enum takes
+about 1.5 MiB of stack in one frame and calls `RunnerCommand`'s, which takes
+about 1 MiB more, so a parse needs more than a 2 MiB test worker. The test-only
+inherent `Cli::parse_from` and `Cli::try_parse_from` parse on an 8 MiB thread;
+calling `<Cli as Parser>::parse_from` directly in a test bypasses that and
+overflows when `RUST_MIN_STACK` is unset. To find a frame like this, read the
+prologues: `xcrun objdump -d` the test binary and look for
+`sub x9, sp, #N, lsl #12` (a stack-probe loop) at the top of a function.
 
 ### A daemon background loop must not inherit the reconciler's gating
 

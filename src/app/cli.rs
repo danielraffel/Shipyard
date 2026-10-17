@@ -42,6 +42,11 @@ impl Cli {
     /// thread used by the real CLI, so exercise that same parser on a bounded
     /// main-thread-sized stack instead of making every parser test depend on
     /// `RUST_MIN_STACK` in its environment.
+    ///
+    /// In a debug build the derived builder for the top-level `Command` enum
+    /// takes about 1.5 MiB of stack in one frame and calls `RunnerCommand`'s,
+    /// which takes about 1 MiB more, so a parse needs more than the 2 MiB a
+    /// test worker gets.
     fn try_parse_from<I, T>(arguments: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
@@ -55,6 +60,18 @@ impl Cli {
             .expect("spawn CLI parser test thread")
             .join()
             .expect("CLI parser test thread")
+    }
+
+    /// `Parser::parse_from` on the same main-thread-sized stack. Clap's own
+    /// `parse_from` does not go through `try_parse_from` above, so without
+    /// this every test that calls `Cli::parse_from` overflows a default test
+    /// worker. On a parse error it exits the way clap's does.
+    pub(super) fn parse_from<I, T>(arguments: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString>,
+    {
+        Self::try_parse_from(arguments).unwrap_or_else(|error| error.exit())
     }
 }
 
@@ -3731,6 +3748,19 @@ mod tests {
         AuthCommand, Cli, Command, DependencyCommand, PulpDependencyCommand, QueueHoldCommand,
         RunnerCommand, WaitCommand,
     };
+
+    #[test]
+    fn parse_from_fits_a_default_test_worker_stack() {
+        // An explicit 2 MiB thread is what a test worker gets when
+        // RUST_MIN_STACK is unset, whatever this process's environment says.
+        let cli = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| Cli::parse_from(["shipyard", "--json", "daemon", "status"]))
+            .expect("spawn a default-sized thread")
+            .join()
+            .expect("Cli::parse_from on a 2 MiB thread");
+        assert!(matches!(cli.command, Command::Daemon { .. }));
+    }
 
     #[test]
     fn doctor_repo_overrides_are_available_on_both_auth_surfaces() {

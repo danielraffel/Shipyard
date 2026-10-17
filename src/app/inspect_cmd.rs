@@ -97,8 +97,6 @@ pub(super) fn inspect_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
     use super::{InspectArgs, inspect_command};
     use crate::app::cli::{Cli, Command};
     use crate::identity::RuntimeMode;

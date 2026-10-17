@@ -1731,7 +1731,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use chrono::{TimeZone, Utc};
-    use clap::Parser;
     use serde_json::Value;
 
     use super::{

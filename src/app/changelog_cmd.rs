@@ -495,7 +495,6 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, ExitCode};
 
-    use clap::Parser;
     use serde_json::Value;
 
     use super::{normalize_repo_url, strip_release_sections};
