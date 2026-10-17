@@ -3525,7 +3525,7 @@ mod tests {
         let summary = store
             .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
             .unwrap();
-        assert_eq!(summary, (1, 1, 0, 0));
+        assert_eq!(summary, (1, 1, 0, 0, 1));
     }
 
     #[test]
