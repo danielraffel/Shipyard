@@ -68,7 +68,14 @@ fn main() {
     let head = git(&root, &["rev-parse", "HEAD"]);
     let clean = git(
         &root,
-        &["status", "--porcelain", "--untracked-files=normal"],
+        // Status is read during concurrent builds; never take Git's optional
+        // index lock just to decide whether provenance can be authenticated.
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+        ],
     )
     .is_some_and(|status| status.is_empty());
     // Ignored Rust inputs can alter compilation without appearing in status.

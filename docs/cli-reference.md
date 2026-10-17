@@ -516,6 +516,13 @@ shape. Only an authenticated `production` or `synthetic` label is eligible for
 provenance-qualified scorecard populations; unknown rows remain visible in the
 `scorecard.provenance` counts and are excluded from promotion decisions.
 
+The current GitHub importer does not assign authenticated `production` or
+`synthetic` provenance, so imported GitHub rows normally remain `unknown` and
+`qualified_jobs` is expected to be zero. That is an honest unavailable
+measurement, not evidence that no production jobs exist. A future producer
+must attach verified provenance at the producer boundary; the importer does
+not infer it from event names, repository, workflow, or runner identity.
+
 The agent-facing queries are `summary`, `scorecard`, `slowest`, `watch`,
 `advise`, and `compare`. `scorecard` returns one bounded project-level view of
 job outcomes (success, failure, and other terminal outcomes), worker-minutes,

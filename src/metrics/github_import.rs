@@ -25,6 +25,16 @@ pub struct GithubImportRequest {
     pub limit: u32,
 }
 
+/// Outcome of a bounded GitHub import. Malformed workflow runs are skipped so
+/// one provider record cannot discard otherwise usable job observations.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GithubImportReport {
+    /// Completed job rows written to the metrics store.
+    pub imported: usize,
+    /// Workflow runs skipped because their identity was malformed.
+    pub skipped_runs: usize,
+}
+
 impl GithubImportRequest {
     /// The project key rows are stored under.
     #[must_use]
@@ -77,6 +87,16 @@ pub fn import_github<E>(
     gh: &mut dyn FnMut(&[String]) -> Result<Value, E>,
     store_error: &dyn Fn(String) -> E,
 ) -> Result<usize, E> {
+    import_github_report(store, request, gh, store_error).map(|report| report.imported)
+}
+
+/// Import GitHub jobs and report malformed workflow runs skipped along the way.
+pub fn import_github_report<E>(
+    store: &MetricsStore,
+    request: &GithubImportRequest,
+    gh: &mut dyn FnMut(&[String]) -> Result<Value, E>,
+    store_error: &dyn Fn(String) -> E,
+) -> Result<GithubImportReport, E> {
     let mut run_args = vec![
         "api".to_owned(),
         "-X".to_owned(),
@@ -99,23 +119,26 @@ pub fn import_github<E>(
     // `total_count` therefore does not make this response malformed; the
     // caller's imported count remains a bounded sample rather than a census.
     let mut run_ids = Vec::with_capacity(run_values.len());
+    let mut skipped_runs = 0usize;
     for run in run_values {
-        let metadata = serde_json::from_value::<GithubRunMetadata>(run.clone())
-            .map_err(|error| store_error(format!("GitHub workflow run parse failed: {error}")))?;
+        let metadata = match serde_json::from_value::<GithubRunMetadata>(run.clone()) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                skipped_runs = skipped_runs.saturating_add(1);
+                continue;
+            }
+        };
         let Some(run_id) = metadata.id else {
-            return Err(store_error(
-                "GitHub workflow run has no numeric id".to_owned(),
-            ));
+            skipped_runs = skipped_runs.saturating_add(1);
+            continue;
         };
         let Some(event) = metadata.event.as_deref().filter(|event| !event.is_empty()) else {
-            return Err(store_error(format!(
-                "GitHub workflow run {run_id} has no event"
-            )));
+            skipped_runs = skipped_runs.saturating_add(1);
+            continue;
         };
         if event == "merge_group" && metadata.head_sha.as_deref().is_none_or(str::is_empty) {
-            return Err(store_error(format!(
-                "GitHub merge_group run {run_id} has no head_sha"
-            )));
+            skipped_runs = skipped_runs.saturating_add(1);
+            continue;
         }
         run_ids.push((run_id, workflow_run_single_pr(run), metadata));
     }
@@ -207,12 +230,18 @@ pub fn import_github<E>(
         }
     }
     if pending_inputs.is_empty() {
-        return Ok(0);
+        return Ok(GithubImportReport {
+            imported: 0,
+            skipped_runs,
+        });
     }
     store
         .record_terminal_observations(&pending_inputs)
         .map_err(|error| store_error(format!("GitHub metrics record failed: {error}")))?;
-    Ok(pending_inputs.len())
+    Ok(GithubImportReport {
+        imported: pending_inputs.len(),
+        skipped_runs,
+    })
 }
 
 #[cfg(test)]
@@ -290,6 +319,35 @@ mod tests {
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
         assert_eq!(identity.4, None);
+    }
+
+    #[test]
+    fn skips_and_counts_malformed_workflow_runs_without_losing_valid_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let request = GithubImportRequest {
+            repo: "acme/pulp".to_owned(),
+            project: None,
+            workflow: None,
+            branch: None,
+            limit: 5,
+        };
+        let mut gh = |argv: &[String]| -> Result<Value, String> {
+            if argv[3].ends_with("/runs") {
+                Ok(json!({"workflow_runs": [
+                    {"id": 8, "event": "merge_group"},
+                    {"id": 7, "event": "pull_request", "head_sha": "head",
+                     "pull_requests": [{"number": 9}]}
+                ]}))
+            } else {
+                Ok(json!({"jobs": [{"id": 1, "name": "macos",
+                    "conclusion": "success", "completed_at": "2026-09-30T10:10:00Z"}]}))
+            }
+        };
+        let report = import_github_report(&store, &request, &mut gh, &|error| error).unwrap();
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.skipped_runs, 1);
+        assert_eq!(store.list(Some("acme/pulp"), 10).unwrap().len(), 1);
     }
 
     #[test]

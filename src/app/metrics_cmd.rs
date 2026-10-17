@@ -18,7 +18,7 @@ use crate::identity::RuntimeMode;
 use crate::metrics::freshness::{
     DEFAULT_STALE_AFTER_HOURS, Freshness, FreshnessStatus, parse_stale_after,
 };
-use crate::metrics::github_import::{self, GithubImportRequest};
+use crate::metrics::github_import::{self, GithubImportReport, GithubImportRequest};
 #[cfg(test)]
 use crate::metrics::github_import::{
     github_jobs_api_path, github_runs_api_path, workflow_run_single_pr,
@@ -46,6 +46,8 @@ struct MetricsImportOutput {
     database: String,
     source: String,
     imported: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped_runs: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -247,6 +249,7 @@ pub(super) fn metrics_command<W: Write>(
                     database: store.path().display().to_string(),
                     source: "tartci".to_owned(),
                     imported,
+                    skipped_runs: None,
                 };
                 write_output(stdout, json_output, &output, || {
                     format!("imported {imported} tartci metric rows")
@@ -264,20 +267,25 @@ pub(super) fn metrics_command<W: Write>(
                     database: store.path().display().to_string(),
                     source: "merge-receipt".to_owned(),
                     imported,
+                    skipped_runs: None,
                 };
                 write_output(stdout, json_output, &output, || {
                     format!("imported {imported} merge receipts")
                 })?;
             }
             MetricsImportCommand::Github(args) => {
-                let imported = import_github(&store, &args)?;
+                let report = import_github(&store, &args)?;
                 let output = MetricsImportOutput {
                     database: store.path().display().to_string(),
                     source: "github".to_owned(),
-                    imported,
+                    imported: report.imported,
+                    skipped_runs: Some(report.skipped_runs),
                 };
                 write_output(stdout, json_output, &output, || {
-                    format!("imported {imported} GitHub job rows")
+                    format!(
+                        "imported {} GitHub job rows (skipped {} malformed workflow runs)",
+                        report.imported, report.skipped_runs
+                    )
                 })?;
             }
         },
@@ -564,7 +572,7 @@ fn import_tartci(
 fn import_github(
     store: &MetricsStore,
     args: &MetricsImportGithubArgs,
-) -> Result<usize, CliFailure> {
+) -> Result<GithubImportReport, CliFailure> {
     let request = GithubImportRequest {
         repo: args.repo.clone(),
         project: args.project.clone(),
@@ -573,7 +581,7 @@ fn import_github(
         limit: args.limit,
     };
     let mut gh = |argv: &[String]| gh_json(argv);
-    github_import::import_github(store, &request, &mut gh, &|message| {
+    github_import::import_github_report(store, &request, &mut gh, &|message| {
         CliFailure::new(1, message)
     })
 }
