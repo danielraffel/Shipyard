@@ -11,8 +11,9 @@ use super::{
 };
 use crate::daemon_ipc::read_daemon_status;
 use crate::daemon_runtime::{
-    DaemonRunConfig, DaemonRunError, DaemonSpawnFailedError, SpawnRequest, normalize_repos,
-    resolve_repos, run_blocking, spawn_detached, stop_running,
+    DaemonRunConfig, DaemonRunError, DaemonSpawnFailedError, DaemonStopOutcome, SpawnRequest,
+    describe_unconfirmed_shutdown, normalize_repos, resolve_repos, run_blocking, spawn_detached,
+    stop_running_outcome,
 };
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
@@ -64,11 +65,23 @@ pub(super) fn ensure_execution_daemon(
         let Some(configured) = configured_repositories_with_missing(configured, &requested) else {
             return Ok(0);
         };
-        if !stop_running(&runtime_paths.state_dir) {
-            return Err(CliFailure::new(
-                3,
-                "daemon disappeared while registering a repository; retry the submission",
-            ));
+        match stop_running_outcome(&runtime_paths.state_dir) {
+            DaemonStopOutcome::Stopped => {}
+            DaemonStopOutcome::Absent => {
+                return Err(CliFailure::new(
+                    3,
+                    "daemon disappeared while registering a repository; retry the submission",
+                ));
+            }
+            DaemonStopOutcome::Unconfirmed => {
+                return Err(CliFailure::new(
+                    3,
+                    format!(
+                        "{}; refusing to replace it while registering a repository",
+                        describe_unconfirmed_shutdown(&runtime_paths.state_dir)
+                    ),
+                ));
+            }
         }
         return spawn_execution_daemon(mode, runtime_paths, configured);
     }
@@ -158,8 +171,14 @@ pub(super) fn daemon_command<W: Write>(
         ),
         DaemonCommand::Run { repos } => daemon_run(mode, runtime_paths, &repos),
         DaemonCommand::Stop => {
-            let stopped = stop_running(&runtime_paths.state_dir);
-            render_daemon_stop(stdout, json, stopped)
+            let outcome = stop_running_outcome(&runtime_paths.state_dir);
+            if outcome == DaemonStopOutcome::Unconfirmed {
+                return Err(CliFailure::new(
+                    3,
+                    describe_unconfirmed_shutdown(&runtime_paths.state_dir),
+                ));
+            }
+            render_daemon_stop(stdout, json, outcome == DaemonStopOutcome::Stopped)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?;
             Ok(ExitCode::SUCCESS)
         }
@@ -941,12 +960,20 @@ where
     } else {
         Vec::new()
     };
-    let stopped_prior = stop_running(&runtime_paths.state_dir);
-    if had_prior && !stopped_prior && read_daemon_status(&runtime_paths.state_dir).is_some() {
+    let stop_outcome = stop_running_outcome(&runtime_paths.state_dir);
+    let stopped_prior = stop_outcome == DaemonStopOutcome::Stopped;
+    if stop_outcome == DaemonStopOutcome::Unconfirmed || (had_prior && !stopped_prior) {
         return Err(DaemonRefreshError {
             stopped_prior: false,
             repos: prior_repos,
-            error: "prior daemon did not stop; refusing to report a refreshed daemon".to_owned(),
+            error: format!(
+                "{}; refusing to report a refreshed daemon",
+                if stop_outcome == DaemonStopOutcome::Unconfirmed {
+                    describe_unconfirmed_shutdown(&runtime_paths.state_dir)
+                } else {
+                    "prior daemon did not stop".to_owned()
+                }
+            ),
         });
     }
     // A refresh re-resolves the watch set rather than copying the prior
@@ -1304,7 +1331,7 @@ mod tests {
         DaemonRefreshError, DaemonRefreshOutcome, RuntimeMode, configured_repos_from_status,
         configured_repositories_with_missing, daemon_command, execute_daemon_refresh,
         render_daemon_refresh, render_daemon_refresh_error, render_daemon_start,
-        render_daemon_status, render_daemon_stop, stop_running,
+        render_daemon_status, render_daemon_stop,
     };
 
     #[test]
@@ -1330,7 +1357,7 @@ mod tests {
     #[cfg(unix)]
     use super::{DaemonRunConfig, daemon_run_with_repos, read_daemon_status, run_blocking};
     use crate::app::cli::DaemonCommand;
-    use crate::daemon_runtime::SpawnRequest;
+    use crate::daemon_runtime::{SpawnRequest, stop_running};
     use crate::paths::RuntimePaths;
 
     #[cfg(unix)]
@@ -1773,6 +1800,68 @@ mod tests {
 
         assert!(!outcome.stopped_prior);
         assert!(outcome.repos.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_recovers_refused_socket_after_daemon_disappears() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let daemon_dir = temp.path().join("daemon");
+        std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
+        let socket = daemon_dir.join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        drop(listener);
+        let outcome = execute_daemon_refresh(
+            RuntimeMode::Isolated,
+            None,
+            Some(temp.path().to_path_buf()),
+            &runtime_paths(temp.path()),
+            &["owner/repo".to_owned()],
+            None,
+            |repos| repos,
+            |_request: &SpawnRequest| Ok(999),
+        )
+        .expect("stale endpoint permits refresh");
+        assert!(!outcome.stopped_prior);
+        assert_eq!(outcome.new_pid, 999);
+        assert!(!socket.exists(), "stale endpoint is cleaned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambiguous_pid_blocks_refresh_and_stop_success() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let daemon_dir = temp.path().join("daemon");
+        std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
+        let pid_path = daemon_dir.join("daemon.pid");
+        std::fs::write(&pid_path, "invalid").expect("pid evidence");
+        let error = execute_daemon_refresh(
+            RuntimeMode::Isolated,
+            None,
+            Some(temp.path().to_path_buf()),
+            &runtime_paths(temp.path()),
+            &[],
+            None,
+            |repos| repos,
+            |_request: &SpawnRequest| panic!("ambiguous daemon must prevent spawn"),
+        )
+        .expect_err("unconfirmed shutdown");
+        assert!(!error.stopped_prior);
+        let mut out = Vec::new();
+        assert!(
+            daemon_command(
+                DaemonCommand::Stop,
+                RuntimeMode::Isolated,
+                None,
+                Some(temp.path().to_path_buf()),
+                &runtime_paths(temp.path()),
+                true,
+                &mut out
+            )
+            .is_err()
+        );
+        assert!(out.is_empty());
+        assert_eq!(std::fs::read_to_string(pid_path).unwrap(), "invalid");
     }
 
     #[test]

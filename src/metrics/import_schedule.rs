@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::MetricsStore;
-use super::github_import::{GithubImportRequest, import_github};
+use super::github_import::{GithubImportRequest, import_github_report};
 use crate::config::LoadedConfig;
 
 /// How often the daemon asks whether an import is due.
@@ -139,6 +139,8 @@ pub struct RepoScheduleState {
     pub last_attempt_at: Option<DateTime<Utc>>,
     pub last_success_at: Option<DateTime<Utc>>,
     pub last_imported: Option<usize>,
+    #[serde(default)]
+    pub last_skipped_runs: Option<usize>,
     pub last_error: Option<String>,
 }
 
@@ -172,6 +174,8 @@ pub struct RepoImportOutcome {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_runs: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -231,6 +235,7 @@ pub fn run_pass(
                     repo: repo.clone(),
                     status: "not_due",
                     imported: None,
+                    skipped_runs: None,
                     error: None,
                 });
             }
@@ -256,18 +261,20 @@ pub fn run_pass(
             limit: config.limit,
         };
         let mut gh = |argv: &[String]| gh_for_repo(&repo, argv);
-        let result = import_github(&store, &request, &mut gh, &|message| message);
+        let result = import_github_report(&store, &request, &mut gh, &|message| message);
         let entry = state.repos.entry(repo.clone()).or_default();
         entry.last_attempt_at = Some(now);
         match result {
-            Ok(imported) => {
+            Ok(report) => {
                 entry.last_success_at = Some(now);
-                entry.last_imported = Some(imported);
+                entry.last_imported = Some(report.imported);
+                entry.last_skipped_runs = Some(report.skipped_runs);
                 entry.last_error = None;
                 pass.repos.push(RepoImportOutcome {
                     repo,
                     status: "imported",
-                    imported: Some(imported),
+                    imported: Some(report.imported),
+                    skipped_runs: Some(report.skipped_runs),
                     error: None,
                 });
             }
@@ -277,6 +284,7 @@ pub fn run_pass(
                     repo,
                     status: "failed",
                     imported: None,
+                    skipped_runs: None,
                     error: Some(error),
                 });
             }
@@ -345,7 +353,10 @@ mod tests {
         move |repo, argv| {
             calls.push(format!("{repo} {}", argv[3]));
             if argv[3].ends_with("/runs") {
-                Ok(json!({"workflow_runs": [{"id": 7, "pull_requests": []}]}))
+                Ok(
+                    json!({"workflow_runs": [{"id": 7, "event": "merge_group", "run_attempt": 1,
+                    "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "pull_requests": []}]}),
+                )
             } else {
                 Ok(
                     json!({"jobs": [{"id": 1, "name": "macos", "conclusion": "success",

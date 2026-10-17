@@ -1743,6 +1743,15 @@ reports `no_healthy_lane` when a sampled gate fails too often; `summary
 --group-by host` folds ephemeral runners into their host. Definitions and floors: `docs/cli-reference.md`
 ("Proxy-first verdicts").
 
+The GitHub metrics importer skips malformed workflow-run identity records,
+counts them as `skipped_runs`, and preserves valid job rows. Real GitHub imports
+currently carry no authenticated `production`/`synthetic` provenance, so their
+rows are `unknown` and `qualified_jobs: 0` means unavailable evidence, never
+that production jobs do not exist; provenance must be attached by a trusted
+producer rather than inferred from event, repository, workflow, or runner
+identity. Build provenance checks use `git --no-optional-locks status` to avoid
+contending for `.git/index.lock` during concurrent Git operations.
+
 When fixing GitHub importer bugs, keep Actions list endpoints absolute
 (`/repos/<owner>/<repo>/...`) and force `gh api -X GET` whenever `-f` supplies
 query parameters. `gh api -f` defaults to POST, which can turn a valid list
@@ -2699,6 +2708,17 @@ existing daemon can refresh credentials independently of the submitting shell;
 running daemon from another Shipyard version must be refreshed before a new
 job is persisted. Adding a new repository to a same-version daemon refreshes
 its registration set while exact live workers remain independently owned.
+
+Daemon shutdown is fail-closed when runtime ownership is ambiguous. If
+`daemon stop` or `daemon refresh` reports an unconfirmed live PID or a fresh
+empty/invalid `daemon/daemon.pid`, it preserves the PID file and socket rather
+than guessing. Confirm that no Shipyard daemon is running for that state
+directory, remove only the exact `daemon/daemon.pid` (and a non-answering
+`daemon/daemon.sock` if present), then retry `shipyard daemon refresh`. A live
+PID whose process started after the PID file was modified, or an invalid PID
+file older than five seconds with no answering endpoint, is recognized as
+reused/crash residue and removed automatically. Never delete the evidence
+while its process or IPC endpoint is attributable to Shipyard.
 
 A renamed or transferred repository keeps answering ordinary API reads at its
 old slug (a 301), but the GitHub App installation lookup for the old name is a
@@ -4989,4 +5009,5 @@ compute from those receipts and exact repo/PR joins; PR counts and GitHub
 `partial` or `unavailable`, never a zero-cost merge, and an `unavailable` row
 has no value. Wasted compute per change counts every failed or cancelled job of
 the merged pull request, earlier pushes included; duplicate receipts for one
-head count once.
+head count once. Waste is matched by PR number, so
+merge-group runs are not counted, and it is not limited to the scorecard window.

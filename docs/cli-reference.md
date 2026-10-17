@@ -507,6 +507,22 @@ and provider-neutral:
   `tartci runtime export` when a project uses tartci VM lanes.
 - `shipyard metrics import merge-receipt --file <path>` imports validated `shipyard-merge-receipt/v1` JSON/JSONL; invalid or unavailable provenance stays fail-closed.
 
+GitHub imports retain the workflow event, provider run ID, run attempt, and
+authoritative head SHA on the SQLite run row. These dimensions are independent:
+an event can have multiple attempts, and an attempt can be observed alongside
+other event dimensions. Missing provider fields remain `NULL`. The importer
+does not infer organic or synthetic provenance from event names or pull-request
+shape. Only an authenticated `production` or `synthetic` label is eligible for
+provenance-qualified scorecard populations; unknown rows remain visible in the
+`scorecard.provenance` counts and are excluded from promotion decisions.
+
+The current GitHub importer does not assign authenticated `production` or
+`synthetic` provenance, so imported GitHub rows normally remain `unknown` and
+`qualified_jobs` is expected to be zero. That is an honest unavailable
+measurement, not evidence that no production jobs exist. A future producer
+must attach verified provenance at the producer boundary; the importer does
+not infer it from event names, repository, workflow, or runner identity.
+
 The agent-facing queries are `summary`, `scorecard`, `slowest`, `watch`,
 `advise`, and `compare`. `scorecard` returns one bounded project-level view of
 job outcomes (success, failure, and other terminal outcomes), worker-minutes,
@@ -518,6 +534,19 @@ use as `unavailable` until those values have durable source telemetry; it never
 infers them from job duration. Human output is available by default; `--json`
 returns structured rows, findings, or the scorecard for plugins, MCP tools, and
 monitoring agents.
+
+Scorecard JSON includes an authenticated strata receipt under `strata` using
+schema `shipyard-metrics-strata/v1`. It counts jobs and includes `repo`,
+`window_since`, `window_until`, `source_head`, `generated_at`, `unit`, the
+`normal_pr`, `merge_group`, `rerun`, and `unclassified` strata, and an
+`aggregate`. Each stratum has `observed_jobs`, `qualified_jobs`, `provenance`,
+`coverage`, and `reason`. Only verified production rows with valid
+provider/run/head/attempt identity qualify; merge-group rows do not require a
+pull-request number. Unknown, synthetic, and unverified rows remain visible
+with zero qualified jobs. Observed windows are `partial` because recent-N
+import completeness is unproven. The receipt does not set a minimum sample
+threshold or establish safe-merge authority. When repository binding is
+unavailable, an explicit unavailable envelope is emitted.
 
 The scorecard also reports cost proxies needed for the fleet baseline:
 `wasted_compute_minutes` sums measured duration for failed or cancelled jobs,

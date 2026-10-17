@@ -638,6 +638,20 @@ a deadline for the content the code reads (`read_pid_file(path) == Some(pid)`).
 To prove a fix, widen the window rather than loop on luck: delaying the stub's
 write by 0.5 s failed the old test on every run.
 
+### Recovering daemon PID evidence
+
+`daemon stop` and `daemon refresh` fail closed when a live PID cannot be
+authenticated as Shipyard-owned, or when an empty/invalid `daemon/daemon.pid`
+is too new to distinguish from a writer that is still starting. They preserve
+the file and endpoint in that case. First confirm that no Shipyard daemon is
+running for the state directory. Then remove **only** that exact
+`daemon/daemon.pid` (and a non-answering `daemon/daemon.sock` if present) and
+retry `shipyard daemon refresh`; never remove a PID file while its process or
+IPC endpoint is still attributable to Shipyard. A PID whose process started
+after the PID file was last modified, or an invalid file older than five
+seconds with no answering endpoint, is recognized as crash/reuse residue and
+cleaned automatically.
+
 ## A green test job must have printed its summary
 
 `python3 -m unittest discover` exits 0 whenever its process ends with status
@@ -1337,6 +1351,14 @@ older than `--stale-after` (default 24h, or `[metrics] stale_after`). A stale
 store turns every window into "insufficient samples"; that is a missing import,
 not a lane problem — run `metrics import github` or have the operator enable
 the daemon's `[metrics.import]` job (machine-global config, default off).
+GitHub metrics imports skip malformed workflow-run identity records and report
+`skipped_runs`; they continue importing valid jobs. Current GitHub production
+imports attach no authenticated `production`/`synthetic` provenance, so rows
+remain `unknown` and `qualified_jobs: 0` is an unavailable measurement, not a
+claim that production had no jobs. Do not infer provenance from event, repo,
+workflow, or runner fields. Build provenance reads use `git --no-optional-locks
+status` so concurrent Git operations do not contend on `.git/index.lock`.
+
 `--fail-on-stale` exits 3. `--project` accepts `owner/name` or the short name;
 both reach the same rows, and `empty` usually means a mistyped key.
 
@@ -3885,4 +3907,5 @@ list, and gate receipt hash; GitHub merged PR counts cannot authorize a safe
 merge denominator or replace gate evidence. Wasted compute per safely merged change covers every
 failed or cancelled job of the merged pull request, earlier pushes included;
 duplicate receipts for one head count once, and an `unavailable` row has no
-value.
+value. Merge-group runs carry no PR number and are not counted, and the
+waste is not limited to the scorecard window.
