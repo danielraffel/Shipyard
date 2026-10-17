@@ -1324,6 +1324,14 @@ older than `--stale-after` (default 24h, or `[metrics] stale_after`). A stale
 store turns every window into "insufficient samples"; that is a missing import,
 not a lane problem — run `metrics import github` or have the operator enable
 the daemon's `[metrics.import]` job (machine-global config, default off).
+GitHub metrics imports skip malformed workflow-run identity records and report
+`skipped_runs`; they continue importing valid jobs. Current GitHub production
+imports attach no authenticated `production`/`synthetic` provenance, so rows
+remain `unknown` and `qualified_jobs: 0` is an unavailable measurement, not a
+claim that production had no jobs. Do not infer provenance from event, repo,
+workflow, or runner fields. Build provenance reads use `git --no-optional-locks
+status` so concurrent Git operations do not contend on `.git/index.lock`.
+
 `--fail-on-stale` exits 3. `--project` accepts `owner/name` or the short name;
 both reach the same rows, and `empty` usually means a mistyped key.
 

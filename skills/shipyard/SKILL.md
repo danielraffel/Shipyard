@@ -1743,6 +1743,15 @@ reports `no_healthy_lane` when a sampled gate fails too often; `summary
 --group-by host` folds ephemeral runners into their host. Definitions and floors: `docs/cli-reference.md`
 ("Proxy-first verdicts").
 
+The GitHub metrics importer skips malformed workflow-run identity records,
+counts them as `skipped_runs`, and preserves valid job rows. Real GitHub imports
+currently carry no authenticated `production`/`synthetic` provenance, so their
+rows are `unknown` and `qualified_jobs: 0` means unavailable evidence, never
+that production jobs do not exist; provenance must be attached by a trusted
+producer rather than inferred from event, repository, workflow, or runner
+identity. Build provenance checks use `git --no-optional-locks status` to avoid
+contending for `.git/index.lock` during concurrent Git operations.
+
 When fixing GitHub importer bugs, keep Actions list endpoints absolute
 (`/repos/<owner>/<repo>/...`) and force `gh api -X GET` whenever `-f` supplies
 query parameters. `gh api -f` defaults to POST, which can turn a valid list
