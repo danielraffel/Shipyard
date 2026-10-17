@@ -1410,7 +1410,9 @@ fn wasted_merge_per_change(milliseconds: i64, changes: usize) -> f64 {
 #[allow(clippy::cast_precision_loss)]
 /// Failed and cancelled compute across every head of `repo`'s pull request
 /// `pr`: (milliseconds, job samples). A row with no or a negative duration
-/// is not counted.
+/// is not counted. Runs are matched by PR number, so merge-group runs, which
+/// carry none, are not counted. The query is not limited to the scorecard's
+/// window: a change counted in the window brings all of its PR's waste.
 fn pull_request_waste(
     conn: &rusqlite::Connection,
     repo: &str,
@@ -2749,6 +2751,36 @@ mod tests {
             .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
             .unwrap();
         assert_eq!(summary, (1, 1, 5000, 1));
+    }
+
+    #[test]
+    fn a_negative_duration_on_an_earlier_push_adds_no_waste() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        // The earlier push's failed job has a negative duration; the merged
+        // head passed. The change still joins, and the bad row adds nothing.
+        insert_scorecard_sample(&store, "repo", 34, "failure", -1, 0, false);
+        insert_scorecard_sample(&store, "repo", 34, "success", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute("UPDATE runs SET repo='owner/repo' WHERE pr=34", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE runs SET sha=?1 WHERE pr=34 AND status='failure'",
+            [&"e".repeat(40)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE runs SET sha=?1 WHERE pr=34 AND status='success'",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt("pr-34", "owner/repo", "repo", 34, 'a')])
+            .unwrap();
+        let summary = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(summary, (1, 1, 0, 0));
     }
 
     #[test]

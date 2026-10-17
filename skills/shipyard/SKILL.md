@@ -4981,4 +4981,5 @@ compute from those receipts and exact repo/PR joins; PR counts and GitHub
 `partial` or `unavailable`, never a zero-cost merge, and an `unavailable` row
 has no value. Wasted compute per change counts every failed or cancelled job of
 the merged pull request, earlier pushes included; duplicate receipts for one
-head count once.
+head count once. Waste is matched by PR number, so
+merge-group runs are not counted, and it is not limited to the scorecard window.
