@@ -1605,24 +1605,28 @@ impl MetricsStore {
                     run.head_sha, job.provider, run.provenance, run.provenance_verified
                FROM jobs job JOIN runs run ON run.id = job.run_id
               WHERE {} AND job.completed_at IS NOT NULL
+                AND lower(trim(run.repo)) = ?6
                 AND julianday(job.completed_at) >= julianday(?4)
                 AND julianday(job.completed_at) <= julianday(?5)",
             project_key::sql_filter("run.project", "run.repo")
         ))?;
         let key = ProjectKey::parse(project);
         let (any, short, full) = project_key::sql_params(key.as_ref());
-        for row in statement.query_map(params![any, short, full, cutoff, window_until], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, bool>(7)?,
-            ))
-        })? {
+        for row in statement.query_map(
+            params![any, short, full, cutoff, window_until, repo],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, bool>(7)?,
+                ))
+            },
+        )? {
             let (event, attempt, pr, provider_run_id, head_sha, provider, provenance, verified) =
                 row?;
             let index = strata_index(event.as_deref(), attempt);
@@ -4005,6 +4009,50 @@ mod tests {
         );
         assert_eq!(receipt.aggregate.observed_jobs, 3);
         assert_eq!(receipt.aggregate.qualified_jobs, 1);
+    }
+
+    #[test]
+    fn authenticated_strata_receipt_excludes_jobs_without_repository_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let bound = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            repo: Some("Owner/Shipyard".to_owned()),
+            job: "linux".to_owned(),
+            status: "success".to_owned(),
+            provider: Some("github-hosted".to_owned()),
+            duration_ms: 100,
+            completed_at: Some(Utc::now()),
+            external_id: Some("github:9/1/1".to_owned()),
+            event: Some("pull_request".to_owned()),
+            run_attempt: Some(1),
+            pr: Some(9),
+            provider_run_id: Some(1),
+            head_sha: Some("a".repeat(40)),
+            provenance: Some("production".to_owned()),
+            provenance_verified: true,
+            ..MetricRecordInput::default()
+        };
+        store.record_terminal_observation(&bound).unwrap();
+        store
+            .record_terminal_observation(&MetricRecordInput {
+                repo: None,
+                job: "unbound".to_owned(),
+                external_id: Some("github:9/2/1".to_owned()),
+                pr: Some(10),
+                provider_run_id: Some(2),
+                head_sha: Some("b".repeat(40)),
+                ..bound
+            })
+            .unwrap();
+
+        let receipt = store
+            .authenticated_strata_receipt("shipyard", 1, &"c".repeat(40))
+            .unwrap();
+        assert_eq!(receipt.repo, "owner/shipyard");
+        assert_eq!(receipt.aggregate.observed_jobs, 1);
+        assert_eq!(receipt.aggregate.qualified_jobs, 1);
+        assert_eq!(receipt.strata.normal_pr.observed_jobs, 1);
     }
 
     #[test]
