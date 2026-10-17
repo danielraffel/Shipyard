@@ -138,7 +138,6 @@ fn render_result<W: Write>(
 mod tests {
     use std::fs;
 
-    use clap::Parser;
     use serde_json::json;
     use tempfile::TempDir;
     use toml::Table;
