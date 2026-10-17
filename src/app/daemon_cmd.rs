@@ -12,7 +12,8 @@ use super::{
 use crate::daemon_ipc::read_daemon_status;
 use crate::daemon_runtime::{
     DaemonRunConfig, DaemonRunError, DaemonSpawnFailedError, DaemonStopOutcome, SpawnRequest,
-    normalize_repos, resolve_repos, run_blocking, spawn_detached, stop_running_outcome,
+    describe_unconfirmed_shutdown, normalize_repos, resolve_repos, run_blocking, spawn_detached,
+    stop_running_outcome,
 };
 use crate::identity::RuntimeMode;
 use crate::output::write_json_envelope;
@@ -75,7 +76,10 @@ pub(super) fn ensure_execution_daemon(
             DaemonStopOutcome::Unconfirmed => {
                 return Err(CliFailure::new(
                     3,
-                    "prior daemon shutdown is unconfirmed; refusing to replace it while registering a repository",
+                    format!(
+                        "{}; refusing to replace it while registering a repository",
+                        describe_unconfirmed_shutdown(&runtime_paths.state_dir)
+                    ),
                 ));
             }
         }
@@ -171,7 +175,7 @@ pub(super) fn daemon_command<W: Write>(
             if outcome == DaemonStopOutcome::Unconfirmed {
                 return Err(CliFailure::new(
                     3,
-                    "daemon shutdown is unconfirmed; runtime evidence was preserved",
+                    describe_unconfirmed_shutdown(&runtime_paths.state_dir),
                 ));
             }
             render_daemon_stop(stdout, json, outcome == DaemonStopOutcome::Stopped)
@@ -962,7 +966,14 @@ where
         return Err(DaemonRefreshError {
             stopped_prior: false,
             repos: prior_repos,
-            error: "prior daemon did not stop; refusing to report a refreshed daemon".to_owned(),
+            error: format!(
+                "{}; refusing to report a refreshed daemon",
+                if stop_outcome == DaemonStopOutcome::Unconfirmed {
+                    describe_unconfirmed_shutdown(&runtime_paths.state_dir)
+                } else {
+                    "prior daemon did not stop".to_owned()
+                }
+            ),
         });
     }
     // A refresh re-resolves the watch set rather than copying the prior

@@ -71,6 +71,12 @@ const WEBHOOK_REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 #[cfg(unix)]
 const WEBHOOK_REVERIFY_INTERVAL: Duration = Duration::from_mins(30);
 
+/// A pid file is written before the daemon starts serving IPC. If a process
+/// with that PID started after the file was last modified, the PID was reused
+/// and the file is crash residue rather than evidence of an owned process.
+#[cfg(unix)]
+const INVALID_PID_RECOVERY_AGE: Duration = Duration::from_secs(5);
+
 /// Foreground daemon runtime configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonRunConfig {
@@ -1138,6 +1144,22 @@ pub(crate) fn stop_running_outcome(state_dir: &Path) -> DaemonStopOutcome {
     stop_running_with_status(state_dir, |path| read_daemon_status(path).is_some())
 }
 
+/// Explain the evidence that requires an operator to resolve an ambiguous
+/// shutdown before retrying a replacement.
+pub(crate) fn describe_unconfirmed_shutdown(state_dir: &Path) -> String {
+    let pid_path = state_dir.join("daemon").join("daemon.pid");
+    let evidence = match fs::read_to_string(&pid_path) {
+        Ok(contents) if contents.trim().is_empty() => "empty or invalid PID".to_owned(),
+        Ok(contents) => format!("PID {}", contents.trim()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "missing PID".to_owned(),
+        Err(error) => format!("unreadable PID ({error})"),
+    };
+    format!(
+        "daemon shutdown is unconfirmed for {} ({evidence}); confirm that no Shipyard daemon is running for this state directory, remove only that exact file, then retry `shipyard daemon refresh`",
+        pid_path.display()
+    )
+}
+
 fn stop_running_with_status(
     state_dir: &Path,
     mut status_available: impl FnMut(&Path) -> bool,
@@ -1153,12 +1175,32 @@ fn stop_running_with_status(
         pid == std::process::id() || (pid_alive(pid) && process_looks_like_shipyard_daemon(pid))
     });
 
-    let stop_attempt = socket_path
-        .exists()
-        .then(|| send_stop_request(&socket_path));
+    #[cfg(unix)]
+    let pid_was_reused =
+        pid.is_some_and(|pid| pid_alive(pid) && process_started_after_pid_file(pid, &pid_path));
+    #[cfg(not(unix))]
+    let pid_was_reused = false;
+    let stop_attempt =
+        (!pid_was_reused && socket_path.exists()).then(|| send_stop_request(&socket_path));
     let stop_requested = matches!(stop_attempt, Some(Ok(())));
     let endpoint_unreachable = matches!(stop_attempt, Some(Err(ref error))
-        if matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound));
+        if matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound))
+        || stop_attempt.is_none();
+    #[cfg(unix)]
+    let invalid_pid_is_stale = pid.is_none()
+        && pid_path.exists()
+        && endpoint_unreachable
+        && pid_file_is_older_than(&pid_path, INVALID_PID_RECOVERY_AGE);
+
+    #[cfg(unix)]
+    if pid_was_reused || invalid_pid_is_stale {
+        // A live process that started after the pid file was written cannot be
+        // the daemon that created it. Likewise, an invalid file left behind by
+        // a crash is recoverable once it has aged beyond the write window and
+        // no IPC endpoint answers. Neither case authorizes signaling a process.
+        let _ = cleanup_stale_runtime_files(&daemon_dir);
+        return DaemonStopOutcome::Absent;
+    }
 
     // Status is an observation, not proof of absence. A reachable IPC endpoint
     // still needs its shutdown observed when the initial status request failed.
@@ -1202,6 +1244,7 @@ fn stop_running_with_status(
     if let Some(pid) = pid.filter(|pid| *pid > 0 && *pid != std::process::id())
         && pid_alive(pid)
         && process_looks_like_shipyard_daemon(pid)
+        && !pid_was_reused
     {
         let stopped = terminate_daemon_pid(pid, Duration::from_secs(3));
         if stopped {
@@ -2255,6 +2298,78 @@ fn read_pid_file(path: &Path) -> Option<u32> {
         .parse::<u32>()
         .ok()
         .filter(|pid| (1..=i32::MAX as u32).contains(pid))
+}
+
+#[cfg(unix)]
+fn pid_file_is_older_than(path: &Path, age: Duration) -> bool {
+    let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|elapsed| elapsed >= age)
+}
+
+#[cfg(unix)]
+fn process_started_after_pid_file(pid: u32, pid_path: &Path) -> bool {
+    let Ok(modified) = fs::metadata(pid_path).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    let Ok(output) = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "etime="])
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(elapsed_seconds) = parse_process_elapsed(String::from_utf8_lossy(&output.stdout).trim())
+    else {
+        return false;
+    };
+    let Some(started) = SystemTime::now().checked_sub(Duration::from_secs(elapsed_seconds)) else {
+        return false;
+    };
+    // `ps etime` is whole-second resolution. Keep a small margin so a daemon
+    // that wrote its PID immediately after fork is not mistaken for a reused
+    // PID merely because both timestamps fall in the same second.
+    started
+        .duration_since(modified)
+        .is_ok_and(|delta| delta >= Duration::from_secs(2))
+}
+
+#[cfg(unix)]
+fn parse_process_elapsed(value: &str) -> Result<u64, ()> {
+    let (days, clock) = if let Some((days, clock)) = value.split_once('-') {
+        (days.parse::<u64>().map_err(|_| ())?, clock)
+    } else {
+        (0, value)
+    };
+    let fields = clock
+        .split(':')
+        .map(|field| field.trim().parse::<u64>().map_err(|_| ()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let seconds = match fields.as_slice() {
+        [minutes, seconds] => minutes
+            .checked_mul(60)
+            .and_then(|value| value.checked_add(*seconds)),
+        [hours, minutes, seconds] => hours
+            .checked_mul(3600)
+            .and_then(|value| {
+                minutes
+                    .checked_mul(60)
+                    .and_then(|minutes| value.checked_add(minutes))
+            })
+            .and_then(|value| value.checked_add(*seconds)),
+        _ => None,
+    }
+    .ok_or(())?;
+    days.checked_mul(86_400)
+        .ok_or(())?
+        .checked_add(seconds)
+        .ok_or(())
 }
 
 #[cfg(unix)]
@@ -4331,6 +4446,63 @@ mod tests {
             super::stop_running_outcome(temp.path()),
             super::DaemonStopOutcome::Absent
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_invalid_pid_file_without_an_answering_endpoint_is_recoverable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let daemon_dir = temp.path().join("daemon");
+        std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
+        let pid_path = daemon_dir.join("daemon.pid");
+        std::fs::write(&pid_path, "").expect("empty pid file");
+        let touched = Command::new("touch")
+            .args(["-t", "200001010000", pid_path.to_str().unwrap()])
+            .status()
+            .expect("touch available");
+        assert!(touched.success());
+
+        assert_eq!(
+            super::stop_running_outcome(temp.path()),
+            super::DaemonStopOutcome::Absent
+        );
+        assert!(!pid_path.exists(), "stale invalid evidence is cleaned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pid_started_after_pid_file_is_reused_and_recoverable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let daemon_dir = temp.path().join("daemon");
+        std::fs::create_dir_all(&daemon_dir).expect("daemon dir");
+        let pid_path = daemon_dir.join("daemon.pid");
+        // Create the evidence before starting the unrelated process. Rewriting
+        // the PID and restoring the old mtime models a reused PID after reboot.
+        std::fs::write(&pid_path, "1").expect("placeholder pid");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("unowned child");
+        std::fs::write(&pid_path, child.id().to_string()).expect("reused pid");
+        let touched = Command::new("touch")
+            .args(["-t", "200001010000", pid_path.to_str().unwrap()])
+            .status()
+            .expect("touch available");
+        assert!(touched.success());
+
+        assert!(pid_alive(child.id()), "control: child is alive");
+        assert!(process_started_after_pid_file(child.id(), &pid_path));
+        assert_eq!(
+            super::stop_running_outcome(temp.path()),
+            super::DaemonStopOutcome::Absent
+        );
+        assert!(
+            pid_alive(child.id()),
+            "unowned process must not be signaled"
+        );
+        assert!(!pid_path.exists(), "reused PID evidence is cleaned");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[cfg(unix)]

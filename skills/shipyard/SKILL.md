@@ -2700,6 +2700,17 @@ running daemon from another Shipyard version must be refreshed before a new
 job is persisted. Adding a new repository to a same-version daemon refreshes
 its registration set while exact live workers remain independently owned.
 
+Daemon shutdown is fail-closed when runtime ownership is ambiguous. If
+`daemon stop` or `daemon refresh` reports an unconfirmed live PID or a fresh
+empty/invalid `daemon/daemon.pid`, it preserves the PID file and socket rather
+than guessing. Confirm that no Shipyard daemon is running for that state
+directory, remove only the exact `daemon/daemon.pid` (and a non-answering
+`daemon/daemon.sock` if present), then retry `shipyard daemon refresh`. A live
+PID whose process started after the PID file was modified, or an invalid PID
+file older than five seconds with no answering endpoint, is recognized as
+reused/crash residue and removed automatically. Never delete the evidence
+while its process or IPC endpoint is attributable to Shipyard.
+
 A renamed or transferred repository keeps answering ordinary API reads at its
 old slug (a 301), but the GitHub App installation lookup for the old name is a
 plain 404, so a daemon watching the old slug fails webhook registration on
