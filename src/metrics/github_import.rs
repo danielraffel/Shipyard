@@ -91,6 +91,7 @@ pub fn import_github<E>(
 }
 
 /// Import GitHub jobs and report malformed workflow runs skipped along the way.
+#[allow(clippy::too_many_lines)]
 pub fn import_github_report<E>(
     store: &MetricsStore,
     request: &GithubImportRequest,
@@ -121,12 +122,9 @@ pub fn import_github_report<E>(
     let mut run_ids = Vec::with_capacity(run_values.len());
     let mut skipped_runs = 0usize;
     for run in run_values {
-        let metadata = match serde_json::from_value::<GithubRunMetadata>(run.clone()) {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                skipped_runs = skipped_runs.saturating_add(1);
-                continue;
-            }
+        let Ok(metadata) = serde_json::from_value::<GithubRunMetadata>(run.clone()) else {
+            skipped_runs = skipped_runs.saturating_add(1);
+            continue;
         };
         let Some(run_id) = metadata.id else {
             skipped_runs = skipped_runs.saturating_add(1);
