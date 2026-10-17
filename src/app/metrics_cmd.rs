@@ -18,15 +18,15 @@ use crate::identity::RuntimeMode;
 use crate::metrics::freshness::{
     DEFAULT_STALE_AFTER_HOURS, Freshness, FreshnessStatus, parse_stale_after,
 };
-use crate::metrics::github_import::{self, GithubImportRequest};
+use crate::metrics::github_import::{self, GithubImportReport, GithubImportRequest};
 #[cfg(test)]
 use crate::metrics::github_import::{
     github_jobs_api_path, github_runs_api_path, workflow_run_single_pr,
 };
 use crate::metrics::proxy::{Basis, ProxyValue, WALL_CONTEXT_LABEL};
 use crate::metrics::{
-    GateClass, MetricRecordInput, MetricsFinding, MetricsJobRow, MetricsStore, MetricsSummaryRow,
-    StewardshipScorecard, SummaryGroupBy, parse_duration_ms,
+    AuthenticatedStrataReceipt, GateClass, MetricRecordInput, MetricsFinding, MetricsJobRow,
+    MetricsStore, MetricsSummaryRow, StewardshipScorecard, SummaryGroupBy, parse_duration_ms,
 };
 use crate::output::write_pretty_json;
 
@@ -46,6 +46,8 @@ struct MetricsImportOutput {
     database: String,
     source: String,
     imported: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped_runs: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +90,8 @@ struct MetricsScorecardOutput<'a> {
     #[serde(flatten)]
     scorecard: &'a StewardshipScorecard,
     freshness: &'a Freshness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strata: Option<AuthenticatedStrataReceipt>,
 }
 
 /// `--stale-after` wins; otherwise `[metrics] stale_after`; otherwise 24h.
@@ -245,6 +249,7 @@ pub(super) fn metrics_command<W: Write>(
                     database: store.path().display().to_string(),
                     source: "tartci".to_owned(),
                     imported,
+                    skipped_runs: None,
                 };
                 write_output(stdout, json_output, &output, || {
                     format!("imported {imported} tartci metric rows")
@@ -262,20 +267,25 @@ pub(super) fn metrics_command<W: Write>(
                     database: store.path().display().to_string(),
                     source: "merge-receipt".to_owned(),
                     imported,
+                    skipped_runs: None,
                 };
                 write_output(stdout, json_output, &output, || {
                     format!("imported {imported} merge receipts")
                 })?;
             }
             MetricsImportCommand::Github(args) => {
-                let imported = import_github(&store, &args)?;
+                let report = import_github(&store, &args)?;
                 let output = MetricsImportOutput {
                     database: store.path().display().to_string(),
                     source: "github".to_owned(),
-                    imported,
+                    imported: report.imported,
+                    skipped_runs: Some(report.skipped_runs),
                 };
                 write_output(stdout, json_output, &output, || {
-                    format!("imported {imported} GitHub job rows")
+                    format!(
+                        "imported {} GitHub job rows (skipped {} malformed workflow runs)",
+                        report.imported, report.skipped_runs
+                    )
                 })?;
             }
         },
@@ -390,9 +400,22 @@ pub(super) fn metrics_command<W: Write>(
             let freshness =
                 freshness_for(&store, Some(&args.project), &args.freshness, config_cwd)?;
             let exit = stale_exit(&freshness, args.freshness.fail_on_stale);
+            let strata =
+                match store.authenticated_strata_receipt_from_metadata(&args.project, since_days) {
+                    Ok(receipt) => receipt,
+                    Err(error) => MetricsStore::unavailable_authenticated_strata_receipt(
+                        &args.project,
+                        since_days,
+                        format!("strata receipt unavailable: {error}"),
+                    )
+                    .map_err(|fallback| {
+                        CliFailure::new(1, format!("metrics strata receipt failed: {fallback}"))
+                    })?,
+                };
             let output = MetricsScorecardOutput {
                 scorecard: &scorecard,
                 freshness: &freshness,
+                strata: Some(strata),
             };
             write_output(stdout, json_output, &output, || {
                 let mut text = if freshness.is_degraded() {
@@ -486,6 +509,12 @@ fn record_input(args: MetricsRecordArgs) -> Result<MetricRecordInput, CliFailure
         cache_hit: None,
         runner_assigned: args.runner_assigned,
         labels: (!args.labels.is_empty()).then_some(args.labels),
+        event: None,
+        provider_run_id: None,
+        run_attempt: None,
+        head_sha: None,
+        provenance: None,
+        provenance_verified: false,
         started_at: parse_rfc3339(args.started_at.as_deref())?,
         completed_at: parse_rfc3339(args.completed_at.as_deref())?,
     })
@@ -543,7 +572,7 @@ fn import_tartci(
 fn import_github(
     store: &MetricsStore,
     args: &MetricsImportGithubArgs,
-) -> Result<usize, CliFailure> {
+) -> Result<GithubImportReport, CliFailure> {
     let request = GithubImportRequest {
         repo: args.repo.clone(),
         project: args.project.clone(),
@@ -552,7 +581,7 @@ fn import_github(
         limit: args.limit,
     };
     let mut gh = |argv: &[String]| gh_json(argv);
-    github_import::import_github(store, &request, &mut gh, &|message| {
+    github_import::import_github_report(store, &request, &mut gh, &|message| {
         CliFailure::new(1, message)
     })
 }
@@ -970,6 +999,53 @@ mod tests {
         assert!(trend["rows"].is_array());
         assert!(trend["trend"].is_array());
         assert_eq!(trend["basis"], "wall_time");
+    }
+
+    #[test]
+    fn scorecard_json_emits_authenticated_strata_receipt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        store
+            .record_terminal_observation(&MetricRecordInput {
+                project: "shipyard".to_owned(),
+                repo: Some("owner/shipyard".to_owned()),
+                job: "linux".to_owned(),
+                provider: Some("github-hosted".to_owned()),
+                status: "success".to_owned(),
+                duration_ms: 100,
+                completed_at: Some(Utc::now()),
+                external_id: Some("github:9/1/1".to_owned()),
+                event: Some("pull_request".to_owned()),
+                run_attempt: Some(1),
+                pr: Some(9),
+                provider_run_id: Some(1),
+                head_sha: Some("a".repeat(40)),
+                provenance: Some("production".to_owned()),
+                provenance_verified: true,
+                ..MetricRecordInput::default()
+            })
+            .expect("observation");
+        let mut output = Vec::new();
+        metrics_command(
+            MetricsCommand::Scorecard(crate::app::cli::MetricsWatchArgs {
+                project: "shipyard".to_owned(),
+                since: "14d".to_owned(),
+                required: Vec::new(),
+                basis: crate::app::cli::MetricsBasis::Proxy,
+                freshness: no_freshness_flags(),
+            }),
+            temp.path(),
+            None,
+            true,
+            &mut output,
+        )
+        .expect("scorecard command");
+        let json: Value = serde_json::from_slice(&output).expect("json");
+        assert_eq!(json["strata"]["schema"], "shipyard-metrics-strata/v1");
+        assert_eq!(json["strata"]["unit"], "job");
+        assert_eq!(json["strata"]["strata"]["normal_pr"]["observed_jobs"], 1);
+        assert_eq!(json["strata"]["strata"]["normal_pr"]["qualified_jobs"], 1);
+        assert_eq!(json["strata"]["strata"]["normal_pr"]["coverage"], "partial");
     }
 
     #[test]
