@@ -3252,7 +3252,7 @@ mod tests {
             "owner/repo",
             "feature/x",
             "main",
-            &"a".repeat(40),
+            "a".repeat(40),
             "policy",
         );
         state.append_run(DispatchedRun {
