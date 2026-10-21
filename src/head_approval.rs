@@ -149,6 +149,20 @@ thread_local! {
     static AGENT_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static AGENT_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static HOST_SIGNERS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static HOST_SESSIONS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` as if this host's signers file listed `sessions` (`None`: no
+/// list), on this thread.
+#[cfg(test)]
+pub(crate) fn with_host_sessions<T>(sessions: Option<&[&str]>, body: impl FnOnce() -> T) -> T {
+    HOST_SESSIONS.with(|cell| {
+        *cell.borrow_mut() =
+            sessions.map(|lines| lines.iter().map(|line| session_value(line)).collect());
+    });
+    let result = body();
+    HOST_SESSIONS.with(|cell| *cell.borrow_mut() = None);
+    result
 }
 
 /// Run `body` as if this host's signers file allowed `signers`, on this thread.
@@ -446,6 +460,102 @@ pub fn signers_shape(table: &toml::Table) -> Result<(), String> {
             "[{CONFIG_TABLE}] {SIGNERS_KEY} must be a list of reviewer names, not {value}"
         )),
     }
+}
+
+/// The `sessions` key of [`SIGNERS_FILE`]: the exact `session:` lines a
+/// reviewer writes on its verdicts. The queue-arm guard reads the same key.
+pub const SESSIONS_KEY: &str = "sessions";
+
+/// `line` without a leading `session:`, so an allowlist entry may be written
+/// either way.
+fn session_value(line: &str) -> String {
+    let text = line.trim();
+    text.get(..8)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("session:"))
+        .map_or(text, |_| text[8..].trim())
+        .to_owned()
+}
+
+/// The `session:` lines this host's signers file accepts on an App APPROVE,
+/// or `None` when the file is absent or has no `sessions` key (the rule is
+/// off, with a warning). A file that cannot be read, or a `sessions` value
+/// that is not a list of strings, admits nobody.
+#[must_use]
+pub fn reviewer_sessions() -> Option<Vec<String>> {
+    sessions_at(&guards_dir()?.join(SIGNERS_FILE))
+}
+
+/// [`reviewer_sessions`] read from `path`.
+fn sessions_at(path: &std::path::Path) -> Option<Vec<String>> {
+    if !path.exists() {
+        return None;
+    }
+    let Some(data) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return Some(Vec::new());
+    };
+    let Some(object) = data.as_object() else {
+        return Some(Vec::new());
+    };
+    let lines = object.get(SESSIONS_KEY)?;
+    let Some(lines) = lines
+        .as_array()
+        .filter(|lines| lines.iter().all(Value::is_string))
+    else {
+        return Some(Vec::new());
+    };
+    Some(
+        lines
+            .iter()
+            .filter_map(Value::as_str)
+            .map(session_value)
+            .filter(|value| !value.is_empty())
+            .collect(),
+    )
+}
+
+/// This host's [`reviewer_sessions`]. Tests read `with_host_sessions`.
+#[cfg(not(test))]
+fn host_sessions() -> Option<Vec<String>> {
+    reviewer_sessions()
+}
+
+#[cfg(test)]
+fn host_sessions() -> Option<Vec<String>> {
+    HOST_SESSIONS.with(|cell| cell.borrow().clone())
+}
+
+/// Why `body`'s `session:` lines do not admit an App APPROVE under
+/// `sessions`, or `None`. Every such line must be listed, and there must be
+/// at least one. The `<!-- session: ... -->` stamp `ghapp` adds is not one.
+fn session_refusal(body: &str, sessions: Option<&[String]>) -> Option<String> {
+    let Some(sessions) = sessions else {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "warning: no `{SESSIONS_KEY}` list in the guards directory's {SIGNERS_FILE}; \
+                 an App APPROVE is judged without its `session:` line, so a copied \
+                 `reviewer:` line passes"
+            );
+        });
+        return None;
+    };
+    let pattern =
+        Regex::new(r"(?m)^[ \t]*session:[ \t]*(.*?)[ \t]*$").expect("session pattern compiles");
+    let found: Vec<String> = pattern
+        .captures_iter(body)
+        .filter_map(|capture| capture.get(1))
+        .map(|value| session_value(value.as_str()))
+        .collect();
+    if found.is_empty() {
+        return Some("it has no `session:` line".to_owned());
+    }
+    found
+        .iter()
+        .find(|line| !sessions.contains(*line))
+        .map(|line| format!("its session line `session: {line}` is not on this host's allowlist"))
 }
 
 /// This host's [`reviewer_signers`] for `repo`. Tests read `with_host_signers`.
@@ -892,8 +1002,10 @@ fn approver_allowed(record: &Value, policy: &ApprovalPolicy) -> bool {
 ///
 /// Every agent posts as the same App, so the App's identity says nothing
 /// about who reviewed: an APPROVE `ghapp` stamped with an `unattributed`
-/// session never counts, and on a host with a signers file the body must
-/// carry a `reviewer: <name>` line naming an allowed signer.
+/// session never counts, on a host with a session allowlist every `session:`
+/// line must be listed (and one must be present), and on a host with a
+/// signers file the body must carry a `reviewer: <name>` line naming an
+/// allowed signer.
 fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<String> {
     let body = record
         .get("body")
@@ -901,6 +1013,12 @@ fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<Strin
         .unwrap_or_default();
     if stamped_session(body).as_deref() == Some("unattributed") {
         return Some("its session stamp is unattributed".to_owned());
+    }
+    // Host-local: the repository-side rule has no host to read.
+    if policy.signer_source == SignerSource::Host
+        && let Some(refusal) = session_refusal(body, host_sessions().as_deref())
+    {
+        return Some(refusal);
     }
     if policy.signer_source == SignerSource::Base && policy.signers.is_none() {
         return Some(format!(

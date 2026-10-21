@@ -187,7 +187,19 @@ blocks an earlier approval. A HOLD whose time cannot be read always blocks.
   list takes precedence over the host file, and it is the one the server-side
   `review-verdict` status applies (the status reads no host's file). Without
   either, the signer rule is off on that host;
-  roll it out one host at a time. Each refusal is printed and recorded in
+  roll it out one host at a time.
+* A signer line can be copied, so a host can also list the exact `session:`
+  lines its reviewers write, under a `sessions` key in the same file:
+  `{"sessions": ["session: pulp-review (team-lead team, agent pulp-review, host m3)"]}`
+  (the `session:` prefix is optional in an entry). With the list present, an App
+  APPROVE counts only when it carries at least one `session:` line and every
+  one of them is listed; the `<!-- session: ... -->` stamp `ghapp` adds is not
+  such a line (pulp#10563: a `Daniels-M5-Studio` session signed its APPROVE
+  `reviewer: pulp-review`). An empty list, a `sessions` value that is not a list
+  of strings, or a file that cannot be read admits no App APPROVE. With no file,
+  or a file without the key, the rule is off and the guard prints a warning
+  once. The list is host-local: the server-side `review-verdict` status never
+  reads it. Each refusal is printed and recorded in
   `excluded_approvals`, and Shipyard's own paths report
   `excluded_app_approval:<why>`. A HOLD never needs a signer.
 
@@ -778,6 +790,7 @@ Per-host switches, all in the guards directory:
 |---|---|---|---|
 | review before arm or merge | on | `shipyard guards install --opt-in-review-before-arm` removes an opt-out | `shipyard guards install --opt-out-review-before-arm "<reason>"` |
 | signer rule for App approvals | off | a `reviewer-signers.json` file | remove the file |
+| session allowlist for App approvals | off (warns) | a `sessions` list in `reviewer-signers.json` | remove the key |
 | rebase carry | off | a `rebase-carry` file, or `SHIPYARD_REBASE_CARRY=1` | remove the file; `SHIPYARD_REBASE_CARRY=0` forces it off |
 | HOLD dequeues or disarms | off | a `hold-disarms` file, or `SHIPYARD_HOLD_DISARMS=1` | remove the file; `SHIPYARD_HOLD_DISARMS=0` forces it off |
 

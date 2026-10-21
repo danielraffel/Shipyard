@@ -183,7 +183,10 @@ human the base lists in `[auto_merge] human_reviewers`, empty by default; a
 HOLD from any OWNER/MEMBER/COLLABORATOR still counts; never the PR author's;
 an App APPROVE must be signed with a `reviewer: <name>` line from the base's
 `[auto_merge] reviewer_signers`, else the host's `reviewer-signers.json`,
-where either exists, and never counts when stamped `unattributed`)
+where either exists, and never counts when stamped `unattributed`; where the
+host's `reviewer-signers.json` has a `sessions` list, every `session:` line on
+the App APPROVE must be listed and one must be present, since a copied
+`reviewer:` line otherwise passes; with no list the guard warns once)
 arms or merges only a
 head that carries an
 approval of that exact head from an identity listed in

@@ -1092,6 +1092,131 @@ fn pulp_10320s_unsigned_approve_needs_an_allowed_signer() {
     assert!(gate_on(&by_default("Generous-Corp/pulp"), &head, &[comment]).allows());
 }
 
+const LISTED_SESSION: &str = "session: pulp-review (team-lead team, agent pulp-review, host m3)";
+
+/// The fleet App's APPROVE of `head` carrying `lines`, signed by the base.
+fn app_approve(head: &str, lines: &[&str]) -> (ApprovalPolicy, Value) {
+    let mut policy = by_default("Generous-Corp/pulp");
+    policy.signers = Some(vec!["pulp-review".to_owned()]);
+    let body = format!(
+        "Read-only review.\n{}\nverdict: APPROVE head:{head}",
+        lines.join("\n")
+    );
+    (policy, fleet("2026-10-18T23:33:31Z", &body))
+}
+
+/// pulp#10563 at 8a4e7dd4: a `Daniels-M5-Studio` session signed its APPROVE
+/// `reviewer: pulp-review`. With a session allowlist on the host it needs a
+/// listed `session:` line; the listed line passes.
+#[test]
+fn a_forged_signer_line_needs_a_listed_session_line() {
+    let head = "a".repeat(40);
+    let listed: &[&str] = &[LISTED_SESSION];
+    let forged = app_approve(
+        &head,
+        &[
+            "reviewer: pulp-review",
+            "<!-- session: Daniels-M5-Studio//root/independent_repair_review agent: independent_repair_review -->",
+        ],
+    );
+    super::with_host_sessions(Some(listed), || {
+        assert!(!gate_on(&forged.0, &head, std::slice::from_ref(&forged.1)).allows());
+        assert_eq!(
+            super::verdict_audit_events(
+                &head,
+                &[],
+                std::slice::from_ref(&forged.1),
+                &forged.0,
+                None
+            ),
+            vec!["excluded_app_approval:it has no `session:` line".to_owned()]
+        );
+        let (policy, plain) = app_approve(
+            &head,
+            &[
+                "session: Daniels-M5-Studio/01a0ec3e-83bb-7c72-9086-8a4048dbe113",
+                "reviewer: pulp-review",
+            ],
+        );
+        assert_eq!(
+            super::verdict_audit_events(&head, &[], std::slice::from_ref(&plain), &policy, None),
+            vec![
+                "excluded_app_approval:its session line `session: Daniels-M5-Studio/01a0ec3e-83bb-7c72-9086-8a4048dbe113` is not on this host's allowlist"
+                    .to_owned()
+            ]
+        );
+        assert!(!gate_on(&policy, &head, &[plain]).allows());
+        let (policy, mixed) = app_approve(
+            &head,
+            &[
+                LISTED_SESSION,
+                "session: Daniels-M5-Studio/x",
+                "reviewer: pulp-review",
+            ],
+        );
+        assert!(
+            !gate_on(&policy, &head, &[mixed]).allows(),
+            "every session line must be listed"
+        );
+        let (policy, good) = app_approve(&head, &[LISTED_SESSION, "reviewer: pulp-review"]);
+        assert!(
+            gate_on(&policy, &head, &[good]).allows(),
+            "the listed line passes"
+        );
+        let (policy, unsigned) = app_approve(&head, &[LISTED_SESSION, "reviewer: codex-g2h"]);
+        assert!(
+            !gate_on(&policy, &head, &[unsigned]).allows(),
+            "a listed session does not replace the signer rule"
+        );
+    });
+    // No allowlist on the host: today's behaviour (with a warning).
+    super::with_host_sessions(None, || {
+        assert!(gate_on(&forged.0, &head, std::slice::from_ref(&forged.1)).allows());
+    });
+    // The repository-side rule never reads the host's list.
+    let mut repository_side = forged.0.clone();
+    repository_side.signer_source = super::SignerSource::Base;
+    super::with_host_sessions(Some(&[]), || {
+        assert!(gate_on(&repository_side, &head, std::slice::from_ref(&forged.1)).allows());
+    });
+}
+
+#[test]
+fn the_session_allowlist_is_off_without_one_and_fails_closed() {
+    let temp = tempfile::tempdir().expect("temp");
+    let path = temp.path().join(super::SIGNERS_FILE);
+    assert_eq!(super::sessions_at(&path), None, "no file: off");
+    let listed = vec![LISTED_SESSION["session: ".len()..].to_owned()];
+    for (contents, expected) in [
+        (r#"{"default": ["pulp-review"]}"#.to_owned(), None),
+        (r#"{"sessions": []}"#.to_owned(), Some(Vec::new())),
+        (
+            format!(r#"{{"sessions": "{LISTED_SESSION}"}}"#),
+            Some(Vec::new()),
+        ),
+        (
+            format!(r#"{{"sessions": ["{LISTED_SESSION}", 7]}}"#),
+            Some(Vec::new()),
+        ),
+        ("{not json".to_owned(), Some(Vec::new())),
+        (r#"["pulp-review"]"#.to_owned(), Some(Vec::new())),
+        (
+            format!(r#"{{"sessions": ["  {LISTED_SESSION}  "]}}"#),
+            Some(listed.clone()),
+        ),
+        (
+            format!(
+                r#"{{"sessions": ["{}"]}}"#,
+                &LISTED_SESSION["session: ".len()..]
+            ),
+            Some(listed.clone()),
+        ),
+    ] {
+        std::fs::write(&path, &contents).expect("write");
+        assert_eq!(super::sessions_at(&path), expected, "{contents}");
+    }
+}
+
 #[test]
 fn a_missing_signers_file_is_off_and_an_unreadable_one_admits_nobody() {
     let temp = tempfile::tempdir().expect("temp");
