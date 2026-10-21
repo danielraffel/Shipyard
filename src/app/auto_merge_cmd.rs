@@ -220,9 +220,7 @@ pub(super) fn execute_auto_merge(
                             .archive_scoped_locked(&state.repo, request.pr, &lock)
                             .map_err(AutoMergeOperationError::Store)?;
                         return Ok(AutoMergeOutcome::Merged {
-                            cleanup_warning: receipt_warning
-                                .map(|warning| format!("{error}; {warning}"))
-                                .or(Some(error)),
+                            cleanup_warning: Some(join_warnings(Some(error), receipt_warning)),
                         });
                     }
                     return Ok(AutoMergeOutcome::MergeFailed { error });
@@ -244,7 +242,7 @@ pub(super) fn execute_auto_merge(
                         } else {
                             Ok(())
                         };
-                    cleanup_warning.or(receipt_warning.err())
+                    join_warning_options(cleanup_warning, receipt_warning.err())
                 }
             };
             store
@@ -1140,7 +1138,22 @@ fn classify_builtin_merge_success(
     Ok(MergeDisposition::Enqueued)
 }
 
-/// Emit the authenticated merge receipt only after a direct merge has been
+fn join_warnings(first: Option<String>, second: Option<String>) -> String {
+    match (first, second) {
+        (Some(first), Some(second)) => format!("{first}; {second}"),
+        (Some(first), None) | (None, Some(first)) => first,
+        (None, None) => String::new(),
+    }
+}
+
+fn join_warning_options(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (None, None) => None,
+        (first, second) => Some(join_warnings(first, second)),
+    }
+}
+
+/// Emit a gate-bound merge receipt only after a direct merge has been
 /// confirmed by GitHub. Metrics are observational: a store failure is surfaced
 /// as a warning after the merge, never used to authorize or undo the merge.
 fn emit_confirmed_merge_receipt(
@@ -1659,8 +1672,8 @@ pub(super) fn supervise_merge_queue(
                             })
                     } else {
                         None
-                    }
-                    .or(receipt_warning);
+                    };
+                    let cleanup_warning = join_warning_options(cleanup_warning, receipt_warning);
                     if let Err(error) = archive_queue_state_if_current(
                         store,
                         &state,
@@ -3283,6 +3296,22 @@ mod tests {
         assert_eq!(first, second);
         state.update_evidence("macos", "fail");
         assert!(required_checks(&state).is_err());
+    }
+
+    #[test]
+    fn merge_receipt_warning_is_retained_alongside_cleanup_warning() {
+        assert_eq!(
+            join_warning_options(
+                Some("branch cleanup failed".to_owned()),
+                Some("merge receipt refused".to_owned()),
+            )
+            .as_deref(),
+            Some("branch cleanup failed; merge receipt refused")
+        );
+        assert_eq!(
+            join_warning_options(None, Some("merge receipt refused".to_owned())).as_deref(),
+            Some("merge receipt refused")
+        );
     }
 
     #[cfg(unix)]
