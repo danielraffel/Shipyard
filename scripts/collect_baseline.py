@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import hashlib
 import math
 import pathlib
 import os
@@ -342,7 +343,9 @@ def baseline_readiness(card: dict[str, Any], started: dt.datetime,
     if not isinstance(pass_history, dict):
         reasons.append({"status": "unavailable", "reason": "prospective pass history is unavailable"})
     else:
-        if not pass_history.get("five_continuous_24h_days"):
+        if pass_history.get("status") == "unavailable":
+            reasons.append({"status": "unavailable", "reason": "prospective pass history is unavailable"})
+        elif not pass_history.get("five_continuous_24h_days"):
             reasons.append({"status": "insufficient", "reason": "prospective pass history has fewer than five continuous elapsed 24-hour days"})
         if pass_history.get("missing_intervals") or pass_history.get("failing_intervals"):
             reasons.append({"status": "unavailable", "reason": "prospective pass history contains missing or failed intervals"})
@@ -387,7 +390,8 @@ def baseline_readiness(card: dict[str, Any], started: dt.datetime,
     report_complete = not reasons
     optimization_eligible = report_complete and not eligibility_reasons
     status = "ready" if optimization_eligible else "complete_insufficient" if report_complete else (
-        "insufficient" if any(reason["status"] == "insufficient" for reason in reasons) else "unavailable")
+        "unavailable" if any(reason["status"] == "unavailable" for reason in reasons)
+        else "insufficient")
     return {"status": status, "exit": report_complete, "report_complete": report_complete,
             "optimization_eligible": optimization_eligible, "elapsed_days": elapsed_days,
             "reasons": reasons, "optimization_reasons": eligibility_reasons}
@@ -440,6 +444,11 @@ def update_state(path: pathlib.Path, project: str, started: dt.datetime,
         temporary_path = temporary.name
     os.replace(temporary_path, path)
     return state
+
+
+def default_pass_history_path(args: argparse.Namespace) -> pathlib.Path:
+    key = f"{args.repo}|{args.source_identity}|{args.config_identity}".encode()
+    return args.state.with_name("baseline-pass-history-" + hashlib.sha256(key).hexdigest()[:16] + ".json")
 
 
 def pass_config_identity(args: argparse.Namespace) -> str:
@@ -517,11 +526,12 @@ def main() -> int:
         parser.error("--expected-interval-secs must be positive")
     if args.cadence_slack_secs < 0:
         parser.error("--cadence-slack-secs must be non-negative")
-    args.pass_history_path = args.pass_history or args.state.with_name("baseline-pass-history.json")
+    args.pass_history_path = args.pass_history or default_pass_history_path(args)
 
     events: list[dict[str, Any]] = []
     pass_report: dict[str, Any] | None = None
     pass_recorded = False
+    attempt_started_at = dt.datetime.now(dt.timezone.utc)
     try:
         events = import_organic(args) if args.collect else []
         card = authoritative_scorecard(args)
@@ -529,13 +539,16 @@ def main() -> int:
         if args.collect:
             counts = [event.get("imported") for event in events if event.get("source") in {"github", "tartci"}]
             imported_count = sum(value for value in counts if isinstance(value, int) and not isinstance(value, bool))
-            # Persist the collection observation before recording its successful
-            # pass. A state-write failure must never leave a success-only history.
-            state = update_state(args.state, args.project, completed_at, card, events,
+            for event in events:
+                event.setdefault("attempt_started_at", attempt_started_at.isoformat())
+            state = update_state(args.state, args.project, attempt_started_at, card, events,
                                  observed_at=completed_at, repo=args.repo, db=args.db)
-            pass_report = record_pass_observation(args, "success", completed_at, imported_count=imported_count)
-            pass_recorded = True
-            state = update_state(args.state, args.project, completed_at, card, events,
+            try:
+                pass_report = record_pass_observation(args, "success", completed_at, imported_count=imported_count)
+                pass_recorded = True
+            except (OSError, HistoryValidationError, ValueError, TypeError) as history_error:
+                pass_report = {"status": "unavailable", "reasons": [{"status": "unavailable", "reason": f"prospective pass history unavailable: {history_error}"}]}
+            state = update_state(args.state, args.project, attempt_started_at, card, events,
                                  observed_at=completed_at, repo=args.repo, db=args.db,
                                  pass_history=pass_report, record_observation=False)
         else:
@@ -544,7 +557,7 @@ def main() -> int:
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired) as exc:
         if args.collect and not pass_recorded:
             try:
-                record_pass_observation(args, "failed", dt.datetime.now(dt.timezone.utc), error=str(exc))
+                record_pass_observation(args, "failed", attempt_started_at, error=str(exc))
             except (OSError, HistoryValidationError, ValueError):
                 pass
         print(f"baseline collection failed: {exc}", file=sys.stderr)
