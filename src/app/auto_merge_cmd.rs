@@ -210,12 +210,14 @@ pub(super) fn execute_auto_merge(
                     if merge_error_confirms_merged(&error)
                         || pr_is_merged(request.pr, cwd, request.pr_snapshot_file.as_deref())
                     {
-                        let receipt_warning =
-                            if request.merge_result.is_none() && request.merge_command.is_none() {
-                                emit_confirmed_merge_receipt(store, cwd, &state).err()
-                            } else {
-                                None
-                            };
+                        let receipt_warning = if request.merge_result.is_none()
+                            && request.merge_command.is_none()
+                            && owns_native_merge_authority(&state)
+                        {
+                            emit_confirmed_merge_receipt(store, cwd, &state).err()
+                        } else {
+                            None
+                        };
                         store
                             .archive_scoped_locked(&state.repo, request.pr, &lock)
                             .map_err(AutoMergeOperationError::Store)?;
@@ -236,12 +238,14 @@ pub(super) fn execute_auto_merge(
                     return Ok(AutoMergeOutcome::Enqueued);
                 }
                 MergeDisposition::Merged { cleanup_warning } => {
-                    let receipt_warning =
-                        if request.merge_result.is_none() && request.merge_command.is_none() {
-                            emit_confirmed_merge_receipt(store, cwd, &state)
-                        } else {
-                            Ok(())
-                        };
+                    let receipt_warning = if request.merge_result.is_none()
+                        && request.merge_command.is_none()
+                        && owns_native_merge_authority(&state)
+                    {
+                        emit_confirmed_merge_receipt(store, cwd, &state)
+                    } else {
+                        Ok(())
+                    };
                     join_warning_options(cleanup_warning, receipt_warning.err())
                 }
             };
@@ -1681,7 +1685,9 @@ pub(super) fn supervise_merge_queue(
                     };
                 }
                 if observation.merged {
-                    let receipt_warning = emit_confirmed_merge_receipt(store, cwd, &state).err();
+                    let receipt_warning = owns_native_merge_authority(&state)
+                        .then(|| emit_confirmed_merge_receipt(store, cwd, &state).err())
+                        .flatten();
                     let cleanup_warning = if delete_branch {
                         require_branch_cleanup_git(&mut client, cwd, global_dir)
                             .err()
@@ -3601,7 +3607,10 @@ mod tests {
             ),
             "merged outcome: {merged:?}"
         );
-        assert_eq!(merged_count, 1, "confirmed merge must emit one receipt");
+        assert_eq!(
+            merged_count, 0,
+            "a merge Shipyard did not authorize must not emit a safe receipt"
+        );
 
         let (queue_merged, queue_count) = run("queue_merged", true);
         assert!(
