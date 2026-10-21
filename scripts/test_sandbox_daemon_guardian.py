@@ -1188,34 +1188,71 @@ class GuardianLifecycleTests(unittest.TestCase):
                 fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
             self.assertFalse(guardian._exclusive_lock_is_contended(path))
 
+    def lock_path(self) -> Path:
+        directory = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, True))
+        path = Path(directory) / "writer.lock"
+        path.touch()
+        return path
+
+    def holder_scan(self, path: Path, *holders: int) -> mock.Mock:
+        """An all-process ``lsof -b -F pfDi`` result: this process plus each
+        holder with a descriptor on ``path``'s device and inode."""
+        lock = path.stat()
+        lines = [f"p{os.getpid()}", "f0", "D0x1000013", "i2"]
+        for pid in holders:
+            lines += [f"p{pid}", "fcwd", "D0x1000013", "i3", "f3",
+                      f"D{hex(lock.st_dev)}", f"i{lock.st_ino}"]
+        return mock.Mock(returncode=0, stdout="\n".join(lines) + "\n", stderr="")
+
     def test_holder_probe_distinguishes_no_match_from_lsof_failure(self) -> None:
-        path = Path("/tmp/writer.lock")
-        no_match = mock.Mock(returncode=1, stdout="", stderr="")
-        with mock.patch.object(guardian.subprocess, "run", return_value=no_match):
+        path = self.lock_path()
+        with mock.patch.object(guardian, "_run_bounded", return_value=self.holder_scan(path)):
             self.assertEqual(guardian._lock_holders(path), ())
 
         failed = mock.Mock(returncode=1, stdout="", stderr="permission denied")
-        with mock.patch.object(guardian.subprocess, "run", return_value=failed):
+        with mock.patch.object(guardian, "_run_bounded", return_value=failed):
             with self.assertRaisesRegex(
                 guardian.GuardianError, "could not inspect writer-domain holders"
             ):
                 guardian._lock_holders(path)
 
-    def test_holder_probe_rejects_inconsistent_lsof_success(self) -> None:
-        path = Path("/tmp/writer.lock")
-        inconsistent = mock.Mock(returncode=0, stdout="", stderr="")
+    def test_holder_probe_rejects_a_scan_that_did_not_list_this_process(self) -> None:
+        path = self.lock_path()
+        empty = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(
-            guardian.subprocess, "run", return_value=inconsistent
-        ), self.assertRaisesRegex(guardian.GuardianError, "inconsistent lsof"):
+            guardian, "_run_bounded", return_value=empty
+        ), self.assertRaisesRegex(guardian.GuardianError, "did not list this process"):
             guardian._lock_holders(path)
 
+    def test_holder_probe_matches_device_and_inode_not_inode_alone(self) -> None:
+        path = self.lock_path()
+        lock = path.stat()
+        same_inode_other_device = mock.Mock(
+            returncode=0,
+            stdout=f"p{os.getpid()}\nf0\np4242\nf3\nD{hex(lock.st_dev + 1)}\n"
+            f"i{lock.st_ino}\n",
+            stderr="",
+        )
+        with mock.patch.object(guardian, "_run_bounded", return_value=same_inode_other_device):
+            self.assertEqual(guardian._lock_holders(path), ())
+        with mock.patch.object(
+            guardian, "_run_bounded", return_value=self.holder_scan(path, 4242, 17)
+        ):
+            self.assertEqual(guardian._lock_holders(path), (17, 4242))
+
+    def test_holder_probe_of_a_missing_lock_runs_no_scan(self) -> None:
+        with mock.patch.object(guardian, "_run_bounded") as run:
+            self.assertEqual(guardian._lock_holders(Path("/nonexistent/writer.lock")), ())
+        run.assert_not_called()
+
     def test_holder_probe_revalidates_before_one_timeout_retry(self) -> None:
-        path = Path("/tmp/writer.lock")
+        path = self.lock_path()
         revalidate = mock.Mock()
         timeout = subprocess.TimeoutExpired(["lsof"], 7)
-        success = mock.Mock(returncode=0, stdout="p4242\nf3\n", stderr="")
+        success = self.holder_scan(path, 4242)
         with mock.patch.object(
-            guardian.subprocess, "run", side_effect=[timeout, success]
+            guardian, "_run_bounded", side_effect=[timeout, success]
         ) as run:
             self.assertEqual(
                 guardian._lock_holders(
@@ -1227,16 +1264,7 @@ class GuardianLifecycleTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         self.assertEqual(
             run.call_args_list[0].args[0],
-            [
-                "/usr/sbin/lsof",
-                "-nP",
-                "-S",
-                "2",
-                "-F",
-                "pf",
-                "--",
-                str(path),
-            ],
+            ["/usr/sbin/lsof", "-b", "-w", "-nP", "-S", "2", "-F", "pfDi"],
         )
         revalidate.assert_called_once()
         retry_deadline = revalidate.call_args.args[0]
@@ -1247,28 +1275,28 @@ class GuardianLifecycleTests(unittest.TestCase):
         )
 
     def test_holder_probe_does_not_retry_when_revalidation_fails(self) -> None:
-        path = Path("/tmp/writer.lock")
+        path = self.lock_path()
         timeout = subprocess.TimeoutExpired(["lsof"], 7)
         revalidation_failure = guardian.GuardianError("identity changed")
         revalidate = mock.Mock(side_effect=revalidation_failure)
         with mock.patch.object(
-            guardian.subprocess, "run", side_effect=[timeout]
+            guardian, "_run_bounded", side_effect=[timeout]
         ) as run, self.assertRaisesRegex(guardian.GuardianError, "identity changed"):
             guardian._lock_holders(path, retry_after_timeout=revalidate)
         run.assert_called_once()
         revalidate.assert_called_once()
 
     def test_holder_probe_identity_and_retry_stay_within_composite_budget(self) -> None:
-        path = Path("/tmp/writer.lock")
+        path = self.lock_path()
         timeout = subprocess.TimeoutExpired(["lsof"], 7)
-        success = mock.Mock(returncode=1, stdout="", stderr="")
+        success = self.holder_scan(path)
         revalidate = mock.Mock()
         with mock.patch.object(
             guardian.time,
             "monotonic",
             side_effect=[100.0, 100.0, 107.0, 122.0],
         ), mock.patch.object(
-            guardian.subprocess, "run", side_effect=[timeout, success]
+            guardian, "_run_bounded", side_effect=[timeout, success]
         ) as run:
             self.assertEqual(
                 guardian._lock_holders(
@@ -1289,14 +1317,14 @@ class GuardianLifecycleTests(unittest.TestCase):
         )
 
     def test_holder_probe_explicit_deadline_is_not_refreshed(self) -> None:
-        path = Path("/tmp/writer.lock")
+        path = self.lock_path()
         timeout = subprocess.TimeoutExpired(["lsof"], 7)
-        success = mock.Mock(returncode=1, stdout="", stderr="")
+        success = self.holder_scan(path)
         revalidate = mock.Mock()
         with mock.patch.object(
             guardian.time, "monotonic", side_effect=[100.0, 110.0, 110.0]
         ), mock.patch.object(
-            guardian.subprocess, "run", side_effect=[timeout, success]
+            guardian, "_run_bounded", side_effect=[timeout, success]
         ) as run:
             self.assertEqual(
                 guardian._lock_holders(
@@ -1311,7 +1339,7 @@ class GuardianLifecycleTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[1].kwargs["timeout"], 5.0)
 
     def test_holder_probe_refresh_never_overruns_shorter_outer_deadline(self) -> None:
-        path = Path("/tmp/writer.lock")
+        path = self.lock_path()
         timeout = subprocess.TimeoutExpired(["lsof"], 7)
         revalidate = mock.Mock()
         with mock.patch.object(
@@ -1319,7 +1347,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             "monotonic",
             side_effect=[100.0, 100.0, 107.0, 115.0],
         ), mock.patch.object(
-            guardian.subprocess, "run", side_effect=[timeout]
+            guardian, "_run_bounded", side_effect=[timeout]
         ) as run, self.assertRaisesRegex(
             guardian.GuardianError, "deadline expired"
         ):
@@ -1333,7 +1361,7 @@ class GuardianLifecycleTests(unittest.TestCase):
         revalidate.assert_called_once_with(115.0)
 
     def test_idle_wait_wrapper_forwards_capped_holder_deadline(self) -> None:
-        path = Path("/tmp/writer.lock")
+        path = self.lock_path()
         holder_deadlines: list[float] = []
 
         def observe_holders(
@@ -1377,7 +1405,7 @@ class GuardianLifecycleTests(unittest.TestCase):
             revalidate = mock.Mock()
             timeout = subprocess.TimeoutExpired(["lsof"], 7)
             with mock.patch.object(
-                guardian.subprocess, "run", side_effect=[timeout, timeout]
+                guardian, "_run_bounded", side_effect=[timeout, timeout]
             ), self.assertRaisesRegex(
                 guardian.GuardianError, "after 2 attempt"
             ):
@@ -1395,13 +1423,14 @@ class GuardianLifecycleTests(unittest.TestCase):
                 all(payload["lock_inode"] == path.stat().st_ino for payload in payloads)
             )
 
-    def test_holder_probe_rejects_incomplete_structured_output(self) -> None:
-        path = Path("/tmp/writer.lock")
-        incomplete = mock.Mock(returncode=0, stdout="p4242\n", stderr="")
-        with mock.patch.object(
-            guardian.subprocess, "run", return_value=incomplete
-        ), self.assertRaisesRegex(guardian.GuardianError, "incomplete lsof"):
-            guardian._lock_holders(path)
+    def test_holder_probe_rejects_malformed_structured_output(self) -> None:
+        path = self.lock_path()
+        for stdout in (f"p{os.getpid()}\nf3\nDnot-hex\n", f"p{os.getpid()}\nx1\n", "i7\n"):
+            malformed = mock.Mock(returncode=0, stdout=stdout, stderr="")
+            with mock.patch.object(
+                guardian, "_run_bounded", return_value=malformed
+            ), self.assertRaisesRegex(guardian.GuardianError, "invalid structured lsof"):
+                guardian._lock_holders(path)
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS lsof proof")
     def test_holder_probe_observes_real_macos_holder_and_no_holder(self) -> None:
@@ -1412,6 +1441,101 @@ class GuardianLifecycleTests(unittest.TestCase):
                 self.assertEqual(guardian._lock_holders(path), (os.getpid(),))
                 fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
             self.assertEqual(guardian._lock_holders(path), ())
+
+    class UnkillableChild:
+        """A Popen stand-in for a child in uninterruptible wait: it never
+        finishes, and SIGKILL does not change that."""
+
+        instances: list["GuardianLifecycleTests.UnkillableChild"] = []
+
+        def __init__(self, argv, **_kwargs) -> None:
+            self.argv = argv
+            self.pid = 99999
+            self.kills = 0
+            self.stdout = io.StringIO()
+            self.stderr = io.StringIO()
+            GuardianLifecycleTests.UnkillableChild.instances.append(self)
+
+        def communicate(self, input=None, timeout=None):
+            time.sleep(min(timeout or 0, 0.05))
+            raise subprocess.TimeoutExpired(self.argv, timeout)
+
+        def kill(self) -> None:
+            self.kills += 1
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout=None):
+            if timeout is None:
+                # subprocess.run's post-kill wait: on a real host this never returns.
+                raise AssertionError("unbounded wait on a child in uninterruptible wait")
+            time.sleep(min(timeout, 0.05))
+            raise subprocess.TimeoutExpired(self.argv, timeout)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc) -> bool:
+            return False
+
+    def test_bounded_run_abandons_a_child_that_survives_sigkill(self) -> None:
+        self.UnkillableChild.instances.clear()
+        guardian._ABANDONED_CHILDREN.clear()
+        started = time.monotonic()
+        with mock.patch.object(
+            guardian.subprocess, "Popen", self.UnkillableChild
+        ), contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(
+            guardian.GuardianError, r"did not exit 0\.1s after SIGKILL"
+        ):
+            guardian._run_bounded(["/usr/sbin/lsof", "-b"], timeout=0.1, kill_grace=0.1)
+        self.assertLess(time.monotonic() - started, 2.0)
+        (child,) = self.UnkillableChild.instances
+        self.assertEqual(child.kills, 1)
+        self.assertTrue(child.stdout.closed and child.stderr.closed)
+        self.assertEqual(guardian._ABANDONED_CHILDREN[-1]["pid"], 99999)
+
+    def test_bounded_run_still_reports_a_timeout_for_a_killable_child(self) -> None:
+        # A real child that ignores SIGTERM but not SIGKILL: run()'s contract.
+        argv = [sys.executable, "-c",
+                "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)"]
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            guardian._run_bounded(argv, timeout=0.5)
+        self.assertLess(time.monotonic() - started, 0.5 + guardian.CHILD_KILL_GRACE_SECONDS + 1)
+        done = guardian._run_bounded([sys.executable, "-c", "print('ok')"], timeout=10)
+        self.assertEqual((done.returncode, done.stdout), (0, "ok\n"))
+
+    def test_an_unkillable_holder_scan_still_ends_in_a_receipt(self) -> None:
+        # m3, 2026-10-20: lsof stuck on a wedged DeviceFS mount held the
+        # guardian in subprocess.run's post-kill wait; no receipt was written.
+        self.UnkillableChild.instances.clear()
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.make_guardian(Path(directory))
+            lock = Path(directory) / "writer.lock"
+            lock.touch()
+
+            def lifecycle(acquire, *_rest):
+                acquire()
+                with mock.patch.object(guardian.subprocess, "Popen", self.UnkillableChild):
+                    guardian._lock_holders(lock)
+
+            log = io.StringIO()
+            started = time.monotonic()
+            with mock.patch.object(
+                guardian, "run_lifecycle", side_effect=lifecycle
+            ), mock.patch.object(
+                guardian, "LOCK_HOLDER_ATTEMPT_TIMEOUT", 0.1
+            ), mock.patch.object(
+                guardian, "CHILD_KILL_GRACE_SECONDS", 0.1
+            ), mock.patch.object(guardian.signal, "signal"), contextlib.redirect_stderr(log):
+                self.assertEqual(active.run(), 1)
+            self.assertLess(time.monotonic() - started, 5.0)
+            receipt = json.loads(active.final_receipt.read_text(encoding="utf-8"))
+            self.assertIn("did not exit", receipt["failure"])
+            self.assertIn("abandoned", receipt["failure"])
+            self.assertIn("final receipt written", log.getvalue())
+            self.assertGreaterEqual(len(self.UnkillableChild.instances), 1)
 
     def test_json_status_probe_does_not_inherit_protected_stdio_marker(self) -> None:
         snapshot = guardian.ProcessSnapshot(

@@ -88,10 +88,18 @@ thread with `try_send`, dropping and counting a line rather than ever waiting.
 Keep `run_never_holds_the_process_stdio_locks_for_the_command` and the
 `webhook_listener_keeps_serving_*` tests passing.
 
-A Sandbox E2E canary that never writes `guardian.log` was never spawned:
-launchd can defer a RunAtLoad (speculative) launch indefinitely on a busy host,
-so the workflow kickstarts the guardian after bootstrapping it and always boots
-out its label at the end. See the ci skill for the `launchctl print` signature.
+A Sandbox E2E canary with an empty `guardian.log` either was never spawned or
+hung in a child: launchd can defer a RunAtLoad (speculative) launch indefinitely
+on a busy host, so the workflow kickstarts the guardian after bootstrapping it
+and always boots out its label at the end. See the ci skill for the
+`launchctl print` signature. The guardian now logs each lifecycle step, flushed,
+so an empty log means it never ran. A wedged filesystem (m3, 2026-10-20: a stuck
+CoreDevice DeviceFS mount) holds any `lsof` that stats it in uninterruptible
+wait; the guardian therefore runs `lsof -b` and matches the writer-domain lock
+by device and inode itself, abandons a child that survives SIGKILL
+(`_run_bounded`) and still writes its receipt, and the workflow's
+`wedged_mount_preflight.py` step refuses a host whose mount-point `stat` does
+not answer, before any lease exists.
 Another run's leftover canary registration, or a concurrent canary, lands in
 the guardian receipt's `launchd_recovery.warnings`, never in `errors`, so it
 cannot fail an unrelated run.

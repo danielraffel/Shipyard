@@ -189,6 +189,76 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _progress(message: str) -> None:
+    """One flushed guardian.log line: launchd kills a stuck guardian, and a
+    buffered line is then lost with it."""
+    print(f"guardian: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {message}",
+          file=sys.stderr, flush=True)
+
+
+# Seconds a child may take to exit after SIGKILL before it is abandoned.
+CHILD_KILL_GRACE_SECONDS = 2.0
+# Children abandoned in uninterruptible wait, for the failure message and tests.
+_ABANDONED_CHILDREN: list[dict[str, object]] = []
+
+
+def _run_bounded(
+    argv: list[str],
+    *,
+    timeout: float,
+    cwd: Optional[Union[str, Path]] = None,
+    env: Optional[dict[str, str]] = None,
+    kill_grace: Optional[float] = None,
+) -> subprocess.CompletedProcess[str]:
+    """``subprocess.run(capture_output=True, text=True, check=False)`` whose
+    wait after the kill is bounded too.
+
+    ``subprocess.run`` kills a timed-out child and then waits for it without a
+    bound. A child in uninterruptible wait (lsof stat-ing a wedged filesystem)
+    never exits, so that wait never returns and the guardian never writes a
+    receipt. Here a child still alive ``kill_grace`` seconds after SIGKILL is
+    abandoned and GuardianError raised; a child that does exit raises
+    TimeoutExpired as ``subprocess.run`` would.
+    """
+    if kill_grace is None:
+        kill_grace = CHILD_KILL_GRACE_SECONDS
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        try:
+            stdout, stderr = process.communicate(timeout=kill_grace)
+        except subprocess.TimeoutExpired:
+            for stream in (process.stdout, process.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except OSError:
+                    pass
+            _ABANDONED_CHILDREN.append(
+                {"pid": process.pid, "argv": list(argv), "timeout_seconds": timeout}
+            )
+            _progress(f"abandoned unkillable child pid={process.pid} argv={argv!r}")
+            raise GuardianError(
+                f"{argv[0]} (pid {process.pid}) did not exit {kill_grace:g}s after "
+                f"SIGKILL following a {timeout:g}s timeout; abandoned it "
+                "(uninterruptible wait, likely a wedged filesystem)"
+            ) from error
+        raise subprocess.TimeoutExpired(
+            argv, timeout, output=stdout, stderr=stderr
+        ) from error
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
 def _run(
     argv: list[str],
     *,
@@ -222,20 +292,16 @@ def _capture_status_timeout(
     commands = {
         "child-sample.txt": ["/usr/bin/sample", str(child_pid), "1", "1"],
         "production-sample.txt": ["/usr/bin/sample", str(production_pid), "1", "1"],
-        "child-lsof.txt": ["/usr/sbin/lsof", "-nP", "-p", str(child_pid)],
-        "production-lsof.txt": ["/usr/sbin/lsof", "-nP", "-p", str(production_pid)],
+        "child-lsof.txt": ["/usr/sbin/lsof", "-b", "-w", "-nP", "-p", str(child_pid)],
+        "production-lsof.txt": [
+            "/usr/sbin/lsof", "-b", "-w", "-nP", "-p", str(production_pid)
+        ],
         "unix-sockets.txt": ["/usr/sbin/netstat", "-anv", "-f", "unix"],
     }
     for name, argv in commands.items():
         try:
-            result = subprocess.run(
-                argv,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=4.0,
-                check=False,
-            )
-            (evidence / name).write_bytes(result.stdout + result.stderr)
+            result = _run_bounded(argv, timeout=4.0)
+            (evidence / name).write_text(result.stdout + result.stderr, encoding="utf-8")
         except Exception as error:  # diagnostic failure must not mask the timeout
             (evidence / name).write_text(
                 f"diagnostic failed: {type(error).__name__}: {error}\n",
@@ -354,12 +420,17 @@ def _darwin_argv_environment(pid: int) -> tuple[str, tuple[str, ...], dict[str, 
 def _lsof_field(
     pid: int, descriptor: str, *, deadline: Optional[float] = None
 ) -> str:
-    result = _run(
-        ["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", descriptor, "-Fn"],
+    # -b: never stat a mount (a wedged one blocks lsof in the kernel).
+    argv = ["/usr/sbin/lsof", "-b", "-w", "-a", "-p", str(pid), "-d", descriptor, "-Fn"]
+    result = _run_bounded(
+        argv,
         cwd="/",
         env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
         timeout=_bounded_timeout(deadline),
     )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise GuardianError(f"command failed ({result.returncode}): {argv!r}: {detail}")
     values = [line[1:] for line in result.stdout.splitlines() if line.startswith("n")]
     if len(values) != 1:
         raise GuardianError(f"could not resolve fd {descriptor} for pid {pid}: {values!r}")
@@ -860,6 +931,7 @@ def _record_foreign_writers(pids: tuple[int, ...]) -> None:
             f"pid={entry['pid']} ppid={entry.get('ppid')} "
             f"started={entry.get('start_time')} command={entry.get('command')!r}",
             file=sys.stderr,
+            flush=True,
         )
 
 
@@ -871,15 +943,23 @@ def _lock_holders(
     refresh_retry_deadline_after_revalidation: bool = False,
     diagnostic_root: Optional[Path] = None,
 ) -> tuple[int, ...]:
+    # Every process's descriptors, matched to the lock by device and inode.
+    # A path argument makes lsof stat every mount, and a wedged mount (a stuck
+    # CoreDevice DeviceFS) then holds it in uninterruptible wait for good; -b
+    # avoids those calls but cannot match a path, so the match is done here.
+    try:
+        lock_stat = path.stat()
+    except FileNotFoundError:
+        return ()
     argv = [
         "/usr/sbin/lsof",
+        "-b",
+        "-w",
         "-nP",
         "-S",
         LOCK_HOLDER_KERNEL_TIMEOUT,
         "-F",
-        "pf",
-        "--",
-        str(path),
+        "pfDi",
     ]
     if refresh_retry_deadline_after_revalidation:
         composite_deadline = (
@@ -901,13 +981,7 @@ def _lock_holders(
             operation_deadline, default=LOCK_HOLDER_ATTEMPT_TIMEOUT
         )
         try:
-            result = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
+            result = _run_bounded(argv, timeout=timeout)
             break
         except subprocess.TimeoutExpired as error:
             if diagnostic_root is not None:
@@ -957,42 +1031,48 @@ def _lock_holders(
 
     assert result is not None
     diagnostic = result.stderr.strip()
-    if result.returncode not in (0, 1) or diagnostic:
+    if result.returncode != 0 or diagnostic:
         raise GuardianError(
             f"could not inspect writer-domain holders for {path}: "
             f"returncode={result.returncode}, stderr={diagnostic!r}"
         )
-    holders: list[int] = []
+    holders: set[int] = set()
+    listed_self = False
     current_pid: Optional[int] = None
-    current_has_file = False
+    current_fd: Optional[str] = None
+    device: Optional[int] = None
     for field in result.stdout.splitlines():
-        if field.startswith("p") and field[1:].isdigit():
-            if current_pid is not None and not current_has_file:
+        tag, value = field[:1], field[1:]
+        if tag == "p" and value.isdigit():
+            current_pid = int(value)
+            current_fd = None
+            listed_self = listed_self or current_pid == os.getpid()
+        elif tag == "f" and value and current_pid is not None:
+            current_fd = value
+            device = None
+        elif tag == "D" and current_fd is not None:
+            try:
+                device = int(value, 0)
+            except ValueError:
                 raise GuardianError(
-                    f"incomplete lsof holder result for {path}: pid {current_pid} "
-                    "has no file record"
-                )
-            current_pid = int(field[1:])
-            current_has_file = False
-            holders.append(current_pid)
-        elif field.startswith("f") and len(field) > 1 and current_pid is not None:
-            current_has_file = True
+                    f"invalid structured lsof field for {path}: {field!r}"
+                ) from None
+        elif tag == "i" and value.isdigit() and current_fd is not None:
+            if device == lock_stat.st_dev and int(value) == lock_stat.st_ino:
+                assert current_pid is not None
+                holders.add(current_pid)
         else:
             raise GuardianError(
                 f"invalid structured lsof field for {path}: {field!r}"
             )
-    if current_pid is not None and not current_has_file:
+    if not listed_self:
+        # The scan covers every process, this one included: a result without
+        # it saw nothing, which must not read as "no holder".
         raise GuardianError(
-            f"incomplete lsof holder result for {path}: pid {current_pid} "
-            "has no file record"
+            f"incomplete lsof holder result for {path}: the scan did not list "
+            f"this process ({os.getpid()})"
         )
-    observed = tuple(sorted(set(holders)))
-    if (result.returncode == 0) != bool(observed):
-        raise GuardianError(
-            f"inconsistent lsof holder result for {path}: "
-            f"returncode={result.returncode}, holders={observed!r}"
-        )
-    return observed
+    return tuple(sorted(holders))
 
 
 def _exclusive_lock_is_contended(path: Path) -> bool:
@@ -3132,9 +3212,17 @@ class Guardian:
             )
         )
 
+    def _logged(self, name: str, step: Callable[[], None]) -> Callable[[], None]:
+        def logged() -> None:
+            _progress(f"{name}: start")
+            step()
+            _progress(f"{name}: done")
+        return logged
+
     def run(self) -> int:
         signal.signal(signal.SIGTERM, self.request_stop)
         signal.signal(signal.SIGINT, self.request_stop)
+        _progress(f"started pid={os.getpid()} label={self.launchd_label}")
         try:
             self.launchd_recovery = self.recover_terminal_launchd_jobs()
         except Exception as error:
@@ -3153,13 +3241,13 @@ class Guardian:
         reason = "completed"
         try:
             run_lifecycle(
-                self.acquire,
-                self.preflight_and_transition,
-                self.start_candidate,
-                self.wait_for_owner,
-                self.stop_candidate,
-                self.finalize_production,
-                self.release,
+                self._logged("acquire", self.acquire),
+                self._logged("preflight", self.preflight_and_transition),
+                self._logged("start candidate", self.start_candidate),
+                self._logged("wait for owner", self.wait_for_owner),
+                self._logged("stop candidate", self.stop_candidate),
+                self._logged("finalize production", self.finalize_production),
+                self._logged("release", self.release),
             )
         except ReconciledAfterOwnerEnded:
             reason = RETAINED_RECONCILED_REASON
@@ -3280,6 +3368,7 @@ class Guardian:
             # This receipt is recovery authority for the narrow crash window
             # between publication and launchd accepting the self-unload.
             _durable_atomic_json(self.final_receipt, final_payload)
+            _progress(f"final receipt written: reason={reason} failure={self.failure!r}")
             try:
                 self.unregister_terminal_launchd_job()
             except Exception as error:

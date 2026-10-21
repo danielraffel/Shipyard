@@ -108,6 +108,14 @@ jobs:
             --authority-sha "$GITHUB_SHA" -- \
             .venv-sandbox/bin/python -m pytest tools/sandbox-e2e/
 
+      - name: Refuse a host with a wedged filesystem mount
+        id: wedged_mount_preflight
+        if: ${{ matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-') }}
+        # lsof stats every mount point; a wedged one holds it in the kernel and
+        # the guardian would hang until launchd boots it out. Fail here, naming
+        # the mount, before any lease or launchd job exists.
+        run: python3 scripts/wedged_mount_preflight.py
+
       - name: Run exact isolated M3 candidate and focused Sandbox
         if: ${{ matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-') }}
         env:
@@ -346,7 +354,7 @@ jobs:
           touch "$canary_root/done"
 
       - name: Verify M3 guardian and production daemon invariants
-        if: ${{ always() && matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-') }}
+        if: ${{ always() && steps.wedged_mount_preflight.outcome == 'success' && matrix.key == 'macos-arm64' && matrix.provider == 'local' && startsWith(runner.name, 'Shipyard-studio-') }}
         run: |
           set -euo pipefail
           installed="$HOME/.local/bin/shipyard"
