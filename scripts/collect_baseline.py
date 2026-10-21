@@ -447,7 +447,7 @@ def update_state(path: pathlib.Path, project: str, started: dt.datetime,
 
 
 def default_pass_history_path(args: argparse.Namespace) -> pathlib.Path:
-    key = f"{args.repo}|{pass_config_identity(args)}".encode()
+    key = f"{args.repo}|{args.source_identity}|{pass_config_identity(args)}".encode()
     return args.state.with_name("baseline-pass-history-" + hashlib.sha256(key).hexdigest()[:16] + ".json")
 
 
@@ -552,15 +552,10 @@ def main() -> int:
                                  observed_at=completed_at, repo=args.repo, db=args.db,
                                  pass_history=pass_report, record_observation=False)
         else:
-            if args.pass_history_path.exists():
-                try:
-                    existing = load_history(args.pass_history_path, repository=args.repo,
-                                            source_identity=args.source_identity,
-                                            config_identity=pass_config_identity(args))
-                    pass_report = existing.summarize(
-                        completed_at - dt.timedelta(seconds=existing.retention_window_secs), completed_at)
-                except (OSError, HistoryValidationError, ValueError, TypeError):
-                    pass_report = {"status": "unavailable", "reasons": [{"status": "unavailable", "reason": "prospective pass history unavailable"}]}
+            prior_state = json.loads(args.state.read_text()) if args.state.exists() else {}
+            pass_report = prior_state.get("pass_history")
+            if not isinstance(pass_report, dict):
+                pass_report = {"status": "unavailable", "reasons": [{"status": "unavailable", "reason": "prospective pass history unavailable"}]}
             state = update_state(args.state, args.project, completed_at, card, events, observed_at=completed_at,
                                  repo=args.repo, db=args.db, pass_history=pass_report)
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired) as exc:

@@ -573,8 +573,11 @@ class PassHistory:
         trailing_interval_unobserved = following is None
         if prior is None:
             uncertainty.append("history does not begin before the requested window")
+            # A fresh baseline may begin at its first prospective observation;
+            # there is no pre-window obligation before collection started.
             first = in_window[0] if in_window else None
-            add_missing(since, _parse_timestamp(first.observed_at) if first else until, "history_starts_after_window")
+            if first is None:
+                add_missing(since, until, "history_starts_after_window")
         elif (since - _parse_timestamp(prior.observed_at)).total_seconds() > cadence_limit:
             uncertainty.append("the requested window starts after a cadence gap")
             add_missing(
