@@ -291,10 +291,11 @@ class PassHistory:
             self.retention_window_secs, "retention_window_secs"
         )
         if self.max_observations is None:
+            effective_interval = max(1, self.expected_interval_secs - self.cadence_slack_secs)
             self.max_observations = max(
                 DEFAULT_MAX_OBSERVATIONS,
-                math.ceil(self.retention_window_secs / self.expected_interval_secs) + 1,
-                math.ceil(FIVE_DAYS_SECONDS / self.expected_interval_secs) + 1,
+                math.ceil(self.retention_window_secs / effective_interval) + 2,
+                math.ceil(FIVE_DAYS_SECONDS / effective_interval) + 2,
             )
         self.max_observations = _positive_int(self.max_observations, "max_observations")
         self.cadence_slack_secs = _nonnegative_int(
