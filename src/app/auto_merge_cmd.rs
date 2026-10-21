@@ -3519,6 +3519,7 @@ mod tests {
         let root = PathBuf::from(
             std::env::var_os("SHIPYARD_MERGE_RECEIPT_FIXTURE_ROOT").expect("fixture root env"),
         );
+        let mode = root.join("mode");
         let live_snapshot = root.join("live_snapshot.json");
         std::fs::write(
             &live_snapshot,
@@ -3616,6 +3617,22 @@ mod tests {
             queue_count, 1,
             "queue merged observation must emit one receipt"
         );
+
+        let (enqueued, enqueued_count) = run("enqueued", false);
+        assert!(matches!(enqueued, AutoMergeOutcome::Enqueued));
+        assert_eq!(enqueued_count, 0, "queue admission must not emit a receipt");
+
+        for mode_name in ["missing", "zero"] {
+            let (outcome, count) = run(mode_name, true);
+            let warning = match outcome {
+                AutoMergeOutcome::Merged { cleanup_warning } => {
+                    cleanup_warning.expect("receipt refusal warning")
+                }
+                other => panic!("incomplete merge should remain merged with warning: {other:?}"),
+            };
+            assert!(warning.contains("merge receipt"), "{mode_name}: {warning}");
+            assert_eq!(count, 0, "{mode_name} must not emit a receipt");
+        }
     }
 
     #[cfg(unix)]
