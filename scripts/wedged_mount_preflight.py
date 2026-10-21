@@ -5,8 +5,14 @@ lsof stats every mount point. When one mount is wedged (on m3, 2026-10-20: a
 stuck CoreDevice DeviceFS mount), that stat blocks in the kernel in
 uninterruptible wait, so lsof never returns and the guardian would hang until
 its launchd job is booted out. This check stats each mount point in a child
-process, the same call lsof makes, and fails naming the mount the child is
-stuck on. A process in long uninterruptible wait alone is not a wedge (macOS
+process, the same call lsof makes, then reads its filesystem statistics and
+the first entry of its root directory, and fails naming the mount and the
+call the child is stuck on. A stat of a mount point's root can be answered
+from the kernel's cached attributes while the filesystem's server is stuck
+(on m3 the preflight passed a stat of every mount while rg hung in readdir),
+so the statvfs and directory read are what reach that server. Passing says
+only that those three calls returned for every mount, not that every call on
+every mount will. A process in long uninterruptible wait alone is not a wedge (macOS
 keeps some system extensions there for days), so those are listed only as
 context.
 
@@ -25,19 +31,29 @@ from typing import List, NamedTuple, Optional, Tuple
 
 DEFAULT_TIMEOUT_SECONDS = 20.0
 LONG_WAIT_SECONDS = 120
-# Prints each mount point before stat-ing it, then "ok", so the parent can name
-# the one it stopped on.
+# The calls made on each mount point, in order. "readdir" reads one entry.
+CALLS = ("stat", "statvfs", "readdir")
+# Prints "<call> <mount point>" before each call, then "ok", so the parent can
+# name the mount and call it stopped on. `hook` is a seam for tests.
 PROBE = """
 import os, sys
+def hook(call, path):
+    pass
+def readdir(path):
+    with os.scandir(path) as entries:
+        next(entries, None)
+CALLS = {"stat": os.stat, "statvfs": os.statvfs, "readdir": readdir}
 for path in sys.argv[1:]:
-    print("stat " + path, flush=True)
-    try:
-        os.stat(path)
-    except OSError:
-        pass
-    print("ok", flush=True)
+    for call in %r:
+        print(call + " " + path, flush=True)
+        hook(call, path)
+        try:
+            CALLS[call](path)
+        except OSError:
+            pass
+        print("ok", flush=True)
 print("done", flush=True)
-"""
+""" % (CALLS,)
 
 
 class Stuck(NamedTuple):
@@ -58,21 +74,23 @@ def mount_points(mount_output: str) -> List[Tuple[str, str]]:
     return points
 
 
-def wedged_mount(probe_output: str, finished: bool) -> Optional[str]:
-    """The mount the probe was stat-ing when it stopped, or None if it finished."""
+def wedged_mount(probe_output: str, finished: bool) -> Optional[Tuple[str, str]]:
+    """``(mount point, call)`` the probe was in when it stopped, or None if it
+    finished."""
     if finished:
         return None
     last = None
     for line in probe_output.splitlines():
-        if line.startswith("stat "):
-            last = line[len("stat "):]
+        call, _, path = line.partition(" ")
+        if call in CALLS and path:
+            last = (path, call)
         elif line == "ok":
             last = None
-    return last or "(before the first mount)"
+    return last or ("(before the first mount)", "start")
 
 
 def probe_mounts(paths: List[str], timeout: float) -> Tuple[str, bool]:
-    """Run the stat probe; ``(output so far, finished)``. A probe that does not
+    """Run the probe; ``(output so far, finished)``. A probe that does not
     finish in ``timeout`` is left running: it cannot be killed."""
     process = subprocess.Popen(
         [sys.executable, "-I", "-c", PROBE, *paths],
@@ -149,13 +167,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     output, finished = probe_mounts([path for path, _ in points], args.timeout)
     stuck_on = wedged_mount(output, finished)
     if stuck_on is None:
-        print(f"wedged-mount preflight: {len(points)} mount points answered in "
-              f"{time.monotonic() - started:.1f}s")
+        print(f"wedged-mount preflight: stat, statvfs and a one-entry directory read "
+              f"returned for {len(points)} mount points in {time.monotonic() - started:.1f}s; "
+              "this does not prove every call on every mount will")
         return 0
-    line = next((text for path, text in points if path == stuck_on), stuck_on)
-    print(f"::error title=wedged mount::stat of mount point {stuck_on} did not return in "
-          f"{args.timeout:g}s ({line}). lsof stats every mount, so the sandbox guardian would "
-          "hang. Fix the host (unmount the filesystem, restart its service, or reboot) "
+    stuck_path, stuck_call = stuck_on
+    line = next((text for path, text in points if path == stuck_path), stuck_path)
+    print(f"::error title=wedged mount::{stuck_call} of mount point {stuck_path} did not "
+          f"return in "
+          f"{args.timeout:g}s ({line}). lsof reaches every mount, so the sandbox guardian "
+          "could hang. Fix the host (unmount the filesystem, restart its service, or reboot) "
           "before rerunning.")
     try:
         ps_text = (open(args.ps_output, encoding="utf-8").read() if args.ps_output

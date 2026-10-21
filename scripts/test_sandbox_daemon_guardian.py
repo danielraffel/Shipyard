@@ -1274,6 +1274,17 @@ class GuardianLifecycleTests(unittest.TestCase):
             guardian.PRODUCTION_IDENTITY_REVALIDATION_TIMEOUT,
         )
 
+    def test_the_fd_lookup_never_stats_a_mount(self) -> None:
+        # Without -b, lsof stats every mount and blocks for good on a wedged one.
+        answer = subprocess.CompletedProcess([], 0, "p4242\nfcwd\nn/Users/x/work\n", "")
+        with mock.patch.object(guardian, "_run_bounded", return_value=answer) as run:
+            self.assertEqual(guardian._lsof_field(4242, "cwd"), "/Users/x/work")
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/sbin/lsof", "-b", "-w", "-a", "-p", "4242", "-d", "cwd", "-Fn"],
+        )
+
     def test_holder_probe_does_not_retry_when_revalidation_fails(self) -> None:
         path = self.lock_path()
         timeout = subprocess.TimeoutExpired(["lsof"], 7)
