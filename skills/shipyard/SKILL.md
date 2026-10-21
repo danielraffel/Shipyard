@@ -5051,3 +5051,11 @@ merge-group runs are not counted, and it is not limited to the scorecard window.
 
 `shipyard metrics repeated-work-cost` is read-only shadow accounting; duration
 remains unavailable until queue-to-metrics provenance is authenticated.
+
+### Prospective baseline pass history
+
+`collect_baseline.py` records controller-observed pass attempts in a locked,
+atomic sidecar. Readiness requires observed continuity; historical activity
+counts and status-only runs must not be used to manufacture prospective
+coverage. Sidecars are keyed by repository, source identity, cadence, and
+configuration so changing collection policy cannot mix incompatible history.
