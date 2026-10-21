@@ -72,6 +72,22 @@ class BaselineScorecardTests(unittest.TestCase):
             self.assertEqual(payload["observations"][0]["status"], "empty")
             self.assertTrue(report["trailing_interval_unobserved"])
 
+    def test_default_pass_history_sidecar_is_identity_keyed(self):
+        args = type("Args", (), {"repo": "o/pulp", "source_identity": "collector:v1",
+                                  "config_identity": "policy:v1", "state": Path("/tmp/state.json")})()
+        first = MOD.default_pass_history_path(args)
+        args.config_identity = "policy:v2"
+        self.assertNotEqual(first.name, MOD.default_pass_history_path(args).name)
+
+    def test_unavailable_pass_history_still_writes_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+            state = MOD.update_state(path, "pulp", started, {"missing_strata": ["normal_pr"]}, [],
+                                     observed_at=started + dt.timedelta(days=1), pass_history={"status": "unavailable"})
+            self.assertTrue(path.exists())
+            self.assertEqual(state["baseline_readiness"]["status"], "unavailable")
+
     def test_pass_history_records_failed_completion_with_error(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
