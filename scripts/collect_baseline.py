@@ -447,7 +447,7 @@ def update_state(path: pathlib.Path, project: str, started: dt.datetime,
 
 
 def default_pass_history_path(args: argparse.Namespace) -> pathlib.Path:
-    key = f"{args.repo}|{args.source_identity}|{args.config_identity}".encode()
+    key = f"{args.repo}|{pass_config_identity(args)}".encode()
     return args.state.with_name("baseline-pass-history-" + hashlib.sha256(key).hexdigest()[:16] + ".json")
 
 
