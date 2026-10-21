@@ -114,6 +114,26 @@ class PassHistoryTests(unittest.TestCase):
             )
         self.assertEqual(len(store.observations), 361)
 
+    def test_short_cadence_retains_anchor_with_jitter(self) -> None:
+        cadence = 15 * 60
+        store = history.PassHistory.create(
+            repository=REPO, source_identity=SOURCE, config_identity=CONFIG,
+            expected_interval_secs=cadence, cadence_slack_secs=300,
+        )
+        first = START
+        for sample in range((14 * 24 * 60 * 60) // cadence + 2):
+            point = first + timedelta(seconds=sample * cadence + (60 if sample % 2 else -60))
+            store.append(history.PassObservation(
+                repo=REPO, observed_at=point, expected_interval_secs=cadence,
+                status="empty", source_identity=SOURCE, config_identity=CONFIG,
+            ), now=point)
+        until = store.observations[-1].observed_at
+        report = store.summarize(
+            datetime.fromisoformat(until.replace("Z", "+00:00")) - timedelta(days=14),
+            datetime.fromisoformat(until.replace("Z", "+00:00")),
+        )
+        self.assertFalse(report["missing_intervals"])
+
     def test_partial_history_does_not_claim_full_window_coverage(self) -> None:
         store = self.make_history()
         store.append(observation(2), now=START + timedelta(days=2))
