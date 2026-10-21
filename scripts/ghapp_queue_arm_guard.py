@@ -876,6 +876,9 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
         # reviewer_sessions); None when the host lists none. Host-local only, so
         # the repository-side rule never reads it.
         "sessions": None if from_base_only else reviewer_sessions(),
+        # Which `ghapp` stamp hosts each short host name in a `session:` line
+        # stands for (see reviewer_session_hosts). Host-local, like sessions.
+        "session_hosts": {} if from_base_only else reviewer_session_hosts(),
         # The repository-side rule (review-verdict status): no host's file,
         # and a default-mode repository with no list admits no App APPROVE.
         "signers_required": from_base_only and from_default and not reviewers,
@@ -946,6 +949,61 @@ def reviewer_sessions() -> list[str] | None:
     return [value for value in (_session_value(line) for line in lines) if value]
 
 
+# The `session_hosts` key of SIGNERS_FILE: for each short host name a
+# `session:` line names (`host m3`), the hostnames `ghapp` stamps from that
+# machine, e.g. {"m3": ["Daniels-Mac-Studio-m3"]}. A hostname is not
+# predictable from the short name (macOS appends `-2`, `-4` on a clash), so the
+# map is written out rather than derived.
+SESSION_HOSTS_KEY = "session_hosts"
+# The host a `session:` line names: its last `host <name>`, e.g.
+# `pulp-review (team-lead team, agent pulp-review, host m3)`.
+_SESSION_HOST = re.compile(r"\bhost[ \t]+([^\s,()]+)[ \t]*\)?[ \t]*$")
+
+
+def reviewer_session_hosts() -> dict[str, list[str]]:
+    """This host's ``session_hosts`` map, short host name to the stamp
+    hostnames it stands for, both lowercased. A missing file or key, or a value
+    that is not an object of string lists, maps nothing, so with a session
+    allowlist no App APPROVE is admitted."""
+    path = _guards_dir() / SIGNERS_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    hosts = data.get(SESSION_HOSTS_KEY) if isinstance(data, dict) else None
+    if not isinstance(hosts, dict) or not all(
+            isinstance(names, list) and all(isinstance(name, str) for name in names)
+            for names in hosts.values()):
+        return {}
+    return {str(short).strip().lower(): [name.strip().lower() for name in names if name.strip()]
+            for short, names in hosts.items()}
+
+
+def stamp_refusal(text: str, found: list[str], hosts: dict[str, list[str]]) -> str | None:
+    """Why ``text``'s ``ghapp`` stamp does not match the host its ``session:``
+    lines ``found`` name, or None. There must be exactly one stamp, and every
+    line must name a host that ``hosts`` maps to the stamp's hostname: a
+    copied ``session:`` line keeps the reviewer's host, while the stamp names
+    the machine that actually posted (tartci#623)."""
+    stamps = _SESSION_STAMP.findall(text)
+    if not stamps:
+        return "it has no `ghapp` session stamp"
+    if len(stamps) > 1:
+        return f"it carries {len(stamps)} `ghapp` session stamps"
+    stamp_host = stamps[0][0].lower()
+    for line in found:
+        named = _SESSION_HOST.search(line)
+        if named is None:
+            return f"its session line `session: {line}` names no host"
+        short = named.group(1).lower()
+        if short not in hosts:
+            return f"host {short} has no `{SESSION_HOSTS_KEY}` entry on this host"
+        if stamp_host not in hosts[short]:
+            return (f"its stamp host {stamps[0][0]} is not host {short} "
+                    f"({', '.join(hosts[short]) or 'no hostnames'})")
+    return None
+
+
 def _warn_no_session_allowlist() -> None:
     global _SESSIONS_WARNED
     if not _SESSIONS_WARNED:
@@ -955,9 +1013,11 @@ def _warn_no_session_allowlist() -> None:
               "`session:` line, so a copied `reviewer:` line passes", file=sys.stderr)
 
 
-def session_refusal(text: str, sessions: list[str] | None) -> str | None:
+def session_refusal(text: str, sessions: list[str] | None,
+                    hosts: dict[str, list[str]] | None = None) -> str | None:
     """Why ``text``'s ``session:`` lines do not admit an App APPROVE, or None.
-    Every such line must be listed, and there must be at least one."""
+    Every such line must be listed, there must be at least one, and the
+    ``ghapp`` stamp must come from the host they name (see stamp_refusal)."""
     if sessions is None:
         _warn_no_session_allowlist()
         return None
@@ -967,7 +1027,7 @@ def session_refusal(text: str, sessions: list[str] | None) -> str | None:
     unlisted = [line for line in found if line not in sessions]
     if unlisted:
         return f"its session line `session: {unlisted[0]}` is not on this host's allowlist"
-    return None
+    return stamp_refusal(text, found, reviewer_session_hosts() if hosts is None else hosts)
 
 
 def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
@@ -976,8 +1036,10 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
     Every agent posts as the same App, so the App's identity says nothing
     about who reviewed. An APPROVE stamped by ``ghapp`` with an
     ``unattributed`` session never counts, nor, under the repository-side rule
-    (``review-verdict``), one with no stamp at all; on a host with a session allowlist
-    every ``session:`` line must be listed (and one must be present), and on a
+    (``review-verdict``), one with no stamp at all; on a host with a session
+    allowlist every ``session:`` line must be listed (and one must be present)
+    and the single ``ghapp`` stamp must come from the host those lines name,
+    and on a
     host with a signers file the body must carry a ``reviewer: <name>`` line
     naming an allowed signer.
     """
@@ -993,7 +1055,8 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
     if os.environ.get(SIGNERS_FROM_BASE_ENV) != "1":
         # Host-local: the repository-side rule has no host to read.
         refusal = session_refusal(
-            text, policy["sessions"] if "sessions" in policy else reviewer_sessions())
+            text, policy["sessions"] if "sessions" in policy else reviewer_sessions(),
+            policy.get("session_hosts"))
         if refusal is not None:
             return refusal
     signers = policy.get("signers")

@@ -3181,6 +3181,10 @@ class ReviewIdentity(unittest.TestCase):
                              "an unreadable file admits nobody")
 
     LISTED = "session: pulp-review (team-lead team, agent pulp-review, host m3)"
+    # The stamp `ghapp` adds on m3, whose hostname the short name `m3` maps to.
+    M3_STAMP = "<!-- session: Daniels-Mac-Studio-m3/01a1-genuine agent: pulp-review -->"
+    HOSTS = {"m3": ["Daniels-Mac-Studio-m3", "Daniels-Mac-Studio-m3-4"],
+             "m5": ["Daniels-M5-Studio"]}
 
     def session_case(self, contents: str | None) -> contextlib.ExitStack:
         """A scratch guards directory holding ``contents`` as the signers file."""
@@ -3201,7 +3205,8 @@ class ReviewIdentity(unittest.TestCase):
         return guard.review_verdict(self.HEAD, "danielraffel", [comment], [], policy)
 
     def test_a_forged_signer_line_needs_a_listed_session_line(self) -> None:
-        listed = json.dumps({"default": ["pulp-review"], "sessions": [self.LISTED]})
+        listed = json.dumps({"default": ["pulp-review"], "sessions": [self.LISTED],
+                             "session_hosts": self.HOSTS})
         stack = self.session_case(listed)
         with stack:
             # pulp#10563 at 8a4e7dd4: a Daniels-M5-Studio session signed as pulp-review.
@@ -3219,10 +3224,12 @@ class ReviewIdentity(unittest.TestCase):
             self.assertFalse(self.app_verdict(self.LISTED, "session: Daniels-M5-Studio/x",
                                               "reviewer: pulp-review")[0],
                              "every session line must be listed")
-            allowed = self.app_verdict(self.LISTED, "reviewer: pulp-review")
+            allowed = self.app_verdict(self.LISTED, "reviewer: pulp-review", self.M3_STAMP)
             self.assertTrue(allowed[0], allowed[1])
-            self.assertTrue(self.app_verdict("  " + self.LISTED + "  ", "reviewer: pulp-review")[0])
-            self.assertFalse(self.app_verdict(self.LISTED, "reviewer: codex-g2h")[0],
+            self.assertTrue(self.app_verdict("  " + self.LISTED + "  ", "reviewer: pulp-review",
+                                             self.M3_STAMP)[0])
+            self.assertFalse(self.app_verdict(self.LISTED, "reviewer: codex-g2h",
+                                              self.M3_STAMP)[0],
                              "a listed session does not replace the signer rule")
             hold = self.app_verdict("session: Daniels-M5-Studio/x", "reviewer: pulp-review",
                                     verdict="HOLD")
@@ -3238,7 +3245,13 @@ class ReviewIdentity(unittest.TestCase):
             (json.dumps({"sessions": [self.LISTED, 7]}), False, False),     # not all strings
             ("{not json", False, False),                                    # unreadable
             (json.dumps(["pulp-review"]), False, False),                    # not an object
-            (json.dumps({"sessions": [self.LISTED[len("session: "):]]}), True, False),  # no prefix
+            (json.dumps({"sessions": [self.LISTED[len("session: "):]],
+                         "session_hosts": self.HOSTS}), True, False),       # no prefix
+            (json.dumps({"sessions": [self.LISTED]}), False, False),        # no host map
+            (json.dumps({"sessions": [self.LISTED],
+                         "session_hosts": {"m3": "Daniels-Mac-Studio-m3"}}), False, False),
+            (json.dumps({"sessions": [self.LISTED],
+                         "session_hosts": ["Daniels-Mac-Studio-m3"]}), False, False),
         )
         for contents, counts, warns in cases:
             stack = self.session_case(contents)
@@ -3246,7 +3259,8 @@ class ReviewIdentity(unittest.TestCase):
                 guard._SESSIONS_WARNED = False
                 errors = io.StringIO()
                 with contextlib.redirect_stderr(errors):
-                    allowed, why = self.app_verdict(self.LISTED, "reviewer: pulp-review")
+                    allowed, why = self.app_verdict(self.LISTED, "reviewer: pulp-review",
+                                                    self.M3_STAMP)
                     # With the rule off, today's behaviour: a bare signer line passes.
                     bare = self.app_verdict("reviewer: pulp-review")[0]
                 self.assertEqual(allowed, counts, f"{contents}: {why}")
@@ -3254,6 +3268,93 @@ class ReviewIdentity(unittest.TestCase):
                 self.assertEqual("no `sessions` list" in errors.getvalue(), warns,
                                  f"{contents}: {errors.getvalue()!r}")
                 self.assertLessEqual(errors.getvalue().count("WARNING"), 1, "warned once")
+
+    # tartci#623's deciding APPROVE (comment 6321450475), exactly as posted: it
+    # copied infra-review2's signer and session lines, and ghapp on the M5
+    # Studio stamped it.
+    TARTCI_623 = (
+        "Exact-head re-review completed for `a26e79ebb8d841f5f2dd6eb33d349f65ebdf0df3`.\n\n"
+        "The prior approval at `a5e2fe1eba87d197c7643c665167e4446d1aba2c` carries across the "
+        "merge-only current head; the protected `review-verdict` check confirms every commit "
+        "since is a merge of the base and every PR file remains unchanged. Required checks are "
+        "green: `lint`, `python-39-tests`, `python-floor`, and `review-verdict`. No blocker "
+        "found.\n\n"
+        "reviewer: infra-review2\n"
+        "session: infra-review2 (team-lead team, agent infra-review2, host m3)\n"
+        "<!-- session: Daniels-M5-Studio/unattributed -->\n"
+        "verdict: APPROVE head:a26e79ebb8d841f5f2dd6eb33d349f65ebdf0df3")
+    INFRA_LINE = "session: infra-review2 (team-lead team, agent infra-review2, host m3)"
+
+    def infra_verdict(self, body: str) -> tuple[bool, str]:
+        head = "a26e79ebb8d841f5f2dd6eb33d349f65ebdf0df3"
+        policy = guard.review_policy('[auto_merge]\nreviewer_signers = ["infra-review2"]\n',
+                                     "danielraffel/tartci", True)
+        comment = self.comment("shipyard-local[bot]", body)
+        return guard.review_verdict(head, "danielraffel", [comment], [], policy)
+
+    def test_a_copied_session_line_needs_a_stamp_from_its_host(self) -> None:
+        contents = json.dumps({"default": ["infra-review2"], "sessions": [self.INFRA_LINE],
+                               "session_hosts": self.HOSTS})
+        stamp = "<!-- session: Daniels-M5-Studio/unattributed -->"
+        attributed = "<!-- session: Daniels-M5-Studio/01a15711-0679-70e0-81d2-4eb92dd5e038 -->"
+        genuine = "<!-- session: Daniels-Mac-Studio-m3/08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb -->"
+        with self.session_case(contents):
+            for body, why in (
+                (self.TARTCI_623, "its session stamp is unattributed"),
+                (self.TARTCI_623.replace(stamp, attributed),
+                 "its stamp host Daniels-M5-Studio is not host m3"),
+                (self.TARTCI_623.replace(stamp + "\n", ""), "it has no `ghapp` session stamp"),
+                (self.TARTCI_623.replace(stamp, genuine + "\n" + attributed),
+                 "it carries 2 `ghapp` session stamps"),
+                (self.TARTCI_623.replace(stamp, attributed).replace("host m3", "host m9"),
+                 "is not on this host's allowlist"),
+            ):
+                with self.subTest(why=why):
+                    guard.EXCLUDED_APPROVALS.clear()
+                    allowed, _ = self.infra_verdict(body)
+                    self.assertFalse(allowed)
+                    self.assertTrue(any(why in row for row in guard.EXCLUDED_APPROVALS),
+                                    guard.EXCLUDED_APPROVALS)
+            allowed, why = self.infra_verdict(self.TARTCI_623.replace(stamp, genuine))
+            self.assertTrue(allowed, why)
+            # Stamp hostnames compare without case, and any listed one counts.
+            allowed, why = self.infra_verdict(self.TARTCI_623.replace(
+                stamp, genuine.replace("Daniels-Mac-Studio-m3", "daniels-mac-studio-m3-4")))
+            self.assertTrue(allowed, why)
+        # A session line that names no host, or a host with no map entry.
+        unhosted = "session: infra-review2 (team-lead team, agent infra-review2)"
+        for listed, hosts, why in (
+            (unhosted, self.HOSTS, "names no host"),
+            (self.INFRA_LINE, {"m5": ["Daniels-M5-Studio"]}, "host m3 has no `session_hosts`"),
+            (self.INFRA_LINE, {"m3": []}, "is not host m3"),
+        ):
+            body = self.TARTCI_623.replace(stamp, genuine).replace(self.INFRA_LINE, listed)
+            with self.subTest(why=why), self.session_case(json.dumps(
+                    {"default": ["infra-review2"], "sessions": [listed],
+                     "session_hosts": hosts})):
+                guard.EXCLUDED_APPROVALS.clear()
+                self.assertFalse(self.infra_verdict(body)[0])
+                self.assertTrue(any(why in row for row in guard.EXCLUDED_APPROVALS),
+                                guard.EXCLUDED_APPROVALS)
+
+    def test_a_genuine_verdict_passes_once_ghapp_stamps_it(self) -> None:
+        # infra-review2's tartci#628 APPROVE (comment 6308128031) was posted
+        # unstamped (body file or stdin); it counts with the stamp its later
+        # posts through `ghapp api -f body=` carry on m3 (tartci 6328633216).
+        body = ("This re-posts my tartci#628 APPROVE at head 532f9756 in the signed format, "
+                "with a session line.\n\n"
+                f"{self.INFRA_LINE}\n"
+                "reviewer: infra-review2\n"
+                "verdict: APPROVE head:a26e79ebb8d841f5f2dd6eb33d349f65ebdf0df3\n")
+        contents = json.dumps({"default": ["infra-review2"], "sessions": [self.INFRA_LINE],
+                               "session_hosts": self.HOSTS})
+        with self.session_case(contents):
+            guard.EXCLUDED_APPROVALS.clear()
+            self.assertFalse(self.infra_verdict(body)[0], "unstamped, as it was posted")
+            stamp = "<!-- session: Daniels-Mac-Studio-m3/08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb -->"
+            stamped = body.replace("verdict:", stamp + "\nverdict:")
+            allowed, why = self.infra_verdict(stamped)
+            self.assertTrue(allowed, why)
 
     def test_the_repository_side_rule_never_reads_the_host_sessions(self) -> None:
         stack = self.session_case(json.dumps({"sessions": []}))

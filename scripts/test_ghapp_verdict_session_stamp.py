@@ -58,7 +58,53 @@ class Stamp(unittest.TestCase):
         self.assertIsNone(stamp.stamped(f"verdict: APPROVE head:{HEAD}\nthen prose"))
         once = stamp.stamped(VERDICT)
         assert once is not None
-        self.assertIsNone(stamp.stamped(once))
+        self.assertEqual(stamp.stamped(once), once, "a re-stamp replaces, never adds")
+
+    def test_a_stamp_already_in_the_body_is_replaced(self) -> None:
+        # tartci#623: a copied verdict could carry a hand-written stamp naming
+        # the reviewer's machine, and a stamper that kept it vouched for it.
+        forged_line = "<!-- session: Daniels-Mac-Studio-m3/infra-review2 -->"
+        for body in (
+            f"Looks right.\n{forged_line}\nverdict: APPROVE head:{HEAD}\n",
+            f"Looks right. {forged_line}\n\nverdict: APPROVE head:{HEAD}\n",
+            f"{forged_line}\n{forged_line}\nverdict: APPROVE head:{HEAD}",
+            f"Looks right.\n<!-- session:\nDaniels-Mac-Studio-m3/x -->\nverdict: APPROVE head:{HEAD}",
+        ):
+            with self.subTest(body=body):
+                out = stamp.stamped(body)
+                assert out is not None
+                found = guard._SESSION_STAMP.findall(out)
+                self.assertEqual(len(found), 1, out)
+                self.assertEqual(found[0][1], "sess-A")
+                self.assertNotIn("Daniels-Mac-Studio-m3", out)
+                self.assertEqual(guard.marker_verdict(out), ("APPROVE", HEAD))
+        self.assertTrue(stamp.stamped(f"Looks right. {forged_line}\n\nverdict: APPROVE head:{HEAD}")
+                        .startswith("Looks right."))
+
+    def test_a_body_file_comment_is_stamped_as_a_body(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            path = pathlib.Path(scratch) / "verdict.md"
+            path.write_text(VERDICT, encoding="utf-8")
+            for args, expected_prefix in (
+                (["pr", "comment", "5", "--body-file", str(path)], ["pr", "comment", "5"]),
+                (["issue", "comment", "5", "-F", str(path), "--repo", "o/r"],
+                 ["issue", "comment", "5"]),
+                (["pr", "comment", f"--body-file={path}", "5"], ["pr", "comment"]),
+            ):
+                with self.subTest(args=args):
+                    out = stamp.rewrite(args)
+                    at = len(expected_prefix)
+                    self.assertEqual(out[:at], expected_prefix)
+                    self.assertEqual(out[at], "--body")
+                    self.assertEqual(guard.stamped_session(out[at + 1]), "sess-A")
+                    self.assertEqual(guard.marker_verdict(out[at + 1]), ("APPROVE", HEAD))
+                    self.assertEqual(len(out), len(args) + (1 if "=" in args[-2] else 0))
+            self.assertEqual(path.read_text(encoding="utf-8"), VERDICT, "the file is untouched")
+            path.write_text("just a note", encoding="utf-8")
+            args = ["pr", "comment", "5", "--body-file", str(path)]
+            self.assertEqual(stamp.rewrite(args), args)
+        stdin = ["pr", "comment", "5", "--body-file", "-"]
+        self.assertEqual(stamp.rewrite(stdin), stdin)
 
     def test_an_unknown_session_is_stamped_unattributed(self) -> None:
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):

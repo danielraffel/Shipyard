@@ -19,11 +19,13 @@ Output: ``SHIPYARD-STAMP-V1``, the (possibly rewritten) argv, then
 rewritten argv only when both sentinels are present and reads for at most 5
 seconds, so a failure, a hang or a truncated answer posts the comment
 unstamped, never blocks it; the stamper also stops itself after 5 seconds.
-Handled: ``pr comment``/``issue comment`` with ``--body``/``-b``; ``api`` on an
-issue-comment endpoint with ``-f``/``-F``/``--field``/``--raw-field body=...``,
-or ``--input <file>`` holding exactly ``{"body": ...}``, which becomes a
-``--raw-field body=...`` (no file is written). Anything else (``--body-file``,
-stdin, other fields) passes through unstamped.
+Handled: ``pr comment``/``issue comment`` with ``--body``/``-b``, or with
+``--body-file``/``-F <file>``, which becomes a ``--body`` (no file is written);
+``api`` on an issue-comment endpoint with ``-f``/``-F``/``--field``/
+``--raw-field body=...``, or ``--input <file>`` holding exactly
+``{"body": ...}``, which becomes a ``--raw-field body=...``. Anything else
+(stdin, other fields) passes through unstamped. A stamp already in the body is
+replaced, never kept.
 """
 
 from __future__ import annotations
@@ -45,7 +47,10 @@ _MARKER = re.compile(
     r"^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})"
     r"|verdict:[ \t]*(APPROVE|HOLD)[ \t]+head:[ \t]*([0-9a-f]{40}))[ \t]*$"
 )
-_STAMPED = re.compile(r"<!--\s*session:")
+# Any stamp already in a body, whole line or inline. The stamper replaces it:
+# the arm guard checks the stamp's host against the `session:` line, so a
+# stamp written by hand (or copied with the rest of a verdict) must not stand.
+_STAMPED = re.compile(r"<!--\s*session:.*?-->", re.DOTALL)
 _COMMENT_ENDPOINT = re.compile(r"^/?repos/[^/]+/[^/]+/issues/(?:[0-9]+/comments|comments/[0-9]+)$")
 
 
@@ -58,11 +63,11 @@ def stamp() -> str:
 
 
 def stamped(body: str) -> str | None:
-    """``body`` with the stamp above its verdict line, or ``None`` when it is
-    not a verdict or already carries a stamp."""
-    if _STAMPED.search(body):
-        return None
-    lines = body.split("\n")
+    """``body`` with this session's stamp above its verdict line, in place of
+    any stamp it already carried, or ``None`` when it is not a verdict."""
+    lines = [line for line in body.split("\n")
+             if not (_STAMPED.search(line) and not _STAMPED.sub("", line).strip())]
+    lines = _STAMPED.sub("", "\n".join(lines)).split("\n")
     index = max((i for i, line in enumerate(lines) if line.strip()), default=None)
     if index is None or not _MARKER.match(lines[index]):
         return None
@@ -120,6 +125,20 @@ def rewrite(args: list[str]) -> list[str]:
                 if new is not None:
                     out[i] = "--body=" + new
                 return out
+        for i, arg in enumerate(out):
+            if arg in ("--body-file", "-F") and i + 1 < len(out):
+                path, span = out[i + 1], 2
+            elif arg.startswith("--body-file="):
+                path, span = arg[len("--body-file="):], 1
+            else:
+                continue
+            if path == "-":
+                return out
+            with open(path, encoding="utf-8") as handle:
+                new = stamped(handle.read())
+            if new is not None:
+                out[i:i + span] = ["--body", new]
+            return out
         return out
     if out and out[0] == "api":
         if not any(_COMMENT_ENDPOINT.match(arg) for arg in out[1:] if not arg.startswith("-")):

@@ -86,7 +86,9 @@ the base config says and on any Python.
 **An agent cannot approve its own landing.** `verdict-session-stamp` (run by
 `ghapp` before native `gh`, bounded to 5 seconds) adds
 `<!-- session: <host>/<session> agent: <id> -->` above the marker line of a
-verdict comment. The session is `CLAUDE_CODE_SESSION_ID`, else
+verdict comment, posted with `--body`, `--body-file <file>`, an `api`
+`body=` field, or `--input`. A stamp already in the body, whether written by
+hand or copied with the rest of a verdict, is replaced rather than kept. The session is `CLAUDE_CODE_SESSION_ID`, else
 `CODEX_COMPANION_SESSION_ID`, else `unattributed`; `agent: <id>` appears only
 when `SHIPYARD_AGENT_ID` is set. The marker stays the last line, so every
 verdict reader is unchanged. The arm guard, and `head_approval` for Shipyard's
@@ -198,7 +200,17 @@ blocks an earlier approval. A HOLD whose time cannot be read always blocks.
   APPROVE counts only when it carries at least one `session:` line and every
   one of them is listed; the `<!-- session: ... -->` stamp `ghapp` adds is not
   such a line (pulp#10563: a `Daniels-M5-Studio` session signed its APPROVE
-  `reviewer: pulp-review`). An empty list, a `sessions` value that is not a list
+  `reviewer: pulp-review`). A `session:` line can be copied too (tartci#623
+  carried infra-review2's line, `host m3`, under a `Daniels-M5-Studio` stamp),
+  so with the list present the APPROVE must also carry exactly one `ghapp`
+  stamp, not `unattributed`, whose hostname is one the host named in each
+  `session:` line maps to under a `session_hosts` key:
+  `{"session_hosts": {"m3": ["Daniels-Mac-Studio-m3"], "m5": ["Daniels-M5-Studio"]}}`.
+  Hostnames compare without case; list every name a machine has stamped
+  under, since macOS can rename one (`-2`, `-4`) on a clash. A missing stamp,
+  two stamps, a `session:` line with no `host <name>`, a host with no entry,
+  a missing or malformed `session_hosts` value, or a stamp from another
+  machine refuses the APPROVE. An empty list, a `sessions` value that is not a list
   of strings, or a file that cannot be read admits no App APPROVE. With no file,
   or a file without the key, the rule is off and the guard prints a warning
   once. The list is host-local: the server-side `review-verdict` status never
@@ -793,7 +805,7 @@ Per-host switches, all in the guards directory:
 |---|---|---|---|
 | review before arm or merge | on | `shipyard guards install --opt-in-review-before-arm` removes an opt-out | `shipyard guards install --opt-out-review-before-arm "<reason>"` |
 | signer rule for App approvals | off | a `reviewer-signers.json` file | remove the file |
-| session allowlist for App approvals | off (warns) | a `sessions` list in `reviewer-signers.json` | remove the key |
+| session allowlist for App approvals | off (warns) | a `sessions` list in `reviewer-signers.json` (with a `session_hosts` map, or nothing is admitted) | remove the key |
 | rebase carry | off | a `rebase-carry` file, or `SHIPYARD_REBASE_CARRY=1` | remove the file; `SHIPYARD_REBASE_CARRY=0` forces it off |
 | HOLD dequeues or disarms | off | a `hold-disarms` file, or `SHIPYARD_HOLD_DISARMS=1` | remove the file; `SHIPYARD_HOLD_DISARMS=0` forces it off |
 

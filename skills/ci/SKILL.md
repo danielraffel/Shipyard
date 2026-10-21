@@ -188,7 +188,10 @@ server-side `review-verdict` status also refuses one with no ghapp stamp, so
 post verdicts through `ghapp api .../issues/N/comments -f body=`); where the
 host's `reviewer-signers.json` has a `sessions` list, every `session:` line on
 the App APPROVE must be listed and one must be present, since a copied
-`reviewer:` line otherwise passes; with no list the guard warns once)
+`reviewer:` line otherwise passes, and its single `ghapp` stamp must come
+from a hostname the `session_hosts` map gives for the line's `host <name>`,
+since a copied `session:` line otherwise passes; with no list the guard warns
+once)
 arms or merges only a
 head that carries an
 approval of that exact head from an identity listed in
