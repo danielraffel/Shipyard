@@ -5025,3 +5025,11 @@ has no value. Wasted compute per change counts every failed or cancelled job of
 the merged pull request, earlier pushes included; duplicate receipts for one
 head count once. Waste is matched by PR number, so
 merge-group runs are not counted, and it is not limited to the scorecard window.
+
+### Prospective baseline pass history
+
+`collect_baseline.py` records controller-observed pass attempts in a locked,
+atomic sidecar. Readiness requires observed continuity; historical activity
+counts and status-only runs must not be used to manufacture prospective
+coverage. Sidecars are keyed by repository, source identity, cadence, and
+configuration so changing collection policy cannot mix incompatible history.
