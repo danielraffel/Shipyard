@@ -74,7 +74,7 @@ class BaselineScorecardTests(unittest.TestCase):
 
     def test_default_pass_history_sidecar_is_identity_keyed(self):
         args = type("Args", (), {"repo": "o/pulp", "source_identity": "collector:v1",
-                                  "config_identity": "policy:v1", "state": Path("/tmp/state.json")})()
+                                  "config_identity": "policy:v1", "expected_interval_secs": 3600, "cadence_slack_secs": 300, "state": Path("/tmp/state.json")})()
         first = MOD.default_pass_history_path(args)
         args.config_identity = "policy:v2"
         self.assertNotEqual(first.name, MOD.default_pass_history_path(args).name)
