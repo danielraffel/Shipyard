@@ -552,12 +552,21 @@ def main() -> int:
                                  observed_at=completed_at, repo=args.repo, db=args.db,
                                  pass_history=pass_report, record_observation=False)
         else:
+            if args.pass_history_path.exists():
+                try:
+                    existing = load_history(args.pass_history_path, repository=args.repo,
+                                            source_identity=args.source_identity,
+                                            config_identity=pass_config_identity(args))
+                    pass_report = existing.summarize(
+                        completed_at - dt.timedelta(seconds=existing.retention_window_secs), completed_at)
+                except (OSError, HistoryValidationError, ValueError, TypeError):
+                    pass_report = {"status": "unavailable", "reasons": [{"status": "unavailable", "reason": "prospective pass history unavailable"}]}
             state = update_state(args.state, args.project, completed_at, card, events, observed_at=completed_at,
                                  repo=args.repo, db=args.db, pass_history=pass_report)
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired) as exc:
         if args.collect and not pass_recorded:
             try:
-                record_pass_observation(args, "failed", attempt_started_at, error=str(exc))
+                record_pass_observation(args, "failed", dt.datetime.now(dt.timezone.utc), error=str(exc))
             except (OSError, HistoryValidationError, ValueError):
                 pass
         print(f"baseline collection failed: {exc}", file=sys.stderr)
