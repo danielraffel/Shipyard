@@ -3323,7 +3323,7 @@ mod tests {
             "owner/repo",
             "feature/x",
             "main",
-            &"a".repeat(40),
+            "a".repeat(40),
             "policy",
         );
         // Reused evidence has no dispatched run, but it still gates the
@@ -3398,7 +3398,7 @@ mod tests {
             "owner/repo",
             "feature/receipt",
             "main",
-            &"a".repeat(40),
+            "a".repeat(40),
             "receipt-test-policy",
         );
         state.append_run(DispatchedRun {
@@ -3486,9 +3486,7 @@ mod tests {
         std::fs::create_dir_all(&project).expect("project config");
         std::fs::write(
             project.join("config.toml"),
-            format!(
-                "[github.auth]\nsource = \"command\"\ntoken_command = [\"/bin/echo\", \"ghs_fixture\"]\n",
-                ),
+            "[github.auth]\nsource = \"command\"\ntoken_command = [\"/bin/echo\", \"ghs_fixture\"]\n",
         )
         .expect("auth config");
 
