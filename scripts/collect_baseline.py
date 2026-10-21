@@ -10,15 +10,25 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import pathlib
 import os
+import re
 import subprocess
 import sqlite3
 import tempfile
 import sys
 from typing import Any, Sequence
 
+from baseline_pass_history import (
+    HistoryValidationError,
+    PassObservation,
+    append_observation,
+)
+
 REQUIRED_STRATA = ("normal_pr", "merge_group", "rerun", "outage", "concurrent_agents")
+STRATA_CONTRACT = "shipyard-metrics-strata/v1"
+PRODUCER_STRATA = ("normal_pr", "merge_group", "rerun", "unclassified")
 
 
 def run(command: Sequence[str], *, stdin: str | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -155,6 +165,124 @@ def summarize_import(source: str, output: str) -> dict[str, Any]:
     return {"source": source, "status": "completed", "imported": value.get("imported")}
 
 
+def consume_authenticated_strata(card: dict[str, Any], *, repo: str | None = None,
+                                  since_days: int | None = None,
+                                  reference_at: dt.datetime | None = None) -> dict[str, Any]:
+    """Consume only the canonical authenticated job-observation receipt."""
+    unavailable = {
+        name: {"status": "unavailable", "reason":
+               "no authenticated versioned stratum record is present"}
+        for name in REQUIRED_STRATA
+    }
+    for name in ("outage", "concurrent_agents"):
+        unavailable[name]["reason"] = "independent authenticated provider contract is not available"
+    payload = card.get("strata")
+    if not isinstance(payload, dict) or payload.get("schema") != STRATA_CONTRACT:
+        card["strata"] = unavailable
+        card["missing_strata"] = list(REQUIRED_STRATA)
+        card["provenance_status"] = "unverified_organic_input"
+        return card
+    if repo is not None and payload.get("repo") != repo:
+        card["strata"] = unavailable
+        card["missing_strata"] = list(REQUIRED_STRATA)
+        card["provenance_status"] = "unverified_organic_input"
+        return card
+    if payload.get("unit") != "job" or not isinstance(payload.get("source_head"), str) \
+            or not re.fullmatch(r"[0-9a-fA-F]{40}", payload["source_head"]) \
+            or not isinstance(payload.get("generated_at"), str):
+        card["strata"] = unavailable
+        card["missing_strata"] = list(REQUIRED_STRATA)
+        card["provenance_status"] = "unverified_organic_input"
+        return card
+    try:
+        window_since = dt.datetime.fromisoformat(str(payload["window_since"]).replace("Z", "+00:00"))
+        window_until = dt.datetime.fromisoformat(str(payload["window_until"]).replace("Z", "+00:00"))
+        generated_at = dt.datetime.fromisoformat(payload["generated_at"].replace("Z", "+00:00"))
+        if any(value.tzinfo is None or value.utcoffset() is None
+               for value in (window_since, window_until, generated_at)):
+            raise ValueError("strata timestamps must include timezone offsets")
+    except (KeyError, TypeError, ValueError):
+        window_since = window_until = None
+    reference_at = reference_at or dt.datetime.now(dt.timezone.utc)
+    if reference_at.tzinfo is None or reference_at.utcoffset() is None:
+        reference_at = None
+    if window_since is None or window_until is None or reference_at is None \
+            or window_until <= window_since \
+            or (since_days is not None and (window_until - window_since).total_seconds()
+                != since_days * 86400) \
+            or (since_days is not None and abs((window_until - reference_at).total_seconds()) > 300) \
+            or (since_days is not None and abs((window_since -
+                (reference_at - dt.timedelta(days=since_days))).total_seconds()) > 300) \
+            or generated_at < window_until \
+            or generated_at > reference_at + dt.timedelta(seconds=300):
+        card["strata"] = unavailable
+        card["missing_strata"] = list(REQUIRED_STRATA)
+        card["provenance_status"] = "unverified_organic_input"
+        return card
+    records = payload.get("strata")
+    aggregate = payload.get("aggregate")
+    if not isinstance(records, dict) or set(records) != set(PRODUCER_STRATA) \
+            or not isinstance(aggregate, dict):
+        card["strata"] = unavailable
+        card["missing_strata"] = list(REQUIRED_STRATA)
+        card["provenance_status"] = "unverified_organic_input"
+        return card
+
+    def valid_count(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    if not valid_count(aggregate.get("observed_jobs")) or not valid_count(aggregate.get("qualified_jobs")) \
+            or aggregate["qualified_jobs"] > aggregate["observed_jobs"]:
+        return {**card, "strata": unavailable, "missing_strata": list(REQUIRED_STRATA),
+                "provenance_status": "unverified_organic_input"}
+    observed_total = qualified_total = 0
+    accepted: dict[str, dict[str, Any]] = {}
+    sufficient: set[str] = set()
+    for name in PRODUCER_STRATA:
+        record = records.get(name)
+        if not isinstance(record, dict):
+            return {**card, "strata": unavailable, "missing_strata": list(REQUIRED_STRATA),
+                    "provenance_status": "unverified_organic_input"}
+        observed = record.get("observed_jobs")
+        qualified = record.get("qualified_jobs")
+        if not valid_count(observed) or not valid_count(qualified) or qualified > observed \
+                or record.get("provenance") not in {"authenticated", "unverified", "unknown"} \
+                or record.get("coverage") not in {"complete", "partial", "unavailable"} \
+                or not isinstance(record.get("reason"), str) \
+                or (record["provenance"] != "authenticated" and qualified != 0):
+            return {**card, "strata": unavailable, "missing_strata": list(REQUIRED_STRATA),
+                    "provenance_status": "unverified_organic_input"}
+        observed_total += observed
+        qualified_total += qualified
+        if record["provenance"] == "authenticated" and record["coverage"] == "complete":
+            accepted[name] = dict(record)
+            # Mandatory category presence is distinct from a producer-selected
+            # sample threshold: a measured zero remains available but cannot
+            # establish representative activity.
+            if qualified > 0:
+                sufficient.add(name)
+    if aggregate["observed_jobs"] != observed_total or aggregate["qualified_jobs"] != qualified_total:
+        return {**card, "strata": unavailable, "missing_strata": list(REQUIRED_STRATA),
+                "provenance_status": "unverified_organic_input"}
+
+    # Preserve unverified/unknown observations for audit visibility while only
+    # authenticated complete records can enter the promotion population.
+    card["strata"] = {name: dict(records[name]) for name in PRODUCER_STRATA}
+    for name in ("outage", "concurrent_agents"):
+        card["strata"][name] = unavailable[name]
+    card["strata_sufficiency"] = {
+        name: {"status": "sufficient" if name in sufficient else "insufficient",
+               "qualified_jobs": card["strata"].get(name, {}).get("qualified_jobs")}
+        for name in REQUIRED_STRATA
+    }
+    card["missing_strata"] = [name for name in REQUIRED_STRATA if name not in sufficient]
+    card["provenance_status"] = (
+        "authenticated_strata_complete" if len(sufficient) == len(REQUIRED_STRATA)
+        else "authenticated_strata_partial" if accepted else "unverified_organic_input"
+    )
+    return card
+
+
 def validate_state_layout(db: pathlib.Path) -> pathlib.Path:
     db = db.expanduser()
     if db.name != "metrics.db" or db.parent.name != "metrics":
@@ -182,19 +310,79 @@ def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
         "status": "unavailable", "value": None,
         "reason": "collector does not import or authenticate merge receipts",
     }
-    card["provenance_status"] = "unverified_organic_input"
     card.pop("database", None)
-    card["strata"] = {name: {"status": "unavailable", "reason":
-                       "no authenticated stratum label is present in the imported telemetry"}
-                      for name in REQUIRED_STRATA}
-    card["missing_strata"] = list(REQUIRED_STRATA)
-    return card
+    return consume_authenticated_strata(card, repo=args.repo, since_days=args.since_days,
+                                        reference_at=dt.datetime.now(dt.timezone.utc))
+
+
+def baseline_readiness(card: dict[str, Any], started: dt.datetime,
+                       observed_at: dt.datetime,
+                       pass_history: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Require the preregistered prospective baseline controls explicitly."""
+    reasons: list[dict[str, str]] = []
+    elapsed_days = (observed_at - started).total_seconds() / 86400
+    if elapsed_days < 5:
+        reasons.append({"status": "insufficient", "reason": "fewer than five continuous elapsed 24-hour days"})
+
+    if not isinstance(pass_history, dict):
+        reasons.append({"status": "unavailable", "reason": "prospective pass history is unavailable"})
+    else:
+        if not pass_history.get("five_continuous_24h_days"):
+            reasons.append({"status": "insufficient", "reason": "prospective pass history has fewer than five continuous elapsed 24-hour days"})
+        if pass_history.get("missing_intervals") or pass_history.get("failing_intervals"):
+            reasons.append({"status": "unavailable", "reason": "prospective pass history contains missing or failed intervals"})
+
+    instrumentation = card.get("instrumentation_coverage")
+    if not isinstance(instrumentation, dict) or instrumentation.get("status") != "available" \
+            or instrumentation.get("continuous") is not True \
+            or isinstance(instrumentation.get("continuous_days"), bool) \
+            or not isinstance(instrumentation.get("continuous_days"), (int, float)) \
+            or not math.isfinite(float(instrumentation.get("continuous_days", float("nan")))) \
+            or instrumentation.get("continuous_days") < 5:
+        reasons.append({"status": "unavailable", "reason": "continuous instrumentation coverage is unavailable"})
+
+    eligibility_reasons: list[dict[str, str]] = []
+    for field, minimum, label in (("important_lanes", 30, "important lane"),
+                                  ("host_generations", 10, "host generation")):
+        coverage = card.get(field)
+        if not isinstance(coverage, dict) or not coverage:
+            reasons.append({"status": "unavailable", "reason": f"{label} coverage is unavailable"})
+            continue
+        for name, entry in coverage.items():
+            if not isinstance(entry, dict):
+                reasons.append({"status": "unavailable", "reason": f"{label} {name} coverage is malformed"})
+            elif entry.get("status") == "insufficient":
+                eligibility_reasons.append({"status": "insufficient", "reason": f"{label} {name} explicitly insufficient"})
+            elif entry.get("status") != "available" or not isinstance(entry.get("completed_jobs"), int) \
+                    or isinstance(entry.get("completed_jobs"), bool) or entry["completed_jobs"] < minimum:
+                reasons.append({"status": "unavailable", "reason": f"{label} {name} lacks {minimum} completed jobs"})
+
+    strata = card.get("strata")
+    sufficiency = card.get("strata_sufficiency")
+    if card.get("missing_strata") or not isinstance(sufficiency, dict) \
+            or any(name not in sufficiency or not isinstance(sufficiency[name], dict)
+                   or sufficiency[name].get("status") != "sufficient" for name in REQUIRED_STRATA):
+        reasons.append({"status": "unavailable", "reason": "mandatory strata sample sufficiency is unavailable"})
+    for name in REQUIRED_STRATA:
+        entry = strata.get(name) if isinstance(strata, dict) else None
+        if not isinstance(entry, dict) or entry.get("provenance") != "authenticated" \
+                or entry.get("coverage") != "complete":
+            reasons.append({"status": "unavailable", "reason": f"mandatory {name} period is unavailable"})
+
+    report_complete = not reasons
+    optimization_eligible = report_complete and not eligibility_reasons
+    status = "ready" if optimization_eligible else "complete_insufficient" if report_complete else (
+        "insufficient" if any(reason["status"] == "insufficient" for reason in reasons) else "unavailable")
+    return {"status": status, "exit": report_complete, "report_complete": report_complete,
+            "optimization_eligible": optimization_eligible, "elapsed_days": elapsed_days,
+            "reasons": reasons, "optimization_reasons": eligibility_reasons}
 
 
 def update_state(path: pathlib.Path, project: str, started: dt.datetime,
                  card: dict[str, Any], events: list[dict[str, Any]],
                  observed_at: dt.datetime | None = None, repo: str | None = None,
-                 db: pathlib.Path | None = None) -> dict[str, Any]:
+                 db: pathlib.Path | None = None,
+                 pass_history: dict[str, Any] | None = None) -> dict[str, Any]:
     state = json.loads(path.read_text()) if path.exists() else {}
     state.setdefault("started_at", started.isoformat())
     state.setdefault("observations", [])
@@ -204,22 +392,28 @@ def update_state(path: pathlib.Path, project: str, started: dt.datetime,
         state["identity"] = state_identity(path, project, repo, db)
     state["project"] = project
     state["last_observed_at"] = observed_at.isoformat()
+    if pass_history is not None:
+        state["pass_history"] = pass_history
     imported = any((event.get("new_rows") or 0) > 0 for event in events)
     activity_dates = set()
     for event in events:
         activity_dates.update(value for value in event.get("source_activity_dates", []) if isinstance(value, str))
-    baseline_start = dt.datetime.fromisoformat(state["started_at"].replace("Z", "+00:00")).date()
+    baseline_started = dt.datetime.fromisoformat(state["started_at"].replace("Z", "+00:00"))
+    baseline_start = baseline_started.date()
     has_activity = imported or bool(activity_dates)
     if has_activity:
         state["observations"].append({"at": state["last_observed_at"], "events": events,
                                        "source_activity_dates": sorted(activity_dates), "scorecard": card})
     observed_days = {value for item in state["observations"] for value in item.get("source_activity_dates", [])
-                     if value >= baseline_start.isoformat() and dt.date.fromisoformat(value).weekday() < 5}
-    collection_days = {item["at"][:10] for item in state["observations"]
-                       if dt.date.fromisoformat(item["at"][:10]).weekday() < 5}
-    state["collection_weekday_days"] = len(collection_days)
-    state["weekday_days_observed"] = len(observed_days)
-    state["baseline_exit"] = len(observed_days) >= 5 and not card.get("missing_strata")
+                     if value >= baseline_start.isoformat()}
+    collection_days = {item["at"][:10] for item in state["observations"]}
+    state["collection_days_observed"] = len(collection_days)
+    state["source_activity_days_observed"] = len(observed_days)
+    # Retain legacy keys as telemetry aliases; readiness no longer uses them.
+    state["collection_weekday_days"] = state["collection_days_observed"]
+    state["weekday_days_observed"] = state["source_activity_days_observed"]
+    state["baseline_readiness"] = baseline_readiness(card, baseline_started, observed_at, pass_history)
+    state["baseline_exit"] = state["baseline_readiness"]["exit"]
     payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=path.name + ".", delete=False) as temporary:
@@ -229,6 +423,51 @@ def update_state(path: pathlib.Path, project: str, started: dt.datetime,
         temporary_path = temporary.name
     os.replace(temporary_path, path)
     return state
+
+
+def pass_config_identity(args: argparse.Namespace) -> str:
+    return (
+        f"{args.config_identity};interval={args.expected_interval_secs};"
+        f"slack={args.cadence_slack_secs}"
+    )
+
+
+def record_pass_observation(args: argparse.Namespace, status: str, observed_at: dt.datetime,
+                            *, imported_count: int = 0, error: str | None = None) -> dict[str, Any]:
+    controller_now = dt.datetime.now(dt.timezone.utc)
+    config_identity = pass_config_identity(args)
+    if status == "failed":
+        observation = PassObservation.failed(
+            repo=args.repo, observed_at=observed_at,
+            expected_interval_secs=args.expected_interval_secs,
+            source_identity=args.source_identity, config_identity=config_identity,
+            error=error or "collection failed",
+        )
+    elif status == "success":
+        observation = PassObservation.success(
+            repo=args.repo, observed_at=observed_at,
+            expected_interval_secs=args.expected_interval_secs,
+            source_identity=args.source_identity, config_identity=config_identity,
+            imported_count=imported_count,
+        )
+    else:
+        raise ValueError(f"unsupported pass status: {status}")
+    history = append_observation(
+        args.pass_history_path, observation, repository=args.repo,
+        source_identity=args.source_identity, config_identity=config_identity,
+        expected_interval_secs=args.expected_interval_secs,
+        cadence_slack_secs=args.cadence_slack_secs, now=controller_now,
+    )
+    baseline_started = (
+        dt.datetime.fromisoformat(
+            json.loads(args.state.read_text()).get("started_at", observed_at.isoformat()).replace("Z", "+00:00")
+        )
+        if args.state.exists()
+        else observed_at
+    )
+    if baseline_started >= observed_at:
+        baseline_started = observed_at - dt.timedelta(seconds=1)
+    return history.summarize(baseline_started, observed_at)
 
 
 def main() -> int:
@@ -244,29 +483,60 @@ def main() -> int:
     parser.add_argument("--since-days", type=int, default=5)
     parser.add_argument("--collect", action="store_true", help="run provider imports")
     parser.add_argument("--timeout-seconds", type=int, default=300)
+    parser.add_argument("--pass-history", type=pathlib.Path,
+                        help="prospective pass history sidecar (defaults beside --state)")
+    parser.add_argument("--source-identity", default="shipyard.collect_baseline:v1")
+    parser.add_argument("--config-identity", default="baseline-policy:v1")
+    parser.add_argument("--expected-interval-secs", type=int, default=3600)
+    parser.add_argument("--cadence-slack-secs", type=int, default=0)
     args = parser.parse_args()
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
+    if args.expected_interval_secs <= 0:
+        parser.error("--expected-interval-secs must be positive")
+    if args.cadence_slack_secs < 0:
+        parser.error("--cadence-slack-secs must be non-negative")
+    args.pass_history_path = args.pass_history or args.state.with_name("baseline-pass-history.json")
+
+    events: list[dict[str, Any]] = []
+    pass_report: dict[str, Any] | None = None
+    pass_recorded = False
     try:
         events = import_organic(args) if args.collect else []
         card = authoritative_scorecard(args)
-        state = update_state(args.state, args.project, dt.datetime.now(dt.timezone.utc), card, events, repo=args.repo, db=args.db)
-    except (OSError, RuntimeError, ValueError) as exc:
+        completed_at = dt.datetime.now(dt.timezone.utc)
+        if args.collect:
+            counts = [event.get("imported") for event in events if event.get("source") in {"github", "tartci"}]
+            imported_count = sum(value for value in counts if isinstance(value, int) and not isinstance(value, bool))
+            pass_report = record_pass_observation(args, "success", completed_at, imported_count=imported_count)
+            pass_recorded = True
+        state = update_state(args.state, args.project, completed_at, card, events, observed_at=completed_at,
+                             repo=args.repo, db=args.db, pass_history=pass_report)
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired) as exc:
+        if args.collect and not pass_recorded:
+            try:
+                record_pass_observation(args, "failed", dt.datetime.now(dt.timezone.utc), error=str(exc))
+            except (OSError, HistoryValidationError, ValueError):
+                pass
         print(f"baseline collection failed: {exc}", file=sys.stderr)
         return 1
     output = {"project": args.project, "database": "configured metrics store", "scorecard": card,
-              "baseline": {"weekday_days_observed": state["weekday_days_observed"],
-                           "collection_weekday_days": state.get("collection_weekday_days", 0),
+              "baseline": {"source_activity_days_observed": state["source_activity_days_observed"],
+                           "collection_days_observed": state.get("collection_days_observed", 0),
+                           "readiness": state.get("baseline_readiness", {"status": "unavailable"}),
                            "exit": state["baseline_exit"]}, "events": events}
     if args.status_markdown:
         args.status_markdown.write_text(
             "# Organic baseline status\n\n"
             f"- Project: `{args.project}`\n- Observed: `{state['last_observed_at']}`\n"
-            f"- Weekdays observed: **{state['weekday_days_observed']}** (exit requires five)\n"
-            f"- Exit: **{'yes' if state['baseline_exit'] else 'no'}**\n"
+            f"- Source activity dates observed: **{state['source_activity_days_observed']}** (telemetry only)\n"
+            f"- Continuous elapsed days: **{state['baseline_readiness'].get('elapsed_days', 0):.2f}** (exit requires five with active instrumentation)\n"
+            f"- Prospective pass history: **{state.get('pass_history', {}).get('continuous_elapsed_days', 0):.2f}** days; trailing interval unobserved: **{state.get('pass_history', {}).get('trailing_interval_unobserved', 'unavailable')}**\n"
+            f"- Baseline report complete: **{'yes' if state['baseline_readiness'].get('report_complete') else 'no'}**\n"
+            f"- Optimization eligibility: **{'yes' if state['baseline_readiness'].get('optimization_eligible') else 'no'}**\n"
             f"- Safely merged denominator: **{card.get('collector_safe_merge_denominator', {}).get('status', 'unavailable')}**\n"
-            "- Provenance: **unverified organic input**; synthetic provenance is not asserted by this wrapper.\n"
-            "- Strata: **unavailable** until authenticated labels are emitted by the producer.\n\n"
+            f"- Provenance: **{card.get('provenance_status', 'unverified_organic_input')}**.\n"
+            f"- Strata: **{len(REQUIRED_STRATA) - len(card.get('missing_strata', REQUIRED_STRATA))}/{len(REQUIRED_STRATA)} sufficient**; authenticated producer records only.\n\n"
             "Synthetic provenance, unavailable phases, and merge denominators are not imputed.\n"
         )
     print(json.dumps(output, indent=2, sort_keys=True))
