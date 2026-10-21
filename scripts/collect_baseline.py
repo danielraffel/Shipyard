@@ -562,8 +562,8 @@ def main() -> int:
         if args.collect and not pass_recorded:
             try:
                 record_pass_observation(args, "failed", dt.datetime.now(dt.timezone.utc), error=str(exc))
-            except (OSError, HistoryValidationError, ValueError):
-                pass
+            except (OSError, HistoryValidationError, ValueError, TypeError) as history_error:
+                print(f"prospective pass history unavailable: {history_error}", file=sys.stderr)
         print(f"baseline collection failed: {exc}", file=sys.stderr)
         return 1
     output = {"project": args.project, "database": "configured metrics store", "scorecard": card,
