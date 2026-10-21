@@ -301,6 +301,8 @@ class PassHistory:
         self.cadence_slack_secs = _nonnegative_int(
             self.cadence_slack_secs, "cadence_slack_secs"
         )
+        if self.cadence_slack_secs >= self.expected_interval_secs:
+            raise HistoryValidationError("cadence_slack_secs must be less than expected_interval_secs")
         normalized: list[PassObservation] = []
         for observation in self.observations:
             self._validate_observation_identity(observation)
