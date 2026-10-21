@@ -358,9 +358,15 @@ class PassHistory:
             return
         newest = max(_parse_timestamp(item.observed_at) for item in self.observations)
         cutoff = newest - timedelta(seconds=self.retention_window_secs)
-        retained = [
-            item for item in self.observations if _parse_timestamp(item.observed_at) >= cutoff
-        ]
+        retained = [item for item in self.observations
+                    if _parse_timestamp(item.observed_at) >= cutoff]
+        # Keep one observation immediately before the retention boundary as an
+        # anchor. Without it, a continuous history with jitter appears to have
+        # a missing interval every time the 14-day window advances.
+        anchors = [item for item in self.observations
+                   if _parse_timestamp(item.observed_at) < cutoff]
+        if anchors:
+            retained.insert(0, max(anchors, key=lambda item: _parse_timestamp(item.observed_at)))
         self.observations = retained[-self.max_observations :]
 
     def append(

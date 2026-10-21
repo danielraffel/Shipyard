@@ -94,12 +94,13 @@ class BaselineScorecardTests(unittest.TestCase):
             repository="o/p", source_identity="collector:test:v1", config_identity="policy:test:v1",
             expected_interval_secs=3600,
         )
-        first = observed - dt.timedelta(days=14)
+        first = observed - dt.timedelta(days=14, seconds=7)
         for index in range(24 * 14 + 1):
-            point = first + dt.timedelta(hours=index)
+            point = first + dt.timedelta(hours=index, seconds=(index % 3) * 30)
             store.append(history.PassObservation.success(
                 repo="o/p", observed_at=point, expected_interval_secs=3600,
                 source_identity="collector:test:v1", config_identity="policy:test:v1"), now=point)
+        observed = point
         report = store.summarize(max(started, observed - dt.timedelta(days=14)), observed)
         self.assertFalse(report["missing_intervals"])
 
