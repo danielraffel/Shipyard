@@ -210,11 +210,19 @@ pub(super) fn execute_auto_merge(
                     if merge_error_confirms_merged(&error)
                         || pr_is_merged(request.pr, cwd, request.pr_snapshot_file.as_deref())
                     {
+                        let receipt_warning =
+                            if request.merge_result.is_none() && request.merge_command.is_none() {
+                                emit_confirmed_merge_receipt(store, cwd, &state).err()
+                            } else {
+                                None
+                            };
                         store
                             .archive_scoped_locked(&state.repo, request.pr, &lock)
                             .map_err(AutoMergeOperationError::Store)?;
                         return Ok(AutoMergeOutcome::Merged {
-                            cleanup_warning: Some(error),
+                            cleanup_warning: receipt_warning
+                                .map(|warning| format!("{error}; {warning}"))
+                                .or(Some(error)),
                         });
                     }
                     return Ok(AutoMergeOutcome::MergeFailed { error });
