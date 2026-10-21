@@ -1163,6 +1163,22 @@ fn emit_confirmed_merge_receipt(
 ) -> Result<(), String> {
     let client = gh_client(cwd)?;
     let info = verify_live_merge_target(&client, cwd, state, "recording merge receipt")?;
+    let receipt = confirmed_merge_receipt(state, &info)?;
+    let state_dir = store
+        .path()
+        .parent()
+        .ok_or_else(|| "merge receipt refused: state directory is unavailable".to_owned())?;
+    MetricsStore::open(state_dir)
+        .map_err(|error| format!("merge receipt store unavailable: {error}"))?
+        .import_merge_receipts(&[receipt])
+        .map_err(|error| format!("merge receipt import failed: {error}"))?;
+    Ok(())
+}
+
+/// Build the receipt only from the authoritative post-merge REST observation
+/// and the immutable gate evidence captured in ship-state. Keeping this
+/// validation separate makes every emission path exercise the same guards.
+fn confirmed_merge_receipt(state: &ShipState, info: &PrHeadInfo) -> Result<MergeReceipt, String> {
     if !info.merged {
         return Err("merge receipt refused: GitHub did not confirm the PR is merged".to_owned());
     }
@@ -1186,7 +1202,7 @@ fn emit_confirmed_merge_receipt(
         merge_commit_sha,
         merged_at.to_rfc3339()
     ));
-    let receipt = MergeReceipt {
+    Ok(MergeReceipt {
         schema: MERGE_RECEIPT_SCHEMA.to_owned(),
         receipt_id,
         repo: state.repo.clone(),
@@ -1207,27 +1223,29 @@ fn emit_confirmed_merge_receipt(
         required_checks,
         gate_receipt_sha256: gate_sha.clone(),
         evidence: format!("sha256:{gate_sha};merge:{merge_commit_sha}"),
-    };
-    let state_dir = store
-        .path()
-        .parent()
-        .ok_or_else(|| "merge receipt refused: state directory is unavailable".to_owned())?;
-    MetricsStore::open(state_dir)
-        .map_err(|error| format!("merge receipt store unavailable: {error}"))?
-        .import_merge_receipts(&[receipt])
-        .map_err(|error| format!("merge receipt import failed: {error}"))?;
-    Ok(())
+    })
 }
 
 fn required_checks(state: &ShipState) -> Result<Vec<String>, String> {
     if ship_terminal_verdict(state) != Some(true) {
         return Err("merge receipt refused: required evidence is not terminal green".to_owned());
     }
-    let mut checks = state
+    // Keep the receipt's required-check list identical to the verdict's
+    // gating set: every evidence target gates unless it was explicitly
+    // marked advisory. Evidence can be reused or supplied without a fresh
+    // dispatched run, so deriving this from dispatched_runs understates what
+    // actually decided the merge.
+    let advisory_targets = state
         .dispatched_runs
         .iter()
-        .filter(|run| run.required)
-        .map(|run| run.target.clone())
+        .filter(|run| !run.required)
+        .map(|run| run.target.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut checks = state
+        .evidence_snapshot
+        .keys()
+        .filter(|target| !advisory_targets.contains(target.as_str()))
+        .cloned()
         .collect::<BTreeSet<_>>();
     if checks.is_empty() {
         return Err("merge receipt refused: no required checks were recorded".to_owned());
@@ -3299,6 +3317,43 @@ mod tests {
     }
 
     #[test]
+    fn merge_receipt_required_checks_match_evidence_gating_set() {
+        let mut state = ShipState::new(
+            43,
+            "owner/repo",
+            "feature/x",
+            "main",
+            &"a".repeat(40),
+            "policy",
+        );
+        // Reused evidence has no dispatched run, but it still gates the
+        // terminal verdict and must appear in the receipt.
+        state.update_evidence("reused-macos", "pass");
+        assert_eq!(
+            required_checks(&state).expect("evidence-only gate"),
+            vec!["reused-macos"]
+        );
+
+        state.append_run(DispatchedRun {
+            target: "advisory-linux".to_owned(),
+            provider: "fixture".to_owned(),
+            run_id: "2".to_owned(),
+            status: "completed".to_owned(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            attempt: 1,
+            last_heartbeat_at: None,
+            phase: None,
+            required: false,
+        });
+        state.update_evidence("advisory-linux", "pass");
+        assert_eq!(
+            required_checks(&state).expect("mixed gate"),
+            vec!["reused-macos"]
+        );
+    }
+
+    #[test]
     fn merge_receipt_warning_is_retained_alongside_cleanup_warning() {
         assert_eq!(
             join_warning_options(
@@ -3311,6 +3366,257 @@ mod tests {
         assert_eq!(
             join_warning_options(None, Some("merge receipt refused".to_owned())).as_deref(),
             Some("merge receipt refused")
+        );
+    }
+
+    fn merge_receipt_fixture(name: &str) -> Value {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/github")
+            .join(name);
+        serde_json::from_str(&std::fs::read_to_string(path).expect("merge receipt fixture"))
+            .expect("merge receipt JSON")
+    }
+
+    fn merge_receipt_fixture_info(name: &str) -> PrHeadInfo {
+        let value = merge_receipt_fixture(name);
+        PrHeadInfo {
+            head_ref: value["head"]["ref"].as_str().expect("head ref").to_owned(),
+            head_repo: Some("owner/repo".to_owned()),
+            sha: value["head"]["sha"].as_str().expect("head sha").to_owned(),
+            base_ref: value["base"]["ref"].as_str().expect("base ref").to_owned(),
+            merged: value["merged"].as_bool().expect("merged"),
+            merge_commit_sha: value["merge_commit_sha"].as_str().map(str::to_owned),
+            merged_at: value["merged_at"]
+                .as_str()
+                .map(|value| value.parse().expect("merged_at")),
+        }
+    }
+
+    fn receipt_test_state(pr: u64) -> ShipState {
+        let mut state = ShipState::new(
+            pr,
+            "owner/repo",
+            "feature/receipt",
+            "main",
+            &"a".repeat(40),
+            "receipt-test-policy",
+        );
+        state.append_run(DispatchedRun {
+            target: "sandbox".to_owned(),
+            provider: "fixture".to_owned(),
+            run_id: "receipt-run".to_owned(),
+            status: "completed".to_owned(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            attempt: 1,
+            last_heartbeat_at: None,
+            phase: None,
+            required: true,
+        });
+        state.update_evidence("sandbox", "pass");
+        state
+    }
+
+    #[test]
+    fn merge_receipt_fixtures_require_confirmation_and_complete_merge_identity() {
+        let state = receipt_test_state(601);
+        let receipt = confirmed_merge_receipt(
+            &state,
+            &merge_receipt_fixture_info("merge_receipt_confirmed.json"),
+        )
+        .expect("confirmed fixture emits receipt");
+        assert_eq!(receipt.pr, 601);
+        assert_eq!(receipt.merge_commit_sha, "b".repeat(40));
+        assert_eq!(receipt.required_checks, vec!["sandbox"]);
+
+        for (fixture, expected) in [
+            (
+                "merge_receipt_missing_timestamp.json",
+                "merged timestamp is unavailable",
+            ),
+            (
+                "merge_receipt_zero_sha.json",
+                "merge commit SHA is unavailable",
+            ),
+        ] {
+            let error = confirmed_merge_receipt(&state, &merge_receipt_fixture_info(fixture))
+                .expect_err("incomplete merge fixture must refuse receipt");
+            assert!(error.contains(expected), "{fixture}: {error}");
+        }
+    }
+
+    /// Exercise the real post-merge call sites with a deterministic `gh`
+    /// fixture. The mode file lets one child process replay merged, enqueued,
+    /// and incomplete-identity observations without mutating the host's
+    /// ambient GitHub configuration.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn merge_receipt_emission_paths_are_fixture_driven() {
+        const CHILD: &str = "SHIPYARD_MERGE_RECEIPT_FIXTURE_CHILD";
+        let temp = tempfile::tempdir().expect("fixture root");
+        let mode = temp.path().join("mode");
+        std::fs::write(&mode, "merged\n").expect("mode");
+        let fake_gh = temp.path().join("gh");
+        let confirmed =
+            serde_json::to_string(&merge_receipt_fixture("merge_receipt_confirmed.json"))
+                .expect("confirmed fixture");
+        let missing = serde_json::to_string(&merge_receipt_fixture(
+            "merge_receipt_missing_timestamp.json",
+        ))
+        .expect("missing fixture");
+        let zero = serde_json::to_string(&merge_receipt_fixture("merge_receipt_zero_sha.json"))
+            .expect("zero fixture");
+        let queue = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/github/merge_receipt_queue_merged.json");
+        let script = format!(
+            "#!/bin/sh\nmode=$(cat '{mode}')\ncase \"$*\" in\n  *\"api repos/owner/repo/pulls/\"*|*\"api repos/{{owner}}/{{repo}}/pulls/\"*)\n    case \"$mode\" in missing) echo '{missing}';; zero) echo '{zero}';; *) echo '{confirmed}';; esac ;;\n  *\"api graphql\"*)
+    case \"$mode\" in
+      enqueued) echo '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"id\":\"PR_receipt\",\"headRefOid\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"baseRefName\":\"main\",\"merged\":false,\"autoMergeRequest\":null,\"timelineItems\":{{\"nodes\":[]}}}},\"mergeQueue\":{{\"entries\":{{\"nodes\":[{{\"position\":1,\"pullRequest\":{{\"number\":42}}}}],\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}}}}}}}}}}}}';;
+      *) cat '{queue}';;
+    esac;;\n  *) echo \"unexpected gh fixture call: $*\" >&2; exit 91 ;;\nesac\n",
+            mode = mode.display(),
+            confirmed = confirmed,
+            missing = missing,
+            zero = zero,
+            queue = queue.display(),
+        );
+        crate::test_support::write_executable_script(&fake_gh, &script);
+        let project = temp.path().join(".shipyard");
+        std::fs::create_dir_all(&project).expect("project config");
+        std::fs::write(
+            project.join("config.toml"),
+            format!(
+                "[github.auth]\nsource = \"command\"\ntoken_command = [\"/bin/echo\", \"ghs_fixture\"]\n",
+                ),
+        )
+        .expect("auth config");
+
+        if std::env::var_os(CHILD).is_none() {
+            let path = format!(
+                "{}:{}",
+                temp.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "app::auto_merge_cmd::tests::merge_receipt_emission_paths_are_fixture_driven",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("PATH", path)
+                .env("SHIPYARD_MERGE_RECEIPT_FIXTURE_ROOT", temp.path())
+                .output()
+                .expect("fixture child");
+            assert!(
+                output.status.success(),
+                "fixture child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let root = PathBuf::from(
+            std::env::var_os("SHIPYARD_MERGE_RECEIPT_FIXTURE_ROOT").expect("fixture root env"),
+        );
+        let live_snapshot = root.join("live_snapshot.json");
+        std::fs::write(
+            &live_snapshot,
+            std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/github/merge_receipt_confirmed.json"),
+            )
+            .expect("live snapshot"),
+        )
+        .expect("write live snapshot");
+        let enqueued_snapshot = root.join("enqueued_snapshot.json");
+        std::fs::write(
+            &enqueued_snapshot,
+            r#"{"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"base":{"ref":"main"}}"#,
+        )
+        .expect("write enqueued snapshot");
+        let run = |mode_name: &str, supervise: bool| -> (AutoMergeOutcome, usize) {
+            std::fs::write(&mode, format!("{mode_name}\n")).expect("mode update");
+            let store =
+                ShipStateStore::new(root.join(mode_name).join("state")).expect("ship state store");
+            let mut state = receipt_test_state(42);
+            if supervise {
+                state.merge_queue_attempt_started_at = Some(Utc::now());
+                state.merge_queue_enqueue_succeeded_at = Some(Utc::now());
+            }
+            store.save(&state).expect("state");
+            let outcome = crate::gh::allow_bare_gh_for_test(|| {
+                if supervise {
+                    supervise_merge_queue(
+                        &store,
+                        &root,
+                        RuntimeMode::Isolated,
+                        &root,
+                        42,
+                        false,
+                        None,
+                    )
+                } else {
+                    execute_auto_merge(
+                        &store,
+                        &root,
+                        &AutoMergeRequest {
+                            mode: RuntimeMode::Isolated,
+                            global_dir: root.clone(),
+                            pr: 42,
+                            merge_method: MergeMethod::Squash,
+                            delete_branch: false,
+                            admin: false,
+                            pr_snapshot_file: Some(if mode_name == "enqueued" {
+                                enqueued_snapshot.clone()
+                            } else {
+                                live_snapshot.clone()
+                            }),
+                            merge_command: None,
+                            merge_result: None,
+                            expected_validation: Some(ValidatedShipIdentity::from(&state)),
+                        },
+                    )
+                    .expect("auto merge")
+                }
+            });
+            let metrics = MetricsStore::open(root.join(mode_name).as_path()).expect("metrics");
+            let count = rusqlite::Connection::open(metrics.path())
+                .expect("metrics db")
+                .query_row("SELECT count(*) FROM merge_receipts", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .expect("receipt count");
+            (outcome, count)
+        };
+
+        let (merged, merged_count) = run("merged", false);
+        assert!(
+            matches!(
+                merged,
+                AutoMergeOutcome::Merged {
+                    cleanup_warning: None
+                }
+            ),
+            "merged outcome: {merged:?}"
+        );
+        assert_eq!(merged_count, 1, "confirmed merge must emit one receipt");
+
+        let (queue_merged, queue_count) = run("queue_merged", true);
+        assert!(
+            matches!(
+                queue_merged,
+                AutoMergeOutcome::Merged {
+                    cleanup_warning: None
+                }
+            ),
+            "queue outcome: {queue_merged:?}"
+        );
+        assert_eq!(
+            queue_count, 1,
+            "queue merged observation must emit one receipt"
         );
     }
 
