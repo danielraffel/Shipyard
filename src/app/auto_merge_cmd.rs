@@ -6,7 +6,9 @@ use std::process::{Command, ExitCode};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::{
     CliFailure,
@@ -20,6 +22,8 @@ use crate::merge_queue::{
     parse_pr_observation, parse_queue_snapshot,
 };
 use crate::merge_queue_control::MergeQueueMutationGuard;
+use crate::metrics::MetricsStore;
+use crate::metrics::merge_receipt::{MergeReceipt, SCHEMA as MERGE_RECEIPT_SCHEMA};
 use crate::output::write_json_envelope;
 use crate::ship_state::{ShipState, ShipStatePrLock, ShipStateStore};
 use crate::watch::ship_terminal_verdict;
@@ -131,6 +135,7 @@ impl std::error::Error for AutoMergeOperationError {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn execute_auto_merge(
     store: &ShipStateStore,
     cwd: &Path,
@@ -224,7 +229,15 @@ pub(super) fn execute_auto_merge(
                     }
                     return Ok(AutoMergeOutcome::Enqueued);
                 }
-                MergeDisposition::Merged { cleanup_warning } => cleanup_warning,
+                MergeDisposition::Merged { cleanup_warning } => {
+                    let receipt_warning =
+                        if request.merge_result.is_none() && request.merge_command.is_none() {
+                            emit_confirmed_merge_receipt(store, cwd, &state)
+                        } else {
+                            Ok(())
+                        };
+                    cleanup_warning.or(receipt_warning.err())
+                }
             };
             store
                 .archive_scoped_locked(&state.repo, request.pr, &lock)
@@ -1119,6 +1132,125 @@ fn classify_builtin_merge_success(
     Ok(MergeDisposition::Enqueued)
 }
 
+/// Emit the authenticated merge receipt only after a direct merge has been
+/// confirmed by GitHub. Metrics are observational: a store failure is surfaced
+/// as a warning after the merge, never used to authorize or undo the merge.
+fn emit_confirmed_merge_receipt(
+    store: &ShipStateStore,
+    cwd: &Path,
+    state: &ShipState,
+) -> Result<(), String> {
+    let client = gh_client(cwd)?;
+    let info = verify_live_merge_target(&client, cwd, state, "recording merge receipt")?;
+    if !info.merged {
+        return Err("merge receipt refused: GitHub did not confirm the PR is merged".to_owned());
+    }
+    let merge_commit_sha = info
+        .merge_commit_sha
+        .as_deref()
+        .filter(|sha| is_nonzero_sha(sha))
+        .ok_or_else(|| "merge receipt refused: merge commit SHA is unavailable".to_owned())?;
+    let merged_at = info
+        .merged_at
+        .ok_or_else(|| "merge receipt refused: merged timestamp is unavailable".to_owned())?;
+    let required_checks = required_checks(state)?;
+    let gate_sha = gate_receipt_sha256(state, &required_checks)?;
+    let pr = i64::try_from(state.pr)
+        .map_err(|_| "merge receipt refused: PR number exceeds signed storage range".to_owned())?;
+    let receipt_id = sha256_hex(format!(
+        "{}|{}|{}|{}|{}",
+        state.repo,
+        state.pr,
+        state.head_sha,
+        merge_commit_sha,
+        merged_at.to_rfc3339()
+    ));
+    let receipt = MergeReceipt {
+        schema: MERGE_RECEIPT_SCHEMA.to_owned(),
+        receipt_id,
+        repo: state.repo.clone(),
+        project: state
+            .repo
+            .rsplit('/')
+            .next()
+            .unwrap_or(&state.repo)
+            .to_owned(),
+        base_branch: state.base_branch.clone(),
+        pr,
+        head_sha: state.head_sha.clone(),
+        validated_head_sha: state.head_sha.clone(),
+        merge_commit_sha: merge_commit_sha.to_owned(),
+        merged_at,
+        safe_merge: true,
+        source: "shipyard".to_owned(),
+        required_checks,
+        gate_receipt_sha256: gate_sha.clone(),
+        evidence: format!("sha256:{gate_sha};merge:{merge_commit_sha}"),
+    };
+    let state_dir = store
+        .path()
+        .parent()
+        .ok_or_else(|| "merge receipt refused: state directory is unavailable".to_owned())?;
+    MetricsStore::open(state_dir)
+        .map_err(|error| format!("merge receipt store unavailable: {error}"))?
+        .import_merge_receipts(&[receipt])
+        .map_err(|error| format!("merge receipt import failed: {error}"))?;
+    Ok(())
+}
+
+fn required_checks(state: &ShipState) -> Result<Vec<String>, String> {
+    if ship_terminal_verdict(state) != Some(true) {
+        return Err("merge receipt refused: required evidence is not terminal green".to_owned());
+    }
+    let mut checks = state
+        .dispatched_runs
+        .iter()
+        .filter(|run| run.required)
+        .map(|run| run.target.clone())
+        .collect::<BTreeSet<_>>();
+    if checks.is_empty() {
+        return Err("merge receipt refused: no required checks were recorded".to_owned());
+    }
+    if checks.iter().any(|target| {
+        state
+            .evidence_snapshot
+            .get(target)
+            .is_none_or(|status| status != "pass")
+    }) {
+        return Err("merge receipt refused: a required check lacks pass evidence".to_owned());
+    }
+    Ok(std::mem::take(&mut checks).into_iter().collect())
+}
+
+fn gate_receipt_sha256(state: &ShipState, required_checks: &[String]) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "repo": state.repo,
+        "pr": state.pr,
+        "base_branch": state.base_branch,
+        "head_sha": state.head_sha,
+        "policy_signature": state.policy_signature,
+        "attempt": state.attempt,
+        "required_checks": required_checks,
+        "evidence": state.evidence_snapshot,
+        "runs": state.dispatched_runs,
+    });
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|error| format!("merge gate receipt serialization failed: {error}"))?;
+    Ok(sha256_hex(bytes))
+}
+
+fn sha256_hex(value: impl AsRef<[u8]>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(value);
+    format!("{:x}", digest.finalize())
+}
+
+fn is_nonzero_sha(value: &str) -> bool {
+    value.len() == 40
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !value.chars().all(|character| character == '0')
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum QueueAdmission {
     Arm { pr_id: String },
@@ -1510,6 +1642,7 @@ pub(super) fn supervise_merge_queue(
                     };
                 }
                 if observation.merged {
+                    let receipt_warning = emit_confirmed_merge_receipt(store, cwd, &state).err();
                     let cleanup_warning = if delete_branch {
                         require_branch_cleanup_git(&mut client, cwd, global_dir)
                             .err()
@@ -1518,7 +1651,8 @@ pub(super) fn supervise_merge_queue(
                             })
                     } else {
                         None
-                    };
+                    }
+                    .or(receipt_warning);
                     if let Err(error) = archive_queue_state_if_current(
                         store,
                         &state,
@@ -2892,6 +3026,8 @@ struct PrHeadInfo {
     sha: String,
     base_ref: String,
     merged: bool,
+    merge_commit_sha: Option<String>,
+    merged_at: Option<DateTime<Utc>>,
 }
 
 fn pr_head_info_rest(
@@ -2941,12 +3077,27 @@ fn pr_head_info_rest(
         .get("merged")
         .and_then(Value::as_bool)
         .ok_or_else(|| "REST fallback: PR JSON missing merged state".to_owned())?;
+    let merge_commit_sha = value
+        .get("merge_commit_sha")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let merged_at = value
+        .get("merged_at")
+        .and_then(Value::as_str)
+        .map(|value| {
+            value
+                .parse::<DateTime<Utc>>()
+                .map_err(|error| format!("REST fallback: invalid merged_at: {error}"))
+        })
+        .transpose()?;
     Ok(PrHeadInfo {
         head_ref,
         head_repo,
         sha,
         base_ref,
         merged,
+        merge_commit_sha,
+        merged_at,
     })
 }
 
@@ -3092,6 +3243,39 @@ fn fields(items: impl IntoIterator<Item = (&'static str, Value)>) -> BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ship_state::DispatchedRun;
+
+    #[test]
+    fn merge_receipt_gate_requires_all_required_targets_green() {
+        let mut state = ShipState::new(
+            42,
+            "owner/repo",
+            "feature/x",
+            "main",
+            &"a".repeat(40),
+            "policy",
+        );
+        state.append_run(DispatchedRun {
+            target: "macos".to_owned(),
+            provider: "github".to_owned(),
+            run_id: "1".to_owned(),
+            status: "completed".to_owned(),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            attempt: 1,
+            last_heartbeat_at: None,
+            phase: None,
+            required: true,
+        });
+        state.update_evidence("macos", "pass");
+        let checks = required_checks(&state).expect("green required check");
+        assert_eq!(checks, vec!["macos"]);
+        let first = gate_receipt_sha256(&state, &checks).expect("hash");
+        let second = gate_receipt_sha256(&state, &checks).expect("hash is deterministic");
+        assert_eq!(first, second);
+        state.update_evidence("macos", "fail");
+        assert!(required_checks(&state).is_err());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3861,6 +4045,8 @@ mod tests {
             sha: "validated".to_owned(),
             base_ref: "main".to_owned(),
             merged: false,
+            merge_commit_sha: None,
+            merged_at: None,
         };
         assert!(validate_live_merge_target_info(&info, &state, "test").is_ok());
         info.base_ref = "release".to_owned();
