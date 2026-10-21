@@ -3016,6 +3016,7 @@ class ReviewIdentity(unittest.TestCase):
         policy = guard.review_policy(None, "danielraffel/tartci", True)
         policy["humans"] = list(humans)
         policy["signers"] = None  # whatever this host's guards directory holds
+        policy["sessions"] = None
         return policy
 
     def test_a_distinguishable_author_cannot_approve_their_own_head(self) -> None:
@@ -3178,6 +3179,87 @@ class ReviewIdentity(unittest.TestCase):
             path.write_text("{not json")
             self.assertEqual(guard.reviewer_signers("Generous-Corp/pulp"), [],
                              "an unreadable file admits nobody")
+
+    LISTED = "session: pulp-review (team-lead team, agent pulp-review, host m3)"
+
+    def session_case(self, contents: str | None) -> contextlib.ExitStack:
+        """A scratch guards directory holding ``contents`` as the signers file."""
+        stack = contextlib.ExitStack()
+        scratch = stack.enter_context(tempfile.TemporaryDirectory())
+        # Restored on exit, with the pop below.
+        stack.enter_context(mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": scratch}))
+        os.environ.pop("SHIPYARD_SIGNERS_FROM_BASE", None)
+        if contents is not None:
+            (pathlib.Path(scratch) / guard.SIGNERS_FILE).write_text(contents)
+        return stack
+
+    def app_verdict(self, *lines: str, verdict: str = "APPROVE") -> tuple[bool, str]:
+        body = "\n".join(["Read-only review.", *lines, f"verdict: {verdict} head:{self.HEAD}"])
+        policy = guard.review_policy('[auto_merge]\nreviewer_signers = ["pulp-review"]\n',
+                                     "Generous-Corp/pulp", True)
+        comment = self.comment("shipyard-local[bot]", body)
+        return guard.review_verdict(self.HEAD, "danielraffel", [comment], [], policy)
+
+    def test_a_forged_signer_line_needs_a_listed_session_line(self) -> None:
+        listed = json.dumps({"default": ["pulp-review"], "sessions": [self.LISTED]})
+        stack = self.session_case(listed)
+        with stack:
+            # pulp#10563 at 8a4e7dd4: a Daniels-M5-Studio session signed as pulp-review.
+            forged = self.app_verdict(
+                "reviewer: pulp-review",
+                "<!-- session: Daniels-M5-Studio//root/independent_repair_review "
+                "agent: independent_repair_review -->")
+            self.assertFalse(forged[0], forged[1])
+            guard.EXCLUDED_APPROVALS.clear()
+            self.app_verdict("session: Daniels-M5-Studio/01a0ec3e-83bb-7c72-9086-8a4048dbe113",
+                             "reviewer: pulp-review")
+            self.assertIn("shipyard-local[bot] (its session line `session: Daniels-M5-Studio/"
+                          "01a0ec3e-83bb-7c72-9086-8a4048dbe113` is not on this host's "
+                          "allowlist)", guard.EXCLUDED_APPROVALS)
+            self.assertFalse(self.app_verdict(self.LISTED, "session: Daniels-M5-Studio/x",
+                                              "reviewer: pulp-review")[0],
+                             "every session line must be listed")
+            allowed = self.app_verdict(self.LISTED, "reviewer: pulp-review")
+            self.assertTrue(allowed[0], allowed[1])
+            self.assertTrue(self.app_verdict("  " + self.LISTED + "  ", "reviewer: pulp-review")[0])
+            self.assertFalse(self.app_verdict(self.LISTED, "reviewer: codex-g2h")[0],
+                             "a listed session does not replace the signer rule")
+            hold = self.app_verdict("session: Daniels-M5-Studio/x", "reviewer: pulp-review",
+                                    verdict="HOLD")
+            self.assertFalse(hold[0], "a HOLD from any session still holds")
+
+    def test_the_session_allowlist_fails_closed_but_is_off_without_one(self) -> None:
+        # (signers file, the listed line counts, warned that the rule is off)
+        cases = (
+            (None, True, True),                                             # no file: today's rule
+            (json.dumps({"default": ["pulp-review"]}), True, True),         # no sessions key
+            (json.dumps({"sessions": []}), False, False),                   # empty list: nobody
+            (json.dumps({"sessions": self.LISTED}), False, False),          # not a list
+            (json.dumps({"sessions": [self.LISTED, 7]}), False, False),     # not all strings
+            ("{not json", False, False),                                    # unreadable
+            (json.dumps(["pulp-review"]), False, False),                    # not an object
+            (json.dumps({"sessions": [self.LISTED[len("session: "):]]}), True, False),  # no prefix
+        )
+        for contents, counts, warns in cases:
+            stack = self.session_case(contents)
+            with stack:
+                guard._SESSIONS_WARNED = False
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    allowed, why = self.app_verdict(self.LISTED, "reviewer: pulp-review")
+                    # With the rule off, today's behaviour: a bare signer line passes.
+                    bare = self.app_verdict("reviewer: pulp-review")[0]
+                self.assertEqual(allowed, counts, f"{contents}: {why}")
+                self.assertEqual(bare, warns, contents)
+                self.assertEqual("no `sessions` list" in errors.getvalue(), warns,
+                                 f"{contents}: {errors.getvalue()!r}")
+                self.assertLessEqual(errors.getvalue().count("WARNING"), 1, "warned once")
+
+    def test_the_repository_side_rule_never_reads_the_host_sessions(self) -> None:
+        stack = self.session_case(json.dumps({"sessions": []}))
+        with stack, mock.patch.dict(os.environ, {"SHIPYARD_SIGNERS_FROM_BASE": "1"}):
+            allowed, why = self.app_verdict("reviewer: pulp-review")
+            self.assertTrue(allowed, why)
 
     def test_only_the_last_line_is_a_verdict(self) -> None:
         self.assertIsNone(guard.marker_verdict(f"verdict: APPROVE head:{self.HEAD}\nthen more"))

@@ -872,6 +872,10 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
         # reviewer_signers); None when the host has no signers file.
         "signers": (configured_signers if configured_signers is not None or from_base_only
                     else reviewer_signers(repo)),
+        # The `session:` lines this host accepts on an App APPROVE (see
+        # reviewer_sessions); None when the host lists none. Host-local only, so
+        # the repository-side rule never reads it.
+        "sessions": None if from_base_only else reviewer_sessions(),
         # The repository-side rule (review-verdict status): no host's file,
         # and a default-mode repository with no list admits no App APPROVE.
         "signers_required": from_base_only and from_default and not reviewers,
@@ -906,18 +910,86 @@ def reviewer_signers(repo: str) -> list[str] | None:
         return []
 
 
+# The `sessions` key of SIGNERS_FILE: the exact `session:` lines a reviewer
+# writes on its verdicts, e.g. ["session: pulp-review (team-lead team, ...)"].
+SESSIONS_KEY = "sessions"
+# A `session:` line a reviewer writes itself. The `<!-- session: ... -->`
+# stamp ghapp adds is not one: it starts with `<!--`.
+_SESSION_LINE = re.compile(r"^[ \t]*session:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+_SESSIONS_WARNED = False
+
+
+def _session_value(line: str) -> str:
+    """``line`` without a leading ``session:``, so an allowlist entry may be
+    written either way."""
+    text = line.strip()
+    return text[len("session:"):].strip() if text.lower().startswith("session:") else text
+
+
+def reviewer_sessions() -> list[str] | None:
+    """The ``session:`` lines this host's signers file accepts on an App
+    APPROVE, or None when the file is absent or has no ``sessions`` key (the
+    rule is off, with a warning). A file that cannot be read, or a ``sessions``
+    value that is not a list of strings, admits nobody."""
+    path = _guards_dir() / SIGNERS_FILE
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict) or SESSIONS_KEY not in data:
+        return None if isinstance(data, dict) else []
+    lines = data[SESSIONS_KEY]
+    if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
+        return []
+    return [value for value in (_session_value(line) for line in lines) if value]
+
+
+def _warn_no_session_allowlist() -> None:
+    global _SESSIONS_WARNED
+    if not _SESSIONS_WARNED:
+        _SESSIONS_WARNED = True
+        print(f"queue-arm-guard: WARNING: no `{SESSIONS_KEY}` list in "
+              f"{_guards_dir() / SIGNERS_FILE}; an App APPROVE is judged without its "
+              "`session:` line, so a copied `reviewer:` line passes", file=sys.stderr)
+
+
+def session_refusal(text: str, sessions: list[str] | None) -> str | None:
+    """Why ``text``'s ``session:`` lines do not admit an App APPROVE, or None.
+    Every such line must be listed, and there must be at least one."""
+    if sessions is None:
+        _warn_no_session_allowlist()
+        return None
+    found = [_session_value(line) for line in _SESSION_LINE.findall(text)]
+    if not found:
+        return "it has no `session:` line"
+    unlisted = [line for line in found if line not in sessions]
+    if unlisted:
+        return f"its session line `session: {unlisted[0]}` is not on this host's allowlist"
+    return None
+
+
 def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
     """Why the fleet App's APPROVE in ``body`` does not count, or None.
 
     Every agent posts as the same App, so the App's identity says nothing
     about who reviewed. An APPROVE stamped by ``ghapp`` with an
-    ``unattributed`` session never counts, and on a host with a signers file
-    the body must carry a ``reviewer: <name>`` line naming an allowed signer.
+    ``unattributed`` session never counts, on a host with a session allowlist
+    every ``session:`` line must be listed (and one must be present), and on a
+    host with a signers file the body must carry a ``reviewer: <name>`` line
+    naming an allowed signer.
     """
     text = body if isinstance(body, str) else ""
     stamp = _SESSION_STAMP.findall(text)
     if stamp and stamp[-1][1] == UNATTRIBUTED:
         return "its session stamp is unattributed"
+    if os.environ.get(SIGNERS_FROM_BASE_ENV) != "1":
+        # Host-local: the repository-side rule has no host to read.
+        refusal = session_refusal(
+            text, policy["sessions"] if "sessions" in policy else reviewer_sessions())
+        if refusal is not None:
+            return refusal
     signers = policy.get("signers")
     if signers is None and policy.get("signers_required"):
         return ("no signer list is configured on the base branch "

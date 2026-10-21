@@ -3743,7 +3743,11 @@ App counts only as a `Bot` (a user account named `shipyard-local` counts for
 nothing), an App APPROVE stamped `unattributed` never counts, and on a host
 with `reviewer-signers.json` (or a base that sets `[auto_merge]
 reviewer_signers`, which wins and is what the server-side status applies) it
-needs a `reviewer: <name>` line naming an allowed signer; its
+needs a `reviewer: <name>` line naming an allowed signer; a host whose
+`reviewer-signers.json` lists `sessions` also requires every `session:` line
+on the APPROVE to be listed, and at least one (a `reviewer:` line can be
+copied; `ghapp`'s `<!-- session: -->` stamp is not such a line; an empty or
+malformed list admits nobody; no list warns once and keeps the old rule); its
 override,
 `GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
 `docs/ghapp-guards.md`, Review before arm). A HOLD acts too: on a host with
