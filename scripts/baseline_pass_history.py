@@ -32,7 +32,9 @@ DEFAULT_RETENTION_WINDOW_SECS = 14 * DAY_SECONDS
 # The effective default is raised for tighter cadences below.  This minimum is
 # enough for a fourteen-day window at a twenty-minute cadence (1,009 samples).
 DEFAULT_MAX_OBSERVATIONS = 1024
-DEFAULT_CADENCE_SLACK_SECS = 0
+# Controller completion is the observation boundary, so small scheduler and
+# import jitter must not turn an otherwise continuous cadence into a gap.
+DEFAULT_CADENCE_SLACK_SECS = 300
 DEFAULT_CLOCK_SKEW_SECS = 5 * 60
 
 
