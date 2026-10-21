@@ -9,6 +9,7 @@ from pathlib import Path
 SPEC = importlib.util.spec_from_file_location("collect_baseline", Path(__file__).with_name("collect_baseline.py"))
 MOD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MOD)
+import baseline_pass_history as history
 
 
 class BaselineScorecardTests(unittest.TestCase):
@@ -85,6 +86,22 @@ class BaselineScorecardTests(unittest.TestCase):
             payload = json.loads(args.pass_history_path.read_text())
             self.assertEqual(payload["observations"][0]["status"], "failed")
             self.assertEqual(payload["observations"][0]["error"], "provider timeout")
+
+    def test_pass_history_summary_clamps_to_retention_window(self):
+        started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        observed = started + dt.timedelta(days=20)
+        store = history.PassHistory.create(
+            repository="o/p", source_identity="collector:test:v1", config_identity="policy:test:v1",
+            expected_interval_secs=3600,
+        )
+        first = observed - dt.timedelta(days=14)
+        for index in range(24 * 14 + 1):
+            point = first + dt.timedelta(hours=index)
+            store.append(history.PassObservation.success(
+                repo="o/p", observed_at=point, expected_interval_secs=3600,
+                source_identity="collector:test:v1", config_identity="policy:test:v1"), now=point)
+        report = store.summarize(max(started, observed - dt.timedelta(days=14)), observed)
+        self.assertFalse(report["missing_intervals"])
 
     def test_scorecard_delegates_to_rust_and_keeps_strata_unavailable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -252,8 +269,6 @@ class CollectorInvocationTests(unittest.TestCase):
             args.state.write_text("{}")
             with self.assertRaisesRegex(RuntimeError, "count unavailable"):
                 MOD.import_organic(args)
-
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -88,7 +88,8 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     unknown_imports = [event["source"] for event in events
                        if event.get("source") in {"github", "tartci"}
                        and (not isinstance(event.get("imported"), int)
-                            or isinstance(event.get("imported"), bool))]
+                            or isinstance(event.get("imported"), bool)
+                            or event.get("imported") < 0)]
     if unknown_imports:
         raise RuntimeError(
             "provider import count unavailable; refusing to record a successful pass: "
@@ -396,7 +397,8 @@ def update_state(path: pathlib.Path, project: str, started: dt.datetime,
                  card: dict[str, Any], events: list[dict[str, Any]],
                  observed_at: dt.datetime | None = None, repo: str | None = None,
                  db: pathlib.Path | None = None,
-                 pass_history: dict[str, Any] | None = None) -> dict[str, Any]:
+                 pass_history: dict[str, Any] | None = None,
+                 record_observation: bool = True) -> dict[str, Any]:
     state = json.loads(path.read_text()) if path.exists() else {}
     state.setdefault("started_at", started.isoformat())
     state.setdefault("observations", [])
@@ -415,7 +417,7 @@ def update_state(path: pathlib.Path, project: str, started: dt.datetime,
     baseline_started = dt.datetime.fromisoformat(state["started_at"].replace("Z", "+00:00"))
     baseline_start = baseline_started.date()
     has_activity = imported or bool(activity_dates)
-    if has_activity:
+    if has_activity and record_observation:
         state["observations"].append({"at": state["last_observed_at"], "events": events,
                                        "source_activity_dates": sorted(activity_dates), "scorecard": card})
     observed_days = {value for item in state["observations"] for value in item.get("source_activity_dates", [])
@@ -426,7 +428,8 @@ def update_state(path: pathlib.Path, project: str, started: dt.datetime,
     # Retain legacy keys as telemetry aliases; readiness no longer uses them.
     state["collection_weekday_days"] = state["collection_days_observed"]
     state["weekday_days_observed"] = state["source_activity_days_observed"]
-    state["baseline_readiness"] = baseline_readiness(card, baseline_started, observed_at, pass_history)
+    state["baseline_readiness"] = baseline_readiness(card, baseline_started, observed_at,
+                                                      pass_history if isinstance(pass_history, dict) else None)
     state["baseline_exit"] = state["baseline_readiness"]["exit"]
     payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -481,7 +484,11 @@ def record_pass_observation(args: argparse.Namespace, status: str, observed_at: 
     )
     if baseline_started >= observed_at:
         baseline_started = observed_at - dt.timedelta(seconds=1)
-    return history.summarize(baseline_started, observed_at)
+    summary_started = max(
+        baseline_started,
+        observed_at - dt.timedelta(seconds=history.retention_window_secs),
+    )
+    return history.summarize(summary_started, observed_at)
 
 
 def main() -> int:
@@ -530,7 +537,7 @@ def main() -> int:
             pass_recorded = True
             state = update_state(args.state, args.project, completed_at, card, events,
                                  observed_at=completed_at, repo=args.repo, db=args.db,
-                                 pass_history=pass_report)
+                                 pass_history=pass_report, record_observation=False)
         else:
             state = update_state(args.state, args.project, completed_at, card, events, observed_at=completed_at,
                                  repo=args.repo, db=args.db, pass_history=pass_report)
