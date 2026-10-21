@@ -65,6 +65,25 @@ class PassHistoryTests(unittest.TestCase):
         self.assertTrue(report["missing_intervals"])
         self.assertFalse(report["full_window_coverage"])
 
+    def test_default_slack_allows_small_controller_completion_jitter(self) -> None:
+        store = history.PassHistory.create(
+            repository=REPO, source_identity=SOURCE, config_identity=CONFIG,
+            expected_interval_secs=3600,
+        )
+        store.append(
+            history.PassObservation(repo=REPO, observed_at=START, expected_interval_secs=3600,
+                                    status="empty", source_identity=SOURCE, config_identity=CONFIG),
+            now=START,
+        )
+        jittered = START + timedelta(hours=1, seconds=5)
+        store.append(
+            history.PassObservation(repo=REPO, observed_at=jittered, expected_interval_secs=3600,
+                                    status="empty", source_identity=SOURCE, config_identity=CONFIG),
+            now=jittered,
+        )
+        report = store.summarize(START, jittered)
+        self.assertFalse(report["missing_intervals"])
+
     def test_five_elapsed_days_span_weekend(self) -> None:
         store = self.make_history()
         for day in range(6):

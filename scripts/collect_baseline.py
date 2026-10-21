@@ -21,6 +21,7 @@ import sys
 from typing import Any, Sequence
 
 from baseline_pass_history import (
+    DEFAULT_RETENTION_WINDOW_SECS,
     HistoryValidationError,
     PassObservation,
     append_observation,
@@ -84,6 +85,15 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     if imported.returncode:
         raise RuntimeError(f"TartCI import failed: {imported.stderr.strip()}")
     events.append(summarize_import("tartci", imported.stdout))
+    unknown_imports = [event["source"] for event in events
+                       if event.get("source") in {"github", "tartci"}
+                       and (not isinstance(event.get("imported"), int)
+                            or isinstance(event.get("imported"), bool))]
+    if unknown_imports:
+        raise RuntimeError(
+            "provider import count unavailable; refusing to record a successful pass: "
+            + ", ".join(unknown_imports)
+        )
     after = count_jobs(args.db, args.project, args.repo)
     activity_dates = source_activity_dates(args.db, args.project, args.repo)
     if before is not None and after is not None:
@@ -320,7 +330,11 @@ def baseline_readiness(card: dict[str, Any], started: dt.datetime,
                        pass_history: dict[str, Any] | None = None) -> dict[str, Any]:
     """Require the preregistered prospective baseline controls explicitly."""
     reasons: list[dict[str, str]] = []
-    elapsed_days = (observed_at - started).total_seconds() / 86400
+    retention_secs = (pass_history or {}).get("retention_window_secs", DEFAULT_RETENTION_WINDOW_SECS)
+    if not isinstance(retention_secs, int) or isinstance(retention_secs, bool) or retention_secs <= 0:
+        retention_secs = DEFAULT_RETENTION_WINDOW_SECS
+    effective_started = max(started, observed_at - dt.timedelta(seconds=retention_secs))
+    elapsed_days = (observed_at - effective_started).total_seconds() / 86400
     if elapsed_days < 5:
         reasons.append({"status": "insufficient", "reason": "fewer than five continuous elapsed 24-hour days"})
 
@@ -488,7 +502,7 @@ def main() -> int:
     parser.add_argument("--source-identity", default="shipyard.collect_baseline:v1")
     parser.add_argument("--config-identity", default="baseline-policy:v1")
     parser.add_argument("--expected-interval-secs", type=int, default=3600)
-    parser.add_argument("--cadence-slack-secs", type=int, default=0)
+    parser.add_argument("--cadence-slack-secs", type=int, default=300)
     args = parser.parse_args()
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
@@ -508,10 +522,18 @@ def main() -> int:
         if args.collect:
             counts = [event.get("imported") for event in events if event.get("source") in {"github", "tartci"}]
             imported_count = sum(value for value in counts if isinstance(value, int) and not isinstance(value, bool))
+            # Persist the collection observation before recording its successful
+            # pass. A state-write failure must never leave a success-only history.
+            state = update_state(args.state, args.project, completed_at, card, events,
+                                 observed_at=completed_at, repo=args.repo, db=args.db)
             pass_report = record_pass_observation(args, "success", completed_at, imported_count=imported_count)
             pass_recorded = True
-        state = update_state(args.state, args.project, completed_at, card, events, observed_at=completed_at,
-                             repo=args.repo, db=args.db, pass_history=pass_report)
+            state = update_state(args.state, args.project, completed_at, card, events,
+                                 observed_at=completed_at, repo=args.repo, db=args.db,
+                                 pass_history=pass_report)
+        else:
+            state = update_state(args.state, args.project, completed_at, card, events, observed_at=completed_at,
+                                 repo=args.repo, db=args.db, pass_history=pass_report)
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired) as exc:
         if args.collect and not pass_recorded:
             try:
