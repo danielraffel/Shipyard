@@ -1585,13 +1585,19 @@ resolver. When `GITHUB_EVENT_NAME` is a pull request and that head differs from
 GitHub-hosted. That covers the Sandbox M3 canary. To run those legs, a
 maintainer pushes the reviewed commits to a branch of this repository.
 Same-repo PRs, pushes, and dispatches resolve exactly as before.
+This stops repository variables from routing fork code onto the host runners;
+a fork that edits the workflow is still stopped only by the fork-PR approval
+setting (all external contributors), which must stay on.
 
 **The macOS signing job builds with fresh Rust homes.** `sign-and-upload-macos`
 points `CARGO_HOME` and `RUSTUP_HOME` at new directories under `RUNNER_TEMP`
 before installing Rust, so the signed build installs its toolchain and fetches
 crates fresh instead of reading a shared runner's `~/.cargo` registry or
 `~/.rustup` toolchains. A `rustup` already on the runner's `PATH` is still the
-one that installs them. Runner selection is unchanged.
+one that installs them, and the `cargo`/`rustc` proxies in a shared
+`~/.cargo/bin` on `PATH` are still the shared ones too. Full isolation comes
+only from running the job as a dedicated runner user. Runner selection is
+unchanged.
 
 To land jobs on the Mac, register a runner carrying the matching labels with
 `shipyard runner register --repo <owner/repo> --labels self-hosted,macos,arm64,local-mac`

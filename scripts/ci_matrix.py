@@ -203,7 +203,9 @@ def resolve_runs_on(target_key: str, env: Mapping[str, str] = os.environ) -> dic
 
     if is_fork_pull_request(env) and _is_self_hosted(provider, selector):
         # Skip rather than fall back to GitHub-hosted: CI runs on local
-        # hardware, and fork code never reaches the persistent host runners.
+        # hardware, and the resolver never selects a host runner for a fork
+        # PR. A fork that edits the workflow itself is stopped only by the
+        # repo's fork-PR approval setting.
         provider = SKIPPED_PROVIDER
         selector = ""
 
@@ -259,9 +261,9 @@ def skipped_notices(workflow: str, env: Mapping[str, str] = os.environ) -> list[
         if row["provider"] == SKIPPED_PROVIDER
     ]
     return [
-        f"::notice title=Fork pull request::Skipped {name}: self-hosted runners "
-        "never run fork code. A maintainer can push the reviewed commits to a "
-        "branch of this repository to run it."
+        f"::notice title=Fork pull request::Skipped {name}: the resolver never "
+        "selects a self-hosted runner for a fork pull request. A maintainer can "
+        "push the reviewed commits to a branch of this repository to run it."
         for name in skipped
     ]
 
