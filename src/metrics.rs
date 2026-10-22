@@ -5239,4 +5239,54 @@ mod tests {
             "neither new row may survive the failed batch"
         );
     }
+    #[test]
+    fn survivor_timing_counts_distinct_and_excluded_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let mk = |id: &str, d: &str, ms| QueueTerminalTiming {
+            queue_job_id: id.into(),
+            queue_identity: format!("i-{id}"),
+            disposition: d.into(),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+            total_ms: ms,
+        };
+        store
+            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("clean", "clean", Some(10)))
+            .unwrap();
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &mk("uncertain", "uncertain", Some(20)),
+            )
+            .unwrap();
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &mk("cancel", "cancelled_mid_run", Some(30)),
+            )
+            .unwrap();
+        for id in ["clean", "clean", "uncertain", "cancel", "missing"] {
+            store
+                .record_repeated_work_shadow(&RepeatedWorkShadowInput {
+                    kind: RepeatedWorkKind::SupersededExactHead,
+                    branch: "b".into(),
+                    sha: "s".into(),
+                    target_config: "t".into(),
+                    mode: "m".into(),
+                    job_id: id.into(),
+                    superseded_job_id: "o".into(),
+                    superseded_sha: "o".into(),
+                })
+                .unwrap();
+        }
+        let r = store.repeated_work_survivor_timing(100).unwrap();
+        assert_eq!(r.shadow_rows, 4);
+        assert_eq!(r.distinct_survivors, 4);
+        assert_eq!(r.matched_clean, 1);
+        assert_eq!(r.avoided_survivor_ms, Some(10));
+        assert_eq!(r.excluded_uncertain, 1);
+        assert_eq!(r.excluded_cancelled, 1);
+        assert_eq!(r.unmatched, 1);
+    }
 }
