@@ -5288,4 +5288,40 @@ mod tests {
         assert_eq!(r.excluded_cancelled, 1);
         assert_eq!(r.unmatched, 1);
     }
+    #[test]
+    fn queue_timing_contract_rejects_identity_and_downgrades() {
+        let d = tempfile::tempdir().unwrap();
+        let st = MetricsStore::open(d.path()).unwrap();
+        let mk = |id: &str, ident: &str, disp: &str, ms: Option<i64>| QueueTerminalTiming {
+            queue_job_id: id.into(),
+            queue_identity: ident.into(),
+            disposition: disp.into(),
+            started_at: None,
+            completed_at: None,
+            total_ms: ms,
+        };
+        st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "a", "clean", Some(9)))
+            .unwrap();
+        st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "a", "clean", Some(4)))
+            .unwrap();
+        assert_eq!(
+            st.read_queue_timing("x").unwrap().unwrap().total_ms,
+            Some(9)
+        );
+        st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "a", "uncertain", Some(1)))
+            .unwrap();
+        st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "a", "clean", Some(2)))
+            .unwrap();
+        assert_eq!(
+            st.read_queue_timing("x")
+                .unwrap()
+                .unwrap()
+                .queue_disposition,
+            "uncertain"
+        );
+        assert!(
+            st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "b", "clean", Some(2)))
+                .is_err()
+        );
+    }
 }
