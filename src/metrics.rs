@@ -27,7 +27,7 @@ pub use project_key::ProjectKey;
 
 /// Reserved provider identity for authenticated local queue timing rows.
 pub const QUEUE_PROVIDER: &str = "shipyard-queue";
-const QUEUE_AUTHORITY_TOKEN: &str = "shipyard-queue-terminal-v1";
+pub(crate) const QUEUE_AUTHORITY_TOKEN: &str = "shipyard-queue-terminal-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QueueTerminalTiming {
