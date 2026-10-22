@@ -363,12 +363,17 @@ impl Queue {
             }
             prior
         };
-        if matches!(prior.status, JobStatus::Completed | JobStatus::Cancelled)
-            && prior.status == job.status
+        let classification_prior = if prior.status == job.status
+            && matches!(job.status, JobStatus::Completed | JobStatus::Cancelled)
+            && (job.status == JobStatus::Completed || job.started_at.is_some())
         {
-            return Ok(());
-        }
-        if let Some(disposition) = classify_queue_terminal(&prior, job) {
+            let mut synthetic = prior.clone();
+            synthetic.status = JobStatus::Running;
+            synthetic
+        } else {
+            prior.clone()
+        };
+        if let Some(disposition) = classify_queue_terminal(&classification_prior, job) {
             let disposition = match disposition {
                 QueueTerminalDisposition::Clean => "clean",
                 QueueTerminalDisposition::CancelledMidRun => "cancelled_mid_run",

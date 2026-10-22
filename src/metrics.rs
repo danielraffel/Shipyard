@@ -575,6 +575,7 @@ impl MetricsStore {
             "clean" | "cancelled_mid_run" | "uncertain" => timing.disposition.as_str(),
             _ => return Err("invalid queue timing disposition".into()),
         };
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<(String, String)> = tx
