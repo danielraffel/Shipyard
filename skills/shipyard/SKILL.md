@@ -220,8 +220,13 @@ The daemon opens no public Funnel unless the host's owner asks:
 config; a tracked project layer cannot turn it on). Start, re-apply and stop
 never run `tailscale funnel reset`: they remove only the HTTPS 443 path `/`
 handler (`funnel --https=443 --set-path=/ off`), and stop removes it only
-while it still points at this daemon's port, so the owner's other Serve and
-Funnel routes survive.
+while it still points at exactly this daemon's port. Funnel is switched on
+per host and port, not per path, so before mounting the daemon reads
+`tailscale funnel status --json` and refuses (the daemon stays on the polling
+fallback) when port 443 holds any tailnet-only Serve route besides `/`, since
+enabling Funnel would publish it. Routes on other ports, or on a 443 the owner
+already funneled, are left as they are. Move a private 443 route to another
+port (or funnel it deliberately) before opting in.
 
 The local listener answers from a pool of eight workers. A connection reaches
 a worker only once its whole header block has arrived; headers must arrive

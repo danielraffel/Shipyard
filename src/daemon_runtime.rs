@@ -2524,48 +2524,10 @@ fn load_or_create_webhook_secret(state_dir: &Path) -> Result<String, DaemonRunEr
     fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
     let secret = base64::engine::general_purpose::STANDARD.encode(random);
     let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    write_private_file_atomically(&path, secret.as_bytes())?;
+    // A fresh 0600 temporary file (created exclusively), synced and renamed
+    // into place, so no reader ever sees the secret half-written or looser.
+    crate::durable_file::replace(&path, secret.as_bytes())?;
     Ok(secret)
-}
-
-/// Write `contents` to `path` so that no reader ever sees it with looser
-/// permissions than 0600 or half-written: a fresh temporary file is created
-/// with mode 0600 (`create_new`, so a planted file or symlink is refused),
-/// synced, then renamed over `path`.
-#[cfg(unix)]
-fn write_private_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let mut temp_name = file_name.to_os_string();
-    temp_name.push(format!(
-        ".tmp.{}.{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos())
-    ));
-    let temp = path.with_file_name(temp_name);
-    let written = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        fs::rename(&temp, path)
-    })();
-    if written.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    written?;
-    crate::durable_file::sync_parent_directory(path)
 }
 
 #[cfg(unix)]
@@ -4638,7 +4600,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         let old_inode = std::fs::metadata(&path).expect("metadata").ino();
 
-        super::write_private_file_atomically(&path, b"s3cret").expect("write");
+        crate::durable_file::replace(&path, b"s3cret").expect("write");
         let metadata = std::fs::metadata(&path).expect("metadata");
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         // Renamed into place, not rewritten through the old 0644 inode.
