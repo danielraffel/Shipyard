@@ -3756,7 +3756,19 @@ needs a `reviewer: <name>` line naming an allowed signer; a host whose
 `reviewer-signers.json` lists `sessions` also requires every `session:` line
 on the APPROVE to be listed, and at least one (a `reviewer:` line can be
 copied; `ghapp`'s `<!-- session: -->` stamp is not such a line; an empty or
-malformed list admits nobody; no list warns once and keeps the old rule); its
+malformed list admits nobody; no list warns once and keeps the old rule; with
+the list, the APPROVE also needs exactly one `ghapp` stamp from a hostname
+that `session_hosts` maps the line's `host <name>` to, because a `session:`
+line can be copied too, and `ghapp` now removes every stamp already in any
+comment body, to a fixed point, and stamps `--body-file`, `-F body=@file` and
+stdin bodies, deciding what is a verdict with the arm guard's own
+`marker_verdict` so a `\r\n` ending cannot hide one; `ghapp` waits 30 s
+for the stamper and refuses a verdict it did not answer for ("verdict NOT
+posted, retry") rather than post it unstamped; when the stamper fails or
+times out, or for GraphQL and review requests it does not parse, `ghapp`
+refuses any body carrying stamp text, `\u`-escaped and Unicode-spaced forms
+included; the guards count only the exact ASCII stamp and refuse an APPROVE
+with any non-canonical variant); its
 override,
 `GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
 `docs/ghapp-guards.md`, Review before arm). A HOLD acts too: on a host with

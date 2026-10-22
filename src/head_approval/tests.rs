@@ -1093,6 +1093,10 @@ fn pulp_10320s_unsigned_approve_needs_an_allowed_signer() {
 }
 
 const LISTED_SESSION: &str = "session: pulp-review (team-lead team, agent pulp-review, host m3)";
+/// The stamp `ghapp` adds on m3, whose hostname the short name `m3` maps to.
+const M3_STAMP: &str = "<!-- session: Daniels-Mac-Studio-m3/01a1-genuine agent: pulp-review -->";
+const M3_HOSTS: &[&str] = &["Daniels-Mac-Studio-m3", "Daniels-Mac-Studio-m3-4"];
+const M5_HOSTS: &[&str] = &["Daniels-M5-Studio"];
 
 /// The fleet App's APPROVE of `head` carrying `lines`, signed by the base.
 fn app_approve(head: &str, lines: &[&str]) -> (ApprovalPolicy, Value) {
@@ -1119,55 +1123,60 @@ fn a_forged_signer_line_needs_a_listed_session_line() {
             "<!-- session: Daniels-M5-Studio//root/independent_repair_review agent: independent_repair_review -->",
         ],
     );
-    super::with_host_sessions(Some(listed), || {
-        assert!(!gate_on(&forged.0, &head, std::slice::from_ref(&forged.1)).allows());
-        assert_eq!(
-            super::verdict_audit_events(
+    let hosts: &[(&str, &[&str])] = &[("m3", M3_HOSTS), ("m5", M5_HOSTS)];
+    super::with_host_session_hosts(hosts, || {
+        super::with_host_sessions(Some(listed), || {
+            assert!(!gate_on(&forged.0, &head, std::slice::from_ref(&forged.1)).allows());
+            assert_eq!(
+                super::verdict_audit_events(
+                    &head,
+                    &[],
+                    std::slice::from_ref(&forged.1),
+                    &forged.0,
+                    None
+                ),
+                vec!["excluded_app_approval:it has no `session:` line".to_owned()]
+            );
+            let (policy, plain) = app_approve(
                 &head,
-                &[],
-                std::slice::from_ref(&forged.1),
-                &forged.0,
-                None
-            ),
-            vec!["excluded_app_approval:it has no `session:` line".to_owned()]
-        );
-        let (policy, plain) = app_approve(
-            &head,
-            &[
-                "session: Daniels-M5-Studio/01a0ec3e-83bb-7c72-9086-8a4048dbe113",
-                "reviewer: pulp-review",
-            ],
-        );
-        assert_eq!(
+                &[
+                    "session: Daniels-M5-Studio/01a0ec3e-83bb-7c72-9086-8a4048dbe113",
+                    "reviewer: pulp-review",
+                ],
+            );
+            assert_eq!(
             super::verdict_audit_events(&head, &[], std::slice::from_ref(&plain), &policy, None),
             vec![
                 "excluded_app_approval:its session line `session: Daniels-M5-Studio/01a0ec3e-83bb-7c72-9086-8a4048dbe113` is not on this host's allowlist"
                     .to_owned()
             ]
         );
-        assert!(!gate_on(&policy, &head, &[plain]).allows());
-        let (policy, mixed) = app_approve(
-            &head,
-            &[
-                LISTED_SESSION,
-                "session: Daniels-M5-Studio/x",
-                "reviewer: pulp-review",
-            ],
-        );
-        assert!(
-            !gate_on(&policy, &head, &[mixed]).allows(),
-            "every session line must be listed"
-        );
-        let (policy, good) = app_approve(&head, &[LISTED_SESSION, "reviewer: pulp-review"]);
-        assert!(
-            gate_on(&policy, &head, &[good]).allows(),
-            "the listed line passes"
-        );
-        let (policy, unsigned) = app_approve(&head, &[LISTED_SESSION, "reviewer: codex-g2h"]);
-        assert!(
-            !gate_on(&policy, &head, &[unsigned]).allows(),
-            "a listed session does not replace the signer rule"
-        );
+            assert!(!gate_on(&policy, &head, &[plain]).allows());
+            let (policy, mixed) = app_approve(
+                &head,
+                &[
+                    LISTED_SESSION,
+                    "session: Daniels-M5-Studio/x",
+                    "reviewer: pulp-review",
+                ],
+            );
+            assert!(
+                !gate_on(&policy, &head, &[mixed]).allows(),
+                "every session line must be listed"
+            );
+            let (policy, good) =
+                app_approve(&head, &[LISTED_SESSION, "reviewer: pulp-review", M3_STAMP]);
+            assert!(
+                gate_on(&policy, &head, &[good]).allows(),
+                "the listed line passes"
+            );
+            let (policy, unsigned) =
+                app_approve(&head, &[LISTED_SESSION, "reviewer: codex-g2h", M3_STAMP]);
+            assert!(
+                !gate_on(&policy, &head, &[unsigned]).allows(),
+                "a listed session does not replace the signer rule"
+            );
+        });
     });
     // No allowlist on the host: today's behaviour (with a warning).
     super::with_host_sessions(None, || {
@@ -1179,6 +1188,202 @@ fn a_forged_signer_line_needs_a_listed_session_line() {
     super::with_host_sessions(Some(&[]), || {
         assert!(gate_on(&repository_side, &head, std::slice::from_ref(&forged.1)).allows());
     });
+}
+
+const INFRA_SESSION: &str = "session: infra-review2 (team-lead team, agent infra-review2, host m3)";
+const TARTCI_623_HEAD: &str = "a26e79ebb8d841f5f2dd6eb33d349f65ebdf0df3";
+const TARTCI_623_STAMP: &str = "<!-- session: Daniels-M5-Studio/unattributed -->";
+
+/// tartci#623's deciding APPROVE (comment 6321450475), exactly as posted: it
+/// copied infra-review2's signer and session lines, and `ghapp` on the M5
+/// Studio stamped it.
+fn tartci_623() -> String {
+    format!(
+        "Exact-head re-review completed for `{TARTCI_623_HEAD}`.\n\n\
+         The prior approval at `a5e2fe1eba87d197c7643c665167e4446d1aba2c` carries across the \
+         merge-only current head; the protected `review-verdict` check confirms every commit \
+         since is a merge of the base and every PR file remains unchanged. Required checks are \
+         green: `lint`, `python-39-tests`, `python-floor`, and `review-verdict`. No blocker \
+         found.\n\n\
+         reviewer: infra-review2\n\
+         {INFRA_SESSION}\n\
+         {TARTCI_623_STAMP}\n\
+         verdict: APPROVE head:{TARTCI_623_HEAD}"
+    )
+}
+
+/// What the host-local rule says about the fleet App's APPROVE `body` of
+/// tartci#623's head: `None` when it counts, else the refusal.
+fn infra_refusal(body: &str) -> Option<String> {
+    let mut policy = by_default("danielraffel/tartci");
+    policy.signers = Some(vec!["infra-review2".to_owned()]);
+    let comment = fleet("2026-10-21T16:47:39Z", body);
+    if gate_on(&policy, TARTCI_623_HEAD, std::slice::from_ref(&comment)).allows() {
+        return None;
+    }
+    let events = super::verdict_audit_events(
+        TARTCI_623_HEAD,
+        &[],
+        std::slice::from_ref(&comment),
+        &policy,
+        None,
+    );
+    Some(events.join("; "))
+}
+
+/// Shipyard#881 review 6331485438: `<!--` + U+00A0 + `session:` passed
+/// `ghapp`'s byte check and counted as an m3 stamp. Only the exact ASCII form
+/// counts; any variant refuses the APPROVE, alone or beside a genuine stamp.
+#[test]
+fn only_the_exact_stamp_counts_and_a_variant_refuses() {
+    let genuine = "<!-- session: Daniels-Mac-Studio-m3/08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb -->";
+    let hosts: &[(&str, &[&str])] = &[("m3", M3_HOSTS), ("m5", M5_HOSTS)];
+    let body = tartci_623();
+    super::with_host_session_hosts(hosts, || {
+        super::with_host_sessions(Some(&[INFRA_SESSION]), || {
+            assert_eq!(
+                infra_refusal(&body.replace(TARTCI_623_STAMP, genuine)),
+                None
+            );
+            for variant in [
+                genuine.replace("<!-- ", "<!--\u{a0}"),
+                genuine.replace("<!-- ", "<!--\u{2003}"),
+                genuine.replace("<!-- ", "<!--  "),
+                genuine.replace("<!-- ", "<!--"),
+                genuine.replace("session: ", "session:\u{a0}"),
+                genuine.replace("session:", "SESSION:"),
+                genuine.replace("<!-- ", "<!--\t"),
+            ] {
+                assert_eq!(super::stamped_session(&variant), None, "{variant:?}");
+                for with in [variant.clone(), format!("{genuine}\n{variant}")] {
+                    let refusal = infra_refusal(&body.replace(TARTCI_623_STAMP, &with))
+                        .expect("a variant refuses");
+                    assert!(
+                        refusal.contains("it carries a non-canonical session stamp"),
+                        "{with:?}: {refusal}"
+                    );
+                }
+            }
+        });
+    });
+}
+
+#[test]
+fn a_copied_session_line_needs_a_stamp_from_its_host() {
+    let attributed = "<!-- session: Daniels-M5-Studio/01a15711-0679-70e0-81d2-4eb92dd5e038 -->";
+    let genuine = "<!-- session: Daniels-Mac-Studio-m3/08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb -->";
+    let hosts: &[(&str, &[&str])] = &[("m3", M3_HOSTS), ("m5", M5_HOSTS)];
+    let body = tartci_623();
+    super::with_host_session_hosts(hosts, || {
+        super::with_host_sessions(Some(&[INFRA_SESSION]), || {
+            for (body, why) in [
+                (body.clone(), "its session stamp is unattributed"),
+                (
+                    body.replace(TARTCI_623_STAMP, attributed),
+                    "its stamp host Daniels-M5-Studio is not host m3",
+                ),
+                (
+                    body.replace(&format!("{TARTCI_623_STAMP}\n"), ""),
+                    "it has no `ghapp` session stamp",
+                ),
+                (
+                    body.replace(TARTCI_623_STAMP, &format!("{genuine}\n{attributed}")),
+                    "it carries 2 `ghapp` session stamps",
+                ),
+                (
+                    body.replace(TARTCI_623_STAMP, attributed)
+                        .replace("host m3", "host m9"),
+                    "is not on this host's allowlist",
+                ),
+            ] {
+                let refusal = infra_refusal(&body).expect(why);
+                assert!(refusal.contains(why), "{why}: {refusal}");
+            }
+            assert_eq!(
+                infra_refusal(&body.replace(TARTCI_623_STAMP, genuine)),
+                None
+            );
+            let other_case = genuine.replace("Daniels-Mac-Studio-m3", "daniels-mac-studio-m3-4");
+            assert_eq!(
+                infra_refusal(&body.replace(TARTCI_623_STAMP, &other_case)),
+                None
+            );
+        });
+    });
+    let unhosted = "session: infra-review2 (team-lead team, agent infra-review2)";
+    let only_m5: &[(&str, &[&str])] = &[("m5", M5_HOSTS)];
+    let empty_m3: &[(&str, &[&str])] = &[("m3", &[])];
+    for (line, hosts, why) in [
+        (unhosted, hosts, "names no host"),
+        (INFRA_SESSION, only_m5, "host m3 has no `session_hosts`"),
+        (INFRA_SESSION, empty_m3, "is not host m3"),
+    ] {
+        let body = body
+            .replace(TARTCI_623_STAMP, genuine)
+            .replace(INFRA_SESSION, line);
+        super::with_host_session_hosts(hosts, || {
+            super::with_host_sessions(Some(&[line]), || {
+                let refusal = infra_refusal(&body).expect(why);
+                assert!(refusal.contains(why), "{why}: {refusal}");
+            });
+        });
+    }
+}
+
+/// infra-review2's tartci#628 APPROVE (comment 6308128031) was posted
+/// unstamped; it counts with the stamp its later posts through `ghapp api
+/// -f body=` carry on m3 (tartci comment 6328633216).
+#[test]
+fn a_genuine_verdict_passes_once_ghapp_stamps_it() {
+    let body = format!(
+        "This re-posts my tartci#628 APPROVE at head 532f9756 in the signed format, with a \
+         session line.\n\n{INFRA_SESSION}\nreviewer: infra-review2\n\
+         verdict: APPROVE head:{TARTCI_623_HEAD}\n"
+    );
+    let stamped = body.replace(
+        "verdict:",
+        "<!-- session: Daniels-Mac-Studio-m3/08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb -->\nverdict:",
+    );
+    super::with_host_session_hosts(&[("m3", M3_HOSTS)], || {
+        super::with_host_sessions(Some(&[INFRA_SESSION]), || {
+            let refusal = infra_refusal(&body).expect("unstamped, as it was posted");
+            assert!(
+                refusal.contains("it has no `ghapp` session stamp"),
+                "{refusal}"
+            );
+            assert_eq!(infra_refusal(&stamped), None);
+        });
+    });
+}
+
+#[test]
+fn the_session_host_map_fails_closed() {
+    let temp = tempfile::tempdir().expect("temp");
+    let path = temp.path().join(super::SIGNERS_FILE);
+    assert!(super::session_hosts_at(&path).is_empty(), "no file: no map");
+    let m3: super::SessionHosts = [("m3".to_owned(), vec!["daniels-mac-studio-m3".to_owned()])]
+        .into_iter()
+        .collect();
+    for (contents, expected) in [
+        (r#"{"sessions": []}"#, super::SessionHosts::new()),
+        (r#"{"session_hosts": ["m3"]}"#, super::SessionHosts::new()),
+        (
+            r#"{"session_hosts": {"m3": "Daniels-Mac-Studio-m3"}}"#,
+            super::SessionHosts::new(),
+        ),
+        (
+            r#"{"session_hosts": {"m3": ["Daniels-Mac-Studio-m3", 7]}}"#,
+            super::SessionHosts::new(),
+        ),
+        ("{not json", super::SessionHosts::new()),
+        (
+            r#"{"session_hosts": {" M3 ": [" Daniels-Mac-Studio-m3 ", ""]}}"#,
+            m3.clone(),
+        ),
+    ] {
+        std::fs::write(&path, contents).expect("write");
+        assert_eq!(super::session_hosts_at(&path), expected, "{contents}");
+    }
 }
 
 #[test]
@@ -2499,4 +2704,39 @@ fn only_the_repository_side_rule_requires_a_stamp() {
             Some("it has no `ghapp` session stamp")
         );
     });
+}
+
+/// Every line boundary Python's `str.splitlines` knows ends a verdict line
+/// here too, so this gate, the queue-arm guard and the verdict stamper read
+/// the same verdict (Shipyard#881 review: a `\r\n` ending once split them).
+#[test]
+fn a_verdict_line_ends_where_the_python_readers_end_it() {
+    let head = "a".repeat(40);
+    for ending in [
+        "\r\n",
+        "\r",
+        "\u{2028}",
+        "\u{2029}",
+        "\u{0c}",
+        "\u{0b}",
+        "\u{85}",
+        "\u{1e}",
+        "\n\r\n \r\n",
+    ] {
+        assert_eq!(
+            super::marker_verdict(&format!("verdict: APPROVE head:{head}{ending}")),
+            Some((super::Verdict::Approve, head.clone())),
+            "{ending:?}"
+        );
+        assert_eq!(
+            super::marker_verdict(&format!("x{ending}verdict: HOLD head:{head}{ending}")),
+            Some((super::Verdict::Hold, head.clone())),
+            "{ending:?}"
+        );
+        assert_eq!(
+            super::marker_verdict(&format!("verdict: APPROVE head:{head}{ending}then prose")),
+            None,
+            "{ending:?}"
+        );
+    }
 }

@@ -150,6 +150,27 @@ thread_local! {
     static AGENT_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static HOST_SIGNERS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     static HOST_SESSIONS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    static HOST_SESSION_HOSTS: std::cell::RefCell<SessionHosts> = const { std::cell::RefCell::new(SessionHosts::new()) };
+}
+
+/// Run `body` as if this host's signers file mapped each short host name in
+/// `hosts` to its stamp hostnames, on this thread.
+#[cfg(test)]
+pub(crate) fn with_host_session_hosts<T>(hosts: &[(&str, &[&str])], body: impl FnOnce() -> T) -> T {
+    HOST_SESSION_HOSTS.with(|cell| {
+        *cell.borrow_mut() = hosts
+            .iter()
+            .map(|(short, names)| {
+                (
+                    short.to_ascii_lowercase(),
+                    names.iter().map(|name| name.to_ascii_lowercase()).collect(),
+                )
+            })
+            .collect();
+    });
+    let result = body();
+    HOST_SESSION_HOSTS.with(|cell| cell.borrow_mut().clear());
+    result
 }
 
 /// Run `body` as if this host's signers file listed `sessions` (`None`: no
@@ -219,9 +240,21 @@ pub fn arming_agent() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// `<!-- session: <host>/<session>[ agent: <id>] -->`, exactly the ASCII form
+/// `ghapp`'s stamper writes: single spaces, printable ASCII only. Same
+/// pattern as the queue-arm guard's `_SESSION_STAMP`.
 fn stamp_pattern() -> Regex {
-    Regex::new(r"<!--\s*session:\s*([^/\s]+)/(\S+?)(?:\s+agent:\s*(\S+?))?\s*-->")
+    Regex::new(r"<!-- session: ([!-.0-~]+)/([!-~]+?)(?: agent: ([!-~]+?))? -->")
         .expect("stamp pattern compiles")
+}
+
+/// Whether `body` has stamp-like text that is not an exact stamp: other
+/// spacing or case, or Unicode whitespace (`<!--` + U+00A0 + `session:` once
+/// passed `ghapp`'s byte check and counted as a stamp). An App APPROVE
+/// carrying one is refused, never read as stamped.
+fn noncanonical_stamp(body: &str) -> bool {
+    let variant = Regex::new(r"(?i)<!--\s*session\s*:").expect("variant pattern compiles");
+    variant.is_match(&stamp_pattern().replace_all(body, ""))
 }
 
 /// The session a verdict comment was stamped with by `ghapp`, if any.
@@ -516,6 +549,114 @@ fn sessions_at(path: &std::path::Path) -> Option<Vec<String>> {
     )
 }
 
+/// For each short host name a `session:` line names (`host m3`), the
+/// hostnames `ghapp` stamps from that machine, both lowercased.
+pub type SessionHosts = std::collections::BTreeMap<String, Vec<String>>;
+
+/// The `session_hosts` key of [`SIGNERS_FILE`], e.g.
+/// `{"m3": ["Daniels-Mac-Studio-m3"]}`. A hostname is not predictable from
+/// the short name (macOS appends `-2`, `-4` on a clash), so the map is
+/// written out rather than derived. The queue-arm guard reads the same key.
+pub const SESSION_HOSTS_KEY: &str = "session_hosts";
+
+/// This host's `session_hosts` map. A missing file or key, or a value that is
+/// not an object of string lists, maps nothing, so with a session allowlist
+/// no App APPROVE is admitted.
+#[must_use]
+pub fn reviewer_session_hosts() -> SessionHosts {
+    guards_dir().map_or_else(SessionHosts::new, |dir| {
+        session_hosts_at(&dir.join(SIGNERS_FILE))
+    })
+}
+
+/// [`reviewer_session_hosts`] read from `path`.
+fn session_hosts_at(path: &std::path::Path) -> SessionHosts {
+    let data = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let Some(hosts) = data
+        .as_ref()
+        .and_then(|data| data.get(SESSION_HOSTS_KEY))
+        .and_then(Value::as_object)
+    else {
+        return SessionHosts::new();
+    };
+    let mut out = SessionHosts::new();
+    for (short, names) in hosts {
+        let Some(names) = names
+            .as_array()
+            .filter(|names| names.iter().all(Value::is_string))
+        else {
+            return SessionHosts::new();
+        };
+        out.insert(
+            short.trim().to_ascii_lowercase(),
+            names
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|name| name.trim().to_ascii_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect(),
+        );
+    }
+    out
+}
+
+#[cfg(not(test))]
+fn host_session_hosts() -> SessionHosts {
+    reviewer_session_hosts()
+}
+
+#[cfg(test)]
+fn host_session_hosts() -> SessionHosts {
+    HOST_SESSION_HOSTS.with(|cell| cell.borrow().clone())
+}
+
+/// Why `body`'s `ghapp` stamp does not match the host its `session:` lines
+/// `found` name, or `None`. There must be exactly one stamp, and every line
+/// must name a host that `hosts` maps to the stamp's hostname: a copied
+/// `session:` line keeps the reviewer's host, while the stamp names the
+/// machine that actually posted (tartci#623).
+fn stamp_refusal(body: &str, found: &[String], hosts: &SessionHosts) -> Option<String> {
+    let stamps: Vec<String> = stamp_pattern()
+        .captures_iter(body)
+        .filter_map(|capture| capture.get(1))
+        .map(|host| host.as_str().to_owned())
+        .collect();
+    let stamp_host = match stamps.as_slice() {
+        [] => return Some("it has no `ghapp` session stamp".to_owned()),
+        [host] => host,
+        many => return Some(format!("it carries {} `ghapp` session stamps", many.len())),
+    };
+    let host_pattern = Regex::new(r"\bhost[ \t]+([^\s,()]+)[ \t]*\)?[ \t]*$")
+        .expect("session host pattern compiles");
+    for line in found {
+        let Some(short) = host_pattern
+            .captures(line)
+            .and_then(|capture| capture.get(1))
+        else {
+            return Some(format!("its session line `session: {line}` names no host"));
+        };
+        let short = short.as_str().to_ascii_lowercase();
+        let Some(names) = hosts.get(&short) else {
+            return Some(format!(
+                "host {short} has no `{SESSION_HOSTS_KEY}` entry on this host"
+            ));
+        };
+        if !names.contains(&stamp_host.to_ascii_lowercase()) {
+            let listed = if names.is_empty() {
+                "no hostnames".to_owned()
+            } else {
+                names.join(", ")
+            };
+            return Some(format!(
+                "its stamp host {stamp_host} is not host {short} ({listed})"
+            ));
+        }
+    }
+    None
+}
+
 /// This host's [`reviewer_sessions`]. Tests read `with_host_sessions`.
 #[cfg(not(test))]
 fn host_sessions() -> Option<Vec<String>> {
@@ -529,8 +670,13 @@ fn host_sessions() -> Option<Vec<String>> {
 
 /// Why `body`'s `session:` lines do not admit an App APPROVE under
 /// `sessions`, or `None`. Every such line must be listed, and there must be
-/// at least one. The `<!-- session: ... -->` stamp `ghapp` adds is not one.
-fn session_refusal(body: &str, sessions: Option<&[String]>) -> Option<String> {
+/// at least one. The `<!-- session: ... -->` stamp `ghapp` adds is not one,
+/// and it must come from the host they name (see [`stamp_refusal`]).
+fn session_refusal(
+    body: &str,
+    sessions: Option<&[String]>,
+    hosts: &SessionHosts,
+) -> Option<String> {
     let Some(sessions) = sessions else {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
@@ -552,10 +698,12 @@ fn session_refusal(body: &str, sessions: Option<&[String]>) -> Option<String> {
     if found.is_empty() {
         return Some("it has no `session:` line".to_owned());
     }
-    found
-        .iter()
-        .find(|line| !sessions.contains(*line))
-        .map(|line| format!("its session line `session: {line}` is not on this host's allowlist"))
+    if let Some(line) = found.iter().find(|line| !sessions.contains(*line)) {
+        return Some(format!(
+            "its session line `session: {line}` is not on this host's allowlist"
+        ));
+    }
+    stamp_refusal(body, &found, hosts)
 }
 
 /// This host's [`reviewer_signers`] for `repo`. Tests read `with_host_signers`.
@@ -888,12 +1036,25 @@ enum Verdict {
     Hold,
 }
 
+/// `body` split at every line boundary Python's `str.splitlines` knows, so
+/// this reads the same last line as the queue-arm guard and the verdict
+/// stamper. `str::lines` splits only at `\n`, so a body ending in a lone
+/// `\r` or U+2028 was a verdict to one reader and not to another.
+fn python_lines(body: &str) -> impl DoubleEndedIterator<Item = &str> {
+    body.split([
+        '\n', '\r', '\u{0b}', '\u{0c}', '\u{1c}', '\u{1d}', '\u{1e}', '\u{85}', '\u{2028}',
+        '\u{2029}',
+    ])
+}
+
 fn marker_verdict(body: &str) -> Option<(Verdict, String)> {
     let pattern = Regex::new(
         r"^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})|verdict:[ \t]*(APPROVE|HOLD)[ \t]+head:[ \t]*([0-9a-f]{40}))[ \t]*$",
     )
     .expect("marker pattern compiles");
-    let line = body.lines().rev().find(|line| !line.trim().is_empty())?;
+    let line = python_lines(body)
+        .rev()
+        .find(|line| !line.trim().is_empty())?;
     pattern.captures(line).and_then(|capture| {
         if let Some(head) = capture.get(1) {
             return Some((Verdict::Approve, head.as_str().to_ascii_lowercase()));
@@ -1003,8 +1164,9 @@ fn approver_allowed(record: &Value, policy: &ApprovalPolicy) -> bool {
 /// Every agent posts as the same App, so the App's identity says nothing
 /// about who reviewed: an APPROVE `ghapp` stamped with an `unattributed`
 /// session never counts, nor, under the repository-side rule, one with no
-/// stamp at all, on a host with a session allowlist every `session:`
-/// line must be listed (and one must be present), and on a host with a
+/// stamp at all; on a host with a session allowlist every `session:` line
+/// must be listed (and one must be present) and the single `ghapp` stamp must
+/// come from the host those lines name; and on a host with a
 /// signers file the body must carry a `reviewer: <name>` line naming an
 /// allowed signer.
 fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<String> {
@@ -1012,6 +1174,9 @@ fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<Strin
         .get("body")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    if noncanonical_stamp(body) {
+        return Some("it carries a non-canonical session stamp".to_owned());
+    }
     let session = stamped_session(body);
     if session.as_deref() == Some("unattributed") {
         return Some("its session stamp is unattributed".to_owned());
@@ -1024,7 +1189,8 @@ fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<Strin
     }
     // Host-local: the repository-side rule has no host to read.
     if policy.signer_source == SignerSource::Host
-        && let Some(refusal) = session_refusal(body, host_sessions().as_deref())
+        && let Some(refusal) =
+            session_refusal(body, host_sessions().as_deref(), &host_session_hosts())
     {
         return Some(refusal);
     }

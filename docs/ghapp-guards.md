@@ -84,9 +84,48 @@ this rule (no pull request, no config, no comments), so it is inert whatever
 the base config says and on any Python.
 
 **An agent cannot approve its own landing.** `verdict-session-stamp` (run by
-`ghapp` before native `gh`, bounded to 5 seconds) adds
+`ghapp` before native `gh`; `ghapp` waits up to 30 seconds for its answer,
+and refuses a verdict it did not answer for, "verdict NOT posted, retry",
+rather than post it unstamped) adds
 `<!-- session: <host>/<session> agent: <id> -->` above the marker line of a
-verdict comment. The session is `CLAUDE_CODE_SESSION_ID`, else
+verdict comment, posted with `--body`, `--body-file <file>`, an `api`
+`body=` field (a typed `-F body=@<file>` is read), or `--input`; `ghapp`
+first spools a body read from stdin (`--body-file -`, `--input -`,
+`-F body=@-`) to a private file, so stdin is covered too. What counts as a
+verdict is the arm guard's own `marker_verdict`, loaded from the installed
+`queue-arm-guard`, so a body ending in `\r\n`, a lone `\r` or U+2028 is a
+verdict to the stamper exactly when it is to the guards (`head_approval`
+splits lines the same way). Every stamp already in any comment body, verdict
+or not, whether written by hand or copied with the rest of a verdict, is
+removed, repeatedly until none is left, since one pass can join the pieces
+around a removed stamp into a new one; only a verdict then gets this
+session's stamp. Bodies are read byte for byte (`surrogateescape`), so a
+stray non-UTF-8 byte cannot crash the stamper. Comments it stamps or strips:
+`pr comment`, `issue comment` and `pr review` bodies, `pr close` and `issue
+close` comments, and `api` calls to an issue-comment endpoint however it is
+written (a query, a trailing slash or an API host is dropped first), every
+`body=` field and an `--input` body among them.
+
+The stamp is optional; other stamp text is not. After the stamper, whatever
+it answered, `ghapp` checks the final request and every body source gh will
+read (arguments, fields, `--input`, `-F k=@file`, body files and spooled
+stdin) on every command except `pr create`, `pr edit`, `issue create` and
+`issue edit` (descriptions, which no review guard reads), and refuses it if
+any carries stamp text other than the one stamp line the stamper reports
+writing (`SHIPYARD-STAMP-OWN` in its answer). Stamp text is matched wider
+than any guard reads it: `!--` then `session` in any case before the next
+`>`, whatever bytes lie between (Unicode whitespace), with a `\u` escape
+(GitHub decodes one in a GraphQL string or `--input` JSON) or a `&#`/`&lt`
+entity decoded first; text that cannot be decoded is refused.
+
+The guards count a stamp only in the exact ASCII form the stamper writes,
+`<!-- session: <host>/<session>[ agent: <id>] -->` with single spaces, and an
+App APPROVE carrying any other stamp-like text (`<!--`, whitespace,
+`session:` in another spacing, case or Unicode whitespace) is refused as
+"non-canonical", never read as stamped. A body file
+that is not a regular file (a FIFO) cannot be checked and is refused; an
+`api` output filter (`--jq`, `--template`) is never sent and is not checked.
+A request without stamp text posts as before. The session is `CLAUDE_CODE_SESSION_ID`, else
 `CODEX_COMPANION_SESSION_ID`, else `unattributed`; `agent: <id>` appears only
 when `SHIPYARD_AGENT_ID` is set. The marker stays the last line, so every
 verdict reader is unchanged. The arm guard, and `head_approval` for Shipyard's
@@ -198,7 +237,17 @@ blocks an earlier approval. A HOLD whose time cannot be read always blocks.
   APPROVE counts only when it carries at least one `session:` line and every
   one of them is listed; the `<!-- session: ... -->` stamp `ghapp` adds is not
   such a line (pulp#10563: a `Daniels-M5-Studio` session signed its APPROVE
-  `reviewer: pulp-review`). An empty list, a `sessions` value that is not a list
+  `reviewer: pulp-review`). A `session:` line can be copied too (tartci#623
+  carried infra-review2's line, `host m3`, under a `Daniels-M5-Studio` stamp),
+  so with the list present the APPROVE must also carry exactly one `ghapp`
+  stamp, not `unattributed`, whose hostname is one the host named in each
+  `session:` line maps to under a `session_hosts` key:
+  `{"session_hosts": {"m3": ["Daniels-Mac-Studio-m3"], "m5": ["Daniels-M5-Studio"]}}`.
+  Hostnames compare without case; list every name a machine has stamped
+  under, since macOS can rename one (`-2`, `-4`) on a clash. A missing stamp,
+  two stamps, a `session:` line with no `host <name>`, a host with no entry,
+  a missing or malformed `session_hosts` value, or a stamp from another
+  machine refuses the APPROVE. An empty list, a `sessions` value that is not a list
   of strings, or a file that cannot be read admits no App APPROVE. With no file,
   or a file without the key, the rule is off and the guard prints a warning
   once. The list is host-local: the server-side `review-verdict` status never
@@ -793,7 +842,7 @@ Per-host switches, all in the guards directory:
 |---|---|---|---|
 | review before arm or merge | on | `shipyard guards install --opt-in-review-before-arm` removes an opt-out | `shipyard guards install --opt-out-review-before-arm "<reason>"` |
 | signer rule for App approvals | off | a `reviewer-signers.json` file | remove the file |
-| session allowlist for App approvals | off (warns) | a `sessions` list in `reviewer-signers.json` | remove the key |
+| session allowlist for App approvals | off (warns) | a `sessions` list in `reviewer-signers.json` (with a `session_hosts` map, or nothing is admitted) | remove the key |
 | rebase carry | off | a `rebase-carry` file, or `SHIPYARD_REBASE_CARRY=1` | remove the file; `SHIPYARD_REBASE_CARRY=0` forces it off |
 | HOLD dequeues or disarms | off | a `hold-disarms` file, or `SHIPYARD_HOLD_DISARMS=1` | remove the file; `SHIPYARD_HOLD_DISARMS=0` forces it off |
 
