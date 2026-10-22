@@ -45,6 +45,15 @@ APPROVE counts at all ("no signer list is configured on the base branch").
 Every repository that relies on the status, or on `shipyard review-verdict`,
 must set the list on its base branch first.
 
+An App APPROVE must also carry the `<!-- session: <host>/<session> -->` stamp
+`ghapp` adds, and not an `unattributed` one ("it has no `ghapp` session
+stamp"). Every fleet agent posts as the App, and a body posted around the
+stamper (stdin, a raw API call, the web UI) names no session at all:
+tartci#623's copied APPROVE, with its `unattributed` stamp removed, passed the
+status before this rule. Reviewers post through a stamped path (`ghapp api
+.../issues/N/comments -f body=...`). A host's own guard does not require the
+stamp unless its `reviewer-signers.json` lists `sessions`.
+
 A status belongs to a commit, but a decision belongs to a pull request, and
 two open pull requests can share a head (one branch opened into two bases, a
 fork pushing an approved commit). The status is `success` only when the guard

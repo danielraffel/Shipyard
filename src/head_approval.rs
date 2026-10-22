@@ -1002,7 +1002,8 @@ fn approver_allowed(record: &Value, policy: &ApprovalPolicy) -> bool {
 ///
 /// Every agent posts as the same App, so the App's identity says nothing
 /// about who reviewed: an APPROVE `ghapp` stamped with an `unattributed`
-/// session never counts, on a host with a session allowlist every `session:`
+/// session never counts, nor, under the repository-side rule, one with no
+/// stamp at all, on a host with a session allowlist every `session:`
 /// line must be listed (and one must be present), and on a host with a
 /// signers file the body must carry a `reviewer: <name>` line naming an
 /// allowed signer.
@@ -1011,8 +1012,15 @@ fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<Strin
         .get("body")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if stamped_session(body).as_deref() == Some("unattributed") {
+    let session = stamped_session(body);
+    if session.as_deref() == Some("unattributed") {
         return Some("its session stamp is unattributed".to_owned());
+    }
+    // The repository-side rule: an APPROVE posted around ghapp's stamper
+    // (stdin, a raw API call) names no session at all (tartci#623's copy,
+    // stamp removed, still passed the review-verdict status).
+    if policy.signer_source == SignerSource::Base && session.is_none() {
+        return Some("it has no `ghapp` session stamp".to_owned());
     }
     // Host-local: the repository-side rule has no host to read.
     if policy.signer_source == SignerSource::Host

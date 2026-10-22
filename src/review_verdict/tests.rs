@@ -50,11 +50,19 @@ fn gh(
     }
 }
 
+/// The stamp `ghapp` adds on the reviewer's host.
+const STAMP: &str = "<!-- session: Daniels-Mac-Studio-m3/review-1 -->";
+
 fn app_approval(head: &str, signer: Option<&str>) -> Value {
     let line = signer.map_or_else(String::new, |name| format!("reviewer: {name}\n"));
+    app_comment(&format!(
+        "Reviewed.\n{line}{STAMP}\nverdict: APPROVE head:{head}"
+    ))
+}
+
+fn app_comment(body: &str) -> Value {
     json!({"id": 5, "login": "shipyard-local[bot]", "type": "Bot", "association": "CONTRIBUTOR",
-           "at": "2026-10-14T17:00:00Z",
-           "body": format!("Reviewed.\n{line}verdict: APPROVE head:{head}")})
+           "at": "2026-10-14T17:00:00Z", "body": body})
 }
 
 fn owner_review(head: &str) -> Value {
@@ -97,6 +105,40 @@ fn an_unsigned_app_approval_is_refused() {
             .contains(&"excluded_app_approval:it has no `reviewer: <name>` line".to_owned()),
         "{verdict:?}"
     );
+}
+
+/// tartci#623's deciding APPROVE (comment 6321450475) with its
+/// `Daniels-M5-Studio/unattributed` stamp, as posted, and with the stamp
+/// removed, as it would be posted around `ghapp`'s stamper: the signer and
+/// session lines were copied from infra-review2, so neither may count.
+#[test]
+fn tartci_623s_copied_approve_counts_neither_stamped_unattributed_nor_unstamped() {
+    let copied = |stamp: &str| {
+        format!(
+            "Exact-head re-review completed.\n\nreviewer: infra-review2\n\
+             session: infra-review2 (team-lead team, agent infra-review2, host m3)\n\
+             {stamp}verdict: APPROVE head:{HEAD}"
+        )
+    };
+    for (body, why) in [
+        (
+            copied("<!-- session: Daniels-M5-Studio/unattributed -->\n"),
+            "its session stamp is unattributed",
+        ),
+        (copied(""), "it has no `ghapp` session stamp"),
+    ] {
+        let verdict = judged(Some(SIGNED), vec![app_comment(&body)]);
+        assert!(!verdict.allowed(), "{why}: {verdict:?}");
+        assert!(
+            verdict
+                .audit_events
+                .contains(&format!("excluded_app_approval:{why}")),
+            "{why}: {verdict:?}"
+        );
+    }
+    // Control: the same body with a stamp from a named session counts.
+    let stamped = copied(&format!("{STAMP}\n"));
+    assert!(judged(Some(SIGNED), vec![app_comment(&stamped)]).allowed());
 }
 
 /// The host's file lists codex-g2h; the base does not.

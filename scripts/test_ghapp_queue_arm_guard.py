@@ -3258,8 +3258,20 @@ class ReviewIdentity(unittest.TestCase):
     def test_the_repository_side_rule_never_reads_the_host_sessions(self) -> None:
         stack = self.session_case(json.dumps({"sessions": []}))
         with stack, mock.patch.dict(os.environ, {"SHIPYARD_SIGNERS_FROM_BASE": "1"}):
-            allowed, why = self.app_verdict("reviewer: pulp-review")
+            allowed, why = self.app_verdict("reviewer: pulp-review",
+                                            "<!-- session: Daniels-Mac-Studio-m3/review-1 -->")
             self.assertTrue(allowed, why)
+
+    def test_only_the_repository_side_rule_requires_a_stamp(self) -> None:
+        # A host's own judgement of an unstamped, signed APPROVE is unchanged;
+        # the review-verdict status refuses it.
+        with self.session_case(None):
+            self.assertTrue(self.app_verdict("reviewer: pulp-review")[0])
+            with mock.patch.dict(os.environ, {"SHIPYARD_SIGNERS_FROM_BASE": "1"}):
+                guard.EXCLUDED_APPROVALS.clear()
+                self.assertFalse(self.app_verdict("reviewer: pulp-review")[0])
+                self.assertIn("shipyard-local[bot] (it has no `ghapp` session stamp)",
+                              guard.EXCLUDED_APPROVALS)
 
     def test_only_the_last_line_is_a_verdict(self) -> None:
         self.assertIsNone(guard.marker_verdict(f"verdict: APPROVE head:{self.HEAD}\nthen more"))
