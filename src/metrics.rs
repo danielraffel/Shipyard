@@ -583,6 +583,14 @@ impl MetricsStore {
         Ok(())
     }
 
+    pub(crate) fn read_queue_timing(
+        &self,
+        queue_job_id: &str,
+    ) -> Result<Option<QueueTimingRow>, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        Ok(conn.query_row("SELECT queue_job_id, queue_identity, queue_disposition, started_at, completed_at, total_ms FROM jobs WHERE queue_job_id=?1", params![queue_job_id], |r| Ok(QueueTimingRow { queue_job_id: r.get(0)?, queue_identity: r.get(1)?, queue_disposition: r.get(2)?, started_at: r.get(3)?, completed_at: r.get(4)?, total_ms: r.get(5)? })).optional()?)
+    }
+
     /// Open a metrics store under the selected Shipyard state directory.
     pub fn open(state_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let dir = state_dir.join("metrics");
