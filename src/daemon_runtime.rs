@@ -191,13 +191,17 @@ pub fn run_blocking(config: DaemonRunConfig) -> Result<(), DaemonRunError> {
     let running = Arc::new(AtomicBool::new(true));
     let stop_flag = Arc::clone(&running);
     let last_event_at = Arc::new(Mutex::new(None));
-    let enable_tunnel = std::env::var("SHIPYARD_ENABLE_TUNNEL").ok();
+    let enable_tunnel = tunnel_opt_in(
+        std::env::var("SHIPYARD_ENABLE_TUNNEL").ok(),
+        crate::config::LoadedConfig::load_machine_global_from_dir(config.global_dir.clone())
+            .ok()
+            .as_ref(),
+    );
     let (webhook_tx, webhook_rx) = mpsc::channel::<Value>();
     let tunnel_runtime = start_tunnel_runtime(
         &running,
         &config.state_dir,
         std::env::var("SHIPYARD_DEV_TUNNEL_URL").ok(),
-        config.mode,
         enable_tunnel.as_deref(),
         webhook_tx,
     )?;
@@ -1469,14 +1473,13 @@ fn start_tunnel_runtime(
     running: &Arc<AtomicBool>,
     state_dir: &Path,
     url_override: Option<String>,
-    mode: RuntimeMode,
     enable_tunnel: Option<&str>,
     event_sender: mpsc::Sender<Value>,
 ) -> Result<TunnelRuntime, DaemonRunError> {
     let initial = daemon_tunnel_config(url_override);
     let has_dev_override = initial.backend == "development";
     let snapshot = Arc::new(Mutex::new(initial));
-    if has_dev_override || !tunnel_enabled(enable_tunnel, mode) {
+    if has_dev_override || !tunnel_enabled(enable_tunnel) {
         return Ok(TunnelRuntime::inactive(snapshot));
     }
 
@@ -1498,14 +1501,30 @@ fn start_tunnel_runtime(
     })
 }
 
+/// Machine-global config key that opts this host into public webhook ingress.
 #[cfg(unix)]
-fn tunnel_enabled(value: Option<&str>, mode: RuntimeMode) -> bool {
+const PUBLIC_INGRESS_CONFIG_KEY: &str = "daemon.public_ingress";
+
+/// The effective tunnel opt-in. The public Funnel is off unless the host's
+/// owner asked for it: `SHIPYARD_ENABLE_TUNNEL` wins when set (so `=0` can
+/// override the config), else `[daemon] public_ingress = true` in the
+/// machine-global config. A tracked project layer cannot turn it on.
+#[cfg(unix)]
+fn tunnel_opt_in(env: Option<String>, global: Option<&LoadedConfig>) -> Option<String> {
+    env.or_else(|| {
+        global
+            .and_then(|config| config.get(PUBLIC_INGRESS_CONFIG_KEY))
+            .and_then(toml::Value::as_bool)
+            .map(|enabled| if enabled { "1" } else { "0" }.to_owned())
+    })
+}
+
+#[cfg(unix)]
+fn tunnel_enabled(value: Option<&str>) -> bool {
     if cfg!(test) {
         return false;
     }
-    value.map_or(mode == RuntimeMode::Shipyard, |value| {
-        parse_tunnel_enabled(Some(value))
-    })
+    parse_tunnel_enabled(value)
 }
 
 #[cfg(unix)]
@@ -1525,6 +1544,28 @@ const WEBHOOK_HEADER_LIMIT: usize = 64 * 1024;
 /// Upper bound on receiving one whole delivery. GitHub gives up after 10s.
 #[cfg(unix)]
 const WEBHOOK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// The headers must have arrived this soon after the connection was accepted.
+#[cfg(unix)]
+const WEBHOOK_HEADER_TIMEOUT: Duration = Duration::from_secs(3);
+/// Threads that read, verify and answer deliveries. A connection reaches one
+/// only once its whole header block has arrived, so idle or trickling
+/// sockets never occupy them.
+#[cfg(unix)]
+const WEBHOOK_WORKERS: usize = 8;
+/// Accepted connections still waiting for their headers or a free worker.
+/// Past this the oldest is closed, so a socket flood stays bounded.
+#[cfg(unix)]
+const WEBHOOK_PENDING_LIMIT: usize = 64;
+/// Refusal lines stop once daemon.log reaches this size; the file rotates
+/// before the next daemon start (`log_retention::rotate_if_oversize`).
+#[cfg(unix)]
+const DAEMON_LOG_REFUSAL_CEILING: u64 = 64 * 1024 * 1024;
+/// Window in which repeated refusals for the same reason fold into a count.
+#[cfg(unix)]
+const REFUSAL_FOLD_WINDOW: Duration = Duration::from_mins(1);
+/// Longest attacker-supplied field the refusal log copies verbatim.
+#[cfg(unix)]
+const LOG_FIELD_LIMIT: usize = 64;
 #[cfg(unix)]
 const DELIVERY_DEDUPE_TTL: Duration = Duration::from_mins(5);
 
@@ -1537,10 +1578,62 @@ fn start_webhook_listener(
     // `write_stderr` waits for the shared writer-domain lease, which an
     // exclusive sandbox audit can hold for minutes; it gives up after its
     // timeout, and the failed line is counted rather than lost silently.
-    let log = DeliveryLog::spawn(DELIVERY_LOG_CAPACITY, |line| {
-        crate::writer_domain_lease::write_stderr(format_args!("{line}")).is_ok()
-    });
+    let mut paused = false;
+    let log = DeliveryLog::spawn(DELIVERY_LOG_CAPACITY, move |line| {
+        match refusal_log_gate(stderr_file_len(), &mut paused) {
+            RefusalLogGate::Write => {
+                crate::writer_domain_lease::write_stderr(format_args!("{line}")).is_ok()
+            }
+            RefusalLogGate::Pause(notice) => {
+                crate::writer_domain_lease::write_stderr(format_args!("{notice}")).is_ok()
+            }
+            RefusalLogGate::Skip => true,
+        }
+    })
+    .folding_per_reason();
     start_webhook_listener_with_log(running, event_sender, secret, log)
+}
+
+/// What the refusal writer does with its next line, given daemon.log's size.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum RefusalLogGate {
+    Write,
+    /// The log just crossed the ceiling: write this one notice instead.
+    Pause(String),
+    Skip,
+}
+
+/// Refusal lines are attacker-driven, so they alone may never grow daemon.log
+/// past [`DAEMON_LOG_REFUSAL_CEILING`]. The live file is not renamed behind
+/// the daemon (see `log_retention`); it rotates at the next start.
+#[cfg(unix)]
+fn refusal_log_gate(log_len: Option<u64>, paused: &mut bool) -> RefusalLogGate {
+    let over = log_len.is_some_and(|len| len >= DAEMON_LOG_REFUSAL_CEILING);
+    match (over, *paused) {
+        (false, _) => {
+            *paused = false;
+            RefusalLogGate::Write
+        }
+        (true, false) => {
+            *paused = true;
+            RefusalLogGate::Pause(format!(
+                "shipyard daemon: webhook refusal logging paused: daemon.log is over {DAEMON_LOG_REFUSAL_CEILING} bytes; it rotates when the daemon restarts"
+            ))
+        }
+        (true, true) => RefusalLogGate::Skip,
+    }
+}
+
+/// Size of the regular file stderr points at (daemon.log under the daemon);
+/// `None` for a pipe or terminal.
+#[cfg(unix)]
+fn stderr_file_len() -> Option<u64> {
+    let fd = std::os::fd::AsFd::as_fd(&std::io::stderr())
+        .try_clone_to_owned()
+        .ok()?;
+    let metadata = fs::File::from(fd).metadata().ok()?;
+    metadata.is_file().then_some(metadata.len())
 }
 
 #[cfg(unix)]
@@ -1548,62 +1641,184 @@ fn start_webhook_listener_with_log(
     running: &Arc<AtomicBool>,
     event_sender: mpsc::Sender<Value>,
     secret: String,
-    mut log: DeliveryLog,
+    log: DeliveryLog,
 ) -> Result<LocalWebhookListener, DaemonRunError> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
     let running = Arc::clone(running);
+    let shared = Arc::new(WebhookWorkerShared {
+        secret,
+        event_sender,
+        seen_delivery_ids: Mutex::new(BTreeMap::new()),
+        log: Mutex::new(log),
+    });
     let join = thread::spawn(move || {
-        let mut seen_delivery_ids = BTreeMap::new();
+        // The accept loop only accepts and waits, without blocking, for each
+        // socket's whole header block; reading the body, verifying and
+        // answering happen on a bounded pool. An idle or trickling client
+        // therefore never holds the loop or a worker past the header
+        // deadline.
+        let (work_tx, work_rx) = mpsc::sync_channel::<TcpStream>(WEBHOOK_WORKERS);
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        let workers = (0..WEBHOOK_WORKERS)
+            .map(|_| {
+                let work_rx = Arc::clone(&work_rx);
+                let shared = Arc::clone(&shared);
+                thread::spawn(move || {
+                    loop {
+                        let job = work_rx.lock().map_or(None, |rx| rx.recv().ok());
+                        let Some(stream) = job else {
+                            break;
+                        };
+                        // The headers are already buffered; the deadlines
+                        // run from here so a delivery that queued behind
+                        // busy workers is not timed out unread.
+                        serve_webhook_connection(stream, Instant::now(), &shared);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut pending = std::collections::VecDeque::<(TcpStream, Instant)>::new();
+        let mut peeked = vec![0_u8; WEBHOOK_HEADER_LIMIT + 1];
         while running.load(Ordering::Acquire) {
-            match listener.accept() {
-                Ok((mut stream, _addr)) => {
-                    let (response, rejection) = match read_webhook_request(
-                        &mut stream,
-                        WEBHOOK_READ_TIMEOUT,
-                    ) {
-                        Ok(request) if ingress_probe_nonce(&request).is_some() => {
-                            // The daemon's own public-ingress self-check:
-                            // echo the nonce, log nothing.
-                            let nonce = ingress_probe_nonce(&request).unwrap_or_default();
-                            let _ = stream.set_write_timeout(Some(WEBHOOK_READ_TIMEOUT));
-                            let _ = write!(
-                                stream,
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{nonce}",
-                                nonce.len()
-                            );
+            let mut progressed = false;
+            let mut listener_failed = false;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        progressed = true;
+                        if stream.set_nonblocking(true).is_err() {
                             continue;
                         }
-                        Ok(request) => {
-                            let response = handle_webhook_request(
-                                &request,
-                                &secret,
-                                &event_sender,
-                                &mut seen_delivery_ids,
-                            );
-                            let rejection = (response.status != 200)
-                                .then(|| WebhookRejection::for_request(&request, response));
-                            (response, rejection)
+                        if pending.len() >= WEBHOOK_PENDING_LIMIT {
+                            pending.pop_front();
                         }
-                        Err(rejection) => (rejection.response, Some(*rejection)),
-                    };
-                    // Answer first; the log line never delays or blocks the
-                    // accept loop (it is queued, or dropped and counted).
-                    answer_delivery(&mut stream, &response);
-                    drop(stream);
-                    if let Some(rejection) = rejection {
-                        log.record(rejection.log_line());
+                        pending.push_back((stream, Instant::now()));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        listener_failed = true;
+                        break;
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(_) => break,
             }
+            if listener_failed {
+                break;
+            }
+            let mut waiting = std::collections::VecDeque::with_capacity(pending.len());
+            for (stream, accepted_at) in pending.drain(..) {
+                let headers_ready = match stream.peek(&mut peeked) {
+                    Ok(0) => continue,
+                    // An oversized head goes on too, for the worker to refuse.
+                    Ok(read) => {
+                        read > WEBHOOK_HEADER_LIMIT || find_header_end(&peeked[..read]).is_some()
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(_) => continue,
+                };
+                if headers_ready {
+                    match work_tx.try_send(stream) {
+                        Ok(()) => progressed = true,
+                        Err(mpsc::TrySendError::Full(stream)) => {
+                            waiting.push_back((stream, accepted_at));
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => {}
+                    }
+                } else if accepted_at.elapsed() >= WEBHOOK_HEADER_TIMEOUT {
+                    refuse_idle_connection(stream, &shared);
+                } else {
+                    waiting.push_back((stream, accepted_at));
+                }
+            }
+            pending = waiting;
+            if !progressed {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        drop(pending);
+        drop(work_tx);
+        for worker in workers {
+            let _ = worker.join();
         }
     });
     Ok(LocalWebhookListener { port, join })
+}
+
+/// State every webhook worker shares.
+#[cfg(unix)]
+struct WebhookWorkerShared {
+    secret: String,
+    event_sender: mpsc::Sender<Value>,
+    seen_delivery_ids: Mutex<BTreeMap<String, Instant>>,
+    log: Mutex<DeliveryLog>,
+}
+
+#[cfg(unix)]
+impl WebhookWorkerShared {
+    fn log(&self, rejection: &WebhookRejection) {
+        if let Ok(mut log) = self.log.lock() {
+            log.record_folded(&rejection.fold_key(), rejection.log_line());
+        }
+    }
+}
+
+/// Read, verify and answer one connection that has sent at least one byte.
+#[cfg(unix)]
+fn serve_webhook_connection(mut stream: TcpStream, started: Instant, shared: &WebhookWorkerShared) {
+    let (response, rejection) = match read_screened_webhook_request(&mut stream, started) {
+        Ok(request) if ingress_probe_nonce(&request).is_some() => {
+            // The daemon's own public-ingress self-check: echo the nonce,
+            // log nothing.
+            let nonce = ingress_probe_nonce(&request).unwrap_or_default();
+            let _ = stream.set_write_timeout(Some(WEBHOOK_READ_TIMEOUT));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{nonce}",
+                nonce.len()
+            );
+            return;
+        }
+        Ok(request) => {
+            let response = match shared.seen_delivery_ids.lock() {
+                Ok(mut seen) => handle_webhook_request(
+                    &request,
+                    &shared.secret,
+                    &shared.event_sender,
+                    &mut seen,
+                ),
+                Err(_) => HttpResponse::bad_request(),
+            };
+            let rejection =
+                (response.status != 200).then(|| WebhookRejection::for_request(&request, response));
+            (response, rejection)
+        }
+        Err(rejection) => (rejection.response, Some(*rejection)),
+    };
+    // Answer first; the log line never delays the answer (it is queued, or
+    // dropped and counted).
+    answer_delivery(&mut stream, &response);
+    drop(stream);
+    if let Some(rejection) = rejection {
+        shared.log(&rejection);
+    }
+}
+
+/// Close a connection whose headers did not arrive within the deadline.
+#[cfg(unix)]
+fn refuse_idle_connection(mut stream: TcpStream, shared: &WebhookWorkerShared) {
+    let rejection = WebhookRejection {
+        response: HttpResponse::bad_request(),
+        reason: format!(
+            "timed out after {}ms reading the headers",
+            WEBHOOK_HEADER_TIMEOUT.as_millis()
+        ),
+        progress: ReadProgress::default(),
+    };
+    // Still non-blocking: a peer that is not reading just misses the answer.
+    let _ = write_http_response(&mut stream, &rejection.response);
+    drop(stream);
+    shared.log(&rejection);
 }
 
 #[cfg(unix)]
@@ -1701,6 +1916,18 @@ impl WebhookRejection {
         }
     }
 
+    /// Refusals that differ only in attacker-chosen detail share a key, so a
+    /// flood folds into one counted line per reason per minute.
+    fn fold_key(&self) -> String {
+        let class = self
+            .reason
+            .split(|c: char| c == '"' || c == ':' || c.is_ascii_digit())
+            .next()
+            .unwrap_or_default()
+            .trim();
+        format!("{} {class}", self.response.status)
+    }
+
     fn log_line(&self) -> String {
         let progress = &self.progress;
         let bytes = match (progress.header_bytes, progress.content_length) {
@@ -1713,12 +1940,50 @@ impl WebhookRejection {
         };
         format!(
             "shipyard daemon: rejected webhook delivery {} ({}) with HTTP {}: {} [{bytes}]",
-            progress.delivery.as_deref().unwrap_or("(unknown)"),
-            progress.event.as_deref().unwrap_or("unknown event"),
+            progress
+                .delivery
+                .as_deref()
+                .map_or_else(|| "(unknown)".to_owned(), log_field),
+            progress
+                .event
+                .as_deref()
+                .map_or_else(|| "unknown event".to_owned(), log_field),
             self.response.status,
-            self.reason,
+            clip_for_log(&self.reason, 4 * LOG_FIELD_LIMIT),
         )
     }
+}
+
+/// An attacker-supplied header value as the log shows it: verbatim when it is
+/// short and plainly an identifier (GUIDs and event names), otherwise clipped
+/// to [`LOG_FIELD_LIMIT`] bytes and `Debug`-escaped, so it cannot forge or
+/// break lines.
+#[cfg(unix)]
+fn log_field(value: &str) -> String {
+    if value.len() <= LOG_FIELD_LIMIT
+        && !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        value.to_owned()
+    } else {
+        format!("{:?}", clip_for_log(value, LOG_FIELD_LIMIT))
+    }
+}
+
+/// `value` cut to at most `limit` bytes on a character boundary, marked with
+/// an ellipsis when cut.
+#[cfg(unix)]
+fn clip_for_log(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
 }
 
 /// Queued refused-delivery lines the listener may hold before dropping.
@@ -1737,6 +2002,15 @@ const DELIVERY_LOG_CAPACITY: usize = 256;
 struct DeliveryLog {
     sender: mpsc::SyncSender<String>,
     dropped: u64,
+    /// Per-reason fold windows, when folding is on.
+    folds: Option<std::collections::HashMap<String, FoldWindow>>,
+}
+
+/// One reason's refusals in the current [`REFUSAL_FOLD_WINDOW`].
+#[cfg(unix)]
+struct FoldWindow {
+    started: Instant,
+    folded: u64,
 }
 
 #[cfg(unix)]
@@ -1745,7 +2019,7 @@ impl DeliveryLog {
     /// write are counted, and the count rides on the next line that does.
     /// That count is separate from the listener's queue-full drop count in
     /// [`DeliveryLog::record`]; one landed line can carry both.
-    fn spawn(capacity: usize, write: impl Fn(&str) -> bool + Send + 'static) -> Self {
+    fn spawn(capacity: usize, mut write: impl FnMut(&str) -> bool + Send + 'static) -> Self {
         let (sender, receiver) = mpsc::sync_channel::<String>(capacity);
         thread::spawn(move || {
             let mut unwritten = 0_u64;
@@ -1764,7 +2038,64 @@ impl DeliveryLog {
                 }
             }
         });
-        Self { sender, dropped: 0 }
+        Self {
+            sender,
+            dropped: 0,
+            folds: None,
+        }
+    }
+
+    /// Log the first refusal per reason per [`REFUSAL_FOLD_WINDOW`] and count
+    /// the rest; the count rides on that reason's first line of a later
+    /// window. A refusal flood then costs the log one line per reason per
+    /// minute, not one per request.
+    fn folding_per_reason(mut self) -> Self {
+        self.folds = Some(std::collections::HashMap::new());
+        self
+    }
+
+    fn record_folded(&mut self, key: &str, line: String) {
+        let Some(folds) = self.folds.as_mut() else {
+            self.record(line);
+            return;
+        };
+        let now = Instant::now();
+        if folds.len() > 256 {
+            folds.retain(|_, window| now.duration_since(window.started) < REFUSAL_FOLD_WINDOW);
+        }
+        let earlier = match folds.get_mut(key) {
+            Some(window) if now.duration_since(window.started) < REFUSAL_FOLD_WINDOW => {
+                window.folded += 1;
+                return;
+            }
+            Some(window) => {
+                std::mem::replace(
+                    window,
+                    FoldWindow {
+                        started: now,
+                        folded: 0,
+                    },
+                )
+                .folded
+            }
+            None => {
+                folds.insert(
+                    key.to_owned(),
+                    FoldWindow {
+                        started: now,
+                        folded: 0,
+                    },
+                );
+                0
+            }
+        };
+        if earlier == 0 {
+            self.record(line);
+        } else {
+            self.record(format!(
+                "{line} ({earlier} more like it folded since the last line like it)"
+            ));
+        }
     }
 
     fn record(&mut self, line: String) {
@@ -1783,21 +2114,75 @@ impl DeliveryLog {
     }
 }
 
+/// [`read_webhook_request_from`] without the listener's screening.
+#[cfg(all(unix, test))]
+fn read_webhook_request(
+    stream: &mut TcpStream,
+    timeout: Duration,
+) -> Result<WebhookRequest, Box<WebhookRejection>> {
+    read_webhook_request_from(
+        stream,
+        Instant::now(),
+        timeout.min(WEBHOOK_HEADER_TIMEOUT),
+        timeout,
+        false,
+    )
+}
+
+/// The listener's reader: the headers must arrive within
+/// [`WEBHOOK_HEADER_TIMEOUT`] of `started`, and a request that cannot be
+/// a GitHub delivery (or the ingress self-check) is refused before its body
+/// is read.
+#[cfg(unix)]
+fn read_screened_webhook_request(
+    stream: &mut TcpStream,
+    started: Instant,
+) -> Result<WebhookRequest, Box<WebhookRejection>> {
+    read_webhook_request_from(
+        stream,
+        started,
+        WEBHOOK_HEADER_TIMEOUT,
+        WEBHOOK_READ_TIMEOUT,
+        true,
+    )
+}
+
 /// Read one HTTP request, tolerating a request that arrives across many
 /// socket reads (the tunnel forwards headers and body as separate writes).
 ///
 /// The stream is forced back to blocking mode first: on macOS and the BSDs an
 /// accepted socket inherits `O_NONBLOCK` from the non-blocking listener, so a
 /// plain read returns `WouldBlock` as soon as the next chunk has not arrived.
-/// The whole request must arrive within `timeout`; the body handed to
+/// The headers must arrive within `header_timeout` and the whole request
+/// within `timeout`, both counted from `started`; the body handed to
 /// signature verification is always exactly `Content-Length` bytes.
 #[cfg(unix)]
-fn read_webhook_request(
+fn read_webhook_request_from(
     stream: &mut TcpStream,
+    started: Instant,
+    header_timeout: Duration,
     timeout: Duration,
+    screen: bool,
 ) -> Result<WebhookRequest, Box<WebhookRejection>> {
     let mut progress = ReadProgress::default();
-    read_webhook_request_tracked(stream, timeout, &mut progress).map_err(|reason| {
+    let head = match read_webhook_head(stream, started, header_timeout, &mut progress) {
+        Ok(head) => head,
+        Err(reason) => {
+            return Err(Box::new(WebhookRejection {
+                response: HttpResponse::bad_request(),
+                reason,
+                progress,
+            }));
+        }
+    };
+    if screen && let Some(response) = screen_webhook_head(&head) {
+        return Err(Box::new(WebhookRejection {
+            response,
+            reason: response.body.trim_end().to_owned(),
+            progress,
+        }));
+    }
+    read_webhook_body(stream, head, started + timeout, timeout, &mut progress).map_err(|reason| {
         Box::new(WebhookRejection {
             response: HttpResponse::bad_request(),
             reason,
@@ -1806,16 +2191,55 @@ fn read_webhook_request(
     })
 }
 
+/// A request line and headers, with whatever body bytes arrived alongside.
 #[cfg(unix)]
-fn read_webhook_request_tracked(
+struct WebhookHead {
+    method: String,
+    path: String,
+    headers: BTreeMap<String, String>,
+    content_length: usize,
+    buffer: Vec<u8>,
+    body_start: usize,
+}
+
+/// Refuse, from the headers alone, anything that is neither a plausible
+/// GitHub delivery nor the ingress self-check, so the body is never read.
+/// A request that passes still faces the constant-time HMAC check first.
+#[cfg(unix)]
+fn screen_webhook_head(head: &WebhookHead) -> Option<HttpResponse> {
+    if head.method == "GET"
+        && head
+            .path
+            .starts_with(crate::tunnel_ingress::INGRESS_PROBE_PATH)
+    {
+        return (head.content_length != 0).then(HttpResponse::bad_request);
+    }
+    if head.method != "POST" {
+        return Some(HttpResponse::method_not_allowed());
+    }
+    if head.path != "/webhook" && head.path != "/" {
+        return Some(HttpResponse::not_found());
+    }
+    if !head.headers.contains_key("x-hub-signature-256") {
+        return Some(HttpResponse::unauthorized());
+    }
+    if !head.headers.contains_key("x-github-event") || head.content_length == 0 {
+        return Some(HttpResponse::bad_request());
+    }
+    None
+}
+
+#[cfg(unix)]
+fn read_webhook_head(
     stream: &mut TcpStream,
-    timeout: Duration,
+    started: Instant,
+    header_timeout: Duration,
     progress: &mut ReadProgress,
-) -> Result<WebhookRequest, String> {
+) -> Result<WebhookHead, String> {
     stream
         .set_nonblocking(false)
         .map_err(|error| format!("socket setup failed: {error}"))?;
-    let deadline = Instant::now() + timeout;
+    let deadline = started + header_timeout;
     let mut buffer = Vec::with_capacity(16 * 1024);
 
     let header_end = loop {
@@ -1825,7 +2249,7 @@ fn read_webhook_request_tracked(
         if buffer.len() > WEBHOOK_HEADER_LIMIT {
             return Err(format!("headers exceed {WEBHOOK_HEADER_LIMIT} bytes"));
         }
-        let read = read_webhook_chunk(stream, &mut buffer, deadline, timeout, "headers");
+        let read = read_webhook_chunk(stream, &mut buffer, deadline, header_timeout, "headers");
         progress.received = buffer.len();
         if read? == 0 {
             return Err("connection closed before the headers ended".to_owned());
@@ -1842,12 +2266,18 @@ fn read_webhook_request_tracked(
         parts.next().map(str::to_owned),
         parts.next().map(str::to_owned),
     ) else {
-        return Err(format!("malformed request line {request_line:?}"));
+        return Err(format!(
+            "malformed request line {:?}",
+            clip_for_log(request_line, LOG_FIELD_LIMIT)
+        ));
     };
     let mut headers = BTreeMap::new();
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
-            return Err(format!("malformed header line {line:?}"));
+            return Err(format!(
+                "malformed header line {:?}",
+                clip_for_log(line, LOG_FIELD_LIMIT)
+            ));
         };
         headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
     }
@@ -1862,9 +2292,12 @@ fn read_webhook_request_tracked(
     }
     let length = match headers.get("content-length") {
         None => 0,
-        Some(value) => value
-            .parse::<usize>()
-            .map_err(|_| format!("invalid Content-Length {value:?}"))?,
+        Some(value) => value.parse::<usize>().map_err(|_| {
+            format!(
+                "invalid Content-Length {:?}",
+                clip_for_log(value, LOG_FIELD_LIMIT)
+            )
+        })?,
     };
     progress.content_length = Some(length);
     if length > WEBHOOK_BODY_LIMIT {
@@ -1872,7 +2305,35 @@ fn read_webhook_request_tracked(
             "Content-Length exceeds the {WEBHOOK_BODY_LIMIT}-byte limit"
         ));
     }
-    let body_start = header_end.end;
+    Ok(WebhookHead {
+        method,
+        path: path
+            .split_once('?')
+            .map_or(path.as_str(), |(path, _)| path)
+            .to_owned(),
+        headers,
+        content_length: length,
+        buffer,
+        body_start: header_end.end,
+    })
+}
+
+#[cfg(unix)]
+fn read_webhook_body(
+    stream: &mut TcpStream,
+    head: WebhookHead,
+    deadline: Instant,
+    timeout: Duration,
+    progress: &mut ReadProgress,
+) -> Result<WebhookRequest, String> {
+    let WebhookHead {
+        method,
+        path,
+        headers,
+        content_length: length,
+        mut buffer,
+        body_start,
+    } = head;
     while buffer.len() < body_start + length {
         let read = read_webhook_chunk(stream, &mut buffer, deadline, timeout, "body");
         progress.received = buffer.len();
@@ -1885,10 +2346,7 @@ fn read_webhook_request_tracked(
 
     Ok(WebhookRequest {
         method,
-        path: path
-            .split_once('?')
-            .map_or(path.as_str(), |(path, _)| path)
-            .to_owned(),
+        path,
         headers,
         body,
     })
@@ -2051,6 +2509,13 @@ fn load_or_create_webhook_secret(state_dir: &Path) -> Result<String, DaemonRunEr
     if let Ok(secret) = fs::read_to_string(&path) {
         let secret = secret.trim().to_owned();
         if !secret.is_empty() {
+            // A secret left readable by an older build is tightened in place.
+            use std::os::unix::fs::PermissionsExt;
+            if fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o077 != 0
+            }) {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            }
             return Ok(secret);
         }
     }
@@ -2062,13 +2527,45 @@ fn load_or_create_webhook_secret(state_dir: &Path) -> Result<String, DaemonRunEr
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, &secret)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    }
+    write_private_file_atomically(&path, secret.as_bytes())?;
     Ok(secret)
+}
+
+/// Write `contents` to `path` so that no reader ever sees it with looser
+/// permissions than 0600 or half-written: a fresh temporary file is created
+/// with mode 0600 (`create_new`, so a planted file or symlink is refused),
+/// synced, then renamed over `path`.
+#[cfg(unix)]
+fn write_private_file_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let mut temp_name = file_name.to_os_string();
+    temp_name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    ));
+    let temp = path.with_file_name(temp_name);
+    let written = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written?;
+    crate::durable_file::sync_parent_directory(path)
 }
 
 #[cfg(unix)]
@@ -2887,6 +3384,53 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn global_config_with(toml: &str) -> (tempfile::TempDir, LoadedConfig) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("config.toml"), toml).expect("config");
+        let loaded =
+            LoadedConfig::load_machine_global_from_dir(temp.path().to_path_buf()).expect("load");
+        (temp, loaded)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_tunnel_is_off_without_an_explicit_opt_in() {
+        // No env and no config key: off, whatever the runtime mode.
+        let (_empty_dir, empty) = global_config_with("");
+        assert!(!parse_tunnel_enabled(
+            super::tunnel_opt_in(None, None).as_deref()
+        ));
+        assert!(!parse_tunnel_enabled(
+            super::tunnel_opt_in(None, Some(&empty)).as_deref()
+        ));
+        let (_off_dir, off) = global_config_with("[daemon]\npublic_ingress = false\n");
+        assert!(!parse_tunnel_enabled(
+            super::tunnel_opt_in(None, Some(&off)).as_deref()
+        ));
+        // A non-boolean value is not an opt-in.
+        let (_str_dir, string) = global_config_with("[daemon]\npublic_ingress = \"yes\"\n");
+        assert!(!parse_tunnel_enabled(
+            super::tunnel_opt_in(None, Some(&string)).as_deref()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_tunnel_opts_in_by_env_or_global_config() {
+        let (_on_dir, on) = global_config_with("[daemon]\npublic_ingress = true\n");
+        assert!(parse_tunnel_enabled(
+            super::tunnel_opt_in(None, Some(&on)).as_deref()
+        ));
+        assert!(parse_tunnel_enabled(
+            super::tunnel_opt_in(Some("1".to_owned()), None).as_deref()
+        ));
+        // The env var wins either way, so `=0` overrides the config.
+        assert!(!parse_tunnel_enabled(
+            super::tunnel_opt_in(Some("0".to_owned()), Some(&on)).as_deref()
+        ));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn tunnel_enable_parser_is_explicit_opt_in() {
         assert!(parse_tunnel_enabled(Some("1")));
@@ -3101,7 +3645,6 @@ mod tests {
             &running,
             temp.path(),
             Some("https://shipyard-dev.local".to_owned()),
-            RuntimeMode::Isolated,
             Some("1"),
             tx,
         )
@@ -3120,15 +3663,8 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let temp = tempfile::tempdir().expect("tempdir");
         let (tx, _rx) = mpsc::channel();
-        let runtime = start_tunnel_runtime(
-            &running,
-            temp.path(),
-            None,
-            RuntimeMode::Isolated,
-            Some("false"),
-            tx,
-        )
-        .expect("runtime");
+        let runtime =
+            start_tunnel_runtime(&running, temp.path(), None, Some("false"), tx).expect("runtime");
         let snapshot = runtime.snapshot.lock().expect("snapshot").clone();
 
         assert_eq!(snapshot.backend, "inactive");
@@ -3635,6 +4171,236 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn webhook_listener_answers_a_delivery_within_a_second_past_idle_and_stalled_clients() {
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        let secret = "dev-secret";
+        let listener =
+            super::start_webhook_listener(&running, tx, secret.to_owned()).expect("listener");
+        // Twenty sockets that never send a byte, plus more stalled mid-header
+        // than there are workers.
+        let idle = (0..20)
+            .map(|_| TcpStream::connect(("127.0.0.1", listener.port)).expect("idle"))
+            .collect::<Vec<_>>();
+        let stalled = (0..super::WEBHOOK_WORKERS + 2)
+            .map(|_| {
+                let mut stream = TcpStream::connect(("127.0.0.1", listener.port)).expect("stalled");
+                stream
+                    .write_all(b"POST /webhook HTTP/1.1\r\nHost: x\r\n")
+                    .expect("partial");
+                stream
+            })
+            .collect::<Vec<_>>();
+        thread::sleep(Duration::from_millis(200));
+
+        let (genuine, _) = check_run_delivery(secret, "past-idle");
+        let started = Instant::now();
+        let answer = send_with_timeout(listener.port, &genuine, Duration::from_secs(3));
+        let elapsed = started.elapsed();
+        drop(idle);
+        drop(stalled);
+        running.store(false, Ordering::Release);
+        listener.stop();
+
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer:?}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "idle clients delayed a delivery by {elapsed:?}"
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).expect("event")["kind"],
+            "check_run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_closes_a_client_that_sends_no_headers() {
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, _rx) = mpsc::channel();
+        let listener =
+            super::start_webhook_listener(&running, tx, "dev-secret".to_owned()).expect("listener");
+        let mut idle = TcpStream::connect(("127.0.0.1", listener.port)).expect("connect");
+        idle.set_read_timeout(Some(Duration::from_secs(8)))
+            .expect("timeout");
+        let started = Instant::now();
+        let mut answer = String::new();
+        let _ = idle.read_to_string(&mut answer);
+        let elapsed = started.elapsed();
+        running.store(false, Ordering::Release);
+        listener.stop();
+
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer:?}");
+        assert!(
+            elapsed >= super::WEBHOOK_HEADER_TIMEOUT
+                && elapsed < super::WEBHOOK_HEADER_TIMEOUT + Duration::from_secs(2),
+            "closed after {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_listener_refuses_an_implausible_delivery_before_reading_its_body() {
+        let running = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        let secret = "dev-secret";
+        let listener =
+            super::start_webhook_listener(&running, tx, secret.to_owned()).expect("listener");
+        // Each head promises a body that never comes: only a refusal made from
+        // the headers alone can answer before the body deadline.
+        let heads = [
+            (
+                "PUT /webhook",
+                "X-Hub-Signature-256: sha256=00\r\nX-GitHub-Event: ping\r\n",
+                "405",
+            ),
+            (
+                "POST /admin",
+                "X-Hub-Signature-256: sha256=00\r\nX-GitHub-Event: ping\r\n",
+                "404",
+            ),
+            ("POST /webhook", "X-GitHub-Event: ping\r\n", "401"),
+            ("POST /webhook", "X-Hub-Signature-256: sha256=00\r\n", "400"),
+        ];
+        let mut answers = Vec::new();
+        for (line, headers, _) in heads {
+            let head =
+                format!("{line} HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n{headers}\r\n");
+            let started = Instant::now();
+            let answer = send_with_timeout(listener.port, head.as_bytes(), Duration::from_secs(5));
+            answers.push((answer, started.elapsed()));
+        }
+        // Control: a plausible head is read through, and its signature checked.
+        let (genuine, _) = check_run_delivery(secret, "after-screening");
+        let accepted = send_with_timeout(listener.port, &genuine, Duration::from_secs(3));
+        running.store(false, Ordering::Release);
+        listener.stop();
+
+        for ((answer, elapsed), (line, _, status)) in answers.iter().zip(heads) {
+            assert!(
+                answer.starts_with(&format!("HTTP/1.1 {status}")),
+                "{line}: {answer:?}"
+            );
+            assert!(
+                *elapsed < Duration::from_secs(1),
+                "{line} waited {elapsed:?} for a body"
+            );
+        }
+        assert!(accepted.starts_with("HTTP/1.1 200 OK"), "{accepted:?}");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).expect("event")["kind"],
+            "check_run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_refusal_log_clips_and_escapes_attacker_fields() {
+        let rejection = super::WebhookRejection {
+            response: HttpResponse::unauthorized(),
+            reason: "bad signature".to_owned(),
+            progress: super::ReadProgress {
+                delivery: Some(format!(
+                    "forged\nshipyard daemon: all good {}",
+                    "x".repeat(200)
+                )),
+                event: Some("check_run".to_owned()),
+                ..super::ReadProgress::default()
+            },
+        };
+        let line = rejection.log_line();
+        assert!(!line.contains('\n'), "a header broke the line: {line:?}");
+        assert!(
+            line.contains(r#""forged\nshipyard daemon: all good"#),
+            "{line}"
+        );
+        assert!(line.len() < 300, "unbounded field: {line}");
+        // Control: an ordinary GUID and event name are logged verbatim.
+        let ordinary = super::WebhookRejection {
+            progress: super::ReadProgress {
+                delivery: Some("72d3162e-cc78-11e3-81ab-4c9367dc0958".to_owned()),
+                event: Some("check_run".to_owned()),
+                ..super::ReadProgress::default()
+            },
+            ..rejection
+        };
+        assert!(
+            ordinary
+                .log_line()
+                .contains("delivery 72d3162e-cc78-11e3-81ab-4c9367dc0958 (check_run)"),
+            "{}",
+            ordinary.log_line()
+        );
+        assert_eq!(super::clip_for_log("ééé", 3), "é…");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_refusals_fold_per_reason_per_window() {
+        let (line_tx, line_rx) = mpsc::channel::<String>();
+        let mut log =
+            super::DeliveryLog::spawn(64, move |line| line_tx.send(line.to_owned()).is_ok())
+                .folding_per_reason();
+        for index in 0..10 {
+            log.record_folded("401 bad signature", format!("refused forged-{index}"));
+        }
+        log.record_folded("404 not found", "refused path".to_owned());
+        // A later window's first line carries the count it folded.
+        if let Some(folds) = log.folds.as_mut() {
+            let window = folds.get_mut("401 bad signature").expect("window");
+            window.started -= super::REFUSAL_FOLD_WINDOW;
+        }
+        log.record_folded("401 bad signature", "refused forged-late".to_owned());
+        drop(log);
+        let lines = drain_log_lines(&line_rx);
+        assert_eq!(
+            lines,
+            [
+                "refused forged-0",
+                "refused path",
+                "refused forged-late (9 more like it folded since the last line like it)",
+            ]
+        );
+        // Control: without folding every line is written.
+        let (plain_tx, plain_rx) = mpsc::channel::<String>();
+        let mut plain =
+            super::DeliveryLog::spawn(64, move |line| plain_tx.send(line.to_owned()).is_ok());
+        for index in 0..3 {
+            plain.record_folded("401 bad signature", format!("refused {index}"));
+        }
+        drop(plain);
+        assert_eq!(drain_log_lines(&plain_rx).len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refusal_logging_pauses_once_the_daemon_log_is_over_its_bound() {
+        use super::{DAEMON_LOG_REFUSAL_CEILING as CEILING, RefusalLogGate, refusal_log_gate};
+
+        let mut paused = false;
+        assert_eq!(
+            refusal_log_gate(Some(CEILING - 1), &mut paused),
+            RefusalLogGate::Write
+        );
+        assert_eq!(refusal_log_gate(None, &mut paused), RefusalLogGate::Write);
+        assert!(matches!(
+            refusal_log_gate(Some(CEILING), &mut paused),
+            RefusalLogGate::Pause(_)
+        ));
+        assert_eq!(
+            refusal_log_gate(Some(CEILING + 1), &mut paused),
+            RefusalLogGate::Skip
+        );
+        // Once the log is small again (rotated), lines flow again.
+        assert_eq!(
+            refusal_log_gate(Some(0), &mut paused),
+            RefusalLogGate::Write
+        );
+        assert!(!paused);
+    }
+
+    #[cfg(unix)]
     fn assert_split_delivery_accepted(split_at: impl Fn(usize, usize) -> Vec<usize>) {
         let running = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::channel();
@@ -3859,6 +4625,54 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_secret_replaces_a_readable_file_with_a_private_one() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("webhook-secret");
+        std::fs::write(&path, "").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let old_inode = std::fs::metadata(&path).expect("metadata").ino();
+
+        super::write_private_file_atomically(&path, b"s3cret").expect("write");
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        // Renamed into place, not rewritten through the old 0644 inode.
+        assert_ne!(metadata.ino(), old_inode);
+        assert_eq!(std::fs::read(&path).expect("read"), b"s3cret");
+        let leftovers = std::fs::read_dir(temp.path())
+            .expect("dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != "webhook-secret")
+            .count();
+        assert_eq!(leftovers, 0, "temporary file left behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webhook_secret_loaded_from_a_readable_file_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("daemon").join("webhook-secret");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, "existing-secret\n").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        assert_eq!(
+            load_or_create_webhook_secret(temp.path()).expect("secret"),
+            "existing-secret"
+        );
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[cfg(unix)]

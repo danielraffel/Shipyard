@@ -212,6 +212,29 @@ never the listener's. `daemon status` prints `public ingress: ok` or
 `daemon reconcile` raises an `endpoint_unreachable` alarm, and daemon.log
 records each transition and re-apply.
 
+## Public webhook ingress is opt-in and touches only Shipyard's mount
+
+The daemon opens no public Funnel unless the host's owner asks:
+`[daemon] public_ingress = true` in the machine-global config, or
+`SHIPYARD_ENABLE_TUNNEL=1` (the env var wins when set, so `=0` overrides the
+config; a tracked project layer cannot turn it on). Start, re-apply and stop
+never run `tailscale funnel reset`: they remove only the HTTPS 443 path `/`
+handler (`funnel --https=443 --set-path=/ off`), and stop removes it only
+while it still points at this daemon's port, so the owner's other Serve and
+Funnel routes survive.
+
+The local listener answers from a pool of eight workers. A connection reaches
+a worker only once its whole header block has arrived; headers must arrive
+within 3s of the accept or the socket is closed with 400. A request that is not
+`POST` to `/webhook` or `/` with both `X-Hub-Signature-256` and
+`X-GitHub-Event` (or the ingress self-check) is refused from its headers alone,
+before any body is read; an accepted request still faces the constant-time HMAC
+check first. Refusal lines clip and `Debug`-escape attacker-supplied fields,
+fold repeats into one counted line per reason per minute, and stop once
+daemon.log reaches 64 MiB (it rotates at the next start). The webhook secret is
+written to a fresh 0600 file and renamed into place; `daemon.sock` is 0600, and
+a connection that has not subscribed is closed after 10s without a request.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.
@@ -4156,8 +4179,8 @@ function returns (cancel it in a `finally`), and run the suite through
 `scripts/run_unittest_strict.py`, which requires the last "Ran N tests" line
 to count every discovered test and to end in "OK".
 
-The live webhook gate is intentionally dangerous because it resets the local
-Funnel config:
+The live webhook gate is intentionally dangerous because the validator's own
+cleanup resets the local Funnel config (the daemon itself never does):
 
 ```sh
 scripts/validate_webhook_tunnel_live.py \

@@ -25,6 +25,9 @@ const TAILSCALE_CANDIDATE_BINARIES: [&str; 4] = [
 const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const TAILSCALE_FUNNEL_TIMEOUT: Duration = Duration::from_secs(10);
 const TAILSCALE_RESET_SETTLE: Duration = Duration::from_millis(500);
+/// Turns off exactly the handler `funnel --bg <port>` installs (HTTPS 443,
+/// path `/`), leaving any other Serve/Funnel route on the host in place.
+const SHIPYARD_MOUNT_OFF_ARGS: [&str; 4] = ["funnel", "--https=443", "--set-path=/", "off"];
 
 /// Probe backoffs used while Tailscale is warming up.
 pub const TAILSCALE_PROBE_BACKOFFS: [Duration; 3] = [
@@ -598,6 +601,56 @@ impl TailscaleFunnelBackend {
         let output = run_tailscale(&binary, &["funnel", "status"], TAILSCALE_FUNNEL_TIMEOUT)?;
         Ok(output.output.contains(&format!("127.0.0.1:{local_port}")))
     }
+
+    /// Point Shipyard's own Funnel mount (HTTPS 443, path `/`) at
+    /// `local_port`. Only that handler is replaced: a global `funnel reset`
+    /// would also wipe every other Serve/Funnel route the host's owner set up.
+    fn mount(
+        &mut self,
+        binary: &Path,
+        local_port: u16,
+        public_url: &str,
+    ) -> Result<TunnelInfo, TunnelError> {
+        // A previous daemon's mount names a stale port; drop it first. This
+        // fails harmlessly ("handler does not exist") when nothing is mounted.
+        let removed = run_tailscale(binary, &SHIPYARD_MOUNT_OFF_ARGS, TAILSCALE_FUNNEL_TIMEOUT)?;
+        if removed.code == 0 {
+            thread::sleep(TAILSCALE_RESET_SETTLE);
+        }
+
+        let mut last_output = String::new();
+        for attempt in 1..=3 {
+            let output = run_tailscale(
+                binary,
+                &["funnel", "--bg", &local_port.to_string()],
+                TAILSCALE_FUNNEL_TIMEOUT,
+            )?;
+            last_output.clone_from(&output.output);
+            if output.code != 0 {
+                return Err(TunnelError::new(
+                    TunnelErrorKind::StartFailed,
+                    format!("funnel --bg failed: {}", output.output.trim()),
+                ));
+            }
+            if self.verify_configured(local_port)? {
+                self.configured_port = Some(local_port);
+                self.ingress.set_public_url(public_url);
+                return Ok(TunnelInfo {
+                    public_url: public_url.to_owned(),
+                    backend: self.name().to_owned(),
+                });
+            }
+            thread::sleep(Duration::from_millis(500 * attempt));
+        }
+
+        Err(TunnelError::new(
+            TunnelErrorKind::StartFailed,
+            format!(
+                "funnel --bg returned 0 but serve config didn't persist. last output: {}",
+                last_output.trim()
+            ),
+        ))
+    }
 }
 
 impl TunnelBackend for TailscaleFunnelBackend {
@@ -622,47 +675,7 @@ impl TunnelBackend for TailscaleFunnelBackend {
         })?;
         self.binary = Some(binary.clone());
 
-        let reset = run_tailscale(&binary, &["funnel", "reset"], TAILSCALE_FUNNEL_TIMEOUT)?;
-        if reset.code != 0 {
-            return Err(TunnelError::new(
-                TunnelErrorKind::StartFailed,
-                format!("funnel reset failed: {}", reset.output.trim()),
-            ));
-        }
-        thread::sleep(TAILSCALE_RESET_SETTLE);
-
-        let mut last_output = String::new();
-        for attempt in 1..=3 {
-            let output = run_tailscale(
-                &binary,
-                &["funnel", "--bg", &local_port.to_string()],
-                TAILSCALE_FUNNEL_TIMEOUT,
-            )?;
-            last_output.clone_from(&output.output);
-            if output.code != 0 {
-                return Err(TunnelError::new(
-                    TunnelErrorKind::StartFailed,
-                    format!("funnel --bg failed: {}", output.output.trim()),
-                ));
-            }
-            if self.verify_configured(local_port)? {
-                self.configured_port = Some(local_port);
-                self.ingress.set_public_url(&public_url);
-                return Ok(TunnelInfo {
-                    public_url,
-                    backend: self.name().to_owned(),
-                });
-            }
-            thread::sleep(Duration::from_millis(500 * attempt));
-        }
-
-        Err(TunnelError::new(
-            TunnelErrorKind::StartFailed,
-            format!(
-                "funnel --bg returned 0 but serve config didn't persist. last output: {}",
-                last_output.trim()
-            ),
-        ))
+        self.mount(&binary, local_port, &public_url)
     }
 
     fn verify(&mut self, local_port: u16) -> Result<bool, TunnelError> {
@@ -687,14 +700,23 @@ impl TunnelBackend for TailscaleFunnelBackend {
             self.configured_port = None;
             return Ok(());
         };
-        let output = run_tailscale(&binary, &["funnel", "reset"], TAILSCALE_FUNNEL_TIMEOUT)?;
-        self.configured_port = None;
+        self.binary = Some(binary.clone());
+        // Remove only Shipyard's own mount, and only while it still points at
+        // this daemon's listener; never `funnel reset`, which clears every
+        // Serve/Funnel route on the host.
+        let Some(port) = self.configured_port.take() else {
+            return Ok(());
+        };
+        if !self.verify_configured(port)? {
+            return Ok(());
+        }
+        let output = run_tailscale(&binary, &SHIPYARD_MOUNT_OFF_ARGS, TAILSCALE_FUNNEL_TIMEOUT)?;
         if output.code == 0 {
             Ok(())
         } else {
             Err(TunnelError::new(
                 TunnelErrorKind::StartFailed,
-                format!("funnel reset failed: {}", output.output.trim()),
+                format!("funnel mount removal failed: {}", output.output.trim()),
             ))
         }
     }
@@ -825,9 +847,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        TAILSCALE_PROBE_BACKOFFS, TailscaleStatus, TunnelBackend, TunnelError, TunnelErrorKind,
-        TunnelInfo, TunnelSnapshot, TunnelSupervisorHooks, TunnelSupervisorPolicy,
-        TunnelSupervisorState, TunnelWatchExit, decode_tailscale_status,
+        TAILSCALE_PROBE_BACKOFFS, TailscaleFunnelBackend, TailscaleStatus, TunnelBackend,
+        TunnelError, TunnelErrorKind, TunnelInfo, TunnelSnapshot, TunnelSupervisorHooks,
+        TunnelSupervisorPolicy, TunnelSupervisorState, TunnelWatchExit, decode_tailscale_status,
         probe_tailscale_with_retry, resolve_tailscale_binary_from, start_with_retry,
         supervise_tunnel, tailscale_command, watch_until_lost,
     };
@@ -1381,6 +1403,110 @@ mod tests {
         assert_eq!(
             resolve_tailscale_binary_from(&[missing, executable.clone()]),
             Some(executable)
+        );
+    }
+
+    /// A stand-in `tailscale` CLI that keeps a serve config in `config`, one
+    /// handler per line (`<port> <path> <target>`), and logs every argv.
+    #[cfg(unix)]
+    fn fake_tailscale(dir: &Path) -> std::path::PathBuf {
+        let binary = dir.join("tailscale");
+        crate::test_support::write_executable_script(
+            &binary,
+            &format!(
+                r#"#!/bin/sh
+cfg="{dir}/config"
+echo "$*" >> "{dir}/calls"
+touch "$cfg"
+case "$*" in
+  "funnel status") sed 's/^/|-- /' "$cfg" ;;
+  "funnel reset") : > "$cfg" ;;
+  "funnel --https=443 --set-path=/ off")
+    grep -q '^443 / ' "$cfg" || {{ echo "error: handler does not exist"; exit 1; }}
+    grep -v '^443 / ' "$cfg" > "$cfg.new"; mv "$cfg.new" "$cfg" ;;
+  "funnel --bg "*)
+    grep -v '^443 / ' "$cfg" > "$cfg.new"; mv "$cfg.new" "$cfg"
+    echo "443 / proxy http://127.0.0.1:$3" >> "$cfg" ;;
+  *) exit 2 ;;
+esac
+"#,
+                dir = dir.display()
+            ),
+        );
+        binary
+    }
+
+    #[cfg(unix)]
+    fn fake_backend(binary: &Path) -> TailscaleFunnelBackend {
+        TailscaleFunnelBackend {
+            binary: Some(binary.to_path_buf()),
+            ..TailscaleFunnelBackend::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn funnel_mount_and_stop_leave_other_serve_routes_in_place() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let binary = fake_tailscale(tmp.path());
+        // The owner's own routes, plus a stale mount from an earlier daemon.
+        std::fs::write(
+            tmp.path().join("config"),
+            "8443 / proxy http://127.0.0.1:3000\n443 /grafana proxy http://127.0.0.1:9000\n443 / proxy http://127.0.0.1:1111\n",
+        )
+        .expect("fixture");
+        let mut backend = fake_backend(&binary);
+
+        let info = backend
+            .mount(&binary, 4242, "https://host.example.ts.net")
+            .expect("mount");
+        assert_eq!(info.public_url, "https://host.example.ts.net");
+        let mounted = std::fs::read_to_string(tmp.path().join("config")).expect("config");
+        assert!(
+            mounted.contains("443 / proxy http://127.0.0.1:4242"),
+            "{mounted}"
+        );
+        assert!(
+            !mounted.contains("127.0.0.1:1111"),
+            "stale mount kept: {mounted}"
+        );
+
+        backend.stop().expect("stop");
+        let after = std::fs::read_to_string(tmp.path().join("config")).expect("config");
+        assert_eq!(
+            after,
+            "8443 / proxy http://127.0.0.1:3000\n443 /grafana proxy http://127.0.0.1:9000\n"
+        );
+        let calls = std::fs::read_to_string(tmp.path().join("calls")).expect("calls");
+        assert!(
+            !calls.lines().any(|line| line.contains("reset")),
+            "a global funnel reset ran: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn funnel_stop_leaves_a_root_mount_that_is_not_this_daemons() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let binary = fake_tailscale(tmp.path());
+        let fixture = "443 / proxy http://127.0.0.1:3000\n";
+        std::fs::write(tmp.path().join("config"), fixture).expect("fixture");
+        let mut backend = fake_backend(&binary);
+        backend.configured_port = Some(4242);
+
+        backend.stop().expect("stop");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config")).expect("config"),
+            fixture
+        );
+        // Control: once our mount is the one there, stop removes it.
+        backend
+            .mount(&binary, 4242, "https://host.example.ts.net")
+            .expect("mount");
+        backend.stop().expect("stop");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config")).expect("config"),
+            ""
         );
     }
 
