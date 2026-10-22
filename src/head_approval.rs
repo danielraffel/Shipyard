@@ -1024,12 +1024,25 @@ enum Verdict {
     Hold,
 }
 
+/// `body` split at every line boundary Python's `str.splitlines` knows, so
+/// this reads the same last line as the queue-arm guard and the verdict
+/// stamper. `str::lines` splits only at `\n`, so a body ending in a lone
+/// `\r` or U+2028 was a verdict to one reader and not to another.
+fn python_lines(body: &str) -> impl DoubleEndedIterator<Item = &str> {
+    body.split([
+        '\n', '\r', '\u{0b}', '\u{0c}', '\u{1c}', '\u{1d}', '\u{1e}', '\u{85}', '\u{2028}',
+        '\u{2029}',
+    ])
+}
+
 fn marker_verdict(body: &str) -> Option<(Verdict, String)> {
     let pattern = Regex::new(
         r"^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})|verdict:[ \t]*(APPROVE|HOLD)[ \t]+head:[ \t]*([0-9a-f]{40}))[ \t]*$",
     )
     .expect("marker pattern compiles");
-    let line = body.lines().rev().find(|line| !line.trim().is_empty())?;
+    let line = python_lines(body)
+        .rev()
+        .find(|line| !line.trim().is_empty())?;
     pattern.captures(line).and_then(|capture| {
         if let Some(head) = capture.get(1) {
             return Some((Verdict::Approve, head.as_str().to_ascii_lowercase()));

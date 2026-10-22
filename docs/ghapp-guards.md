@@ -87,8 +87,17 @@ the base config says and on any Python.
 `ghapp` before native `gh`, bounded to 5 seconds) adds
 `<!-- session: <host>/<session> agent: <id> -->` above the marker line of a
 verdict comment, posted with `--body`, `--body-file <file>`, an `api`
-`body=` field, or `--input`. A stamp already in the body, whether written by
-hand or copied with the rest of a verdict, is replaced rather than kept. The session is `CLAUDE_CODE_SESSION_ID`, else
+`body=` field (a typed `-F body=@<file>` is read), or `--input`; `ghapp`
+first spools a body read from stdin (`--body-file -`, `--input -`,
+`-F body=@-`) to a private file, so stdin is covered too. What counts as a
+verdict is the arm guard's own `marker_verdict`, loaded from the installed
+`queue-arm-guard`, so a body ending in `\r\n`, a lone `\r` or U+2028 is a
+verdict to the stamper exactly when it is to the guards (`head_approval`
+splits lines the same way). Every stamp already in any comment body, verdict
+or not, whether written by hand or copied with the rest of a verdict, is
+removed, repeatedly until none is left, since one pass can join the pieces
+around a removed stamp into a new one; only a verdict then gets this
+session's stamp. The session is `CLAUDE_CODE_SESSION_ID`, else
 `CODEX_COMPANION_SESSION_ID`, else `unattributed`; `agent: <id>` appears only
 when `SHIPYARD_AGENT_ID` is set. The marker stays the last line, so every
 verdict reader is unchanged. The arm guard, and `head_approval` for Shipyard's

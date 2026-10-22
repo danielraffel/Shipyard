@@ -3759,8 +3759,10 @@ copied; `ghapp`'s `<!-- session: -->` stamp is not such a line; an empty or
 malformed list admits nobody; no list warns once and keeps the old rule; with
 the list, the APPROVE also needs exactly one `ghapp` stamp from a hostname
 that `session_hosts` maps the line's `host <name>` to, because a `session:`
-line can be copied too, and `ghapp` now replaces any stamp already in a
-verdict body and stamps `--body-file` comments); its
+line can be copied too, and `ghapp` now removes every stamp already in any
+comment body, to a fixed point, and stamps `--body-file`, `-F body=@file` and
+stdin bodies, deciding what is a verdict with the arm guard's own
+`marker_verdict` so a `\r\n` ending cannot hide one); its
 override,
 `GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
 `docs/ghapp-guards.md`, Review before arm). A HOLD acts too: on a host with

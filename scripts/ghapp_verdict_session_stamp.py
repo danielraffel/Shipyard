@@ -22,20 +22,27 @@ unstamped, never blocks it; the stamper also stops itself after 5 seconds.
 Handled: ``pr comment``/``issue comment`` with ``--body``/``-b``, or with
 ``--body-file``/``-F <file>``, which becomes a ``--body`` (no file is written);
 ``api`` on an issue-comment endpoint with ``-f``/``-F``/``--field``/
-``--raw-field body=...``, or ``--input <file>`` holding exactly
-``{"body": ...}``, which becomes a ``--raw-field body=...``. Anything else
-(stdin, other fields) passes through unstamped. A stamp already in the body is
-replaced, never kept.
+``--raw-field body=...`` (a typed ``body=@<file>`` is read), or
+``--input <file>`` holding a ``{"body": ...}`` object, which becomes a
+``--raw-field body=...``. ``ghapp`` spools a body read from stdin to a private
+file first, so stdin takes the file path. Every stamp already in any comment
+body, verdict or not, is removed, repeatedly until none is left, and only a
+verdict gets this session's; what counts as a verdict is queue-arm-guard's
+own ``marker_verdict``.
 """
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
+import pathlib
 import re
 import signal
 import socket
 import sys
+from typing import Any, Callable, Optional, Tuple
 
 SENTINEL = "SHIPYARD-STAMP-V1"
 END = "SHIPYARD-STAMP-END"
@@ -43,6 +50,7 @@ DEADLINE_SECONDS = 5
 SESSION_ENVS = ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
 AGENT_ENV = "SHIPYARD_AGENT_ID"
 # Same pattern as queue-arm-guard's _MARKER and src/head_approval.rs marker_verdict.
+# Used only when queue-arm-guard's own marker_verdict cannot be loaded.
 _MARKER = re.compile(
     r"^[ \t]*(?:reviewed:[ \t]*([0-9a-f]{40})"
     r"|verdict:[ \t]*(APPROVE|HOLD)[ \t]+head:[ \t]*([0-9a-f]{40}))[ \t]*$"
@@ -62,49 +70,127 @@ def stamp() -> str:
     return f"<!-- session: {socket.gethostname().split('.')[0]}/{session}{tail} -->"
 
 
-def stamped(body: str) -> str | None:
-    """``body`` with this session's stamp above its verdict line, in place of
-    any stamp it already carried, or ``None`` when it is not a verdict."""
-    lines = [line for line in body.split("\n")
-             if not (_STAMPED.search(line) and not _STAMPED.sub("", line).strip())]
-    lines = _STAMPED.sub("", "\n".join(lines)).split("\n")
-    index = max((i for i, line in enumerate(lines) if line.strip()), default=None)
-    if index is None or not _MARKER.match(lines[index]):
+def _local_marker_verdict(body: str) -> Optional[Tuple[str, str]]:
+    """queue-arm-guard's ``marker_verdict``, for a host where it cannot be
+    loaded: the last non-blank line by ``str.splitlines``."""
+    lines = [line for line in body.splitlines() if line.strip()]
+    match = _MARKER.match(lines[-1]) if lines else None
+    if match is None:
         return None
-    return "\n".join([*lines[:index], stamp(), *lines[index:]])
+    return ("APPROVE", match.group(1)) if match.group(1) else (match.group(2), match.group(3))
+
+
+_GUARD_MARKER: Optional[Callable[[str], Any]] = None
+
+
+def marker_verdict(body: str) -> Optional[Tuple[str, str]]:
+    """The verdict the arm guard reads in ``body``. The stamper decides what
+    is a verdict with the guard's own parser, loaded from the sibling
+    queue-arm-guard, so a body the guard counts is never one the stamper
+    passes over (a `\\r\\n` ending once was)."""
+    global _GUARD_MARKER
+    if _GUARD_MARKER is None:
+        _GUARD_MARKER = _load_guard_marker() or _local_marker_verdict
+    return _GUARD_MARKER(body)
+
+
+def _load_guard_marker() -> Optional[Callable[[str], Any]]:
+    here = pathlib.Path(__file__).resolve().parent
+    for name in ("ghapp_queue_arm_guard.py", "queue-arm-guard"):
+        candidate = here / name
+        if not candidate.is_file():
+            continue
+        loader = importlib.machinery.SourceFileLoader("_ghapp_arm_guard", str(candidate))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        try:
+            loader.exec_module(module)
+        except Exception:  # noqa: BLE001 - fall back to the local copy
+            continue
+        if callable(getattr(module, "marker_verdict", None)):
+            return module.marker_verdict
+    return None
+
+
+def strip_stamps(body: str) -> str:
+    """``body`` with every stamp removed, repeated until none is left: one
+    pass can join the pieces around a removed stamp into a new one."""
+    while True:
+        lines = [line for line in body.split("\n")
+                 if not (_STAMPED.search(line) and not _STAMPED.sub("", line).strip())]
+        stripped = _STAMPED.sub("", "\n".join(lines))
+        if stripped == body:
+            return body
+        body = stripped
+
+
+def stamped(body: str) -> str | None:
+    """``body`` without any stamp it carried and, when it is a verdict, with
+    this session's stamp above its verdict line; ``None`` when there is
+    nothing to change (not a verdict, no stamp)."""
+    clean = strip_stamps(body)
+    verdict = marker_verdict(clean)
+    if verdict is None:
+        return clean if clean != body else None
+    lines = clean.splitlines()
+    index = max(i for i, line in enumerate(lines) if line.strip())
+    out = "\n".join([*lines[:index], stamp(), *lines[index:]])
+    if clean[-1:] in ("\n", "\r"):
+        out += "\n"
+    return out
+
+
+def _field_body(flag: str, value: str) -> Optional[str]:
+    """The comment body a ``body=`` field sends: a typed field (``-F``,
+    ``--field``) reads ``@<file>`` from that file."""
+    value = value[len("body="):]
+    if flag in ("-F", "--field") and value.startswith("@") and value != "@-":
+        with open(value[1:], encoding="utf-8") as handle:
+            return handle.read()
+    return value
 
 
 def _rewrite_field(args: list[str]) -> bool:
     for i, arg in enumerate(args[:-1]):
         if arg in ("-f", "-F", "--field", "--raw-field") and args[i + 1].startswith("body="):
-            new = stamped(args[i + 1][len("body="):])
+            body = _field_body(arg, args[i + 1])
+            new = stamped(body) if body is not None else None
             if new is not None:
-                args[i + 1] = "body=" + new
+                args[i:i + 2] = ["--raw-field", "body=" + new]
                 return True
     for i, arg in enumerate(args):
         for flag in ("--field=", "--raw-field="):
             if arg.startswith(flag + "body="):
-                new = stamped(arg[len(flag + "body="):])
+                body = _field_body(flag[:-1], arg[len(flag):])
+                new = stamped(body) if body is not None else None
                 if new is not None:
-                    args[i] = flag + "body=" + new
+                    args[i] = "--raw-field=body=" + new
                     return True
     return False
 
 
 def _rewrite_input(args: list[str]) -> bool:
-    for i, arg in enumerate(args[:-1]):
-        if arg != "--input" or args[i + 1] == "-":
+    for i, arg in enumerate(args):
+        if arg == "--input" and i + 1 < len(args):
+            path, span = args[i + 1], 2
+        elif arg.startswith("--input="):
+            path, span = arg[len("--input="):], 1
+        else:
             continue
-        with open(args[i + 1], encoding="utf-8") as handle:
+        if path == "-":
+            return False
+        with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
-        if (not isinstance(payload, dict) or set(payload) != {"body"}
-                or not isinstance(payload["body"], str)):
+        if not isinstance(payload, dict) or not isinstance(payload.get("body"), str):
             return False
         new = stamped(payload["body"])
         if new is None:
             return False
-        # The same request as a field: nothing to write, so nothing to clean up.
-        args[i:i + 2] = ["--raw-field", "body=" + new]
+        # The same request as a field: nothing to write, so nothing to clean
+        # up. An issue comment takes only `body`, so other keys are dropped.
+        args[i:i + span] = ["--raw-field", "body=" + new]
         return True
     return False
 

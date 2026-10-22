@@ -2668,3 +2668,38 @@ fn only_the_repository_side_rule_requires_a_stamp() {
         );
     });
 }
+
+/// Every line boundary Python's `str.splitlines` knows ends a verdict line
+/// here too, so this gate, the queue-arm guard and the verdict stamper read
+/// the same verdict (Shipyard#881 review: a `\r\n` ending once split them).
+#[test]
+fn a_verdict_line_ends_where_the_python_readers_end_it() {
+    let head = "a".repeat(40);
+    for ending in [
+        "\r\n",
+        "\r",
+        "\u{2028}",
+        "\u{2029}",
+        "\u{0c}",
+        "\u{0b}",
+        "\u{85}",
+        "\u{1e}",
+        "\n\r\n \r\n",
+    ] {
+        assert_eq!(
+            super::marker_verdict(&format!("verdict: APPROVE head:{head}{ending}")),
+            Some((super::Verdict::Approve, head.clone())),
+            "{ending:?}"
+        );
+        assert_eq!(
+            super::marker_verdict(&format!("x{ending}verdict: HOLD head:{head}{ending}")),
+            Some((super::Verdict::Hold, head.clone())),
+            "{ending:?}"
+        );
+        assert_eq!(
+            super::marker_verdict(&format!("verdict: APPROVE head:{head}{ending}then prose")),
+            None,
+            "{ending:?}"
+        );
+    }
+}
