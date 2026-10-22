@@ -32,7 +32,9 @@ class BaselineScorecardTests(unittest.TestCase):
             "host_generations": {"host-a": {"status": "insufficient", "completed_jobs": 2}},
             "strata": payload,
         }
-        pass_history = {"five_continuous_24h_days": True, "missing_intervals": [], "failing_intervals": []}
+        pass_history = {"five_continuous_24h_days": True, "missing_intervals": [], "failing_intervals": [],
+                        "window_until": observed.isoformat(), "expected_interval_secs": 3600,
+                        "cadence_slack_secs": 300}
         card = MOD.consume_authenticated_strata(card, repo="o/pulp", since_days=5, reference_at=observed)
         readiness = MOD.baseline_readiness(card, started, observed, pass_history)
         self.assertFalse(readiness["report_complete"])
@@ -55,6 +57,24 @@ class BaselineScorecardTests(unittest.TestCase):
         self.assertTrue(readiness["exit"])
         self.assertFalse(readiness["optimization_eligible"])
         self.assertEqual(readiness["status"], "complete_insufficient")
+
+    def test_readiness_rejects_stale_pass_history_summary(self):
+        started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        observed = started + dt.timedelta(days=5)
+        card = {
+            "instrumentation_coverage": {"status": "available", "continuous": True, "continuous_days": 5.0},
+            "important_lanes": {}, "host_generations": {},
+            "strata": {name: {"provenance": "authenticated", "coverage": "complete", "qualified_jobs": 1}
+                       for name in MOD.REQUIRED_STRATA},
+            "missing_strata": [],
+            "strata_sufficiency": {name: {"status": "sufficient"} for name in MOD.REQUIRED_STRATA},
+        }
+        history_summary = {"five_continuous_24h_days": True, "missing_intervals": [], "failing_intervals": [],
+                           "window_until": (observed - dt.timedelta(hours=2)).isoformat(),
+                           "expected_interval_secs": 3600, "cadence_slack_secs": 300}
+        readiness = MOD.baseline_readiness(card, started, observed, history_summary)
+        self.assertFalse(readiness["report_complete"])
+        self.assertIn("prospective pass history summary is stale", [r["reason"] for r in readiness["reasons"]])
 
     def test_pass_history_records_empty_success_at_controller_completion(self):
         with tempfile.TemporaryDirectory() as directory:

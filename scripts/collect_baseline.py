@@ -349,6 +349,18 @@ def baseline_readiness(card: dict[str, Any], started: dt.datetime,
             reasons.append({"status": "insufficient", "reason": "prospective pass history has fewer than five continuous elapsed 24-hour days"})
         if pass_history.get("missing_intervals") or pass_history.get("failing_intervals"):
             reasons.append({"status": "unavailable", "reason": "prospective pass history contains missing or failed intervals"})
+        window_until_raw = pass_history.get("window_until")
+        try:
+            window_until = dt.datetime.fromisoformat(str(window_until_raw).replace("Z", "+00:00"))
+            expected_interval = pass_history.get("expected_interval_secs")
+            cadence_slack = pass_history.get("cadence_slack_secs", 0)
+            if (not isinstance(expected_interval, int) or isinstance(expected_interval, bool)
+                    or expected_interval <= 0 or not isinstance(cadence_slack, int)
+                    or isinstance(cadence_slack, bool) or cadence_slack < 0
+                    or observed_at - window_until > dt.timedelta(seconds=expected_interval + cadence_slack)):
+                reasons.append({"status": "unavailable", "reason": "prospective pass history summary is stale"})
+        except (TypeError, ValueError):
+            reasons.append({"status": "unavailable", "reason": "prospective pass history summary has no valid window"})
 
     instrumentation = card.get("instrumentation_coverage")
     if not isinstance(instrumentation, dict) or instrumentation.get("status") != "available" \
