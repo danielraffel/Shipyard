@@ -564,7 +564,8 @@ impl MetricsStore {
             "clean" | "cancelled_mid_run" | "uncertain" => timing.disposition.as_str(),
             _ => return Err("invalid queue timing disposition".into()),
         };
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<(String, String)> = tx
             .query_row(
@@ -578,6 +579,7 @@ impl MetricsStore {
                 return Err("queue identity mismatch".into());
             }
             if queue_timing_rank(&old) >= queue_timing_rank(disposition) {
+                tx.commit()?;
                 return Ok(());
             }
             tx.execute(
@@ -585,12 +587,14 @@ impl MetricsStore {
                 params![timing.queue_job_id, disposition, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), (disposition == "clean").then_some(timing.total_ms).flatten().filter(|v| *v >= 0), Utc::now().to_rfc3339()],
             )?;
             tx.commit()?;
+            tx.commit()?;
             return Ok(());
         }
         tx.execute(
             "INSERT INTO queue_timing (queue_job_id, queue_identity, disposition, started_at, completed_at, total_ms, recorded_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![timing.queue_job_id, timing.queue_identity, disposition, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), (disposition == "clean").then_some(timing.total_ms).flatten().filter(|v| *v >= 0), Utc::now().to_rfc3339()],
         )?;
+        tx.commit()?;
         tx.commit()?;
         Ok(())
     }
