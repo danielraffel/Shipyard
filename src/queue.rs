@@ -70,14 +70,27 @@ pub(crate) fn classify_queue_terminal(
     if prior.status != JobStatus::Running || next.status != JobStatus::Completed {
         return Some(QueueTerminalDisposition::Uncertain);
     }
+    if prior.id != next.id
+        || prior.created_at != next.created_at
+        || prior.sha != next.sha
+        || prior.branch != next.branch
+        || prior.mode != next.mode
+        || prior.target_names != next.target_names
+        || next.cancel_requested_at.is_some()
+    {
+        return Some(QueueTerminalDisposition::Uncertain);
+    }
     let timed = next
         .started_at
         .zip(next.completed_at)
         .is_some_and(|(started, completed)| started <= completed);
-    let complete_results = next.target_names.iter().all(|target| {
+    let complete_results = !next.target_names.is_empty() && next.target_names.iter().all(|target| {
         next.results
             .get(target)
-            .is_some_and(|result| result.failure_class.as_deref() != Some("UNCERTAIN"))
+            .is_some_and(|result| {
+                result.failure_class.as_deref() != Some("UNCERTAIN")
+                    && result.error_message.as_deref() != Some(STALE_RECOVERY_MESSAGE)
+            })
     });
     if timed && complete_results {
         Some(QueueTerminalDisposition::Clean)
@@ -1533,7 +1546,10 @@ mod tests {
         );
 
         let mut completed = running.complete().expect("complete");
-        completed.target_names.clear();
+        completed.results.insert(
+            "mac".to_owned(),
+            TargetResult::new("mac", "macos", TargetStatus::Pass, "local"),
+        );
         assert_eq!(
             classify_queue_terminal(&running, &completed),
             Some(QueueTerminalDisposition::Clean)
