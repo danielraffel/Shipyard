@@ -3762,8 +3762,10 @@ that `session_hosts` maps the line's `host <name>` to, because a `session:`
 line can be copied too, and `ghapp` now removes every stamp already in any
 comment body, to a fixed point, and stamps `--body-file`, `-F body=@file` and
 stdin bodies, deciding what is a verdict with the arm guard's own
-`marker_verdict` so a `\r\n` ending cannot hide one; when the stamper fails
-or times out, or for GraphQL and review requests it does not parse, `ghapp`
+`marker_verdict` so a `\r\n` ending cannot hide one; `ghapp` waits 30 s
+for the stamper and refuses a verdict it did not answer for ("verdict NOT
+posted, retry") rather than post it unstamped; when the stamper fails or
+times out, or for GraphQL and review requests it does not parse, `ghapp`
 refuses any body carrying stamp text, `\u`-escaped and Unicode-spaced forms
 included; the guards count only the exact ASCII stamp and refuse an APPROVE
 with any non-canonical variant); its

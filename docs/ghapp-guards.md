@@ -84,7 +84,9 @@ this rule (no pull request, no config, no comments), so it is inert whatever
 the base config says and on any Python.
 
 **An agent cannot approve its own landing.** `verdict-session-stamp` (run by
-`ghapp` before native `gh`, bounded to 5 seconds) adds
+`ghapp` before native `gh`; `ghapp` waits up to 30 seconds for its answer,
+and refuses a verdict it did not answer for, "verdict NOT posted, retry",
+rather than post it unstamped) adds
 `<!-- session: <host>/<session> agent: <id> -->` above the marker line of a
 verdict comment, posted with `--body`, `--body-file <file>`, an `api`
 `body=` field (a typed `-F body=@<file>` is read), or `--input`; `ghapp`

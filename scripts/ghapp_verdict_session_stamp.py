@@ -17,8 +17,9 @@ when just the session matches (every agent of one team shares it).
 Output: ``SHIPYARD-STAMP-V2``, the (possibly rewritten) argv,
 ``SHIPYARD-STAMP-OWN`` and the stamp line this run wrote (empty when none),
 then ``SHIPYARD-STAMP-END``, every item NUL-terminated. ``ghapp`` uses the
-rewritten argv only when that whole answer arrives, reading for at most 5
-seconds; the stamper also stops itself after 5 seconds. Whatever happens
+rewritten argv only when that whole answer arrives, reading for at most 30
+seconds; the stamper stops itself a second before that (25 s at most), and
+a verdict it did not answer for is refused, never posted unstamped. Whatever happens
 here, ``ghapp`` then checks the final request and every body source gh will
 read, and refuses any stamp text other than the one line named after
 ``SHIPYARD-STAMP-OWN``.
@@ -58,7 +59,19 @@ SENTINEL = "SHIPYARD-STAMP-V2"
 # lets that one line through its stamp-text check and nothing else.
 OWN = "SHIPYARD-STAMP-OWN"
 END = "SHIPYARD-STAMP-END"
-DEADLINE_SECONDS = 5
+# Below ghapp's own 30 s wait for the answer, so the stamper gives up first.
+# ghapp passes a lower wait in SHIPYARD_STAMP_DEADLINE_SECONDS (tests).
+DEADLINE_SECONDS = 25
+DEADLINE_ENV = "SHIPYARD_STAMP_DEADLINE_SECONDS"
+
+
+def deadline_seconds() -> int:
+    """This run's deadline: ghapp's wait less one second, at most 25."""
+    try:
+        wait = int(os.environ.get(DEADLINE_ENV, ""))
+    except ValueError:
+        return DEADLINE_SECONDS
+    return max(1, min(DEADLINE_SECONDS, wait - 1))
 SESSION_ENVS = ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
 AGENT_ENV = "SHIPYARD_AGENT_ID"
 # Same pattern as queue-arm-guard's _MARKER and src/head_approval.rs marker_verdict.
@@ -289,7 +302,7 @@ def main(args: list[str]) -> int:
     alarm = hasattr(signal, "SIGALRM")
     previous = signal.signal(signal.SIGALRM, _give_up) if alarm else None
     if alarm:
-        signal.alarm(DEADLINE_SECONDS)
+        signal.alarm(deadline_seconds())
     try:
         try:
             result = rewrite(args)

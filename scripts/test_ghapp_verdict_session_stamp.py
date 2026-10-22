@@ -223,6 +223,7 @@ class Stamp(unittest.TestCase):
             "import importlib.util, sys, time\n"
             f"spec = importlib.util.spec_from_file_location('s', {str(SCRIPT)!r})\n"
             "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "m.DEADLINE_SECONDS = 2\n"
             "m.main(['pr', 'comment'])\n"
             "time.sleep(m.DEADLINE_SECONDS + 1)\n"
             "sys.stderr.write('survived')\n"
@@ -343,6 +344,7 @@ class GhappStampWiring(unittest.TestCase):
                 ["/bin/bash", "-c", script, "ghapp", str(guards), "pr", "comment", "5",
                  "--body", "a b\nverdict: APPROVE head:x"],
                 capture_output=True, check=True, timeout=deadline,
+                env={**os.environ, "SHIPYARD_STAMP_DEADLINE_SECONDS": "2"},
             )
         return [item.decode() for item in result.stdout.split(b"\0")[:-1]]
 
@@ -364,7 +366,9 @@ class GhappStampWiring(unittest.TestCase):
                 ["/bin/bash", "-c", script, "ghapp", str(guards), *args], input=stdin,
                 capture_output=True, check=True, timeout=60,
                 env={"PATH": f"{os.path.dirname(sys.executable)}:/usr/bin:/bin",
-                     "CLAUDE_CODE_SESSION_ID": "sess-M5", "TMPDIR": tmp},
+                     "CLAUDE_CODE_SESSION_ID": "sess-M5", "TMPDIR": tmp,
+                     # The real stamper, with ghapp's real wait.
+                     "SHIPYARD_STAMP_DEADLINE_SECONDS": "30"},
             )
             self.assertEqual(os.listdir(tmp), [], "the spooled body was left behind")
         out, _, rest = result.stdout.partition(b"STDIN\0")
@@ -431,6 +435,8 @@ class GhappStampWiring(unittest.TestCase):
                 capture_output=True, check=False, timeout=60,
                 env={"PATH": f"{os.path.dirname(sys.executable)}:/usr/bin:/bin",
                      "CLAUDE_CODE_SESSION_ID": "sess-M5", "TMPDIR": tmp, "LANG": "en_US.UTF-8",
+                     # A fake stamper is waited on briefly; the real one fully.
+                     "SHIPYARD_STAMP_DEADLINE_SECONDS": "30" if stamper is None else "3",
                      **(env or {})},
             )
             self.assertEqual(os.listdir(tmp), [], "the spooled body was left behind")
@@ -464,16 +470,23 @@ class GhappStampWiring(unittest.TestCase):
             bad_bytes = pathlib.Path(scratch) / "bad.md"
             # The stray byte comes first: a UTF-8 regex stops matching there.
             bad_bytes.write_bytes(b"caf\xff\n" + forged.encode())
+            note = f"see {FORGED}\n"
+            not_posted = "verdict NOT posted, retry"
             cases = [
-                (self.BROKEN, ["api", endpoint, "-f", f"body={forged}"], b"",
-                 "an argument carries session stamp text"),
-                (self.BROKEN, ["api", endpoint, "-f", f"body={multi_line}"], b"",
-                 "an argument carries session stamp text"),
+                (self.BROKEN, ["api", endpoint, "-f", f"body={forged}"], b"", not_posted),
+                (self.BROKEN, ["api", endpoint, "-f", f"body={multi_line}"], b"", not_posted),
                 (self.BROKEN, ["pr", "comment", "5", "--body-file", str(bad_bytes)], b"",
-                 "carries session stamp text"),
+                 not_posted),
                 (self.BROKEN, ["api", endpoint, "--input", "-"],
-                 json.dumps({"body": forged}).encode(), "carries session stamp text"),
-                (self.HUNG, ["issue", "comment", "5", "--body", forged], b"",
+                 json.dumps({"body": forged}).encode(), not_posted),
+                (self.HUNG, ["issue", "comment", "5", "--body", forged], b"", not_posted),
+                # No verdict: judged on its stamp text alone.
+                (self.BROKEN, ["api", endpoint, "-f", f"body={note}"], b"",
+                 "an argument carries session stamp text"),
+                (self.BROKEN, ["api", endpoint, "-f",
+                               f"body={note.replace('<!-- session:', '<!--' + chr(10) + ' session:')}"],
+                 b"", "an argument carries session stamp text"),
+                (self.HUNG, ["issue", "comment", "5", "--body", note], b"",
                  "an argument carries session stamp text"),
             ]
             for stamper, args, stdin, why in cases:
@@ -482,13 +495,59 @@ class GhappStampWiring(unittest.TestCase):
                     self.assertEqual(code, 1, err)
                     self.assertIn("ghapp: refused", err)
                     self.assertIn(why, err)
-            # Without stamp text the comment posts unstamped, as before.
+            # A plain verdict is refused loudly rather than posted unstamped;
+            # a comment with neither a verdict nor stamp text posts as before.
             plain = f"LGTM\nverdict: APPROVE head:{HEAD}\n"
             for stamper in (self.BROKEN, self.HUNG):
-                code, out, _, err = self.run_wrapper(
+                code, _, _, err = self.run_wrapper(
                     ["api", endpoint, "-f", f"body={plain}"], stamper=stamper)
+                self.assertEqual(code, 1, err)
+                self.assertIn(not_posted, err)
+                code, out, _, err = self.run_wrapper(
+                    ["api", endpoint, "-f", "body=thanks"], stamper=stamper)
                 self.assertEqual(code, 0, err)
-                self.assertEqual(out[-1], f"body={plain}".encode())
+                self.assertEqual(out[-1], b"body=thanks")
+
+    # Answers correctly, but only after SLOW_SECONDS.
+    SLOW_SECONDS = 4
+    SLOW = ("#!/bin/sh\nsleep 4\n"
+            "printf 'SHIPYARD-STAMP-V2\\0api\\0repos/o/r/issues/5/comments\\0-f\\0'\n"
+            "printf 'body=stamped\\0SHIPYARD-STAMP-OWN\\0\\0SHIPYARD-STAMP-END\\0'\n")
+
+    def test_a_slow_stamper_gets_the_whole_deadline_and_a_late_one_refuses_the_verdict(self) -> None:
+        import time
+        endpoint = "repos/o/r/issues/5/comments"
+        verdict = f"LGTM\nverdict: APPROVE head:{HEAD}\n"
+        for args, stdin in ((["api", endpoint, "-f", f"body={verdict}"], b""),
+                            (["api", endpoint, "--input", "-"],
+                             json.dumps({"body": verdict}).encode())):
+            with self.subTest(args=args[2:]):
+                # Inside the wait the answer is used ...
+                code, out, _, err = self.run_wrapper(
+                    args, stamper=self.SLOW, stdin=stdin,
+                    env={"SHIPYARD_STAMP_DEADLINE_SECONDS": str(self.SLOW_SECONDS + 4)})
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out[-1], b"body=stamped")
+                # ... past it the verdict is refused, loudly, never posted.
+                started = time.monotonic()
+                code, out, _, err = self.run_wrapper(
+                    args, stamper=self.SLOW, stdin=stdin,
+                    env={"SHIPYARD_STAMP_DEADLINE_SECONDS": "1"})
+                self.assertLess(time.monotonic() - started, self.SLOW_SECONDS + 3)
+                self.assertEqual(code, 1, err)
+                self.assertIn("did not answer within 1s", err)
+                self.assertIn("verdict NOT posted, retry", err)
+                self.assertEqual(out, [])
+
+    def test_the_wait_is_thirty_seconds_and_cannot_be_raised(self) -> None:
+        ghapp = (SCRIPT.parent / "ghapp").read_text(encoding="utf-8")
+        self.assertIn('ghapp_stamp_deadline="${SHIPYARD_STAMP_DEADLINE_SECONDS:-30}"', ghapp)
+        self.assertIn('-le 30 ]] \\\n        || ghapp_stamp_deadline=30', ghapp)
+        self.assertEqual(stamp.DEADLINE_SECONDS, 25)
+        with mock.patch.dict(os.environ, {"SHIPYARD_STAMP_DEADLINE_SECONDS": "30"}):
+            self.assertEqual(stamp.deadline_seconds(), 25)
+        with mock.patch.dict(os.environ, {"SHIPYARD_STAMP_DEADLINE_SECONDS": "3"}):
+            self.assertEqual(stamp.deadline_seconds(), 2)
 
     def test_a_body_file_that_is_not_a_regular_file_is_refused_when_unvouched(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:

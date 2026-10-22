@@ -1664,14 +1664,18 @@ print("stamp" if re.search(r"!--[^>]*session", text, re.IGNORECASE) else "clean"
     return 0
 }
 
-# ghapp_stamp_text_refusal OWN ARGS...: prints why ARGS cannot be sent and
-# returns 1 when ARGS, or a file they name, carry stamp text other than one
-# copy of OWN, or name a body file that is not a regular file (and so cannot
-# be checked).
+# A verdict marker anywhere in a body: the guards read the last line, but a
+# request the stamper did not vouch for is judged on any line.
+ghapp_verdict_pattern='(verdict:[[:space:]]*(APPROVE|HOLD)[[:space:]]+head:[[:space:]]*[0-9a-fA-F]{40}|reviewed:[[:space:]]*[0-9a-fA-F]{40})'
+
+# ghapp_stamp_text_refusal MODE OWN ARGS...: prints why ARGS cannot be sent
+# and returns 1. MODE `stamp`: ARGS, or a file they name, carry stamp text
+# other than one copy of OWN, or name a body file that is not a regular file
+# (and so cannot be checked). MODE `verdict`: they carry a verdict marker.
 ghapp_stamp_text_refusal() {
     # Byte-wise: a body that is not valid UTF-8 is still searched.
-    local LC_ALL=C own="$1"
-    shift
+    local LC_ALL=C mode="$1" own="$2"
+    shift 2
     local command="${1:-}" previous="" argument path text
     for argument in "$@"; do
         path=""
@@ -1704,7 +1708,12 @@ ghapp_stamp_text_refusal() {
             text="${text/"$own"/}"
             own=""
         fi
-        if ghapp_text_has_stamp "$text"; then
+        if [[ "$mode" == verdict ]]; then
+            if [[ "$text" =~ $ghapp_verdict_pattern ]]; then
+                echo "an argument carries a verdict"
+                return 1
+            fi
+        elif ghapp_text_has_stamp "$text"; then
             echo "an argument carries session stamp text"
             return 1
         fi
@@ -1714,7 +1723,12 @@ ghapp_stamp_text_refusal() {
                 return 1
             fi
             text="$(/bin/cat -- "$path"; printf x)"
-            if ghapp_text_has_stamp "$text"; then
+            if [[ "$mode" == verdict ]]; then
+                if [[ "$text" =~ $ghapp_verdict_pattern ]]; then
+                    echo "body file $path carries a verdict"
+                    return 1
+                fi
+            elif ghapp_text_has_stamp "$text"; then
                 echo "body file $path carries session stamp text"
                 return 1
             fi
@@ -1761,21 +1775,28 @@ if [[ "$ghapp_stamp_check" == 1 ]]; then
     done
     set -- "${ghapp_args[@]}"
     ghapp_own_stamp=""
+    ghapp_answered=0
+    # Each read of the stamper's answer waits this long; a test may lower it.
+    ghapp_stamp_deadline="${SHIPYARD_STAMP_DEADLINE_SECONDS:-30}"
+    [[ "$ghapp_stamp_deadline" =~ ^[1-9][0-9]?$ && "$ghapp_stamp_deadline" -le 30 ]] \
+        || ghapp_stamp_deadline=30
     if [[ -x "$guards/verdict-session-stamp" ]]; then
         # The rewritten argument list is used only when the whole answer
-        # arrives; each read waits at most 5 seconds.
+        # arrives.
         ghapp_stamped=()
-        while IFS= read -r -d '' -t 5 ghapp_stamp_item; do
+        while IFS= read -r -d '' -t "$ghapp_stamp_deadline" ghapp_stamp_item; do
             ghapp_stamped+=("$ghapp_stamp_item")
         # The substitution holds none of ghapp's own streams, so a hung
         # stamper cannot keep a caller that captures ghapp's output waiting.
         done < <(exec </dev/null 2>/dev/null
+                 SHIPYARD_STAMP_DEADLINE_SECONDS="$ghapp_stamp_deadline" \
                  PATH="$trusted_path" "$guards/verdict-session-stamp" "$@" || true)
         ghapp_stamp_count="${#ghapp_stamped[@]}"
         if [[ "$ghapp_stamp_count" -ge 4 && "${ghapp_stamped[0]}" == "SHIPYARD-STAMP-V2" && \
               "${ghapp_stamped[$((ghapp_stamp_count - 3))]}" == "SHIPYARD-STAMP-OWN" && \
               "${ghapp_stamped[$((ghapp_stamp_count - 1))]}" == "SHIPYARD-STAMP-END" ]]; then
             ghapp_own_stamp="${ghapp_stamped[$((ghapp_stamp_count - 2))]}"
+            ghapp_answered=1
             if [[ "$ghapp_stamp_count" -gt 4 ]]; then
                 set -- "${ghapp_stamped[@]:1:$((ghapp_stamp_count - 4))}"
             else
@@ -1783,7 +1804,18 @@ if [[ "$ghapp_stamp_check" == 1 ]]; then
             fi
         fi
     fi
-    if ! ghapp_stamp_reason="$(ghapp_stamp_text_refusal "$ghapp_own_stamp" "$@")"; then
+    # A verdict the stamper did not answer for would post unstamped, and an
+    # unstamped App APPROVE is refused at arm time; refuse it now, loudly, so
+    # the reviewer retries instead of finding it later. Other comments post.
+    if [[ -x "$guards/verdict-session-stamp" && "$ghapp_answered" == 0 ]] && \
+            ! ghapp_stamp_reason="$(ghapp_stamp_text_refusal verdict "" "$@")"; then
+        [[ -z "$ghapp_stdin_file" ]] || /bin/rm -f -- "$ghapp_stdin_file"
+        echo "ghapp: refused: the verdict stamper did not answer within" \
+            "${ghapp_stamp_deadline}s (timed out or failed) and $ghapp_stamp_reason;" \
+            "verdict NOT posted, retry." >&2
+        exit 1
+    fi
+    if ! ghapp_stamp_reason="$(ghapp_stamp_text_refusal stamp "$ghapp_own_stamp" "$@")"; then
         [[ -z "$ghapp_stdin_file" ]] || /bin/rm -f -- "$ghapp_stdin_file"
         echo "ghapp: refused: $ghapp_stamp_reason; only ghapp's stamper writes a" \
             "\`<!-- session: -->\` stamp, and it vouched for none here." \
@@ -1808,7 +1840,7 @@ if [[ "$ghapp_stamp_check" == 1 ]]; then
     fi
     unset ghapp_stamped ghapp_stamp_item ghapp_stamp_count ghapp_stdin_file ghapp_args \
         ghapp_previous ghapp_index ghapp_arg ghapp_new ghapp_restore ghapp_own_stamp \
-        ghapp_stamp_reason
+        ghapp_stamp_reason ghapp_answered ghapp_stamp_deadline
 fi
 unset ghapp_stamp_check
 
