@@ -561,37 +561,43 @@ impl MetricsStore {
         {
             return Err("unauthorized queue timing writer".into());
         }
+        let disposition = match timing.disposition.as_str() {
+            "clean" | "cancelled_mid_run" | "uncertain" => timing.disposition.as_str(),
+            _ => return Err("invalid queue timing disposition".into()),
+        };
         let conn = self.connect()?;
-        if let Some((identity, existing)) = conn
+        let existing: Option<(String, String)> = conn
             .query_row(
-                "SELECT queue_identity, queue_disposition FROM jobs WHERE queue_job_id=?1",
+                "SELECT queue_identity, disposition FROM queue_timing WHERE queue_job_id=?1",
                 params![timing.queue_job_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?
-        {
+            .optional()?;
+        fn rank(s: &str) -> u8 {
+            match s {
+                "clean" => 0,
+                "cancelled_mid_run" => 1,
+                "uncertain" => 2,
+                _ => 3,
+            }
+        }
+        if let Some((identity, old)) = existing {
             if identity != timing.queue_identity {
                 return Err("queue identity mismatch".into());
             }
-            fn rank(s: &str) -> u8 {
-                match s {
-                    "clean" => 0,
-                    "cancelled_mid_run" => 1,
-                    "uncertain" => 2,
-                    _ => 3,
-                }
-            }
-            if rank(&existing) >= rank(&timing.disposition) {
+            if rank(&old) >= rank(disposition) {
                 return Ok(());
             }
+            conn.execute(
+                "UPDATE queue_timing SET disposition=?2, started_at=?3, completed_at=?4, total_ms=?5, recorded_at=?6 WHERE queue_job_id=?1",
+                params![timing.queue_job_id, disposition, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), (disposition == "clean").then_some(timing.total_ms).flatten().filter(|v| *v >= 0), Utc::now().to_rfc3339()],
+            )?;
+            return Ok(());
         }
-        conn.execute("INSERT INTO runs (ts,project,status,provenance,provenance_verified) VALUES (?1,'queue','terminal',?2,1)", params![Utc::now().to_rfc3339(), QUEUE_PROVIDER])?;
-        let run_id = conn.last_insert_rowid();
-        let total = (timing.disposition == "clean")
-            .then_some(timing.total_ms)
-            .flatten()
-            .filter(|v| *v >= 0);
-        conn.execute("INSERT INTO jobs (run_id,job,provider,started_at,completed_at,total_ms,status,queue_job_id,queue_identity,queue_disposition) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ", params![run_id, timing.queue_job_id, QUEUE_PROVIDER, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), total, timing.disposition, timing.queue_job_id, timing.queue_identity, timing.disposition])?;
+        conn.execute(
+            "INSERT INTO queue_timing (queue_job_id, queue_identity, disposition, started_at, completed_at, total_ms, recorded_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![timing.queue_job_id, timing.queue_identity, disposition, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), (disposition == "clean").then_some(timing.total_ms).flatten().filter(|v| *v >= 0), Utc::now().to_rfc3339()],
+        )?;
         Ok(())
     }
 
@@ -600,7 +606,7 @@ impl MetricsStore {
         queue_job_id: &str,
     ) -> Result<Option<QueueTimingRow>, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        Ok(conn.query_row("SELECT queue_job_id, queue_identity, queue_disposition, started_at, completed_at, total_ms FROM jobs WHERE queue_job_id=?1", params![queue_job_id], |r| Ok(QueueTimingRow { queue_job_id: r.get(0)?, queue_identity: r.get(1)?, queue_disposition: r.get(2)?, started_at: r.get(3)?, completed_at: r.get(4)?, total_ms: r.get(5)? })).optional()?)
+        Ok(conn.query_row("SELECT queue_job_id, queue_identity, disposition, started_at, completed_at, total_ms FROM queue_timing WHERE queue_job_id=?1", params![queue_job_id], |r| Ok(QueueTimingRow { queue_job_id: r.get(0)?, queue_identity: r.get(1)?, queue_disposition: r.get(2)?, started_at: r.get(3)?, completed_at: r.get(4)?, total_ms: r.get(5)? })).optional()?)
     }
 
     pub fn repeated_work_survivor_timing(
@@ -608,7 +614,7 @@ impl MetricsStore {
         limit: usize,
     ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT DISTINCT s.job_id, j.queue_disposition, j.total_ms FROM repeated_work_shadow s LEFT JOIN jobs j ON j.queue_job_id=s.job_id AND j.provider=?1 ORDER BY s.id DESC LIMIT ?2")?;
+        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id FROM repeated_work_shadow ORDER BY id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id")?;
         let mut out = RepeatedWorkSurvivorTiming {
             shadow_rows: 0,
             distinct_survivors: 0,
@@ -619,19 +625,17 @@ impl MetricsStore {
             avoided_survivor_ms: None,
             final_attempt_only: true,
         };
-        let rows = stmt.query_map(
-            params![QUEUE_PROVIDER, i64::try_from(limit).unwrap_or(i64::MAX)],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                ))
-            },
-        )?;
+        let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
         for row in rows {
-            let (_, disposition, total) = row?;
-            out.shadow_rows += 1;
+            let (count, _, disposition, total) = row?;
+            out.shadow_rows = count as usize;
             out.distinct_survivors += 1;
             match disposition.as_deref() {
                 Some("clean") if total.is_some_and(|v| v >= 0) => {
@@ -734,6 +738,15 @@ impl MetricsStore {
               queue_identity TEXT,
               queue_disposition TEXT,
               UNIQUE(provider, external_id)
+            );
+            CREATE TABLE IF NOT EXISTS queue_timing (
+              queue_job_id TEXT PRIMARY KEY,
+              queue_identity TEXT NOT NULL,
+              disposition TEXT NOT NULL CHECK(disposition IN ('clean','cancelled_mid_run','uncertain')),
+              started_at TEXT,
+              completed_at TEXT,
+              total_ms INTEGER,
+              recorded_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS steps (
               id INTEGER PRIMARY KEY,
@@ -5281,7 +5294,7 @@ mod tests {
                 .unwrap();
         }
         let r = store.repeated_work_survivor_timing(100).unwrap();
-        assert_eq!(r.shadow_rows, 4);
+        assert_eq!(r.shadow_rows, 5);
         assert_eq!(r.distinct_survivors, 4);
         assert_eq!(r.matched_clean, 1);
         assert_eq!(r.avoided_survivor_ms, Some(10));
