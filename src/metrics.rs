@@ -156,6 +156,17 @@ pub struct RepeatedWorkShadowRow {
     pub superseded_sha: String,
 }
 
+/// Read-only cost accounting for repeated-work shadow observations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepeatedWorkCostSummary {
+    pub observations: usize,
+    pub superseded_exact_head: usize,
+    pub duplicate_exact_head_config: usize,
+    pub joined_durations: usize,
+    pub unknown_durations: usize,
+    pub duration_ms: Option<i64>,
+}
+
 /// One grouped timing summary row.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MetricsSummaryRow {
@@ -895,6 +906,54 @@ impl MetricsStore {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Aggregate shadow observations. A duration is joined only when the
+    /// observation's job id is an exact numeric metrics job id.
+    pub fn repeated_work_cost(
+        &self,
+        limit: usize,
+    ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT kind, job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
+        let ids = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = RepeatedWorkCostSummary {
+            observations: 0,
+            superseded_exact_head: 0,
+            duplicate_exact_head_config: 0,
+            joined_durations: 0,
+            unknown_durations: 0,
+            duration_ms: None,
+        };
+        for item in ids {
+            let (kind, job_id) = item?;
+            out.observations += 1;
+            match kind.as_str() {
+                "superseded_exact_head" => out.superseded_exact_head += 1,
+                "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
+                _ => {}
+            }
+            let Some(id) = job_id.parse::<i64>().ok() else {
+                out.unknown_durations += 1;
+                continue;
+            };
+            let duration: Option<i64> = conn
+                .query_row(
+                    "SELECT total_ms FROM jobs WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(ms) = duration.filter(|ms| *ms >= 0) {
+                out.joined_durations += 1;
+                out.duration_ms = Some(out.duration_ms.unwrap_or(0).saturating_add(ms));
+            } else {
+                out.unknown_durations += 1;
+            }
+        }
+        Ok(out)
     }
 
     /// Record one low-friction timing row.

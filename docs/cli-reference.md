@@ -150,6 +150,7 @@ shipyard metrics record --project pulp --job linux-arm64 --step compile --durati
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics summary --project pulp --json
+shipyard metrics repeated-work-cost --limit 1000 --json
 shipyard metrics summary --project pulp --group-by host --json   # fold ephemeral runners into their host
 shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json

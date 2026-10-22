@@ -1128,6 +1128,8 @@ pub(crate) enum MetricsCommand {
     /// `--group-by host` folds runners into their physical host: a
     /// `*-host-<id>` label, else the `shipyard runner tag` in the runner name.
     Summary(MetricsSummaryArgs),
+    /// Read-only repeated-work shadow cost aggregation.
+    RepeatedWorkCost(MetricsRepeatedWorkCostArgs),
     /// Show slowest successful jobs.
     Slowest(MetricsListArgs),
     /// Compare before/after windows per job class.
@@ -2006,6 +2008,13 @@ pub(crate) struct MetricsListArgs {
     pub(crate) project: Option<String>,
     /// Maximum rows.
     #[arg(long, default_value_t = 20)]
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsRepeatedWorkCostArgs {
+    /// Maximum shadow observations to include.
+    #[arg(long, default_value_t = 1000)]
     pub(crate) limit: usize,
 }
 
