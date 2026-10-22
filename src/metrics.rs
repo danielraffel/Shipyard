@@ -49,6 +49,18 @@ pub(crate) struct QueueTimingRow {
     pub total_ms: Option<i64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepeatedWorkSurvivorTiming {
+    pub shadow_rows: usize,
+    pub distinct_survivors: usize,
+    pub matched_clean: usize,
+    pub excluded_uncertain: usize,
+    pub excluded_cancelled: usize,
+    pub unmatched: usize,
+    pub avoided_survivor_ms: Option<i64>,
+    pub final_attempt_only: bool,
+}
+
 /// Durable Shipyard metrics store backed by `SQLite`.
 #[derive(Debug)]
 pub struct MetricsStore {
@@ -589,6 +601,53 @@ impl MetricsStore {
     ) -> Result<Option<QueueTimingRow>, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
         Ok(conn.query_row("SELECT queue_job_id, queue_identity, queue_disposition, started_at, completed_at, total_ms FROM jobs WHERE queue_job_id=?1", params![queue_job_id], |r| Ok(QueueTimingRow { queue_job_id: r.get(0)?, queue_identity: r.get(1)?, queue_disposition: r.get(2)?, started_at: r.get(3)?, completed_at: r.get(4)?, total_ms: r.get(5)? })).optional()?)
+    }
+
+    pub fn repeated_work_survivor_timing(
+        &self,
+        limit: usize,
+    ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT DISTINCT s.job_id, j.queue_disposition, j.total_ms FROM repeated_work_shadow s LEFT JOIN jobs j ON j.queue_job_id=s.job_id AND j.provider=?1 ORDER BY s.id DESC LIMIT ?2")?;
+        let mut out = RepeatedWorkSurvivorTiming {
+            shadow_rows: 0,
+            distinct_survivors: 0,
+            matched_clean: 0,
+            excluded_uncertain: 0,
+            excluded_cancelled: 0,
+            unmatched: 0,
+            avoided_survivor_ms: None,
+            final_attempt_only: true,
+        };
+        let rows = stmt.query_map(
+            params![QUEUE_PROVIDER, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (_, disposition, total) = row?;
+            out.shadow_rows += 1;
+            out.distinct_survivors += 1;
+            match disposition.as_deref() {
+                Some("clean") if total.is_some_and(|v| v >= 0) => {
+                    out.matched_clean += 1;
+                    out.avoided_survivor_ms = Some(
+                        out.avoided_survivor_ms
+                            .unwrap_or(0)
+                            .saturating_add(total.unwrap()),
+                    );
+                }
+                Some("uncertain") => out.excluded_uncertain += 1,
+                Some("cancelled_mid_run") => out.excluded_cancelled += 1,
+                _ => out.unmatched += 1,
+            }
+        }
+        Ok(out)
     }
 
     /// Open a metrics store under the selected Shipyard state directory.
