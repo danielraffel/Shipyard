@@ -5340,6 +5340,11 @@ mod tests {
                 .queue_disposition,
             "uncertain"
         );
+        assert_eq!(
+            st.read_queue_timing("x").unwrap().unwrap().total_ms,
+            None,
+            "non-clean terminal rows must never retain a duration"
+        );
         assert!(
             st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "b", "clean", Some(2)))
                 .is_err()

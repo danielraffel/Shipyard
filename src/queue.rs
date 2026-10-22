@@ -1618,6 +1618,19 @@ mod tests {
             Some(QueueTerminalDisposition::Uncertain)
         );
 
+        let mut uncertain_result = completed.clone();
+        let mut result = TargetResult::new("mac", "macos", TargetStatus::Error, "local");
+        result.failure_class = Some("UNCERTAIN".to_owned());
+        result.error_message = Some("worker reported an ambiguous completion".to_owned());
+        uncertain_result
+            .results
+            .insert("mac".to_owned(), result);
+        assert_eq!(
+            classify_queue_terminal(&running, &uncertain_result),
+            Some(QueueTerminalDisposition::Uncertain),
+            "an UNCERTAIN result must never be counted as a clean duration"
+        );
+
         let mut missing = completed.clone();
         missing.results.clear();
         assert_eq!(
