@@ -15,7 +15,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::job::{CancellationProof, Job, JobKind, JobStatus, TargetResult, TargetStatus};
-use crate::metrics::{MetricsStore, RepeatedWorkKind, RepeatedWorkShadowInput};
+use crate::metrics::{
+    MetricsStore, QUEUE_AUTHORITY_TOKEN, QueueTerminalTiming, RepeatedWorkKind,
+    RepeatedWorkShadowInput,
+};
 use crate::queue_request::{
     QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest,
 };
@@ -36,6 +39,75 @@ pub const STALE_RUNNING_CANCEL_REASON: &str =
 const ORPHAN_REQUEST_MESSAGE: &str = "Queued request envelope missing or unreadable";
 const SUPERSEDED_MESSAGE: &str =
     "Superseded by a newer queued job for the same branch, targets, and mode.";
+
+/// Conservative classification of a durable queue terminal transition.
+///
+/// This is deliberately pure. Metrics writers can consume it after the queue
+/// commit without changing queue liveness or inventing timing evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueueTerminalDisposition {
+    /// A running job completed with authoritative timing and target results.
+    Clean,
+    /// A job that had started was cancelled; its partial runtime is excluded.
+    CancelledMidRun,
+    /// The transition is ambiguous or carries recovery uncertainty.
+    Uncertain,
+    /// A pending job was cancelled before it ever ran; no timing row exists.
+    NoTiming,
+}
+
+/// Classify a terminal transition from its persisted predecessor.
+pub(crate) fn classify_queue_terminal(prior: &Job, next: &Job) -> Option<QueueTerminalDisposition> {
+    if !matches!(next.status, JobStatus::Completed | JobStatus::Cancelled) {
+        return None;
+    }
+    if prior.status == JobStatus::Pending && next.status == JobStatus::Cancelled {
+        return Some(QueueTerminalDisposition::NoTiming);
+    }
+    if prior.status == JobStatus::Running && next.status == JobStatus::Cancelled {
+        return Some(QueueTerminalDisposition::CancelledMidRun);
+    }
+    if prior.status != JobStatus::Running || next.status != JobStatus::Completed {
+        return Some(QueueTerminalDisposition::Uncertain);
+    }
+    if prior.id != next.id
+        || prior.created_at != next.created_at
+        || prior.sha != next.sha
+        || prior.branch != next.branch
+        || prior.mode != next.mode
+        || prior.target_names != next.target_names
+        || next.cancel_requested_at.is_some()
+    {
+        return Some(QueueTerminalDisposition::Uncertain);
+    }
+    let timed = next
+        .started_at
+        .zip(next.completed_at)
+        .is_some_and(|(started, completed)| started <= completed);
+    let complete_results = !next.target_names.is_empty()
+        && next.target_names.iter().all(|target| {
+            next.results.get(target).is_some_and(|result| {
+                result.failure_class.as_deref() != Some("UNCERTAIN")
+                    && result.error_message.as_deref() != Some(STALE_RECOVERY_MESSAGE)
+            })
+        });
+    if timed && complete_results {
+        Some(QueueTerminalDisposition::Clean)
+    } else {
+        Some(QueueTerminalDisposition::Uncertain)
+    }
+}
+
+pub(crate) fn queue_timing_identity(job: &Job) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
+        job.created_at.to_rfc3339(),
+        job.sha,
+        job.branch,
+        job.mode,
+        job.target_names.join(",")
+    )
+}
 
 /// Cancellation reason for a pending job whose pull request was already merged
 /// while it waited in the queue.
@@ -246,45 +318,82 @@ impl Queue {
 
     /// Replace a queued job matched by id, then trim old completed jobs.
     pub fn update(&mut self, job: &Job) -> QueueResult<()> {
-        let _lock = StateLock::acquire(self.state_lock_file())?;
-        let mut jobs = self.read_jobs_from_disk()?;
-        let Some(queued) = jobs.iter_mut().find(|queued| queued.id == job.id) else {
-            return Err(QueueError::StateConflict(format!(
-                "job {} is not present in the durable queue",
-                job.id
-            )));
+        let prior = {
+            let _lock = StateLock::acquire(self.state_lock_file())?;
+            let mut jobs = self.read_jobs_from_disk()?;
+            let Some(index) = jobs.iter().position(|queued| queued.id == job.id) else {
+                return Err(QueueError::StateConflict(format!(
+                    "job {} is not present in the durable queue",
+                    job.id
+                )));
+            };
+            let queued = &jobs[index];
+            if queued.status == JobStatus::Running
+                && queued.cancel_requested_at.is_some()
+                && (job.cancel_requested_at != queued.cancel_requested_at
+                    || job.cancellation_reason != queued.cancellation_reason
+                    || job.cancellation_proof != queued.cancellation_proof)
+            {
+                return Err(QueueError::StateConflict(format!(
+                    "job {} has a newer cancellation request",
+                    job.id
+                )));
+            }
+            if matches!(queued.status, JobStatus::Completed | JobStatus::Cancelled)
+                && queued.status != job.status
+            {
+                return Err(QueueError::StateConflict(format!(
+                    "job {} is already terminal as {:?}",
+                    job.id, queued.status
+                )));
+            }
+            let prior = queued.clone();
+            let terminal = matches!(job.status, JobStatus::Completed | JobStatus::Cancelled);
+            if terminal {
+                crate::log_retention::invalidate_conflicting_terminal_manifest(
+                    &self.state_dir,
+                    job,
+                )?;
+            }
+            jobs[index] = job.clone();
+            let _ = trim_terminal(&mut jobs);
+            self.save_jobs_to_disk(&jobs)?;
+            if terminal {
+                let _ = crate::log_retention::write_terminal_manifest(&self.state_dir, job);
+            }
+            prior
         };
-        if queued.status == JobStatus::Running
-            && queued.cancel_requested_at.is_some()
-            && (job.cancel_requested_at != queued.cancel_requested_at
-                || job.cancellation_reason != queued.cancellation_reason
-                || job.cancellation_proof != queued.cancellation_proof)
+        let classification_prior = if prior.status == job.status
+            && matches!(job.status, JobStatus::Completed | JobStatus::Cancelled)
+            && (job.status == JobStatus::Completed || job.started_at.is_some())
         {
-            return Err(QueueError::StateConflict(format!(
-                "job {} has a newer cancellation request",
-                job.id
-            )));
-        }
-        if matches!(queued.status, JobStatus::Completed | JobStatus::Cancelled)
-            && queued.status != job.status
-        {
-            return Err(QueueError::StateConflict(format!(
-                "job {} is already terminal as {:?}",
-                job.id, queued.status
-            )));
-        }
-        let terminal = matches!(job.status, JobStatus::Completed | JobStatus::Cancelled);
-        if terminal {
-            crate::log_retention::invalidate_conflicting_terminal_manifest(&self.state_dir, job)?;
-        }
-        *queued = job.clone();
-        let _ = trim_terminal(&mut jobs);
-        self.save_jobs_to_disk(&jobs)?;
-        if terminal {
-            // The queue outcome is authoritative and must not be stranded by
-            // an ancillary manifest failure (notably a full log filesystem).
-            // Missing manifests remain fail-safe protected during cleanup.
-            let _ = crate::log_retention::write_terminal_manifest(&self.state_dir, job);
+            let mut synthetic = prior.clone();
+            synthetic.status = JobStatus::Running;
+            synthetic
+        } else {
+            prior.clone()
+        };
+        if let Some(disposition) = classify_queue_terminal(&classification_prior, job) {
+            let disposition = match disposition {
+                QueueTerminalDisposition::Clean => "clean",
+                QueueTerminalDisposition::CancelledMidRun => "cancelled_mid_run",
+                QueueTerminalDisposition::Uncertain => "uncertain",
+                QueueTerminalDisposition::NoTiming => return Ok(()),
+            };
+            if let Ok(store) = MetricsStore::open(&self.state_dir) {
+                let timing = QueueTerminalTiming {
+                    queue_job_id: job.id.clone(),
+                    queue_identity: queue_timing_identity(job),
+                    disposition: disposition.to_owned(),
+                    started_at: job.started_at,
+                    completed_at: job.completed_at,
+                    total_ms: job
+                        .started_at
+                        .zip(job.completed_at)
+                        .map(|(s, e)| (e - s).num_milliseconds()),
+                };
+                let _ = store.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &timing);
+            }
         }
         Ok(())
     }
@@ -1413,6 +1522,7 @@ fn sync_directory_best_effort(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use super::{QueueTerminalDisposition, classify_queue_terminal, stale_recovery_result};
     use std::cell::Cell;
     use std::fs;
     use std::io;
@@ -1462,6 +1572,83 @@ mod tests {
         let mut running = job(branch, sha, &["mac"]).start().expect("start");
         running.started_at = Some(Utc::now() - chrono::Duration::seconds(started_secs_ago));
         running
+    }
+
+    #[test]
+    fn terminal_classifier_is_conservative_and_transition_based() {
+        let pending = job("main", "pending", &["mac"]);
+        let mut cancelled = pending.clone();
+        cancelled.status = JobStatus::Cancelled;
+        assert_eq!(
+            classify_queue_terminal(&pending, &cancelled),
+            Some(QueueTerminalDisposition::NoTiming)
+        );
+
+        let running = pending.start().expect("start");
+        let mut mid_run_cancel = running.clone();
+        mid_run_cancel.status = JobStatus::Cancelled;
+        assert_eq!(
+            classify_queue_terminal(&running, &mid_run_cancel),
+            Some(QueueTerminalDisposition::CancelledMidRun)
+        );
+
+        let mut completed = running.complete().expect("complete");
+        completed.results.insert(
+            "mac".to_owned(),
+            TargetResult::new("mac", "macos", TargetStatus::Pass, "local"),
+        );
+        assert_eq!(
+            classify_queue_terminal(&running, &completed),
+            Some(QueueTerminalDisposition::Clean)
+        );
+
+        let mut uncertain = completed.clone();
+        uncertain.completed_at = None;
+        assert_eq!(
+            classify_queue_terminal(&running, &uncertain),
+            Some(QueueTerminalDisposition::Uncertain)
+        );
+
+        let mut stale = completed.clone();
+        stale
+            .results
+            .insert("mac".to_owned(), stale_recovery_result("mac"));
+        assert_eq!(
+            classify_queue_terminal(&running, &stale),
+            Some(QueueTerminalDisposition::Uncertain)
+        );
+
+        let mut uncertain_result = completed.clone();
+        let mut result = TargetResult::new("mac", "macos", TargetStatus::Error, "local");
+        result.failure_class = Some("UNCERTAIN".to_owned());
+        result.error_message = Some("worker reported an ambiguous completion".to_owned());
+        uncertain_result.results.insert("mac".to_owned(), result);
+        assert_eq!(
+            classify_queue_terminal(&running, &uncertain_result),
+            Some(QueueTerminalDisposition::Uncertain),
+            "an UNCERTAIN result must never be counted as a clean duration"
+        );
+
+        let mut missing = completed.clone();
+        missing.results.clear();
+        assert_eq!(
+            classify_queue_terminal(&running, &missing),
+            Some(QueueTerminalDisposition::Uncertain)
+        );
+
+        let mut contested = completed.clone();
+        contested.cancel_requested_at = Some(Utc::now());
+        assert_eq!(
+            classify_queue_terminal(&running, &contested),
+            Some(QueueTerminalDisposition::Uncertain)
+        );
+
+        let mut identity_mismatch = completed;
+        identity_mismatch.sha = "different".to_owned();
+        assert_eq!(
+            classify_queue_terminal(&running, &identity_mismatch),
+            Some(QueueTerminalDisposition::Uncertain)
+        );
     }
 
     #[test]

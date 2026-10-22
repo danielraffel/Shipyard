@@ -25,6 +25,43 @@ use serde_json::Value;
 
 pub use project_key::ProjectKey;
 
+/// Reserved provider identity for authenticated local queue timing rows.
+pub const QUEUE_PROVIDER: &str = "shipyard-queue";
+pub(crate) const QUEUE_AUTHORITY_TOKEN: &str = "shipyard-queue-terminal-v1";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QueueTerminalTiming {
+    pub queue_job_id: String,
+    pub queue_identity: String,
+    pub disposition: String,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub total_ms: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct QueueTimingRow {
+    pub queue_job_id: String,
+    pub queue_identity: String,
+    pub queue_disposition: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub total_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepeatedWorkSurvivorTiming {
+    pub shadow_rows: usize,
+    pub distinct_survivors: usize,
+    pub matched_clean: usize,
+    pub excluded_uncertain: usize,
+    pub excluded_cancelled: usize,
+    pub unmatched: usize,
+    pub avoided_survivor_ms: Option<i64>,
+    pub final_attempt_only: bool,
+}
+
 /// Durable Shipyard metrics store backed by `SQLite`.
 #[derive(Debug)]
 pub struct MetricsStore {
@@ -513,7 +550,118 @@ type ScorecardSample = (
     Option<i64>,
 );
 
+fn queue_timing_rank(s: &str) -> u8 {
+    match s {
+        "clean" => 0,
+        "cancelled_mid_run" => 1,
+        "uncertain" => 2,
+        _ => 3,
+    }
+}
+
 impl MetricsStore {
+    pub(crate) fn record_queue_terminal(
+        &self,
+        token: &str,
+        timing: &QueueTerminalTiming,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if token != QUEUE_AUTHORITY_TOKEN
+            || timing.queue_job_id.is_empty()
+            || timing.queue_identity.is_empty()
+        {
+            return Err("unauthorized queue timing writer".into());
+        }
+        let disposition = match timing.disposition.as_str() {
+            "clean" | "cancelled_mid_run" | "uncertain" => timing.disposition.as_str(),
+            _ => return Err("invalid queue timing disposition".into()),
+        };
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT queue_identity, disposition FROM queue_timing WHERE queue_job_id=?1",
+                params![timing.queue_job_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((identity, old)) = existing {
+            if identity != timing.queue_identity {
+                return Err("queue identity mismatch".into());
+            }
+            if queue_timing_rank(&old) >= queue_timing_rank(disposition) {
+                tx.commit()?;
+                return Ok(());
+            }
+            tx.execute(
+                "UPDATE queue_timing SET disposition=?2, started_at=?3, completed_at=?4, total_ms=?5, recorded_at=?6 WHERE queue_job_id=?1",
+                params![timing.queue_job_id, disposition, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), (disposition == "clean").then_some(timing.total_ms).flatten().filter(|v| *v >= 0), Utc::now().to_rfc3339()],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute(
+            "INSERT INTO queue_timing (queue_job_id, queue_identity, disposition, started_at, completed_at, total_ms, recorded_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![timing.queue_job_id, timing.queue_identity, disposition, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), (disposition == "clean").then_some(timing.total_ms).flatten().filter(|v| *v >= 0), Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn read_queue_timing(
+        &self,
+        queue_job_id: &str,
+    ) -> Result<Option<QueueTimingRow>, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        Ok(conn.query_row("SELECT queue_job_id, queue_identity, disposition, started_at, completed_at, total_ms FROM queue_timing WHERE queue_job_id=?1", params![queue_job_id], |r| Ok(QueueTimingRow { queue_job_id: r.get(0)?, queue_identity: r.get(1)?, queue_disposition: r.get(2)?, started_at: r.get(3)?, completed_at: r.get(4)?, total_ms: r.get(5)? })).optional()?)
+    }
+
+    pub fn repeated_work_survivor_timing(
+        &self,
+        limit: usize,
+    ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id FROM repeated_work_shadow ORDER BY id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id")?;
+        let mut out = RepeatedWorkSurvivorTiming {
+            shadow_rows: 0,
+            distinct_survivors: 0,
+            matched_clean: 0,
+            excluded_uncertain: 0,
+            excluded_cancelled: 0,
+            unmatched: 0,
+            avoided_survivor_ms: None,
+            final_attempt_only: true,
+        };
+        let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (count, _, disposition, total) = row?;
+            out.shadow_rows = usize::try_from(count).unwrap_or(usize::MAX);
+            out.distinct_survivors += 1;
+            match disposition.as_deref() {
+                Some("clean") if total.is_some_and(|v| v >= 0) => {
+                    out.matched_clean += 1;
+                    out.avoided_survivor_ms = Some(
+                        out.avoided_survivor_ms
+                            .unwrap_or(0)
+                            .saturating_add(total.unwrap()),
+                    );
+                }
+                Some("uncertain") => out.excluded_uncertain += 1,
+                Some("cancelled_mid_run") => out.excluded_cancelled += 1,
+                _ => out.unmatched += 1,
+            }
+        }
+        Ok(out)
+    }
+
     /// Open a metrics store under the selected Shipyard state directory.
     pub fn open(state_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let dir = state_dir.join("metrics");
@@ -595,6 +743,15 @@ impl MetricsStore {
               external_id TEXT,
               correlation_id TEXT,
               UNIQUE(provider, external_id)
+            );
+            CREATE TABLE IF NOT EXISTS queue_timing (
+              queue_job_id TEXT PRIMARY KEY,
+              queue_identity TEXT NOT NULL,
+              disposition TEXT NOT NULL CHECK(disposition IN ('clean','cancelled_mid_run','uncertain')),
+              started_at TEXT,
+              completed_at TEXT,
+              total_ms INTEGER,
+              recorded_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS steps (
               id INTEGER PRIMARY KEY,
@@ -998,6 +1155,13 @@ impl MetricsStore {
         input: &MetricRecordInput,
         refresh_existing: bool,
     ) -> Result<i64, Box<dyn std::error::Error>> {
+        if input
+            .provider
+            .as_deref()
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case(QUEUE_PROVIDER))
+        {
+            return Err("reserved queue provider requires authenticated queue writer".into());
+        }
         let (project, repo) =
             project_key::normalize_for_write(&input.project, input.repo.as_deref());
         let normalized = MetricRecordInput {
@@ -1142,6 +1306,11 @@ impl MetricsStore {
     }
 
     fn import_tartci_value(&self, value: &Value) -> Result<bool, Box<dyn std::error::Error>> {
+        if value_str(value, "provider")
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case(QUEUE_PROVIDER))
+        {
+            return Err("reserved queue provider is not accepted from tartci import".into());
+        }
         let conn = self.connect()?;
         let provider = value_str(value, "provider").unwrap_or("tartci").to_owned();
         let external_id = nonempty(value_str(value, "external_id").map(str::to_owned));
@@ -2264,7 +2433,16 @@ fn insert_run(conn: &Connection, run: &RunInsert) -> Result<i64, rusqlite::Error
     Ok(conn.last_insert_rowid())
 }
 
+fn is_reserved_queue_label(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case(QUEUE_PROVIDER)
+}
+
 fn insert_job(conn: &Connection, job: &JobInsert) -> Result<i64, rusqlite::Error> {
+    if job.provider.as_deref().is_some_and(is_reserved_queue_label) {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "reserved queue provider".to_owned(),
+        ));
+    }
     conn.execute(
         "INSERT OR IGNORE INTO jobs (
           run_id, machine_id, job, target, platform, backend, provider,
@@ -5079,6 +5257,97 @@ mod tests {
             .unwrap(),
             0,
             "neither new row may survive the failed batch"
+        );
+    }
+    #[test]
+    fn survivor_timing_counts_distinct_and_excluded_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let mk = |id: &str, d: &str, ms| QueueTerminalTiming {
+            queue_job_id: id.into(),
+            queue_identity: format!("i-{id}"),
+            disposition: d.into(),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+            total_ms: ms,
+        };
+        store
+            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("clean", "clean", Some(10)))
+            .unwrap();
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &mk("uncertain", "uncertain", Some(20)),
+            )
+            .unwrap();
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &mk("cancel", "cancelled_mid_run", Some(30)),
+            )
+            .unwrap();
+        for id in ["clean", "clean", "uncertain", "cancel", "missing"] {
+            store
+                .record_repeated_work_shadow(&RepeatedWorkShadowInput {
+                    kind: RepeatedWorkKind::SupersededExactHead,
+                    branch: "b".into(),
+                    sha: "s".into(),
+                    target_config: "t".into(),
+                    mode: "m".into(),
+                    job_id: id.into(),
+                    superseded_job_id: "o".into(),
+                    superseded_sha: "o".into(),
+                })
+                .unwrap();
+        }
+        let r = store.repeated_work_survivor_timing(100).unwrap();
+        assert_eq!(r.shadow_rows, 5);
+        assert_eq!(r.distinct_survivors, 4);
+        assert_eq!(r.matched_clean, 1);
+        assert_eq!(r.avoided_survivor_ms, Some(10));
+        assert_eq!(r.excluded_uncertain, 1);
+        assert_eq!(r.excluded_cancelled, 1);
+        assert_eq!(r.unmatched, 1);
+    }
+    #[test]
+    fn queue_timing_contract_rejects_identity_and_downgrades() {
+        let d = tempfile::tempdir().unwrap();
+        let st = MetricsStore::open(d.path()).unwrap();
+        let mk = |id: &str, ident: &str, disp: &str, ms: Option<i64>| QueueTerminalTiming {
+            queue_job_id: id.into(),
+            queue_identity: ident.into(),
+            disposition: disp.into(),
+            started_at: None,
+            completed_at: None,
+            total_ms: ms,
+        };
+        st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "a", "clean", Some(9)))
+            .unwrap();
+        st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "a", "clean", Some(4)))
+            .unwrap();
+        assert_eq!(
+            st.read_queue_timing("x").unwrap().unwrap().total_ms,
+            Some(9)
+        );
+        st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "a", "uncertain", Some(1)))
+            .unwrap();
+        st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "a", "clean", Some(2)))
+            .unwrap();
+        assert_eq!(
+            st.read_queue_timing("x")
+                .unwrap()
+                .unwrap()
+                .queue_disposition,
+            "uncertain"
+        );
+        assert_eq!(
+            st.read_queue_timing("x").unwrap().unwrap().total_ms,
+            None,
+            "non-clean terminal rows must never retain a duration"
+        );
+        assert!(
+            st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "b", "clean", Some(2)))
+                .is_err()
         );
     }
 }
