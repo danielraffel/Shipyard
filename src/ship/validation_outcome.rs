@@ -10,7 +10,7 @@ use crate::evidence::canonical_repository;
 use crate::executor::dispatch::ResolvedTarget;
 use crate::job::{CancellationCause, Job, JobStatus, ValidationMode};
 use crate::metrics::{MetricsStore, QUEUE_AUTHORITY_TOKEN, QueueTerminalTiming};
-use crate::queue::{ALREADY_MERGED_CANCEL_REASON, Queue, QueueError};
+use crate::queue::{ALREADY_MERGED_CANCEL_REASON, Queue, QueueError, QueueTerminalDisposition, classify_queue_terminal};
 use crate::queue_request::{
     QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionKind,
     QueuedExecutionOutcome, QueuedShipDisposition, QueuedShipDispositionKind,
@@ -60,29 +60,17 @@ pub(crate) fn persist_terminal_outcome(
         .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
     persist_recovered_outcomes(std::slice::from_ref(job), state_dir, &ship_state).map(|result| {
         if let Ok(store) = MetricsStore::open(state_dir) {
-            let disposition = if job.status == JobStatus::Cancelled {
-                "cancelled_mid_run"
-            } else {
-                "clean"
+            let mut prior = job.clone();
+            prior.status = if job.started_at.is_some() { JobStatus::Running } else { JobStatus::Pending };
+            let Some(disposition) = classify_queue_terminal(&prior, job) else { return result; };
+            let (disposition, total_ms) = match disposition {
+                QueueTerminalDisposition::Clean => ("clean", job.started_at.zip(job.completed_at).map(|(s, e)| (e - s).num_milliseconds())),
+                QueueTerminalDisposition::CancelledMidRun => ("cancelled_mid_run", None),
+                QueueTerminalDisposition::Uncertain => ("uncertain", None),
+                QueueTerminalDisposition::NoTiming => return result,
             };
-            let total_ms = job
-                .started_at
-                .zip(job.completed_at)
-                .map(|(s, e)| (e - s).num_milliseconds());
-            let timing = QueueTerminalTiming {
-                queue_job_id: job.id.clone(),
-                queue_identity: format!(
-                    "{}:{}:{}:{:?}",
-                    job.created_at.to_rfc3339(),
-                    job.sha,
-                    job.branch,
-                    job.mode
-                ),
-                disposition: disposition.to_owned(),
-                started_at: job.started_at,
-                completed_at: job.completed_at,
-                total_ms,
-            };
+            let identity = format!("{}\u{{1f}}{}\u{{1f}}{}\u{{1f}}{:?}\u{{1f}}{}", job.created_at.to_rfc3339(), job.sha, job.branch, job.mode, job.target_names.join(","));
+            let timing = QueueTerminalTiming { queue_job_id: job.id.clone(), queue_identity: identity, disposition: disposition.to_owned(), started_at: job.started_at, completed_at: job.completed_at, total_ms };
             let _ = store.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &timing);
         }
         result
