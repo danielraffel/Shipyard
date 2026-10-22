@@ -39,6 +39,7 @@ pub(crate) struct QueueTerminalTiming {
     pub total_ms: Option<i64>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct QueueTimingRow {
     pub queue_job_id: String,
@@ -606,6 +607,7 @@ impl MetricsStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn read_queue_timing(
         &self,
         queue_job_id: &str,
