@@ -326,9 +326,8 @@ pub(super) fn metrics_command<W: Write>(
             })?;
             write_output(stdout, json_output, &summary, || {
                 format!(
-                    "{} repeated-work observations, {} ms joined cost",
-                    summary.observations,
-                    summary.duration_ms.unwrap_or(0)
+                    "{} repeated-work observations; avoided cost unavailable ({} unjoined)",
+                    summary.observations, summary.unknown_durations
                 )
             })?;
         }

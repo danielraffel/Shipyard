@@ -159,6 +159,7 @@ pub struct RepeatedWorkShadowRow {
 /// Read-only cost accounting for repeated-work shadow observations.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RepeatedWorkCostSummary {
+    pub cost_basis: &'static str,
     pub observations: usize,
     pub superseded_exact_head: usize,
     pub duplicate_exact_head_config: usize,
@@ -920,6 +921,7 @@ impl MetricsStore {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut out = RepeatedWorkCostSummary {
+            cost_basis: "avoided_repeated_work",
             observations: 0,
             superseded_exact_head: 0,
             duplicate_exact_head_config: 0,
@@ -935,23 +937,10 @@ impl MetricsStore {
                 "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
                 _ => {}
             }
-            let Some(id) = job_id.parse::<i64>().ok() else {
-                out.unknown_durations += 1;
-                continue;
-            };
-            let duration: Option<i64> = conn
-                .query_row(
-                    "SELECT total_ms FROM jobs WHERE id = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(ms) = duration.filter(|ms| *ms >= 0) {
-                out.joined_durations += 1;
-                out.duration_ms = Some(out.duration_ms.unwrap_or(0).saturating_add(ms));
-            } else {
-                out.unknown_durations += 1;
-            }
+            // Queue ids (`sy-...`) are not SQLite job identities. Without an
+            // authenticated linkage, every duration remains unavailable.
+            let _ = job_id;
+            out.unknown_durations += 1;
         }
         Ok(out)
     }
