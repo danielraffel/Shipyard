@@ -910,8 +910,8 @@ impl MetricsStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Aggregate shadow observations. A duration is joined only when the
-    /// observation's job id is an exact numeric metrics job id.
+    /// Aggregate shadow observations. Durations remain unavailable until a
+    /// provenance-safe queue-to-metrics linkage exists.
     pub fn repeated_work_cost(
         &self,
         limit: usize,
