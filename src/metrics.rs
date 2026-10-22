@@ -591,7 +591,7 @@ impl MetricsStore {
             .then_some(timing.total_ms)
             .flatten()
             .filter(|v| *v >= 0);
-        conn.execute("INSERT INTO jobs (run_id,job,provider,started_at,completed_at,total_ms,status,queue_job_id,queue_identity,queue_disposition) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(queue_job_id) DO UPDATE SET completed_at=excluded.completed_at,total_ms=CASE WHEN excluded.queue_disposition='clean' THEN excluded.total_ms ELSE NULL END,queue_disposition=excluded.queue_disposition", params![run_id, timing.queue_job_id, QUEUE_PROVIDER, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), total, timing.disposition, timing.queue_job_id, timing.queue_identity, timing.disposition])?;
+        conn.execute("INSERT INTO jobs (run_id,job,provider,started_at,completed_at,total_ms,status,queue_job_id,queue_identity,queue_disposition) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ", params![run_id, timing.queue_job_id, QUEUE_PROVIDER, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), total, timing.disposition, timing.queue_job_id, timing.queue_identity, timing.disposition])?;
         Ok(())
     }
 
