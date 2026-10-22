@@ -1622,9 +1622,7 @@ mod tests {
         let mut result = TargetResult::new("mac", "macos", TargetStatus::Error, "local");
         result.failure_class = Some("UNCERTAIN".to_owned());
         result.error_message = Some("worker reported an ambiguous completion".to_owned());
-        uncertain_result
-            .results
-            .insert("mac".to_owned(), result);
+        uncertain_result.results.insert("mac".to_owned(), result);
         assert_eq!(
             classify_queue_terminal(&running, &uncertain_result),
             Some(QueueTerminalDisposition::Uncertain),
