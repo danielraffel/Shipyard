@@ -18,7 +18,9 @@ Output: ``SHIPYARD-STAMP-V1``, the (possibly rewritten) argv, then
 ``SHIPYARD-STAMP-END``, every item NUL-terminated. ``ghapp`` uses the
 rewritten argv only when both sentinels are present and reads for at most 5
 seconds, so a failure, a hang or a truncated answer posts the comment
-unstamped, never blocks it; the stamper also stops itself after 5 seconds.
+unstamped; the stamper also stops itself after 5 seconds. ``ghapp`` then
+refuses the comment only if its body carries stamp text, which nothing has
+vouched for.
 Handled: ``pr comment``/``issue comment`` with ``--body``/``-b``, or with
 ``--body-file``/``-F <file>``, which becomes a ``--body`` (no file is written);
 ``api`` on an issue-comment endpoint with ``-f``/``-F``/``--field``/
@@ -44,6 +46,10 @@ import socket
 import sys
 from typing import Any, Callable, Optional, Tuple
 
+# A body that is not valid UTF-8 is read and written back byte for byte, so
+# one stray byte cannot crash the stamper and post a foreign stamp unstripped
+# (Python reads argv the same way).
+BODY_ERRORS = "surrogateescape"
 SENTINEL = "SHIPYARD-STAMP-V1"
 END = "SHIPYARD-STAMP-END"
 DEADLINE_SECONDS = 5
@@ -147,7 +153,7 @@ def _field_body(flag: str, value: str) -> Optional[str]:
     ``--field``) reads ``@<file>`` from that file."""
     value = value[len("body="):]
     if flag in ("-F", "--field") and value.startswith("@") and value != "@-":
-        with open(value[1:], encoding="utf-8") as handle:
+        with open(value[1:], encoding="utf-8", errors=BODY_ERRORS) as handle:
             return handle.read()
     return value
 
@@ -181,7 +187,7 @@ def _rewrite_input(args: list[str]) -> bool:
             continue
         if path == "-":
             return False
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8", errors=BODY_ERRORS) as handle:
             payload = json.load(handle)
         if not isinstance(payload, dict) or not isinstance(payload.get("body"), str):
             return False
@@ -220,7 +226,7 @@ def rewrite(args: list[str]) -> list[str]:
                 continue
             if path == "-":
                 return out
-            with open(path, encoding="utf-8") as handle:
+            with open(path, encoding="utf-8", errors=BODY_ERRORS) as handle:
                 new = stamped(handle.read())
             if new is not None:
                 out[i:i + span] = ["--body", new]
@@ -252,7 +258,8 @@ def main(args: list[str]) -> int:
         except Exception:  # noqa: BLE001 - never block a comment over a stamp
             return 0
         sys.stdout.buffer.write(
-            b"".join(item.encode() + b"\0" for item in [SENTINEL, *result, END]))
+            b"".join(item.encode("utf-8", BODY_ERRORS) + b"\0"
+                     for item in [SENTINEL, *result, END]))
         return 0
     finally:
         if alarm:

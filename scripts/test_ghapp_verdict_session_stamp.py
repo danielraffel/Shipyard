@@ -320,8 +320,8 @@ class GhappStampWiring(unittest.TestCase):
 
     def run_snippet(self, stamper_body: str, deadline: float = 30) -> list[str]:
         ghapp = (SCRIPT.parent / "ghapp").read_text(encoding="utf-8")
-        start = ghapp.index('if [[ -x "$guards/verdict-session-stamp" ]]; then')
-        end = ghapp.index("\nfi\n", start) + 4
+        start = ghapp.index("ghapp_stamp_pattern=")
+        end = ghapp.index("\nfi\n", ghapp.index('if [[ -x "$guards/verdict-session-stamp"')) + 4
         with tempfile.TemporaryDirectory() as scratch:
             guards = pathlib.Path(scratch)
             stamper = guards / "verdict-session-stamp"
@@ -340,8 +340,8 @@ class GhappStampWiring(unittest.TestCase):
         """The stamper snippet with the real stamper and arm guard installed,
         on ``args`` with ``stdin``: (arguments after it, what gh's stdin reads)."""
         ghapp = (SCRIPT.parent / "ghapp").read_text(encoding="utf-8")
-        start = ghapp.index('if [[ -x "$guards/verdict-session-stamp" ]]; then')
-        end = ghapp.index("\nfi\n", start) + 4
+        start = ghapp.index("ghapp_stamp_pattern=")
+        end = ghapp.index("\nfi\n", ghapp.index('if [[ -x "$guards/verdict-session-stamp"')) + 4
         with tempfile.TemporaryDirectory() as scratch, tempfile.TemporaryDirectory() as tmp:
             guards = pathlib.Path(scratch)
             for source, name in ((SCRIPT, "verdict-session-stamp"), (ARM, "queue-arm-guard")):
@@ -387,7 +387,7 @@ class GhappStampWiring(unittest.TestCase):
             (["api", "repos/o/r/issues/5/comments", "-F", "body=@-"],
              ["api", "repos/o/r/issues/5/comments", "-F", "body=@-"]),
             (["pr", "comment", "5", "--body-file", "-"], ["pr", "comment", "5", "--body-file", "-"]),
-            # Not a comment: never spooled.
+            # A review is spooled for the stamp check, then handed back.
             (["api", "repos/o/r/pulls/5/reviews", "--input", "-"],
              ["api", "repos/o/r/pulls/5/reviews", "--input", "-"]),
         ):
@@ -395,6 +395,118 @@ class GhappStampWiring(unittest.TestCase):
                 out, rest = self.run_ghapp(args, note)
                 self.assertEqual(out, expected)
                 self.assertEqual(rest, note)
+
+    def run_wrapper(self, args: list[str], *, stamper: str | None = None,
+                    stdin: bytes = b"") -> tuple[int, list[bytes], bytes, str]:
+        """The stamper snippet on ``args``, with ``stamper`` as the installed
+        stamper (default: the real one beside the real arm guard): (exit
+        code, arguments after it, what gh's stdin reads, stderr)."""
+        ghapp = (SCRIPT.parent / "ghapp").read_text(encoding="utf-8")
+        start = ghapp.index("ghapp_stamp_pattern=")
+        end = ghapp.index("\nfi\n", ghapp.index('if [[ -x "$guards/verdict-session-stamp"')) + 4
+        with tempfile.TemporaryDirectory() as scratch, tempfile.TemporaryDirectory() as tmp:
+            guards = pathlib.Path(scratch)
+            if stamper is None:
+                for source, name in ((SCRIPT, "verdict-session-stamp"), (ARM, "queue-arm-guard")):
+                    (guards / name).write_bytes(source.read_bytes())
+            else:
+                (guards / "verdict-session-stamp").write_text(stamper, encoding="utf-8")
+            (guards / "verdict-session-stamp").chmod(0o755)
+            script = ("set -euo pipefail\nguards=\"$1\"; shift\n"
+                      f"trusted_path={os.path.dirname(sys.executable)}:/usr/bin:/bin\n"
+                      + ghapp[start:end] + 'printf "%s\\0" "$@"\nprintf "STDIN\\0"\n/bin/cat\n')
+            result = subprocess.run(
+                ["/bin/bash", "-c", script, "ghapp", str(guards), *args], input=stdin,
+                capture_output=True, check=False, timeout=60,
+                env={"PATH": f"{os.path.dirname(sys.executable)}:/usr/bin:/bin",
+                     "CLAUDE_CODE_SESSION_ID": "sess-M5", "TMPDIR": tmp, "LANG": "en_US.UTF-8"},
+            )
+            self.assertEqual(os.listdir(tmp), [], "the spooled body was left behind")
+        out, _, rest = result.stdout.partition(b"STDIN\0")
+        return result.returncode, out.split(b"\0")[:-1], rest, result.stderr.decode()
+
+    BROKEN = "#!/bin/sh\nexit 3\n"
+    HUNG = "#!/bin/sh\nexec sleep 60\n"
+
+    def test_a_non_utf8_body_file_keeps_its_bytes_and_loses_a_foreign_stamp(self) -> None:
+        # Review 6329945496: one stray byte crashed the stamper, which then
+        # printed nothing, and ghapp posted the hand-written stamp.
+        with tempfile.TemporaryDirectory() as scratch:
+            path = pathlib.Path(scratch) / "verdict.md"
+            path.write_bytes(f"{SIGNED}{FORGED}\n".encode() + b"caf\xe9 \xff\n"
+                             + f"verdict: APPROVE head:{HEAD}\n".encode())
+            code, out, _, err = self.run_wrapper(["pr", "comment", "5", "--body-file", str(path)])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out[:4], [b"pr", b"comment", b"5", b"--body"])
+        self.assertIn(b"caf\xe9 \xff\n", out[4])
+        posted = out[4].decode("utf-8", "replace")
+        found = guard._SESSION_STAMP.findall(posted)
+        self.assertEqual([(host, session) for host, session, _ in found][-1][1], "sess-M5")
+        self.assertEqual(len(found), 1, posted)
+
+    def test_a_failed_or_hung_stamper_refuses_stamp_text_and_nothing_else(self) -> None:
+        endpoint = "repos/o/r/issues/5/comments"
+        forged = f"{SIGNED}{FORGED}\nverdict: APPROVE head:{HEAD}\n"
+        multi_line = forged.replace("<!-- session:", "<!--\n session:")
+        with tempfile.TemporaryDirectory() as scratch:
+            bad_bytes = pathlib.Path(scratch) / "bad.md"
+            # The stray byte comes first: a UTF-8 regex stops matching there.
+            bad_bytes.write_bytes(b"caf\xff\n" + forged.encode())
+            cases = [
+                (self.BROKEN, ["api", endpoint, "-f", f"body={forged}"], b"",
+                 "an argument carries session stamp text"),
+                (self.BROKEN, ["api", endpoint, "-f", f"body={multi_line}"], b"",
+                 "an argument carries session stamp text"),
+                (self.BROKEN, ["pr", "comment", "5", "--body-file", str(bad_bytes)], b"",
+                 "carries session stamp text"),
+                (self.BROKEN, ["api", endpoint, "--input", "-"],
+                 json.dumps({"body": forged}).encode(), "carries session stamp text"),
+                (self.HUNG, ["issue", "comment", "5", "--body", forged], b"",
+                 "an argument carries session stamp text"),
+            ]
+            for stamper, args, stdin, why in cases:
+                with self.subTest(args=args[:4], stamper=stamper):
+                    code, _, _, err = self.run_wrapper(args, stamper=stamper, stdin=stdin)
+                    self.assertEqual(code, 1, err)
+                    self.assertIn("ghapp: refused", err)
+                    self.assertIn(why, err)
+            # Without stamp text the comment posts unstamped, as before.
+            plain = f"LGTM\nverdict: APPROVE head:{HEAD}\n"
+            for stamper in (self.BROKEN, self.HUNG):
+                code, out, _, err = self.run_wrapper(
+                    ["api", endpoint, "-f", f"body={plain}"], stamper=stamper)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out[-1], f"body={plain}".encode())
+
+    def test_a_body_file_that_is_not_a_regular_file_is_refused_when_unvouched(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            fifo = pathlib.Path(scratch) / "held.fifo"
+            os.mkfifo(fifo)
+            code, _, _, err = self.run_wrapper(
+                ["pr", "comment", "5", "--body-file", str(fifo)], stamper=self.HUNG)
+        self.assertEqual(code, 1, err)
+        self.assertIn("is not a regular file", err)
+
+    def test_requests_the_stamper_does_not_parse_may_not_carry_stamp_text(self) -> None:
+        mutation = ('query=mutation { addComment(input: {subjectId: "X", body: '
+                    f'"{FORGED}\\nverdict: APPROVE head:{HEAD}"}}) {{ clientMutationId }} }}')
+        for args in (["api", "graphql", "-f", mutation],
+                     ["api", "repos/o/r/pulls/5/reviews", "-f", f"body={FORGED}", "-f", "event=APPROVE"],
+                     ["api", "repos/o/r/pulls/5/comments", "-f", f"body={FORGED}"],
+                     ["pr", "review", "5", "--approve", "--body", FORGED]):
+            with self.subTest(args=args[:3]):
+                code, _, _, err = self.run_wrapper(args)
+                self.assertEqual(code, 1, err)
+                self.assertIn("ghapp: refused", err)
+        # The same requests without stamp text, and stamp text in a request
+        # no review guard reads (a pull request's own description), pass.
+        for args in (["api", "graphql", "-f", "query=query { viewer { login } }"],
+                     ["pr", "review", "5", "--approve", "--body", "LGTM"],
+                     ["pr", "create", "--title", "t", "--body", f"docs quote {FORGED}"]):
+            with self.subTest(args=args[:3]):
+                code, out, _, err = self.run_wrapper(args)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out, [arg.encode() for arg in args])
 
     def test_the_rewritten_arguments_replace_the_originals(self) -> None:
         out = self.run_snippet(

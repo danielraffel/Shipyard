@@ -97,7 +97,15 @@ splits lines the same way). Every stamp already in any comment body, verdict
 or not, whether written by hand or copied with the rest of a verdict, is
 removed, repeatedly until none is left, since one pass can join the pieces
 around a removed stamp into a new one; only a verdict then gets this
-session's stamp. The session is `CLAUDE_CODE_SESSION_ID`, else
+session's stamp. Bodies are read byte for byte (`surrogateescape`), so a
+stray non-UTF-8 byte cannot crash the stamper. The stamp is optional, but
+stamp text nothing vouched for is not: when the stamper fails or times out
+on a comment, or the request is one it does not parse but a review guard
+reads (`api graphql`, a pull request's reviews or review comments, `pr
+review`), `ghapp` refuses the request if any argument, body file,
+`--input` or spooled stdin carries `<!--` followed by `session:`, and a body
+file that is not a regular file (a FIFO) cannot be checked and is refused.
+A request without stamp text posts as before. The session is `CLAUDE_CODE_SESSION_ID`, else
 `CODEX_COMPANION_SESSION_ID`, else `unattributed`; `agent: <id>` appears only
 when `SHIPYARD_AGENT_ID` is set. The marker stays the last line, so every
 verdict reader is unchanged. The arm guard, and `head_approval` for Shipyard's
