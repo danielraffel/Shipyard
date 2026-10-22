@@ -2417,7 +2417,16 @@ fn insert_run(conn: &Connection, run: &RunInsert) -> Result<i64, rusqlite::Error
     Ok(conn.last_insert_rowid())
 }
 
+fn is_reserved_queue_label(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case(QUEUE_PROVIDER)
+}
+
 fn insert_job(conn: &Connection, job: &JobInsert) -> Result<i64, rusqlite::Error> {
+    if job.provider.as_deref().is_some_and(is_reserved_queue_label) {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "reserved queue provider".to_owned(),
+        ));
+    }
     conn.execute(
         "INSERT OR IGNORE INTO jobs (
           run_id, machine_id, job, target, platform, backend, provider,
