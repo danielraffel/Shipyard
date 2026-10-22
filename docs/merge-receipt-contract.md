@@ -44,7 +44,11 @@ produce `partial` or `unavailable` coverage rather than a zero-cost claim, and
 an `unavailable` row carries no value. Distinct PR throughput is never used as
 a substitute.
 
-The current GitHub API importer does not produce these receipts because it has
-no Shipyard gate-evidence provenance. A future producer must emit this schema
-at the protected merge boundary, after exact-head and gate receipt checks.
-Until then, the honest state is unavailable.
+Shipyard emits this schema at the protected merge boundary after exact-head and
+gate receipt checks, when Shipyard owns native merge authority and a follow-up
+GitHub read confirms that the PR merged. This includes a merge-command error
+whose follow-up read confirms the merge. A manually merged PR, or a merge that
+Shipyard did not authorize, receives no safe-merge receipt. The producer is
+observational: a receipt-store failure is surfaced as a cleanup warning after
+the merge and never authorizes or undoes the merge.
+The GitHub API importer remains read-only and does not manufacture receipts.

@@ -1,0 +1,8 @@
+{
+  "merged": true,
+  "state": "closed",
+  "head": {"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ref": "feature/receipt"},
+  "base": {"ref": "main"},
+  "merge_commit_sha": "0000000000000000000000000000000000000000",
+  "merged_at": "2026-10-21T20:00:00Z"
+}

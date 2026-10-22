@@ -1,0 +1,17 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "id": "PR_receipt",
+        "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "baseRefName": "main",
+        "merged": true,
+        "autoMergeRequest": null,
+        "timelineItems": {"nodes": []}
+      },
+      "mergeQueue": {
+        "entries": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "merged": true,
+  "state": "closed",
+  "head": {"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ref": "feature/receipt"},
+  "base": {"ref": "main"},
+  "merge_commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

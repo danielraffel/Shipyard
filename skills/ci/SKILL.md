@@ -3935,3 +3935,8 @@ waste is not limited to the scorecard window.
 `shipyard metrics repeated-work-cost` is read-only shadow accounting. Treat
 duration as unavailable until queue-to-metrics provenance is authenticated.
 
+
+At the protected merge boundary, Shipyard may produce that receipt only after
+GitHub confirms the exact validated head is merged and supplies a nonzero merge
+commit and merge timestamp. Queue admission or auto-merge activation is not a
+merge receipt; queue supervision must wait for the later merged observation.
