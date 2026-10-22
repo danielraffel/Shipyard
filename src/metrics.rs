@@ -1042,7 +1042,7 @@ impl MetricsStore {
         input: &MetricRecordInput,
         refresh_existing: bool,
     ) -> Result<i64, Box<dyn std::error::Error>> {
-        if input.provider.as_deref() == Some(QUEUE_PROVIDER) {
+        if input.provider.as_deref().is_some_and(|p| p.trim().eq_ignore_ascii_case(QUEUE_PROVIDER)) {
             return Err("reserved queue provider requires authenticated queue writer".into());
         }
         let (project, repo) =
@@ -1189,6 +1189,9 @@ impl MetricsStore {
     }
 
     fn import_tartci_value(&self, value: &Value) -> Result<bool, Box<dyn std::error::Error>> {
+        if value_str(value, "provider").is_some_and(|p| p.trim().eq_ignore_ascii_case(QUEUE_PROVIDER)) {
+            return Err("reserved queue provider is not accepted from tartci import".into());
+        }
         let conn = self.connect()?;
         let provider = value_str(value, "provider").unwrap_or("tartci").to_owned();
         let external_id = nonempty(value_str(value, "external_id").map(str::to_owned));
