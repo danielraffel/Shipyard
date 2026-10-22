@@ -363,6 +363,11 @@ impl Queue {
             }
             prior
         };
+        if matches!(prior.status, JobStatus::Completed | JobStatus::Cancelled)
+            && prior.status == job.status
+        {
+            return Ok(());
+        }
         if let Some(disposition) = classify_queue_terminal(&prior, job) {
             let disposition = match disposition {
                 QueueTerminalDisposition::Clean => "clean",
