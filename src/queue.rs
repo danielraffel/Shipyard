@@ -15,7 +15,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::job::{CancellationProof, Job, JobKind, JobStatus, TargetResult, TargetStatus};
-use crate::metrics::{MetricsStore, RepeatedWorkKind, RepeatedWorkShadowInput};
+use crate::metrics::{
+    MetricsStore, QUEUE_AUTHORITY_TOKEN, QueueTerminalTiming, RepeatedWorkKind,
+    RepeatedWorkShadowInput,
+};
 use crate::queue_request::{
     QueueRequestStore, QueuedExecutionEnvelope, QueuedExecutionKind, QueuedExecutionRequest,
 };
@@ -93,6 +96,17 @@ pub(crate) fn classify_queue_terminal(prior: &Job, next: &Job) -> Option<QueueTe
     } else {
         Some(QueueTerminalDisposition::Uncertain)
     }
+}
+
+pub(crate) fn queue_timing_identity(job: &Job) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
+        job.created_at.to_rfc3339(),
+        job.sha,
+        job.branch,
+        job.mode,
+        job.target_names.join(",")
+    )
 }
 
 /// Cancellation reason for a pending job whose pull request was already merged
@@ -304,45 +318,72 @@ impl Queue {
 
     /// Replace a queued job matched by id, then trim old completed jobs.
     pub fn update(&mut self, job: &Job) -> QueueResult<()> {
-        let _lock = StateLock::acquire(self.state_lock_file())?;
-        let mut jobs = self.read_jobs_from_disk()?;
-        let Some(queued) = jobs.iter_mut().find(|queued| queued.id == job.id) else {
-            return Err(QueueError::StateConflict(format!(
-                "job {} is not present in the durable queue",
-                job.id
-            )));
+        let prior = {
+            let _lock = StateLock::acquire(self.state_lock_file())?;
+            let mut jobs = self.read_jobs_from_disk()?;
+            let Some(index) = jobs.iter().position(|queued| queued.id == job.id) else {
+                return Err(QueueError::StateConflict(format!(
+                    "job {} is not present in the durable queue",
+                    job.id
+                )));
+            };
+            let queued = &jobs[index];
+            if queued.status == JobStatus::Running
+                && queued.cancel_requested_at.is_some()
+                && (job.cancel_requested_at != queued.cancel_requested_at
+                    || job.cancellation_reason != queued.cancellation_reason
+                    || job.cancellation_proof != queued.cancellation_proof)
+            {
+                return Err(QueueError::StateConflict(format!(
+                    "job {} has a newer cancellation request",
+                    job.id
+                )));
+            }
+            if matches!(queued.status, JobStatus::Completed | JobStatus::Cancelled)
+                && queued.status != job.status
+            {
+                return Err(QueueError::StateConflict(format!(
+                    "job {} is already terminal as {:?}",
+                    job.id, queued.status
+                )));
+            }
+            let prior = queued.clone();
+            let terminal = matches!(job.status, JobStatus::Completed | JobStatus::Cancelled);
+            if terminal {
+                crate::log_retention::invalidate_conflicting_terminal_manifest(
+                    &self.state_dir,
+                    job,
+                )?;
+            }
+            jobs[index] = job.clone();
+            let _ = trim_terminal(&mut jobs);
+            self.save_jobs_to_disk(&jobs)?;
+            if terminal {
+                let _ = crate::log_retention::write_terminal_manifest(&self.state_dir, job);
+            }
+            prior
         };
-        if queued.status == JobStatus::Running
-            && queued.cancel_requested_at.is_some()
-            && (job.cancel_requested_at != queued.cancel_requested_at
-                || job.cancellation_reason != queued.cancellation_reason
-                || job.cancellation_proof != queued.cancellation_proof)
-        {
-            return Err(QueueError::StateConflict(format!(
-                "job {} has a newer cancellation request",
-                job.id
-            )));
-        }
-        if matches!(queued.status, JobStatus::Completed | JobStatus::Cancelled)
-            && queued.status != job.status
-        {
-            return Err(QueueError::StateConflict(format!(
-                "job {} is already terminal as {:?}",
-                job.id, queued.status
-            )));
-        }
-        let terminal = matches!(job.status, JobStatus::Completed | JobStatus::Cancelled);
-        if terminal {
-            crate::log_retention::invalidate_conflicting_terminal_manifest(&self.state_dir, job)?;
-        }
-        *queued = job.clone();
-        let _ = trim_terminal(&mut jobs);
-        self.save_jobs_to_disk(&jobs)?;
-        if terminal {
-            // The queue outcome is authoritative and must not be stranded by
-            // an ancillary manifest failure (notably a full log filesystem).
-            // Missing manifests remain fail-safe protected during cleanup.
-            let _ = crate::log_retention::write_terminal_manifest(&self.state_dir, job);
+        if let Some(disposition) = classify_queue_terminal(&prior, job) {
+            let disposition = match disposition {
+                QueueTerminalDisposition::Clean => "clean",
+                QueueTerminalDisposition::CancelledMidRun => "cancelled_mid_run",
+                QueueTerminalDisposition::Uncertain => "uncertain",
+                QueueTerminalDisposition::NoTiming => return Ok(()),
+            };
+            if let Ok(store) = MetricsStore::open(&self.state_dir) {
+                let timing = QueueTerminalTiming {
+                    queue_job_id: job.id.clone(),
+                    queue_identity: queue_timing_identity(job),
+                    disposition: disposition.to_owned(),
+                    started_at: job.started_at,
+                    completed_at: job.completed_at,
+                    total_ms: job
+                        .started_at
+                        .zip(job.completed_at)
+                        .map(|(s, e)| (e - s).num_milliseconds()),
+                };
+                let _ = store.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &timing);
+            }
         }
         Ok(())
     }
