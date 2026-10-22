@@ -2716,6 +2716,32 @@ backend = "local"
         (temp, config)
     }
 
+    /// Record the overlay in the index under a case variant of its path, as a
+    /// branch committing `.Shipyard.Local/Config.toml` leaves it once checked
+    /// out on a case-insensitive filesystem. The on-disk file the loader reads
+    /// keeps its lowercase name, so this reproduces on any filesystem.
+    fn track_overlay_under_case_variant(temp: &tempfile::TempDir, file: &str) {
+        let repo = temp.path().join("repo");
+        let output = std::process::Command::new("git")
+            .args(["hash-object", "-w", ".shipyard.local/config.toml"])
+            .current_dir(&repo)
+            .output()
+            .expect("git hash-object");
+        assert!(output.status.success());
+        let blob = String::from_utf8(output.stdout).expect("utf8 hash");
+        let status = std::process::Command::new("git")
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{},.Shipyard.Local/{file}", blob.trim()),
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("git update-index");
+        assert!(status.success());
+    }
+
     fn ssh_target_toml(options: &str) -> String {
         format!(
             "[targets.linux]\nbackend = \"ssh\"\nplatform = \"linux-arm64\"\nhost = \"builder\"\nssh_options = {options}\n"
@@ -2797,6 +2823,40 @@ backend = "local"
         );
         resolve_targets(&config, ValidationMode::Full)
             .expect_err("a committed .shipyard.local is tracked config");
+    }
+
+    #[test]
+    fn case_variant_committed_local_overlay_is_still_repository_controlled() {
+        let ssh = ssh_target_toml(r#"["-oProxyCommand=touch /tmp/x"]"#);
+        let auth = "[github.auth]\nsource = \"command\"\ntoken_command = [\"/bin/sh\", \"-c\", \"touch marker\"]\n";
+
+        // Negative controls: an overlay committed as `.Shipyard.Local/Config.toml`
+        // is the same tracked file to a case-insensitive checkout.
+        let (temp, config) = layered_config("", "[project]\nname = \"forge\"\n", Some(&ssh), false);
+        track_overlay_under_case_variant(&temp, "Config.toml");
+        let error = resolve_targets(&config, ValidationMode::Full)
+            .expect_err("case-variant committed ssh_options must be refused");
+        assert!(
+            error.to_string().contains("repository-controlled config"),
+            "{error}"
+        );
+
+        let (temp, config) = layered_config("", "", Some(auth), false);
+        track_overlay_under_case_variant(&temp, "CONFIG.TOML");
+        crate::gh::GhClient::from_loaded_config(&config)
+            .expect_err("case-variant committed github.auth must be refused");
+
+        // Positive controls: a different file tracked beside an untracked
+        // overlay does not make the overlay tracked.
+        let (temp, config) = layered_config("", "[project]\nname = \"forge\"\n", Some(&ssh), false);
+        track_overlay_under_case_variant(&temp, "Config.toml.example");
+        resolve_targets(&config, ValidationMode::Full)
+            .expect("untracked local overlay ssh_options still honoured");
+
+        let (temp, config) = layered_config("", "", Some(auth), false);
+        track_overlay_under_case_variant(&temp, "other.toml");
+        crate::gh::GhClient::from_loaded_config(&config)
+            .expect("untracked local github.auth still honoured");
     }
 
     #[test]

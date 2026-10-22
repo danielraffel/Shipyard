@@ -331,9 +331,29 @@ fn read_layer(path: &Path) -> ConfigResult<Option<Table>> {
 
 /// Whether git tracks `file` inside `dir`. Anything git cannot answer counts
 /// as untracked, which is what a directory outside any checkout is.
+///
+/// The match ignores case across the whole repository-relative path: on a
+/// case-insensitive filesystem the loader reads `.shipyard.local/config.toml`
+/// through a committed `.Shipyard.Local/Config.toml`, and a plain pathspec
+/// would miss that index entry. A relative `:(icase)` pathspec is not enough
+/// either, because git matches the cwd prefix case-sensitively, so anchor the
+/// full path at the top of the work tree.
 fn git_tracks(dir: &Path, file: &str) -> bool {
+    let Some(prefix) = Command::new("git")
+        .args(["rev-parse", "--show-prefix"])
+        .current_dir(dir)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+    else {
+        return false;
+    };
+    let prefix = prefix.strip_suffix('\n').unwrap_or(&prefix);
+    let pathspec = format!(":(top,icase,literal){prefix}{file}");
     Command::new("git")
-        .args(["ls-files", "--error-unmatch", "--", file])
+        .args(["ls-files", "--error-unmatch", "--", &pathspec])
         .current_dir(dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
