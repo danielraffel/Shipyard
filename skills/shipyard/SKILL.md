@@ -1812,7 +1812,11 @@ To raise the quota above the ambient `gh` user token's 5,000/hr, point
 (`scripts/shipyard-github-app-token`) for the 12,500/hr installation bucket.
 Put the block in the **global** config dir (find it with `shipyard paths`;
 macOS `~/Library/Application Support/shipyard/config.toml`) to cover every repo
-on the machine — not the tracked project config. The same App private key works
+on the machine — not the tracked project config. A tracked layer may not set
+github.auth: `.shipyard/config.toml`, or a `.shipyard.local/config.toml` the
+branch committed, containing `[github.auth]` fails closed with an error naming
+the file; move the table to the global config or an untracked
+`.shipyard.local/config.toml`. The same App private key works
 across multiple Macs (M1/Studio/M5). Full setup, permissions, and the
 additional-client steps: [`docs/github-app-quota.md`](../../docs/github-app-quota.md).
 

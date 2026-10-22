@@ -1402,8 +1402,10 @@ with `-f`; without `-X GET`, `gh api -f` can POST and produce misleading 404s.
 
 ## GitHub Auth Diagnostics
 
-Before blaming ambient `gh auth status`, check whether the repo config has
-`[github.auth]`. Shipyard can inject env or command-helper tokens into its
+Before blaming ambient `gh auth status`, check whether the machine-global or
+untracked `.shipyard.local` config has `[github.auth]`. A tracked layer may not
+set github.auth: Shipyard refuses one in `.shipyard/config.toml` (or a committed
+`.shipyard.local/config.toml`) and names where to move it. Shipyard can inject env or command-helper tokens into its
 built-in `gh` subprocesses as `GH_TOKEN`, including helpers that mint GitHub
 App installation tokens. `shipyard doctor --rate-limit --json` reports the
 effective source and rate-limit buckets. For GitHub App or fine-grained tokens,
@@ -2625,6 +2627,18 @@ fallback = [
 There is no `shipyard config` or `shipyard targets` subcommand yet. Inspect
 target definitions in `.shipyard/config.toml` and `.shipyard.local/config.toml`,
 and use `shipyard status --json` for live target state.
+
+Tracked config (`.shipyard/config.toml`, or a `.shipyard.local/config.toml`
+the branch committed) may declare targets but may not make `ssh` act on the
+controller: its `ssh_options` refuse `ProxyCommand`, `ProxyJump`,
+`LocalCommand`, `PermitLocalCommand`, `KnownHostsCommand`, `Include`, `Match`,
+`ForwardAgent`, `-F`, `-J`, `-A` and positional arguments (any `-o` spelling,
+case-insensitive), and it may not change the backend of a target the
+machine-global config declares. Connection tuning (`-p`, `-o
+ServerAliveInterval=30`) is fine. Put such options in the machine-global config
+or an untracked `.shipyard.local/config.toml`; those layers are unrestricted.
+An SSH or Windows `host` may not start with `-`. Shipyard's own SSH probes and
+remote commands pass `-o ForwardAgent=no` after the configured options.
 
 ### Same-backend transient retry (`[ship] transient_local_retries`)
 

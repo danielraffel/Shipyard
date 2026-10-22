@@ -3488,7 +3488,8 @@ mod tests {
             queue = queue.display(),
         );
         crate::test_support::write_executable_script(&fake_gh, &script);
-        let project = temp.path().join(".shipyard");
+        // Untracked local overlay: a tracked layer may not set github.auth.
+        let project = temp.path().join(".shipyard.local");
         std::fs::create_dir_all(&project).expect("project config");
         std::fs::write(
             project.join("config.toml"),
@@ -5062,7 +5063,8 @@ exit 91
         }
 
         let log = std::path::PathBuf::from(std::env::var_os(LOG).expect("child log path"));
-        let project = temp.path().join(".shipyard");
+        // Untracked local overlay: a tracked layer may not set github.auth.
+        let project = temp.path().join(".shipyard.local");
         std::fs::create_dir_all(&project).expect("project config dir");
         std::fs::write(
             project.join("config.toml"),

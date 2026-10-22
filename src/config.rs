@@ -185,10 +185,15 @@ impl LoadedConfig {
             let detail = stderr.lines().next().unwrap_or("").trim();
             return fallback(format!("git show {spec} failed: {detail}"));
         }
-        let project = match String::from_utf8_lossy(&output.stdout).parse::<Table>() {
+        let mut project = match String::from_utf8_lossy(&output.stdout).parse::<Table>() {
             Ok(table) => table,
             Err(error) => return fallback(format!("{spec} is not valid TOML: {error}")),
         };
+        // GitHub credentials never come from a tracked layer; see
+        // `repository_controlled_layers`.
+        if let Some(toml::Value::Table(github)) = project.get_mut("github") {
+            github.remove("auth");
+        }
         let mut data = Table::new();
         let layered =
             merge_if_present(&mut data, &self.global_dir.join("config.toml")).and_then(|()| {
@@ -213,11 +218,36 @@ impl LoadedConfig {
     /// Resolve a dotted key from the merged configuration.
     #[must_use]
     pub fn get<'a>(&'a self, dotted_key: &str) -> Option<&'a toml::Value> {
-        let mut current = self.data.get(dotted_key.split('.').next()?)?;
-        for part in dotted_key.split('.').skip(1) {
-            current = current.get(part)?;
+        table_get(&self.data, dotted_key)
+    }
+
+    /// The config files the repository being operated on controls, parsed,
+    /// keeping only those `relevant` accepts.
+    ///
+    /// That is the tracked project file and, when a branch has committed it,
+    /// the local overlay file. Credentials and controller-side execution must
+    /// never come from these layers. The local overlay is only asked about git
+    /// when it is relevant, so the common path spawns nothing.
+    pub fn repository_controlled_layers(
+        &self,
+        relevant: impl Fn(&Table) -> bool,
+    ) -> ConfigResult<Vec<(PathBuf, Table)>> {
+        let mut layers = Vec::new();
+        if let Some(project_dir) = &self.project_dir {
+            let path = project_dir.join("config.toml");
+            if let Some(table) = read_layer(&path)?.filter(|table| relevant(table)) {
+                layers.push((path, table));
+            }
         }
-        Some(current)
+        if let Some(local_dir) = &self.local_dir {
+            let path = local_dir.join("config.toml");
+            if let Some(table) = read_layer(&path)?.filter(|table| relevant(table))
+                && git_tracks(local_dir, "config.toml")
+            {
+                layers.push((path, table));
+            }
+        }
+        Ok(layers)
     }
 
     /// Resolve a dotted key as a string.
@@ -272,22 +302,49 @@ impl Error for ConfigLoadError {
     }
 }
 
-fn merge_if_present(base: &mut Table, path: &Path) -> ConfigResult<()> {
-    if !path.exists() {
-        return Ok(());
+/// Resolve a dotted key inside one parsed config table.
+#[must_use]
+pub fn table_get<'a>(table: &'a Table, dotted_key: &str) -> Option<&'a toml::Value> {
+    let mut current = table.get(dotted_key.split('.').next()?)?;
+    for part in dotted_key.split('.').skip(1) {
+        current = current.get(part)?;
     }
+    Some(current)
+}
 
+fn read_layer(path: &Path) -> ConfigResult<Option<Table>> {
+    if !path.exists() {
+        return Ok(None);
+    }
     let contents = fs::read_to_string(path).map_err(|source| ConfigLoadError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let parsed = contents
-        .parse::<toml::Table>()
+    contents
+        .parse::<Table>()
+        .map(Some)
         .map_err(|source| ConfigLoadError::Parse {
             path: path.to_path_buf(),
             source: Box::new(source),
-        })?;
-    deep_merge(base, &parsed);
+        })
+}
+
+/// Whether git tracks `file` inside `dir`. Anything git cannot answer counts
+/// as untracked, which is what a directory outside any checkout is.
+fn git_tracks(dir: &Path, file: &str) -> bool {
+    Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--", file])
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn merge_if_present(base: &mut Table, path: &Path) -> ConfigResult<()> {
+    if let Some(parsed) = read_layer(path)? {
+        deep_merge(base, &parsed);
+    }
     Ok(())
 }
 

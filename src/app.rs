@@ -1774,13 +1774,14 @@ mod tests {
         std::fs::set_permissions(path, permissions).expect("chmod script");
     }
 
-    /// Point `dir`'s Shipyard project config at a refusing fake `gh`, so a
-    /// command run with `--cwd dir` never runs the host's.
+    /// Point `dir`'s untracked local Shipyard config at a refusing fake `gh`,
+    /// so a command run with `--cwd dir` never runs the host's. (A tracked
+    /// layer may not set `github.auth`.)
     fn refuse_gh_in(dir: &std::path::Path) {
-        std::fs::create_dir_all(dir.join(".shipyard")).expect("project config dir");
+        std::fs::create_dir_all(dir.join(".shipyard.local")).expect("local config dir");
         #[cfg(unix)]
         std::fs::write(
-            dir.join(".shipyard/config.toml"),
+            dir.join(".shipyard.local/config.toml"),
             crate::test_support::refusing_gh_config(),
         )
         .expect("project config");
