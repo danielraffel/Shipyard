@@ -4954,6 +4954,42 @@ mod tests {
     }
 
     #[test]
+    fn repeated_work_cost_keeps_all_unlinked_ids_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        for (kind, id) in [
+            ("superseded_exact_head", "sy-abc"),
+            ("duplicate_exact_head_config", "42"),
+            ("future_kind", "7"),
+        ] {
+            let input = RepeatedWorkShadowInput {
+                kind: if kind == "superseded_exact_head" {
+                    RepeatedWorkKind::SupersededExactHead
+                } else {
+                    RepeatedWorkKind::DuplicateExactHeadConfig
+                },
+                branch: "main".into(),
+                sha: "sha".into(),
+                target_config: "cfg".into(),
+                mode: "normal".into(),
+                job_id: id.into(),
+                superseded_job_id: "old".into(),
+                superseded_sha: "oldsha".into(),
+            };
+            store.record_repeated_work_shadow(&input).unwrap();
+        }
+        let summary = store.repeated_work_cost(100).unwrap();
+        assert_eq!(summary.duration_ms, None);
+        assert_eq!(summary.joined_durations, 0);
+        assert_eq!(summary.unknown_durations, 3);
+        assert_eq!(store.repeated_work_cost(0).unwrap().observations, 0);
+        assert_eq!(
+            serde_json::to_value(summary).unwrap()["duration_ms"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
     fn terminal_batch_rolls_back_when_sql_fails_after_first_write() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
