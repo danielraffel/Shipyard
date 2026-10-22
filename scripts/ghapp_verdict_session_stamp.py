@@ -14,17 +14,20 @@ stays the last line, so every verdict reader is unchanged. ``queue-arm-guard``
 refuses an arm whose agent id equals the deciding approval's, and only warns
 when just the session matches (every agent of one team shares it).
 
-Output: ``SHIPYARD-STAMP-V1``, the (possibly rewritten) argv, then
-``SHIPYARD-STAMP-END``, every item NUL-terminated. ``ghapp`` uses the
-rewritten argv only when both sentinels are present and reads for at most 5
-seconds, so a failure, a hang or a truncated answer posts the comment
-unstamped; the stamper also stops itself after 5 seconds. ``ghapp`` then
-refuses the comment only if its body carries stamp text, which nothing has
-vouched for.
-Handled: ``pr comment``/``issue comment`` with ``--body``/``-b``, or with
-``--body-file``/``-F <file>``, which becomes a ``--body`` (no file is written);
-``api`` on an issue-comment endpoint with ``-f``/``-F``/``--field``/
-``--raw-field body=...`` (a typed ``body=@<file>`` is read), or
+Output: ``SHIPYARD-STAMP-V2``, the (possibly rewritten) argv,
+``SHIPYARD-STAMP-OWN`` and the stamp line this run wrote (empty when none),
+then ``SHIPYARD-STAMP-END``, every item NUL-terminated. ``ghapp`` uses the
+rewritten argv only when that whole answer arrives, reading for at most 5
+seconds; the stamper also stops itself after 5 seconds. Whatever happens
+here, ``ghapp`` then checks the final request and every body source gh will
+read, and refuses any stamp text other than the one line named after
+``SHIPYARD-STAMP-OWN``.
+Handled: ``pr comment``, ``issue comment`` and ``pr review`` with
+``--body``/``-b``, or with ``--body-file``/``-F <file>``, which becomes a
+``--body`` (no file is written); ``pr close``/``issue close`` with
+``--comment``/``-c``; ``api`` on an issue-comment endpoint (after dropping a
+host, query and trailing slash) with every ``-f``/``-F``/``--field``/
+``--raw-field body=...`` (a typed ``body=@<file>`` is read) and an
 ``--input <file>`` holding a ``{"body": ...}`` object, which becomes a
 ``--raw-field body=...``. ``ghapp`` spools a body read from stdin to a private
 file first, so stdin takes the file path. Every stamp already in any comment
@@ -50,7 +53,10 @@ from typing import Any, Callable, Optional, Tuple
 # one stray byte cannot crash the stamper and post a foreign stamp unstripped
 # (Python reads argv the same way).
 BODY_ERRORS = "surrogateescape"
-SENTINEL = "SHIPYARD-STAMP-V1"
+SENTINEL = "SHIPYARD-STAMP-V2"
+# Precedes the stamp line this run wrote (empty when it wrote none): ghapp
+# lets that one line through its stamp-text check and nothing else.
+OWN = "SHIPYARD-STAMP-OWN"
 END = "SHIPYARD-STAMP-END"
 DEADLINE_SECONDS = 5
 SESSION_ENVS = ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
@@ -65,7 +71,24 @@ _MARKER = re.compile(
 # the arm guard checks the stamp's host against the `session:` line, so a
 # stamp written by hand (or copied with the rest of a verdict) must not stand.
 _STAMPED = re.compile(r"<!--\s*session:.*?-->", re.DOTALL)
-_COMMENT_ENDPOINT = re.compile(r"^/?repos/[^/]+/[^/]+/issues/(?:[0-9]+/comments|comments/[0-9]+)$")
+_COMMENT_ENDPOINT = re.compile(r"^repos/[^/]+/[^/]+/issues/(?:[0-9]+/comments|comments/[0-9]+)$")
+_API_HOST = re.compile(r"^[a-z][a-z0-9+.-]*://[^/]*(?:/api/v3)?", re.IGNORECASE)
+# The pull-request and issue commands that post a comment, with the options
+# that carry its text and the options that name a file holding it.
+COMMENT_COMMANDS = {
+    ("pr", "comment"): (("--body", "-b"), ("--body-file", "-F")),
+    ("issue", "comment"): (("--body", "-b"), ("--body-file", "-F")),
+    ("pr", "review"): (("--body", "-b"), ("--body-file", "-F")),
+    ("pr", "close"): (("--comment", "-c"), ()),
+    ("issue", "close"): (("--comment", "-c"), ()),
+}
+
+
+def api_path(argument: str) -> str:
+    """An `api` endpoint as GitHub routes it: no scheme and host (or
+    `/api/v3`), query, fragment, or leading and trailing slashes."""
+    path = _API_HOST.sub("", argument.split("#", 1)[0].split("?", 1)[0])
+    return path.strip("/")
 
 
 def stamp() -> str:
@@ -159,13 +182,15 @@ def _field_body(flag: str, value: str) -> Optional[str]:
 
 
 def _rewrite_field(args: list[str]) -> bool:
+    """Every `body=` field stamped or stripped in place."""
+    changed = False
     for i, arg in enumerate(args[:-1]):
         if arg in ("-f", "-F", "--field", "--raw-field") and args[i + 1].startswith("body="):
             body = _field_body(arg, args[i + 1])
             new = stamped(body) if body is not None else None
             if new is not None:
                 args[i:i + 2] = ["--raw-field", "body=" + new]
-                return True
+                changed = True
     for i, arg in enumerate(args):
         for flag in ("--field=", "--raw-field="):
             if arg.startswith(flag + "body="):
@@ -173,8 +198,8 @@ def _rewrite_field(args: list[str]) -> bool:
                 new = stamped(body) if body is not None else None
                 if new is not None:
                     args[i] = "--raw-field=body=" + new
-                    return True
-    return False
+                    changed = True
+    return changed
 
 
 def _rewrite_input(args: list[str]) -> bool:
@@ -201,42 +226,55 @@ def _rewrite_input(args: list[str]) -> bool:
     return False
 
 
-def rewrite(args: list[str]) -> list[str]:
-    """``args`` with a verdict comment's body stamped; unchanged otherwise."""
-    out = list(args)
-    if len(out) >= 2 and out[0] in ("pr", "issue") and out[1] == "comment":
-        for i, arg in enumerate(out[:-1]):
-            if arg in ("--body", "-b"):
-                new = stamped(out[i + 1])
-                if new is not None:
-                    out[i + 1] = new
-                return out
-        for i, arg in enumerate(out):
-            if arg.startswith("--body="):
-                new = stamped(arg[len("--body="):])
-                if new is not None:
-                    out[i] = "--body=" + new
-                return out
-        for i, arg in enumerate(out):
-            if arg in ("--body-file", "-F") and i + 1 < len(out):
-                path, span = out[i + 1], 2
-            elif arg.startswith("--body-file="):
-                path, span = arg[len("--body-file="):], 1
-            else:
+def _rewrite_command(out: list[str], text_flags: tuple[str, ...],
+                     file_flags: tuple[str, ...]) -> None:
+    """Every comment text in a pull-request or issue command, stamped or
+    stripped in place; a text file becomes the first text option."""
+    i = 0
+    while i < len(out):
+        arg, value, span, is_file = out[i], None, 0, False
+        for flag in (*text_flags, *file_flags):
+            if arg == flag and i + 1 < len(out):
+                value, span, is_file = out[i + 1], 2, flag in file_flags
+            elif flag.startswith("--") and arg.startswith(flag + "="):
+                value, span, is_file = arg[len(flag) + 1:], 1, flag in file_flags
+            if span:
+                break
+        if not span:
+            i += 1
+            continue
+        if is_file:
+            if value == "-":
+                i += span
                 continue
-            if path == "-":
-                return out
-            with open(path, encoding="utf-8", errors=BODY_ERRORS) as handle:
-                new = stamped(handle.read())
+            with open(value, encoding="utf-8", errors=BODY_ERRORS) as handle:
+                body = handle.read()
+            new = stamped(body)
             if new is not None:
-                out[i:i + span] = ["--body", new]
-            return out
+                out[i:i + span] = [text_flags[0], new]
+                span = 2
+        else:
+            new = stamped(value)
+            if new is not None:
+                out[i:i + span] = [out[i], new] if span == 2 else [f"{arg.split('=', 1)[0]}={new}"]
+        i += span
+
+
+def rewrite(args: list[str]) -> list[str]:
+    """``args`` with every comment body stamped (a verdict) or stripped of
+    stamps; unchanged otherwise."""
+    out = list(args)
+    if len(out) >= 2 and (out[0], out[1]) in COMMENT_COMMANDS:
+        _rewrite_command(out, *COMMENT_COMMANDS[(out[0], out[1])])
         return out
     if out and out[0] == "api":
-        if not any(_COMMENT_ENDPOINT.match(arg) for arg in out[1:] if not arg.startswith("-")):
+        if not any(_COMMENT_ENDPOINT.match(api_path(arg))
+                   for arg in out[1:] if not arg.startswith("-")):
             return out
-        if not _rewrite_field(out):
-            _rewrite_input(out)
+        # Both: gh sends `--input` as the request body and the fields as the
+        # query, so a clean field must not hide a stamped input.
+        _rewrite_field(out)
+        _rewrite_input(out)
     return out
 
 
@@ -257,9 +295,12 @@ def main(args: list[str]) -> int:
             result = rewrite(args)
         except Exception:  # noqa: BLE001 - never block a comment over a stamp
             return 0
+        own = stamp()
+        if not any(own in arg for arg in result):
+            own = ""
         sys.stdout.buffer.write(
             b"".join(item.encode("utf-8", BODY_ERRORS) + b"\0"
-                     for item in [SENTINEL, *result, END]))
+                     for item in [SENTINEL, *result, OWN, own, END]))
         return 0
     finally:
         if alarm:

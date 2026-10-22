@@ -98,13 +98,21 @@ or not, whether written by hand or copied with the rest of a verdict, is
 removed, repeatedly until none is left, since one pass can join the pieces
 around a removed stamp into a new one; only a verdict then gets this
 session's stamp. Bodies are read byte for byte (`surrogateescape`), so a
-stray non-UTF-8 byte cannot crash the stamper. The stamp is optional, but
-stamp text nothing vouched for is not: when the stamper fails or times out
-on a comment, or the request is one it does not parse but a review guard
-reads (`api graphql`, a pull request's reviews or review comments, `pr
-review`), `ghapp` refuses the request if any argument, body file,
-`--input` or spooled stdin carries `<!--` followed by `session:`, and a body
-file that is not a regular file (a FIFO) cannot be checked and is refused.
+stray non-UTF-8 byte cannot crash the stamper. Comments it stamps or strips:
+`pr comment`, `issue comment` and `pr review` bodies, `pr close` and `issue
+close` comments, and `api` calls to an issue-comment endpoint however it is
+written (a query, a trailing slash or an API host is dropped first), every
+`body=` field and an `--input` body among them.
+
+The stamp is optional; other stamp text is not. After the stamper, whatever
+it answered, `ghapp` checks the final request and every body source gh will
+read (arguments, fields, `--input`, `-F k=@file`, body files and spooled
+stdin) on every command except `pr create`, `pr edit`, `issue create` and
+`issue edit` (descriptions, which no review guard reads), and refuses it if
+any carries `<!--` followed by `session:` other than the one stamp line the
+stamper reports writing (`SHIPYARD-STAMP-OWN` in its answer). A body file
+that is not a regular file (a FIFO) cannot be checked and is refused; an
+`api` output filter (`--jq`, `--template`) is never sent and is not checked.
 A request without stamp text posts as before. The session is `CLAUDE_CODE_SESSION_ID`, else
 `CODEX_COMPANION_SESSION_ID`, else `unattributed`; `agent: <id>` appears only
 when `SHIPYARD_AGENT_ID` is set. The marker stays the last line, so every
