@@ -25,6 +25,9 @@ use serde_json::Value;
 
 pub use project_key::ProjectKey;
 
+/// Reserved provider identity for authenticated local queue timing rows.
+pub const QUEUE_PROVIDER: &str = "shipyard-queue";
+
 /// Durable Shipyard metrics store backed by `SQLite`.
 #[derive(Debug)]
 pub struct MetricsStore {
@@ -594,6 +597,9 @@ impl MetricsStore {
               failure_class TEXT,
               external_id TEXT,
               correlation_id TEXT,
+              queue_job_id TEXT,
+              queue_identity TEXT,
+              queue_disposition TEXT,
               UNIQUE(provider, external_id)
             );
             CREATE TABLE IF NOT EXISTS steps (
@@ -647,6 +653,13 @@ impl MetricsStore {
         add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
         add_column_if_missing(&conn, "jobs", "labels_json", "TEXT")?;
         add_column_if_missing(&conn, "jobs", "correlation_id", "TEXT")?;
+        add_column_if_missing(&conn, "jobs", "queue_job_id", "TEXT")?;
+        add_column_if_missing(&conn, "jobs", "queue_identity", "TEXT")?;
+        add_column_if_missing(&conn, "jobs", "queue_disposition", "TEXT")?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS jobs_queue_job_id_unique ON jobs(queue_job_id) WHERE queue_job_id IS NOT NULL",
+            [],
+        )?;
         add_column_if_missing(&conn, "runs", "event", "TEXT")?;
         add_column_if_missing(&conn, "runs", "provider_run_id", "INTEGER")?;
         add_column_if_missing(&conn, "runs", "run_attempt", "INTEGER")?;
@@ -998,6 +1011,9 @@ impl MetricsStore {
         input: &MetricRecordInput,
         refresh_existing: bool,
     ) -> Result<i64, Box<dyn std::error::Error>> {
+        if input.provider.as_deref() == Some(QUEUE_PROVIDER) {
+            return Err("reserved queue provider requires authenticated queue writer".into());
+        }
         let (project, repo) =
             project_key::normalize_for_write(&input.project, input.repo.as_deref());
         let normalized = MetricRecordInput {
