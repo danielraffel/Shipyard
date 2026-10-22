@@ -37,6 +37,55 @@ const ORPHAN_REQUEST_MESSAGE: &str = "Queued request envelope missing or unreada
 const SUPERSEDED_MESSAGE: &str =
     "Superseded by a newer queued job for the same branch, targets, and mode.";
 
+/// Conservative classification of a durable queue terminal transition.
+///
+/// This is deliberately pure. Metrics writers can consume it after the queue
+/// commit without changing queue liveness or inventing timing evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueueTerminalDisposition {
+    /// A running job completed with authoritative timing and target results.
+    Clean,
+    /// A job that had started was cancelled; its partial runtime is excluded.
+    CancelledMidRun,
+    /// The transition is ambiguous or carries recovery uncertainty.
+    Uncertain,
+    /// A pending job was cancelled before it ever ran; no timing row exists.
+    NoTiming,
+}
+
+/// Classify a terminal transition from its persisted predecessor.
+pub(crate) fn classify_queue_terminal(
+    prior: &Job,
+    next: &Job,
+) -> Option<QueueTerminalDisposition> {
+    if !matches!(next.status, JobStatus::Completed | JobStatus::Cancelled) {
+        return None;
+    }
+    if prior.status == JobStatus::Pending && next.status == JobStatus::Cancelled {
+        return Some(QueueTerminalDisposition::NoTiming);
+    }
+    if prior.status == JobStatus::Running && next.status == JobStatus::Cancelled {
+        return Some(QueueTerminalDisposition::CancelledMidRun);
+    }
+    if prior.status != JobStatus::Running || next.status != JobStatus::Completed {
+        return Some(QueueTerminalDisposition::Uncertain);
+    }
+    let timed = next
+        .started_at
+        .zip(next.completed_at)
+        .is_some_and(|(started, completed)| started <= completed);
+    let complete_results = next.target_names.iter().all(|target| {
+        next.results
+            .get(target)
+            .is_some_and(|result| result.failure_class.as_deref() != Some("UNCERTAIN"))
+    });
+    if timed && complete_results {
+        Some(QueueTerminalDisposition::Clean)
+    } else {
+        Some(QueueTerminalDisposition::Uncertain)
+    }
+}
+
 /// Cancellation reason for a pending job whose pull request was already merged
 /// while it waited in the queue.
 pub const ALREADY_MERGED_CANCEL_REASON: &str = "PR already merged";
@@ -1413,6 +1462,7 @@ fn sync_directory_best_effort(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use super::{QueueTerminalDisposition, classify_queue_terminal};
     use std::cell::Cell;
     use std::fs;
     use std::io;
@@ -1462,6 +1512,39 @@ mod tests {
         let mut running = job(branch, sha, &["mac"]).start().expect("start");
         running.started_at = Some(Utc::now() - chrono::Duration::seconds(started_secs_ago));
         running
+    }
+
+    #[test]
+    fn terminal_classifier_is_conservative_and_transition_based() {
+        let pending = job("main", "pending", &["mac"]);
+        let mut cancelled = pending.clone();
+        cancelled.status = JobStatus::Cancelled;
+        assert_eq!(
+            classify_queue_terminal(&pending, &cancelled),
+            Some(QueueTerminalDisposition::NoTiming)
+        );
+
+        let running = pending.start().expect("start");
+        let mut mid_run_cancel = running.clone();
+        mid_run_cancel.status = JobStatus::Cancelled;
+        assert_eq!(
+            classify_queue_terminal(&running, &mid_run_cancel),
+            Some(QueueTerminalDisposition::CancelledMidRun)
+        );
+
+        let mut completed = running.complete().expect("complete");
+        completed.target_names.clear();
+        assert_eq!(
+            classify_queue_terminal(&running, &completed),
+            Some(QueueTerminalDisposition::Clean)
+        );
+
+        let mut uncertain = completed.clone();
+        uncertain.completed_at = None;
+        assert_eq!(
+            classify_queue_terminal(&running, &uncertain),
+            Some(QueueTerminalDisposition::Uncertain)
+        );
     }
 
     #[test]
