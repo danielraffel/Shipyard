@@ -12,7 +12,7 @@ use crate::job::{CancellationCause, Job, JobStatus, ValidationMode};
 use crate::metrics::{MetricsStore, QUEUE_AUTHORITY_TOKEN, QueueTerminalTiming};
 use crate::queue::{
     ALREADY_MERGED_CANCEL_REASON, Queue, QueueError, QueueTerminalDisposition,
-    classify_queue_terminal,
+    classify_queue_terminal, queue_timing_identity,
 };
 use crate::queue_request::{
     QueueOutcomeStore, QueueRequestError, QueueRequestStore, QueuedExecutionKind,
@@ -84,14 +84,7 @@ pub(crate) fn persist_terminal_outcome(
                 QueueTerminalDisposition::Uncertain => ("uncertain", None),
                 QueueTerminalDisposition::NoTiming => return result,
             };
-            let identity = format!(
-                "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{}",
-                job.created_at.to_rfc3339(),
-                job.sha,
-                job.branch,
-                job.mode,
-                job.target_names.join(",")
-            );
+            let identity = queue_timing_identity(job);
             let timing = QueueTerminalTiming {
                 queue_job_id: job.id.clone(),
                 queue_identity: identity,

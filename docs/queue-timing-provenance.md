@@ -6,9 +6,7 @@ does not make queue scheduling depend on metrics storage.
 ## Identity and granularity
 
 The queue `Job.id` is the only authoritative identity for a local queue job.
-Metrics stores a nullable `jobs.queue_job_id` and a partial unique index over
-non-null values. A terminal event may insert or refresh one metrics row for one
-queue job; it must never create one row per validation target.
+Metrics stores one authoritative `queue_timing` row keyed by `queue_job_id`. A terminal event may insert or refresh one row for one queue job; it must never create one row per validation target.
 
 Rows written by the queue producer use a queue-owned provider identity and are
 excluded from GitHub/TartCI pull-request aggregates. They are advisory timing
