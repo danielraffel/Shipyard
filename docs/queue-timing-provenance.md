@@ -14,6 +14,11 @@ Rows written by the queue producer use a queue-owned provider identity and are
 excluded from GitHub/TartCI pull-request aggregates. They are advisory timing
 evidence, not a second provider observation.
 
+That provider identity is reserved for the in-process terminal producer.
+`metrics record` and import paths must reject attempts to supply it or a
+`queue_job_id`; callers cannot authenticate queue provenance by choosing a
+string.
+
 ## Producer boundary
 
 The producer runs after a queue terminal state has been durably committed. It
@@ -27,6 +32,12 @@ completion is retained as excluded or flagged evidence and is never used as a
 duration. Requeued jobs measure the final attempt only; this limitation is
 explicit in reports.
 
+Mid-run cancellations are also excluded or flagged. A later conservative
+terminal state wins over an earlier clean callback, and an older callback may
+never restore a duration after an uncertain or cancelled state. Refreshes must
+validate immutable queue identity (creation time, SHA, branch, targets, and
+mode), not only the short queue ID.
+
 ## Aggregation semantics
 
 `repeated_work_shadow.job_id` identifies the surviving job. A matching timing
@@ -39,6 +50,10 @@ Unmatched, excluded, and unknown-duration observations remain visible as
 coverage counts. They are never converted to zero and never treated as
 evidence of savings.
 
+If several shadow rows identify one survivor, counting that survivor once is an
+intentional conservative undercount. In a supersession chain, unmatched rows
+for jobs that never ran are expected and remain part of coverage reporting.
+
 ## Required validation
 
 The implementation must prove migration of an old database, exact identity
@@ -46,3 +61,8 @@ round-trips, duplicate terminal-event deduplication, multi-target and
 multi-shadow aggregation, never-started cancellation exclusion, uncertain
 completion exclusion, best-effort failure behavior, and unchanged existing
 pull-request aggregates.
+
+Validation must also prove that ordinary record/import APIs cannot forge queue
+provenance, that immutable identity mismatches are rejected, that mid-run
+cancellation is excluded, and that callback ordering cannot turn an uncertain
+or cancelled result back into a clean duration.
