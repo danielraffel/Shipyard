@@ -27,6 +27,27 @@ pub use project_key::ProjectKey;
 
 /// Reserved provider identity for authenticated local queue timing rows.
 pub const QUEUE_PROVIDER: &str = "shipyard-queue";
+const QUEUE_AUTHORITY_TOKEN: &str = "shipyard-queue-terminal-v1";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QueueTerminalTiming {
+    pub queue_job_id: String,
+    pub queue_identity: String,
+    pub disposition: String,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub total_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct QueueTimingRow {
+    pub queue_job_id: String,
+    pub queue_identity: String,
+    pub queue_disposition: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub total_ms: Option<i64>,
+}
 
 /// Durable Shipyard metrics store backed by `SQLite`.
 #[derive(Debug)]
@@ -517,6 +538,16 @@ type ScorecardSample = (
 );
 
 impl MetricsStore {
+    pub(crate) fn record_queue_terminal(&self, token: &str, timing: &QueueTerminalTiming) -> Result<(), Box<dyn std::error::Error>> {
+        if token != QUEUE_AUTHORITY_TOKEN || timing.queue_job_id.is_empty() || timing.queue_identity.is_empty() { return Err("unauthorized queue timing writer".into()); }
+        let conn = self.connect()?;
+        conn.execute("INSERT INTO runs (ts,project,status,provenance,provenance_verified) VALUES (?1,'queue','terminal',?2,1)", params![Utc::now().to_rfc3339(), QUEUE_PROVIDER])?;
+        let run_id = conn.last_insert_rowid();
+        let total = (timing.disposition == "clean").then_some(timing.total_ms).flatten().filter(|v| *v >= 0);
+        conn.execute("INSERT INTO jobs (run_id,job,provider,started_at,completed_at,total_ms,status,queue_job_id,queue_identity,queue_disposition) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(queue_job_id) DO UPDATE SET completed_at=excluded.completed_at,total_ms=CASE WHEN excluded.queue_disposition='clean' THEN excluded.total_ms ELSE NULL END,queue_disposition=excluded.queue_disposition", params![run_id, timing.queue_job_id, QUEUE_PROVIDER, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), total, timing.disposition, timing.queue_job_id, timing.queue_identity, timing.disposition])?;
+        Ok(())
+    }
+
     /// Open a metrics store under the selected Shipyard state directory.
     pub fn open(state_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let dir = state_dir.join("metrics");
