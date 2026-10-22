@@ -56,6 +56,7 @@ name  = "shipyard-release-bot"
 email = "shipyard-release-bot@users.noreply.github.com"
 
 [auto_merge]
+human_reviewers = ["danielraffel"]
 # Who may sign the fleet App's `verdict: APPROVE`: an approval posted through
 # ghapp counts only with a `reviewer: <name>` line naming one of these. This
 # list beats any host's reviewer-signers.json. `shipyard review-verdict` and
