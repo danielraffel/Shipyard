@@ -4,7 +4,7 @@ description: Upgrade the Shipyard CLI to the latest (or a specific) version
 ---
 
 Upgrade the `shipyard` CLI binary in place. Uses the same installer
-the Claude Code plugin's SessionStart hook calls — drops the new
+the Claude Code plugin's SessionStart hook tells you to run — drops the new
 binary at `~/.local/bin/shipyard` (the canonical location), no
 other files touched.
 

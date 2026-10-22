@@ -13,7 +13,7 @@ companion to the same directory by default:
 | Path | Lands at |
 |---|---|
 | `curl … install.sh` | `~/.local/bin/shipyard` |
-| Claude Code plugin (auto-installs on first session if missing) | `~/.local/bin/shipyard` |
+| Claude Code plugin (prints the install command on first session if missing; never installs on its own) | `~/.local/bin/shipyard` |
 | Codex one-liner (same `install.sh`) | `~/.local/bin/shipyard` |
 | Project pinners (see "Pin a specific version" below) | `~/.local/bin/shipyard` (recommended) |
 
@@ -30,6 +30,11 @@ curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
 Downloads the matched CLI/provider pair for your platform and installs both in
 `~/.local/bin`. A rollback to a release before v0.127.0 removes the newer
 provider after the older CLI passes its smoke test.
+
+Every download is checked against the release's `checksums.sha256` before it
+is mounted, re-signed, or run. A digest mismatch, or a checksums file with no
+entry for the asset, aborts the install. Only a release that publishes no
+`checksums.sha256` at all installs unverified, with a warning.
 
 ## First-run auth
 
