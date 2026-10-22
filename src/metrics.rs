@@ -538,12 +538,47 @@ type ScorecardSample = (
 );
 
 impl MetricsStore {
-    pub(crate) fn record_queue_terminal(&self, token: &str, timing: &QueueTerminalTiming) -> Result<(), Box<dyn std::error::Error>> {
-        if token != QUEUE_AUTHORITY_TOKEN || timing.queue_job_id.is_empty() || timing.queue_identity.is_empty() { return Err("unauthorized queue timing writer".into()); }
+    pub(crate) fn record_queue_terminal(
+        &self,
+        token: &str,
+        timing: &QueueTerminalTiming,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if token != QUEUE_AUTHORITY_TOKEN
+            || timing.queue_job_id.is_empty()
+            || timing.queue_identity.is_empty()
+        {
+            return Err("unauthorized queue timing writer".into());
+        }
         let conn = self.connect()?;
+        if let Some((identity, existing)) = conn
+            .query_row(
+                "SELECT queue_identity, queue_disposition FROM jobs WHERE queue_job_id=?1",
+                params![timing.queue_job_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if identity != timing.queue_identity {
+                return Err("queue identity mismatch".into());
+            }
+            fn rank(s: &str) -> u8 {
+                match s {
+                    "clean" => 0,
+                    "cancelled_mid_run" => 1,
+                    "uncertain" => 2,
+                    _ => 3,
+                }
+            }
+            if rank(&existing) >= rank(&timing.disposition) {
+                return Ok(());
+            }
+        }
         conn.execute("INSERT INTO runs (ts,project,status,provenance,provenance_verified) VALUES (?1,'queue','terminal',?2,1)", params![Utc::now().to_rfc3339(), QUEUE_PROVIDER])?;
         let run_id = conn.last_insert_rowid();
-        let total = (timing.disposition == "clean").then_some(timing.total_ms).flatten().filter(|v| *v >= 0);
+        let total = (timing.disposition == "clean")
+            .then_some(timing.total_ms)
+            .flatten()
+            .filter(|v| *v >= 0);
         conn.execute("INSERT INTO jobs (run_id,job,provider,started_at,completed_at,total_ms,status,queue_job_id,queue_identity,queue_disposition) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(queue_job_id) DO UPDATE SET completed_at=excluded.completed_at,total_ms=CASE WHEN excluded.queue_disposition='clean' THEN excluded.total_ms ELSE NULL END,queue_disposition=excluded.queue_disposition", params![run_id, timing.queue_job_id, QUEUE_PROVIDER, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), total, timing.disposition, timing.queue_job_id, timing.queue_identity, timing.disposition])?;
         Ok(())
     }
@@ -1042,7 +1077,11 @@ impl MetricsStore {
         input: &MetricRecordInput,
         refresh_existing: bool,
     ) -> Result<i64, Box<dyn std::error::Error>> {
-        if input.provider.as_deref().is_some_and(|p| p.trim().eq_ignore_ascii_case(QUEUE_PROVIDER)) {
+        if input
+            .provider
+            .as_deref()
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case(QUEUE_PROVIDER))
+        {
             return Err("reserved queue provider requires authenticated queue writer".into());
         }
         let (project, repo) =
@@ -1189,7 +1228,9 @@ impl MetricsStore {
     }
 
     fn import_tartci_value(&self, value: &Value) -> Result<bool, Box<dyn std::error::Error>> {
-        if value_str(value, "provider").is_some_and(|p| p.trim().eq_ignore_ascii_case(QUEUE_PROVIDER)) {
+        if value_str(value, "provider")
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case(QUEUE_PROVIDER))
+        {
             return Err("reserved queue provider is not accepted from tartci import".into());
         }
         let conn = self.connect()?;
