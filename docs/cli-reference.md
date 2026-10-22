@@ -150,6 +150,7 @@ shipyard metrics record --project pulp --job linux-arm64 --step compile --durati
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics summary --project pulp --json
+shipyard metrics repeated-work-cost --limit 1000 --json
 shipyard metrics summary --project pulp --group-by host --json   # fold ephemeral runners into their host
 shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
@@ -758,3 +759,8 @@ phase), its duration and status, and optional start/completion timestamps. A
 terminal refresh updates the existing row only when the phase name matches;
 new phase names append rows under the same correlation ID. No phase duration is
 inferred from a job total.
+
+`metrics repeated-work-cost` is read-only shadow accounting. It reports the
+avoided repeated-work cost basis and preserves duration as unavailable until a
+provenance-safe linkage from queue job IDs to metrics rows exists; it never
+infers cost from numeric-looking IDs.

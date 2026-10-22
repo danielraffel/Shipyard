@@ -320,6 +320,17 @@ pub(super) fn metrics_command<W: Write>(
             write_summary(stdout, json_output, store.path(), group_by, rows, freshness)?;
             return Ok(exit);
         }
+        MetricsCommand::RepeatedWorkCost(args) => {
+            let summary = store.repeated_work_cost(args.limit).map_err(|error| {
+                CliFailure::new(1, format!("metrics repeated-work-cost failed: {error}"))
+            })?;
+            write_output(stdout, json_output, &summary, || {
+                format!(
+                    "{} repeated-work observations; avoided cost unavailable ({} unjoined)",
+                    summary.observations, summary.unknown_durations
+                )
+            })?;
+        }
         MetricsCommand::Slowest(args) => {
             let rows = store
                 .slowest(args.project.as_deref(), args.limit)

@@ -5034,3 +5034,8 @@ has no value. Wasted compute per change counts every failed or cancelled job of
 the merged pull request, earlier pushes included; duplicate receipts for one
 head count once. Waste is matched by PR number, so
 merge-group runs are not counted, and it is not limited to the scorecard window.
+
+### Repeated-work cost
+
+`shipyard metrics repeated-work-cost` is read-only shadow accounting; duration
+remains unavailable until queue-to-metrics provenance is authenticated.

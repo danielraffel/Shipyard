@@ -156,6 +156,19 @@ pub struct RepeatedWorkShadowRow {
     pub superseded_sha: String,
 }
 
+/// Read-only avoided-cost accounting; durations stay unavailable until a
+/// provenance-safe queue-to-metrics linkage exists.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepeatedWorkCostSummary {
+    pub cost_basis: &'static str,
+    pub observations: usize,
+    pub superseded_exact_head: usize,
+    pub duplicate_exact_head_config: usize,
+    pub joined_durations: usize,
+    pub unknown_durations: usize,
+    pub duration_ms: Option<i64>,
+}
+
 /// One grouped timing summary row.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MetricsSummaryRow {
@@ -895,6 +908,42 @@ impl MetricsStore {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Aggregate shadow observations. Durations remain unavailable until a
+    /// provenance-safe queue-to-metrics linkage exists.
+    pub fn repeated_work_cost(
+        &self,
+        limit: usize,
+    ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT kind, job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
+        let ids = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = RepeatedWorkCostSummary {
+            cost_basis: "avoided_repeated_work",
+            observations: 0,
+            superseded_exact_head: 0,
+            duplicate_exact_head_config: 0,
+            joined_durations: 0,
+            unknown_durations: 0,
+            duration_ms: None,
+        };
+        for item in ids {
+            let (kind, job_id) = item?;
+            out.observations += 1;
+            match kind.as_str() {
+                "superseded_exact_head" => out.superseded_exact_head += 1,
+                "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
+                _ => {}
+            }
+            // Queue ids (`sy-...`) are not SQLite job identities. Without an
+            // authenticated linkage, every duration remains unavailable.
+            let _ = job_id;
+            out.unknown_durations += 1;
+        }
+        Ok(out)
     }
 
     /// Record one low-friction timing row.
@@ -4903,6 +4952,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(event, "pull_request");
+    }
+
+    #[test]
+    fn repeated_work_cost_keeps_all_unlinked_ids_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        for (kind, id) in [
+            (RepeatedWorkKind::SupersededExactHead, "sy-abc"),
+            (RepeatedWorkKind::DuplicateExactHeadConfig, "42"),
+        ] {
+            let input = RepeatedWorkShadowInput {
+                kind,
+                branch: "main".into(),
+                sha: "sha".into(),
+                target_config: "cfg".into(),
+                mode: "normal".into(),
+                job_id: id.into(),
+                superseded_job_id: "old".into(),
+                superseded_sha: "oldsha".into(),
+            };
+            store.record_repeated_work_shadow(&input).unwrap();
+        }
+        let conn = Connection::open(store.path()).unwrap();
+        conn.execute("INSERT INTO repeated_work_shadow (observed_at,kind,branch,sha,target_config,mode,job_id,superseded_job_id,superseded_sha) VALUES ('now','future_kind','main','sha','cfg','normal','7','old','oldsha')", []).unwrap();
+        let summary = store.repeated_work_cost(100).unwrap();
+        assert_eq!(summary.duration_ms, None);
+        assert_eq!(summary.joined_durations, 0);
+        assert_eq!(summary.unknown_durations, 3);
+        assert_eq!(summary.superseded_exact_head, 1);
+        assert_eq!(summary.duplicate_exact_head_config, 1);
+        assert_eq!(store.repeated_work_cost(0).unwrap().observations, 0);
+        assert_eq!(
+            serde_json::to_value(summary).unwrap()["duration_ms"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
