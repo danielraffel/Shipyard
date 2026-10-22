@@ -54,10 +54,7 @@ pub(crate) enum QueueTerminalDisposition {
 }
 
 /// Classify a terminal transition from its persisted predecessor.
-pub(crate) fn classify_queue_terminal(
-    prior: &Job,
-    next: &Job,
-) -> Option<QueueTerminalDisposition> {
+pub(crate) fn classify_queue_terminal(prior: &Job, next: &Job) -> Option<QueueTerminalDisposition> {
     if !matches!(next.status, JobStatus::Completed | JobStatus::Cancelled) {
         return None;
     }
@@ -84,14 +81,13 @@ pub(crate) fn classify_queue_terminal(
         .started_at
         .zip(next.completed_at)
         .is_some_and(|(started, completed)| started <= completed);
-    let complete_results = !next.target_names.is_empty() && next.target_names.iter().all(|target| {
-        next.results
-            .get(target)
-            .is_some_and(|result| {
+    let complete_results = !next.target_names.is_empty()
+        && next.target_names.iter().all(|target| {
+            next.results.get(target).is_some_and(|result| {
                 result.failure_class.as_deref() != Some("UNCERTAIN")
                     && result.error_message.as_deref() != Some(STALE_RECOVERY_MESSAGE)
             })
-    });
+        });
     if timed && complete_results {
         Some(QueueTerminalDisposition::Clean)
     } else {
@@ -1475,9 +1471,7 @@ fn sync_directory_best_effort(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        QueueTerminalDisposition, classify_queue_terminal, stale_recovery_result,
-    };
+    use super::{QueueTerminalDisposition, classify_queue_terminal, stale_recovery_result};
     use std::cell::Cell;
     use std::fs;
     use std::io;
@@ -1565,7 +1559,9 @@ mod tests {
         );
 
         let mut stale = completed.clone();
-        stale.results.insert("mac".to_owned(), stale_recovery_result("mac"));
+        stale
+            .results
+            .insert("mac".to_owned(), stale_recovery_result("mac"));
         assert_eq!(
             classify_queue_terminal(&running, &stale),
             Some(QueueTerminalDisposition::Uncertain)
