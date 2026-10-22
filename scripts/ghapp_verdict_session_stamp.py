@@ -70,7 +70,7 @@ _MARKER = re.compile(
 # Any stamp already in a body, whole line or inline. The stamper replaces it:
 # the arm guard checks the stamp's host against the `session:` line, so a
 # stamp written by hand (or copied with the rest of a verdict) must not stand.
-_STAMPED = re.compile(r"<!--\s*session:.*?-->", re.DOTALL)
+_STAMPED = re.compile(r"<!--\s*session\s*:.*?-->", re.DOTALL | re.IGNORECASE)
 _COMMENT_ENDPOINT = re.compile(r"^repos/[^/]+/[^/]+/issues/(?:[0-9]+/comments|comments/[0-9]+)$")
 _API_HOST = re.compile(r"^[a-z][a-z0-9+.-]*://[^/]*(?:/api/v3)?", re.IGNORECASE)
 # The pull-request and issue commands that post a comment, with the options

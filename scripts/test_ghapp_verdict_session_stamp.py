@@ -605,6 +605,64 @@ class GhappStampWiring(unittest.TestCase):
             ["api", "repos/o/r/issues/1/comments", "-f", f"x={jq}"])
         self.assertEqual(code, 1, err)
 
+    def test_a_stamp_spelled_any_other_way_is_refused(self) -> None:
+        # Shipyard#881 review 6331485438: Unicode whitespace passed the byte
+        # check, and GitHub decodes a `\\u003c` in a GraphQL string or in
+        # `--input` JSON into the stamp's `<`.
+        nbsp = "<!--\u00a0session: Daniels-Mac-Studio-m3/x -->"
+        verdict = f"\\nverdict: APPROVE head:{HEAD}"
+        graphql = ('query=mutation { addComment(input: {subjectId: "X", body: '
+                   '"%s%s"}) { clientMutationId } }')
+        reviews = "repos/o/r/pulls/5/reviews"
+        with tempfile.TemporaryDirectory() as scratch:
+            escaped_input = pathlib.Path(scratch) / "review.json"
+            escaped_input.write_text(
+                '{"event": "APPROVE", "body": "\\u003c!-- session: Daniels-Mac-Studio-m3/x -->'
+                f'{verdict}"}}', encoding="utf-8")
+            cases = [
+                ["api", "graphql", "-f", graphql % (nbsp, verdict)],
+                ["api", "graphql", "-f",
+                 graphql % ("\\u003c!-- session: Daniels-Mac-Studio-m3/x -->", verdict)],
+                ["api", "graphql", "-f",
+                 graphql % ("\\u003C!-- \\u0073ession: Daniels-Mac-Studio-m3/x -->", verdict)],
+                ["api", "graphql", "-f",
+                 graphql % ("\\u{3c}!-- session: Daniels-Mac-Studio-m3/x -->", verdict)],
+                ["api", "graphql", "-f",
+                 graphql % ("&lt;!-- session: Daniels-Mac-Studio-m3/x -->", verdict)],
+                ["api", "graphql", "-f",
+                 graphql % ("&#60;!-- session: Daniels-Mac-Studio-m3/x -->", verdict)],
+                # The `!` escaped too, so only decoding finds the marker.
+                ["api", "graphql", "-f",
+                 graphql % ("&lt;&#33;-- session: Daniels-Mac-Studio-m3/x -->", verdict)],
+                ["api", "graphql", "-f",
+                 graphql % ("\\u{3c}\\u{21}-- session: Daniels-Mac-Studio-m3/x -->", verdict)],
+                ["api", reviews, "--input", str(escaped_input)],
+                ["api", reviews, "-f", f"body={nbsp}", "-f", "event=APPROVE"],
+                ["pr", "merge", "5", "--body", "<!--\u2003SESSION: x/y -->"],
+            ]
+            for args in cases:
+                with self.subTest(args=args[1:3]):
+                    code, _, _, err = self.run_wrapper(args)
+                    self.assertEqual(code, 1, err)
+                    self.assertIn("carries session stamp text", err)
+        # Negative controls: escapes and entities with no stamp in them pass,
+        # and a query string's `&` does not count as an entity.
+        for args in (["api", "graphql", "-f",
+                      graphql % ("caf\\u00e9 &amp; \\u003cb\\u003e", verdict)],
+                     ["api", "repos/o/r/issues/5/comments?per_page=100&page=2"]):
+            with self.subTest(args=args[1:3]):
+                code, out, _, err = self.run_wrapper(args)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out, [arg.encode() for arg in args])
+
+    def test_the_stamper_strips_a_unicode_spaced_stamp(self) -> None:
+        nbsp = "<!--\u00a0session: Daniels-Mac-Studio-m3/x -->"
+        out = stamp.stamped(f"LGTM\n{nbsp}\nverdict: APPROVE head:{HEAD}\n")
+        assert out is not None
+        self.assertNotIn("Daniels-Mac-Studio-m3", out)
+        self.assertFalse(guard.noncanonical_stamp(out))
+        self.assertEqual(len(guard._SESSION_STAMP.findall(out)), 1)
+
     def test_only_the_stamp_the_stamper_wrote_passes(self) -> None:
         # A stamper that answers but leaves a foreign stamp in place (or
         # names a different line as its own) does not get it through.

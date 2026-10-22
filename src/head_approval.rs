@@ -240,9 +240,21 @@ pub fn arming_agent() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// `<!-- session: <host>/<session>[ agent: <id>] -->`, exactly the ASCII form
+/// `ghapp`'s stamper writes: single spaces, printable ASCII only. Same
+/// pattern as the queue-arm guard's `_SESSION_STAMP`.
 fn stamp_pattern() -> Regex {
-    Regex::new(r"<!--\s*session:\s*([^/\s]+)/(\S+?)(?:\s+agent:\s*(\S+?))?\s*-->")
+    Regex::new(r"<!-- session: ([!-.0-~]+)/([!-~]+?)(?: agent: ([!-~]+?))? -->")
         .expect("stamp pattern compiles")
+}
+
+/// Whether `body` has stamp-like text that is not an exact stamp: other
+/// spacing or case, or Unicode whitespace (`<!--` + U+00A0 + `session:` once
+/// passed `ghapp`'s byte check and counted as a stamp). An App APPROVE
+/// carrying one is refused, never read as stamped.
+fn noncanonical_stamp(body: &str) -> bool {
+    let variant = Regex::new(r"(?i)<!--\s*session\s*:").expect("variant pattern compiles");
+    variant.is_match(&stamp_pattern().replace_all(body, ""))
 }
 
 /// The session a verdict comment was stamped with by `ghapp`, if any.
@@ -1162,6 +1174,9 @@ fn app_approval_refusal(record: &Value, policy: &ApprovalPolicy) -> Option<Strin
         .get("body")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    if noncanonical_stamp(body) {
+        return Some("it carries a non-canonical session stamp".to_owned());
+    }
     let session = stamped_session(body);
     if session.as_deref() == Some("unattributed") {
         return Some("its session stamp is unattributed".to_owned());

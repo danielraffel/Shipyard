@@ -3764,7 +3764,9 @@ comment body, to a fixed point, and stamps `--body-file`, `-F body=@file` and
 stdin bodies, deciding what is a verdict with the arm guard's own
 `marker_verdict` so a `\r\n` ending cannot hide one; when the stamper fails
 or times out, or for GraphQL and review requests it does not parse, `ghapp`
-refuses any body carrying `<!-- session:` text); its
+refuses any body carrying stamp text, `\u`-escaped and Unicode-spaced forms
+included; the guards count only the exact ASCII stamp and refuse an APPROVE
+with any non-canonical variant); its
 override,
 `GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
 `docs/ghapp-guards.md`, Review before arm). A HOLD acts too: on a host with

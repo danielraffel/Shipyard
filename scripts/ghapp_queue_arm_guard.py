@@ -178,9 +178,20 @@ SESSION_ENVS = ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
 AGENT_ENV = "SHIPYARD_AGENT_ID"
 UNATTRIBUTED = "unattributed"
 # `<!-- session: <host>/<session>[ agent: <id>] -->`, stamped by ghapp on
-# verdict comments.
+# verdict comments: exactly the ASCII form the stamper writes, single spaces
+# and printable ASCII only. Same pattern as src/head_approval.rs stamp_pattern.
 _SESSION_STAMP = re.compile(
-    r"<!--\s*session:\s*([^/\s]+)/(\S+?)(?:\s+agent:\s*(\S+?))?\s*-->")
+    r"<!-- session: ([!-.0-~]+)/([!-~]+?)(?: agent: ([!-~]+?))? -->")
+# Anything else that reads like a stamp: other spacing or case, or Unicode
+# whitespace (Shipyard#881 review: `<!--` + U+00A0 + `session:` passed ghapp's
+# byte check and counted here as an m3 stamp). An App APPROVE carrying one is
+# refused, never read as stamped.
+_STAMP_VARIANT = re.compile(r"<!--\s*session\s*:", re.IGNORECASE)
+
+
+def noncanonical_stamp(body: str) -> bool:
+    """Whether ``body`` has stamp-like text that is not an exact stamp."""
+    return _STAMP_VARIANT.search(_SESSION_STAMP.sub("", body)) is not None
 # The rebase carry (see rebase_carry) is a separate switch, off by default.
 REBASE_CARRY_ENV = "SHIPYARD_REBASE_CARRY"
 REBASE_CARRY_FILE = "rebase-carry"
@@ -1034,7 +1045,8 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
     """Why the fleet App's APPROVE in ``body`` does not count, or None.
 
     Every agent posts as the same App, so the App's identity says nothing
-    about who reviewed. An APPROVE stamped by ``ghapp`` with an
+    about who reviewed. An APPROVE with stamp-like text that is not an exact
+    stamp never counts, and one stamped by ``ghapp`` with an
     ``unattributed`` session never counts, nor, under the repository-side rule
     (``review-verdict``), one with no stamp at all; on a host with a session
     allowlist every ``session:`` line must be listed (and one must be present)
@@ -1044,6 +1056,8 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
     naming an allowed signer.
     """
     text = body if isinstance(body, str) else ""
+    if noncanonical_stamp(text):
+        return "it carries a non-canonical session stamp"
     stamp = _SESSION_STAMP.findall(text)
     if stamp and stamp[-1][1] == UNATTRIBUTED:
         return "its session stamp is unattributed"

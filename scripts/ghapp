@@ -1635,7 +1635,34 @@ fi
 # than the one line the stamper reports writing is refused. Only a pull
 # request's or an issue's own description, which no review guard reads, may
 # quote stamp text.
-ghapp_stamp_pattern='<!--[[:space:]]*session:'
+# Matched byte-wise, and wider than the guards' own stamp pattern: `!--`
+# then `session` in any case before the next `>`, whatever lies between
+# (Unicode whitespace is several bytes) and however the `<` is written (a
+# GraphQL or JSON `\u003c`, an HTML `&lt;`).
+ghapp_stamp_pattern='!--[^>]*[Ss][Ee][Ss][Ss][Ii][Oo][Nn]'
+
+# ghapp_text_has_stamp TEXT: whether TEXT carries stamp text. Text with a
+# `\u` escape (GitHub decodes one in a GraphQL string or `--input` JSON, and
+# it can spell any letter of the marker) or a `&#`/`&lt` entity is decoded
+# first; text that cannot be decoded counts as stamp text.
+ghapp_text_has_stamp() {
+    local LC_ALL=C
+    [[ "$1" =~ $ghapp_stamp_pattern ]] && return 0
+    case "$1" in
+        *'\u'*|*'\U'*|*'&#'*|*'&'[Ll][Tt]*) ;;
+        *) return 1 ;;
+    esac
+    [[ "$(printf '%s' "$1" | PATH="$trusted_path" python3 -I -c '
+import html, re, sys
+text = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
+for _ in range(4):
+    text = re.sub(r"\\u\{([0-9A-Fa-f]{1,6})\}", lambda m: chr(int(m[1], 16)), text)
+    text = re.sub(r"\\[uU]([0-9A-Fa-f]{4})", lambda m: chr(int(m[1], 16)), text)
+    text = html.unescape(text)
+print("stamp" if re.search(r"!--[^>]*session", text, re.IGNORECASE) else "clean")
+' 2>/dev/null)" == clean ]] && return 1
+    return 0
+}
 
 # ghapp_stamp_text_refusal OWN ARGS...: prints why ARGS cannot be sent and
 # returns 1 when ARGS, or a file they name, carry stamp text other than one
@@ -1677,7 +1704,7 @@ ghapp_stamp_text_refusal() {
             text="${text/"$own"/}"
             own=""
         fi
-        if [[ "$text" =~ $ghapp_stamp_pattern ]]; then
+        if ghapp_text_has_stamp "$text"; then
             echo "an argument carries session stamp text"
             return 1
         fi
@@ -1687,7 +1714,7 @@ ghapp_stamp_text_refusal() {
                 return 1
             fi
             text="$(/bin/cat -- "$path"; printf x)"
-            if [[ "$text" =~ $ghapp_stamp_pattern ]]; then
+            if ghapp_text_has_stamp "$text"; then
                 echo "body file $path carries session stamp text"
                 return 1
             fi

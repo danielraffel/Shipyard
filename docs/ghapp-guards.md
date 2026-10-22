@@ -109,8 +109,18 @@ it answered, `ghapp` checks the final request and every body source gh will
 read (arguments, fields, `--input`, `-F k=@file`, body files and spooled
 stdin) on every command except `pr create`, `pr edit`, `issue create` and
 `issue edit` (descriptions, which no review guard reads), and refuses it if
-any carries `<!--` followed by `session:` other than the one stamp line the
-stamper reports writing (`SHIPYARD-STAMP-OWN` in its answer). A body file
+any carries stamp text other than the one stamp line the stamper reports
+writing (`SHIPYARD-STAMP-OWN` in its answer). Stamp text is matched wider
+than any guard reads it: `!--` then `session` in any case before the next
+`>`, whatever bytes lie between (Unicode whitespace), with a `\u` escape
+(GitHub decodes one in a GraphQL string or `--input` JSON) or a `&#`/`&lt`
+entity decoded first; text that cannot be decoded is refused.
+
+The guards count a stamp only in the exact ASCII form the stamper writes,
+`<!-- session: <host>/<session>[ agent: <id>] -->` with single spaces, and an
+App APPROVE carrying any other stamp-like text (`<!--`, whitespace,
+`session:` in another spacing, case or Unicode whitespace) is refused as
+"non-canonical", never read as stamped. A body file
 that is not a regular file (a FIFO) cannot be checked and is refused; an
 `api` output filter (`--jq`, `--template`) is never sent and is not checked.
 A request without stamp text posts as before. The session is `CLAUDE_CODE_SESSION_ID`, else

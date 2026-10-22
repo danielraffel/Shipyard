@@ -3292,6 +3292,46 @@ class ReviewIdentity(unittest.TestCase):
         comment = self.comment("shipyard-local[bot]", body)
         return guard.review_verdict(head, "danielraffel", [comment], [], policy)
 
+    def test_only_the_exact_stamp_counts_and_a_variant_refuses(self) -> None:
+        # Shipyard#881 review 6331485438: `<!--` + U+00A0 + `session:` passed
+        # ghapp's byte check and counted here as an m3 stamp.
+        genuine = "<!-- session: Daniels-Mac-Studio-m3/08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb -->"
+        contents = json.dumps({"default": ["infra-review2"], "sessions": [self.INFRA_LINE],
+                               "session_hosts": self.HOSTS})
+        stamp = "<!-- session: Daniels-M5-Studio/unattributed -->"
+        with self.session_case(contents):
+            allowed, why = self.infra_verdict(self.TARTCI_623.replace(stamp, genuine))
+            self.assertTrue(allowed, why)
+            for variant in (genuine.replace("<!-- ", "<!--\u00a0"),
+                            genuine.replace("<!-- ", "<!--\u2003"),
+                            genuine.replace("<!-- ", "<!--  "),
+                            genuine.replace("<!-- ", "<!--"),
+                            genuine.replace("session: ", "session:\u00a0"),
+                            genuine.replace("session:", "SESSION:"),
+                            genuine.replace("<!-- ", "<!--\t")):
+                with self.subTest(variant=variant):
+                    self.assertEqual(guard._SESSION_STAMP.findall(variant), [])
+                    guard.EXCLUDED_APPROVALS.clear()
+                    allowed, _ = self.infra_verdict(self.TARTCI_623.replace(stamp, variant))
+                    self.assertFalse(allowed)
+                    self.assertTrue(any("non-canonical session stamp" in row
+                                        for row in guard.EXCLUDED_APPROVALS),
+                                    guard.EXCLUDED_APPROVALS)
+                    # Beside a genuine stamp it still refuses, never counts.
+                    guard.EXCLUDED_APPROVALS.clear()
+                    allowed, _ = self.infra_verdict(
+                        self.TARTCI_623.replace(stamp, genuine + "\n" + variant))
+                    self.assertFalse(allowed)
+        # Under the repository-side rule too.
+        with self.session_case(None), mock.patch.dict(os.environ,
+                                                      {"SHIPYARD_SIGNERS_FROM_BASE": "1"}):
+            guard.EXCLUDED_APPROVALS.clear()
+            nbsp = genuine.replace("<!-- ", "<!--\u00a0")
+            self.assertFalse(self.app_verdict("reviewer: pulp-review", nbsp)[0])
+            self.assertIn("shipyard-local[bot] (it carries a non-canonical session stamp)",
+                          guard.EXCLUDED_APPROVALS)
+            self.assertTrue(self.app_verdict("reviewer: pulp-review", genuine)[0])
+
     def test_a_copied_session_line_needs_a_stamp_from_its_host(self) -> None:
         contents = json.dumps({"default": ["infra-review2"], "sessions": [self.INFRA_LINE],
                                "session_hosts": self.HOSTS})

@@ -1231,6 +1231,43 @@ fn infra_refusal(body: &str) -> Option<String> {
     Some(events.join("; "))
 }
 
+/// Shipyard#881 review 6331485438: `<!--` + U+00A0 + `session:` passed
+/// `ghapp`'s byte check and counted as an m3 stamp. Only the exact ASCII form
+/// counts; any variant refuses the APPROVE, alone or beside a genuine stamp.
+#[test]
+fn only_the_exact_stamp_counts_and_a_variant_refuses() {
+    let genuine = "<!-- session: Daniels-Mac-Studio-m3/08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb -->";
+    let hosts: &[(&str, &[&str])] = &[("m3", M3_HOSTS), ("m5", M5_HOSTS)];
+    let body = tartci_623();
+    super::with_host_session_hosts(hosts, || {
+        super::with_host_sessions(Some(&[INFRA_SESSION]), || {
+            assert_eq!(
+                infra_refusal(&body.replace(TARTCI_623_STAMP, genuine)),
+                None
+            );
+            for variant in [
+                genuine.replace("<!-- ", "<!--\u{a0}"),
+                genuine.replace("<!-- ", "<!--\u{2003}"),
+                genuine.replace("<!-- ", "<!--  "),
+                genuine.replace("<!-- ", "<!--"),
+                genuine.replace("session: ", "session:\u{a0}"),
+                genuine.replace("session:", "SESSION:"),
+                genuine.replace("<!-- ", "<!--\t"),
+            ] {
+                assert_eq!(super::stamped_session(&variant), None, "{variant:?}");
+                for with in [variant.clone(), format!("{genuine}\n{variant}")] {
+                    let refusal = infra_refusal(&body.replace(TARTCI_623_STAMP, &with))
+                        .expect("a variant refuses");
+                    assert!(
+                        refusal.contains("it carries a non-canonical session stamp"),
+                        "{with:?}: {refusal}"
+                    );
+                }
+            }
+        });
+    });
+}
+
 #[test]
 fn a_copied_session_line_needs_a_stamp_from_its_host() {
     let attributed = "<!-- session: Daniels-M5-Studio/01a15711-0679-70e0-81d2-4eb92dd5e038 -->";
