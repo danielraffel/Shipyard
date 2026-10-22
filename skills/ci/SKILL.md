@@ -874,7 +874,7 @@ PRs are gone.
 | Regenerate CHANGELOG.md from tags | `shipyard changelog regenerate` |
 | CI drift gate for CHANGELOG.md | `shipyard changelog check` |
 | Run the post-tag hook locally | `shipyard release-bot hook run --tag v0.9.0` |
-| Audit a generated post-tag hook | The run step must contain literal Bash `tag="${GITHUB_REF#refs/tags/}"`; {% raw %}`${{GITHUB_REF#refs/tags/}}`{% endraw %} is invalid GitHub expression syntax. PR pushes from the detached tag checkout must first attach the deterministic local branch, then use Shipyard's supervised push and target `HEAD:refs/heads/<branch>` so repository hooks see both a branch and `SHIPYARD_PR_RUNNING=1`. Repositories requiring signed bot commits set `release.post_tag_hook.ssh_signing_setup_script`; never hand-edit the owned workflow. Consumer workflows install the exact generating CLI by default; a repository that must avoid racing its own draft release may explicitly set `release.post_tag_hook.workflow_shipyard_version = "latest"`. Only exact stable optional-`v` semver or `latest` is accepted, and the CLI override wins lower config. |
+| Audit a generated post-tag hook | The run step must contain literal Bash `tag="${GITHUB_REF#refs/tags/}"`; {% raw %}`${{GITHUB_REF#refs/tags/}}`{% endraw %} is invalid GitHub expression syntax. PR pushes from the detached tag checkout must first attach the deterministic local branch, then use Shipyard's supervised push and target `HEAD:refs/heads/<branch>` so repository hooks see both a branch and `SHIPYARD_PR_RUNNING=1`. Repositories requiring signed bot commits set `release.post_tag_hook.ssh_signing_setup_script`; never hand-edit the owned workflow. Consumer workflows install the exact generating CLI by default; a repository that must avoid racing its own draft release may explicitly set `release.post_tag_hook.workflow_shipyard_version = "latest"`; Shipyard itself uses `checkout` (build the tagged checkout; refused outside the `shipyard` package). Only exact stable optional-`v` semver, `latest`, or `checkout` is accepted, and the CLI override wins lower config. The installer always comes from the pinned tag on `raw.githubusercontent.com` (`main` for `latest`); checkout uses `persist-credentials: false` and only the `hook run` step receives the push token. |
 | Live-probe the release chain | `shipyard doctor --release-chain` (dispatches + waits) |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |
@@ -1574,6 +1574,24 @@ selector with repo var `LOCAL_MACOS_ARM64_RUNS_ON_JSON` if a different label set
 is needed. An explicit `*_runner_selector_json` input still wins over the
 provider default. This is *not* a hidden fallback — `local` only takes effect
 when explicitly requested, and the default remains GitHub-hosted.
+
+**Fork pull requests skip self-hosted legs.** Repository variables reach
+fork PRs, so `ci.yml` and `sandbox-e2e.yml` pass
+{% raw %}`PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}`{% endraw %} to the
+resolver. When `GITHUB_EVENT_NAME` is a pull request and that head differs from
+`GITHUB_REPOSITORY` (or is missing), any target that would resolve to the
+`local` provider or a `self-hosted` selector is dropped from the matrix
+(provider `skipped`, empty selector) with a `::notice::`; it is never moved to
+GitHub-hosted. That covers the Sandbox M3 canary. To run those legs, a
+maintainer pushes the reviewed commits to a branch of this repository.
+Same-repo PRs, pushes, and dispatches resolve exactly as before.
+
+**The macOS signing job builds with fresh Rust homes.** `sign-and-upload-macos`
+points `CARGO_HOME` and `RUSTUP_HOME` at new directories under `RUNNER_TEMP`
+before installing Rust, so the signed build installs its toolchain and fetches
+crates fresh instead of reading a shared runner's `~/.cargo` registry or
+`~/.rustup` toolchains. A `rustup` already on the runner's `PATH` is still the
+one that installs them. Runner selection is unchanged.
 
 To land jobs on the Mac, register a runner carrying the matching labels with
 `shipyard runner register --repo <owner/repo> --labels self-hosted,macos,arm64,local-mac`

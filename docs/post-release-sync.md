@@ -59,8 +59,9 @@ trailers = [
 ]
 only_for_tag_pattern = "v*"
 max_push_attempts    = 5
-# Optional: exact stable version or `latest`. When omitted, hook install
-# pins the version of the CLI doing the rendering.
+# Optional: exact stable version or `latest` (`checkout` is reserved for the
+# Shipyard repository). When omitted, hook install pins the version of the
+# CLI doing the rendering.
 # workflow_shipyard_version = "v0.127.2"
 
 [release.post_tag_hook.bot_identity]
@@ -77,6 +78,9 @@ The CLI flag `--shipyard-version` takes precedence over
 workflow pins the generating CLI version. `latest` is an explicit opt-in for a
 repository whose tag workflow runs before its own release artifacts publish.
 Consumer repositories should normally retain the exact-version default.
+`checkout` builds the CLI from the tagged checkout; install refuses it unless
+the repository's `Cargo.toml` is the `shipyard` package. Shipyard's own
+workflow uses it because its release is still a draft when the tag fires.
 
 The workflow:
 
@@ -91,11 +95,17 @@ The workflow:
    refuses to write this workflow until that label is visible to GitHub; create
    it first on the authority host with
    `shipyard runner register --count 1 --labels <repo>-queue-authority-<machine>`.
-3. Checks out the immutable release tag with full history + tags via
-   `RELEASE_BOT_TOKEN || GITHUB_TOKEN`; PR-mode commits use the tag commit time,
-   so a workflow retry reproduces the exact commit SHA.
-4. Installs shipyard via `curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh`, pinned to a version.
-5. Runs `shipyard release-bot hook run --tag "${GITHUB_REF#refs/tags/}"`.
+3. Checks out the immutable release tag with full history + tags and
+   `persist-credentials: false`; PR-mode commits use the tag commit time, so a
+   workflow retry reproduces the exact commit SHA.
+4. Installs shipyard with the `install.sh` from that version's own tag on
+   `raw.githubusercontent.com/danielraffel/Shipyard/<tag>/` (`main` only for an
+   explicit `latest`). The Shipyard repository itself uses `checkout` and builds
+   the CLI from the tagged checkout instead.
+5. Runs `shipyard release-bot hook run --tag "${GITHUB_REF#refs/tags/}"`. Only
+   this step receives `RELEASE_BOT_TOKEN || GITHUB_TOKEN`, as a git
+   `http.extraheader` set through the step's environment, so the token is never
+   written to `.git/config` and the install step never sees it.
 
 That final command reads `[release.post_tag_hook]`, executes `command`, checks
 `watch` for diffs, and commits with the configured trailers. Direct mode adds

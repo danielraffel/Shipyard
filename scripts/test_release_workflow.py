@@ -15,6 +15,10 @@ import package_release  # noqa: E402
 
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 AUTO_RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "auto-release.yml"
+VERSION_AT_LAND_WORKFLOW = ROOT / ".github" / "workflows" / "version-at-land.yml"
+POST_TAG_SYNC_WORKFLOW = ROOT / ".github" / "workflows" / "post-tag-sync.yml"
+ATTEST = "uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2"
+CHECKOUT = "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0"
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
@@ -95,7 +99,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("attestations: write", text)
         self.assertIn("id-token: write", text)
         # Two subjects, three bounded attempts each.
-        self.assertEqual(text.count("uses: actions/attest@v4"), 6)
+        self.assertEqual(text.count(ATTEST), 6)
         self.assertIn("release/shipyard-linux-*", text)
         self.assertIn("release/shipyard-windows-*.exe", text)
         self.assertIn("release/shipyard-workstream-provider-linux-*", text)
@@ -121,7 +125,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             with self.subTest(job=job):
                 attests = [
                     step for step in self._steps(job)
-                    if "uses: actions/attest@v4" in step
+                    if ATTEST in step
                 ]
                 self.assertEqual(len(attests), 3)
                 first, second, third = attests
@@ -146,9 +150,83 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("if:", steps[publish_index])
         last_attest = max(
             index for index, step in enumerate(steps)
-            if "uses: actions/attest@v4" in step
+            if ATTEST in step
         )
         self.assertGreater(publish_index, last_attest)
+
+    def test_macos_signing_job_builds_with_fresh_rust_homes(self) -> None:
+        steps = self._steps("sign-and-upload-macos")
+        names = [step.split("\n", 1)[0] for step in steps]
+        isolate = names.index("name: Isolate the build from shared Rust homes")
+        # Before the toolchain install and every cargo invocation.
+        self.assertLess(isolate, names.index("name: Install Rust"))
+        self.assertLess(isolate, next(
+            index for index, step in enumerate(steps)
+            if "scripts/release-macos-local.sh" in step
+        ))
+        step = steps[isolate]
+        self.assertIn('root="${RUNNER_TEMP:?}/shipyard-rust-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"', step)
+        self.assertIn('rm -rf "$root"', step)
+        self.assertIn('echo "CARGO_HOME=$root/cargo" >> "$GITHUB_ENV"', step)
+        self.assertIn('echo "RUSTUP_HOME=$root/rustup" >> "$GITHUB_ENV"', step)
+        self.assertNotIn("if:", step)
+        # Runner selection is unchanged by the isolation.
+        job = RELEASE_WORKFLOW.read_text(encoding="utf-8").split("\n  sign-and-upload-macos:\n", 1)[1]
+        self.assertIn(
+            "runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}",
+            job.split("steps:", 1)[0],
+        )
+
+    def test_rust_home_isolation_is_specific_to_the_signing_job(self) -> None:
+        # Negative control: the unsigned build matrix keeps its runner homes.
+        for job in ("build", "live-smoke", "release"):
+            with self.subTest(job=job):
+                self.assertFalse(any(
+                    "CARGO_HOME" in step or "RUSTUP_HOME" in step
+                    for step in self._steps(job)
+                ))
+
+    def test_release_path_actions_are_pinned_to_commit_shas(self) -> None:
+        uses = re.compile(r"^\s*(?:- )?uses: ([^\s@]+)@(\S+)(.*)$")
+        for workflow in (
+            RELEASE_WORKFLOW,
+            AUTO_RELEASE_WORKFLOW,
+            VERSION_AT_LAND_WORKFLOW,
+            POST_TAG_SYNC_WORKFLOW,
+        ):
+            text = workflow.read_text(encoding="utf-8")
+            found = 0
+            for line in text.splitlines():
+                match = uses.match(line)
+                if not match:
+                    continue
+                found += 1
+                action, ref, comment = match.groups()
+                with self.subTest(workflow=workflow.name, action=action):
+                    self.assertRegex(ref, r"^[0-9a-f]{40}$")
+                    self.assertRegex(comment, r"^ # \S")
+            self.assertGreater(found, 0, workflow.name)
+
+    def test_workflow_run_scripts_never_interpolate_inputs(self) -> None:
+        # An `${{ inputs.* }}` inside `run:` becomes shell source; pass it via env.
+        cloud = ROOT / ".github" / "workflows" / "cloud-live-smoke.yml"
+        text = cloud.read_text(encoding="utf-8")
+        self.assertIn("NOTE_INPUT: ${{ inputs.note }}", text)
+        self.assertIn('echo "note=$NOTE_INPUT"', text)
+        for workflow in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            with self.subTest(workflow=workflow.name):
+                lines = workflow.read_text(encoding="utf-8").splitlines()
+                in_run, indent = False, 0
+                for line in lines:
+                    stripped = line.lstrip()
+                    current = len(line) - len(stripped)
+                    if in_run and stripped and current <= indent:
+                        in_run = False
+                    if stripped.startswith(("run: |", "- run: |")):
+                        in_run, indent = True, current
+                        continue
+                    if in_run or stripped.startswith(("run: ", "- run: ")):
+                        self.assertNotRegex(line, r"\$\{\{\s*inputs\.", line)
 
     def test_auto_release_workflow_supports_doctor_release_chain(self) -> None:
         text = AUTO_RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -156,7 +234,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("secrets.RELEASE_BOT_TOKEN", text)
         self.assertIn("RELEASE_BOT_TOKEN is required", text)
         self.assertNotIn("secrets.GITHUB_TOKEN", text)
-        self.assertIn("actions/checkout@v5", text)
+        self.assertIn(CHECKOUT, text)
         self.assertIn("Cargo.toml", text)
         self.assertIn("version unchanged", text)
         self.assertIn("git tag -a", text)

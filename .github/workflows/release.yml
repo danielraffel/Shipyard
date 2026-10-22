@@ -55,7 +55,7 @@ jobs:
       matrix_json: ${{ steps.resolve.outputs.matrix_json }}
       macos_arm64_runs_on_json: ${{ steps.resolve.outputs.macos_arm64_runs_on_json }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - id: resolve
         env:
@@ -78,7 +78,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve-runners.outputs.matrix_json) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Validate release runner architecture
         shell: bash
@@ -124,7 +124,7 @@ jobs:
 
       - name: Upload non-macOS artifact
         if: matrix.package_target != 'macos-arm64'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: release-${{ matrix.package_target }}
           path: artifacts/release/${{ github.ref_name }}/*
@@ -152,10 +152,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Download the linux-x64 release binary
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: release-linux-x64
           path: smoke-bin
@@ -181,10 +181,10 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Download non-macOS artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           path: artifacts/
 
@@ -207,7 +207,7 @@ jobs:
       - name: Attest non-macOS release assets (attempt 1)
         id: attest_nonmac_1
         continue-on-error: true
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             release/shipyard-linux-*
@@ -221,7 +221,7 @@ jobs:
         id: attest_nonmac_2
         if: steps.attest_nonmac_1.outcome == 'failure'
         continue-on-error: true
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             release/shipyard-linux-*
@@ -233,7 +233,7 @@ jobs:
         run: sleep 90
       - name: Attest non-macOS release assets (attempt 3)
         if: steps.attest_nonmac_2.outcome == 'failure'
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             release/shipyard-linux-*
@@ -253,7 +253,20 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The signed build must not read a toolchain or crate sources that an
+      # earlier job on a shared runner could have written to ~/.cargo or
+      # ~/.rustup. Fresh homes cost a cold toolchain and registry fetch.
+      - name: Isolate the build from shared Rust homes
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP:?}/shipyard-rust-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -rf "$root"
+          mkdir -p "$root/cargo" "$root/rustup"
+          echo "CARGO_HOME=$root/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$root/rustup" >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
@@ -335,7 +348,7 @@ jobs:
       - name: Attest signed and notarized macOS release asset (attempt 1)
         id: attest_macos_1
         continue-on-error: true
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/release/${{ github.ref_name }}/shipyard-macos-arm64.dmg
       - name: Back off before retrying attestation
@@ -345,7 +358,7 @@ jobs:
         id: attest_macos_2
         if: steps.attest_macos_1.outcome == 'failure'
         continue-on-error: true
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/release/${{ github.ref_name }}/shipyard-macos-arm64.dmg
       - name: Back off before the last attestation attempt
@@ -353,7 +366,7 @@ jobs:
         run: sleep 90
       - name: Attest signed and notarized macOS release asset (attempt 3)
         if: steps.attest_macos_2.outcome == 'failure'
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/release/${{ github.ref_name }}/shipyard-macos-arm64.dmg
 
