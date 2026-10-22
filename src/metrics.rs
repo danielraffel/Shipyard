@@ -40,6 +40,16 @@ pub(crate) struct QueueTerminalTiming {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct QueueTimingRow {
+    pub queue_job_id: String,
+    pub queue_identity: String,
+    pub queue_disposition: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub total_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RepeatedWorkSurvivorTiming {
     pub shadow_rows: usize,
     pub distinct_survivors: usize,
@@ -594,6 +604,14 @@ impl MetricsStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn read_queue_timing(
+        &self,
+        queue_job_id: &str,
+    ) -> Result<Option<QueueTimingRow>, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        Ok(conn.query_row("SELECT queue_job_id, queue_identity, disposition, started_at, completed_at, total_ms FROM queue_timing WHERE queue_job_id=?1", params![queue_job_id], |r| Ok(QueueTimingRow { queue_job_id: r.get(0)?, queue_identity: r.get(1)?, queue_disposition: r.get(2)?, started_at: r.get(3)?, completed_at: r.get(4)?, total_ms: r.get(5)? })).optional()?)
     }
 
     pub fn repeated_work_survivor_timing(
