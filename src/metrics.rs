@@ -565,7 +565,8 @@ impl MetricsStore {
             _ => return Err("invalid queue timing disposition".into()),
         };
         let conn = self.connect()?;
-        let existing: Option<(String, String)> = conn
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String)> = tx
             .query_row(
                 "SELECT queue_identity, disposition FROM queue_timing WHERE queue_job_id=?1",
                 params![timing.queue_job_id],
@@ -579,16 +580,18 @@ impl MetricsStore {
             if queue_timing_rank(&old) >= queue_timing_rank(disposition) {
                 return Ok(());
             }
-            conn.execute(
+            tx.execute(
                 "UPDATE queue_timing SET disposition=?2, started_at=?3, completed_at=?4, total_ms=?5, recorded_at=?6 WHERE queue_job_id=?1",
                 params![timing.queue_job_id, disposition, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), (disposition == "clean").then_some(timing.total_ms).flatten().filter(|v| *v >= 0), Utc::now().to_rfc3339()],
             )?;
+            tx.commit()?;
             return Ok(());
         }
-        conn.execute(
+        tx.execute(
             "INSERT INTO queue_timing (queue_job_id, queue_identity, disposition, started_at, completed_at, total_ms, recorded_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![timing.queue_job_id, timing.queue_identity, disposition, timing.started_at.map(|v| v.to_rfc3339()), timing.completed_at.map(|v| v.to_rfc3339()), (disposition == "clean").then_some(timing.total_ms).flatten().filter(|v| *v >= 0), Utc::now().to_rfc3339()],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
