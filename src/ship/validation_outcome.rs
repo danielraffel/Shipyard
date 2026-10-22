@@ -55,6 +55,7 @@ pub(super) fn persist_recovered_outcomes(
 }
 
 /// Persist the kind-specific durable outcome for one terminal queue job.
+#[allow(clippy::manual_inspect)]
 pub(crate) fn persist_terminal_outcome(
     job: &Job,
     state_dir: &Path,

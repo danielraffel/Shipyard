@@ -539,6 +539,15 @@ type ScorecardSample = (
     Option<i64>,
 );
 
+fn queue_timing_rank(s: &str) -> u8 {
+    match s {
+        "clean" => 0,
+        "cancelled_mid_run" => 1,
+        "uncertain" => 2,
+        _ => 3,
+    }
+}
+
 impl MetricsStore {
     pub(crate) fn record_queue_terminal(
         &self,
@@ -563,19 +572,11 @@ impl MetricsStore {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        fn rank(s: &str) -> u8 {
-            match s {
-                "clean" => 0,
-                "cancelled_mid_run" => 1,
-                "uncertain" => 2,
-                _ => 3,
-            }
-        }
         if let Some((identity, old)) = existing {
             if identity != timing.queue_identity {
                 return Err("queue identity mismatch".into());
             }
-            if rank(&old) >= rank(disposition) {
+            if queue_timing_rank(&old) >= queue_timing_rank(disposition) {
                 return Ok(());
             }
             conn.execute(
@@ -617,7 +618,7 @@ impl MetricsStore {
         })?;
         for row in rows {
             let (count, _, disposition, total) = row?;
-            out.shadow_rows = count as usize;
+            out.shadow_rows = usize::try_from(count).unwrap_or(usize::MAX);
             out.distinct_survivors += 1;
             match disposition.as_deref() {
                 Some("clean") if total.is_some_and(|v| v >= 0) => {
