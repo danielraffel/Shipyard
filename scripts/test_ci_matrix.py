@@ -269,7 +269,7 @@ class CiMatrixTests(unittest.TestCase):
             "matrix.key == 'macos-arm64' && matrix.provider == 'local' && "
             "startsWith(runner.name, 'Shipyard-studio-')"
         )
-        self.assertEqual(workflow.count(predicate), 3)
+        self.assertEqual(workflow.count(predicate), 4)
         self.assertNotIn("startsWith(runner.name, 'pulp-studio')", workflow)
         self.assertIn('test "$RUNNER_NAME" = "Shipyard-studio-02"', workflow)
         self.assertIn('if [ "$host_id" != "studio" ]; then', workflow)
