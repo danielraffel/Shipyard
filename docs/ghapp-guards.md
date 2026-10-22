@@ -176,7 +176,10 @@ blocks an earlier approval. A HOLD whose time cannot be read always blocks.
 * The App's identity says nothing about which agent reviewed, since every
   agent posts as it. So an App APPROVE does not count when `ghapp` stamped it
   with an `unattributed` session (pulp#10315: a bare APPROVE from a session
-  with no identity armed the pull request). On a host whose guards directory
+  with no identity armed the pull request), and the repository-side
+  `review-verdict` rule also refuses one with no stamp at all, since a body
+  posted around the stamper names no session (tartci#623's copy, stamp
+  removed). On a host whose guards directory
   holds `reviewer-signers.json`, an App APPROVE counts only with a
   `reviewer: <name>` line naming an allowed signer (pulp#10320: an APPROVE
   with no reviewer of record). The file is

@@ -23,7 +23,10 @@ import test_ghapp_queue_arm_guard as arm  # noqa: E402
 
 STATUS = pathlib.Path(__file__).with_name("review_verdict_status.py")
 SIGNERS = '[auto_merge]\nreviewer_signers = ["pulp-review", "infra-review2"]\n'
-SIGNED_APPROVE = f"Reviewed.\nreviewer: pulp-review\nverdict: APPROVE head:{{head}}"
+# The stamp ghapp adds on the reviewer's host; the status refuses an App
+# APPROVE without one.
+STAMP = "<!-- session: Daniels-Mac-Studio-m3/review-1 -->"
+SIGNED_APPROVE = f"Reviewed.\nreviewer: pulp-review\n{STAMP}\nverdict: APPROVE head:{{head}}"
 REPO = "danielraffel/Shipyard"
 HEAD = arm.HEAD_784
 
@@ -152,7 +155,7 @@ class ReviewVerdictStatus(unittest.TestCase):
         # pulp-review and infra-review2; the status must not read it.
         def approve(signer: str | None) -> list[dict[str, Any]]:
             line = f"reviewer: {signer}\n" if signer else ""
-            return [self.comment(f"Reviewed.\n{line}verdict: APPROVE head:{HEAD}",
+            return [self.comment(f"Reviewed.\n{line}{STAMP}\nverdict: APPROVE head:{HEAD}",
                                  "2026-10-12T15:00:00Z")]
         self.assertEqual(self.judged(approve(None), SIGNERS), "failure", "unsigned")
         self.assertEqual(self.judged(approve("codex-g2h"), SIGNERS), "failure", "unlisted")
@@ -167,9 +170,28 @@ class ReviewVerdictStatus(unittest.TestCase):
         config = '[auto_merge]\nreviewer_signers = ["pulp-review", "infra-review2"]\n'
         unsigned = [self.comment(f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
         self.assertEqual(self.judged(unsigned, config), "failure")
-        signed = [self.comment(f"Reviewed.\nreviewer: infra-review2\nverdict: APPROVE head:{HEAD}",
-                               "2026-10-12T15:00:00Z")]
+        signed = [self.comment(f"Reviewed.\nreviewer: infra-review2\n{STAMP}\n"
+                               f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
         self.assertEqual(self.judged(signed, config), "success")
+
+    def test_tartci_623s_copied_approve_fails_stamped_unattributed_or_unstamped(self) -> None:
+        # tartci#623's deciding APPROVE (comment 6321450475) copied
+        # infra-review2's signer and session lines under a
+        # Daniels-M5-Studio/unattributed stamp. Posted around ghapp's stamper
+        # it would carry no stamp; neither form may pass the status.
+        def copied(stamp: str) -> list[dict[str, Any]]:
+            return [self.comment(
+                "Exact-head re-review completed.\n\nreviewer: infra-review2\n"
+                "session: infra-review2 (team-lead team, agent infra-review2, host m3)\n"
+                f"{stamp}verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
+        for stamp, why in (("<!-- session: Daniels-M5-Studio/unattributed -->\n",
+                            "its session stamp is unattributed"),
+                           ("", "it has no `ghapp` session stamp")):
+            with self.subTest(why=why):
+                self.assertEqual(self.judged(copied(stamp), SIGNERS), "failure")
+                result = self.post(self.answers(copied(stamp), SIGNERS))
+                self.assertIn(why, result.stderr)
+        self.assertEqual(self.judged(copied(STAMP + "\n"), SIGNERS), "success", "control")
 
     def test_an_approve_naming_the_head_is_success(self) -> None:
         trail = [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z")]

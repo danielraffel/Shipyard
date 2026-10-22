@@ -975,7 +975,8 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
 
     Every agent posts as the same App, so the App's identity says nothing
     about who reviewed. An APPROVE stamped by ``ghapp`` with an
-    ``unattributed`` session never counts, on a host with a session allowlist
+    ``unattributed`` session never counts, nor, under the repository-side rule
+    (``review-verdict``), one with no stamp at all; on a host with a session allowlist
     every ``session:`` line must be listed (and one must be present), and on a
     host with a signers file the body must carry a ``reviewer: <name>`` line
     naming an allowed signer.
@@ -984,6 +985,11 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
     stamp = _SESSION_STAMP.findall(text)
     if stamp and stamp[-1][1] == UNATTRIBUTED:
         return "its session stamp is unattributed"
+    if os.environ.get(SIGNERS_FROM_BASE_ENV) == "1" and not stamp:
+        # The repository-side rule: an APPROVE posted around ghapp's stamper
+        # (stdin, a raw API call) names no session at all (tartci#623's copy,
+        # stamp removed, still passed this status).
+        return "it has no `ghapp` session stamp"
     if os.environ.get(SIGNERS_FROM_BASE_ENV) != "1":
         # Host-local: the repository-side rule has no host to read.
         refusal = session_refusal(

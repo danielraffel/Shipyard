@@ -1641,8 +1641,10 @@ impl History {
             .to_string()));
         }
         if joined.contains("/comments") {
+            // With a base signer list the repository-side rule applies: a
+            // signed and stamped APPROVE.
             let signer = if self.config.is_some() {
-                "reviewer: pulp-review\n"
+                "reviewer: pulp-review\n<!-- session: Daniels-Mac-Studio-m3/review-1 -->\n"
             } else {
                 ""
             };
@@ -2476,4 +2478,25 @@ fn a_blob_whose_content_is_short_of_its_size_is_unknown() {
             "{data:?} of {size:?} must be unknown"
         );
     }
+}
+
+/// Only the repository-side rule requires a stamp: a host's own judgement of
+/// an unstamped, signed App APPROVE is unchanged (its session allowlist, if
+/// any, decides).
+#[test]
+fn only_the_repository_side_rule_requires_a_stamp() {
+    let comment = fleet(
+        "2026-10-12T01:00:00Z",
+        &format!("Reviewed.\nreviewer: pulp-review\nverdict: APPROVE head:{HEAD}"),
+    );
+    let mut policy = by_default("danielraffel/tartci");
+    policy.signers = Some(vec!["pulp-review".to_owned()]);
+    super::with_host_sessions(None, || {
+        assert_eq!(super::app_approval_refusal(&comment, &policy), None);
+        policy.signer_source = super::SignerSource::Base;
+        assert_eq!(
+            super::app_approval_refusal(&comment, &policy).as_deref(),
+            Some("it has no `ghapp` session stamp")
+        );
+    });
 }
