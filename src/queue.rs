@@ -1475,7 +1475,9 @@ fn sync_directory_best_effort(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueueTerminalDisposition, classify_queue_terminal};
+    use super::{
+        QueueTerminalDisposition, classify_queue_terminal, stale_recovery_result,
+    };
     use std::cell::Cell;
     use std::fs;
     use std::io;
@@ -1559,6 +1561,34 @@ mod tests {
         uncertain.completed_at = None;
         assert_eq!(
             classify_queue_terminal(&running, &uncertain),
+            Some(QueueTerminalDisposition::Uncertain)
+        );
+
+        let mut stale = completed.clone();
+        stale.results.insert("mac".to_owned(), stale_recovery_result("mac"));
+        assert_eq!(
+            classify_queue_terminal(&running, &stale),
+            Some(QueueTerminalDisposition::Uncertain)
+        );
+
+        let mut missing = completed.clone();
+        missing.results.clear();
+        assert_eq!(
+            classify_queue_terminal(&running, &missing),
+            Some(QueueTerminalDisposition::Uncertain)
+        );
+
+        let mut contested = completed.clone();
+        contested.cancel_requested_at = Some(Utc::now());
+        assert_eq!(
+            classify_queue_terminal(&running, &contested),
+            Some(QueueTerminalDisposition::Uncertain)
+        );
+
+        let mut identity_mismatch = completed;
+        identity_mismatch.sha = "different".to_owned();
+        assert_eq!(
+            classify_queue_terminal(&running, &identity_mismatch),
             Some(QueueTerminalDisposition::Uncertain)
         );
     }
