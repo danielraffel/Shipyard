@@ -22,6 +22,7 @@ from version_bump_check import (
     bump_version,
     git_diff_names,
     load_config,
+    max_level,
     read_version,
     refresh_cargo_lock,
     version_at_base,
@@ -62,23 +63,38 @@ def drain_base(repo: Path, head: str, fallback: str | None) -> str:
 
 
 def plan(repo: Path, config: Config, base: str, head: str) -> list[Assignment]:
-    changed = git_diff_names(base, head)
-    verdicts = assess_surfaces(config, changed, base, head, repo)
+    """Assess every change that landed on main since `base` on its own, then
+    take the highest level per surface.
+
+    A `Version-Bump: <surface>=skip` trailer covers only the change that
+    carries it. Judging `base..head` as one range let a single skipped change
+    suppress every later release until the next marker, so nothing ever
+    released again.
+    """
+    levels: dict[str, str] = {}
+    landed = git(repo, "rev-list", "--first-parent", "--reverse",
+                 f"{base}..{head}").stdout.split()
+    for commit in landed:
+        parent = git(repo, "rev-parse", f"{commit}^1").stdout.strip()
+        changed = git_diff_names(parent, commit)
+        for verdict in assess_surfaces(config, changed, parent, commit, repo):
+            name = verdict.surface.name
+            levels[name] = max_level(levels.get(name, "none"), verdict.final_level)
     assignments: list[Assignment] = []
-    for verdict in verdicts:
-        if verdict.final_level == "none":
+    for surface in config.surfaces:
+        level = levels.get(surface.name, "none")
+        if level == "none":
             continue
         current = next((version_at_base(base, vf)
-                        for vf in verdict.surface.version_files
+                        for vf in surface.version_files
                         if version_at_base(base, vf)), None)
         if not current:
             current = next((read_version(repo, vf)
-                            for vf in verdict.surface.version_files
+                            for vf in surface.version_files
                             if read_version(repo, vf)), None)
         if current:
             assignments.append(Assignment(
-                verdict.surface.name, verdict.final_level, current,
-                bump_version(current, verdict.final_level)))
+                surface.name, level, current, bump_version(current, level)))
     return assignments
 
 
