@@ -117,6 +117,53 @@ class ReleaseWorkflowTests(unittest.TestCase):
         body = text[start : start + 1 + following.start()] if following else text[start:]
         return re.split(r"\n      - ", body)[1:]
 
+    def _job_permissions(self, job: str) -> dict[str, str]:
+        """The job-level `permissions:` block of `job` (empty when absent)."""
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        start = text.index(f"\n  {job}:\n")
+        header = text[start:].split("\n    steps:\n", 1)[0]
+        block = re.search(r"\n    permissions:\n((?:      \S.*\n?)+)", header)
+        if not block:
+            return {}
+        return dict(
+            line.strip().split(": ", 1) for line in block.group(1).splitlines()
+        )
+
+    def test_release_workflow_grants_no_permissions_by_default(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("\npermissions: {}\n", text)
+        top = text.split("\njobs:\n", 1)[0]
+        self.assertNotIn("write", top)
+
+    def test_release_jobs_get_only_the_permissions_they_use(self) -> None:
+        signing = {"attestations": "write", "contents": "write", "id-token": "write"}
+        expected = {
+            "resolve-runners": {"contents": "read"},
+            "build": {"contents": "read"},
+            "live-smoke": {"contents": "read"},
+            "release": signing,
+            "sign-and-upload-macos": signing,
+        }
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        jobs = re.findall(r"^  ([A-Za-z0-9_-]+):\n", text.split("\njobs:\n", 1)[1], re.M)
+        self.assertEqual(sorted(jobs), sorted(expected))
+        for job, permissions in expected.items():
+            with self.subTest(job=job):
+                self.assertEqual(self._job_permissions(job), permissions)
+
+    def test_release_checkouts_do_not_persist_the_job_token(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        checkouts = text.count(f"uses: {CHECKOUT}")
+        self.assertGreater(checkouts, 0)
+        self.assertEqual(
+            text.count(
+                f"uses: {CHECKOUT}\n        with:\n          persist-credentials: false\n"
+            ),
+            checkouts,
+        )
+        # Nothing after checkout reuses a persisted git credential.
+        self.assertNotRegex(text, r"\bgit (push|fetch|pull|ls-remote)\b")
+
     def test_attestation_retries_only_after_a_failed_attempt(self) -> None:
         for job, prefix in (
             ("release", "attest_nonmac"),

@@ -35,10 +35,8 @@ on:
         default: ""
         type: string
 
-permissions:
-  attestations: write
-  contents: write
-  id-token: write
+# Each job grants only what its own steps use; nothing is granted by default.
+permissions: {}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -51,11 +49,15 @@ jobs:
   resolve-runners:
     name: Resolve runners
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       matrix_json: ${{ steps.resolve.outputs.matrix_json }}
       macos_arm64_runs_on_json: ${{ steps.resolve.outputs.macos_arm64_runs_on_json }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - id: resolve
         env:
@@ -74,11 +76,15 @@ jobs:
     needs: resolve-runners
     name: Build ${{ matrix.package_target }} [${{ matrix.provider }}]
     runs-on: ${{ fromJSON(matrix.runs_on_json) }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve-runners.outputs.matrix_json) }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Validate release runner architecture
         shell: bash
@@ -153,6 +159,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Download the linux-x64 release binary
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
@@ -180,8 +188,15 @@ jobs:
     needs: [build, live-smoke]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    # Creates the draft release (contents) and signs its build provenance.
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Download non-macOS artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
@@ -252,8 +267,15 @@ jobs:
     needs: [resolve-runners, release]
     if: startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}
+    # Uploads the DMG and publishes the release (contents) after attesting it.
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       # The signed build must not read a toolchain or crate sources that an
       # earlier job on a shared runner could have written to ~/.cargo or
