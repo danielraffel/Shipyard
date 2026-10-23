@@ -497,7 +497,7 @@ fn open_pull_request_transport_supports_more_than_one_hundred_rows() {
         &format!(
             r#"
 test "$9" = --limit
-test "${{10}}" = 1000
+test "${{10}}" = 200
 cat '{}'
 "#,
             rows_path.display()
@@ -514,7 +514,7 @@ cat '{}'
 #[test]
 fn open_pull_request_transport_refuses_the_bounded_limit() {
     let temp = tempfile::tempdir().expect("temp");
-    let rows = (1..=1000)
+    let rows = (1..=200)
         .map(|number| {
             serde_json::json!({
                 "id": format!("PR_{number}"),
@@ -536,7 +536,7 @@ fn open_pull_request_transport_refuses_the_bounded_limit() {
 
     let error = pull_requests(&actions, "owner/repo", "main", &BTreeMap::new())
         .expect_err("bounded inventory");
-    assert!(error.contains("reached 1000"), "{error}");
+    assert!(error.contains("reached 200"), "{error}");
 }
 #[cfg(unix)]
 #[test]
