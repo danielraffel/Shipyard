@@ -12,6 +12,10 @@ use crate::required_check_policy::{
 const BOUNDED_GH_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const BOUNDED_GH_STDERR_BYTES: usize = 64 * 1024;
 const MAX_MERGE_QUEUE_PAGES: usize = 10;
+// Keep the GraphQL connection bounded well below gh's 1,000-row maximum. The
+// release smoke gate uses the same read with the Actions token, where a 1,000
+// row request has repeatedly produced 502/EOF responses despite a 48-PR repo.
+const MAX_OPEN_PR_ROWS: usize = 200;
 
 pub(super) fn resolve_repos(mut repos: Vec<String>, cwd: &Path) -> Result<Vec<String>, CliFailure> {
     if repos.is_empty() {
@@ -496,7 +500,7 @@ pub(super) fn pull_requests(
         "--base".to_owned(),
         base.to_owned(),
         "--limit".to_owned(),
-        "1000".to_owned(),
+        MAX_OPEN_PR_ROWS.to_string(),
         "--json".to_owned(),
         OPEN_PR_LIST_FIELDS.to_owned(),
     ];
@@ -504,8 +508,10 @@ pub(super) fn pull_requests(
     let rows = value
         .as_array()
         .ok_or_else(|| "open PR list was not an array".to_owned())?;
-    if rows.len() == 1000 {
-        return Err("open PR list reached 1000; refusing a possibly partial snapshot".to_owned());
+    if rows.len() == MAX_OPEN_PR_ROWS {
+        return Err(format!(
+            "open PR list reached {MAX_OPEN_PR_ROWS}; refusing a possibly partial snapshot"
+        ));
     }
     rows.iter().map(|row| parse_pr(row, positions)).collect()
 }
