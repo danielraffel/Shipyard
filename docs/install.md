@@ -33,8 +33,12 @@ provider after the older CLI passes its smoke test.
 
 Every download is checked against the release's `checksums.sha256` before it
 is mounted, re-signed, or run. A digest mismatch, or a checksums file with no
-entry for the asset, aborts the install. Only a release that publishes no
-`checksums.sha256` at all installs unverified, with a warning.
+entry for the asset, aborts the install, and so does a release that publishes no `checksums.sha256`
+or whose checksums file cannot be downloaded. Every published release since
+v0.1.0 ships the file. To install a tag that predates checksums anyway, set
+`SHIPYARD_ALLOW_UNVERIFIED_INSTALL=1`; the install then proceeds with a loud
+warning. The escape hatch only covers a missing checksums file, never a
+mismatch, a missing entry, or a failed checksums download.
 
 ## First-run auth
 

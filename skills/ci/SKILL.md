@@ -791,8 +791,10 @@ read does. Run the same gate by hand with
 (the macOS DMG, or the Linux/Windows CLI and provider binaries) before it
 mounts, `chmod`s, ad-hoc signs, or runs them. A digest mismatch, a failed
 checksums download, or a checksums file with no entry for the asset exits 1.
-Only a release that publishes no `checksums.sha256` at all (none known today)
-installs with a `WARN`. The ad-hoc re-sign fallback for the v0.42/v0.43
+A release that publishes no `checksums.sha256` is refused too (every published
+release since v0.1.0 ships it); the only escape hatch is
+`SHIPYARD_ALLOW_UNVERIFIED_INSTALL=1`, which installs such a release with a
+loud warning and never bypasses a mismatch or missing entry. The ad-hoc re-sign fallback for the v0.42/v0.43
 notarization SIGKILL is unchanged; it now only ever applies to verified bytes.
 `SHIPYARD_SKIP_DOWNLOAD=1` reuses local bytes and is not checksum-verified.
 Regression test: `scripts/test_install_checksum.py`.

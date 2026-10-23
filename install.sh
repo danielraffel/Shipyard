@@ -110,8 +110,21 @@ verify_asset_checksum() {
 
 fetch_release_checksums() {
     if [ -z "${CHECKSUMS_URL}" ]; then
-        echo "WARN: release ${VERSION_LABEL} publishes no ${CHECKSUMS_ASSET}; installing without checksum verification." >&2
-        return 0
+        # Every published release since v0.1.0 carries checksums.sha256, so a
+        # missing manifest means a broken or tampered release, not an old one.
+        if [ "${SHIPYARD_ALLOW_UNVERIFIED_INSTALL:-0}" = "1" ]; then
+            echo "WARNING: ************************************************************" >&2
+            echo "WARNING: release ${VERSION_LABEL} publishes no ${CHECKSUMS_ASSET}." >&2
+            echo "WARNING: SHIPYARD_ALLOW_UNVERIFIED_INSTALL=1 is set, so the download is" >&2
+            echo "WARNING: installed WITHOUT checksum verification. Its bytes are untrusted." >&2
+            echo "WARNING: ************************************************************" >&2
+            return 0
+        fi
+        echo "ERROR: release ${VERSION_LABEL} publishes no ${CHECKSUMS_ASSET}; refusing to install unverified bytes." >&2
+        echo "  Every published Shipyard release since v0.1.0 ships ${CHECKSUMS_ASSET}; its absence" >&2
+        echo "  means the release is incomplete or has been altered. To install a tag that" >&2
+        echo "  predates checksums anyway, re-run with SHIPYARD_ALLOW_UNVERIFIED_INSTALL=1." >&2
+        exit 1
     fi
     CHECKSUMS_FILE="$(mktemp -d)/${CHECKSUMS_ASSET}"
     if ! download_asset "${CHECKSUMS_URL}" "${CHECKSUMS_FILE}" \

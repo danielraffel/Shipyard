@@ -162,7 +162,9 @@ class InstallChecksumTests(unittest.TestCase):
         hdiutil.write_text(FAKE_HDIUTIL, encoding="utf-8")
         hdiutil.chmod(0o755)
 
-    def run_install(self, uname_s: str, uname_m: str) -> subprocess.CompletedProcess:
+    def run_install(
+        self, uname_s: str, uname_m: str, extra_env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess:
         env = {
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin}:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -175,6 +177,7 @@ class InstallChecksumTests(unittest.TestCase):
             "FIXTURE_CURL_LOG": str(self.curl_log),
             "FIXTURE_TOOL_LOG": str(self.tool_log),
             "FIXTURE_DMG_PAYLOAD": str(self.root / "dmg-payload"),
+            **(extra_env or {}),
         }
         return subprocess.run(
             ["bash", str(INSTALL_SH)],
@@ -234,12 +237,45 @@ class InstallChecksumTests(unittest.TestCase):
         self.assertIn("has no entry for shipyard-linux-x64", result.stderr)
         self.assert_nothing_installed()
 
-    def test_release_without_checksums_warns_and_installs(self) -> None:
+    def test_release_without_checksums_is_refused(self) -> None:
         self.publish(self.linux_assets(), checksums=False)
         result = self.run_install("Linux", "x86_64")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 1)
         self.assertIn("publishes no checksums.sha256", result.stderr)
+        self.assertIn("SHIPYARD_ALLOW_UNVERIFIED_INSTALL=1", result.stderr)
+        fetched = self.curl_log.read_text(encoding="utf-8")
+        self.assertNotIn("shipyard-linux-x64", fetched, "nothing may be downloaded")
+        self.assert_nothing_installed()
+
+    def test_unreachable_checksums_is_refused_even_with_escape_hatch(self) -> None:
+        self.publish(self.linux_assets())
+        (self.served / "checksums.sha256").write_bytes(b"")
+        result = self.run_install(
+            "Linux", "x86_64", {"SHIPYARD_ALLOW_UNVERIFIED_INSTALL": "1"}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("failed to download checksums.sha256", result.stderr)
+        self.assert_nothing_installed()
+
+    def test_escape_hatch_installs_unverified_release_loudly(self) -> None:
+        self.publish(self.linux_assets(), checksums=False)
+        result = self.run_install(
+            "Linux", "x86_64", {"SHIPYARD_ALLOW_UNVERIFIED_INSTALL": "1"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("WITHOUT checksum verification", result.stderr)
+        self.assertIn("SHIPYARD_ALLOW_UNVERIFIED_INSTALL=1 is set", result.stderr)
+        self.assertNotIn("Verified sha256", result.stdout)
         self.assertTrue((self.install_dir / "shipyard").exists())
+
+    def test_escape_hatch_does_not_bypass_a_mismatch(self) -> None:
+        self.publish(self.linux_assets(), tamper="shipyard-linux-x64")
+        result = self.run_install(
+            "Linux", "x86_64", {"SHIPYARD_ALLOW_UNVERIFIED_INSTALL": "1"}
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("sha256 mismatch for shipyard-linux-x64", result.stderr)
+        self.assert_nothing_installed()
 
     # ── macOS DMG path ───────────────────────────────────────────────
 
@@ -253,6 +289,15 @@ class InstallChecksumTests(unittest.TestCase):
         self.assertIn("hdiutil attach", calls)
         self.assertIn("codesign", calls)
         self.assertTrue((self.install_dir / "shipyard").exists())
+
+    def test_dmg_release_without_checksums_is_refused_before_download(self) -> None:
+        self.install_macos_shims()
+        self.publish(self.macos_dmg(), checksums=False)
+        result = self.run_install("Darwin", "arm64")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("publishes no checksums.sha256", result.stderr)
+        self.assertEqual(self.tool_calls(), "", "no hdiutil/codesign/xattr may run")
+        self.assert_nothing_installed()
 
     def test_tampered_dmg_is_refused_before_mount_or_signing(self) -> None:
         self.install_macos_shims()
