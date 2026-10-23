@@ -922,13 +922,16 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    // Only the unix-gated fake tailscale fixtures construct the backend by name.
+    #[cfg(unix)]
+    use super::TailscaleFunnelBackend;
     use super::{
-        TAILSCALE_PROBE_BACKOFFS, TailscaleFunnelBackend, TailscaleStatus, TunnelBackend,
-        TunnelError, TunnelErrorKind, TunnelInfo, TunnelSnapshot, TunnelSupervisorHooks,
-        TunnelSupervisorPolicy, TunnelSupervisorState, TunnelWatchExit, Value,
-        decode_tailscale_status, private_routes_on_443, probe_tailscale_with_retry,
-        resolve_tailscale_binary_from, root_mount_targets, start_with_retry, supervise_tunnel,
-        tailscale_command, watch_until_lost,
+        TAILSCALE_PROBE_BACKOFFS, TailscaleStatus, TunnelBackend, TunnelError, TunnelErrorKind,
+        TunnelInfo, TunnelSnapshot, TunnelSupervisorHooks, TunnelSupervisorPolicy,
+        TunnelSupervisorState, TunnelWatchExit, Value, decode_tailscale_status,
+        private_routes_on_443, probe_tailscale_with_retry, resolve_tailscale_binary_from,
+        root_mount_targets, start_with_retry, supervise_tunnel, tailscale_command,
+        watch_until_lost,
     };
 
     #[derive(Default)]
