@@ -5,6 +5,10 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+Metrics imports preserve exact-head safety when GitHub omits a workflow run's
+pull-request list: `pull_request` and `pull_request_target` runs may use the
+commit-to-pull-requests API, but zero or multiple matches remain unknown.
+
 ## Webhook repository identity
 
 Webhook registrar repository keys are canonical lowercase `owner/name` values

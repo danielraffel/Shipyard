@@ -64,11 +64,27 @@ pub fn github_jobs_api_path(repo: &str, run_id: i64) -> String {
     format!("/repos/{repo}/actions/runs/{run_id}/jobs")
 }
 
+/// `gh api` path resolving a commit to its pull requests.
+#[must_use]
+pub fn github_commit_pulls_api_path(repo: &str, sha: &str) -> String {
+    format!("/repos/{repo}/commits/{sha}/pulls")
+}
+
 /// A run's pull request, only when it names exactly one.
 #[must_use]
 pub fn workflow_run_single_pr(run: &Value) -> Option<i64> {
     let pull_requests = run.get("pull_requests")?.as_array()?;
     let [pull_request] = pull_requests.as_slice() else {
+        return None;
+    };
+    pull_request.get("number").and_then(Value::as_i64)
+}
+
+/// A commit's pull request, only when GitHub names exactly one.
+#[must_use]
+pub fn commit_pulls_single_pr(pulls: &Value) -> Option<i64> {
+    let pulls = pulls.as_array()?;
+    let [pull_request] = pulls.as_slice() else {
         return None;
     };
     pull_request.get("number").and_then(Value::as_i64)
@@ -142,7 +158,35 @@ pub fn import_github_report<E>(
     }
     let project = request.project_key();
     let mut pending_inputs = Vec::new();
-    for (run_id, pr, metadata) in run_ids {
+    for (run_id, run_pr, metadata) in run_ids {
+        // GitHub's workflow-runs API commonly leaves `pull_requests` empty
+        // for pull_request_target runs (and for some App-authenticated
+        // responses). Resolve the exact head through GitHub's authoritative
+        // commit-to-PR endpoint instead of guessing from branch names or
+        // event shape. Multiple associated PRs remain deliberately unknown.
+        let pr = if run_pr.is_some() {
+            run_pr
+        } else if matches!(
+            metadata.event.as_deref(),
+            Some("pull_request" | "pull_request_target")
+        ) && metadata
+            .head_sha
+            .as_deref()
+            .is_some_and(|sha| !sha.is_empty())
+        {
+            let sha = metadata.head_sha.as_deref().expect("checked above");
+            let pulls = gh(&[
+                "api".to_owned(),
+                "-X".to_owned(),
+                "GET".to_owned(),
+                github_commit_pulls_api_path(&request.repo, sha),
+                "-f".to_owned(),
+                "per_page=100".to_owned(),
+            ])?;
+            commit_pulls_single_pr(&pulls)
+        } else {
+            None
+        };
         let mut page = 1u32;
         let mut observed = 0u64;
         let mut seen_job_ids = HashSet::new();
@@ -317,6 +361,58 @@ mod tests {
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
         assert_eq!(identity.4, None);
+    }
+
+    #[test]
+    fn resolves_pr_from_authoritative_commit_lookup_when_run_omits_pull_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let request = GithubImportRequest {
+            repo: "danielraffel/Shipyard".to_owned(),
+            project: None,
+            workflow: None,
+            branch: None,
+            limit: 5,
+        };
+        let mut calls = Vec::new();
+        let mut gh = |argv: &[String]| -> Result<Value, String> {
+            calls.push(argv[3].clone());
+            if argv[3].ends_with("/runs") {
+                Ok(json!({"workflow_runs": [{
+                    "id": 42, "event": "pull_request_target",
+                    "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "head_branch": "feature/test", "pull_requests": []
+                }]}))
+            } else if argv[3].contains("/commits/") {
+                Ok(json!([{"number": 894}]))
+            } else {
+                Ok(json!({"jobs": [{
+                    "id": 7, "name": "macos", "conclusion": "success",
+                    "started_at": "2026-10-23T10:00:00Z",
+                    "completed_at": "2026-10-23T10:01:00Z"
+                }]}))
+            }
+        };
+        assert_eq!(
+            import_github(&store, &request, &mut gh, &|error| error).unwrap(),
+            1
+        );
+        assert!(calls[1].contains("/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/pulls"));
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        let pr: i64 = conn
+            .query_row("SELECT pr FROM runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pr, 894);
+    }
+
+    #[test]
+    fn commit_pull_lookup_keeps_ambiguous_associations_unknown() {
+        assert_eq!(commit_pulls_single_pr(&json!([])), None);
+        assert_eq!(
+            commit_pulls_single_pr(&json!([{"number": 1}, {"number": 2}])),
+            None
+        );
+        assert_eq!(commit_pulls_single_pr(&json!([{"number": 3}])), Some(3));
     }
 
     #[test]

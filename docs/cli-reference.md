@@ -513,7 +513,10 @@ authoritative head SHA on the SQLite run row. These dimensions are independent:
 an event can have multiple attempts, and an attempt can be observed alongside
 other event dimensions. Missing provider fields remain `NULL`. The importer
 does not infer organic or synthetic provenance from event names or pull-request
-shape. Only an authenticated `production` or `synthetic` label is eligible for
+shape. When a workflow-run response omits its pull-request list, a
+`pull_request`/`pull_request_target` run may resolve its exact head through
+GitHub's commit-to-pull-requests endpoint; ambiguous or unavailable
+associations remain `NULL`. Only an authenticated `production` or `synthetic` label is eligible for
 provenance-qualified scorecard populations; unknown rows remain visible in the
 `scorecard.provenance` counts and are excluded from promotion decisions.
 
