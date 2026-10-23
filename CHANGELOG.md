@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03460"></a>
+## [0.346.0] - 2026-10-23
+
+- fix/guardian mixed timeout foreign reconcile ([#901](https://github.com/danielraffel/Shipyard/pull/901))
+
 <a id="v03450"></a>
 ## [0.345.0] - 2026-10-23
 
@@ -2498,6 +2503,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.346.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.346.0
 [0.345.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.345.0
 [0.344.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.344.1
 [0.344.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.344.0
