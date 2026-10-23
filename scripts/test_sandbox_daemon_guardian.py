@@ -806,6 +806,42 @@ class GuardianLifecycleTests(unittest.TestCase):
                     )
                 )
 
+    def test_owner_end_then_holder_timeout_then_foreign_writer_is_reconcilable(
+        self,
+    ) -> None:
+        # m3, 2026-10-23: run 39881545054 retained the lease with this shape.
+        lock = Path("/tmp/state/.sandbox-writer-domain.lock")
+        failure = (
+            "GuardianError: OwnerEnded: Actions owner ended before canary completion; "
+            "restore production: GuardianError: timed out inspecting writer-domain "
+            f"holders for {lock} after 2 attempt(s); restore production: "
+            "GuardianError: foreign process entered the production writer domain: "
+            "(68866,)"
+        )
+        self.assertTrue(
+            guardian._is_reconcilable_retained_failure(
+                failure, expected_lock_path=lock, expected_production_pid=66051
+            )
+        )
+        for candidate, expected_lock, expected_pid in (
+            (failure, Path("/tmp/other.lock"), 66051),
+            (failure, lock, None),
+            (failure, None, 66051),
+            (failure.replace("after 2 attempt(s)", "after 1 attempt(s)"), lock, 66051),
+            (failure.replace("(68866,)", "(0,)"), lock, 66051),
+            (failure + "; unrelated cleanup failure", lock, 66051),
+            (failure.replace("GuardianError: OwnerEnded: Actions owner ended before "
+                             "canary completion; ", "GuardianError: "), lock, 66051),
+        ):
+            with self.subTest(candidate=candidate, lock=expected_lock, pid=expected_pid):
+                self.assertFalse(
+                    guardian._is_reconcilable_retained_failure(
+                        candidate,
+                        expected_lock_path=expected_lock,
+                        expected_production_pid=expected_pid,
+                    )
+                )
+
     def test_a_fenced_receipt_binds_to_a_replaced_production(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             active = self.make_guardian(Path(directory))
