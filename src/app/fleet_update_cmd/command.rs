@@ -103,7 +103,10 @@ pub(super) fn remote_update_command(
         Some(version),
         tag_requires_companion(target),
     );
-    let exact_asset_curl_shim = exact_asset_curl_shim(&authority.platform_asset.name);
+    let exact_asset_curl_shim = exact_asset_curl_shim(
+        &authority.platform_asset.name,
+        &authority.platform_asset.sha256,
+    );
     let auth_token_command = if tag_supports_auth_resolver(target) {
         resolver_auth_token_command(
             binary,
@@ -562,9 +565,15 @@ sys.stdout.write(token)"#;
     )
 }
 
-pub(super) fn exact_asset_curl_shim(asset_name: &str) -> String {
+/// curl stand-in for the release's own install.sh. It answers the release
+/// lookup with the controller-staged asset plus a `checksums.sha256` holding
+/// the sha256 the controller already pinned against the release's manifest, so
+/// install.sh verifies the staged bytes instead of refusing a release listing
+/// that has no checksums asset. Every other request goes to the real curl
+/// (install.sh downloads the `file://` URLs through it).
+pub(super) fn exact_asset_curl_shim(asset_name: &str, asset_sha256: &str) -> String {
     format!(
-        "#!/bin/bash\nset -euo pipefail\ncase \"$*\" in\n  *\"/releases/tags/\"*) /usr/bin/printf '{{\"assets\":[{{\"name\":\"{asset_name}\",\"url\":\"file://%s\",\"browser_download_url\":\"file://%s\"}}]}}\\n200\\n' \"$SHIPYARD_FLEET_ASSET_PATH\" \"$SHIPYARD_FLEET_ASSET_PATH\" ;;\n  *) exec /usr/bin/curl \"$@\" ;;\nesac"
+        "#!/bin/bash\nset -euo pipefail\ncase \"$*\" in\n  *\"/releases/tags/\"*) checksums_dir=\"$SHIPYARD_FLEET_ASSET_PATH.checksums\"; /bin/mkdir -p \"$checksums_dir\"; /usr/bin/printf '%s  %s\\n' '{asset_sha256}' '{asset_name}' > \"$checksums_dir/checksums.sha256\"; /usr/bin/printf '{{\"assets\":[{{\"name\":\"{asset_name}\",\"url\":\"file://%s\",\"browser_download_url\":\"file://%s\"}},{{\"name\":\"checksums.sha256\",\"url\":\"file://%s\",\"browser_download_url\":\"file://%s\"}}]}}\\n200\\n' \"$SHIPYARD_FLEET_ASSET_PATH\" \"$SHIPYARD_FLEET_ASSET_PATH\" \"$checksums_dir/checksums.sha256\" \"$checksums_dir/checksums.sha256\" ;;\n  *) exec /usr/bin/curl \"$@\" ;;\nesac"
     )
 }
 
@@ -653,7 +662,10 @@ pub(super) fn local_update_command(plan: &HostUpdatePlan) -> String {
     let (auth_helper_url, auth_wrapper_url, close_guard_url) =
         auth_support::source_urls(&plan.release_authority);
     let auth_contract = auth_support::wrapper_helper_contract_probe(&plan.auth_helper);
-    let curl_shim = exact_asset_curl_shim(&plan.release_authority.platform_asset.name);
+    let curl_shim = exact_asset_curl_shim(
+        &plan.release_authority.platform_asset.name,
+        &plan.release_authority.platform_asset.sha256,
+    );
     let auth_token_command = if tag_supports_auth_resolver(&plan.target) {
         resolver_auth_token_command(
             &plan.binary,
