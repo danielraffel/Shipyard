@@ -688,11 +688,17 @@ fn observe_admission_candidates(
     repo: &str,
     base: &str,
     labels: &[String],
+    require_authority_fence: bool,
 ) -> Result<(RepoObservation, Vec<RunCancellation>, Vec<u64>), String> {
     with_stable_admission_authority(|| {
         let observation = observe_repo(actions, repo, base, false)?;
         let (candidates, blocking_only) = admission_candidates(actions, &observation, labels)?;
-        fence_admission_authority(actions, &observation)?;
+        // A read-only verdict has no subsequent mutation to protect. Avoid a
+        // second full GitHub census there; the apply path keeps the exact-head
+        // fence before any destructive action.
+        if require_authority_fence {
+            fence_admission_authority(actions, &observation)?;
+        }
         Ok((observation, candidates, blocking_only))
     })
 }
@@ -808,7 +814,7 @@ pub(super) fn admission_clean_command<W: Write>(
         .with_absolute_deadline(Instant::now() + ADMISSION_OBSERVATION_TIMEOUT);
     let actions = &admission_actions;
     let (mut observation, mut candidates, mut blocking_only) =
-        match observe_admission_candidates(actions, &repo, &base, &labels) {
+        match observe_admission_candidates(actions, &repo, &base, &labels, args.apply) {
             Ok(observation) => observation,
             Err(error) => return_verdict!(Error, "observation_failed", &repo, &[], Some(&error)),
         };
@@ -842,6 +848,27 @@ pub(super) fn admission_clean_command<W: Write>(
         pending_admission_cancellations(&observed_ledger, &canonical_repo, &base);
     let mut blocker_run_ids =
         admission_blocker_run_ids(&candidates, &blocking_only, &observed_pending);
+    // Report-only admission is an observation, not a mutation precondition.
+    // Return the snapshot verdict after checking the ledger lock, without
+    // running a second full census; the apply path below performs the
+    // exact-head fence.
+    if !args.apply {
+        let _ledger_lock = acquire_admission_ledger_lock!(&blocker_run_ids);
+        if candidates.is_empty() && blocking_only.is_empty() && observed_pending.is_empty() {
+            return_verdict!(Admit, "clean", &canonical_repo, &[], None);
+        }
+        return_verdict!(
+            Defer,
+            if observed_pending.is_empty() {
+                "stale_compatible_runs"
+            } else {
+                "cancellation_pending"
+            },
+            &canonical_repo,
+            &blocker_run_ids,
+            None
+        );
+    }
     if candidates.is_empty() && blocking_only.is_empty() && observed_pending.is_empty() {
         let _ledger_lock = acquire_admission_ledger_lock!(&[]);
         let ledger = load_ledger(&ledger_path)?;
@@ -878,19 +905,6 @@ pub(super) fn admission_clean_command<W: Write>(
             );
         }
         return_verdict!(Admit, "clean", &canonical_repo, &[], None);
-    }
-    if !args.apply {
-        return_verdict!(
-            Defer,
-            if observed_pending.is_empty() {
-                "stale_compatible_runs"
-            } else {
-                "cancellation_pending"
-            },
-            &canonical_repo,
-            &blocker_run_ids,
-            None
-        );
     }
     let Ok(authority) = authority_status(
         &runtime_paths.state_dir,
@@ -953,7 +967,7 @@ pub(super) fn admission_clean_command<W: Write>(
             );
         }
     }
-    match observe_admission_candidates(actions, &canonical_repo, &base, &labels) {
+    match observe_admission_candidates(actions, &canonical_repo, &base, &labels, true) {
         Ok((refreshed_observation, refreshed_candidates, refreshed_blocking)) => {
             observation = refreshed_observation;
             candidates = refreshed_candidates;
@@ -1009,7 +1023,7 @@ pub(super) fn admission_clean_command<W: Write>(
     }
     save_ledger(&ledger_path, &ledger)?;
     let (remaining, remaining_blocking) =
-        match observe_admission_candidates(actions, &canonical_repo, &base, &labels) {
+        match observe_admission_candidates(actions, &canonical_repo, &base, &labels, true) {
             Ok((_, candidates, blocking)) => (candidates, blocking),
             Err(error) => return_verdict!(
                 Error,
