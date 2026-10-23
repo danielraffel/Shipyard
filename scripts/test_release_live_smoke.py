@@ -125,7 +125,7 @@ class ReleaseLiveSmokeTests(unittest.TestCase):
         code, out, _ = self.run_main(run)
         self.assertEqual(code, 1)
         self.assertIn("timed out", out)
-        self.assertEqual(calls, 6)
+        self.assertEqual(calls, 10)
 
     def test_transient_failure_is_retried_then_passes(self) -> None:
         calls = 0
@@ -157,8 +157,8 @@ class ReleaseLiveSmokeTests(unittest.TestCase):
 
         code, out, _ = self.run_main(run)
         self.assertEqual(code, 1)
-        self.assertIn("3 attempts", out)
-        self.assertEqual(calls, 6)
+        self.assertIn("5 attempts", out)
+        self.assertEqual(calls, 10)
 
     def test_permanent_failure_is_not_retried(self) -> None:
         calls = 0

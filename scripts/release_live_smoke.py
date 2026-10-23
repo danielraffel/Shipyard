@@ -33,8 +33,8 @@ from pathlib import Path
 DEFAULT_REPOS = ("Generous-Corp/pulp",)
 DEFAULT_LABELS = "self-hosted,macos,arm64"
 PROBE_TIMEOUT_SECONDS = 300
-PROBE_ATTEMPTS = 3
-PROBE_RETRY_DELAYS_SECONDS = (1.0, 3.0)
+PROBE_ATTEMPTS = 5
+PROBE_RETRY_DELAYS_SECONDS = (1.0, 3.0, 10.0, 30.0)
 # Defer reasons admission-clean returns before any GitHub read (a contended
 # lock). They prove nothing about whether the binary can observe GitHub.
 UNOBSERVED_DEFER_REASONS = frozenset({"observation_in_progress", "stewardship_in_progress"})
