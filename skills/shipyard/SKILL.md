@@ -611,6 +611,16 @@ versions. The read-only version gate rejects those edits unless the PR carries
 the explicit release recovery trailer. After merge, `version-at-land.yml` is the
 single writer and assigns the next versions.
 
+It judges each first-parent change since the last `Version-Bump-Applied` marker
+on its own, then takes the highest level per surface. A
+`Version-Bump: <surface>=skip` trailer therefore skips only the change that
+carries it. Before 2026-10-23 the whole range was judged at once, so one
+skipped change merged after the marker silenced every later release. Shipyard
+sat at v0.344.1 for six days because of it. If `main` keeps landing src changes
+but no tag appears, run
+`python3 scripts/version_at_land.py --base <last marker> --head origin/main --json`
+and expect a non-empty plan.
+
 ## Stale ship-state records: `discard --repo` and `prune`
 
 The daemon archives a record when its PR's `pull_request.closed` webhook
