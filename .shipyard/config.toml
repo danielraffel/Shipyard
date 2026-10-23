@@ -45,11 +45,11 @@ trailers = [
 ]
 only_for_tag_pattern = "v*"
 max_push_attempts    = 5
-# Shipyard dogfoods its hook while the triggering release is still a draft.
-# Resolve the latest already-published, checksum-verified CLI instead of
-# racing assets for the new tag. Consumer repositories remain pinned by
-# default unless they opt into this explicitly.
-workflow_shipyard_version = "latest"
+# Shipyard dogfoods its hook while the triggering release is still a draft,
+# so it builds the CLI from the tagged checkout instead of racing the new
+# tag's assets or trusting whatever release is `latest`. Only this repository
+# can use `checkout`; consumer repositories stay pinned to an exact version.
+workflow_shipyard_version = "checkout"
 
 [release.post_tag_hook.bot_identity]
 name  = "shipyard-release-bot"

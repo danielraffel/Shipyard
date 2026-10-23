@@ -44,6 +44,11 @@ pub const CLIENT_WRITER_QUEUE_CAPACITY: usize = RING_BUFFER_SIZE + 1024;
 /// GitHub snapshot, which can take tens of seconds.
 #[cfg(unix)]
 pub const CLIENT_WRITE_STALL_TIMEOUT: Duration = Duration::from_mins(1);
+/// A connection that has not subscribed is closed after this long without a
+/// request, so idle sockets cannot pin the [`MAX_IPC_CLIENTS`] slots.
+/// Subscribers are exempt: they legitimately stay quiet between events.
+#[cfg(unix)]
+pub const IDLE_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum bytes accepted for one newline-delimited client request.
 pub const MAX_IPC_FRAME_BYTES: usize = 64 * 1024;
 /// Maximum serialized bytes retained for one outbound IPC frame.
@@ -208,6 +213,8 @@ struct SharedState {
     next_id: usize,
     clients: std::collections::BTreeMap<usize, Arc<UnixStream>>,
     next_client_id: usize,
+    /// Overrides [`IDLE_CLIENT_TIMEOUT`] (tests shorten it).
+    idle_client_timeout: Option<Duration>,
 }
 
 #[cfg(unix)]
@@ -262,6 +269,17 @@ impl IpcServer {
         }
     }
 
+    /// Close unsubscribed clients after `timeout` without a request instead
+    /// of [`IDLE_CLIENT_TIMEOUT`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_idle_client_timeout(self, timeout: Duration) -> Self {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.idle_client_timeout = Some(timeout);
+        }
+        self
+    }
+
     /// Install a callback invoked when a client sends `{"type":"stop"}`.
     #[must_use]
     pub fn with_stop_request<F>(mut self, callback: F) -> Self
@@ -296,6 +314,12 @@ impl IpcServer {
         }
 
         let listener = UnixListener::bind(&self.socket_path)?;
+        // Owner-only, whatever the umask: the socket accepts `stop` and
+        // streams every event the daemon sees.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))?;
+        }
         listener.set_nonblocking(true)?;
         self.running.store(true, Ordering::Release);
 
@@ -516,10 +540,19 @@ fn handle_client(
     let mut subscriber_id = None;
     let mut reader = BufReader::new(stream);
     let mut frame = Vec::new();
+    let mut last_request = Instant::now();
+    let idle_timeout = shared
+        .lock()
+        .ok()
+        .and_then(|shared| shared.idle_client_timeout)
+        .unwrap_or(IDLE_CLIENT_TIMEOUT);
 
     while running.load(Ordering::Acquire) {
         match read_bounded_frame(&mut reader, &mut frame) {
             FrameRead::Pending => {
+                if subscriber_id.is_none() && last_request.elapsed() >= idle_timeout {
+                    break;
+                }
                 thread::sleep(Duration::from_millis(50));
                 continue;
             }
@@ -536,7 +569,7 @@ fn handle_client(
                 break;
             }
             FrameRead::End | FrameRead::Failed => break,
-            FrameRead::Complete => {}
+            FrameRead::Complete => last_request = Instant::now(),
         }
         let Ok(message) = serde_json::from_slice::<Value>(&frame) else {
             frame.clear();
@@ -605,6 +638,9 @@ fn handle_client(
             }
             _ => {}
         }
+        // Idle time runs from the last answer, not the request: a slow
+        // status snapshot is not the client's silence.
+        last_request = Instant::now();
     }
 
     if let Some(id) = subscriber_id {
@@ -1419,6 +1455,104 @@ mod tests {
         assert_eq!(lines[1]["code"], "ipc_frame_too_large");
         assert_eq!(lines[1]["retryable"], false);
         assert_eq!(lines[2]["type"], "goodbye");
+
+        server.stop().expect("stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_socket_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let socket_path = short_socket_path();
+        let mut server = IpcServer::new(socket_path.clone(), dummy_state);
+        server.start().expect("start");
+        let mode = std::fs::metadata(&socket_path)
+            .expect("socket metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        server.stop().expect("stop");
+        assert_eq!(mode, 0o600);
+    }
+
+    /// Wait for `stream` to be closed by the daemon, up to `limit`.
+    #[cfg(unix)]
+    fn closed_within(stream: &UnixStream, limit: Duration) -> bool {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("timeout");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(_) => return true,
+            }
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_unsubscribed_client_is_dropped_but_a_quiet_subscriber_is_kept() {
+        let socket_path = short_socket_path();
+        let mut server = IpcServer::new(socket_path.clone(), dummy_state)
+            .with_idle_client_timeout(Duration::from_millis(300));
+        server.start().expect("start");
+
+        let idle = UnixStream::connect(&socket_path).expect("connect idle");
+        let mut subscriber = UnixStream::connect(&socket_path).expect("connect subscriber");
+        subscriber
+            .write_all(b"{\"type\":\"subscribe\"}\n")
+            .expect("subscribe");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.subscriber_count() != 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(server.subscriber_count(), 1);
+
+        assert!(
+            closed_within(&idle, Duration::from_secs(3)),
+            "an idle unsubscribed client kept its slot"
+        );
+        // Well past the idle timeout, the silent subscriber is still served.
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(server.subscriber_count(), 1);
+        server.broadcast_event(json!({"kind": "ping", "payload": {}}));
+        let lines = read_lines(subscriber, 2);
+        assert_eq!(lines[0]["type"], "hello");
+        assert_eq!(lines[1]["type"], "event");
+
+        server.stop().expect("stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_client_that_keeps_asking_is_not_idle() {
+        let socket_path = short_socket_path();
+        let mut server = IpcServer::new(socket_path.clone(), dummy_state)
+            .with_idle_client_timeout(Duration::from_millis(400));
+        server.start().expect("start");
+
+        let mut stream = UnixStream::connect(&socket_path).expect("connect");
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(200));
+            stream
+                .write_all(b"{\"type\":\"status\"}\n")
+                .expect("status request");
+        }
+        let lines = read_lines(stream, 5);
+        assert_eq!(lines[0]["type"], "hello");
+        assert!(
+            lines[1..].iter().all(|line| line["type"] == "status"),
+            "{lines:?}"
+        );
 
         server.stop().expect("stop");
     }

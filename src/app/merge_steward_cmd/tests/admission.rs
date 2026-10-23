@@ -238,8 +238,9 @@ fn a_plan_made_under_moved_authority_is_remade_from_fresh_reads() {
         "test -e .pr-authority-seen && head=cccccccccccccccccccccccccccccccccccccccc || { : > .pr-authority-seen; head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; }",
     );
     let labels = ["arm64", "macos", "self-hosted"].map(str::to_owned);
-    let (observation, _, _) = observe_admission_candidates(&actions, "owner/repo", "main", &labels)
-        .expect("the second attempt observes a still authority");
+    let (observation, _, _) =
+        observe_admission_candidates(&actions, "owner/repo", "main", &labels, true)
+            .expect("the second attempt observes a still authority");
     assert_eq!(
         observation.prs[0].fact.head_sha,
         "c".repeat(40),
@@ -256,7 +257,7 @@ fn an_authority_that_never_holds_is_still_an_error() {
         "n=$(cat .reads 2>/dev/null || echo 0); n=$((n+1)); echo $n > .reads; head=$(printf '%040d' $n)",
     );
     let labels = ["arm64", "macos", "self-hosted"].map(str::to_owned);
-    let error = observe_admission_candidates(&actions, "owner/repo", "main", &labels)
+    let error = observe_admission_candidates(&actions, "owner/repo", "main", &labels, true)
         .expect_err("a moving authority never yields a plan");
     assert!(error.starts_with(ADMISSION_AUTHORITY_CHANGED), "{error}");
     assert!(error.contains("3 consecutive attempts"), "{error}");
@@ -395,10 +396,15 @@ fn cross_process_contender_defers_and_owner_death_forces_fresh_observation() {
     assert_eq!(exit, ExitCode::SUCCESS);
     let verdict: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(verdict["verdict"], "admit");
-    assert!(
-        fs::read_to_string(&calls)
-            .unwrap()
-            .contains("api repos/owner/repo")
+    let calls_text = fs::read_to_string(&calls).unwrap();
+    assert!(calls_text.contains("api repos/owner/repo"));
+    assert_eq!(
+        calls_text
+            .lines()
+            .filter(|line| line.starts_with("pr list "))
+            .count(),
+        1,
+        "read-only admission should avoid a second full PR census"
     );
 
     let hang_temp = tempfile::tempdir().expect("hang temp");

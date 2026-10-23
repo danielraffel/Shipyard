@@ -95,6 +95,11 @@ minutes. Treat these as cost proxies only. A safely-merged-change denominator
 requires a durable merge receipt and remains unavailable when the local metrics
 store has only PR/job observations; never substitute distinct PR count.
 
+GitHub Actions can omit `pull_requests` on `pull_request_target` runs. The
+metrics importer resolves those rows only through the exact commit's
+authoritative pull-request API response, and keeps the identity unknown when
+that response is empty or ambiguous.
+
 ## Version-only release bumps
 
 The CLI version is part of the CI surface map. Even a release-only
@@ -103,6 +108,17 @@ The CLI version is part of the CI surface map. Even a release-only
 truthful on release PRs.
 
 Shipyard coordinates validation across local, SSH, and cloud targets.
+
+## A repository without skill/version gates sets `pr_gates = false`
+
+`shipyard pr` refuses to start when it cannot find `skill_sync_check.py`,
+`version_bump_check.py` or `versioning.json`. When adopting Shipyard in a
+repository that has none of them on purpose, add `[validation] pr_gates =
+false` to that repository's tracked `.shipyard/config.toml` instead of copying
+placeholder scripts. Only the boolean `false` opts out; anything else keeps the
+gates strict. Never put it in the machine-global config or an untracked
+`.shipyard.local` overlay: `shipyard pr` refuses it there (exit 2), and refuses
+it in any repository whose gate scripts exist.
 
 ## `shipyard pr` suggests folding same-session siblings
 
@@ -894,7 +910,7 @@ PRs are gone.
 | Regenerate CHANGELOG.md from tags | `shipyard changelog regenerate` |
 | CI drift gate for CHANGELOG.md | `shipyard changelog check` |
 | Run the post-tag hook locally | `shipyard release-bot hook run --tag v0.9.0` |
-| Audit a generated post-tag hook | The run step must contain literal Bash `tag="${GITHUB_REF#refs/tags/}"`; {% raw %}`${{GITHUB_REF#refs/tags/}}`{% endraw %} is invalid GitHub expression syntax. PR pushes from the detached tag checkout must first attach the deterministic local branch, then use Shipyard's supervised push and target `HEAD:refs/heads/<branch>` so repository hooks see both a branch and `SHIPYARD_PR_RUNNING=1`. Repositories requiring signed bot commits set `release.post_tag_hook.ssh_signing_setup_script`; never hand-edit the owned workflow. Consumer workflows install the exact generating CLI by default; a repository that must avoid racing its own draft release may explicitly set `release.post_tag_hook.workflow_shipyard_version = "latest"`. Only exact stable optional-`v` semver or `latest` is accepted, and the CLI override wins lower config. |
+| Audit a generated post-tag hook | The run step must contain literal Bash `tag="${GITHUB_REF#refs/tags/}"`; {% raw %}`${{GITHUB_REF#refs/tags/}}`{% endraw %} is invalid GitHub expression syntax. PR pushes from the detached tag checkout must first attach the deterministic local branch, then use Shipyard's supervised push and target `HEAD:refs/heads/<branch>` so repository hooks see both a branch and `SHIPYARD_PR_RUNNING=1`. Repositories requiring signed bot commits set `release.post_tag_hook.ssh_signing_setup_script`; never hand-edit the owned workflow. Consumer workflows install the exact generating CLI by default; a repository that must avoid racing its own draft release may explicitly set `release.post_tag_hook.workflow_shipyard_version = "latest"`; Shipyard itself uses `checkout` (build the tagged checkout; refused outside the `shipyard` package). Only exact stable optional-`v` semver, `latest`, or `checkout` is accepted, and the CLI override wins lower config. The installer always comes from the pinned tag on `raw.githubusercontent.com` (`main` for `latest`); checkout uses `persist-credentials: false` and only the `hook run` step receives the push token. |
 | Live-probe the release chain | `shipyard doctor --release-chain` (dispatches + waits) |
 | Show queue and status | `shipyard status --json` |
 | Show all queued jobs | `shipyard queue --json` |
@@ -929,7 +945,7 @@ PRs are gone.
 | **Runner provisioning: audit host-class and local PATH drift** | `shipyard runner audit [--repo <owner/repo>]` (paginated; flags non-conforming names + missing `<repo>-build` / `<repo>-build-<class>` labels, fatally rejects advisory/required label overlap, and strictly checks every in-scope local runner's `.path` against Shipyard's canonical system-first value; malformed/unreadable local inventory fails closed; exit 1 on drift). New/service-less registration preserves that PATH through `config.sh`; drain and stop/uninstall a service-installed runner before reconciliation because Shipyard never stops live capacity implicitly. |
 | **Runner provisioning: VM-slot-aware free macOS capacity** | `shipyard runner capacity [--json]` (reads `tart list` + `tart get` per `[host_class.*]`, using configured `tart_home` as `TART_HOME`; counts only running macOS/darwin VMs; `free = Σ max(0, cap − running_macos)`; fail-closed, exit 1 if any host/VM OS unreadable) |
 | **Runner fleet visibility: exact-head queue/release liveness** | `shipyard runner fleet-status --repo <owner/repo> --target macos [--json]` (bounded pagination plus one shared 30-second GitHub deadline; deadline expiry renders a fail-closed partial assessment instead of hanging; stable auth/rate/truncation reasons; detects optional/superseded capacity owners and cleared enrollment). **Read `routing_confidence` next to `routable_free`.** A failed GitHub read is classified `transient` / `denied` / `unclassified`; only a transient one is retried, and one the controller's own repo-scope census can corroborate is demoted to a named `degraded_observations` entry instead of making healthy capacity unroutable. A denial, or a gap with nothing to corroborate it, still reports zero routable slots. A declared expected host that cannot serve `--target` prints under `other targets` and does not raise the verdict. |
-| **Roll one exact Shipyard release across the fleet** | Configure absolute `host_class.<name>.shipyard_bin` and remote `github_cli` paths, explicit `shipyard_mode`/`shipyard_global_dir`/`shipyard_state_dir`, plus self-contained machine-global command auth. Review `shipyard runner fleet-update --to vX.Y.Z --host-class <class> --json`, then add `--apply`; repeat the selector for an ordered subset or use explicit `--all-hosts`. Before any host, Shipyard binds the annotated tag's full tag-object/commit/tree OIDs, release ID, exact checksum-manifest and macOS DMG SHA-256, and `release.yml` build-provenance attestations, closes the mint window, and freezes that authority for every selected host. Release assets stream by immutable asset ID into owner-private hard-capped staging; exact declared size and SHA are verified before attestation, while partial files and escaped pipe holders are bounded by the same process-tree deadline. Missing attestations, manifest/source drift, implicit/duplicate hosts, authority/asset receipt mismatch, cross-host pair-hash mismatch, mixed CLI/provider pairs, or a companion retained by legacy rollback fail closed. Receipts preserve complete authority plus before/after paths, versions, double hashes, daemon identity, and configured repositories; rollout stops at the first failure. Each applied host is then re-read in a fresh process (installed version, daemon version + refreshed pid, ghapp guards current when the release ships them) and the run ends with a `fleet_summary` naming verified/failed/not-attempted hosts. |
+| **Roll one exact Shipyard release across the fleet** | Configure absolute `host_class.<name>.shipyard_bin` and remote `github_cli` paths, explicit `shipyard_mode`/`shipyard_global_dir`/`shipyard_state_dir`, plus self-contained machine-global command auth. Review `shipyard runner fleet-update --to vX.Y.Z --host-class <class> --json`, then add `--apply`; repeat the selector for an ordered subset or use explicit `--all-hosts`. Before any host, Shipyard binds the annotated tag's full tag-object/commit/tree OIDs, release ID, exact checksum-manifest and macOS DMG SHA-256, and `release.yml` build-provenance attestations, closes the mint window, and freezes that authority for every selected host. Release assets stream by immutable asset ID into owner-private hard-capped staging; exact declared size and SHA are verified before attestation, while partial files and escaped pipe holders are bounded by the same process-tree deadline. Missing attestations, manifest/source drift, implicit/duplicate hosts, authority/asset receipt mismatch, cross-host pair-hash mismatch, mixed CLI/provider pairs, or a companion retained by legacy rollback fail closed. Receipts preserve complete authority plus before/after paths, versions, double hashes, daemon identity, and configured repositories; rollout stops at the first failure. The release's own install.sh runs against the staged asset through a curl shim that also serves a `checksums.sha256` holding the controller-pinned SHA-256, so an install.sh that refuses a release with no checksums manifest still installs the verified staged bytes. Each applied host is then re-read in a fresh process (installed version, daemon version + refreshed pid, ghapp guards current when the release ships them) and the run ends with a `fleet_summary` naming verified/failed/not-attempted hosts. |
 | **Keep the fleet on the latest release** | The local release script's last stage is the verified rollout (exit 6 names lagging hosts; `--no-fleet-rollout` warns). The controller backstop is `shipyard runner fleet-reconcile [--apply]`: it rolls the newest release that has itself soaked for 30 minutes (a newer release never restarts an older one's soak), alerts once when a host lags a release for over 2 h (`--lag-alert-hours`), retries a tag at most once every 6 hours, and exits 9 on anything unreadable. Install its agent only with `scripts/install_fleet_reconcile.sh --install` on the controller. `shipyard doctor --fleet` shows each host's version against the latest release. Each tick's `daemon_problems` names hosts whose daemon is stopped, watches no repositories, or has no launcher, so it will not restart after a reboot; the launcher install needs the host's console. A daemon refuses a slug its credential answers HTTP 404 for (a renamed or transferred repository's old name) and logs `refusing to watch <slug>`; `shipyard daemon refresh --repo <current name>` fixes it. |
 
 The first governed replacement of a deployed pre-release-matched legacy auth
@@ -1422,8 +1438,10 @@ with `-f`; without `-X GET`, `gh api -f` can POST and produce misleading 404s.
 
 ## GitHub Auth Diagnostics
 
-Before blaming ambient `gh auth status`, check whether the repo config has
-`[github.auth]`. Shipyard can inject env or command-helper tokens into its
+Before blaming ambient `gh auth status`, check whether the machine-global or
+untracked `.shipyard.local` config has `[github.auth]`. A tracked layer may not
+set github.auth: Shipyard refuses one in `.shipyard/config.toml` (or a committed
+`.shipyard.local/config.toml`) and names where to move it. Shipyard can inject env or command-helper tokens into its
 built-in `gh` subprocesses as `GH_TOKEN`, including helpers that mint GitHub
 App installation tokens. `shipyard doctor --rate-limit --json` reports the
 effective source and rate-limit buckets. For GitHub App or fine-grained tokens,
@@ -1595,6 +1613,30 @@ is needed. An explicit `*_runner_selector_json` input still wins over the
 provider default. This is *not* a hidden fallback — `local` only takes effect
 when explicitly requested, and the default remains GitHub-hosted.
 
+**Fork pull requests skip self-hosted legs.** Repository variables reach
+fork PRs, so `ci.yml` and `sandbox-e2e.yml` pass
+{% raw %}`PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}`{% endraw %} to the
+resolver. When `GITHUB_EVENT_NAME` is a pull request and that head differs from
+`GITHUB_REPOSITORY` (or is missing), any target that would resolve to the
+`local` provider or a `self-hosted` selector is dropped from the matrix
+(provider `skipped`, empty selector) with a `::notice::`; it is never moved to
+GitHub-hosted. That covers the Sandbox M3 canary. To run those legs, a
+maintainer pushes the reviewed commits to a branch of this repository.
+Same-repo PRs, pushes, and dispatches resolve exactly as before.
+This stops repository variables from routing fork code onto the host runners;
+a fork that edits the workflow is still stopped only by the fork-PR approval
+setting (all external contributors), which must stay on.
+
+**The macOS signing job builds with fresh Rust homes.** `sign-and-upload-macos`
+points `CARGO_HOME` and `RUSTUP_HOME` at new directories under `RUNNER_TEMP`
+before installing Rust, so the signed build installs its toolchain and fetches
+crates fresh instead of reading a shared runner's `~/.cargo` registry or
+`~/.rustup` toolchains. A `rustup` already on the runner's `PATH` is still the
+one that installs them, and the `cargo`/`rustc` proxies in a shared
+`~/.cargo/bin` on `PATH` are still the shared ones too. Full isolation comes
+only from running the job as a dedicated runner user. Runner selection is
+unchanged.
+
 To land jobs on the Mac, register a runner carrying the matching labels with
 `shipyard runner register --repo <owner/repo> --labels self-hosted,macos,arm64,local-mac`
 (see the runner-provisioning rows above). This is the mechanism behind routing
@@ -1660,7 +1702,7 @@ itself.
 
 | You're here | Does live mode matter? |
 |---|---|
-| Solo macOS dev with Tailscale + Funnel enabled | **Yes, big win.** `shipyard daemon start` registers webhooks on tracked repos and streams events; the macOS menu-bar app and any `shipyard watch` invocation in a terminal both consume the same stream. |
+| Solo macOS dev with Tailscale + Funnel enabled | **Yes, big win.** The public Funnel is off unless the host opts in with `[daemon] public_ingress = true` in the machine-global config or `SHIPYARD_ENABLE_TUNNEL=1` (the env var wins either way, so `=0` overrides the config). Once opted in, `shipyard daemon start` registers webhooks on tracked repos and streams events; the macOS menu-bar app and any `shipyard watch` invocation in a terminal both consume the same stream. |
 | CI / headless server / someone without Tailscale | **Ignore it.** The daemon needs a public tunnel (Tailscale Funnel in v1) to receive webhooks. Without that, `shipyard watch` and everything else fall back to polling — behavior is unchanged from the pre-daemon CLI. |
 | Agent running one-shot `shipyard ship` + `watch --follow` | **Probably doesn't matter.** The daemon helps most when multiple sessions or the GUI are tracking the same state concurrently; a single session blocking on `watch --follow` already has its own connection. |
 
@@ -2645,6 +2687,21 @@ fallback = [
 There is no `shipyard config` or `shipyard targets` subcommand yet. Inspect
 target definitions in `.shipyard/config.toml` and `.shipyard.local/config.toml`,
 and use `shipyard status --json` for live target state.
+
+Tracked config (`.shipyard/config.toml`, or a `.shipyard.local/config.toml`
+the branch committed) may declare targets, but its `ssh_options` are an
+allowlist of connection tuning: the flags `-4`, `-6`, `-q`, `-v`, `-C`, `-T`,
+`-p <port>`, `-l <user>`, and `-o` with `ConnectTimeout`, `ServerAliveInterval`,
+`ServerAliveCountMax`, `TCPKeepAlive`, `Compression`, `BatchMode`, `LogLevel`,
+`Port`, `User`, `AddressFamily`, `ConnectionAttempts`, `IdentitiesOnly=yes` or
+`StrictHostKeyChecking=yes|accept-new` (any `-o` spelling, case-insensitive,
+single plain value). Everything else (`ProxyCommand`, `-I`/`PKCS11Provider`,
+`-L`/`-R`/`-D`, `-F`, `-J`, `-A`, `-i`, `-E`, ...) is refused, and tracked config
+may not change the backend of a target the machine-global config declares. Move
+other options to the machine-global config or an untracked
+`.shipyard.local/config.toml`; those layers are unrestricted.
+An SSH or Windows `host` may not start with `-`. Shipyard's own SSH probes and
+remote commands pass `-o ForwardAgent=no` after the configured options.
 
 ### Same-backend transient retry (`[ship] transient_local_retries`)
 

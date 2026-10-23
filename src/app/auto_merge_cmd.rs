@@ -212,7 +212,7 @@ pub(super) fn execute_auto_merge(
                     {
                         let receipt_warning = if request.merge_result.is_none()
                             && request.merge_command.is_none()
-                            && owns_native_merge_authority(&state)
+                            && can_emit_confirmed_merge_receipt(&state)
                         {
                             emit_confirmed_merge_receipt(store, cwd, &state).err()
                         } else {
@@ -240,7 +240,7 @@ pub(super) fn execute_auto_merge(
                 MergeDisposition::Merged { cleanup_warning } => {
                     let receipt_warning = if request.merge_result.is_none()
                         && request.merge_command.is_none()
-                        && owns_native_merge_authority(&state)
+                        && can_emit_confirmed_merge_receipt(&state)
                     {
                         emit_confirmed_merge_receipt(store, cwd, &state)
                     } else {
@@ -1507,6 +1507,19 @@ fn owns_native_merge_authority(state: &ShipState) -> bool {
         || state.merge_queue_observed_at.is_some()
 }
 
+/// A maintainer may merge a PR manually after Shipyard has completed its
+/// exact-head validation. That merge has no native queue authority, but it
+/// can still be measured safely when durable ship state records a live
+/// validation attempt and terminal-green gate evidence. Every caller still
+/// requires a post-merge GitHub observation before emitting a receipt.
+fn can_emit_confirmed_merge_receipt(state: &ShipState) -> bool {
+    owns_native_merge_authority(state)
+        || (state.merge_queue_attempt_started_at.is_some()
+            && state.abandoned.is_none()
+            && ship_terminal_verdict(state) == Some(true)
+            && !state.evidence_snapshot.is_empty())
+}
+
 fn auto_merge_has_exact_head_proof(state: &ShipState) -> bool {
     state.merge_queue_enqueue_succeeded_at.is_some()
 }
@@ -1685,7 +1698,7 @@ pub(super) fn supervise_merge_queue(
                     };
                 }
                 if observation.merged {
-                    let receipt_warning = owns_native_merge_authority(&state)
+                    let receipt_warning = can_emit_confirmed_merge_receipt(&state)
                         .then(|| emit_confirmed_merge_receipt(store, cwd, &state).err())
                         .flatten();
                     let cleanup_warning = if delete_branch {
@@ -3488,7 +3501,8 @@ mod tests {
             queue = queue.display(),
         );
         crate::test_support::write_executable_script(&fake_gh, &script);
-        let project = temp.path().join(".shipyard");
+        // Untracked local overlay: a tracked layer may not set github.auth.
+        let project = temp.path().join(".shipyard.local");
         std::fs::create_dir_all(&project).expect("project config");
         std::fs::write(
             project.join("config.toml"),
@@ -4682,6 +4696,25 @@ mod tests {
     }
 
     #[test]
+    fn manual_maintainer_merge_receipts_require_live_green_validation() {
+        let mut state = ShipState::new(10, "owner/repo", "feature/x", "main", "abc", "policy");
+        assert!(!can_emit_confirmed_merge_receipt(&state));
+
+        state.merge_queue_attempt_started_at = Some(chrono::Utc::now());
+        state.update_evidence("mac", "pass");
+        assert!(can_emit_confirmed_merge_receipt(&state));
+
+        state.abandoned = Some(crate::ship_state::AbandonRecord {
+            reason: "test".to_owned(),
+            evidence: "test".to_owned(),
+            stalled_minutes: 1,
+            job_id: None,
+            abandoned_at: chrono::Utc::now(),
+        });
+        assert!(!can_emit_confirmed_merge_receipt(&state));
+    }
+
+    #[test]
     fn prior_queue_authority_requires_observed_recoverable_eviction_to_rearm() {
         let attempt = chrono::DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
             .expect("attempt")
@@ -5062,7 +5095,8 @@ exit 91
         }
 
         let log = std::path::PathBuf::from(std::env::var_os(LOG).expect("child log path"));
-        let project = temp.path().join(".shipyard");
+        // Untracked local overlay: a tracked layer may not set github.auth.
+        let project = temp.path().join(".shipyard.local");
         std::fs::create_dir_all(&project).expect("project config dir");
         std::fs::write(
             project.join("config.toml"),

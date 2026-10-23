@@ -3,6 +3,71 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03502"></a>
+## [0.350.2] - 2026-10-23
+
+- asr/sy ci 20261022 ([#892](https://github.com/danielraffel/Shipyard/pull/892))
+
+<a id="v03501"></a>
+## [0.350.1] - 2026-10-23
+
+- fix/metrics github pr identity 20261023 ([#916](https://github.com/danielraffel/Shipyard/pull/916))
+
+<a id="v03500"></a>
+## [0.350.0] - 2026-10-23
+
+- Avoid duplicate read-only admission census ([#915](https://github.com/danielraffel/Shipyard/pull/915))
+
+<a id="v03490"></a>
+## [0.349.0] - 2026-10-23
+
+- Keep bulk PR census lightweight ([#914](https://github.com/danielraffel/Shipyard/pull/914))
+
+<a id="v03481"></a>
+## [0.348.1] - 2026-10-23
+
+- Extend transient release smoke backoff ([#913](https://github.com/danielraffel/Shipyard/pull/913))
+
+<a id="v03480"></a>
+## [0.348.0] - 2026-10-23
+
+- Bound open PR observation queries ([#912](https://github.com/danielraffel/Shipyard/pull/912))
+
+<a id="v03471"></a>
+## [0.347.1] - 2026-10-23
+
+- Version release smoke gate changes ([#911](https://github.com/danielraffel/Shipyard/pull/911))
+- Retry transient release smoke observations ([#910](https://github.com/danielraffel/Shipyard/pull/910))
+
+<a id="v03460"></a>
+## [0.346.0] - 2026-10-23
+
+- fix/guardian mixed timeout foreign reconcile ([#901](https://github.com/danielraffel/Shipyard/pull/901))
+
+<a id="v03450"></a>
+## [0.345.0] - 2026-10-23
+
+- fix/version at land per change skip ([#903](https://github.com/danielraffel/Shipyard/pull/903))
+- asr/fleet update checksums shim 20261022 ([#900](https://github.com/danielraffel/Shipyard/pull/900))
+- asr/sy ingress 20261022 ([#891](https://github.com/danielraffel/Shipyard/pull/891))
+- asr/sy config 20261022 ([#893](https://github.com/danielraffel/Shipyard/pull/893))
+- Produce authenticated merge receipts after confirmed merges ([#877](https://github.com/danielraffel/Shipyard/pull/877))
+- fix(metrics): surface baseline pass-history write failures ([#884](https://github.com/danielraffel/Shipyard/pull/884))
+- Add fail-closed queue timing provenance and survivor metrics ([#887](https://github.com/danielraffel/Shipyard/pull/887))
+- fix/stamp host matches session line ([#881](https://github.com/danielraffel/Shipyard/pull/881))
+- feat/repeated work metrics 20261021 ([#885](https://github.com/danielraffel/Shipyard/pull/885))
+- fix/review verdict requires stamp ([#886](https://github.com/danielraffel/Shipyard/pull/886))
+- fix/sandbox guardian unkillable lsof ([#879](https://github.com/danielraffel/Shipyard/pull/879))
+- fix/arm guard session allowlist ([#878](https://github.com/danielraffel/Shipyard/pull/878))
+- fix/python tests cannot exit zero ([#871](https://github.com/danielraffel/Shipyard/pull/871))
+- fix/metrics receipt repo binding 20261017 ([#876](https://github.com/danielraffel/Shipyard/pull/876))
+- fix/foreground queue recovery 20261016 ([#868](https://github.com/danielraffel/Shipyard/pull/868))
+- fix/cli parse from test stack ([#875](https://github.com/danielraffel/Shipyard/pull/875))
+- feat/metrics strata receipt 20261017 ([#874](https://github.com/danielraffel/Shipyard/pull/874))
+- fix/daemon recovery only 20261017 ([#873](https://github.com/danielraffel/Shipyard/pull/873))
+- fix/merge receipt waste followups ([#872](https://github.com/danielraffel/Shipyard/pull/872))
+- route capability shadow runtime 20261016 ([#867](https://github.com/danielraffel/Shipyard/pull/867))
+
 <a id="v03441"></a>
 ## [0.344.1] - 2026-10-16
 
@@ -2474,6 +2539,15 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.350.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.350.2
+[0.350.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.350.1
+[0.350.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.350.0
+[0.349.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.349.0
+[0.348.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.348.1
+[0.348.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.348.0
+[0.347.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.347.1
+[0.346.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.346.0
+[0.345.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.345.0
 [0.344.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.344.1
 [0.344.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.344.0
 [0.343.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.343.0

@@ -119,9 +119,13 @@ to use a different quota bucket or a more portable credential setup.
 If `GH_TOKEN` is exported in the parent environment, `gh` itself gives
 that token precedence over keychain auth.
 
-Add `[github.auth]` to global config, `.shipyard/config.toml`, or
-`.shipyard.local/config.toml`. Prefer local config for personal helper
-paths and vault names. Shipyard never stores raw tokens, GitHub App
+Add `[github.auth]` to global config or an untracked
+`.shipyard.local/config.toml`. A tracked layer may not set github.auth:
+the table names commands Shipyard runs and binaries it hands tokens to, so
+Shipyard refuses to build its GitHub client when `.shipyard/config.toml`
+(or a `.shipyard.local/config.toml` the branch committed) contains it, and
+the error names the file and where to move the table. Prefer local config
+for personal helper paths and vault names. Shipyard never stores raw tokens, GitHub App
 private keys, Keychain items, or 1Password sessions.
 
 Environment token:

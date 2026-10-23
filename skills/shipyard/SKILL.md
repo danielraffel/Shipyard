@@ -5,6 +5,10 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+Metrics imports preserve exact-head safety when GitHub omits a workflow run's
+pull-request list: `pull_request` and `pull_request_target` runs may use the
+commit-to-pull-requests API, but zero or multiple matches remain unknown.
+
 ## Webhook repository identity
 
 Webhook registrar repository keys are canonical lowercase `owner/name` values
@@ -212,6 +216,37 @@ never the listener's. `daemon status` prints `public ingress: ok` or
 `daemon reconcile` raises an `endpoint_unreachable` alarm, and daemon.log
 records each transition and re-apply.
 
+## Public webhook ingress is opt-in and touches only Shipyard's mount
+
+The daemon opens no public Funnel unless the host's owner asks:
+`[daemon] public_ingress = true` in the machine-global config, or
+`SHIPYARD_ENABLE_TUNNEL=1` (the env var wins when set, so `=0` overrides the
+config; a tracked project layer cannot turn it on). Start, re-apply and stop
+never run `tailscale funnel reset`: they remove only the HTTPS 443 path `/`
+handler (`funnel --https=443 --set-path=/ off`), and stop removes it only
+while it still points at exactly this daemon's port. Funnel is switched on
+per host and port, not per path, so before mounting the daemon reads
+`tailscale funnel status --json` and refuses (the daemon stays on the polling
+fallback) when port 443 holds any tailnet-only Serve route: enabling Funnel
+would publish a route other than `/`, and mounting would replace the owner's
+own tailnet-only `/`. Routes on other ports, or on a 443 the owner
+already funneled, are left as they are. Move a private 443 route to another
+port (or funnel it deliberately) before opting in.
+
+The local listener answers from a pool of eight workers. A connection reaches
+a worker only once its whole header block has arrived; headers must arrive
+within 3s of the accept or the socket is closed with 400. A request that is not
+`POST` to `/webhook` or `/` with both `X-Hub-Signature-256` and
+`X-GitHub-Event` (or the ingress self-check) is refused from its headers alone,
+before any body is read; an accepted request still faces the constant-time HMAC
+check first. The body is read on the worker and must complete within 10s of the
+hand-off, so a client that sends plausible headers and then trickles its body
+holds a worker for up to 10s. Refusal lines clip and `Debug`-escape attacker-supplied fields,
+fold repeats into one counted line per reason per minute, and stop once
+daemon.log reaches 64 MiB (it rotates at the next start). The webhook secret is
+written to a fresh 0600 file and renamed into place; `daemon.sock` is 0600, and
+a connection that has not subscribed is closed after 10s without a request.
+
 ## A config PATCH replaces; it does not merge
 
 `PATCH /repos/{owner}/{repo}/hooks/{id}` replaces the whole `config` object.
@@ -328,6 +363,28 @@ When asserting a gate "ran", check for `rc in (0, 1)` — not `rc == 0`. Zero is
 "ran and passed"; conflating it with "ran" is the same mistake one level up.
 `scripts/**` maps to this skill, so a change to either gate needs a note here.
 
+
+## A repository without the gates opts out of them explicitly
+
+`shipyard pr` resolves `skill_sync_check.py`, `version_bump_check.py` and
+`versioning.json` before anything else, so a repository with none of them
+(spectr, whence and tartci on this fleet) stopped at `could not find
+skill_sync_check.py` and could not use `shipyard pr` at all. Such a repository
+sets `[validation] pr_gates = false` in `.shipyard/config.toml`; `shipyard pr`
+then says it skipped both gates and hands off to `shipyard ship`.
+
+Only an explicit boolean `false` counts. A missing key, `true` or the string
+`"false"` keeps the gates, and a repository that keeps them and has lost a
+script still gets the hard error: the opt-out is a declaration, never a
+fallback, because a vanished gate script usually means a moved path. The
+opt-out does not supply ship targets either; a repository with no `[targets]`
+(tartci) still cannot use `shipyard ship`.
+
+The key is read only from layers the repository controls (the tracked project
+file, or a committed overlay). Merged config would let the machine-global file
+or Pulp's untracked overlay turn off Pulp's gates with nothing changing in
+Pulp, so a `pr_gates` set there is refused with exit 2, as is an opt-out in a
+repository whose gate scripts resolve.
 ## Crash-safe state writes
 
 Write Shipyard state files (ship state, queue requests, receipts, holds) with
@@ -549,10 +606,12 @@ host while a sandbox canary is running: the probe itself is a foreign holder.
 Every later Sandbox macOS run fails this way when an earlier run retained the
 host lease with a failure shape the guardian does not recognize. Read that
 run's `guardian-receipt.json` under `/tmp/shipyard-sandbox-m3-<run>-<attempt>`:
-its `failure` names the cause. Two shapes reconcile on the next run: both
+its `failure` names the cause. Three shapes reconcile on the next run: both
 restore-production holder inspections timing out on the production
-writer-domain lock (`lsof` on a loaded host), and a fenced lease whose
-production daemon was replaced afterwards, which binds to the current daemon.
+writer-domain lock (`lsof` on a loaded host); an owner end where one
+inspection timed out on that lock and the other saw a short-lived foreign
+writer (m3, run 39881545054); and a fenced lease whose production daemon was
+replaced afterwards, which binds to the current daemon.
 Anything else still needs a guardian change; do not delete the lease by hand.
 
 "Actions owner ended before canary completion" with `sandbox_passed: true` in
@@ -587,6 +646,16 @@ A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
 versions. The read-only version gate rejects those edits unless the PR carries
 the explicit release recovery trailer. After merge, `version-at-land.yml` is the
 single writer and assigns the next versions.
+
+It judges each first-parent change since the last `Version-Bump-Applied` marker
+on its own, then takes the highest level per surface. A
+`Version-Bump: <surface>=skip` trailer therefore skips only the change that
+carries it. Before 2026-10-23 the whole range was judged at once, so one
+skipped change merged after the marker silenced every later release. Shipyard
+sat at v0.344.1 for six days because of it. If `main` keeps landing src changes
+but no tag appears, run
+`python3 scripts/version_at_land.py --base <last marker> --head origin/main --json`
+and expect a non-empty plan.
 
 ## Stale ship-state records: `discard --repo` and `prune`
 
@@ -1253,7 +1322,10 @@ on every remote `[host_class.<name>]`. Review `shipyard runner fleet-update
 do not assemble per-host SSH/install pipelines. Repeat `--host-class` only for
 a reviewed ordered subset, or use explicit `--all-hosts`. Missing, unknown, and
 duplicate selection fails closed; apply stops before later hosts after the
-first failure.
+first failure. The release's install.sh installs the controller-staged asset
+through a curl shim that also serves a `checksums.sha256` with the SHA-256 the
+controller pinned, so an install.sh that refuses releases without a checksums
+manifest still installs over fleet-update.
 
 Every applied host is then **independently verified** in a fresh process:
 - the installed `shipyard --version` must equal the target;
@@ -1489,8 +1561,13 @@ Generated consumer workflows install the exact generating CLI by default. A
 repository whose post-tag hook runs while its own new release is still draft
 may explicitly set `release.post_tag_hook.workflow_shipyard_version =
 "latest"` to use the latest already-published CLI. Only exact stable
-optional-`v` semver or `latest` is valid; invalid configuration must refuse
-before overwriting the workflow, and an explicit CLI override has precedence.
+optional-`v` semver, `latest`, or `checkout` is valid; invalid configuration
+must refuse before overwriting the workflow, and an explicit CLI override has
+precedence. `checkout` (Shipyard's own repository only; install refuses it
+elsewhere) builds the CLI from the tagged checkout. Every variant fetches
+`install.sh` from the pinned tag on `raw.githubusercontent.com` (`main` for
+`latest`), checks out with `persist-credentials: false`, and hands the push
+token only to the `hook run` step.
 Repositories that require signed bot commits should set
 `release.post_tag_hook.ssh_signing_setup_script` to a safe repository-relative
 helper path. Hook installation then regenerates the required secret-backed SSH
@@ -1820,7 +1897,11 @@ To raise the quota above the ambient `gh` user token's 5,000/hr, point
 (`scripts/shipyard-github-app-token`) for the 12,500/hr installation bucket.
 Put the block in the **global** config dir (find it with `shipyard paths`;
 macOS `~/Library/Application Support/shipyard/config.toml`) to cover every repo
-on the machine — not the tracked project config. The same App private key works
+on the machine — not the tracked project config. A tracked layer may not set
+github.auth: `.shipyard/config.toml`, or a `.shipyard.local/config.toml` the
+branch committed, containing `[github.auth]` fails closed with an error naming
+the file; move the table to the global config or an untracked
+`.shipyard.local/config.toml`. The same App private key works
 across multiple Macs (M1/Studio/M5). Full setup, permissions, and the
 additional-client steps: [`docs/github-app-quota.md`](../../docs/github-app-quota.md).
 
@@ -4164,8 +4245,8 @@ function returns (cancel it in a `finally`), and run the suite through
 `scripts/run_unittest_strict.py`, which requires the last "Ran N tests" line
 to count every discovered test and to end in "OK".
 
-The live webhook gate is intentionally dangerous because it resets the local
-Funnel config:
+The live webhook gate is intentionally dangerous because the validator's own
+cleanup resets the local Funnel config (the daemon itself never does):
 
 ```sh
 scripts/validate_webhook_tunnel_live.py \

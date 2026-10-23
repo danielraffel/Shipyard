@@ -26,12 +26,15 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_REPOS = ("Generous-Corp/pulp",)
 DEFAULT_LABELS = "self-hosted,macos,arm64"
 PROBE_TIMEOUT_SECONDS = 300
+PROBE_ATTEMPTS = 5
+PROBE_RETRY_DELAYS_SECONDS = (1.0, 3.0, 10.0, 30.0)
 # Defer reasons admission-clean returns before any GitHub read (a contended
 # lock). They prove nothing about whether the binary can observe GitHub.
 UNOBSERVED_DEFER_REASONS = frozenset({"observation_in_progress", "stewardship_in_progress"})
@@ -105,12 +108,34 @@ def judge_steward(repo: str, code: int, stdout: str, stderr: str) -> ProbeResult
     return ProbeResult("steward (dry-run)", repo, ok, detail)
 
 
+def _retryable_probe_failure(code: int, stdout: str, stderr: str) -> bool:
+    """Recognize transport/transient observation failures, not bad binaries."""
+    text = f"{stdout}\n{stderr}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "bad gateway",
+            "unexpected end of json input",
+            "connection reset",
+            "connection refused",
+            "timed out",
+            "timeout",
+        )
+    )
+
+
 def run_probes(
     binary: str,
     repos: list[str],
     base: str,
     labels: str,
     run=subprocess.run,
+    sleep=time.sleep,
 ) -> list[ProbeResult]:
     results: list[ProbeResult] = []
     with tempfile.TemporaryDirectory(prefix="shipyard-release-smoke-") as home:
@@ -139,23 +164,46 @@ def run_probes(
             )
             for argv, judge in probes:
                 assert "--apply" not in argv
-                try:
-                    completed = run(
-                        argv,
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                        timeout=PROBE_TIMEOUT_SECONDS,
-                        check=False,
-                    )
-                except subprocess.TimeoutExpired:
-                    results.append(
-                        ProbeResult(argv[5], repo, False, f"timed out after {PROBE_TIMEOUT_SECONDS}s")
-                    )
-                    continue
-                results.append(
-                    judge(repo, completed.returncode, completed.stdout, completed.stderr)
-                )
+                for attempt in range(PROBE_ATTEMPTS):
+                    try:
+                        completed = run(
+                            argv,
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            timeout=PROBE_TIMEOUT_SECONDS,
+                            check=False,
+                        )
+                    except subprocess.TimeoutExpired:
+                        if attempt + 1 < PROBE_ATTEMPTS:
+                            sleep(PROBE_RETRY_DELAYS_SECONDS[attempt])
+                            continue
+                        results.append(
+                            ProbeResult(
+                                argv[5],
+                                repo,
+                                False,
+                                f"timed out after {PROBE_TIMEOUT_SECONDS}s ({PROBE_ATTEMPTS} attempts)",
+                            )
+                        )
+                        break
+                    result = judge(repo, completed.returncode, completed.stdout, completed.stderr)
+                    if result.ok or not _retryable_probe_failure(
+                        completed.returncode, completed.stdout, completed.stderr
+                    ):
+                        results.append(result)
+                        break
+                    if attempt + 1 < PROBE_ATTEMPTS:
+                        sleep(PROBE_RETRY_DELAYS_SECONDS[attempt])
+                    else:
+                        results.append(
+                            ProbeResult(
+                                result.name,
+                                result.repo,
+                                result.ok,
+                                f"{result.detail} (after {PROBE_ATTEMPTS} attempts)",
+                            )
+                        )
     return results
 
 
@@ -173,11 +221,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None, run=subprocess.run) -> int:
+def main(argv: list[str] | None = None, run=subprocess.run, sleep=time.sleep) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     binary = str(Path(args.binary).resolve())
     repos = args.repos or list(DEFAULT_REPOS)
-    results = run_probes(binary, repos, args.base, args.labels, run=run)
+    results = run_probes(binary, repos, args.base, args.labels, run=run, sleep=sleep)
     failed = [result for result in results if not result.ok]
     for result in results:
         mark = "ok  " if result.ok else "FAIL"

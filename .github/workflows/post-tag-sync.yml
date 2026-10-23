@@ -16,7 +16,7 @@ permissions:
   pull-requests: write
 
 env:
-  SHIPYARD_VERSION: "latest"
+  SHIPYARD_VERSION: "${{ github.ref_name }}"
 
 jobs:
   sync:
@@ -24,20 +24,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout release tag with full history
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
           fetch-tags: true
-          persist-credentials: true
-          token: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+          # Only the docs-sync step below receives the push token.
+          persist-credentials: false
 
-      - name: Install shipyard (pinned)
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
+        with:
+          toolchain: stable
+
+      - name: Build shipyard from the release tag
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "https://generouscorp.com/Shipyard/install.sh" | SHIPYARD_VERSION="$SHIPYARD_VERSION" bash
-          shipyard --version
+          cargo build --release --locked --bin shipyard
+          echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+          target/release/shipyard --version
 
 
       - name: Run post-tag docs sync
@@ -45,5 +51,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          # Git credentials for this step only; nothing is written to .git/config.
+          auth="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
           tag="${GITHUB_REF#refs/tags/}"
           shipyard release-bot hook run --tag "$tag"

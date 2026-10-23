@@ -57,10 +57,15 @@ jobs:
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.linux_runs_on_json) }}
     steps:
       - name: Confirm dispatch payload
+        # Inputs reach the shell as data, never as script text.
+        env:
+          RUNNER_PROVIDER_INPUT: ${{ inputs.runner_provider }}
+          NOTE_INPUT: ${{ inputs.note }}
+          SLEEP_SECONDS_INPUT: ${{ inputs.sleep_seconds }}
         run: |
-          echo "runner_provider=${{ inputs.runner_provider }}"
-          echo "note=${{ inputs.note }}"
-          seconds="${{ inputs.sleep_seconds }}"
+          echo "runner_provider=$RUNNER_PROVIDER_INPUT"
+          echo "note=$NOTE_INPUT"
+          seconds="$SLEEP_SECONDS_INPUT"
           if ! [[ "$seconds" =~ ^[0-9]+$ ]]; then
             echo "sleep_seconds must be numeric" >&2
             exit 2

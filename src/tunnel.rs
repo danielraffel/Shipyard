@@ -25,6 +25,9 @@ const TAILSCALE_CANDIDATE_BINARIES: [&str; 4] = [
 const TAILSCALE_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const TAILSCALE_FUNNEL_TIMEOUT: Duration = Duration::from_secs(10);
 const TAILSCALE_RESET_SETTLE: Duration = Duration::from_millis(500);
+/// Turns off exactly the handler `funnel --bg <port>` installs (HTTPS 443,
+/// path `/`), leaving any other Serve/Funnel route on the host in place.
+const SHIPYARD_MOUNT_OFF_ARGS: [&str; 4] = ["funnel", "--https=443", "--set-path=/", "off"];
 
 /// Probe backoffs used while Tailscale is warming up.
 pub const TAILSCALE_PROBE_BACKOFFS: [Duration; 3] = [
@@ -595,8 +598,77 @@ impl TailscaleFunnelBackend {
         let Some(binary) = self.binary.clone() else {
             return Ok(false);
         };
-        let output = run_tailscale(&binary, &["funnel", "status"], TAILSCALE_FUNNEL_TIMEOUT)?;
-        Ok(output.output.contains(&format!("127.0.0.1:{local_port}")))
+        Ok(read_serve_config(&binary)?
+            .is_some_and(|config| root_mount_targets(&config, local_port)))
+    }
+
+    /// Point Shipyard's own Funnel mount (HTTPS 443, path `/`) at
+    /// `local_port`. Only that handler is replaced: a global `funnel reset`
+    /// would also wipe every other Serve/Funnel route the host's owner set up.
+    fn mount(
+        &mut self,
+        binary: &Path,
+        local_port: u16,
+        public_url: &str,
+    ) -> Result<TunnelInfo, TunnelError> {
+        // Funnel is switched on per host:port, not per path, so `funnel --bg`
+        // would also publish any tailnet-only Serve route on 443, and turning
+        // our mount off later leaves that switch on. A tailnet-only `/` is the
+        // owner's service, which mounting would replace. Refuse instead.
+        let Some(config) = read_serve_config(binary)? else {
+            return Err(TunnelError::new(
+                TunnelErrorKind::StartFailed,
+                "could not read `tailscale funnel status --json`; not enabling Funnel",
+            ));
+        };
+        if let Some(host_port) = private_routes_on_443(&config) {
+            return Err(TunnelError::new(
+                TunnelErrorKind::StartFailed,
+                format!(
+                    "{host_port} has tailnet-only Serve routes; enabling Funnel would publish them"
+                ),
+            ));
+        }
+
+        // A previous daemon's mount names a stale port; drop it first. This
+        // fails harmlessly ("handler does not exist") when nothing is mounted.
+        let removed = run_tailscale(binary, &SHIPYARD_MOUNT_OFF_ARGS, TAILSCALE_FUNNEL_TIMEOUT)?;
+        if removed.code == 0 {
+            thread::sleep(TAILSCALE_RESET_SETTLE);
+        }
+
+        let mut last_output = String::new();
+        for attempt in 1..=3 {
+            let output = run_tailscale(
+                binary,
+                &["funnel", "--bg", &local_port.to_string()],
+                TAILSCALE_FUNNEL_TIMEOUT,
+            )?;
+            last_output.clone_from(&output.output);
+            if output.code != 0 {
+                return Err(TunnelError::new(
+                    TunnelErrorKind::StartFailed,
+                    format!("funnel --bg failed: {}", output.output.trim()),
+                ));
+            }
+            if self.verify_configured(local_port)? {
+                self.configured_port = Some(local_port);
+                self.ingress.set_public_url(public_url);
+                return Ok(TunnelInfo {
+                    public_url: public_url.to_owned(),
+                    backend: self.name().to_owned(),
+                });
+            }
+            thread::sleep(Duration::from_millis(500 * attempt));
+        }
+
+        Err(TunnelError::new(
+            TunnelErrorKind::StartFailed,
+            format!(
+                "funnel --bg returned 0 but serve config didn't persist. last output: {}",
+                last_output.trim()
+            ),
+        ))
     }
 }
 
@@ -622,47 +694,7 @@ impl TunnelBackend for TailscaleFunnelBackend {
         })?;
         self.binary = Some(binary.clone());
 
-        let reset = run_tailscale(&binary, &["funnel", "reset"], TAILSCALE_FUNNEL_TIMEOUT)?;
-        if reset.code != 0 {
-            return Err(TunnelError::new(
-                TunnelErrorKind::StartFailed,
-                format!("funnel reset failed: {}", reset.output.trim()),
-            ));
-        }
-        thread::sleep(TAILSCALE_RESET_SETTLE);
-
-        let mut last_output = String::new();
-        for attempt in 1..=3 {
-            let output = run_tailscale(
-                &binary,
-                &["funnel", "--bg", &local_port.to_string()],
-                TAILSCALE_FUNNEL_TIMEOUT,
-            )?;
-            last_output.clone_from(&output.output);
-            if output.code != 0 {
-                return Err(TunnelError::new(
-                    TunnelErrorKind::StartFailed,
-                    format!("funnel --bg failed: {}", output.output.trim()),
-                ));
-            }
-            if self.verify_configured(local_port)? {
-                self.configured_port = Some(local_port);
-                self.ingress.set_public_url(&public_url);
-                return Ok(TunnelInfo {
-                    public_url,
-                    backend: self.name().to_owned(),
-                });
-            }
-            thread::sleep(Duration::from_millis(500 * attempt));
-        }
-
-        Err(TunnelError::new(
-            TunnelErrorKind::StartFailed,
-            format!(
-                "funnel --bg returned 0 but serve config didn't persist. last output: {}",
-                last_output.trim()
-            ),
-        ))
+        self.mount(&binary, local_port, &public_url)
     }
 
     fn verify(&mut self, local_port: u16) -> Result<bool, TunnelError> {
@@ -687,17 +719,86 @@ impl TunnelBackend for TailscaleFunnelBackend {
             self.configured_port = None;
             return Ok(());
         };
-        let output = run_tailscale(&binary, &["funnel", "reset"], TAILSCALE_FUNNEL_TIMEOUT)?;
-        self.configured_port = None;
+        self.binary = Some(binary.clone());
+        // Remove only Shipyard's own mount, and only while it still points at
+        // this daemon's listener; never `funnel reset`, which clears every
+        // Serve/Funnel route on the host.
+        let Some(port) = self.configured_port.take() else {
+            return Ok(());
+        };
+        if !self.verify_configured(port)? {
+            return Ok(());
+        }
+        let output = run_tailscale(&binary, &SHIPYARD_MOUNT_OFF_ARGS, TAILSCALE_FUNNEL_TIMEOUT)?;
         if output.code == 0 {
             Ok(())
         } else {
             Err(TunnelError::new(
                 TunnelErrorKind::StartFailed,
-                format!("funnel reset failed: {}", output.output.trim()),
+                format!("funnel mount removal failed: {}", output.output.trim()),
             ))
         }
     }
+}
+
+/// The host's Serve/Funnel config (`ipn.ServeConfig`), or `None` when it
+/// cannot be read or parsed. An empty config decodes as an empty object.
+fn read_serve_config(binary: &Path) -> Result<Option<Value>, TunnelError> {
+    let output = run_tailscale(
+        binary,
+        &["funnel", "status", "--json"],
+        TAILSCALE_FUNNEL_TIMEOUT,
+    )?;
+    if output.code != 0 {
+        return Ok(None);
+    }
+    // stdout comes first in `output`; any stderr warning trails the JSON.
+    let mut values = serde_json::Deserializer::from_str(output.output.trim()).into_iter::<Value>();
+    Ok(match values.next() {
+        Some(Ok(Value::Null)) => Some(Value::Object(serde_json::Map::new())),
+        Some(Ok(config @ Value::Object(_))) => Some(config),
+        _ => None,
+    })
+}
+
+fn web_443_entries(config: &Value) -> impl Iterator<Item = (&String, &Value)> {
+    config
+        .get("Web")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(host_port, _)| host_port.ends_with(":443"))
+}
+
+/// The first `<host>:443` that holds any Serve route while Funnel is still
+/// off for it. A route other than `/` would be published by `funnel --bg`;
+/// a tailnet-only `/` is the owner's own service, never a Shipyard mount
+/// (Shipyard's mount is always funneled), and mounting would replace it.
+fn private_routes_on_443(config: &Value) -> Option<String> {
+    web_443_entries(config)
+        .find(|(host_port, web)| {
+            let funneled = config
+                .pointer("/AllowFunnel")
+                .and_then(|allow| allow.get(host_port.as_str()))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let has_mounts = web
+                .get("Handlers")
+                .and_then(Value::as_object)
+                .is_some_and(|handlers| !handlers.is_empty());
+            has_mounts && !funneled
+        })
+        .map(|(host_port, _)| host_port.clone())
+}
+
+/// Whether the HTTPS 443 `/` handler proxies to exactly this local port.
+fn root_mount_targets(config: &Value, local_port: u16) -> bool {
+    let want = format!("http://127.0.0.1:{local_port}");
+    web_443_entries(config).any(|(_, web)| {
+        web.pointer("/Handlers/~1/Proxy")
+            .and_then(Value::as_str)
+            .is_some_and(|proxy| proxy.trim_end_matches('/') == want)
+    })
 }
 
 /// Probe Tailscale repeatedly, returning the first ready status or the last
@@ -824,12 +925,16 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    // Only the unix-gated fake tailscale fixtures construct the backend by name.
+    #[cfg(unix)]
+    use super::TailscaleFunnelBackend;
     use super::{
         TAILSCALE_PROBE_BACKOFFS, TailscaleStatus, TunnelBackend, TunnelError, TunnelErrorKind,
         TunnelInfo, TunnelSnapshot, TunnelSupervisorHooks, TunnelSupervisorPolicy,
-        TunnelSupervisorState, TunnelWatchExit, decode_tailscale_status,
-        probe_tailscale_with_retry, resolve_tailscale_binary_from, start_with_retry,
-        supervise_tunnel, tailscale_command, watch_until_lost,
+        TunnelSupervisorState, TunnelWatchExit, Value, decode_tailscale_status,
+        private_routes_on_443, probe_tailscale_with_retry, resolve_tailscale_binary_from,
+        root_mount_targets, start_with_retry, supervise_tunnel, tailscale_command,
+        watch_until_lost,
     };
 
     #[derive(Default)]
@@ -1381,6 +1486,248 @@ mod tests {
         assert_eq!(
             resolve_tailscale_binary_from(&[missing, executable.clone()]),
             Some(executable)
+        );
+    }
+
+    /// A stand-in `tailscale` CLI that keeps a serve config in `config`, one
+    /// handler per line (`<port> <path> <proxy>`), the funneled ports in
+    /// `funnel`, and logs every argv. Like tailscaled, Funnel is a per-port
+    /// switch: `funnel --bg` turns it on for 443, and `off` drops it only once
+    /// no handler is left on that port.
+    #[cfg(unix)]
+    fn fake_tailscale(dir: &Path) -> std::path::PathBuf {
+        let binary = dir.join("tailscale");
+        crate::test_support::write_executable_script(
+            &binary,
+            &format!(
+                r#"#!/bin/sh
+cfg="{dir}/config"
+fun="{dir}/funnel"
+echo "$*" >> "{dir}/calls"
+touch "$cfg" "$fun"
+case "$*" in
+  "funnel status --json")
+    awk -v funneled="$(cat "$fun")" '
+      {{ if (!($1 in h)) order[n++] = $1
+        h[$1] = h[$1] (h[$1] == "" ? "" : ",") "\"" $2 "\":{{\"Proxy\":\"" $3 "\"}}" }}
+      END {{
+        printf "{{\"Web\":{{"
+        for (i = 0; i < n; i++) printf "%s\"host.example.ts.net:%s\":{{\"Handlers\":{{%s}}}}", (i ? "," : ""), order[i], h[order[i]]
+        printf "}},\"AllowFunnel\":{{"
+        c = split(funneled, f, " ")
+        for (i = 1; i <= c; i++) printf "%s\"host.example.ts.net:%s\":true", (i > 1 ? "," : ""), f[i]
+        printf "}}}}\n"
+      }}' "$cfg" ;;
+  "funnel reset") : > "$cfg"; : > "$fun" ;;
+  "funnel --https=443 --set-path=/ off")
+    grep -q '^443 / ' "$cfg" || {{ echo "error: handler does not exist"; exit 1; }}
+    grep -v '^443 / ' "$cfg" > "$cfg.new"; mv "$cfg.new" "$cfg"
+    grep -q '^443 ' "$cfg" || {{ grep -v '^443$' "$fun" > "$fun.new"; mv "$fun.new" "$fun"; }} ;;
+  "funnel --bg "*)
+    grep -v '^443 / ' "$cfg" > "$cfg.new"; mv "$cfg.new" "$cfg"
+    echo "443 / http://127.0.0.1:$3" >> "$cfg"
+    grep -q '^443$' "$fun" || echo 443 >> "$fun" ;;
+  *) exit 2 ;;
+esac
+"#,
+                dir = dir.display()
+            ),
+        );
+        binary
+    }
+
+    #[cfg(unix)]
+    fn fake_backend(binary: &Path) -> TailscaleFunnelBackend {
+        TailscaleFunnelBackend {
+            binary: Some(binary.to_path_buf()),
+            ..TailscaleFunnelBackend::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn read(dir: &Path, name: &str) -> String {
+        std::fs::read_to_string(dir.join(name)).expect(name)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn funnel_mount_and_stop_leave_other_serve_routes_in_place() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let binary = fake_tailscale(tmp.path());
+        // The owner's tailnet-only route on another port, plus a stale mount
+        // (and its Funnel switch) from an earlier daemon.
+        std::fs::write(
+            tmp.path().join("config"),
+            "8443 / http://127.0.0.1:3000\n443 / http://127.0.0.1:1111\n",
+        )
+        .expect("fixture");
+        std::fs::write(tmp.path().join("funnel"), "443\n").expect("fixture");
+        let mut backend = fake_backend(&binary);
+
+        let info = backend
+            .mount(&binary, 4242, "https://host.example.ts.net")
+            .expect("mount");
+        assert_eq!(info.public_url, "https://host.example.ts.net");
+        let mounted = read(tmp.path(), "config");
+        assert!(mounted.contains("443 / http://127.0.0.1:4242"), "{mounted}");
+        assert!(
+            !mounted.contains("127.0.0.1:1111"),
+            "stale mount kept: {mounted}"
+        );
+        assert_eq!(read(tmp.path(), "funnel"), "443\n");
+
+        backend.stop().expect("stop");
+        assert_eq!(read(tmp.path(), "config"), "8443 / http://127.0.0.1:3000\n");
+        assert_eq!(read(tmp.path(), "funnel"), "");
+        let calls = read(tmp.path(), "calls");
+        assert!(
+            !calls.lines().any(|line| line.contains("reset")),
+            "a global funnel reset ran: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn funnel_mount_refuses_to_publish_tailnet_only_routes_on_443() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let binary = fake_tailscale(tmp.path());
+        let fixture = "8443 / http://127.0.0.1:3000\n443 /grafana http://127.0.0.1:9000\n";
+        std::fs::write(tmp.path().join("config"), fixture).expect("fixture");
+        let mut backend = fake_backend(&binary);
+
+        let error = backend
+            .mount(&binary, 4242, "https://host.example.ts.net")
+            .expect_err("mount must refuse");
+        assert_eq!(error.kind, TunnelErrorKind::StartFailed);
+        assert!(
+            error.message.contains("tailnet-only Serve routes"),
+            "{}",
+            error.message
+        );
+        assert_eq!(read(tmp.path(), "config"), fixture);
+        assert_eq!(read(tmp.path(), "funnel"), "");
+        let calls = read(tmp.path(), "calls");
+        assert_eq!(calls, "funnel status --json\n", "mutated after refusing");
+        assert_eq!(backend.configured_port, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn funnel_mount_refuses_to_replace_a_tailnet_only_root_route_on_443() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let binary = fake_tailscale(tmp.path());
+        // The owner's own `tailscale serve --bg 3000`: 443 `/`, Funnel off.
+        let fixture = "443 / http://127.0.0.1:3000\n";
+        std::fs::write(tmp.path().join("config"), fixture).expect("fixture");
+        let mut backend = fake_backend(&binary);
+
+        let error = backend
+            .mount(&binary, 4242, "https://host.example.ts.net")
+            .expect_err("mount must refuse");
+        assert_eq!(error.kind, TunnelErrorKind::StartFailed);
+        assert!(
+            error.message.contains("tailnet-only Serve routes"),
+            "{}",
+            error.message
+        );
+        assert_eq!(read(tmp.path(), "config"), fixture);
+        assert_eq!(read(tmp.path(), "funnel"), "");
+        let calls = read(tmp.path(), "calls");
+        assert_eq!(calls, "funnel status --json\n", "mutated after refusing");
+        assert_eq!(backend.configured_port, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn funnel_mount_proceeds_when_443_is_already_funneled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let binary = fake_tailscale(tmp.path());
+        // The owner already published /grafana; mounting changes nothing for it.
+        std::fs::write(
+            tmp.path().join("config"),
+            "443 /grafana http://127.0.0.1:9000\n",
+        )
+        .expect("fixture");
+        std::fs::write(tmp.path().join("funnel"), "443\n").expect("fixture");
+        let mut backend = fake_backend(&binary);
+
+        backend
+            .mount(&binary, 4242, "https://host.example.ts.net")
+            .expect("mount");
+        backend.stop().expect("stop");
+        assert_eq!(
+            read(tmp.path(), "config"),
+            "443 /grafana http://127.0.0.1:9000\n"
+        );
+        assert_eq!(read(tmp.path(), "funnel"), "443\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn funnel_mount_refuses_when_serve_config_is_unreadable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let binary = tmp.path().join("tailscale");
+        crate::test_support::write_executable_script(
+            &binary,
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}/calls\"\necho 'not json'\n",
+                tmp.path().display()
+            ),
+        );
+        let mut backend = fake_backend(&binary);
+
+        let error = backend
+            .mount(&binary, 4242, "https://host.example.ts.net")
+            .expect_err("mount must refuse");
+        assert_eq!(error.kind, TunnelErrorKind::StartFailed);
+        assert_eq!(read(tmp.path(), "calls"), "funnel status --json\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn funnel_stop_leaves_a_root_mount_that_is_not_this_daemons() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let binary = fake_tailscale(tmp.path());
+        // 42420 shares a prefix with our port 4242 but is the owner's. It is
+        // funneled, so mounting may replace it (a tailnet-only `/` is refused).
+        let fixture = "443 / http://127.0.0.1:42420\n";
+        std::fs::write(tmp.path().join("config"), fixture).expect("fixture");
+        std::fs::write(tmp.path().join("funnel"), "443\n").expect("fixture");
+        let mut backend = fake_backend(&binary);
+        backend.configured_port = Some(4242);
+
+        backend.stop().expect("stop");
+        assert_eq!(read(tmp.path(), "config"), fixture);
+        // Control: once our mount is the one there, stop removes it.
+        backend
+            .mount(&binary, 4242, "https://host.example.ts.net")
+            .expect("mount");
+        backend.stop().expect("stop");
+        assert_eq!(read(tmp.path(), "config"), "");
+    }
+
+    #[test]
+    fn serve_config_screen_reads_tailscale_json() {
+        let config: Value = serde_json::from_str(
+            r#"{"TCP":{"443":{"HTTPS":true}},
+                "Web":{"h.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:4242"}}},
+                       "h.ts.net:8443":{"Handlers":{"/admin":{"Proxy":"http://127.0.0.1:9"}}}},
+                "AllowFunnel":{"h.ts.net:443":true}}"#,
+        )
+        .expect("json");
+        assert_eq!(private_routes_on_443(&config), None);
+        assert!(root_mount_targets(&config, 4242));
+        assert!(!root_mount_targets(&config, 424));
+        assert!(!root_mount_targets(&config, 42420));
+
+        let private: Value = serde_json::from_str(
+            r#"{"Web":{"h.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:4242"},
+                                                    "/grafana":{"Proxy":"http://127.0.0.1:9000"}}}}}"#,
+        )
+        .expect("json");
+        assert_eq!(
+            private_routes_on_443(&private).as_deref(),
+            Some("h.ts.net:443")
         );
     }
 

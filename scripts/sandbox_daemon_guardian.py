@@ -588,6 +588,17 @@ def _is_reconcilable_retained_failure(
             Path(inspection_exhaustion.group("first")) == expected_lock_path
             and Path(inspection_exhaustion.group("second")) == expected_lock_path
         )
+    # m3, 2026-10-23: the owner ended, the first restore timed out inspecting the
+    # production lock's holders, and the second saw a short-lived foreign writer.
+    # Each half is reconcilable alone; production was never quiesced either way.
+    mixed_exhaustion = re.fullmatch(
+        "GuardianError: OwnerEnded: Actions owner ended before canary completion; "
+        + holder_timeout.format(name="lock")
+        + f"; restore production: {foreign}",
+        failure,
+    )
+    if mixed_exhaustion is not None:
+        return Path(mixed_exhaustion.group("lock")) == expected_lock_path
     deadline_exhaustion = re.fullmatch(
         r"GuardianError: restore production: GuardianError: timed out inspecting writer-domain "
         r"holders for (?P<lock>.+) after 2 attempt\(s\); restore production: "

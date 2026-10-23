@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use crate::config::{ConfigLoadError, LoadedConfig};
+use crate::config::{ConfigLoadError, LoadedConfig, table_get};
 
 use super::{DEFAULT_REFRESH_SKEW_SECONDS, helper_failure_is_transient, redact_token_like_text};
 
@@ -73,6 +73,7 @@ impl GhAuthConfig {
     }
 
     pub(super) fn from_loaded_config(config: &LoadedConfig) -> Result<Self, GhConfigError> {
+        reject_repository_controlled_auth(config)?;
         let Some(value) = config.get("github.auth") else {
             return Ok(Self::ambient());
         };
@@ -82,6 +83,27 @@ impl GhAuthConfig {
             .map_err(|source| GhConfigError::Parse { source })?;
         raw.into_config()
     }
+}
+
+/// `github.auth` names a command to run and binaries to hand an App token to,
+/// so a branch must not be able to set it. Refuse rather than ignore, so a
+/// repository that committed it learns where the table belongs.
+fn reject_repository_controlled_auth(config: &LoadedConfig) -> Result<(), GhConfigError> {
+    let layers = config
+        .repository_controlled_layers(|table| table_get(table, "github.auth").is_some())
+        .map_err(GhConfigError::Load)?;
+    let Some((path, _)) = layers.first() else {
+        return Ok(());
+    };
+    Err(GhConfigError::Invalid {
+        message: format!(
+            "`github.auth` is set in repository-controlled config {}; a tracked layer may not \
+             set github.auth. Move the [github.auth] table to the machine-global config {} or \
+             to an untracked .shipyard.local/config.toml",
+            path.display(),
+            config.global_dir.join("config.toml").display()
+        ),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

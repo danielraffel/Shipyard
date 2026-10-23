@@ -172,7 +172,9 @@ https://github.com/settings/installations/<installation-id>
 
 Shipyard currently uses GitHub App installation tokens through a command helper.
 Put the `[github.auth]` block in one of two places — never in the tracked
-project `.shipyard/config.toml`, since it points at private-key paths:
+project `.shipyard/config.toml`, since it points at private-key paths and
+names a command Shipyard runs. Shipyard refuses a tracked `[github.auth]`
+with an error naming the file, rather than running it:
 
 - **Global (recommended for one credential across every repo on the machine):**
   Shipyard's global config dir. Find it with `shipyard paths` (the `global_dir`

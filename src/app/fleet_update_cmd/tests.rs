@@ -998,6 +998,13 @@ fn install_through_fleet_shim(pinned_sha256: Option<&str>, with_token: bool) -> 
             std::fs::read(install_dir.join("shipyard")).expect("installed"),
             asset_bytes
         );
+        let manifest = std::fs::read_to_string(
+            temp.path()
+                .join("release-asset.checksums")
+                .join("checksums.sha256"),
+        )
+        .expect("served manifest");
+        assert_eq!(manifest, format!("{pinned}  shipyard-linux-arm64\n"));
     } else {
         assert!(!install_dir.join("shipyard").exists());
     }

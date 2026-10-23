@@ -858,9 +858,149 @@ pub fn resolve_targets(
     config: &LoadedConfig,
     mode: ValidationMode,
 ) -> Result<Vec<ResolvedTarget>, DispatchError> {
+    reject_repository_controlled_target_overrides(config)?;
     let mut targets = resolve_targets_from_table(&config.data, mode)?;
     apply_trusted_project_environment(config, &mut targets)?;
     Ok(targets)
+}
+
+/// A branch's tracked config may declare targets, but its `ssh_options` may
+/// only tune the connection (see `ssh::repository_ssh_option_violation`), and
+/// it may not move a target the machine-global config
+/// declares onto another backend. Machine-global and untracked local
+/// overlay settings are not restricted.
+fn reject_repository_controlled_target_overrides(
+    config: &LoadedConfig,
+) -> Result<(), DispatchError> {
+    let layers = config
+        .repository_controlled_layers(|table| {
+            table.contains_key("targets") || forbidden_ssh_options(table, "").is_some()
+        })
+        .map_err(|error| invalid_target("*", error.to_string()))?;
+    for (path, layer) in &layers {
+        if let Some((key, reason)) = forbidden_ssh_options(layer, "") {
+            return Err(invalid_target(
+                &key,
+                format!(
+                    "{reason} in repository-controlled config {}; move it to the machine-global \
+                     config (or an untracked .shipyard.local/config.toml)",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    let sets_backend = |table: &Table| table.contains_key("type") || table.contains_key("backend");
+    if !layers.iter().any(|(_, layer)| {
+        layer
+            .get("targets")
+            .and_then(Value::as_table)
+            .is_some_and(|targets| {
+                targets
+                    .values()
+                    .filter_map(Value::as_table)
+                    .any(sets_backend)
+            })
+    }) {
+        return Ok(());
+    }
+    let machine = LoadedConfig::load_machine_global_from_dir(config.global_dir.clone())
+        .map_err(|error| invalid_target("*", error.to_string()))?;
+    let Some(machine_targets) = machine.data.get("targets").and_then(Value::as_table) else {
+        return Ok(());
+    };
+    for (name, machine_target) in machine_targets {
+        let Some(machine_target) = machine_target
+            .as_table()
+            .filter(|table| sets_backend(table) || declares_implicit_local_target(table))
+        else {
+            continue;
+        };
+        let tracked_sets_backend = layers.iter().any(|(_, layer)| {
+            layer
+                .get("targets")
+                .and_then(|targets| targets.get(name))
+                .and_then(Value::as_table)
+                .is_some_and(sets_backend)
+        });
+        let effective = config
+            .data
+            .get("targets")
+            .and_then(|targets| targets.get(name))
+            .and_then(Value::as_table)
+            .map(normalize_backend_name);
+        let declared = normalize_backend_name(machine_target);
+        if tracked_sets_backend && effective.as_deref() != Some(declared.as_str()) {
+            return Err(invalid_target(
+                name,
+                format!(
+                    "repository-controlled config may not move this machine-declared {declared:?} \
+                     target to another backend; if the machine-global table only tunes a \
+                     repository-declared target, set its backend there explicitly"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Keys only a remote (ssh, Windows, pool or cloud) target reads.
+const REMOTE_ONLY_TARGET_KEYS: &[&str] = &[
+    "host",
+    "hosts",
+    "repo_path",
+    "ssh_options",
+    "identity_file",
+    "remote_bundle_path",
+    "bundle_upload_timeout_secs",
+    "bundle_apply_timeout_secs",
+    "windows_vs_detect",
+    "windows_host_mutex",
+    "windows_host_mutex_name",
+    "provider",
+    "runner_overrides",
+    "poll_interval_secs",
+    "dispatch_settle_secs",
+    "cloud_max_poll_secs",
+    "max_poll_secs",
+];
+
+/// Whether a machine-global target table with no `type`/`backend` declares a
+/// local target of its own (it names a `platform` or `cwd` and nothing only a
+/// remote target reads), rather than tuning a target a repository declares
+/// (`ssh_options`, `timeout_secs`, ...). Only a declaration pins the backend.
+fn declares_implicit_local_target(table: &Table) -> bool {
+    (table.contains_key("platform") || table.contains_key("cwd"))
+        && !REMOTE_ONLY_TARGET_KEYS
+            .iter()
+            .any(|key| table.contains_key(*key))
+}
+
+/// The first `ssh_options` array under `table` that repository-controlled
+/// config may not supply, as its dotted key and the reason.
+fn forbidden_ssh_options(table: &Table, prefix: &str) -> Option<(String, String)> {
+    table.iter().find_map(|(key, value)| {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            Value::Array(values) if key == "ssh_options" => {
+                let options = values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                ssh::repository_ssh_option_violation(&options).map(|reason| (path, reason))
+            }
+            Value::Table(child) => forbidden_ssh_options(child, &path),
+            Value::Array(values) => values
+                .iter()
+                .filter_map(Value::as_table)
+                .find_map(|child| forbidden_ssh_options(child, &path)),
+            _ => None,
+        }
+    })
 }
 
 fn apply_trusted_project_environment(
@@ -1423,6 +1563,7 @@ fn resolved_ssh(
     table: &Table,
     validation_table: &Table,
 ) -> Result<ResolvedTarget, DispatchError> {
+    reject_option_like_host(name, table)?;
     let target = SshTargetConfig {
         name: name.to_owned(),
         platform: platform.to_owned(),
@@ -1461,6 +1602,7 @@ fn resolved_windows(
     table: &Table,
     validation_table: &Table,
 ) -> Result<ResolvedTarget, DispatchError> {
+    reject_option_like_host(name, table)?;
     let target = WindowsTargetConfig {
         name: name.to_owned(),
         platform: platform.to_owned(),
@@ -2330,6 +2472,17 @@ fn attempt_log_path(base: &std::path::Path, attempt: usize) -> PathBuf {
     PathBuf::from(format!("{}.attempt-{attempt}", base.to_string_lossy()))
 }
 
+/// `ssh` would read a host that starts with `-` as an option.
+fn reject_option_like_host(name: &str, table: &Table) -> Result<(), DispatchError> {
+    match table_str(table, "host") {
+        Some(host) if host.starts_with('-') => Err(invalid_target(
+            name,
+            format!("host {host:?} may not start with '-'"),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn invalid_target(target: &str, reason: String) -> DispatchError {
     DispatchError::InvalidTargetConfig {
         target: target.to_owned(),
@@ -2557,6 +2710,393 @@ backend = "local"
             panic!("expected local validation");
         };
         assert_eq!(validation.environment["PULP_SDK_DIR"], trusted_sdk);
+    }
+
+    /// Lay out global, tracked project and (optionally) local overlay layers in
+    /// a fresh git checkout; `commit_local` commits the overlay to the branch.
+    fn layered_config(
+        global_toml: &str,
+        project_toml: &str,
+        local_toml: Option<&str>,
+        commit_local: bool,
+    ) -> (tempfile::TempDir, LoadedConfig) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        let repo = temp.path().join("repo");
+        let project = repo.join(".shipyard");
+        std::fs::create_dir_all(&global).expect("global dir");
+        std::fs::create_dir_all(&project).expect("project dir");
+        initialize_repository(&repo, "git@github.com:Generous-Corp/forge.git");
+        std::fs::write(global.join("config.toml"), global_toml).expect("global config");
+        std::fs::write(project.join("config.toml"), project_toml).expect("project config");
+        let local = local_toml.map(|contents| {
+            let local = repo.join(".shipyard.local");
+            std::fs::create_dir_all(&local).expect("local dir");
+            std::fs::write(local.join("config.toml"), contents).expect("local config");
+            if commit_local {
+                let status = std::process::Command::new("git")
+                    .args(["add", "-f", ".shipyard.local/config.toml"])
+                    .current_dir(&repo)
+                    .status()
+                    .expect("git add");
+                assert!(status.success());
+            }
+            local
+        });
+        let source = if local.is_some() {
+            LocalOverlaySource::Direct
+        } else {
+            LocalOverlaySource::None
+        };
+        let config =
+            LoadedConfig::load(Some(global), Some(project), local, source).expect("loaded config");
+        (temp, config)
+    }
+
+    /// Record the overlay in the index under a case variant of its path, as a
+    /// branch committing `.Shipyard.Local/Config.toml` leaves it once checked
+    /// out on a case-insensitive filesystem. The on-disk file the loader reads
+    /// keeps its lowercase name, so this reproduces on any filesystem.
+    fn track_overlay_under_case_variant(temp: &tempfile::TempDir, file: &str) {
+        let repo = temp.path().join("repo");
+        let output = std::process::Command::new("git")
+            .args(["hash-object", "-w", ".shipyard.local/config.toml"])
+            .current_dir(&repo)
+            .output()
+            .expect("git hash-object");
+        assert!(output.status.success());
+        let blob = String::from_utf8(output.stdout).expect("utf8 hash");
+        let status = std::process::Command::new("git")
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{},.Shipyard.Local/{file}", blob.trim()),
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("git update-index");
+        assert!(status.success());
+    }
+
+    fn ssh_target_toml(options: &str) -> String {
+        format!(
+            "[targets.linux]\nbackend = \"ssh\"\nplatform = \"linux-arm64\"\nhost = \"builder\"\nssh_options = {options}\n"
+        )
+    }
+
+    #[test]
+    fn tracked_ssh_options_cannot_run_commands_on_the_controller() {
+        for options in [
+            r#"["-oProxyCommand=touch /tmp/x"]"#,
+            r#"["-o", "ProxyCommand touch /tmp/x"]"#,
+            r#"["-o", "LocalCommand=touch /tmp/x", "-o", "PermitLocalCommand=yes"]"#,
+            r#"["-o", "KnownHostsCommand=/bin/sh"]"#,
+            r#"["-F", "/tmp/evil"]"#,
+            r#"["-J", "bastion"]"#,
+            r#"["-o", "Include /tmp/evil"]"#,
+            r#"["-I", "/tmp/evil.so"]"#,
+            r#"["-oPKCS11Provider=/tmp/evil.so"]"#,
+            r#"["-o", "SecurityKeyProvider /tmp/evil.so"]"#,
+            r#"["-o", "XAuthLocation=/tmp/evil"]"#,
+            r#"["-E", "/tmp/log"]"#,
+            r#"["-L", "8080:localhost:80"]"#,
+            r#"["-R", "9000:localhost:22"]"#,
+            r#"["-D", "1080"]"#,
+        ] {
+            let (_temp, config) = layered_config("", &ssh_target_toml(options), None, false);
+            let error = resolve_targets(&config, ValidationMode::Full)
+                .expect_err("tracked controller-side ssh option must be refused");
+            assert!(
+                matches!(&error, DispatchError::InvalidTargetConfig { target, reason }
+                    if target == "targets.linux.ssh_options"
+                        && reason.contains("repository-controlled config")
+                        && reason.contains("machine-global")),
+                "{options}: {error}"
+            );
+        }
+
+        // A host-pool or fallback table nested deeper is still found.
+        let (_temp, config) = layered_config(
+            "",
+            "[targets.mac]\nbackend = \"local\"\n[targets.mac.extra]\nssh_options = [\"-oProxyJump=x\"]\n",
+            None,
+            false,
+        );
+        assert!(resolve_targets(&config, ValidationMode::Full).is_err());
+    }
+
+    #[test]
+    fn tracked_connection_tuning_and_machine_layer_ssh_options_still_resolve() {
+        let (_temp, config) = layered_config(
+            "",
+            &ssh_target_toml(
+                r#"["-oServerAliveInterval=30", "-p", "2222", "-o", "StrictHostKeyChecking accept-new", "-oIdentitiesOnly=yes", "-qC"]"#,
+            ),
+            None,
+            false,
+        );
+        let target = resolve_targets(&config, ValidationMode::Full)
+            .expect("connection tuning is allowed")
+            .remove(0);
+        let ResolvedBackend::Ssh(ssh) = target.backend else {
+            panic!("expected ssh backend");
+        };
+        assert_eq!(
+            ssh.ssh_options,
+            [
+                "-oServerAliveInterval=30",
+                "-p",
+                "2222",
+                "-o",
+                "StrictHostKeyChecking accept-new",
+                "-oIdentitiesOnly=yes",
+                "-qC"
+            ]
+        );
+
+        // The machine-global layer is not restricted.
+        for options in [
+            r#"["-o", "ProxyJump=bastion"]"#,
+            r#"["-I", "/usr/lib/opensc-pkcs11.so", "-o", "XAuthLocation=/opt/X11/bin/xauth"]"#,
+            r#"["-L", "8080:localhost:80", "-E", "/tmp/ssh.log"]"#,
+        ] {
+            let (_temp, config) = layered_config(
+                &ssh_target_toml(options),
+                "[project]\nname = \"forge\"\n",
+                None,
+                false,
+            );
+            resolve_targets(&config, ValidationMode::Full)
+                .unwrap_or_else(|error| panic!("global {options} is honoured: {error}"));
+        }
+
+        // Neither is an untracked local overlay...
+        let (_temp, config) = layered_config(
+            "",
+            "[project]\nname = \"forge\"\n",
+            Some(&ssh_target_toml(r#"["-o", "ProxyJump=bastion"]"#)),
+            false,
+        );
+        resolve_targets(&config, ValidationMode::Full).expect("local ProxyJump is honoured");
+
+        // ...but a local overlay the branch committed is repository-controlled.
+        let (_temp, config) = layered_config(
+            "",
+            "[project]\nname = \"forge\"\n",
+            Some(&ssh_target_toml(r#"["-o", "ProxyJump=bastion"]"#)),
+            true,
+        );
+        resolve_targets(&config, ValidationMode::Full)
+            .expect_err("a committed .shipyard.local is tracked config");
+    }
+
+    /// Rename the overlay on disk to `name` and commit it under that name. On a
+    /// filesystem that folds `name` to `config.toml` the loader still reads the
+    /// committed file. Returns false when the filesystem does not fold it.
+    fn commit_overlay_as(temp: &tempfile::TempDir, name: &str) -> bool {
+        let local = temp.path().join("repo/.shipyard.local");
+        std::fs::rename(local.join("config.toml"), local.join(name)).expect("rename overlay");
+        if !local.join("config.toml").exists() {
+            return false;
+        }
+        let status = std::process::Command::new("git")
+            .args(["add", "-f", "--", &format!(".shipyard.local/{name}")])
+            .current_dir(temp.path().join("repo"))
+            .status()
+            .expect("git add");
+        assert!(status.success());
+        true
+    }
+
+    #[test]
+    fn unicode_folded_committed_local_overlay_is_still_repository_controlled() {
+        // `conﬁg.toml` (U+FB01 ligature) is the same file as `config.toml` to
+        // APFS, which folds full Unicode, but not to git's ASCII-only icase.
+        let ssh = ssh_target_toml(r#"["-oProxyCommand=touch /tmp/x"]"#);
+        let (temp, config) = layered_config("", "[project]\nname = \"forge\"\n", Some(&ssh), false);
+        if !commit_overlay_as(&temp, "con\u{fb01}g.toml") {
+            eprintln!("skipping: filesystem does not fold U+FB01");
+            return;
+        }
+        let error = resolve_targets(&config, ValidationMode::Full)
+            .expect_err("unicode-folded committed ssh_options must be refused");
+        assert!(
+            error.to_string().contains("repository-controlled config"),
+            "{error}"
+        );
+
+        let auth = "[github.auth]\nsource = \"command\"\ntoken_command = [\"/bin/sh\", \"-c\", \"touch marker\"]\n";
+        let (temp, config) = layered_config("", "", Some(auth), false);
+        assert!(commit_overlay_as(&temp, "con\u{fb01}g.toml"));
+        crate::gh::GhClient::from_loaded_config(&config)
+            .expect_err("unicode-folded committed github.auth must be refused");
+
+        // Positive control, as in Pulp: a tracked `config.toml.example` beside
+        // an untracked overlay is a different file.
+        let (temp, config) = layered_config("", "[project]\nname = \"forge\"\n", Some(&ssh), false);
+        let repo = temp.path().join("repo");
+        std::fs::write(repo.join(".shipyard.local/config.toml.example"), &ssh).expect("example");
+        let status = std::process::Command::new("git")
+            .args(["add", "-f", ".shipyard.local/config.toml.example"])
+            .current_dir(&repo)
+            .status()
+            .expect("git add");
+        assert!(status.success());
+        resolve_targets(&config, ValidationMode::Full)
+            .expect("untracked overlay beside a tracked example is honoured");
+    }
+
+    #[test]
+    fn tracked_layer_cannot_move_an_implicitly_local_machine_target() {
+        // No `type`/`backend` in the machine config means local.
+        let (_temp, config) = layered_config(
+            "[targets.mac]\nplatform = \"macos-arm64\"\n",
+            "[targets.mac]\nbackend = \"ssh\"\nhost = \"attacker.invalid\"\n",
+            None,
+            false,
+        );
+        let error = resolve_targets(&config, ValidationMode::Full)
+            .expect_err("tracked config may not move an implicit local target to ssh");
+        assert!(
+            matches!(&error, DispatchError::InvalidTargetConfig { target, reason }
+                if target == "mac" && reason.contains("\"local\"")),
+            "{error}"
+        );
+
+        // A machine-global table that only tunes a repository-declared ssh
+        // target is not a local declaration, so the documented migration of
+        // ssh_options out of tracked config keeps working.
+        for machine in [
+            "[targets.linux]\nssh_options = [\"-o\", \"ProxyJump=bastion\"]\n",
+            "[targets.linux]\ntimeout_secs = 600\n",
+            "[targets.linux]\nplatform = \"linux-arm64\"\nidentity_file = \"~/.ssh/ci\"\n",
+        ] {
+            let (_temp, config) =
+                layered_config(machine, &ssh_target_toml(r#"["-p", "2222"]"#), None, false);
+            let target = resolve_targets(&config, ValidationMode::Full)
+                .unwrap_or_else(|error| panic!("{machine}: {error}"))
+                .remove(0);
+            assert!(
+                matches!(target.backend, ResolvedBackend::Ssh(_)),
+                "{machine}"
+            );
+        }
+
+        // Restating the implicit backend explicitly is not a move.
+        let (_temp, config) = layered_config(
+            "[targets.mac]\nplatform = \"macos-arm64\"\n",
+            "[targets.mac]\nbackend = \"local\"\n",
+            None,
+            false,
+        );
+        resolve_targets(&config, ValidationMode::Full).expect("same backend is allowed");
+    }
+
+    #[test]
+    fn case_variant_committed_local_overlay_is_still_repository_controlled() {
+        let ssh = ssh_target_toml(r#"["-oProxyCommand=touch /tmp/x"]"#);
+        let auth = "[github.auth]\nsource = \"command\"\ntoken_command = [\"/bin/sh\", \"-c\", \"touch marker\"]\n";
+
+        // Negative controls: an overlay committed as `.Shipyard.Local/Config.toml`
+        // is the same tracked file to a case-insensitive checkout.
+        let (temp, config) = layered_config("", "[project]\nname = \"forge\"\n", Some(&ssh), false);
+        track_overlay_under_case_variant(&temp, "Config.toml");
+        let error = resolve_targets(&config, ValidationMode::Full)
+            .expect_err("case-variant committed ssh_options must be refused");
+        assert!(
+            error.to_string().contains("repository-controlled config"),
+            "{error}"
+        );
+
+        let (temp, config) = layered_config("", "", Some(auth), false);
+        track_overlay_under_case_variant(&temp, "CONFIG.TOML");
+        crate::gh::GhClient::from_loaded_config(&config)
+            .expect_err("case-variant committed github.auth must be refused");
+
+        // Positive controls: a different file tracked beside an untracked
+        // overlay does not make the overlay tracked.
+        let (temp, config) = layered_config("", "[project]\nname = \"forge\"\n", Some(&ssh), false);
+        track_overlay_under_case_variant(&temp, "Config.toml.example");
+        resolve_targets(&config, ValidationMode::Full)
+            .expect("untracked local overlay ssh_options still honoured");
+
+        let (temp, config) = layered_config("", "", Some(auth), false);
+        track_overlay_under_case_variant(&temp, "other.toml");
+        crate::gh::GhClient::from_loaded_config(&config)
+            .expect("untracked local github.auth still honoured");
+    }
+
+    #[test]
+    fn tracked_layer_cannot_configure_github_auth() {
+        let auth = "[github.auth]\nsource = \"command\"\ntoken_command = [\"/bin/sh\", \"-c\", \"touch marker\"]\n";
+
+        let (_temp, config) = layered_config("", auth, None, false);
+        let error = crate::gh::GhClient::from_loaded_config(&config)
+            .expect_err("tracked github.auth must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("tracked layer may not set github.auth")
+                && message.contains("machine-global config"),
+            "{message}"
+        );
+
+        // A local overlay the branch committed is tracked too.
+        let (_temp, config) = layered_config("", "", Some(auth), true);
+        crate::gh::GhClient::from_loaded_config(&config)
+            .expect_err("committed .shipyard.local github.auth must be refused");
+
+        // Controls: the machine-global layer and an untracked local overlay
+        // still configure auth; constructing the client runs nothing.
+        let (_temp, config) = layered_config(auth, "[project]\nname = \"forge\"\n", None, false);
+        crate::gh::GhClient::from_loaded_config(&config).expect("global github.auth honoured");
+        let (_temp, config) = layered_config("", "", Some(auth), false);
+        crate::gh::GhClient::from_loaded_config(&config)
+            .expect("untracked local github.auth honoured");
+    }
+
+    #[test]
+    fn ssh_host_that_parses_as_an_option_is_refused() {
+        let (_temp, config) = layered_config(
+            "",
+            "[targets.linux]\nbackend = \"ssh\"\nhost = \"-oProxyCommand=touch /tmp/x\"\n",
+            None,
+            false,
+        );
+        let error = resolve_targets(&config, ValidationMode::Full)
+            .expect_err("option-like host must be refused");
+        assert!(
+            error.to_string().contains("may not start with '-'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tracked_layer_cannot_move_a_machine_declared_target_to_another_backend() {
+        let machine = "[targets.linux]\nbackend = \"ssh\"\nhost = \"builder\"\n";
+        let (_temp, config) = layered_config(
+            machine,
+            "[targets.linux]\nbackend = \"local\"\n",
+            None,
+            false,
+        );
+        let error = resolve_targets(&config, ValidationMode::Full)
+            .expect_err("tracked backend flip must be refused");
+        assert!(
+            matches!(&error, DispatchError::InvalidTargetConfig { target, .. } if target == "linux"),
+            "{error}"
+        );
+
+        // Control: tracked config may still declare its own local target and
+        // tune the machine's target without touching its backend.
+        let (_temp, config) = layered_config(
+            machine,
+            "[targets.linux]\nbackend = \"ssh\"\ntimeout_secs = 60\n[targets.mac]\nbackend = \"local\"\n",
+            None,
+            false,
+        );
+        let targets = resolve_targets(&config, ValidationMode::Full).expect("resolves");
+        assert_eq!(targets.len(), 2);
     }
 
     #[test]

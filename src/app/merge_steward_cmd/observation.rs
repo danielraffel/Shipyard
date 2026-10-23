@@ -12,6 +12,10 @@ use crate::required_check_policy::{
 const BOUNDED_GH_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const BOUNDED_GH_STDERR_BYTES: usize = 64 * 1024;
 const MAX_MERGE_QUEUE_PAGES: usize = 10;
+// Keep the GraphQL connection bounded well below gh's 1,000-row maximum. The
+// release smoke gate uses the same read with the Actions token, where a 1,000
+// row request has repeatedly produced 502/EOF responses despite a 48-PR repo.
+const MAX_OPEN_PR_ROWS: usize = 200;
 
 pub(super) fn resolve_repos(mut repos: Vec<String>, cwd: &Path) -> Result<Vec<String>, CliFailure> {
     if repos.is_empty() {
@@ -430,11 +434,13 @@ fn merge_queue_next_cursor(queue: &Value) -> Result<Option<&str>, String> {
 ///   GitHub's response budget. Checks are reconstructed per head in
 ///   `hydrate_required_check_identities`, for the only pull requests that can
 ///   have them consulted.
+/// - `body` can make a bulk GraphQL response unnecessarily large under the
+///   restricted Actions token. Owner resolution already has a per-PR fallback.
 /// - `commits` nests an `authors` connection inside the commit connection, so a
 ///   page of pull requests requests over 500,000 possible nodes and GitHub
 ///   refuses the query outright. The only consumer is the owner fallback for an
 ///   owner wake, which [`hydrate_owner`] reads per pull request on demand.
-pub(super) const OPEN_PR_LIST_FIELDS: &str = "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,body";
+pub(super) const OPEN_PR_LIST_FIELDS: &str = "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author";
 
 /// Fields read per pull request to resolve the owner a wake is addressed to.
 pub(super) const OWNER_VIEW_FIELDS: &str = "body,commits";
@@ -496,7 +502,7 @@ pub(super) fn pull_requests(
         "--base".to_owned(),
         base.to_owned(),
         "--limit".to_owned(),
-        "1000".to_owned(),
+        MAX_OPEN_PR_ROWS.to_string(),
         "--json".to_owned(),
         OPEN_PR_LIST_FIELDS.to_owned(),
     ];
@@ -504,8 +510,10 @@ pub(super) fn pull_requests(
     let rows = value
         .as_array()
         .ok_or_else(|| "open PR list was not an array".to_owned())?;
-    if rows.len() == 1000 {
-        return Err("open PR list reached 1000; refusing a possibly partial snapshot".to_owned());
+    if rows.len() == MAX_OPEN_PR_ROWS {
+        return Err(format!(
+            "open PR list reached {MAX_OPEN_PR_ROWS}; refusing a possibly partial snapshot"
+        ));
     }
     rows.iter().map(|row| parse_pr(row, positions)).collect()
 }
