@@ -172,7 +172,7 @@ impl LoadedConfig {
                 },
             )
         };
-        let output = match Command::new("git")
+        let output = match git_command()
             .args(["show", &spec])
             .current_dir(cwd)
             .output()
@@ -241,10 +241,18 @@ impl LoadedConfig {
         }
         if let Some(local_dir) = &self.local_dir {
             let path = local_dir.join("config.toml");
-            if let Some(table) = read_layer(&path)?.filter(|table| relevant(table))
-                && git_tracks(local_dir, "config.toml")
-            {
-                layers.push((path, table));
+            if let Some(table) = read_layer(&path)?.filter(|table| relevant(table)) {
+                let tracked =
+                    git_tracks(local_dir, "config.toml").map_err(|reason| ConfigLoadError::Io {
+                        path: path.clone(),
+                        source: std::io::Error::other(format!(
+                            "git could not tell whether this overlay is committed, so it is not \
+                             trusted: {reason}"
+                        )),
+                    })?;
+                if tracked {
+                    layers.push((path, table));
+                }
             }
         }
         Ok(layers)
@@ -329,9 +337,40 @@ fn read_layer(path: &Path) -> ConfigResult<Option<Table>> {
         })
 }
 
+/// Environment that makes `git` act on some other repository than the one
+/// `current_dir` is in. Git exports `GIT_DIR` to hooks (and `rebase -x`), and
+/// in a linked worktree that alone makes `rev-parse` treat the cwd as the top
+/// of the work tree, so every question about the checkout must clear them.
+const REPOSITORY_SELECTING_GIT_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
+
+/// A `git` command that discovers its repository from `current_dir` alone.
+fn git_command() -> Command {
+    clear_repository_selecting_env(Command::new("git"))
+}
+
+fn clear_repository_selecting_env(mut command: Command) -> Command {
+    for name in REPOSITORY_SELECTING_GIT_ENV {
+        command.env_remove(name);
+    }
+    command
+}
+
 /// Whether git tracks `file` inside `dir`. A directory outside any work tree,
-/// or a host without git, counts as untracked; any other git failure counts
-/// as tracked, so a layer git cannot vouch for is never trusted.
+/// or a host without git, counts as untracked; any other git failure is an
+/// error, so a layer git cannot vouch for is never trusted.
 ///
 /// The match ignores case across the whole repository-relative path: on a
 /// case-insensitive filesystem the loader reads `.shipyard.local/config.toml`
@@ -339,41 +378,44 @@ fn read_layer(path: &Path) -> ConfigResult<Option<Table>> {
 /// would miss that index entry. A relative `:(icase)` pathspec is not enough
 /// either, because git matches the cwd prefix case-sensitively, so anchor the
 /// full path at the top of the work tree.
-fn git_tracks(dir: &Path, file: &str) -> bool {
+fn git_tracks(dir: &Path, file: &str) -> Result<bool, String> {
     // Without git there is no checkout a branch could have committed to.
-    let Ok(output) = Command::new("git")
+    let Ok(output) = git_command()
         .args(["rev-parse", "--show-toplevel", "--show-prefix"])
         .current_dir(dir)
         .env("LC_ALL", "C")
         .output()
     else {
-        return false;
+        return Ok(false);
     };
     if !output.status.success() {
-        // Outside any work tree the overlay cannot be tracked; any other git
-        // failure inside one fails closed.
-        return !String::from_utf8_lossy(&output.stderr).contains("not a git repository");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("not a git repository") {
+            return Ok(false);
+        }
+        return Err(format!("`git rev-parse` failed: {}", stderr.trim()));
     }
-    let Ok(stdout) = String::from_utf8(output.stdout) else {
-        return true;
-    };
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| "`git rev-parse` printed a non-UTF-8 path".to_owned())?;
     let mut lines = stdout.lines();
     let (Some(top), prefix) = (lines.next(), lines.next().unwrap_or("")) else {
-        return true;
+        return Err("`git rev-parse` printed no work tree".to_owned());
     };
     let pathspec = format!(":(top,icase,literal){prefix}{file}");
-    let named = Command::new("git")
+    let named = git_command()
         .args(["ls-files", "--error-unmatch", "--", &pathspec])
         .current_dir(dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
-    match named {
-        Ok(status) if status.success() => return true,
-        Ok(status) if status.code() == Some(1) => {}
-        _ => return true,
+        .status()
+        .map_err(|error| format!("`git ls-files` did not run: {error}"))?;
+    match named.code() {
+        Some(0) => Ok(true),
+        Some(1) => {
+            tracked_entry_is_same_file(Path::new(top), &format!("{prefix}{file}"), &dir.join(file))
+        }
+        _ => Err(format!("`git ls-files` exited with {named}")),
     }
-    tracked_entry_is_same_file(Path::new(top), &format!("{prefix}{file}"), &dir.join(file))
 }
 
 /// Whether any tracked entry at the depth of `relative` is the same file as
@@ -384,30 +426,46 @@ fn git_tracks(dir: &Path, file: &str) -> bool {
 /// entries at the same depth are compared, since folding never adds or
 /// removes a `/`; a tracked `config.toml.example` beside the overlay is a
 /// different file.
-fn tracked_entry_is_same_file(top: &Path, relative: &str, path: &Path) -> bool {
-    let Ok(target) = same_file::Handle::from_path(path) else {
-        return false;
+fn tracked_entry_is_same_file(top: &Path, relative: &str, path: &Path) -> Result<bool, String> {
+    let Some(target) = file_identity(path) else {
+        return Ok(false);
     };
-    let Ok(output) = Command::new("git")
+    let output = git_command()
         .args(["ls-files", "-z"])
         .current_dir(top)
-        .stderr(std::process::Stdio::null())
         .output()
-    else {
-        return true;
-    };
+        .map_err(|error| format!("`git ls-files` did not run: {error}"))?;
     if !output.status.success() {
-        return true;
+        return Err(format!(
+            "`git ls-files` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     let depth = relative.matches('/').count();
-    output
+    Ok(output
         .stdout
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty() && entry.split(|byte| *byte == b'/').count() == depth + 1)
         .map(index_entry_path)
-        .any(|entry| {
-            same_file::Handle::from_path(top.join(entry)).is_ok_and(|handle| handle == target)
-        })
+        .any(|entry| file_identity(&top.join(entry)).as_ref() == Some(&target)))
+}
+
+/// The device and inode `path` resolves to, read from metadata so a tracked
+/// FIFO or device is never opened.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> Option<same_file::Handle> {
+    fs::metadata(path)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .and_then(|_| same_file::Handle::from_path(path).ok())
 }
 
 #[cfg(unix)]
@@ -446,7 +504,7 @@ fn has_config_file(dir: &Path) -> bool {
 }
 
 fn worktree_main_local_dir(base: &Path, local_overlay_dir_name: &str) -> Option<PathBuf> {
-    let common_output = Command::new("git")
+    let common_output = git_command()
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(base)
         .output()
@@ -469,7 +527,7 @@ fn worktree_main_local_dir(base: &Path, local_overlay_dir_name: &str) -> Option<
     };
 
     let main_checkout = common_dir.parent()?.to_path_buf();
-    let toplevel_output = Command::new("git")
+    let toplevel_output = git_command()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(base)
         .output()

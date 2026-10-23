@@ -909,9 +909,10 @@ fn reject_repository_controlled_target_overrides(
         return Ok(());
     };
     for (name, machine_target) in machine_targets {
-        // A machine target with no `type`/`backend` is implicitly local, and is
-        // pinned just the same.
-        let Some(machine_target) = machine_target.as_table() else {
+        let Some(machine_target) = machine_target
+            .as_table()
+            .filter(|table| sets_backend(table) || declares_implicit_local_target(table))
+        else {
             continue;
         };
         let tracked_sets_backend = layers.iter().any(|(_, layer)| {
@@ -933,12 +934,45 @@ fn reject_repository_controlled_target_overrides(
                 name,
                 format!(
                     "repository-controlled config may not move this machine-declared {declared:?} \
-                     target to another backend"
+                     target to another backend; if the machine-global table only tunes a \
+                     repository-declared target, set its backend there explicitly"
                 ),
             ));
         }
     }
     Ok(())
+}
+
+/// Keys only a remote (ssh, Windows, pool or cloud) target reads.
+const REMOTE_ONLY_TARGET_KEYS: &[&str] = &[
+    "host",
+    "hosts",
+    "repo_path",
+    "ssh_options",
+    "identity_file",
+    "remote_bundle_path",
+    "bundle_upload_timeout_secs",
+    "bundle_apply_timeout_secs",
+    "windows_vs_detect",
+    "windows_host_mutex",
+    "windows_host_mutex_name",
+    "provider",
+    "runner_overrides",
+    "poll_interval_secs",
+    "dispatch_settle_secs",
+    "cloud_max_poll_secs",
+    "max_poll_secs",
+];
+
+/// Whether a machine-global target table with no `type`/`backend` declares a
+/// local target of its own (it names a `platform` or `cwd` and nothing only a
+/// remote target reads), rather than tuning a target a repository declares
+/// (`ssh_options`, `timeout_secs`, ...). Only a declaration pins the backend.
+fn declares_implicit_local_target(table: &Table) -> bool {
+    (table.contains_key("platform") || table.contains_key("cwd"))
+        && !REMOTE_ONLY_TARGET_KEYS
+            .iter()
+            .any(|key| table.contains_key(*key))
 }
 
 /// The first `ssh_options` array under `table` that repository-controlled
@@ -2929,6 +2963,25 @@ backend = "local"
                 if target == "mac" && reason.contains("\"local\"")),
             "{error}"
         );
+
+        // A machine-global table that only tunes a repository-declared ssh
+        // target is not a local declaration, so the documented migration of
+        // ssh_options out of tracked config keeps working.
+        for machine in [
+            "[targets.linux]\nssh_options = [\"-o\", \"ProxyJump=bastion\"]\n",
+            "[targets.linux]\ntimeout_secs = 600\n",
+            "[targets.linux]\nplatform = \"linux-arm64\"\nidentity_file = \"~/.ssh/ci\"\n",
+        ] {
+            let (_temp, config) =
+                layered_config(machine, &ssh_target_toml(r#"["-p", "2222"]"#), None, false);
+            let target = resolve_targets(&config, ValidationMode::Full)
+                .unwrap_or_else(|error| panic!("{machine}: {error}"))
+                .remove(0);
+            assert!(
+                matches!(target.backend, ResolvedBackend::Ssh(_)),
+                "{machine}"
+            );
+        }
 
         // Restating the implicit backend explicitly is not a move.
         let (_temp, config) = layered_config(
