@@ -572,10 +572,12 @@ host while a sandbox canary is running: the probe itself is a foreign holder.
 Every later Sandbox macOS run fails this way when an earlier run retained the
 host lease with a failure shape the guardian does not recognize. Read that
 run's `guardian-receipt.json` under `/tmp/shipyard-sandbox-m3-<run>-<attempt>`:
-its `failure` names the cause. Two shapes reconcile on the next run: both
+its `failure` names the cause. Three shapes reconcile on the next run: both
 restore-production holder inspections timing out on the production
-writer-domain lock (`lsof` on a loaded host), and a fenced lease whose
-production daemon was replaced afterwards, which binds to the current daemon.
+writer-domain lock (`lsof` on a loaded host); an owner end where one
+inspection timed out on that lock and the other saw a short-lived foreign
+writer (m3, run 39881545054); and a fenced lease whose production daemon was
+replaced afterwards, which binds to the current daemon.
 Anything else still needs a guardian change; do not delete the lease by hand.
 
 "Actions owner ended before canary completion" with `sandbox_passed: true` in
