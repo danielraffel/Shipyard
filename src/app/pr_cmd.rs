@@ -820,7 +820,6 @@ fn git_output(cwd: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use std::fs;
 
     use crate::config::{LoadedConfig, LocalOverlaySource};
