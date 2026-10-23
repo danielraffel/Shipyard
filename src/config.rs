@@ -258,11 +258,53 @@ impl LoadedConfig {
         Ok(layers)
     }
 
+    /// Every layer file that sets `dotted_key`, in load order (machine-global,
+    /// tracked project, local overlay), with whether the repository controls
+    /// that layer the way [`Self::repository_controlled_layers`] judges it: the
+    /// tracked project file, or a local overlay a branch has committed. A local
+    /// overlay git cannot classify counts as not controlled.
+    pub fn layers_setting(&self, dotted_key: &str) -> ConfigResult<Vec<LayerSetting>> {
+        let mut found = Vec::new();
+        let mut push = |path: PathBuf, repository_controlled: bool| -> ConfigResult<()> {
+            if let Some(table) = read_layer(&path)?
+                && let Some(value) = table_get(&table, dotted_key)
+            {
+                found.push(LayerSetting {
+                    path,
+                    value: value.clone(),
+                    repository_controlled,
+                });
+            }
+            Ok(())
+        };
+        push(self.global_dir.join("config.toml"), false)?;
+        if let Some(project_dir) = &self.project_dir {
+            push(project_dir.join("config.toml"), true)?;
+        }
+        if let Some(local_dir) = &self.local_dir {
+            let tracked = git_tracks(local_dir, "config.toml").unwrap_or(false);
+            push(local_dir.join("config.toml"), tracked)?;
+        }
+        Ok(found)
+    }
+
     /// Resolve a dotted key as a string.
     #[must_use]
     pub fn get_str<'a>(&'a self, dotted_key: &str) -> Option<&'a str> {
         self.get(dotted_key)?.as_str()
     }
+}
+
+/// One config layer file's setting of a key, from [`LoadedConfig::layers_setting`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerSetting {
+    /// The layer file that sets the key.
+    pub path: PathBuf,
+    /// The value that file gives it.
+    pub value: toml::Value,
+    /// Whether the repository controls this layer (tracked project file, or a
+    /// committed local overlay).
+    pub repository_controlled: bool,
 }
 
 /// Errors that can occur while loading configuration.

@@ -284,7 +284,11 @@ pub(super) fn pr_command<W: Write>(
     let repo_root = git_output(cwd, &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
         .map_err(|error| CliFailure::new(2, error))?;
-    let gates = resolve_pr_gates(&repo_root, config)?;
+    let gates = if pr_gates_opt_out(config, &repo_root)? {
+        None
+    } else {
+        Some(resolve_pr_gates(&repo_root, config)?)
+    };
     let python = args
         .python_command
         .as_deref()
@@ -292,11 +296,19 @@ pub(super) fn pr_command<W: Write>(
 
     warn_missing_release_bot_token(stdout, cwd, config);
     print_fold_suggestions(stdout, cwd, config, &args.base);
-    run_skill_sync(stdout, &python, &gates, &repo_root, &args.base)?;
-    // Version numbers are assigned by the single writer after the merge.
-    // Keep the gate as a read-only check so this command can never create a
-    // competing version commit on an author branch.
-    run_version_bump(stdout, &python, &gates, &repo_root, &args)?;
+    if let Some(gates) = &gates {
+        run_skill_sync(stdout, &python, gates, &repo_root, &args.base)?;
+        // Version numbers are assigned by the single writer after the merge.
+        // Keep the gate as a read-only check so this command can never create a
+        // competing version commit on an author branch.
+        run_version_bump(stdout, &python, gates, &repo_root, &args)?;
+    } else {
+        writeln!(
+            stdout,
+            "▸ Skill-sync and version-bump gates skipped: this repository sets validation.pr_gates = false"
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
 
     let steward_handoff =
         resolve_steward_handoff(&args, protected_base_auto_handoff(cwd, &args.base));
@@ -356,6 +368,54 @@ fn protected_base_auto_handoff(cwd: &Path, base: &str) -> bool {
         .and_then(|contents| contents.parse::<toml::Table>().ok())
         .and_then(|table| table.get("merge_steward")?.get("auto_handoff")?.as_bool())
         .unwrap_or(false)
+}
+
+/// Whether this repository opted out of the skill-sync and version-bump gates.
+///
+/// A repository with none declares so with `[validation] pr_gates = false` in
+/// its own config. Only an explicit boolean `false` counts, and only from a
+/// layer the repository controls: the machine-global file applies to every
+/// repository on the host and the local overlay is unreviewed, so either one
+/// could switch a gated repository's gates off unseen. A setting there is
+/// refused (exit 2). So is an opt-out in a repository whose gate scripts
+/// resolve, since "no gates" and "gate scripts present" contradict each other.
+/// Everywhere else a missing gate script stays a hard error, because it
+/// usually means a moved path rather than a repository without gates.
+fn pr_gates_opt_out(config: &LoadedConfig, repo_root: &Path) -> Result<bool, CliFailure> {
+    let layers = config
+        .layers_setting("validation.pr_gates")
+        .map_err(|error| CliFailure::new(2, error.to_string()))?;
+    if let Some(outside) = layers.iter().find(|layer| !layer.repository_controlled) {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "validation.pr_gates is set in {}, which this repository does not control. \
+                 Only the repository's own .shipyard/config.toml may opt it out of its \
+                 skill-sync and version-bump gates; remove the key there.",
+                outside.path.display()
+            ),
+        ));
+    }
+    let Some(setting) = layers
+        .last()
+        .filter(|layer| layer.value.as_bool().is_some_and(|enabled| !enabled))
+    else {
+        return Ok(false);
+    };
+    for script in [SKILL_SYNC, VERSION_BUMP] {
+        if let Ok(path) = resolve(script, repo_root, config) {
+            return Err(CliFailure::new(
+                2,
+                format!(
+                    "{} sets validation.pr_gates = false, but this repository has the gate \
+                     script {}. A repository with gates must run them; remove the opt-out.",
+                    setting.path.display(),
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(true)
 }
 
 fn resolve_pr_gates(repo_root: &Path, config: &LoadedConfig) -> Result<PrGates, CliFailure> {
@@ -760,7 +820,6 @@ fn git_output(cwd: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use std::fs;
 
     use crate::config::{LoadedConfig, LocalOverlaySource};
@@ -885,6 +944,111 @@ mod tests {
                 String::from("Version-Bump: sdk=skip reason=\"manual bump later\""),
                 String::from("Skill-Update: skip skill=ci reason=\"docs-only\"")
             ]
+        );
+    }
+
+    /// A repository at `root` with the given config layers: machine-global,
+    /// tracked project and an untracked local overlay.
+    fn layered(
+        root: &Path,
+        global: Option<&str>,
+        project: Option<&str>,
+        local: Option<&str>,
+    ) -> LoadedConfig {
+        let write = |dir: PathBuf, contents: Option<&str>| {
+            let contents = contents?;
+            fs::create_dir_all(&dir).expect("layer dir");
+            fs::write(dir.join("config.toml"), contents).expect("layer file");
+            Some(dir)
+        };
+        let global_dir = root.join("global");
+        fs::create_dir_all(&global_dir).expect("global dir");
+        write(global_dir.clone(), global);
+        LoadedConfig::load(
+            Some(global_dir),
+            write(root.join(".shipyard"), project),
+            write(root.join(".shipyard.local"), local),
+            LocalOverlaySource::Direct,
+        )
+        .expect("layered config")
+    }
+
+    const OPT_OUT: &str = "[validation]\npr_gates = false\n";
+
+    #[test]
+    fn only_an_explicit_false_in_the_repository_config_opts_out() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = layered(root.path(), None, Some(OPT_OUT), None);
+        assert!(pr_gates_opt_out(&config, root.path()).expect("opt-out"));
+        for contents in [
+            "",
+            "[validation]\npr_gates = true\n",
+            // A string is not the boolean: a typo must not turn the gates off.
+            "[validation]\npr_gates = \"false\"\n",
+            "[validation]\nskill_sync_script = \"scripts/sync.py\"\n",
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let config = layered(root.path(), None, Some(contents), None);
+            assert!(
+                !pr_gates_opt_out(&config, root.path()).expect("no opt-out"),
+                "{contents:?} disabled the gates"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_global_opt_out_is_refused() {
+        // It would switch off the gates of every repository on the host.
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = layered(root.path(), Some(OPT_OUT), None, None);
+        let error =
+            pr_gates_opt_out(&config, root.path()).expect_err("global opt-out must be refused");
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("global"), "{}", error.message);
+    }
+
+    #[test]
+    fn an_untracked_local_overlay_opt_out_is_refused() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = layered(root.path(), None, None, Some(OPT_OUT));
+        let error =
+            pr_gates_opt_out(&config, root.path()).expect_err("local opt-out must be refused");
+        assert_eq!(error.code, 2);
+        assert!(
+            error.message.contains(".shipyard.local"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn an_opt_out_beside_gate_scripts_is_refused() {
+        let root = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(root.path().join("tools/scripts")).expect("scripts dir");
+        fs::write(root.path().join("tools/scripts/skill_sync_check.py"), "").expect("script");
+        let config = layered(root.path(), None, Some(OPT_OUT), None);
+        let error = pr_gates_opt_out(&config, root.path())
+            .expect_err("an opt-out beside gate scripts must be refused");
+        assert_eq!(error.code, 2);
+        assert!(
+            error.message.contains("skill_sync_check.py"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_repository_without_gate_scripts_still_fails_unless_it_opts_out() {
+        // The opt-out is a declaration, not a fallback: a repository that
+        // keeps its gates and has lost a script still gets the hard error.
+        let root = tempfile::tempdir().expect("tempdir");
+        let error = resolve_pr_gates(root.path(), &config_from_toml("", root.path()))
+            .err()
+            .expect("missing scripts must fail");
+        assert!(
+            error.message.contains("skill_sync_check.py"),
+            "{}",
+            error.message
         );
     }
 

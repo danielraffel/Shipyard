@@ -355,6 +355,28 @@ When asserting a gate "ran", check for `rc in (0, 1)` — not `rc == 0`. Zero is
 "ran and passed"; conflating it with "ran" is the same mistake one level up.
 `scripts/**` maps to this skill, so a change to either gate needs a note here.
 
+
+## A repository without the gates opts out of them explicitly
+
+`shipyard pr` resolves `skill_sync_check.py`, `version_bump_check.py` and
+`versioning.json` before anything else, so a repository with none of them
+(spectr, whence and tartci on this fleet) stopped at `could not find
+skill_sync_check.py` and could not use `shipyard pr` at all. Such a repository
+sets `[validation] pr_gates = false` in `.shipyard/config.toml`; `shipyard pr`
+then says it skipped both gates and hands off to `shipyard ship`.
+
+Only an explicit boolean `false` counts. A missing key, `true` or the string
+`"false"` keeps the gates, and a repository that keeps them and has lost a
+script still gets the hard error: the opt-out is a declaration, never a
+fallback, because a vanished gate script usually means a moved path. The
+opt-out does not supply ship targets either; a repository with no `[targets]`
+(tartci) still cannot use `shipyard ship`.
+
+The key is read only from layers the repository controls (the tracked project
+file, or a committed overlay). Merged config would let the machine-global file
+or Pulp's untracked overlay turn off Pulp's gates with nothing changing in
+Pulp, so a `pr_gates` set there is refused with exit 2, as is an opt-out in a
+repository whose gate scripts resolve.
 ## Crash-safe state writes
 
 Write Shipyard state files (ship state, queue requests, receipts, holds) with
