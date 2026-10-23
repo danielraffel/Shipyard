@@ -104,6 +104,14 @@ truthful on release PRs.
 
 Shipyard coordinates validation across local, SSH, and cloud targets.
 
+## A repository without skill/version gates sets `pr_gates = false`
+
+`shipyard pr` refuses to start when it cannot find `skill_sync_check.py`,
+`version_bump_check.py` or `versioning.json`. When adopting Shipyard in a
+repository that has none of them on purpose, add `[validation] pr_gates =
+false` to `.shipyard/config.toml` instead of copying placeholder scripts. Only
+the boolean `false` opts out; anything else keeps the gates strict.
+
 ## `shipyard pr` suggests folding same-session siblings
 
 Before the skill-sync and version gates, `shipyard pr` reads the current agent
