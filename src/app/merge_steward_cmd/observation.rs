@@ -434,11 +434,13 @@ fn merge_queue_next_cursor(queue: &Value) -> Result<Option<&str>, String> {
 ///   GitHub's response budget. Checks are reconstructed per head in
 ///   `hydrate_required_check_identities`, for the only pull requests that can
 ///   have them consulted.
+/// - `body` can make a bulk GraphQL response unnecessarily large under the
+///   restricted Actions token. Owner resolution already has a per-PR fallback.
 /// - `commits` nests an `authors` connection inside the commit connection, so a
 ///   page of pull requests requests over 500,000 possible nodes and GitHub
 ///   refuses the query outright. The only consumer is the owner fallback for an
 ///   owner wake, which [`hydrate_owner`] reads per pull request on demand.
-pub(super) const OPEN_PR_LIST_FIELDS: &str = "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,body";
+pub(super) const OPEN_PR_LIST_FIELDS: &str = "id,number,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author";
 
 /// Fields read per pull request to resolve the owner a wake is addressed to.
 pub(super) const OWNER_VIEW_FIELDS: &str = "body,commits";
