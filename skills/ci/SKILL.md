@@ -109,8 +109,11 @@ Shipyard coordinates validation across local, SSH, and cloud targets.
 `shipyard pr` refuses to start when it cannot find `skill_sync_check.py`,
 `version_bump_check.py` or `versioning.json`. When adopting Shipyard in a
 repository that has none of them on purpose, add `[validation] pr_gates =
-false` to `.shipyard/config.toml` instead of copying placeholder scripts. Only
-the boolean `false` opts out; anything else keeps the gates strict.
+false` to that repository's tracked `.shipyard/config.toml` instead of copying
+placeholder scripts. Only the boolean `false` opts out; anything else keeps the
+gates strict. Never put it in the machine-global config or an untracked
+`.shipyard.local` overlay: `shipyard pr` refuses it there (exit 2), and refuses
+it in any repository whose gate scripts exist.
 
 ## `shipyard pr` suggests folding same-session siblings
 

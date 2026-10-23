@@ -65,6 +65,15 @@ pr_gates = false
 described below. The opt-out is a declaration, never a fallback: a repository
 that has gates and has lost a script must not ship silently.
 
+It is honoured only from a layer the repository controls: the tracked
+`.shipyard/config.toml`, or a local overlay a branch has committed. Set in the
+machine-global config (which applies to every repository on the host) or in
+an untracked `.shipyard.local/config.toml`, `pr_gates` is refused with exit 2
+and the file is named, because either could switch off a gated repository's
+gates without any change to that repository. An opt-out in a repository whose
+gate scripts resolve is refused too: "no gates" and "gate scripts present"
+contradict each other.
+
 ## Precedence between env var and config
 
 Env wins. This mirrors every other Shipyard config lever so a

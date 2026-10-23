@@ -367,6 +367,12 @@ script still gets the hard error: the opt-out is a declaration, never a
 fallback, because a vanished gate script usually means a moved path. The
 opt-out does not supply ship targets either; a repository with no `[targets]`
 (tartci) still cannot use `shipyard ship`.
+
+The key is read only from layers the repository controls (the tracked project
+file, or a committed overlay). Merged config would let the machine-global file
+or Pulp's untracked overlay turn off Pulp's gates with nothing changing in
+Pulp, so a `pr_gates` set there is refused with exit 2, as is an opt-out in a
+repository whose gate scripts resolve.
 ## Crash-safe state writes
 
 Write Shipyard state files (ship state, queue requests, receipts, holds) with
