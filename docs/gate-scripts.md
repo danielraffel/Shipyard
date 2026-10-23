@@ -49,6 +49,22 @@ not silently fall through to the defaults, because a broken override
 almost always hides a typo or a stale path rather than an intentional
 "fall back."
 
+## Repositories without these gates
+
+A repository that has no skill-sync or versioning gates at all (for example
+tartci) declares that in `.shipyard/config.toml`:
+
+```toml
+[validation]
+pr_gates = false
+```
+
+`shipyard pr` then skips both gates, says so, and goes straight to
+`shipyard ship`. Only an explicit boolean `false` does this; a missing key,
+`true`, or a string keeps the gates, and a missing script still fails as
+described below. The opt-out is a declaration, never a fallback: a repository
+that has gates and has lost a script must not ship silently.
+
 ## Precedence between env var and config
 
 Env wins. This mirrors every other Shipyard config lever so a

@@ -284,7 +284,11 @@ pub(super) fn pr_command<W: Write>(
     let repo_root = git_output(cwd, &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
         .map_err(|error| CliFailure::new(2, error))?;
-    let gates = resolve_pr_gates(&repo_root, config)?;
+    let gates = if pr_gates_disabled(config) {
+        None
+    } else {
+        Some(resolve_pr_gates(&repo_root, config)?)
+    };
     let python = args
         .python_command
         .as_deref()
@@ -292,11 +296,19 @@ pub(super) fn pr_command<W: Write>(
 
     warn_missing_release_bot_token(stdout, cwd, config);
     print_fold_suggestions(stdout, cwd, config, &args.base);
-    run_skill_sync(stdout, &python, &gates, &repo_root, &args.base)?;
-    // Version numbers are assigned by the single writer after the merge.
-    // Keep the gate as a read-only check so this command can never create a
-    // competing version commit on an author branch.
-    run_version_bump(stdout, &python, &gates, &repo_root, &args)?;
+    if let Some(gates) = &gates {
+        run_skill_sync(stdout, &python, gates, &repo_root, &args.base)?;
+        // Version numbers are assigned by the single writer after the merge.
+        // Keep the gate as a read-only check so this command can never create a
+        // competing version commit on an author branch.
+        run_version_bump(stdout, &python, gates, &repo_root, &args)?;
+    } else {
+        writeln!(
+            stdout,
+            "▸ Skill-sync and version-bump gates skipped: this repository sets validation.pr_gates = false"
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    }
 
     let steward_handoff =
         resolve_steward_handoff(&args, protected_base_auto_handoff(cwd, &args.base));
@@ -356,6 +368,14 @@ fn protected_base_auto_handoff(cwd: &Path, base: &str) -> bool {
         .and_then(|contents| contents.parse::<toml::Table>().ok())
         .and_then(|table| table.get("merge_steward")?.get("auto_handoff")?.as_bool())
         .unwrap_or(false)
+}
+
+/// A repository with no skill-sync or versioning gates declares so with
+/// `[validation] pr_gates = false`. Only an explicit boolean `false` skips
+/// them: everywhere else a missing gate script stays a hard error, because it
+/// usually means a moved path rather than a repository without gates.
+fn pr_gates_disabled(config: &LoadedConfig) -> bool {
+    config.get("validation.pr_gates").and_then(toml::Value::as_bool) == Some(false)
 }
 
 fn resolve_pr_gates(repo_root: &Path, config: &LoadedConfig) -> Result<PrGates, CliFailure> {
@@ -886,6 +906,34 @@ mod tests {
                 String::from("Skill-Update: skip skill=ci reason=\"docs-only\"")
             ]
         );
+    }
+
+    #[test]
+    fn only_an_explicit_false_disables_the_pr_gates() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let disabled = config_from_toml("[validation]\npr_gates = false\n", root.path());
+        assert!(pr_gates_disabled(&disabled));
+        for contents in [
+            "",
+            "[validation]\npr_gates = true\n",
+            // A string is not the boolean: a typo must not turn the gates off.
+            "[validation]\npr_gates = \"false\"\n",
+            "[validation]\nskill_sync_script = \"scripts/sync.py\"\n",
+        ] {
+            let config = config_from_toml(contents, root.path());
+            assert!(!pr_gates_disabled(&config), "{contents:?} disabled the gates");
+        }
+    }
+
+    #[test]
+    fn a_repository_without_gate_scripts_still_fails_unless_it_opts_out() {
+        // The opt-out is a declaration, not a fallback: a repository that
+        // keeps its gates and has lost a script still gets the hard error.
+        let root = tempfile::tempdir().expect("tempdir");
+        let error = resolve_pr_gates(root.path(), &config_from_toml("", root.path()))
+            .err()
+            .expect("missing scripts must fail");
+        assert!(error.message.contains("skill_sync_check.py"), "{}", error.message);
     }
 
     #[test]
