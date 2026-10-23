@@ -680,6 +680,47 @@ impl MetricsStore {
         &self.path
     }
 
+    /// Delete raw run, job, and step samples older than `retention_days`.
+    /// Merge receipts are retained because they are durable provenance.
+    pub fn prune_older_than(
+        &self,
+        retention_days: i64,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        if retention_days <= 0 {
+            return Ok(0);
+        }
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let cutoff = (Utc::now() - Duration::days(retention_days)).to_rfc3339();
+        let mut deleted = 0;
+        loop {
+            let mut conn = self.connect()?;
+            conn.busy_timeout(std::time::Duration::from_millis(250))?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let ids = {
+                let mut statement =
+                    tx.prepare("SELECT id FROM runs WHERE ts < ?1 ORDER BY id LIMIT 250")?;
+                statement
+                    .query_map([&cutoff], |row| row.get::<_, i64>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            if ids.is_empty() {
+                tx.commit()?;
+                break;
+            }
+            for run_id in &ids {
+                tx.execute(
+                    "DELETE FROM steps WHERE job_id IN (SELECT id FROM jobs WHERE run_id = ?1)",
+                    [run_id],
+                )?;
+                tx.execute("DELETE FROM jobs WHERE run_id = ?1", [run_id])?;
+                tx.execute("DELETE FROM runs WHERE id = ?1", [run_id])?;
+            }
+            tx.commit()?;
+            deleted += ids.len();
+        }
+        Ok(deleted)
+    }
+
     fn connect(&self) -> Result<Connection, rusqlite::Error> {
         Connection::open(&self.path)
     }
@@ -5348,6 +5389,30 @@ mod tests {
         assert!(
             st.record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("x", "b", "clean", Some(2)))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn metrics_retention_prunes_raw_samples_but_keeps_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        store
+            .record(&MetricRecordInput {
+                project: "pulp".into(),
+                job: "old".into(),
+                duration_ms: 10,
+                status: "success".into(),
+                completed_at: Some(old),
+                ..MetricRecordInput::default()
+            })
+            .unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 1);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 }

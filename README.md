@@ -212,6 +212,12 @@ You need only the tools used by your setup:
 Run `shipyard doctor` to check the tools and credentials for the current
 configuration.
 
+Shipyard stores optional CI timing data in its local SQLite metrics database so
+scorecards can measure queueing, waste, and rework. `shipyard cleanup --apply`
+keeps raw samples for 90 days by default; set
+`SHIPYARD_METRICS_RETENTION_DAYS` to another number, or `0` to disable pruning.
+Merge receipts are retained as durable provenance.
+
 ## This repository uses Shipyard
 
 Shipyard validates itself on macOS, Linux, and Windows. The workflows and
