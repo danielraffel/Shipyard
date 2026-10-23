@@ -150,6 +150,41 @@ class VersionAtLandTests(unittest.TestCase):
         self.assertEqual({item["surface"] for item in payload["plan"]}, {"cli", "plugin"})
         self.assertEqual({item["assigned"] for item in payload["plan"]}, {"0.292.1", "0.112.0"})
 
+    def _land(self, path: str, body: str, message: str) -> None:
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body)
+        run(self.repo, "git", "add", path)
+        run(self.repo, "git", "commit", "-qm", message)
+
+    def _plan(self) -> dict:
+        result = run(self.repo, "python3", "scripts/version_at_land.py", "--base", self.base,
+                     "--head", "HEAD", "--config", "scripts/versioning.json", "--json")
+        return json.loads(result.stdout)
+
+    def test_skip_trailer_covers_only_its_own_change(self) -> None:
+        self._land("src/telemetry.rs", "pub fn shadow() {}\n",
+                   'feat: internal telemetry\n\nVersion-Bump: cli=skip reason="internal"')
+        self._land("src/cli.rs", "pub fn cli() {}\n", "fix: cli")
+        payload = self._plan()
+        self.assertEqual(payload["status"], "dry-run")
+        self.assertEqual([(item["surface"], item["assigned"]) for item in payload["plan"]],
+                         [("cli", "0.292.1")])
+
+    def test_skip_trailer_alone_still_assigns_nothing(self) -> None:
+        self._land("src/telemetry.rs", "pub fn shadow() {}\n",
+                   'feat: internal telemetry\n\nVersion-Bump: cli=skip reason="internal"')
+        self.assertEqual(self._plan()["plan"], [])
+
+    def test_skipped_side_branch_merged_after_marker_does_not_block_later_landings(self) -> None:
+        run(self.repo, "git", "checkout", "-qb", "side")
+        self._land("src/telemetry.rs", "pub fn shadow() {}\n",
+                   'feat: internal telemetry\n\nVersion-Bump: cli=skip reason="internal"')
+        run(self.repo, "git", "checkout", "-q", "main")
+        run(self.repo, "git", "merge", "-q", "--no-ff", "side", "-m", "Merge side")
+        self._land("src/cli.rs", "pub fn cli() {}\n", "fix: cli")
+        self.assertEqual([item["assigned"] for item in self._plan()["plan"]], ["0.292.1"])
+
 
 if __name__ == "__main__":
     unittest.main()
