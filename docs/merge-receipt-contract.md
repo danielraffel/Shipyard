@@ -45,10 +45,11 @@ an `unavailable` row carries no value. Distinct PR throughput is never used as
 a substitute.
 
 Shipyard emits this schema at the protected merge boundary after exact-head and
-gate receipt checks, when Shipyard owns native merge authority and a follow-up
-GitHub read confirms that the PR merged. This includes a merge-command error
-whose follow-up read confirms the merge. A manually merged PR, or a merge that
-Shipyard did not authorize, receives no safe-merge receipt. The producer is
-observational: a receipt-store failure is surfaced as a cleanup warning after
-the merge and never authorizes or undoes the merge.
+gate receipt checks and a follow-up GitHub read confirms that the PR merged.
+Native merge-queue merges and manual maintainer merges are eligible when
+durable ship state records the exact validated head, a live validation attempt,
+and terminal-green required-gate evidence. A merge with no such evidence
+receives no safe-merge receipt. The producer is observational: a receipt-store
+failure is surfaced as a cleanup warning after the merge and never authorizes
+or undoes the merge.
 The GitHub API importer remains read-only and does not manufacture receipts.
