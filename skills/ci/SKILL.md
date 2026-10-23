@@ -95,6 +95,11 @@ minutes. Treat these as cost proxies only. A safely-merged-change denominator
 requires a durable merge receipt and remains unavailable when the local metrics
 store has only PR/job observations; never substitute distinct PR count.
 
+GitHub Actions can omit `pull_requests` on `pull_request_target` runs. The
+metrics importer resolves those rows only through the exact commit's
+authoritative pull-request API response, and keeps the identity unknown when
+that response is empty or ambiguous.
+
 ## Version-only release bumps
 
 The CLI version is part of the CI surface map. Even a release-only
