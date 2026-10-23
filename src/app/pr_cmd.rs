@@ -375,7 +375,10 @@ fn protected_base_auto_handoff(cwd: &Path, base: &str) -> bool {
 /// them: everywhere else a missing gate script stays a hard error, because it
 /// usually means a moved path rather than a repository without gates.
 fn pr_gates_disabled(config: &LoadedConfig) -> bool {
-    config.get("validation.pr_gates").and_then(toml::Value::as_bool) == Some(false)
+    config
+        .get("validation.pr_gates")
+        .and_then(toml::Value::as_bool)
+        .is_some_and(|enabled| !enabled)
 }
 
 fn resolve_pr_gates(repo_root: &Path, config: &LoadedConfig) -> Result<PrGates, CliFailure> {
@@ -921,7 +924,10 @@ mod tests {
             "[validation]\nskill_sync_script = \"scripts/sync.py\"\n",
         ] {
             let config = config_from_toml(contents, root.path());
-            assert!(!pr_gates_disabled(&config), "{contents:?} disabled the gates");
+            assert!(
+                !pr_gates_disabled(&config),
+                "{contents:?} disabled the gates"
+            );
         }
     }
 
@@ -933,7 +939,11 @@ mod tests {
         let error = resolve_pr_gates(root.path(), &config_from_toml("", root.path()))
             .err()
             .expect("missing scripts must fail");
-        assert!(error.message.contains("skill_sync_check.py"), "{}", error.message);
+        assert!(
+            error.message.contains("skill_sync_check.py"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
