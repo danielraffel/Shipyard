@@ -1548,8 +1548,9 @@ const WEBHOOK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const WEBHOOK_HEADER_TIMEOUT: Duration = Duration::from_secs(3);
 /// Threads that read, verify and answer deliveries. A connection reaches one
-/// only once its whole header block has arrived, so idle or trickling
-/// sockets never occupy them.
+/// only once its whole header block has arrived, so idle sockets and
+/// trickled headers never occupy them. A body is read on the worker within
+/// [`WEBHOOK_READ_TIMEOUT`], so a trickled body can hold one that long.
 #[cfg(unix)]
 const WEBHOOK_WORKERS: usize = 8;
 /// Accepted connections still waiting for their headers or a free worker.
@@ -1656,9 +1657,10 @@ fn start_webhook_listener_with_log(
     let join = thread::spawn(move || {
         // The accept loop only accepts and waits, without blocking, for each
         // socket's whole header block; reading the body, verifying and
-        // answering happen on a bounded pool. An idle or trickling client
-        // therefore never holds the loop or a worker past the header
-        // deadline.
+        // answering happen on a bounded pool. An idle client, or one that
+        // trickles its headers, therefore never holds the loop or a worker;
+        // one that trickles its body holds a worker for at most
+        // WEBHOOK_READ_TIMEOUT.
         let (work_tx, work_rx) = mpsc::sync_channel::<TcpStream>(WEBHOOK_WORKERS);
         let work_rx = Arc::new(Mutex::new(work_rx));
         let workers = (0..WEBHOOK_WORKERS)

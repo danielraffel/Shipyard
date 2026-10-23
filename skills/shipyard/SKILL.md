@@ -223,8 +223,9 @@ handler (`funnel --https=443 --set-path=/ off`), and stop removes it only
 while it still points at exactly this daemon's port. Funnel is switched on
 per host and port, not per path, so before mounting the daemon reads
 `tailscale funnel status --json` and refuses (the daemon stays on the polling
-fallback) when port 443 holds any tailnet-only Serve route besides `/`, since
-enabling Funnel would publish it. Routes on other ports, or on a 443 the owner
+fallback) when port 443 holds any tailnet-only Serve route: enabling Funnel
+would publish a route other than `/`, and mounting would replace the owner's
+own tailnet-only `/`. Routes on other ports, or on a 443 the owner
 already funneled, are left as they are. Move a private 443 route to another
 port (or funnel it deliberately) before opting in.
 
@@ -234,7 +235,9 @@ within 3s of the accept or the socket is closed with 400. A request that is not
 `POST` to `/webhook` or `/` with both `X-Hub-Signature-256` and
 `X-GitHub-Event` (or the ingress self-check) is refused from its headers alone,
 before any body is read; an accepted request still faces the constant-time HMAC
-check first. Refusal lines clip and `Debug`-escape attacker-supplied fields,
+check first. The body is read on the worker and must complete within 10s of the
+hand-off, so a client that sends plausible headers and then trickles its body
+holds a worker for up to 10s. Refusal lines clip and `Debug`-escape attacker-supplied fields,
 fold repeats into one counted line per reason per minute, and stop once
 daemon.log reaches 64 MiB (it rotates at the next start). The webhook secret is
 written to a fresh 0600 file and renamed into place; `daemon.sock` is 0600, and

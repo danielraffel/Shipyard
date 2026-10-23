@@ -613,7 +613,8 @@ impl TailscaleFunnelBackend {
     ) -> Result<TunnelInfo, TunnelError> {
         // Funnel is switched on per host:port, not per path, so `funnel --bg`
         // would also publish any tailnet-only Serve route on 443, and turning
-        // our mount off later leaves that switch on. Refuse instead.
+        // our mount off later leaves that switch on. A tailnet-only `/` is the
+        // owner's service, which mounting would replace. Refuse instead.
         let Some(config) = read_serve_config(binary)? else {
             return Err(TunnelError::new(
                 TunnelErrorKind::StartFailed,
@@ -769,8 +770,10 @@ fn web_443_entries(config: &Value) -> impl Iterator<Item = (&String, &Value)> {
         .filter(|(host_port, _)| host_port.ends_with(":443"))
 }
 
-/// The first `<host>:443` that holds a Serve route other than `/` while
-/// Funnel is still off for it: `funnel --bg` would make that route public.
+/// The first `<host>:443` that holds any Serve route while Funnel is still
+/// off for it. A route other than `/` would be published by `funnel --bg`;
+/// a tailnet-only `/` is the owner's own service, never a Shipyard mount
+/// (Shipyard's mount is always funneled), and mounting would replace it.
 fn private_routes_on_443(config: &Value) -> Option<String> {
     web_443_entries(config)
         .find(|(host_port, web)| {
@@ -779,11 +782,11 @@ fn private_routes_on_443(config: &Value) -> Option<String> {
                 .and_then(|allow| allow.get(host_port.as_str()))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let other_mounts = web
+            let has_mounts = web
                 .get("Handlers")
                 .and_then(Value::as_object)
-                .is_some_and(|handlers| handlers.keys().any(|mount| mount != "/"));
-            other_mounts && !funneled
+                .is_some_and(|handlers| !handlers.is_empty());
+            has_mounts && !funneled
         })
         .map(|(host_port, _)| host_port.clone())
 }
@@ -1610,6 +1613,32 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn funnel_mount_refuses_to_replace_a_tailnet_only_root_route_on_443() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let binary = fake_tailscale(tmp.path());
+        // The owner's own `tailscale serve --bg 3000`: 443 `/`, Funnel off.
+        let fixture = "443 / http://127.0.0.1:3000\n";
+        std::fs::write(tmp.path().join("config"), fixture).expect("fixture");
+        let mut backend = fake_backend(&binary);
+
+        let error = backend
+            .mount(&binary, 4242, "https://host.example.ts.net")
+            .expect_err("mount must refuse");
+        assert_eq!(error.kind, TunnelErrorKind::StartFailed);
+        assert!(
+            error.message.contains("tailnet-only Serve routes"),
+            "{}",
+            error.message
+        );
+        assert_eq!(read(tmp.path(), "config"), fixture);
+        assert_eq!(read(tmp.path(), "funnel"), "");
+        let calls = read(tmp.path(), "calls");
+        assert_eq!(calls, "funnel status --json\n", "mutated after refusing");
+        assert_eq!(backend.configured_port, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn funnel_mount_proceeds_when_443_is_already_funneled() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let binary = fake_tailscale(tmp.path());
@@ -1659,9 +1688,11 @@ esac
     fn funnel_stop_leaves_a_root_mount_that_is_not_this_daemons() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let binary = fake_tailscale(tmp.path());
-        // 42420 shares a prefix with our port 4242 but is the owner's.
+        // 42420 shares a prefix with our port 4242 but is the owner's. It is
+        // funneled, so mounting may replace it (a tailnet-only `/` is refused).
         let fixture = "443 / http://127.0.0.1:42420\n";
         std::fs::write(tmp.path().join("config"), fixture).expect("fixture");
+        std::fs::write(tmp.path().join("funnel"), "443\n").expect("fixture");
         let mut backend = fake_backend(&binary);
         backend.configured_port = Some(4242);
 
