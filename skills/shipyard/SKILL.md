@@ -1245,7 +1245,10 @@ on every remote `[host_class.<name>]`. Review `shipyard runner fleet-update
 do not assemble per-host SSH/install pipelines. Repeat `--host-class` only for
 a reviewed ordered subset, or use explicit `--all-hosts`. Missing, unknown, and
 duplicate selection fails closed; apply stops before later hosts after the
-first failure.
+first failure. The release's install.sh installs the controller-staged asset
+through a curl shim that also serves a `checksums.sha256` with the SHA-256 the
+controller pinned, so an install.sh that refuses releases without a checksums
+manifest still installs over fleet-update.
 
 Every applied host is then **independently verified** in a fresh process:
 - the installed `shipyard --version` must equal the target;
