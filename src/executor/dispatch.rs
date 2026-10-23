@@ -864,8 +864,9 @@ pub fn resolve_targets(
     Ok(targets)
 }
 
-/// A branch's tracked config may declare targets, but may not make `ssh` run
-/// something on the controller, nor move a target the machine-global config
+/// A branch's tracked config may declare targets, but its `ssh_options` may
+/// only tune the connection (see `ssh::repository_ssh_option_violation`), and
+/// it may not move a target the machine-global config
 /// declares onto another backend. Machine-global and untracked local
 /// overlay settings are not restricted.
 fn reject_repository_controlled_target_overrides(
@@ -881,8 +882,8 @@ fn reject_repository_controlled_target_overrides(
             return Err(invalid_target(
                 &key,
                 format!(
-                    "{reason} in repository-controlled config {}; set such ssh_options in the \
-                     machine-global config or an untracked .shipyard.local/config.toml",
+                    "{reason} in repository-controlled config {}; move it to the machine-global \
+                     config (or an untracked .shipyard.local/config.toml)",
                     path.display()
                 ),
             ));
@@ -2758,6 +2759,14 @@ backend = "local"
             r#"["-F", "/tmp/evil"]"#,
             r#"["-J", "bastion"]"#,
             r#"["-o", "Include /tmp/evil"]"#,
+            r#"["-I", "/tmp/evil.so"]"#,
+            r#"["-oPKCS11Provider=/tmp/evil.so"]"#,
+            r#"["-o", "SecurityKeyProvider /tmp/evil.so"]"#,
+            r#"["-o", "XAuthLocation=/tmp/evil"]"#,
+            r#"["-E", "/tmp/log"]"#,
+            r#"["-L", "8080:localhost:80"]"#,
+            r#"["-R", "9000:localhost:22"]"#,
+            r#"["-D", "1080"]"#,
         ] {
             let (_temp, config) = layered_config("", &ssh_target_toml(options), None, false);
             let error = resolve_targets(&config, ValidationMode::Full)
@@ -2765,7 +2774,8 @@ backend = "local"
             assert!(
                 matches!(&error, DispatchError::InvalidTargetConfig { target, reason }
                     if target == "targets.linux.ssh_options"
-                        && reason.contains("repository-controlled config")),
+                        && reason.contains("repository-controlled config")
+                        && reason.contains("machine-global")),
                 "{options}: {error}"
             );
         }
@@ -2784,7 +2794,9 @@ backend = "local"
     fn tracked_connection_tuning_and_machine_layer_ssh_options_still_resolve() {
         let (_temp, config) = layered_config(
             "",
-            &ssh_target_toml(r#"["-oServerAliveInterval=30", "-p", "2222"]"#),
+            &ssh_target_toml(
+                r#"["-oServerAliveInterval=30", "-p", "2222", "-o", "StrictHostKeyChecking accept-new", "-oIdentitiesOnly=yes", "-qC"]"#,
+            ),
             None,
             false,
         );
@@ -2794,16 +2806,34 @@ backend = "local"
         let ResolvedBackend::Ssh(ssh) = target.backend else {
             panic!("expected ssh backend");
         };
-        assert_eq!(ssh.ssh_options, ["-oServerAliveInterval=30", "-p", "2222"]);
+        assert_eq!(
+            ssh.ssh_options,
+            [
+                "-oServerAliveInterval=30",
+                "-p",
+                "2222",
+                "-o",
+                "StrictHostKeyChecking accept-new",
+                "-oIdentitiesOnly=yes",
+                "-qC"
+            ]
+        );
 
         // The machine-global layer is not restricted.
-        let (_temp, config) = layered_config(
-            &ssh_target_toml(r#"["-o", "ProxyJump=bastion"]"#),
-            "[project]\nname = \"forge\"\n",
-            None,
-            false,
-        );
-        resolve_targets(&config, ValidationMode::Full).expect("global ProxyJump is honoured");
+        for options in [
+            r#"["-o", "ProxyJump=bastion"]"#,
+            r#"["-I", "/usr/lib/opensc-pkcs11.so", "-o", "XAuthLocation=/opt/X11/bin/xauth"]"#,
+            r#"["-L", "8080:localhost:80", "-E", "/tmp/ssh.log"]"#,
+        ] {
+            let (_temp, config) = layered_config(
+                &ssh_target_toml(options),
+                "[project]\nname = \"forge\"\n",
+                None,
+                false,
+            );
+            resolve_targets(&config, ValidationMode::Full)
+                .unwrap_or_else(|error| panic!("global {options} is honoured: {error}"));
+        }
 
         // Neither is an untracked local overlay...
         let (_temp, config) = layered_config(

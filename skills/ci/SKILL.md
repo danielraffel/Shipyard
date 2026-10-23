@@ -2629,14 +2629,17 @@ target definitions in `.shipyard/config.toml` and `.shipyard.local/config.toml`,
 and use `shipyard status --json` for live target state.
 
 Tracked config (`.shipyard/config.toml`, or a `.shipyard.local/config.toml`
-the branch committed) may declare targets but may not make `ssh` act on the
-controller: its `ssh_options` refuse `ProxyCommand`, `ProxyJump`,
-`LocalCommand`, `PermitLocalCommand`, `KnownHostsCommand`, `Include`, `Match`,
-`ForwardAgent`, `-F`, `-J`, `-A` and positional arguments (any `-o` spelling,
-case-insensitive), and it may not change the backend of a target the
-machine-global config declares. Connection tuning (`-p`, `-o
-ServerAliveInterval=30`) is fine. Put such options in the machine-global config
-or an untracked `.shipyard.local/config.toml`; those layers are unrestricted.
+the branch committed) may declare targets, but its `ssh_options` are an
+allowlist of connection tuning: the flags `-4`, `-6`, `-q`, `-v`, `-C`, `-T`,
+`-p <port>`, `-l <user>`, and `-o` with `ConnectTimeout`, `ServerAliveInterval`,
+`ServerAliveCountMax`, `TCPKeepAlive`, `Compression`, `BatchMode`, `LogLevel`,
+`Port`, `User`, `AddressFamily`, `ConnectionAttempts`, `IdentitiesOnly=yes` or
+`StrictHostKeyChecking=yes|accept-new` (any `-o` spelling, case-insensitive,
+single plain value). Everything else (`ProxyCommand`, `-I`/`PKCS11Provider`,
+`-L`/`-R`/`-D`, `-F`, `-J`, `-A`, `-i`, `-E`, ...) is refused, and tracked config
+may not change the backend of a target the machine-global config declares. Move
+other options to the machine-global config or an untracked
+`.shipyard.local/config.toml`; those layers are unrestricted.
 An SSH or Windows `host` may not start with `-`. Shipyard's own SSH probes and
 remote commands pass `-o ForwardAgent=no` after the configured options.
 
