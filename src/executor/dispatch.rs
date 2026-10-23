@@ -909,7 +909,9 @@ fn reject_repository_controlled_target_overrides(
         return Ok(());
     };
     for (name, machine_target) in machine_targets {
-        let Some(machine_target) = machine_target.as_table().filter(|t| sets_backend(t)) else {
+        // A machine target with no `type`/`backend` is implicitly local, and is
+        // pinned just the same.
+        let Some(machine_target) = machine_target.as_table() else {
             continue;
         };
         let tracked_sets_backend = layers.iter().any(|(_, layer)| {
@@ -2853,6 +2855,89 @@ backend = "local"
         );
         resolve_targets(&config, ValidationMode::Full)
             .expect_err("a committed .shipyard.local is tracked config");
+    }
+
+    /// Rename the overlay on disk to `name` and commit it under that name. On a
+    /// filesystem that folds `name` to `config.toml` the loader still reads the
+    /// committed file. Returns false when the filesystem does not fold it.
+    fn commit_overlay_as(temp: &tempfile::TempDir, name: &str) -> bool {
+        let local = temp.path().join("repo/.shipyard.local");
+        std::fs::rename(local.join("config.toml"), local.join(name)).expect("rename overlay");
+        if !local.join("config.toml").exists() {
+            return false;
+        }
+        let status = std::process::Command::new("git")
+            .args(["add", "-f", "--", &format!(".shipyard.local/{name}")])
+            .current_dir(temp.path().join("repo"))
+            .status()
+            .expect("git add");
+        assert!(status.success());
+        true
+    }
+
+    #[test]
+    fn unicode_folded_committed_local_overlay_is_still_repository_controlled() {
+        // `conﬁg.toml` (U+FB01 ligature) is the same file as `config.toml` to
+        // APFS, which folds full Unicode, but not to git's ASCII-only icase.
+        let ssh = ssh_target_toml(r#"["-oProxyCommand=touch /tmp/x"]"#);
+        let (temp, config) = layered_config("", "[project]\nname = \"forge\"\n", Some(&ssh), false);
+        if !commit_overlay_as(&temp, "con\u{fb01}g.toml") {
+            eprintln!("skipping: filesystem does not fold U+FB01");
+            return;
+        }
+        let error = resolve_targets(&config, ValidationMode::Full)
+            .expect_err("unicode-folded committed ssh_options must be refused");
+        assert!(
+            error.to_string().contains("repository-controlled config"),
+            "{error}"
+        );
+
+        let auth = "[github.auth]\nsource = \"command\"\ntoken_command = [\"/bin/sh\", \"-c\", \"touch marker\"]\n";
+        let (temp, config) = layered_config("", "", Some(auth), false);
+        assert!(commit_overlay_as(&temp, "con\u{fb01}g.toml"));
+        crate::gh::GhClient::from_loaded_config(&config)
+            .expect_err("unicode-folded committed github.auth must be refused");
+
+        // Positive control, as in Pulp: a tracked `config.toml.example` beside
+        // an untracked overlay is a different file.
+        let (temp, config) = layered_config("", "[project]\nname = \"forge\"\n", Some(&ssh), false);
+        let repo = temp.path().join("repo");
+        std::fs::write(repo.join(".shipyard.local/config.toml.example"), &ssh).expect("example");
+        let status = std::process::Command::new("git")
+            .args(["add", "-f", ".shipyard.local/config.toml.example"])
+            .current_dir(&repo)
+            .status()
+            .expect("git add");
+        assert!(status.success());
+        resolve_targets(&config, ValidationMode::Full)
+            .expect("untracked overlay beside a tracked example is honoured");
+    }
+
+    #[test]
+    fn tracked_layer_cannot_move_an_implicitly_local_machine_target() {
+        // No `type`/`backend` in the machine config means local.
+        let (_temp, config) = layered_config(
+            "[targets.mac]\nplatform = \"macos-arm64\"\n",
+            "[targets.mac]\nbackend = \"ssh\"\nhost = \"attacker.invalid\"\n",
+            None,
+            false,
+        );
+        let error = resolve_targets(&config, ValidationMode::Full)
+            .expect_err("tracked config may not move an implicit local target to ssh");
+        assert!(
+            matches!(&error, DispatchError::InvalidTargetConfig { target, reason }
+                if target == "mac" && reason.contains("\"local\"")),
+            "{error}"
+        );
+
+        // Restating the implicit backend explicitly is not a move.
+        let (_temp, config) = layered_config(
+            "[targets.mac]\nplatform = \"macos-arm64\"\n",
+            "[targets.mac]\nbackend = \"local\"\n",
+            None,
+            false,
+        );
+        resolve_targets(&config, ValidationMode::Full).expect("same backend is allowed");
     }
 
     #[test]

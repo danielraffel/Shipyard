@@ -329,8 +329,9 @@ fn read_layer(path: &Path) -> ConfigResult<Option<Table>> {
         })
 }
 
-/// Whether git tracks `file` inside `dir`. Anything git cannot answer counts
-/// as untracked, which is what a directory outside any checkout is.
+/// Whether git tracks `file` inside `dir`. A directory outside any work tree,
+/// or a host without git, counts as untracked; any other git failure counts
+/// as tracked, so a layer git cannot vouch for is never trusted.
 ///
 /// The match ignores case across the whole repository-relative path: on a
 /// case-insensitive filesystem the loader reads `.shipyard.local/config.toml`
@@ -339,26 +340,85 @@ fn read_layer(path: &Path) -> ConfigResult<Option<Table>> {
 /// either, because git matches the cwd prefix case-sensitively, so anchor the
 /// full path at the top of the work tree.
 fn git_tracks(dir: &Path, file: &str) -> bool {
-    let Some(prefix) = Command::new("git")
-        .args(["rev-parse", "--show-prefix"])
+    // Without git there is no checkout a branch could have committed to.
+    let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--show-toplevel", "--show-prefix"])
         .current_dir(dir)
-        .stderr(std::process::Stdio::null())
+        .env("LC_ALL", "C")
         .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
     else {
         return false;
     };
-    let prefix = prefix.strip_suffix('\n').unwrap_or(&prefix);
+    if !output.status.success() {
+        // Outside any work tree the overlay cannot be tracked; any other git
+        // failure inside one fails closed.
+        return !String::from_utf8_lossy(&output.stderr).contains("not a git repository");
+    }
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return true;
+    };
+    let mut lines = stdout.lines();
+    let (Some(top), prefix) = (lines.next(), lines.next().unwrap_or("")) else {
+        return true;
+    };
     let pathspec = format!(":(top,icase,literal){prefix}{file}");
-    Command::new("git")
+    let named = Command::new("git")
         .args(["ls-files", "--error-unmatch", "--", &pathspec])
         .current_dir(dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .status();
+    match named {
+        Ok(status) if status.success() => return true,
+        Ok(status) if status.code() == Some(1) => {}
+        _ => return true,
+    }
+    tracked_entry_is_same_file(Path::new(top), &format!("{prefix}{file}"), &dir.join(file))
+}
+
+/// Whether any tracked entry at the depth of `relative` is the same file as
+/// `path`. Git's `icase` folds ASCII only, but APFS and NTFS fold full
+/// Unicode, so a branch can commit `.shipyard.local/con\u{fb01}g.toml` that
+/// the loader opens as `config.toml` without any pathspec matching it. File
+/// identity catches that, and a tracked symlink to the overlay too. Only
+/// entries at the same depth are compared, since folding never adds or
+/// removes a `/`; a tracked `config.toml.example` beside the overlay is a
+/// different file.
+fn tracked_entry_is_same_file(top: &Path, relative: &str, path: &Path) -> bool {
+    let Ok(target) = same_file::Handle::from_path(path) else {
+        return false;
+    };
+    let Ok(output) = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(top)
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    let depth = relative.matches('/').count();
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty() && entry.split(|byte| *byte == b'/').count() == depth + 1)
+        .map(index_entry_path)
+        .any(|entry| {
+            same_file::Handle::from_path(top.join(entry)).is_ok_and(|handle| handle == target)
+        })
+}
+
+#[cfg(unix)]
+fn index_entry_path(entry: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(entry))
+}
+
+#[cfg(not(unix))]
+fn index_entry_path(entry: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(entry).into_owned())
 }
 
 fn merge_if_present(base: &mut Table, path: &Path) -> ConfigResult<()> {
