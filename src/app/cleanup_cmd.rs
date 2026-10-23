@@ -20,6 +20,7 @@ use crate::log_retention::{
     publish_gzip_derivative, read_terminal_manifest, retire_verified_gzip_source,
     sync_parent_directory, verify_gzip_for_retirement,
 };
+use crate::metrics::MetricsStore;
 use crate::output::write_json_envelope;
 use crate::queue::Queue;
 use crate::ship_state::ShipStateStore;
@@ -377,6 +378,7 @@ fn cleanup_retention(
     )?;
     scan_bundles(state_dir, dry_run, &mut items)?;
     scan_evidence(state_dir, dry_run, &mut items)?;
+    prune_metrics(state_dir, dry_run, &mut items);
     if !dry_run {
         apply_cleanup_staging(&staging_candidates)?;
     }
@@ -411,6 +413,46 @@ fn cleanup_retention(
         low_watermark_bytes: policy.low_watermark_bytes,
         dry_run,
     })
+}
+
+const DEFAULT_METRICS_RETENTION_DAYS: i64 = 90;
+
+fn prune_metrics(state_dir: &Path, dry_run: bool, items: &mut Vec<CleanupItem>) {
+    let days = std::env::var("SHIPYARD_METRICS_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_METRICS_RETENTION_DAYS);
+    if days <= 0 {
+        return;
+    }
+    let path = state_dir.join("metrics").join("metrics.db");
+    if !path.exists() {
+        return;
+    }
+    let size = path.metadata().map_or(0, |metadata| metadata.len());
+    let result = if dry_run {
+        Ok(0)
+    } else {
+        MetricsStore::open(state_dir).and_then(|store| store.prune_older_than(days))
+    };
+    let (action, reason) = match result {
+        Ok(_) if dry_run => (
+            "would-delete".to_owned(),
+            format!("Raw samples older than {days} days would be pruned"),
+        ),
+        Ok(deleted) => (
+            "delete".to_owned(),
+            format!("Pruned {deleted} raw runs older than {days} days"),
+        ),
+        Err(error) => ("skip".to_owned(), format!("Metrics prune skipped: {error}")),
+    };
+    items.push(CleanupItem {
+        path: path.display().to_string(),
+        kind: "metrics".to_owned(),
+        action,
+        size_bytes: if dry_run { size } else { 0 },
+        reason,
+    });
 }
 
 #[derive(Debug)]
