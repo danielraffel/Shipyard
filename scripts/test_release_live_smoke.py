@@ -44,7 +44,7 @@ class ReleaseLiveSmokeTests(unittest.TestCase):
     def run_main(self, run, *extra: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = smoke.main(["--binary", "/bin/true", *extra], run=run)
+            code = smoke.main(["--binary", "/bin/true", *extra], run=run, sleep=lambda _: None)
         return code, out.getvalue(), err.getvalue()
 
     def test_admit_and_clean_steward_pass(self) -> None:
@@ -115,12 +115,63 @@ class ReleaseLiveSmokeTests(unittest.TestCase):
         self.assertTrue(all(argv[argv.index("--labels") + 1] == "self-hosted,x" for argv in admission))
 
     def test_timeout_fails(self) -> None:
+        calls = 0
+
         def run(argv, **kwargs):
+            nonlocal calls
+            calls += 1
             raise subprocess.TimeoutExpired(argv, 1)
 
         code, out, _ = self.run_main(run)
         self.assertEqual(code, 1)
         self.assertIn("timed out", out)
+        self.assertEqual(calls, 6)
+
+    def test_transient_failure_is_retried_then_passes(self) -> None:
+        calls = 0
+
+        def run(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return subprocess.CompletedProcess(argv, 1, "", "HTTP 502 Bad Gateway")
+            if "admission-clean" in argv:
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({"verdict": "admit", "repo": "Generous-Corp/pulp"}), ""
+                )
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"repos": [{"repo": "Generous-Corp/pulp", "errors": []}]}), ""
+            )
+
+        code, out, _ = self.run_main(run)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(calls, 3)
+
+    def test_persistent_transient_failure_is_bounded(self) -> None:
+        calls = 0
+
+        def run(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            return subprocess.CompletedProcess(argv, 1, "", "HTTP 503 Service Unavailable")
+
+        code, out, _ = self.run_main(run)
+        self.assertEqual(code, 1)
+        self.assertIn("3 attempts", out)
+        self.assertEqual(calls, 6)
+
+    def test_permanent_failure_is_not_retried(self) -> None:
+        calls = 0
+
+        def run(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            return subprocess.CompletedProcess(argv, 1, "", NODE_LIMIT)
+
+        code, out, _ = self.run_main(run)
+        self.assertEqual(code, 1)
+        self.assertIn("500,000", out)
+        self.assertEqual(calls, 2)
 
 
 if __name__ == "__main__":
