@@ -3,6 +3,30 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03450"></a>
+## [0.345.0] - 2026-10-23
+
+- fix/version at land per change skip ([#903](https://github.com/danielraffel/Shipyard/pull/903))
+- asr/fleet update checksums shim 20261022 ([#900](https://github.com/danielraffel/Shipyard/pull/900))
+- asr/sy ingress 20261022 ([#891](https://github.com/danielraffel/Shipyard/pull/891))
+- asr/sy config 20261022 ([#893](https://github.com/danielraffel/Shipyard/pull/893))
+- Produce authenticated merge receipts after confirmed merges ([#877](https://github.com/danielraffel/Shipyard/pull/877))
+- fix(metrics): surface baseline pass-history write failures ([#884](https://github.com/danielraffel/Shipyard/pull/884))
+- Add fail-closed queue timing provenance and survivor metrics ([#887](https://github.com/danielraffel/Shipyard/pull/887))
+- fix/stamp host matches session line ([#881](https://github.com/danielraffel/Shipyard/pull/881))
+- feat/repeated work metrics 20261021 ([#885](https://github.com/danielraffel/Shipyard/pull/885))
+- fix/review verdict requires stamp ([#886](https://github.com/danielraffel/Shipyard/pull/886))
+- fix/sandbox guardian unkillable lsof ([#879](https://github.com/danielraffel/Shipyard/pull/879))
+- fix/arm guard session allowlist ([#878](https://github.com/danielraffel/Shipyard/pull/878))
+- fix/python tests cannot exit zero ([#871](https://github.com/danielraffel/Shipyard/pull/871))
+- fix/metrics receipt repo binding 20261017 ([#876](https://github.com/danielraffel/Shipyard/pull/876))
+- fix/foreground queue recovery 20261016 ([#868](https://github.com/danielraffel/Shipyard/pull/868))
+- fix/cli parse from test stack ([#875](https://github.com/danielraffel/Shipyard/pull/875))
+- feat/metrics strata receipt 20261017 ([#874](https://github.com/danielraffel/Shipyard/pull/874))
+- fix/daemon recovery only 20261017 ([#873](https://github.com/danielraffel/Shipyard/pull/873))
+- fix/merge receipt waste followups ([#872](https://github.com/danielraffel/Shipyard/pull/872))
+- route capability shadow runtime 20261016 ([#867](https://github.com/danielraffel/Shipyard/pull/867))
+
 <a id="v03441"></a>
 ## [0.344.1] - 2026-10-16
 
@@ -2474,6 +2498,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.345.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.345.0
 [0.344.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.344.1
 [0.344.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.344.0
 [0.343.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.343.0
