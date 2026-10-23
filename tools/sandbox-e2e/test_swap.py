@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -451,6 +452,19 @@ def test_install_script_replaces_existing_binary_atomically(sandbox: Sandbox) ->
     binary.chmod(0o755)
     old_inode = binary.stat().st_ino
 
+    # install.sh fails closed without a release checksums.sha256, so the fake
+    # release publishes one that matches the fake asset bytes served below.
+    def fake_asset(label: str) -> bytes:
+        return f'#!/bin/sh\necho "{label} 9.9.9"\n'.encode()
+
+    checksums = "".join(
+        f"{hashlib.sha256(fake_asset(label)).hexdigest()}  {asset}\n"
+        for label, asset in (
+            ("shipyard", "shipyard-linux-arm64"),
+            ("shipyard-workstream-provider", "shipyard-workstream-provider-linux-arm64"),
+        )
+    )
+
     fake_curl = sandbox.bin_dir / "curl"
     fake_curl.write_text(
         "#!/bin/sh\n"
@@ -464,6 +478,12 @@ def test_install_script_replaces_existing_binary_atomically(sandbox: Sandbox) ->
         "    *) shift ;;\n"
         "  esac\n"
         "done\n"
+        "case \"$out\" in *checksums.sha256)\n"
+        "  cat > \"$out\" <<'SUMS'\n"
+        f"{checksums}"
+        "SUMS\n"
+        "  exit 0 ;;\n"
+        "esac\n"
         "if [ -n \"$out\" ]; then\n"
         "  label='shipyard'\n"
         "  case \"$out\" in *workstream-provider*) label='shipyard-workstream-provider' ;; esac\n"
@@ -475,7 +495,7 @@ def test_install_script_replaces_existing_binary_atomically(sandbox: Sandbox) ->
         "  exit 0\n"
         "fi\n"
         "cat <<'JSON'\n"
-        "{\"assets\":[{\"name\":\"shipyard-linux-arm64\",\"browser_download_url\":\"https://example.invalid/shipyard-linux-arm64\"},{\"name\":\"shipyard-workstream-provider-linux-arm64\",\"browser_download_url\":\"https://example.invalid/shipyard-workstream-provider-linux-arm64\"}]}\n"
+        "{\"assets\":[{\"name\":\"checksums.sha256\",\"browser_download_url\":\"https://example.invalid/checksums.sha256\"},{\"name\":\"shipyard-linux-arm64\",\"browser_download_url\":\"https://example.invalid/shipyard-linux-arm64\"},{\"name\":\"shipyard-workstream-provider-linux-arm64\",\"browser_download_url\":\"https://example.invalid/shipyard-workstream-provider-linux-arm64\"}]}\n"
         "JSON\n"
         "if [ \"$write_out\" -eq 1 ]; then printf '200\\n'; fi\n",
         encoding="utf-8",
@@ -500,6 +520,7 @@ def test_install_script_replaces_existing_binary_atomically(sandbox: Sandbox) ->
     )
 
     assert "Installed shipyard" in result.stdout
+    assert "Verified sha256 for shipyard-linux-arm64." in result.stdout
     assert binary.stat().st_ino != old_inode
     assert (
         subprocess.check_output([str(binary), "--version"], text=True).strip()
