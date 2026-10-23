@@ -896,7 +896,6 @@ fn open_pr_list_fields_carry_no_nested_or_heavy_connections() {
             "autoMergeRequest",
             "labels",
             "author",
-            "body",
         ]
     );
 }
@@ -912,7 +911,7 @@ fn bulk_pull_request_read_requests_the_pinned_fields_and_leaves_owner_open() {
         &format!(
             r#"
 case "$*" in
-  "pr list "*) printf '%s\n' "$*" >> '{root}/list-args'; printf '%s' '[{{"id":"PR_a","number":1,"isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"a","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"author":{{"login":"alice"}},"body":"plain"}},{{"id":"PR_b","number":2,"isDraft":false,"baseRefName":"main","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRefName":"b","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"author":{{"login":"bob"}},"body":"<!-- whence {{\"prov\": {{\"session\": \"sess-b\"}}}} -->"}}]' ;;
+  "pr list "*) printf '%s\n' "$*" >> '{root}/list-args'; printf '%s' '[{{"id":"PR_a","number":1,"isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"a","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"author":{{"login":"alice"}}}},{{"id":"PR_b","number":2,"isDraft":false,"baseRefName":"main","headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRefName":"b","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"author":{{"login":"bob"}}}}]' ;;
   *) printf '%s' '{{}}' ;;
 esac
 "#
@@ -927,8 +926,9 @@ esac
         "{args}"
     );
     assert!(!args.contains("commits"), "{args}");
+    assert!(!args.contains("body"), "{args}");
     assert_eq!(prs.len(), 2);
     assert_eq!(prs[0].owner, None, "no whence and no commits: undecided");
     assert_eq!(prs[0].fact.author.as_deref(), Some("alice"));
-    assert_eq!(prs[1].owner.as_deref(), Some("sess-b"));
+    assert_eq!(prs[1].owner, None, "owner is resolved lazily from PR view");
 }
