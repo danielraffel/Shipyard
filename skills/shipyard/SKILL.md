@@ -1531,8 +1531,13 @@ Generated consumer workflows install the exact generating CLI by default. A
 repository whose post-tag hook runs while its own new release is still draft
 may explicitly set `release.post_tag_hook.workflow_shipyard_version =
 "latest"` to use the latest already-published CLI. Only exact stable
-optional-`v` semver or `latest` is valid; invalid configuration must refuse
-before overwriting the workflow, and an explicit CLI override has precedence.
+optional-`v` semver, `latest`, or `checkout` is valid; invalid configuration
+must refuse before overwriting the workflow, and an explicit CLI override has
+precedence. `checkout` (Shipyard's own repository only; install refuses it
+elsewhere) builds the CLI from the tagged checkout. Every variant fetches
+`install.sh` from the pinned tag on `raw.githubusercontent.com` (`main` for
+`latest`), checks out with `persist-credentials: false`, and hands the push
+token only to the `hook run` step.
 Repositories that require signed bot commits should set
 `release.post_tag_hook.ssh_signing_setup_script` to a safe repository-relative
 helper path. Hook installation then regenerates the required secret-backed SSH

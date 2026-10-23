@@ -26,6 +26,8 @@ use crate::output::write_json_envelope;
 use crate::ship_state::{ShipState, ShipStateStore};
 
 const POST_TAG_WORKFLOW: &str = "post-tag-sync.yml";
+const CHECKOUT_SHIPYARD_VERSION: &str = "checkout";
+const SHIPYARD_INSTALLER_BASE: &str = "https://raw.githubusercontent.com/danielraffel/Shipyard";
 
 pub(super) fn release_bot_command<W: Write>(
     command: ReleaseBotCommand,
@@ -352,6 +354,9 @@ fn hook_install<W: Write>(
     };
     validate_workflow_shipyard_version(shipyard_version)
         .map_err(|error| CliFailure::new(1, error))?;
+    if shipyard_version == CHECKOUT_SHIPYARD_VERSION {
+        ensure_checkout_builds_shipyard(cwd).map_err(|error| CliFailure::new(1, error))?;
+    }
     let workflows_dir = cwd.join(".github").join("workflows");
     fs::create_dir_all(&workflows_dir).map_err(|error| {
         CliFailure::new(
@@ -669,6 +674,7 @@ fn validate_workflow_shipyard_version(value: &str) -> Result<&str, String> {
         })
     };
     if value == "latest"
+        || value == CHECKOUT_SHIPYARD_VERSION
         || (value == value.trim()
             && valid_component(components.next())
             && valid_component(components.next())
@@ -678,8 +684,34 @@ fn validate_workflow_shipyard_version(value: &str) -> Result<&str, String> {
         return Ok(value);
     }
     Err(format!(
-        "release.post_tag_hook workflow shipyard version must be `latest` or an exact stable semantic version, got {value:?}"
+        "release.post_tag_hook workflow shipyard version must be `latest`, `{CHECKOUT_SHIPYARD_VERSION}`, or an exact stable semantic version, got {value:?}"
     ))
+}
+
+// `checkout` builds the CLI from the tagged checkout itself. Only the Shipyard
+// repository can do that, and it must: its own release is still a draft when
+// the tag fires, so neither the tag's installer nor `latest` can serve it
+// without racing or trusting a different build.
+fn ensure_checkout_builds_shipyard(cwd: &Path) -> Result<(), String> {
+    let manifest = cwd.join("Cargo.toml");
+    let package = fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| {
+            table
+                .get("package")
+                .and_then(|package| package.get("name"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        });
+    if package.as_deref() == Some("shipyard") {
+        Ok(())
+    } else {
+        Err(format!(
+            "release.post_tag_hook workflow shipyard version `{CHECKOUT_SHIPYARD_VERSION}` builds the tagged checkout and is only valid in the Shipyard repository ({} has no `shipyard` package)",
+            manifest.display()
+        ))
+    }
 }
 
 fn render_workflow(
@@ -699,6 +731,47 @@ fn render_workflow(
 "
         )
     });
+    // The installer always comes from this repository on GitHub: the exact
+    // tag for a pinned version, `main` only for an explicit `latest`.
+    let (env_version, install) = if shipyard_version == CHECKOUT_SHIPYARD_VERSION {
+        (
+            "${{ github.ref_name }}".to_owned(),
+            r#"      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-13
+        with:
+          toolchain: stable
+
+      - name: Build shipyard from the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin shipyard
+          echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+          target/release/shipyard --version
+"#
+            .to_owned(),
+        )
+    } else {
+        let (name, installer_ref) = if shipyard_version == "latest" {
+            ("latest", "main".to_owned())
+        } else if shipyard_version.starts_with('v') {
+            ("pinned", shipyard_version.to_owned())
+        } else {
+            ("pinned", format!("v{shipyard_version}"))
+        };
+        (
+            shipyard_version.to_owned(),
+            format!(
+                r#"      - name: Install shipyard ({name})
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "{SHIPYARD_INSTALLER_BASE}/{installer_ref}/install.sh" | SHIPYARD_VERSION="$SHIPYARD_VERSION" bash
+          shipyard --version
+"#
+            ),
+        )
+    };
     format!(
         r#"name: Post-tag docs sync
 
@@ -718,7 +791,7 @@ permissions:
   pull-requests: write
 
 env:
-  SHIPYARD_VERSION: "{shipyard_version}"
+  SHIPYARD_VERSION: "{env_version}"
 
 jobs:
   sync:
@@ -726,27 +799,28 @@ jobs:
     runs-on: {runner}
     steps:
       - name: Checkout release tag with full history
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{{{ github.ref }}}}
           fetch-depth: 0
           fetch-tags: true
-          persist-credentials: true
-          token: ${{{{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}}}
+          # Only the docs-sync step below receives the push token.
+          persist-credentials: false
 
-      - name: Install shipyard (pinned)
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fsSL "https://generouscorp.com/Shipyard/install.sh" | SHIPYARD_VERSION="$SHIPYARD_VERSION" bash
-          shipyard --version
-
+{install}
 {signing_setup}
       - name: Run post-tag docs sync
         shell: bash
         env:
           GITHUB_TOKEN: ${{{{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}}}
         run: |
+          set -euo pipefail
+          # Git credentials for this step only; nothing is written to .git/config.
+          auth="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
           tag="${{GITHUB_REF#refs/tags/}}"
           shipyard release-bot hook run --tag "$tag"
 "#
@@ -2294,7 +2368,7 @@ workflow_shipyard_version = "latest"
     }
 
     #[test]
-    fn dogfood_workflow_is_the_exact_latest_renderer() {
+    fn dogfood_workflow_is_the_exact_checkout_renderer() {
         let config = config_from_toml(include_str!("../../.shipyard/config.toml"));
         let hook = load_hook_config(&config);
         let configured = hook
@@ -2303,7 +2377,7 @@ workflow_shipyard_version = "latest"
             .expect("valid dogfood workflow version")
             .as_deref()
             .expect("dogfood workflow version");
-        assert_eq!(configured, "latest");
+        assert_eq!(configured, CHECKOUT_SHIPYARD_VERSION);
         assert_eq!(
             include_str!("../../.github/workflows/post-tag-sync.yml").replace("\r\n", "\n"),
             render_workflow(
@@ -2322,10 +2396,140 @@ workflow_shipyard_version = "latest"
         assert!(workflow.contains("secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN"));
         assert!(workflow.contains(r#"SHIPYARD_VERSION: "v0.51.0""#));
         assert!(workflow.contains(r#"tags: ["v*"]"#));
-        assert!(workflow.contains("curl -fsSL \"https://generouscorp.com/Shipyard/install.sh\""));
+        assert!(workflow.contains(
+            "curl -fsSL \"https://raw.githubusercontent.com/danielraffel/Shipyard/v0.51.0/install.sh\""
+        ));
         assert!(workflow.contains(r#"tag="${GITHUB_REF#refs/tags/}""#));
         assert!(!workflow.contains(r#"tag="${{GITHUB_REF#refs/tags/}}""#));
         assert!(workflow.contains("pull-requests: write"));
+    }
+
+    // Every rendered variant: no other installer origin, no persisted push
+    // credentials, and the token reaches exactly one step, the push.
+    #[test]
+    fn render_workflow_scopes_the_push_token_to_the_sync_step() {
+        for version in ["v0.51.0", "0.51.0", "latest", CHECKOUT_SHIPYARD_VERSION] {
+            let workflow = render_workflow("v*", version, "ubuntu-latest", None);
+            assert!(!workflow.contains("generouscorp.com"), "{version}");
+            assert!(!workflow.contains("persist-credentials: true"), "{version}");
+            assert!(workflow.contains("persist-credentials: false"), "{version}");
+            assert!(
+                workflow.contains(
+                    "uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0"
+                ),
+                "{version}"
+            );
+            assert_eq!(
+                workflow.matches("secrets.RELEASE_BOT_TOKEN").count(),
+                1,
+                "{version}"
+            );
+            let steps: Vec<&str> = workflow.split("\n      - name: ").skip(1).collect();
+            let with_token: Vec<&str> = steps
+                .iter()
+                .filter(|step| step.contains("secrets.RELEASE_BOT_TOKEN"))
+                .map(|step| step.lines().next().unwrap_or_default())
+                .collect();
+            assert_eq!(with_token, ["Run post-tag docs sync"], "{version}");
+            let sync = steps.last().expect("sync step");
+            assert!(
+                sync.contains("export GIT_CONFIG_KEY_0=\"http.https://github.com/.extraheader\"")
+            );
+            assert!(sync.contains("echo \"::add-mask::$auth\""));
+            assert!(!workflow.contains("git config"), "{version}");
+        }
+    }
+
+    #[test]
+    fn render_workflow_fetches_the_installer_for_the_pinned_tag() {
+        for (version, installer) in [
+            ("v0.51.0", "Shipyard/v0.51.0/install.sh"),
+            ("0.51.0", "Shipyard/v0.51.0/install.sh"),
+            ("latest", "Shipyard/main/install.sh"),
+        ] {
+            let workflow = render_workflow("v*", version, "ubuntu-latest", None);
+            assert!(
+                workflow.contains(&format!(
+                    "curl -fsSL \"https://raw.githubusercontent.com/danielraffel/{installer}\""
+                )),
+                "{version}"
+            );
+            assert!(workflow.contains(&format!(r#"SHIPYARD_VERSION: "{version}""#)));
+            assert!(!workflow.contains("cargo build"), "{version}");
+        }
+    }
+
+    #[test]
+    fn render_workflow_checkout_builds_the_release_tag_itself() {
+        let workflow = render_workflow("v*", CHECKOUT_SHIPYARD_VERSION, "ubuntu-latest", None);
+        assert!(workflow.contains(r#"SHIPYARD_VERSION: "${{ github.ref_name }}""#));
+        assert!(workflow.contains("cargo build --release --locked --bin shipyard"));
+        assert!(workflow.contains("ref: ${{ github.ref }}"));
+        assert!(!workflow.contains("curl"));
+        assert!(!workflow.contains("install.sh"));
+        assert!(!workflow.contains("latest\""));
+    }
+
+    #[test]
+    fn hook_install_refuses_checkout_outside_the_shipyard_repository() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let error = hook_install(
+            &mut Vec::new(),
+            &empty_config(),
+            temp.path(),
+            "v*",
+            Some(CHECKOUT_SHIPYARD_VERSION),
+            false,
+            None,
+        )
+        .expect_err("no Cargo.toml");
+        assert!(
+            error
+                .message()
+                .contains("only valid in the Shipyard repository")
+        );
+        assert!(!temp.path().join(".github").exists());
+
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"not-shipyard\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("manifest");
+        hook_install(
+            &mut Vec::new(),
+            &empty_config(),
+            temp.path(),
+            "v*",
+            Some(CHECKOUT_SHIPYARD_VERSION),
+            false,
+            None,
+        )
+        .expect_err("another package");
+        assert!(!temp.path().join(".github").exists());
+
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"shipyard\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("manifest");
+        hook_install(
+            &mut Vec::new(),
+            &empty_config(),
+            temp.path(),
+            "v*",
+            Some(CHECKOUT_SHIPYARD_VERSION),
+            false,
+            None,
+        )
+        .expect("shipyard checkout");
+        let workflow = fs::read_to_string(
+            temp.path()
+                .join(".github")
+                .join("workflows")
+                .join(POST_TAG_WORKFLOW),
+        )
+        .expect("workflow");
+        assert!(workflow.contains("cargo build --release --locked --bin shipyard"));
     }
 
     #[test]

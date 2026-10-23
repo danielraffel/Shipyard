@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -199,6 +200,129 @@ class CiMatrixTests(unittest.TestCase):
         self.assertEqual(
             json.loads(rows["macos-arm64"]["runs_on_json"]),
             ["self-hosted", "studio", "shipyard-sandbox-m3"],
+        )
+
+    FORK_PR = {
+        "REQUESTED_PROVIDER": "local",
+        "GITHUB_EVENT_NAME": "pull_request",
+        "GITHUB_REPOSITORY": "danielraffel/Shipyard",
+        "PR_HEAD_REPO": "someone/Shipyard",
+    }
+
+    def test_fork_pull_request_skips_self_hosted_legs(self) -> None:
+        for workflow in ("ci", "sandbox-e2e"):
+            with self.subTest(workflow=workflow):
+                outputs = ci_matrix.workflow_outputs(workflow, self.FORK_PR)
+                rows = json.loads(outputs["matrix_json"])["include"]
+                # Skipped, not moved: no macOS row at all, hosted or local.
+                self.assertNotIn("macos-arm64", [row["key"] for row in rows])
+                self.assertNotIn("self-hosted", outputs["matrix_json"])
+                self.assertNotIn("macos-15", outputs["matrix_json"])
+                self.assertNotIn(
+                    ci_matrix.SANDBOX_M3_CAPABILITY_LABEL, outputs["matrix_json"]
+                )
+                self.assertEqual(outputs["macos_arm64_provider"], "skipped")
+                self.assertEqual(outputs["macos_arm64_runs_on_json"], "")
+                # Legs that never used a self-hosted runner run as today.
+                self.assertEqual(outputs["linux_provider"], "github-hosted")
+                self.assertEqual(json.loads(outputs["linux_runs_on_json"]), "ubuntu-latest")
+
+    def test_fork_pull_request_skips_any_self_hosted_selector(self) -> None:
+        for env in (
+            dict(self.FORK_PR, LOCAL_MACOS_ARM64_RUNS_ON_JSON='"studio"'),
+            dict(
+                self.FORK_PR,
+                REQUESTED_PROVIDER="github-hosted",
+                EXPLICIT_LINUX_RUNNER_SELECTOR_JSON='["Self-Hosted","linux"]',
+            ),
+            dict(
+                self.FORK_PR,
+                REQUESTED_PROVIDER="namespace",
+                NAMESPACE_LINUX_RUNS_ON_JSON='["self-hosted","tart"]',
+            ),
+        ):
+            key = "linux" if "LOCAL_MACOS_ARM64_RUNS_ON_JSON" not in env else "macos-arm64"
+            with self.subTest(env=env):
+                row = ci_matrix.resolve_runs_on(key, env)
+                self.assertEqual(row["provider"], "skipped")
+                self.assertEqual(row["runs_on_json"], "")
+
+    def test_fork_pull_request_keeps_non_self_hosted_providers(self) -> None:
+        row = ci_matrix.resolve_runs_on(
+            "macos-arm64", dict(self.FORK_PR, REQUESTED_PROVIDER="namespace")
+        )
+        self.assertEqual(row["provider"], "namespace")
+        self.assertEqual(
+            json.loads(row["runs_on_json"]), "namespace-profile-generouscorp-macos"
+        )
+
+    def test_pull_request_with_unknown_head_repo_counts_as_fork(self) -> None:
+        for head in ("", "   "):
+            with self.subTest(head=head):
+                row = ci_matrix.resolve_runs_on(
+                    "macos-arm64", dict(self.FORK_PR, PR_HEAD_REPO=head)
+                )
+                self.assertEqual(row["provider"], "skipped")
+
+    def test_same_repo_pull_request_runs_on_local_fleet_as_before(self) -> None:
+        # Case differences in the slug are the same repository.
+        env = dict(self.FORK_PR, PR_HEAD_REPO="DanielRaffel/shipyard")
+        self.assertFalse(ci_matrix.is_fork_pull_request(env))
+        for workflow in ("ci", "sandbox-e2e"):
+            with self.subTest(workflow=workflow):
+                without_context = {"REQUESTED_PROVIDER": "local"}
+                self.assertEqual(
+                    ci_matrix.workflow_outputs(workflow, env),
+                    ci_matrix.workflow_outputs(workflow, without_context),
+                )
+        rows = {
+            row["key"]: row
+            for row in ci_matrix.workflow_matrix("sandbox-e2e", env)["include"]
+        }
+        self.assertEqual(
+            json.loads(rows["macos-arm64"]["runs_on_json"]),
+            ["self-hosted", "local-mac", "shipyard-sandbox-m3"],
+        )
+        self.assertEqual(ci_matrix.skipped_notices("ci", env), [])
+
+    def test_push_and_dispatch_ignore_pr_head_context(self) -> None:
+        for event in ("push", "workflow_dispatch", ""):
+            with self.subTest(event=event):
+                env = dict(self.FORK_PR, GITHUB_EVENT_NAME=event)
+                self.assertFalse(ci_matrix.is_fork_pull_request(env))
+                row = ci_matrix.resolve_runs_on("macos-arm64", env)
+                self.assertEqual(row["provider"], "local")
+                self.assertEqual(
+                    json.loads(row["runs_on_json"]), ["self-hosted", "local-mac"]
+                )
+
+    def test_fork_pull_request_prints_a_notice_per_skipped_leg(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "github-output"
+            env = dict(self.FORK_PR, GITHUB_OUTPUT=str(output))
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch(
+                "sys.stdout", new_callable=io.StringIO
+            ) as stdout:
+                self.assertEqual(ci_matrix.main(["--workflow", "ci", "--github-output"]), 0)
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("::notice title=Fork pull request::Skipped macOS ARM64"))
+
+    def test_pull_request_workflows_pass_the_head_repo_to_the_resolver(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        for name in ("ci.yml", "sandbox-e2e.yml"):
+            with self.subTest(workflow=name):
+                workflow = (root / ".github/workflows" / name).read_text(encoding="utf-8")
+                resolve = workflow.split("      - id: resolve\n", 1)[1].split("\n\n", 1)[0]
+                self.assertIn(
+                    "PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}",
+                    resolve,
+                )
+        ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        guard = "    if: needs.resolve-runners.outputs.linux_provider != 'skipped'\n"
+        self.assertEqual(
+            ci.count("runs-on: ${{ fromJSON(needs.resolve-runners.outputs.linux_runs_on_json) }}"),
+            ci.count(guard),
         )
 
     def test_workflows_do_not_implicitly_route_macos_to_local_runner(self) -> None:

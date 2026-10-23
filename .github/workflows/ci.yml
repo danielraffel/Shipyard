@@ -52,6 +52,8 @@ jobs:
 
       - id: resolve
         env:
+          # With GITHUB_EVENT_NAME and GITHUB_REPOSITORY, a fork PR skips self-hosted legs.
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           REQUESTED_PROVIDER: ${{ inputs.runner_provider || vars.DEFAULT_RUNNER_PROVIDER || 'github-hosted' }}
           EXPLICIT_LINUX_RUNNER_SELECTOR_JSON: ${{ inputs.linux_runner_selector_json || '' }}
           EXPLICIT_MACOS_ARM64_RUNNER_SELECTOR_JSON: ${{ inputs.macos_arm64_runner_selector_json || '' }}
@@ -127,6 +129,7 @@ jobs:
   coverage:
     needs: resolve-runners
     name: Coverage >= 75% [${{ needs.resolve-runners.outputs.linux_provider }}]
+    if: needs.resolve-runners.outputs.linux_provider != 'skipped'
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.linux_runs_on_json) }}
     steps:
       - uses: actions/checkout@v5
@@ -178,6 +181,7 @@ jobs:
   packaging-helper:
     needs: resolve-runners
     name: Python helper tests [${{ needs.resolve-runners.outputs.linux_provider }}]
+    if: needs.resolve-runners.outputs.linux_provider != 'skipped'
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.linux_runs_on_json) }}
     steps:
       - uses: actions/checkout@v5

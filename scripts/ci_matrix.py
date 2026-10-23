@@ -6,7 +6,8 @@ opt-in provider for repos/accounts that still have access. The `local`
 provider routes to the maintainer's self-hosted Mac (label set
 `["self-hosted","local-mac"]`) for the macOS release/build leg, falling back
 to github-hosted for targets with no local box. Workflow inputs or repository
-variables can override defaults without editing YAML.
+variables can override defaults without editing YAML. A pull request from a
+fork never resolves to a self-hosted runner: those legs are skipped.
 """
 
 from __future__ import annotations
@@ -22,6 +23,9 @@ from typing import Mapping
 
 VALID_PROVIDERS = ("namespace", "github-hosted", "local")
 SANDBOX_M3_CAPABILITY_LABEL = "shipyard-sandbox-m3"
+# Provider reported for a leg a fork pull request may not run. Its runs-on
+# selector is empty, so a job that reads it without a guard fails closed.
+SKIPPED_PROVIDER = "skipped"
 
 
 @dataclass(frozen=True)
@@ -140,6 +144,27 @@ def requested_provider(env: Mapping[str, str]) -> str:
     return provider
 
 
+def is_fork_pull_request(env: Mapping[str, str]) -> bool:
+    """True for a pull request whose head is not this repository.
+
+    Repository variables such as DEFAULT_RUNNER_PROVIDER reach fork pull
+    requests too, so they alone would put fork code on the persistent
+    self-hosted Macs. An unknown head repository (deleted fork) is a fork.
+    """
+    if _env(env, "GITHUB_EVENT_NAME") not in {"pull_request", "pull_request_target"}:
+        return False
+    head = _env(env, "PR_HEAD_REPO").lower()
+    return not head or head != _env(env, "GITHUB_REPOSITORY").lower()
+
+
+def _is_self_hosted(provider: str, selector: str) -> bool:
+    if provider == "local":
+        return True
+    decoded = json.loads(selector)
+    labels = [decoded] if isinstance(decoded, str) else decoded
+    return any(str(label).lower() == "self-hosted" for label in labels)
+
+
 def resolve_runs_on(target_key: str, env: Mapping[str, str] = os.environ) -> dict[str, str]:
     target = TARGETS[target_key]
     provider = requested_provider(env)
@@ -176,6 +201,14 @@ def resolve_runs_on(target_key: str, env: Mapping[str, str] = os.environ) -> dic
             provider = "github-hosted"
             selector = json.dumps(target.github_hosted_label)
 
+    if is_fork_pull_request(env) and _is_self_hosted(provider, selector):
+        # Skip rather than fall back to GitHub-hosted: CI runs on local
+        # hardware, and the resolver never selects a host runner for a fork
+        # PR. A fork that edits the workflow itself is stopped only by the
+        # repo's fork-PR approval setting.
+        provider = SKIPPED_PROVIDER
+        selector = ""
+
     return {
         "key": target.key,
         "name": target.display_name,
@@ -193,6 +226,8 @@ def workflow_matrix(workflow: str, env: Mapping[str, str] = os.environ) -> dict[
     rows = []
     for target_key in target_keys:
         row = resolve_runs_on(target_key, env)
+        if row["provider"] == SKIPPED_PROVIDER:
+            continue
         if workflow == "sandbox-e2e" and target_key == "macos-arm64" and row["provider"] == "local":
             selector = json.loads(row["runs_on_json"])
             if not isinstance(selector, list) or "self-hosted" not in selector:
@@ -217,6 +252,20 @@ def workflow_outputs(workflow: str, env: Mapping[str, str] = os.environ) -> dict
         outputs[f"{output_key}_runs_on_json"] = row["runs_on_json"]
         outputs[f"{output_key}_provider"] = row["provider"]
     return outputs
+
+
+def skipped_notices(workflow: str, env: Mapping[str, str] = os.environ) -> list[str]:
+    skipped = [
+        row["name"]
+        for row in (resolve_runs_on(key, env) for key in WORKFLOW_TARGETS[workflow])
+        if row["provider"] == SKIPPED_PROVIDER
+    ]
+    return [
+        f"::notice title=Fork pull request::Skipped {name}: the resolver never "
+        "selects a self-hosted runner for a fork pull request. A maintainer can "
+        "push the reviewed commits to a branch of this repository to run it."
+        for name in skipped
+    ]
 
 
 def write_outputs(outputs: Mapping[str, str], path: Path) -> None:
@@ -244,6 +293,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     outputs = workflow_outputs(args.workflow)
+    for notice in skipped_notices(args.workflow):
+        print(notice, file=sys.stdout if args.github_output else sys.stderr)
     if args.github_output:
         output_path = os.environ.get("GITHUB_OUTPUT")
         if not output_path:
