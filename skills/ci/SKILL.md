@@ -1642,7 +1642,7 @@ itself.
 
 | You're here | Does live mode matter? |
 |---|---|
-| Solo macOS dev with Tailscale + Funnel enabled | **Yes, big win.** `shipyard daemon start` registers webhooks on tracked repos and streams events; the macOS menu-bar app and any `shipyard watch` invocation in a terminal both consume the same stream. |
+| Solo macOS dev with Tailscale + Funnel enabled | **Yes, big win.** The public Funnel is off unless the host opts in with `[daemon] public_ingress = true` in the machine-global config or `SHIPYARD_ENABLE_TUNNEL=1` (the env var wins either way, so `=0` overrides the config). Once opted in, `shipyard daemon start` registers webhooks on tracked repos and streams events; the macOS menu-bar app and any `shipyard watch` invocation in a terminal both consume the same stream. |
 | CI / headless server / someone without Tailscale | **Ignore it.** The daemon needs a public tunnel (Tailscale Funnel in v1) to receive webhooks. Without that, `shipyard watch` and everything else fall back to polling — behavior is unchanged from the pre-daemon CLI. |
 | Agent running one-shot `shipyard ship` + `watch --follow` | **Probably doesn't matter.** The daemon helps most when multiple sessions or the GUI are tracking the same state concurrently; a single session blocking on `watch --follow` already has its own connection. |
 

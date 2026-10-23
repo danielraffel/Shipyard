@@ -618,8 +618,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--allow-funnel-reset",
         action="store_true",
         help=(
-            "Allow the Rust daemon to run its Tailscale backend. This calls "
-            "`tailscale funnel reset`, matching runtime behavior, so only use "
+            "Allow the Rust daemon to run its Tailscale backend. The "
+            "validator's cleanup calls `tailscale funnel reset`, so only use "
             "when no production Funnel is needed."
         ),
     )
