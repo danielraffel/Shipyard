@@ -19,13 +19,14 @@ These are **decoupled by policy** (`RELEASING.md`) — plugin files are delivere
 
 ## Versioning & Skill-Sync Policy
 
-Enforcement runs in three layers, all calling the same two scripts.
+Enforcement runs in two layers, both calling the same two scripts. (There is
+deliberately no agent `PostToolUse` hook: it would execute whichever checkout's
+scripts the edited file sat in.)
 
 | Layer | Where | Mode |
 |---|---|---|
-| 1 (agent hook) | `hooks/hooks.json` PostToolUse | `--mode=hint` — advisory text only |
-| 2 (pre-push)   | `.githooks/pre-push` (install via `scripts/install-githooks.sh`) | `--mode=report` advisory by default; `SHIPYARD_ENFORCE_PREPUSH=1` upgrades to hard fail |
-| 3 (CI)         | `.github/workflows/version-skill-check.yml` | `--mode=report` with `SHIPYARD_ENFORCE_PREPUSH=1` — blocks merge |
+| 1 (pre-push)   | `.githooks/pre-push` (install via `scripts/install-githooks.sh`) | `--mode=report` advisory by default; `SHIPYARD_ENFORCE_PREPUSH=1` upgrades to hard fail |
+| 2 (CI)         | `.github/workflows/version-skill-check.yml` | `--mode=report` with `SHIPYARD_ENFORCE_PREPUSH=1` — blocks merge |
 
 Scripts:
 

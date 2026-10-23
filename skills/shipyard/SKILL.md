@@ -312,6 +312,14 @@ the daily implementation as of `v0.51.0` / `v0.51.1`, but do not replace
 Pulp pins, reset Tailscale Funnel, or merge GUI cutover support without a clear
 go/no-go for that operation.
 
+`install.sh` fails closed on a `checksums.sha256` mismatch, missing entry, or
+missing/undownloadable checksums file (escape hatch for pre-checksum tags:
+`SHIPYARD_ALLOW_UNVERIFIED_INSTALL=1`, loud warning),
+and the plugin's SessionStart hook only prints the install command when the
+CLI is missing; it never downloads or runs the installer itself. Details and
+tests: `skills/ci/SKILL.md` ("`install.sh` verifies `checksums.sha256`"),
+`scripts/test_install_checksum.py`, `scripts/test_check_cli_hook.py`.
+
 ## The gate scripts are shared with Pulp — and defaulted to Pulp's layout
 
 `scripts/version_bump_check.py` and `scripts/skill_sync_check.py` are the same

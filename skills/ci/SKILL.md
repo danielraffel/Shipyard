@@ -800,6 +800,26 @@ repository. The job runs with `contents: read` only. v0.302.0-v0.307.0 shipped a
 GitHub refused on every call; a fake-backed unit test cannot see that, one real
 read does. Run the same gate by hand with
 `python3 scripts/release_live_smoke.py --binary target/release/shipyard`.
+
+## `install.sh` verifies `checksums.sha256` before it signs anything
+
+`install.sh` downloads the release's `checksums.sha256` and checks each asset
+(the macOS DMG, or the Linux/Windows CLI and provider binaries) before it
+mounts, `chmod`s, ad-hoc signs, or runs them. A digest mismatch, a failed
+checksums download, or a checksums file with no entry for the asset exits 1.
+A release that publishes no `checksums.sha256` is refused too (every published
+release since v0.1.0 ships it); the only escape hatch is
+`SHIPYARD_ALLOW_UNVERIFIED_INSTALL=1`, which installs such a release with a
+loud warning and never bypasses a mismatch or missing entry. The ad-hoc re-sign fallback for the v0.42/v0.43
+notarization SIGKILL is unchanged; it now only ever applies to verified bytes.
+`SHIPYARD_SKIP_DOWNLOAD=1` reuses local bytes and is not checksum-verified.
+Regression test: `scripts/test_install_checksum.py`.
+
+The plugin's SessionStart hook (`hooks/check-cli.sh`) never runs the
+installer. When `shipyard` is missing it prints the `install.sh` command and
+exits 0. There is no `PostToolUse` version/skill hint hook; the pre-push hook
+and `version-skill-check.yml` are the two enforcement layers.
+
 ## Cargo caches: GitHub-hosted restore, main-only save, none for releases
 
 A tag ref can restore only its own cache entries and main's, and main never
@@ -3622,9 +3642,9 @@ lifecycle means changing all of these together:
 | Surface | Gate | Two-sided? |
 |---|---|---|
 | `src/app/fleet_update_cmd.rs:50` | `MIN_PAIRED_BINARY_TARGET` | yes |
-| `install.sh:116-129` | `REQUIRE_PROVIDER`, else `rm -f` the provider | yes |
+| `install.sh:179-189` | `REQUIRE_PROVIDER`, else `rm -f` the provider | yes |
 | `scripts/release_macos_local.py:465` | `_provider_expected_for_tag` | yes |
-| `hooks/check-cli.sh:100` | `version_gte "$INSTALLED" "0.127.0"` | no |
+| `hooks/check-cli.sh:94` | `version_gte "$INSTALLED" "0.127.0"` | no |
 | `scripts/package_release.py:649` | unconditional | n/a |
 
 "Two-sided" means the low side does not merely skip the check, it asserts the

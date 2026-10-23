@@ -58,6 +58,82 @@ download_asset() {
     fi
 }
 
+# Release integrity: every published release carries checksums.sha256
+# ("<sha256>  <asset>" lines). Downloaded bytes are verified against it
+# before anything mounts, re-signs or executes them, so the macOS ad-hoc
+# signing paths below only ever touch checksum-verified bytes.
+CHECKSUMS_ASSET="checksums.sha256"
+CHECKSUMS_FILE=""
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+    else
+        return 1
+    fi
+}
+
+verify_asset_checksum() {
+    file="$1"
+    asset_name="$2"
+    if [ -z "${CHECKSUMS_FILE}" ]; then
+        return 0
+    fi
+    expected=$(awk -v name="${asset_name}" '
+        { entry = $2; sub(/^\*/, "", entry) }
+        entry == name { print tolower($1); exit }
+    ' "${CHECKSUMS_FILE}")
+    if [ -z "${expected}" ]; then
+        echo "ERROR: ${CHECKSUMS_ASSET} for ${VERSION_LABEL} has no entry for ${asset_name}; refusing to install unverified bytes." >&2
+        rm -f "${file}"
+        exit 1
+    fi
+    actual=$(sha256_of "${file}") || actual=""
+    if [ -z "${actual}" ]; then
+        echo "ERROR: no sha256 tool (sha256sum, shasum or python3) available to verify ${asset_name}." >&2
+        rm -f "${file}"
+        exit 1
+    fi
+    if [ "$(printf '%s' "${actual}" | tr 'A-F' 'a-f')" != "${expected}" ]; then
+        echo "ERROR: sha256 mismatch for ${asset_name} (${VERSION_LABEL}); refusing to install." >&2
+        echo "  expected ${expected}" >&2
+        echo "  actual   ${actual}" >&2
+        rm -f "${file}"
+        exit 1
+    fi
+    echo "Verified sha256 for ${asset_name}."
+}
+
+fetch_release_checksums() {
+    if [ -z "${CHECKSUMS_URL}" ]; then
+        # Every published release since v0.1.0 carries checksums.sha256, so a
+        # missing manifest means a broken or tampered release, not an old one.
+        if [ "${SHIPYARD_ALLOW_UNVERIFIED_INSTALL:-0}" = "1" ]; then
+            echo "WARNING: ************************************************************" >&2
+            echo "WARNING: release ${VERSION_LABEL} publishes no ${CHECKSUMS_ASSET}." >&2
+            echo "WARNING: SHIPYARD_ALLOW_UNVERIFIED_INSTALL=1 is set, so the download is" >&2
+            echo "WARNING: installed WITHOUT checksum verification. Its bytes are untrusted." >&2
+            echo "WARNING: ************************************************************" >&2
+            return 0
+        fi
+        echo "ERROR: release ${VERSION_LABEL} publishes no ${CHECKSUMS_ASSET}; refusing to install unverified bytes." >&2
+        echo "  Every published Shipyard release since v0.1.0 ships ${CHECKSUMS_ASSET}; its absence" >&2
+        echo "  means the release is incomplete or has been altered. To install a tag that" >&2
+        echo "  predates checksums anyway, re-run with SHIPYARD_ALLOW_UNVERIFIED_INSTALL=1." >&2
+        exit 1
+    fi
+    CHECKSUMS_FILE="$(mktemp -d)/${CHECKSUMS_ASSET}"
+    if ! download_asset "${CHECKSUMS_URL}" "${CHECKSUMS_FILE}" \
+            "${CHECKSUMS_URL_IS_API}" || [ ! -s "${CHECKSUMS_FILE}" ]; then
+        echo "ERROR: failed to download ${CHECKSUMS_ASSET} for ${VERSION_LABEL}; refusing to install unverified bytes." >&2
+        exit 1
+    fi
+}
+
 ARTIFACT_PREFIX="${SHIPYARD_ARTIFACT_PREFIX:-shipyard}"
 PROVIDER_ARTIFACT_PREFIX="${SHIPYARD_PROVIDER_ARTIFACT_PREFIX:-shipyard-workstream-provider}"
 BINARY_NAME="shipyard"
@@ -247,6 +323,8 @@ RELEASE_URL=""
 RELEASE_URL_IS_API=0
 PROVIDER_RELEASE_URL=""
 PROVIDER_RELEASE_URL_IS_API=0
+CHECKSUMS_URL=""
+CHECKSUMS_URL_IS_API=0
 if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ]; then
     echo "Resolving ${VERSION_LABEL} from ${REPO}..."
     if ! RELEASE_RESPONSE="$(curl_shipyard -sSL -w '\n%{http_code}' "https://api.github.com/repos/${REPO}/${API_PATH}")"; then
@@ -312,6 +390,17 @@ if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" != "1" ]; then
                 | head -1 \
                 | cut -d '"' -f 4 || true)
         fi
+    fi
+    CHECKSUMS_URL=$(printf '%s' "${RELEASE_JSON}" \
+        | select_asset_url "${CHECKSUMS_ASSET}" "${PREFER_API_ASSET_URL}" || true)
+    if [ -n "${CHECKSUMS_URL}" ] && [ "${PREFER_API_ASSET_URL}" = "1" ]; then
+        CHECKSUMS_URL_IS_API=1
+    fi
+    if [ -z "${CHECKSUMS_URL}" ]; then
+        CHECKSUMS_URL=$(printf '%s' "${RELEASE_JSON}" \
+            | grep -E "browser_download_url.*/${CHECKSUMS_ASSET}\"" \
+            | head -1 \
+            | cut -d '"' -f 4 || true)
     fi
     if [ -z "${DMG_URL}" ] && [ -z "${RELEASE_URL}" ]; then
         echo "No binary found for ${ARTIFACT} in ${VERSION_LABEL}." >&2
@@ -408,7 +497,9 @@ if [ "${SHIPYARD_SKIP_DOWNLOAD:-0}" = "1" ]; then
 elif [ -n "${DMG_URL}" ]; then
     echo "Downloading ${ARTIFACT}.dmg (${VERSION_LABEL})..."
     DMG_TMP="$(mktemp -d)/shipyard.dmg"
+    fetch_release_checksums
     download_asset "${DMG_URL}" "${DMG_TMP}" "${DMG_URL_IS_API}"
+    verify_asset_checksum "${DMG_TMP}" "${ARTIFACT}.dmg"
     MOUNT_POINT="$(mktemp -d)/mnt"
     if ! hdiutil attach -nobrowse -readonly \
             -mountpoint "${MOUNT_POINT}" "${DMG_TMP}" >/dev/null 2>&1; then
@@ -437,12 +528,15 @@ elif [ -n "${DMG_URL}" ]; then
     hdiutil detach "${MOUNT_POINT}" >/dev/null 2>&1 || true
     rm -f "${DMG_TMP}"
 else
+    fetch_release_checksums
     echo "Downloading ${ARTIFACT} (${VERSION_LABEL})..."
     download_asset "${RELEASE_URL}" "${STAGED_DEST}" "${RELEASE_URL_IS_API}"
+    verify_asset_checksum "${STAGED_DEST}" "${ARTIFACT}"
     if [ "${REQUIRE_PROVIDER}" = "1" ]; then
         echo "Downloading ${PROVIDER_ARTIFACT} (${VERSION_LABEL})..."
         download_asset "${PROVIDER_RELEASE_URL}" "${STAGED_PROVIDER_DEST}" \
             "${PROVIDER_RELEASE_URL_IS_API}"
+        verify_asset_checksum "${STAGED_PROVIDER_DEST}" "${PROVIDER_ARTIFACT}"
     fi
 fi
 chmod +x "${STAGED_DEST}"

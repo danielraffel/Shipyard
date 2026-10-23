@@ -2,9 +2,9 @@
 # SessionStart hook for the Claude Code plugin.
 #
 # Three jobs:
-#   1. Bootstrap: if no `shipyard` binary is on PATH, curl install.sh
-#      (best-effort). The plugin is deferential — it only installs
-#      when something's actually missing.
+#   1. Bootstrap hint: if no `shipyard` binary is on PATH, print the
+#      install command and exit. The hook never downloads or runs an
+#      installer itself — installing is the user's explicit choice.
 #   2. Staleness signal: if a shipyard binary IS on PATH but is older
 #      than this plugin build's `min_shipyard_version`, emit a Claude
 #      Code SessionStart JSON response with `systemMessage` (renders
@@ -29,25 +29,19 @@ case "$(uname -s)" in
 esac
 DISMISS_FILE="$SHIPYARD_STATE_DIR/plugin-upgrade-dismissed.json"
 
-# ── Bootstrap ───────────────────────────────────────────────────────
+# ── Bootstrap hint ──────────────────────────────────────────────────
 
 if ! command -v shipyard &>/dev/null; then
   echo ""
-  echo "[Shipyard] CLI binary not found. Installing..."
-  echo ""
-  curl -fsSL https://raw.githubusercontent.com/danielraffel/Shipyard/main/install.sh | sh
-  if command -v shipyard &>/dev/null; then
-    echo ""
-    echo "[Shipyard] Installed successfully: $(shipyard --version)"
-  elif [ -f "$HOME/.local/bin/shipyard" ]; then
-    echo ""
-    echo "[Shipyard] Installed to ~/.local/bin/shipyard"
+  if [ -x "$HOME/.local/bin/shipyard" ]; then
+    echo "[Shipyard] CLI is installed at ~/.local/bin/shipyard but not on PATH."
     echo "[Shipyard] Add to PATH: export PATH=\"\$HOME/.local/bin:\$PATH\""
   else
-    echo ""
-    echo "[Shipyard] Installation may have failed. Try manually:"
+    echo "[Shipyard] CLI binary not found. To install it, run:"
     echo "  curl -fsSL https://raw.githubusercontent.com/danielraffel/Shipyard/main/install.sh | sh"
+    echo "[Shipyard] install.sh verifies the release checksums before installing."
   fi
+  echo ""
   exit 0
 fi
 

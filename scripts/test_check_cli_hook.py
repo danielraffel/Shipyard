@@ -274,5 +274,64 @@ class CheckCliHookTests(unittest.TestCase):
                 self.assertFalse(curl_marker.exists())
 
 
+    def _run_without_shipyard(self, root: Path, *, local_bin: bool = False):
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        marker = root / "network-or-installer-ran"
+        for name in ("curl", "wget", "sh"):
+            tool = bin_dir / name
+            tool.write_text(
+                f"#!/bin/bash\necho \"$0 $*\" >> '{marker}'\n"
+                f"echo 'FAIL: check-cli.sh ran {name}' >&2\nexit 99\n",
+                encoding="utf-8",
+            )
+            tool.chmod(0o755)
+        home = root / "home"
+        if local_bin:
+            installed = home / ".local" / "bin" / "shipyard"
+            installed.parent.mkdir(parents=True)
+            installed.write_text("#!/bin/sh\necho 'shipyard 0.127.0'\n", encoding="utf-8")
+            installed.chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(ROOT / "hooks" / "check-cli.sh")],
+            env={
+                "HOME": str(home),
+                "PATH": f"{bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+                "CLAUDE_PLUGIN_ROOT": str(ROOT),
+            },
+            capture_output=True,
+            text=True,
+        )
+        return result, marker
+
+    def test_missing_cli_prints_install_command_without_network(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result, marker = self._run_without_shipyard(Path(temp))
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("CLI binary not found", result.stdout)
+            self.assertIn(
+                "https://raw.githubusercontent.com/danielraffel/Shipyard/main/install.sh",
+                result.stdout,
+            )
+            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+            self.assertNotIn("FAIL:", result.stderr)
+
+    def test_off_path_local_install_gets_a_path_hint_without_network(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result, marker = self._run_without_shipyard(Path(temp), local_bin=True)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("not on PATH", result.stdout)
+            self.assertFalse(marker.exists())
+
+    def test_dead_post_tool_use_version_hint_hook_is_gone(self) -> None:
+        hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        self.assertNotIn("version-skill-hint", json.dumps(hooks))
+        self.assertFalse((ROOT / "hooks" / "version-skill-hint.sh").exists())
+        # The hand-back inbox poll is the PostToolUse hook that must remain.
+        self.assertIn("handback-inbox-poll.sh", json.dumps(hooks["hooks"]["PostToolUse"]))
+
+
 if __name__ == "__main__":
     unittest.main()

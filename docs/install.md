@@ -13,7 +13,7 @@ companion to the same directory by default:
 | Path | Lands at |
 |---|---|
 | `curl … install.sh` | `~/.local/bin/shipyard` |
-| Claude Code plugin (auto-installs on first session if missing) | `~/.local/bin/shipyard` |
+| Claude Code plugin (prints the install command on first session if missing; never installs on its own) | `~/.local/bin/shipyard` |
 | Codex one-liner (same `install.sh`) | `~/.local/bin/shipyard` |
 | Project pinners (see "Pin a specific version" below) | `~/.local/bin/shipyard` (recommended) |
 
@@ -30,6 +30,15 @@ curl -fsSL https://generouscorp.com/Shipyard/install.sh | sh
 Downloads the matched CLI/provider pair for your platform and installs both in
 `~/.local/bin`. A rollback to a release before v0.127.0 removes the newer
 provider after the older CLI passes its smoke test.
+
+Every download is checked against the release's `checksums.sha256` before it
+is mounted, re-signed, or run. A digest mismatch, or a checksums file with no
+entry for the asset, aborts the install, and so does a release that publishes no `checksums.sha256`
+or whose checksums file cannot be downloaded. Every published release since
+v0.1.0 ships the file. To install a tag that predates checksums anyway, set
+`SHIPYARD_ALLOW_UNVERIFIED_INSTALL=1`; the install then proceeds with a loud
+warning. The escape hatch only covers a missing checksums file, never a
+mismatch, a missing entry, or a failed checksums download.
 
 ## First-run auth
 

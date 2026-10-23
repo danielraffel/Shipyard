@@ -954,51 +954,46 @@ fn exact_asset_shim_serves_authenticated_and_unauthenticated_installer_urls() {
 }
 
 /// Runs the repository's real install.sh through the fleet shim, the way
-/// `runner fleet-update` does, and checks the manifest the shim served pins
-/// the staged asset's actual sha256. An install.sh that does not verify
-/// checksums ignores the extra listing; one that does verifies against it.
+/// `runner fleet-update` does, so install.sh's checksum gate sees the
+/// controller-pinned manifest. Returns the installer's exit status and stderr.
 #[cfg(unix)]
-#[test]
-fn real_installer_installs_fleet_staged_asset_with_pinned_manifest() {
+fn install_through_fleet_shim(pinned_sha256: Option<&str>, with_token: bool) -> (bool, String) {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
 
-    for with_token in [false, true] {
-        let temp = tempfile::tempdir().expect("temp");
-        let asset_bytes = b"#!/bin/sh\necho 'shipyard 0.100.0'\n";
-        let asset = temp.path().join("release-asset");
-        std::fs::write(&asset, asset_bytes).expect("asset");
-        let pinned = format!("{:x}", Sha256::digest(asset_bytes));
-        let shim = temp.path().join("curl-exact-asset");
-        std::fs::write(
-            &shim,
-            exact_asset_curl_shim("shipyard-linux-arm64", &pinned),
-        )
-        .expect("shim");
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-        let install_dir = temp.path().join("bin");
-        std::fs::create_dir(&install_dir).expect("install dir");
-        let mut command = Command::new("/bin/bash");
-        command
-            .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
-            .env_clear()
-            .env("HOME", temp.path())
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("SHIPYARD_FLEET_ASSET_PATH", &asset)
-            .env("SHIPYARD_VERSION", "0.100.0")
-            .env("SHIPYARD_INSTALL_DIR", &install_dir)
-            .env("SHIPYARD_CURL_BIN", &shim)
-            .env("SHIPYARD_INSTALL_TEST_UNAME_S", "Linux")
-            .env("SHIPYARD_INSTALL_TEST_UNAME_M", "aarch64");
-        if with_token {
-            command.env("SHIPYARD_GITHUB_TOKEN", "fleet-test-token");
-        }
-        let output = command.output().expect("run install.sh");
-        assert!(
-            output.status.success(),
-            "token={with_token}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let temp = tempfile::tempdir().expect("temp");
+    let asset_bytes = b"#!/bin/sh\necho 'shipyard 0.100.0'\n";
+    let asset = temp.path().join("release-asset");
+    std::fs::write(&asset, asset_bytes).expect("asset");
+    let actual = format!("{:x}", Sha256::digest(asset_bytes));
+    let pinned = pinned_sha256.map_or(actual, str::to_owned);
+    let shim = temp.path().join("curl-exact-asset");
+    std::fs::write(
+        &shim,
+        exact_asset_curl_shim("shipyard-linux-arm64", &pinned),
+    )
+    .expect("shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let install_dir = temp.path().join("bin");
+    std::fs::create_dir(&install_dir).expect("install dir");
+    let mut command = Command::new("/bin/bash");
+    command
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("SHIPYARD_FLEET_ASSET_PATH", &asset)
+        .env("SHIPYARD_VERSION", "0.100.0")
+        .env("SHIPYARD_INSTALL_DIR", &install_dir)
+        .env("SHIPYARD_CURL_BIN", &shim)
+        .env("SHIPYARD_INSTALL_TEST_UNAME_S", "Linux")
+        .env("SHIPYARD_INSTALL_TEST_UNAME_M", "aarch64");
+    if with_token {
+        command.env("SHIPYARD_GITHUB_TOKEN", "fleet-test-token");
+    }
+    let output = command.output().expect("run install.sh");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if output.status.success() {
         assert_eq!(
             std::fs::read(install_dir.join("shipyard")).expect("installed"),
             asset_bytes
@@ -1010,7 +1005,30 @@ fn real_installer_installs_fleet_staged_asset_with_pinned_manifest() {
         )
         .expect("served manifest");
         assert_eq!(manifest, format!("{pinned}  shipyard-linux-arm64\n"));
+    } else {
+        assert!(!install_dir.join("shipyard").exists());
     }
+    (output.status.success(), stderr)
+}
+
+#[cfg(unix)]
+#[test]
+fn real_installer_verifies_fleet_staged_asset_against_pinned_manifest() {
+    for with_token in [false, true] {
+        let (ok, stderr) = install_through_fleet_shim(None, with_token);
+        assert!(ok, "token={with_token}: {stderr}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn real_installer_refuses_fleet_staged_asset_that_misses_the_pin() {
+    let (ok, stderr) = install_through_fleet_shim(Some(&"b".repeat(64)), false);
+    assert!(!ok);
+    assert!(
+        stderr.contains("sha256 mismatch for shipyard-linux-arm64"),
+        "{stderr}"
+    );
 }
 
 #[test]
