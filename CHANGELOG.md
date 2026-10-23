@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03490"></a>
+## [0.349.0] - 2026-10-23
+
+- Keep bulk PR census lightweight ([#914](https://github.com/danielraffel/Shipyard/pull/914))
+
 <a id="v03481"></a>
 ## [0.348.1] - 2026-10-23
 
@@ -2519,6 +2524,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.349.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.349.0
 [0.348.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.348.1
 [0.348.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.348.0
 [0.347.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.347.1
