@@ -1493,9 +1493,9 @@ mod tests {
             super::doctor_gh_program(crate::identity::RuntimeMode::Shipyard, temp.path()),
             "gh"
         );
-        std::fs::create_dir_all(temp.path().join(".shipyard")).expect("project dir");
+        std::fs::create_dir_all(temp.path().join(".shipyard.local")).expect("local dir");
         std::fs::write(
-            temp.path().join(".shipyard/config.toml"),
+            temp.path().join(".shipyard.local/config.toml"),
             crate::test_support::refusing_gh_config(),
         )
         .expect("config");

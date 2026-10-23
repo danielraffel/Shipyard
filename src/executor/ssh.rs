@@ -735,6 +735,115 @@ pub fn ssh_options(configured_options: &[String], identity_file: Option<&str>) -
     options
 }
 
+/// `ssh` short flags repository-controlled config may pass on their own.
+const ALLOWED_SSH_FLAGS: &str = "46qvCT";
+
+/// `-o` keywords repository-controlled config may set, with the values each
+/// accepts (`None` means any single plain token).
+const ALLOWED_SSH_KEYWORDS: &[(&str, Option<&[&str]>)] = &[
+    ("addressfamily", None),
+    ("batchmode", None),
+    ("compression", None),
+    ("connectionattempts", None),
+    ("connecttimeout", None),
+    ("identitiesonly", Some(&["yes"])),
+    ("loglevel", None),
+    ("port", None),
+    ("serveralivecountmax", None),
+    ("serveraliveinterval", None),
+    ("stricthostkeychecking", Some(&["yes", "accept-new"])),
+    ("tcpkeepalive", None),
+    ("user", None),
+];
+
+/// Whether `value` is one plain token: no quoting, whitespace, `%` or `$`
+/// expansion, or path separators.
+fn plain_ssh_value(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-@".contains(character))
+        && !value.starts_with('-')
+}
+
+/// Why one `-o` argument may not come from repository-controlled config.
+fn repository_ssh_keyword_violation(argument: &str) -> Option<String> {
+    let trimmed = argument.trim();
+    let split = trimmed
+        .find(|character: char| character == '=' || character.is_whitespace())
+        .unwrap_or(trimmed.len());
+    let (keyword, rest) = trimmed.split_at(split);
+    let rest = rest.trim_start();
+    let value = rest.strip_prefix('=').unwrap_or(rest).trim_start();
+    let lowered = keyword.to_ascii_lowercase();
+    let Some((_, allowed_values)) = ALLOWED_SSH_KEYWORDS
+        .iter()
+        .find(|(allowed, _)| *allowed == lowered)
+    else {
+        return Some(format!("ssh option -o {argument:?} is not allowed"));
+    };
+    let value_ok = plain_ssh_value(value)
+        && allowed_values
+            .is_none_or(|values| values.contains(&value.to_ascii_lowercase().as_str()));
+    if value_ok {
+        None
+    } else {
+        Some(format!(
+            "ssh option -o {argument:?} has a value that is not allowed"
+        ))
+    }
+}
+
+/// Why `options` may not come from repository-controlled config, if they may not.
+///
+/// A branch's tracked config may only tune a connection: the flags `-4`, `-6`,
+/// `-q`, `-v`, `-C`, `-T`, `-p <port>`, `-l <user>`, and `-o` with one of
+/// [`ALLOWED_SSH_KEYWORDS`]. Anything else (commands, libraries, files,
+/// forwards, other config files, jump hosts, agent forwarding) is refused,
+/// because it could act on the controller. Short flags are parsed the way
+/// `getopt` would, so bundled (`-qp 22`) and attached (`-oKey=value`) forms
+/// count; keywords compare case-insensitively.
+#[must_use]
+pub fn repository_ssh_option_violation(options: &[String]) -> Option<String> {
+    let mut tokens = options.iter();
+    while let Some(token) = tokens.next() {
+        let Some(flags) = token.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            return Some(format!("unexpected positional ssh argument {token:?}"));
+        };
+        if flags.starts_with('-') {
+            return Some(format!("ssh argument {token:?} is not allowed"));
+        }
+        for (index, flag) in flags.char_indices() {
+            if ALLOWED_SSH_FLAGS.contains(flag) {
+                continue;
+            }
+            if !matches!(flag, 'o' | 'p' | 'l') {
+                return Some(format!("ssh flag -{flag} is not allowed"));
+            }
+            let attached = &flags[index + flag.len_utf8()..];
+            let argument = if attached.is_empty() {
+                let Some(next) = tokens.next() else {
+                    return Some(format!("ssh flag -{flag} is missing its argument"));
+                };
+                next.as_str()
+            } else {
+                attached
+            };
+            let violation = match flag {
+                'o' => repository_ssh_keyword_violation(argument),
+                'p' if !argument.is_empty() && argument.bytes().all(|b| b.is_ascii_digit()) => None,
+                'l' if plain_ssh_value(argument) => None,
+                _ => Some(format!("ssh flag -{flag} {argument:?} is not allowed")),
+            };
+            if violation.is_some() {
+                return violation;
+            }
+            break;
+        }
+    }
+    None
+}
+
 /// Classify one failed probe attempt.
 #[must_use]
 pub fn classify_probe_error(stderr: &str, returncode: i32) -> ProbeCategory {
@@ -963,6 +1072,10 @@ fn ssh_capture_command(host: &str, ssh_options: &[String], remote_command: &str)
     command.args([
         "-o",
         &format!("ConnectTimeout={PROBE_CONNECT_TIMEOUT_SECS}"),
+        // After the configured options, so an explicit machine-level choice
+        // still wins, but ahead of any ~/.ssh/config `ForwardAgent yes`.
+        "-o",
+        "ForwardAgent=no",
     ]);
     command.arg(host);
     command.arg(remote_command);
@@ -1240,7 +1353,8 @@ mod tests {
         CommandCapture, ProbeCategory, ProbeDiagnostic, SshExecutor, SshOperations,
         SshTargetConfig, SshValidation, SshValidationRequest, build_probe_command,
         build_remote_command, classify_probe_error, diagnose_target_with, format_ssh_diagnosis,
-        is_transient_ssh_error, shlex_quote, ssh_options,
+        is_transient_ssh_error, repository_ssh_option_violation, shlex_quote, ssh_capture_command,
+        ssh_options,
     };
 
     struct FakeSshOperations {
@@ -1564,6 +1678,116 @@ mod tests {
         );
         assert_eq!(classify_probe_error("", 255), ProbeCategory::Network);
         assert_eq!(classify_probe_error("weird", 1), ProbeCategory::Unknown);
+    }
+
+    #[test]
+    fn repository_ssh_options_are_an_allowlist() {
+        let owned = |options: &[&str]| options.iter().map(|o| (*o).to_owned()).collect::<Vec<_>>();
+        for refused in [
+            &["-oProxyCommand=touch /tmp/x"][..],
+            &["-o", "ProxyCommand=touch /tmp/x"],
+            &["-o", "ProxyCommand touch /tmp/x"],
+            &["-o", "\"ProxyCommand\" touch /tmp/x"],
+            &["-oproxycommand touch /tmp/x"],
+            &["-o", " PROXYJUMP = bastion"],
+            &["-oLocalCommand=touch /tmp/x"],
+            &["-o", "PermitLocalCommand=yes"],
+            &["-o", "KnownHostsCommand=/bin/sh -c x"],
+            &["-o", "Include /tmp/evil"],
+            &["-o", "Match exec \"touch /tmp/x\""],
+            &["-o", "ForwardAgent=yes"],
+            // Named in review: libraries, files and forwards.
+            &["-I", "/tmp/evil.so"],
+            &["-I/tmp/evil.so"],
+            &["-o", "PKCS11Provider=/tmp/evil.so"],
+            &["-oSecurityKeyProvider /tmp/evil.so"],
+            &["-o", "XAuthLocation=/tmp/evil"],
+            &["-E", "/tmp/log"],
+            &["-L", "8080:localhost:80"],
+            &["-R", "9000:localhost:22"],
+            &["-D", "1080"],
+            &["-qD1080"],
+            // Anything else not on the list.
+            &["-o", "UserKnownHostsFile=/dev/null"],
+            &["-o", "ControlPath=/tmp/sock"],
+            &["-i", "/tmp/key"],
+            &["-W", "host:22"],
+            &["-M"],
+            &["-F", "/tmp/evil"],
+            &["-J", "bastion"],
+            &["-p", "22", "-A"],
+            &["-qA"],
+            // Allowed keywords with values outside their allowlist.
+            &["-o", "IdentitiesOnly=no"],
+            &["-o", "StrictHostKeyChecking=no"],
+            &["-o", "Port=22 ProxyCommand x"],
+            &["-o", "User=%d/../x"],
+            &["-p", "22x"],
+            &["-l", "-F"],
+            &["-o"],
+            &["evil.example"],
+            &["--", "x"],
+        ] {
+            assert!(
+                repository_ssh_option_violation(&owned(refused)).is_some(),
+                "{refused:?} must be refused"
+            );
+        }
+        let message =
+            repository_ssh_option_violation(&owned(&["-o", "PKCS11Provider=x"])).expect("refused");
+        assert!(message.contains("PKCS11Provider"), "{message}");
+
+        for accepted in [
+            &[][..],
+            &["-oServerAliveInterval=30"],
+            &["-o", "ServerAliveInterval 30"],
+            &["-oconnecttimeout 5"],
+            &["-o", "ServerAliveCountMax = 3"],
+            &[
+                "-p",
+                "2222",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "BatchMode=yes",
+            ],
+            &["-4", "-6", "-q", "-vvv", "-C", "-T", "-l", "builder"],
+            &["-qp2222", "-lbuilder"],
+            &["-o", "TCPKeepAlive=yes", "-o", "Compression=yes"],
+            &["-o", "LogLevel=ERROR", "-o", "AddressFamily=inet"],
+            &[
+                "-o",
+                "Port=22",
+                "-o",
+                "User=ci-runner",
+                "-oConnectionAttempts=3",
+            ],
+            &["-o", "IdentitiesOnly=YES"],
+            &["-o", "StrictHostKeyChecking=accept-new"],
+            &["-o", "StrictHostKeyChecking yes"],
+        ] {
+            assert_eq!(
+                repository_ssh_option_violation(&owned(accepted)),
+                None,
+                "{accepted:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_command_disables_agent_forwarding_after_configured_options() {
+        let command = ssh_capture_command("host", &["-p".to_owned(), "2222".to_owned()], "true");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let forward = args
+            .iter()
+            .position(|arg| arg == "ForwardAgent=no")
+            .expect("ForwardAgent=no");
+        assert_eq!(args[forward - 1], "-o");
+        assert!(forward > 1, "configured options come first: {args:?}");
+        assert_eq!(&args[args.len() - 2..], ["host", "true"]);
     }
 
     #[test]

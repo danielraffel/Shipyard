@@ -2103,9 +2103,9 @@ exit 2
         // A token helper in the cwd's own Shipyard config is refused for a
         // client built from that config; the hermetic client never reads it.
         let temp = TempDir::new().expect("tempdir");
-        std::fs::create_dir_all(temp.path().join(".shipyard")).expect("project dir");
+        std::fs::create_dir_all(temp.path().join(".shipyard.local")).expect("local dir");
         std::fs::write(
-            temp.path().join(".shipyard/config.toml"),
+            temp.path().join(".shipyard.local/config.toml"),
             "[github.auth]\nsource = \"command\"\ntoken_command = [\"/Users/someone/.local/bin/ghapp\"]\n",
         )
         .expect("config");

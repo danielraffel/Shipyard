@@ -172,7 +172,7 @@ impl LoadedConfig {
                 },
             )
         };
-        let output = match Command::new("git")
+        let output = match git_command()
             .args(["show", &spec])
             .current_dir(cwd)
             .output()
@@ -185,10 +185,15 @@ impl LoadedConfig {
             let detail = stderr.lines().next().unwrap_or("").trim();
             return fallback(format!("git show {spec} failed: {detail}"));
         }
-        let project = match String::from_utf8_lossy(&output.stdout).parse::<Table>() {
+        let mut project = match String::from_utf8_lossy(&output.stdout).parse::<Table>() {
             Ok(table) => table,
             Err(error) => return fallback(format!("{spec} is not valid TOML: {error}")),
         };
+        // GitHub credentials never come from a tracked layer; see
+        // `repository_controlled_layers`.
+        if let Some(toml::Value::Table(github)) = project.get_mut("github") {
+            github.remove("auth");
+        }
         let mut data = Table::new();
         let layered =
             merge_if_present(&mut data, &self.global_dir.join("config.toml")).and_then(|()| {
@@ -213,11 +218,44 @@ impl LoadedConfig {
     /// Resolve a dotted key from the merged configuration.
     #[must_use]
     pub fn get<'a>(&'a self, dotted_key: &str) -> Option<&'a toml::Value> {
-        let mut current = self.data.get(dotted_key.split('.').next()?)?;
-        for part in dotted_key.split('.').skip(1) {
-            current = current.get(part)?;
+        table_get(&self.data, dotted_key)
+    }
+
+    /// The config files the repository being operated on controls, parsed,
+    /// keeping only those `relevant` accepts.
+    ///
+    /// That is the tracked project file and, when a branch has committed it,
+    /// the local overlay file. Credentials and controller-side execution must
+    /// never come from these layers. The local overlay is only asked about git
+    /// when it is relevant, so the common path spawns nothing.
+    pub fn repository_controlled_layers(
+        &self,
+        relevant: impl Fn(&Table) -> bool,
+    ) -> ConfigResult<Vec<(PathBuf, Table)>> {
+        let mut layers = Vec::new();
+        if let Some(project_dir) = &self.project_dir {
+            let path = project_dir.join("config.toml");
+            if let Some(table) = read_layer(&path)?.filter(|table| relevant(table)) {
+                layers.push((path, table));
+            }
         }
-        Some(current)
+        if let Some(local_dir) = &self.local_dir {
+            let path = local_dir.join("config.toml");
+            if let Some(table) = read_layer(&path)?.filter(|table| relevant(table)) {
+                let tracked =
+                    git_tracks(local_dir, "config.toml").map_err(|reason| ConfigLoadError::Io {
+                        path: path.clone(),
+                        source: std::io::Error::other(format!(
+                            "git could not tell whether this overlay is committed, so it is not \
+                             trusted: {reason}"
+                        )),
+                    })?;
+                if tracked {
+                    layers.push((path, table));
+                }
+            }
+        }
+        Ok(layers)
     }
 
     /// Resolve a dotted key as a string.
@@ -272,22 +310,179 @@ impl Error for ConfigLoadError {
     }
 }
 
-fn merge_if_present(base: &mut Table, path: &Path) -> ConfigResult<()> {
-    if !path.exists() {
-        return Ok(());
+/// Resolve a dotted key inside one parsed config table.
+#[must_use]
+pub fn table_get<'a>(table: &'a Table, dotted_key: &str) -> Option<&'a toml::Value> {
+    let mut current = table.get(dotted_key.split('.').next()?)?;
+    for part in dotted_key.split('.').skip(1) {
+        current = current.get(part)?;
     }
+    Some(current)
+}
 
+fn read_layer(path: &Path) -> ConfigResult<Option<Table>> {
+    if !path.exists() {
+        return Ok(None);
+    }
     let contents = fs::read_to_string(path).map_err(|source| ConfigLoadError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let parsed = contents
-        .parse::<toml::Table>()
+    contents
+        .parse::<Table>()
+        .map(Some)
         .map_err(|source| ConfigLoadError::Parse {
             path: path.to_path_buf(),
             source: Box::new(source),
-        })?;
-    deep_merge(base, &parsed);
+        })
+}
+
+/// Environment that makes `git` act on some other repository than the one
+/// `current_dir` is in. Git exports `GIT_DIR` to hooks (and `rebase -x`), and
+/// in a linked worktree that alone makes `rev-parse` treat the cwd as the top
+/// of the work tree, so every question about the checkout must clear them.
+const REPOSITORY_SELECTING_GIT_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
+
+/// A `git` command that discovers its repository from `current_dir` alone.
+fn git_command() -> Command {
+    clear_repository_selecting_env(Command::new("git"))
+}
+
+fn clear_repository_selecting_env(mut command: Command) -> Command {
+    for name in REPOSITORY_SELECTING_GIT_ENV {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// Whether git tracks `file` inside `dir`. A directory outside any work tree,
+/// or a host without git, counts as untracked; any other git failure is an
+/// error, so a layer git cannot vouch for is never trusted.
+///
+/// The match ignores case across the whole repository-relative path: on a
+/// case-insensitive filesystem the loader reads `.shipyard.local/config.toml`
+/// through a committed `.Shipyard.Local/Config.toml`, and a plain pathspec
+/// would miss that index entry. A relative `:(icase)` pathspec is not enough
+/// either, because git matches the cwd prefix case-sensitively, so anchor the
+/// full path at the top of the work tree.
+fn git_tracks(dir: &Path, file: &str) -> Result<bool, String> {
+    // Without git there is no checkout a branch could have committed to.
+    let Ok(output) = git_command()
+        .args(["rev-parse", "--show-toplevel", "--show-prefix"])
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .output()
+    else {
+        return Ok(false);
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("not a git repository") {
+            return Ok(false);
+        }
+        return Err(format!("`git rev-parse` failed: {}", stderr.trim()));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| "`git rev-parse` printed a non-UTF-8 path".to_owned())?;
+    let mut lines = stdout.lines();
+    let (Some(top), prefix) = (lines.next(), lines.next().unwrap_or("")) else {
+        return Err("`git rev-parse` printed no work tree".to_owned());
+    };
+    let pathspec = format!(":(top,icase,literal){prefix}{file}");
+    let named = git_command()
+        .args(["ls-files", "--error-unmatch", "--", &pathspec])
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("`git ls-files` did not run: {error}"))?;
+    match named.code() {
+        Some(0) => Ok(true),
+        Some(1) => {
+            tracked_entry_is_same_file(Path::new(top), &format!("{prefix}{file}"), &dir.join(file))
+        }
+        _ => Err(format!("`git ls-files` exited with {named}")),
+    }
+}
+
+/// Whether any tracked entry at the depth of `relative` is the same file as
+/// `path`. Git's `icase` folds ASCII only, but APFS and NTFS fold full
+/// Unicode, so a branch can commit `.shipyard.local/con\u{fb01}g.toml` that
+/// the loader opens as `config.toml` without any pathspec matching it. File
+/// identity catches that, and a tracked symlink to the overlay too. Only
+/// entries at the same depth are compared, since folding never adds or
+/// removes a `/`; a tracked `config.toml.example` beside the overlay is a
+/// different file.
+fn tracked_entry_is_same_file(top: &Path, relative: &str, path: &Path) -> Result<bool, String> {
+    let Some(target) = file_identity(path) else {
+        return Ok(false);
+    };
+    let output = git_command()
+        .args(["ls-files", "-z"])
+        .current_dir(top)
+        .output()
+        .map_err(|error| format!("`git ls-files` did not run: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`git ls-files` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let depth = relative.matches('/').count();
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty() && entry.split(|byte| *byte == b'/').count() == depth + 1)
+        .map(index_entry_path)
+        .any(|entry| file_identity(&top.join(entry)).as_ref() == Some(&target)))
+}
+
+/// The device and inode `path` resolves to, read from metadata so a tracked
+/// FIFO or device is never opened.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> Option<same_file::Handle> {
+    fs::metadata(path)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .and_then(|_| same_file::Handle::from_path(path).ok())
+}
+
+#[cfg(unix)]
+fn index_entry_path(entry: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(entry))
+}
+
+#[cfg(not(unix))]
+fn index_entry_path(entry: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(entry).into_owned())
+}
+
+fn merge_if_present(base: &mut Table, path: &Path) -> ConfigResult<()> {
+    if let Some(parsed) = read_layer(path)? {
+        deep_merge(base, &parsed);
+    }
     Ok(())
 }
 
@@ -309,7 +504,7 @@ fn has_config_file(dir: &Path) -> bool {
 }
 
 fn worktree_main_local_dir(base: &Path, local_overlay_dir_name: &str) -> Option<PathBuf> {
-    let common_output = Command::new("git")
+    let common_output = git_command()
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(base)
         .output()
@@ -332,7 +527,7 @@ fn worktree_main_local_dir(base: &Path, local_overlay_dir_name: &str) -> Option<
     };
 
     let main_checkout = common_dir.parent()?.to_path_buf();
-    let toplevel_output = Command::new("git")
+    let toplevel_output = git_command()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(base)
         .output()

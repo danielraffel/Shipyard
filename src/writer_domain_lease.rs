@@ -231,7 +231,12 @@ pub(crate) fn ensure_protected_dir_all(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     let _writer_domain = acquire_for_protected_path(path)?;
-    fs::create_dir_all(path)
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    // Owner-only, like the state directory it lives in; not umask-dependent.
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path)
 }
 
 /// Fence an `OpenOptions::create(true)` call only when it can create a new
@@ -811,5 +816,31 @@ mod tests {
         for writer in writers {
             writer.join().expect("writer join");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_protected_dir_all_creates_owner_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nested = temp.path().join("a/b");
+        ensure_protected_dir_all(&nested).expect("create");
+        for dir in [temp.path().join("a"), nested.clone()] {
+            let mode = fs::metadata(&dir).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
+
+        // An existing directory is left exactly as it was.
+        let existing = temp.path().join("existing");
+        fs::create_dir(&existing).expect("existing");
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).expect("chmod");
+        ensure_protected_dir_all(&existing).expect("existing is fine");
+        let mode = fs::metadata(&existing)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
     }
 }
