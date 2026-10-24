@@ -959,7 +959,12 @@ mod tests {
             .expect_err("tracked host_class is refused");
         assert!(
             error.contains("`host_class` is set in repository-controlled config")
-                && error.contains(".shipyard/config.toml"),
+                && error.contains(
+                    &Path::new(".shipyard")
+                        .join("config.toml")
+                        .display()
+                        .to_string()
+                ),
             "{error}"
         );
         config
@@ -973,7 +978,8 @@ mod tests {
         let error = config
             .refuse_repository_controlled(&["host_class"])
             .expect_err("committed overlay is repository-controlled");
-        assert!(error.contains(".shipyard.local/config.toml"), "{error}");
+        let overlay = Path::new(".shipyard.local").join("config.toml");
+        assert!(error.contains(&overlay.display().to_string()), "{error}");
     }
 
     #[test]
