@@ -591,7 +591,10 @@ fn resume_skips_when_the_pull_request_head_moves_after_observation() {
     let mut out = Vec::new();
     let code = queue_resume_command(&args(true), &rt, true, &mut out).expect("resume");
     assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&out));
-    assert_eq!(output_json(&out)["entries"][0]["outcome"], "skipped_pr_head_changed");
+    assert_eq!(
+        output_json(&out)["entries"][0]["outcome"],
+        "skipped_pr_head_changed"
+    );
     assert!(mutations(&log).is_empty());
     assert_eq!(load_ledger(&ledger_file).expect("ledger").entries.len(), 1);
 }
