@@ -234,6 +234,79 @@ class PassHistoryTests(unittest.TestCase):
         self.assertFalse(report["full_window_coverage"])
         self.assertEqual(report["continuous_elapsed_secs"], 0)
 
+    def test_later_failure_cannot_be_masked_by_an_older_successful_run(self) -> None:
+        store = history.PassHistory.create(
+            repository=REPO,
+            source_identity=SOURCE,
+            config_identity=CONFIG,
+            expected_interval_secs=3600,
+        )
+        for hour in range(4):
+            store.append(
+                history.PassObservation(
+                    repo=REPO,
+                    observed_at=START + timedelta(hours=hour),
+                    expected_interval_secs=3600,
+                    status="empty",
+                    source_identity=SOURCE,
+                    config_identity=CONFIG,
+                ),
+                now=START + timedelta(hours=hour),
+            )
+        failed_at = START + timedelta(hours=4)
+        store.append(
+            history.PassObservation(
+                repo=REPO,
+                observed_at=failed_at,
+                expected_interval_secs=3600,
+                status="failed",
+                source_identity=SOURCE,
+                config_identity=CONFIG,
+                error="timeout",
+            ),
+            now=failed_at,
+        )
+        for hour in (5, 6):
+            point = START + timedelta(hours=hour)
+            store.append(
+                history.PassObservation(
+                    repo=REPO,
+                    observed_at=point,
+                    expected_interval_secs=3600,
+                    status="empty",
+                    source_identity=SOURCE,
+                    config_identity=CONFIG,
+                ),
+                now=point,
+            )
+        report = store.summarize(START, START + timedelta(hours=6))
+        self.assertEqual(report["continuous_elapsed_secs"], 3600)
+        self.assertFalse(report["five_continuous_24h_days"])
+
+    def test_cadence_gap_resets_trailing_duration(self) -> None:
+        store = history.PassHistory.create(
+            repository=REPO,
+            source_identity=SOURCE,
+            config_identity=CONFIG,
+            expected_interval_secs=3600,
+        )
+        for hour in (0, 1, 3):
+            point = START + timedelta(hours=hour)
+            store.append(
+                history.PassObservation(
+                    repo=REPO,
+                    observed_at=point,
+                    expected_interval_secs=3600,
+                    status="empty",
+                    source_identity=SOURCE,
+                    config_identity=CONFIG,
+                ),
+                now=point,
+            )
+        report = store.summarize(START, START + timedelta(hours=3))
+        self.assertTrue(report["missing_intervals"])
+        self.assertEqual(report["continuous_elapsed_secs"], 0)
+
     def test_failure_overlapping_window_start_is_reported(self) -> None:
         store = self.make_history()
         store.append(
