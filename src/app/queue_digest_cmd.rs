@@ -35,6 +35,16 @@ pub(super) fn queue_digest_command<W: Write>(
                 .map_err(|error| CliFailure::new(1, error.to_string()))?,
         );
         data.insert(
+            "queue_idle".to_owned(),
+            serde_json::to_value(digest.queue_idle)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+        data.insert(
+            "alerts".to_owned(),
+            serde_json::to_value(&digest.alerts)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?,
+        );
+        data.insert(
             "errors".to_owned(),
             serde_json::to_value(&digest.errors)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?,
@@ -87,5 +97,10 @@ mod tests {
         assert_eq!(exit, ExitCode::SUCCESS);
         let payload: Value = serde_json::from_slice(&output).expect("JSON envelope");
         assert_eq!(payload["digest_schema_version"], 2);
+        assert_eq!(payload["queue_idle"], true);
+        assert_eq!(
+            payload["alerts"][0],
+            "merge_queue_idle_with_green_unarmed_work"
+        );
     }
 }

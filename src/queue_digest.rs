@@ -157,6 +157,14 @@ pub struct QueueDigest {
     pub observers: Vec<ObserverDigest>,
     /// Pull requests grouped by actionable state.
     pub buckets: DigestBuckets,
+    /// Whether every observed merge queue is currently empty. `None` means
+    /// that no complete observer census was available, so an empty queue
+    /// cannot be claimed.
+    pub queue_idle: Option<bool>,
+    /// Deterministic, read-only alerts for a supervisor. These never authorize
+    /// queue mutation; they identify an idle queue with mergeable work waiting
+    /// outside GitHub's queue.
+    pub alerts: Vec<String>,
     /// Fail-closed diagnostics. Sorted for deterministic output.
     pub errors: Vec<String>,
 }
@@ -168,6 +176,8 @@ impl QueueDigest {
             complete: false,
             observers: Vec::new(),
             buckets: DigestBuckets::default(),
+            queue_idle: None,
+            alerts: vec!["queue_observer_unavailable".to_owned()],
             errors: vec![error],
         }
     }
@@ -271,6 +281,13 @@ pub fn read_digest_at(state_root: &Path, stale_after_seconds: u64, now: SystemTi
     digest.errors.sort();
     digest.errors.dedup();
     digest.complete = digest.errors.is_empty() && !digest.observers.is_empty();
+    digest.queue_idle = (!digest.observers.is_empty() && digest.complete).then(|| {
+        digest
+            .observers
+            .iter()
+            .all(|observer| observer.queue_count == 0)
+    });
+    digest.alerts = queue_alerts(&digest);
     digest
 }
 
@@ -533,8 +550,32 @@ fn complete_digest() -> QueueDigest {
         complete: true,
         observers: Vec::new(),
         buckets: DigestBuckets::default(),
+        queue_idle: Some(true),
+        alerts: Vec::new(),
         errors: Vec::new(),
     }
+}
+
+fn queue_alerts(digest: &QueueDigest) -> Vec<String> {
+    if !digest.complete {
+        return vec!["queue_census_incomplete".to_owned()];
+    }
+    let Some(true) = digest.queue_idle else {
+        return Vec::new();
+    };
+    let mut alerts = Vec::new();
+    // An armed PR is the queue owner's actionable idle condition: GitHub has
+    // been asked to enqueue it, but no queue entry is present.
+    if !digest.buckets.armed.is_empty() {
+        alerts.push("merge_queue_idle_with_pending_work".to_owned());
+    }
+    // A green, unarmed PR is a separate handoff condition. It may be waiting
+    // for a human/agent decision and must not be described as an armed queue
+    // item.
+    if !digest.buckets.green_unarmed.is_empty() {
+        alerts.push("merge_queue_idle_with_green_unarmed_work".to_owned());
+    }
+    alerts
 }
 
 fn has_failed_check(checks: &[CheckSnapshot]) -> bool {
@@ -562,7 +603,17 @@ fn has_failed_check(checks: &[CheckSnapshot]) -> bool {
 /// Render a digest as deterministic operator-facing Markdown.
 #[must_use]
 pub fn render_markdown(digest: &QueueDigest) -> String {
-    let mut lines = vec![
+    let mut lines = render_header(digest);
+    append_observers(&mut lines, digest);
+    append_buckets(&mut lines, digest);
+    append_diagnostics(&mut lines, digest);
+    let mut output = lines.join("\n");
+    output.push('\n');
+    output
+}
+
+fn render_header(digest: &QueueDigest) -> Vec<String> {
+    vec![
         format!(
             "# Queue digest ({})",
             if digest.complete {
@@ -572,23 +623,18 @@ pub fn render_markdown(digest: &QueueDigest) -> String {
             }
         ),
         format!("- observers: {}", digest.observers.len()),
-    ];
+        format!(
+            "- queue_idle: {}",
+            digest
+                .queue_idle
+                .map_or_else(|| "unknown".to_owned(), |idle| idle.to_string())
+        ),
+    ]
+}
+
+fn append_observers(lines: &mut Vec<String>, digest: &QueueDigest) {
     for observer in &digest.observers {
-        let incomplete_reasons = if observer.incomplete_reasons.is_empty() {
-            "none".to_owned()
-        } else {
-            observer
-                .incomplete_reasons
-                .iter()
-                .map(|reason| {
-                    serde_json::to_string(reason)
-                        .unwrap_or_else(|_| "unknown".to_owned())
-                        .trim_matches('"')
-                        .to_owned()
-                })
-                .collect::<Vec<_>>()
-                .join(",")
-        };
+        let incomplete_reasons = render_incomplete_reasons(observer);
         lines.push(format!(
             "- `{}` `{}` base `{}`; state `{}`; captured_at={}; age={}s; stale={}; truncated={}; incomplete_reasons={}; file `{}`",
             observer.repo,
@@ -603,6 +649,26 @@ pub fn render_markdown(digest: &QueueDigest) -> String {
             observer.state_file
         ));
     }
+}
+
+fn render_incomplete_reasons(observer: &ObserverDigest) -> String {
+    if observer.incomplete_reasons.is_empty() {
+        return "none".to_owned();
+    }
+    observer
+        .incomplete_reasons
+        .iter()
+        .map(|reason| {
+            serde_json::to_string(reason)
+                .unwrap_or_else(|_| "unknown".to_owned())
+                .trim_matches('"')
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn append_buckets(lines: &mut Vec<String>, digest: &QueueDigest) {
     let buckets = [
         ("queued", &digest.buckets.queued),
         ("armed", &digest.buckets.armed),
@@ -636,6 +702,9 @@ pub fn render_markdown(digest: &QueueDigest) -> String {
             ));
         }
     }
+}
+
+fn append_diagnostics(lines: &mut Vec<String>, digest: &QueueDigest) {
     if digest.errors.is_empty() {
         lines.push("- errors: none".to_owned());
     } else {
@@ -647,9 +716,17 @@ pub fn render_markdown(digest: &QueueDigest) -> String {
                 .map(|error| format!("- **FAIL-CLOSED:** {error}")),
         );
     }
-    let mut output = lines.join("\n");
-    output.push('\n');
-    output
+    if digest.alerts.is_empty() {
+        lines.push("- alerts: none".to_owned());
+    } else {
+        lines.push("## Alerts".to_owned());
+        lines.extend(
+            digest
+                .alerts
+                .iter()
+                .map(|alert| format!("- **ALERT:** {alert}")),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -734,6 +811,11 @@ mod tests {
         write_state(temp.path(), "two.json", &state("o/r2", "release", 2, "red"));
         let digest = read_digest_at(temp.path(), 900, SystemTime::now() + Duration::from_secs(1));
         assert!(digest.complete, "{digest:?}");
+        assert_eq!(digest.queue_idle, Some(true));
+        assert_eq!(
+            digest.alerts,
+            vec!["merge_queue_idle_with_green_unarmed_work".to_owned()]
+        );
         assert_eq!(digest.observers.len(), 2);
         assert_eq!(digest.buckets.green_unarmed[0].number, 1);
         assert_eq!(digest.buckets.red[0].url, "https://github.test/o/r2/pull/2");
@@ -754,6 +836,57 @@ mod tests {
         write_state(temp.path(), "one.json", &value);
         let digest = read_digest_at(temp.path(), u64::MAX, SystemTime::now());
         assert!(digest.complete, "{digest:?}");
+    }
+
+    #[test]
+    fn incomplete_digest_does_not_claim_idle_or_emit_mergeable_work_alert() {
+        let temp = tempfile::tempdir().expect("temp");
+        let digest = read_digest_at(temp.path(), 900, SystemTime::now());
+        assert!(!digest.complete);
+        assert_eq!(digest.queue_idle, None);
+        assert_eq!(digest.alerts, vec!["queue_observer_unavailable".to_owned()]);
+    }
+
+    #[test]
+    fn queued_work_clears_idle_alert() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut queued = state("o/queued", "main", 9, "green_unarmed");
+        queued.snapshot.queue.push(QueueEntrySnapshot {
+            base: "main".to_owned(),
+            pr: 9,
+            position: 1,
+            url: "https://github.test/o/queued/pull/9".to_owned(),
+            pr_head_sha: "h".repeat(40),
+            merge_group_sha: None,
+            enqueued_at: "2026-10-24T00:00:00Z".to_owned(),
+            checks: vec![],
+            receipt_decisions: vec![],
+            test_tier: vec![],
+        });
+        refresh_hashes(&mut queued);
+        write_state(temp.path(), "queued.json", &queued);
+
+        let digest = read_digest_at(temp.path(), 900, SystemTime::now());
+        assert!(digest.complete, "{digest:?}");
+        assert_eq!(digest.queue_idle, Some(false));
+        assert!(digest.alerts.is_empty());
+    }
+
+    #[test]
+    fn armed_work_uses_the_queue_owner_alert() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut armed = state("o/armed", "main", 10, "green_unarmed");
+        armed.snapshot.pull_requests[0].auto_merge = true;
+        refresh_hashes(&mut armed);
+        write_state(temp.path(), "armed.json", &armed);
+
+        let digest = read_digest_at(temp.path(), 900, SystemTime::now());
+        assert!(digest.complete, "{digest:?}");
+        assert_eq!(digest.queue_idle, Some(true));
+        assert_eq!(
+            digest.alerts,
+            vec!["merge_queue_idle_with_pending_work".to_owned()]
+        );
     }
 
     #[test]

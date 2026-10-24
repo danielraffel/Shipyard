@@ -95,6 +95,13 @@ minutes. Treat these as cost proxies only. A safely-merged-change denominator
 requires a durable merge receipt and remains unavailable when the local metrics
 store has only PR/job observations; never substitute distinct PR count.
 
+`shipyard queue-digest --json` exposes `queue_idle` and deterministic `alerts`.
+Treat `merge_queue_idle_with_pending_work` as a supervisor notification for an
+armed-but-not-enqueued PR, and
+`merge_queue_idle_with_green_unarmed_work` as the separate handoff notification
+for a green PR awaiting an arm decision. Neither authorizes enqueue, rerun,
+merge, or any other queue mutation.
+
 GitHub Actions can omit `pull_requests` on `pull_request_target` runs. The
 metrics importer resolves those rows only through the exact commit's
 authoritative pull-request API response, and keeps the identity unknown when
