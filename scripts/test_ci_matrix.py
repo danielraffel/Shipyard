@@ -187,7 +187,7 @@ class CiMatrixTests(unittest.TestCase):
         rows = {row["key"]: row for row in matrix["include"]}
         self.assertEqual(
             json.loads(rows["macos-arm64"]["runs_on_json"]),
-            ["self-hosted", "local-mac", "shipyard-sandbox-m3"],
+            ["self-hosted", "shipyard-sandbox-m3"],
         )
 
     def test_sandbox_local_override_cannot_escape_m3_capability(self) -> None:
@@ -202,7 +202,7 @@ class CiMatrixTests(unittest.TestCase):
         rows = {row["key"]: row for row in matrix["include"]}
         self.assertEqual(
             json.loads(rows["macos-arm64"]["runs_on_json"]),
-            ["self-hosted", "studio", "shipyard-sandbox-m3"],
+            ["self-hosted", "shipyard-sandbox-m3"],
         )
 
     FORK_PR = {
@@ -289,7 +289,7 @@ class CiMatrixTests(unittest.TestCase):
         }
         trusted = (
             {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main"},
-            {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/topic"},
+            {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main"},
         )
         untrusted = (
             {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/7/merge"},
@@ -297,6 +297,10 @@ class CiMatrixTests(unittest.TestCase):
             {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/heads/main"},
             {"GITHUB_EVENT_NAME": "pull_request_target", "GITHUB_REF": "refs/heads/main"},
             {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/topic"},
+            # A dispatch can run any branch's code; only main is trusted.
+            {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/topic"},
+            {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/tags/v1.0.0"},
+            {"GITHUB_EVENT_NAME": "workflow_dispatch"},
             {"GITHUB_EVENT_NAME": "merge_group", "GITHUB_REF": "refs/heads/main"},
             {},
         )
@@ -310,7 +314,7 @@ class CiMatrixTests(unittest.TestCase):
                 }
                 self.assertEqual(
                     json.loads(rows["macos-arm64"]["runs_on_json"]),
-                    ["self-hosted", "local-mac", "shipyard-sandbox-m3"],
+                    ["self-hosted", "shipyard-sandbox-m3"],
                 )
                 self.assertEqual(ci_matrix.skipped_notices("sandbox-e2e", env), [])
         for context in untrusted:

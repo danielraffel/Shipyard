@@ -9,7 +9,7 @@ to github-hosted for targets with no local box. Workflow inputs or repository
 variables can override defaults without editing YAML. A pull request from a
 fork never resolves to a self-hosted runner: those legs are skipped. The
 self-hosted macOS Sandbox leg (the M3 canary) runs only for trusted code: a
-push to main or a workflow_dispatch. Every pull request skips it.
+push to main or a workflow_dispatch of main. Every pull request skips it.
 """
 
 from __future__ import annotations
@@ -163,14 +163,14 @@ def is_trusted_sandbox_event(env: Mapping[str, str]) -> bool:
     """True when the run may use the M3 Sandbox canary runner.
 
     That runner is the owner's GUI session beside the production daemon, so
-    only code already on main (a push to main) or a run a maintainer started
-    (workflow_dispatch) may land there. Any other event, same-repo pull
-    requests included, is untrusted.
+    only code on main may land there: a push to main, or a workflow_dispatch
+    of main (a dispatch can name any branch). Any other event or ref, same-repo
+    pull requests included, is untrusted.
     """
-    event = _env(env, "GITHUB_EVENT_NAME")
-    if event == "workflow_dispatch":
-        return True
-    return event == "push" and _env(env, "GITHUB_REF") == "refs/heads/main"
+    return (
+        _env(env, "GITHUB_EVENT_NAME") in {"push", "workflow_dispatch"}
+        and _env(env, "GITHUB_REF") == "refs/heads/main"
+    )
 
 
 def _is_self_hosted(provider: str, selector: str) -> bool:
@@ -258,7 +258,7 @@ def workflow_matrix(workflow: str, env: Mapping[str, str] = os.environ) -> dict[
             continue
         if _is_untrusted_sandbox_canary(workflow, row, env):
             # Dropped, not moved to GitHub-hosted: no check run is created,
-            # so nothing is left pending. Push to main or dispatch to run it.
+            # so nothing is left pending. Push to main or dispatch main to run it.
             continue
         if workflow == "sandbox-e2e" and target_key == "macos-arm64" and row["provider"] == "local":
             selector = json.loads(row["runs_on_json"])
@@ -266,9 +266,11 @@ def workflow_matrix(workflow: str, env: Mapping[str, str] = os.environ) -> dict[
                 raise SystemExit(
                     "the local Sandbox M3 canary requires a self-hosted label array"
                 )
-            if SANDBOX_M3_CAPABILITY_LABEL not in selector:
-                selector.append(SANDBOX_M3_CAPABILITY_LABEL)
-            row["runs_on_json"] = json.dumps(selector, separators=(",", ":"))
+            # Exactly these two labels: the M3 canary runner carries only the
+            # shipyard-sandbox* labels, not local-mac or a host override.
+            row["runs_on_json"] = json.dumps(
+                ["self-hosted", SANDBOX_M3_CAPABILITY_LABEL], separators=(",", ":")
+            )
         if workflow in {"package-smoke", "release"}:
             row.update(PACKAGE_ROWS[target_key])
             row["name"] = f"{row['name']} package"
@@ -299,9 +301,8 @@ def skipped_notices(workflow: str, env: Mapping[str, str] = os.environ) -> list[
         elif _is_untrusted_sandbox_canary(workflow, row, env):
             notices.append(
                 f"::notice title=Sandbox M3 canary::Skipped {name}: the self-hosted "
-                "Sandbox canary runs only for a push to main or a workflow_dispatch, "
-                "never for a pull request. A maintainer can dispatch Sandbox E2E on "
-                "the branch to run it."
+                "Sandbox canary runs only for a push to main or a workflow_dispatch "
+                "of main, never for a pull request or another branch."
             )
     return notices
 

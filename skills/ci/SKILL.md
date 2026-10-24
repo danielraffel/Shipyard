@@ -1641,19 +1641,27 @@ setting (all external contributors), which must stay on.
 **The Sandbox M3 canary runs only for trusted code.** The self-hosted macOS
 leg of `sandbox-e2e.yml` runs as the M3 owner, in the owner's GUI session
 beside the production daemon (it `launchctl bootstrap`s into `gui/$(id -u)`).
-`scripts/ci_matrix.py` (`is_trusted_sandbox_event`) keeps that leg only for a
-`push` to `refs/heads/main` or a `workflow_dispatch`. Every other event, a
-same-repo pull request included, drops it from the matrix with a
+`scripts/ci_matrix.py` (`is_trusted_sandbox_event`) keeps that leg only when
+`GITHUB_REF` is `refs/heads/main` and the event is a `push` or a
+`workflow_dispatch` (a dispatch can name any branch, so a dispatch of another
+ref is untrusted too). Every other event or ref, a same-repo pull request
+included, drops it from the matrix with a
 `::notice title=Sandbox M3 canary::`; the Linux leg and a GitHub-hosted macOS
 leg are unaffected, and `ci.yml` is unaffected. A dropped leg creates no check
 run, so nothing waits on a pending `Sandbox macOS ARM64 [local]`; no ruleset or
-branch protection on Shipyard's `main` requires it. To run the canary on a
-branch, dispatch Sandbox E2E on it
-(`gh workflow run sandbox-e2e.yml --ref <branch> -f runner_provider=local`).
-On M3 the canary runs on the owner runner `Shipyard-studio-02-sandbox`
-(labels `shipyard-sandbox*` only); `fleet-move-runner` splits it off
+branch protection on Shipyard's `main` requires it. Branch code reaches the
+canary only after it merges; to rerun it on main, dispatch Sandbox E2E on
+main (`gh workflow run sandbox-e2e.yml --ref main -f runner_provider=local`).
+The local selector is exactly `["self-hosted","shipyard-sandbox-m3"]`; a
+`LOCAL_MACOS_ARM64_RUNS_ON_JSON` or dispatch selector does not change it. On
+M3 the canary runs on the owner runner `Shipyard-studio-02-sandbox` (labels
+`shipyard-sandbox*` only, no `local-mac`); `fleet-move-runner` splits it off
 `Shipyard-studio-02`, which moves to the `ci` user without those labels. The
-workflow's runner-name guard accepts both names.
+workflow's runner-name guard accepts both names. The workflow-side gate is
+not the boundary, since a pull request can edit the workflow: the sandbox
+runner's own job-started hook (`ACTIONS_RUNNER_HOOK_JOB_STARTED`, installed
+by `fleet-move-runner` in the runner folder) fails any job that is not a push
+or dispatch of `danielraffel/Shipyard` `refs/heads/main`.
 
 **The macOS signing job builds with fresh Rust homes.** `sign-and-upload-macos`
 points `CARGO_HOME` and `RUSTUP_HOME` at new directories under `RUNNER_TEMP`
