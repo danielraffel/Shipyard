@@ -137,6 +137,11 @@ shipyard pr-watch rules-replay --repo Generous-Corp/pulp --since 2d --tick 5m --
 shipyard watch                 # live-tail an in-flight ship
 shipyard watch local --target linux-vm --command '<cmd>' --milestone-regex '<re>' --terminal-regex '<re>'
 shipyard queue                 # show all jobs with priorities
+shipyard queue triage --repo OWNER/REPO [--apply]          # cancel PR runs that cannot merge at their head (superseded,
+                                                            #   conflicting, required check failed); prioritizes the one PR
+                                                            #   that says it fixes a check red on the base; records a restore ledger
+shipyard queue prioritize --pr N --repo OWNER/REPO [--apply] # cancel queued, not-started PR runs ahead of N on shared runner labels
+shipyard queue resume [--repo OWNER/REPO] [--apply]         # re-run ledger entries still open, same head, no longer doomed
 shipyard logs <id>             # per-target logs
 shipyard logs <id> --target windows
 shipyard --json logs <id>      # typed availability/lifecycle metadata, not log content

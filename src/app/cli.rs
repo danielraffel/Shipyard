@@ -253,8 +253,12 @@ pub(super) enum Command {
         /// New priority.
         priority: QueuePriority,
     },
-    /// Show all jobs in the queue.
-    Queue,
+    /// Show all jobs in the queue, or triage a repository's GitHub CI backlog.
+    Queue {
+        /// Backlog subcommand. Omit to show Shipyard's local job queue.
+        #[command(subcommand)]
+        command: Option<QueueCommand>,
+    },
     /// Hold local queue admission while an exact child mutates runner state.
     #[command(name = "queue-hold")]
     QueueHold {
@@ -979,6 +983,81 @@ pub(super) enum MergeQueueCommand {
         /// Human-readable reconciliation evidence.
         #[arg(long)]
         reason: String,
+    },
+}
+
+/// Keep a pull-request CI backlog draining on a small runner pool.
+///
+/// Every subcommand is a dry run unless `--apply` is passed. Cancelled runs are
+/// recorded in a restore ledger under the state directory, and `resume`
+/// re-runs them once they can help their pull request merge again.
+#[derive(Debug, Subcommand)]
+pub(super) enum QueueCommand {
+    /// Cancel workflow runs that cannot help their pull request merge.
+    ///
+    /// A pull-request run is doomed when its head is no longer the pull
+    /// request's head, the pull request conflicts with its base, or a required
+    /// check already failed on that head. Merge-group, push, and scheduled
+    /// runs are never touched. When a required check is red on the base and
+    /// exactly one open pull request says it fixes it, that pull request is
+    /// prioritized too.
+    Triage {
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Base branch whose open pull requests own the runs.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Report the unblocking fix but do not prioritize it.
+        #[arg(long = "no-prioritize-unblocking")]
+        no_prioritize_unblocking: bool,
+        /// Cancel doomed runs and record them in the restore ledger.
+        #[arg(long)]
+        apply: bool,
+        /// Override the restore-ledger path. Test hook.
+        #[arg(long = "ledger", hide = true)]
+        ledger: Option<PathBuf>,
+    },
+    /// Move one pull request's waiting jobs to the front of the runner queue.
+    ///
+    /// Cancels pull-request runs whose waiting jobs queued earlier on a
+    /// compatible runner label set. A run with any job already in progress is
+    /// never cancelled. Cancelled runs are recorded for `queue resume`.
+    Prioritize {
+        /// Pull request to move to the front.
+        #[arg(long)]
+        pr: u64,
+        /// Owner/repo slug. Defaults to the current checkout's repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Base branch the pull request targets.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Cancel the yielding runs and record them in the restore ledger.
+        #[arg(long)]
+        apply: bool,
+        /// Override the restore-ledger path. Test hook.
+        #[arg(long = "ledger", hide = true)]
+        ledger: Option<PathBuf>,
+    },
+    /// Re-run recorded runs that can help their pull request merge again.
+    ///
+    /// An entry is re-run when its pull request is still open at the same head
+    /// and no longer doomed, then cleared. Entries whose pull request closed or
+    /// advanced are cleared without a re-run; still-doomed entries are kept.
+    Resume {
+        /// Owner/repo slug. Defaults to every repository in the ledger.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Base branch the recorded pull requests target.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Re-run and clear entries. Without this flag, only report.
+        #[arg(long)]
+        apply: bool,
+        /// Override the restore-ledger path. Test hook.
+        #[arg(long = "ledger", hide = true)]
+        ledger: Option<PathBuf>,
     },
 }
 
@@ -4199,6 +4278,58 @@ mod tests {
                     fd: 9,
                     ..
                 }
+            }
+        ));
+    }
+
+    #[test]
+    fn bare_queue_still_lists_local_jobs_and_drain_subcommands_parse() {
+        let bare = Cli::try_parse_from(["shipyard", "queue"]).expect("bare queue");
+        assert!(matches!(bare.command, Command::Queue { command: None }));
+
+        let triage = Cli::try_parse_from([
+            "shipyard",
+            "queue",
+            "triage",
+            "--repo",
+            "owner/repo",
+            "--apply",
+        ])
+        .expect("triage");
+        assert!(matches!(
+            triage.command,
+            Command::Queue {
+                command: Some(super::QueueCommand::Triage {
+                    apply: true,
+                    no_prioritize_unblocking: false,
+                    ..
+                })
+            }
+        ));
+
+        let prioritize = Cli::try_parse_from(["shipyard", "queue", "prioritize", "--pr", "10931"])
+            .expect("prioritize");
+        assert!(matches!(
+            prioritize.command,
+            Command::Queue {
+                command: Some(super::QueueCommand::Prioritize {
+                    pr: 10931,
+                    apply: false,
+                    ..
+                })
+            }
+        ));
+        assert!(Cli::try_parse_from(["shipyard", "queue", "prioritize"]).is_err());
+
+        let resume = Cli::try_parse_from(["shipyard", "queue", "resume"]).expect("resume");
+        assert!(matches!(
+            resume.command,
+            Command::Queue {
+                command: Some(super::QueueCommand::Resume {
+                    repo: None,
+                    apply: false,
+                    ..
+                })
             }
         ));
     }

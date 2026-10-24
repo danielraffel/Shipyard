@@ -419,13 +419,25 @@ where
                 stdout,
             );
         }
+        Command::Queue {
+            command: Some(command),
+        } => {
+            return handle_queue_drain_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths,
+                cli.json,
+                stdout,
+            );
+        }
         command @ (Command::Status
         | Command::Evidence { .. }
         | Command::Logs { .. }
         | Command::Cancel { .. }
         | Command::QueueReconcileOrphan { .. }
         | Command::Bump { .. }
-        | Command::Queue
+        | Command::Queue { command: None }
         | Command::Cleanup { .. }) => {
             return handle_state_command(
                 command,
@@ -890,7 +902,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Cancel { .. }
         | Command::QueueReconcileOrphan { .. }
         | Command::Bump { .. }
-        | Command::Queue
+        | Command::Queue { .. }
         | Command::QueueHold { .. }
         | Command::QueueObserve { .. }
         | Command::QueueDigest { .. }
@@ -932,6 +944,88 @@ fn handle_rescue_variant<W: Write>(
     let config = LoadedConfig::load_from_cwd(mode, cwd)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     rescue_command(&args, &config, cwd, state_root, json, stdout)
+}
+
+fn handle_queue_drain_command<W: Write>(
+    command: self::cli::QueueCommand,
+    mode: RuntimeMode,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json: bool,
+    stdout: &mut W,
+) -> Result<ExitCode, CliFailure> {
+    use self::cli::QueueCommand;
+    use self::merge_steward_cmd::queue_drain::{
+        QueueDrainArgs, QueueDrainRuntime, queue_prioritize_command, queue_resume_command,
+        queue_triage_command,
+    };
+    let config = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
+        mode,
+        cwd,
+        runtime_paths.global_dir.clone(),
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config);
+    let runtime = QueueDrainRuntime {
+        cwd,
+        mode,
+        runtime_paths,
+        actions: &actions,
+    };
+    match command {
+        QueueCommand::Triage {
+            repo,
+            base,
+            no_prioritize_unblocking,
+            apply,
+            ledger,
+        } => queue_triage_command(
+            &QueueDrainArgs {
+                repo,
+                base,
+                apply,
+                ledger,
+            },
+            !no_prioritize_unblocking,
+            &runtime,
+            json,
+            stdout,
+        ),
+        QueueCommand::Prioritize {
+            pr,
+            repo,
+            base,
+            apply,
+            ledger,
+        } => queue_prioritize_command(
+            &QueueDrainArgs {
+                repo,
+                base,
+                apply,
+                ledger,
+            },
+            pr,
+            &runtime,
+            json,
+            stdout,
+        ),
+        QueueCommand::Resume {
+            repo,
+            base,
+            apply,
+            ledger,
+        } => queue_resume_command(
+            &QueueDrainArgs {
+                repo,
+                base,
+                apply,
+                ledger,
+            },
+            &runtime,
+            json,
+            stdout,
+        ),
+    }
 }
 
 fn handle_setup_command<W: Write>(
@@ -1011,7 +1105,7 @@ fn handle_state_command<W: Write>(
         Command::Bump { job_id, priority } => {
             bump_command(&job_id, priority, state_dir, json, stdout)
         }
-        Command::Queue => queue_command(state_dir, json, stdout),
+        Command::Queue { .. } => queue_command(state_dir, json, stdout),
         Command::Cleanup {
             validation_tmp: true,
             dry_run,

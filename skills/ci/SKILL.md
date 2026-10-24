@@ -909,6 +909,8 @@ PRs are gone.
 | Live-tail the active ship | `shipyard watch` (or `shipyard watch --pr <n>`) |
 | One-shot snapshot | `shipyard watch --no-follow --json` |
 | Watch a long local/SSH VM build | `shipyard watch local --target <name> --command '<cmd>' --milestone-regex '<re>' --terminal-regex '<re>'` |
+| Drain a backed-up PR CI queue | `shipyard queue triage --repo OWNER/REPO --apply --json`, then later `shipyard queue resume --repo OWNER/REPO --apply --json` (see [Draining a GitHub CI backlog](#draining-a-github-ci-backlog-triage-prioritize-the-fix-resume)) |
+| Move one PR's waiting jobs to the front | `shipyard queue prioritize --pr <n> --repo OWNER/REPO --apply --json` |
 | Merge on green (cron-safe one-shot) | `shipyard auto-merge <pr>` (0=merged, 1=fail, 2=not-found, 3=in-flight, 10=automatic classic merge refused) |
 | Diagnose RELEASE_BOT_TOKEN | `shipyard release-bot status --json` |
 | Configure RELEASE_BOT_TOKEN | `shipyard release-bot setup` (guided) |
@@ -2666,6 +2668,64 @@ authority and `HOLD` state, but it never acquires a mutation lease or calls a
 GitHub mutation. Its state file, append-only transition log, and exclusive lock
 provide a durable handoff boundary for queue-monitor agents. See
 [`docs/queue-observer.md`](../../docs/queue-observer.md).
+
+### Draining a GitHub CI backlog: triage, prioritize the fix, resume
+
+When a repository's pull-request runs pile up behind a small self-hosted pool,
+do not let runs that cannot land hold slots, and do not let the fix that turns
+a red base green wait behind them. The default play is three commands, each a
+dry run until `--apply`:
+
+```bash
+shipyard queue triage --repo OWNER/REPO --json            # read the plan
+shipyard queue triage --repo OWNER/REPO --apply --json    # cancel doomed runs
+shipyard queue prioritize --pr N --repo OWNER/REPO --apply --json  # only if triage could not pick the fix
+shipyard queue resume --repo OWNER/REPO --apply --json    # later: re-run what is restorable
+```
+
+- **triage** marks a `pull_request` run *doomed* when its head is no longer
+  the pull request's head, the pull request is `DIRTY`/`CONFLICTING`, or a
+  required check (classic protection plus rulesets) already concluded
+  `failure`/`action_required` on that head. Transient conclusions
+  (`cancelled`, `timed_out`, `startup_failure`, `stale`) and a failure produced
+  by the run itself (a queued re-run) never doom a run. Merge-group, push, and
+  scheduled runs are never touched. With `--apply` it cancels doomed runs,
+  queued and in progress, because none of them can let their pull request
+  merge at that head.
+- triage also reads the base head's checks. When a required context is red on
+  the base, an open pull request that names that context next to a fix word
+  (`fix`, `unblock`, `repair`, `restore`, `revert`) in its title or
+  description, or that carries the `shipyard:unblock` label, is an unblocking
+  candidate. With exactly one candidate, triage prioritizes it in the same
+  pass. With several, it lists them and you choose with `queue prioritize`.
+  `--no-prioritize-unblocking` reports without jumping.
+- **prioritize** cancels other pull requests' runs whose waiting jobs queued
+  before the target's waiting jobs on a compatible runner label set (one set
+  contains the other). A run with **any job in progress is never cancelled**;
+  it is reported under `kept`. Each run's jobs are re-read immediately before
+  its cancel, so a job that started in the meantime keeps its run. The command
+  refuses (exit 2) a draft, conflicting, superseded, or already-failed target,
+  or one with nothing waiting.
+- Every cancel is written to the restore ledger
+  (`<state_dir>/queue-drain.json`) *before* GitHub is asked, and rolled back
+  when GitHub refuses. **resume** re-runs an entry's cancelled jobs
+  (`rerun-failed-jobs`, so jobs that already passed are kept) when its pull
+  request is still open at the same head and no longer doomed, then clears it.
+  Entries whose pull request closed or advanced are cleared without a re-run;
+  still-conflicting or still-failed entries stay for a later resume. A re-run
+  queues behind the prioritized fix because its jobs get a new queue time.
+- **Merge-queue landing always beats PR-head CI.** No subcommand ever
+  cancels, re-runs, or yields a `merge_group` run (by event or by a
+  `gh-readonly-queue/*` branch), a push run, or any run of a pull request that
+  holds a merge-queue entry. Enqueued pull requests are reported as
+  `in_merge_queue` (triage), `kept` (prioritize), or `hold_for_merge_queue`
+  (resume), and `prioritize` refuses an enqueued target. Membership is
+  re-read right before every cancel and re-run, so a pull request enqueued
+  mid-pass keeps its runs.
+- Mutations hold the same merge-queue mutation guard as the steward:
+  `--apply` works only on the configured `merge_queue.mutation_machine`, and
+  `shipyard merge-queue hold` stops it. All GitHub reads and writes use the
+  configured GitHub App token path, never the personal `gh` login.
 
 ### Durable agent handoff boundary
 
