@@ -314,7 +314,7 @@ class CollectorInvocationTests(unittest.TestCase):
             shipyard.write_text("#!/bin/sh\ncase \"$*\" in *metrics*import*) echo '{\"imported\": 1}';; *) echo '{\"job_samples\": 1}';; esac\n")
             tartci.write_text("#!/bin/sh\necho '{\"project\":\"pulp\",\"repo\":\"o/pulp\",\"provider\":\"tart\",\"external_id\":\"fixture-1\"}'\n")
             merge_receipts = root / "merge-receipts.jsonl"
-            merge_receipts.write_text("{}\n")
+            merge_receipts.write_text(json.dumps({"repo": "o/pulp"}) + "\n")
             shipyard.chmod(0o755); tartci.chmod(0o755)
             args = type("Args", (), {"db": db, "state": root / "state.json", "project": "pulp", "repo": "o/pulp", "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5, "timeout_seconds": 5})()
             args.merge_receipts = merge_receipts
@@ -354,7 +354,7 @@ class CollectorInvocationTests(unittest.TestCase):
             shipyard = root / "shipyard"; tartci = root / "tartci"; receipts = root / "receipts.jsonl"
             shipyard.write_text("#!/bin/sh\ncase \"$*\" in *merge-receipt*) echo 'bad receipt' >&2; exit 1;; *metrics*import*) echo '{\"imported\": 1}';; *) echo '{}';; esac\n")
             tartci.write_text("#!/bin/sh\necho '{\"project\":\"p\",\"repo\":\"o/p\",\"provider\":\"tart\",\"external_id\":\"fixture-1\"}'\n")
-            receipts.write_text("ignored\n")
+            receipts.write_text(json.dumps({"repo": "o/p"}) + "\n")
             shipyard.chmod(0o755); tartci.chmod(0o755)
             args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p", "repo": "o/p",
                 "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5,
@@ -362,6 +362,13 @@ class CollectorInvocationTests(unittest.TestCase):
             args.state.write_text("{}")
             with self.assertRaisesRegex(RuntimeError, "merge receipt import failed"):
                 MOD.import_organic(args)
+
+    def test_collect_rejects_merge_receipt_for_another_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipts.jsonl"
+            path.write_text(json.dumps({"repo": "other/repo"}) + "\n")
+            with self.assertRaisesRegex(RuntimeError, "repository other than"):
+                MOD.validate_merge_receipt_scope(path, "owner/repo")
 
 if __name__ == "__main__":
     unittest.main()

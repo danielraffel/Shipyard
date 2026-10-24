@@ -955,6 +955,67 @@ impl MetricsStore {
         Ok(imported)
     }
 
+    /// Export validated producer receipts for one exact repository. The
+    /// caller owns the handoff destination; this method never infers receipts
+    /// from GitHub or creates new records.
+    pub fn export_merge_receipts(
+        &self,
+        repo: &str,
+    ) -> Result<Vec<crate::metrics::merge_receipt::MergeReceipt>, Box<dyn std::error::Error>> {
+        let repo = crate::evidence::canonical_repository(repo);
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            "SELECT schema,receipt_id,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence
+             FROM merge_receipts WHERE lower(trim(repo)) = lower(trim(?1)) ORDER BY merged_at, receipt_id",
+        )?;
+        let rows = statement.query_map([repo], |row| {
+            let required_checks_json: String = row.get(12)?;
+            let required_checks = serde_json::from_str(&required_checks_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    12,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let merged_at_text: String = row.get(9)?;
+            let merged_at = DateTime::parse_from_rfc3339(&merged_at_text)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        9,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?
+                .with_timezone(&Utc);
+            Ok(crate::metrics::merge_receipt::MergeReceipt {
+                schema: row.get(0)?,
+                receipt_id: row.get(1)?,
+                repo: row.get(2)?,
+                project: row.get(3)?,
+                base_branch: row.get(4)?,
+                pr: row.get(5)?,
+                head_sha: row.get(6)?,
+                validated_head_sha: row.get(7)?,
+                merge_commit_sha: row.get(8)?,
+                merged_at,
+                safe_merge: row.get::<_, i64>(10)? == 1,
+                source: row.get(11)?,
+                required_checks,
+                gate_receipt_sha256: row.get(13)?,
+                evidence: row.get(14)?,
+            })
+        })?;
+        let mut receipts = Vec::new();
+        for row in rows {
+            let receipt = row?;
+            receipt
+                .validate()
+                .map_err(|error| format!("stored merge receipt is invalid: {error}"))?;
+            receipts.push(receipt);
+        }
+        Ok(receipts)
+    }
+
     /// Count safe merged heads and the failed/cancelled compute attached to
     /// those exact PR identities in the scorecard window.
     pub(crate) fn safe_merge_summary(
@@ -3557,6 +3618,38 @@ mod tests {
         let mut changed = first;
         changed.evidence = "sha256:changed".into();
         assert!(store.import_merge_receipts(&[changed]).is_err());
+    }
+
+    #[test]
+    fn merge_receipt_export_filters_exact_repository_and_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let first = test_receipt("export-1", "OWNER/REPO", "repo", 1, 'a');
+        let other = test_receipt("export-2", "other/repo", "repo", 2, 'd');
+        store
+            .import_merge_receipts(&[first.clone(), other])
+            .unwrap();
+
+        let exported = store.export_merge_receipts("owner/repo").unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].receipt_id, first.receipt_id);
+        assert_eq!(exported[0].repo, "owner/repo");
+        assert_eq!(exported[0].project, "repo");
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_receipts SET safe_merge = 2 WHERE receipt_id = 'export-1'",
+                [],
+            )
+            .unwrap();
+        assert!(store.export_merge_receipts("owner/repo").is_err());
+        assert!(
+            store
+                .export_merge_receipts("missing/repo")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

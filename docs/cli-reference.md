@@ -149,6 +149,7 @@ shipyard evidence command --list
 shipyard metrics record --project pulp --job linux-arm64 --step compile --duration 18.4s --target linux-arm64 --backend local --provider tart-linux --host macstudio
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
+shipyard metrics export merge-receipt --repo Generous-Corp/pulp --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
 shipyard metrics summary --project pulp --json
 shipyard metrics repeated-work-cost --limit 1000 --json
 shipyard metrics summary --project pulp --group-by host --json   # fold ephemeral runners into their host
@@ -507,6 +508,12 @@ and provider-neutral:
 - `shipyard metrics import tartci` imports JSON/JSONL from
   `tartci runtime export` when a project uses tartci VM lanes.
 - `shipyard metrics import merge-receipt --file <path>` imports validated `shipyard-merge-receipt/v1` JSON/JSONL; invalid or unavailable provenance stays fail-closed.
+- `shipyard metrics export merge-receipt --repo <owner/repo> --file <path>` writes the
+  producer's already-validated receipts for exactly that repository as an atomic
+  JSONL handoff. It reads only the local `merge_receipts` store; it never queries
+  GitHub or manufactures receipts. An empty export fails closed without
+  replacing the destination, so the downstream cannot record a false
+  successful handoff.
 
 GitHub imports retain the workflow event, provider run ID, run attempt, and
 authoritative head SHA on the SQLite run row. These dimensions are independent:
