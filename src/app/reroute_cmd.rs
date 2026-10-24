@@ -28,7 +28,8 @@ use serde_json::Value;
 
 use super::CliFailure;
 use crate::capacity::{
-    HostCapacity, any_unreadable, gather_configured_host_capacities, parse_host_classes, total_free,
+    HostCapacity, any_unreadable, configured_host_classes, gather_configured_host_capacities,
+    total_free,
 };
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
@@ -92,7 +93,7 @@ pub(super) fn reroute_watch_command<W: Write>(
         }
     }
 
-    let classes = parse_host_classes(&config.data).map_err(|e| CliFailure::new(2, e))?;
+    let classes = configured_host_classes(config).map_err(|e| CliFailure::new(2, e))?;
     if classes.is_empty() {
         return Err(CliFailure::new(
             1,
@@ -146,8 +147,7 @@ fn tick<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<(), CliFailure> {
-    let hosts =
-        gather_configured_host_capacities(&config.data).map_err(|e| CliFailure::new(2, e))?;
+    let hosts = gather_configured_host_capacities(config).map_err(|e| CliFailure::new(2, e))?;
     let free = total_free(&hosts);
     let unreadable = any_unreadable(&hosts);
     let candidates = list_cloud_queued_macos(actions, repo, &args.target)?;

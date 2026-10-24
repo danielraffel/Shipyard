@@ -21,9 +21,8 @@ use sha2::{Digest, Sha256};
 
 use super::CliFailure;
 use crate::capacity::{
-    HostCapacity, HostClassConfig, REMOTE_OBSERVER_PATH, any_unreadable,
-    observer_ssh_probe_options, parse_host_classes, probe_host_capacity_until,
-    remote_observer_command, total_free,
+    HostCapacity, HostClassConfig, REMOTE_OBSERVER_PATH, any_unreadable, configured_host_classes,
+    observer_ssh_probe_options, probe_host_capacity_until, remote_observer_command, total_free,
 };
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
@@ -128,7 +127,7 @@ pub(super) fn collect_fleet_assessment(
     actions: &GitHubActions,
 ) -> Result<FleetAssessment, CliFailure> {
     let repo = super::runner_cmd::resolve_repo_slug(args.repo, cwd)?;
-    let classes = parse_host_classes(&config.data).map_err(|e| CliFailure::new(2, e))?;
+    let classes = configured_host_classes(config).map_err(|e| CliFailure::new(2, e))?;
     if classes.is_empty() {
         return Err(CliFailure::new(
             1,

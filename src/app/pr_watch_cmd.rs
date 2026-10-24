@@ -30,6 +30,15 @@ use crate::pr_watch::{WatchQuery, gather, ledger, wakes};
 /// Per-request bound. Observation must never strand the invoking agent.
 pub(super) const GITHUB_READ_TIMEOUT: StdDuration = StdDuration::from_mins(2);
 
+/// `[pr_watch]` keys that name a program this machine runs (the digest
+/// command, the cmux binary) or a host it reaches over SSH. The daemon reads
+/// only machine-global config; the command must not let a branch set them.
+const MACHINE_ONLY_PR_WATCH_KEYS: &[&str] = &[
+    "pr_watch.digest.command",
+    "pr_watch.handback.cmux_path",
+    "pr_watch.handback.hosts",
+];
+
 pub(super) fn pr_watch_command<W: Write>(
     command: PrWatchCommand,
     config: &LoadedConfig,
@@ -38,6 +47,9 @@ pub(super) fn pr_watch_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    config
+        .refuse_repository_controlled(MACHINE_ONLY_PR_WATCH_KEYS)
+        .map_err(|error| CliFailure::new(WAIT_EXIT_INVALID, format!("[pr_watch]: {error}")))?;
     let watch = WatchConfig::from_config(config)
         .map_err(|error| CliFailure::new(WAIT_EXIT_INVALID, format!("[pr_watch]: {error}")))?;
     for warning in &watch.warnings {
@@ -926,4 +938,93 @@ fn digest_command<W: Write>(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(all(test, unix))]
+mod machine_only_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    use tempfile::TempDir;
+
+    use super::pr_watch_command;
+    use crate::app::cli::{PrWatchCommand, PrWatchDigestArgs};
+    use crate::config::{LoadedConfig, LocalOverlaySource};
+    use crate::identity::RuntimeMode;
+    use crate::paths::RuntimePaths;
+    use crate::platform::Platform;
+
+    const LEDGER: &str = r#"{"schema":"shipyard.pr-watch.ledger/v1","repo":"o/r","base":"main","entries":{"1:red_while_armed:h":{"pr":1,"kind":"red_while_armed","key":"h","title":"t","url":"https://github.com/o/r/pull/1","verdict":"v","evidence":"e","head_sha":"h","first_seen_at":"2020-01-01T00:00:00Z","last_seen_at":"2020-01-01T00:00:00Z","addressed_at":null,"addressed_reason":null,"digested_at":null}},"comments":{},"last_scan_at":null,"last_digest_at":null,"digest_claim":null}"#;
+
+    /// Post a digest whose `[pr_watch.digest] command` leaves a marker, set in
+    /// the tracked project file (`tracked`) or the machine-global config.
+    fn post_digest(tracked: bool) -> (TempDir, PathBuf, Result<(), String>) {
+        let sandbox = TempDir::new().expect("tempdir");
+        let root = sandbox.path();
+        let (repo, global) = (root.join("repo"), root.join("global"));
+        std::fs::create_dir_all(repo.join(".shipyard")).expect("project dir");
+        std::fs::create_dir_all(&global).expect("global dir");
+        let marker = root.join("MARKER");
+        let command = root.join("digest");
+        std::fs::write(
+            &command,
+            format!("#!/bin/sh\ncat >/dev/null\ntouch '{}'\n", marker.display()),
+        )
+        .expect("write command");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let layer = if tracked {
+            repo.join(".shipyard/config.toml")
+        } else {
+            global.join("config.toml")
+        };
+        std::fs::write(
+            layer,
+            format!("[pr_watch.digest]\ncommand = [\"{}\"]\n", command.display()),
+        )
+        .expect("write layer");
+        let ledger = root.join("ledger.json");
+        std::fs::write(&ledger, LEDGER).expect("write ledger");
+        let config = LoadedConfig::load(
+            Some(global),
+            Some(repo.join(".shipyard")),
+            None,
+            LocalOverlaySource::None,
+        )
+        .expect("load");
+        let paths = RuntimePaths::for_platform(Platform::current(), root, RuntimeMode::Shipyard);
+        let result = pr_watch_command(
+            PrWatchCommand::Digest(PrWatchDigestArgs {
+                repo: Some("o/r".to_owned()),
+                base: None,
+                post: true,
+                state_file: Some(ledger),
+            }),
+            &config,
+            Path::new(&repo),
+            &paths,
+            true,
+            &mut Vec::new(),
+        )
+        .map(|_| ())
+        .map_err(|failure| failure.message);
+        (sandbox, marker, result)
+    }
+
+    #[test]
+    fn tracked_digest_command_is_refused_before_it_runs() {
+        let (_sandbox, marker, result) = post_digest(true);
+        let error = result.expect_err("refused");
+        assert!(
+            error.contains("a tracked layer may not set pr_watch.digest.command"),
+            "{error}"
+        );
+        assert!(!marker.exists(), "the tracked digest command must not run");
+    }
+
+    #[test]
+    fn machine_global_digest_command_still_delivers() {
+        let (_sandbox, marker, result) = post_digest(false);
+        result.expect("delivered");
+        assert!(marker.exists(), "control: the configured command ran");
+    }
 }

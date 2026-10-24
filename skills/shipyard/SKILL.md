@@ -897,7 +897,12 @@ PR=FLAGS --control merged-clean` runs the same rules over a past window. The
 daemon job is off unless `[pr_watch] enabled = true`; its digest is off unless
 `[pr_watch.digest] enabled = true` (never `[pr_watch] digest = true` beside a
 `[pr_watch.digest]` table: TOML rejects a key that is both, and a table without
-`enabled` stays off with a warning in the `pr_watch_pass` event). See
+`enabled` stays off with a warning in the `pr_watch_pass` event). The keys that
+name what this machine runs or reaches, `[pr_watch.digest] command`,
+`[pr_watch.handback] cmux_path` and `[pr_watch.handback.hosts]`, belong in the
+machine-global config or an untracked `.shipyard.local/config.toml`: every
+`pr-watch` subcommand refuses them in `.shipyard/config.toml` or a committed
+`.shipyard.local/config.toml`, naming the file, before anything runs. See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
 `shipyard pr-watch rules` is the rules-first watcher: one JSONL event per new
@@ -1906,7 +1911,12 @@ on the machine — not the tracked project config. A tracked layer may not set
 github.auth: `.shipyard/config.toml`, or a `.shipyard.local/config.toml` the
 branch committed, containing `[github.auth]` fails closed with an error naming
 the file; move the table to the global config or an untracked
-`.shipyard.local/config.toml`. The same App private key works
+`.shipyard.local/config.toml`. Shipyard asks git whether the overlay is
+committed with `safe.bareRepository=explicit`, so a branch that commits a bare
+repository layout (`HEAD`, `objects/`, `refs/`, `config`) as `.shipyard.local`
+cannot make that inner repository answer "untracked"; git refuses and the overlay
+is not trusted. The same rule covers `host_class` and the `pr_watch` keys that
+name a program or host (see "Capacity (VM-slot accounting)"). The same App private key works
 across multiple Macs (M1/Studio/M5). Full setup, permissions, and the
 additional-client steps: [`docs/github-app-quota.md`](../../docs/github-app-quota.md).
 
@@ -3170,9 +3180,15 @@ store; the probe then runs with `TART_HOME=<absolute-path>` and reads the same
 store. Linux/Windows Tart VMs do not reduce this free-slot count.
 **Fail-closed:** an unreadable host or VM OS counts the host as 0 free and the
 command exits non-zero — a silent host must never read as spare capacity.
-Configure host classes (operator-specific, so keep these in
-`~/.config/shipyard/config.toml` or `.shipyard.local/`, not the committed repo
-config):
+Configure host classes in the machine-global config (`shipyard paths`) or an
+untracked `.shipyard.local/config.toml`. A host class names programs the
+controller spawns (`tart_bin`, `tartci_bin`, `github_cli`, ...) and the SSH
+destination it reaches, so a tracked layer may not set `host_class`: `runner
+capacity`, `runner reroute-watch`, `runner fleet-status`, `runner watch` and
+`ship`'s macOS VM-slot admission refuse one in `.shipyard/config.toml` or a
+committed `.shipyard.local/config.toml`, naming the file, before probing
+anything. (`who`, `fleet-update` and `fleet-reconcile` already read only the
+machine-global config.)
 
 ```toml
 [host_class.studio]

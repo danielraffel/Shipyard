@@ -1,4 +1,4 @@
-use crate::capacity::parse_host_classes;
+use crate::capacity::configured_host_classes;
 use crate::config::LoadedConfig;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,7 +35,7 @@ pub(in crate::app) fn fleet_liveness_policy(config: &LoadedConfig) -> FleetLiven
     if delegated {
         return FleetLivenessPolicy::Delegated;
     }
-    match parse_host_classes(&config.data) {
+    match configured_host_classes(config) {
         Ok(classes) if classes.is_empty() => FleetLivenessPolicy::NoConfiguredPool,
         Ok(_) => FleetLivenessPolicy::MonitorConfiguredPool { every_ticks },
         Err(_) => FleetLivenessPolicy::InvalidPoolConfiguration { every_ticks },

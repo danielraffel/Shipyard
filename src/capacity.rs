@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use toml::{Table, Value as TomlValue};
 
+use crate::config::LoadedConfig;
 use crate::executor::ssh::shlex_quote;
 use crate::process::{BoundedOutputError, run_output_until};
 
@@ -350,9 +351,27 @@ pub fn any_unreadable(hosts: &[HostCapacity]) -> bool {
 /// Returns a config parse error before probing when the host-class section is
 /// malformed. Individual host probe failures are folded into unreadable
 /// [`HostCapacity`] rows instead of failing the whole snapshot.
-pub fn gather_configured_host_capacities(data: &Table) -> Result<Vec<HostCapacity>, String> {
-    let classes = parse_host_classes(data)?;
+pub fn gather_configured_host_capacities(
+    config: &LoadedConfig,
+) -> Result<Vec<HostCapacity>, String> {
+    let classes = configured_host_classes(config)?;
     Ok(classes.iter().map(probe_host_capacity).collect())
+}
+
+/// The `[host_class.*]` this machine may probe, from layered config.
+///
+/// A host class names the programs the controller spawns (`tart_bin`,
+/// `tartci_bin`, `github_cli`, ...) and the SSH destination it reaches, so it
+/// is machine policy: a tracked project file or committed local overlay that
+/// sets it is refused before anything runs. The machine-global config and an
+/// untracked `.shipyard.local` keep working.
+///
+/// # Errors
+/// When a repository-controlled layer sets `host_class`, or the section is
+/// malformed (see [`parse_host_classes`]).
+pub fn configured_host_classes(config: &LoadedConfig) -> Result<Vec<HostClassConfig>, String> {
+    config.refuse_repository_controlled(&["host_class"])?;
+    parse_host_classes(&config.data)
 }
 
 /// Probe one host class and fold the result into a [`HostCapacity`].
@@ -618,6 +637,69 @@ mod tests {
 
     fn table(input: &str) -> Table {
         input.parse().expect("toml")
+    }
+
+    /// A repository whose `.shipyard/config.toml` (when `tracked`) or the
+    /// machine-global config (otherwise) names a `tart` that leaves a marker.
+    #[cfg(unix)]
+    fn host_class_marker_config(
+        tracked: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, LoadedConfig) {
+        use std::os::unix::fs::PermissionsExt;
+        let sandbox = tempfile::TempDir::new().expect("tempdir");
+        let repo = sandbox.path().join("repo");
+        let global = sandbox.path().join("global");
+        let marker = sandbox.path().join("MARKER");
+        std::fs::create_dir_all(repo.join(".shipyard")).expect("project dir");
+        std::fs::create_dir_all(&global).expect("global dir");
+        let tart = sandbox.path().join("tart");
+        std::fs::write(
+            &tart,
+            format!("#!/bin/sh\ntouch '{}'\necho '[]'\n", marker.display()),
+        )
+        .expect("write tart");
+        std::fs::set_permissions(&tart, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let host_class = format!(
+            "[host_class.box]\ncap = 1\ntart_bin = \"{}\"\n",
+            tart.display()
+        );
+        let layer = if tracked {
+            repo.join(".shipyard/config.toml")
+        } else {
+            global.join("config.toml")
+        };
+        std::fs::write(layer, host_class).expect("write layer");
+        let config = LoadedConfig::load(
+            Some(global),
+            Some(repo.join(".shipyard")),
+            None,
+            crate::config::LocalOverlaySource::None,
+        )
+        .expect("load");
+        (sandbox, marker, config)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_host_class_is_refused_before_anything_runs() {
+        let (_sandbox, marker, config) = host_class_marker_config(true);
+        let error = gather_configured_host_capacities(&config).expect_err("refused");
+        assert!(
+            error.contains("a tracked layer may not set host_class"),
+            "{error}"
+        );
+        assert!(!marker.exists(), "the tracked tart_bin must not run");
+        assert!(configured_host_classes(&config).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_global_host_class_still_probes() {
+        let (_sandbox, marker, config) = host_class_marker_config(false);
+        let hosts = gather_configured_host_capacities(&config).expect("trusted");
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].running, Some(0), "{:?}", hosts[0].source);
+        assert!(marker.exists(), "control: the configured tart_bin ran");
     }
 
     #[test]

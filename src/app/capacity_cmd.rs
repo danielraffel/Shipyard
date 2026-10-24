@@ -50,8 +50,7 @@ pub(super) fn capacity_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let hosts =
-        gather_configured_host_capacities(&config.data).map_err(|e| CliFailure::new(2, e))?;
+    let hosts = gather_configured_host_capacities(config).map_err(|e| CliFailure::new(2, e))?;
 
     if hosts.is_empty() {
         let msg = "No [host_class.<name>] entries configured. Add e.g.\n\n  \
