@@ -623,21 +623,26 @@ class PassHistory:
                     }
                 )
 
-        longest_run = 0
+        # Readiness depends on the run that is continuous through the end of
+        # the observation window.  A prior successful run must not mask a
+        # later failed interval and make the baseline appear healthy again.
+        trailing_run = 0
         run_start: datetime | None = None
         previous_point: datetime | None = None
         for item in in_window:
             point = _parse_timestamp(item.observed_at)
             if item.status == "failed":
                 run_start = None
+                trailing_run = 0
             elif (
                 run_start is None
                 or previous_point is None
                 or (point - previous_point).total_seconds() > cadence_limit
             ):
                 run_start = point
+                trailing_run = 0
             else:
-                longest_run = max(longest_run, int((point - run_start).total_seconds()))
+                trailing_run = int((point - run_start).total_seconds())
             previous_point = point
 
         full_window_coverage = bool(in_window) and not missing and not failures
@@ -657,9 +662,9 @@ class PassHistory:
             "full_window_coverage": full_window_coverage,
             "trailing_interval_unobserved": trailing_interval_unobserved,
             "exhaustive_provider_window_coverage": "unproven",
-            "continuous_elapsed_secs": longest_run,
-            "continuous_elapsed_days": longest_run / DAY_SECONDS,
-            "five_continuous_24h_days": longest_run >= FIVE_DAYS_SECONDS,
+            "continuous_elapsed_secs": trailing_run,
+            "continuous_elapsed_days": trailing_run / DAY_SECONDS,
+            "five_continuous_24h_days": trailing_run >= FIVE_DAYS_SECONDS,
             "missing_intervals": missing,
             "failing_intervals": failures,
             "uncertainty": uncertainty,
