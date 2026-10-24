@@ -905,3 +905,50 @@ fn triage_lets_a_running_gate_finish_when_only_a_required_check_failed() {
         vec!["api -X POST repos/owner/repo/actions/runs/61/cancel".to_owned()]
     );
 }
+
+#[test]
+fn resume_holds_a_pull_request_that_enters_the_merge_queue_before_the_rerun() {
+    let mut fixture = Fixture::new();
+    fixture.prs(&[pr_row(1, HEAD_ONE, "BLOCKED", "Feature one")]);
+    for status in ["queued", "waiting", "pending", "requested", "in_progress"] {
+        fixture.runs(status, &[]);
+    }
+    fixture.head_checks(HEAD_ONE, &[]);
+    fixture.route(
+        "api repos/owner/repo/actions/runs/100",
+        cancelled_run(run_row(
+            100,
+            1,
+            HEAD_ONE,
+            "completed",
+            "pull_request",
+            "09:00",
+        )),
+    );
+    let (actions, paths, log) = fixture.build();
+    // The observation sees an empty merge queue, so the decision is Rerun;
+    // the live re-read right before the re-run finds the PR enqueued.
+    patch_first_then(
+        &fixture,
+        "'api graphql '*",
+        &merge_queue_body(&[]),
+        &merge_queue_body(&[(1, HEAD_ONE)]),
+    );
+    let ledger_file = paths.state_dir.join(LEDGER_FILE);
+    let mut ledger = RestoreLedger::default();
+    ledger.record(ledger_entry(REPO, 100, 1, HEAD_ONE));
+    save_ledger(&ledger_file, &ledger).expect("seed");
+
+    let rt = runtime(&fixture.temp, &paths, &actions);
+    let mut out = Vec::new();
+    let code = queue_resume_command(&args(true), &rt, true, &mut out).expect("resume");
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&out));
+    let report = output_json(&out);
+    assert_eq!(report["entries"][0]["action"], "rerun");
+    assert_eq!(
+        report["entries"][0]["outcome"],
+        "held_pull_request_enqueued"
+    );
+    assert!(mutations(&log).is_empty());
+    assert_eq!(load_ledger(&ledger_file).expect("ledger").entries.len(), 1);
+}
