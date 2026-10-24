@@ -552,6 +552,51 @@ fn resume_reruns_restorable_entries_and_clears_the_ledger() {
 }
 
 #[test]
+fn resume_skips_when_the_pull_request_head_moves_after_observation() {
+    let mut fixture = Fixture::new();
+    fixture.prs(&[pr_row(1, HEAD_ONE, "BLOCKED", "Feature one")]);
+    for status in ["queued", "waiting", "pending", "requested", "in_progress"] {
+        fixture.runs(status, &[]);
+    }
+    fixture.head_checks(HEAD_ONE, &[]);
+    fixture.route(
+        "api repos/owner/repo/actions/runs/100",
+        json!({"status": "completed", "conclusion": "cancelled"}),
+    );
+    let (actions, paths, log) = fixture.build();
+    // The initial observation sees HEAD_ONE; the live recheck sees a newer
+    // head, so the cancelled run must remain in the ledger without rerunning.
+    patch_first_then(
+        &fixture,
+        "*'pr list --repo owner/repo'*",
+        &json!([pr_row(1, HEAD_ONE, "BLOCKED", "Feature one")]),
+        &json!([pr_row(1, HEAD_TWO, "BLOCKED", "Feature one")]),
+    );
+    let ledger_file = paths.state_dir.join(LEDGER_FILE);
+    let mut ledger = RestoreLedger::default();
+    ledger.record(RestoreEntry {
+        repo: REPO.to_owned(),
+        base: "main".to_owned(),
+        run_id: 100,
+        workflow: "Build and Test".to_owned(),
+        pr_number: 1,
+        head_sha: HEAD_ONE.to_owned(),
+        status_at_cancel: "queued".to_owned(),
+        cause: CancelCause::YieldedTo { pr_number: 10931 },
+        recorded_at: "2026-10-24T10:00:00Z".to_owned(),
+    });
+    save_ledger(&ledger_file, &ledger).expect("seed");
+
+    let rt = runtime(&fixture.temp, &paths, &actions);
+    let mut out = Vec::new();
+    let code = queue_resume_command(&args(true), &rt, true, &mut out).expect("resume");
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&out));
+    assert_eq!(output_json(&out)["entries"][0]["outcome"], "skipped_pr_head_changed");
+    assert!(mutations(&log).is_empty());
+    assert_eq!(load_ledger(&ledger_file).expect("ledger").entries.len(), 1);
+}
+
+#[test]
 fn triage_never_cancels_merge_queue_push_or_enqueued_pull_request_runs() {
     let mut fixture = Fixture::new();
     fixture.prs(&[
