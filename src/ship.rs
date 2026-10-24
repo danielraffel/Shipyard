@@ -1361,8 +1361,7 @@ fn scheduler_vm_slots(
     if !jobs_use_vm_slot(jobs, request_store, "macos") {
         return Ok(Vec::new());
     }
-    let hosts =
-        gather_configured_host_capacities(&config.data).map_err(ShipExecutionError::VmSlot)?;
+    let hosts = gather_configured_host_capacities(config).map_err(ShipExecutionError::VmSlot)?;
     if hosts.is_empty() {
         return Ok(Vec::new());
     }

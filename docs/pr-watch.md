@@ -315,6 +315,13 @@ m3 = "m3"
 Daniels-Mac-Studio-m3 = "m3"
 ```
 
+`cmux_path`, the `hosts` table and `[pr_watch.digest] command` name what this
+machine runs or reaches over SSH, so they belong in the machine-global config
+(which is all the daemon reads) or an untracked `.shipyard.local/config.toml`.
+Every `shipyard pr-watch` subcommand refuses them in `.shipyard/config.toml` or
+a committed `.shipyard.local/config.toml`, naming the file, before anything
+runs.
+
 **Measuring it.** A delivering pass appends a `wake.*` event for every
 transition of an owner-actionable episode to the ledger's event log
 (`<ledger>.events.jsonl`, beside `opened`/`addressed:*`), with a structured

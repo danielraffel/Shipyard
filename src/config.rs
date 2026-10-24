@@ -12,6 +12,18 @@ use crate::paths::RuntimePaths;
 /// Result type for configuration operations.
 pub type ConfigResult<T> = Result<T, ConfigLoadError>;
 
+/// Keys that name a program the controller runs, a host it reaches, or a
+/// credential it uses. Only the machine-global layer and an untracked local
+/// overlay may set them: a branch that could would run its own code on the
+/// controller. See [`LoadedConfig::refuse_repository_controlled`].
+pub const MACHINE_ONLY_KEYS: &[&str] = &[
+    "github.auth",
+    "host_class",
+    "pr_watch.digest.command",
+    "pr_watch.handback.cmux_path",
+    "pr_watch.handback.hosts",
+];
+
 /// Records how the local overlay directory was resolved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalOverlaySource {
@@ -189,10 +201,10 @@ impl LoadedConfig {
             Ok(table) => table,
             Err(error) => return fallback(format!("{spec} is not valid TOML: {error}")),
         };
-        // GitHub credentials never come from a tracked layer; see
-        // `repository_controlled_layers`.
-        if let Some(toml::Value::Table(github)) = project.get_mut("github") {
-            github.remove("auth");
+        // Credentials and controller-side programs never come from a tracked
+        // layer; see `MACHINE_ONLY_KEYS`.
+        for key in MACHINE_ONLY_KEYS {
+            remove_dotted(&mut project, key);
         }
         let mut data = Table::new();
         let layered =
@@ -256,6 +268,40 @@ impl LoadedConfig {
             }
         }
         Ok(layers)
+    }
+
+    /// Refuse when a repository-controlled layer (see
+    /// [`Self::repository_controlled_layers`]) sets any of `dotted_keys`.
+    /// Refuse rather than ignore, so a repository that committed one learns
+    /// where it belongs. Callers check before they run anything those keys
+    /// name.
+    ///
+    /// # Errors
+    /// Names the first offending layer and key, or why git could not tell
+    /// whether the local overlay is committed.
+    pub fn refuse_repository_controlled(&self, dotted_keys: &[&str]) -> Result<(), String> {
+        let sets = |table: &Table| {
+            dotted_keys
+                .iter()
+                .copied()
+                .find(|key| table_get(table, key).is_some())
+        };
+        let layers = self
+            .repository_controlled_layers(|table| sets(table).is_some())
+            .map_err(|error| error.to_string())?;
+        let Some((key, path)) = layers
+            .iter()
+            .find_map(|(path, table)| Some((sets(table)?, path)))
+        else {
+            return Ok(());
+        };
+        Err(format!(
+            "`{key}` is set in repository-controlled config {}; a tracked layer may not set \
+             {key}, because it names what this machine runs or reaches. Move it to the \
+             machine-global config {} or to an untracked .shipyard.local/config.toml",
+            path.display(),
+            self.global_dir.join("config.toml").display()
+        ))
     }
 
     /// Every layer file that sets `dotted_key`, in load order (machine-global,
@@ -399,8 +445,15 @@ const REPOSITORY_SELECTING_GIT_ENV: &[&str] = &[
 ];
 
 /// A `git` command that discovers its repository from `current_dir` alone.
+///
+/// Discovery never settles on a bare repository: a branch can commit one
+/// (`HEAD`, `objects/`, `refs/`, `config`) inside `.shipyard.local`, and git
+/// would otherwise answer from that inner repository's empty index and call
+/// the committed overlay untracked. Refused discovery fails closed.
 fn git_command() -> Command {
-    clear_repository_selecting_env(Command::new("git"))
+    let mut command = clear_repository_selecting_env(Command::new("git"));
+    command.args(["-c", "safe.bareRepository=explicit"]);
+    command
 }
 
 fn clear_repository_selecting_env(mut command: Command) -> Command {
@@ -539,6 +592,21 @@ fn deep_merge(base: &mut Table, overlay: &Table) {
             }
         }
     }
+}
+
+/// Remove a dotted key from a parsed layer, if present.
+fn remove_dotted(table: &mut Table, dotted_key: &str) {
+    let (parents, leaf) = dotted_key
+        .rsplit_once('.')
+        .map_or((None, dotted_key), |(parents, leaf)| (Some(parents), leaf));
+    let mut current = table;
+    for part in parents.into_iter().flat_map(|parents| parents.split('.')) {
+        match current.get_mut(part) {
+            Some(toml::Value::Table(next)) => current = next,
+            _ => return,
+        }
+    }
+    current.remove(leaf);
 }
 
 fn has_config_file(dir: &Path) -> bool {
@@ -857,6 +925,141 @@ mod tests {
 
         assert_eq!(config.get_str("targets.windows.host"), Some("rust.example"));
         assert_eq!(config.local_overlay_source, LocalOverlaySource::Direct);
+    }
+
+    const HOST_CLASS: &str = "[host_class.box]\ntart_bin = \"tools/tart\"\n";
+
+    /// A repository with `layer` (relative to it) holding a host class, and a
+    /// separate global dir. `commit` adds the layer to the index.
+    fn repo_with_host_class(layer: &str, commit: bool) -> (TempDir, LoadedConfig) {
+        let sandbox = TempDir::new().expect("tempdir");
+        let repo = sandbox.path().join("repo");
+        let global_dir = sandbox.path().join("global");
+        std::fs::create_dir_all(&global_dir).expect("global dir");
+        seed_git_repo(&repo);
+        let path = repo.join(layer);
+        std::fs::create_dir_all(path.parent().expect("layer dir")).expect("layer dir");
+        std::fs::write(&path, HOST_CLASS).expect("write layer");
+        if commit {
+            git(&["add", "-f", layer], &repo);
+            git(&["commit", "-q", "-m", "layer"], &repo);
+        }
+        let config =
+            LoadedConfig::load_from_cwd_with_global_dir(RuntimeMode::Shipyard, &repo, global_dir)
+                .expect("load");
+        assert!(config.get("host_class.box").is_some(), "control: merged");
+        (sandbox, config)
+    }
+
+    #[test]
+    fn tracked_project_layer_may_not_set_machine_only_keys() {
+        let (_sandbox, config) = repo_with_host_class(".shipyard/config.toml", true);
+        let error = config
+            .refuse_repository_controlled(&["host_class"])
+            .expect_err("tracked host_class is refused");
+        assert!(
+            error.contains("`host_class` is set in repository-controlled config")
+                && error.contains(
+                    &Path::new(".shipyard")
+                        .join("config.toml")
+                        .display()
+                        .to_string()
+                ),
+            "{error}"
+        );
+        config
+            .refuse_repository_controlled(&["pr_watch.digest.command"])
+            .expect("only the named keys are refused");
+    }
+
+    #[test]
+    fn committed_local_overlay_may_not_set_machine_only_keys() {
+        let (_sandbox, config) = repo_with_host_class(".shipyard.local/config.toml", true);
+        let error = config
+            .refuse_repository_controlled(&["host_class"])
+            .expect_err("committed overlay is repository-controlled");
+        let overlay = Path::new(".shipyard.local").join("config.toml");
+        assert!(error.contains(&overlay.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn untracked_local_overlay_and_global_layer_may_set_machine_only_keys() {
+        let (_sandbox, config) = repo_with_host_class(".shipyard.local/config.toml", false);
+        config
+            .refuse_repository_controlled(&["host_class"])
+            .expect("an untracked overlay is the operator's");
+
+        let global = TempDir::new().expect("tempdir");
+        std::fs::write(global.path().join("config.toml"), HOST_CLASS).expect("write global");
+        let machine =
+            LoadedConfig::load_machine_global_from_dir(global.path().to_path_buf()).expect("load");
+        machine
+            .refuse_repository_controlled(super::MACHINE_ONLY_KEYS)
+            .expect("machine-global config is trusted");
+    }
+
+    #[test]
+    fn committed_bare_repository_cannot_vouch_for_the_overlay() {
+        // A branch commits a bare-repository layout as `.shipyard.local`, so
+        // git run from inside it would read that inner repository's empty
+        // index and call the committed overlay untracked.
+        let sandbox = TempDir::new().expect("tempdir");
+        let repo = sandbox.path().join("repo");
+        let global_dir = sandbox.path().join("global");
+        std::fs::create_dir_all(&global_dir).expect("global dir");
+        seed_git_repo(&repo);
+        let local = repo.join(".shipyard.local");
+        std::fs::create_dir_all(local.join("objects")).expect("objects");
+        std::fs::create_dir_all(local.join("refs/heads")).expect("refs");
+        std::fs::write(local.join("objects/.keep"), "").expect("keep");
+        std::fs::write(local.join("refs/heads/.keep"), "").expect("keep");
+        std::fs::write(local.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+        std::fs::write(
+            local.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tworktree = .\n",
+        )
+        .expect("inner config");
+        std::fs::write(local.join("config.toml"), HOST_CLASS).expect("overlay");
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-q", "-m", "embedded bare repository"], &repo);
+
+        let config =
+            LoadedConfig::load_from_cwd_with_global_dir(RuntimeMode::Shipyard, &repo, global_dir)
+                .expect("load");
+        assert_eq!(config.local_dir.as_deref(), Some(local.as_path()));
+        let error = config
+            .refuse_repository_controlled(&["host_class"])
+            .expect_err("the inner repository must not answer for the overlay");
+        assert!(error.contains("not trusted"), "{error}");
+    }
+
+    #[test]
+    fn project_layer_at_ref_drops_machine_only_keys() {
+        let sandbox = TempDir::new().expect("tempdir");
+        let repo = sandbox.path().join("repo");
+        let global_dir = sandbox.path().join("global");
+        std::fs::create_dir_all(&global_dir).expect("global dir");
+        seed_git_repo(&repo);
+        std::fs::create_dir_all(repo.join(".shipyard")).expect("project dir");
+        std::fs::write(
+            repo.join(".shipyard/config.toml"),
+            format!(
+                "{HOST_CLASS}[pr_watch]\nbase = \"main\"\n[pr_watch.digest]\ncommand = [\"x\"]\n"
+            ),
+        )
+        .expect("write project");
+        git(&["add", ".shipyard/config.toml"], &repo);
+        git(&["commit", "-q", "-m", "policy"], &repo);
+        std::fs::write(repo.join(".shipyard/config.toml"), "").expect("empty working copy");
+        let working =
+            LoadedConfig::load_from_cwd_with_global_dir(RuntimeMode::Shipyard, &repo, global_dir)
+                .expect("load");
+        let (base, source) =
+            working.with_project_layer_at_ref(RuntimeMode::Shipyard, &repo, "HEAD");
+        assert_eq!(source, ProjectLayerSource::GitRef("HEAD".to_owned()));
+        assert_eq!(base.get_str("pr_watch.base"), Some("main"), "control");
+        assert!(base.get("host_class").is_none());
+        assert!(base.get("pr_watch.digest.command").is_none());
     }
 
     fn seed_git_repo(repo: &Path) {
