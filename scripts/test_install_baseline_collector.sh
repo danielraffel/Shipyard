@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"; SCRIPT="$ROOT/scripts/install_baseline_collector.sh"; TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT; fake="$TMP/python3"; printf '#!/bin/sh\nexit 0\n' > "$fake"; chmod +x "$fake"
+"$SCRIPT" --python "$fake" --collector "$ROOT/scripts/collect_baseline.py" --interval 900 >"$TMP/out"; grep -q 'action=dry-run' "$TMP/out"; if "$SCRIPT" --python "$fake" --collector "$ROOT/scripts/collect_baseline.py" --interval 899 >/dev/null 2>&1; then exit 1; fi; echo "baseline collector installer checks passed"
