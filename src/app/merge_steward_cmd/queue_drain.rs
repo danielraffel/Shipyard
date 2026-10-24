@@ -498,6 +498,28 @@ fn enqueued_now(
     Ok(positions.contains_key(&pr_number))
 }
 
+/// Re-read the pull request immediately before restoring a cancelled run.
+///
+/// The resume decision is made from an earlier observation.  A push can move
+/// the pull request to a new head between that observation and the mutation;
+/// rerunning the ledger entry in that case would spend CI on an obsolete SHA.
+fn resume_head_recheck(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+    pr_number: u64,
+    expected_head: &str,
+) -> Result<Option<String>, String> {
+    let prs = open_pull_requests(actions, repo, base)?;
+    let Some(pr) = prs.into_iter().find(|pr| pr.pr.number == pr_number) else {
+        return Ok(Some("skipped_pr_not_open".to_owned()));
+    };
+    if !pr.pr.head_sha.eq_ignore_ascii_case(expected_head) {
+        return Ok(Some("skipped_pr_head_changed".to_owned()));
+    }
+    Ok(None)
+}
+
 fn run_still_active(
     actions: &GitHubActions,
     repo: &str,
@@ -1101,6 +1123,23 @@ fn rerun_entry(
         Err(error) => {
             let _ = guard.finish("live_recheck_failed");
             return ("live_recheck_failed".to_owned(), Some(error));
+        }
+    }
+    match resume_head_recheck(
+        actions,
+        &observation.repo,
+        &observation.base,
+        entry.pr_number,
+        &entry.head_sha,
+    ) {
+        Ok(None) => {}
+        Ok(Some(skip)) => {
+            let _ = guard.finish("skipped_after_live_head_recheck");
+            return (skip, None);
+        }
+        Err(error) => {
+            let _ = guard.finish("live_head_recheck_failed");
+            return ("live_head_recheck_failed".to_owned(), Some(error));
         }
     }
     // Re-running only cancelled/failed jobs keeps jobs that already passed.
