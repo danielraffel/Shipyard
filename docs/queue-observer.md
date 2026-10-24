@@ -136,7 +136,14 @@ and the observer rejects missing or malformed GraphQL connection `nodes` or
 GraphQL `errors`, policy fields, or label/assignee nodes are rejected rather
 than filtered into an apparently healthy snapshot. Diagnostic
 JSON/Markdown is still emitted so a supervisor can hand the exact problem back
-to the responsible owner. Transition logs are deliberately not treated as
+to the responsible owner. The digest also reports `queue_idle` (`true`,
+`false`, or `null` when no complete census is available) and deterministic
+`alerts`. `merge_queue_idle_with_pending_work` means the observer sees no
+GitHub merge-queue entry while at least one auto-merge-armed PR waits. The
+separate `merge_queue_idle_with_green_unarmed_work` alert identifies green PRs
+that still need an agent or human to arm them. Both alert the queue owner but
+never authorize queue mutation.
+Transition logs are deliberately not treated as
 current state and `.jsonl` files are ignored. A schema-2 cursor is re-bootstrap
 eligible for `queue-observe` but remains fail-closed for `queue-digest` until a
 fresh schema-3 observation replaces it.
