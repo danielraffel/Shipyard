@@ -20,6 +20,12 @@ managed SSH aliases. Attempts without a GitHub external id are retained by
 TartCI but excluded from Shipyard's joinable baseline with an explicit count;
 they cannot contribute to safely merged throughput or wasted-compute metrics.
 
+On the observation controller, install the supervised hourly schedule with
+`scripts/install_baseline_collector.sh --install`. The installer is dry-run by
+default, validates the collector before loading launchd, and keeps state and
+status files outside the repository. A missing merge-receipt handoff remains
+unavailable in the scorecard; the collector never turns it into zero.
+
 The producer-side handoff is explicit and read-only. On the Shipyard state
 directory that records protected merges, run:
 
