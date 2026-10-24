@@ -2689,9 +2689,11 @@ shipyard queue resume --repo OWNER/REPO --apply --json    # later: re-run what i
   `failure`/`action_required` on that head. Transient conclusions
   (`cancelled`, `timed_out`, `startup_failure`, `stale`) and a failure produced
   by the run itself (a queued re-run) never doom a run. Merge-group, push, and
-  scheduled runs are never touched. With `--apply` it cancels doomed runs,
-  queued and in progress, because none of them can let their pull request
-  merge at that head.
+  scheduled runs are never touched. With `--apply` it cancels a superseded or
+  conflicting run whether queued or running. A run doomed only by a failed
+  required check is cancelled only while it has not started (`cancel: false`
+  in the JSON otherwise): a lost runner also reports `failure`, so a running
+  gate is left to finish.
 - triage also reads the base head's checks. When a required context is red on
   the base, an open pull request that names that context next to a fix word
   (`fix`, `unblock`, `repair`, `restore`, `revert`) in its title or
@@ -2711,6 +2713,13 @@ shipyard queue resume --repo OWNER/REPO --apply --json    # later: re-run what i
   when GitHub refuses. **resume** re-runs an entry's cancelled jobs
   (`rerun-failed-jobs`, so jobs that already passed are kept) when its pull
   request is still open at the same head and no longer doomed, then clears it.
+  The ledger is a host-local file, so its contents are claims: the repository
+  comes from `--repo` or the checkout (entries naming another repository are
+  reported `refused_other_repository` and left alone), and before each re-run
+  the live run must be a `pull_request` run off a non-`gh-readonly-queue/`
+  branch, at the entry's head, owned by the entry's pull request. Any mismatch
+  is reported `refused` with the reason, the entry is kept, and the command
+  exits 1.
   Entries whose pull request closed or advanced are cleared without a re-run;
   still-conflicting or still-failed entries stay for a later resume. A re-run
   queues behind the prioritized fix because its jobs get a new queue time.

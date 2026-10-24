@@ -243,6 +243,26 @@ fn check_row(name: &str, conclusion: &str, run_id: u64) -> Value {
     })
 }
 
+fn cancelled_run(mut run: Value) -> Value {
+    run["status"] = json!("completed");
+    run["conclusion"] = json!("cancelled");
+    run
+}
+
+fn ledger_entry(repo: &str, run_id: u64, pr_number: u64, head: &str) -> RestoreEntry {
+    RestoreEntry {
+        repo: repo.to_owned(),
+        base: "main".to_owned(),
+        run_id,
+        workflow: "Build and Test".to_owned(),
+        pr_number,
+        head_sha: head.to_owned(),
+        status_at_cancel: "queued".to_owned(),
+        cause: CancelCause::YieldedTo { pr_number: 10931 },
+        recorded_at: "2026-10-24T10:00:00Z".to_owned(),
+    }
+}
+
 fn runtime<'a>(
     temp: &'a tempfile::TempDir,
     paths: &'a RuntimePaths,
@@ -508,7 +528,14 @@ fn resume_reruns_restorable_entries_and_clears_the_ledger() {
     }
     fixture.route(
         "api repos/owner/repo/actions/runs/100",
-        json!({"status": "completed", "conclusion": "cancelled"}),
+        cancelled_run(run_row(
+            100,
+            1,
+            HEAD_ONE,
+            "completed",
+            "pull_request",
+            "09:00",
+        )),
     );
     let (actions, paths, log) = fixture.build();
     let ledger_file = paths.state_dir.join(LEDGER_FILE);
@@ -561,7 +588,14 @@ fn resume_skips_when_the_pull_request_head_moves_after_observation() {
     fixture.head_checks(HEAD_ONE, &[]);
     fixture.route(
         "api repos/owner/repo/actions/runs/100",
-        json!({"status": "completed", "conclusion": "cancelled"}),
+        cancelled_run(run_row(
+            100,
+            1,
+            HEAD_ONE,
+            "completed",
+            "pull_request",
+            "09:00",
+        )),
     );
     let (actions, paths, log) = fixture.build();
     // The initial observation sees HEAD_ONE; the live recheck sees a newer
@@ -746,4 +780,128 @@ fn resume_holds_entries_whose_pull_request_is_enqueued() {
     );
     assert!(mutations(&log).is_empty());
     assert_eq!(load_ledger(&ledger_file).expect("ledger").entries.len(), 1);
+}
+
+#[test]
+fn resume_refuses_forged_ledger_entries_and_keeps_them() {
+    let mut fixture = Fixture::new();
+    fixture.prs(&[
+        pr_row(1, HEAD_ONE, "BLOCKED", "Feature one"),
+        pr_row(2, HEAD_TWO, "BLOCKED", "Feature two"),
+    ]);
+    for status in ["queued", "waiting", "pending", "requested", "in_progress"] {
+        fixture.runs(status, &[]);
+    }
+    fixture.head_checks(HEAD_ONE, &[]);
+    fixture.head_checks(HEAD_TWO, &[]);
+    // Each entry claims a cancelled PR-1 run at HEAD_ONE, but the live run is
+    // a merge-group run, a push, a run at another head, or another PR's run.
+    let mut merge_group = run_row(501, 1, HEAD_ONE, "completed", "merge_group", "09:00");
+    merge_group["head_branch"] = json!("gh-readonly-queue/main/pr-1-abc");
+    let mut push = run_row(502, 1, HEAD_ONE, "completed", "push", "09:00");
+    push["head_branch"] = json!("main");
+    let other_head = run_row(503, 1, HEAD_OLD, "completed", "pull_request", "09:00");
+    let other_pr = run_row(504, 2, HEAD_ONE, "completed", "pull_request", "09:00");
+    for (run_id, run) in [
+        (501, merge_group),
+        (502, push),
+        (503, other_head),
+        (504, other_pr),
+    ] {
+        fixture.route(
+            &format!("api repos/owner/repo/actions/runs/{run_id}"),
+            cancelled_run(run),
+        );
+    }
+    let (actions, paths, log) = fixture.build();
+    let ledger_file = paths.state_dir.join(LEDGER_FILE);
+    let mut ledger = RestoreLedger::default();
+    for run_id in [501, 502, 503, 504] {
+        ledger.record(ledger_entry(REPO, run_id, 1, HEAD_ONE));
+    }
+    // An entry naming another repository is never acted on against it, nor
+    // against the repository being resumed.
+    ledger.record(ledger_entry("victim/other", 505, 1, HEAD_ONE));
+    save_ledger(&ledger_file, &ledger).expect("seed");
+
+    let rt = runtime(&fixture.temp, &paths, &actions);
+    let mut out = Vec::new();
+    let code = queue_resume_command(&args(true), &rt, true, &mut out).expect("resume");
+    assert_eq!(code, ExitCode::from(1), "{}", String::from_utf8_lossy(&out));
+    let report = output_json(&out);
+    let outcomes = report["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| {
+            (
+                entry["run_id"].as_u64().unwrap(),
+                entry["outcome"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for run_id in [501, 502, 503, 504] {
+        assert_eq!(outcomes[&run_id], "refused", "{report}");
+    }
+    assert_eq!(outcomes[&505], "refused_other_repository");
+    assert!(mutations(&log).is_empty());
+    let calls = fs::read_to_string(&log).expect("log");
+    assert!(!calls.contains("victim/other"));
+    assert!(!calls.contains("runs/505"));
+    assert_eq!(load_ledger(&ledger_file).expect("ledger").entries.len(), 5);
+}
+
+#[test]
+fn triage_lets_a_running_gate_finish_when_only_a_required_check_failed() {
+    let mut fixture = Fixture::new();
+    fixture.prs(&[
+        pr_row(1, HEAD_ONE, "BLOCKED", "Feature one"),
+        pr_row(2, HEAD_TWO, "BLOCKED", "Feature two"),
+    ]);
+    for status in ["queued", "waiting", "pending", "requested"] {
+        fixture.runs(status, &[]);
+    }
+    fixture.runs(
+        "in_progress",
+        &[
+            // Required check failed on PR 1's head, but its gate is running.
+            run_row(60, 1, HEAD_ONE, "in_progress", "pull_request", "08:00"),
+            // PR 2 advanced past this running run: superseded, cancelled.
+            run_row(61, 2, HEAD_OLD, "in_progress", "pull_request", "08:01"),
+        ],
+    );
+    fixture.head_checks(HEAD_ONE, &[check_row("macos", "failure", 59)]);
+    fixture.route(
+        "api repos/owner/repo/commits/main",
+        json!({"sha": HEAD_BASE}),
+    );
+    fixture.head_checks(HEAD_BASE, &[]);
+    fixture.route(
+        "api repos/owner/repo/actions/runs/61",
+        json!({"status": "in_progress", "conclusion": null}),
+    );
+    let (actions, paths, log) = fixture.build();
+    let rt = runtime(&fixture.temp, &paths, &actions);
+    let mut out = Vec::new();
+    let code = queue_triage_command(&args(true), true, &rt, true, &mut out).expect("triage");
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&out));
+    let report = output_json(&out);
+    assert_eq!(report["doomed"], 2);
+    let cancel = report["runs"]
+        .as_array()
+        .expect("runs")
+        .iter()
+        .map(|run| {
+            (
+                run["run_id"].as_u64().unwrap(),
+                run["cancel"].as_bool().unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert!(!cancel[&60]);
+    assert!(cancel[&61]);
+    assert_eq!(
+        mutations(&log),
+        vec!["api -X POST repos/owner/repo/actions/runs/61/cancel".to_owned()]
+    );
 }

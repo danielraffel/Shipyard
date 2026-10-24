@@ -520,15 +520,19 @@ fn resume_head_recheck(
     Ok(None)
 }
 
-fn run_still_active(
+/// Re-read a doomed run's live status: a run that finished, or one that
+/// started while its doom rests only on a failed required check, is skipped.
+fn doomed_run_still_cancellable(
     actions: &GitHubActions,
     repo: &str,
     run_id: u64,
+    reason: &crate::queue_drain::DoomReason,
 ) -> Result<Option<String>, String> {
     let (status, _) = actions
         .run_status_conclusion(repo, run_id)
         .map_err(|error| error.to_string())?;
-    Ok((!crate::queue_drain::run_is_active(&status)).then(|| format!("skipped_run_{status}")))
+    Ok((!crate::queue_drain::may_cancel_doomed(reason, &status))
+        .then(|| format!("skipped_run_{status}")))
 }
 
 /// Cancel yields from a priority plan. Each run's jobs are re-read right before
@@ -750,6 +754,9 @@ pub(in crate::app) fn queue_triage_command<W: Write>(
             let RunVerdict::Doomed { reason } = &entry.verdict else {
                 continue;
             };
+            if !entry.cancel {
+                continue;
+            }
             let Some(pr_number) = entry.pr_number else {
                 continue;
             };
@@ -767,7 +774,8 @@ pub(in crate::app) fn queue_triage_command<W: Write>(
                 recorded_at: Utc::now().to_rfc3339(),
             };
             let run_id = entry.run_id;
-            let recheck = || run_still_active(&actions, &observation.repo, run_id);
+            let recheck =
+                || doomed_run_still_cancellable(&actions, &observation.repo, run_id, reason);
             results.push(cancel_and_record(
                 runtime,
                 &actions,
@@ -980,31 +988,35 @@ pub(in crate::app) fn queue_resume_command<W: Write>(
         None
     };
     let mut ledger = load_ledger(&ledger_path)?;
-    let repos = match &args.repo {
-        Some(repo) => vec![repo.clone()],
-        None => ledger
-            .entries
-            .values()
-            .map(|entry| entry.repo.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect(),
-    };
+    // The target repository comes from `--repo` or the checkout, never from
+    // the ledger: the ledger is a host-local file and only names candidates.
+    let repo = resolve_repo(args.repo.clone(), runtime.cwd)?;
     let mut reports = Vec::new();
     let mut failed = false;
-    for repo in repos {
+    let entries = ledger
+        .entries
+        .values()
+        .filter(|entry| entry.base == args.base)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !entries.is_empty() {
         let actions = scoped_actions(runtime.actions, &repo);
-        let entries = ledger
-            .for_repo(&repo)
-            .into_iter()
-            .filter(|entry| entry.base == args.base)
-            .cloned()
-            .collect::<Vec<_>>();
-        if entries.is_empty() {
-            continue;
-        }
         let mut observation =
             observe(&actions, &repo, &args.base).map_err(|error| CliFailure::new(1, error))?;
+        let (entries, foreign): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|entry| entry.repo.eq_ignore_ascii_case(&observation.repo));
+        for entry in foreign {
+            reports.push(ResumeReport {
+                run_id: entry.run_id,
+                pr_number: entry.pr_number,
+                decision: ResumeDecision::Drop {
+                    reason: "not resumed here".to_owned(),
+                },
+                outcome: Some("refused_other_repository".to_owned()),
+                error: None,
+            });
+        }
         let numbers = entries.iter().map(|entry| entry.pr_number).collect();
         hydrate_checks(&actions, &mut observation, &numbers)
             .map_err(|error| CliFailure::new(1, error))?;
@@ -1093,11 +1105,38 @@ fn rerun_entry(
     observation: &Observation,
     entry: &RestoreEntry,
 ) -> (String, Option<String>) {
-    let (status, conclusion) = match actions.run_status_conclusion(&observation.repo, entry.run_id)
-    {
-        Ok(state) => state,
-        Err(error) => return ("status_read_failed".to_owned(), Some(error.to_string())),
+    let live = match gh_json(
+        actions,
+        &[
+            "api".to_owned(),
+            format!("repos/{}/actions/runs/{}", observation.repo, entry.run_id),
+        ],
+        "recorded workflow run",
+    ) {
+        Ok(live) => live,
+        Err(error) => return ("status_read_failed".to_owned(), Some(error)),
     };
+    let Some(run) = super::observation::parse_run(&live) else {
+        return (
+            "refused".to_owned(),
+            Some(format!("run {} response is malformed", entry.run_id)),
+        );
+    };
+    let pr_branch = observation
+        .prs
+        .iter()
+        .find(|pr| pr.pr.number == entry.pr_number)
+        .map(|pr| pr.pr.head_branch.as_str());
+    if let Err(reason) = crate::queue_drain::verify_live_run(entry, &run, pr_branch) {
+        // The entry stays in the ledger; nothing is re-run.
+        return ("refused".to_owned(), Some(reason));
+    }
+    let status = run.status;
+    let conclusion = live
+        .get("conclusion")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     if !status.eq_ignore_ascii_case("completed") || !conclusion.eq_ignore_ascii_case("cancelled") {
         // The cancel never landed or the run was re-run elsewhere; nothing to
         // restore, so the entry is cleared.

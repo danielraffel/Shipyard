@@ -516,3 +516,74 @@ fn resume_holds_an_enqueued_pull_request() {
         ResumeDecision::HoldForMergeQueue
     );
 }
+
+#[test]
+fn required_check_failure_cancels_only_runs_that_have_not_started() {
+    let failed = DoomReason::RequiredCheckFailed {
+        contexts: vec!["macos".to_owned()],
+    };
+    let superseded = DoomReason::SupersededHead {
+        current_head: HEAD_B.to_owned(),
+    };
+    let conflicting = DoomReason::Conflicting {
+        merge_state: "DIRTY".to_owned(),
+    };
+    assert!(may_cancel_doomed(&failed, "queued"));
+    assert!(!may_cancel_doomed(&failed, "in_progress"));
+    assert!(may_cancel_doomed(&superseded, "in_progress"));
+    assert!(may_cancel_doomed(&conflicting, "in_progress"));
+    assert!(!may_cancel_doomed(&superseded, "completed"));
+
+    let prs = vec![pr(
+        1,
+        HEAD_A,
+        "BLOCKED",
+        vec![check("macos", "completed", Some("failure"), 5)],
+    )];
+    let triage = plan_triage(
+        &[
+            run(10, 1, HEAD_A, "in_progress", "pull_request"),
+            run(11, 1, HEAD_A, "queued", "pull_request"),
+        ],
+        &prs,
+        &required(),
+    );
+    assert!(matches!(triage[0].verdict, RunVerdict::Doomed { .. }));
+    assert!(!triage[0].cancel);
+    assert!(triage[1].cancel);
+}
+
+#[test]
+fn live_run_must_match_the_recorded_pull_request_run() {
+    let recorded = entry(100, 1, HEAD_A);
+    let live = run(100, 1, HEAD_A, "completed", "pull_request");
+    assert!(verify_live_run(&recorded, &live, Some("branch-1")).is_ok());
+
+    let mut merge_group = run(100, 1, HEAD_A, "completed", "merge_group");
+    merge_group.head_branch = "gh-readonly-queue/main/pr-1-abc".to_owned();
+    let mut readonly = live.clone();
+    readonly.head_branch = "gh-readonly-queue/main/pr-1-abc".to_owned();
+    let push = run(100, 1, HEAD_A, "completed", "push");
+    let other_head = run(100, 1, HEAD_B, "completed", "pull_request");
+    let other_pr = run(100, 2, HEAD_A, "completed", "pull_request");
+    let other_id = run(101, 1, HEAD_A, "completed", "pull_request");
+    let mut unassociated = live.clone();
+    unassociated.pull_request_number = None;
+    for forged in [
+        &merge_group,
+        &readonly,
+        &push,
+        &other_head,
+        &other_pr,
+        &other_id,
+    ] {
+        assert!(
+            verify_live_run(&recorded, forged, Some("branch-1")).is_err(),
+            "{forged:?}"
+        );
+    }
+    // Without GitHub's association, only the PR's own branch is accepted.
+    assert!(verify_live_run(&recorded, &unassociated, Some("branch-1")).is_ok());
+    assert!(verify_live_run(&recorded, &unassociated, Some("branch-9")).is_err());
+    assert!(verify_live_run(&recorded, &unassociated, None).is_err());
+}

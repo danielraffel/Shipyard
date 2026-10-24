@@ -1046,7 +1046,8 @@ pub(super) enum QueueCommand {
     /// and no longer doomed, then cleared. Entries whose pull request closed or
     /// advanced are cleared without a re-run; still-doomed entries are kept.
     Resume {
-        /// Owner/repo slug. Defaults to every repository in the ledger.
+        /// Owner/repo slug. Defaults to the current checkout's repo; ledger
+        /// entries naming another repository are never acted on.
         #[arg(long)]
         repo: Option<String>,
         /// Base branch the recorded pull requests target.

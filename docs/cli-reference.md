@@ -141,7 +141,7 @@ shipyard queue triage --repo OWNER/REPO [--apply]          # cancel PR runs that
                                                             #   conflicting, required check failed); prioritizes the one PR
                                                             #   that says it fixes a check red on the base; records a restore ledger
 shipyard queue prioritize --pr N --repo OWNER/REPO [--apply] # cancel queued, not-started PR runs ahead of N on shared runner labels
-shipyard queue resume [--repo OWNER/REPO] [--apply]         # re-run ledger entries still open, same head, no longer doomed
+shipyard queue resume --repo OWNER/REPO [--apply]           # re-run ledger entries still open, same head, no longer doomed
 shipyard logs <id>             # per-target logs
 shipyard logs <id> --target windows
 shipyard --json logs <id>      # typed availability/lifecycle metadata, not log content

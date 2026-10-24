@@ -142,6 +142,23 @@ pub struct RunTriage {
     /// Decision.
     #[serde(flatten)]
     pub verdict: RunVerdict,
+    /// Whether `--apply` may cancel this run (see [`may_cancel_doomed`]).
+    pub cancel: bool,
+}
+
+/// Whether a doomed run in `status` may be cancelled.
+///
+/// A superseded or conflicting head is proven by the pull request itself, so
+/// those runs are cancelled whether queued or running. A failed required check
+/// is weaker evidence -- a lost runner also reports `failure` -- so on that
+/// signal only runs that have not started are cancelled; a running gate is left
+/// to finish.
+#[must_use]
+pub fn may_cancel_doomed(reason: &DoomReason, status: &str) -> bool {
+    match reason {
+        DoomReason::SupersededHead { .. } | DoomReason::Conflicting { .. } => run_is_active(status),
+        DoomReason::RequiredCheckFailed { .. } => job_is_waiting(status),
+    }
 }
 
 /// Find the open pull request a run belongs to.
@@ -285,6 +302,10 @@ pub fn plan_triage(
                 pr_number: pr.map(|pr| pr.pr.number),
                 head_sha: run.head_sha.clone(),
                 created_at: run.created_at.clone(),
+                cancel: match &verdict {
+                    RunVerdict::Doomed { reason } => may_cancel_doomed(reason, &run.status),
+                    _ => false,
+                },
                 verdict,
             }
         })
@@ -738,6 +759,49 @@ pub fn resume_decision(
         },
         Some(reason) => ResumeDecision::Keep { reason },
     }
+}
+
+/// Prove that the live run a ledger entry names is the pull-request run that
+/// was cancelled, before anything re-runs it.
+///
+/// The ledger is a host-local file any local process can write, so its run ID
+/// is a claim, not authority. The live run must be a `pull_request` run off a
+/// non-merge-queue branch, at the entry's exact head, owned by the entry's
+/// pull request (by GitHub's association, or by branch when GitHub omits it).
+pub fn verify_live_run(
+    entry: &RestoreEntry,
+    live: &StewardRun,
+    pr_head_branch: Option<&str>,
+) -> Result<(), String> {
+    if live.id != entry.run_id {
+        return Err(format!(
+            "live run is {} but the entry names {}",
+            live.id, entry.run_id
+        ));
+    }
+    if !is_pull_request_run(live) {
+        return Err(format!(
+            "run {} is a `{}` run on `{}`, not pull-request CI",
+            live.id, live.event, live.head_branch
+        ));
+    }
+    if !is_full_sha(&live.head_sha) || !live.head_sha.eq_ignore_ascii_case(&entry.head_sha) {
+        return Err(format!(
+            "run {} is at {}, not the recorded head {}",
+            live.id, live.head_sha, entry.head_sha
+        ));
+    }
+    let owned = match live.pull_request_number {
+        Some(number) => number == entry.pr_number,
+        None => pr_head_branch.is_some_and(|branch| branch == live.head_branch),
+    };
+    if !owned {
+        return Err(format!(
+            "run {} does not belong to pull request #{}",
+            live.id, entry.pr_number
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
