@@ -90,6 +90,20 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
         tartci_event["excluded_unjoinable"] = excluded
         tartci_event["exclusion_reason"] = "missing external_id cannot be joined to a GitHub job"
     events.append(tartci_event)
+    merge_receipts = getattr(args, "merge_receipts", None)
+    if merge_receipts is not None:
+        receipt_path = pathlib.Path(merge_receipts).expanduser()
+        imported_receipts = run([
+            args.shipyard, "--state-dir", state_dir, "metrics", "import", "merge-receipt",
+            "--file", str(receipt_path), "--json",
+        ], timeout=args.timeout_seconds)
+        if imported_receipts.returncode:
+            raise RuntimeError(f"merge receipt import failed: {imported_receipts.stderr.strip()}")
+        receipt_event = summarize_import("merge-receipt", imported_receipts.stdout)
+        imported_count = receipt_event.get("imported")
+        if not isinstance(imported_count, int) or isinstance(imported_count, bool) or imported_count < 0:
+            raise RuntimeError("merge receipt import count unavailable; refusing to record a successful pass")
+        events.append(receipt_event)
     unknown_imports = [event["source"] for event in events
                        if event.get("source") in {"github", "tartci"}
                        and (not isinstance(event.get("imported"), int)
@@ -364,11 +378,15 @@ def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
         card = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"authoritative scorecard was not JSON: {exc}") from exc
-    # Keep the denominator explicit even when an older binary emits no field.
-    card["collector_safe_merge_denominator"] = {
-        "status": "unavailable", "value": None,
-        "reason": "collector does not import or authenticate merge receipts",
-    }
+    # Preserve the scorecard's producer-bound receipt result. An older binary
+    # may omit the field, in which case the denominator remains unavailable.
+    safe_merge = card.get("safely_merged_changes")
+    card["collector_safe_merge_denominator"] = (
+        dict(safe_merge) if isinstance(safe_merge, dict) else {
+            "status": "unavailable", "value": None,
+            "reason": "scorecard did not report a safe-merge denominator",
+        }
+    )
     card.pop("database", None)
     return consume_authenticated_strata(card, repo=args.repo, since_days=args.since_days,
                                         reference_at=dt.datetime.now(dt.timezone.utc))
@@ -571,6 +589,8 @@ def main() -> int:
     parser.add_argument("--tartci-host", help="plain fleet host that owns the runtime export")
     parser.add_argument("--tartci-remote-command", default="tartci",
                         help="remote TartCI command when --tartci-host is used")
+    parser.add_argument("--merge-receipts", type=pathlib.Path,
+                        help="producer-bound Shipyard merge receipt JSON/JSONL to import")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--since-days", type=int, default=5)
     parser.add_argument("--collect", action="store_true", help="run provider imports")

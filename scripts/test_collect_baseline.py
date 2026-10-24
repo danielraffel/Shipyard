@@ -156,6 +156,19 @@ class BaselineScorecardTests(unittest.TestCase):
             self.assertEqual(result["strata"]["rerun"]["status"], "unavailable")
             self.assertEqual(commands[0][commands[0].index("--project") + 1], "Generous-Corp/pulp")
 
+    def test_scorecard_preserves_producer_safe_merge_denominator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = type("Args", (), {"db": Path(directory) / "metrics" / "metrics.db", "project": "pulp", "repo": "Generous-Corp/pulp",
+                                      "shipyard": "shipyard", "since_days": 5, "timeout_seconds": 300})()
+            original = MOD.run
+            MOD.run = lambda *a, **k: subprocess.CompletedProcess(
+                a[0], 0, json.dumps({"safely_merged_changes": {"status": "available", "value": 2}}), "")
+            try:
+                result = MOD.authoritative_scorecard(args)
+            finally:
+                MOD.run = original
+            self.assertEqual(result["collector_safe_merge_denominator"], {"status": "available", "value": 2})
+
     def test_unknown_contract_keeps_all_strata_unavailable(self):
         card = {"strata": {"schema": "shipyard-metrics-strata/v0"}}
         result = MOD.consume_authenticated_strata(card)
@@ -300,8 +313,11 @@ class CollectorInvocationTests(unittest.TestCase):
             shipyard = root / "shipyard"; tartci = root / "tartci"
             shipyard.write_text("#!/bin/sh\ncase \"$*\" in *metrics*import*) echo '{\"imported\": 1}';; *) echo '{\"job_samples\": 1}';; esac\n")
             tartci.write_text("#!/bin/sh\necho '{\"project\":\"pulp\",\"repo\":\"o/pulp\",\"provider\":\"tart\",\"external_id\":\"fixture-1\"}'\n")
+            merge_receipts = root / "merge-receipts.jsonl"
+            merge_receipts.write_text("{}\n")
             shipyard.chmod(0o755); tartci.chmod(0o755)
             args = type("Args", (), {"db": db, "state": root / "state.json", "project": "pulp", "repo": "o/pulp", "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5, "timeout_seconds": 5})()
+            args.merge_receipts = merge_receipts
             args.state.write_text("{}")
             original = MOD.count_jobs
             try:
@@ -310,6 +326,7 @@ class CollectorInvocationTests(unittest.TestCase):
                 MOD.count_jobs = original
             self.assertEqual(events[-1]["new_rows"], 0)
             self.assertEqual(events[-1]["source_activity_dates"], ["2026-10-16"])
+            self.assertEqual([event["source"] for event in events], ["github", "tartci", "merge-receipt", "collection"])
 
     def test_collect_refuses_unknown_provider_counts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -326,6 +343,24 @@ class CollectorInvocationTests(unittest.TestCase):
                 "timeout_seconds": 5})()
             args.state.write_text("{}")
             with self.assertRaisesRegex(RuntimeError, "count unavailable"):
+                MOD.import_organic(args)
+
+    def test_collect_fails_closed_when_merge_receipt_import_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            conn = __import__("sqlite3").connect(db)
+            conn.executescript("create table runs(id integer primary key, project text, repo text); create table jobs(id integer primary key, run_id integer, started_at text, completed_at text);")
+            conn.commit(); conn.close()
+            shipyard = root / "shipyard"; tartci = root / "tartci"; receipts = root / "receipts.jsonl"
+            shipyard.write_text("#!/bin/sh\ncase \"$*\" in *merge-receipt*) echo 'bad receipt' >&2; exit 1;; *metrics*import*) echo '{\"imported\": 1}';; *) echo '{}';; esac\n")
+            tartci.write_text("#!/bin/sh\necho '{\"project\":\"p\",\"repo\":\"o/p\",\"provider\":\"tart\",\"external_id\":\"fixture-1\"}'\n")
+            receipts.write_text("ignored\n")
+            shipyard.chmod(0o755); tartci.chmod(0o755)
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p", "repo": "o/p",
+                "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5,
+                "timeout_seconds": 5, "merge_receipts": receipts})()
+            args.state.write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "merge receipt import failed"):
                 MOD.import_organic(args)
 
 if __name__ == "__main__":

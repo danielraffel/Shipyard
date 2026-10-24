@@ -1,6 +1,6 @@
 # Organic fleet baseline collection
 
-`collect_baseline.py` is the scheduled observation wrapper for the fleet optimization baseline. It imports real GitHub job timing through Shipyard, imports real TartCI runtime exports, and does not import merge receipts. It does not create metric rows itself, infer a merge outcome from a pull request, or turn an unavailable phase into zero.
+`collect_baseline.py` is the scheduled observation wrapper for the fleet optimization baseline. It imports real GitHub job timing through Shipyard and real TartCI runtime exports. When the protected merge producer publishes a `shipyard-merge-receipt/v1` JSON/JSONL export, pass it explicitly with `--merge-receipts`; the wrapper imports it through Shipyard's transactional validator. It does not create metric rows itself, infer a merge outcome from a pull request, or turn an unavailable phase into zero.
 
 Run it from a scheduler on the observing machine with a state file that is outside the repository:
 
@@ -11,6 +11,7 @@ python3 scripts/collect_baseline.py \
   --state "$SHIPYARD_STATE_DIR/baseline-status.json" \
   --status-markdown "$SHIPYARD_STATE_DIR/baseline-status.md" \
   --tartci-host m5s \
+  --merge-receipts "$SHIPYARD_STATE_DIR/merge-receipts.jsonl" \
   --collect
 ```
 
@@ -23,6 +24,7 @@ The command writes an append-only observation history and reports continuous
 elapsed 24-hour days, required activity strata, organic sample counts, and the
 safe-merge denominator. The baseline cannot exit while normal PR, merge-group,
 rerun, outage, or concurrent-agent activity is absent. Safe-merge throughput
-remains unavailable in this collector; failed or cancelled jobs are never
-treated as merged changes. Synthetic provenance is not asserted by this
-wrapper; use only the organic provider exports intended for the baseline.
+remains unavailable without `--merge-receipts`; failed or cancelled jobs are
+never treated as merged changes. A receipt import failure fails the collection
+pass. Synthetic provenance is not asserted by this wrapper; use only the
+organic provider exports intended for the baseline.
