@@ -2048,8 +2048,12 @@ mod tests {
             .save_scoped_locked(&concurrent, &lock)
             .expect("concurrent update");
         drop(lock);
+        // Atomicity is proven by the blocked check above and the merged state
+        // below, not by how fast the seed finishes. After the lock is released
+        // it still does several synced file replaces, which can take seconds on
+        // a loaded Windows runner, so this bound only guards against a hang.
         done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(60))
             .expect("seed completed")
             .expect("seed succeeded");
         worker.join().expect("worker");

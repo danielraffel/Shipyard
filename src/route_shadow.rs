@@ -656,17 +656,33 @@ pub fn record_dispatch_observation_best_effort(
     route_attempts: &[RouteAttempt],
     observed_at: DateTime<Utc>,
 ) {
-    let Some(snapshot) = scheduler_snapshot(job_id, target, &[], observed_at) else {
+    let Some(pending) =
+        dispatch_observation(state_dir, job_id, target, route_attempts, observed_at)
+    else {
         return;
     };
-    let Some(_attempt) = route_attempts.iter().rev().find(|attempt| {
+    let Some(sender) = observation_sender() else {
+        return;
+    };
+    let _ = enqueue_observation(sender, pending);
+}
+
+/// Build the post-dispatch observation, or `None` when no attempt names one of
+/// the target's scheduler candidates.
+fn dispatch_observation(
+    state_dir: &std::path::Path,
+    job_id: &str,
+    target: &ResolvedTarget,
+    route_attempts: &[RouteAttempt],
+    observed_at: DateTime<Utc>,
+) -> Option<PendingObservation> {
+    let snapshot = scheduler_snapshot(job_id, target, &[], observed_at)?;
+    route_attempts.iter().rev().find(|attempt| {
         snapshot
             .candidates
             .iter()
             .any(|candidate| candidate.route_id == attempt.route_id)
-    }) else {
-        return;
-    };
+    })?;
     let observation = RouteShadowObservation {
         correlation_id: snapshot.request_id.clone(),
         snapshot: {
@@ -678,16 +694,10 @@ pub fn record_dispatch_observation_best_effort(
         capability_provenance: "shipyard.dispatch.attempts".to_owned(),
         route_attempts: Some(route_attempts.to_vec()),
     };
-    let Some(sender) = observation_sender() else {
-        return;
-    };
-    let _ = enqueue_observation(
-        sender,
-        PendingObservation {
-            state_dir: state_dir.to_path_buf(),
-            observation,
-        },
-    );
+    Some(PendingObservation {
+        state_dir: state_dir.to_path_buf(),
+        observation,
+    })
 }
 
 fn observation_sender() -> Option<&'static SyncSender<PendingObservation>> {
@@ -699,37 +709,42 @@ fn observation_sender() -> Option<&'static SyncSender<PendingObservation>> {
                 .name("route-shadow-receipts".to_owned())
                 .spawn(move || {
                     while let Ok(pending) = receiver.recv() {
-                        let store = RouteShadowReceiptStore::new(pending.state_dir);
-                        if pending
-                            .observation
-                            .route_attempts
-                            .as_ref()
-                            .is_some_and(|a| !a.is_empty())
-                        {
-                            match store.attach_selected_route_best_effort(&pending.observation) {
-                                Ok(Some(_)) | Err(_) => continue,
-                                Ok(None) => {}
-                            }
-                        }
-                        if store
-                            .load(&pending.observation.snapshot.request_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|receipt| receipt.observation)
-                            .is_some_and(|metadata| {
-                                metadata.expires_at > pending.observation.observed_at
-                                    && pending.observation.route_attempts.is_none()
-                            })
-                        {
-                            continue;
-                        }
-                        let _ = store.record_observation_best_effort(&pending.observation);
+                        write_pending_observation(pending);
                     }
                 })
                 .is_ok();
             worker_started.then_some(sender)
         })
         .as_ref()
+}
+
+/// Persist one queued observation. Runs only on the background writer.
+fn write_pending_observation(pending: PendingObservation) {
+    let store = RouteShadowReceiptStore::new(pending.state_dir);
+    if pending
+        .observation
+        .route_attempts
+        .as_ref()
+        .is_some_and(|a| !a.is_empty())
+    {
+        match store.attach_selected_route_best_effort(&pending.observation) {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {}
+        }
+    }
+    if store
+        .load(&pending.observation.snapshot.request_id)
+        .ok()
+        .flatten()
+        .and_then(|receipt| receipt.observation)
+        .is_some_and(|metadata| {
+            metadata.expires_at > pending.observation.observed_at
+                && pending.observation.route_attempts.is_none()
+        })
+    {
+        return;
+    }
+    let _ = store.record_observation_best_effort(&pending.observation);
 }
 
 fn enqueue_observation(
@@ -884,8 +899,8 @@ mod tests {
     use super::{
         PendingObservation, ROUTE_SHADOW_SCHEMA_VERSION, RouteAvailability, RouteCandidateSnapshot,
         RouteCapabilitySnapshot, RouteCounterfactualOutcome, RouteShadowError,
-        RouteShadowObservation, RouteShadowReceiptStore, enqueue_observation, evaluate,
-        record_dispatch_observation_best_effort, scheduler_snapshot,
+        RouteShadowObservation, RouteShadowReceiptStore, dispatch_observation, enqueue_observation,
+        evaluate, scheduler_snapshot, write_pending_observation,
     };
     use crate::executor::dispatch::{
         FallbackBackend, FallbackTargetConfig, ResolvedBackend, ResolvedHostPoolConfig,
@@ -1431,7 +1446,10 @@ mod tests {
             }),
             ..host_pool_target()
         };
-        record_dispatch_observation_best_effort(
+        // Drive the writer synchronously. The process-wide background sink is
+        // shared with every other test that dispatches, and it drops on a full
+        // queue by design, so polling it for this receipt races the suite.
+        let pending = dispatch_observation(
             temp.path(),
             "job-nested",
             &target,
@@ -1450,23 +1468,20 @@ mod tests {
                 },
             ],
             Utc::now(),
+        )
+        .expect("nested attempt matches the outer fallback candidate");
+        write_pending_observation(pending);
+        let receipt = RouteShadowReceiptStore::new(temp.path())
+            .load("job-nested:nested")
+            .expect("load receipt")
+            .expect("nested fallback receipt");
+        assert!(
+            receipt
+                .observation
+                .as_ref()
+                .expect("metadata")
+                .snapshot_rebuilt_at_dispatch
         );
-        let store = RouteShadowReceiptStore::new(temp.path());
-        for _ in 0..100 {
-            if let Ok(Some(receipt)) = store.load("job-nested:nested") {
-                assert!(receipt.observation.is_some());
-                assert!(
-                    receipt
-                        .observation
-                        .as_ref()
-                        .expect("metadata")
-                        .snapshot_rebuilt_at_dispatch
-                );
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        panic!("nested fallback receipt");
     }
 
     #[test]
