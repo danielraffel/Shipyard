@@ -178,28 +178,31 @@ class CiMatrixTests(unittest.TestCase):
         self.assertEqual(rows["linux-arm64"]["provider"], "github-hosted")
         self.assertEqual(rows["windows"]["provider"], "github-hosted")
 
+    PUSH_TO_MAIN = {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main"}
+
     def test_sandbox_local_macos_requires_explicit_m3_canary_capability(self) -> None:
         matrix = ci_matrix.workflow_matrix(
-            "sandbox-e2e", {"REQUESTED_PROVIDER": "local"}
+            "sandbox-e2e", dict(self.PUSH_TO_MAIN, REQUESTED_PROVIDER="local")
         )
         rows = {row["key"]: row for row in matrix["include"]}
         self.assertEqual(
             json.loads(rows["macos-arm64"]["runs_on_json"]),
-            ["self-hosted", "local-mac", "shipyard-sandbox-m3"],
+            ["self-hosted", "shipyard-sandbox-m3"],
         )
 
     def test_sandbox_local_override_cannot_escape_m3_capability(self) -> None:
         matrix = ci_matrix.workflow_matrix(
             "sandbox-e2e",
-            {
-                "REQUESTED_PROVIDER": "local",
-                "LOCAL_MACOS_ARM64_RUNS_ON_JSON": '["self-hosted","studio"]',
-            },
+            dict(
+                self.PUSH_TO_MAIN,
+                REQUESTED_PROVIDER="local",
+                LOCAL_MACOS_ARM64_RUNS_ON_JSON='["self-hosted","studio"]',
+            ),
         )
         rows = {row["key"]: row for row in matrix["include"]}
         self.assertEqual(
             json.loads(rows["macos-arm64"]["runs_on_json"]),
-            ["self-hosted", "studio", "shipyard-sandbox-m3"],
+            ["self-hosted", "shipyard-sandbox-m3"],
         )
 
     FORK_PR = {
@@ -268,22 +271,101 @@ class CiMatrixTests(unittest.TestCase):
         # Case differences in the slug are the same repository.
         env = dict(self.FORK_PR, PR_HEAD_REPO="DanielRaffel/shipyard")
         self.assertFalse(ci_matrix.is_fork_pull_request(env))
-        for workflow in ("ci", "sandbox-e2e"):
-            with self.subTest(workflow=workflow):
-                without_context = {"REQUESTED_PROVIDER": "local"}
+        without_context = {"REQUESTED_PROVIDER": "local"}
+        self.assertEqual(
+            ci_matrix.workflow_outputs("ci", env),
+            ci_matrix.workflow_outputs("ci", without_context),
+        )
+        self.assertEqual(ci_matrix.skipped_notices("ci", env), [])
+        # The Sandbox M3 canary is the exception: no pull request runs it.
+        rows = ci_matrix.workflow_matrix("sandbox-e2e", env)["include"]
+        self.assertEqual([row["key"] for row in rows], ["linux"])
+
+    def test_sandbox_m3_canary_runs_only_for_push_to_main_or_dispatch(self) -> None:
+        local = {
+            "REQUESTED_PROVIDER": "local",
+            "GITHUB_REPOSITORY": "danielraffel/Shipyard",
+            "PR_HEAD_REPO": "danielraffel/Shipyard",
+        }
+        trusted = (
+            {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main"},
+            {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main"},
+        )
+        untrusted = (
+            {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/7/merge"},
+            # A head ref named main is still pull request code.
+            {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/heads/main"},
+            {"GITHUB_EVENT_NAME": "pull_request_target", "GITHUB_REF": "refs/heads/main"},
+            {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/topic"},
+            # A dispatch can run any branch's code; only main is trusted.
+            {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/topic"},
+            {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/tags/v1.0.0"},
+            {"GITHUB_EVENT_NAME": "workflow_dispatch"},
+            {"GITHUB_EVENT_NAME": "merge_group", "GITHUB_REF": "refs/heads/main"},
+            {},
+        )
+        for context in trusted:
+            with self.subTest(context=context):
+                env = dict(local, **context)
+                self.assertTrue(ci_matrix.is_trusted_sandbox_event(env))
+                rows = {
+                    row["key"]: row
+                    for row in ci_matrix.workflow_matrix("sandbox-e2e", env)["include"]
+                }
                 self.assertEqual(
-                    ci_matrix.workflow_outputs(workflow, env),
-                    ci_matrix.workflow_outputs(workflow, without_context),
+                    json.loads(rows["macos-arm64"]["runs_on_json"]),
+                    ["self-hosted", "shipyard-sandbox-m3"],
                 )
+                self.assertEqual(ci_matrix.skipped_notices("sandbox-e2e", env), [])
+        for context in untrusted:
+            with self.subTest(context=context):
+                env = dict(local, **context)
+                self.assertFalse(ci_matrix.is_trusted_sandbox_event(env))
+                outputs = ci_matrix.workflow_outputs("sandbox-e2e", env)
+                rows = json.loads(outputs["matrix_json"])["include"]
+                # Dropped, not moved: the Linux leg runs as before.
+                self.assertEqual([row["key"] for row in rows], ["linux"])
+                self.assertEqual(rows[0]["provider"], "github-hosted")
+                self.assertNotIn("self-hosted", outputs["matrix_json"])
+                self.assertNotIn("macos-15", outputs["matrix_json"])
+                notices = ci_matrix.skipped_notices("sandbox-e2e", env)
+                self.assertEqual(len(notices), 1)
+                self.assertTrue(
+                    notices[0].startswith(
+                        "::notice title=Sandbox M3 canary::Skipped macOS ARM64"
+                    )
+                )
+
+    def test_sandbox_untrusted_gate_covers_any_self_hosted_selector(self) -> None:
+        pr = {"GITHUB_EVENT_NAME": "pull_request"}
+        for env in (
+            dict(pr, EXPLICIT_MACOS_ARM64_RUNNER_SELECTOR_JSON='["self-hosted","studio"]'),
+            dict(pr, REQUESTED_PROVIDER="namespace",
+                 NAMESPACE_MACOS_ARM64_RUNS_ON_JSON='["Self-Hosted","m3"]'),
+        ):
+            with self.subTest(env=env):
+                rows = ci_matrix.workflow_matrix("sandbox-e2e", env)["include"]
+                self.assertEqual([row["key"] for row in rows], ["linux"])
+
+    def test_sandbox_pull_request_keeps_hosted_macos_leg(self) -> None:
+        # Only the self-hosted canary is gated; a hosted macOS leg is isolated.
+        env = {"GITHUB_EVENT_NAME": "pull_request", "REQUESTED_PROVIDER": "github-hosted"}
         rows = {
             row["key"]: row
             for row in ci_matrix.workflow_matrix("sandbox-e2e", env)["include"]
         }
-        self.assertEqual(
-            json.loads(rows["macos-arm64"]["runs_on_json"]),
-            ["self-hosted", "local-mac", "shipyard-sandbox-m3"],
-        )
-        self.assertEqual(ci_matrix.skipped_notices("ci", env), [])
+        self.assertEqual(json.loads(rows["macos-arm64"]["runs_on_json"]), "macos-15")
+        self.assertEqual(ci_matrix.skipped_notices("sandbox-e2e", env), [])
+
+    def test_ci_workflow_ignores_the_sandbox_trust_gate(self) -> None:
+        env = {
+            "GITHUB_EVENT_NAME": "pull_request",
+            "REQUESTED_PROVIDER": "local",
+            "GITHUB_REPOSITORY": "danielraffel/Shipyard",
+            "PR_HEAD_REPO": "danielraffel/Shipyard",
+        }
+        rows = {row["key"]: row for row in ci_matrix.workflow_matrix("ci", env)["include"]}
+        self.assertEqual(rows["macos-arm64"]["provider"], "local")
 
     def test_push_and_dispatch_ignore_pr_head_context(self) -> None:
         for event in ("push", "workflow_dispatch", ""):
@@ -395,7 +477,9 @@ class CiMatrixTests(unittest.TestCase):
         )
         self.assertEqual(workflow.count(predicate), 4)
         self.assertNotIn("startsWith(runner.name, 'pulp-studio')", workflow)
-        self.assertIn('test "$RUNNER_NAME" = "Shipyard-studio-02"', workflow)
+        self.assertIn(
+            "            Shipyard-studio-02|Shipyard-studio-02-sandbox) ;;\n", workflow
+        )
         self.assertIn('if [ "$host_id" != "studio" ]; then', workflow)
         self.assertIn("sandbox-e2e must run on M3: tartci host.id", workflow)
         self.assertNotIn('case "$(hostname)" in', workflow)

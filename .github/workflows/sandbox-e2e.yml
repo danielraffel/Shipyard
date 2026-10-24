@@ -124,7 +124,12 @@ jobs:
           SHIPYARD_BINARY_FOR_TEST: ${{ github.workspace }}/target/release/shipyard
         run: |
           set -euo pipefail
-          test "$RUNNER_NAME" = "Shipyard-studio-02"
+          # fleet-move-runner splits the shipyard-sandbox* labels off the
+          # ci-user runner onto an owner runner named <name>-sandbox.
+          case "$RUNNER_NAME" in
+            Shipyard-studio-02|Shipyard-studio-02-sandbox) ;;
+            *) echo "sandbox-e2e must run on M3's Shipyard-studio-02(-sandbox) runner, not $RUNNER_NAME" >&2; exit 1 ;;
+          esac
           # The host is M3 by its configured fleet identity, never its live
           # hostname: macOS renames a host on a Bonjour name collision
           # (Daniels-Mac-Studio-m3 became Daniels-Mac-Studio-m3-4.local).
@@ -135,7 +140,7 @@ jobs:
           if [ "$host_id" != "studio" ]; then
             echo "sandbox-e2e must run on M3: tartci host.id \"studio\" in $profile;" \
               "this host declares \"${host_id:-no host.id}\" (hostname $(hostname))." \
-              "Route the job to M3's Shipyard-studio-02 runner, or set [host] id in that profile." >&2
+              "Route the job to M3's Shipyard-studio-02-sandbox runner, or set [host] id in that profile." >&2
             exit 1
           fi
           installed="$HOME/.local/bin/shipyard"
