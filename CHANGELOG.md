@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03550"></a>
+## [0.355.0] - 2026-10-24
+
+- feat/queue digest idle alert ([#923](https://github.com/danielraffel/Shipyard/pull/923))
+
 <a id="v03540"></a>
 ## [0.354.0] - 2026-10-24
 
@@ -2561,6 +2566,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.355.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.355.0
 [0.354.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.354.0
 [0.353.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.353.0
 [0.352.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.352.0
