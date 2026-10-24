@@ -14,6 +14,15 @@ The read-only `queue-digest` surface reports `queue_idle` and emits
 separate `merge_queue_idle_with_green_unarmed_work` handoff alert for a green
 unarmed PR. These are alerts for the queue owner, never mutation permissions.
 
+`shipyard queue triage|prioritize|resume` drains a backed-up pull-request CI
+backlog: cancel runs that cannot land at their head, move the fix for a red base
+ahead of other pull requests' waiting jobs, and later re-run what was cancelled
+from the restore ledger (`<state_dir>/queue-drain.json`). It never touches
+merge-group runs, push runs, or any run of an enqueued pull request, never
+cancels a run with a job in progress when prioritizing, and mutates only under
+the merge-queue mutation guard. The default play is in the `ci` skill under
+"Draining a GitHub CI backlog".
+
 ## Webhook repository identity
 
 Webhook registrar repository keys are canonical lowercase `owner/name` values

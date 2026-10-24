@@ -231,6 +231,8 @@ pub mod queue;
 pub mod queue_absent_recovery;
 /// Read-only aggregation of durable queue-observer state across repositories.
 pub mod queue_digest;
+/// Transport-free triage, priority-jump, and resume planning for a CI backlog.
+pub mod queue_drain;
 /// Stable read-only GitHub queue snapshots, state hashing, and delta tracking.
 pub mod queue_observer;
 /// Durable queued execution request and outcome stores.
