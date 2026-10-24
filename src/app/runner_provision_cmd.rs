@@ -2237,22 +2237,19 @@ mod tests {
     #[test]
     fn installed_runner_version_reads_the_binary_not_directory_presence() {
         let temp = tempfile::tempdir().expect("temp");
-        let listener = temp.path().join("bin/Runner.Listener");
-        std::fs::create_dir_all(listener.parent().expect("parent")).expect("bin dir");
-        std::os::unix::fs::symlink("/bin/echo", &listener)
-            .expect("link immutable executable fixture");
-        let expected = Command::new("/bin/echo")
-            .arg("--version")
-            .output()
-            .expect("reference version")
-            .stdout;
-        let expected = String::from_utf8(expected)
-            .expect("utf8 reference version")
-            .trim()
-            .to_owned();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        assert_eq!(installed_runner_version(temp.path()), None);
+        // The fixture prints its own fixed version, so the expectation does not
+        // depend on the host's echo: uutils coreutils is a multicall binary
+        // that dispatches on argv[0] and does nothing useful as Runner.Listener.
+        crate::test_support::write_executable_script(
+            &bin.join("Runner.Listener"),
+            "#!/bin/sh\n[ \"$1\" = --version ] || exit 2\necho ' 9.9.9-fixture '\n",
+        );
         assert_eq!(
             installed_runner_version(temp.path()).as_deref(),
-            Some(expected.as_str())
+            Some("9.9.9-fixture")
         );
         assert_ne!(
             installed_runner_version(temp.path()).as_deref(),
