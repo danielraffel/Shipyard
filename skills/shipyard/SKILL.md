@@ -116,6 +116,10 @@ cannot fail an unrelated run.
 The macOS Sandbox E2E job proves it is on M3 by the tartci fleet profile's
 `[host] id = "studio"`, never the live hostname, which macOS changes on a
 Bonjour name collision (`Daniels-Mac-Studio-m3-4.local`). See the ci skill.
+It runs only for a push to main or a workflow_dispatch, never for a pull
+request (`is_trusted_sandbox_event` in `scripts/ci_matrix.py`), on the owner
+runner `Shipyard-studio-02-sandbox` (or `Shipyard-studio-02` before its split).
+To exercise it on a branch, dispatch Sandbox E2E with `runner_provider=local`.
 
 A quiet `daemon.log` during a Sandbox E2E run is expected: the sandbox audit
 holds the writer-domain lock exclusively, so `write_stderr` waits up to 30s

@@ -7,7 +7,9 @@ provider routes to the maintainer's self-hosted Mac (label set
 `["self-hosted","local-mac"]`) for the macOS release/build leg, falling back
 to github-hosted for targets with no local box. Workflow inputs or repository
 variables can override defaults without editing YAML. A pull request from a
-fork never resolves to a self-hosted runner: those legs are skipped.
+fork never resolves to a self-hosted runner: those legs are skipped. The
+self-hosted macOS Sandbox leg (the M3 canary) runs only for trusted code: a
+push to main or a workflow_dispatch. Every pull request skips it.
 """
 
 from __future__ import annotations
@@ -157,6 +159,20 @@ def is_fork_pull_request(env: Mapping[str, str]) -> bool:
     return not head or head != _env(env, "GITHUB_REPOSITORY").lower()
 
 
+def is_trusted_sandbox_event(env: Mapping[str, str]) -> bool:
+    """True when the run may use the M3 Sandbox canary runner.
+
+    That runner is the owner's GUI session beside the production daemon, so
+    only code already on main (a push to main) or a run a maintainer started
+    (workflow_dispatch) may land there. Any other event, same-repo pull
+    requests included, is untrusted.
+    """
+    event = _env(env, "GITHUB_EVENT_NAME")
+    if event == "workflow_dispatch":
+        return True
+    return event == "push" and _env(env, "GITHUB_REF") == "refs/heads/main"
+
+
 def _is_self_hosted(provider: str, selector: str) -> bool:
     if provider == "local":
         return True
@@ -217,6 +233,18 @@ def resolve_runs_on(target_key: str, env: Mapping[str, str] = os.environ) -> dic
     }
 
 
+def _is_untrusted_sandbox_canary(
+    workflow: str, row: Mapping[str, str], env: Mapping[str, str]
+) -> bool:
+    return (
+        workflow == "sandbox-e2e"
+        and row["key"] == "macos-arm64"
+        and row["provider"] != SKIPPED_PROVIDER
+        and _is_self_hosted(row["provider"], row["runs_on_json"])
+        and not is_trusted_sandbox_event(env)
+    )
+
+
 def workflow_matrix(workflow: str, env: Mapping[str, str] = os.environ) -> dict[str, list[dict[str, str]]]:
     try:
         target_keys = WORKFLOW_TARGETS[workflow]
@@ -227,6 +255,10 @@ def workflow_matrix(workflow: str, env: Mapping[str, str] = os.environ) -> dict[
     for target_key in target_keys:
         row = resolve_runs_on(target_key, env)
         if row["provider"] == SKIPPED_PROVIDER:
+            continue
+        if _is_untrusted_sandbox_canary(workflow, row, env):
+            # Dropped, not moved to GitHub-hosted: no check run is created,
+            # so nothing is left pending. Push to main or dispatch to run it.
             continue
         if workflow == "sandbox-e2e" and target_key == "macos-arm64" and row["provider"] == "local":
             selector = json.loads(row["runs_on_json"])
@@ -255,17 +287,23 @@ def workflow_outputs(workflow: str, env: Mapping[str, str] = os.environ) -> dict
 
 
 def skipped_notices(workflow: str, env: Mapping[str, str] = os.environ) -> list[str]:
-    skipped = [
-        row["name"]
-        for row in (resolve_runs_on(key, env) for key in WORKFLOW_TARGETS[workflow])
-        if row["provider"] == SKIPPED_PROVIDER
-    ]
-    return [
-        f"::notice title=Fork pull request::Skipped {name}: the resolver never "
-        "selects a self-hosted runner for a fork pull request. A maintainer can "
-        "push the reviewed commits to a branch of this repository to run it."
-        for name in skipped
-    ]
+    notices = []
+    for row in (resolve_runs_on(key, env) for key in WORKFLOW_TARGETS[workflow]):
+        name = row["name"]
+        if row["provider"] == SKIPPED_PROVIDER:
+            notices.append(
+                f"::notice title=Fork pull request::Skipped {name}: the resolver never "
+                "selects a self-hosted runner for a fork pull request. A maintainer can "
+                "push the reviewed commits to a branch of this repository to run it."
+            )
+        elif _is_untrusted_sandbox_canary(workflow, row, env):
+            notices.append(
+                f"::notice title=Sandbox M3 canary::Skipped {name}: the self-hosted "
+                "Sandbox canary runs only for a push to main or a workflow_dispatch, "
+                "never for a pull request. A maintainer can dispatch Sandbox E2E on "
+                "the branch to run it."
+            )
+    return notices
 
 
 def write_outputs(outputs: Mapping[str, str], path: Path) -> None:
