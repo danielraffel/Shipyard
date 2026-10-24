@@ -1441,7 +1441,11 @@ with `-f`; without `-X GET`, `gh api -f` can POST and produce misleading 404s.
 Before blaming ambient `gh auth status`, check whether the machine-global or
 untracked `.shipyard.local` config has `[github.auth]`. A tracked layer may not
 set github.auth: Shipyard refuses one in `.shipyard/config.toml` (or a committed
-`.shipyard.local/config.toml`) and names where to move it. Shipyard can inject env or command-helper tokens into its
+`.shipyard.local/config.toml`) and names where to move it. The same refusal
+covers `[host_class.*]` (runner capacity, reroute-watch, fleet-status, and
+`ship`'s VM-slot admission) and `[pr_watch.digest] command`, `[pr_watch.handback]
+cmux_path` and `[pr_watch.handback.hosts]` (every `pr-watch` subcommand): each
+names a program this machine runs or a host it reaches. Shipyard can inject env or command-helper tokens into its
 built-in `gh` subprocesses as `GH_TOKEN`, including helpers that mint GitHub
 App installation tokens. `shipyard doctor --rate-limit --json` reports the
 effective source and rate-limit buckets. For GitHub App or fine-grained tokens,
