@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03560"></a>
+## [0.356.0] - 2026-10-24
+
+- feat(queue): triage, prioritize, and resume a pull-request CI backlog ([#927](https://github.com/danielraffel/Shipyard/pull/927))
+
 <a id="v03552"></a>
 ## [0.355.2] - 2026-10-24
 
@@ -2576,6 +2581,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.356.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.356.0
 [0.355.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.355.2
 [0.355.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.355.1
 [0.355.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.355.0
