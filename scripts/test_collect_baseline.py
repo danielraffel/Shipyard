@@ -268,6 +268,27 @@ class CollectorInvocationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             MOD.validate_tartci_export(json.dumps(bad), "o/pulp", "pulp")
 
+    def test_prepare_tartci_export_excludes_unjoinable_local_attempts(self):
+        text = "\n".join(json.dumps(record) for record in [
+            {"project": "pulp", "repo": "o/pulp", "provider": "tart", "external_id": "job-1"},
+            {"project": "pulp", "repo": "o/pulp", "provider": "tart", "external_id": ""},
+        ])
+        normalized, excluded = MOD.prepare_tartci_export(text, "o/pulp", "pulp")
+        self.assertEqual(excluded, 1)
+        self.assertEqual(json.loads(normalized)[0]["external_id"], "job-1")
+
+    def test_tartci_export_command_can_read_a_named_fleet_host(self):
+        args = type("Args", (), {"tartci": "tartci", "tartci_host": "m5s",
+                                  "tartci_remote_command": "tartci", "repo": "o/pulp",
+                                  "since_days": 5})()
+        self.assertEqual(MOD.tartci_export_command(args), [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "m5s", "tartci",
+            "runtime", "export", "--repo", "o/pulp", "--since-days", "5",
+        ])
+        args.tartci_host = "m5s;touch"
+        with self.assertRaises(ValueError):
+            MOD.tartci_export_command(args)
+
     def test_collect_uses_selected_db_and_counts_only_new_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()

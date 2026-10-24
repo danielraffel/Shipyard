@@ -78,14 +78,18 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     if github.returncode:
         raise RuntimeError(f"GitHub import failed: {github.stderr.strip()}")
     events.append(summarize_import("github", github.stdout))
-    tartci = run([args.tartci, "runtime", "export", "--repo", args.repo, "--since-days", str(args.since_days)], timeout=args.timeout_seconds)
+    tartci = run(tartci_export_command(args), timeout=args.timeout_seconds)
     if tartci.returncode:
         raise RuntimeError(f"TartCI export failed: {tartci.stderr.strip()}")
-    validate_tartci_export(tartci.stdout, args.repo, args.project)
-    imported = run([args.shipyard, "--state-dir", state_dir, "metrics", "import", "tartci", "--json"], stdin=tartci.stdout, timeout=args.timeout_seconds)
+    normalized, excluded = prepare_tartci_export(tartci.stdout, args.repo, args.project)
+    imported = run([args.shipyard, "--state-dir", state_dir, "metrics", "import", "tartci", "--json"], stdin=normalized, timeout=args.timeout_seconds)
     if imported.returncode:
         raise RuntimeError(f"TartCI import failed: {imported.stderr.strip()}")
-    events.append(summarize_import("tartci", imported.stdout))
+    tartci_event = summarize_import("tartci", imported.stdout)
+    if excluded:
+        tartci_event["excluded_unjoinable"] = excluded
+        tartci_event["exclusion_reason"] = "missing external_id cannot be joined to a GitHub job"
+    events.append(tartci_event)
     unknown_imports = [event["source"] for event in events
                        if event.get("source") in {"github", "tartci"}
                        and (not isinstance(event.get("imported"), int)
@@ -141,7 +145,7 @@ def source_activity_dates(db: pathlib.Path, project: str, repo: str) -> set[str]
         return None
 
 
-def validate_tartci_export(text: str, repo: str, project: str) -> None:
+def _tartci_records(text: str) -> list[dict[str, Any]]:
     if not text.strip():
         raise RuntimeError("TartCI export was empty")
     records = []
@@ -157,6 +161,36 @@ def validate_tartci_export(text: str, repo: str, project: str) -> None:
                     raise RuntimeError("TartCI export contained malformed JSON") from exc
     if not records or any(not isinstance(record, dict) for record in records):
         raise RuntimeError("TartCI export must contain JSON objects")
+    return records
+
+
+def prepare_tartci_export(text: str, repo: str, project: str) -> tuple[str, int]:
+    """Return only joinable records and the explicit count excluded.
+
+    TartCI also records local attempts that never received a GitHub job id.
+    They are useful to TartCI's local diagnostics but cannot be joined to the
+    Shipyard job table, so silently importing them would inflate throughput.
+    A malformed record, wrong project, or invalid provider remains fatal.
+    """
+    records = _tartci_records(text)
+    invalid = [record for record in records if record.get("repo") != repo or record.get("project") != project
+               or not isinstance(record.get("provider"), str) or not record["provider"].strip()
+               or ("external_id" in record and not isinstance(record.get("external_id"), str))]
+    if invalid:
+        raise RuntimeError("TartCI export record lacks exact project/repo or valid provider/external_id type")
+    joinable = [record for record in records if isinstance(record.get("external_id"), str)
+                and record["external_id"].strip()]
+    if not joinable:
+        raise RuntimeError("TartCI export contained no joinable provider/external_id records")
+    keys = [(record["provider"], record["external_id"]) for record in joinable]
+    if len(keys) != len(set(keys)):
+        raise RuntimeError("TartCI export contains duplicate provider/external_id records")
+    return json.dumps(joinable, sort_keys=True), len(records) - len(joinable)
+
+
+def validate_tartci_export(text: str, repo: str, project: str) -> None:
+    """Strict compatibility validator retained for callers and tests."""
+    records = _tartci_records(text)
     missing = [record for record in records if record.get("repo") != repo or record.get("project") != project
                or not isinstance(record.get("provider"), str) or not record["provider"].strip()
                or not isinstance(record.get("external_id"), str) or not record["external_id"].strip()]
@@ -165,6 +199,19 @@ def validate_tartci_export(text: str, repo: str, project: str) -> None:
     keys = [(record["provider"], record["external_id"]) for record in records]
     if len(keys) != len(set(keys)):
         raise RuntimeError("TartCI export contains duplicate provider/external_id records")
+
+
+def tartci_export_command(args: argparse.Namespace) -> list[str]:
+    command = [getattr(args, "tartci_remote_command", "tartci")] if getattr(args, "tartci_host", None) else [args.tartci]
+    if getattr(args, "tartci_host", None):
+        host = str(args.tartci_host)
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", host):
+            raise ValueError("--tartci-host must be a plain fleet host name")
+        remote = command[0]
+        if not re.fullmatch(r"[A-Za-z0-9_./-]+", remote):
+            raise ValueError("--tartci-remote-command must be a path or command name")
+        command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, remote]
+    return command + ["runtime", "export", "--repo", args.repo, "--since-days", str(args.since_days)]
 
 
 def summarize_import(source: str, output: str) -> dict[str, Any]:
@@ -521,6 +568,9 @@ def main() -> int:
     parser.add_argument("--status-markdown", type=pathlib.Path)
     parser.add_argument("--shipyard", default="shipyard")
     parser.add_argument("--tartci", default="tartci")
+    parser.add_argument("--tartci-host", help="plain fleet host that owns the runtime export")
+    parser.add_argument("--tartci-remote-command", default="tartci",
+                        help="remote TartCI command when --tartci-host is used")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--since-days", type=int, default=5)
     parser.add_argument("--collect", action="store_true", help="run provider imports")
