@@ -93,6 +93,7 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     merge_receipts = getattr(args, "merge_receipts", None)
     if merge_receipts is not None:
         receipt_path = pathlib.Path(merge_receipts).expanduser()
+        validate_merge_receipt_scope(receipt_path, args.repo)
         imported_receipts = run([
             args.shipyard, "--state-dir", state_dir, "metrics", "import", "merge-receipt",
             "--file", str(receipt_path), "--json",
@@ -200,6 +201,32 @@ def prepare_tartci_export(text: str, repo: str, project: str) -> tuple[str, int]
     if len(keys) != len(set(keys)):
         raise RuntimeError("TartCI export contains duplicate provider/external_id records")
     return json.dumps(joinable, sort_keys=True), len(records) - len(joinable)
+
+
+def validate_merge_receipt_scope(path: pathlib.Path, repo: str) -> None:
+    """Bind an explicit producer handoff to the requested repository."""
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        raise RuntimeError(f"merge receipt handoff is unreadable: {exc}") from exc
+    if not text.strip():
+        raise RuntimeError("merge receipt handoff is empty")
+    try:
+        value = json.loads(text)
+        records = value if isinstance(value, list) else [value]
+    except json.JSONDecodeError:
+        records = []
+        for line in text.splitlines():
+            if line.strip():
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("merge receipt handoff contained malformed JSON") from exc
+    if not records or any(not isinstance(record, dict) for record in records):
+        raise RuntimeError("merge receipt handoff must contain JSON objects")
+    expected = repo.strip().casefold()
+    if any(str(record.get("repo", "")).strip().casefold() != expected for record in records):
+        raise RuntimeError(f"merge receipt handoff contains a repository other than {repo}")
 
 
 def validate_tartci_export(text: str, repo: str, project: str) -> None:

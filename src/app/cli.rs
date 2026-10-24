@@ -1119,6 +1119,12 @@ pub(crate) enum MetricsCommand {
         #[command(subcommand)]
         source: MetricsImportCommand,
     },
+    /// Export producer-bound records for an explicit handoff.
+    Export {
+        /// Export source.
+        #[command(subcommand)]
+        source: MetricsExportCommand,
+    },
     /// List recent job rows.
     List(MetricsListArgs),
     /// Summarize p50/p90/min/max/failure-rate by project,target,backend,host.
@@ -1867,6 +1873,22 @@ pub(crate) enum MetricsImportCommand {
     Github(MetricsImportGithubArgs),
     /// Import producer-self-asserted, format-validated protected-branch merge receipts (JSON/JSONL).
     MergeReceipt(MetricsImportMergeReceiptArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum MetricsExportCommand {
+    /// Export validated protected-branch merge receipts as JSONL.
+    MergeReceipt(MetricsExportMergeReceiptArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsExportMergeReceiptArgs {
+    /// Exact owner/repo slug to export; prevents cross-repository handoffs.
+    #[arg(long)]
+    pub(crate) repo: String,
+    /// Destination JSONL file. The write is atomic.
+    #[arg(long)]
+    pub(crate) file: PathBuf,
 }
 
 #[derive(Debug, Args)]

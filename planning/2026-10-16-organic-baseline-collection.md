@@ -20,6 +20,21 @@ managed SSH aliases. Attempts without a GitHub external id are retained by
 TartCI but excluded from Shipyard's joinable baseline with an explicit count;
 they cannot contribute to safely merged throughput or wasted-compute metrics.
 
+The producer-side handoff is explicit and read-only. On the Shipyard state
+directory that records protected merges, run:
+
+```sh
+shipyard --state-dir "$PRODUCER_STATE_DIR" metrics export merge-receipt \
+  --repo Generous-Corp/pulp \
+  --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
+```
+
+The observer then passes that file as `--merge-receipts`. The export reads only
+validated receipts already persisted by Shipyard, scopes them to the exact
+repository, and atomically replaces the handoff file when at least one receipt
+exists. An empty export fails without replacing the previous handoff. It never
+asks GitHub for merge state or creates a receipt.
+
 The command writes an append-only observation history and reports continuous
 elapsed 24-hour days, required activity strata, organic sample counts, and the
 safe-merge denominator. The baseline cannot exit while normal PR, merge-group,

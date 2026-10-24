@@ -9,8 +9,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::app::cli::{
-    MetricsCommand, MetricsFreshnessArgs, MetricsGroupBy, MetricsImportCommand,
-    MetricsImportGithubArgs, MetricsImportTartciArgs, MetricsRecordArgs,
+    MetricsCommand, MetricsExportCommand, MetricsExportMergeReceiptArgs, MetricsFreshnessArgs,
+    MetricsGroupBy, MetricsImportCommand, MetricsImportGithubArgs, MetricsImportTartciArgs,
+    MetricsRecordArgs,
 };
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::config::LoadedConfig;
@@ -48,6 +49,14 @@ struct MetricsImportOutput {
     imported: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     skipped_runs: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetricsExportOutput {
+    database: String,
+    source: String,
+    file: String,
+    exported: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,6 +179,28 @@ fn stale_exit(freshness: &Freshness, fail_on_stale: bool) -> std::process::ExitC
     }
 }
 
+fn write_merge_receipts_jsonl(
+    path: &Path,
+    receipts: &[crate::metrics::merge_receipt::MergeReceipt],
+) -> Result<(), CliFailure> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
+    for receipt in receipts {
+        let line = serde_json::to_string(receipt)
+            .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
+        writeln!(temporary, "{line}")
+            .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
+    }
+    temporary.persist(path).map_err(|error| {
+        CliFailure::new(1, format!("merge receipt export failed: {}", error.error))
+    })?;
+    Ok(())
+}
+
 /// The required status checks `watch` classified lanes against, and where
 /// they came from.
 #[derive(Clone, Debug, Serialize)]
@@ -285,6 +316,42 @@ pub(super) fn metrics_command<W: Write>(
                     format!(
                         "imported {} GitHub job rows (skipped {} malformed workflow runs)",
                         report.imported, report.skipped_runs
+                    )
+                })?;
+            }
+        },
+        MetricsCommand::Export { source } => match source {
+            MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs { repo, file }) => {
+                let receipts = store.export_merge_receipts(&repo).map_err(|error| {
+                    CliFailure::new(1, format!("merge receipt export failed: {error}"))
+                })?;
+                if receipts.is_empty() {
+                    return Err(CliFailure::new(
+                        1,
+                        format!("merge receipt export failed: no receipts for {repo}"),
+                    ));
+                }
+                let destination = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+                let store_path = std::fs::canonicalize(store.path())
+                    .unwrap_or_else(|_| store.path().to_path_buf());
+                if destination == store_path {
+                    return Err(CliFailure::new(
+                        1,
+                        "merge receipt export failed: destination must not be the metrics database",
+                    ));
+                }
+                write_merge_receipts_jsonl(&file, &receipts)?;
+                let output = MetricsExportOutput {
+                    database: store.path().display().to_string(),
+                    source: "merge-receipt".to_owned(),
+                    file: file.display().to_string(),
+                    exported: receipts.len(),
+                };
+                write_output(stdout, json_output, &output, || {
+                    format!(
+                        "exported {} merge receipts to {}",
+                        receipts.len(),
+                        file.display()
                     )
                 })?;
             }
@@ -908,7 +975,9 @@ fn _json_debug(value: &impl Serialize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::cli::MetricsImportMergeReceiptArgs;
+    use crate::app::cli::{
+        MetricsExportCommand, MetricsExportMergeReceiptArgs, MetricsImportMergeReceiptArgs,
+    };
 
     fn no_freshness_flags() -> MetricsFreshnessArgs {
         MetricsFreshnessArgs {
@@ -1094,6 +1163,103 @@ mod tests {
         changed["evidence"] = serde_json::json!("sha256:changed");
         std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
         assert_eq!(run(Some(path)).unwrap_err().code, 1);
+    }
+
+    #[test]
+    fn merge_receipt_export_writes_atomic_repository_scoped_jsonl() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let receipt = crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
+            receipt_id: "export-cli".to_owned(),
+            repo: "owner/repo".to_owned(),
+            project: "repo".to_owned(),
+            base_branch: "main".to_owned(),
+            pr: 1,
+            head_sha: "a".repeat(40),
+            validated_head_sha: "a".repeat(40),
+            merge_commit_sha: "b".repeat(40),
+            merged_at: Utc::now(),
+            safe_merge: true,
+            source: "shipyard".to_owned(),
+            required_checks: vec!["linux".to_owned()],
+            gate_receipt_sha256: "c".repeat(64),
+            evidence: "sha256:export-cli".to_owned(),
+        };
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .expect("receipt");
+        let destination = temp.path().join("handoff.jsonl");
+        let mut output = Vec::new();
+        metrics_command(
+            MetricsCommand::Export {
+                source: MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
+                    repo: "owner/repo".to_owned(),
+                    file: destination.clone(),
+                }),
+            },
+            temp.path(),
+            None,
+            true,
+            &mut output,
+        )
+        .expect("export");
+        let json: Value = serde_json::from_slice(&output).expect("export summary");
+        assert_eq!(json["exported"], 1);
+        let lines = std::fs::read_to_string(destination).expect("handoff");
+        assert_eq!(lines.lines().count(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(lines.trim()).expect("receipt json")["receipt_id"],
+            "export-cli"
+        );
+    }
+
+    #[test]
+    fn merge_receipt_export_refuses_empty_or_database_destinations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let destination = temp.path().join("handoff.jsonl");
+        let run = |repo: &str, file: std::path::PathBuf| {
+            let mut output = Vec::new();
+            metrics_command(
+                MetricsCommand::Export {
+                    source: MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
+                        repo: repo.to_owned(),
+                        file,
+                    }),
+                },
+                temp.path(),
+                None,
+                true,
+                &mut output,
+            )
+        };
+        let error = run("missing/repo", destination).expect_err("empty export must fail");
+        assert!(error.message().contains("no receipts"));
+        let receipt = crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
+            receipt_id: "export-db-destination".to_owned(),
+            repo: "owner/repo".to_owned(),
+            project: "repo".to_owned(),
+            base_branch: "main".to_owned(),
+            pr: 1,
+            head_sha: "a".repeat(40),
+            validated_head_sha: "a".repeat(40),
+            merge_commit_sha: "b".repeat(40),
+            merged_at: Utc::now(),
+            safe_merge: true,
+            source: "shipyard".to_owned(),
+            required_checks: vec!["linux".to_owned()],
+            gate_receipt_sha256: "c".repeat(64),
+            evidence: "sha256:export-db-destination".to_owned(),
+        };
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .expect("receipt");
+        let db_path = store.path().to_path_buf();
+        let error = run("owner/repo", db_path.clone()).expect_err("database overwrite must fail");
+        assert!(error.message().contains("metrics database"));
+        assert!(db_path.is_file(), "database survived rejected export");
     }
 
     #[test]
