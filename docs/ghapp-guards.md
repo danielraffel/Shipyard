@@ -89,6 +89,174 @@ as `shipyard landing --pr <n>` (see `docs/landing-model.md`).
 A GraphQL body read from stdin (`--input -`, `query=@-`) cannot be inspected
 and is refused as ambiguous.
 
+### A tiered required check must prove its full lane
+
+A repository can gate an expensive lane behind a fleet-App dispatch. On a
+pull request run, its required check runs only a cheap contract lane and
+concludes `success`; the full lane runs when the fleet App dispatches the
+workflow on the head. GitHub cannot tell that success from the full lane's,
+so native auto-merge would enqueue the head as soon as it is armed.
+
+**Opt in** by naming the checks, and the one App whose tier records count, in
+the base branch's `.shipyard/config.toml` (read through the API from the base,
+never from the head):
+
+```toml
+[queue]
+tiered_required_checks = ["macos"]
+tier_record_app = "pulp-tier-records"
+```
+
+A repository without `tiered_required_checks` pays one config read per landing
+and is otherwise unaffected. One that names tiered checks without
+`tier_record_app`, or names `github-actions` or the fleet App
+`shipyard-local`, refuses every landing until the config is fixed.
+
+**Where the tier comes from: a tier record, never an annotation.** Any step of
+a job, including the code under test, can print a `::notice`, so a later
+annotation could claim a wider tier, and enough annotations push the real one
+past GitHub's caps. The guard ignores tier annotations. The tier is read from
+a *tier record*: a check run on the pull request's head named
+`shipyard-test-tier/<check>` (for example `shipyard-test-tier/macos`),
+created by the `tier_record_app` App through the Checks API, whose
+`output.summary` is one JSON object:
+
+```json
+{"schema":"shipyard-test-tier/v1","check":"macos","tier":"deferred",
+ "run_id":123,"run_attempt":1,"trigger":"pull_request","actor":"<author>",
+ "selector":"pr-fast+pr-guard","full_lane_workflow":"build.yml",
+ "full_suite_runs_in":"merge_group"}
+```
+
+`run_id` and `run_attempt` are the workflow run and attempt whose job is the
+check, so a record from an earlier run or attempt never speaks for a rerun.
+`trigger` and `actor` name the event and account that started the run; a
+full lane is a `workflow_dispatch` by `shipyard-local[bot]`. The guard reports
+them but does not need them: the record App already decided the tier.
+`full_lane_workflow` names the workflow whose dispatch on the head, by the
+fleet App, runs the full lane. A label is not a full-lane path: a `labeled`
+run of the workflow shadows the required check the merge queue reads (Pulp
+#11044 removed `labeled` from `build.yml` for that reason). The record carries
+no label.
+
+**Why a dedicated App, not the workflow's own token.** GitHub lets a check run
+be updated only by the app that created it. Every job's `GITHUB_TOKEN` acts as
+`github-actions`, and a pull request job can hold `checks: write` (the default
+under permissive token settings), so a record `github-actions` created could be
+PATCHed from `deferred` to `full` by the code under test. A check run carries
+no update time, so nothing would show it. Records from `github-actions` never
+count. A record created by a dedicated App cannot be touched by pull request
+code at all, provided only a workflow pull requests cannot edit holds the
+App's key. The fleet App is refused for the same reason: every agent posts as
+it.
+
+**Publishing the record.** Use a `workflow_run` workflow on the default
+branch, which runs the default branch's definition (a pull request cannot
+edit it) and is the only holder of the record App's private key. The record
+must be decided from facts pull request code cannot write, never from the
+run's outputs, artifacts or logs.
+
+**Custody of the record App's key** is what the whole rule rests on: whoever
+can mint the App's token can forge a record.
+
+- Keep it in an **Actions Environment secret** whose deployment-branch policy
+  allows only the default branch, and give only the `workflow_run` publisher
+  job that `environment:`. A **repository-level secret is not enough**: a
+  same-repository pull request's runs can read it.
+- Never keep the key, or a token minted from it, on a host where agent
+  sessions run as the same OS user. A same-user agent could read it, mint a
+  token and post a record. This is the same limit as any same-user secret on
+  an agent host.
+- Where a host must hold it, hold it under a separate OS user that agent
+  sessions cannot act as, and have that user publish.
+
+**The tiered job may not hold `checks: write` either (defence in depth).** A
+same-repo pull request can grant its jobs `checks: write` in its own workflow
+file, whatever the repository default is, and a check run carries no update
+time to show a rewrite. So before a head is allowed, the guard also reads the
+tiered job's log (`repos/<o>/<r>/actions/jobs/<id>/logs`) for the
+`GITHUB_TOKEN Permissions` group the runner prints in "Set up job". `Checks`
+must be `read` or `none` (not listed is `none`). A log that cannot be read, or
+a group that is missing, never closes or holds a line that is not
+`<Scope>: read|write|none`, refuses. The log is read only when the records
+would otherwise allow, so a refusal costs nothing extra.
+
+Publisher sketch:
+
+{% raw %}
+```yaml
+on:
+  workflow_run:
+    workflows: [Build]          # the workflow whose job is the tiered check
+    types: [completed]
+jobs:
+  tier-record:
+    runs-on: ubuntu-latest
+    # The key is an Environment secret; the environment's deployment-branch
+    # policy admits only the default branch, so no pull request run reads it.
+    environment: tier-record
+    permissions: {}
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.TIER_RECORD_APP_ID }}
+          private-key: ${{ secrets.TIER_RECORD_APP_KEY }}
+      - env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          CREATED_AT: ${{ github.event.workflow_run.created_at }}
+        # Decides the tier from facts the runner or GitHub recorded, never
+        # from a label timeline: `fast` or `full` only for a
+        # `workflow_dispatch` run whose triggering actor is the fleet App
+        # (`shipyard-local[bot]`) and whose head_sha is HEAD_SHA, and whose
+        # `macos` job's step conclusions (jobs API, exactly this attempt) show
+        # the full lane ran. A `pull_request` run, a dispatch by anyone else,
+        # or anything it cannot place publishes `deferred` or nothing. Then
+        # creates the shipyard-test-tier/macos check run on HEAD_SHA,
+        # completed, with output.title = tier and output.summary = the JSON
+        # above, `full_lane_workflow` included.
+        run: ./.github/scripts/publish-tier-record.sh
+```
+{% endraw %}
+
+**The rule.** For each tiered check, the guard takes the latest check run of
+that name on the exact head (highest id):
+
+1. Missing or not `completed`: refuse. Arm-on-open runs before the checks do,
+   and a head armed then would be enqueued the moment a deferred lane went
+   green. The steward's native-arm backstop (`shipyard runner steward
+   --arm-unqueued`) arms it once it is green and its tier is full.
+2. Not a GitHub Actions job, or its job (`repos/<o>/<r>/actions/jobs/<id>`)
+   cannot be read: refuse.
+3. Of the tier records bound to that job's `run_id` and `run_attempt` (name,
+   app `tier_record_app`, `completed`, a valid `shipyard-test-tier/v1` summary
+   naming the check): any `deferred` refuses, and none at all refuses. A later
+   record cannot widen an earlier `deferred` one, so a forged record can only
+   refuse.
+4. The tiered job's token held `checks: write`, or its `GITHUB_TOKEN
+   Permissions` log group cannot be read or parsed: refuse.
+
+An unreadable config or a partial check-run listing refuses. The refusal
+prints a `queue-arm-guard: fix:` line: for a deferred tier, "dispatch
+`build.yml` on head <sha> as the fleet App and wait for the full lane" (the
+record's `full_lane_workflow`; without one, "dispatch the workflow of
+`<check>`").
+
+No override applies: `GHAPP_ALLOW_QUEUE_REARM=1` does not land such a head.
+
+Shipyard applies the same rule itself (`src/deferred_tier.rs`, mirrored from
+`tier_blockers` in the guard) on every path that arms, enqueues or merges:
+arm-on-open in `shipyard ship`/`shipyard pr`, the validated arm and classic
+merge of `shipyard auto-merge` (`head_approval_verdict`), the steward's
+native-arm backstop (`ArmSkip::DeferredTier`) and managed enqueue
+(`waiting_full_test_tier`), the runner carrier's exact-head arm (left
+disarmed), and `base-health`'s jump enqueue (`refused: ...`). Arm-on-open and the backstop also go through this guard;
+the others carry the internal marker and go past it, so each checks for
+itself.
+
 ### Review before arm or merge
 
 An arm or enqueue the table above allows, and any direct merge, is still
@@ -821,7 +989,7 @@ queue removal is refreshable.
 | `SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1` | Shipyard itself, just before one of its own arms, enqueues or merges, with that run's one-shot nonce | the arm guard runs only the review rule, whatever the internal marker says, and records the attempt. Without a valid nonce it is ignored and every rule applies |
 | `SHIPYARD_QUEUE_MUTATION_NONCE`, `SHIPYARD_QUEUE_MUTATION_NONCE_DIR` | Shipyard itself, only on the child it built for one call | name the one-shot record that makes the two switches above count (below) |
 | `GHAPP_ALLOW_UNREVIEWED_ARM=1` | nobody | refused and audited; the review rule has no override |
-| `GHAPP_ALLOW_QUEUE_REARM=1` | an operator, deliberately, for one command | the arm guard allows a refused arm and prints a `WARNING` naming what it overrode |
+| `GHAPP_ALLOW_QUEUE_REARM=1` | an operator, deliberately, for one command | the arm guard allows a refused arm and prints a `WARNING` naming what it overrode; it never lands a head whose [tiered check](#a-tiered-required-check-must-prove-its-full-lane) has not proven its full lane |
 | `GHAPP_ALLOW_QUEUE_REMOVAL=1` | an operator, deliberately, with a stated reason | the removal guard allows the dequeue/disable, with a `WARNING` and an audit record, only for a `defect-fix` or the main-red fix PR itself (below) |
 | `GHAPP_ALLOW_BRANCH_REFRESH=1` | an operator, deliberately, for one command | the branch-refresh guard allows a refused refresh and prints a `WARNING` |
 

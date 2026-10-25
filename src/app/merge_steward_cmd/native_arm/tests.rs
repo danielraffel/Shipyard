@@ -203,6 +203,47 @@ fn an_unmanaged_green_unarmed_pr_is_armed_with_merge() {
     assert!(!calls.to_ascii_lowercase().contains("squash"), "{calls}");
 }
 
+/// A green candidate whose tiered `macos` check ran only its deferred tier is
+/// skipped with the fix, and nothing is armed.
+#[cfg(unix)]
+#[test]
+fn the_backstop_never_arms_a_deferred_head() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls.log");
+    let summary = r#"{\"schema\":\"shipyard-test-tier/v1\",\"check\":\"macos\",\"tier\":\"deferred\",\"run_id\":700,\"run_attempt\":1,\"trigger\":\"pull_request\",\"actor\":\"author\",\"full_lane_workflow\":\"build.yml\"}"#;
+    let script = never_armed_then_arms(&log.display().to_string()).replacen(
+        "case \"$*\" in\n",
+        &format!(
+            r#"case "$*" in
+  *contents/.shipyard/config.toml*) printf '%s\n' '[queue]' 'tiered_required_checks = ["macos"]' 'tier_record_app = "pulp-tier-records"' ;;
+  *"commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs"*) printf '%s' '[{{"total_count":2,"check_runs":[{{"id":9,"name":"macos","status":"completed","app":{{"slug":"github-actions"}}}},{{"id":750,"name":"shipyard-test-tier/macos","status":"completed","app":{{"slug":"pulp-tier-records"}},"output":{{"summary":"{summary}"}}}}]}}]' ;;
+  *actions/jobs/9*) printf '%s' '{{"id":9,"run_id":700,"run_attempt":1}}' ;;
+"#
+        ),
+        1,
+    );
+    let actions = fake_gh(&temp, &script);
+    let observation = observation(pr_row(&serde_json::json!({})), true);
+    let (status, unhealthy) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &report(StewardDecision::Unmanaged),
+        "shipyard:no-auto-merge",
+        true,
+    );
+    assert!(!unhealthy, "{status:?}");
+    assert_eq!(status.results[0].outcome, "skipped");
+    match &status.results[0].skip {
+        Some(crate::auto_arm::ArmSkip::DeferredTier { detail }) => assert!(
+            detail.contains("dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"),
+            "{detail}"
+        ),
+        other => panic!("expected a deferred-tier skip, got {other:?}"),
+    }
+    let calls = std::fs::read_to_string(&log).expect("log");
+    assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+}
+
 /// Audit mode is the default for the steward, and it must mutate nothing.
 #[cfg(unix)]
 #[test]

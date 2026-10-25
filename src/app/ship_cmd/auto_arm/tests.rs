@@ -101,6 +101,93 @@ fn a_never_armed_pr_is_armed_with_merge_and_reported() {
     assert!(gh.called("id=PR_node"));
 }
 
+/// A [`FakeGh`] for a repository that lists `macos` as tiered, whose latest
+/// `macos` run (job 9 of workflow run 700, attempt 1) is `status` and carries
+/// one tier record for that attempt with `tier`, or none when `tier` is `None`.
+fn tiered(status: &str, tier: Option<&str>) -> FakeGh {
+    let mut runs = vec![serde_json::json!({
+        "id": 9, "name": "macos", "status": status, "conclusion": "success",
+        "app": {"slug": "github-actions"}})];
+    if let Some(tier) = tier {
+        runs.push(serde_json::json!({
+            "id": 750, "name": "shipyard-test-tier/macos", "status": "completed",
+            "app": {"slug": "pulp-tier-records"},
+            "output": {"title": tier, "summary": serde_json::json!({
+                "schema": "shipyard-test-tier/v1", "check": "macos", "tier": tier,
+                "run_id": 700, "run_attempt": 1, "trigger": "pull_request", "actor": "author", "full_lane_workflow": "build.yml"}).to_string()}}));
+    }
+    let listing = serde_json::json!([{"total_count": runs.len(), "check_runs": runs}]);
+    FakeGh::new(vec![
+        ("pr view", Ok(pr_view("PR_node", false))),
+        ("isInMergeQueue", Ok(never_armed_state())),
+        (
+            "contents/.shipyard/config.toml",
+            Ok("[queue]\ntiered_required_checks = [\"macos\"]\ntier_record_app = \"pulp-tier-records\"\n".to_owned()),
+        ),
+        ("/check-runs?per_page=100", Ok(listing.to_string())),
+        (
+            "actions/jobs/9/logs",
+            Ok("2026-10-24T10:00:00.1Z ##[group]GITHUB_TOKEN Permissions\n\
+                2026-10-24T10:00:00.1Z Checks: read\n\
+                2026-10-24T10:00:00.1Z ##[endgroup]\n"
+                .to_owned()),
+        ),
+        (
+            "actions/jobs/9",
+            Ok(r#"{"id":9,"run_id":700,"run_attempt":1}"#.to_owned()),
+        ),
+        ("enablePullRequestAutoMerge", Ok(arm_accepted())),
+    ])
+}
+
+/// A deferred required check passed a cheap lane only; arming would let the
+/// queue take it as green.
+#[test]
+fn a_deferred_tiered_check_is_never_armed() {
+    let gh = tiered("completed", Some("deferred"));
+    let outcome = run(&gh);
+    assert!(!outcome.armed, "{}", outcome.line);
+    assert!(
+        outcome.line.contains(
+            "dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"
+        ),
+        "{}",
+        outcome.line
+    );
+    assert!(!gh.called("enablePullRequestAutoMerge"));
+}
+
+/// Arm-on-open runs before the checks do. A head armed then would be enqueued
+/// the moment a deferred lane went green, so it is not armed until the tiered
+/// check has completed.
+#[test]
+fn a_tiered_check_that_has_not_completed_is_not_armed_on_open() {
+    let gh = tiered("queued", None);
+    let outcome = run(&gh);
+    assert!(!outcome.armed, "{}", outcome.line);
+    assert!(
+        outcome.line.contains("is queued, not completed"),
+        "{}",
+        outcome.line
+    );
+    assert!(!gh.called("enablePullRequestAutoMerge"));
+}
+
+#[test]
+fn a_full_lane_record_arms_and_a_missing_one_does_not() {
+    let gh = tiered("completed", Some("fast"));
+    assert!(run(&gh).armed);
+    let gh = tiered("completed", None);
+    let outcome = run(&gh);
+    assert!(!outcome.armed, "{}", outcome.line);
+    assert!(
+        outcome.line.contains("its tier is unproven"),
+        "{}",
+        outcome.line
+    );
+    assert!(!gh.called("enablePullRequestAutoMerge"));
+}
+
 /// A squash subject folds the version-bump marker commit in and trips release
 /// automation. No arm request may ever name a squash.
 #[test]

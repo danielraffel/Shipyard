@@ -233,7 +233,7 @@ fn jump(actions: &GitHubActions, repo: &str, pr: u64) -> String {
     let Some((owner, name)) = repo.split_once('/') else {
         return format!("failed: repo `{repo}` is not OWNER/REPO");
     };
-    let query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id state headRefOid mergeQueueEntry{position}}}}";
+    let query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id state headRefOid baseRefName mergeQueueEntry{position}}}}";
     let raw = match actions.run_gh(&[
         "api".to_owned(),
         "graphql".to_owned(),
@@ -268,6 +268,21 @@ fn jump(actions: &GitHubActions, repo: &str, pr: u64) -> String {
         .and_then(Value::as_u64);
     if position == Some(1) {
         return "already_first".to_owned();
+    }
+    // The jump goes past the ghapp guard with the internal marker, so the
+    // guard's tier rule is applied here, before the dequeue.
+    let base = field("baseRefName");
+    if base.is_empty() {
+        return "failed: the pull request carried no base branch".to_owned();
+    }
+    let run_gh = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
+    match crate::deferred_tier::deferred_tier_checks(&run_gh, repo, &base, &head) {
+        Ok(checks) => {
+            if let Some(detail) = crate::deferred_tier::explain_all(&checks) {
+                return format!("refused: {detail}");
+            }
+        }
+        Err(detail) => return format!("failed: test tier unreadable: {detail}"),
     }
     let mutate = |query: &str, extra: &[String]| {
         let mut args = vec![
@@ -381,6 +396,50 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("auto-jump is off"), "{text}");
         assert!(!decisions_path(dir.path()).exists());
+    }
+
+    /// The jump goes past the ghapp guard, so it applies the tier rule itself:
+    /// a fix PR whose tiered check ran only its deferred lane is neither
+    /// dequeued nor re-enqueued.
+    #[cfg(unix)]
+    #[test]
+    fn the_jump_refuses_a_head_whose_tiered_check_is_deferred() {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls.log");
+        let summary = r#"{\"schema\":\"shipyard-test-tier/v1\",\"check\":\"macos\",\"tier\":\"deferred\",\"run_id\":700,\"run_attempt\":1,\"trigger\":\"pull_request\",\"actor\":\"author\",\"full_lane_workflow\":\"build.yml\"}"#;
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *contents/.shipyard/config.toml*) printf '%s\n' '[queue]' 'tiered_required_checks = ["macos"]' 'tier_record_app = "pulp-tier-records"' ;;
+  *check-runs*) printf '%s' '[{{"total_count":2,"check_runs":[{{"id":9,"name":"macos","status":"completed","app":{{"slug":"github-actions"}}}},{{"id":750,"name":"shipyard-test-tier/macos","status":"completed","app":{{"slug":"pulp-tier-records"}},"output":{{"summary":"{summary}"}}}}]}}]' ;;
+  *actions/jobs/9*) printf '%s' '{{"id":9,"run_id":700,"run_attempt":1}}' ;;
+  *headRefOid*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_1","state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","baseRefName":"main","mergeQueueEntry":{{"position":3}}}}}}}}}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            log = log.display()
+        );
+        let gh = temp.path().join("gh");
+        crate::test_support::write_executable_script(&gh, &script);
+        let config = crate::config::LoadedConfig {
+            data: toml::Table::new(),
+            global_dir: temp.path().join("global"),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: crate::config::LocalOverlaySource::None,
+        };
+        let actions =
+            GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(gh);
+        let outcome = jump(&actions, "o/r", 8933);
+        assert!(outcome.starts_with("refused: "), "{outcome}");
+        assert!(
+            outcome.contains("dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"),
+            "{outcome}"
+        );
+        let calls = std::fs::read_to_string(&log).expect("log");
+        assert!(!calls.contains("dequeuePullRequest"), "{calls}");
+        assert!(!calls.contains("enqueuePullRequest"), "{calls}");
     }
 
     #[test]

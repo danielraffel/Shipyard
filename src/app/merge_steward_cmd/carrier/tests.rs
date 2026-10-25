@@ -209,6 +209,7 @@ case "$*" in
   *issues/42/comments*) printf '%s' '[{{"id":77,"body":"Review of {HEAD}: approved.\nreviewed:{HEAD}"}}]' ;;
   *"actions/runs?head_sha={GROUP}&per_page=100&event=merge_group"*) printf '%s' '{{"total_count":1,"workflow_runs":[{{"id":500,"path":".github/workflows/build.yml","name":"Build","event":"merge_group","head_sha":"{GROUP}","status":"completed","conclusion":"failure","run_attempt":1,"run_started_at":"2026-10-09T08:02:00Z"}}]}}' ;;
   *"actions/runs/500/jobs"*) printf '%s' '{{"total_count":2,"jobs":[{{"name":"Linux (x64) [github-hosted]","status":"completed","conclusion":"failure","runner_name":"hosted-1"}},{macos_job}]}}' ;;
+  *contents/.shipyard/config.toml*) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
   *) printf '%s' '{{}}' ;;
 esac
 "#
@@ -330,6 +331,53 @@ fn apply_rearms_only_the_intended_action_with_the_exact_head() {
     let calls = gh_calls(&temp);
     assert!(calls.contains(&format!("head={HEAD}")), "{calls}");
     assert!(calls.contains("expectedHeadOid"), "{calls}");
+}
+
+/// The carrier's arm goes past the ghapp guard with the internal marker, so
+/// it applies the tier rule itself: a head whose tiered check ran only its
+/// deferred lane is left disarmed.
+#[cfg(unix)]
+#[test]
+fn apply_leaves_a_head_whose_tiered_check_is_deferred_disarmed() {
+    let temp = tempfile::tempdir().expect("temp");
+    let summary = r#"{\"schema\":\"shipyard-test-tier/v1\",\"check\":\"macos\",\"tier\":\"deferred\",\"run_id\":700,\"run_attempt\":1,\"trigger\":\"pull_request\",\"actor\":\"author\",\"full_lane_workflow\":\"build.yml\"}"#;
+    let body = ejected_gh_body(STARVED_MACOS, ARMED).replacen(
+        "case \"$*\" in\n",
+        &format!(
+            r#"case "$*" in
+  *contents/.shipyard/config.toml*) printf '%s\n' '[queue]' 'tiered_required_checks = ["macos"]' 'tier_record_app = "pulp-tier-records"' ;;
+  *"commits/{HEAD}/check-runs"*) printf '%s' '[{{"total_count":2,"check_runs":[{{"id":9,"name":"macos","status":"completed","app":{{"slug":"github-actions"}}}},{{"id":750,"name":"shipyard-test-tier/macos","status":"completed","app":{{"slug":"pulp-tier-records"}},"output":{{"summary":"{summary}"}}}}]}}]' ;;
+  *actions/jobs/9*) printf '%s' '{{"id":9,"run_id":700,"run_attempt":1}}' ;;
+"#
+        ),
+        1,
+    );
+    let actions = fake_gh(&temp, &body);
+    let observation = ejected_observation();
+    let mut report = planned_report(&actions, &observation);
+    let (store, global_dir) = authority(&temp, "m5s");
+    let classes = BTreeSet::from([CarrierClass::Rearm]);
+    apply_intent(
+        &actions,
+        &observation,
+        temp.path(),
+        &BTreeMap::new(),
+        &rearm_intent(),
+        &classes,
+        &store,
+        RuntimeMode::Shipyard,
+        &global_dir,
+        &mut report,
+    );
+    let error = report.prs[0].error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains(
+            "dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"
+        ),
+        "{report:?}"
+    );
+    assert!(report.prs[0].mutation.is_none(), "{report:?}");
+    assert!(!gh_calls(&temp).contains("enablePullRequestAutoMerge"));
 }
 
 #[cfg(unix)]

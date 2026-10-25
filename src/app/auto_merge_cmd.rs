@@ -2296,8 +2296,32 @@ fn require_head_approval(client: &GhClient, cwd: &Path, state: &ShipState) -> Re
     head_approval_verdict(&run_gh, state)
 }
 
-/// [`require_head_approval`] over any `gh` transport.
+/// [`require_head_approval`] over any `gh` transport: the approval gate, then
+/// the tier rule ([`crate::deferred_tier`]), which holds whether or not the
+/// repository requires approval.
 fn head_approval_verdict(
+    run_gh: crate::head_approval::RunGh<'_>,
+    state: &ShipState,
+) -> Result<(), String> {
+    approval_verdict(run_gh, state)?;
+    let checks = crate::deferred_tier::deferred_tier_checks(
+        run_gh,
+        &state.repo,
+        &state.base_branch,
+        &state.head_sha,
+    )
+    .map_err(|detail| {
+        format!(
+            "PR #{}: the test tier of its tiered required checks could not be read ({detail}); \
+             refusing to arm blind",
+            state.pr
+        )
+    })?;
+    crate::deferred_tier::explain_all(&checks)
+        .map_or(Ok(()), |detail| Err(format!("PR #{}: {detail}", state.pr)))
+}
+
+fn approval_verdict(
     run_gh: crate::head_approval::RunGh<'_>,
     state: &ShipState,
 ) -> Result<(), String> {
@@ -5408,7 +5432,8 @@ exit 91
         assert_eq!(head_approval_verdict(&gh, &validated_9438()), Ok(()));
     }
 
-    /// A repository without the policy pays one read and is never refused.
+    /// A repository without the policy pays the config reads (approval, then
+    /// tier) and is never refused.
     #[test]
     fn a_repository_without_the_policy_reads_nothing_else() {
         let calls = std::cell::RefCell::new(Vec::new());
@@ -5416,7 +5441,57 @@ exit 91
         let mut state = validated_9438();
         state.repo = "someone/else".to_owned();
         assert_eq!(head_approval_verdict(&gh, &state), Ok(()));
-        assert_eq!(calls.borrow().len(), 1, "{:?}", calls.borrow());
+        assert_eq!(calls.borrow().len(), 2, "{:?}", calls.borrow());
+        assert!(
+            calls
+                .borrow()
+                .iter()
+                .all(|call| call.contains("contents/.shipyard/config.toml")),
+            "{:?}",
+            calls.borrow()
+        );
+    }
+
+    /// Every validated arm and the classic merge go through
+    /// [`head_approval_verdict`], so a tiered check that ran only its
+    /// deferred lane refuses them all, even where approval is not required.
+    #[test]
+    fn a_validated_head_whose_tiered_check_is_deferred_is_not_armed() {
+        let state = ShipState::new(
+            42,
+            "owner/repo",
+            "feature",
+            "main",
+            "a".repeat(40),
+            "policy",
+        );
+        let summary = serde_json::json!({
+            "schema": "shipyard-test-tier/v1", "check": "macos", "tier": "deferred",
+            "run_id": 700, "run_attempt": 1, "trigger": "pull_request", "actor": "author", "full_lane_workflow": "build.yml"})
+        .to_string();
+        let listing = serde_json::json!([{"total_count": 2, "check_runs": [
+            {"id": 9, "name": "macos", "status": "completed", "app": {"slug": "github-actions"}},
+            {"id": 750, "name": "shipyard-test-tier/macos", "status": "completed",
+             "app": {"slug": "pulp-tier-records"}, "output": {"summary": summary}}]}])
+        .to_string();
+        let gh = |args: &[String]| -> Result<String, String> {
+            let joined = args.join(" ");
+            if joined.contains("contents/.shipyard/config.toml") {
+                return Ok("[queue]\ntiered_required_checks = [\"macos\"]\ntier_record_app = \"pulp-tier-records\"\n".to_owned());
+            }
+            if joined.contains("/check-runs?per_page=100") {
+                return Ok(listing.clone());
+            }
+            if joined.contains("actions/jobs/9") {
+                return Ok(r#"{"id":9,"run_id":700,"run_attempt":1}"#.to_owned());
+            }
+            Err(format!("unscripted gh call: {joined}"))
+        };
+        let error = head_approval_verdict(&gh, &state).expect_err("refused");
+        assert!(
+            error.contains("dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"),
+            "{error}"
+        );
     }
 
     /// A repository on the review-by-default list needs no config to refuse

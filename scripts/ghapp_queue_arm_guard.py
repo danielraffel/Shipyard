@@ -213,6 +213,16 @@ OVERRIDES_LOG = "overrides.jsonl"
 NOT_RUN_IN_FULL = ("skipped", "neutral")
 # The annotation a job prints when it decides whether a receipt is reused.
 RECEIPT_DECISION_TITLE = "shipyard-receipt-decision"
+# Tier records: check runs named TIER_RECORD_PREFIX + <check>, created by the
+# App the base names in `[queue] tier_record_app`, saying which test tier a run
+# attempt ran. Never the Actions app, whose records a pull request job could
+# PATCH, nor the fleet App every agent posts as. Same as src/deferred_tier.rs.
+TIER_RECORD_PREFIX = "shipyard-test-tier/"
+TIER_RECORD_SCHEMA = "shipyard-test-tier/v1"
+ACTIONS_APP = "github-actions"
+DEFERRED_TIER = "deferred"
+# The log group the runner prints in "Set up job" listing the token's scopes.
+TOKEN_PERMISSIONS_HEADER = "GITHUB_TOKEN Permissions"
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
 MERGE_MUTATIONS = ("mergepullrequest",)
 # Same pattern as src/head_approval.rs marker_verdict.
@@ -1553,6 +1563,281 @@ def _reused_receipt(repo: str, run: dict[str, Any]) -> str | None:
         if isinstance(decision, dict) and decision.get("verdict") == "reuse":
             return str(decision.get("reason") or "no reason given")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Tiered required checks: the twin of src/deferred_tier.rs.
+# ---------------------------------------------------------------------------
+
+
+def tier_policy(config_text: str | None) -> tuple[list[str], str | None]:
+    """``(tiered_required_checks, tier_record_app)`` from the base's config;
+    ``([], None)`` when no check is tiered."""
+    if not config_text or "tiered_required_checks" not in config_text:
+        return [], None
+    try:
+        import tomllib
+    except ImportError as error:
+        raise GuardError("the base config names tiered checks, and reading it needs "
+                         "Python 3.11 or later (tomllib)") from error
+    try:
+        queue = tomllib.loads(config_text).get("queue")
+    except tomllib.TOMLDecodeError as error:
+        raise GuardError(f"the base config does not parse: {error}") from error
+    names = queue.get("tiered_required_checks") if isinstance(queue, dict) else None
+    if names is None:
+        return [], None
+    if (not isinstance(names, list)
+            or not all(isinstance(name, str) and name.strip() for name in names)):
+        raise GuardError("`queue.tiered_required_checks` is not a list of check names")
+    if not names:
+        return [], None
+    app = queue.get("tier_record_app")
+    app = app.strip() if isinstance(app, str) else ""
+    if not app:
+        raise GuardError("`queue.tiered_required_checks` is set but `queue.tier_record_app` "
+                         "names no app")
+    if app.lower() == ACTIONS_APP:
+        raise GuardError(f"`queue.tier_record_app` may not be `{ACTIONS_APP}`: pull request "
+                         "jobs act as that app and could rewrite its records")
+    if app.lower() == FLEET_AUTHOR:
+        raise GuardError(f"`queue.tier_record_app` may not be `{FLEET_AUTHOR}`: every agent "
+                         "posts as the fleet App, so it could write a record")
+    return names, app
+
+
+def _check_runs(repo: str, head: str, api_json: Any) -> list[dict[str, Any]]:
+    pages = api_json(["api", "--paginate", "--slurp",
+                      f"repos/{repo}/commits/{head}/check-runs?per_page=100"])
+    pages = pages if isinstance(pages, list) else [pages]
+    listed: list[dict[str, Any]] = []
+    total = None
+    for page in pages:
+        runs = page.get("check_runs") if isinstance(page, dict) else None
+        if not isinstance(runs, list):
+            raise GuardError(f"the check runs of {head[:12]} are unreadable")
+        total = page.get("total_count")
+        listed.extend(run for run in runs if isinstance(run, dict))
+    if total != len(listed):
+        raise GuardError(f"the check runs of {head[:12]} are partial")
+    return listed
+
+
+def _app_slug(run: dict[str, Any]) -> Any:
+    return (run.get("app") or {}).get("slug") if isinstance(run.get("app"), dict) else None
+
+
+def _tier_records(listed: list[dict[str, Any]], check: str, run_id: int,
+                  run_attempt: int, record_app: str) -> list[dict[str, Any]]:
+    """The tier records bound to one run attempt of ``check``."""
+    records = []
+    for record in listed:
+        if (record.get("name") != TIER_RECORD_PREFIX + check
+                or _app_slug(record) != record_app or record.get("status") != "completed"):
+            continue
+        output = record.get("output") if isinstance(record.get("output"), dict) else {}
+        try:
+            summary = json.loads(str(output.get("summary") or ""))
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(summary, dict) and summary.get("schema") == TIER_RECORD_SCHEMA
+                and summary.get("check") == check and summary.get("run_id") == run_id
+                and summary.get("run_attempt") == run_attempt
+                and isinstance(summary.get("tier"), str) and summary["tier"].strip()):
+            records.append(summary)
+    return records
+
+
+def checks_scope(log: str) -> str:
+    """The ``Checks`` scope of a job's token, from the TOKEN_PERMISSIONS_HEADER
+    group of its log; ``none`` when the group does not list it. Raises
+    :class:`GuardError` when the group is missing, never closes, or holds a
+    line that is not ``<Scope>: read|write|none``. Same as src/deferred_tier.rs."""
+    def text(line: str) -> str:
+        line = line.rstrip("\r")
+        stamp, _, rest = line.partition(" ")
+        return rest if rest and stamp.endswith("Z") and "T" in stamp else line
+
+    lines = iter(text(line) for line in log.splitlines())
+    if not any(line.removeprefix("##[group]").strip() == TOKEN_PERMISSIONS_HEADER
+               for line in lines):
+        raise GuardError(f"its log has no `{TOKEN_PERMISSIONS_HEADER}` group")
+    checks = None
+    for line in lines:
+        line = line.strip()
+        if line == "##[endgroup]":
+            return checks or "none"
+        scope, colon, level = line.partition(":")
+        scope, level = scope.strip(), level.strip().lower()
+        if not colon or not scope or level not in ("read", "write", "none"):
+            raise GuardError(f"its `{TOKEN_PERMISSIONS_HEADER}` group has an unparseable "
+                             f"line `{line}`")
+        if scope.lower() == "checks":
+            if checks is not None:
+                raise GuardError(f"its `{TOKEN_PERMISSIONS_HEADER}` group lists `Checks` twice")
+            checks = level
+    raise GuardError(f"its `{TOKEN_PERMISSIONS_HEADER}` group never closes")
+
+
+def tier_blockers(repo: str, head: str, tiered: list[str], record_app: str,
+                  api_json: Any = None, api_text: Any = None) -> list[dict[str, Any]]:
+    """What holds ``head`` back for each tiered check, as ``{check, blocker, ...}``.
+
+    The tier is never read from annotations, which the code under test can
+    print. Per tiered check, its latest check run on the head must be a
+    completed GitHub Actions job, and the tier records bound to that job's run
+    attempt, created by ``record_app`` (never the Actions app, whose records a
+    pull request job could PATCH), must exist and none may say ``deferred``. Then, as defence in depth, the
+    job's own token may not have been able to write check runs. Raises
+    :class:`GuardError` when the check runs cannot be read in full.
+    """
+    api_json = api_json or run_real_gh
+    api_text = api_text or run_real_gh_text
+    listed = _check_runs(repo, head, api_json)
+    latest: dict[str, dict[str, Any]] = {}
+    for run in listed:
+        name, run_id = run.get("name"), run.get("id")
+        if isinstance(name, str) and isinstance(run_id, int):
+            if name not in latest or run_id > latest[name]["id"]:
+                latest[name] = run
+    blockers = []
+    for check in tiered:
+        found = {"check": check, "head": head}
+        run = latest.get(check)
+        if run is None:
+            blockers.append({**found, "blocker": "pending", "status": "missing"})
+            continue
+        if run.get("status") != "completed":
+            blockers.append({**found, "blocker": "pending",
+                             "status": run.get("status") or "unknown"})
+            continue
+        if _app_slug(run) != ACTIONS_APP:
+            blockers.append({**found, "blocker": "unreadable", "reason": (
+                "it is not a GitHub Actions job, so no tier record can be bound to it")})
+            continue
+        try:
+            job = api_json(["api", f"repos/{repo}/actions/jobs/{run['id']}"])
+        except GuardError as error:
+            blockers.append({**found, "blocker": "unreadable",
+                             "reason": f"job {run['id']} unreadable: {error}"})
+            continue
+        run_id = job.get("run_id") if isinstance(job, dict) else None
+        attempt = job.get("run_attempt") if isinstance(job, dict) else None
+        if not isinstance(run_id, int) or not isinstance(attempt, int):
+            blockers.append({**found, "blocker": "unreadable",
+                             "reason": f"job {run['id']} names no run_id and run_attempt"})
+            continue
+        records = _tier_records(listed, check, run_id, attempt, record_app)
+        if not records:
+            blockers.append({**found, "blocker": "missing_record", "run_id": run_id,
+                             "run_attempt": attempt})
+            continue
+        deferred = next((record for record in records
+                         if record["tier"].strip().lower() == DEFERRED_TIER), None)
+        if deferred is not None:
+            blockers.append({**found, "blocker": "deferred", "record": deferred})
+            continue
+        # Read only when the records would allow: a refusal needs no log.
+        try:
+            level = checks_scope(api_text(["api", f"repos/{repo}/actions/jobs/{run['id']}/logs"]))
+        except GuardError as error:
+            blockers.append({**found, "blocker": "unreadable",
+                             "reason": f"job {run['id']}: {error}"})
+            continue
+        if level not in ("read", "none"):
+            blockers.append({**found, "blocker": "checks_writable", "level": level})
+    return blockers
+
+
+def _explain_blocker(blocker: dict[str, Any]) -> tuple[str, str]:
+    """``(why, fix)`` for one tier blocker; same text as src/deferred_tier.rs."""
+    check, head = blocker["check"], blocker["head"][:12]
+    kind = blocker["blocker"]
+    if kind == "pending" and blocker["status"] == "missing":
+        why = f"tiered required check `{check}` has not run on {head}"
+    elif kind == "pending":
+        why = f"tiered required check `{check}` on {head} is {blocker['status']}, not completed"
+    elif kind == "deferred":
+        record = blocker["record"]
+        runs_in = record.get("full_suite_runs_in")
+        why = (f"required check `{check}` on {head} ran only the deferred tier (selector "
+               f"{record.get('selector') or 'unknown'}"
+               + (f"; full suite runs in {runs_in}" if runs_in else "")
+               + "); its success is not a full-suite result")
+    elif kind == "checks_writable":
+        why = (f"the job of tiered required check `{check}` on {head} ran with "
+               f"`checks: {blocker['level']}`, so it could have rewritten its own tier record")
+    elif kind == "missing_record":
+        why = (f"tiered required check `{check}` on {head} has no `{TIER_RECORD_PREFIX}{check}` "
+               f"record for run {blocker['run_id']} attempt {blocker['run_attempt']}, so its "
+               "tier is unproven")
+    else:
+        why = f"the tier of required check `{check}` on {head} cannot be read ({blocker['reason']})"
+    if kind == "pending":
+        fix = (f"wait for `{check}` to complete; the steward's native-arm backstop arms the "
+               "head once it is green and its tier is full")
+    elif kind == "deferred":
+        record = blocker["record"]
+        workflow = record.get("full_lane_workflow")
+        what = (f"`{workflow}`" if isinstance(workflow, str) and workflow.strip()
+                else f"the workflow of `{check}`")
+        fix = f"dispatch {what} on head {head} as the fleet App and wait for the full lane"
+    elif kind == "checks_writable":
+        fix = (f"give the `{check}` job `checks: read` or `checks: none` in its workflow "
+               "permissions and rerun it")
+    elif kind == "missing_record":
+        fix = (f"the workflow publishes a `{TIER_RECORD_PREFIX}{check}` check run for this run "
+               "attempt (docs/ghapp-guards.md)")
+    else:
+        fix = "read it again once GitHub answers"
+    return why, fix
+
+
+def deferred_tier_refusal(targets: list[dict[str, Any]], repo: str | None) -> bool:
+    """Print and return whether a tiered required check holds a target back.
+
+    No override exists: the correct path (have the full lane run) is always
+    available, and a deferred head is never ready to land.
+    """
+    refused: list[tuple[str, dict[str, Any] | None]] = []
+    for target in targets:
+        target_repo = target.get("repo") or repo
+        number, head, base = target.get("pr"), target.get("head"), target.get("base")
+        label = f"PR #{number}"
+        if not target_repo or not isinstance(head, str) or not head or not base:
+            refused.append((f"{label}: cannot tell which head and base would land, so its "
+                            "test tier cannot be checked", None))
+            continue
+        try:
+            tiered, record_app = tier_policy(base_config_text(target_repo, base))
+            found = (tier_blockers(target_repo, head, tiered, record_app)
+                     if tiered and record_app else [])
+        except GuardError as error:
+            refused.append((f"{label}: cannot read the test tier of its tiered required checks "
+                            f"({error}); refusing to land a head that may be untested", None))
+            continue
+        for blocker in found:
+            why, fix = _explain_blocker(blocker)
+            refused.append((f"{label}: {why}", {
+                "what": why, "cause": f"tier_{blocker['blocker']}",
+                "evidence": f"https://github.com/{target_repo}/pull/{number}",
+                "command": fix, "safe_to_auto_apply": False,
+                "verify": (f"the latest `{blocker['check']}` run on {head[:12]} is completed and "
+                           f"its `{TIER_RECORD_PREFIX}{blocker['check']}` record is not "
+                           f"`{DEFERRED_TIER}`, and the same landing command passes this guard"),
+            }))
+    if not refused:
+        return False
+    print(
+        f"queue-arm-guard: refusing to arm or merge a head whose tiered required checks have "
+        f"not proven their full lane: {' | '.join(message for message, _ in refused)} "
+        "Each `queue-arm-guard: fix:` line below says what to do next.",
+        file=sys.stderr,
+    )
+    for _, fix in refused:
+        if fix is not None:
+            print(f"queue-arm-guard: fix: {json.dumps(fix, sort_keys=True)}", file=sys.stderr)
+    return True
 
 
 def _same_patch(old_diff: str, new_diff: str, record: dict[str, Any]) -> str | None:
@@ -3010,8 +3295,9 @@ def rest_fields(args: list[str]) -> dict[str, Any]:
     return fields
 
 
-def _target(classification: dict[str, Any], action: str, bound: Any) -> dict[str, Any]:
-    return {**classification, "action": action,
+def _target(response: Any, action: str, bound: Any) -> dict[str, Any]:
+    """One classified landing target, with the base its required checks are read from."""
+    return {**classify_pr_queue_state(response), "action": action, "base": _base_ref(response),
             "bound_head": bound if isinstance(bound, str) else None}
 
 
@@ -3039,7 +3325,7 @@ def arm_request(args: list[str]) -> list[dict[str, Any]] | None:
             # with no queue. Either lands the head at once.
             if "--admin" in args or not base_has_merge_queue(owner, name, base):
                 action = "merge"
-        return [_target(classify_pr_queue_state(response), action, bound[-1] if bound else None)]
+        return [_target(response, action, bound[-1] if bound else None)]
     if args and args[0] == "api":
         parser = _require_parser()
         try:
@@ -3058,7 +3344,7 @@ def arm_request(args: list[str]) -> list[dict[str, Any]] | None:
         if not any(name in compact for name in (*ARM_MUTATIONS, *MERGE_MUTATIONS)):
             return None
         return [
-            _target(classify_pr_queue_state(graphql(PR_BY_ID_QUERY, {"id": node})), action, bound)
+            _target(graphql(PR_BY_ID_QUERY, {"id": node}), action, bound)
             for action, node, bound in landing_mutations(document, graphql_variables(args))
         ]
     return None
@@ -3122,7 +3408,7 @@ def rest_merge_request(args: list[str], endpoint: str) -> list[dict[str, Any]] |
         return None
     owner, name, number = match.group(1), match.group(2), match.group(3)
     response = graphql(PR_BY_NUMBER_QUERY, {"owner": owner, "name": name, "number": number})
-    return [_target(classify_pr_queue_state(response), "merge", fields.get("sha"))]
+    return [_target(response, "merge", fields.get("sha"))]
 
 
 def _base_ref(response: Any) -> str | None:
@@ -3292,7 +3578,9 @@ def judge(args: list[str], seen: dict[str, Any]) -> int:
             file=sys.stderr,
         )
         return 1
-    # The queue-state override does not stand in for a review.
+    # Neither override stands in for a full-lane result or a review.
+    if deferred_tier_refusal(targets, repo):
+        return 1
     if review_refusal(targets, repo):
         return 1
     if refusals:

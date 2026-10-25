@@ -62,6 +62,8 @@ pub mod daemon_runtime;
 pub mod daemon_version;
 #[cfg_attr(windows, allow(dead_code, unused_imports))]
 pub(crate) mod daemon_worker_capacity;
+/// Refuse to arm a head whose required check ran only its deferred test tier.
+pub mod deferred_tier;
 /// Typed dependency-channel policy and immutable consumer locks.
 pub mod dependency;
 /// Bounded CI failure diagnosis (`shipyard diagnose`): failing step, tests,

@@ -94,6 +94,13 @@ pub(super) fn arm_native_auto_merge(
         Ok(note) => note,
         Err(refusal) => return refusal,
     };
+    // After the approval gate: no head is armed while a tiered required check
+    // has not proven its full lane.
+    if verdict.arms()
+        && let Err(refusal) = tier_gate(run_gh, repo, pr, &queue, &facts)
+    {
+        return refusal;
+    }
     match verdict {
         ArmVerdict::Skip(skip) => skipped(format!(
             "▸ Auto-merge left as it is on #{pr}: {}{}",
@@ -231,6 +238,41 @@ fn approval_note(
         ))),
         Err(detail) => Err(skipped(format!(
             "⚠︎ Auto-merge not armed on #{pr}: whether its head is approved could not \
+             be read ({detail}); refusing to arm blind."
+        ))),
+    }
+}
+
+/// Refuse the arm when a required check ran only its deferred test tier on the
+/// head the queue state names ([`crate::deferred_tier`]), or when that cannot
+/// be read.
+fn tier_gate(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    queue: &Value,
+    facts: &PrFacts,
+) -> Result<(), ArmOutcome> {
+    let read = queue
+        .pointer("/data/repository/pullRequest/headRefOid")
+        .and_then(Value::as_str)
+        .filter(|head| !head.is_empty())
+        .ok_or_else(|| "the merge-queue state carried no head".to_owned())
+        .and_then(|head| {
+            let base = facts
+                .base
+                .as_deref()
+                .ok_or_else(|| "the pull request carried no base branch".to_owned())?;
+            crate::deferred_tier::deferred_tier_checks(run_gh, repo, base, head)
+        });
+    match read {
+        Ok(checks) => crate::deferred_tier::explain_all(&checks).map_or(Ok(()), |detail| {
+            Err(skipped(format!(
+                "▸ Auto-merge not armed on #{pr}: {detail}."
+            )))
+        }),
+        Err(detail) => Err(skipped(format!(
+            "⚠︎ Auto-merge not armed on #{pr}: the test tier of its required checks could not \
              be read ({detail}); refusing to arm blind."
         ))),
     }

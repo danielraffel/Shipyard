@@ -1104,6 +1104,92 @@ esac
     assert!(!handoff.wake_consumer_available);
 }
 
+/// The enqueue fake above, on a base that lists `macos` as tiered, whose
+/// latest `macos` run (job 9 of run 700, attempt 1) carries one tier record
+/// saying `tier`. `# CONFIG_ERROR` turns off the shared config shim so this
+/// script answers the config itself.
+#[cfg(unix)]
+fn tiered_enqueue_actions(
+    temp: &tempfile::TempDir,
+    log: &std::path::Path,
+    tier: &str,
+) -> GitHubActions {
+    let summary = format!(
+        r#"{{\"schema\":\"shipyard-test-tier/v1\",\"check\":\"macos\",\"tier\":\"{tier}\",\"run_id\":700,\"run_attempt\":1,\"trigger\":\"pull_request\",\"actor\":\"author\",\"full_lane_workflow\":\"build.yml\"}}"#
+    );
+    fake_gh(
+        temp,
+        &format!(
+            r#"
+# CONFIG_ERROR
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *contents/.shipyard/config.toml*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = false' '[queue]' 'tiered_required_checks = ["macos"]' 'tier_record_app = "pulp-tier-records"' ;;
+  *"commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs"*) printf '%s' '[{{"total_count":2,"check_runs":[{{"id":9,"name":"macos","status":"completed","app":{{"slug":"github-actions"}}}},{{"id":750,"name":"shipyard-test-tier/macos","status":"completed","app":{{"slug":"pulp-tier-records"}},"output":{{"summary":"{summary}"}}}}]}}]' ;;
+  *actions/jobs/9/logs*) printf '%s\n' '2026-10-24T10:00:00.1Z ##[group]GITHUB_TOKEN Permissions' '2026-10-24T10:00:00.1Z Checks: read' '2026-10-24T10:00:00.1Z ##[endgroup]' ;;
+  *actions/jobs/9*) printf '%s' '{{"id":9,"run_id":700,"run_attempt":1}}' ;;
+  *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *"query=query("*"mergeQueue"*)
+    printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  "pr view "*)
+    printf '%s' '{{"id":"PR_kw","number":42,"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRefName":"feature","mergeStateStatus":"CLEAN","autoMergeRequest":null,"labels":[],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/100"}}]}}' ;;
+  *"stackConfig"*) printf '%s' '{{"data":{{"repository":{{"stackConfig":{{"text":"stacked_pr_mode = \"observe\"\n"}},"pullRequest":{{"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stack":null,"stackEntry":null}}}}}}}}' ;;
+  *"stackEntry"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"stack":null,"stackEntry":null}}}}}}}}' ;;
+  *"enqueuePullRequest"*) printf '%s' '{{"data":{{"enqueuePullRequest":{{"mergeQueueEntry":{{"position":1}}}}}}}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            log = log.display()
+        ),
+    )
+}
+
+/// The managed enqueue goes past the ghapp guard with the internal marker, so
+/// the steward applies the tier rule itself: a head whose tiered check ran
+/// only its deferred lane waits and is never enqueued; the same head with a
+/// full-lane record is.
+#[cfg(unix)]
+#[test]
+fn managed_enqueue_waits_on_a_deferred_tier_and_enqueues_a_full_one() {
+    for (tier, expected) in [("deferred", "waiting_full_test_tier"), ("fast", "enqueued")] {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let actions = tiered_enqueue_actions(&temp, &log, tier);
+        let pr = ready_pr();
+        let observation = observation_for(pr.clone(), true);
+        let policy = queue_policy();
+        let mut ledger = StewardLedger::default();
+        let mutation_control = mutation_control(&temp, "studio", "studio");
+        let ledger_path = temp.path().join("ledger.json");
+        let context =
+            mutation_apply_context(&actions, &observation, &ledger_path, &mutation_control);
+
+        let (mutation, error) = mutate_pr(
+            &context,
+            &pr,
+            &policy,
+            &StewardDecision::ArmMergeQueue,
+            &mut ledger,
+        );
+
+        assert_eq!(mutation.as_deref(), Some(expected), "{tier}: {error:?}");
+        let calls = fs::read_to_string(&log).expect("calls");
+        assert!(calls.contains("/check-runs?per_page=100"), "{calls}");
+        if tier == "deferred" {
+            let detail = error.expect("the refusal says why");
+            assert!(
+                detail.contains("dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"),
+                "{detail}"
+            );
+            assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+            assert!(ledger.terminal_handoffs.is_empty());
+        } else {
+            assert!(error.is_none(), "{error:?}");
+            assert!(calls.contains("enqueuePullRequest"), "{calls}");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn enqueue_revalidation_refuses_a_new_current_head_provenance_blocker() {

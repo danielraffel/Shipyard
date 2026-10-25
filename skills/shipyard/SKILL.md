@@ -552,6 +552,29 @@ annotation (`transient_interruption::classify_jobs`). `TIMED_OUT`,
 head and check; `--max-transient-reruns` refuses anything above 1 and the code
 clamps it as well. Do not add a second classifier: extend this one.
 
+## A tiered required check must prove its full lane before anything arms
+
+A check the base lists in `[queue] tiered_required_checks` (Pulp: `macos`)
+can pass a cheap lane while the full lane waits on a fleet-App dispatch of
+its workflow on the head (Pulp: `build.yml`, which no longer runs on
+`labeled`). Its
+tier is read only from a `shipyard-test-tier/<check>` check run created by the
+App the base names in `[queue] tier_record_app` and bound by
+`run_id`/`run_attempt` to the check's latest run. Tier annotations are
+ignored, since code under test can print them, and so are records from
+`github-actions`, which a pull request job with `checks: write` could PATCH. As defence in depth the tiered job's own `GITHUB_TOKEN
+Permissions` log group must show `Checks` as `read` or `none`; a missing or
+unparseable group refuses. The
+`ghapp` arm guard and every Shipyard arm, enqueue and merge path
+(`src/deferred_tier.rs`, the twin of `tier_blockers` in
+`scripts/ghapp_queue_arm_guard.py`) refuse while that check is missing or not
+completed, its record is missing, or any bound record says `deferred`. The
+fix for a deferred tier: dispatch the record's `full_lane_workflow` on the
+head as the fleet App and wait for the full lane. No override lands it, neither
+`GHAPP_ALLOW_QUEUE_REARM` nor anything else, and arm-on-open leaves such a head to
+the steward's native-arm backstop. Do not dispatch or label it yourself to
+get past it. See `docs/ghapp-guards.md`.
+
 ## The carrier re-arms with `expectedHeadOid`, through the internal path
 
 `runner carrier --apply --class rearm` arms native auto-merge with
