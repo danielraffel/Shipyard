@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::metrics::merge_receipt::{MergeReceipt, SCHEMA as MERGE_RECEIPT_SCHEMA};
@@ -30,6 +31,9 @@ pub struct MergedObservation {
     /// Digest of the authoritative policy marker and canonical required-check
     /// name/status/conclusion observations on the exact merged head.
     pub policy_evidence_digest: String,
+    pub policy_checks: Vec<String>,
+    /// Canonical full identity/status/conclusion evidence for every required check.
+    pub policy_evidence: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -46,6 +50,9 @@ pub struct DelegatedValidationWitness {
     /// `None` is explicit: it never authorizes a receipt by itself.
     #[serde(default)]
     pub approval_identity: Option<String>,
+    /// Exact protected-branch required context/app identities captured before arm.
+    #[serde(default)]
+    pub policy_checks: Vec<String>,
 }
 
 impl DelegatedValidationWitness {
@@ -68,6 +75,7 @@ impl DelegatedValidationWitness {
             created_at: Utc::now(),
             armed_at: None,
             approval_identity,
+            policy_checks: Vec::new(),
         }
     }
 
@@ -89,8 +97,14 @@ impl DelegatedValidationWitness {
         let temp = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| io::Error::other(format!("serialize delegated witness: {error}")))?;
-        fs::write(&temp, bytes)?;
-        fs::rename(temp, path)
+        let mut file = fs::File::create(&temp)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()?;
+        fs::rename(temp, &path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Mark a previously persisted witness as having received native arm.
@@ -106,8 +120,32 @@ impl DelegatedValidationWitness {
         if self.armed_at.is_none() {
             return Err("delegated receipt refused: witness was never armed".to_owned());
         }
-        if self.approval_identity.is_none() {
-            return Err("delegated receipt refused: approval identity is unavailable".to_owned());
+        let approval = self.approval_identity.as_deref().ok_or_else(|| {
+            "delegated receipt refused: approval identity is unavailable".to_owned()
+        })?;
+        validate_approval_identity(approval)?;
+        let approval_value: Value = serde_json::from_str(approval)
+            .map_err(|_| "delegated receipt refused: malformed approval identity".to_owned())?;
+        let approval_head = approval_value
+            .get("head_sha")
+            .and_then(Value::as_str)
+            .filter(|head| is_sha(head))
+            .ok_or_else(|| {
+                "delegated receipt refused: approval head identity is unavailable".to_owned()
+            })?;
+        if !same_sha(approval_head, &self.head_sha) {
+            return Err(
+                "delegated receipt refused: approval head differs from witnessed head".to_owned(),
+            );
+        }
+        if self.policy_checks.is_empty() {
+            return Err(
+                "delegated receipt refused: protected-branch policy identity is unavailable"
+                    .to_owned(),
+            );
+        }
+        if self.policy_checks != observation.policy_checks {
+            return Err("delegated receipt refused: protected-branch policy drifted".to_owned());
         }
         if !observation.merged {
             return Err("delegated receipt refused: merge is not confirmed".to_owned());
@@ -151,6 +189,16 @@ impl DelegatedValidationWitness {
                     .to_owned(),
             );
         }
+        let canonical_policy_evidence = serde_json::json!({
+            "required_checks_known": true,
+            "checks": observation.policy_evidence,
+        });
+        let computed_policy_digest = sha256(
+            serde_json::to_vec(&canonical_policy_evidence).map_err(|error| error.to_string())?,
+        );
+        if !computed_policy_digest.eq_ignore_ascii_case(&observation.policy_evidence_digest) {
+            return Err("delegated receipt refused: required-check policy evidence digest does not match evidence".to_owned());
+        }
         let required_checks = observation
             .required_checks
             .keys()
@@ -163,6 +211,8 @@ impl DelegatedValidationWitness {
             "head_sha": self.head_sha,
             "required_checks": required_checks,
             "policy_evidence_digest": observation.policy_evidence_digest,
+            "policy_checks": self.policy_checks,
+            "policy_evidence": observation.policy_evidence,
             "approval_identity": self.approval_identity,
             "armed_at": self.armed_at,
         });
@@ -212,6 +262,118 @@ impl DelegatedValidationWitness {
     }
 }
 
+/// Extract the exact protected-branch policy identity attached by the live
+/// GitHub reader. A materialized rollup alone cannot prove this set.
+pub fn policy_checks_from_snapshot(snapshot: &Value) -> Result<Vec<String>, String> {
+    let entries = snapshot
+        .get("_required_check_policy")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "delegated receipt refused: protected-branch policy identity is unavailable".to_owned()
+        })?;
+    let mut checks = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let object = entry.as_object().ok_or_else(|| {
+            "delegated receipt refused: malformed protected-branch policy identity".to_owned()
+        })?;
+        let context = object
+            .get("context")
+            .and_then(Value::as_str)
+            .filter(|context| !context.is_empty())
+            .ok_or_else(|| {
+                "delegated receipt refused: protected-branch policy context is missing".to_owned()
+            })?;
+        let app = match object.get("app_id") {
+            None | Some(Value::Null) => "any".to_owned(),
+            Some(value) => value.as_u64().map(|id| id.to_string()).ok_or_else(|| {
+                "delegated receipt refused: protected-branch app identity is malformed".to_owned()
+            })?,
+        };
+        checks.push(format!("{context}@app:{app}"));
+    }
+    let mut sorted = checks.clone();
+    sorted.sort();
+    if checks.is_empty() || sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(
+            "delegated receipt refused: protected-branch policy identity is empty or duplicated"
+                .to_owned(),
+        );
+    }
+    Ok(sorted)
+}
+
+fn validate_approval_identity(raw: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|_| "delegated receipt refused: malformed approval identity".to_owned())?;
+    let object = value.as_object().ok_or_else(|| {
+        "delegated receipt refused: approval identity is not an object".to_owned()
+    })?;
+    let via = object
+        .get("via")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if via == "head_bound" {
+        let head = object
+            .get("head_sha")
+            .and_then(Value::as_str)
+            .filter(|head| is_sha(head))
+            .ok_or_else(|| {
+                "delegated receipt refused: approval head identity is malformed".to_owned()
+            })?;
+        let _ = head;
+        let nested = object.get("approval").ok_or_else(|| {
+            "delegated receipt refused: head-bound approval is incomplete".to_owned()
+        })?;
+        return validate_approval_value(nested);
+    }
+    if !matches!(via, "review" | "marker" | "carried") {
+        return Err("delegated receipt refused: approval identity has unknown schema".to_owned());
+    }
+    if via == "review" || via == "marker" {
+        if object
+            .get("login")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err("delegated receipt refused: approval reviewer login is missing".to_owned());
+        }
+    }
+    if let Some(app_id) = object.get("performed_via_github_app_id")
+        && !app_id.is_null()
+        && app_id.as_u64().is_none()
+    {
+        return Err("delegated receipt refused: approval app identity is malformed".to_owned());
+    }
+    if via == "marker"
+        && object
+            .get("comment_id")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+    {
+        return Err("delegated receipt refused: approval comment identity is missing".to_owned());
+    }
+    if via == "carried" {
+        if object
+            .get("from_head")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|head| !is_sha(head))
+            || object.get("approval").is_none()
+        {
+            return Err(
+                "delegated receipt refused: carried approval provenance is incomplete".to_owned(),
+            );
+        }
+        validate_approval_value(object.get("approval").expect("checked above"))?;
+    }
+    Ok(())
+}
+
+fn validate_approval_value(value: &Value) -> Result<(), String> {
+    let raw = serde_json::to_string(value)
+        .map_err(|_| "delegated receipt refused: malformed carried approval".to_owned())?;
+    validate_approval_identity(&raw)
+}
+
 fn same_sha(left: &str, right: &str) -> bool {
     left.len() == 40 && right.len() == 40 && left.eq_ignore_ascii_case(right)
 }
@@ -252,7 +414,10 @@ mod tests {
             "a".repeat(40),
             "main",
             "feature",
-            Some("reviewer".to_owned()),
+            Some(format!(
+                r#"{{"via":"head_bound","head_sha":"{}","approval":{{"via":"marker","login":"reviewer","comment_id":7}}}}"#,
+                "a".repeat(40)
+            )),
         );
         witness.save(dir.path()).expect("save");
         let path = DelegatedValidationWitness::path(dir.path(), "owner/repo", 42);
@@ -272,13 +437,23 @@ mod tests {
             "a".repeat(40),
             "main",
             "feature",
-            Some("reviewer".to_owned()),
+            Some(format!(
+                r#"{{"via":"head_bound","head_sha":"{}","approval":{{"via":"review","login":"reviewer","performed_via_github_app_id":1}}}}"#,
+                "a".repeat(40)
+            )),
         );
         witness.armed_at = Some(Utc::now());
+        witness.policy_checks = vec!["macos@app:1".to_owned()];
         witness
     }
 
     fn observation() -> MergedObservation {
+        let policy_evidence = vec![serde_json::json!({
+            "name": "macos",
+            "app_id": 1,
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+        })];
         MergedObservation {
             head_sha: "a".repeat(40),
             base_branch: "main".to_owned(),
@@ -289,7 +464,15 @@ mod tests {
                 "macos".to_owned(),
                 "SUCCESS".to_owned(),
             )]),
-            policy_evidence_digest: "c".repeat(64),
+            policy_evidence_digest: evidence_digest(
+                serde_json::to_vec(&serde_json::json!({
+                    "required_checks_known": true,
+                    "checks": policy_evidence,
+                }))
+                .expect("policy evidence"),
+            ),
+            policy_checks: vec!["macos@app:1".to_owned()],
+            policy_evidence,
         }
     }
 
@@ -330,5 +513,27 @@ mod tests {
         let mut no_approval = witness();
         no_approval.approval_identity = None;
         assert!(no_approval.receipt(&observation()).is_err());
+    }
+
+    #[test]
+    fn approval_identity_schema_is_recursive_and_strict() {
+        let mut malformed = witness();
+        malformed.approval_identity = Some(r#"{"via":"carried","from_head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","approval":{"via":"marker","login":"reviewer"}}"#.to_owned());
+        assert!(malformed.receipt(&observation()).is_err());
+        malformed.approval_identity = Some(
+            r#"{"via":"review","login":"reviewer","performed_via_github_app_id":"1"}"#.to_owned(),
+        );
+        assert!(malformed.receipt(&observation()).is_err());
+    }
+
+    #[test]
+    fn policy_identity_requires_unique_entries() {
+        let duplicate = serde_json::json!({
+            "_required_check_policy": [
+                {"context":"macos","app_id":1},
+                {"context":"macos","app_id":1}
+            ]
+        });
+        assert!(policy_checks_from_snapshot(&duplicate).is_err());
     }
 }

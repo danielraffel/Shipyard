@@ -328,8 +328,11 @@ fn consume_delegated_witness(
             "authoritative required-check policy was unavailable; delegated receipt withheld",
         ));
     }
+    let policy_checks = crate::delegated_validation::policy_checks_from_snapshot(snapshot)
+        .map_err(|error| CliFailure::new(1, error))?;
     let mut evidence = Vec::new();
-    let checks = snapshot
+    let mut checks = std::collections::BTreeMap::new();
+    for entry in snapshot
         .get("statusCheckRollup")
         .and_then(Value::as_array)
         .ok_or_else(|| {
@@ -338,25 +341,94 @@ fn consume_delegated_witness(
                 "required-check rollup was unavailable; delegated receipt withheld",
             )
         })?
-        .iter()
-        .filter(|entry| entry.get("isRequired").and_then(Value::as_bool) == Some(true))
-        .filter_map(|entry| {
-            let name = entry
-                .get("name")
-                .or_else(|| entry.get("context"))?
-                .as_str()?;
-            let conclusion = entry
-                .get("conclusion")
-                .or_else(|| entry.get("state"))?
-                .as_str()?;
-            evidence.push(serde_json::json!({
-                "name": name,
-                "status": entry.get("status").or_else(|| entry.get("state")).cloned().unwrap_or(Value::Null),
-                "conclusion": conclusion,
-            }));
-            Some((name.to_owned(), conclusion.to_owned()))
+    {
+        let required = entry
+            .get("isRequired")
+            .ok_or_else(|| CliFailure::new(1, "required-check rollup omitted required marker; delegated receipt withheld"))?
+            .as_bool()
+            .ok_or_else(|| CliFailure::new(1, "required-check rollup required marker was malformed; delegated receipt withheld"))?;
+        if !required {
+            continue;
+        }
+        let name = entry
+            .get("name")
+            .or_else(|| entry.get("context"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                CliFailure::new(
+                    1,
+                    "required-check rollup omitted check identity; delegated receipt withheld",
+                )
+            })?;
+        let conclusion = entry
+            .get("conclusion")
+            .or_else(|| entry.get("state"))
+            .and_then(Value::as_str)
+            .filter(|conclusion| !conclusion.is_empty())
+            .ok_or_else(|| {
+                CliFailure::new(
+                    1,
+                    "required-check rollup omitted terminal conclusion; delegated receipt withheld",
+                )
+            })?;
+        let app = match entry.get("app_id") {
+            None | Some(Value::Null) => "any".to_owned(),
+            Some(value) => value.as_u64().map(|id| id.to_string()).ok_or_else(|| {
+                CliFailure::new(
+                    1,
+                    "required-check rollup app identity was malformed; delegated receipt withheld",
+                )
+            })?,
+        };
+        let identity = format!("{name}@app:{app}");
+        if !policy_checks.iter().any(|policy| policy == &identity) {
+            return Err(CliFailure::new(
+                1,
+                "required-check rollup did not match protected-branch policy; delegated receipt withheld",
+            ));
+        }
+        if checks
+            .insert(name.to_owned(), conclusion.to_owned())
+            .is_some()
+        {
+            return Err(CliFailure::new(
+                1,
+                "required-check rollup contained duplicate check identity; delegated receipt withheld",
+            ));
+        }
+        evidence.push(serde_json::json!({
+            "name": name,
+            "app_id": entry.get("app_id").cloned().unwrap_or(Value::Null),
+            "status": entry.get("status").or_else(|| entry.get("state")).cloned().unwrap_or(Value::Null),
+            "conclusion": conclusion,
+        }));
+    }
+    let mut observed_policy = checks
+        .keys()
+        .map(|name| {
+            let app = evidence
+                .iter()
+                .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
+                .and_then(|entry| entry.get("app_id"))
+                .and_then(|value| {
+                    if value.is_null() {
+                        Some("any".to_owned())
+                    } else {
+                        value.as_u64().map(|id| id.to_string())
+                    }
+                })
+                .unwrap_or_else(|| "invalid".to_owned());
+            format!("{name}@app:{app}")
         })
-        .collect();
+        .collect::<Vec<_>>();
+    observed_policy.sort();
+    if observed_policy != policy_checks {
+        return Err(CliFailure::new(
+            1,
+            "required-check rollup did not materialize the complete protected-branch policy; delegated receipt withheld",
+        ));
+    }
     evidence.sort_by_key(|entry| {
         entry
             .get("name")
@@ -396,6 +468,8 @@ fn consume_delegated_witness(
             .and_then(Value::as_str)
             .and_then(|value| value.parse().ok()),
         required_checks: checks,
+        policy_checks,
+        policy_evidence: evidence,
         policy_evidence_digest: crate::delegated_validation::evidence_digest(
             serde_json::to_vec(&policy_evidence)
                 .map_err(|error| CliFailure::new(1, error.to_string()))?,
@@ -1090,19 +1164,83 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        RuntimeMode, WaitOutcome, WaitPrState, evaluate_pr_green_for_wait, evaluate_pr_queue_state,
-        evaluate_run_for_wait, parse_github_repo_slug, release_manifest, render_wait_outcome,
-        resolve_repo_slug, wait_exit_code, wait_failure, wait_job, wait_pr, wait_release, wait_run,
+        RuntimeMode, WaitOutcome, WaitPrState, consume_delegated_witness,
+        evaluate_pr_green_for_wait, evaluate_pr_queue_state, evaluate_run_for_wait,
+        parse_github_repo_slug, release_manifest, render_wait_outcome, resolve_repo_slug,
+        wait_exit_code, wait_failure, wait_job, wait_pr, wait_release, wait_run,
     };
     use crate::app::{
         WAIT_EXIT_CLOSED, WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG,
         WAIT_EXIT_TIMEOUT, WAIT_EXIT_UNSUPPORTED,
     };
+    use crate::delegated_validation::DelegatedValidationWitness;
     use crate::gh::GhPrepareError;
     use crate::job::{Job, Priority, TargetResult, TargetStatus, ValidationMode};
     use crate::queue::{KEEP_COMPLETED, Queue};
     use crate::wait as wait_logic;
     use crate::wait_transport::wait_for_condition_with_timeout;
+
+    fn delegated_snapshot(policy_context: &str) -> Value {
+        serde_json::json!({
+            "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "baseRefName": "main",
+            "state": "MERGED",
+            "merged": true,
+            "mergeCommit": {"oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+            "mergedAt": "2026-10-25T12:00:00Z",
+            "_required_checks_known": true,
+            "_required_check_policy": [{"context": policy_context, "app_id": 1}],
+            "statusCheckRollup": [{"name": policy_context, "app_id": 1, "isRequired": true, "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        })
+    }
+
+    fn save_delegated_witness(state_dir: &Path) {
+        let mut witness = DelegatedValidationWitness::new(
+            "owner/repo",
+            42,
+            "a".repeat(40),
+            "main",
+            "feature",
+            Some(format!(
+                r#"{{"via":"head_bound","head_sha":"{}","approval":{{"via":"review","login":"reviewer"}}}}"#,
+                "a".repeat(40)
+            )),
+        );
+        witness.armed_at = Some(chrono::Utc::now());
+        witness.policy_checks = vec!["macos@app:1".to_owned()];
+        witness.save(state_dir).expect("witness");
+    }
+
+    #[test]
+    fn delegated_merge_consumes_witness_only_after_receipt_import() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        save_delegated_witness(temp.path());
+        consume_delegated_witness(
+            temp.path(),
+            temp.path(),
+            "owner/repo",
+            42,
+            Some(&delegated_snapshot("macos")),
+        )
+        .expect("consume");
+        assert!(!DelegatedValidationWitness::path(temp.path(), "owner/repo", 42).exists());
+    }
+
+    #[test]
+    fn delegated_policy_drift_keeps_witness_for_retry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        save_delegated_witness(temp.path());
+        let error = consume_delegated_witness(
+            temp.path(),
+            temp.path(),
+            "owner/repo",
+            42,
+            Some(&delegated_snapshot("linux")),
+        )
+        .expect_err("policy drift");
+        assert!(error.message.contains("policy"));
+        assert!(DelegatedValidationWitness::path(temp.path(), "owner/repo", 42).exists());
+    }
 
     #[test]
     fn parse_github_repo_slug_supports_common_remote_forms() {

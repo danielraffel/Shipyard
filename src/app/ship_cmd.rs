@@ -341,7 +341,30 @@ pub(super) fn ship_command<W: Write>(
     // fails, do not arm: an arm without a durable witness cannot produce a
     // gate-bound receipt safely.
     let mut delegated_witness = if targets.is_empty() && !repo.is_empty() {
-        let witness = crate::delegated_validation::DelegatedValidationWitness::new(
+        let policy_snapshot =
+            crate::wait_transport::fetch_pr_snapshot(&repo, pr_context.number, cwd)
+                .map_err(|error| {
+                    CliFailure::new(
+                        1,
+                        format!("read protected-branch policy before delegated arm: {error}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    CliFailure::new(
+                        1,
+                        "protected-branch policy snapshot unavailable; delegated arm withheld",
+                    )
+                })?;
+        if policy_snapshot.get("_required_checks_known") != Some(&Value::Bool(true)) {
+            return Err(CliFailure::new(
+                1,
+                "authoritative protected-branch policy unavailable; delegated arm withheld",
+            ));
+        }
+        let policy_checks =
+            crate::delegated_validation::policy_checks_from_snapshot(&policy_snapshot)
+                .map_err(|error| CliFailure::new(1, error))?;
+        let mut witness = crate::delegated_validation::DelegatedValidationWitness::new(
             repo.clone(),
             pr_context.number,
             sha.clone(),
@@ -349,6 +372,7 @@ pub(super) fn ship_command<W: Write>(
             branch.clone(),
             None,
         );
+        witness.policy_checks = policy_checks;
         witness.save(&runtime_paths.state_dir).map_err(|error| {
             CliFailure::new(1, format!("persist delegated validation witness: {error}"))
         })?;

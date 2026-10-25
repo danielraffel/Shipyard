@@ -259,7 +259,20 @@ fn approval_note(
                 crate::head_approval::HeadGate::Approved { approval } => {
                     // Keep reviewer login/comment/review/app and carried-head
                     // provenance, rather than only a display string.
-                    serde_json::to_string(&approval).ok()
+                    let Some(head) = queue
+                        .pointer("/data/repository/pullRequest/headRefOid")
+                        .and_then(Value::as_str)
+                    else {
+                        return Err(skipped(
+                            "⚠︎ Auto-merge not armed: approval head was unavailable.".to_owned(),
+                        ));
+                    };
+                    serde_json::to_string(&serde_json::json!({
+                        "via": "head_bound",
+                        "head_sha": head,
+                        "approval": approval,
+                    }))
+                    .ok()
                 }
                 _ => None,
             },
