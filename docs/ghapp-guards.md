@@ -7,9 +7,42 @@ next step, and the refusal exists because the next step is something else.
 
 ## What runs
 
-`scripts/ghapp` runs these optional guards from `$SHIPYARD_GHAPP_GUARDS_DIR`
-(default `~/.config/shipyard/guards`) before the native `gh`. A guard that is not
-present, or not executable, is skipped.
+`scripts/ghapp` runs these guards from `$SHIPYARD_GHAPP_GUARDS_DIR`
+(default `~/.config/shipyard/guards`) before the native `gh`. The two queue
+guards are required for the requests they judge: when `queue-arm-guard` is
+missing, unreadable or not executable, `ghapp` refuses every request that can
+arm, enqueue or merge (`pr merge`, `enablePullRequestAutoMerge`,
+`enqueuePullRequest`, `mergePullRequest`, a non-GET REST `pulls/<n>/merge`,
+and a GraphQL body it cannot read) with ``ghapp: queue-arm-guard is not
+installed; run `shipyard guards install` ``, and the same holds for
+`queue-removal-guard` and the requests it judges (`pr merge --disable-auto`,
+`dequeuePullRequest`, `disablePullRequestAutoMerge`). There is no override.
+Other requests pass, and any other guard that is not present, or not
+executable, is skipped. A queue guard counts as installed when its path
+resolves to a regular, readable, executable file; a symlink to such a file
+counts too (`shipyard guards install` never writes one), while a dangling
+symlink, a directory or a non-executable file refuses. Anything the wrapper
+cannot classify for certain (a body on stdin, a FIFO, a device or a symlinked
+body file, a JSON body with escapes, a method-override header) counts as a
+landing and a removal, so a missing guard refuses it.
+
+### Upgrading a host
+
+The guards `ghapp` runs are the installed copies in
+`~/.config/shipyard/guards`, and `ghapp` itself runs from the auth generation
+under `~/.local/share/shipyard/auth-generations/`. Neither changes when a new
+Shipyard binary lands. Right after a release that changes them, on every
+host (the fleet today: m1, m3, m5 and m5s):
+
+1. `shipyard update` (or the fleet update), which installs the new binary and
+   its `ghapp` auth generation;
+2. `shipyard guards install`, which places this build's guards;
+3. `shipyard guards status` and `shipyard doctor` to confirm both.
+
+Until both steps run on a host, its `ghapp` paths keep the previous guards and
+wrapper behaviour, so the protections a release adds there are not in effect.
+Shipyard's own review check before each of its landings runs from the copy in
+its binary and needs only step 1.
 
 | installed name | source | refuses |
 |---|---|---|
@@ -150,7 +183,8 @@ carried the arming session. Override removals in `queue-removals.jsonl` now
 carry `host`, `session` and `agent` too. A missing session
 is recorded as `unattributed` and never refuses anything; a ledger that cannot
 be written is reported and does not block. Shipyard's own marked mutations
-(`SHIPYARD_INTERNAL_QUEUE_MUTATION=1`) are not judged again, but each is
+(`SHIPYARD_INTERNAL_QUEUE_MUTATION=1` with that call's one-shot nonce, below)
+are not judged again, but each is
 recorded with `review: shipyard internal` from what the request itself binds,
 with no GitHub call: repository, pull request (or, for a GraphQL landing, the
 `node` id and no number), head and verb. An entry also records
@@ -346,15 +380,27 @@ reviewer's act: an agent landing its own head must not post the verdict.
 
 An unreadable pull request, policy or comment list refuses.
 
-**Operator override.** `GHAPP_ALLOW_UNREVIEWED_ARM=1` lands anyway. It prints
-a `WARNING` naming the refusal it overrode and appends one JSON line (`at`,
-`override`, `refusal`, `argv`, `cwd`) to `overrides.jsonl` in the guards
-directory. It is for an operator, never for an agent. `GHAPP_ALLOW_QUEUE_REARM`
-does not stand in for it: a queue refusal it overrides still needs the review.
-A request that names no head (a GraphQL body on stdin) needs both overrides.
+**No override.** This rule has none. `GHAPP_ALLOW_UNREVIEWED_ARM=1` is
+refused: the guard says it is not honoured, appends one JSON line (`at`,
+`override`, `refusal`, `argv`, `cwd`, `honoured: false`, `declined`) to
+`overrides.jsonl` in the guards directory, and the refusal stands.
+`GHAPP_ALLOW_QUEUE_REARM` does not stand in for a review: a queue refusal it
+overrides still needs the verdict, and a request that names no head (a
+GraphQL body on stdin) is refused whatever is set.
 Shipyard's own validated enqueue and classic merge carry
 `SHIPYARD_INTERNAL_QUEUE_MUTATION` and apply the same rule in Rust
-(`crate::head_approval`); its `--arm` override names who armed.
+(`crate::head_approval`). They no longer
+rely on that twin alone: before each arm, enqueue or merge (`ship`,
+`auto-merge`, the merge steward, the carrier, a base-health jump) Shipyard runs
+this guard itself, from the copy it bundles, with
+`SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1`. In that mode the guard applies this review
+rule and nothing else (Shipyard judges queue state), ignores the internal
+marker and records every attempt, allowed or refused, with `caller`,
+`verdict_comment_id` and `signer`, to the ledger `SHIPYARD_QUEUE_ARMS_LOG`
+names: `queue-arms.jsonl` in Shipyard's state directory. That mode, like the
+internal marker, is honoured only with the one-shot nonce Shipyard issues for
+the call (Environment switches, below); without one the guard applies every
+rule. `ship --arm` and `pr --arm` ask only for an arm the verdict allows.
 
 ### A HOLD takes its head out of the landing path
 
@@ -394,7 +440,7 @@ The head lands again only once a newer verdict approves it, which
 goes to the real `gh` with the exported App token, not back through `ghapp`, so
 `queue-removal-guard` keeps refusing agents' own dequeues and disarms. On a
 host with the switch on, posting a HOLD that names a pull request's head is
-therefore the one way to dequeue or disarm it without the operator override,
+therefore the one way to dequeue or disarm it without the removal override,
 and the public HOLD is its trace. Do not add another.
 
 **It never refuses, and a failure is public:** `ghapp` runs it with `|| true`,
@@ -771,26 +817,43 @@ queue removal is refreshable.
 
 | variable | who sets it | effect |
 |---|---|---|
-| `SHIPYARD_INTERNAL_QUEUE_MUTATION=1` | Shipyard itself, on its own exact-head, audited queue commands (enqueue arm, classic merge, merge-steward enqueue, disable/dequeue revocation) | both queue guards step aside; Shipyard's admission rules already made the decision |
+| `SHIPYARD_INTERNAL_QUEUE_MUTATION=1` | Shipyard itself, on its own exact-head, audited queue commands (enqueue arm, classic merge, merge-steward enqueue, disable/dequeue revocation), with that call's one-shot nonce | both queue guards step aside, once per nonce; Shipyard's admission rules already made the decision, and Shipyard ran this guard's review rule itself first (`SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1`). Without a valid nonce it is ignored |
+| `SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1` | Shipyard itself, just before one of its own arms, enqueues or merges, with that run's one-shot nonce | the arm guard runs only the review rule, whatever the internal marker says, and records the attempt. Without a valid nonce it is ignored and every rule applies |
+| `SHIPYARD_QUEUE_MUTATION_NONCE`, `SHIPYARD_QUEUE_MUTATION_NONCE_DIR` | Shipyard itself, only on the child it built for one call | name the one-shot record that makes the two switches above count (below) |
+| `GHAPP_ALLOW_UNREVIEWED_ARM=1` | nobody | refused and audited; the review rule has no override |
 | `GHAPP_ALLOW_QUEUE_REARM=1` | an operator, deliberately, for one command | the arm guard allows a refused arm and prints a `WARNING` naming what it overrode |
 | `GHAPP_ALLOW_QUEUE_REMOVAL=1` | an operator, deliberately, with a stated reason | the removal guard allows the dequeue/disable, with a `WARNING` and an audit record, only for a `defect-fix` or the main-red fix PR itself (below) |
 | `GHAPP_ALLOW_BRANCH_REFRESH=1` | an operator, deliberately, for one command | the branch-refresh guard allows a refused refresh and prints a `WARNING` |
 
 Setting `SHIPYARD_INTERNAL_QUEUE_MUTATION` by hand claims Shipyard's authority
-for a command Shipyard did not audit. Do not. The removal guard honours it only
-when the nearest deciding ancestor process is the Shipyard binary: it walks up
-from its own parent, skips shells, `env`, `timeout` and the `gh` shim (not Python),
-and requires the first other process to be named `shipyard`. An agent that
-exports the marker has its own runtime (`codex`, `node`, `claude`) there, even
-when a Shipyard process launched that agent, so the marker is ignored and the
-request is judged like any other. The deciding process must also run the
-installed binary: its executable path, read from the kernel
-(`proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux) rather than its name,
-must resolve to a file named `shipyard` under
-`~/.local/share/shipyard/auth-generations/`. A binary merely named
-`shipyard` elsewhere, or a dev build under `target/`, does not pass. This
-stops an agent that exports the marker by habit or names a binary to match;
-anyone who can write into the install root can still pass it.
+for a command Shipyard did not audit, and does not work. Both queue guards
+honour the marker, and the arm guard honours `SHIPYARD_QUEUE_ARM_REVIEW_ONLY`,
+only for the one call Shipyard built it for. For each such call Shipyard draws
+a fresh 32-byte random nonce and puts it only in that child's environment
+(`SHIPYARD_QUEUE_MUTATION_NONCE`, with `SHIPYARD_QUEUE_MUTATION_NONCE_DIR`
+naming the directory). It writes one record per guard purpose (`internal-arm`,
+`internal-removal`, `review-only`): a file named by the SHA-256 of
+`<nonce>:<purpose>`, holding the purpose, mode 0600, in
+`queue-mutation-nonces/` beside the arms ledger, a directory it keeps at 0700.
+A guard consumes its record (the removal guard's `consume_nonce`): opened
+without following links, it must be a regular file owned by the same user,
+readable by no one else, at most ten minutes old and naming that purpose,
+and it is unlinked before the switch takes effect. Unlinking is the claim, so
+each record works once. A marker or switch with no nonce, a wrong one, a
+reused one, or a record that fails any check is ignored, with a note, and the
+request is judged in full. Records nobody consumed (a native `gh` runs no
+guard) are dropped by Shipyard after ten minutes.
+
+Shipyard itself never passes these on: a Shipyard process that starts with
+the marker, the review-only switch, a nonce variable or any `GHAPP_ALLOW_*`
+override in its environment re-executes itself without them, so no runner,
+validation command or hook it spawns inherits one, and it strips them from
+every `gh` and guard child except the ones it marks.
+
+The nonce ties the marker to a call Shipyard made instead of to whoever
+exported it or to the process tree. It is not a boundary against a process
+running as the same user that deliberately forges Shipyard's own state
+directory.
 
 ### Queue-removal override decisions
 

@@ -4,11 +4,17 @@ use std::process::ExitCode;
 
 #[cfg(not(windows))]
 fn main() -> ExitCode {
+    if let Some(code) = shipyard::queue_arm_gate::relaunch_without_inherited_queue_authority() {
+        return code;
+    }
     shipyard::app::run()
 }
 
 #[cfg(windows)]
 fn main() -> ExitCode {
+    if let Some(code) = shipyard::queue_arm_gate::relaunch_without_inherited_queue_authority() {
+        return code;
+    }
     // The Windows process main thread has a smaller default stack than the
     // CLI's production dispatch shape requires. Match the test-worker stack
     // contract without changing Unix process or signal semantics.

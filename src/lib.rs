@@ -229,6 +229,8 @@ pub mod profile_apply;
 pub mod queue;
 /// Crash-safe, opt-in recovery of exact ship work missing from the queue.
 pub mod queue_absent_recovery;
+/// Runs the `ghapp` queue-arm guard's review rule before Shipyard lands a head.
+pub mod queue_arm_gate;
 /// Read-only aggregation of durable queue-observer state across repositories.
 pub mod queue_digest;
 /// Transport-free triage, priority-jump, and resume planning for a CI backlog.

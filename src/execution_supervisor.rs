@@ -1775,6 +1775,7 @@ mod tests {
             advisory_targets: BTreeSet::new(),
             adopt_head: false,
             metadata_authority_receipt: None,
+            leave_unarmed: false,
             targets: Vec::new(),
         });
         QueueRequestStore::new(state_dir)
@@ -1856,6 +1857,7 @@ mod tests {
                     producer: "app:15368".to_owned(),
                 }],
             }),
+            leave_unarmed: false,
             targets: Vec::new(),
         });
         QueueRequestStore::new(state_dir)

@@ -619,6 +619,33 @@ fn enqueue_unstacked_pull_request(
         }
         Err(error) => {
             let message = error.to_string();
+            if crate::queue_arm_gate::is_refusal(&message) {
+                // The queue-arm guard refused before anything reached GitHub.
+                let audit_error = guard.finish("refused_by_queue_arm_guard").err();
+                let continuation_error = resolve_success_continuation(
+                    context.ledger_path,
+                    ledger,
+                    &context.observation.repo,
+                    &context.observation.base,
+                    pr.fact.number,
+                    &pr.fact.head_sha,
+                )
+                .err();
+                let mut details = vec![message];
+                if let Some(error) = audit_error {
+                    details.push(format!("mutation audit also failed: {error}"));
+                }
+                if let Some(error) = continuation_error {
+                    details.push(format!(
+                        "terminal continuation resolution failed: {}",
+                        error.message
+                    ));
+                }
+                return (
+                    Some("waiting_head_approval".to_owned()),
+                    Some(details.join("; ")),
+                );
+            }
             if enqueue_requirements_pending(&message) {
                 let audit_error = guard.finish("rejected_requirements").err();
                 let continuation_error = resolve_success_continuation(

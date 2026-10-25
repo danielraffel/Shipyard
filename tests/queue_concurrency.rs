@@ -91,6 +91,7 @@ fn ship_request_for_repo(
         adopt_head: false,
         pr_snapshot_file: None,
         metadata_authority_receipt: None,
+        leave_unarmed: false,
         targets: vec![target],
     }
 }

@@ -93,7 +93,9 @@ pub(super) fn run_pr_provenance_hook<W: Write>(
         .iter()
         .map(|argument| expand(argument))
         .collect::<Vec<_>>();
-    let output = Command::new(&program)
+    let mut hook_command = Command::new(&program);
+    crate::queue_arm_gate::strip_queue_authority(&mut hook_command);
+    let output = hook_command
         .args(&arguments)
         .current_dir(cwd)
         .env("SHIPYARD_PR_NUMBER", &pr_number)

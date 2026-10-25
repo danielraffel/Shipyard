@@ -410,6 +410,8 @@ fn spawn_command(request: &StreamingCommand<'_>) -> Result<ProcessTree, Streamin
         command.current_dir(cwd);
     }
     command.envs(&request.environment);
+    // A validation command is the repository's; it carries no queue authority.
+    crate::queue_arm_gate::strip_queue_authority(&mut command);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     Ok(ProcessTree::spawn(&mut command)?)
 }

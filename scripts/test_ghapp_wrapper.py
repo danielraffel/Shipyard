@@ -186,6 +186,12 @@ class GhappWrapperTests(unittest.TestCase):
             encoding="utf-8",
         )
         close_guard.chmod(0o755)
+        # Both queue guards are required for the requests they judge; these
+        # stand-ins allow everything, so each case tests only what it names.
+        for name in ("queue-removal-guard", "queue-arm-guard"):
+            stand_in = guards / name
+            stand_in.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            stand_in.chmod(0o755)
         self.environment = {
             **os.environ,
             "SHIPYARD_GITHUB_APP_TOKEN_HELPER": str(self.helper),
@@ -2117,15 +2123,213 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertTrue(self.helper_log.exists())
         self.assertFalse(self.gh_log.exists())
 
-    def test_absent_queue_arm_guard_is_optional(self) -> None:
-        self.assertFalse((self.root / "guards" / "queue-arm-guard").exists())
+    LANDINGS = (
+        ("pr", "merge", "7", "--merge", "--repo", "owner/repo"),
+        ("pr", "merge", "7", "--auto", "--match-head-commit", "a" * 40, "--repo", "owner/repo"),
+        ("api", "graphql", "-f",
+         "query=mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id}){clientMutationId}}"),
+        ("api", "graphql", "-f",
+         "query=mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){clientMutationId}}"),
+        ("api", "-X", "PUT", "repos/owner/repo/pulls/7/merge", "-f", "sha=" + "a" * 40),
+        ("api", "graphql", "--input", "-"),
+    )
+    REMOVALS = (
+        ("pr", "merge", "7", "--disable-auto", "--repo", "owner/repo"),
+        ("api", "graphql", "-f",
+         "query=mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}"),
+        ("api", "graphql", "-f",
+         "query=mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){clientMutationId}}"),
+    )
+    READS = (
+        ("api", "repos/Generous-Corp/pulp/hooks"),
+        ("api", "repos/owner/repo/pulls/7/merge"),
+        ("api", "graphql", "-f", "query=query{viewer{login}}"),
+        ("pr", "view", "7", "--repo", "owner/repo"),
+    )
 
-        result = self.run_wrapper(
-            "api", "repos/Generous-Corp/pulp/hooks"
+    def fresh(self) -> None:
+        """A clean fixture for one subtest, bound to owner/repo."""
+        self.temporary.cleanup()
+        self.setUp()
+        self.environment["GH_REPO"] = "owner/repo"
+
+    def run_quiet(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """The wrapper with an empty standard input, so a request that reads
+        its body from stdin cannot wait on the test runner's."""
+        return subprocess.run(
+            [str(self.wrapper), *args],
+            cwd=self.root,
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=60,
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.gh_log.exists())
+    def break_guard(self, name: str, how: str) -> None:
+        guard = self.root / "guards" / name
+        if how == "missing":
+            guard.unlink()
+        elif how == "not executable":
+            guard.chmod(0o644)
+        elif how == "unreadable":
+            guard.chmod(0o311)
+
+    def test_a_missing_queue_arm_guard_refuses_every_landing(self) -> None:
+        for how in ("missing", "not executable", "unreadable"):
+            for arguments in self.LANDINGS:
+                with self.subTest(how=how, arguments=arguments):
+                    self.fresh()
+                    self.break_guard("queue-arm-guard", how)
+                    result = self.run_quiet(*arguments)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(
+                        "ghapp: queue-arm-guard is not installed; run `shipyard guards install`",
+                        result.stderr,
+                    )
+                    self.assertFalse(self.gh_log.exists(), "the landing reached gh")
+
+    def test_a_missing_queue_arm_guard_still_passes_reads_and_removals(self) -> None:
+        for arguments in self.READS + self.REMOVALS:
+            with self.subTest(arguments=arguments):
+                self.fresh()
+                self.break_guard("queue-arm-guard", "missing")
+                result = self.run_quiet(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(self.gh_log.exists())
+
+    def test_a_missing_queue_removal_guard_refuses_every_removal(self) -> None:
+        for arguments in self.REMOVALS + (("api", "graphql", "--input", "-"),):
+            with self.subTest(arguments=arguments):
+                self.fresh()
+                self.break_guard("queue-removal-guard", "missing")
+                result = self.run_quiet(*arguments)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(
+                    "ghapp: queue-removal-guard is not installed; run `shipyard guards install`",
+                    result.stderr,
+                )
+                self.assertFalse(self.gh_log.exists(), "the removal reached gh")
+        for arguments in self.READS + self.LANDINGS[:5]:
+            with self.subTest(arguments=arguments):
+                self.fresh()
+                self.break_guard("queue-removal-guard", "missing")
+                result = self.run_quiet(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def queue_kinds(self, *arguments: str) -> set[str]:
+        """What the wrapper's own classifier says about one request, run
+        under /bin/bash exactly as the wrapper defines it."""
+        wrapper = WRAPPER.read_text(encoding="utf-8")
+        start = wrapper.index("ghapp_queue_body() {")
+        body_end = wrapper.index("\n}\n", wrapper.index("ghapp_queue_mutation_kinds() {")) + 3
+        script = self.root / "kinds.sh"
+        script.write_text(wrapper[start:body_end], encoding="utf-8")
+        result = subprocess.run(
+            ["/bin/bash", "-c", 'set -euo pipefail; source "$0"; ghapp_queue_mutation_kinds "$@"',
+             str(script), *arguments],
+            text=True, capture_output=True, check=True, stdin=subprocess.DEVNULL, timeout=30,
+        )
+        return set(result.stdout.split())
+
+    def test_every_landing_shape_is_classified(self) -> None:
+        body = self.root / "body.json"
+        body.write_text('{"query":"mutation{enqueuePullRequest(input:{})}"}', encoding="utf-8")
+        escaped = self.root / "escaped.json"
+        escaped.write_text('{"query":"mutation{\\u0065nqueuePullRequest(input:{})}"}',
+                           encoding="utf-8")
+        # A symlinked body counts as both whatever it points at now: what gh
+        # reads later may not be what this check read.
+        harmless = self.root / "harmless.json"
+        harmless.write_text('{"query":"query{viewer{login}}"}', encoding="utf-8")
+        link = self.root / "link.json"
+        link.symlink_to(harmless)
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo)
+        merge = "repos/o/r/pulls/7/merge"
+        landings = {
+            "--method as its own argument": ("api", "--method", "PUT", merge),
+            "-X lower case": ("api", "-X", "put", merge),
+            "-XPUT combined": ("api", "-XPUT", merge),
+            "--method= combined": ("api", "--method=put", merge),
+            "leading slash": ("api", "-X", "PUT", "/" + merge),
+            "full URL": ("api", "-X", "PUT", "https://api.github.com/" + merge),
+            "GHES URL": ("api", "-X", "PUT", "https://ghe.example.com/api/v3/" + merge),
+            "trailing slash": ("api", "-X", "PUT", merge + "/"),
+            "query string": ("api", "-X", "PUT", merge + "?x=1"),
+            "query string after a slash": ("api", "-X", "PUT", merge + "/?x=1"),
+            "upper-case path": ("api", "-X", "PUT", "REPOS/O/R/PULLS/7/MERGE"),
+            "field-implied method": ("api", merge, "-f", "sha=x"),
+            "method-override header": ("api", "-H", "X-HTTP-Method-Override: PUT", merge),
+            "graphql by path": ("api", "/graphql", "-f", "query=mutation{enqueuePullRequest}"),
+            "graphql by URL": ("api", "https://api.github.com/graphql", "-f",
+                               "query=mutation{enablePullRequestAutoMerge(input:{})}"),
+            "--raw-field": ("api", "graphql", "--raw-field", "query=mutation{mergePullRequest}"),
+            "-F literal": ("api", "graphql", "-F", "query=mutation{mergePullRequest}"),
+            "alias": ("api", "graphql", "-f", "query=mutation{ a: enqueuePullRequest(input:{}) }"),
+            "comment and newlines": ("api", "graphql", "-f",
+                                     "query=mutation # landing\n{\n  EnqueuePullRequest\n}"),
+            "--input file": ("api", "graphql", "--input", str(body)),
+            "@file": ("api", "graphql", "-f", f"query=@{body}"),
+            "JSON escapes": ("api", "graphql", "--input", str(escaped)),
+            "--input stdin": ("api", "graphql", "--input", "-"),
+            "--input /dev/stdin": ("api", "graphql", "--input", "/dev/stdin"),
+            "--input fifo": ("api", "graphql", "--input", str(fifo)),
+            "--input symlink": ("api", "graphql", "--input", str(link)),
+            "--input=": ("api", "graphql", f"--input={body}"),
+            "@/dev/stdin": ("api", "graphql", "-f", "query=@/dev/stdin"),
+            "pr merge": ("pr", "merge", "7"),
+            "pr -R before merge": ("pr", "-R", "o/r", "merge", "7"),
+            "pr --repo before merge": ("pr", "--repo", "o/r", "merge", "7", "--auto"),
+            "pr --repo= before merge": ("pr", "--repo=o/r", "merge", "7"),
+        }
+        for label, arguments in landings.items():
+            with self.subTest(label):
+                self.assertIn("landing", self.queue_kinds(*arguments), arguments)
+        reads = {
+            "GET merge state": ("api", merge),
+            "full-URL GET": ("api", "https://api.github.com/" + merge),
+            "explicit GET with a field": ("api", "-X", "GET", merge, "-f", "a=1"),
+            "graphql query": ("api", "graphql", "-f", "query=query{viewer{login}}"),
+            "pull": ("api", "repos/o/r/pulls/7"),
+            "pr view after -R": ("pr", "-R", "o/r", "view", "7"),
+        }
+        for label, arguments in reads.items():
+            with self.subTest(label):
+                self.assertEqual(self.queue_kinds(*arguments), set(), arguments)
+        self.assertEqual(self.queue_kinds("pr", "--repo", "o/r", "merge", "7", "--disable-auto"),
+                         {"removal"})
+
+    def test_a_missing_queue_arm_guard_refuses_the_new_shapes_end_to_end(self) -> None:
+        for arguments in (
+            ("api", "--method", "PUT", "repos/owner/repo/pulls/7/merge"),
+            ("api", "-X", "PUT", "/repos/owner/repo/pulls/7/merge/"),
+            ("api", "-X", "PUT", "repos/owner/repo/pulls/7/merge?a=1"),
+            ("api", "/graphql", "-f", "query=mutation{enqueuePullRequest(input:{})}"),
+            ("api", "graphql", "--input", "/dev/stdin"),
+            ("pr", "-R", "owner/repo", "merge", "7"),
+        ):
+            with self.subTest(arguments=arguments):
+                self.fresh()
+                self.break_guard("queue-arm-guard", "missing")
+                result = self.run_quiet(*arguments)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                # `pr -R <repo> merge` is already outside ghapp's grammar.
+                self.assertTrue(
+                    "queue-arm-guard is not installed" in result.stderr
+                    or "outside privileged grammar" in result.stderr,
+                    result.stderr,
+                )
+                self.assertFalse(self.gh_log.exists(), "the landing reached gh")
+
+    def test_installed_queue_guards_judge_as_before(self) -> None:
+        for arguments in self.LANDINGS + self.REMOVALS + self.READS:
+            with self.subTest(arguments=arguments):
+                self.fresh()
+                result = self.run_quiet(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(self.gh_log.exists())
 
     def test_branch_refresh_guard_uses_app_token_before_native_gh(self) -> None:
         guards = self.root / "guards"

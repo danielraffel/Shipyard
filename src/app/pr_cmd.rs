@@ -337,6 +337,7 @@ pub(super) fn pr_command<W: Write>(
             invocation: ShipInvocation::PrCommand,
             foreground: false,
             arm_auto_merge: args.arm_auto_merge,
+            leave_unarmed: args.arm_auto_merge.leaves_unarmed(),
             body_append: args.body_append,
         },
         config,
@@ -347,11 +348,14 @@ pub(super) fn pr_command<W: Write>(
     )
 }
 
+/// The steward receipt `shipyard pr` writes, if any. `--no-arm` writes none:
+/// a receipt hands the steward authority to enqueue the head.
 fn resolve_steward_handoff(
     args: &PrCommandArgs,
     protected_default: bool,
 ) -> Option<super::ship_cmd::ShipStewardHandoff> {
     (args.steward_handoff_preference != StewardHandoffPreference::Disabled
+        && args.arm_auto_merge != super::cli::ArmRequest::Off
         && (protected_default || args.workstream_id.is_some() || args.context_url.is_some()))
     .then(|| super::ship_cmd::ShipStewardHandoff {
         workstream_id: args.workstream_id.clone(),
@@ -1054,20 +1058,24 @@ mod tests {
 
     #[test]
     fn steward_handoff_is_project_default_or_cli_opt_in_with_opt_out() {
-        let automatic = resolve_steward_handoff(&pr_args(), true).expect("default");
+        let armed = || PrCommandArgs {
+            arm_auto_merge: crate::app::cli::ArmRequest::Default,
+            ..pr_args()
+        };
+        let automatic = resolve_steward_handoff(&armed(), true).expect("default");
         assert!(automatic.workstream_id.is_none());
 
         let explicit = PrCommandArgs {
             workstream_id: Some(String::from("GEN-7")),
             context_url: Some(String::from("https://linear.example/GEN-7")),
-            ..pr_args()
+            ..armed()
         };
         let resolved = resolve_steward_handoff(&explicit, false).expect("explicit");
         assert_eq!(resolved.workstream_id.as_deref(), Some("GEN-7"));
 
         let contextual = PrCommandArgs {
             context_url: Some(String::from("https://linear.example/GEN-9")),
-            ..pr_args()
+            ..armed()
         };
         let resolved =
             resolve_steward_handoff(&contextual, false).expect("context URL enables handoff");
@@ -1078,9 +1086,25 @@ mod tests {
 
         let disabled = PrCommandArgs {
             steward_handoff_preference: StewardHandoffPreference::Disabled,
-            ..pr_args()
+            ..armed()
         };
         assert!(resolve_steward_handoff(&disabled, true).is_none());
+    }
+
+    /// `shipyard pr --no-arm` must not hand the head to a steward, which
+    /// would enqueue it, whatever the project default says.
+    #[test]
+    fn no_arm_writes_no_steward_handoff() {
+        let no_arm = PrCommandArgs {
+            arm_auto_merge: crate::app::cli::ArmRequest::Off,
+            ..pr_args()
+        };
+        assert!(resolve_steward_handoff(&no_arm, true).is_none());
+        let explicit = PrCommandArgs {
+            workstream_id: Some(String::from("GEN-7")),
+            ..no_arm
+        };
+        assert!(resolve_steward_handoff(&explicit, true).is_none());
     }
 
     #[cfg(unix)]

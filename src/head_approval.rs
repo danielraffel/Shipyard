@@ -1436,19 +1436,19 @@ impl HeadGate {
                  fleet App (a `ghapp` verdict comment) or a human the base lists in \
                  `[auto_merge] human_reviewers`, never the PR author, with no later HOLD \
                  naming it. This repository arms only approved \
-                 heads; left disarmed. Arm deliberately with `--arm`",
+                 heads; left disarmed until a reviewer posts that verdict",
                 short(head)
             ),
             Self::SelfApproved { head, agent } => format!(
                 "the approval of head {} was posted by this same agent ({agent}); an agent \
                  cannot approve its own landing. Left disarmed until another agent approves \
-                 it, or someone arms it with `--arm`",
+                 it",
                 short(head)
             ),
             Self::EjectionCap { head, ejections } => format!(
                 "the merge queue removed head {} {} times ({}), and no approval followed the \
-                 last removal; left disarmed until a reviewer approves it again, a new head is \
-                 pushed, or someone arms it with `--arm`",
+                 last removal; left disarmed until a reviewer approves it again or a new head \
+                 is pushed",
                 short(head),
                 ejections.len(),
                 ejections

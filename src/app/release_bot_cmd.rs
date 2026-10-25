@@ -981,7 +981,9 @@ fn run_hook(
         ));
         return result;
     }
-    let command = Command::new("sh")
+    let mut hook = Command::new("sh");
+    crate::queue_arm_gate::strip_queue_authority(&mut hook);
+    let command = hook
         .arg("-c")
         .arg(&config.command)
         .current_dir(cwd)

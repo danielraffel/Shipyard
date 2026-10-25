@@ -194,6 +194,34 @@ envelope.
 
 `--no-arm` opts out for one invocation; the `shipyard:no-auto-merge` label opts a
 pull request out permanently. Neither is something to reach for by default.
+`--no-arm` means validate only: nothing that invocation starts arms, enqueues
+or merges. `shipyard pr --no-arm` writes no steward handoff (it implies
+`--no-steward-handoff`, and refuses `--workstream-id`/`--context-url`), and the
+handed-off `ship` skips its post-validation merge phase, reporting
+`left unarmed (--no-arm)`, in the foreground and when the daemon owns it.
+
+**Every Shipyard landing passes `queue-arm-guard`.** Before any request that
+can arm, enqueue or merge (`enablePullRequestAutoMerge`, `enqueuePullRequest`,
+`mergePullRequest`, `gh pr merge`, REST `PUT pulls/<n>/merge`), from `ship`,
+`auto-merge`, the merge steward, the carrier or a base-health jump, Shipyard
+runs the guard it bundles (the same bytes `shipyard guards install` places)
+with `SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1`, against the same `gh` and token. The
+guard's review rule decides, exactly as for an agent's `ghapp` request: an
+exact-head `verdict: APPROVE head:<sha>` from an allowed signer, bound by
+`expectedHeadOid` / `--match-head-commit` / `sha=`; an unverdicted head, a
+verdict naming another head, an unlisted `reviewer:` signer, an
+`unattributed` stamp or a `session:` line off the host's allowlist refuses,
+and nothing reaches GitHub. This holds whether or not `gh` is the `ghapp`
+wrapper. Each attempt, allowed or refused, appends a line to
+`queue-arms.jsonl` in Shipyard's state directory (`repo`, `pr`, `head`,
+`verb`, `verdict`, `verdict_comment_id`, `signer`, `caller`; override the path
+with `SHIPYARD_QUEUE_ARMS_LOG`). A guard that cannot run (no `python3` 3.11+)
+refuses. The steward reports a refusal as `waiting_head_approval`. There is no
+override: `--arm` asks only for an arm the verdict allows, and
+`GHAPP_ALLOW_UNREVIEWED_ARM` is refused and audited. The review-only switch
+and Shipyard's internal marker count only with the one-shot nonce Shipyard
+issues for that call; exported by hand, they are ignored and every rule
+applies.
 
 **Head approval.** A repository whose base branch sets
 `[auto_merge] arm_requires_head_approval = true` (the default for pulp, vellum,
@@ -247,7 +275,7 @@ approval newer than its last removal; the line lists each removal's reason.
 Removals are counted from the last 100 timeline events only, so a very busy pull
 request can under-count them; that errs lenient (an approval is still required),
 never strict.
-`--arm` arms past the check on purpose and the line names who armed it. Rebasing
+`--arm` has no override: it arms only what the verdict allows. Rebasing
 an approved pull request produces a new head with no approval, so it stays
 disarmed until it is approved again.
 

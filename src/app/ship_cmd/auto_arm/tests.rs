@@ -80,7 +80,7 @@ fn arm_accepted() -> String {
 }
 
 fn run(gh: &FakeGh) -> ArmOutcome {
-    arm_native_auto_merge(&|args| gh.run(args), "owner/repo", 7, false, None)
+    arm_native_auto_merge(&|args| gh.run(args), "owner/repo", 7, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +281,7 @@ fn a_multi_line_diagnostic_is_collapsed_to_one_line() {
 #[test]
 fn a_repo_without_owner_and_name_arms_nothing() {
     let gh = FakeGh::new(vec![("pr view", Ok(pr_view("PR_node", false)))]);
-    let outcome = arm_native_auto_merge(&|args| gh.run(args), "not-a-slug", 7, false, None);
+    let outcome = arm_native_auto_merge(&|args| gh.run(args), "not-a-slug", 7, false);
     assert!(!outcome.armed);
     assert!(outcome.line.contains("could not be read"));
     assert!(!gh.called("enablePullRequestAutoMerge"));
@@ -363,11 +363,7 @@ fn jsonl(records: &[serde_json::Value]) -> String {
 /// One arm attempt on #9438 after a rebase to `head`, as `shipyard pr` makes
 /// it, on a repository that arms only approved heads. Returns the outcome and
 /// how many arm mutations were sent.
-fn ship_9438_head(
-    head: &str,
-    comments: &[serde_json::Value],
-    override_by: Option<&str>,
-) -> (ArmOutcome, usize) {
+fn ship_9438_head(head: &str, comments: &[serde_json::Value]) -> (ArmOutcome, usize) {
     let gh = FakeGh::new(vec![
         ("pr view", Ok(pr_view("PR_9438", false))),
         ("isInMergeQueue", Ok(pr_9438_queue(head).to_string())),
@@ -379,13 +375,7 @@ fn ship_9438_head(
         ("issues/9438/comments", Ok(jsonl(comments))),
         ("enablePullRequestAutoMerge", Ok(arm_accepted())),
     ]);
-    let outcome = arm_native_auto_merge(
-        &|args| gh.run(args),
-        "Generous-Corp/pulp",
-        9438,
-        false,
-        override_by,
-    );
+    let outcome = arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 9438, false);
     let arms = gh
         .calls
         .borrow()
@@ -402,7 +392,7 @@ fn replaying_9438_leaves_the_pr_disarmed_after_every_rebase() {
     let comments = pr_9438_bot_comments();
     let mut arms = 0;
     for head in PR_9438_HEADS {
-        let (outcome, sent) = ship_9438_head(head, &comments, None);
+        let (outcome, sent) = ship_9438_head(head, &comments);
         arms += sent;
         assert!(!outcome.armed, "{head}: {}", outcome.line);
         assert!(
@@ -424,7 +414,7 @@ fn replaying_9438_with_a_marker_for_the_rebased_head_arms_exactly_once() {
     let mut armed_heads = Vec::new();
     let mut arms = 0;
     for head in PR_9438_HEADS {
-        let (outcome, sent) = ship_9438_head(head, &comments, None);
+        let (outcome, sent) = ship_9438_head(head, &comments);
         arms += sent;
         if outcome.armed {
             armed_heads.push(*head);
@@ -434,23 +424,13 @@ fn replaying_9438_with_a_marker_for_the_rebased_head_arms_exactly_once() {
     assert_eq!(armed_heads, vec![PR_9438_HEADS[6]]);
 }
 
-/// `--arm` arms an unapproved head on purpose, and the result says who did.
+/// There is no override: an unapproved head is not armed, whatever was asked.
 #[test]
-fn an_explicit_arm_overrides_the_policy_and_names_who_armed() {
-    let (outcome, arms) = ship_9438_head(
-        PR_9438_HEADS[0],
-        &pr_9438_bot_comments(),
-        Some("operator@studio"),
-    );
-    assert!(outcome.armed, "{}", outcome.line);
-    assert_eq!(arms, 1);
-    assert!(
-        outcome
-            .line
-            .contains("explicit `--arm` from operator@studio"),
-        "{}",
-        outcome.line
-    );
+fn an_unapproved_head_is_never_armed() {
+    let (outcome, arms) = ship_9438_head(PR_9438_HEADS[0], &pr_9438_bot_comments());
+    assert!(!outcome.armed, "{}", outcome.line);
+    assert_eq!(arms, 0);
+    assert!(!outcome.line.contains("--arm"), "{}", outcome.line);
 }
 
 /// An unreadable policy is not an absent one.
@@ -490,8 +470,8 @@ fn the_approval_policy_is_read_from_the_base_branch() {
 }
 
 /// What each invocation asks for reaches the arm: `--no-arm` sends nothing,
-/// the default is refused on an unapproved head, and `--arm` arms it and
-/// names who did.
+/// and the default (also what `--arm` asks for) is refused on an unapproved
+/// head.
 #[test]
 fn each_arm_request_reaches_the_arm_as_asked() {
     use crate::app::cli::ArmRequest;
@@ -518,17 +498,6 @@ fn each_arm_request_reaches_the_arm_as_asked() {
     let outcome = arm_for_request(&|a| default.run(a), "o/r", 9438, false, ArmRequest::Default)
         .expect("attempted");
     assert!(!outcome.armed, "{}", outcome.line);
-
-    let forced = gh(head);
-    let outcome = arm_for_request(&|a| forced.run(a), "o/r", 9438, false, ArmRequest::Override)
-        .expect("attempted");
-    assert!(outcome.armed, "{}", outcome.line);
-    assert!(
-        outcome.line.contains("explicit `--arm` from "),
-        "{}",
-        outcome.line
-    );
-    assert!(outcome.line.contains('@'), "{}", outcome.line);
 }
 
 /// `ship`'s arm-on-open re-enqueues a starved head of #8678 at exactly that
@@ -578,7 +547,7 @@ fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
     let approval = r#"{"id":1,"login":"shipyard-local[bot]","type":"Bot","association":"CONTRIBUTOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:f0fb2fb38ef5c900efad7ea0630906f081db53a9"}"#;
     let gh = reenqueue_8678(approval);
     let outcome = crate::head_approval::with_host_review_default(true, || {
-        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None)
+        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true)
     });
     assert!(outcome.armed, "{}", outcome.line);
     assert!(
@@ -606,7 +575,7 @@ fn ship_does_not_arm_a_head_approved_only_by_an_unlisted_human() {
     let human = r#"{"id":1,"login":"fable-graph","type":"User","association":"COLLABORATOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:f0fb2fb38ef5c900efad7ea0630906f081db53a9"}"#;
     let gh = reenqueue_8678(human);
     let outcome = crate::head_approval::with_host_review_default(true, || {
-        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None)
+        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true)
     });
     assert!(!outcome.armed, "{}", outcome.line);
     assert!(
@@ -625,7 +594,7 @@ fn ship_does_not_arm_an_unreviewed_head_on_a_listed_repository() {
     let stale = r#"{"id":1,"login":"shipyard-local[bot]","type":"Bot","association":"CONTRIBUTOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:2410ca497342cfc0264bf5b72713de0b56099a0f"}"#;
     let gh = reenqueue_8678(stale);
     let outcome = crate::head_approval::with_host_review_default(true, || {
-        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true, None)
+        arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true)
     });
     assert!(!outcome.armed, "{}", outcome.line);
     assert!(

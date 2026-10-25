@@ -78,6 +78,7 @@ impl AttributorCommand {
         {
             let (program, rest) = self.argv.split_first()?;
             let mut command = std::process::Command::new(program);
+            crate::queue_arm_gate::strip_queue_authority(&mut command);
             command
                 .args(rest)
                 .args([

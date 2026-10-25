@@ -1323,6 +1323,7 @@ fn handle_ship_variant<W: Write>(
             invocation: ship_cmd::ShipInvocation::Direct,
             foreground,
             arm_auto_merge,
+            leave_unarmed: arm_auto_merge.leaves_unarmed(),
             body_append,
         },
         mode,

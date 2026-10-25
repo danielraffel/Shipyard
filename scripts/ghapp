@@ -1600,17 +1600,183 @@ if [[ ! -f "$close_guard" || ! -x "$close_guard" ]]; then
     exit 1
 fi
 PATH="$trusted_path" "$close_guard" "${guard_arguments[@]}" || exit 1
-if [[ -x "$guards/queue-removal-guard" ]]; then
+
+# Whether this request can land a pull request (arm, enqueue, merge) or take
+# one out of the queue (dequeue, disarm). Prints `landing`, `removal`, both,
+# or nothing. Anything it cannot read for certain counts as both: a body from
+# stdin, a FIFO, a device or a symlink, a JSON body with escapes, or a method
+# override header. It decides only whether a missing queue guard refuses; when
+# a guard is installed, the guard judges every request itself.
+ghapp_queue_body() {
+    # A regular, non-symlinked file outside /dev and /proc, read once (the
+    # native gh reads it again). Anything else fails, which counts as both.
+    case "$1" in
+        /dev/*|/proc/*|-) return 1 ;;
+    esac
+    [[ -f "$1" && ! -L "$1" && -r "$1" ]] || return 1
+    /usr/bin/head -c 1048576 "$1" 2>/dev/null
+}
+ghapp_is_pull_merge_endpoint() {
+    # The argument as a path: no scheme and host, no GHES `api/v3` prefix, no
+    # leading or trailing slash, no query or fragment, lower case.
+    local path
+    path="$(printf '%s' "$1" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+    case "$path" in
+        http://*|https://*)
+            path="${path#*://}"
+            [[ "$path" == */* ]] || return 1
+            path="/${path#*/}"
+            ;;
+    esac
+    path="${path%%\?*}"
+    path="${path%%#*}"
+    path="${path#/}"
+    path="${path#api/v3/}"
+    path="${path%/}"
+    [[ "$path" =~ ^repos/[^/]+/[^/]+/pulls/[^/]+/merge$ ]]
+}
+ghapp_queue_mutation_kinds() {
+    local compact="" argument body="" chunk="" method="" previous="" endpoint=""
+    local landing=0 removal=0 fields=0 subcommand="" skip=0
+    if [[ "${1:-}" == "pr" ]]; then
+        # `gh pr` takes -R/--repo before its subcommand too.
+        for argument in "${@:2}"; do
+            if [[ "$skip" == 1 ]]; then
+                skip=0
+                continue
+            fi
+            case "$argument" in
+                -R|--repo) skip=1 ;;
+                -R?*|--repo=*) ;;
+                -*) ;;
+                *)
+                    subcommand="$argument"
+                    break
+                    ;;
+            esac
+        done
+        [[ "$subcommand" == "merge" ]] || return 0
+        for argument in "$@"; do
+            if [[ "$argument" == "--disable-auto" ]]; then
+                printf 'removal\n'
+                return 0
+            fi
+        done
+        printf 'landing\n'
+        return 0
+    fi
+    [[ "${1:-}" == "api" ]] || return 0
+    for argument in "${@:2}"; do
+        case "$previous" in
+            -X|--method) method="$argument" ;;
+            --input)
+                if chunk="$(ghapp_queue_body "$argument")"; then
+                    body="$body$chunk"
+                else
+                    landing=1
+                    removal=1
+                fi
+                ;;
+            -H|--header)
+                case "$(printf '%s' "$argument" | /usr/bin/tr '[:upper:]' '[:lower:]')" in
+                    *method-override*|*x-http-method*)
+                        landing=1
+                        removal=1
+                        ;;
+                esac
+                ;;
+        esac
+        case "$argument" in
+            -f|-F|--field|--raw-field|--input|-f?*|-F?*|--field=*|--raw-field=*|--input=*)
+                fields=1
+                ;;
+        esac
+        case "$argument" in
+            -X?*) method="${argument#-X}" ;;
+            --method=*) method="${argument#--method=}" ;;
+            --header=*|-H?*)
+                case "$(printf '%s' "$argument" | /usr/bin/tr '[:upper:]' '[:lower:]')" in
+                    *method-override*|*x-http-method*)
+                        landing=1
+                        removal=1
+                        ;;
+                esac
+                ;;
+            --input=*)
+                if chunk="$(ghapp_queue_body "${argument#--input=}")"; then
+                    body="$body$chunk"
+                else
+                    landing=1
+                    removal=1
+                fi
+                ;;
+            *=@*)
+                if chunk="$(ghapp_queue_body "${argument#*=@}")"; then
+                    body="$body$chunk"
+                else
+                    landing=1
+                    removal=1
+                fi
+                ;;
+        esac
+        # Any argument may be the endpoint; a field value never has this shape.
+        if ghapp_is_pull_merge_endpoint "$argument"; then
+            endpoint="$argument"
+        fi
+        compact="$compact$argument"
+        previous="$argument"
+    done
+    case "$body" in
+        *'\u'*|*'\U'*)
+            # JSON escapes can spell a mutation name this check cannot see.
+            landing=1
+            removal=1
+            ;;
+    esac
+    compact="$(printf '%s%s' "$compact" "$body" | /usr/bin/tr -d '[:space:]' | /usr/bin/tr '[:upper:]' '[:lower:]')"
+    case "$compact" in
+        *enablepullrequestautomerge*|*enqueuepullrequest*|*mergepullrequest*) landing=1 ;;
+    esac
+    case "$compact" in
+        *dequeuepullrequest*|*disablepullrequestautomerge*) removal=1 ;;
+    esac
+    # `gh api` sends GET unless told otherwise or given a field or body.
+    if [[ -z "$method" && "$fields" == 0 ]]; then
+        method="GET"
+    fi
+    if [[ -n "$endpoint" && \
+          "$(printf '%s' "$method" | /usr/bin/tr '[:lower:]' '[:upper:]')" != "GET" ]]; then
+        landing=1
+    fi
+    [[ "$landing" == 1 ]] && printf 'landing\n'
+    [[ "$removal" == 1 ]] && printf 'removal\n'
+    return 0
+}
+
+# The two queue guards are required for the requests they judge: a missing,
+# unreadable or non-executable guard refuses every such request, with no
+# override. Requests neither guard judges pass as before.
+ghapp_queue_kinds="$(ghapp_queue_mutation_kinds "$@")"
+ghapp_guard_usable() {
+    [[ -f "$1" && -r "$1" && -x "$1" ]]
+}
+if ghapp_guard_usable "$guards/queue-removal-guard"; then
     PATH="$trusted_path" "$guards/queue-removal-guard" "$@" || exit 1
+elif [[ "$ghapp_queue_kinds" == *removal* ]]; then
+    echo "ghapp: queue-removal-guard is not installed; run \`shipyard guards install\`" >&2
+    exit 1
 fi
-# Optional, like the removal guard: an absent file means the host predates it
-# (`shipyard doctor` reports that). When present it refuses arming or enqueuing
-# a PR that is already queued, already armed, merged/closed, unreadable, or
-# ejected with no new head since; Shipyard's own path carries
-# SHIPYARD_INTERNAL_QUEUE_MUTATION=1.
-if [[ -x "$guards/queue-arm-guard" ]]; then
+# It refuses arming, enqueuing or merging a PR without an exact-head review
+# verdict, and arming or enqueuing one that is already queued, already armed,
+# merged/closed, unreadable, or ejected with no new head since. Shipyard's own
+# path carries SHIPYARD_INTERNAL_QUEUE_MUTATION=1 with a one-shot nonce.
+if ghapp_guard_usable "$guards/queue-arm-guard"; then
     PATH="$trusted_path" "$guards/queue-arm-guard" "$@" || exit 1
+elif [[ "$ghapp_queue_kinds" == *landing* ]]; then
+    echo "ghapp: queue-arm-guard is not installed; run \`shipyard guards install\`" >&2
+    exit 1
 fi
+unset ghapp_queue_kinds
 # Optional as well. It refuses `pr update-branch` / the REST and GraphQL
 # branch-refresh equivalents only when the base branch's `[merge]
 # refresh_branch` policy is "only-if-conflicting" and the refresh is provably

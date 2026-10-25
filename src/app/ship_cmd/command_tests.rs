@@ -145,6 +145,7 @@ fn ship_command_runs_local_target_merges_and_archives_state() {
             invocation: ShipInvocation::Direct,
             foreground: true,
             arm_auto_merge: crate::app::cli::ArmRequest::Off,
+            leave_unarmed: false,
             body_append: None,
         },
         &loaded_config(temp.path()),
@@ -236,6 +237,7 @@ fn ship_command_green_merge_failure_keeps_active_state_and_exits_success() {
             invocation: ShipInvocation::Direct,
             foreground: true,
             arm_auto_merge: crate::app::cli::ArmRequest::Off,
+            leave_unarmed: false,
             body_append: None,
         },
         &loaded_config(temp.path()),
@@ -301,6 +303,7 @@ fn daemon_finish_selects_repository_when_pr_numbers_collide() {
         adopt_head: false,
         pr_snapshot_file: None,
         metadata_authority_receipt: None,
+        leave_unarmed: false,
         targets: Vec::new(),
     };
     let job = Job::create(
@@ -407,6 +410,7 @@ fn daemon_finish_preserves_green_validation_when_ship_state_is_missing() {
         adopt_head: false,
         pr_snapshot_file: Some(snapshot),
         metadata_authority_receipt: None,
+        leave_unarmed: false,
         targets: Vec::new(),
     };
     let job = Job::create(
@@ -493,6 +497,7 @@ fn daemon_finish_refuses_same_head_replacement_validation_identity() {
         adopt_head: false,
         pr_snapshot_file: None,
         metadata_authority_receipt: None,
+        leave_unarmed: false,
         targets: Vec::new(),
     };
     let job = Job::create(
@@ -604,6 +609,7 @@ fn ship_command_preflight_failure_happens_before_state_mutation() {
             invocation: ShipInvocation::Direct,
             foreground: true,
             arm_auto_merge: crate::app::cli::ArmRequest::Off,
+            leave_unarmed: false,
             body_append: None,
         },
         &unreachable_ssh_config(temp.path()),
@@ -682,6 +688,7 @@ exit 2
             invocation: ShipInvocation::Direct,
             foreground: true,
             arm_auto_merge: crate::app::cli::ArmRequest::Off,
+            leave_unarmed: false,
             body_append: None,
         },
         &loaded_config(temp.path()),
@@ -748,6 +755,7 @@ exit 2
         invocation: ShipInvocation::Direct,
         foreground: true,
         arm_auto_merge: crate::app::cli::ArmRequest::Off,
+        leave_unarmed: false,
         body_append: None,
     };
 
@@ -815,6 +823,7 @@ fn ship_command_skip_target_excludes_unreachable_target_before_preflight() {
             invocation: ShipInvocation::Direct,
             foreground: true,
             arm_auto_merge: crate::app::cli::ArmRequest::Off,
+            leave_unarmed: false,
             body_append: None,
         },
         &local_and_unreachable_config(temp.path()),
@@ -895,6 +904,7 @@ exit 2
             invocation: ShipInvocation::Direct,
             foreground: true,
             arm_auto_merge: crate::app::cli::ArmRequest::Off,
+            leave_unarmed: false,
             body_append: None,
         },
         &loaded_config(temp.path()),
@@ -1011,6 +1021,7 @@ exit 2
             invocation: ShipInvocation::Direct,
             foreground: true,
             arm_auto_merge: crate::app::cli::ArmRequest::Off,
+            leave_unarmed: false,
             body_append: None,
         },
         &loaded_config(temp.path()),
@@ -1085,6 +1096,7 @@ fn ship_pr_44_keeping_state(
             invocation: ShipInvocation::Direct,
             foreground: true,
             arm_auto_merge: crate::app::cli::ArmRequest::Off,
+            leave_unarmed: false,
             body_append: None,
         },
         &loaded_config(temp),

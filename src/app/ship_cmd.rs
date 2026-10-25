@@ -98,8 +98,11 @@ pub(super) struct ShipCommandArgs {
     pub(super) foreground: bool,
     /// Arm GitHub-native auto-merge once the pull request is known, so a green
     /// pull request cannot sit unqueued because nothing armed it. `--no-arm`
-    /// clears it; `--arm` arms past the repository's head-approval policy.
+    /// clears it. Every arm passes the queue-arm guard's review rule.
     pub(super) arm_auto_merge: super::cli::ArmRequest,
+    /// Skip the post-validation merge phase, which arms or enqueues
+    /// (`--no-arm`, via [`super::cli::ArmRequest::leaves_unarmed`]).
+    pub(super) leave_unarmed: bool,
     /// Text (or `@file` contents) added to the pull request body once, after
     /// the attribution line and before the provenance block.
     pub(super) body_append: Option<String>,
@@ -140,6 +143,7 @@ fn changed_surface_stage_command(
 ) -> std::process::Command {
     let mut child = std::process::Command::new("/bin/sh");
     child.arg("-c").arg(command).current_dir(cwd);
+    crate::queue_arm_gate::strip_queue_authority(&mut child);
     child.env("SHIPYARD_CHANGED_SURFACE_RESULT_DIR", result_dir);
     if compare_full {
         child.env("SHIPYARD_CHANGED_SURFACE_COMPARE_FULL", "1");
@@ -460,6 +464,7 @@ pub(super) fn ship_command<W: Write>(
         adopt_head: args.adopt_head,
         pr_snapshot_file: args.pr_snapshot_file.clone(),
         metadata_authority_receipt,
+        leave_unarmed: args.leave_unarmed,
         targets,
     };
 
@@ -572,6 +577,7 @@ pub(super) fn ship_command<W: Write>(
         args.merge_command,
         args.merge_result,
         args.pr_snapshot_file,
+        request.leave_unarmed,
     )?;
     // Issue #303: when validation failed, resolve failing-job + log diagnostics
     // before we render so the human / JSON output points the user at the
@@ -1292,6 +1298,7 @@ pub(super) fn finish_background_ship(
         None,
         None,
         request.pr_snapshot_file.clone(),
+        request.leave_unarmed,
     )?;
     Ok((
         state.exit_code(),

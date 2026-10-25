@@ -312,6 +312,7 @@ mod tests {
             adopt_head: false,
             pr_snapshot_file: None,
             metadata_authority_receipt: None,
+            leave_unarmed: false,
             targets: Vec::new(),
         };
         let pending = Job::create(
@@ -396,6 +397,7 @@ mod tests {
             adopt_head: false,
             pr_snapshot_file: None,
             metadata_authority_receipt: None,
+            leave_unarmed: false,
             targets: Vec::new(),
         };
         let (job, log_dir) = terminal_ship_job_with_missing_manifest(&state_dir, &request);

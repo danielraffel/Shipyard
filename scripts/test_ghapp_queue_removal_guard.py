@@ -21,6 +21,22 @@ if SPEC is None or SPEC.loader is None:
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 
+
+def issue_nonce(directory: pathlib.Path, *purposes: str) -> dict[str, str]:
+    """What Shipyard does for one of its own calls: a fresh nonce and a 0600
+    record per purpose in a 0700 directory. Returns the variables naming them."""
+    import secrets
+
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    nonce = secrets.token_hex(32)
+    for purpose in purposes:
+        path = directory / guard.nonce_record_name(nonce, purpose)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as record:
+            record.write(purpose)
+    return {guard.NONCE_ENV: nonce, guard.NONCE_DIR_ENV: str(directory)}
+
 # A case that clears the environment drops HOME, and Path.home() then falls back
 # to the account's real home: the guard appended every such case to the real
 # ~/.local/state/shipyard/queue-removals.jsonl on whatever host ran the suite. Every case
@@ -206,56 +222,36 @@ class QueueRemovalGuardTests(unittest.TestCase):
                 1,
             )
 
-    def test_internal_marker_is_honoured_only_from_a_shipyard_parent(self) -> None:
-        args = ["api", "graphql", "-f", "query=mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }"]
-        home = scratch_home(self)
-        installed = str(pathlib.Path(home) / ".local/share/shipyard/auth-generations/abc/shipyard")
-        with mock.patch.object(
-            guard, "process_ancestry", return_value=[("bash", "/bin/bash"), ("shipyard", installed)]
-        ):
-            self.assertEqual(
-                self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1", HOME=home)[0], 0)
-        for ancestry in (
-            [("bash", "/bin/bash"), ("zsh", "/bin/zsh"), ("codex", "/opt/codex")],
-            [("bash", "/bin/bash"), ("node", "/usr/bin/node"), ("shipyard", installed)],
-            # A Python-driven agent launched by Shipyard decides; its python
-            # is not skipped to reach the shipyard above it.
-            [("bash", "/bin/bash"), ("python3", "/usr/bin/python3"), ("shipyard", installed)],
-            [("bash", "/bin/bash"), ("Python", "/usr/bin/python3"), ("shipyard", installed)],
-            # Named shipyard, but not the installed binary.
-            [("bash", "/bin/bash"), ("shipyard", "/tmp/x/shipyard")],
-            [("bash", "/bin/bash"), ("shipyard", None)],
-            [],
-        ):
-            with self.subTest(ancestry=ancestry), mock.patch.object(
-                guard, "process_ancestry", return_value=ancestry
-            ):
-                code, message = self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1",
-                                               HOME=home)
-                self.assertEqual(code, 1)
-                self.assertIn("not the Shipyard binary", message)
+    def nonce(self, *purposes: str, directory: pathlib.Path | None = None) -> dict[str, str]:
+        return issue_nonce(directory or pathlib.Path(scratch_home(self)) / "nonces", *purposes)
 
-    def test_an_install_root_check_resolves_symlinks(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory) / "auth-generations"
-            binary = root / "abc" / "shipyard"
-            binary.parent.mkdir(parents=True)
-            binary.write_text("")
-            link = pathlib.Path(directory) / "bin" / "shipyard"
-            link.parent.mkdir()
-            link.symlink_to(binary)
-            self.assertTrue(guard.is_installed_shipyard(str(link), [root]))
-            elsewhere = pathlib.Path(directory) / "elsewhere" / "shipyard"
-            elsewhere.parent.mkdir()
-            elsewhere.write_text("")
-            self.assertFalse(guard.is_installed_shipyard(str(elsewhere), [root]))
-            # A link named shipyard that resolves to another binary in the root.
-            other = root / "abc" / "ghapp"
-            other.write_text("")
-            renamed = pathlib.Path(directory) / "bin2" / "shipyard"
-            renamed.parent.mkdir()
-            renamed.symlink_to(other)
-            self.assertFalse(guard.is_installed_shipyard(str(renamed), [root]))
+    def test_internal_marker_is_honoured_once_with_shipyards_nonce(self) -> None:
+        args = ["api", "graphql", "-f", "query=mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }"]
+        issued = self.nonce(guard.NONCE_INTERNAL_REMOVAL)
+        self.assertEqual(self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1", **issued)[0], 0)
+        loose = self.nonce(guard.NONCE_INTERNAL_REMOVAL)
+        (pathlib.Path(loose[guard.NONCE_DIR_ENV]) / guard.nonce_record_name(
+            loose[guard.NONCE_ENV], guard.NONCE_INTERNAL_REMOVAL)).chmod(0o644)
+        for label, env in (
+            ("no nonce", {}),
+            ("replayed", issued),
+            ("wrong", {**self.nonce(guard.NONCE_INTERNAL_REMOVAL), guard.NONCE_ENV: "1" * 64}),
+            ("another purpose", self.nonce(guard.NONCE_INTERNAL_ARM)),
+            ("readable by others", loose),
+        ):
+            with self.subTest(label):
+                code, message = self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1", **env)
+                self.assertEqual(code, 1)
+                self.assertIn("no valid one-shot nonce", message)
+
+    def test_a_stale_nonce_record_is_not_honoured(self) -> None:
+        args = ["api", "graphql", "-f", "query=mutation { dequeuePullRequest(input:{id:\"x\"}) { clientMutationId } }"]
+        issued = self.nonce(guard.NONCE_INTERNAL_REMOVAL)
+        record = pathlib.Path(issued[guard.NONCE_DIR_ENV]) / guard.nonce_record_name(
+            issued[guard.NONCE_ENV], guard.NONCE_INTERNAL_REMOVAL)
+        old = record.stat().st_mtime - guard.NONCE_MAX_AGE_SECONDS - 5
+        os.utime(record, (old, old))
+        self.assertEqual(self.run_guard(args, SHIPYARD_INTERNAL_QUEUE_MUTATION="1", **issued)[0], 1)
 
 
 def pr_answer(number: int = 9706, queued: bool = True) -> dict:
@@ -400,7 +396,7 @@ class OverrideReasonThroughFakeGh(unittest.TestCase):
     def test_spoofed_marker_from_this_test_process_is_refused(self) -> None:
         code, message, calls, _ = self.run_with_answer(dequeue(), pr_answer(), SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
         self.assertEqual(code, 1)
-        self.assertIn("not the Shipyard binary", message)
+        self.assertIn("no valid one-shot nonce", message)
         self.assertEqual(calls, [])
 
 
@@ -442,63 +438,15 @@ class ReplayClassifiedRemovals(unittest.TestCase):
                 refused_avoidable += 1
             if row["guard_bypass"].startswith("SHIPYARD_INTERNAL"):
                 # The same request as it was actually made: the spoofed marker alone.
-                with mock.patch.object(guard, "process_ancestry",
-                                       return_value=[("bash", "/bin/bash"), ("codex", "/opt/codex")]):
-                    with mock.patch.dict(os.environ, {"SHIPYARD_INTERNAL_QUEUE_MUTATION": "1",
-                                                          "HOME": scratch_home(self)}, clear=True), \
-                            contextlib.redirect_stderr(io.StringIO()):
-                        self.assertEqual(guard.main(dequeue(f"PR_{row['pr']}")), 1, row)
+                with mock.patch.dict(os.environ, {"SHIPYARD_INTERNAL_QUEUE_MUTATION": "1",
+                                                  "HOME": scratch_home(self)}, clear=True), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(guard.main(dequeue(f"PR_{row['pr']}")), 1, row)
         defect_fixes = sorted(row["pr"] for row in rows if row["cause"] == "defect_fix_push")
         self.assertEqual(sorted(decisions["allowed"]), defect_fixes)
         self.assertEqual(len(defect_fixes), 7)
         self.assertEqual(refused_avoidable, 36)
         self.assertEqual(len(decisions["refused"]), 39, "36 avoidable + 2 receipt edits + 1 unstated")
-
-
-class RealProcessAncestry(unittest.TestCase):
-    """shipyard_parent() reads the live process tree, not a mock."""
-
-    def run_under(self, launcher_name: str) -> subprocess.CompletedProcess:
-        compiler = shutil.which("cc")
-        if compiler is None:
-            self.skipTest("no C compiler to build a launcher process")
-        with tempfile.TemporaryDirectory() as directory:
-            source = pathlib.Path(directory) / "launcher.c"
-            source.write_text(
-                "#include <stdlib.h>\nint main(int c, char **v) { return c > 1 && system(v[1]) == 0 ? 0 : 1; }\n"
-            )
-            launcher = pathlib.Path(directory) / launcher_name
-            built = subprocess.run([compiler, "-o", str(launcher), str(source)], capture_output=True, text=True)
-            if built.returncode != 0:
-                self.skipTest(f"cannot build a launcher: {built.stderr.strip()}")
-            probe = pathlib.Path(directory) / "probe.py"
-            probe.write_text(
-                "import importlib.util, pathlib, sys\n"
-                f"spec = importlib.util.spec_from_file_location('g', {str(SCRIPT)!r})\n"
-                "g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)\n"
-                f"root = pathlib.Path({directory!r})\n"
-                "print(g.shipyard_parent(roots=[root]), g.shipyard_parent(), g.process_ancestry())\n"
-            )
-            # launcher -> system()'s /bin/sh -> bash -> python: the same shape
-            # as shipyard -> ghapp (bash) -> guard (python).
-            return subprocess.run(
-                [str(launcher), f"/bin/bash -c '{sys.executable} {probe}; true'"],
-                capture_output=True,
-                text=True,
-            )
-
-    def test_the_kernel_path_decides_not_the_name(self) -> None:
-        # A launcher named shipyard, run from a temporary directory: it passes
-        # only when that directory is declared an install root, never under
-        # the real install roots.
-        result = self.run_under("shipyard")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.startswith("True False"), result.stdout + result.stderr)
-
-    def test_any_other_launcher_is_not(self) -> None:
-        result = self.run_under("codex")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.startswith("False False"), result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

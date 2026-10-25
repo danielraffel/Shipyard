@@ -817,6 +817,7 @@ mod tests {
             adopt_head: false,
             pr_snapshot_file: None,
             metadata_authority_receipt: None,
+            leave_unarmed: false,
             targets: Vec::new(),
         };
         store

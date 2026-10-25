@@ -153,9 +153,17 @@ pub(super) fn post_run_merge_state(
     merge_command: Option<PathBuf>,
     merge_result: Option<MergeResult>,
     pr_snapshot_file: Option<PathBuf>,
+    leave_unarmed: bool,
 ) -> Result<ShipRenderState, CliFailure> {
     if !validation_passed {
         return Ok(ShipRenderState::ValidationFailed);
+    }
+    if leave_unarmed {
+        // The merge phase arms or enqueues; `--no-arm` means neither happens.
+        return Ok(ShipRenderState::GreenNotMerged(format!(
+            "PR #{pr}: local validation passed; left unarmed (--no-arm), so the merge phase \
+             did not run and nothing armed or enqueued it"
+        )));
     }
     let request = AutoMergeRequest {
         mode,
