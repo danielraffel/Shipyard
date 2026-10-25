@@ -318,6 +318,15 @@ document:
   newer-than-the-last-removal requirement can be missed.
   The same check guards T5's validated arm and the steward's `--arm-unqueued`
   backstop. `--arm` arms past it and names who did.
+* A check the base lists in `[queue] tiered_required_checks` must prove its
+  full lane before the head is armed, here, at T5's validated arm and classic
+  merge, and in every steward path: its latest run on the head must have
+  completed and carry a `shipyard-test-tier/<check>` record that is not
+  `deferred`, and its job's token may not have held `checks: write` (see `docs/ghapp-guards.md`, A tiered required check must prove
+  its full lane). Arm-on-open usually runs before that check completes, so
+  on such a repository it reports the refusal and the `--arm-unqueued`
+  backstop arms the head later. At T5 the refusal fails the merge phase the
+  same way an unapproved head does. Nothing overrides it.
 
 The reason it exists is a gap this state machine cannot close by itself. T5
 (merge on PASS) is the only thing that enqueues a validated head, so a ship that

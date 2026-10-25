@@ -359,6 +359,13 @@ def stub_review(case: unittest.TestCase) -> None:
     case.addCleanup(patcher.stop)
 
 
+def stub_tier(case: unittest.TestCase) -> None:
+    """No tiered check: these cases decide queue state; TieredRequiredChecks decides tiers."""
+    patcher = mock.patch.object(guard, "deferred_tier_refusal", return_value=False)
+    patcher.start()
+    case.addCleanup(patcher.stop)
+
+
 class QueueArmGuardTests(unittest.TestCase):
     def setUp(self) -> None:
         # Run from a directory with no `.shipyard/config.toml` above it, so these
@@ -370,6 +377,7 @@ class QueueArmGuardTests(unittest.TestCase):
         os.chdir(directory)
         self.addCleanup(os.chdir, previous)
         stub_review(self)
+        stub_tier(self)
 
     def run_guard(
         self, args: list[str], responses: list[Any] | None = None, **env: str
@@ -645,6 +653,299 @@ class QueueArmGuardTests(unittest.TestCase):
         self.assertIn("$id", message)
 
 
+TIERED_CONFIG = ('[queue]\ntiered_required_checks = ["macos"]\n'
+                 'tier_record_app = "pulp-tier-records"\n')
+
+
+def tier_record(tier: str, run_id: int = 700, run_attempt: int = 1, **change: Any) -> dict[str, Any]:
+    """A ``shipyard-test-tier/macos`` check run, as the base's record App creates it."""
+    record = {
+        "id": 50 + run_id, "name": "shipyard-test-tier/macos", "status": "completed",
+        "conclusion": "neutral", "app": {"slug": "pulp-tier-records"},
+        "output": {"title": tier, "summary": json.dumps({
+            "schema": "shipyard-test-tier/v1", "check": "macos", "tier": tier,
+            "run_id": run_id, "run_attempt": run_attempt, "selector": "pr-fast+pr-guard",
+            "trigger": "pull_request", "actor": "author", "full_lane_workflow": "build.yml", "full_suite_runs_in": "merge_group"})},
+    }
+    record.update(change)
+    return record
+
+
+def job_log(checks: str) -> str:
+    """The "Set up job" lines a runner prints, with the job's ``Checks`` scope."""
+    stamp = "2026-10-24T10:00:00.1000000Z"
+    return "".join(f"{stamp} {line}\n" for line in (
+        "Current runner version: '2.329.0'", "##[group]GITHUB_TOKEN Permissions",
+        "Actions: read", f"Checks: {checks}", "Contents: read", "Metadata: read",
+        "##[endgroup]", "Secret source: Actions", "##[notice]Checks: write"))
+
+
+class TieredRequiredChecks(unittest.TestCase):
+    """A check the base lists in ``[queue] tiered_required_checks`` must prove,
+    through a tier record the workflow's own token wrote, that its latest run on
+    the head ran its full lane. Annotations are never read: code under test can
+    print them. The same cases as src/deferred_tier/tests.rs."""
+
+    HEAD = "788ba84d032575e04b0c13e1b2fc4a1b105c6148"
+    REPO = "Generous-Corp/pulp"
+
+    def setUp(self) -> None:
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        previous = pathlib.Path.cwd()
+        os.chdir(directory)
+        self.addCleanup(os.chdir, previous)
+        stub_review(self)
+
+    def listing(self) -> str:
+        return f"repos/{self.REPO}/commits/{self.HEAD}/check-runs?per_page=100"
+
+    def answers(self, extra: list[dict[str, Any]], status: str = "completed",
+                macos: bool = True) -> dict[str, Any]:
+        runs = [
+            # An older failed run of the same check, superseded by run 9.
+            {"id": 5, "name": "macos", "status": "completed", "conclusion": "failure",
+             "app": {"slug": "github-actions"}},
+            {"id": 9, "name": "macos", "status": status, "conclusion": "success",
+             "app": {"slug": "github-actions"}, "output": {"annotations_count": 3}},
+        ] if macos else []
+        runs += extra
+        return {
+            self.listing(): [{"total_count": len(runs), "check_runs": runs}],
+            f"repos/{self.REPO}/actions/jobs/9": {"id": 9, "run_id": 700, "run_attempt": 1},
+            self.log_path(): job_log("read"),
+        }
+
+    def log_path(self) -> str:
+        return f"repos/{self.REPO}/actions/jobs/9/logs"
+
+    def run_guard(self, answers: dict[str, Any], config: str | None = TIERED_CONFIG,
+                  **env: str) -> tuple[int, str, list[str]]:
+        calls: list[str] = []
+        response = copy.deepcopy(fixture("pr_never_armed.json"))
+        response["data"]["repository"]["pullRequest"]["baseRefName"] = "main"
+
+        def fake_gh(arguments: list[str]) -> Any:
+            if arguments[:2] == ["api", "graphql"]:
+                return response
+            path = arguments[-1]
+            calls.append(path)
+            if "/annotations" in path:
+                raise AssertionError(f"annotations must never be read: {arguments}")
+            if path not in answers:
+                raise AssertionError(f"unexpected gh call {arguments}")
+            value = answers[path]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        stderr = io.StringIO()
+        configs: list[tuple[str, str]] = []
+
+        def fake_config(repo: str, base: str) -> str | None:
+            configs.append((repo, base))
+            if isinstance(config, Exception):
+                raise config
+            return config
+
+        with (
+            mock.patch.dict(os.environ, {"GH_REPO": self.REPO, "HOME": scratch_home(self), **env},
+                            clear=True),
+            mock.patch.object(guard, "run_real_gh", side_effect=fake_gh),
+            mock.patch.object(guard, "run_real_gh_text", side_effect=fake_gh),
+            mock.patch.object(guard, "base_config_text", side_effect=fake_config),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = guard.main(["pr", "merge", "8672", "--auto", "--merge"])
+        self.assertEqual(configs, [(self.REPO, "main")])
+        return code, stderr.getvalue(), calls
+
+    def fix(self, message: str) -> dict[str, Any]:
+        return json.loads(next(line for line in message.splitlines()
+                               if line.startswith("queue-arm-guard: fix: "))
+                          .removeprefix("queue-arm-guard: fix: "))
+
+    def test_a_deferred_record_is_refused_with_the_fix(self) -> None:
+        code, message, _ = self.run_guard(self.answers([tier_record("deferred")]))
+        self.assertEqual(code, 1, message)
+        self.assertIn("required check `macos` on 788ba84d0325 ran only the deferred tier "
+                      "(selector pr-fast+pr-guard; full suite runs in merge_group)", message)
+        fix = self.fix(message)
+        self.assertEqual(fix["command"], "dispatch `build.yml` on head 788ba84d0325 as the "
+                         "fleet App and wait for the full lane")
+        self.assertEqual(fix["cause"], "tier_deferred")
+
+    def test_the_fix_dispatches_the_full_lane_and_never_names_a_label(self) -> None:
+        # Pulp's build.yml no longer runs on `labeled`; the full lane is a
+        # fleet-App dispatch of the workflow on the head. A record naming no
+        # workflow still says to dispatch, and a stray `label` is never used.
+        record = tier_record("deferred")
+        summary = json.loads(record["output"]["summary"])
+        del summary["full_lane_workflow"]
+        summary["label"] = "macos-ci"
+        record["output"]["summary"] = json.dumps(summary)
+        code, message, _ = self.run_guard(self.answers([record]))
+        self.assertEqual(code, 1, message)
+        self.assertEqual(self.fix(message)["command"],
+                         "dispatch the workflow of `macos` on head 788ba84d0325 as the fleet "
+                         "App and wait for the full lane")
+        self.assertNotIn("macos-ci", message)
+
+    def test_no_override_lands_a_deferred_head(self) -> None:
+        code, message, _ = self.run_guard(self.answers([tier_record("deferred")]),
+                                          GHAPP_ALLOW_QUEUE_REARM="1")
+        self.assertEqual(code, 1, message)
+
+    def test_a_fast_record_bound_to_the_run_is_allowed(self) -> None:
+        code, message, _ = self.run_guard(self.answers([tier_record("fast")]))
+        self.assertEqual(code, 0, message)
+
+    def test_a_missing_or_unbound_record_is_refused(self) -> None:
+        for extra in (
+            [],
+            [tier_record("fast", run_attempt=2)],
+            [tier_record("fast", run_id=699)],
+            [tier_record("fast", app={"slug": "some-app"})],
+            [tier_record("fast", output={"summary": "tier: fast"})],
+        ):
+            with self.subTest(extra=extra):
+                code, message, _ = self.run_guard(self.answers(extra))
+                self.assertEqual(code, 1, message)
+                self.assertIn("has no `shipyard-test-tier/macos` record for run 700 attempt 1",
+                              message)
+
+    def test_a_record_a_pull_request_job_could_rewrite_never_counts(self) -> None:
+        # A pull request job acts as github-actions and may hold checks: write,
+        # so it can PATCH a record that app created from deferred to full with
+        # nothing on the check run to show it. Such a record never counts.
+        patched = tier_record("full", app={"slug": "github-actions"})
+        code, message, _ = self.run_guard(self.answers([patched]))
+        self.assertEqual(code, 1, message)
+        self.assertIn("has no `shipyard-test-tier/macos` record for run 700 attempt 1", message)
+        code, message, _ = self.run_guard(self.answers([tier_record("deferred"), patched]))
+        self.assertEqual(code, 1, message)
+        self.assertIn("ran only the deferred tier", message)
+
+    def test_a_config_whose_record_app_is_writable_by_pr_code_or_agents_refuses(self) -> None:
+        for app in (None, "github-actions", "shipyard-local"):
+            with self.subTest(app=app):
+                config = '[queue]\ntiered_required_checks = ["macos"]\n' + (
+                    f'tier_record_app = "{app}"\n' if app else "")
+                code, message, _ = self.run_guard(self.answers([tier_record("fast")]),
+                                                  config=config)
+                self.assertEqual(code, 1, message)
+                self.assertIn("tier_record_app", message)
+
+    def test_a_full_record_from_a_job_that_could_rewrite_it_is_refused(self) -> None:
+        # The tiered job acts as github-actions, the app that created its
+        # record; with checks: write it could PATCH deferred to full, leaving
+        # nothing on the record to show it.
+        answers = self.answers([tier_record("full")])
+        answers[self.log_path()] = job_log("write")
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("ran with `checks: write`, so it could have rewritten its own tier record",
+                      message)
+        self.assertEqual(self.fix(message)["cause"], "tier_checks_writable")
+        # Control on the same fixture: a read-only job's full record allows.
+        answers[self.log_path()] = job_log("read")
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 0, message)
+
+    def test_the_job_log_is_read_only_when_the_records_would_allow(self) -> None:
+        answers = self.answers([tier_record("deferred")])
+        answers[self.log_path()] = guard.GuardError("never read")
+        code, message, calls = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertNotIn(self.log_path(), calls)
+
+    def test_an_unreadable_or_unparseable_token_header_is_refused(self) -> None:
+        stamp = "2026-10-24T10:00:00Z"
+        for log in (
+            guard.GuardError("cannot read: HTTP 410 logs expired"),
+            f"{stamp} Secret source: Actions\n",
+            job_log("read").replace("##[endgroup]", "Secret source: Actions"),
+            job_log("read").replace("Contents: read", "Contents read"),
+            job_log("read").replace("Contents: read", f"Checks: read\n{stamp} Checks: write"),
+        ):
+            with self.subTest(log=log):
+                answers = self.answers([tier_record("full")])
+                answers[self.log_path()] = log
+                code, message, _ = self.run_guard(answers)
+                self.assertEqual(code, 1, message)
+                self.assertIn("cannot be read", message)
+
+    def test_the_checks_scope_is_read_from_the_header_group_only(self) -> None:
+        self.assertEqual(guard.checks_scope(job_log("none")), "none")
+        self.assertEqual(guard.checks_scope(job_log("write")), "write")
+        unlisted = job_log("read").replace("2026-10-24T10:00:00.1000000Z Checks: read\n", "")
+        self.assertNotIn("Checks: read", unlisted)
+        self.assertEqual(guard.checks_scope(unlisted), "none")
+
+    def test_any_deferred_record_for_the_run_refuses(self) -> None:
+        # A later record cannot widen a deferred one, so a forged record only refuses.
+        for records in ([tier_record("deferred"), tier_record("full")],
+                        [tier_record("full"), tier_record("deferred")]):
+            with self.subTest(records=records):
+                code, message, _ = self.run_guard(self.answers(records))
+                self.assertEqual(code, 1, message)
+                self.assertIn("ran only the deferred tier", message)
+
+    def test_a_check_that_has_not_completed_or_not_run_is_refused(self) -> None:
+        code, message, _ = self.run_guard(self.answers([], status="queued"))
+        self.assertEqual(code, 1, message)
+        self.assertIn("tiered required check `macos` on 788ba84d0325 is queued, not completed",
+                      message)
+        self.assertEqual(self.fix(message)["cause"], "tier_pending")
+        code, message, _ = self.run_guard(self.answers([], macos=False))
+        self.assertEqual(code, 1, message)
+        self.assertIn("tiered required check `macos` has not run on 788ba84d0325", message)
+
+    def test_a_repository_that_lists_no_tiered_check_reads_only_its_config(self) -> None:
+        for config in (None, "[queue.environment_requeue]\nenabled = true\n"):
+            with self.subTest(config=config):
+                code, message, calls = self.run_guard(
+                    self.answers([tier_record("deferred")]), config=config)
+                self.assertEqual(code, 0, message)
+                self.assertEqual(calls, [])
+
+    def test_unreadable_config_listing_or_job_is_refused(self) -> None:
+        for config in (guard.GuardError("cannot read the base config: HTTP 502"),
+                       '[queue]\ntiered_required_checks = "macos"\n'):
+            with self.subTest(config=config):
+                code, message, _ = self.run_guard(self.answers([]), config=config)
+                self.assertEqual(code, 1, message)
+                self.assertIn("cannot read the test tier", message)
+        for listing in (guard.GuardError("gh: HTTP 502"), [{"total_count": 3, "check_runs": []}]):
+            with self.subTest(listing=listing):
+                answers = self.answers([tier_record("fast")])
+                answers[self.listing()] = listing
+                code, message, _ = self.run_guard(answers)
+                self.assertEqual(code, 1, message)
+        answers = self.answers([tier_record("fast")])
+        answers[f"repos/{self.REPO}/actions/jobs/9"] = guard.GuardError("HTTP 404")
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("job 9 unreadable", message)
+
+    def test_a_tiered_check_that_is_not_an_actions_job_is_refused(self) -> None:
+        answers = self.answers([tier_record("fast")])
+        answers[self.listing()][0]["check_runs"][1]["app"] = {"slug": "buildkite"}
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("not a GitHub Actions job", message)
+
+    def test_every_page_of_check_runs_is_read(self) -> None:
+        answers = self.answers([tier_record("deferred")])
+        [page] = answers[self.listing()]
+        runs = page["check_runs"]
+        answers[self.listing()] = [{"total_count": 3, "check_runs": runs[:1]},
+                                   {"total_count": 3, "check_runs": runs[1:]}]
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("ran only the deferred tier", message)
+
+
 class InstalledLayoutEndToEnd(unittest.TestCase):
     """Run the guard as ghapp does: installed names, real subprocess, fake native gh."""
 
@@ -715,6 +1016,7 @@ class BatchAttributionTests(unittest.TestCase):
         os.chdir(self.root)
         self.addCleanup(os.chdir, cwd)
         stub_review(self)
+        stub_tier(self)
 
     def declare(
         self, verdict: Any, *, exit_code: int = 0, command: Any = None, stderr: str = ""
@@ -2113,7 +2415,9 @@ class ReviewBeforeArm(unittest.TestCase):
                               host=host)
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = self.calls()
-            self.assertNotIn("contents/.shipyard/config.toml", calls)
+            # Only the tier rule, which review cannot switch off, reads the
+            # base config, once, and parses it only when it names tiered checks.
+            self.assertEqual(calls.count("contents/.shipyard/config.toml"), 1, calls)
             self.assertNotIn("/comments", calls)
             self.assertNotIn("/pulls/513", calls)
             (self.root / "calls").unlink()

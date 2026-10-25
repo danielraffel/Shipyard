@@ -239,7 +239,12 @@ fn consider_candidate(
             match crate::head_approval::evaluate_excusing(
                 &run_gh, repo, number, &head_sha, base, &queue, excuse,
             ) {
-                Ok(gate) if gate.allows() => ArmVerdict::Arm,
+                Ok(gate) if gate.allows() => {
+                    match tier_verdict(&run_gh, repo, base, number, &head_sha) {
+                        Ok(verdict) => verdict,
+                        Err(result) => return *result,
+                    }
+                }
                 Ok(gate) => ArmVerdict::Skip(ArmSkip::HeadNotApproved {
                     detail: gate.explain(),
                 }),
@@ -281,6 +286,35 @@ fn consider_candidate(
             error: None,
         },
         ArmVerdict::Arm => arm(actions, number, head_sha, &pr.node_id, same_head),
+    }
+}
+
+/// [`ArmVerdict::Arm`] unless a required check ran only its deferred test
+/// tier on `head_sha` ([`crate::deferred_tier`]); an unreadable tier ends the
+/// candidate with its result.
+fn tier_verdict(
+    run_gh: crate::deferred_tier::RunGh<'_>,
+    repo: &str,
+    base: &str,
+    number: u64,
+    head_sha: &str,
+) -> Result<ArmVerdict, Box<NativeArmResult>> {
+    match crate::deferred_tier::deferred_tier_checks(run_gh, repo, base, head_sha) {
+        Ok(checks) => Ok(crate::deferred_tier::explain_all(&checks)
+            .map_or(ArmVerdict::Arm, |detail| {
+                ArmVerdict::Skip(ArmSkip::DeferredTier { detail })
+            })),
+        Err(detail) => Err(Box::new(NativeArmResult {
+            number,
+            head_sha: head_sha.to_owned(),
+            outcome: "skipped".to_owned(),
+            skip: Some(ArmSkip::Unknown {
+                detail: detail.clone(),
+            }),
+            error: Some(format!(
+                "PR #{number} test tier unreadable; refusing to arm blind: {detail}"
+            )),
+        })),
     }
 }
 

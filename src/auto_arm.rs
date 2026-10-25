@@ -122,6 +122,12 @@ pub enum ArmSkip {
         /// The gate's own explanation.
         detail: String,
     },
+    /// A required check ran only its deferred test tier on this head
+    /// ([`crate::deferred_tier`]), so its success is not a full-suite result.
+    DeferredTier {
+        /// Each check holding the head back, and what to do next.
+        detail: String,
+    },
     /// The state could not be determined. Never treated as "unarmed".
     Unknown {
         /// What was missing or malformed.
@@ -160,7 +166,7 @@ impl ArmSkip {
             Self::NativeAutoMergeDisabled => {
                 "the repository does not allow native auto-merge".to_owned()
             }
-            Self::HeadNotApproved { detail } => detail.clone(),
+            Self::HeadNotApproved { detail } | Self::DeferredTier { detail } => detail.clone(),
             Self::Unknown { detail } => format!(
                 "its merge-queue state could not be determined ({detail}); refusing to arm blind"
             ),

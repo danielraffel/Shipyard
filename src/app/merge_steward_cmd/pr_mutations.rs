@@ -188,6 +188,21 @@ fn enqueue_pull_request_with_recovery(
             }
             Err(error) => return (None, Some(format!("head approval unreadable: {error}"))),
         }
+        // The enqueue below goes past the `ghapp` arm guard, so the steward
+        // applies the guard's deferred-tier rule itself.
+        match crate::deferred_tier::deferred_tier_checks(
+            &run_gh,
+            &context.observation.repo,
+            &context.observation.base,
+            &pr.fact.head_sha,
+        ) {
+            Ok(checks) => {
+                if let Some(detail) = crate::deferred_tier::explain_all(&checks) {
+                    return (Some("waiting_full_test_tier".to_owned()), Some(detail));
+                }
+            }
+            Err(error) => return (None, Some(format!("test tier unreadable: {error}"))),
+        }
     }
     let recovery = if recover_hosted_setup_eviction_priority {
         recovery_evidence(context.actions, context.observation, pr, ledger).unwrap_or_else(|_| {

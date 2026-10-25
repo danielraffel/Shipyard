@@ -314,6 +314,14 @@ Two things not to conclude from it:
   arm.** These requests deliberately do not carry Shipyard's internal queue
   marker, so the guard judges them. Report it and move on; never retry it, and
   never set `GHAPP_ALLOW_QUEUE_REARM`.
+- **A tiered required check is never armed before it proves its full lane.**
+  For a check the base lists in `[queue] tiered_required_checks` (Pulp's
+  `macos`), the arm is refused while it has not completed, or while its
+  `shipyard-test-tier/<check>` record (from the base's `tier_record_app`, never
+  `github-actions`) is missing or says `deferred`, or the job's token held
+  `checks: write`: dispatch `build.yml` on the head as the
+  fleet App and wait for the full lane. The steward's native-arm backstop arms
+  it later. See the shipyard skill.
 - **Armed is not merged.** GitHub still waits for the repository's required
   checks and refuses drafts itself. But note the converse: once armed, GitHub
   may merge as soon as the *required* set is green, which can be before
