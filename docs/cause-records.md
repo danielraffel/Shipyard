@@ -97,9 +97,13 @@ skipped, and nothing is rewritten.
 For a local integrity check, run `shipyard cause audit --dir DIR`. It reads
 the cause month files and `fixlinks.jsonl`, reports malformed rows, duplicate
 cause IDs, duplicate red run attempts, and fix-links with no archived cause,
-and exits nonzero when it finds one. Findings are sorted by archive path and
-line. It never rewrites the archive, contacts GitHub, or exposes invalid line
-contents.
+and exits nonzero when it finds one. A structurally proven `rerun_green` link
+(same red and fix run/head, empty changed-file lists, and
+`own_files_method = rerun_same_head`) is allowed without a cause row because
+GitHub may have deleted the original failed log before the archive pass;
+compare-derived and malformed rerun links still require an archived cause.
+Findings are sorted by archive path and line. It never rewrites the archive,
+contacts GitHub, or exposes invalid line contents.
 
 ## The observer: `shipyard cause record`
 
