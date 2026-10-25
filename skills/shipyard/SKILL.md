@@ -3974,8 +3974,11 @@ under a merge queue, merge the base into a PR only to resolve a real conflict.
 
 A missing `queue-arm-guard` or `queue-removal-guard` makes `ghapp` refuse
 every request that guard judges ("not installed; run `shipyard guards
-install`"); the branch-refresh guard is optional (absent means skipped). A
-stale copy still leaves newer protection off. `shipyard guards
+install`"); a symlink to an executable guard counts as installed. The
+branch-refresh guard is optional (absent means skipped). A stale copy still
+leaves newer protection off: after a release, every host needs `shipyard
+update` (new `ghapp` auth generation) and `shipyard guards install`
+(`docs/ghapp-guards.md`, Upgrading a host). `shipyard guards
 install` places this build's exact copies (atomic rename; never overwrites a
 symlink), `shipyard guards status` exits 1 when any is missing or differs by
 content hash, `shipyard doctor` reports them under "ghapp guards" on any host

@@ -1603,12 +1603,59 @@ PATH="$trusted_path" "$close_guard" "${guard_arguments[@]}" || exit 1
 
 # Whether this request can land a pull request (arm, enqueue, merge) or take
 # one out of the queue (dequeue, disarm). Prints `landing`, `removal`, both,
-# or nothing. A GraphQL body this wrapper cannot read (stdin) counts as both.
-# It decides only whether a missing queue guard refuses; when a guard is
-# installed, the guard judges every request itself.
+# or nothing. Anything it cannot read for certain counts as both: a body from
+# stdin, a FIFO, a device or a symlink, a JSON body with escapes, or a method
+# override header. It decides only whether a missing queue guard refuses; when
+# a guard is installed, the guard judges every request itself.
+ghapp_queue_body() {
+    # A regular, non-symlinked file outside /dev and /proc, read once (the
+    # native gh reads it again). Anything else fails, which counts as both.
+    case "$1" in
+        /dev/*|/proc/*|-) return 1 ;;
+    esac
+    [[ -f "$1" && ! -L "$1" && -r "$1" ]] || return 1
+    /usr/bin/head -c 1048576 "$1" 2>/dev/null
+}
+ghapp_is_pull_merge_endpoint() {
+    # The argument as a path: no scheme and host, no GHES `api/v3` prefix, no
+    # leading or trailing slash, no query or fragment, lower case.
+    local path
+    path="$(printf '%s' "$1" | /usr/bin/tr '[:upper:]' '[:lower:]')"
+    case "$path" in
+        http://*|https://*)
+            path="${path#*://}"
+            [[ "$path" == */* ]] || return 1
+            path="/${path#*/}"
+            ;;
+    esac
+    path="${path%%\?*}"
+    path="${path%%#*}"
+    path="${path#/}"
+    path="${path#api/v3/}"
+    path="${path%/}"
+    [[ "$path" =~ ^repos/[^/]+/[^/]+/pulls/[^/]+/merge$ ]]
+}
 ghapp_queue_mutation_kinds() {
-    local compact="" argument body="" method="" previous="" landing=0 removal=0 fields=0
-    if [[ "${1:-}" == "pr" && "${2:-}" == "merge" ]]; then
+    local compact="" argument body="" chunk="" method="" previous="" endpoint=""
+    local landing=0 removal=0 fields=0 subcommand="" skip=0
+    if [[ "${1:-}" == "pr" ]]; then
+        # `gh pr` takes -R/--repo before its subcommand too.
+        for argument in "${@:2}"; do
+            if [[ "$skip" == 1 ]]; then
+                skip=0
+                continue
+            fi
+            case "$argument" in
+                -R|--repo) skip=1 ;;
+                -R?*|--repo=*) ;;
+                -*) ;;
+                *)
+                    subcommand="$argument"
+                    break
+                    ;;
+            esac
+        done
+        [[ "$subcommand" == "merge" ]] || return 0
         for argument in "$@"; do
             if [[ "$argument" == "--disable-auto" ]]; then
                 printf 'removal\n'
@@ -1623,15 +1670,20 @@ ghapp_queue_mutation_kinds() {
         case "$previous" in
             -X|--method) method="$argument" ;;
             --input)
-                if [[ "$argument" == "-" ]]; then
-                    landing=1
-                    removal=1
-                elif [[ -f "$argument" && -r "$argument" ]]; then
-                    body="$body$(/usr/bin/head -c 1048576 "$argument" 2>/dev/null || true)"
+                if chunk="$(ghapp_queue_body "$argument")"; then
+                    body="$body$chunk"
                 else
                     landing=1
                     removal=1
                 fi
+                ;;
+            -H|--header)
+                case "$(printf '%s' "$argument" | /usr/bin/tr '[:upper:]' '[:lower:]')" in
+                    *method-override*|*x-http-method*)
+                        landing=1
+                        removal=1
+                        ;;
+                esac
                 ;;
         esac
         case "$argument" in
@@ -1642,26 +1694,45 @@ ghapp_queue_mutation_kinds() {
         case "$argument" in
             -X?*) method="${argument#-X}" ;;
             --method=*) method="${argument#--method=}" ;;
-            --input=*)
-                landing=1
-                removal=1
+            --header=*|-H?*)
+                case "$(printf '%s' "$argument" | /usr/bin/tr '[:upper:]' '[:lower:]')" in
+                    *method-override*|*x-http-method*)
+                        landing=1
+                        removal=1
+                        ;;
+                esac
                 ;;
-            *=@-)
-                landing=1
-                removal=1
+            --input=*)
+                if chunk="$(ghapp_queue_body "${argument#--input=}")"; then
+                    body="$body$chunk"
+                else
+                    landing=1
+                    removal=1
+                fi
                 ;;
             *=@*)
-                if [[ -f "${argument#*=@}" && -r "${argument#*=@}" ]]; then
-                    body="$body$(/usr/bin/head -c 1048576 "${argument#*=@}" 2>/dev/null || true)"
+                if chunk="$(ghapp_queue_body "${argument#*=@}")"; then
+                    body="$body$chunk"
                 else
                     landing=1
                     removal=1
                 fi
                 ;;
         esac
+        # Any argument may be the endpoint; a field value never has this shape.
+        if ghapp_is_pull_merge_endpoint "$argument"; then
+            endpoint="$argument"
+        fi
         compact="$compact$argument"
         previous="$argument"
     done
+    case "$body" in
+        *'\u'*|*'\U'*)
+            # JSON escapes can spell a mutation name this check cannot see.
+            landing=1
+            removal=1
+            ;;
+    esac
     compact="$(printf '%s%s' "$compact" "$body" | /usr/bin/tr -d '[:space:]' | /usr/bin/tr '[:upper:]' '[:lower:]')"
     case "$compact" in
         *enablepullrequestautomerge*|*enqueuepullrequest*|*mergepullrequest*) landing=1 ;;
@@ -1673,12 +1744,9 @@ ghapp_queue_mutation_kinds() {
     if [[ -z "$method" && "$fields" == 0 ]]; then
         method="GET"
     fi
-    if [[ "$(printf '%s' "$method" | /usr/bin/tr '[:lower:]' '[:upper:]')" != "GET" ]]; then
-        for argument in "${@:2}"; do
-            if [[ "$argument" =~ ^/?repos/[^/]+/[^/]+/pulls/[0-9]+/merge$ ]]; then
-                landing=1
-            fi
-        done
+    if [[ -n "$endpoint" && \
+          "$(printf '%s' "$method" | /usr/bin/tr '[:lower:]' '[:upper:]')" != "GET" ]]; then
+        landing=1
     fi
     [[ "$landing" == 1 ]] && printf 'landing\n'
     [[ "$removal" == 1 ]] && printf 'removal\n'

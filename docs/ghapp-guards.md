@@ -18,7 +18,30 @@ installed; run `shipyard guards install` ``, and the same holds for
 `queue-removal-guard` and the requests it judges (`pr merge --disable-auto`,
 `dequeuePullRequest`, `disablePullRequestAutoMerge`). There is no override.
 Other requests pass, and any other guard that is not present, or not
-executable, is skipped.
+executable, is skipped. A queue guard counts as installed when its path
+resolves to a regular, readable, executable file; a symlink to such a file
+counts too (`shipyard guards install` never writes one), while a dangling
+symlink, a directory or a non-executable file refuses. Anything the wrapper
+cannot classify for certain (a body on stdin, a FIFO, a device or a symlinked
+body file, a JSON body with escapes, a method-override header) counts as a
+landing and a removal, so a missing guard refuses it.
+
+### Upgrading a host
+
+The guards `ghapp` runs are the installed copies in
+`~/.config/shipyard/guards`, and `ghapp` itself runs from the auth generation
+under `~/.local/share/shipyard/auth-generations/`. Neither changes when a new
+Shipyard binary lands. After a release that changes them, on every host:
+
+1. `shipyard update` (or the fleet update), which installs the new binary and
+   its `ghapp` auth generation;
+2. `shipyard guards install`, which places this build's guards;
+3. `shipyard guards status` and `shipyard doctor` to confirm both.
+
+Until both steps run on a host, its `ghapp` paths keep the previous guards and
+wrapper behaviour, so the protections a release adds there are not in effect.
+Shipyard's own review check before each of its landings runs from the copy in
+its binary and needs only step 1.
 
 | installed name | source | refuses |
 |---|---|---|
