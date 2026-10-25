@@ -121,9 +121,9 @@ impl DelegatedValidationWitness {
         let mut file = fs::File::create(&temp)?;
         std::io::Write::write_all(&mut file, &bytes)?;
         file.sync_all()?;
-        fs::rename(temp, &path)?;
+        replace_persisted_witness(&temp, &path)?;
         if let Some(parent) = path.parent() {
-            fs::File::open(parent)?.sync_all()?;
+            sync_parent_directory(parent)?;
         }
         Ok(())
     }
@@ -284,6 +284,44 @@ impl DelegatedValidationWitness {
             Err(error) => Err(error),
         }
     }
+}
+
+/// Replace the witness path after the temporary file has been flushed.
+///
+/// Unix `rename` atomically replaces an existing destination. Windows does
+/// not permit that operation, so remove the old witness only when necessary
+/// and then rename the already durable temporary file into place. The caller
+/// still keeps the witness under the same stable path and the next save can
+/// recover from an interrupted replacement.
+fn replace_persisted_witness(temp: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        match fs::rename(temp, path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                fs::remove_file(path)?;
+                fs::rename(temp, path)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp, path)
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+    // Windows does not allow opening a directory as a synchronizable file.
+    // The file itself was flushed above; the rename is the durable boundary
+    // supported by this platform without a platform API dependency.
+    Ok(())
 }
 
 /// Extract the exact protected-branch policy identity attached by the live
