@@ -1270,8 +1270,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         save_delegated_witness(temp.path());
         let path = DelegatedValidationWitness::path(temp.path(), "owner/repo", 42);
-        let mut forged: Value = serde_json::from_slice(&std::fs::read(&path).expect("read"))
-            .expect("json");
+        let mut forged: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
         forged["repo"] = Value::String("other/repo".to_owned());
         std::fs::write(&path, serde_json::to_vec(&forged).expect("json")).expect("write");
         let error = consume_delegated_witness(
@@ -1287,14 +1287,9 @@ mod tests {
         save_delegated_witness(temp.path());
         let mut snapshot = delegated_snapshot("macos");
         snapshot["headRefName"] = Value::String("other-branch".to_owned());
-        let error = consume_delegated_witness(
-            temp.path(),
-            temp.path(),
-            "owner/repo",
-            42,
-            Some(&snapshot),
-        )
-        .expect_err("branch mismatch");
+        let error =
+            consume_delegated_witness(temp.path(), temp.path(), "owner/repo", 42, Some(&snapshot))
+                .expect_err("branch mismatch");
         assert!(error.message.contains("branch"));
     }
 

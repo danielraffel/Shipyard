@@ -400,7 +400,9 @@ pub(super) fn ship_command<W: Write>(
                 .and_then(toml::Value::as_bool)
                 == Some(true),
             args.arm_auto_merge,
-            delegated_witness.as_ref().map(|witness| witness.head_sha.as_str()),
+            delegated_witness
+                .as_ref()
+                .map(|witness| witness.head_sha.as_str()),
         );
         if let Some(outcome) = outcome {
             report_arm_outcome(&outcome, json_mode, stdout)?;
