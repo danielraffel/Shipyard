@@ -335,13 +335,59 @@ pub(super) fn ship_command<W: Write>(
             writeln!(stdout, "{line}").map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
     }
+    // A delegated ship has no ordinary ShipState. Persist its exact identity
+    // before touching GitHub, so a later merge observer can distinguish an
+    // admitted delegated head from an unrelated native merge. If this write
+    // fails, do not arm: an arm without a durable witness cannot produce a
+    // gate-bound receipt safely.
+    let mut delegated_witness = if targets.is_empty() && !repo.is_empty() {
+        let policy_snapshot =
+            crate::wait_transport::fetch_pr_snapshot(&repo, pr_context.number, cwd)
+                .map_err(|error| {
+                    CliFailure::new(
+                        1,
+                        format!("read protected-branch policy before delegated arm: {error}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    CliFailure::new(
+                        1,
+                        "protected-branch policy snapshot unavailable; delegated arm withheld",
+                    )
+                })?;
+        if policy_snapshot.get("_required_checks_known") != Some(&Value::Bool(true)) {
+            return Err(CliFailure::new(
+                1,
+                "authoritative protected-branch policy unavailable; delegated arm withheld",
+            ));
+        }
+        let policy_checks =
+            crate::delegated_validation::policy_checks_from_snapshot(&policy_snapshot)
+                .map_err(|error| CliFailure::new(1, error))?;
+        let mut witness = crate::delegated_validation::DelegatedValidationWitness::new(
+            repo.clone(),
+            pr_context.number,
+            sha.clone(),
+            pr_context.base_branch.clone(),
+            branch.clone(),
+            None,
+        );
+        witness.policy_checks = policy_checks;
+        witness.save(&runtime_paths.state_dir).map_err(|error| {
+            CliFailure::new(1, format!("persist delegated validation witness: {error}"))
+        })?;
+        Some(witness)
+    } else {
+        None
+    };
+
     // Arm native auto-merge from the one chokepoint every route into `ship`
     // passes through, so `shipyard pr`, a bare `ship`, and `ship --pr` all get
     // it. Never fatal: a refusal is usually the arm guard agreeing there is
     // nothing to arm. See `auto_arm`'s module docs.
     if !repo.is_empty() {
         let arm_actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
-        let outcome = auto_arm::arm_for_request(
+        let outcome = auto_arm::arm_for_request_with_head(
             &|gh_args: &[String]| {
                 arm_actions
                     .run_gh(gh_args)
@@ -354,9 +400,24 @@ pub(super) fn ship_command<W: Write>(
                 .and_then(toml::Value::as_bool)
                 == Some(true),
             args.arm_auto_merge,
+            delegated_witness
+                .as_ref()
+                .map(|witness| witness.head_sha.as_str()),
         );
         if let Some(outcome) = outcome {
             report_arm_outcome(&outcome, json_mode, stdout)?;
+            if outcome.armed
+                && let Some(witness) = delegated_witness.as_mut()
+            {
+                witness
+                    .approval_identity
+                    .clone_from(&outcome.approval_identity);
+                witness
+                    .mark_armed(&runtime_paths.state_dir)
+                    .map_err(|error| {
+                        CliFailure::new(1, format!("persist delegated arm witness: {error}"))
+                    })?;
+            }
         }
     }
     let steward_handoff = apply_requested_steward_handoff(

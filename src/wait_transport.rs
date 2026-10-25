@@ -693,6 +693,20 @@ fn annotate_required_checks(
         return;
     };
     snapshot.insert("_required_checks_known".to_owned(), Value::Bool(true));
+    snapshot.insert(
+        "_required_check_policy".to_owned(),
+        Value::Array(
+            policy
+                .iter()
+                .map(|required| {
+                    serde_json::json!({
+                        "context": required.context,
+                        "app_id": required.app_id,
+                    })
+                })
+                .collect(),
+        ),
+    );
 
     let rollup = snapshot
         .entry("statusCheckRollup")
@@ -725,7 +739,11 @@ fn annotate_required_checks(
             .and_then(Value::as_str)
             .filter(|state| !state.is_empty())
             .unwrap_or("PENDING");
-        rollup.push(required_check_rollup_entry(&required.context, state));
+        rollup.push(required_check_rollup_entry(
+            &required.context,
+            state,
+            required.app_id,
+        ));
     }
 
     // A materialized check that GitHub classifies as required but which was
@@ -738,12 +756,12 @@ fn annotate_required_checks(
                 .and_then(Value::as_str)
                 .filter(|state| !state.is_empty())
                 .unwrap_or("PENDING");
-            rollup.push(required_check_rollup_entry(&name, state));
+            rollup.push(required_check_rollup_entry(&name, state, None));
         }
     }
 }
 
-fn required_check_rollup_entry(name: &str, state: &str) -> Value {
+fn required_check_rollup_entry(name: &str, state: &str, app_id: Option<u64>) -> Value {
     let upper = state.to_ascii_uppercase();
     let conclusion = if matches!(upper.as_str(), "QUEUED" | "IN_PROGRESS" | "PENDING") {
         Value::Null
@@ -755,6 +773,7 @@ fn required_check_rollup_entry(name: &str, state: &str) -> Value {
         "state": upper,
         "conclusion": conclusion,
         "isRequired": true,
+        "app_id": app_id,
     })
 }
 

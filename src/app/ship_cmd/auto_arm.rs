@@ -43,6 +43,8 @@ pub(super) struct ArmOutcome {
     pub(super) armed: bool,
     /// Human-readable line, already prefixed with its own marker.
     pub(super) line: String,
+    /// Identity of the approval that allowed the arm, when one was required.
+    pub(super) approval_identity: Option<String>,
 }
 
 /// A `gh` transport. Returns stdout, or a message that includes stderr.
@@ -58,11 +60,25 @@ pub(super) type RunGh<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
 ///
 /// The head-approval gate ([`crate::head_approval`]) and then the queue-arm
 /// guard's review rule decide every arm; neither has an override.
+#[allow(dead_code)]
 pub(super) fn arm_native_auto_merge(
     run_gh: RunGh<'_>,
     repo: &str,
     pr: u64,
     environment_opt_in: bool,
+) -> ArmOutcome {
+    arm_native_auto_merge_for_head(run_gh, repo, pr, environment_opt_in, None)
+}
+
+/// Arm only when the live queue head still matches the exact head admitted by
+/// a delegated request. The optional fence preserves the legacy callers that
+/// do not carry an admission head.
+pub(super) fn arm_native_auto_merge_for_head(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    environment_opt_in: bool,
+    expected_head: Option<&str>,
 ) -> ArmOutcome {
     let facts = match read_pr_facts(run_gh, repo, pr) {
         Ok(facts) => facts,
@@ -82,6 +98,22 @@ pub(super) fn arm_native_auto_merge(
             ));
         }
     };
+    if let Some(expected_head) = expected_head {
+        let Some(actual_head) = queue
+            .pointer("/data/repository/pullRequest/headRefOid")
+            .and_then(Value::as_str)
+            .filter(|head| !head.is_empty())
+        else {
+            return skipped(format!(
+                "⚠︎ Auto-merge not armed on #{pr}: current head was unavailable; refusing delegated arm."
+            ));
+        };
+        if !actual_head.eq_ignore_ascii_case(expected_head) {
+            return skipped(format!(
+                "⚠︎ Auto-merge not armed on #{pr}: current head differs from delegated head; refusing arm."
+            ));
+        }
+    }
     let report = explain_pr_queue_state(&queue);
 
     let environment = crate::environment_requeue::assess(run_gh, repo, &report, environment_opt_in);
@@ -90,10 +122,11 @@ pub(super) fn arm_native_auto_merge(
     let excuse = environment
         .as_ref()
         .is_some_and(crate::environment_requeue::EnvironmentRequeue::is_allowed_interruption);
-    let override_note = match approval_note(run_gh, repo, pr, &verdict, &queue, &facts, excuse) {
-        Ok(note) => note,
-        Err(refusal) => return refusal,
-    };
+    let (override_note, approval_identity) =
+        match approval_note(run_gh, repo, pr, &verdict, &queue, &facts, excuse) {
+            Ok(note) => note,
+            Err(refusal) => return refusal,
+        };
     // After the approval gate: no head is armed while a tiered required check
     // has not proven its full lane.
     if verdict.arms()
@@ -114,8 +147,23 @@ pub(super) fn arm_native_auto_merge(
                 ))
         )),
         ArmVerdict::Arm => match environment.as_ref().filter(|verdict| verdict.allowed) {
-            Some(verdict) => arm_same_head(run_gh, pr, &facts, &queue, verdict, &override_note),
-            None => arm_new(run_gh, pr, &facts, &queue, &override_note),
+            Some(verdict) => arm_same_head(
+                run_gh,
+                pr,
+                &facts,
+                &queue,
+                verdict,
+                &override_note,
+                approval_identity,
+            ),
+            None => arm_new(
+                run_gh,
+                pr,
+                &facts,
+                &queue,
+                &override_note,
+                approval_identity,
+            ),
         },
     }
 }
@@ -129,6 +177,7 @@ fn arm_same_head(
     queue: &Value,
     verdict: &crate::environment_requeue::EnvironmentRequeue,
     override_note: &str,
+    approval_identity: Option<String>,
 ) -> ArmOutcome {
     let Some(head) = queue
         .pointer("/data/repository/pullRequest/headRefOid")
@@ -148,6 +197,7 @@ fn arm_same_head(
                  without a new push: a same-head re-enqueue ({}).{override_note}",
                 verdict.reason
             ),
+            approval_identity,
         },
         Ok(raw) => skipped(format!(
             "⚠︎ Auto-merge not armed on #{pr}: GitHub accepted the request but returned no armed \
@@ -169,6 +219,7 @@ fn arm_new(
     facts: &PrFacts,
     queue: &Value,
     override_note: &str,
+    approval_identity: Option<String>,
 ) -> ArmOutcome {
     let Some(head) = queue
         .pointer("/data/repository/pullRequest/headRefOid")
@@ -187,6 +238,7 @@ fn arm_new(
                 "▸ Auto-merge armed on #{pr} (merge method MERGE); GitHub enqueues it once \
                  its required checks pass.{override_note}"
             ),
+            approval_identity,
         },
         Ok(raw) => skipped(format!(
             "⚠︎ Auto-merge not armed on #{pr}: GitHub accepted the request but returned no \
@@ -226,12 +278,35 @@ fn approval_note(
     queue: &Value,
     facts: &PrFacts,
     excuse_latest_ejection: bool,
-) -> Result<String, ArmOutcome> {
+) -> Result<(String, Option<String>), ArmOutcome> {
     if let ArmVerdict::Skip(_) = verdict {
-        return Ok(String::new());
+        return Ok((String::new(), None));
     }
     match head_gate(run_gh, repo, pr, queue, facts, excuse_latest_ejection) {
-        Ok(gate) if gate.allows() => Ok(String::new()),
+        Ok(gate) if gate.allows() => Ok((
+            String::new(),
+            match gate {
+                crate::head_approval::HeadGate::Approved { approval } => {
+                    // Keep reviewer login/comment/review/app and carried-head
+                    // provenance, rather than only a display string.
+                    let Some(head) = queue
+                        .pointer("/data/repository/pullRequest/headRefOid")
+                        .and_then(Value::as_str)
+                    else {
+                        return Err(skipped(
+                            "⚠︎ Auto-merge not armed: approval head was unavailable.".to_owned(),
+                        ));
+                    };
+                    serde_json::to_string(&serde_json::json!({
+                        "via": "head_bound",
+                        "head_sha": head,
+                        "approval": approval,
+                    }))
+                    .ok()
+                }
+                _ => None,
+            },
+        )),
         Ok(gate) => Err(skipped(format!(
             "▸ Auto-merge not armed on #{pr}: {}.",
             gate.explain()
@@ -309,6 +384,7 @@ fn head_gate(
 
 /// Act on what the invocation asked of auto-merge: nothing for `--no-arm`,
 /// otherwise an arm the review verdict decides.
+#[allow(dead_code)]
 pub(super) fn arm_for_request(
     run_gh: RunGh<'_>,
     repo: &str,
@@ -316,11 +392,28 @@ pub(super) fn arm_for_request(
     environment_opt_in: bool,
     request: crate::app::cli::ArmRequest,
 ) -> Option<ArmOutcome> {
-    (!request.leaves_unarmed()).then(|| arm_native_auto_merge(run_gh, repo, pr, environment_opt_in))
+    arm_for_request_with_head(run_gh, repo, pr, environment_opt_in, request, None)
+}
+
+pub(super) fn arm_for_request_with_head(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    environment_opt_in: bool,
+    request: crate::app::cli::ArmRequest,
+    expected_head: Option<&str>,
+) -> Option<ArmOutcome> {
+    (!request.leaves_unarmed()).then(|| {
+        arm_native_auto_merge_for_head(run_gh, repo, pr, environment_opt_in, expected_head)
+    })
 }
 
 fn skipped(line: String) -> ArmOutcome {
-    ArmOutcome { armed: false, line }
+    ArmOutcome {
+        armed: false,
+        line,
+        approval_identity: None,
+    }
 }
 
 /// The facts [`PR_QUEUE_STATE_QUERY`] deliberately does not carry.
