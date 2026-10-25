@@ -113,7 +113,7 @@ fn delegated_head_fence_refuses_to_arm_after_a_push() {
         "owner/repo",
         7,
         false,
-        Some(&"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
     );
     assert!(!outcome.armed, "{}", outcome.line);
     assert!(outcome.line.contains("differs from delegated head"));

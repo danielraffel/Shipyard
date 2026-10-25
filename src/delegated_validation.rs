@@ -16,35 +16,51 @@ use sha2::{Digest, Sha256};
 
 use crate::metrics::merge_receipt::{MergeReceipt, SCHEMA as MERGE_RECEIPT_SCHEMA};
 
+/// Serialized delegated witness schema version.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Authoritative post-merge observation supplied by the GitHub reader.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MergedObservation {
+    /// Merged commit's pull-request head SHA.
     pub head_sha: String,
+    /// Base branch observed at merge.
     pub base_branch: String,
+    /// Whether GitHub confirms the pull request merged.
     pub merged: bool,
+    /// GitHub merge commit SHA, when available.
     pub merge_commit_sha: Option<String>,
+    /// GitHub merge timestamp, when available.
     pub merged_at: Option<DateTime<Utc>>,
     /// Required check context -> terminal conclusion on the exact head.
     pub required_checks: std::collections::BTreeMap<String, String>,
     /// Digest of the authoritative policy marker and canonical required-check
     /// name/status/conclusion observations on the exact merged head.
     pub policy_evidence_digest: String,
+    /// Protected-branch policy identities observed at merge.
     pub policy_checks: Vec<String>,
     /// Canonical full identity/status/conclusion evidence for every required check.
     pub policy_evidence: Vec<Value>,
 }
 
+/// Durable identity witness for a delegated validation admission.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DelegatedValidationWitness {
+    /// Serialized witness schema version.
     pub schema_version: u32,
+    /// Canonical repository slug.
     pub repo: String,
+    /// Pull-request number.
     pub pr: u64,
+    /// Exact head admitted for delegated validation.
     pub head_sha: String,
+    /// Base branch admitted for delegated validation.
     pub base_branch: String,
+    /// Source branch admitted for delegated validation.
     pub branch: String,
+    /// Time the witness was created.
     pub created_at: DateTime<Utc>,
+    /// Time native auto-merge was confirmed armed.
     pub armed_at: Option<DateTime<Utc>>,
     /// The arm/review identity is recorded when the caller can provide one.
     /// `None` is explicit: it never authorizes a receipt by itself.
@@ -56,6 +72,7 @@ pub struct DelegatedValidationWitness {
 }
 
 impl DelegatedValidationWitness {
+    /// Construct an unarmed witness for one exact pull-request head.
     #[must_use]
     pub fn new(
         repo: impl Into<String>,
@@ -80,6 +97,7 @@ impl DelegatedValidationWitness {
     }
 
     #[must_use]
+    /// Return the durable, collision-resistant witness path.
     pub fn path(state_dir: &Path, repo: &str, pr: u64) -> PathBuf {
         // A sanitized slug is not a unique filename (`a/b_c` and
         // `a_b/c` collide). Keep the path opaque and collision-resistant;

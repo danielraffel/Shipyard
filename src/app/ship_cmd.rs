@@ -409,7 +409,9 @@ pub(super) fn ship_command<W: Write>(
             if outcome.armed
                 && let Some(witness) = delegated_witness.as_mut()
             {
-                witness.approval_identity = outcome.approval_identity.clone();
+                witness
+                    .approval_identity
+                    .clone_from(&outcome.approval_identity);
                 witness
                     .mark_armed(&runtime_paths.state_dir)
                     .map_err(|error| {

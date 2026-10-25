@@ -228,20 +228,21 @@ fn wait_pr<W: Write>(
     match result {
         Ok(mut outcome) => {
             let mut delegated_receipt_warning = None;
-            if outcome.matched && matches!(state, WaitPrState::Merged) && snapshot_file.is_none() {
-                if let Err(error) = consume_delegated_witness(
+            if outcome.matched
+                && matches!(state, WaitPrState::Merged)
+                && snapshot_file.is_none()
+                && let Err(error) = consume_delegated_witness(
                     state_dir,
                     cwd,
                     &repo,
                     pr_number,
                     merged_snapshot.as_ref(),
-                ) {
-                    let warning = format!("delegated receipt import withheld: {}", error.message());
-                    let _ = crate::writer_domain_lease::write_stderr(format_args!(
-                        "warning: {warning}\n"
-                    ));
-                    delegated_receipt_warning = Some(warning);
-                }
+                )
+            {
+                let warning = format!("delegated receipt import withheld: {}", error.message());
+                let _ =
+                    crate::writer_domain_lease::write_stderr(format_args!("warning: {warning}\n"));
+                delegated_receipt_warning = Some(warning);
             }
             if terminal_wrong {
                 outcome.matched = false;
