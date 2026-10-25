@@ -122,6 +122,7 @@ impl DelegatedValidationWitness {
         std::io::Write::write_all(&mut file, &bytes)?;
         file.sync_all()?;
         replace_persisted_witness(&temp, &path)?;
+        #[cfg(unix)]
         if let Some(parent) = path.parent() {
             sync_parent_directory(parent)?;
         }
@@ -314,14 +315,6 @@ fn replace_persisted_witness(temp: &Path, path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn sync_parent_directory(parent: &Path) -> io::Result<()> {
     fs::File::open(parent)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
-    // Windows does not allow opening a directory as a synchronizable file.
-    // The file itself was flushed above; the rename is the durable boundary
-    // supported by this platform without a platform API dependency.
-    Ok(())
 }
 
 /// Extract the exact protected-branch policy identity attached by the live
