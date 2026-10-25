@@ -96,7 +96,7 @@ fn cause_row(value: Value) -> Option<CiCause> {
 struct ArchiveRows {
     files_scanned: usize,
     causes: Vec<(CiCause, PathBuf, usize)>,
-    fixlinks: Vec<(RedKey, PathBuf, usize)>,
+    fixlinks: Vec<(RedKey, PathBuf, usize, Option<String>, bool)>,
     findings: Vec<Finding>,
 }
 
@@ -166,6 +166,8 @@ fn read_archive(dir: &Path) -> Result<ArchiveRows, CliFailure> {
                     },
                     path.clone(),
                     line_number,
+                    value["derivation"].as_str().map(str::to_owned),
+                    is_proven_rerun_green(&value),
                 ));
             } else if let Some(record) = cause_row(value) {
                 causes.push((record, path.clone(), line_number));
@@ -225,10 +227,14 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
             });
         }
     }
-    let mut seen_fixlinks = BTreeMap::<RedKey, (PathBuf, usize)>::new();
-    for (key, path, line) in fixlinks {
-        if let Some((previous_path, previous_line)) =
-            seen_fixlinks.insert(key.clone(), (path.clone(), line))
+    let mut seen_fixlinks = BTreeMap::<RedKey, Vec<(PathBuf, usize, Option<String>)>>::new();
+    for (key, path, line, derivation, proven_rerun_green) in fixlinks {
+        let previous = seen_fixlinks.entry(key.clone()).or_default();
+        let duplicate = previous.iter().any(|(_, _, prior_derivation)| {
+            !allowed_fixlink_pair(prior_derivation.as_deref(), derivation.as_deref())
+        });
+        if let Some((previous_path, previous_line, _)) = previous.first()
+            && duplicate
         {
             findings.push(finding(
                 &path,
@@ -239,13 +245,19 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
                     "same red run as {}:{}",
                     previous_path
                         .strip_prefix(&args.dir)
-                        .unwrap_or(&previous_path)
+                        .unwrap_or(previous_path)
                         .display(),
                     previous_line
                 ),
             ));
         }
-        if !red_keys.contains(&key) {
+        previous.push((path.clone(), line, derivation));
+        // A rerun can legitimately have no cause row: GitHub may have
+        // deleted the original failed job log before the archive pass, while
+        // the later green rerun remains available as a fix-link. Keep the
+        // stronger check for compare-derived links, which must point at an
+        // archived red attempt.
+        if !red_keys.contains(&key) && !proven_rerun_green {
             findings.push(finding(
                 &path,
                 &args.dir,
@@ -265,6 +277,33 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
         ok: findings.is_empty(),
         findings,
     })
+}
+
+fn is_proven_rerun_green(value: &Value) -> bool {
+    let Some(head_sha) = value["head_sha"].as_str() else {
+        return false;
+    };
+    let Some(fix_head_sha) = value["fix_head_sha"].as_str() else {
+        return false;
+    };
+    value["derivation"].as_str() == Some("rerun_green")
+        && value["fix_run_id"] == value["red_run_id"]
+        && head_sha == fix_head_sha
+        && head_sha.len() == 40
+        && head_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value["files_raw"].as_array().is_some_and(Vec::is_empty)
+        && value["own_files"].as_array().is_some_and(Vec::is_empty)
+        && value["files_truncated"].as_bool() == Some(false)
+        && value["own_files_truncated"].as_bool() == Some(false)
+        && value["own_files_method"].as_str() == Some("rerun_same_head")
+}
+
+fn allowed_fixlink_pair(first: Option<&str>, second: Option<&str>) -> bool {
+    matches!(
+        (first, second),
+        (Some("compare_red_head_to_fix_head"), Some("rerun_green"))
+            | (Some("rerun_green"), Some("compare_red_head_to_fix_head"))
+    )
 }
 
 pub(super) fn command<W: Write>(
@@ -381,5 +420,59 @@ mod tests {
         assert!(report.ok);
         assert!(report.findings.is_empty());
         assert_eq!((report.cause_rows, report.fixlink_rows), (1, 0));
+    }
+
+    #[test]
+    fn accepts_compare_and_rerun_fixlinks_for_one_red_attempt() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("causes")).expect("causes");
+        fs::write(dir.path().join("causes/2026-10.jsonl"), cause(1)).expect("cause");
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":1,"red_attempt":1,"derivation":"compare_red_head_to_fix_head"}
+{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":1,"red_attempt":1,"derivation":"rerun_green"}
+"#,
+        )
+        .expect("fixlinks");
+        let report = audit(&CauseAuditArgs {
+            dir: dir.path().to_path_buf(),
+        })
+        .expect("audit");
+        assert!(report.ok);
+        assert_eq!((report.cause_rows, report.fixlink_rows), (1, 1));
+    }
+
+    #[test]
+    fn accepts_rerun_fixlink_when_original_log_has_no_cause_row() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1,"derivation":"rerun_green","fix_run_id":2,"fix_head_sha":"0123456789abcdef0123456789abcdef01234567","head_sha":"0123456789abcdef0123456789abcdef01234567","files_raw":[],"own_files":[],"files_truncated":false,"own_files_truncated":false,"own_files_method":"rerun_same_head"}
+"#,
+        )
+        .expect("fixlinks");
+        let report = audit(&CauseAuditArgs {
+            dir: dir.path().to_path_buf(),
+        })
+        .expect("audit");
+        assert!(report.ok);
+        assert_eq!((report.cause_rows, report.fixlink_rows), (0, 1));
+    }
+
+    #[test]
+    fn rejects_unproven_orphan_rerun_fixlink() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1,"derivation":"rerun_green"}
+"#,
+        )
+        .expect("fixlinks");
+        let report = audit(&CauseAuditArgs {
+            dir: dir.path().to_path_buf(),
+        })
+        .expect("audit");
+        assert!(!report.ok);
+        assert_eq!(report.findings[0].kind, "orphan_fixlink");
     }
 }
