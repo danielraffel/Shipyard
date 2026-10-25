@@ -60,3 +60,77 @@ fn a_child_shipyard_spawns_inherits_no_queue_authority() {
         );
     }
 }
+
+/// `shipyard queue-hold exec -- <cmd>` with the marker and a valid nonce
+/// exported: the held command sees neither, and a guard call it makes is
+/// judged by every rule. Without the strip the guard would honour the
+/// exported marker and nonce and step aside.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_queue_hold_child_inherits_no_queue_authority_and_is_judged_in_full() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let nonces = temp.path().join("nonces");
+    let nonce = shipyard::queue_arm_gate::issue_nonce(
+        &nonces,
+        &[
+            shipyard::queue_arm_gate::NONCE_INTERNAL_ARM,
+            shipyard::queue_arm_gate::NONCE_REVIEW_ONLY,
+        ],
+    )
+    .expect("nonce");
+    let guard = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("ghapp_queue_arm_guard.py");
+    let env_dump = temp.path().join("child-env");
+    let verdict = temp.path().join("guard");
+    // The held command dumps its environment, then asks the guard to land a
+    // request no head can be read from.
+    let script = "env > \"$1\"; python3 \"$2\" api graphql --input - </dev/null 2> \"$3\"; echo $? >> \"$3\"";
+    let output = shipyard(temp.path())
+        .envs(AUTHORITY)
+        .env("SHIPYARD_INTERNAL_QUEUE_MUTATION", "1")
+        .env("SHIPYARD_QUEUE_MUTATION_NONCE", &nonce)
+        .env("SHIPYARD_QUEUE_MUTATION_NONCE_DIR", &nonces)
+        .env("GH_REPO", "owner/repo")
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .args([
+            "queue-hold",
+            "exec",
+            "--purpose",
+            "tartci-pool-off",
+            "--host-id",
+            "test-m1",
+            "--service",
+            "actions.runner.test.service",
+            "--repo",
+            "owner/repo",
+            "--runner",
+            "runner-one",
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+            "held",
+        ])
+        .arg(&env_dump)
+        .arg(&guard)
+        .arg(&verdict)
+        .output()
+        .expect("queue-hold");
+    assert!(output.status.success(), "{output:?}");
+    let env = std::fs::read_to_string(&env_dump).expect("child env");
+    for (name, _) in AUTHORITY {
+        assert!(
+            !env.lines()
+                .any(|line| line.starts_with(&format!("{name}="))),
+            "{name} reached the held command:\n{env}"
+        );
+    }
+    let judged = std::fs::read_to_string(&verdict).expect("guard output");
+    assert!(
+        judged.contains("refusing ambiguous queue-arm request"),
+        "{judged}"
+    );
+    assert_eq!(judged.lines().last(), Some("1"), "{judged}");
+}

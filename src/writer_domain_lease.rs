@@ -220,7 +220,9 @@ pub(crate) fn run_guarded_child(
             ),
         )
     })?;
-    Command::new(program).args(command_args).status()
+    let mut child = Command::new(program);
+    crate::queue_arm_gate::strip_queue_authority(&mut child);
+    child.args(command_args).status()
 }
 
 /// Create a protected directory only when it is absent. Existing stores are a

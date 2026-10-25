@@ -265,7 +265,10 @@ fn exec_hold(
     let (program, args) = command
         .split_first()
         .expect("queue-hold command checked before lock acquisition");
-    let error = Command::new(program)
+    let mut child = Command::new(program);
+    // The held command is the caller's own; it carries no queue authority.
+    crate::queue_arm_gate::strip_queue_authority(&mut child);
+    let error = child
         .args(args)
         .env("SHIPYARD_QUEUE_HOLD_SCHEMA", SCHEMA.to_string())
         .env("SHIPYARD_QUEUE_HOLD_ID", &hold_id)

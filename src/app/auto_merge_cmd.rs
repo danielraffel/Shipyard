@@ -4142,6 +4142,141 @@ mod tests {
         })
     }
 
+    /// A fake `gh` that answers the queue-arm guard's reads for PR 42 at
+    /// `GATE_HEAD`, with `comments` as its comment list, and logs each call.
+    #[cfg(unix)]
+    fn review_gate_gh(dir: &Path, comments: &serde_json::Value) -> PathBuf {
+        let node = serde_json::json!({
+            "number": 42, "state": "OPEN", "headRefOid": GATE_HEAD, "baseRefName": "main",
+            "isInMergeQueue": false, "mergeQueueEntry": null, "autoMergeRequest": null,
+            "repository": {"nameWithOwner": "Generous-Corp/pulp"},
+            "timelineItems": {"pageInfo": {"hasPreviousPage": false}, "nodes": []},
+        });
+        let answers = serde_json::json!([
+            ["contents/.shipyard/config.toml",
+             {"text": "[auto_merge]\nreviewer_signers = [\"pulp-review\", \"infra-review2\"]\n"}],
+            ["/reviews", {"pages": [[]]}],
+            ["/comments", {"pages": [comments]}],
+            ["mergeQueue(branch", {"json": {"data": {"repository": {"mergeQueue": {"id": "MQ_1"}}}}}],
+            ["node(id:", {"json": {"data": {"node": node}}}],
+            ["pullRequest(number", {"json": {"data": {"repository": {"pullRequest": node}}}}],
+            ["/pulls/42", {"json": {"number": 42, "base": {"ref": "main"},
+                "head": {"sha": GATE_HEAD}, "user": {"login": "shipyard-local[bot]", "type": "Bot"}}}],
+        ]);
+        let table = dir.join("answers.json");
+        std::fs::write(&table, answers.to_string()).expect("answers");
+        let gh = dir.join("gh");
+        crate::test_support::write_executable_script(
+            &gh,
+            &format!(
+                r"#!/usr/bin/env python3
+import json, sys
+argv = ' '.join(sys.argv[1:])
+open({calls:?}, 'a').write(argv + '\n')
+for needle, answer in json.load(open({table:?})):
+    if needle not in argv:
+        continue
+    if 'pages' in answer:
+        sys.stdout.write(json.dumps(answer['pages'] if '--slurp' in sys.argv else answer['pages'][0]))
+    elif 'text' in answer:
+        sys.stdout.write(answer['text'])
+    else:
+        sys.stdout.write(json.dumps(answer['json']))
+    sys.exit(0)
+sys.stderr.write('unexpected gh call: ' + argv + '\n')
+sys.exit(3)
+",
+                calls = dir.join("calls").display().to_string(),
+                table = table.display().to_string(),
+            ),
+        );
+        gh
+    }
+
+    #[cfg(unix)]
+    const GATE_HEAD: &str = "b07b9f1ac9069484e2fa8fdb2319b134c69c3c56";
+
+    /// `command`'s arguments and environment, run by `gh` instead.
+    #[cfg(unix)]
+    fn rehomed(command: &Command, gh: &Path) -> Command {
+        let mut rehomed = Command::new(gh);
+        rehomed.args(command.get_args());
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => rehomed.env(key, value),
+                None => rehomed.env_remove(key),
+            };
+        }
+        rehomed
+    }
+
+    /// Run `gate_landing` on auto-merge's validated-head arm and on its
+    /// classic merge, built by their real builders, with the guard live.
+    #[cfg(unix)]
+    fn gate_auto_merge_landings(comments: &serde_json::Value) -> [Result<(), String>; 2] {
+        let temp = tempfile::tempdir().expect("temp");
+        let gh = review_gate_gh(temp.path(), comments);
+        let guards = temp.path().join("guards");
+        std::fs::create_dir_all(&guards).expect("guards");
+        let ledger = temp
+            .path()
+            .join("state")
+            .join(crate::queue_arm_gate::ARMS_LEDGER);
+        let client = GhClient::ambient();
+        let arm = crate::gh::allow_bare_gh_for_test(|| {
+            native_arm_command(&client, temp.path(), "PR_kw42", GATE_HEAD)
+        })
+        .expect("arm command");
+        let state = ShipState::new(
+            42,
+            "Generous-Corp/pulp",
+            "feature/x",
+            "main",
+            GATE_HEAD,
+            "policy",
+        );
+        let mut classic = Command::new("gh");
+        prepare_classic_merge(&mut classic, &state, MergeMethod::Merge, false, false)
+            .expect("marked");
+        crate::queue_arm_gate::tests_support::with_real_guard(&ledger, &guards, || {
+            [
+                gate_landing(&rehomed(&arm, &gh)),
+                gate_landing(&rehomed(&classic, &gh)),
+            ]
+        })
+    }
+
+    /// Both of auto-merge's landings reach the queue-arm guard's review
+    /// rule: without a verdict on the head each is refused, and with a signed
+    /// exact-head APPROVE each passes.
+    #[cfg(unix)]
+    #[test]
+    fn auto_merge_arm_and_classic_merge_are_refused_without_a_verdict() {
+        for (path, result) in ["validated-head arm", "classic merge"]
+            .into_iter()
+            .zip(gate_auto_merge_landings(&serde_json::json!([])))
+        {
+            let error = result.expect_err(path);
+            assert!(
+                error.contains("no reviewer verdict names head b07b9f1ac906"),
+                "{path}: {error}"
+            );
+        }
+        let approved = serde_json::json!([{
+            "id": 7, "user": {"login": "shipyard-local[bot]", "type": "Bot"},
+            "author_association": "CONTRIBUTOR", "created_at": "2026-10-24T22:53:36Z",
+            "body": format!(
+                "Reviewed.\nreviewer: pulp-review\n<!-- session: Daniels-Mac-Studio-m3/08fb81d8 -->\nverdict: APPROVE head:{GATE_HEAD}"
+            ),
+        }]);
+        for (path, result) in ["validated-head arm", "classic merge"]
+            .into_iter()
+            .zip(gate_auto_merge_landings(&approved))
+        {
+            result.unwrap_or_else(|error| panic!("{path}: {error}"));
+        }
+    }
+
     #[test]
     fn queue_admission_arms_native_auto_merge_on_the_validated_head() {
         let client = GhClient::ambient();

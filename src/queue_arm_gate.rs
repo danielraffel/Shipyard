@@ -452,20 +452,7 @@ fn run_guard(
             .map_err(|error| unavailable(format!("write {}: {error}", guard.name)))?;
     }
     let mut command = Command::new("python3");
-    for (key, value) in gh.get_envs() {
-        match value {
-            Some(value) => command.env(key, value),
-            None => command.env_remove(key),
-        };
-    }
-    if let Some(dir) = gh.get_current_dir() {
-        command.current_dir(dir);
-    }
-    // The landing's own marker and nonce are not this run's; it gets a
-    // review-only nonce of its own.
-    strip_queue_authority(&mut command);
-    let nonce_directory = nonce_dir(Some(ledger));
-    let nonce = issue_nonce(&nonce_directory, &[NONCE_REVIEW_ONLY]).map_err(|error| GateError {
+    review_only_environment(gh, &mut command, ledger).map_err(|error| GateError {
         message: error,
         ran: false,
     })?;
@@ -473,11 +460,7 @@ fn run_guard(
         .arg(bundle.path().join("queue-arm-guard"))
         .args(args)
         .env("PATH", trusted_path())
-        .env("GHAPP_REAL_GH", gh.get_program())
         .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env(REVIEW_ONLY_ENV, "1")
-        .env(NONCE_ENV, nonce)
-        .env(NONCE_DIR_ENV, &nonce_directory)
         .env(CALLER_ENV, caller)
         .env(ARMS_LOG_ENV, ledger);
     if let Some(dir) = guards_dir {
@@ -508,6 +491,35 @@ fn run_guard(
         // A crash before the guard judged anything leaves no ledger line.
         ran: judged,
     })
+}
+
+/// The review-only guard run's environment and working directory: the
+/// landing's own (`gh`'s token and directory), less any queue authority it
+/// carries, which is not this run's (the landing's marker and its nonce
+/// included), plus the review-only switch and a nonce of its own.
+fn review_only_environment(
+    gh: &Command,
+    command: &mut Command,
+    ledger: &Path,
+) -> Result<(), String> {
+    for (key, value) in gh.get_envs() {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
+    if let Some(dir) = gh.get_current_dir() {
+        command.current_dir(dir);
+    }
+    strip_queue_authority(command);
+    let nonce_directory = nonce_dir(Some(ledger));
+    let nonce = issue_nonce(&nonce_directory, &[NONCE_REVIEW_ONLY])?;
+    command
+        .env("GHAPP_REAL_GH", gh.get_program())
+        .env(REVIEW_ONLY_ENV, "1")
+        .env(NONCE_ENV, nonce)
+        .env(NONCE_DIR_ENV, &nonce_directory);
+    Ok(())
 }
 
 fn trusted_path() -> OsString {

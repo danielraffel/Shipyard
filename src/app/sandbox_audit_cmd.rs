@@ -229,7 +229,9 @@ pub(super) fn sandbox_audit_worker_command(
     let (program, args) = command
         .split_first()
         .ok_or_else(|| CliFailure::new(2, "sandbox audit worker command cannot be empty"))?;
-    let status = Command::new(program).args(args).status().map_err(|error| {
+    let mut child = Command::new(program);
+    crate::queue_arm_gate::strip_queue_authority(&mut child);
+    let status = child.args(args).status().map_err(|error| {
         CliFailure::new(1, format!("could not run sandbox audit child: {error}"))
     })?;
     Ok(exit_code(status.code(), status.success()))

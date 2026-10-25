@@ -134,3 +134,39 @@ fn nonce_records_are_named_as_the_guards_name_them() {
         "ab52110613b2955772a8e3c60bd5b65b0d826b70e2a06894b44d055a7a871e2d"
     );
 }
+
+/// The review-only guard run never carries the landing's own authority: its
+/// marker, its nonce and any override are dropped, and it gets the
+/// review-only switch with a nonce of its own.
+#[test]
+fn the_review_only_run_drops_the_landings_authority() {
+    let temp = tempfile::tempdir().expect("temp");
+    let ledger = temp.path().join(super::ARMS_LEDGER);
+    let mut gh = std::process::Command::new("gh");
+    super::mark_internal_queue_mutation(&mut gh).expect("marked");
+    gh.env("GHAPP_ALLOW_UNREVIEWED_ARM", "1")
+        .env("GH_TOKEN", "token");
+    let landing_nonce = env_of(&gh, super::NONCE_ENV).expect("landing nonce");
+    let mut guard = std::process::Command::new("python3");
+    super::review_only_environment(&gh, &mut guard, &ledger).expect("environment");
+    assert_eq!(env_of(&guard, "SHIPYARD_INTERNAL_QUEUE_MUTATION"), None);
+    assert_eq!(env_of(&guard, "GHAPP_ALLOW_UNREVIEWED_ARM"), None);
+    assert_eq!(env_of(&guard, "GH_TOKEN").as_deref(), Some("token"));
+    assert_eq!(env_of(&guard, super::REVIEW_ONLY_ENV).as_deref(), Some("1"));
+    let nonce = env_of(&guard, super::NONCE_ENV).expect("its own nonce");
+    assert_ne!(nonce, landing_nonce);
+    let directory = std::path::PathBuf::from(env_of(&guard, super::NONCE_DIR_ENV).expect("dir"));
+    assert!(
+        directory
+            .join(super::nonce_record_name(&nonce, super::NONCE_REVIEW_ONLY))
+            .is_file()
+    );
+}
+
+/// The value `command` sets for `key`; `None` when unset or removed.
+fn env_of(command: &std::process::Command, key: &str) -> Option<String> {
+    command
+        .get_envs()
+        .find(|(name, _)| *name == key)
+        .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+}

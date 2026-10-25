@@ -2821,9 +2821,13 @@ class ShipyardReviewOnly(unittest.TestCase):
                          ("refused", "shipyard merge-steward", 784, HEAD_784))
 
     def test_the_internal_marker_does_not_skip_the_review(self) -> None:
+        # Even a marker whose own nonce would be honoured: the review-only
+        # switch is judged first, so the review still decides.
+        both = self.nonce("review-only", "internal-arm")
         result = self.land(self.approved_784(comments=[[]], reviews=[[]]),
-                           SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
+                           SHIPYARD_INTERNAL_QUEUE_MUTATION="1", **both)
         self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("no reviewer verdict names head", result.stderr)
 
     def test_an_exact_head_approval_is_allowed_with_its_comment_and_signer(self) -> None:
         signers = self.guards / "reviewer-signers.json"

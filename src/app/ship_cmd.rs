@@ -143,6 +143,7 @@ fn changed_surface_stage_command(
 ) -> std::process::Command {
     let mut child = std::process::Command::new("/bin/sh");
     child.arg("-c").arg(command).current_dir(cwd);
+    crate::queue_arm_gate::strip_queue_authority(&mut child);
     child.env("SHIPYARD_CHANGED_SURFACE_RESULT_DIR", result_dir);
     if compare_full {
         child.env("SHIPYARD_CHANGED_SURFACE_COMPARE_FULL", "1");

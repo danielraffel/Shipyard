@@ -635,6 +635,7 @@ impl GhClient {
             .split_first()
             .ok_or(GhPrepareError::EmptyTokenCommand)?;
         let mut command = Command::new(program);
+        crate::queue_arm_gate::strip_queue_authority(&mut command);
         command.args(args).current_dir(cwd);
         let output = if let Some(timeout) = timeout {
             run_helper_with_timeout(&mut command, program, timeout)?
