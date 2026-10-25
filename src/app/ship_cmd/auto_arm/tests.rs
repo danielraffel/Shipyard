@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use super::{ArmOutcome, arm_for_request, arm_native_auto_merge};
+use super::{ArmOutcome, arm_for_request, arm_native_auto_merge, arm_native_auto_merge_for_head};
 
 /// A scripted `gh` that records every argv it was handed.
 struct FakeGh {
@@ -99,6 +99,25 @@ fn a_never_armed_pr_is_armed_with_merge_and_reported() {
     assert!(outcome.line.contains("Auto-merge armed on #7"));
     assert!(gh.called("mergeMethod:MERGE"));
     assert!(gh.called("id=PR_node"));
+}
+
+#[test]
+fn delegated_head_fence_refuses_to_arm_after_a_push() {
+    let gh = FakeGh::new(vec![
+        ("pr view", Ok(pr_view("PR_node", false))),
+        ("isInMergeQueue", Ok(never_armed_state())),
+        ("enablePullRequestAutoMerge", Ok(arm_accepted())),
+    ]);
+    let outcome = arm_native_auto_merge_for_head(
+        &|args| gh.run(args),
+        "owner/repo",
+        7,
+        false,
+        Some(&"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    );
+    assert!(!outcome.armed, "{}", outcome.line);
+    assert!(outcome.line.contains("differs from delegated head"));
+    assert!(!gh.called("enablePullRequestAutoMerge"));
 }
 
 /// A [`FakeGh`] for a repository that lists `macos` as tiered, whose latest

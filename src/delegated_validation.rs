@@ -81,7 +81,10 @@ impl DelegatedValidationWitness {
 
     #[must_use]
     pub fn path(state_dir: &Path, repo: &str, pr: u64) -> PathBuf {
-        let key = repo.replace(['/', '\\'], "_");
+        // A sanitized slug is not a unique filename (`a/b_c` and
+        // `a_b/c` collide). Keep the path opaque and collision-resistant;
+        // the serialized witness remains the source of the human identity.
+        let key = sha256(repo.as_bytes());
         state_dir
             .join("delegated-validation")
             .join(format!("{key}-{pr}.json"))
@@ -401,7 +404,14 @@ mod tests {
         let path = DelegatedValidationWitness::path(Path::new("/state"), "owner/repo", 42);
         assert_eq!(
             path,
-            PathBuf::from("/state/delegated-validation/owner_repo-42.json")
+            PathBuf::from(format!(
+                "/state/delegated-validation/{}-42.json",
+                sha256("owner/repo")
+            ))
+        );
+        assert_ne!(
+            DelegatedValidationWitness::path(Path::new("/state"), "a/b_c", 42),
+            DelegatedValidationWitness::path(Path::new("/state"), "a_b/c", 42)
         );
     }
 

@@ -316,6 +316,12 @@ fn consume_delegated_witness(
             .map_err(|error| CliFailure::new(1, format!("read delegated witness: {error}")))?,
     )
     .map_err(|error| CliFailure::new(1, format!("parse delegated witness: {error}")))?;
+    if witness.repo != repo || witness.pr != pr {
+        return Err(CliFailure::new(
+            1,
+            "delegated witness identity did not match the requested repository and PR",
+        ));
+    }
     let snapshot = snapshot.ok_or_else(|| {
         CliFailure::new(
             1,
@@ -326,6 +332,22 @@ fn consume_delegated_witness(
         return Err(CliFailure::new(
             1,
             "authoritative required-check policy was unavailable; delegated receipt withheld",
+        ));
+    }
+    let observed_branch = snapshot
+        .get("headRefName")
+        .and_then(Value::as_str)
+        .filter(|branch| !branch.is_empty())
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                "merged PR snapshot omitted head branch; delegated receipt withheld",
+            )
+        })?;
+    if observed_branch != witness.branch {
+        return Err(CliFailure::new(
+            1,
+            "merged head branch differs from delegated witness",
         ));
     }
     let policy_checks = crate::delegated_validation::policy_checks_from_snapshot(snapshot)
@@ -1183,6 +1205,7 @@ mod tests {
     fn delegated_snapshot(policy_context: &str) -> Value {
         serde_json::json!({
             "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "headRefName": "feature",
             "baseRefName": "main",
             "state": "MERGED",
             "merged": true,
@@ -1240,6 +1263,39 @@ mod tests {
         .expect_err("policy drift");
         assert!(error.message.contains("policy"));
         assert!(DelegatedValidationWitness::path(temp.path(), "owner/repo", 42).exists());
+    }
+
+    #[test]
+    fn delegated_witness_rejects_repo_pr_and_branch_mismatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        save_delegated_witness(temp.path());
+        let path = DelegatedValidationWitness::path(temp.path(), "owner/repo", 42);
+        let mut forged: Value = serde_json::from_slice(&std::fs::read(&path).expect("read"))
+            .expect("json");
+        forged["repo"] = Value::String("other/repo".to_owned());
+        std::fs::write(&path, serde_json::to_vec(&forged).expect("json")).expect("write");
+        let error = consume_delegated_witness(
+            temp.path(),
+            temp.path(),
+            "owner/repo",
+            42,
+            Some(&delegated_snapshot("macos")),
+        )
+        .expect_err("repo mismatch");
+        assert!(error.message.contains("identity"));
+
+        save_delegated_witness(temp.path());
+        let mut snapshot = delegated_snapshot("macos");
+        snapshot["headRefName"] = Value::String("other-branch".to_owned());
+        let error = consume_delegated_witness(
+            temp.path(),
+            temp.path(),
+            "owner/repo",
+            42,
+            Some(&snapshot),
+        )
+        .expect_err("branch mismatch");
+        assert!(error.message.contains("branch"));
     }
 
     #[test]

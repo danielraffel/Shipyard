@@ -60,11 +60,25 @@ pub(super) type RunGh<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
 ///
 /// The head-approval gate ([`crate::head_approval`]) and then the queue-arm
 /// guard's review rule decide every arm; neither has an override.
+#[allow(dead_code)]
 pub(super) fn arm_native_auto_merge(
     run_gh: RunGh<'_>,
     repo: &str,
     pr: u64,
     environment_opt_in: bool,
+) -> ArmOutcome {
+    arm_native_auto_merge_for_head(run_gh, repo, pr, environment_opt_in, None)
+}
+
+/// Arm only when the live queue head still matches the exact head admitted by
+/// a delegated request. The optional fence preserves the legacy callers that
+/// do not carry an admission head.
+pub(super) fn arm_native_auto_merge_for_head(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    environment_opt_in: bool,
+    expected_head: Option<&str>,
 ) -> ArmOutcome {
     let facts = match read_pr_facts(run_gh, repo, pr) {
         Ok(facts) => facts,
@@ -84,6 +98,22 @@ pub(super) fn arm_native_auto_merge(
             ));
         }
     };
+    if let Some(expected_head) = expected_head {
+        let Some(actual_head) = queue
+            .pointer("/data/repository/pullRequest/headRefOid")
+            .and_then(Value::as_str)
+            .filter(|head| !head.is_empty())
+        else {
+            return skipped(format!(
+                "⚠︎ Auto-merge not armed on #{pr}: current head was unavailable; refusing delegated arm."
+            ));
+        };
+        if !actual_head.eq_ignore_ascii_case(expected_head) {
+            return skipped(format!(
+                "⚠︎ Auto-merge not armed on #{pr}: current head differs from delegated head; refusing arm."
+            ));
+        }
+    }
     let report = explain_pr_queue_state(&queue);
 
     let environment = crate::environment_requeue::assess(run_gh, repo, &report, environment_opt_in);
@@ -354,6 +384,7 @@ fn head_gate(
 
 /// Act on what the invocation asked of auto-merge: nothing for `--no-arm`,
 /// otherwise an arm the review verdict decides.
+#[allow(dead_code)]
 pub(super) fn arm_for_request(
     run_gh: RunGh<'_>,
     repo: &str,
@@ -361,7 +392,20 @@ pub(super) fn arm_for_request(
     environment_opt_in: bool,
     request: crate::app::cli::ArmRequest,
 ) -> Option<ArmOutcome> {
-    (!request.leaves_unarmed()).then(|| arm_native_auto_merge(run_gh, repo, pr, environment_opt_in))
+    arm_for_request_with_head(run_gh, repo, pr, environment_opt_in, request, None)
+}
+
+pub(super) fn arm_for_request_with_head(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    environment_opt_in: bool,
+    request: crate::app::cli::ArmRequest,
+    expected_head: Option<&str>,
+) -> Option<ArmOutcome> {
+    (!request.leaves_unarmed()).then(|| {
+        arm_native_auto_merge_for_head(run_gh, repo, pr, environment_opt_in, expected_head)
+    })
 }
 
 fn skipped(line: String) -> ArmOutcome {
