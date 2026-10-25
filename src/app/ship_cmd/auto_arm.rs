@@ -43,6 +43,8 @@ pub(super) struct ArmOutcome {
     pub(super) armed: bool,
     /// Human-readable line, already prefixed with its own marker.
     pub(super) line: String,
+    /// Identity of the approval that allowed the arm, when one was required.
+    pub(super) approval_identity: Option<String>,
 }
 
 /// A `gh` transport. Returns stdout, or a message that includes stderr.
@@ -90,10 +92,11 @@ pub(super) fn arm_native_auto_merge(
     let excuse = environment
         .as_ref()
         .is_some_and(crate::environment_requeue::EnvironmentRequeue::is_allowed_interruption);
-    let override_note = match approval_note(run_gh, repo, pr, &verdict, &queue, &facts, excuse) {
-        Ok(note) => note,
-        Err(refusal) => return refusal,
-    };
+    let (override_note, approval_identity) =
+        match approval_note(run_gh, repo, pr, &verdict, &queue, &facts, excuse) {
+            Ok(note) => note,
+            Err(refusal) => return refusal,
+        };
     // After the approval gate: no head is armed while a tiered required check
     // has not proven its full lane.
     if verdict.arms()
@@ -114,8 +117,23 @@ pub(super) fn arm_native_auto_merge(
                 ))
         )),
         ArmVerdict::Arm => match environment.as_ref().filter(|verdict| verdict.allowed) {
-            Some(verdict) => arm_same_head(run_gh, pr, &facts, &queue, verdict, &override_note),
-            None => arm_new(run_gh, pr, &facts, &queue, &override_note),
+            Some(verdict) => arm_same_head(
+                run_gh,
+                pr,
+                &facts,
+                &queue,
+                verdict,
+                &override_note,
+                approval_identity,
+            ),
+            None => arm_new(
+                run_gh,
+                pr,
+                &facts,
+                &queue,
+                &override_note,
+                approval_identity,
+            ),
         },
     }
 }
@@ -129,6 +147,7 @@ fn arm_same_head(
     queue: &Value,
     verdict: &crate::environment_requeue::EnvironmentRequeue,
     override_note: &str,
+    approval_identity: Option<String>,
 ) -> ArmOutcome {
     let Some(head) = queue
         .pointer("/data/repository/pullRequest/headRefOid")
@@ -148,6 +167,7 @@ fn arm_same_head(
                  without a new push: a same-head re-enqueue ({}).{override_note}",
                 verdict.reason
             ),
+            approval_identity,
         },
         Ok(raw) => skipped(format!(
             "⚠︎ Auto-merge not armed on #{pr}: GitHub accepted the request but returned no armed \
@@ -169,6 +189,7 @@ fn arm_new(
     facts: &PrFacts,
     queue: &Value,
     override_note: &str,
+    approval_identity: Option<String>,
 ) -> ArmOutcome {
     let Some(head) = queue
         .pointer("/data/repository/pullRequest/headRefOid")
@@ -187,6 +208,7 @@ fn arm_new(
                 "▸ Auto-merge armed on #{pr} (merge method MERGE); GitHub enqueues it once \
                  its required checks pass.{override_note}"
             ),
+            approval_identity,
         },
         Ok(raw) => skipped(format!(
             "⚠︎ Auto-merge not armed on #{pr}: GitHub accepted the request but returned no \
@@ -226,12 +248,22 @@ fn approval_note(
     queue: &Value,
     facts: &PrFacts,
     excuse_latest_ejection: bool,
-) -> Result<String, ArmOutcome> {
+) -> Result<(String, Option<String>), ArmOutcome> {
     if let ArmVerdict::Skip(_) = verdict {
-        return Ok(String::new());
+        return Ok((String::new(), None));
     }
     match head_gate(run_gh, repo, pr, queue, facts, excuse_latest_ejection) {
-        Ok(gate) if gate.allows() => Ok(String::new()),
+        Ok(gate) if gate.allows() => Ok((
+            String::new(),
+            match gate {
+                crate::head_approval::HeadGate::Approved { approval } => {
+                    // Keep reviewer login/comment/review/app and carried-head
+                    // provenance, rather than only a display string.
+                    serde_json::to_string(&approval).ok()
+                }
+                _ => None,
+            },
+        )),
         Ok(gate) => Err(skipped(format!(
             "▸ Auto-merge not armed on #{pr}: {}.",
             gate.explain()
@@ -320,7 +352,11 @@ pub(super) fn arm_for_request(
 }
 
 fn skipped(line: String) -> ArmOutcome {
-    ArmOutcome { armed: false, line }
+    ArmOutcome {
+        armed: false,
+        line,
+        approval_identity: None,
+    }
 }
 
 /// The facts [`PR_QUEUE_STATE_QUERY`] deliberately does not carry.

@@ -64,6 +64,9 @@ pub mod daemon_version;
 pub(crate) mod daemon_worker_capacity;
 /// Refuse to arm a head whose required check ran only its deferred test tier.
 pub mod deferred_tier;
+/// Durable identity for native auto-merge ships whose validation is delegated
+/// to the repository's required checks.
+pub mod delegated_validation;
 /// Typed dependency-channel policy and immutable consumer locks.
 pub mod dependency;
 /// Bounded CI failure diagnosis (`shipyard diagnose`): failing step, tests,

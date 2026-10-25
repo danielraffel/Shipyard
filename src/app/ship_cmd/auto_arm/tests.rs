@@ -385,6 +385,7 @@ fn json_mode_keeps_the_arm_line_off_stdout() {
     let outcome = ArmOutcome {
         armed: true,
         line: "▸ Auto-merge armed on #7".to_owned(),
+        approval_identity: None,
     };
     let mut stdout = Vec::new();
     super::super::report_arm_outcome(&outcome, true, &mut stdout).expect("reported");
@@ -400,6 +401,7 @@ fn human_mode_writes_the_arm_line_to_stdout() {
     let outcome = ArmOutcome {
         armed: false,
         line: "▸ Auto-merge left as it is on #7: it is a draft".to_owned(),
+        approval_identity: None,
     };
     let mut stdout = Vec::new();
     super::super::report_arm_outcome(&outcome, false, &mut stdout).expect("reported");

@@ -14,7 +14,9 @@ use super::{
     cli::{WaitCommand, WaitPrState},
 };
 use crate::config::LoadedConfig;
+use crate::delegated_validation::{DelegatedValidationWitness, MergedObservation};
 use crate::log_retention::{TerminalLogManifest, read_terminal_manifest};
+use crate::metrics::MetricsStore;
 use crate::output::write_json_envelope;
 use crate::queue::Queue;
 use crate::wait as wait_logic;
@@ -65,6 +67,7 @@ pub(super) fn wait_command<W: Write>(
         } => wait_pr(
             mode,
             daemon_socket,
+            state_dir,
             cwd,
             json,
             stdout,
@@ -169,6 +172,7 @@ fn wait_release<W: Write>(
 fn wait_pr<W: Write>(
     mode: RuntimeMode,
     socket_path: &Path,
+    state_dir: &Path,
     cwd: &Path,
     json: bool,
     stdout: &mut W,
@@ -183,16 +187,22 @@ fn wait_pr<W: Write>(
     let repo = resolve_repo_slug(repo_override, cwd)?;
     let event_filter = pr_event_filter(pr_number, &repo);
     let mut terminal_wrong = false;
+    let mut merged_snapshot = None;
     let result = wait_for_condition_with_timeout(
-        |snapshot| match state {
-            WaitPrState::Green => evaluate_pr_green_for_wait(snapshot, &mut terminal_wrong),
-            WaitPrState::Queued => Ok(evaluate_pr_queue_state(snapshot, "queued")),
-            WaitPrState::Red => Ok(evaluate_pr_queue_state(snapshot, "red")),
-            WaitPrState::Ejected => Ok(evaluate_pr_queue_state(snapshot, "ejected")),
-            WaitPrState::Merged => wait_logic::evaluate_pr_state(snapshot, "merged")
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
-            WaitPrState::Closed => wait_logic::evaluate_pr_state(snapshot, "closed")
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
+        |snapshot| {
+            if matches!(state, WaitPrState::Merged) {
+                merged_snapshot = snapshot.cloned();
+            }
+            match state {
+                WaitPrState::Green => evaluate_pr_green_for_wait(snapshot, &mut terminal_wrong),
+                WaitPrState::Queued => Ok(evaluate_pr_queue_state(snapshot, "queued")),
+                WaitPrState::Red => Ok(evaluate_pr_queue_state(snapshot, "red")),
+                WaitPrState::Ejected => Ok(evaluate_pr_queue_state(snapshot, "ejected")),
+                WaitPrState::Merged => wait_logic::evaluate_pr_state(snapshot, "merged")
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
+                WaitPrState::Closed => wait_logic::evaluate_pr_state(snapshot, "closed")
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
+            }
         },
         |remaining| match snapshot_file {
             Some(path) => read_snapshot_file(path),
@@ -217,6 +227,15 @@ fn wait_pr<W: Write>(
     );
     match result {
         Ok(mut outcome) => {
+            if outcome.matched && matches!(state, WaitPrState::Merged) && snapshot_file.is_none() {
+                consume_delegated_witness(
+                    state_dir,
+                    cwd,
+                    &repo,
+                    pr_number,
+                    merged_snapshot.as_ref(),
+                )?;
+            }
             if terminal_wrong {
                 outcome.matched = false;
                 if !json {
@@ -279,6 +298,119 @@ fn wait_pr_state_exit_code(state: WaitPrState) -> ExitCode {
         WaitPrState::Merged => ExitCode::from(WAIT_EXIT_MERGED),
         WaitPrState::Closed => ExitCode::from(WAIT_EXIT_CLOSED),
     }
+}
+
+fn consume_delegated_witness(
+    state_dir: &Path,
+    _cwd: &Path,
+    repo: &str,
+    pr: u64,
+    snapshot: Option<&Value>,
+) -> Result<(), CliFailure> {
+    let path = DelegatedValidationWitness::path(state_dir, repo, pr);
+    if !path.exists() {
+        return Ok(());
+    }
+    let witness: DelegatedValidationWitness = serde_json::from_slice(
+        &std::fs::read(&path)
+            .map_err(|error| CliFailure::new(1, format!("read delegated witness: {error}")))?,
+    )
+    .map_err(|error| CliFailure::new(1, format!("parse delegated witness: {error}")))?;
+    let snapshot = snapshot.ok_or_else(|| {
+        CliFailure::new(
+            1,
+            "merged PR snapshot was unavailable; delegated receipt withheld",
+        )
+    })?;
+    if snapshot.get("_required_checks_known") != Some(&Value::Bool(true)) {
+        return Err(CliFailure::new(
+            1,
+            "authoritative required-check policy was unavailable; delegated receipt withheld",
+        ));
+    }
+    let mut evidence = Vec::new();
+    let checks = snapshot
+        .get("statusCheckRollup")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                "required-check rollup was unavailable; delegated receipt withheld",
+            )
+        })?
+        .iter()
+        .filter(|entry| entry.get("isRequired").and_then(Value::as_bool) == Some(true))
+        .filter_map(|entry| {
+            let name = entry
+                .get("name")
+                .or_else(|| entry.get("context"))?
+                .as_str()?;
+            let conclusion = entry
+                .get("conclusion")
+                .or_else(|| entry.get("state"))?
+                .as_str()?;
+            evidence.push(serde_json::json!({
+                "name": name,
+                "status": entry.get("status").or_else(|| entry.get("state")).cloned().unwrap_or(Value::Null),
+                "conclusion": conclusion,
+            }));
+            Some((name.to_owned(), conclusion.to_owned()))
+        })
+        .collect();
+    evidence.sort_by_key(|entry| {
+        entry
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    });
+    let policy_evidence = serde_json::json!({
+        "required_checks_known": true,
+        "checks": evidence,
+    });
+    let observation = MergedObservation {
+        head_sha: snapshot
+            .get("headRefOid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        base_branch: snapshot
+            .get("baseRefName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        merged: snapshot
+            .get("merged")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || snapshot
+                .get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case("merged")),
+        merge_commit_sha: snapshot
+            .pointer("/mergeCommit/oid")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        merged_at: snapshot
+            .get("mergedAt")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok()),
+        required_checks: checks,
+        policy_evidence_digest: crate::delegated_validation::evidence_digest(
+            serde_json::to_vec(&policy_evidence)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?,
+        ),
+    };
+    let receipt = witness
+        .receipt(&observation)
+        .map_err(|error| CliFailure::new(1, error))?;
+    MetricsStore::open(state_dir)
+        .map_err(|error| CliFailure::new(1, format!("open metrics store: {error}")))?
+        .import_merge_receipts(std::slice::from_ref(&receipt))
+        .map_err(|error| CliFailure::new(1, format!("import delegated merge receipt: {error}")))?;
+    witness
+        .retire(state_dir)
+        .map_err(|error| CliFailure::new(1, format!("retire delegated witness: {error}")))
 }
 
 fn evaluate_pr_queue_state(snapshot: Option<&Value>, target: &str) -> crate::wait::TruthResult {
@@ -1263,6 +1395,7 @@ artifacts = [
             RuntimeMode::Isolated,
             &temp.path().join("missing.sock"),
             temp.path(),
+            temp.path(),
             false,
             &mut out,
             42,
@@ -1320,6 +1453,7 @@ artifacts = [
             RuntimeMode::Isolated,
             &temp.path().join("missing.sock"),
             temp.path(),
+            temp.path(),
             true,
             &mut out,
             534,
@@ -1365,6 +1499,7 @@ artifacts = [
         let code = wait_pr(
             RuntimeMode::Isolated,
             &temp.path().join("missing.sock"),
+            temp.path(),
             temp.path(),
             false,
             &mut out,

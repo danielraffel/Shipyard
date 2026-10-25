@@ -257,12 +257,17 @@ request and arms native auto-merge, then returns exit 0 with
 `validation: "delegated"` and `verdict_owner: "required-checks"`. It queues no
 job and writes **no** `ShipState`.
 
-That is deliberate. A state with no dispatched runs and no evidence has no
-terminal verdict (`ship_terminal_verdict` returns `None`), so `watch` would
-report it in flight forever and the resume sweep would eventually classify it
-as an orphan and mark it abandoned, which reads as a failure that never
-happened. With no state, the pull request's required checks are the only
-verdict, which is the point of making every target opt-in. Emptying a non-empty
+That remains deliberate for ordinary `ShipState`: a state with no dispatched
+runs and no evidence has no terminal verdict (`ship_terminal_verdict` returns
+`None`), so `watch` would report it in flight forever and the resume sweep
+would eventually classify it as an orphan and mark it abandoned, which reads
+as a failure that never happened. The delegated path therefore writes a
+separate exact-head witness under `delegated-validation/` before arming native
+auto-merge. The witness is not validation evidence and cannot authorize a
+receipt; it only lets a post-merge observer bind a later GitHub confirmation to
+the exact repository, PR, head, base, and arm time; an approval identity is
+optional in the witness and a future consumer must refuse when it is absent.
+If that witness cannot be written, Shipyard refuses to arm. Emptying a non-empty
 default set with `--skip-target` is still refused (exit 2) before any state is
 written, as it always was.
 
