@@ -31,7 +31,8 @@ landing and a removal, so a missing guard refuses it.
 The guards `ghapp` runs are the installed copies in
 `~/.config/shipyard/guards`, and `ghapp` itself runs from the auth generation
 under `~/.local/share/shipyard/auth-generations/`. Neither changes when a new
-Shipyard binary lands. After a release that changes them, on every host:
+Shipyard binary lands. Right after a release that changes them, on every
+host (the fleet today: m1, m3, m5 and m5s):
 
 1. `shipyard update` (or the fleet update), which installs the new binary and
    its `ghapp` auth generation;
