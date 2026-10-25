@@ -649,17 +649,19 @@ fn gh(client: &GhClient, cwd: &Path) -> Result<Command, String> {
         .map_err(|error| format!("gh command preparation failed: {error}"))
 }
 
-use crate::merge_queue::INTERNAL_QUEUE_MUTATION_ENV;
 use crate::merge_queue_control::ARM_ACTION;
 
-/// Mark a queue-mutating `gh` command as Shipyard's own.
+/// Mark a queue-mutating `gh` command as Shipyard's own, for this one call.
 ///
 /// `gh` may resolve to the `ghapp` wrapper, whose queue-removal and queue-arm
 /// guards refuse ad-hoc arm/enqueue/dequeue requests. Shipyard's calls are
 /// already bound to a validated head and admitted by `queue_admission`, so
-/// they carry this marker instead of being re-judged by a second classifier.
-fn mark_internal_queue_mutation(command: &mut Command) -> &mut Command {
-    command.env(INTERNAL_QUEUE_MUTATION_ENV, "1")
+/// they carry the marker and a one-shot nonce
+/// ([`crate::queue_arm_gate::mark_internal_queue_mutation`]) instead of being
+/// re-judged by a second classifier.
+fn mark_internal_queue_mutation(command: &mut Command) -> Result<&mut Command, String> {
+    crate::queue_arm_gate::mark_internal_queue_mutation(command)?;
+    Ok(command)
 }
 
 /// Run the queue-arm guard's review rule ([`crate::queue_arm_gate`]) on a
@@ -670,12 +672,7 @@ fn gate_landing(command: &Command) -> Result<(), String> {
         .get_args()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    crate::queue_arm_gate::check(
-        command,
-        &args,
-        &crate::queue_arm_gate::process_caller(),
-        None,
-    )
+    crate::queue_arm_gate::check(command, &args, &crate::queue_arm_gate::process_caller())
 }
 
 /// Arm GitHub-native auto-merge on the validated head.
@@ -693,7 +690,7 @@ fn native_arm_command(
 ) -> Result<Command, String> {
     let query = r"mutation($prId:ID!,$head:GitObjectID!){enablePullRequestAutoMerge(input:{pullRequestId:$prId,mergeMethod:MERGE,expectedHeadOid:$head}){pullRequest{id}}}";
     let mut command = gh(client, cwd)?;
-    mark_internal_queue_mutation(&mut command).args([
+    mark_internal_queue_mutation(&mut command)?.args([
         "api",
         "graphql",
         "-f",
@@ -712,15 +709,16 @@ fn prepare_classic_merge(
     merge_method: MergeMethod,
     delete_branch: bool,
     admin: bool,
-) {
+) -> Result<(), String> {
     // On a queue-governed base a plain `gh pr merge` enqueues, so the arm
     // guard would otherwise re-read and re-judge Shipyard's own merge.
-    mark_internal_queue_mutation(command).args(classic_merge_args(
+    mark_internal_queue_mutation(command)?.args(classic_merge_args(
         state,
         merge_method,
         delete_branch,
         admin,
     ));
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -954,7 +952,7 @@ fn merge_pr(
             merge_method,
             delete_branch && !isolated_branch_cleanup,
             admin,
-        );
+        )?;
         gate_landing(&command)?;
     }
     let output = command
@@ -2510,7 +2508,7 @@ fn run_queue_mutation(
     // The ghapp wrapper rejects raw queue-removal mutations. This marker is
     // limited to Shipyard's exact-head, machine-authorized, write-ahead-audited
     // path and lets that guard distinguish it from an ad-hoc GraphQL call.
-    mark_internal_queue_mutation(&mut command);
+    mark_internal_queue_mutation(&mut command)?;
     let guard =
         MergeQueueMutationGuard::acquire_in_mode(store, cwd, mode, global_dir, state, action)?;
     let output = command
@@ -3324,6 +3322,7 @@ fn fields(items: impl IntoIterator<Item = (&'static str, Value)>) -> BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::merge_queue::INTERNAL_QUEUE_MUTATION_ENV;
     use crate::ship_state::DispatchedRun;
 
     #[test]
@@ -4227,7 +4226,8 @@ mod tests {
             "policy",
         );
         let mut command = Command::new("gh");
-        prepare_classic_merge(&mut command, &state, MergeMethod::Merge, false, false);
+        prepare_classic_merge(&mut command, &state, MergeMethod::Merge, false, false)
+            .expect("marked");
         assert_eq!(
             command_env(&command, INTERNAL_QUEUE_MUTATION_ENV).as_deref(),
             Some("1")

@@ -1287,7 +1287,6 @@ fn handle_ship_variant<W: Write>(
         foreground,
         no_arm: _,
         arm: _,
-        arm_reason,
         body_append,
     } = command
     else {
@@ -1324,7 +1323,6 @@ fn handle_ship_variant<W: Write>(
             invocation: ship_cmd::ShipInvocation::Direct,
             foreground,
             arm_auto_merge,
-            arm_reason,
             leave_unarmed: arm_auto_merge.leaves_unarmed(),
             body_append,
         },
@@ -1367,7 +1365,6 @@ fn handle_pr_variant<W: Write>(
         no_steward_handoff,
         no_arm: _,
         arm: _,
-        arm_reason,
         fold,
         body_append,
     } = command
@@ -1420,7 +1417,6 @@ fn handle_pr_variant<W: Write>(
             },
             python_command: None,
             arm_auto_merge,
-            arm_reason,
             fold,
             body_append,
         },

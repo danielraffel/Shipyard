@@ -756,11 +756,31 @@ continuously-active-writer Phase 2 boundary.
 - **Guard marker:** every queue-mutating `gh` command Shipyard issues itself
   (the exact-head native auto-merge arm, the classic `gh pr merge`, the audited
   disable/dequeue revocations, and the merge steward's enqueue) sets
-  `SHIPYARD_INTERNAL_QUEUE_MUTATION=1`. When `gh` resolves to the `ghapp`
-  wrapper, its queue-removal and queue-arm guards honour that marker instead of
-  re-judging a call Shipyard's own admission rules above already made (the
-  removal guard only when its calling process is the Shipyard binary); reads
-  never carry it. An ad-hoc arm without it is classified live and refused for a
+  `SHIPYARD_INTERNAL_QUEUE_MUTATION=1` with a fresh one-shot nonce for that
+  call (`crate::queue_arm_gate::mark_internal_queue_mutation`). When `gh`
+  resolves to the `ghapp` wrapper, its queue-removal and queue-arm guards
+  honour that marker, once, instead of re-judging a call Shipyard's own
+  admission rules above already made; without a valid nonce they judge it in
+  full. Reads never carry it, and Shipyard strips it, with every `GHAPP_ALLOW_*`
+  override, from every other child.
+- **Review verdict before every landing:** before the exact-head arm, a
+  re-enqueue, the classic merge or the REST merge fallback (`auto-merge`), the
+  arm on open (`ship`), and the steward's enqueue, Shipyard runs the bundled
+  `queue-arm-guard` with `SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1` and that run's own
+  nonce (`crate::queue_arm_gate::check`). It lands only a head carrying an
+  exact-head `verdict: APPROVE head:<sha>` from an allowed signer, bound to the
+  request (`expectedHeadOid`, `--match-head-commit`, `sha=`); there is no
+  override. A refusal, or a guard that cannot run, stops the mutation before it
+  reaches GitHub: `auto-merge` returns the refusal as an error rather than an
+  enqueued disposition, `ship`'s arm on open reports `Auto-merge not armed`
+  and the ship continues, and the steward records `waiting_head_approval`.
+  Every attempt, allowed or refused, appends a line to `queue-arms.jsonl` in
+  the state directory.
+- **`--no-arm`:** a ship requested with `--no-arm` (also through `shipyard pr
+  --no-arm`, which writes no steward handoff) validates only. After green
+  validation it skips this merge phase and reports `GreenNotMerged` with
+  `left unarmed (--no-arm)`, foreground or daemon-owned
+  (`QueuedShipRequest.leave_unarmed`). An ad-hoc arm without it is classified live and refused for a
   queued, armed, merged/closed, unreadable, or same-head-ejected PR.
 - **Revocation authority:** an active ship-state owns native auto-merge and
   queue authority only while its validated `head_sha` still equals the live PR

@@ -4,15 +4,17 @@
 //! [`crate::cloud::GitHubActions::run_gh_internal_queue_mutation`], the
 //! transport the steward, the carrier and base-health jumps all use, and
 //! asserts on what reached the fake `gh`: the mutation itself only when the
-//! guard allowed it.
+//! guard allowed it. They need a Unix `gh` script and Python; the portable
+//! cases are in `portable_tests`.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
+use super::is_refusal;
 use super::tests_support::with_real_guard;
-use super::{is_landing_request, is_refusal};
 use crate::cloud::GitHubActions;
 
 const REPO: &str = "Generous-Corp/pulp";
@@ -33,6 +35,7 @@ impl Fixture {
         let temp = tempfile::tempdir().expect("temp");
         let answers = json!([
             ["enqueuePullRequest", {"json": {"data": {"enqueuePullRequest": {"mergeQueueEntry": {"position": 1}}}}}],
+            ["dequeuePullRequest", {"json": {"data": {"dequeuePullRequest": {"clientMutationId": null}}}}],
             ["enablePullRequestAutoMerge", {"json": {"data": {"enablePullRequestAutoMerge": {"pullRequest": {"number": 4242}}}}}],
             ["contents/.shipyard/config.toml", {"text": base_config}],
             ["/reviews", {"pages": [[]]}],
@@ -53,9 +56,12 @@ impl Fixture {
             &gh,
             &format!(
                 r"#!/usr/bin/env python3
-import json, sys
+import json, os, sys
 argv = ' '.join(sys.argv[1:])
 open({calls:?}, 'a').write(argv + '\n')
+open({calls:?} + '.env', 'a').write(' '.join(os.environ.get(name, '-') for name in (
+    'SHIPYARD_INTERNAL_QUEUE_MUTATION', 'SHIPYARD_QUEUE_MUTATION_NONCE',
+    'SHIPYARD_QUEUE_MUTATION_NONCE_DIR')) + '\n')
 for needle, answer in json.load(open({table:?})):
     if needle not in argv:
         continue
@@ -104,35 +110,32 @@ sys.exit(3)
         })
     }
 
-    /// An operator's `--arm` (native auto-merge), through the transport
-    /// `ship` uses for it, guard live.
-    fn arm(&self, reason: Option<&str>) -> Result<String, String> {
-        let requested = super::OperatorOverride {
-            operator: "operator@host".to_owned(),
-            reason: reason.map(str::to_owned),
-        };
+    /// `ship`'s arm (also what `--arm` asks for), through its plain
+    /// transport, guard live.
+    fn arm(&self) -> Result<String, String> {
         with_real_guard(&self.ledger_path(), &self.guards(), || {
             self.actions
-                .run_gh_with_operator_override(
-                    &crate::auto_arm::arm_mutation_args_at_head("PR_kwDOpulp4242", HEAD),
-                    &requested,
-                )
+                .run_gh(&crate::auto_arm::arm_mutation_args_at_head(
+                    "PR_kwDOpulp4242",
+                    HEAD,
+                ))
                 .map_err(|error| error.to_string())
         })
+    }
+
+    /// The marker, nonce and nonce directory each `gh` call carried.
+    fn call_envs(&self) -> Vec<Vec<String>> {
+        fs::read_to_string(self.temp.path().join("calls.env"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.split(' ').map(str::to_owned).collect())
+            .collect()
     }
 
     fn armed(&self) -> bool {
         self.calls()
             .lines()
             .any(|line| line.contains("enablePullRequestAutoMerge"))
-    }
-
-    fn overrides(&self) -> Vec<Value> {
-        fs::read_to_string(self.guards().join("overrides.jsonl"))
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("override line"))
-            .collect()
     }
 
     fn calls(&self) -> String {
@@ -197,7 +200,6 @@ fn assert_refused(fixture: &Fixture, result: &Result<String, String>, expected: 
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn steward_enqueue_of_an_unverdicted_head_is_refused() {
     let fixture = Fixture::new(&json!([]), SIGNED_BASE);
@@ -209,7 +211,6 @@ fn steward_enqueue_of_an_unverdicted_head_is_refused() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn steward_enqueue_with_a_verdict_naming_another_head_is_refused() {
     let fixture = Fixture::new(&approve(OTHER_HEAD, "reviewer: pulp-review\n"), SIGNED_BASE);
@@ -221,7 +222,6 @@ fn steward_enqueue_with_a_verdict_naming_another_head_is_refused() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn steward_enqueue_bound_to_another_head_is_refused() {
     // The verdict names the live head, but the mutation would land another.
@@ -232,7 +232,6 @@ fn steward_enqueue_bound_to_another_head_is_refused() {
     assert!(!fixture.mutated(), "{}", fixture.calls());
 }
 
-#[cfg(unix)]
 #[test]
 fn steward_enqueue_with_a_signer_not_on_the_list_is_refused() {
     let fixture = Fixture::new(&approve(HEAD, "reviewer: impostor\n"), SIGNED_BASE);
@@ -244,7 +243,6 @@ fn steward_enqueue_with_a_signer_not_on_the_list_is_refused() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn steward_enqueue_with_an_unattributed_session_stamp_is_refused() {
     let fixture = Fixture::new(
@@ -257,7 +255,6 @@ fn steward_enqueue_with_an_unattributed_session_stamp_is_refused() {
     assert_refused(&fixture, &result, "its session stamp is unattributed");
 }
 
-#[cfg(unix)]
 #[test]
 fn steward_enqueue_with_a_session_line_off_the_hosts_allowlist_is_refused() {
     let fixture = Fixture::new(
@@ -273,7 +270,6 @@ fn steward_enqueue_with_a_session_line_off_the_hosts_allowlist_is_refused() {
     assert_refused(&fixture, &result, "is not on this host's allowlist");
 }
 
-#[cfg(unix)]
 #[test]
 fn steward_enqueue_of_a_signed_exact_head_approval_is_allowed_and_recorded() {
     let fixture = Fixture::new(&approve(HEAD, "reviewer: pulp-review\n"), SIGNED_BASE);
@@ -293,7 +289,6 @@ fn steward_enqueue_of_a_signed_exact_head_approval_is_allowed_and_recorded() {
     assert!(entry["caller"].is_string(), "{entry}");
 }
 
-#[cfg(unix)]
 #[test]
 fn every_attempt_appends_one_ledger_line() {
     let fixture = Fixture::new(&approve(HEAD, "reviewer: pulp-review\n"), SIGNED_BASE);
@@ -307,7 +302,6 @@ fn every_attempt_appends_one_ledger_line() {
     assert_eq!(verdicts, ["refused", "allowed"]);
 }
 
-#[cfg(unix)]
 #[test]
 fn a_guard_that_cannot_run_refuses_and_is_recorded() {
     let temp = tempfile::tempdir().expect("temp");
@@ -323,7 +317,7 @@ fn a_guard_that_cannot_run_refuses_and_is_recorded() {
         format!("query={ENQUEUE}"),
     ];
     let error = with_real_guard(&ledger, temp.path(), || {
-        super::check(&gh, &args, "shipyard test", None)
+        super::check(&gh, &args, "shipyard test")
     })
     .expect_err("refused");
     assert!(is_refusal(&error), "{error}");
@@ -333,48 +327,9 @@ fn a_guard_that_cannot_run_refuses_and_is_recorded() {
     assert_eq!(entry["caller"], "shipyard test", "{entry}");
 }
 
-#[test]
-fn only_requests_that_can_land_are_gated() {
-    let argv = |words: &[&str]| {
-        words
-            .iter()
-            .map(|word| (*word).to_owned())
-            .collect::<Vec<_>>()
-    };
-    for landing in [
-        argv(&["api", "graphql", "-f", &format!("query={ENQUEUE}")]),
-        argv(&[
-            "api",
-            "graphql",
-            "-f",
-            "query=mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id}){pullRequest{id}}}",
-        ]),
-        argv(&["pr", "merge", "7", "--match-head-commit", HEAD, "--merge"]),
-        argv(&["api", "-X", "PUT", "repos/o/r/pulls/7/merge", "-f", "sha=x"]),
-    ] {
-        assert!(is_landing_request(&landing), "{landing:?}");
-    }
-    for read in [
-        argv(&["api", "repos/o/r/pulls/7"]),
-        argv(&["api", "-X", "GET", "repos/o/r/pulls/7/merge"]),
-        argv(&["pr", "view", "7"]),
-        argv(&["pr", "merge", "7", "--disable-auto"]),
-        argv(&[
-            "api",
-            "graphql",
-            "-f",
-            "query=mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){pullRequest{id}}}",
-        ]),
-        argv(&["api", "graphql", "-f", "query=query{viewer{login}}"]),
-    ] {
-        assert!(!is_landing_request(&read), "{read:?}");
-    }
-}
-
 /// The steward's transport, not just the gate in isolation: without the
 /// real guard, the same unverdicted enqueue reaches GitHub. This is the
 /// control for the refusals above.
-#[cfg(unix)]
 #[test]
 fn without_the_guard_the_same_request_reaches_github() {
     let fixture = Fixture::new(&json!([]), SIGNED_BASE);
@@ -392,14 +347,12 @@ fn without_the_guard_the_same_request_reaches_github() {
     assert!(fixture.mutated());
 }
 
-/// `--arm` on a head with no verdict: the guard judges it and, with no stated
-/// reason, refuses the override, so nothing reaches GitHub. Its refusal never
-/// points back at `--arm`.
-#[cfg(unix)]
+/// `--arm` on a head with no verdict: the guard refuses it, nothing reaches
+/// GitHub, and the refusal never points back at `--arm`.
 #[test]
 fn explicit_arm_without_a_verdict_is_refused() {
     let fixture = Fixture::new(&json!([]), SIGNED_BASE);
-    let error = fixture.arm(None).expect_err("refused");
+    let error = fixture.arm().expect_err("refused");
     assert!(is_refusal(&error), "{error}");
     assert!(
         error.contains("no reviewer verdict names head bca87fe519d6"),
@@ -409,45 +362,32 @@ fn explicit_arm_without_a_verdict_is_refused() {
     assert!(!fixture.armed(), "{}", fixture.calls());
     let entry = fixture.ledger().pop().expect("ledger line");
     assert_eq!(entry["verdict"], "refused", "{entry}");
-    let audit = fixture
-        .overrides()
-        .pop()
-        .expect("the declined override is audited");
-    assert_eq!(audit["honoured"], false, "{audit}");
-    assert_eq!(audit["operator"], "operator@host", "{audit}");
 }
 
-/// `--arm` on a head with a signed exact-head APPROVE lands on the review
-/// itself; the override is never needed.
-#[cfg(unix)]
+/// `--arm` on a head with a signed exact-head APPROVE lands on the review.
 #[test]
 fn explicit_arm_with_a_verdict_passes() {
     let fixture = Fixture::new(&approve(HEAD, "reviewer: pulp-review\n"), SIGNED_BASE);
-    fixture.arm(None).expect("allowed");
+    fixture.arm().expect("allowed");
     assert!(fixture.armed(), "{}", fixture.calls());
     let entry = fixture.ledger().pop().expect("ledger line");
     assert_eq!(entry["verdict"], "allowed", "{entry}");
     assert_eq!(entry["signer"], "pulp-review", "{entry}");
-    assert!(fixture.overrides().is_empty());
 }
 
-/// Even with a reason, an agent's environment cannot use the override.
-#[cfg(unix)]
+/// An override on the landing command reaches neither the guard nor `gh`:
+/// the unverdicted arm is refused all the same.
 #[test]
-fn explicit_arm_with_a_reason_is_refused_in_an_agent_context() {
+fn an_override_on_the_landing_command_is_stripped() {
     let fixture = Fixture::new(&json!([]), SIGNED_BASE);
     let mut gh = std::process::Command::new(fixture.temp.path().join("gh"));
-    gh.env("CLAUDECODE", "1");
-    let requested = super::OperatorOverride {
-        operator: "operator@host".to_owned(),
-        reason: Some("read it myself".to_owned()),
-    };
+    gh.env("GHAPP_ALLOW_UNREVIEWED_ARM", "1")
+        .env("GHAPP_ALLOW_QUEUE_REARM", "1");
     let error = with_real_guard(&fixture.ledger_path(), &fixture.guards(), || {
         super::check(
             &gh,
             &crate::auto_arm::arm_mutation_args_at_head("PR_kwDOpulp4242", HEAD),
             "shipyard ship",
-            Some(&requested),
         )
     })
     .expect_err("refused");
@@ -455,26 +395,73 @@ fn explicit_arm_with_a_reason_is_refused_in_an_agent_context() {
         error.contains("refusing to arm or merge an unreviewed head"),
         "{error}"
     );
-    let audit = fixture.overrides().pop().expect("audited");
-    assert_eq!(audit["honoured"], false, "{audit}");
-    assert_eq!(audit["reason"], "read it myself", "{audit}");
     assert!(
-        audit["declined"]
-            .as_str()
-            .is_some_and(|why| why.contains("CLAUDECODE")),
-        "{audit}"
+        !error.contains("is not honoured"),
+        "the override reached the guard: {error}"
     );
 }
 
-/// An override in the environment that nobody requested is stripped.
+/// Each internal mutation carries the marker with a fresh nonce whose 0600
+/// records sit in a 0700 directory; the guards' own `consume_nonce` honours
+/// each record once, and only for its purpose.
 #[test]
-fn an_unrequested_override_is_stripped() {
-    let mut command = std::process::Command::new("gh");
-    command.env(super::UNREVIEWED_OVERRIDE_ENV, "1");
-    super::apply_override(&mut command, None);
-    assert!(
-        command
-            .get_envs()
-            .any(|(key, value)| { key == super::UNREVIEWED_OVERRIDE_ENV && value.is_none() })
+fn internal_mutations_carry_a_fresh_one_shot_nonce() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new(&json!([]), SIGNED_BASE);
+    let dequeue = [
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        "query=mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}".to_owned(),
+    ];
+    for _ in 0..2 {
+        with_real_guard(&fixture.ledger_path(), &fixture.guards(), || {
+            fixture.actions.run_gh_internal_queue_mutation(&dequeue)
+        })
+        .expect("ran");
+    }
+    let envs = fixture.call_envs();
+    assert_eq!(envs.len(), 2, "{envs:?}");
+    assert_eq!(envs[0][0], "1");
+    assert_ne!(envs[0][1], envs[1][1], "each call gets its own nonce");
+    let (nonce, directory) = (&envs[0][1], PathBuf::from(&envs[0][2]));
+    assert_eq!(nonce.len(), 64, "{nonce}");
+    assert_eq!(
+        fs::metadata(&directory).expect("dir").permissions().mode() & 0o777,
+        0o700
     );
+    for purpose in [super::NONCE_INTERNAL_ARM, super::NONCE_INTERNAL_REMOVAL] {
+        let record = directory.join(super::nonce_record_name(nonce, purpose));
+        assert_eq!(
+            fs::metadata(&record).expect("record").permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let consume = |purpose: &str| {
+        let removal = crate::ghapp_guards::MANAGED_GUARDS
+            .iter()
+            .find(|guard| guard.name == "queue-removal-guard")
+            .expect("bundled");
+        let script = fixture.temp.path().join("removal_guard.py");
+        fs::write(&script, removal.contents).expect("script");
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(format!(
+                "import importlib.machinery, importlib.util\n\
+                 loader = importlib.machinery.SourceFileLoader('g', {:?})\n\
+                 module = importlib.util.module_from_spec(importlib.util.spec_from_loader('g', loader))\n\
+                 loader.exec_module(module)\n\
+                 print(module.consume_nonce({purpose:?}))",
+                script.display().to_string()
+            ))
+            .env(super::NONCE_ENV, nonce)
+            .env(super::NONCE_DIR_ENV, &directory)
+            .output()
+            .expect("python3");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    assert_eq!(consume(super::NONCE_REVIEW_ONLY), "False", "wrong purpose");
+    assert_eq!(consume(super::NONCE_INTERNAL_REMOVAL), "True");
+    assert_eq!(consume(super::NONCE_INTERNAL_REMOVAL), "False", "replayed");
+    assert_eq!(consume(super::NONCE_INTERNAL_ARM), "True");
 }

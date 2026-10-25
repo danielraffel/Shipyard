@@ -51,8 +51,6 @@ pub(super) struct PrCommandArgs {
     /// Arm GitHub-native auto-merge on the pull request once `ship` knows it.
     /// Cleared by `--no-arm`.
     pub(super) arm_auto_merge: super::cli::ArmRequest,
-    /// `--arm-reason`: why `--arm` lands an unapproved head.
-    pub(super) arm_reason: Option<String>,
     /// Sibling branches whose own commits are carried onto this branch first.
     pub(super) fold: Vec<String>,
     /// Forwarded to `ship`: text appended to the pull request body once.
@@ -339,7 +337,6 @@ pub(super) fn pr_command<W: Write>(
             invocation: ShipInvocation::PrCommand,
             foreground: false,
             arm_auto_merge: args.arm_auto_merge,
-            arm_reason: args.arm_reason,
             leave_unarmed: args.arm_auto_merge.leaves_unarmed(),
             body_append: args.body_append,
         },
@@ -870,7 +867,6 @@ mod tests {
             steward_handoff_preference: StewardHandoffPreference::ProjectDefault,
             python_command: None,
             arm_auto_merge: crate::app::cli::ArmRequest::Off,
-            arm_reason: None,
             fold: Vec::new(),
             body_append: None,
         }

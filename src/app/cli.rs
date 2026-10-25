@@ -739,19 +739,11 @@ pub(super) enum Command {
         /// Shipyard does make passes the queue-arm guard's review rule.
         #[arg(long = "no-arm")]
         no_arm: bool,
-        /// Arm native auto-merge, asking for the queue-arm guard's operator
-        /// override when the head carries no exact-head approval. The guard
-        /// still judges every arm: without an approval it honours the
-        /// override only for an operator at an interactive terminal, with
-        /// `--arm-reason`, and never in an agent's environment (`CLAUDECODE`,
-        /// `CLAUDE_CODE_*`, `CODEX_*`); otherwise the arm is refused. Each
-        /// attempt is recorded with the operator and the reason.
+        /// Arm native auto-merge when the head's review verdict allows it
+        /// (the default). There is no override: a head without an exact-head
+        /// approval from an allowed signer stays unarmed.
         #[arg(long = "arm", conflicts_with = "no_arm")]
         arm: bool,
-        /// Why `--arm` lands a head no reviewer approved; the override needs
-        /// one, and it is recorded with the operator who gave it.
-        #[arg(long = "arm-reason", value_name = "REASON", requires = "arm")]
-        arm_reason: Option<String>,
         /// Execute in this terminal for debugging instead of daemon ownership.
         #[arg(long)]
         foreground: bool,
@@ -848,19 +840,11 @@ pub(super) enum Command {
         /// signer.
         #[arg(long = "no-arm")]
         no_arm: bool,
-        /// Arm native auto-merge, asking for the queue-arm guard's operator
-        /// override when the head carries no exact-head approval. The guard
-        /// still judges every arm: without an approval it honours the
-        /// override only for an operator at an interactive terminal, with
-        /// `--arm-reason`, and never in an agent's environment (`CLAUDECODE`,
-        /// `CLAUDE_CODE_*`, `CODEX_*`); otherwise the arm is refused. Each
-        /// attempt is recorded with the operator and the reason.
+        /// Arm native auto-merge when the head's review verdict allows it
+        /// (the default). There is no override: a head without an exact-head
+        /// approval from an allowed signer stays unarmed.
         #[arg(long = "arm", conflicts_with = "no_arm")]
         arm: bool,
-        /// Why `--arm` lands a head no reviewer approved; the override needs
-        /// one, and it is recorded with the operator who gave it.
-        #[arg(long = "arm-reason", value_name = "REASON", requires = "arm")]
-        arm_reason: Option<String>,
         /// Before anything else, cherry-pick this sibling branch's own commits
         /// (over origin/<base>; merges, version bumps and patches already here
         /// are skipped) onto the current branch. Repeatable; all-or-nothing.
@@ -3804,9 +3788,7 @@ impl Command {
     #[must_use]
     pub(crate) const fn arm_auto_merge(&self) -> Option<ArmRequest> {
         match self {
-            Self::Ship { no_arm, arm, .. } | Self::Pr { no_arm, arm, .. } => Some(if *arm {
-                ArmRequest::Override
-            } else if *no_arm {
+            Self::Ship { no_arm, .. } | Self::Pr { no_arm, .. } => Some(if *no_arm {
                 ArmRequest::Off
             } else {
                 ArmRequest::Default
@@ -3821,12 +3803,9 @@ impl Command {
 pub(crate) enum ArmRequest {
     /// `--no-arm`: leave auto-merge alone.
     Off,
-    /// Arm, subject to every refusal, including the repository's
-    /// head-approval policy.
+    /// Arm (the default, or `--arm`), subject to every refusal, including
+    /// the queue-arm guard's review rule, which has no override.
     Default,
-    /// `--arm`: arm, asking the queue-arm guard for its audited operator
-    /// override when the head carries no approval.
-    Override,
 }
 
 impl ArmRequest {
@@ -4695,7 +4674,7 @@ mod tests {
             ),
             (
                 vec!["shipyard", "pr", "--arm"],
-                Some(super::ArmRequest::Override),
+                Some(super::ArmRequest::Default),
             ),
             (vec!["shipyard", "ship"], Some(super::ArmRequest::Default)),
             (
@@ -4704,7 +4683,7 @@ mod tests {
             ),
             (
                 vec!["shipyard", "ship", "--arm"],
-                Some(super::ArmRequest::Override),
+                Some(super::ArmRequest::Default),
             ),
         ] {
             let cli = Cli::try_parse_from(argv.clone()).expect("parses");
@@ -4718,7 +4697,6 @@ mod tests {
     fn no_arm_conflicts_with_a_steward_handoff() {
         assert!(super::ArmRequest::Off.leaves_unarmed());
         assert!(!super::ArmRequest::Default.leaves_unarmed());
-        assert!(!super::ArmRequest::Override.leaves_unarmed());
         for flag in ["--workstream-id", "--context-url"] {
             let error = Cli::try_parse_from(["shipyard", "pr", "--no-arm", flag, "x"])
                 .expect_err("--no-arm conflicts with a handoff flag");

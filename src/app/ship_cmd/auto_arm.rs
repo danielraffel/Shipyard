@@ -56,16 +56,13 @@ pub(super) type RunGh<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
 /// [`crate::environment_requeue::CONFIG_KEY`]: when set, a head ejected once
 /// for an environment failure is armed without a new push.
 ///
-/// `override_by` is set when the operator passed `--arm`: a head the
-/// head-approval gate ([`crate::head_approval`]) refuses still goes to the
-/// queue-arm guard, which honours or refuses the operator override itself.
-/// Every other refusal still applies.
+/// The head-approval gate ([`crate::head_approval`]) and then the queue-arm
+/// guard's review rule decide every arm; neither has an override.
 pub(super) fn arm_native_auto_merge(
     run_gh: RunGh<'_>,
     repo: &str,
     pr: u64,
     environment_opt_in: bool,
-    override_by: Option<&str>,
 ) -> ArmOutcome {
     let facts = match read_pr_facts(run_gh, repo, pr) {
         Ok(facts) => facts,
@@ -93,16 +90,7 @@ pub(super) fn arm_native_auto_merge(
     let excuse = environment
         .as_ref()
         .is_some_and(crate::environment_requeue::EnvironmentRequeue::is_allowed_interruption);
-    let override_note = match approval_note(
-        run_gh,
-        repo,
-        pr,
-        &verdict,
-        &queue,
-        &facts,
-        override_by,
-        excuse,
-    ) {
+    let override_note = match approval_note(run_gh, repo, pr, &verdict, &queue, &facts, excuse) {
         Ok(note) => note,
         Err(refusal) => return refusal,
     };
@@ -230,28 +218,18 @@ fn approval_note(
     verdict: &ArmVerdict,
     queue: &Value,
     facts: &PrFacts,
-    override_by: Option<&str>,
     excuse_latest_ejection: bool,
 ) -> Result<String, ArmOutcome> {
     if let ArmVerdict::Skip(_) = verdict {
         return Ok(String::new());
     }
-    match (
-        head_gate(run_gh, repo, pr, queue, facts, excuse_latest_ejection),
-        override_by,
-    ) {
-        (Ok(gate), _) if gate.allows() => Ok(String::new()),
-        // The queue-arm guard, which judges the arm itself, decides whether
-        // the operator's override applies, and records it either way.
-        (_, Some(by)) => Ok(format!(
-            " Armed under the queue-arm guard's operator override, requested by {by} with \
-             `--arm`; the guard recorded who and why."
-        )),
-        (Ok(gate), None) => Err(skipped(format!(
+    match head_gate(run_gh, repo, pr, queue, facts, excuse_latest_ejection) {
+        Ok(gate) if gate.allows() => Ok(String::new()),
+        Ok(gate) => Err(skipped(format!(
             "▸ Auto-merge not armed on #{pr}: {}.",
             gate.explain()
         ))),
-        (Err(detail), None) => Err(skipped(format!(
+        Err(detail) => Err(skipped(format!(
             "⚠︎ Auto-merge not armed on #{pr}: whether its head is approved could not \
              be read ({detail}); refusing to arm blind."
         ))),
@@ -288,8 +266,7 @@ fn head_gate(
 }
 
 /// Act on what the invocation asked of auto-merge: nothing for `--no-arm`,
-/// an approval-gated arm by default, and an override for `--arm` that names
-/// [`operator_identity`] as who armed it.
+/// otherwise an arm the review verdict decides.
 pub(super) fn arm_for_request(
     run_gh: RunGh<'_>,
     repo: &str,
@@ -297,39 +274,7 @@ pub(super) fn arm_for_request(
     environment_opt_in: bool,
     request: crate::app::cli::ArmRequest,
 ) -> Option<ArmOutcome> {
-    use crate::app::cli::ArmRequest;
-    let override_by = match request {
-        ArmRequest::Off => return None,
-        ArmRequest::Default => None,
-        ArmRequest::Override => Some(operator_identity()),
-    };
-    Some(arm_native_auto_merge(
-        run_gh,
-        repo,
-        pr,
-        environment_opt_in,
-        override_by.as_deref(),
-    ))
-}
-
-/// Who is running this command, for the record an `--arm` override leaves.
-///
-/// The GitHub credential is shared by every agent on a host, so it names no
-/// one; the operating-system user and host name at least name the machine and
-/// account the override came from.
-pub(super) fn operator_identity() -> String {
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "an unknown user".to_owned());
-    let host = std::process::Command::new("hostname")
-        .arg("-s")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|host| !host.is_empty())
-        .unwrap_or_else(|| "an unknown host".to_owned());
-    format!("{user}@{host}")
+    (!request.leaves_unarmed()).then(|| arm_native_auto_merge(run_gh, repo, pr, environment_opt_in))
 }
 
 fn skipped(line: String) -> ArmOutcome {

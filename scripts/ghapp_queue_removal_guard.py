@@ -178,107 +178,71 @@ def is_queue_removal(args: list[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Who is asking: the internal marker is Shipyard's, and only Shipyard's.
+# Who is asking: the internal marker is Shipyard's, and only for the one call
+# Shipyard built it for.
 # ---------------------------------------------------------------------------
 
-# Processes that sit between Shipyard and this guard without deciding anything:
-# the ghapp wrapper's shell, a `gh` shim that execs it, `env`, `timeout`.
-# Python is not among them: no Shipyard path reaches ghapp through a Python
-# helper, and a Python-driven agent is a deciding process like any other.
-WRAPPER_PROCESSES = {"bash", "sh", "zsh", "dash", "env", "timeout", "gh", "ghapp"}
+# Shipyard puts a fresh random nonce in the environment of exactly the `gh`
+# (or guard) child it builds for one of its own queue mutations, and writes a
+# record for it: a 0600 file, in a 0700 directory it owns, named by the
+# SHA-256 of the nonce and the purpose it is for. A guard honours a marker only
+# when it can consume that record: it opens the file without following links,
+# checks it is a regular file owned by this user, readable by no one else,
+# younger than NONCE_MAX_AGE_SECONDS and naming the purpose, then unlinks it.
+# Unlinking is the claim, so each record is honoured once. A marker without a
+# nonce, with a wrong or reused one, or with a record that fails any check is
+# ignored and the request is judged in full. This ties the marker to a call
+# Shipyard made rather than to whoever exported it; it is not a boundary
+# against a process of the same user that forges Shipyard's own state.
+NONCE_ENV = "SHIPYARD_QUEUE_MUTATION_NONCE"
+NONCE_DIR_ENV = "SHIPYARD_QUEUE_MUTATION_NONCE_DIR"
+NONCE_MAX_AGE_SECONDS = 600
+# The purposes Shipyard issues records for; one record serves one guard once.
+NONCE_INTERNAL_REMOVAL = "internal-removal"
+NONCE_INTERNAL_ARM = "internal-arm"
+NONCE_REVIEW_ONLY = "review-only"
 
 
-def _process_name_and_parent(pid: int) -> tuple[str, int] | None:
-    try:
-        output = subprocess.run(
-            ["/bin/ps", "-o", "ppid=", "-o", "comm=", "-p", str(pid)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
-    parent, _, command = output.partition(" ")
-    command = command.strip()
-    try:
-        return command, int(parent.strip())
-    except ValueError:
-        return None
+def nonce_record_name(nonce: str, purpose: str) -> str:
+    """The record's file name: what Shipyard writes and the guard looks for."""
+    import hashlib
+
+    return hashlib.sha256(f"{nonce}:{purpose}".encode("utf-8")).hexdigest()
 
 
-def executable_path(pid: int) -> str | None:
-    """The real executable of ``pid``, from the kernel rather than its name."""
-    if sys.platform.startswith("linux"):
-        try:
-            return os.readlink(f"/proc/{pid}/exe")
-        except OSError:
-            return None
-    if sys.platform == "darwin":
-        try:
-            import ctypes
+def consume_nonce(purpose: str) -> bool:
+    """Whether this process carries Shipyard's one-shot nonce for ``purpose``,
+    consuming its record. Never raises."""
+    import stat
+    import time
 
-            libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
-            buffer = ctypes.create_string_buffer(4096)
-            length = libproc.proc_pidpath(ctypes.c_int(pid), buffer, ctypes.c_uint32(4096))
-        except (OSError, AttributeError):
-            return None
-        return buffer.value.decode("utf-8", "replace") if length > 0 else None
-    return None
-
-
-def process_ancestry(limit: int = 8) -> list[tuple[str, str | None]]:
-    """``(basename, executable path)`` from this guard's parent upward, nearest first."""
-    entries: list[tuple[str, str | None]] = []
-    pid = os.getppid()
-    while pid > 1 and len(entries) < limit:
-        found = _process_name_and_parent(pid)
-        if found is None:
-            break
-        command, parent = found
-        entries.append((posixpath.basename(command).lstrip("-"), executable_path(pid)))
-        pid = parent
-    return entries
-
-
-def install_roots() -> list[pathlib.Path]:
-    """Where an installed Shipyard binary lives: one auth generation per release."""
-    return [pathlib.Path.home() / ".local" / "share" / "shipyard" / "auth-generations"]
-
-
-def is_installed_shipyard(path: str | None, roots: list[pathlib.Path]) -> bool:
-    """Whether ``path`` resolves to a ``shipyard`` binary under an install root."""
-    if not path:
+    nonce = os.environ.get(NONCE_ENV, "")
+    directory = os.environ.get(NONCE_DIR_ENV, "")
+    if not re.fullmatch(r"[0-9a-f]{64}", nonce) or not directory:
         return False
-    real = pathlib.Path(os.path.realpath(path))
-    if real.name != "shipyard":
+    try:
+        uid = os.getuid()
+        info = os.lstat(directory)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != uid
+                or info.st_mode & 0o077):
+            return False
+        path = os.path.join(directory, nonce_record_name(nonce, purpose))
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            record = os.fstat(descriptor)
+            if (not stat.S_ISREG(record.st_mode) or record.st_uid != uid
+                    or record.st_mode & 0o077
+                    or time.time() - record.st_mtime > NONCE_MAX_AGE_SECONDS):
+                return False
+            content = os.read(descriptor, 256).decode("utf-8", "replace").strip()
+        finally:
+            os.close(descriptor)
+        if content != purpose:
+            return False
+        os.unlink(path)
+    except (OSError, AttributeError, ValueError):
         return False
-    for root in roots:
-        resolved = pathlib.Path(os.path.realpath(root))
-        if resolved == real.parent or resolved in real.parents:
-            return True
-    return False
-
-
-def shipyard_parent(
-    ancestry: list[tuple[str, str | None]] | None = None,
-    roots: list[pathlib.Path] | None = None,
-) -> bool:
-    """True when the nearest deciding ancestor is the installed Shipyard binary.
-
-    Shells and the ghapp wrapper are skipped; the first other process decides.
-    An agent that exports the marker from its own shell has that agent
-    (codex, node, claude, python) as the nearest deciding ancestor, even when
-    the agent itself was launched by a Shipyard process. The deciding process
-    must also run an executable that resolves under a Shipyard install root,
-    read from the kernel, so a binary merely named ``shipyard`` does not pass.
-    """
-    roots = install_roots() if roots is None else roots
-    for name, path in process_ancestry() if ancestry is None else ancestry:
-        if name in WRAPPER_PROCESSES:
-            continue
-        return name == "shipyard" and is_installed_shipyard(path, roots)
-    return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +531,7 @@ def main(args: list[str]) -> int:
         if not is_queue_removal(args):
             return 0
     except GuardError as error:
-        if marker and shipyard_parent():
+        if marker and consume_nonce(NONCE_INTERNAL_REMOVAL):
             return 0
         if override:
             print(
@@ -581,11 +545,11 @@ def main(args: list[str]) -> int:
         print(f"queue-removal-guard: refusing ambiguous API request: {error}", file=sys.stderr)
         return 1
     if marker:
-        if shipyard_parent():
+        if consume_nonce(NONCE_INTERNAL_REMOVAL):
             return 0
         print(
-            "queue-removal-guard: ignoring SHIPYARD_INTERNAL_QUEUE_MUTATION=1: the "
-            "calling process is not the Shipyard binary, so it cannot claim "
+            "queue-removal-guard: ignoring SHIPYARD_INTERNAL_QUEUE_MUTATION=1: it carries "
+            "no valid one-shot nonce from a call Shipyard made, so it cannot claim "
             "Shipyard's authority.",
             file=sys.stderr,
         )

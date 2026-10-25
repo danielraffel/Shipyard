@@ -216,9 +216,12 @@ wrapper. Each attempt, allowed or refused, appends a line to
 `queue-arms.jsonl` in Shipyard's state directory (`repo`, `pr`, `head`,
 `verb`, `verdict`, `verdict_comment_id`, `signer`, `caller`; override the path
 with `SHIPYARD_QUEUE_ARMS_LOG`). A guard that cannot run (no `python3` 3.11+)
-refuses. The steward reports a refusal as `waiting_head_approval`. `--arm` is
-a request for the guard's own audited override (`GHAPP_ALLOW_UNREVIEWED_ARM`),
-recorded with the operator and `--arm-reason`, and declined to agents.
+refuses. The steward reports a refusal as `waiting_head_approval`. There is no
+override: `--arm` asks only for an arm the verdict allows, and
+`GHAPP_ALLOW_UNREVIEWED_ARM` is refused and audited. The review-only switch
+and Shipyard's internal marker count only with the one-shot nonce Shipyard
+issues for that call; exported by hand, they are ignored and every rule
+applies.
 
 **Head approval.** A repository whose base branch sets
 `[auto_merge] arm_requires_head_approval = true` (the default for pulp, vellum,
@@ -272,9 +275,7 @@ approval newer than its last removal; the line lists each removal's reason.
 Removals are counted from the last 100 timeline events only, so a very busy pull
 request can under-count them; that errs lenient (an approval is still required),
 never strict.
-`--arm` asks the queue-arm guard for its operator override, which it honours
-only with `--arm-reason`, at an interactive terminal and outside an agent's
-environment; otherwise the arm is refused like any other. Rebasing
+`--arm` has no override: it arms only what the verdict allows. Rebasing
 an approved pull request produces a new head with no approval, so it stays
 disarmed until it is approved again.
 

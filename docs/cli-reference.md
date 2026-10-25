@@ -224,9 +224,8 @@ shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --works
 shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-form handoff identifiers
 shipyard pr --no-arm                                # validate only: no arm, no steward handoff, no merge phase;
                                                     #   conflicts with --workstream-id/--context-url
-shipyard pr --arm --arm-reason "..."                # ask the queue-arm guard's operator override for an unapproved
-                                                    #   head: honoured only at an interactive terminal, outside an
-                                                    #   agent's environment; recorded with operator and reason
+shipyard pr --arm                                   # arm when the head's review verdict allows it (the default);
+                                                    #   there is no override for an unapproved head
                                                     # title/body come from origin/<base>..HEAD non-merge commits (never empty);
                                                     #   [pr.body] attribution = "..." closes every composed body once
 shipyard pr --body-append "Proxy: ..."              # add text to the PR body once, after the attribution line and before the
