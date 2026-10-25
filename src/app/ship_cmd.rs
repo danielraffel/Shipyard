@@ -387,7 +387,7 @@ pub(super) fn ship_command<W: Write>(
     // nothing to arm. See `auto_arm`'s module docs.
     if !repo.is_empty() {
         let arm_actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
-        let outcome = auto_arm::arm_for_request(
+        let outcome = auto_arm::arm_for_request_with_head(
             &|gh_args: &[String]| {
                 arm_actions
                     .run_gh(gh_args)
@@ -400,6 +400,7 @@ pub(super) fn ship_command<W: Write>(
                 .and_then(toml::Value::as_bool)
                 == Some(true),
             args.arm_auto_merge,
+            delegated_witness.as_ref().map(|witness| witness.head_sha.as_str()),
         );
         if let Some(outcome) = outcome {
             report_arm_outcome(&outcome, json_mode, stdout)?;
