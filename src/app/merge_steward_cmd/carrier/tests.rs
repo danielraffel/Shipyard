@@ -372,7 +372,7 @@ fn apply_leaves_a_head_whose_tiered_check_is_deferred_disarmed() {
     let error = report.prs[0].error.as_deref().unwrap_or_default();
     assert!(
         error.contains(
-            "dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"
+            "dispatch `build.yml` with `pr_number=42` as the fleet App and wait for the full lane"
         ),
         "{report:?}"
     );

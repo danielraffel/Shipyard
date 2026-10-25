@@ -223,6 +223,9 @@ ACTIONS_APP = "github-actions"
 DEFERRED_TIER = "deferred"
 # The log group the runner prints in "Set up job" listing the token's scopes.
 TOKEN_PERMISSIONS_HEADER = "GITHUB_TOKEN Permissions"
+# The workflow_dispatch input naming the pull request whose merge ref
+# (refs/pull/<n>/merge) the full lane checks out.
+FULL_LANE_PR_INPUT = "pr_number"
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
 MERGE_MUTATIONS = ("mergepullrequest",)
 # Same pattern as src/head_approval.rs marker_verdict.
@@ -1679,7 +1682,67 @@ def checks_scope(log: str) -> str:
     raise GuardError(f"its `{TOKEN_PERMISSIONS_HEADER}` group never closes")
 
 
+def _tested_merge(repo: str, pr: int, base: str, head: str, record: dict[str, Any],
+                  api_json: Any) -> str | None:
+    """Why a full-lane record does not prove it tested this pull request's
+    merge ref at the current head, or ``None`` when it does.
+
+    All of these must hold: ``tested_ref`` is ``refs/pull/<n>/merge`` for this
+    pull request; ``tested_sha``'s parents are exactly ``[merged_base, head]``,
+    in GitHub's order (base first, head second); and ``merged_base`` is on the
+    base branch. A bare branch, a merge of an older head, the reversed order,
+    another ref, or a record missing any of the three fields is not. Same as
+    src/deferred_tier.rs ``tested_merge``.
+    """
+    def is_sha(value: Any) -> bool:
+        return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
+
+    tested = record.get("tested_sha")
+    if not is_sha(tested):
+        return "its record names no `tested_sha`"
+    if tested.lower() == head.lower():
+        return f"it tested the bare branch at {head[:12]}, not a merge with the base"
+    merge_ref = f"refs/pull/{pr}/merge"
+    tested_ref = record.get("tested_ref")
+    if not isinstance(tested_ref, str):
+        return f"its record names no `tested_ref` ({merge_ref})"
+    if tested_ref != merge_ref:
+        return f"it tested `{tested_ref}`, not this pull request's `{merge_ref}`"
+    merged_base = record.get("merged_base")
+    if not is_sha(merged_base):
+        return "its record names no `merged_base`"
+    try:
+        commit = api_json(["api", f"repos/{repo}/commits/{tested}"])
+    except GuardError as error:
+        return f"tested commit {tested[:12]} is unreadable: {error}"
+    parents = [parent.get("sha") for parent in (commit.get("parents") or [])
+               if isinstance(parent, dict) and isinstance(parent.get("sha"), str)
+               ] if isinstance(commit, dict) else []
+    if len(parents) != 2:
+        return (f"tested commit {tested[:12]} has {len(parents)} parent(s), so it is not "
+                "a merge")
+    first, second = parents
+    # GitHub's refs/pull/<n>/merge puts the base first and the head second.
+    if second.lower() != head.lower():
+        if first.lower() == head.lower():
+            return (f"tested commit {tested[:12]} has the head as its first parent, the "
+                    f"reverse of GitHub's merge ref, so it is not {merge_ref}")
+        return (f"tested commit {tested[:12]} is not a merge of the current head {head[:12]} "
+                f"(its parents are {first[:12]} and {second[:12]}): a stale merge")
+    if first.lower() != merged_base.lower():
+        return (f"its record names `merged_base` {merged_base[:12]} but tested commit "
+                f"{tested[:12]} merged {first[:12]}")
+    try:
+        compare = api_json(["api", f"repos/{repo}/compare/{merged_base}...{base}"])
+    except GuardError as error:
+        return f"whether {merged_base[:12]} is on `{base}` is unreadable: {error}"
+    if isinstance(compare, dict) and compare.get("status") in ("identical", "ahead"):
+        return None
+    return f"tested commit {tested[:12]} merged {merged_base[:12]}, which is not on `{base}`"
+
+
 def tier_blockers(repo: str, head: str, tiered: list[str], record_app: str,
+                  pr: int, base: str,
                   api_json: Any = None, api_text: Any = None) -> list[dict[str, Any]]:
     """What holds ``head`` back for each tiered check, as ``{check, blocker, ...}``.
 
@@ -1687,8 +1750,10 @@ def tier_blockers(repo: str, head: str, tiered: list[str], record_app: str,
     print. Per tiered check, its latest check run on the head must be a
     completed GitHub Actions job, and the tier records bound to that job's run
     attempt, created by ``record_app`` (never the Actions app, whose records a
-    pull request job could PATCH), must exist and none may say ``deferred``. Then, as defence in depth, the
-    job's own token may not have been able to write check runs. Raises
+    pull request job could PATCH), must exist and none may say ``deferred``. Each
+    must show it tested this pull request's merge at the current head
+    (:func:`_tested_merge`). Then, as defence in depth, the job's own token may
+    not have been able to write check runs. Raises
     :class:`GuardError` when the check runs cannot be read in full.
     """
     api_json = api_json or run_real_gh
@@ -1702,7 +1767,7 @@ def tier_blockers(repo: str, head: str, tiered: list[str], record_app: str,
                 latest[name] = run
     blockers = []
     for check in tiered:
-        found = {"check": check, "head": head}
+        found = {"check": check, "head": head, "pr": pr}
         run = latest.get(check)
         if run is None:
             blockers.append({**found, "blocker": "pending", "status": "missing"})
@@ -1737,6 +1802,13 @@ def tier_blockers(repo: str, head: str, tiered: list[str], record_app: str,
         if deferred is not None:
             blockers.append({**found, "blocker": "deferred", "record": deferred})
             continue
+        untested = next(((record, why) for record in records
+                         if (why := _tested_merge(repo, pr, base, head, record, api_json))),
+                        None)
+        if untested is not None:
+            blockers.append({**found, "blocker": "untested_merge", "record": untested[0],
+                             "reason": untested[1]})
+            continue
         # Read only when the records would allow: a refusal needs no log.
         try:
             level = checks_scope(api_text(["api", f"repos/{repo}/actions/jobs/{run['id']}/logs"]))
@@ -1764,6 +1836,9 @@ def _explain_blocker(blocker: dict[str, Any]) -> tuple[str, str]:
                f"{record.get('selector') or 'unknown'}"
                + (f"; full suite runs in {runs_in}" if runs_in else "")
                + "); its success is not a full-suite result")
+    elif kind == "untested_merge":
+        why = (f"the full lane of tiered required check `{check}` on {head} did not test this "
+               f"pull request's merge with its base ({blocker['reason']})")
     elif kind == "checks_writable":
         why = (f"the job of tiered required check `{check}` on {head} ran with "
                f"`checks: {blocker['level']}`, so it could have rewritten its own tier record")
@@ -1776,12 +1851,13 @@ def _explain_blocker(blocker: dict[str, Any]) -> tuple[str, str]:
     if kind == "pending":
         fix = (f"wait for `{check}` to complete; the steward's native-arm backstop arms the "
                "head once it is green and its tier is full")
-    elif kind == "deferred":
-        record = blocker["record"]
+    elif kind in ("deferred", "untested_merge"):
+        record, pr = blocker["record"], blocker["pr"]
         workflow = record.get("full_lane_workflow")
         what = (f"`{workflow}`" if isinstance(workflow, str) and workflow.strip()
                 else f"the workflow of `{check}`")
-        fix = f"dispatch {what} on head {head} as the fleet App and wait for the full lane"
+        fix = (f"dispatch {what} with `{FULL_LANE_PR_INPUT}={pr}` as the fleet App and wait "
+               "for the full lane")
     elif kind == "checks_writable":
         fix = (f"give the `{check}` job `checks: read` or `checks: none` in its workflow "
                "permissions and rerun it")
@@ -1804,13 +1880,14 @@ def deferred_tier_refusal(targets: list[dict[str, Any]], repo: str | None) -> bo
         target_repo = target.get("repo") or repo
         number, head, base = target.get("pr"), target.get("head"), target.get("base")
         label = f"PR #{number}"
-        if not target_repo or not isinstance(head, str) or not head or not base:
+        if (not target_repo or not isinstance(head, str) or not head or not base
+                or not isinstance(number, int)):
             refused.append((f"{label}: cannot tell which head and base would land, so its "
                             "test tier cannot be checked", None))
             continue
         try:
             tiered, record_app = tier_policy(base_config_text(target_repo, base))
-            found = (tier_blockers(target_repo, head, tiered, record_app)
+            found = (tier_blockers(target_repo, head, tiered, record_app, number, base)
                      if tiered and record_app else [])
         except GuardError as error:
             refused.append((f"{label}: cannot read the test tier of its tiered required checks "

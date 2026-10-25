@@ -235,7 +235,7 @@ fn the_backstop_never_arms_a_deferred_head() {
     assert_eq!(status.results[0].outcome, "skipped");
     match &status.results[0].skip {
         Some(crate::auto_arm::ArmSkip::DeferredTier { detail }) => assert!(
-            detail.contains("dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"),
+            detail.contains("dispatch `build.yml` with `pr_number=42` as the fleet App and wait for the full lane"),
             "{detail}"
         ),
         other => panic!("expected a deferred-tier skip, got {other:?}"),
