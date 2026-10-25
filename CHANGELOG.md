@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03590"></a>
+## [0.359.0] - 2026-10-25
+
+- fix: retain delegated validation witnesses for merge receipts ([#933](https://github.com/danielraffel/Shipyard/pull/933))
+
 <a id="v03580"></a>
 ## [0.358.0] - 2026-10-25
 
@@ -2591,6 +2596,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.359.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.359.0
 [0.358.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.358.0
 [0.357.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.357.0
 [0.356.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.356.0
