@@ -7,9 +7,18 @@ next step, and the refusal exists because the next step is something else.
 
 ## What runs
 
-`scripts/ghapp` runs these optional guards from `$SHIPYARD_GHAPP_GUARDS_DIR`
-(default `~/.config/shipyard/guards`) before the native `gh`. A guard that is not
-present, or not executable, is skipped.
+`scripts/ghapp` runs these guards from `$SHIPYARD_GHAPP_GUARDS_DIR`
+(default `~/.config/shipyard/guards`) before the native `gh`. The two queue
+guards are required for the requests they judge: when `queue-arm-guard` is
+missing, unreadable or not executable, `ghapp` refuses every request that can
+arm, enqueue or merge (`pr merge`, `enablePullRequestAutoMerge`,
+`enqueuePullRequest`, `mergePullRequest`, a non-GET REST `pulls/<n>/merge`,
+and a GraphQL body it cannot read) with ``ghapp: queue-arm-guard is not
+installed; run `shipyard guards install` ``, and the same holds for
+`queue-removal-guard` and the requests it judges (`pr merge --disable-auto`,
+`dequeuePullRequest`, `disablePullRequestAutoMerge`). There is no override.
+Other requests pass, and any other guard that is not present, or not
+executable, is skipped.
 
 | installed name | source | refuses |
 |---|---|---|

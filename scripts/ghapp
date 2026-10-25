@@ -1600,17 +1600,115 @@ if [[ ! -f "$close_guard" || ! -x "$close_guard" ]]; then
     exit 1
 fi
 PATH="$trusted_path" "$close_guard" "${guard_arguments[@]}" || exit 1
-if [[ -x "$guards/queue-removal-guard" ]]; then
+
+# Whether this request can land a pull request (arm, enqueue, merge) or take
+# one out of the queue (dequeue, disarm). Prints `landing`, `removal`, both,
+# or nothing. A GraphQL body this wrapper cannot read (stdin) counts as both.
+# It decides only whether a missing queue guard refuses; when a guard is
+# installed, the guard judges every request itself.
+ghapp_queue_mutation_kinds() {
+    local compact="" argument body="" method="" previous="" landing=0 removal=0 fields=0
+    if [[ "${1:-}" == "pr" && "${2:-}" == "merge" ]]; then
+        for argument in "$@"; do
+            if [[ "$argument" == "--disable-auto" ]]; then
+                printf 'removal\n'
+                return 0
+            fi
+        done
+        printf 'landing\n'
+        return 0
+    fi
+    [[ "${1:-}" == "api" ]] || return 0
+    for argument in "${@:2}"; do
+        case "$previous" in
+            -X|--method) method="$argument" ;;
+            --input)
+                if [[ "$argument" == "-" ]]; then
+                    landing=1
+                    removal=1
+                elif [[ -f "$argument" && -r "$argument" ]]; then
+                    body="$body$(/usr/bin/head -c 1048576 "$argument" 2>/dev/null || true)"
+                else
+                    landing=1
+                    removal=1
+                fi
+                ;;
+        esac
+        case "$argument" in
+            -f|-F|--field|--raw-field|--input|-f?*|-F?*|--field=*|--raw-field=*|--input=*)
+                fields=1
+                ;;
+        esac
+        case "$argument" in
+            -X?*) method="${argument#-X}" ;;
+            --method=*) method="${argument#--method=}" ;;
+            --input=*)
+                landing=1
+                removal=1
+                ;;
+            *=@-)
+                landing=1
+                removal=1
+                ;;
+            *=@*)
+                if [[ -f "${argument#*=@}" && -r "${argument#*=@}" ]]; then
+                    body="$body$(/usr/bin/head -c 1048576 "${argument#*=@}" 2>/dev/null || true)"
+                else
+                    landing=1
+                    removal=1
+                fi
+                ;;
+        esac
+        compact="$compact$argument"
+        previous="$argument"
+    done
+    compact="$(printf '%s%s' "$compact" "$body" | /usr/bin/tr -d '[:space:]' | /usr/bin/tr '[:upper:]' '[:lower:]')"
+    case "$compact" in
+        *enablepullrequestautomerge*|*enqueuepullrequest*|*mergepullrequest*) landing=1 ;;
+    esac
+    case "$compact" in
+        *dequeuepullrequest*|*disablepullrequestautomerge*) removal=1 ;;
+    esac
+    # `gh api` sends GET unless told otherwise or given a field or body.
+    if [[ -z "$method" && "$fields" == 0 ]]; then
+        method="GET"
+    fi
+    if [[ "$(printf '%s' "$method" | /usr/bin/tr '[:lower:]' '[:upper:]')" != "GET" ]]; then
+        for argument in "${@:2}"; do
+            if [[ "$argument" =~ ^/?repos/[^/]+/[^/]+/pulls/[0-9]+/merge$ ]]; then
+                landing=1
+            fi
+        done
+    fi
+    [[ "$landing" == 1 ]] && printf 'landing\n'
+    [[ "$removal" == 1 ]] && printf 'removal\n'
+    return 0
+}
+
+# The two queue guards are required for the requests they judge: a missing,
+# unreadable or non-executable guard refuses every such request, with no
+# override. Requests neither guard judges pass as before.
+ghapp_queue_kinds="$(ghapp_queue_mutation_kinds "$@")"
+ghapp_guard_usable() {
+    [[ -f "$1" && -r "$1" && -x "$1" ]]
+}
+if ghapp_guard_usable "$guards/queue-removal-guard"; then
     PATH="$trusted_path" "$guards/queue-removal-guard" "$@" || exit 1
+elif [[ "$ghapp_queue_kinds" == *removal* ]]; then
+    echo "ghapp: queue-removal-guard is not installed; run \`shipyard guards install\`" >&2
+    exit 1
 fi
-# Optional, like the removal guard: an absent file means the host predates it
-# (`shipyard doctor` reports that). When present it refuses arming or enqueuing
-# a PR that is already queued, already armed, merged/closed, unreadable, or
-# ejected with no new head since; Shipyard's own path carries
-# SHIPYARD_INTERNAL_QUEUE_MUTATION=1.
-if [[ -x "$guards/queue-arm-guard" ]]; then
+# It refuses arming, enqueuing or merging a PR without an exact-head review
+# verdict, and arming or enqueuing one that is already queued, already armed,
+# merged/closed, unreadable, or ejected with no new head since. Shipyard's own
+# path carries SHIPYARD_INTERNAL_QUEUE_MUTATION=1 with a one-shot nonce.
+if ghapp_guard_usable "$guards/queue-arm-guard"; then
     PATH="$trusted_path" "$guards/queue-arm-guard" "$@" || exit 1
+elif [[ "$ghapp_queue_kinds" == *landing* ]]; then
+    echo "ghapp: queue-arm-guard is not installed; run \`shipyard guards install\`" >&2
+    exit 1
 fi
+unset ghapp_queue_kinds
 # Optional as well. It refuses `pr update-branch` / the REST and GraphQL
 # branch-refresh equivalents only when the base branch's `[merge]
 # refresh_branch` policy is "only-if-conflicting" and the refresh is provably

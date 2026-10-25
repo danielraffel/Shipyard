@@ -186,6 +186,12 @@ class GhappWrapperTests(unittest.TestCase):
             encoding="utf-8",
         )
         close_guard.chmod(0o755)
+        # Both queue guards are required for the requests they judge; these
+        # stand-ins allow everything, so each case tests only what it names.
+        for name in ("queue-removal-guard", "queue-arm-guard"):
+            stand_in = guards / name
+            stand_in.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            stand_in.chmod(0o755)
         self.environment = {
             **os.environ,
             "SHIPYARD_GITHUB_APP_TOKEN_HELPER": str(self.helper),
@@ -2117,15 +2123,108 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertTrue(self.helper_log.exists())
         self.assertFalse(self.gh_log.exists())
 
-    def test_absent_queue_arm_guard_is_optional(self) -> None:
-        self.assertFalse((self.root / "guards" / "queue-arm-guard").exists())
+    LANDINGS = (
+        ("pr", "merge", "7", "--merge", "--repo", "owner/repo"),
+        ("pr", "merge", "7", "--auto", "--match-head-commit", "a" * 40, "--repo", "owner/repo"),
+        ("api", "graphql", "-f",
+         "query=mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id}){clientMutationId}}"),
+        ("api", "graphql", "-f",
+         "query=mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){clientMutationId}}"),
+        ("api", "-X", "PUT", "repos/owner/repo/pulls/7/merge", "-f", "sha=" + "a" * 40),
+        ("api", "graphql", "--input", "-"),
+    )
+    REMOVALS = (
+        ("pr", "merge", "7", "--disable-auto", "--repo", "owner/repo"),
+        ("api", "graphql", "-f",
+         "query=mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}"),
+        ("api", "graphql", "-f",
+         "query=mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){clientMutationId}}"),
+    )
+    READS = (
+        ("api", "repos/Generous-Corp/pulp/hooks"),
+        ("api", "repos/owner/repo/pulls/7/merge"),
+        ("api", "graphql", "-f", "query=query{viewer{login}}"),
+        ("pr", "view", "7", "--repo", "owner/repo"),
+    )
 
-        result = self.run_wrapper(
-            "api", "repos/Generous-Corp/pulp/hooks"
+    def fresh(self) -> None:
+        """A clean fixture for one subtest, bound to owner/repo."""
+        self.temporary.cleanup()
+        self.setUp()
+        self.environment["GH_REPO"] = "owner/repo"
+
+    def run_quiet(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """The wrapper with an empty standard input, so a request that reads
+        its body from stdin cannot wait on the test runner's."""
+        return subprocess.run(
+            [str(self.wrapper), *args],
+            cwd=self.root,
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=60,
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.gh_log.exists())
+    def break_guard(self, name: str, how: str) -> None:
+        guard = self.root / "guards" / name
+        if how == "missing":
+            guard.unlink()
+        elif how == "not executable":
+            guard.chmod(0o644)
+        elif how == "unreadable":
+            guard.chmod(0o311)
+
+    def test_a_missing_queue_arm_guard_refuses_every_landing(self) -> None:
+        for how in ("missing", "not executable", "unreadable"):
+            for arguments in self.LANDINGS:
+                with self.subTest(how=how, arguments=arguments):
+                    self.fresh()
+                    self.break_guard("queue-arm-guard", how)
+                    result = self.run_quiet(*arguments)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(
+                        "ghapp: queue-arm-guard is not installed; run `shipyard guards install`",
+                        result.stderr,
+                    )
+                    self.assertFalse(self.gh_log.exists(), "the landing reached gh")
+
+    def test_a_missing_queue_arm_guard_still_passes_reads_and_removals(self) -> None:
+        for arguments in self.READS + self.REMOVALS:
+            with self.subTest(arguments=arguments):
+                self.fresh()
+                self.break_guard("queue-arm-guard", "missing")
+                result = self.run_quiet(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(self.gh_log.exists())
+
+    def test_a_missing_queue_removal_guard_refuses_every_removal(self) -> None:
+        for arguments in self.REMOVALS + (("api", "graphql", "--input", "-"),):
+            with self.subTest(arguments=arguments):
+                self.fresh()
+                self.break_guard("queue-removal-guard", "missing")
+                result = self.run_quiet(*arguments)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(
+                    "ghapp: queue-removal-guard is not installed; run `shipyard guards install`",
+                    result.stderr,
+                )
+                self.assertFalse(self.gh_log.exists(), "the removal reached gh")
+        for arguments in self.READS + self.LANDINGS[:5]:
+            with self.subTest(arguments=arguments):
+                self.fresh()
+                self.break_guard("queue-removal-guard", "missing")
+                result = self.run_quiet(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_installed_queue_guards_judge_as_before(self) -> None:
+        for arguments in self.LANDINGS + self.REMOVALS + self.READS:
+            with self.subTest(arguments=arguments):
+                self.fresh()
+                result = self.run_quiet(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(self.gh_log.exists())
 
     def test_branch_refresh_guard_uses_app_token_before_native_gh(self) -> None:
         guards = self.root / "guards"

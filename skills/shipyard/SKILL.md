@@ -3972,8 +3972,10 @@ leave the head alone and land it with `shipyard ship --pr <n>`. The same rule
 applies to a local `git merge origin/main` + `git push`, which no guard sees:
 under a merge queue, merge the base into a PR only to resolve a real conflict.
 
-All three guards are optional to `ghapp` (absent means skipped), so an
-un-installed or stale copy silently leaves the protection off. `shipyard guards
+A missing `queue-arm-guard` or `queue-removal-guard` makes `ghapp` refuse
+every request that guard judges ("not installed; run `shipyard guards
+install`"); the branch-refresh guard is optional (absent means skipped). A
+stale copy still leaves newer protection off. `shipyard guards
 install` places this build's exact copies (atomic rename; never overwrites a
 symlink), `shipyard guards status` exits 1 when any is missing or differs by
 content hash, `shipyard doctor` reports them under "ghapp guards" on any host
