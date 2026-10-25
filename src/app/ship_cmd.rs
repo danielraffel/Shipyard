@@ -100,6 +100,11 @@ pub(super) struct ShipCommandArgs {
     /// pull request cannot sit unqueued because nothing armed it. `--no-arm`
     /// clears it; `--arm` arms past the repository's head-approval policy.
     pub(super) arm_auto_merge: super::cli::ArmRequest,
+    /// `--arm-reason`: why `--arm` lands an unapproved head.
+    pub(super) arm_reason: Option<String>,
+    /// Skip the post-validation merge phase, which arms or enqueues
+    /// (`--no-arm`, via [`super::cli::ArmRequest::leaves_unarmed`]).
+    pub(super) leave_unarmed: bool,
     /// Text (or `@file` contents) added to the pull request body once, after
     /// the attribution line and before the provenance block.
     pub(super) body_append: Option<String>,
@@ -337,11 +342,25 @@ pub(super) fn ship_command<W: Write>(
     // nothing to arm. See `auto_arm`'s module docs.
     if !repo.is_empty() {
         let arm_actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
+        // `--arm` lands past the review rule only as the queue-arm guard's own
+        // audited operator override, which the guard decides; every other arm
+        // is judged by it plainly.
+        let operator_override =
+            (args.arm_auto_merge == super::cli::ArmRequest::Override).then(|| {
+                crate::queue_arm_gate::OperatorOverride {
+                    operator: auto_arm::operator_identity(),
+                    reason: args.arm_reason.clone(),
+                }
+            });
         let outcome = auto_arm::arm_for_request(
             &|gh_args: &[String]| {
-                arm_actions
-                    .run_gh(gh_args)
-                    .map_err(|error| error.to_string())
+                match &operator_override {
+                    Some(requested) => {
+                        arm_actions.run_gh_with_operator_override(gh_args, requested)
+                    }
+                    None => arm_actions.run_gh(gh_args),
+                }
+                .map_err(|error| error.to_string())
             },
             &repo,
             pr_context.number,
@@ -460,6 +479,7 @@ pub(super) fn ship_command<W: Write>(
         adopt_head: args.adopt_head,
         pr_snapshot_file: args.pr_snapshot_file.clone(),
         metadata_authority_receipt,
+        leave_unarmed: args.leave_unarmed,
         targets,
     };
 
@@ -572,6 +592,7 @@ pub(super) fn ship_command<W: Write>(
         args.merge_command,
         args.merge_result,
         args.pr_snapshot_file,
+        request.leave_unarmed,
     )?;
     // Issue #303: when validation failed, resolve failing-job + log diagnostics
     // before we render so the human / JSON output points the user at the
@@ -1292,6 +1313,7 @@ pub(super) fn finish_background_ship(
         None,
         None,
         request.pr_snapshot_file.clone(),
+        request.leave_unarmed,
     )?;
     Ok((
         state.exit_code(),

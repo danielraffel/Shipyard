@@ -346,15 +346,34 @@ reviewer's act: an agent landing its own head must not post the verdict.
 
 An unreadable pull request, policy or comment list refuses.
 
-**Operator override.** `GHAPP_ALLOW_UNREVIEWED_ARM=1` lands anyway. It prints
-a `WARNING` naming the refusal it overrode and appends one JSON line (`at`,
-`override`, `refusal`, `argv`, `cwd`) to `overrides.jsonl` in the guards
-directory. It is for an operator, never for an agent. `GHAPP_ALLOW_QUEUE_REARM`
+**Operator override.** `GHAPP_ALLOW_UNREVIEWED_ARM=1` lands anyway, but only
+for an operator: it needs a stated reason in
+`GHAPP_ALLOW_UNREVIEWED_ARM_REASON`, standard input on an interactive
+terminal, and no agent variable in the environment (`CLAUDECODE`,
+`CLAUDE_CODE_*`, `CODEX_*`). Honoured, it prints a `WARNING` naming the
+operator, the reason and the refusal it overrode; honoured or declined, it
+appends one JSON line (`at`, `override`, `refusal`, `argv`, `cwd`,
+`operator`, `reason`, `honoured`, and `declined` with why) to
+`overrides.jsonl` in the guards directory, and a declined override leaves the
+refusal standing. `GHAPP_ALLOW_QUEUE_REARM`
 does not stand in for it: a queue refusal it overrides still needs the review.
 A request that names no head (a GraphQL body on stdin) needs both overrides.
 Shipyard's own validated enqueue and classic merge carry
 `SHIPYARD_INTERNAL_QUEUE_MUTATION` and apply the same rule in Rust
-(`crate::head_approval`); its `--arm` override names who armed.
+(`crate::head_approval`). They no longer
+rely on that twin alone: before each arm, enqueue or merge (`ship`,
+`auto-merge`, the merge steward, the carrier, a base-health jump) Shipyard runs
+this guard itself, from the copy it bundles, with
+`SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1`. In that mode the guard applies this review
+rule and nothing else (Shipyard judges queue state), ignores the internal
+marker, applies the operator override above to `ship`/`pr --arm` (which sets
+it, with `--arm-reason` and the operator's `user@host`, and strips it
+everywhere else) and records every attempt, allowed or refused, with `caller`,
+`verdict_comment_id` and `signer`, to the ledger `SHIPYARD_QUEUE_ARMS_LOG`
+names: `queue-arms.jsonl` in Shipyard's state directory. Outside that mode
+the internal marker is honoured only when the calling process is the installed
+Shipyard binary (the removal guard's ancestry check); from anything else it is
+ignored and the request is judged in full.
 
 ### A HOLD takes its head out of the landing path
 
@@ -771,7 +790,8 @@ queue removal is refreshable.
 
 | variable | who sets it | effect |
 |---|---|---|
-| `SHIPYARD_INTERNAL_QUEUE_MUTATION=1` | Shipyard itself, on its own exact-head, audited queue commands (enqueue arm, classic merge, merge-steward enqueue, disable/dequeue revocation) | both queue guards step aside; Shipyard's admission rules already made the decision |
+| `SHIPYARD_INTERNAL_QUEUE_MUTATION=1` | Shipyard itself, on its own exact-head, audited queue commands (enqueue arm, classic merge, merge-steward enqueue, disable/dequeue revocation) | both queue guards step aside; Shipyard's admission rules already made the decision, and Shipyard ran this guard's review rule itself first (`SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1`) |
+| `SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1` | Shipyard itself, just before one of its own arms, enqueues or merges | the arm guard runs only the review rule, whatever the internal marker says, and records the attempt |
 | `GHAPP_ALLOW_QUEUE_REARM=1` | an operator, deliberately, for one command | the arm guard allows a refused arm and prints a `WARNING` naming what it overrode |
 | `GHAPP_ALLOW_QUEUE_REMOVAL=1` | an operator, deliberately, with a stated reason | the removal guard allows the dequeue/disable, with a `WARNING` and an audit record, only for a `defect-fix` or the main-red fix PR itself (below) |
 | `GHAPP_ALLOW_BRANCH_REFRESH=1` | an operator, deliberately, for one command | the branch-refresh guard allows a refused refresh and prints a `WARNING` |

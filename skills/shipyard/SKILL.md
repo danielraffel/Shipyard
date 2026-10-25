@@ -3831,7 +3831,15 @@ squash subject folds the `chore: bump versions` marker commit in and trips
 release automation) from `resolve_pr_context`, the one chokepoint every route
 into `ship` passes through — so `shipyard pr`, a bare `ship`, and
 `ship --pr <n>` all arm, and no later route can quietly skip it. `--no-arm`
-opts out. A repository whose base sets `[auto_merge]
+opts out of every landing that invocation would make: no arm, no steward
+handoff (`shipyard pr --no-arm` writes none), and no post-validation merge
+phase, in the foreground or daemon-owned (`ShipExecutionRequest.leave_unarmed`,
+persisted in the queue envelope). Every arm, enqueue or merge Shipyard does
+make first runs the bundled `queue-arm-guard` with
+`SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1` (`crate::queue_arm_gate`, called from the
+`GitHubActions` transports and `auto_merge`'s arm and merge commands), so the
+guard's review rule, not only the `head_approval` twin, decides, and each
+attempt is a line in `queue-arms.jsonl` in the state directory. A repository whose base sets `[auto_merge]
 arm_requires_head_approval = true` (the default for pulp, vellum, tartci and
 Shipyard when their base is silent, on every host unless it has a
 `review-before-arm.opt-out` file, written with a reason by
@@ -3839,8 +3847,10 @@ Shipyard when their base is silent, on every host unless it has a
 `switches.jsonl`, and only that written record counts; `guards status` shows
 a host that is off and fails on anything else at the path) arms
 and classic-merges only an approved head on every path (`ship`, the validated
-arm, the classic merge, the steward backstop); `--arm` overrides it and names
-who did. An approval comment stamped (by `ghapp`) with the arming agent id
+arm, the classic merge, the steward backstop); `--arm` asks the queue-arm
+guard for its operator override, which the guard honours only with
+`--arm-reason`, at an interactive terminal, outside an agent's environment, and
+records with the operator and reason. An approval comment stamped (by `ghapp`) with the arming agent id
 (`SHIPYARD_AGENT_ID`) is `SelfApproved`: an agent cannot approve its own
 landing; a shared session alone never refuses, and unstamped verdicts count
 as before. `shipyard who --pr N` names the host and session (and agent, when
@@ -3899,7 +3909,8 @@ refuses any body carrying stamp text, `\u`-escaped and Unicode-spaced forms
 included; the guards count only the exact ASCII stamp and refuse an APPROVE
 with any non-canonical variant); its
 override,
-`GHAPP_ALLOW_UNREVIEWED_ARM=1`, is loud and recorded in `overrides.jsonl` (see
+`GHAPP_ALLOW_UNREVIEWED_ARM=1` (operator only: a reason, an interactive
+terminal, no agent environment), is loud and recorded in `overrides.jsonl` (see
 `docs/ghapp-guards.md`, Review before arm). A HOLD acts too: on a host with
 `hold-disarms`, `verdict-hold-hook` dequeues or disarms a pull request queued
 or armed at exactly the head a HOLD names, before the HOLD posts, and never

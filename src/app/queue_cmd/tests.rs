@@ -59,6 +59,7 @@ fn orphan_fixture() -> OrphanFixture {
         adopt_head: false,
         pr_snapshot_file: None,
         metadata_authority_receipt: None,
+        leave_unarmed: false,
         targets: Vec::new(),
     };
     let mut job = Job::create(

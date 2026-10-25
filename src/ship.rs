@@ -63,6 +63,8 @@ const DEFAULT_DRAIN_MAX_WORKERS: usize = 2;
 const QUEUE_ENVELOPE_SWEEP_GRACE: Duration = Duration::from_secs(60);
 
 /// Resolved inputs for one `ship` execution.
+// Independent per-request switches, not states of one machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShipExecutionRequest {
     /// Pull request number.
@@ -106,6 +108,9 @@ pub struct ShipExecutionRequest {
     pub pr_snapshot_file: Option<PathBuf>,
     /// Exact trusted authority for a ship with no native validation targets.
     pub metadata_authority_receipt: Option<crate::metadata_authority::MetadataAuthorityReceipt>,
+    /// `--no-arm`: validate only. The post-validation merge phase, which arms
+    /// or enqueues, does not run.
+    pub leave_unarmed: bool,
     /// Ordered target list.
     pub targets: Vec<ResolvedTarget>,
 }
@@ -1292,6 +1297,7 @@ fn execute_run_worker_with_options<D: ShipTargetDispatcher>(
         adopt_head: false,
         pr_snapshot_file: None,
         metadata_authority_receipt: None,
+        leave_unarmed: false,
         targets: request.targets.clone(),
     };
     job = ensure_worker_running_job(queue, &job)?;
@@ -3515,6 +3521,7 @@ mod tests {
             adopt_head: false,
             pr_snapshot_file: None,
             metadata_authority_receipt: None,
+            leave_unarmed: false,
             targets,
         }
     }

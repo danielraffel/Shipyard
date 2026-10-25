@@ -30,7 +30,7 @@
 use serde_json::Value;
 
 use crate::auto_arm::{
-    ArmVerdict, arm_mutation_args, arm_mutation_args_at_head, arm_response_accepted,
+    ArmVerdict, arm_mutation_args_at_head, arm_response_accepted,
     decide_from_queue_state_with_environment, first_graphql_error, is_arm_guard_refusal,
     is_auto_merge_disabled_refusal,
 };
@@ -56,9 +56,10 @@ pub(super) type RunGh<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
 /// [`crate::environment_requeue::CONFIG_KEY`]: when set, a head ejected once
 /// for an environment failure is armed without a new push.
 ///
-/// `override_by` is set when the operator passed `--arm`: the head-approval
-/// gate ([`crate::head_approval`]) is skipped and the result names who
-/// overrode it. Every other refusal still applies.
+/// `override_by` is set when the operator passed `--arm`: a head the
+/// head-approval gate ([`crate::head_approval`]) refuses still goes to the
+/// queue-arm guard, which honours or refuses the operator override itself.
+/// Every other refusal still applies.
 pub(super) fn arm_native_auto_merge(
     run_gh: RunGh<'_>,
     repo: &str,
@@ -119,7 +120,7 @@ pub(super) fn arm_native_auto_merge(
         )),
         ArmVerdict::Arm => match environment.as_ref().filter(|verdict| verdict.allowed) {
             Some(verdict) => arm_same_head(run_gh, pr, &facts, &queue, verdict, &override_note),
-            None => arm_new(run_gh, pr, &facts, &override_note),
+            None => arm_new(run_gh, pr, &facts, &queue, &override_note),
         },
     }
 }
@@ -165,9 +166,26 @@ fn arm_same_head(
     }
 }
 
-/// Arm `pr` on the ordinary path.
-fn arm_new(run_gh: RunGh<'_>, pr: u64, facts: &PrFacts, override_note: &str) -> ArmOutcome {
-    match run_gh(&arm_mutation_args(&facts.node_id)) {
+/// Arm `pr` on the ordinary path, bound to the head the queue state names:
+/// the queue-arm guard lands only a request that binds the head it judged.
+fn arm_new(
+    run_gh: RunGh<'_>,
+    pr: u64,
+    facts: &PrFacts,
+    queue: &Value,
+    override_note: &str,
+) -> ArmOutcome {
+    let Some(head) = queue
+        .pointer("/data/repository/pullRequest/headRefOid")
+        .and_then(Value::as_str)
+        .filter(|head| !head.is_empty())
+    else {
+        return skipped(format!(
+            "⚠︎ Auto-merge not armed on #{pr}: the merge-queue state carried no head to bind \
+             the arm to."
+        ));
+    };
+    match run_gh(&arm_mutation_args_at_head(&facts.node_id, head)) {
         Ok(raw) if arm_response_accepted(&raw) => ArmOutcome {
             armed: true,
             line: format!(
@@ -183,6 +201,11 @@ fn arm_new(run_gh: RunGh<'_>, pr: u64, facts: &PrFacts, override_note: &str) -> 
         Err(detail) if is_auto_merge_disabled_refusal(&detail) => skipped(format!(
             "▸ Auto-merge left as it is on #{pr}: this repository does not allow native \
              auto-merge, so there is nothing to arm."
+        )),
+        Err(detail) if crate::queue_arm_gate::is_review_refusal(&detail) => skipped(format!(
+            "▸ Auto-merge not armed on #{pr}: the queue-arm guard's review rule refused it \
+             (it lands only a head with an exact-head approval) — {}",
+            one_line(&detail)
         )),
         Err(detail) if is_arm_guard_refusal(&detail) => skipped(format!(
             "▸ Auto-merge left as it is on #{pr}: the queue-arm guard declined it, which is \
@@ -210,25 +233,28 @@ fn approval_note(
     override_by: Option<&str>,
     excuse_latest_ejection: bool,
 ) -> Result<String, ArmOutcome> {
-    match (verdict, override_by) {
-        (ArmVerdict::Skip(_), _) => Ok(String::new()),
-        (ArmVerdict::Arm, Some(by)) => Ok(format!(
-            " Armed by an explicit `--arm` from {by}, without checking for an approval of the \
-             head."
+    if let ArmVerdict::Skip(_) = verdict {
+        return Ok(String::new());
+    }
+    match (
+        head_gate(run_gh, repo, pr, queue, facts, excuse_latest_ejection),
+        override_by,
+    ) {
+        (Ok(gate), _) if gate.allows() => Ok(String::new()),
+        // The queue-arm guard, which judges the arm itself, decides whether
+        // the operator's override applies, and records it either way.
+        (_, Some(by)) => Ok(format!(
+            " Armed under the queue-arm guard's operator override, requested by {by} with \
+             `--arm`; the guard recorded who and why."
         )),
-        (ArmVerdict::Arm, None) => {
-            match head_gate(run_gh, repo, pr, queue, facts, excuse_latest_ejection) {
-                Ok(gate) if gate.allows() => Ok(String::new()),
-                Ok(gate) => Err(skipped(format!(
-                    "▸ Auto-merge not armed on #{pr}: {}.",
-                    gate.explain()
-                ))),
-                Err(detail) => Err(skipped(format!(
-                    "⚠︎ Auto-merge not armed on #{pr}: whether its head is approved could not \
-                 be read ({detail}); refusing to arm blind."
-                ))),
-            }
-        }
+        (Ok(gate), None) => Err(skipped(format!(
+            "▸ Auto-merge not armed on #{pr}: {}.",
+            gate.explain()
+        ))),
+        (Err(detail), None) => Err(skipped(format!(
+            "⚠︎ Auto-merge not armed on #{pr}: whether its head is approved could not \
+             be read ({detail}); refusing to arm blind."
+        ))),
     }
 }
 

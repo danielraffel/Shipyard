@@ -770,6 +770,8 @@ impl QueuedRunRequest {
 }
 
 /// Durable `shipyard ship` request snapshot.
+// Independent per-request switches, not states of one machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QueuedShipRequest {
     /// Pull request number.
@@ -807,6 +809,9 @@ pub struct QueuedShipRequest {
     /// Exact trusted authority for a ship with no native validation targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_authority_receipt: Option<crate::metadata_authority::MetadataAuthorityReceipt>,
+    /// `--no-arm`: the daemon validates and skips the merge phase.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub leave_unarmed: bool,
     /// Ordered resolved target snapshots.
     pub targets: Vec<QueuedResolvedTarget>,
 }
@@ -830,6 +835,7 @@ impl From<&ShipExecutionRequest> for QueuedShipRequest {
             advisory_targets: request.advisory_targets.clone(),
             adopt_head: request.adopt_head,
             metadata_authority_receipt: request.metadata_authority_receipt.clone(),
+            leave_unarmed: request.leave_unarmed,
             targets: snapshot_targets(&request.targets),
         }
     }
@@ -856,6 +862,7 @@ impl QueuedShipRequest {
             adopt_head: self.adopt_head,
             pr_snapshot_file: None,
             metadata_authority_receipt: self.metadata_authority_receipt.clone(),
+            leave_unarmed: self.leave_unarmed,
             targets: restore_targets(&self.targets)?,
         })
     }
@@ -4039,6 +4046,7 @@ mod tests {
             adopt_head: false,
             pr_snapshot_file: None,
             metadata_authority_receipt: None,
+            leave_unarmed: false,
             targets: vec![local_target()],
         }
     }
@@ -4083,6 +4091,29 @@ mod tests {
             .expect("writer unblocked")
             .expect("save");
         thread.join().expect("writer thread");
+    }
+
+    #[test]
+    fn no_arm_survives_the_daemon_envelope_and_older_envelopes_read_as_armed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut request = ship_request();
+        request.leave_unarmed = true;
+        store
+            .save(&QueuedExecutionEnvelope::from_ship_request(
+                "job-no-arm",
+                "/work/repo",
+                &request,
+            ))
+            .expect("save");
+        let loaded = store.load("job-no-arm").expect("load").expect("present");
+        assert!(loaded.to_ship_request().expect("ship").leave_unarmed);
+
+        let queued = super::QueuedShipRequest::from(&ship_request());
+        let text = serde_json::to_string(&queued).expect("json");
+        assert!(!text.contains("leave_unarmed"), "{text}");
+        let older: super::QueuedShipRequest = serde_json::from_str(&text).expect("older envelope");
+        assert!(!older.to_execution_request().expect("ship").leave_unarmed);
     }
 
     #[test]

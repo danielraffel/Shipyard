@@ -39,7 +39,10 @@ repository has and Shipyard does not, so Shipyard asks instead of guessing.
 Shipyard's own exact-head, audited enqueue path carries an internal marker
 and bypasses the guard; an operator override exists and always prints a
 WARNING. Both are documented for humans in docs/ghapp-guards.md and are kept
-out of refusal text.
+out of refusal text. Before each of those landings Shipyard runs this file
+itself with ``SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1`` (see ``review_only``): the
+review rule below, unchanged, and nothing else, whether or not its ``gh`` is
+the ``ghapp`` wrapper.
 
 Every queue mutation is attributed on GitHub to the same App actor whether
 Shipyard or an agent issued it, so the guard records each one it judges in
@@ -111,9 +114,18 @@ new tree; and no required check on the new head has concluded ``skipped`` or
 ``neutral`` or reused a receipt. Every carry appends a line to
 ``carries.jsonl`` in the guards directory.
 
-``GHAPP_ALLOW_UNREVIEWED_ARM=1`` is the operator override for this rule alone;
-it prints a WARNING and appends an audit line. ``GHAPP_ALLOW_QUEUE_REARM`` does
-not stand in for it.
+``GHAPP_ALLOW_UNREVIEWED_ARM=1`` is the operator override for this rule alone.
+It is honoured only for an operator: a stated reason in
+``GHAPP_ALLOW_UNREVIEWED_ARM_REASON``, standard input on an interactive
+terminal, and no agent in the environment (``CLAUDECODE``, ``CLAUDE_CODE_*``,
+``CODEX_*``). It prints a WARNING and appends an audit line naming the operator
+and the reason; a refused override is audited too. ``GHAPP_ALLOW_QUEUE_REARM``
+does not stand in for it.
+
+``SHIPYARD_INTERNAL_QUEUE_MUTATION=1`` is honoured only when the calling
+process is the installed Shipyard binary (the removal guard's
+``shipyard_parent``); from anything else it is ignored and the request is
+judged like any other.
 """
 
 from __future__ import annotations
@@ -166,6 +178,13 @@ REVIEW_REQUIRED_REPOS = (
 )
 FLEET_AUTHOR = "shipyard-local"
 REVIEW_OVERRIDE_ENV = "GHAPP_ALLOW_UNREVIEWED_ARM"
+# Why the operator is landing an unreviewed head; the override needs one.
+REVIEW_OVERRIDE_REASON_ENV = "GHAPP_ALLOW_UNREVIEWED_ARM_REASON"
+# Who the operator is, as Shipyard names them; USER@host otherwise.
+REVIEW_OVERRIDE_OPERATOR_ENV = "GHAPP_ALLOW_UNREVIEWED_ARM_OPERATOR"
+# An agent's environment: the override is for operators only.
+AGENT_CONTEXT_ENVS = ("CLAUDECODE",)
+AGENT_CONTEXT_PREFIXES = ("CLAUDE_CODE_", "CODEX_")
 # `1` forces review on for one process (the review-verdict status uses it);
 # nothing in the environment turns it off.
 HOST_ENABLE_ENV = "SHIPYARD_REVIEW_BEFORE_ARM"
@@ -176,6 +195,11 @@ ARMS_LOG_ENV = "SHIPYARD_QUEUE_ARMS_LOG"
 SESSION_ENVS = ("CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_SESSION_ID")
 # Per-agent identity the orchestrator sets; only it can refuse a self-approval.
 AGENT_ENV = "SHIPYARD_AGENT_ID"
+# `1`: Shipyard asks for the review rule alone before its own landing (see
+# review_only). It judges queue state itself.
+REVIEW_ONLY_ENV = "SHIPYARD_QUEUE_ARM_REVIEW_ONLY"
+# Which Shipyard path is landing, for the arms ledger.
+CALLER_ENV = "SHIPYARD_QUEUE_ARM_CALLER"
 UNATTRIBUTED = "unattributed"
 # `<!-- session: <host>/<session>[ agent: <id>] -->`, stamped by ghapp on
 # verdict comments: exactly the ASCII form the stamper writes, single spaces
@@ -822,9 +846,21 @@ def record_arms(targets: list[dict[str, Any]] | None, repo: str | None, verdict:
                     **({"excluded_approvals": target["excluded_approvals"]}
                        if target.get("excluded_approvals") else {}),
                     **({"node": target["node"]} if target.get("node") else {}),
+                    **_approval_fields(target.get("approval")),
+                    **({"caller": os.environ[CALLER_ENV]} if os.environ.get(CALLER_ENV) else {}),
+                    **({"override": target["override"]} if target.get("override") else {}),
                 }, sort_keys=True) + "\n")
     except OSError as error:
         print(f"queue-arm-guard: note: the arms ledger was not written: {error}", file=sys.stderr)
+
+
+def _approval_fields(approval: Any) -> dict[str, Any]:
+    """The deciding verdict's comment id and signer, for the arms ledger."""
+    if not isinstance(approval, dict):
+        return {}
+    return {key: approval[key] for key in ("verdict_comment_id", "verdict_review_id", "signer",
+                                           "approved_head")
+            if approval.get(key) is not None}
 
 
 def _guards_dir() -> pathlib.Path:
@@ -1227,14 +1263,14 @@ def review_verdict(
     return False, f"no reviewer verdict names head {head[:12]}; it needs {wanted}.{stale}"
 
 
-def _deciding_approval_body(
+def _deciding_approval_comment(
     head: str,
     author: str | None,
     comments: list[dict[str, Any]],
     reviews: list[dict[str, Any]],
     policy: dict[str, Any],
-) -> str | None:
-    """The body of the APPROVE comment deciding ``head``, when one does."""
+) -> dict[str, Any] | None:
+    """The APPROVE comment deciding ``head``, when one does."""
     head = head.lower()
     latest = _latest_on(counting_verdicts(author, comments, reviews, policy), head)
     if latest is None or latest[1] != "APPROVE" or latest[0] is None:
@@ -1248,8 +1284,43 @@ def _deciding_approval_body(
                 and _reviewer_counts(login, comment.get("author_association"), policy, author,
                                      "APPROVE", (comment.get("user") or {}).get("type") == "Bot",
                                      body)):
-            return body
+            return comment
     return None
+
+
+def _deciding_approval_body(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> str | None:
+    """The body of the APPROVE comment deciding ``head``, when one does."""
+    comment = _deciding_approval_comment(head, author, comments, reviews, policy)
+    return comment.get("body") if comment is not None else None
+
+
+def deciding_approval(
+    head: str,
+    author: str | None,
+    comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    """Which verdict approved ``head``, for the arms ledger: the comment id
+    and its ``reviewer:`` signer, or the APPROVED review's id."""
+    head = head.lower()
+    comment = _deciding_approval_comment(head, author, comments, reviews, policy)
+    if comment is not None:
+        signed = _SIGNER_LINE.findall(comment.get("body") or "")
+        return {"verdict_comment_id": comment.get("id"),
+                "signer": signed[-1].lower() if signed else None, "approved_head": head}
+    for review in reviews:
+        if (str(review.get("state") or "").upper() == "APPROVED"
+                and str(review.get("commit_id") or "").lower() == head):
+            return {"verdict_review_id": review.get("id"),
+                    "signer": (review.get("user") or {}).get("login"), "approved_head": head}
+    return {"approved_head": head}
 
 
 def self_approval(
@@ -1929,6 +2000,7 @@ def _review_gate(classification: dict[str, Any], repo: str | None
                 f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}", False)
         _note_same_session(classification, label, repo,
                            same_session_note(head, author, comments, reviews, policy))
+        classification["approval"] = deciding_approval(head, author, comments, reviews, policy)
         return True, f"{label} ({repo}): {why}", None
     cause = "hold" if "is HOLD" in why or "HOLD naming" in why else "unreviewed"
     approved = approved_earlier_head(head, author, comments, reviews, policy)
@@ -1943,6 +2015,8 @@ def _review_gate(classification: dict[str, Any], repo: str | None
         carry_note = same_session_note(approved, author, comments, reviews, policy)
         if refusal is None:
             _note_same_session(classification, label, repo, carry_note)
+            classification["approval"] = deciding_approval(approved, author, comments, reviews,
+                                                           policy)
             return True, (
                 f"{label} ({repo}): the approval of {approved[:12]} carries to {head[:12]}: "
                 "every commit since is a merge of the base and every file the pull request "
@@ -1956,6 +2030,8 @@ def _review_gate(classification: dict[str, Any], repo: str | None
                 print(f"ghapp: {label} ({repo}): approval of {approved[:12]} carried across a "
                       f"rebase to {head[:12]} (logged to {REBASE_CARRY_LOG})", file=sys.stderr)
                 _note_same_session(classification, label, repo, carry_note)
+                classification["approval"] = deciding_approval(approved, author, comments,
+                                                               reviews, policy)
                 return True, (
                     f"{label} ({repo}): the approval of {approved[:12]} carries across the rebase "
                     f"to {head[:12]}: same patch-id, same files, the base touched none of them "
@@ -1981,7 +2057,7 @@ def _review_gate(classification: dict[str, Any], repo: str | None
         cause, what, repo, number, head, command, False)
 
 
-def audit_override(message: str) -> None:
+def audit_override(message: str, **fields: Any) -> None:
     """Append one line to the guards' override audit log. Never raises."""
     directory = _guards_dir()
     record = {
@@ -1991,6 +2067,7 @@ def audit_override(message: str) -> None:
         "argv": sys.argv[1:],
         "cwd": os.getcwd(),
         **writer_identity(),
+        **fields,
     }
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -3076,6 +3153,67 @@ def _override(message: str) -> int:
     return 0
 
 
+def agent_context() -> str | None:
+    """The first agent variable in the environment, if any."""
+    for name in sorted(os.environ):
+        if name in AGENT_CONTEXT_ENVS or name.startswith(AGENT_CONTEXT_PREFIXES):
+            return name
+    return None
+
+
+def _interactive() -> bool:
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (OSError, ValueError):
+        return False
+
+
+def override_operator() -> str:
+    """Who is overriding: the name Shipyard passes, or USER@host."""
+    named = os.environ.get(REVIEW_OVERRIDE_OPERATOR_ENV, "").strip()
+    if named:
+        return named
+    user = os.environ.get("USER") or os.environ.get("USERNAME") or "unknown-user"
+    return f"{user}@{host_name()}"
+
+
+def review_override(message: str, targets: list[dict[str, Any]] | None = None) -> bool:
+    """Whether the operator override lands the refused ``message``.
+
+    Only ``GHAPP_ALLOW_UNREVIEWED_ARM=1`` asks; it is honoured for an operator
+    at an interactive terminal with a stated reason, never in an agent's
+    environment. Honoured or not, the attempt is audited.
+    """
+    if os.environ.get(REVIEW_OVERRIDE_ENV) != "1":
+        return False
+    reason = os.environ.get(REVIEW_OVERRIDE_REASON_ENV, "").strip()
+    operator = override_operator()
+    agent = agent_context()
+    if agent is not None:
+        why = f"{agent} is set, and an agent cannot use it"
+    elif not _interactive():
+        why = "it needs an operator at an interactive terminal"
+    elif not reason:
+        why = f"it needs a stated reason in {REVIEW_OVERRIDE_REASON_ENV}"
+    else:
+        why = None
+    if why is not None:
+        audit_override(message, operator=operator, reason=reason or None, honoured=False,
+                       declined=why)
+        print(f"queue-arm-guard: the operator override was not honoured: {why}.",
+              file=sys.stderr)
+        return False
+    audit_override(message, operator=operator, reason=reason, honoured=True)
+    for target in targets or []:
+        target["override"] = {"operator": operator, "reason": reason}
+    print(
+        f"queue-arm-guard: WARNING: {REVIEW_OVERRIDE_ENV}=1 from {operator} lands an "
+        f"unreviewed head ({reason}); recorded in the guards' overrides.jsonl: {message}",
+        file=sys.stderr,
+    )
+    return True
+
+
 def review_refusal(targets: list[dict[str, Any]], repo: str | None) -> bool:
     """Print and return whether an unreviewed head refuses the arm.
 
@@ -3089,13 +3227,7 @@ def review_refusal(targets: list[dict[str, Any]], repo: str | None) -> bool:
     if not refused:
         return False
     message = " | ".join(message for message, _ in refused)
-    if os.environ.get(REVIEW_OVERRIDE_ENV) == "1":
-        audit_override(message)
-        print(
-            f"queue-arm-guard: WARNING: {REVIEW_OVERRIDE_ENV}=1 lands an unreviewed head; "
-            f"recorded in the guards' overrides.jsonl: {message}",
-            file=sys.stderr,
-        )
+    if review_override(message, targets):
         return False
     print(
         f"queue-arm-guard: refusing to arm or merge an unreviewed head: {message} "
@@ -3108,10 +3240,53 @@ def review_refusal(targets: list[dict[str, Any]], repo: str | None) -> bool:
     return True
 
 
+def review_only(args: list[str]) -> int:
+    """The review rule alone, for a landing Shipyard is about to make itself.
+
+    Shipyard judges queue state on its own paths, so only ``review_refusal``
+    runs, exactly as it does for an agent's request, including its operator
+    override. Every judged request is recorded in the arms ledger, allowed or
+    refused; a request naming no head it can classify is refused.
+    """
+    repo = os.environ.get("GH_REPO") or None
+    review = "on" if host_review_default() else f"off: {opt_out_reason()}"
+    try:
+        targets = arm_request(args)
+    except GuardError as error:
+        print(f"queue-arm-guard: refusing to arm or merge: the request cannot be judged: {error}",
+              file=sys.stderr)
+        try:
+            unjudged = internal_targets(args)
+        except Exception:  # noqa: BLE001 - the ledger never gates
+            unjudged = None
+        record_arms(unjudged or [{"repo": repo, "action": "unknown"}], repo, "refused", review)
+        return 1
+    if targets is None:
+        return 0
+    refused = review_refusal(targets, repo)
+    record_arms(targets, repo, "refused" if refused else "allowed", review)
+    return 1 if refused else 0
+
+
+def internal_caller() -> bool:
+    """Whether the installed Shipyard binary is the one asking (the removal
+    guard's ``shipyard_parent``); without that parser, nothing is."""
+    try:
+        return PARSER is not None and bool(PARSER.shipyard_parent())
+    except Exception:  # noqa: BLE001 - an unreadable ancestry claims nothing
+        return False
+
+
 def main(args: list[str]) -> int:
-    if os.environ.get("SHIPYARD_INTERNAL_QUEUE_MUTATION") == "1":
-        # Shipyard's own arm and merge paths judged this already
-        # (head_approval.rs); record it so `shipyard who` can name them too.
+    if os.environ.get(REVIEW_ONLY_ENV) == "1":
+        return review_only(args)
+    if os.environ.get("SHIPYARD_INTERNAL_QUEUE_MUTATION") == "1" and not internal_caller():
+        print("queue-arm-guard: ignoring SHIPYARD_INTERNAL_QUEUE_MUTATION=1: the calling "
+              "process is not the Shipyard binary, so it cannot claim Shipyard's authority.",
+              file=sys.stderr)
+    elif os.environ.get("SHIPYARD_INTERNAL_QUEUE_MUTATION") == "1":
+        # Shipyard's own arm and merge paths ran the review rule already
+        # (queue_arm_gate.rs); record it so `shipyard who` can name them too.
         # Never refuse here, and never fail: parsing is best effort.
         try:
             record_arms(internal_targets(args), os.environ.get("GH_REPO") or None,
@@ -3138,9 +3313,8 @@ def judge(args: list[str], seen: dict[str, Any]) -> int:
         seen["targets"] = targets
     except GuardError as error:
         message = f"refusing ambiguous queue-arm request: {error}"
-        if override and os.environ.get(REVIEW_OVERRIDE_ENV) == "1":
-            # Nothing names the head, so its review cannot be checked either.
-            audit_override(message)
+        # Nothing names the head, so its review cannot be checked either.
+        if override and review_override(message):
             return _override(message)
         if override:
             message += (

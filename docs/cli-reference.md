@@ -222,9 +222,11 @@ shipyard runner steward --arm-unqueued --apply      # arm native auto-merge on t
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-form handoff identifiers
-shipyard pr --no-arm                                # do NOT arm native auto-merge on the PR
-shipyard pr --arm                                   # arm even where [auto_merge] arm_requires_head_approval
-                                                    #   would refuse an unapproved head; the result names who armed
+shipyard pr --no-arm                                # validate only: no arm, no steward handoff, no merge phase;
+                                                    #   conflicts with --workstream-id/--context-url
+shipyard pr --arm --arm-reason "..."                # ask the queue-arm guard's operator override for an unapproved
+                                                    #   head: honoured only at an interactive terminal, outside an
+                                                    #   agent's environment; recorded with operator and reason
                                                     # title/body come from origin/<base>..HEAD non-merge commits (never empty);
                                                     #   [pr.body] attribution = "..." closes every composed body once
 shipyard pr --body-append "Proxy: ..."              # add text to the PR body once, after the attribution line and before the

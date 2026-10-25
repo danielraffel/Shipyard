@@ -434,7 +434,8 @@ fn replaying_9438_with_a_marker_for_the_rebased_head_arms_exactly_once() {
     assert_eq!(armed_heads, vec![PR_9438_HEADS[6]]);
 }
 
-/// `--arm` arms an unapproved head on purpose, and the result says who did.
+/// `--arm` asks for the queue-arm guard's override on an unapproved head
+/// (the guard, not this fake, decides it), and the result says who asked.
 #[test]
 fn an_explicit_arm_overrides_the_policy_and_names_who_armed() {
     let (outcome, arms) = ship_9438_head(
@@ -447,7 +448,7 @@ fn an_explicit_arm_overrides_the_policy_and_names_who_armed() {
     assert!(
         outcome
             .line
-            .contains("explicit `--arm` from operator@studio"),
+            .contains("operator override, requested by operator@studio with `--arm`"),
         "{}",
         outcome.line
     );
@@ -524,7 +525,7 @@ fn each_arm_request_reaches_the_arm_as_asked() {
         .expect("attempted");
     assert!(outcome.armed, "{}", outcome.line);
     assert!(
-        outcome.line.contains("explicit `--arm` from "),
+        outcome.line.contains("operator override, requested by "),
         "{}",
         outcome.line
     );

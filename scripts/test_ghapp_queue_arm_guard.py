@@ -509,9 +509,10 @@ class QueueArmGuardTests(unittest.TestCase):
         self.assertIn("could not be determined", message)
 
     def test_internal_marker_bypasses_without_reading(self) -> None:
-        code, _, calls = self.run_guard(
-            ["pr", "merge", "8669", "--auto"], SHIPYARD_INTERNAL_QUEUE_MUTATION="1"
-        )
+        with mock.patch.object(guard.PARSER, "shipyard_parent", return_value=True):
+            code, _, calls = self.run_guard(
+                ["pr", "merge", "8669", "--auto"], SHIPYARD_INTERNAL_QUEUE_MUTATION="1"
+            )
         self.assertEqual(code, 0)
         self.assertEqual(calls, [])
 
@@ -1895,18 +1896,39 @@ class ReviewBeforeArm(unittest.TestCase):
         ]
 
     def run_guard(self, argv: list[str], answers: list[tuple[str, dict[str, Any]]],
-                  repo: str, host: str | None = "1", **env: str) -> subprocess.CompletedProcess:
+                  repo: str, host: str | None = "1", *, tty: bool = False,
+                  from_shipyard: bool = False, **env: str) -> subprocess.CompletedProcess:
+        """``tty`` puts standard input on a pseudo-terminal, as an operator's
+        shell has; ``from_shipyard`` makes the installed-Shipyard ancestry
+        check answer yes, the one thing a test cannot arrange for real."""
         fake = self.install(answers)
         environment = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake), "GH_REPO": repo,
                        "SHIPYARD_GHAPP_GUARDS_DIR": str(self.guards), "HOME": str(self.root)}
         if host is not None:
             environment["SHIPYARD_REVIEW_BEFORE_ARM"] = host
         environment.update(env)
-        return subprocess.run(
-            [sys.executable, str(self.guards / "queue-arm-guard"), *argv],
-            env=environment, capture_output=True, text=True, check=False,
-            stdin=subprocess.DEVNULL,
-        )
+        script = str(self.guards / "queue-arm-guard")
+        command = [sys.executable, script, *argv]
+        if from_shipyard:
+            command = [sys.executable, "-c", (
+                "import importlib.machinery, importlib.util, sys\n"
+                f"loader = importlib.machinery.SourceFileLoader('guard', {script!r})\n"
+                "module = importlib.util.module_from_spec(importlib.util.spec_from_loader("
+                "'guard', loader))\n"
+                "sys.argv[0] = loader.path\n"
+                "loader.exec_module(module)\n"
+                "module.PARSER.shipyard_parent = lambda *_, **__: True\n"
+                "sys.exit(module.main(sys.argv[1:]))\n"), *argv]
+        if not tty:
+            return subprocess.run(command, env=environment, capture_output=True, text=True,
+                                  check=False, stdin=subprocess.DEVNULL)
+        primary, secondary = os.openpty()
+        try:
+            return subprocess.run(command, env=environment, capture_output=True, text=True,
+                                  check=False, stdin=secondary)
+        finally:
+            os.close(secondary)
+            os.close(primary)
 
     def arm(self, number: int, repo: str, answers: list[tuple[str, dict[str, Any]]],
             bind: str | None = None, **kwargs: Any) -> subprocess.CompletedProcess:
@@ -2122,19 +2144,55 @@ class ReviewBeforeArm(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("cannot read what its review requires", result.stderr)
 
+    def overrides(self) -> list[dict[str, Any]]:
+        path = self.guards / "overrides.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
     def test_the_operator_override_is_loud_and_recorded(self) -> None:
-        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"),
-                          GHAPP_ALLOW_UNREVIEWED_ARM="1", CLAUDE_CODE_SESSION_ID="sess-o",
+        result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), tty=True,
+                          GHAPP_ALLOW_UNREVIEWED_ARM="1",
+                          GHAPP_ALLOW_UNREVIEWED_ARM_REASON="hotfix read by hand",
+                          GHAPP_ALLOW_UNREVIEWED_ARM_OPERATOR="daniel@m3",
                           SHIPYARD_AGENT_ID="agent-o")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("WARNING: GHAPP_ALLOW_UNREVIEWED_ARM=1 lands an unreviewed head", result.stderr)
-        audit = [json.loads(line) for line in
-                 (self.guards / "overrides.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertIn("WARNING: GHAPP_ALLOW_UNREVIEWED_ARM=1 from daniel@m3 lands an unreviewed "
+                      "head (hotfix read by hand)", result.stderr)
+        audit = self.overrides()
         self.assertEqual(len(audit), 1)
         self.assertEqual(audit[0]["override"], "GHAPP_ALLOW_UNREVIEWED_ARM")
+        self.assertEqual((audit[0]["operator"], audit[0]["reason"], audit[0]["honoured"]),
+                         ("daniel@m3", "hotfix read by hand", True))
         # The row says which process wrote it (the sandbox audit relies on it).
-        self.assertEqual((audit[0]["session"], audit[0]["agent"]), ("sess-o", "agent-o"))
+        self.assertEqual(audit[0]["agent"], "agent-o")
         self.assertIn("no reviewer verdict names head", audit[0]["refusal"])
+        self.assertEqual(self.ledger()[-1]["override"],
+                         {"operator": "daniel@m3", "reason": "hotfix read by hand"})
+
+    def test_the_operator_override_is_refused_to_agents_and_without_a_terminal(self) -> None:
+        reason = {"GHAPP_ALLOW_UNREVIEWED_ARM": "1",
+                  "GHAPP_ALLOW_UNREVIEWED_ARM_REASON": "read it myself"}
+        for label, tty, env, why in (
+            ("claude code", True, {"CLAUDECODE": "1"}, "CLAUDECODE is set"),
+            ("claude session", True, {"CLAUDE_CODE_SESSION_ID": "s"},
+             "CLAUDE_CODE_SESSION_ID is set"),
+            ("codex", True, {"CODEX_SANDBOX": "seatbelt"}, "CODEX_SANDBOX is set"),
+            ("no terminal", False, {}, "needs an operator at an interactive terminal"),
+            ("no reason", True, {"GHAPP_ALLOW_UNREVIEWED_ARM_REASON": " "},
+             "needs a stated reason"),
+        ):
+            with self.subTest(label):
+                result = self.arm(513, "danielraffel/tartci", self.case("tartci-513"), tty=tty,
+                                  **{**reason, **env})
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("the operator override was not honoured: ", result.stderr)
+                self.assertIn(why, result.stderr)
+                self.assertIn("refusing to arm or merge an unreviewed head", result.stderr)
+                self.assertNotIn("--arm", result.stderr)
+                self.assertNotIn("GHAPP_ALLOW_UNREVIEWED_ARM=1 from", result.stderr)
+                self.assertEqual(self.overrides()[-1]["honoured"], False)
+                self.assertEqual(self.ledger()[-1]["verdict"], "refused")
 
     def test_the_queue_override_never_stands_in_for_a_review(self) -> None:
         # A queue refusal (armed, not yet queued) the operator overrides,
@@ -2165,7 +2223,8 @@ class ReviewBeforeArm(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("GHAPP_ALLOW_UNREVIEWED_ARM=1 is needed as well", result.stderr)
         result = self.run_guard(argv, [], "danielraffel/tartci", GHAPP_ALLOW_QUEUE_REARM="1",
-                                GHAPP_ALLOW_UNREVIEWED_ARM="1")
+                                GHAPP_ALLOW_UNREVIEWED_ARM="1", tty=True,
+                                GHAPP_ALLOW_UNREVIEWED_ARM_REASON="operator read the body")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.guards / "overrides.jsonl").is_file())
 
@@ -2700,7 +2759,7 @@ class HumanApprovalsAndInternalArms(unittest.TestCase):
              "{pullRequestId:$prId,mergeMethod:MERGE,expectedHeadOid:$head}){pullRequest{id}}}",
              "-f", "prId=PR_kwDO", "-f", f"head={head}"],
         ):
-            result = self.run_guard(argv, [], "danielraffel/Shipyard",
+            result = self.run_guard(argv, [], "danielraffel/Shipyard", from_shipyard=True,
                                     SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
             self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.root / "calls").exists(), "no GitHub call was made")
@@ -2713,9 +2772,85 @@ class HumanApprovalsAndInternalArms(unittest.TestCase):
 
     def test_an_unparseable_internal_request_still_passes(self) -> None:
         result = self.run_guard(["api", "graphql", "--input", "-"], [], "danielraffel/Shipyard",
-                                SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
+                                from_shipyard=True, SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.ledger(), [])
+
+    def test_the_internal_marker_from_anything_but_shipyard_is_judged(self) -> None:
+        result = self.run_guard(
+            ["pr", "merge", "784", "--auto", "--match-head-commit", HEAD_784],
+            self.approved_784(comments=[[]], reviews=[[]]), "danielraffel/Shipyard",
+            SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("ignoring SHIPYARD_INTERNAL_QUEUE_MUTATION=1", result.stderr)
+        self.assertIn("no reviewer verdict names head", result.stderr)
+        self.assertEqual(self.ledger()[-1]["verdict"], "refused")
+
+
+class ShipyardReviewOnly(unittest.TestCase):
+    """Shipyard's own landing paths run the guard with
+    SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1: the review rule, and a ledger row naming
+    the deciding verdict, its signer and the caller, for every attempt."""
+
+    install = ReviewBeforeArm.install
+    case = ReviewBeforeArm.case
+    run_guard = ReviewBeforeArm.run_guard
+    calls = ReviewBeforeArm.calls
+    ledger = ReviewBeforeArm.ledger
+    setUp = ReviewBeforeArm.setUp
+    approved_784 = ReviewBeforeArm.approved_784
+
+    def land(self, answers: list[tuple[str, dict[str, Any]]], **env: str
+             ) -> subprocess.CompletedProcess:
+        return self.run_guard(
+            ["pr", "merge", "784", "--auto", "--match-head-commit", HEAD_784], answers,
+            "danielraffel/Shipyard", SHIPYARD_QUEUE_ARM_REVIEW_ONLY="1",
+            SHIPYARD_QUEUE_ARM_CALLER="shipyard merge-steward", **env)
+
+    def signed(self, signer: str) -> list[list[dict[str, Any]]]:
+        pages = review_fixture("shipyard-784-comments.json")
+        approve = next(c for c in pages[0] if c["id"] == APPROVE_784_COMMENT)
+        return [[comment_like(approve, created_at="2026-10-12T15:00:00Z",
+                              body=f"Reviewed.\nreviewer: {signer}\n"
+                                   f"verdict: APPROVE head:{HEAD_784}")]]
+
+    def test_an_unverdicted_head_is_refused_and_recorded(self) -> None:
+        result = self.land(self.approved_784(comments=[[]], reviews=[[]]))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("no reviewer verdict names head fd0e94e25f44", result.stderr)
+        entry = self.ledger()[-1]
+        self.assertEqual((entry["verdict"], entry["caller"], entry["pr"], entry["head"]),
+                         ("refused", "shipyard merge-steward", 784, HEAD_784))
+
+    def test_the_internal_marker_does_not_skip_the_review(self) -> None:
+        result = self.land(self.approved_784(comments=[[]], reviews=[[]]),
+                           SHIPYARD_INTERNAL_QUEUE_MUTATION="1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_an_exact_head_approval_is_allowed_with_its_comment_and_signer(self) -> None:
+        signers = self.guards / "reviewer-signers.json"
+        signers.write_text(json.dumps({"default": ["pulp-review"]}), encoding="utf-8")
+        result = self.land(self.approved_784(comments=self.signed("pulp-review")))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.ledger()[-1]
+        self.assertEqual((entry["verdict"], entry["verdict_comment_id"], entry["signer"],
+                          entry["caller"]),
+                         ("allowed", APPROVE_784_COMMENT, "pulp-review",
+                          "shipyard merge-steward"))
+
+    def test_a_signer_not_on_the_list_is_refused(self) -> None:
+        signers = self.guards / "reviewer-signers.json"
+        signers.write_text(json.dumps({"default": ["pulp-review"]}), encoding="utf-8")
+        result = self.land(self.approved_784(comments=self.signed("someone-else")))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("its signer someone-else is not one of pulp-review", result.stderr)
+        self.assertEqual(self.ledger()[-1]["verdict"], "refused")
+
+    def test_a_request_it_cannot_judge_is_refused_and_recorded(self) -> None:
+        result = self.run_guard(["api", "graphql", "--input", "-"], [], "danielraffel/Shipyard",
+                                SHIPYARD_QUEUE_ARM_REVIEW_ONLY="1")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.ledger()[-1]["verdict"], "refused")
 
 
 class WriterIdentity(unittest.TestCase):

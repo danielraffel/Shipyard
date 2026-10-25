@@ -728,19 +728,30 @@ pub(super) enum Command {
         /// one on the same base branch is adopted without this flag.
         #[arg(long = "adopt-head")]
         adopt_head: bool,
-        /// Do not arm GitHub-native auto-merge on the pull request. By default
-        /// Shipyard arms it (merge method MERGE) as soon as the pull request is
-        /// known, so a green pull request cannot sit unqueued because nothing
-        /// armed it. Arming is server-owned and survives this process; it does
-        /// not merge anything a required check has not passed.
+        /// Validate only: nothing this ship runs arms, enqueues or merges the
+        /// pull request. Native auto-merge is not armed when the pull request
+        /// is known, and the merge phase after green validation is skipped
+        /// (the ship reports the head left unarmed). By default Shipyard arms
+        /// it (merge method MERGE) as soon as the pull request is known, so a
+        /// green pull request cannot sit unqueued because nothing armed it.
+        /// Arming is server-owned and survives this process; it does not merge
+        /// anything a required check has not passed. Every arm or enqueue
+        /// Shipyard does make passes the queue-arm guard's review rule.
         #[arg(long = "no-arm")]
         no_arm: bool,
-        /// Arm native auto-merge even when the repository arms only heads a
-        /// reviewer approved (`[auto_merge] arm_requires_head_approval`). The
-        /// result names who armed it. Use it when you have read the approval
-        /// yourself, or have decided to land without one.
+        /// Arm native auto-merge, asking for the queue-arm guard's operator
+        /// override when the head carries no exact-head approval. The guard
+        /// still judges every arm: without an approval it honours the
+        /// override only for an operator at an interactive terminal, with
+        /// `--arm-reason`, and never in an agent's environment (`CLAUDECODE`,
+        /// `CLAUDE_CODE_*`, `CODEX_*`); otherwise the arm is refused. Each
+        /// attempt is recorded with the operator and the reason.
         #[arg(long = "arm", conflicts_with = "no_arm")]
         arm: bool,
+        /// Why `--arm` lands a head no reviewer approved; the override needs
+        /// one, and it is recorded with the operator who gave it.
+        #[arg(long = "arm-reason", value_name = "REASON", requires = "arm")]
+        arm_reason: Option<String>,
         /// Execute in this terminal for debugging instead of daemon ownership.
         #[arg(long)]
         foreground: bool,
@@ -815,27 +826,41 @@ pub(super) enum Command {
         adopt_head: bool,
         /// Durable workstream identifier for an atomic merge-steward handoff.
         /// Also enables handoff when the project default is disabled.
-        #[arg(long = "workstream-id", conflicts_with = "no_steward_handoff")]
+        #[arg(long = "workstream-id", conflicts_with_all = ["no_steward_handoff", "no_arm"])]
         workstream_id: Option<String>,
         /// Durable context URL for the steward receipt. Defaults to the PR URL.
-        #[arg(long = "context-url", conflicts_with = "no_steward_handoff")]
+        #[arg(long = "context-url", conflicts_with_all = ["no_steward_handoff", "no_arm"])]
         context_url: Option<String>,
         /// Disable a project-configured automatic steward handoff.
         #[arg(long = "no-steward-handoff", action = ArgAction::SetTrue)]
         no_steward_handoff: bool,
-        /// Do not arm GitHub-native auto-merge on the pull request. By default
-        /// Shipyard arms it (merge method MERGE) as soon as the pull request is
-        /// known, so a green pull request cannot sit unqueued because nothing
-        /// armed it. Arming is server-owned and survives this process; it does
-        /// not merge anything a required check has not passed.
+        /// Validate only: nothing this command starts arms, enqueues or merges
+        /// the pull request. It implies `--no-steward-handoff` (no steward
+        /// receipt is written), native auto-merge is not armed, and the handed
+        /// off `shipyard ship` skips its merge phase after green validation.
+        /// By default Shipyard arms it (merge method MERGE) as soon as the
+        /// pull request is known, so a green pull request cannot sit unqueued
+        /// because nothing armed it. Arming is server-owned and survives this
+        /// process; it does not merge anything a required check has not
+        /// passed. A steward that manages fleet pull requests on its own can
+        /// still enqueue later, and only through the queue-arm guard's review
+        /// rule: an exact-head `verdict: APPROVE head:<sha>` from an allowed
+        /// signer.
         #[arg(long = "no-arm")]
         no_arm: bool,
-        /// Arm native auto-merge even when the repository arms only heads a
-        /// reviewer approved (`[auto_merge] arm_requires_head_approval`). The
-        /// result names who armed it. Use it when you have read the approval
-        /// yourself, or have decided to land without one.
+        /// Arm native auto-merge, asking for the queue-arm guard's operator
+        /// override when the head carries no exact-head approval. The guard
+        /// still judges every arm: without an approval it honours the
+        /// override only for an operator at an interactive terminal, with
+        /// `--arm-reason`, and never in an agent's environment (`CLAUDECODE`,
+        /// `CLAUDE_CODE_*`, `CODEX_*`); otherwise the arm is refused. Each
+        /// attempt is recorded with the operator and the reason.
         #[arg(long = "arm", conflicts_with = "no_arm")]
         arm: bool,
+        /// Why `--arm` lands a head no reviewer approved; the override needs
+        /// one, and it is recorded with the operator who gave it.
+        #[arg(long = "arm-reason", value_name = "REASON", requires = "arm")]
+        arm_reason: Option<String>,
         /// Before anything else, cherry-pick this sibling branch's own commits
         /// (over origin/<base>; merges, version bumps and patches already here
         /// are skipped) onto the current branch. Repeatable; all-or-nothing.
@@ -3799,8 +3824,17 @@ pub(crate) enum ArmRequest {
     /// Arm, subject to every refusal, including the repository's
     /// head-approval policy.
     Default,
-    /// `--arm`: arm without checking for an approval of the head.
+    /// `--arm`: arm, asking the queue-arm guard for its audited operator
+    /// override when the head carries no approval.
     Override,
+}
+
+impl ArmRequest {
+    /// `--no-arm`: validate only, so the ship skips its merge phase too.
+    #[must_use]
+    pub(crate) const fn leaves_unarmed(self) -> bool {
+        matches!(self, Self::Off)
+    }
 }
 
 impl MergeMethod {
@@ -4675,6 +4709,24 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(argv.clone()).expect("parses");
             assert_eq!(cli.command.arm_auto_merge(), expected, "{argv:?}");
+        }
+    }
+
+    /// A steward handoff is authority to enqueue, so `pr --no-arm` refuses
+    /// the flags that would write one.
+    #[test]
+    fn no_arm_conflicts_with_a_steward_handoff() {
+        assert!(super::ArmRequest::Off.leaves_unarmed());
+        assert!(!super::ArmRequest::Default.leaves_unarmed());
+        assert!(!super::ArmRequest::Override.leaves_unarmed());
+        for flag in ["--workstream-id", "--context-url"] {
+            let error = Cli::try_parse_from(["shipyard", "pr", "--no-arm", flag, "x"])
+                .expect_err("--no-arm conflicts with a handoff flag");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag}"
+            );
         }
     }
 

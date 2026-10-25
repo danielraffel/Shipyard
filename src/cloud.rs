@@ -1010,10 +1010,32 @@ impl GitHubActions {
         )
     }
 
+    /// Run an operator's `--arm`: the queue-arm guard's review rule still
+    /// judges it, and decides whether its audited override applies.
+    pub(crate) fn run_gh_with_operator_override(
+        &self,
+        args: &[String],
+        operator_override: &crate::queue_arm_gate::OperatorOverride,
+    ) -> Result<String, GitHubError> {
+        self.run_gh_gated(args, &[], Some(operator_override))
+    }
+
     fn run_gh_with_env(
         &self,
         args: &[String],
         env: &[(&str, &str)],
+    ) -> Result<String, GitHubError> {
+        self.run_gh_gated(args, env, None)
+    }
+
+    /// Every `gh` call this client makes passes here or through
+    /// [`Self::run_gh_with_timeout_output_limits`], and a call that can arm,
+    /// enqueue or merge first passes [`crate::queue_arm_gate::check`].
+    fn run_gh_gated(
+        &self,
+        args: &[String],
+        env: &[(&str, &str)],
+        operator_override: Option<&crate::queue_arm_gate::OperatorOverride>,
     ) -> Result<String, GitHubError> {
         if let Some(timeout) = self.remaining_deadline()? {
             let output = self.run_gh_with_timeout_output_limits(
@@ -1021,14 +1043,16 @@ impl GitHubActions {
                 timeout,
                 Some((DEADLINE_GH_STDOUT_BYTES, DEADLINE_GH_STDERR_BYTES)),
                 env,
+                operator_override,
             )?;
             if !output.success() {
                 return Err(output.command_error(args));
             }
             return Ok(String::from_utf8_lossy(output.stdout()).to_string());
         }
-        let output = self
-            .prepare_gh_command()?
+        let mut command = self.prepare_gh_command()?;
+        gate_landing(&mut command, args, operator_override)?;
+        let output = command
             .envs(env.iter().copied())
             .args(args)
             .output()
@@ -1066,7 +1090,7 @@ impl GitHubActions {
         timeout: Duration,
         env: &[(&str, &str)],
     ) -> Result<String, GitHubError> {
-        let output = self.run_gh_with_timeout_output_limits(args, timeout, None, env)?;
+        let output = self.run_gh_with_timeout_output_limits(args, timeout, None, env, None)?;
         if !output.success() {
             return Err(output.command_error(args));
         }
@@ -1078,7 +1102,7 @@ impl GitHubActions {
         args: &[String],
         timeout: Duration,
     ) -> Result<GitHubCommandOutput, GitHubError> {
-        self.run_gh_with_timeout_output_limits(args, timeout, None, &[])
+        self.run_gh_with_timeout_output_limits(args, timeout, None, &[], None)
     }
 
     pub(crate) fn run_gh_with_timeout_bounded(
@@ -1098,6 +1122,7 @@ impl GitHubActions {
             timeout,
             Some((max_stdout_bytes, max_stderr_bytes)),
             &[],
+            None,
         )?;
         if !output.success() {
             return Err(output.command_error(args));
@@ -1111,6 +1136,7 @@ impl GitHubActions {
         timeout: Duration,
         output_limits: Option<(usize, usize)>,
         env: &[(&str, &str)],
+        operator_override: Option<&crate::queue_arm_gate::OperatorOverride>,
     ) -> Result<GitHubCommandOutput, GitHubError> {
         let timeout = self
             .remaining_deadline()?
@@ -1118,6 +1144,7 @@ impl GitHubActions {
         let started = Instant::now();
         let (deadline, execution_deadline) = gh_command_deadlines(started, timeout)?;
         let mut command = self.prepare_gh_command_with_timeout(timeout)?;
+        gate_landing(&mut command, args, operator_override)?;
         if Instant::now() >= deadline {
             return Err(GitHubError::new(format!(
                 "gh {} timed out during credential preparation after {}ms",
@@ -1265,6 +1292,23 @@ impl GitHubActions {
             )
             .map_err(|error| GitHubError::new(format!("failed to prepare gh command: {error}")))
     }
+}
+
+/// [`crate::queue_arm_gate::check`] for one prepared `gh` command, which then
+/// carries the same override request (or none) to a `ghapp` wrapper.
+fn gate_landing(
+    command: &mut std::process::Command,
+    args: &[String],
+    operator_override: Option<&crate::queue_arm_gate::OperatorOverride>,
+) -> Result<(), GitHubError> {
+    crate::queue_arm_gate::apply_override(command, operator_override);
+    crate::queue_arm_gate::check(
+        command,
+        args,
+        &crate::queue_arm_gate::process_caller(),
+        operator_override,
+    )
+    .map_err(GitHubError::new)
 }
 
 fn gh_command_deadlines(

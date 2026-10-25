@@ -324,6 +324,7 @@ fn passing_validation_survives_non_ready_post_run_ship_state() {
             None,
             None,
             None,
+            false,
         )
         .expect("merge readiness must not invalidate passing validation");
         assert!(matches!(
@@ -423,4 +424,58 @@ fn flaky_required_render_points_at_the_rescue_one_liner() {
         !text.contains("All green"),
         "must not claim all green; got:\n{text}"
     );
+}
+
+/// `--no-arm` validates only: a green ship skips the merge phase, so no
+/// merge, arm or enqueue command runs, foreground or daemon-owned.
+#[cfg(unix)]
+#[test]
+fn no_arm_skips_the_merge_phase_after_green_validation() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = ShipStateStore::new(temp.path().join("ship")).expect("ship state");
+    let state = ShipState::new(
+        7751,
+        "owner/repo",
+        "feature/x",
+        "main",
+        "a".repeat(40),
+        "policy",
+    );
+    store.save(&state).expect("state");
+    let ran = temp.path().join("merge-ran");
+    let merge = temp.path().join("merge");
+    std::fs::write(&merge, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).expect("merge");
+    std::fs::set_permissions(&merge, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let config = LoadedConfig {
+        data: Table::new(),
+        global_dir: temp.path().join("global"),
+        project_dir: None,
+        local_dir: None,
+        local_overlay_source: LocalOverlaySource::None,
+    };
+    let outcome = post_run_merge_state(
+        7751,
+        temp.path(),
+        &store,
+        &config,
+        RuntimeMode::Isolated,
+        "owner/repo",
+        true,
+        &state,
+        Some(merge),
+        None,
+        None,
+        true,
+    )
+    .expect("no-arm outcome");
+    let ShipRenderState::GreenNotMerged(detail) = &outcome else {
+        panic!("expected GreenNotMerged, got {outcome:?}");
+    };
+    assert!(detail.contains("left unarmed (--no-arm)"), "{detail}");
+    assert_eq!(
+        format!("{:?}", outcome.exit_code()),
+        format!("{:?}", ExitCode::SUCCESS)
+    );
+    assert!(!ran.exists(), "the merge phase ran under --no-arm");
 }

@@ -662,6 +662,22 @@ fn mark_internal_queue_mutation(command: &mut Command) -> &mut Command {
     command.env(INTERNAL_QUEUE_MUTATION_ENV, "1")
 }
 
+/// Run the queue-arm guard's review rule ([`crate::queue_arm_gate`]) on a
+/// landing command Shipyard built, before it runs. The marker above makes a
+/// `ghapp` on `PATH` step aside; this is what judges the head instead.
+fn gate_landing(command: &Command) -> Result<(), String> {
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    crate::queue_arm_gate::check(
+        command,
+        &args,
+        &crate::queue_arm_gate::process_caller(),
+        None,
+    )
+}
+
 /// Arm GitHub-native auto-merge on the validated head.
 ///
 /// Shipyard never enqueues a pull request itself. On a merge-queue branch,
@@ -875,7 +891,9 @@ fn merge_pr(
                                 )
                             })?;
                         (*guard).finish("rejected")?;
-                        if terminal_github_error(&error) {
+                        if terminal_github_error(&error)
+                            || crate::queue_arm_gate::is_refusal(&error)
+                        {
                             return Err(error);
                         }
                         return Ok(MergeDisposition::Enqueued);
@@ -937,6 +955,7 @@ fn merge_pr(
             delete_branch && !isolated_branch_cleanup,
             admin,
         );
+        gate_landing(&command)?;
     }
     let output = command
         .current_dir(cwd)
@@ -2339,7 +2358,9 @@ fn arm_native_queue(
     pr_id: &str,
     guard: MergeQueueMutationGuard,
 ) -> Result<MergeQueueMutationGuard, QueueArmError> {
-    let mut command = match native_arm_command(client, cwd, pr_id, &state.head_sha) {
+    let mut command = match native_arm_command(client, cwd, pr_id, &state.head_sha)
+        .and_then(|command| gate_landing(&command).map(|()| command))
+    {
         Ok(command) => command,
         Err(error) => {
             return Err(QueueArmError::Rejected {
@@ -3009,8 +3030,10 @@ fn attempt_merge_put(
     merge_method: MergeMethod,
     cwd: &Path,
 ) -> Result<(), String> {
-    let output = gh(client, cwd)?
-        .args(rest_merge_args(endpoint, head_sha, merge_method))
+    let mut command = gh(client, cwd)?;
+    command.args(rest_merge_args(endpoint, head_sha, merge_method));
+    gate_landing(&command)?;
+    let output = command
         .output()
         .map_err(|error| format!("REST fallback: failed to invoke gh api: {error}"))?;
     if output.status.success() {

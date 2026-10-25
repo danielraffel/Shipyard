@@ -167,6 +167,8 @@ fn ship_args(pr: Option<u64>, gh: Option<std::path::PathBuf>) -> ShipCommandArgs
         invocation: ShipInvocation::Direct,
         foreground: true,
         arm_auto_merge: crate::app::cli::ArmRequest::Off,
+        arm_reason: None,
+        leave_unarmed: false,
         body_append: None,
     }
 }
