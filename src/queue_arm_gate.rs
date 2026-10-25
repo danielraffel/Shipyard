@@ -195,6 +195,7 @@ fn create_private_dir(directory: &Path) -> std::io::Result<()> {
     if let Some(parent) = directory.parent() {
         fs::create_dir_all(parent)?;
     }
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
@@ -577,6 +578,8 @@ pub(crate) mod tests_support {
 
     /// Run `body` with the bundled guard live on this thread, writing its
     /// ledger to `ledger` and reading signers and switches from `guards_dir`.
+    /// The live-guard tests need a Unix `gh` script, so only they call it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn with_real_guard<T>(
         ledger: &Path,
         guards_dir: &Path,
