@@ -227,14 +227,21 @@ fn wait_pr<W: Write>(
     );
     match result {
         Ok(mut outcome) => {
+            let mut delegated_receipt_warning = None;
             if outcome.matched && matches!(state, WaitPrState::Merged) && snapshot_file.is_none() {
-                consume_delegated_witness(
+                if let Err(error) = consume_delegated_witness(
                     state_dir,
                     cwd,
                     &repo,
                     pr_number,
                     merged_snapshot.as_ref(),
-                )?;
+                ) {
+                    let warning = format!("delegated receipt import withheld: {}", error.message());
+                    let _ = crate::writer_domain_lease::write_stderr(format_args!(
+                        "warning: {warning}\n"
+                    ));
+                    delegated_receipt_warning = Some(warning);
+                }
             }
             if terminal_wrong {
                 outcome.matched = false;
@@ -253,6 +260,16 @@ fn wait_pr<W: Write>(
                 && matches!(state, WaitPrState::Green)
                 && snapshot_file.is_none())
             .then(|| pr_validation_signals(mode, cwd, &repo, pr_number, &outcome));
+            let extra = delegated_receipt_warning
+                .map(|warning| ("warning", Value::String(warning)))
+                .or_else(|| {
+                    validation.as_ref().map(|signals| {
+                        (
+                            "validation",
+                            serde_json::to_value(signals).unwrap_or(Value::Null),
+                        )
+                    })
+                });
             render_wait_outcome_with(
                 stdout,
                 json,
@@ -264,12 +281,7 @@ fn wait_pr<W: Write>(
                     "head_sha": outcome.observed.get("head_sha").cloned().unwrap_or(Value::Null),
                 }),
                 &outcome,
-                validation.as_ref().map(|signals| {
-                    (
-                        "validation",
-                        serde_json::to_value(signals).unwrap_or(Value::Null),
-                    )
-                }),
+                extra,
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
             if let (Some(signals), false) = (&validation, json) {
@@ -1188,8 +1200,8 @@ mod tests {
     use super::{
         RuntimeMode, WaitOutcome, WaitPrState, consume_delegated_witness,
         evaluate_pr_green_for_wait, evaluate_pr_queue_state, evaluate_run_for_wait,
-        parse_github_repo_slug, release_manifest, render_wait_outcome, resolve_repo_slug,
-        wait_exit_code, wait_failure, wait_job, wait_pr, wait_release, wait_run,
+        parse_github_repo_slug, release_manifest, render_wait_outcome, render_wait_outcome_with,
+        resolve_repo_slug, wait_exit_code, wait_failure, wait_job, wait_pr, wait_release, wait_run,
     };
     use crate::app::{
         WAIT_EXIT_CLOSED, WAIT_EXIT_INVALID, WAIT_EXIT_NO_FALLBACK, WAIT_EXIT_TERMINAL_WRONG,
@@ -1263,6 +1275,34 @@ mod tests {
         .expect_err("policy drift");
         assert!(error.message.contains("policy"));
         assert!(DelegatedValidationWitness::path(temp.path(), "owner/repo", 42).exists());
+    }
+
+    #[test]
+    fn delegated_receipt_refusal_warning_preserves_merged_match() {
+        let outcome = WaitOutcome {
+            matched: true,
+            transport: "polling".to_owned(),
+            ..WaitOutcome::default()
+        };
+        let mut out = Vec::new();
+        render_wait_outcome_with(
+            &mut out,
+            true,
+            "wait:pr",
+            serde_json::json!({"type": "pr_merged"}),
+            &outcome,
+            Some((
+                "warning",
+                Value::String("delegated receipt import withheld: policy drifted".to_owned()),
+            )),
+        )
+        .expect("render warning");
+        let payload: Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(payload["matched"], true);
+        assert_eq!(
+            payload["warning"].as_str(),
+            Some("delegated receipt import withheld: policy drifted")
+        );
     }
 
     #[test]
