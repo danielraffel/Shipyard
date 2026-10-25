@@ -168,7 +168,9 @@ fn wait_release<W: Write>(
     Ok(wait_exit_code(&outcome))
 }
 
-#[allow(clippy::too_many_arguments)]
+// This is the public wait orchestration boundary; keeping the transport and
+// rendering paths together preserves the exact exit-code contract.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn wait_pr<W: Write>(
     mode: RuntimeMode,
     socket_path: &Path,
@@ -227,22 +229,15 @@ fn wait_pr<W: Write>(
     );
     match result {
         Ok(mut outcome) => {
-            let mut delegated_receipt_warning = None;
-            if outcome.matched
-                && matches!(state, WaitPrState::Merged)
-                && snapshot_file.is_none()
-                && let Err(error) = consume_delegated_witness(
+            let mut receipt_warning = None;
+            if outcome.matched && matches!(state, WaitPrState::Merged) && snapshot_file.is_none() {
+                receipt_warning = delegated_receipt_warning(
                     state_dir,
                     cwd,
                     &repo,
                     pr_number,
                     merged_snapshot.as_ref(),
-                )
-            {
-                let warning = format!("delegated receipt import withheld: {}", error.message());
-                let _ =
-                    crate::writer_domain_lease::write_stderr(format_args!("warning: {warning}\n"));
-                delegated_receipt_warning = Some(warning);
+                );
             }
             if terminal_wrong {
                 outcome.matched = false;
@@ -261,7 +256,7 @@ fn wait_pr<W: Write>(
                 && matches!(state, WaitPrState::Green)
                 && snapshot_file.is_none())
             .then(|| pr_validation_signals(mode, cwd, &repo, pr_number, &outcome));
-            let extra = delegated_receipt_warning
+            let extra = receipt_warning
                 .map(|warning| ("warning", Value::String(warning)))
                 .or_else(|| {
                     validation.as_ref().map(|signals| {
@@ -300,6 +295,19 @@ fn wait_pr<W: Write>(
         }
         Err(error) => Err(wait_failure(error.as_ref())),
     }
+}
+
+fn delegated_receipt_warning(
+    state_dir: &Path,
+    cwd: &Path,
+    repo: &str,
+    pr_number: u64,
+    snapshot: Option<&Value>,
+) -> Option<String> {
+    let error = consume_delegated_witness(state_dir, cwd, repo, pr_number, snapshot).err()?;
+    let warning = format!("delegated receipt import withheld: {}", error.message());
+    let _ = crate::writer_domain_lease::write_stderr(format_args!("warning: {warning}\n"));
+    Some(warning)
 }
 
 fn wait_pr_state_exit_code(state: WaitPrState) -> ExitCode {
@@ -363,6 +371,23 @@ fn consume_delegated_witness(
             "merged head branch differs from delegated witness",
         ));
     }
+    let observation = delegated_observation(snapshot)?;
+    let receipt = witness
+        .receipt(&observation)
+        .map_err(|error| CliFailure::new(1, error))?;
+    MetricsStore::open(state_dir)
+        .map_err(|error| CliFailure::new(1, format!("open metrics store: {error}")))?
+        .import_merge_receipts(std::slice::from_ref(&receipt))
+        .map_err(|error| CliFailure::new(1, format!("import delegated merge receipt: {error}")))?;
+    witness
+        .retire(state_dir)
+        .map_err(|error| CliFailure::new(1, format!("retire delegated witness: {error}")))
+}
+
+// The observation parser mirrors GitHub's rollup schema and must validate all
+// fields before constructing the receipt evidence digest.
+#[allow(clippy::too_many_lines)]
+fn delegated_observation(snapshot: &Value) -> Result<MergedObservation, CliFailure> {
     let policy_checks = crate::delegated_validation::policy_checks_from_snapshot(snapshot)
         .map_err(|error| CliFailure::new(1, error))?;
     let mut evidence = Vec::new();
@@ -510,16 +535,7 @@ fn consume_delegated_witness(
                 .map_err(|error| CliFailure::new(1, error.to_string()))?,
         ),
     };
-    let receipt = witness
-        .receipt(&observation)
-        .map_err(|error| CliFailure::new(1, error))?;
-    MetricsStore::open(state_dir)
-        .map_err(|error| CliFailure::new(1, format!("open metrics store: {error}")))?
-        .import_merge_receipts(std::slice::from_ref(&receipt))
-        .map_err(|error| CliFailure::new(1, format!("import delegated merge receipt: {error}")))?;
-    witness
-        .retire(state_dir)
-        .map_err(|error| CliFailure::new(1, format!("retire delegated witness: {error}")))
+    Ok(observation)
 }
 
 fn evaluate_pr_queue_state(snapshot: Option<&Value>, target: &str) -> crate::wait::TruthResult {

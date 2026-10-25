@@ -137,6 +137,9 @@ impl DelegatedValidationWitness {
     /// Convert a verified merged observation into the normal safe-merge receipt.
     /// Every identity and provenance field is required; this function never
     /// infers a receipt from merged status alone.
+    // This is intentionally a single fail-closed validation sequence: every
+    // field is checked before the normal merge-receipt schema is emitted.
+    #[allow(clippy::too_many_lines)]
     pub fn receipt(&self, observation: &MergedObservation) -> Result<MergeReceipt, String> {
         if self.armed_at.is_none() {
             return Err("delegated receipt refused: witness was never armed".to_owned());
@@ -350,14 +353,13 @@ fn validate_approval_identity(raw: &str) -> Result<(), String> {
     if !matches!(via, "review" | "marker" | "carried") {
         return Err("delegated receipt refused: approval identity has unknown schema".to_owned());
     }
-    if via == "review" || via == "marker" {
-        if object
+    if (via == "review" || via == "marker")
+        && object
             .get("login")
             .and_then(serde_json::Value::as_str)
             .is_none_or(str::is_empty)
-        {
-            return Err("delegated receipt refused: approval reviewer login is missing".to_owned());
-        }
+    {
+        return Err("delegated receipt refused: approval reviewer login is missing".to_owned());
     }
     if let Some(app_id) = object.get("performed_via_github_app_id")
         && !app_id.is_null()
