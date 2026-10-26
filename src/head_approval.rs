@@ -151,6 +151,16 @@ thread_local! {
     static HOST_SIGNERS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     static HOST_SESSIONS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     static HOST_SESSION_HOSTS: std::cell::RefCell<SessionHosts> = const { std::cell::RefCell::new(SessionHosts::new()) };
+    static GUARDS_DIR_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` with [`guards_dir`] at `dir`, on this thread.
+#[cfg(test)]
+pub(crate) fn with_guards_dir<T>(dir: &std::path::Path, body: impl FnOnce() -> T) -> T {
+    GUARDS_DIR_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(dir.to_path_buf()));
+    let result = body();
+    GUARDS_DIR_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    result
 }
 
 /// Run `body` as if this host's signers file mapped each short host name in
@@ -413,6 +423,21 @@ pub fn writer_identity() -> serde_json::Map<String, Value> {
 /// The guards directory: `$SHIPYARD_GHAPP_GUARDS_DIR`, else
 /// `~/.config/shipyard/guards`.
 pub(crate) fn guards_dir() -> Option<std::path::PathBuf> {
+    guards_dir_override().or_else(guards_dir_from_env)
+}
+
+/// [`with_guards_dir`]'s directory on this thread. Tests read no host state.
+#[cfg(test)]
+fn guards_dir_override() -> Option<std::path::PathBuf> {
+    GUARDS_DIR_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(not(test))]
+const fn guards_dir_override() -> Option<std::path::PathBuf> {
+    None
+}
+
+fn guards_dir_from_env() -> Option<std::path::PathBuf> {
     std::env::var_os("SHIPYARD_GHAPP_GUARDS_DIR")
         .filter(|dir| !dir.is_empty())
         .map(std::path::PathBuf::from)
@@ -739,6 +764,9 @@ pub const EJECTION_CAP: usize = 2;
 pub type RunGh<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
 
 /// The repository's approval policy.
+// Each flag is an independent switch read in a different place; an enum would
+// only rename them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ApprovalPolicy {
     /// Whether arming requires an approval of the exact head.
@@ -768,6 +796,12 @@ pub struct ApprovalPolicy {
     /// listed an App APPROVE does not count.
     #[serde(default)]
     pub signer_source: SignerSource,
+    /// Evaluate without side effects: a carry is judged but never appended to
+    /// the carry log. Read-only callers (`shipyard train status`) set it, so
+    /// a report can never pass for a real carry; it is never read from a
+    /// config.
+    #[serde(skip)]
+    pub dry_run: bool,
 }
 
 /// Where an [`ApprovalPolicy`]'s signers came from.
@@ -832,6 +866,7 @@ impl ApprovalPolicy {
                 }),
             rebase_carry: false,
             signer_source: SignerSource::Host,
+            dry_run: false,
         }
     }
 
@@ -2044,7 +2079,9 @@ fn with_carry(run_gh: RunGh<'_>, input: &CarryInput<'_>, gate: HeadGate) -> Head
         Err(_) if input.policy.rebase_carry || host_rebase_carry() => {
             match rebase_carry(run_gh, input.repo, input.pr, &from, input.head) {
                 Ok(record) => {
-                    rebase::log_carry(input.repo, input.pr, &from, input.head, &record);
+                    if !input.policy.dry_run {
+                        rebase::log_carry(input.repo, input.pr, &from, input.head, &record);
+                    }
                     true
                 }
                 Err(_) => return gate,

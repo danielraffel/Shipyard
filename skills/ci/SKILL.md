@@ -322,6 +322,10 @@ Two things not to conclude from it:
   `checks: write`: dispatch `build.yml` on the head as the
   fleet App and wait for the full lane. The steward's native-arm backstop arms
   it later. See the shipyard skill.
+- **`shipyard train status` shows why an approved PR is not in the queue.**
+  It is off unless the base sets `[train] enabled = true`; `SHIPYARD_TRAIN=off`
+  or `shipyard train pause --reason` kills it on a host. Read-only: it never
+  arms or enqueues.
 - **Armed is not merged.** GitHub still waits for the repository's required
   checks and refuses drafts itself. But note the converse: once armed, GitHub
   may merge as soon as the *required* set is green, which can be before

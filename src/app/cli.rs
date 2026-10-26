@@ -581,6 +581,15 @@ pub(super) enum Command {
     /// `base_health.auto_jump` (`off` by default; `dry-run` records "would jump
     /// PR #n" once per episode; `on` dequeues and re-enqueues the fix with
     /// `jump: true`). With `off`, `--act` returns before reading GitHub.
+    /// The merge train: whether it is on for a repository, every open pull
+    /// request's stage on the way into the merge queue, metrics, and the host
+    /// pause. Off unless the base config sets `[train] enabled = true`;
+    /// `SHIPYARD_TRAIN=off` or `train pause` kills it on this host. Read-only.
+    Train {
+        /// Train operation.
+        #[command(subcommand)]
+        command: TrainCommand,
+    },
     #[command(name = "base-health")]
     BaseHealth {
         /// Exact OWNER/REPO. Defaults to the `origin` remote.
@@ -1072,6 +1081,45 @@ pub(super) enum QueueCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub(super) enum TrainCommand {
+    /// Print the switch and, when on, each open pull request's stage and why.
+    Status {
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Base branch.
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Append this pass to the repository's sample file (for `metrics`).
+        #[arg(long)]
+        record: bool,
+    },
+    /// Merges/hour, approved-to-merged p50/p95, queue-empty minutes while a
+    /// ready pull request waited, and batch sizes, from recorded samples.
+    Metrics {
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Window, in hours, ending now.
+        #[arg(long = "since-hours", default_value_t = 24)]
+        since_hours: u32,
+    },
+    /// Pause the train on this host: writes the guards-dir pause file.
+    Pause {
+        /// Why; recorded with who paused and when.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Remove this host's pause file. Only the operator who paused may, with
+    /// a reason, and not while `SHIPYARD_TRAIN` still kills the train.
+    Resume {
+        /// Why; recorded with who resumed and when.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub(super) enum QueueHoldCommand {
     /// Execute one child while it owns the live local queue-admission hold.
     Exec {

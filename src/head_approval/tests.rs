@@ -93,6 +93,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         signers: None,
         rebase_carry: false,
         signer_source: super::SignerSource::Host,
+        dry_run: false,
     }
 }
 
@@ -104,7 +105,7 @@ fn review(login: &str, kind: &str, state: &str, commit: &str, at: &str) -> Value
     json!({"login": login, "type": kind, "at": at, "state": state, "commit_id": commit})
 }
 
-fn empty_queue(head: &str) -> Value {
+pub(crate) fn empty_queue(head: &str) -> Value {
     json!({"data": {"repository": {"pullRequest": {"headRefOid": head,
         "timelineItems": {"nodes": []}}}}})
 }
@@ -604,6 +605,7 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             signers: None,
             rebase_carry: false,
             signer_source: super::SignerSource::Host,
+            dry_run: false,
         }
     );
     let empty: toml::Table = "[project]\nname = \"x\"\n".parse().expect("toml");
@@ -661,7 +663,7 @@ fn an_unreadable_policy_is_an_error_not_the_default() {
 // Repositories that require review by default
 // ---------------------------------------------------------------------------
 
-fn by_default(repo: &str) -> ApprovalPolicy {
+pub(crate) fn by_default(repo: &str) -> ApprovalPolicy {
     ApprovalPolicy::without_config(repo, true)
 }
 
@@ -1606,9 +1608,9 @@ fn the_arm_path_reads_the_author_before_judging() {
 /// Past this size the fake GitHub, like GitHub, omits a text file's patch.
 const LARGE_TEXT: u64 = 100_000;
 
-struct History {
+pub(crate) struct History {
     dir: tempfile::TempDir,
-    approved: String,
+    pub(crate) approved: String,
     blobs_unreadable: bool,
     /// The base requires `macos`, and it concluded `skipped` on every head.
     skipped_required: bool,
@@ -1618,7 +1620,7 @@ struct History {
 }
 
 impl History {
-    fn new(binary: bool) -> Self {
+    pub(crate) fn new(binary: bool) -> Self {
         Self::with(binary, false)
     }
 
@@ -1689,7 +1691,7 @@ impl History {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
-    fn write(&self, name: &str, data: &[u8]) {
+    pub(crate) fn write(&self, name: &str, data: &[u8]) {
         std::fs::write(self.dir.path().join(name), data).expect("write");
     }
 
@@ -1711,7 +1713,7 @@ impl History {
     /// Rebase the approved head onto the base after `on_base` changes the
     /// base (and commits, when it changed anything), then let `on_pr` change
     /// the rebased head (amended into it).
-    fn rebase(&self, on_base: impl FnOnce(&Self), on_pr: impl FnOnce(&Self)) -> String {
+    pub(crate) fn rebase(&self, on_base: impl FnOnce(&Self), on_pr: impl FnOnce(&Self)) -> String {
         self.git(&["checkout", "-q", "main"]);
         on_base(self);
         if !self.git(&["status", "--porcelain"]).is_empty() {
@@ -1862,7 +1864,7 @@ impl History {
         None
     }
 
-    fn gh(&self, args: &[String]) -> Result<String, String> {
+    pub(crate) fn gh(&self, args: &[String]) -> Result<String, String> {
         let joined = args.join(" ");
         if joined.contains(":object(expression:") {
             return Ok(self.trees(&joined));
