@@ -542,6 +542,19 @@ mismatch after it leaves the pull request disarmed with
 head is not approval: a head that is a GitHub `Merge branch '<base>' into`
 commit gets no carrier action until a reviewer approves that head.
 
+
+Three guardrails bound every carry, in the guard and in `head_approval`:
+- **Excluded paths:** a PR touching `[auto_merge] carry_excluded_paths` never
+  carries. The default list is workflows, `.agents/contract.toml`,
+  `tools/ci/**`, the guards and Shipyard's arm code, and signing and release
+  automation.
+- **`carry: no`:** a `carry: no` line in the APPROVE keeps it to its exact
+  head.
+- **A cap:** at most 3 base merges or 48 hours since the verdict.
+
+Every merge carry a landing accepts is logged to `carries.jsonl` with its
+verdict id and both merge bases. Read-only evaluations (`dry_run`: the
+`review-verdict` status, `train status`) never append a row.
 ## A transient rerun needs the interruption signature, not a conclusion
 
 The steward's bounded rerun and the carrier's `redispatch` both rerun only a

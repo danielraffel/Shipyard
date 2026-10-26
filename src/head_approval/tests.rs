@@ -93,6 +93,8 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         signers: None,
         rebase_carry: false,
         signer_source: super::SignerSource::Host,
+        carry_excluded: None,
+        dry_run: false,
     }
 }
 
@@ -604,6 +606,8 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             signers: None,
             rebase_carry: false,
             signer_source: super::SignerSource::Host,
+            carry_excluded: None,
+            dry_run: false,
         }
     );
     let empty: toml::Table = "[project]\nname = \"x\"\n".parse().expect("toml");
@@ -1615,6 +1619,8 @@ struct History {
     /// The base's `.shipyard/config.toml`; `None` answers 404. With one, the
     /// fleet App's approval is signed `reviewer: pulp-review`.
     config: Option<&'static str>,
+    /// Lines written above the fleet App's APPROVE.
+    verdict_note: &'static str,
 }
 
 impl History {
@@ -1632,6 +1638,7 @@ impl History {
             blobs_unreadable: false,
             skipped_required: false,
             config: None,
+            verdict_note: "",
         };
         history.git(&["init", "-q", "-b", "main"]);
         history.git(&["config", "user.email", "r@r"]);
@@ -1752,6 +1759,7 @@ impl History {
             7,
             &self.approved,
             head,
+            &super::ApprovalPolicy::default().carry_excluded_paths(),
         )
         .expect_err("refused")
     }
@@ -1853,9 +1861,14 @@ impl History {
             } else {
                 ""
             };
+            // Now: a carry needs a verdict younger than MAX_CARRY_AGE_HOURS.
+            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
             return Some(Ok(fleet(
-                "2026-10-12T01:00:00Z",
-                &format!("{signer}verdict: APPROVE head:{}", self.approved),
+                &now,
+                &format!(
+                    "{}{signer}verdict: APPROVE head:{}",
+                    self.verdict_note, self.approved
+                ),
             )
             .to_string()));
         }
@@ -2011,6 +2024,35 @@ impl History {
             )
         })
         .expect("readable")
+    }
+
+    /// Merge the base, after one more base commit, into the current merged
+    /// head: one more clean update on the chain.
+    fn merge_again(&self, n: usize) -> String {
+        self.git(&["checkout", "-q", "main"]);
+        self.write("other.txt", format!("unrelated {n}\n").as_bytes());
+        self.git(&["commit", "-qam", "base again"]);
+        self.git(&["checkout", "-q", "head"]);
+        self.git(&[
+            "merge",
+            "-q",
+            "--no-edit",
+            "-m",
+            "Merge branch 'main' into pr",
+            "main",
+        ]);
+        self.git(&["rev-parse", "HEAD"])
+    }
+
+    fn carry_record(&self, head: &str, excluded: &[String]) -> Result<super::MergeCarry, String> {
+        super::merge_only_carry_record(
+            &|args: &[String]| self.gh(args),
+            "danielraffel/tartci",
+            7,
+            &self.approved,
+            head,
+            excluded,
+        )
     }
 
     fn refusal(&self, head: &str) -> String {
@@ -2739,4 +2781,258 @@ fn a_verdict_line_ends_where_the_python_readers_end_it() {
             "{ending:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Carry guardrails (the twin of the Python guard's carry_excluded,
+// carry_limits and MAX_CARRY_MERGES).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn glob_match_treats_double_star_as_whole_segments() {
+    use super::glob_match;
+    assert!(glob_match(
+        ".github/workflows/**",
+        ".github/workflows/ci.yml"
+    ));
+    assert!(glob_match(
+        ".github/workflows/**",
+        ".github/workflows/sub/ci.yml"
+    ));
+    assert!(!glob_match(".github/workflows/**", ".github/ci.yml"));
+    assert!(glob_match(
+        "scripts/ghapp*",
+        "scripts/ghapp_queue_arm_guard.py"
+    ));
+    assert!(!glob_match("scripts/ghapp*", "scripts/sub/ghapp.py"));
+    assert!(glob_match("**/*signing*", "tools/release/signing.sh"));
+    assert!(glob_match("**/*signing*", "signing.toml"));
+    assert!(glob_match("tools/ci/**", "tools/ci/a/b.sh"));
+    assert!(glob_match("src/head_approval?rs", "src/head_approval.rs"));
+    assert!(!glob_match("tools/ci/**", "tools/cid/run.sh"));
+}
+
+#[test]
+fn every_default_exclusion_names_the_paths_it_means() {
+    let defaults = super::ApprovalPolicy::default().carry_excluded_paths();
+    for path in [
+        ".github/workflows/build.yml",
+        ".agents/contract.toml",
+        "tools/ci/run_gate.py",
+        "scripts/ghapp_queue_arm_guard.py",
+        "src/head_approval.rs",
+        "src/head_approval/rebase.rs",
+        "src/queue_arm_gate.rs",
+        "src/auto_arm.rs",
+        "release-please-config.json",
+        "tools/release/codesign.sh",
+    ] {
+        assert!(
+            super::carry_excluded([path], &defaults).is_some(),
+            "{path} should never carry"
+        );
+    }
+    assert_eq!(
+        super::carry_excluded(["src/lib.rs", "docs/x.md"], &defaults),
+        None
+    );
+}
+
+#[test]
+fn the_base_config_replaces_the_excluded_paths() {
+    let table: toml::Table = "[auto_merge]\ncarry_excluded_paths = [\"docs/**\"]\n"
+        .parse()
+        .expect("toml");
+    assert_eq!(
+        super::ApprovalPolicy::from_table(&table).carry_excluded_paths(),
+        vec!["docs/**".to_owned()]
+    );
+    // Not a list of globs: no carry at all.
+    let table: toml::Table = "[auto_merge]\ncarry_excluded_paths = \"docs\"\n"
+        .parse()
+        .expect("toml");
+    assert_eq!(
+        super::ApprovalPolicy::from_table(&table).carry_excluded_paths(),
+        vec!["**".to_owned()]
+    );
+}
+
+/// A pull request that changes an excluded path never carries, even over an
+/// honest merge; the same merge carries when nothing it changes is excluded.
+#[test]
+fn a_merge_carry_refuses_a_pull_request_touching_an_excluded_path() {
+    let history = History::new(false);
+    let head = history.merge(|_| {});
+    let refused = history
+        .carry_record(&head, &["guard.c".to_owned()])
+        .expect_err("refused");
+    assert!(
+        refused.contains("it changes guard.c (guard.c)"),
+        "{refused}"
+    );
+    let carried = history
+        .carry_record(
+            &head,
+            &super::ApprovalPolicy::default().carry_excluded_paths(),
+        )
+        .expect("carries");
+    assert_eq!(carried.merges, 1);
+    assert_ne!(carried.old_base, carried.new_base);
+}
+
+#[test]
+fn an_approval_carries_across_at_most_three_base_merges() {
+    let history = History::new(false);
+    let mut heads = vec![history.merge(|_| {})];
+    for n in 0..3 {
+        heads.push(history.merge_again(n));
+    }
+    let excluded = super::ApprovalPolicy::default().carry_excluded_paths();
+    assert_eq!(
+        history
+            .carry_record(&heads[2], &excluded)
+            .map(|carry| carry.merges),
+        Ok(3)
+    );
+    let refused = history
+        .carry_record(&heads[3], &excluded)
+        .expect_err("refused");
+    assert!(refused.contains("more than 3 base merges"), "{refused}");
+}
+
+fn limits_input<'a>(
+    comments: &'a [Value],
+    policy: &'a super::ApprovalPolicy,
+) -> super::CarryInput<'a> {
+    super::CarryInput {
+        repo: "danielraffel/tartci",
+        pr: 7,
+        head: HEAD,
+        reviews: &[],
+        comments,
+        policy,
+        author: Some("someone-else"),
+    }
+}
+
+/// `carry: no` in the deciding APPROVE, or a verdict older than 48h, keeps
+/// the approval to its exact head; a plain recent APPROVE carries.
+#[test]
+fn carry_no_or_an_old_verdict_keeps_an_approval_to_its_exact_head() {
+    const FROM: &str = "1111111111111111111111111111111111111111";
+    let policy = required(&["reviewer"]);
+    let now = chrono::DateTime::parse_from_rfc3339("2026-10-26T12:00:00Z")
+        .expect("time")
+        .with_timezone(&chrono::Utc);
+    let approve = |at: &str, body: &str| {
+        json!({"login": "reviewer", "type": "User", "association": "MEMBER", "at": at,
+               "body": format!("{body}verdict: APPROVE head:{FROM}")})
+    };
+    let limits =
+        |comments: &[Value]| super::carry_limits(FROM, &limits_input(comments, &policy), now);
+    assert_eq!(
+        limits(&[approve("2026-10-26T10:00:00Z", "Looks good.\n")]),
+        None
+    );
+    assert_eq!(
+        limits(&[approve("2026-10-26T10:00:00Z", "Looks good.\ncarry: no\n")]),
+        Some("its verdict says `carry: no`".to_owned())
+    );
+    assert_eq!(
+        limits(&[approve("2026-10-26T10:00:00Z", "  Carry :NO \n")]),
+        Some("its verdict says `carry: no`".to_owned())
+    );
+    assert!(
+        limits(&[approve("2026-10-24T11:59:00Z", "")])
+            .is_some_and(|why| why.contains("older than 48h"))
+    );
+    assert_eq!(limits(&[approve("2026-10-24T12:01:00Z", "")]), None);
+}
+
+/// The evaluation itself honours `carry: no`: the same honest merge carries
+/// without the line and not with it.
+#[test]
+fn carry_no_in_the_approve_stops_the_merge_carry() {
+    let mut history = History::new(false);
+    let head = history.merge(|_| {});
+    assert!(matches!(
+        history.gate(&head),
+        HeadGate::Approved {
+            approval: Approval::Carried { .. }
+        }
+    ));
+    history.verdict_note = "Reviewed.\ncarry: no\n";
+    assert!(matches!(history.gate(&head), HeadGate::NotApproved { .. }));
+}
+
+/// The rebase carry refuses an excluded path too, before reading anything
+/// else about the rebase.
+#[test]
+fn a_rebase_carry_refuses_a_pull_request_touching_an_excluded_path() {
+    let history = History::new(false);
+    let head = history.rebase(|history| history.write("more.txt", b"more base\n"), |_| {});
+    let refused = super::rebase_carry(
+        &|args: &[String]| history.gh(args),
+        "danielraffel/tartci",
+        7,
+        &history.approved,
+        &head,
+        &["guard.c".to_owned()],
+    )
+    .expect_err("refused");
+    assert!(
+        refused.contains("it changes guard.c (guard.c)"),
+        "{refused}"
+    );
+}
+
+/// Only a landing logs a carry: a dry evaluation (a read-only caller) judges
+/// the same merge-only and rebase carries and leaves `carries.jsonl`
+/// byte-identical; the same evaluation as a landing appends each.
+#[test]
+fn a_dry_evaluation_judges_carries_without_logging_them() {
+    let guards = tempfile::tempdir().expect("guards");
+    let log = guards.path().join("carries.jsonl");
+    std::fs::write(&log, "{\"kind\":\"rebase\",\"earlier\":true}\n").expect("seed");
+    let before = std::fs::read(&log).expect("log");
+    let merged = History::new(false);
+    let merge_head = merged.merge(|_| {});
+    let rebased = History::new(false);
+    let rebase_head = rebased.rebase(|history| history.write("more.txt", b"more base\n"), |_| {});
+    let evaluate = |history: &History, head: &str, dry_run: bool| {
+        let mut policy = by_default("danielraffel/tartci");
+        policy.rebase_carry = true;
+        policy.dry_run = dry_run;
+        super::with_guards_dir(guards.path(), || {
+            super::evaluate_with_policy_for_author(
+                &|args: &[String]| history.gh(args),
+                "danielraffel/tartci",
+                7,
+                head,
+                &policy,
+                &empty_queue(head),
+                None,
+            )
+        })
+        .expect("readable")
+    };
+    for (history, head) in [(&merged, &merge_head), (&rebased, &rebase_head)] {
+        assert!(matches!(
+            evaluate(history, head, true),
+            HeadGate::Approved {
+                approval: Approval::Carried { .. }
+            }
+        ));
+    }
+    assert_eq!(std::fs::read(&log).expect("log"), before);
+    evaluate(&merged, &merge_head, false);
+    evaluate(&rebased, &rebase_head, false);
+    let rows: Vec<Value> = std::fs::read_to_string(&log)
+        .expect("log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("json"))
+        .collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[1]["kind"], "merge");
+    assert_eq!(rows[2]["kind"], "rebase");
 }

@@ -87,6 +87,8 @@ pub fn review_verdict(
     let head = head.map_or_else(|| live.clone(), str::to_ascii_lowercase);
     let mut policy = head_approval::read_policy_repository_side(run_gh, repo, &base)?;
     policy.rebase_carry = rebase_carry;
+    // A status is read-only: it judges a carry but never logs one.
+    policy.dry_run = true;
     let (gate, events) = head_approval::evaluate_with_policy_for_author_with_events(
         run_gh,
         repo,
