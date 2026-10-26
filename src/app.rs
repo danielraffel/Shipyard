@@ -75,6 +75,7 @@ mod sandbox_audit_cmd;
 mod ship_cmd;
 mod ship_state_cmd;
 mod targets_cmd;
+mod train_cmd;
 mod update_cmd;
 mod verdicts_cmd;
 mod wait_cmd;
@@ -659,6 +660,16 @@ where
         Command::QueueHold { command } => {
             return queue_hold_command(command, &runtime_paths.state_dir, cli.json, stdout);
         }
+        Command::Train { command } => {
+            return train_cmd::train(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
+        }
         Command::QueueObserve {
             repo,
             base,
@@ -933,6 +944,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Rollup { .. }
         | Command::Who { .. }
         | Command::BaseHealth { .. }
+        | Command::Train { .. }
         | Command::Diagnose { .. }
         | Command::Doctor { .. }
         | Command::Daemon { .. }

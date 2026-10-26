@@ -606,6 +606,32 @@ full lane. No override lands it, neither
 the steward's native-arm backstop. Do not dispatch or label it yourself to
 get past it. See `docs/ghapp-guards.md`.
 
+## The merge train is off unless the base turns it on
+
+`shipyard train status|metrics|pause|resume` is the merge train's read-only
+first phase (#935). It is off unless the base branch's `.shipyard/config.toml`
+sets `[train] enabled = true`, read through the API. `SHIPYARD_TRAIN=off`
+(`0` and `false` too, or `off:<owner/repo>`) and a guards-dir `train.pause`
+written by `shipyard train pause --reason` kill it on a host, whatever the config says,
+and a pause file that does not parse still pauses. Only the operator who
+paused can `train resume --reason`, and not while the env still kills; both
+are audited in `train-pauses.jsonl`. While off, `status` makes
+at most the one config read (none when killed) and records nothing, and no
+landing path consults it: the steward's managed enqueue is byte-identical
+with `[train]` absent or false (`tests/train_off.rs`). A PR's stage uses
+`head_approval`'s evaluation, carry included; never match verdict text
+yourself to decide a PR is approved. `status` evaluates approvals dry
+(`ApprovalPolicy::dry_run`), so a reported carry is never written to
+`carries.jsonl`. The goal is merges/hour and
+approved-to-merged latency, not batch size: under HEADGREEN every queue entry
+builds its own group. `train status --record` once per pass feeds
+`train metrics`, which also reports heads per merged PR (PR-head churn).
+The steward's handoff is a commit status on one head, so a clean base merge
+leaves a managed PR `HandoffMissing`; `train status` reports whether the
+newest handed-off earlier head carries to the current one under the same
+merge-only rule as an approval. The steward itself still requires the status
+on the head until the train admits PRs.
+
 ## The carrier re-arms with `expectedHeadOid`, through the internal path
 
 `runner carrier --apply --class rearm` arms native auto-merge with
