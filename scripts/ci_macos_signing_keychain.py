@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 import shlex
 import shutil
 import subprocess
@@ -50,6 +51,17 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _user_home() -> Path:
+    """Resolve the service user's home independently of inherited ``HOME``.
+
+    launchd services can inherit an empty or stale HOME even though the
+    process has the correct user identity. The `security -d user` commands
+    use HOME to locate that user's keychain preferences, so make the identity
+    explicit while leaving the keychain contents untouched.
+    """
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
 def prepare(keychain: Path, state_path: Path, signing_home: Path) -> None:
     """Snapshot user keychain state before installing the ephemeral keychain."""
     state: dict[str, Any] = {
@@ -58,10 +70,16 @@ def prepare(keychain: Path, state_path: Path, signing_home: Path) -> None:
     }
     _write_state(state_path, state)
 
-    default_result = _security("default-keychain", "-d", "user")
-    list_result = _security("list-keychains", "-d", "user")
+    user_home = _user_home()
+    default_result = _security("default-keychain", "-d", "user", home=user_home)
+    list_result = _security("list-keychains", "-d", "user", home=user_home)
     if default_result.returncode != 0 or list_result.returncode != 0:
-        raise RuntimeError("could not snapshot the user keychain configuration")
+        failures = []
+        for name, result in (("default-keychain", default_result), ("list-keychains", list_result)):
+            if result.returncode != 0:
+                detail = result.stderr.strip()
+                failures.append(f"{name} exited {result.returncode}" + (f": {detail}" if detail else ""))
+        raise RuntimeError("could not snapshot the user keychain configuration (" + "; ".join(failures) + ")")
 
     defaults = _parse_keychain_output(default_result.stdout)
     keychains = _parse_keychain_output(list_result.stdout)
@@ -111,8 +129,9 @@ def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
         if not isinstance(default_keychain, str) or not default_keychain:
             failures.append("saved default keychain is invalid")
 
-        verified_list = _security("list-keychains", "-d", "user")
-        verified_default = _security("default-keychain", "-d", "user")
+        user_home = _user_home()
+        verified_list = _security("list-keychains", "-d", "user", home=user_home)
+        verified_default = _security("default-keychain", "-d", "user", home=user_home)
         if verified_list.returncode != 0 or verified_default.returncode != 0:
             failures.append("could not verify the user keychain configuration")
         else:
@@ -129,9 +148,14 @@ def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
 
     # The path is generated from RUNNER_TEMP and GITHUB_RUN_ID. Deletion is
     # safe to retry and must not be skipped when setup failed partway through.
-    deletion = _security("delete-keychain", str(keychain))
-    if deletion.returncode != 0:
-        failures.append("could not delete the ephemeral signing keychain")
+    # A failed snapshot writes `snapshot_complete=false` before any ephemeral
+    # keychain is created. Avoid reporting a misleading cleanup failure for a
+    # path that was never created; if a keychain exists, deletion remains
+    # mandatory and fail-closed.
+    if keychain.exists():
+        deletion = _security("delete-keychain", str(keychain))
+        if deletion.returncode != 0:
+            failures.append("could not delete the ephemeral signing keychain")
     shutil.rmtree(signing_home, ignore_errors=True)
 
     if failures:

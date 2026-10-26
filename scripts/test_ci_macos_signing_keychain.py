@@ -16,6 +16,15 @@ def completed(stdout: str = "", returncode: int = 0) -> subprocess.CompletedProc
 
 
 class SigningKeychainTests(unittest.TestCase):
+    def test_user_home_uses_account_identity_when_home_is_stale(self) -> None:
+        with mock.patch.dict(subject.os.environ, {"HOME": "/stale/home"}):
+            with mock.patch.object(
+                subject.pwd,
+                "getpwuid",
+                return_value=type("Passwd", (), {"pw_dir": "/Users/ci"})(),
+            ):
+                self.assertEqual(subject._user_home(), Path("/Users/ci"))
+
     def test_security_isolates_preferences_with_explicit_home(self) -> None:
         with mock.patch.object(
             subject.subprocess, "run", return_value=completed()
@@ -39,8 +48,9 @@ class SigningKeychainTests(unittest.TestCase):
                 completed(),
                 completed(),
             ]
-            with mock.patch.object(subject, "_security", side_effect=responses) as security:
-                subject.prepare(keychain, state, root / "signing home")
+            with mock.patch.object(subject, "_user_home", return_value=root / "user home"):
+                with mock.patch.object(subject, "_security", side_effect=responses) as security:
+                    subject.prepare(keychain, state, root / "signing home")
             calls = security.call_args_list
             self.assertTrue((root / "signing home/Library/Preferences").is_dir())
             self.assertFalse(
@@ -73,16 +83,27 @@ class SigningKeychainTests(unittest.TestCase):
                 completed(f'"{default}"'),
                 completed(),
             ]
-            with mock.patch.object(subject, "_security", side_effect=verify) as security:
-                subject.restore(keychain, state, root / "signing home")
+            keychain.touch()
+            with mock.patch.object(subject, "_user_home", return_value=root / "user home"):
+                with mock.patch.object(subject, "_security", side_effect=verify) as security:
+                    subject.restore(keychain, state, root / "signing home")
             self.assertEqual(
                 security.call_args_list,
                 [
-                    mock.call("list-keychains", "-d", "user"),
-                    mock.call("default-keychain", "-d", "user"),
+                    mock.call("list-keychains", "-d", "user", home=root / "user home"),
+                    mock.call("default-keychain", "-d", "user", home=root / "user home"),
                     mock.call("delete-keychain", str(keychain)),
                 ],
             )
+
+    def test_incomplete_snapshot_does_not_report_missing_keychain_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.write_text(json.dumps({"snapshot_complete": False}))
+            with mock.patch.object(subject, "_security") as security:
+                subject.restore(root / "never-created.keychain", state, root / "home")
+            security.assert_not_called()
 
     def test_unavailable_snapshot_fails_before_keychain_creation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -98,6 +119,7 @@ class SigningKeychainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             keychain = root / "keychain"
+            keychain.touch()
             with mock.patch.object(subject, "_security", return_value=completed()) as security:
                 with self.assertRaisesRegex(RuntimeError, "state is unavailable"):
                     subject.restore(keychain, root / "missing", root / "home")
@@ -127,6 +149,7 @@ class SigningKeychainTests(unittest.TestCase):
                 "default_keychain": "/original",
                 "search_list": ["/original"],
             }))
+            (root / "ephemeral").touch()
             responses = [completed('"/original"'), completed('"/original"'), completed(returncode=1)]
             with mock.patch.object(subject, "_security", side_effect=responses):
                 with self.assertRaisesRegex(RuntimeError, "could not delete"):
