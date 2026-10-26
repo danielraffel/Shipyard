@@ -63,7 +63,12 @@ def _user_home() -> Path:
 
 
 def prepare(keychain: Path, state_path: Path, signing_home: Path) -> None:
-    """Snapshot user keychain state before installing the ephemeral keychain."""
+    """Snapshot user keychain state before installing the ephemeral keychain.
+
+    A launchd service account may have no user-domain keychain at all. That is
+    a valid empty baseline because signing runs entirely under ``signing_home``
+    with an explicit ephemeral keychain.
+    """
     state: dict[str, Any] = {
         "snapshot_complete": False,
         "keychain_creation_started": False,
@@ -75,7 +80,14 @@ def prepare(keychain: Path, state_path: Path, signing_home: Path) -> None:
     user_home = _user_home()
     default_result = _security("default-keychain", "-d", "user", home=user_home)
     list_result = _security("list-keychains", "-d", "user", home=user_home)
-    if default_result.returncode != 0 or list_result.returncode != 0:
+    keychains = _parse_keychain_output(list_result.stdout) if list_result.returncode == 0 else []
+    no_user_keychain = (
+        default_result.returncode != 0
+        and list_result.returncode == 0
+        and not keychains
+        and "default keychain could not be found" in default_result.stderr.lower()
+    )
+    if list_result.returncode != 0 or (default_result.returncode != 0 and not no_user_keychain):
         failures = []
         for name, result in (("default-keychain", default_result), ("list-keychains", list_result)):
             if result.returncode != 0:
@@ -83,18 +95,15 @@ def prepare(keychain: Path, state_path: Path, signing_home: Path) -> None:
                 failures.append(f"{name} exited {result.returncode}" + (f": {detail}" if detail else ""))
         raise RuntimeError("could not snapshot the user keychain configuration (" + "; ".join(failures) + ")")
 
-    defaults = _parse_keychain_output(default_result.stdout)
-    keychains = _parse_keychain_output(list_result.stdout)
-    if len(defaults) != 1:
-        raise RuntimeError("security returned an unusable default keychain snapshot")
-    if not keychains:
-        raise RuntimeError("security returned an unusable keychain search list snapshot")
-
-    state.update(
-        snapshot_complete=True,
-        default_keychain=defaults[0],
-        search_list=keychains,
-    )
+    if no_user_keychain:
+        state.update(snapshot_complete=True, snapshot_mode="none", default_keychain=None, search_list=[])
+    else:
+        defaults = _parse_keychain_output(default_result.stdout)
+        if len(defaults) != 1:
+            raise RuntimeError("security returned an unusable default keychain snapshot")
+        if not keychains:
+            raise RuntimeError("security returned an unusable keychain search list snapshot")
+        state.update(snapshot_complete=True, snapshot_mode="user", default_keychain=defaults[0], search_list=keychains)
     _write_state(state_path, state)
 
     state["keychain_creation_started"] = True
@@ -128,7 +137,7 @@ def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
     except (OSError, json.JSONDecodeError):
         failures.append("saved keychain state is unavailable")
 
-    if state and state.get("snapshot_complete") is True:
+    if state and state.get("snapshot_complete") is True and state.get("snapshot_mode", "user") != "none":
         search_list = state.get("search_list")
         default_keychain = state.get("default_keychain")
         if not isinstance(search_list, list) or not all(
@@ -167,7 +176,7 @@ def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
     # snapshot was always followed by creation in that version.
     if state and "keychain_created" not in state and state.get("snapshot_complete") is True:
         keychain_created = True
-    if (creation_started or keychain_created) and keychain.exists():
+    if creation_started or keychain_created:
         deletion = _security("delete-keychain", str(keychain))
         if deletion.returncode != 0:
             failures.append("could not delete the ephemeral signing keychain")

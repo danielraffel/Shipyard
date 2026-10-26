@@ -11,8 +11,10 @@ from unittest import mock
 import ci_macos_signing_keychain as subject
 
 
-def completed(stdout: str = "", returncode: int = 0) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(["security"], returncode, stdout, "")
+def completed(
+    stdout: str = "", returncode: int = 0, stderr: str = ""
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(["security"], returncode, stdout, stderr)
 
 
 class SigningKeychainTests(unittest.TestCase):
@@ -31,6 +33,53 @@ class SigningKeychainTests(unittest.TestCase):
         ) as run:
             subject._security("list-keychains", "-d", "user", home=Path("/tmp/isolated home"))
         self.assertEqual(run.call_args.kwargs["env"]["HOME"], "/tmp/isolated home")
+
+    def test_prepare_accepts_empty_service_user_keychain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            keychain = root / "ephemeral.keychain-db"
+            state = root / "state.json"
+            responses = [
+                completed(
+                    returncode=1,
+                    stderr="SecKeychainCopyDomainDefault user: A default keychain could not be found.",
+                ),
+                completed(),
+                completed(),
+                completed(f'"{keychain}"'),
+                completed(f'"{keychain}"'),
+                completed(),
+                completed(),
+            ]
+            with mock.patch.object(subject, "_security", side_effect=responses):
+                subject.prepare(keychain, state, root / "signing-home")
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["snapshot_mode"], "none")
+            self.assertEqual(saved["search_list"], [])
+
+    def test_restore_empty_service_user_keychain_only_deletes_ephemeral(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.write_text(json.dumps({
+                "snapshot_complete": True,
+                "snapshot_mode": "none",
+                "keychain_created": True,
+            }))
+            with mock.patch.object(subject, "_security", return_value=completed()) as security:
+                subject.restore(root / "ephemeral.keychain", state, root / "home")
+            security.assert_called_once_with("delete-keychain", str(root / "ephemeral.keychain"))
+
+    def test_default_failure_with_nonempty_search_list_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            responses = [
+                completed(returncode=1, stderr="permission denied"),
+                completed('"/Users/ci/login.keychain-db"'),
+            ]
+            with mock.patch.object(subject, "_security", side_effect=responses):
+                with self.assertRaisesRegex(RuntimeError, "could not snapshot"):
+                    subject.prepare(root / "keychain", root / "state", root / "home")
 
     def test_prepare_never_mutates_default_or_search_list_and_handles_spaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
