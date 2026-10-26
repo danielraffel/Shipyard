@@ -594,8 +594,7 @@ fn ensure_snapshot_matches_live_head(snapshot: &Value, live_head: Option<&str>) 
 // Keep this list limited to fields accepted by `gh pr view --json`. In
 // particular, `merged` is not a supported field; a merged PR is represented by
 // `state == "MERGED"` and normalized by the evaluator.
-const PR_VIEW_JSON_FIELDS: &str =
-    "number,headRefName,headRefOid,baseRefName,state,mergeable,mergeStateStatus,statusCheckRollup";
+const PR_VIEW_JSON_FIELDS: &str = "number,headRefName,headRefOid,baseRefName,state,mergedAt,mergeable,mergeStateStatus,mergeCommit,statusCheckRollup";
 const PR_CHECKS_JSON_FIELDS: &str = "name,state,bucket,link";
 
 fn fetch_required_check_policy(
@@ -905,6 +904,12 @@ pub fn synthesize_pr_snapshot_from_rest(pr_number: u64, pr: &Value, check_runs: 
         .unwrap_or("")
         .to_uppercase();
     let merged = pr.get("merged").and_then(Value::as_bool).unwrap_or(false);
+    let merge_commit = pr
+        .get("merge_commit_sha")
+        .and_then(Value::as_str)
+        .map(|oid| serde_json::json!({"oid": oid}))
+        .unwrap_or(Value::Null);
+    let merged_at = pr.get("merged_at").cloned().unwrap_or(Value::Null);
     let mergeable = pr.get("mergeable").cloned().unwrap_or(Value::Null);
     let mergeable_state = pr
         .get("mergeable_state")
@@ -932,6 +937,8 @@ pub fn synthesize_pr_snapshot_from_rest(pr_number: u64, pr: &Value, check_runs: 
         "baseRefName": base_ref,
         "state": state,
         "merged": merged,
+        "mergedAt": merged_at,
+        "mergeCommit": merge_commit,
         "mergeable": mergeable,
         "mergeStateStatus": mergeable_state,
         "statusCheckRollup": rollup,
@@ -1935,6 +1942,8 @@ mod tests {
             "merged": false,
             "mergeable": true,
             "mergeable_state": "clean",
+            "merge_commit_sha": "fedcba9876543210",
+            "merged_at": "2026-10-25T12:00:00Z",
             "head": { "sha": "abc123" },
         });
         let check_runs = serde_json::json!({
@@ -1950,6 +1959,8 @@ mod tests {
         assert_eq!(snapshot["state"], "OPEN");
         assert_eq!(snapshot["mergeStateStatus"], "CLEAN");
         assert_eq!(snapshot["merged"], false);
+        assert_eq!(snapshot["mergedAt"], "2026-10-25T12:00:00Z");
+        assert_eq!(snapshot["mergeCommit"]["oid"], "fedcba9876543210");
         assert_eq!(snapshot["mergeable"], true);
         assert_eq!(snapshot["_rest_fallback"], true);
         assert_eq!(snapshot["_required_checks_known"], false);
@@ -1973,6 +1984,16 @@ mod tests {
             !PR_VIEW_JSON_FIELDS
                 .split(',')
                 .any(|field| field == "merged")
+        );
+        assert!(
+            PR_VIEW_JSON_FIELDS
+                .split(',')
+                .any(|field| field == "mergeCommit")
+        );
+        assert!(
+            PR_VIEW_JSON_FIELDS
+                .split(',')
+                .any(|field| field == "mergedAt")
         );
     }
 
