@@ -670,13 +670,10 @@ pub fn accept(
         return Err(why);
     }
     let all: Vec<&str> = seen.keys().map(String::as_str).collect();
-    let excluded: Vec<String> = config
-        .exclude_paths
-        .iter()
-        .chain(carry_excluded)
-        .cloned()
-        .collect();
-    if let Some(why) = head_approval::carry_excluded(all.iter().copied(), &excluded) {
+    // Checked apart, so a carry allow never re-includes a rollup exclusion.
+    if let Some(why) = head_approval::carry_excluded(all.iter().copied(), &config.exclude_paths)
+        .or_else(|| head_approval::carry_excluded(all.iter().copied(), carry_excluded))
+    {
         return Err(format!("a rollup member cannot land this way: {why}"));
     }
     for pattern in &config.hot_files {
@@ -1401,12 +1398,6 @@ pub fn form(
 ) -> (Vec<u64>, Vec<(u64, String)>) {
     let mut sorted: Vec<&Candidate> = candidates.iter().collect();
     sorted.sort_by_key(|candidate| candidate.pr);
-    let excluded: Vec<String> = config
-        .exclude_paths
-        .iter()
-        .chain(carry_excluded)
-        .cloned()
-        .collect();
     let mut chosen: Vec<&Candidate> = Vec::new();
     let mut skipped = Vec::new();
     for candidate in sorted {
@@ -1417,31 +1408,41 @@ pub fn form(
                     config.max_members
                 ));
             }
-            head_approval::carry_excluded(candidate.files.iter().map(String::as_str), &excluded)
-                .or_else(|| {
-                    chosen.iter().find_map(|other| {
-                        candidate
-                            .files
+            // Checked apart, so a carry allow never re-includes a rollup exclusion.
+            head_approval::carry_excluded(
+                candidate.files.iter().map(String::as_str),
+                &config.exclude_paths,
+            )
+            .or_else(|| {
+                head_approval::carry_excluded(
+                    candidate.files.iter().map(String::as_str),
+                    carry_excluded,
+                )
+            })
+            .or_else(|| {
+                chosen.iter().find_map(|other| {
+                    candidate
+                        .files
+                        .iter()
+                        .find(|name| other.files.contains(name))
+                        .map(|name| format!("#{} also changes {name}", other.pr))
+                })
+            })
+            .or_else(|| {
+                config.hot_files.iter().find_map(|pattern| {
+                    let hot = |files: &[String]| {
+                        files
                             .iter()
-                            .find(|name| other.files.contains(name))
-                            .map(|name| format!("#{} also changes {name}", other.pr))
+                            .any(|name| head_approval::glob_match(pattern, name))
+                    };
+                    if !hot(&candidate.files) {
+                        return None;
+                    }
+                    chosen.iter().find(|other| hot(&other.files)).map(|other| {
+                        format!("#{} already changes a hot file ({pattern})", other.pr)
                     })
                 })
-                .or_else(|| {
-                    config.hot_files.iter().find_map(|pattern| {
-                        let hot = |files: &[String]| {
-                            files
-                                .iter()
-                                .any(|name| head_approval::glob_match(pattern, name))
-                        };
-                        if !hot(&candidate.files) {
-                            return None;
-                        }
-                        chosen.iter().find(|other| hot(&other.files)).map(|other| {
-                            format!("#{} already changes a hot file ({pattern})", other.pr)
-                        })
-                    })
-                })
+            })
         });
         match why {
             Some(why) => skipped.push((candidate.pr, why)),

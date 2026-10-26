@@ -2859,6 +2859,130 @@ fn the_base_config_replaces_the_excluded_paths() {
     );
 }
 
+fn carry_policy(config: &str) -> Vec<String> {
+    let table: toml::Table = format!("[auto_merge]\n{config}\n").parse().expect("toml");
+    super::ApprovalPolicy::from_table(&table).carry_excluded_paths()
+}
+
+fn carries(path: &str, excluded: &[String]) -> bool {
+    super::carry_excluded([path], excluded).is_none()
+}
+
+#[test]
+fn extra_carry_exclusions_add_to_the_defaults_and_to_a_replaced_list() {
+    let extra = carry_policy("carry_excluded_paths_extra = [\"docs/**\"]");
+    assert!(!carries("docs/x.md", &extra));
+    // The defaults still hold.
+    assert!(!carries(".github/workflows/ci.yml", &extra));
+    // Control: without the extra glob the same path carries.
+    assert!(carries(
+        "docs/x.md",
+        &carry_policy("carry_excluded_paths_extra = []")
+    ));
+    let replaced =
+        carry_policy("carry_excluded_paths = [\"a/**\"]\ncarry_excluded_paths_extra = [\"b/**\"]");
+    assert_eq!(replaced, vec!["a/**".to_owned(), "b/**".to_owned()]);
+    // The replace list still replaces: a default path now carries.
+    assert!(carries(".github/workflows/ci.yml", &replaced));
+}
+
+#[test]
+fn an_allow_reincludes_a_default_path_and_nothing_else() {
+    let allowed = carry_policy(
+        "carry_excluded_paths_allow = [\".shipyard/notes/**\", \"release-please-config.json\"]",
+    );
+    assert!(carries(".shipyard/notes/a.toml", &allowed));
+    assert!(carries("release-please-config.json", &allowed));
+    // Neighbours stay excluded.
+    assert!(!carries(".shipyard/config.toml", &allowed));
+    assert!(!carries(".shipyard/other.toml", &allowed));
+    assert!(!carries(".release-please-manifest.json", &allowed));
+    // A signing name under an allowed directory stays excluded at match time.
+    assert!(!carries(".shipyard/notes/signing.toml", &allowed));
+    // Control: without the allow the same paths never carry.
+    let defaults = super::ApprovalPolicy::default().carry_excluded_paths();
+    assert!(!carries(".shipyard/notes/a.toml", &defaults));
+    assert!(!carries("release-please-config.json", &defaults));
+}
+
+#[test]
+fn a_refused_allow_turns_every_carry_off() {
+    for (entry, why) in [
+        (".github/workflows/ci.yml", "overlaps .github/workflows/**"),
+        (".github/workflows/**", "overlaps .github/workflows/**"),
+        ("tools/ci/run.sh", "overlaps tools/ci/**"),
+        ("tools/ci/sub/**", "overlaps tools/ci/**"),
+        (
+            "scripts/ghapp_queue_arm_guard.py",
+            "overlaps scripts/ghapp*",
+        ),
+        ("src/auto_arm/**", "overlaps src/auto_arm"),
+        ("tools/release/codesign.sh", "overlaps **/*codesign*"),
+        ("x/notarize.sh", "overlaps **/*notariz*"),
+        (".shipyard/**", "overlaps .shipyard/config.toml"),
+        (".shipyard/config.toml", "overlaps .shipyard/config.toml"),
+        (".agents/contract.toml", "overlaps .agents/contract.toml"),
+        ("docs/x.md", "is not under a default"),
+        ("src/lib.rs", "is not under a default"),
+        (".shipyard/*.toml", "is not a repository path"),
+        (".shipyard/../tools/ci/run.sh", "is not a repository path"),
+        ("/.shipyard/a", "is not a repository path"),
+    ] {
+        let error = super::carry_allow_error(entry).unwrap_or_default();
+        assert!(error.contains(why), "{entry}: {error:?}");
+        let table: toml::Table =
+            format!("[auto_merge]\ncarry_excluded_paths_allow = [{entry:?}]\n")
+                .parse()
+                .expect("toml");
+        let section = table["auto_merge"].as_table().expect("table");
+        assert!(
+            super::carry_paths(section)
+                .expect_err("refused")
+                .contains(entry),
+            "{entry}"
+        );
+        assert_eq!(
+            carry_policy(&format!("carry_excluded_paths_allow = [{entry:?}]")),
+            vec!["**".to_owned()],
+            "{entry}"
+        );
+    }
+    // Control: an allowed default path is accepted.
+    assert_eq!(super::carry_allow_error(".shipyard/notes/a.toml"), None);
+    assert_eq!(
+        super::carry_allow_error(".release-please-manifest.json"),
+        None
+    );
+}
+
+#[test]
+fn a_bang_outside_the_allow_list_or_a_non_list_turns_every_carry_off() {
+    for config in [
+        "carry_excluded_paths = [\"!tools/ci/**\"]",
+        "carry_excluded_paths_extra = [\"!tools/ci/**\"]",
+        "carry_excluded_paths_extra = \"docs/**\"",
+        "carry_excluded_paths_allow = \".shipyard/notes/**\"",
+    ] {
+        assert_eq!(carry_policy(config), vec!["**".to_owned()], "{config}");
+    }
+    // Control: the same globs, well formed, are read.
+    assert!(carries(
+        ".shipyard/notes/a",
+        &carry_policy("carry_excluded_paths_allow = [\".shipyard/notes/**\"]")
+    ));
+}
+
+#[test]
+fn a_protected_path_never_carries_even_when_a_replaced_list_allows_it() {
+    // A protected path a `!` entry names stays excluded whenever a glob
+    // excludes it.
+    let excluded = vec!["tools/**".to_owned(), "!tools/ci/run.sh".to_owned()];
+    assert!(!carries("tools/ci/run.sh", &excluded));
+    // Control: an unprotected path the `!` names carries.
+    let excluded = vec!["tools/**".to_owned(), "!tools/x.sh".to_owned()];
+    assert!(carries("tools/x.sh", &excluded));
+}
+
 /// A pull request that changes an excluded path never carries, even over an
 /// honest merge; the same merge carries when nothing it changes is excluded.
 #[test]

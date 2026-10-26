@@ -1312,6 +1312,25 @@ fn formation_takes_the_oldest_ready_disjoint_members() {
 }
 
 #[test]
+fn a_carry_allow_never_reincludes_a_rollup_exclusion() {
+    let candidates = vec![candidate(5, &[".shipyard/notes/a.toml"])];
+    let mut excluded = ApprovalPolicy::default().carry_excluded_paths();
+    excluded.push("!.shipyard/notes/**".to_owned());
+    // Control: the carry allow alone lets the member ride.
+    assert_eq!(form(&candidates, &config(), &excluded).0, vec![5]);
+    let excluding = Config {
+        exclude_paths: vec![".shipyard/notes/**".to_owned()],
+        ..config()
+    };
+    let (chosen, skipped) = form(&candidates, &excluding, &excluded);
+    assert!(chosen.is_empty());
+    assert!(
+        skipped[0].1.contains(".shipyard/notes/a.toml"),
+        "{skipped:?}"
+    );
+}
+
+#[test]
 fn a_failed_rollup_is_bisected_by_halves_down_to_its_culprit() {
     assert_eq!(split(&[1, 2, 3, 4], true), Split::Land);
     assert_eq!(

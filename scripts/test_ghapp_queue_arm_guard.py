@@ -2803,6 +2803,28 @@ class ReviewBeforeArm(unittest.TestCase):
                            config="[auto_merge]\ncarry_excluded_paths = []\n")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_a_carry_allow_reincludes_a_default_path_and_a_refused_one_stops_every_carry(
+            self) -> None:
+        allow = "[auto_merge]\ncarry_excluded_paths_allow = [\".shipyard/notes/**\"]\n"
+        history = CarryHistory(self.root / "repo-allow", extra={".shipyard/notes/a.toml": b"x\n"})
+        result = self.land(history, history.merge(), config=allow)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Control: without the allow the same pull request never carries.
+        history = CarryHistory(self.root / "repo-default",
+                               extra={".shipyard/notes/a.toml": b"x\n"})
+        result = self.land(history, history.merge())
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("it changes .shipyard/notes/a.toml", result.stderr)
+        self.assertEqual(len(self.logged_carries()), 1)
+        # A refused allow turns every carry off, even for a path nothing excludes.
+        history = CarryHistory(self.root / "repo-refused")
+        result = self.land(history, history.merge(), config=(
+            "[auto_merge]\ncarry_excluded_paths_allow = [\".github/workflows/ci.yml\"]\n"))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("carry configuration is refused", result.stderr)
+        self.assertIn("overlaps .github/workflows/**", result.stderr)
+        self.assertEqual(len(self.logged_carries()), 1)
+
     def test_carry_no_keeps_an_approval_to_its_exact_head(self) -> None:
         history = CarryHistory(self.root / "repo")
         head = history.merge()
@@ -3445,6 +3467,98 @@ class WriterIdentity(unittest.TestCase):
                                  [("sess-c", "agent-c")], name)
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(guard.writer_identity(), {"session": "unattributed"})
+
+
+class CarryExclusionConfig(unittest.TestCase):
+    """The twin of src/head_approval/tests.rs's carry_paths tests."""
+
+    @staticmethod
+    def paths(config: str) -> list[str]:
+        policy = guard.review_policy(f"[auto_merge]\n{config}\n", "danielraffel/Shipyard", False)
+        return policy["carry_excluded"]
+
+    @staticmethod
+    def carries(path: str, excluded: list[str]) -> bool:
+        return guard.carry_excluded([path], excluded) is None
+
+    def test_extra_globs_add_to_the_defaults_and_to_a_replaced_list(self) -> None:
+        extra = self.paths('carry_excluded_paths_extra = ["docs/**"]')
+        self.assertFalse(self.carries("docs/x.md", extra))
+        self.assertFalse(self.carries(".github/workflows/ci.yml", extra))
+        # Control: without the extra glob the same path carries.
+        self.assertTrue(self.carries("docs/x.md", self.paths("carry_excluded_paths_extra = []")))
+        replaced = self.paths('carry_excluded_paths = ["a/**"]\n'
+                              'carry_excluded_paths_extra = ["b/**"]')
+        self.assertEqual(replaced, ["a/**", "b/**"])
+        # The replace list still replaces: a default path now carries.
+        self.assertTrue(self.carries(".github/workflows/ci.yml", replaced))
+
+    def test_an_allow_reincludes_a_default_path_and_nothing_else(self) -> None:
+        allowed = self.paths('carry_excluded_paths_allow = '
+                             '[".shipyard/notes/**", "release-please-config.json"]')
+        self.assertTrue(self.carries(".shipyard/notes/a.toml", allowed))
+        self.assertTrue(self.carries("release-please-config.json", allowed))
+        for path in (".shipyard/config.toml", ".shipyard/other.toml",
+                     ".release-please-manifest.json", ".shipyard/notes/signing.toml"):
+            with self.subTest(path=path):
+                self.assertFalse(self.carries(path, allowed))
+        # Control: without the allow the same paths never carry.
+        defaults = list(guard.DEFAULT_CARRY_EXCLUDED_PATHS)
+        self.assertFalse(self.carries(".shipyard/notes/a.toml", defaults))
+        self.assertFalse(self.carries("release-please-config.json", defaults))
+
+    def test_a_refused_allow_turns_every_carry_off(self) -> None:
+        for entry, why in (
+                (".github/workflows/ci.yml", "overlaps .github/workflows/**"),
+                (".github/workflows/**", "overlaps .github/workflows/**"),
+                ("tools/ci/run.sh", "overlaps tools/ci/**"),
+                ("tools/ci/sub/**", "overlaps tools/ci/**"),
+                ("scripts/ghapp_queue_arm_guard.py", "overlaps scripts/ghapp*"),
+                ("src/auto_arm/**", "overlaps src/auto_arm"),
+                ("tools/release/codesign.sh", "overlaps **/*codesign*"),
+                ("x/notarize.sh", "overlaps **/*notariz*"),
+                (".shipyard/**", "overlaps .shipyard/config.toml"),
+                (".shipyard/config.toml", "overlaps .shipyard/config.toml"),
+                (".agents/contract.toml", "overlaps .agents/contract.toml"),
+                ("docs/x.md", "is not under a default"),
+                ("src/lib.rs", "is not under a default"),
+                (".shipyard/*.toml", "is not a repository path"),
+                (".shipyard/../tools/ci/run.sh", "is not a repository path"),
+                ("/.shipyard/a", "is not a repository path")):
+            with self.subTest(entry=entry):
+                self.assertIn(why, guard.carry_allow_error(entry) or "")
+                with self.assertRaisesRegex(guard.GuardError, re.escape(entry)):
+                    guard.carry_paths({"carry_excluded_paths_allow": [entry]})
+                policy = guard.review_policy(
+                    f"[auto_merge]\ncarry_excluded_paths_allow = [{json.dumps(entry)}]\n",
+                    "danielraffel/Shipyard", False)
+                self.assertEqual(policy["carry_excluded"], ["**"])
+                self.assertIn(entry, policy["carry_error"])
+        # Control: an allowed default path is accepted.
+        self.assertIsNone(guard.carry_allow_error(".shipyard/notes/a.toml"))
+        self.assertIsNone(guard.carry_allow_error(".release-please-manifest.json"))
+
+    def test_a_bang_outside_the_allow_list_or_a_non_list_turns_every_carry_off(self) -> None:
+        for config in ('carry_excluded_paths = ["!tools/ci/**"]',
+                       'carry_excluded_paths_extra = ["!tools/ci/**"]',
+                       'carry_excluded_paths_extra = "docs/**"',
+                       'carry_excluded_paths_allow = ".shipyard/notes/**"'):
+            with self.subTest(config=config):
+                self.assertEqual(self.paths(config), ["**"])
+        # Control: the same globs, well formed, are read.
+        self.assertTrue(self.carries(
+            ".shipyard/notes/a", self.paths('carry_excluded_paths_allow = [".shipyard/notes/**"]')))
+
+    def test_a_protected_path_never_carries_even_when_a_replaced_list_allows_it(self) -> None:
+        self.assertFalse(self.carries("tools/ci/run.sh", ["tools/**", "!tools/ci/run.sh"]))
+        # Control: an unprotected path the `!` names carries.
+        self.assertTrue(self.carries("tools/x.sh", ["tools/**", "!tools/x.sh"]))
+
+    def test_the_protected_globs_match_src_head_approval_rs(self) -> None:
+        source = (pathlib.Path(__file__).resolve().parent.parent / "src" / "head_approval.rs"
+                  ).read_text(encoding="utf-8")
+        block = source.split("pub const PROTECTED_CARRY_PATHS: &[&str] = &[", 1)[1].split("];", 1)[0]
+        self.assertEqual(tuple(re.findall(r'"([^"]+)"', block)), guard.PROTECTED_CARRY_PATHS)
 
 
 class CarryHistory:

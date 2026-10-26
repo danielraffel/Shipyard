@@ -548,7 +548,11 @@ Three guardrails bound every carry, in the guard and in `head_approval`:
   carries, and never joins a rollup. The default list is workflows,
   `.agents/contract.toml`, `tools/ci/**`, `.shipyard/**` (the review, carry
   and train policy itself), the guards and Shipyard's arm code, and signing
-  and release automation.
+  and release automation. `carry_excluded_paths` replaces that list;
+  `carry_excluded_paths_extra` adds to it, and `carry_excluded_paths_allow`
+  re-includes default paths, never workflows, `tools/ci/**`, the CI contract,
+  `.shipyard/config.toml`, the guards, arm code or signing. A refused entry
+  turns every carry off (docs/ghapp-guards.md).
 - **`carry: no`:** a `carry: no` line in the APPROVE keeps it to its exact
   head.
 - **A cap:** at most 3 base merges or 48 hours since the verdict.

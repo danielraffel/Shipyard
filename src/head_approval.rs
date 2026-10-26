@@ -110,6 +110,12 @@ pub const HUMAN_REVIEWERS_KEY: &str = "human_reviewers";
 pub const SIGNERS_KEY: &str = "reviewer_signers";
 /// `[auto_merge]` key replacing [`DEFAULT_CARRY_EXCLUDED_PATHS`].
 pub const CARRY_EXCLUDED_KEY: &str = "carry_excluded_paths";
+/// `[auto_merge]` key adding globs to the carry exclusions (the defaults, or
+/// [`CARRY_EXCLUDED_KEY`]'s list when set).
+pub const CARRY_EXCLUDED_EXTRA_KEY: &str = "carry_excluded_paths_extra";
+/// `[auto_merge]` key re-including paths a default exclusion covers; never a
+/// [`PROTECTED_CARRY_PATHS`] path ([`carry_allow_error`]).
+pub const CARRY_EXCLUDED_ALLOW_KEY: &str = "carry_excluded_paths_allow";
 /// Paths whose change means an approval never carries to a new head: a carry
 /// must never be the way a workflow, the CI contract, the guards or
 /// Shipyard's own arm code, or signing and release automation lands
@@ -131,6 +137,29 @@ pub const DEFAULT_CARRY_EXCLUDED_PATHS: &[&str] = &[
     "src/app/merge_steward_cmd/native_arm*",
     "release-please-config.json",
     ".release-please-manifest.json",
+    "**/*codesign*",
+    "**/*notariz*",
+    "**/*signing*",
+];
+/// Default exclusions that no [`CARRY_EXCLUDED_ALLOW_KEY`] entry re-includes:
+/// workflows, the CI contract, the carry policy itself, the guards and
+/// Shipyard's arm code, and signing. A `**/` name glob is enforced on every
+/// match ([`carry_excluded`]) rather than when the allow list is read. The
+/// Python guard's `PROTECTED_CARRY_PATHS` is the same.
+pub const PROTECTED_CARRY_PATHS: &[&str] = &[
+    ".github/workflows/**",
+    ".agents/contract.toml",
+    ".shipyard/config.toml",
+    "tools/ci/**",
+    "scripts/ghapp*",
+    "src/head_approval*",
+    "src/head_approval/**",
+    "src/queue_arm_gate*",
+    "src/auto_arm*",
+    "src/auto_arm/**",
+    "src/ghapp_guards*",
+    "src/app/ship_cmd/auto_arm*",
+    "src/app/merge_steward_cmd/native_arm*",
     "**/*codesign*",
     "**/*notariz*",
     "**/*signing*",
@@ -827,9 +856,9 @@ pub struct ApprovalPolicy {
     /// listed an App APPROVE does not count.
     #[serde(default)]
     pub signer_source: SignerSource,
-    /// The base's [`CARRY_EXCLUDED_KEY`]; `None` is
-    /// [`DEFAULT_CARRY_EXCLUDED_PATHS`]. A value that is not a list of strings
-    /// is `["**"]`: no carry at all.
+    /// The carry exclusions the base's `[auto_merge]` sets ([`carry_paths`]);
+    /// `None` is [`DEFAULT_CARRY_EXCLUDED_PATHS`]. A configuration
+    /// [`carry_paths`] refuses is `["**"]`: no carry at all.
     #[serde(default)]
     pub carry_excluded: Option<Vec<String>>,
     /// Evaluate without side effects: a carry is judged but never appended to
@@ -903,17 +932,7 @@ impl ApprovalPolicy {
             rebase_carry: false,
             signer_source: SignerSource::Host,
             dry_run: false,
-            carry_excluded: section.get(CARRY_EXCLUDED_KEY).map(|value| {
-                value
-                    .as_array()
-                    .and_then(|paths| {
-                        paths
-                            .iter()
-                            .map(|path| path.as_str().map(str::to_owned))
-                            .collect::<Option<Vec<_>>>()
-                    })
-                    .unwrap_or_else(|| vec!["**".to_owned()])
-            }),
+            carry_excluded: carry_paths(section).unwrap_or_else(|_| Some(vec!["**".to_owned()])),
         }
     }
 
@@ -2654,24 +2673,155 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
 }
 
 /// Why a pull request changing `paths` never carries an approval, or `None`.
+///
+/// An `excluded` entry starting with `!` is an allow ([`carry_paths`]): a
+/// path it matches carries unless a [`PROTECTED_CARRY_PATHS`] glob matches it.
 #[must_use]
 pub fn carry_excluded<'a>(
     paths: impl IntoIterator<Item = &'a str>,
     excluded: &[String],
 ) -> Option<String> {
+    let (allowed, blocked): (Vec<&String>, Vec<&String>) = excluded
+        .iter()
+        .partition(|pattern| pattern.starts_with('!'));
     let mut sorted: Vec<&str> = paths.into_iter().collect();
     sorted.sort_unstable();
     sorted.into_iter().find_map(|path| {
-        excluded
+        let pattern = blocked.iter().find(|pattern| glob_match(pattern, path))?;
+        let protected = PROTECTED_CARRY_PATHS
             .iter()
-            .find(|pattern| glob_match(pattern, path))
-            .map(|pattern| {
-                format!(
-                    "it changes {path} ({pattern}), and a change there always needs a verdict \
-                     naming its exact head"
-                )
-            })
+            .any(|protected| glob_match(protected, path));
+        if !protected
+            && allowed
+                .iter()
+                .any(|allow| glob_match(allow.strip_prefix('!').unwrap_or(allow), path))
+        {
+            return None;
+        }
+        Some(format!(
+            "it changes {path} ({pattern}), and a change there always needs a verdict \
+             naming its exact head"
+        ))
     })
+}
+
+/// The carry exclusions an `[auto_merge]` table sets, for
+/// [`ApprovalPolicy::carry_excluded`]: `None` when it sets none of
+/// [`CARRY_EXCLUDED_KEY`], [`CARRY_EXCLUDED_EXTRA_KEY`] and
+/// [`CARRY_EXCLUDED_ALLOW_KEY`]. The list is [`CARRY_EXCLUDED_KEY`]'s (which
+/// replaces the defaults) or [`DEFAULT_CARRY_EXCLUDED_PATHS`], then the extra
+/// globs, then each allow as a `!` entry ([`carry_excluded`]). The Python
+/// guard's `carry_paths` is the same.
+///
+/// # Errors
+///
+/// Why the table is refused: a value that is not a list of strings, a `!`
+/// outside the allow list, or an allow [`carry_allow_error`] refuses.
+pub fn carry_paths(section: &toml::Table) -> Result<Option<Vec<String>>, String> {
+    let list = |key: &str| -> Result<Option<Vec<String>>, String> {
+        section
+            .get(key)
+            .map(|value| {
+                value
+                    .as_array()
+                    .and_then(|paths| {
+                        paths
+                            .iter()
+                            .map(|path| path.as_str().map(str::to_owned))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .ok_or_else(|| format!("[auto_merge] {key} must be a list of globs"))
+            })
+            .transpose()
+    };
+    let replace = list(CARRY_EXCLUDED_KEY)?;
+    let extra = list(CARRY_EXCLUDED_EXTRA_KEY)?;
+    let allow = list(CARRY_EXCLUDED_ALLOW_KEY)?;
+    if replace.is_none() && extra.is_none() && allow.is_none() {
+        return Ok(None);
+    }
+    for (key, paths) in [
+        (CARRY_EXCLUDED_KEY, &replace),
+        (CARRY_EXCLUDED_EXTRA_KEY, &extra),
+    ] {
+        if let Some(path) = paths.iter().flatten().find(|path| path.starts_with('!')) {
+            return Err(format!(
+                "[auto_merge] {key} entry {path} may not start with !"
+            ));
+        }
+    }
+    let mut paths = replace.unwrap_or_else(|| {
+        DEFAULT_CARRY_EXCLUDED_PATHS
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect()
+    });
+    paths.extend(extra.unwrap_or_default());
+    for entry in allow.unwrap_or_default() {
+        if let Some(why) = carry_allow_error(&entry) {
+            return Err(format!(
+                "[auto_merge] {CARRY_EXCLUDED_ALLOW_KEY} entry {entry} {why}"
+            ));
+        }
+        paths.push(format!("!{entry}"));
+    }
+    Ok(Some(paths))
+}
+
+/// Why `entry` may not be a [`CARRY_EXCLUDED_ALLOW_KEY`] entry, or `None`. An
+/// entry is a repository path or `<directory>/**`, under a
+/// [`DEFAULT_CARRY_EXCLUDED_PATHS`] glob, and overlapping no
+/// [`PROTECTED_CARRY_PATHS`] glob. A directory is not checked against a `**/`
+/// name glob, which [`carry_excluded`] enforces under it.
+#[must_use]
+pub fn carry_allow_error(entry: &str) -> Option<String> {
+    let (path, tree) = entry
+        .strip_suffix("/**")
+        .map_or((entry, false), |directory| (directory, true));
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments
+        .iter()
+        .any(|segment| matches!(*segment, "" | "." | ".."))
+        || path.contains(['*', '?', '[', '\\', '!'])
+    {
+        return Some("is not a repository path or <directory>/**".to_owned());
+    }
+    let ancestors: Vec<String> = (1..=segments.len())
+        .map(|count| segments[..count].join("/"))
+        .collect();
+    let covered = DEFAULT_CARRY_EXCLUDED_PATHS.iter().any(|default| {
+        if tree {
+            default.strip_suffix("/**").is_some_and(|prefix| {
+                ancestors
+                    .iter()
+                    .any(|ancestor| glob_match(prefix, ancestor))
+            })
+        } else {
+            glob_match(default, path)
+        }
+    });
+    if !covered {
+        return Some(
+            "is not under a default carry exclusion; the allow list only re-includes defaults"
+                .to_owned(),
+        );
+    }
+    PROTECTED_CARRY_PATHS
+        .iter()
+        .filter(|protected| !tree || !protected.starts_with("**/"))
+        .find(|protected| {
+            let parts: Vec<&str> = protected.split('/').collect();
+            ancestors
+                .iter()
+                .any(|ancestor| glob_match(protected, ancestor))
+                || (tree
+                    && parts.len() > segments.len()
+                    && !parts[..segments.len()].contains(&"**")
+                    && glob_match(&parts[..segments.len()].join("/"), path))
+        })
+        .map(|protected| {
+            format!("overlaps {protected}, which always needs a verdict naming its exact head")
+        })
 }
 
 /// Directories read per GraphQL query by [`tree_modes`].

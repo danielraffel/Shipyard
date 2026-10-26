@@ -332,6 +332,11 @@ class RollupAcceptance(unittest.TestCase):
         self.assertIn("within 2 merges", self.accept(hub, merges[-1], {**ON, "max_members": 2})[0])
         self.assertIn("hot file", self.accept(hub, merges[-1], {**ON, "hot_files": ["*.txt"]})[0])
         self.assertIn("a.txt", self.accept(hub, merges[-1], {**ON, "exclude_paths": ["a.txt"]})[0])
+        # A carry allow never re-includes the train's own exclusion.
+        allowing = {**self.policy, "carry_excluded": ["*.txt", "!a.txt"]}
+        self.assertIn("a.txt", self.accept(hub, merges[-1], {**ON, "exclude_paths": ["a.txt"]},
+                                           policy=allowing)[0])
+        self.assertIn("b.txt", self.accept(hub, merges[-1], policy=allowing)[0])
         self.assertIsNone(self.accept(hub, merges[-1])[0])
         workflow = self.scratch.on(self.base, {".github/workflows/ci.yml": "on: push\n"})
         merges = self.scratch.build(self.base, [workflow])
