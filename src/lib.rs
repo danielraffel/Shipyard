@@ -266,6 +266,8 @@ pub mod reuse_record_store;
 /// `shipyard review-verdict`: whether a pull request's head may land, by the
 /// repository-side rule.
 pub mod review_verdict;
+/// Rollup batching: several approved pull requests landed as one tested merge.
+pub mod rollup;
 /// Shadow-only ordered route and capability receipts.
 pub mod route_shadow;
 /// Self-hosted runner provisioning (register/list/remove) pure logic.

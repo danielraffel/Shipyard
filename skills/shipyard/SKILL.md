@@ -555,6 +555,20 @@ Three guardrails bound every carry, in the guard and in `head_approval`:
 Every merge carry a landing accepts is logged to `carries.jsonl` with its
 verdict id and both merge bases. Read-only evaluations (`dry_run`: the
 `review-verdict` status, `train status`) never append a row.
+
+## Rollups: several approved pull requests as one tested merge
+
+Off unless the base's `.shipyard/config.toml` sets `[train] enabled = true`
+and `mode = "rollup"` (docs/rollups.md). `shipyard rollup plan` picks the
+oldest ready members with disjoint files; `build --members a,b --apply`
+pushes `shipyard-train/rollup-<a>`, one merge per member's exact approved
+head and nothing else; `verify --pr N` runs the guard's rule; `land --pr N`
+needs the merge method MERGE, then prints the steward handoff (merge-queue)
+or, with `--apply` (direct), merges with `sha=` bound once required checks
+pass and refuses if the base moved. Never edit a rollup branch by hand: any
+commit that is not a member merge makes the guard refuse it. A failed rollup
+is bisected with `rollup split`. A `rollup-of:` comment is a notice, never
+evidence.
 ## A transient rerun needs the interruption signature, not a conclusion
 
 The steward's bounded rerun and the carrier's `redispatch` both rerun only a

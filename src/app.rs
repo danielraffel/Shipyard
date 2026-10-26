@@ -66,6 +66,7 @@ mod rescue_cmd;
 mod reuse_cmd;
 mod reuse_rederive;
 mod review_verdict_cmd;
+mod rollup_cmd;
 mod run_cmd;
 mod runner_cmd;
 mod runner_kill_cmd;
@@ -539,6 +540,16 @@ where
                 stdout,
             );
         }
+        Command::Rollup { command } => {
+            return rollup_cmd::rollup_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
+        }
         Command::ReviewVerdict {
             pr,
             repo,
@@ -919,6 +930,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Landing { .. }
         | Command::Inspect { .. }
         | Command::ReviewVerdict { .. }
+        | Command::Rollup { .. }
         | Command::Who { .. }
         | Command::BaseHealth { .. }
         | Command::Diagnose { .. }

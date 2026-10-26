@@ -588,6 +588,14 @@ fn approval_evidence(approval: &crate::head_approval::Approval) -> String {
             comment_id.map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
             app(performed_via_github_app_id)
         ),
+        crate::head_approval::Approval::Rollup { members } => format!(
+            "rollup:{}",
+            members
+                .iter()
+                .map(|member| format!("#{}@{}", member.pr, member.head))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
         crate::head_approval::Approval::Carried {
             from_head,
             approval,

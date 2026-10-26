@@ -634,6 +634,22 @@ internal marker, is honoured only with the one-shot nonce Shipyard issues for
 the call (Environment switches, below); without one the guard applies every
 rule. `ship --arm` and `pr --arm` ask only for an arm the verdict allows.
 
+### A rollup lands on its members' own approvals
+
+A rollup head (branch `shipyard-train/rollup-*`, on a base whose
+`.shipyard/config.toml` sets `[train] enabled = true` and `mode = "rollup"`)
+has no verdict of its own. When no verdict names it, the guard
+(`rollup_acceptance`) and Shipyard's gate (`crate::rollup::accept`) accept it
+only when every merge on its first-parent chain merges the exact head of an
+open member pull request whose own review counts at that head (a carried
+approval does not, by default), each merge changes exactly that member's
+files to its approved blobs and modes, the members change disjoint files,
+the base touched none of them since, and no member changes an excluded path.
+A HOLD naming the rollup head stops it. `SHIPYARD_TRAIN=off` or a
+`train.pause` file in the guards directory refuses every rollup on the host.
+The notice comment on the rollup pull request is never read. See
+[rollups.md](rollups.md).
+
 ### A HOLD takes its head out of the landing path
 
 A HOLD posted on a head that is already armed or queued did not stop it: on
