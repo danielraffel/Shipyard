@@ -201,9 +201,10 @@ class RollupAcceptance(unittest.TestCase):
                 guard.train_config(bad)
 
     def test_the_kill_switch_and_pause_file_stop_the_train(self) -> None:
-        for value in ("off", "0", "false", "off:o/r", "FALSE:O/R"):
+        for value in ("off", "0", "false", "off:o/r", "OFF:O/R"):
             self.assertIsNotNone(guard.train_stopped(REPO, value, None), value)
-        for value in ("on", "", "off:other/repo"):
+        # The merge train's switch scopes only `off:`.
+        for value in ("on", "", "off:other/repo", "false:o/r"):
             self.assertIsNone(guard.train_stopped(REPO, value, None), value)
         (self.root / "guards").mkdir()
         (self.root / "guards" / "train.pause").write_text("")
