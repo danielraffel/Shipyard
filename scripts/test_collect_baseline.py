@@ -363,6 +363,49 @@ class CollectorInvocationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "merge receipt import failed"):
                 MOD.import_organic(args)
 
+    def test_merge_receipt_health_binds_bytes_and_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handoff = root / "receipts.jsonl"
+            health = root / "receipts.health.json"
+            value = {"schema": "shipyard-merge-receipt/v1", "receipt_id": "r-1", "repo": "owner/repo",
+                     "project": "repo", "base_branch": "main", "pr": 1, "head_sha": "a" * 40,
+                     "validated_head_sha": "a" * 40, "merge_commit_sha": "b" * 40,
+                     "merged_at": "2026-10-26T00:00:00Z", "safe_merge": True, "source": "shipyard",
+                     "required_checks": ["test"], "gate_receipt_sha256": "c" * 64, "evidence": "sha256:r-1"}
+            handoff.write_text(json.dumps(value) + "\n")
+            payload = handoff.read_bytes()
+            generated = MOD.receipt_handoff.health_payload(
+                repo="owner/repo", file=handoff, checked_at=dt.datetime.now(dt.timezone.utc),
+                status="fresh", exported_at=dt.datetime.now(dt.timezone.utc),
+                receipts=[value], payload=payload,
+                producer={"identity": "shipyard", "version": "unavailable", "executable_sha256": "unavailable"})
+            health.write_text(json.dumps(generated))
+            handoff.write_text(json.dumps({**value, "evidence": "sha256:tampered"}) + "\n")
+            with self.assertRaisesRegex(RuntimeError, "(byte count|digest) does not match"):
+                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+
+    def test_merge_receipt_health_rejects_stale_before_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handoff = root / "receipts.jsonl"
+            health = root / "receipts.health.json"
+            value = {"schema": "shipyard-merge-receipt/v1", "receipt_id": "r-1", "repo": "owner/repo",
+                     "project": "repo", "base_branch": "main", "pr": 1, "head_sha": "a" * 40,
+                     "validated_head_sha": "a" * 40, "merge_commit_sha": "b" * 40,
+                     "merged_at": "2026-10-26T00:00:00Z", "safe_merge": True, "source": "shipyard",
+                     "required_checks": ["test"], "gate_receipt_sha256": "c" * 64, "evidence": "sha256:r-1"}
+            handoff.write_text(json.dumps(value) + "\n")
+            payload = handoff.read_bytes()
+            old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
+            generated = MOD.receipt_handoff.health_payload(
+                repo="owner/repo", file=handoff, checked_at=old, status="fresh", exported_at=old,
+                receipts=[value], payload=payload,
+                producer={"identity": "shipyard", "version": "unavailable", "executable_sha256": "unavailable"})
+            health.write_text(json.dumps(generated))
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+
     def test_collect_rejects_merge_receipt_for_another_repository(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "receipts.jsonl"

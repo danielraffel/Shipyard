@@ -550,7 +550,10 @@ and provider-neutral:
 - `scripts/merge_receipt_handoff.py export ...` supervises that producer export
   and writes an atomic `shipyard-merge-receipt-handoff/v1` health sidecar;
   `... check --stale-after 2h` exits `3` for a missing, malformed, failed,
-  empty, or stale handoff. An empty producer store remains unavailable. `scripts/install_merge_receipt_handoff.sh` installs
+  empty, stale, or tampered handoff. It verifies the sidecar's payload digest,
+  byte/record counts, exact receipt schema, producer identity, and duplicate/
+  conflict rules. An empty producer store remains unavailable; the baseline
+  collector uses `--merge-receipt-health` to preserve that unavailable state. `scripts/install_merge_receipt_handoff.sh` installs
   the producer export as a managed per-user launchd job. These helpers are
   observational and never authorize or infer a merge.
 

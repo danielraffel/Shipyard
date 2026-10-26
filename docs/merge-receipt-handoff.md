@@ -17,8 +17,8 @@ python3 scripts/merge_receipt_handoff.py export \
 
 The wrapper calls only `shipyard metrics export merge-receipt`, which is
 repository-scoped, local, atomic, and read-only with respect to GitHub. It
-writes a separate atomic health sidecar containing the export time, count, and
-latest merged timestamp. Export failure records `status=error` and never
+writes a separate atomic health sidecar containing the export time, producer identity, latest merged timestamp,
+record count, byte count, and SHA-256 of the exact JSONL payload. Export failure records `status=error` and never
 claims a fresh handoff or replaces a previously successful handoff.
 
 Install a supervised per-user macOS job with a dry-run first:
@@ -43,5 +43,8 @@ python3 scripts/merge_receipt_handoff.py check \
 ```
 
 `check` exits `0` for a valid, recent handoff and `3` for a missing,
-malformed, failed, empty, or stale handoff. This status is observational only;
+malformed, failed, empty, stale, tampered, duplicate, or conflicting handoff.
+The baseline collector requires and verifies this sidecar when
+`--merge-receipt-health` is supplied, preserving an unavailable denominator
+instead of importing stale data. This status is observational only;
 it cannot authorize, undo, or infer a merge.

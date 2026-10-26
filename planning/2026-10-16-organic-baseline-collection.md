@@ -12,6 +12,7 @@ python3 scripts/collect_baseline.py \
   --status-markdown "$SHIPYARD_STATE_DIR/baseline-status.md" \
   --tartci-host m5s \
   --merge-receipts "$SHIPYARD_STATE_DIR/merge-receipts.jsonl" \
+  --merge-receipt-health "$SHIPYARD_STATE_DIR/merge-receipts.health.json" \
   --collect
 ```
 

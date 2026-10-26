@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
@@ -88,10 +89,13 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             health = root / "handoff.health.json"
             handoff.write_text(json.dumps(receipt()) + "\n")
             now = dt.datetime.now(dt.timezone.utc)
+            handoff_payload = handoff.read_bytes()
             health.write_text(json.dumps({
                 "schema": "shipyard-merge-receipt-handoff/v1", "repo": "owner/repo",
                 "file": str(handoff), "status": "fresh", "checked_at": now.isoformat().replace("+00:00", "Z"),
                 "exported_at": now.isoformat().replace("+00:00", "Z"), "receipt_count": 1,
+                "handoff_bytes": len(handoff_payload), "handoff_sha256": hashlib.sha256(handoff_payload).hexdigest(),
+                "producer": {"identity": "shipyard", "version": "unavailable", "executable_sha256": "unavailable"},
             }))
             fresh = self.invoke("check", "--file", str(handoff), "--health-file", str(health), "--stale-after", "2h")
             self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
@@ -112,6 +116,26 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             result = self.invoke("check", "--file", str(handoff), "--health-file", str(health))
             self.assertEqual(result.returncode, 3)
             self.assertEqual(json.loads(result.stdout)["status"], "error")
+
+    def test_check_rejects_duplicate_and_conflicting_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            health = root / "handoff.health.json"
+            for second in (receipt(), {**receipt(), "receipt_id": "r-2", "head_sha": "d" * 40,
+                                      "validated_head_sha": "d" * 40}):
+                handoff = root / "handoff.jsonl"
+                handoff.write_text(json.dumps(receipt()) + "\n" + json.dumps(second) + "\n")
+                now = dt.datetime.now(dt.timezone.utc)
+                health.write_text(json.dumps({"schema": "shipyard-merge-receipt-handoff/v1",
+                    "repo": "owner/repo", "file": str(handoff), "status": "fresh",
+                    "exported_at": now.isoformat().replace("+00:00", "Z"),
+                    "handoff_bytes": len(handoff.read_bytes()),
+                    "handoff_sha256": hashlib.sha256(handoff.read_bytes()).hexdigest(),
+                    "receipt_count": 2,
+                    "producer": {"identity": "shipyard", "version": "unavailable", "executable_sha256": "unavailable"}}))
+                result = self.invoke("check", "--file", str(handoff), "--health-file", str(health))
+                self.assertEqual(result.returncode, 3)
+                self.assertRegex(json.loads(result.stdout)["error"], "duplicates receipt_id|conflicts")
 
     def test_check_rejects_minimal_tampered_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

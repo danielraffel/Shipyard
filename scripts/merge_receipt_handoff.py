@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
@@ -21,6 +22,7 @@ from typing import Any
 
 SCHEMA = "shipyard-merge-receipt-handoff/v1"
 EXIT_STALE = 3
+MAX_FUTURE_SKEW_SECS = 300
 _REPO = re.compile(r"^[^/\s]+/[^/\s]+$")
 
 
@@ -89,7 +91,7 @@ RECEIPT_FIELDS = frozenset({
 })
 
 
-def validate_receipt_record(value: dict[str, Any], *, line_number: int, repo: str) -> None:
+def validate_receipt_record(value: dict[str, Any], *, line_number: int, repo: str, now_value: dt.datetime | None = None) -> None:
     if set(value) != RECEIPT_FIELDS:
         missing = sorted(RECEIPT_FIELDS - set(value))
         extra = sorted(set(value) - RECEIPT_FIELDS)
@@ -122,15 +124,20 @@ def validate_receipt_record(value: dict[str, Any], *, line_number: int, repo: st
             or not all(char in "0123456789abcdef" for char in digest)
             or set(digest) == {"0"}):
         raise RuntimeError(f"handoff line {line_number} has an invalid gate receipt hash")
-    parse_timestamp(value["merged_at"], field="merged_at")
+    merged_at = parse_timestamp(value["merged_at"], field="merged_at")
+    if now_value is not None and merged_at > now_value + dt.timedelta(seconds=MAX_FUTURE_SKEW_SECS):
+        raise RuntimeError(f"handoff line {line_number} merged_at is in the future")
 
 
-def read_receipts(path: pathlib.Path, repo: str) -> list[dict[str, Any]]:
+def read_handoff(path: pathlib.Path, repo: str, *, now_value: dt.datetime | None = None) -> tuple[list[dict[str, Any]], bytes]:
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+        payload = path.read_bytes()
+        text = payload.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
         raise RuntimeError(f"handoff is unreadable: {exc}") from exc
     records: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    by_pr: dict[tuple[str, int], tuple[str, str, str, str]] = {}
     for line_number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
@@ -140,16 +147,43 @@ def read_receipts(path: pathlib.Path, repo: str) -> list[dict[str, Any]]:
             raise RuntimeError(f"handoff line {line_number} is not JSON: {exc.msg}") from exc
         if not isinstance(value, dict):
             raise RuntimeError(f"handoff line {line_number} is not an object")
-        validate_receipt_record(value, line_number=line_number, repo=repo)
+        validate_receipt_record(value, line_number=line_number, repo=repo, now_value=now_value)
+        receipt_id = value["receipt_id"]
+        if receipt_id in seen_ids:
+            raise RuntimeError(f"handoff line {line_number} duplicates receipt_id {receipt_id}")
+        seen_ids.add(receipt_id)
+        identity = (value["project"], value["base_branch"], value["head_sha"], value["merge_commit_sha"])
+        pr_key = (value["repo"].strip().casefold(), value["pr"])
+        prior = by_pr.get(pr_key)
+        if prior is not None and prior != identity:
+            raise RuntimeError(f"handoff line {line_number} conflicts with another receipt for PR {value['pr']}")
+        by_pr[pr_key] = identity
         records.append(value)
     if not records:
         raise RuntimeError("handoff is empty")
-    return records
+    return records, payload
+
+
+def read_receipts(path: pathlib.Path, repo: str, *, now_value: dt.datetime | None = None) -> list[dict[str, Any]]:
+    return read_handoff(path, repo, now_value=now_value)[0]
+
+
+def payload_digest(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def producer_identity(shipyard: pathlib.Path) -> dict[str, str]:
+    try:
+        digest = payload_digest(shipyard.read_bytes())
+    except OSError:
+        digest = "unavailable"
+    return {"identity": "shipyard", "version": "unavailable", "executable_sha256": digest}
 
 
 def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
                    status: str, exported_at: dt.datetime | None = None,
                    receipts: list[dict[str, Any]] | None = None,
+                   payload: bytes | None = None, producer: dict[str, str] | None = None,
                    error: str | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schema": SCHEMA,
@@ -158,6 +192,9 @@ def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
         "status": status,
         "checked_at": timestamp(checked_at),
         "receipt_count": len(receipts or []),
+        "handoff_bytes": len(payload) if payload is not None else None,
+        "handoff_sha256": payload_digest(payload) if payload is not None else None,
+        "producer": producer or {"identity": "shipyard", "version": "unavailable", "executable_sha256": "unavailable"},
     }
     if exported_at is not None:
         payload["exported_at"] = timestamp(exported_at)
@@ -201,14 +238,14 @@ def export(args: argparse.Namespace) -> int:
         write_health(health_file, health_payload(repo=args.repo, file=file,
                                                   checked_at=now(), status="error", error=error))
         raise RuntimeError(error)
-    receipts = read_receipts(file, args.repo)
     exported = now()
-    write_health(health_file, health_payload(repo=args.repo, file=file,
-                                              checked_at=exported, status="fresh",
-                                              exported_at=exported, receipts=receipts))
-    print(json.dumps(health_payload(repo=args.repo, file=file, checked_at=exported,
-                                    status="fresh", exported_at=exported,
-                                    receipts=receipts), sort_keys=True))
+    receipts, payload = read_handoff(file, args.repo, now_value=exported)
+    producer = producer_identity(shipyard)
+    health = health_payload(repo=args.repo, file=file, checked_at=exported, status="fresh",
+                            exported_at=exported, receipts=receipts, payload=payload,
+                            producer=producer)
+    write_health(health_file, health)
+    print(json.dumps(health, sort_keys=True))
     return 0
 
 
@@ -227,13 +264,26 @@ def check(args: argparse.Namespace) -> int:
         recorded_file = health.get("file")
         if not isinstance(recorded_file, str) or pathlib.Path(recorded_file).resolve() != file.resolve():
             raise RuntimeError("health sidecar is bound to a different handoff file")
-        records = read_receipts(file, repo)
+        records, handoff_payload = read_handoff(file, repo, now_value=checked)
         exported_at = parse_timestamp(health.get("exported_at"), field="exported_at")
-        age = max(0.0, (checked - exported_at).total_seconds())
-        status = "fresh" if age <= threshold else "stale"
+        if exported_at > checked + dt.timedelta(seconds=MAX_FUTURE_SKEW_SECS):
+            raise RuntimeError("health sidecar exported_at is in the future")
+        expected_bytes = health.get("handoff_bytes")
+        expected_sha = health.get("handoff_sha256")
+        if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or expected_bytes != len(handoff_payload):
+            raise RuntimeError("health sidecar byte count does not match handoff")
+        if not isinstance(expected_sha, str) or expected_sha != payload_digest(handoff_payload):
+            raise RuntimeError("health sidecar digest does not match handoff")
+        if health.get("receipt_count") != len(records):
+            raise RuntimeError("health sidecar record count does not match handoff")
+        producer = health.get("producer")
+        if not isinstance(producer, dict) or producer.get("identity") != "shipyard":
+            raise RuntimeError("health sidecar has no producer identity")
+        status = "fresh" if health.get("status") == "fresh" and (checked - exported_at).total_seconds() <= threshold else "stale"
         payload = dict(health)
         payload.update({"status": status, "checked_at": timestamp(checked),
-                        "age_seconds": int(age), "stale_after_seconds": threshold,
+                        "age_seconds": max(0, int((checked - exported_at).total_seconds())),
+                        "stale_after_seconds": threshold,
                         "receipt_count": len(records)})
     except (OSError, json.JSONDecodeError, RuntimeError, ValueError) as exc:
         payload = {"schema": SCHEMA, "status": "error", "checked_at": timestamp(checked),

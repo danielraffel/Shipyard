@@ -21,6 +21,11 @@ import tempfile
 import sys
 from typing import Any, Sequence
 
+try:
+    import merge_receipt_handoff as receipt_handoff
+except ModuleNotFoundError:  # pragma: no cover - direct managed script has a sibling module
+    receipt_handoff = None
+
 from baseline_pass_history import (
     DEFAULT_RETENTION_WINDOW_SECS,
     HistoryValidationError,
@@ -93,7 +98,14 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     merge_receipts = getattr(args, "merge_receipts", None)
     if merge_receipts is not None:
         receipt_path = pathlib.Path(merge_receipts).expanduser()
-        validate_merge_receipt_scope(receipt_path, args.repo)
+        health_path = getattr(args, "merge_receipt_health", None)
+        if health_path is not None:
+            validate_merge_receipt_health(
+                pathlib.Path(health_path).expanduser(), receipt_path, args.repo,
+                getattr(args, "merge_receipt_stale_after", "2h"),
+            )
+        else:
+            validate_merge_receipt_scope(receipt_path, args.repo)
         imported_receipts = run([
             args.shipyard, "--state-dir", state_dir, "metrics", "import", "merge-receipt",
             "--file", str(receipt_path), "--json",
@@ -201,6 +213,51 @@ def prepare_tartci_export(text: str, repo: str, project: str) -> tuple[str, int]
     if len(keys) != len(set(keys)):
         raise RuntimeError("TartCI export contains duplicate provider/external_id records")
     return json.dumps(joinable, sort_keys=True), len(records) - len(joinable)
+
+
+def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, repo: str,
+                                  stale_after: str) -> dict[str, Any]:
+    """Require a producer health sidecar before importing its handoff."""
+    if receipt_handoff is None:
+        raise RuntimeError("merge receipt health validation is unavailable")
+    try:
+        threshold = receipt_handoff.parse_duration(stale_after)
+        health = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"merge receipt health is unreadable: {exc}") from exc
+    if not isinstance(health, dict) or health.get("schema") != receipt_handoff.SCHEMA:
+        raise RuntimeError("merge receipt health has an unsupported schema")
+    if health.get("status") != "fresh":
+        raise RuntimeError(f"merge receipt health is {health.get('status', 'unknown')}")
+    if health.get("repo", "").strip().casefold() != repo.strip().casefold():
+        raise RuntimeError(f"merge receipt health names a repository other than {repo}")
+    recorded_file = health.get("file")
+    if not isinstance(recorded_file, str) or pathlib.Path(recorded_file).resolve() != handoff.resolve():
+        raise RuntimeError("merge receipt health is bound to a different handoff file")
+    checked = dt.datetime.now(dt.timezone.utc)
+    try:
+        exported_at = receipt_handoff.parse_timestamp(health.get("exported_at"), field="exported_at")
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if exported_at > checked + dt.timedelta(seconds=receipt_handoff.MAX_FUTURE_SKEW_SECS):
+        raise RuntimeError("merge receipt health exported_at is in the future")
+    age = max(0.0, (checked - exported_at).total_seconds())
+    if age > threshold:
+        raise RuntimeError(f"merge receipt handoff is stale ({int(age)}s; threshold {threshold}s)")
+    try:
+        records, payload = receipt_handoff.read_handoff(handoff, repo, now_value=checked)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"merge receipt handoff failed health validation: {exc}") from exc
+    if health.get("handoff_bytes") != len(payload):
+        raise RuntimeError("merge receipt health byte count does not match handoff")
+    if health.get("handoff_sha256") != receipt_handoff.payload_digest(payload):
+        raise RuntimeError("merge receipt health digest does not match handoff")
+    if health.get("receipt_count") != len(records):
+        raise RuntimeError("merge receipt health record count does not match handoff")
+    producer = health.get("producer")
+    if not isinstance(producer, dict) or producer.get("identity") != "shipyard":
+        raise RuntimeError("merge receipt health has no producer identity")
+    return health
 
 
 def validate_merge_receipt_scope(path: pathlib.Path, repo: str) -> None:
@@ -618,6 +675,10 @@ def main() -> int:
                         help="remote TartCI command when --tartci-host is used")
     parser.add_argument("--merge-receipts", type=pathlib.Path,
                         help="producer-bound Shipyard merge receipt JSON/JSONL to import")
+    parser.add_argument("--merge-receipt-health", type=pathlib.Path,
+                        help="producer health sidecar required before importing --merge-receipts")
+    parser.add_argument("--merge-receipt-stale-after", default="2h",
+                        help="maximum producer handoff age when --merge-receipt-health is supplied")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--since-days", type=int, default=5)
     parser.add_argument("--collect", action="store_true", help="run provider imports")
