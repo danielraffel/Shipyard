@@ -3,8 +3,8 @@
 
 The export is deliberately local and read-only with respect to GitHub: it calls
 Shipyard's existing repository-scoped export, then publishes a small health
-sidecar.  The sidecar lets an observer distinguish a healthy empty period from a
-producer that stopped running, without manufacturing a merge receipt.
+sidecar. The sidecar gives an observer a durable producer timestamp and an
+explicit failure state without manufacturing a merge receipt.
 """
 from __future__ import annotations
 
@@ -226,7 +226,6 @@ def export(args: argparse.Namespace) -> int:
         raise ValueError(f"Shipyard executable is unavailable: {shipyard}")
     if not _REPO.fullmatch(args.repo):
         raise ValueError("--repo must be OWNER/REPO")
-    started = now()
     file.parent.mkdir(parents=True, exist_ok=True)
     staged = tempfile.NamedTemporaryFile("wb", dir=file.parent, prefix=f".{file.name}.", delete=False)
     staged_path = pathlib.Path(staged.name)
