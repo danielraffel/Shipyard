@@ -803,6 +803,23 @@ pr_edit_equivalent() {
     fi
 }
 
+# `--replace-existing` is a Shipyard-only, release-upload capability. Strip it
+# before the native-help grammar is checked so it cannot silently widen any
+# other gh surface or change the verified native-option digest.
+release_upload_replace_existing=0
+if [[ "${1:-}" == "release" && "${2:-}" == "upload" ]]; then
+    release_upload_filtered=("$1" "$2")
+    for release_upload_argument in "${@:3}"; do
+        if [[ "$release_upload_argument" == "--replace-existing" ]]; then
+            release_upload_replace_existing=1
+        else
+            release_upload_filtered+=("$release_upload_argument")
+        fi
+    done
+    set -- "${release_upload_filtered[@]}"
+    unset release_upload_filtered release_upload_argument
+fi
+
 command_name="${1:-}"
 subcommand_name="$(grammar_subcommand "$command_name" "${2:-}")"
 if [[ "$command_name" == "pr" && "${2:-}" == "edit" ]]; then
@@ -2012,8 +2029,15 @@ unset ghapp_stamp_check
 
 if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \
       -n "${release_upload_stage_dir:-}" ]]; then
-    "$gh_binary" release upload "$release_upload_canonical_tag" \
-        "${release_upload_staged_assets[@]}" --repo "$repo"
+    release_upload_args=(release upload "$release_upload_canonical_tag" \
+        "${release_upload_staged_assets[@]}" --repo "$repo")
+    if [[ "${release_upload_replace_existing:-0}" == 1 ]]; then
+        # The public grammar does not expose native `--clobber`. This explicit
+        # release-only capability is admitted only after the same exact-tag,
+        # explicit-repository, regular-file staging checks above.
+        release_upload_args+=(--clobber)
+    fi
+    "$gh_binary" "${release_upload_args[@]}"
     exit 0
 fi
 

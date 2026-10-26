@@ -1586,8 +1586,10 @@ means a permission is actually missing. Details: `docs/github-app-quota.md`.
 The bounded App-authenticated publication exception is
 `ghapp release upload <tag> <files>... --repo OWNER/REPO`. It accepts only an
 existing release, stable private snapshots of non-symlink regular files, and
-an explicit repository; `--clobber`, lifecycle creation/deletion, and tag
-retargeting remain outside the privileged grammar.
+an explicit repository. `--replace-existing` is the sole bounded overwrite
+flag, translated to native `--clobber` only after those checks; native
+`--clobber`, lifecycle creation/deletion, and tag retargeting remain outside
+the privileged grammar.
 
 ## Supervised-Push Signal (`SHIPYARD_PR_RUNNING=1`)
 

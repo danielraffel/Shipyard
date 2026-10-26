@@ -316,7 +316,7 @@ def upload_artifact_and_checksums(
             config.repo,
             config.tag,
             str(artifact),
-            "--clobber",
+            "--replace-existing",
         ]
     )
     checksums = merge_release_checksum(config, artifact, runner)
@@ -329,7 +329,7 @@ def upload_artifact_and_checksums(
             config.repo,
             config.tag,
             str(checksums),
-            "--clobber",
+            "--replace-existing",
         ]
     )
     return checksums
