@@ -583,11 +583,16 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             )
             runner = FakeRunner(assets=[])
 
-            release_macos_local.upload_artifact_and_checksums(config, artifact, runner)
+            with mock.patch.object(
+                release_macos_local,
+                "require_ghapp",
+                return_value="/Users/tester/.local/bin/ghapp",
+            ):
+                release_macos_local.upload_artifact_and_checksums(config, artifact, runner)
 
             uploads = [
                 command for command in runner.commands
-                if command[:3] == ["ghapp", "release", "upload"]
+                if command[:3] == ["/Users/tester/.local/bin/ghapp", "release", "upload"]
             ]
             self.assertEqual(len(uploads), 2)
             self.assertTrue(all("--replace-existing" in command for command in uploads))
