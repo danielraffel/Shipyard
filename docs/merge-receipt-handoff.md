@@ -56,4 +56,6 @@ The producer and observer bind each receipt to the explicit protected base
 branch (default `main`) and repository basename. Freshness requires both the
 handoff export and the producer store's newest `imported_at` timestamp
 (`freshness_basis=handoff_export_and_source_import`), not the age of a
-historical receipt.
+historical receipt. `exported_at` is the canonical handoff-generation time,
+and `stale_after_seconds` binds the producer freshness window to the observer
+policy; a mismatch is rejected.

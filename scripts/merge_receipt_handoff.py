@@ -29,12 +29,12 @@ FRESHNESS_BASIS = "handoff_export_and_source_import"
 _REPO = re.compile(r"^[^/\s]+/[^/\s]+$")
 HEALTH_FIELDS = frozenset({
     "schema", "repo", "project", "base_branch", "file", "status", "checked_at",
-    "exported_at", "latest_merged_at", "source_imported_at", "freshness_basis", "receipt_count",
+    "exported_at", "latest_merged_at", "source_imported_at", "freshness_basis", "stale_after_seconds", "receipt_count",
     "handoff_bytes", "handoff_sha256", "producer", "error",
 })
 REQUIRED_HEALTH_FIELDS = frozenset({
     "schema", "repo", "project", "base_branch", "file", "status", "checked_at",
-    "exported_at", "latest_merged_at", "source_imported_at", "freshness_basis",
+    "exported_at", "latest_merged_at", "source_imported_at", "freshness_basis", "stale_after_seconds",
     "receipt_count", "handoff_bytes", "handoff_sha256", "producer",
 })
 PRODUCER_FIELDS = frozenset({"identity", "version", "executable_sha256"})
@@ -236,6 +236,7 @@ def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
                    base_branch: str = DEFAULT_BASE_BRANCH,
                    status: str, exported_at: dt.datetime | None = None,
                    source_imported_at: str | None = None,
+                   stale_after_seconds: int | None = None,
                    receipts: list[dict[str, Any]] | None = None,
                    payload: bytes | None = None, producer: dict[str, str] | None = None,
                    error: str | None = None) -> dict[str, Any]:
@@ -257,6 +258,8 @@ def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
         payload["exported_at"] = timestamp(exported_at)
     if source_imported_at is not None:
         payload["source_imported_at"] = source_imported_at
+    if stale_after_seconds is not None:
+        payload["stale_after_seconds"] = stale_after_seconds
     if receipts:
         payload["latest_merged_at"] = max(
             (parse_timestamp(record["merged_at"], field="merged_at") for record in receipts),
@@ -276,6 +279,7 @@ def export(args: argparse.Namespace) -> int:
     state_dir = require_abs_path(args.state_dir, "--state-dir")
     file = require_abs_path(args.file, "--file")
     health_file = require_abs_path(args.health_file, "--health-file")
+    stale_after_seconds = parse_duration(args.stale_after)
     if not shipyard.is_file() or not os.access(shipyard, os.X_OK):
         raise ValueError(f"Shipyard executable is unavailable: {shipyard}")
     if not _REPO.fullmatch(args.repo):
@@ -287,6 +291,7 @@ def export(args: argparse.Namespace) -> int:
     command = [str(shipyard), "--state-dir", str(state_dir), "metrics", "export",
                "merge-receipt", "--repo", args.repo, "--file", str(staged_path)]
     try:
+        source_before = source_imported_at(state_dir, args.repo, args.base_branch)
         completed = subprocess.run(command, text=True, capture_output=True,
                                    timeout=args.timeout_seconds, check=False)
         if completed.returncode != 0:
@@ -297,10 +302,13 @@ def export(args: argparse.Namespace) -> int:
         receipts, payload = read_handoff(staged_path, args.repo, base_branch=args.base_branch,
                                          now_value=exported)
         imported_at = source_imported_at(state_dir, args.repo, args.base_branch)
+        if imported_at != source_before:
+            raise RuntimeError("producer merge receipt source changed during export")
         producer = producer_identity(shipyard)
         health = health_payload(repo=args.repo, file=file, base_branch=args.base_branch,
                                 checked_at=exported, status="fresh",
                                 exported_at=exported, source_imported_at=imported_at,
+                                stale_after_seconds=stale_after_seconds,
                                 receipts=receipts, payload=payload,
                                 producer=producer)
         # Validation completed against the staged payload; publish only after
@@ -343,6 +351,8 @@ def check(args: argparse.Namespace) -> int:
             raise RuntimeError(f"health sidecar status is {health.get('status', 'unknown')}")
         if not REQUIRED_HEALTH_FIELDS.issubset(health):
             raise RuntimeError("health sidecar is missing required fields")
+        if health.get("stale_after_seconds") != threshold:
+            raise RuntimeError("health sidecar freshness window does not match requested policy")
         repo = health.get("repo")
         if not isinstance(repo, str) or not _REPO.fullmatch(repo):
             raise RuntimeError("health sidecar has no valid repo")
@@ -420,6 +430,7 @@ def parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--state-dir", type=pathlib.Path, required=True)
     export_parser.add_argument("--repo", required=True)
     export_parser.add_argument("--base-branch", default=DEFAULT_BASE_BRANCH)
+    export_parser.add_argument("--stale-after", default="2h")
     export_parser.add_argument("--file", type=pathlib.Path, required=True)
     export_parser.add_argument("--health-file", type=pathlib.Path, required=True)
     export_parser.add_argument("--timeout-seconds", type=int, default=300)

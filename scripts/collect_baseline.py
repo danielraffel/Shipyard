@@ -263,6 +263,8 @@ def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, rep
         raise RuntimeError(f"merge receipt health is {health.get('status', 'unknown')}")
     if not receipt_handoff.REQUIRED_HEALTH_FIELDS.issubset(health):
         raise RuntimeError("merge receipt health is missing required fields")
+    if health.get("stale_after_seconds") != threshold:
+        raise RuntimeError("merge receipt health freshness window does not match requested policy")
     health_repo = health.get("repo")
     if (not isinstance(health_repo, str)
             or health_repo.strip().casefold() != repo.strip().casefold()):

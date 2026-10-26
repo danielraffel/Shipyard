@@ -45,6 +45,7 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             "freshness_basis": "handoff_export_and_source_import", "checked_at": observed.isoformat().replace("+00:00", "Z"),
             "exported_at": observed.isoformat().replace("+00:00", "Z"),
             "latest_merged_at": "2026-10-26T00:00:00Z", "source_imported_at": observed.isoformat().replace("+00:00", "Z"),
+            "stale_after_seconds": 7200,
             "receipt_count": 1,
             "handoff_bytes": len(payload), "handoff_sha256": hashlib.sha256(payload).hexdigest(),
             "producer": {"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64},
@@ -232,6 +233,15 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
             self.assertEqual(result.returncode, 3)
             self.assertIn("producer contains unknown fields", json.loads(result.stdout)["error"])
+
+    def test_check_rejects_policy_window_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp); handoff = root / "handoff.jsonl"; health = root / "health.json"
+            handoff.write_text(json.dumps(receipt()) + "\n")
+            sidecar = self.health(handoff, stale_after_seconds=3600); health.write_text(json.dumps(sidecar))
+            result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health), "--stale-after", "2h")
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("freshness window", json.loads(result.stdout)["error"])
 
     def test_check_requires_freshness_metadata_and_matches_latest_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
