@@ -1743,15 +1743,18 @@ Use `local` only on private repos / the owner's own machine, never a public repo
 with untrusted PRs.
 
 The tag release's CI signing step may temporarily add an imported Developer ID
-keychain. It must snapshot and verify the user-domain default keychain and
-complete search list without mutating either; pass the ephemeral keychain
-directly to `codesign`. Its `always()` cleanup deletes the ephemeral keychain.
+keychain. It snapshots and verifies a normal user-domain default keychain and
+complete search list without mutating either; a dedicated service account with
+no user-domain keychain records an explicit empty baseline instead. In both
+cases, all signing queries use the isolated temporary `HOME`, the ephemeral
+keychain is passed directly to `codesign`, and `always()` cleanup deletes it.
 Never parse `security list-keychains` with line-based quote stripping or make a
 CI signing keychain the persistent runner user's default.
 
 `codesign --keychain` still requires that identity keychain to appear in the
 calling process's user search list. Configure that list under the release
-step's isolated temporary `HOME` and pass the same `HOME` only to `codesign`;
+step's isolated temporary `HOME` and pass the same `HOME` to signing queries
+and `codesign`;
 never add the ephemeral keychain to the persistent runner user's search list.
 
 For an unattended local macOS release, use

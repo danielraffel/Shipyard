@@ -519,9 +519,12 @@ class PackageReleaseTests(unittest.TestCase):
 
             with mock.patch.dict(
                 os.environ,
-                {"SHIPYARD_SIGNING_KEYCHAIN": str(keychain)},
+                {
+                    "SHIPYARD_SIGNING_KEYCHAIN": str(keychain),
+                    "SHIPYARD_SIGNING_HOME": "/tmp/isolated signing home",
+                },
                 clear=True,
-            ), mock.patch.object(package_release, "run", side_effect=fake_run):
+            ), mock.patch.object(package_release, "run", side_effect=fake_run) as run:
                 with package_release.signing_keychain_first():
                     calls.append(["inside"])
 
@@ -529,6 +532,9 @@ class PackageReleaseTests(unittest.TestCase):
         set_calls = [call for call in calls if call[:5] == prefix]
         self.assertEqual(str(keychain.resolve()), set_calls[0][5])
         self.assertEqual(set_calls[-1], [*prefix, "/tmp/login.keychain-db"])
+        for call in run.call_args_list:
+            if call.args[0][:2] == ["security", "list-keychains"]:
+                self.assertEqual(call.kwargs["env"]["HOME"], "/tmp/isolated signing home")
 
     def test_empty_search_list_fails_before_any_write(self) -> None:
         calls: list[list[str]] = []
@@ -542,7 +548,10 @@ class PackageReleaseTests(unittest.TestCase):
 
             with mock.patch.dict(
                 os.environ,
-                {"SHIPYARD_SIGNING_KEYCHAIN": str(keychain)},
+                {
+                    "SHIPYARD_SIGNING_KEYCHAIN": str(keychain),
+                    "SHIPYARD_SIGNING_HOME": "/tmp/isolated signing home",
+                },
                 clear=True,
             ), mock.patch.object(package_release, "run", side_effect=fake_run):
                 with self.assertRaises(SystemExit):
@@ -550,6 +559,25 @@ class PackageReleaseTests(unittest.TestCase):
                         pass
 
         self.assertFalse(any("-s" in call for call in calls))
+
+    def test_signing_keychain_is_listed_uses_isolated_home(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SHIPYARD_SIGNING_HOME": "/tmp/isolated signing home",
+            },
+            clear=True,
+        ), mock.patch.object(
+            package_release,
+            "run",
+            return_value='"/tmp/ephemeral.keychain-db"\n',
+        ) as run:
+            self.assertTrue(
+                package_release.signing_keychain_is_listed(
+                    Path("/tmp/ephemeral.keychain-db")
+                )
+            )
+        self.assertEqual(run.call_args.kwargs["env"]["HOME"], "/tmp/isolated signing home")
 
     def test_disposable_keychain_imports_p12_with_full_partition_list(self) -> None:
         calls: list[list[str]] = []

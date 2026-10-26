@@ -3706,6 +3706,14 @@ GitHub's hosted-macOS queue. Full provider semantics:
 When the release workflow imports an ephemeral signing identity, preserve the
 runner owner's exact user keychain default and search-list order by never
 mutating either: pass the ephemeral keychain explicitly to `codesign`.
+The keychain snapshot helper resolves the runner account's home from its
+login identity rather than trusting a stale launchd `HOME`; keep that explicit
+binding when changing the signing path. A dedicated service account with no
+user-domain keychain records an explicit empty baseline and signs only through
+the isolated signing home and explicit ephemeral keychain. If setup fails
+before creating the ephemeral keychain, cleanup reports the setup failure
+without inventing a second deletion failure, while any recorded creation is
+deleted fail-closed.
 Cleanup must run under `always()`, verify both settings stayed unchanged, and
 delete the ephemeral keychain even when signing setup fails.
 Because `codesign --keychain` does not bypass its search-list eligibility

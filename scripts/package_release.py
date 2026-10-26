@@ -196,6 +196,16 @@ def expanded_env_path(name: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(os.environ[name]))).resolve()
 
 
+def signing_security_env() -> dict[str, str] | None:
+    """Use isolated keychain preferences for CI signing queries."""
+    home = os.environ.get("SHIPYARD_SIGNING_HOME")
+    if not home:
+        return None
+    env = os.environ.copy()
+    env["HOME"] = home
+    return env
+
+
 @contextlib.contextmanager
 def signing_keychain_first():
     configured = os.environ.get("SHIPYARD_SIGNING_KEYCHAIN")
@@ -207,18 +217,28 @@ def signing_keychain_first():
     if not Path(keychain).is_file():
         raise SystemExit(f"Configured signing keychain does not exist: {keychain}")
     original = shlex.split(
-        run(["security", "list-keychains", "-d", "user"], capture=True)
+        run(
+            ["security", "list-keychains", "-d", "user"],
+            capture=True,
+            env=signing_security_env(),
+        )
     )
     if not original:
         raise SystemExit(
             "User keychain search list read empty; refusing to replace it for signing"
         )
     desired = [keychain, *(item for item in original if str(Path(item).resolve()) != keychain)]
-    run(["security", "list-keychains", "-d", "user", "-s", *desired])
+    run(
+        ["security", "list-keychains", "-d", "user", "-s", *desired],
+        env=signing_security_env(),
+    )
     try:
         yield
     finally:
-        run(["security", "list-keychains", "-d", "user", "-s", *original])
+        run(
+            ["security", "list-keychains", "-d", "user", "-s", *original],
+            env=signing_security_env(),
+        )
 
 
 def signing_keychain_is_listed(keychain: Path) -> bool:
@@ -230,7 +250,11 @@ def signing_keychain_is_listed(keychain: Path) -> bool:
     less predictable.
     """
     listed = shlex.split(
-        run(["security", "list-keychains", "-d", "user"], capture=True)
+        run(
+            ["security", "list-keychains", "-d", "user"],
+            capture=True,
+            env=signing_security_env(),
+        )
     )
     resolved = keychain.resolve()
     return any(Path(item).resolve() == resolved for item in listed)
