@@ -1590,6 +1590,8 @@ an explicit repository. `--replace-existing` is the sole bounded overwrite
 flag, translated to native `--clobber` only after those checks; native
 `--clobber`, lifecycle creation/deletion, and tag retargeting remain outside
 the privileged grammar.
+The local macOS release script calls `ghapp` for both signed-asset and
+checksum uploads; native `gh` rejects the wrapper-only replacement flag.
 
 ## Supervised-Push Signal (`SHIPYARD_PR_RUNNING=1`)
 
