@@ -1757,8 +1757,10 @@ other VM managers can all record or import rows.
 
 For a continuous organic baseline, use `scripts/install_baseline_collector.sh`
 from the observation controller. It installs a dry-run-by-default hourly
-launchd job, keeps state outside the repository, and preserves unavailable
-merge-receipt and provenance fields instead of inferring them.
+launchd job, copies the collector and its pass-history dependency into the
+managed Shipyard state directory, and points launchd at that durable copy.
+State remains outside the repository, and unavailable merge-receipt and
+provenance fields are preserved instead of inferred.
 
 `shipyard run command` writes a best-effort metrics row alongside command
 evidence. Import cloud and VM history explicitly when comparing local hardware
