@@ -547,6 +547,19 @@ and provider-neutral:
   GitHub or manufactures receipts. An empty export fails closed without
   replacing the destination, so the downstream cannot record a false
   successful handoff.
+- `scripts/merge_receipt_handoff.py export ...` supervises that producer export
+  and writes an atomic `shipyard-merge-receipt-handoff/v1` health sidecar;
+  `... check --repo <owner/repo> --base-branch main --stale-after 2h` exits `3` for a missing, malformed, failed,
+  empty, stale, or tampered handoff. It verifies the sidecar's payload digest,
+  byte/record counts, exact receipt schema, producer identity, and duplicate/
+  conflict rules. An empty producer store remains unavailable; the baseline
+  collector uses `--merge-receipt-health` to preserve that unavailable state. `scripts/install_merge_receipt_handoff.sh` installs
+  the producer export as a managed per-user launchd job. The sidecar also binds
+  the producer DB's newest `imported_at` for the exact repository/base branch;
+  missing or stale source metadata is unavailable. The sidecar records the
+  producer `stale_after_seconds` policy and observers reject a mismatched
+  window. These helpers are
+  observational and never authorize or infer a merge.
 
 GitHub imports retain the workflow event, provider run ID, run attempt, and
 authoritative head SHA on the SQLite run row. These dimensions are independent:

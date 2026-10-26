@@ -313,11 +313,8 @@ class CollectorInvocationTests(unittest.TestCase):
             shipyard = root / "shipyard"; tartci = root / "tartci"
             shipyard.write_text("#!/bin/sh\ncase \"$*\" in *metrics*import*) echo '{\"imported\": 1}';; *) echo '{\"job_samples\": 1}';; esac\n")
             tartci.write_text("#!/bin/sh\necho '{\"project\":\"pulp\",\"repo\":\"o/pulp\",\"provider\":\"tart\",\"external_id\":\"fixture-1\"}'\n")
-            merge_receipts = root / "merge-receipts.jsonl"
-            merge_receipts.write_text(json.dumps({"repo": "o/pulp"}) + "\n")
             shipyard.chmod(0o755); tartci.chmod(0o755)
             args = type("Args", (), {"db": db, "state": root / "state.json", "project": "pulp", "repo": "o/pulp", "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5, "timeout_seconds": 5})()
-            args.merge_receipts = merge_receipts
             args.state.write_text("{}")
             original = MOD.count_jobs
             try:
@@ -326,7 +323,7 @@ class CollectorInvocationTests(unittest.TestCase):
                 MOD.count_jobs = original
             self.assertEqual(events[-1]["new_rows"], 0)
             self.assertEqual(events[-1]["source_activity_dates"], ["2026-10-16"])
-            self.assertEqual([event["source"] for event in events], ["github", "tartci", "merge-receipt", "collection"])
+            self.assertEqual([event["source"] for event in events], ["github", "tartci", "collection"])
 
     def test_collect_refuses_unknown_provider_counts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -360,8 +357,146 @@ class CollectorInvocationTests(unittest.TestCase):
                 "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5,
                 "timeout_seconds": 5, "merge_receipts": receipts})()
             args.state.write_text("{}")
-            with self.assertRaisesRegex(RuntimeError, "merge receipt import failed"):
+            with self.assertRaisesRegex(RuntimeError, "health sidecar is required"):
                 MOD.import_organic(args)
+
+    def test_merge_receipt_health_preflight_runs_before_provider_imports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            shipyard = root / "shipyard"; tartci = root / "tartci"; receipts = root / "receipts.jsonl"
+            marker = root / "provider-ran"
+            shipyard.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+            tartci.write_text("#!/bin/sh\ntouch '%s'\nexit 1\n" % marker)
+            receipts.write_text(json.dumps({"repo": "o/p"}) + "\n")
+            shipyard.chmod(0o755); tartci.chmod(0o755)
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p", "repo": "o/p",
+                "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5,
+                "timeout_seconds": 5, "merge_receipts": receipts})()
+            args.state.write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "health sidecar is required"):
+                MOD.import_organic(args)
+            self.assertFalse(marker.exists(), "provider imports must not run before receipt preflight")
+
+    def test_merge_receipt_health_binds_bytes_and_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handoff = root / "receipts.jsonl"
+            health = root / "receipts.health.json"
+            value = {"schema": "shipyard-merge-receipt/v1", "receipt_id": "r-1", "repo": "owner/repo",
+                     "project": "repo", "base_branch": "main", "pr": 1, "head_sha": "a" * 40,
+                     "validated_head_sha": "a" * 40, "merge_commit_sha": "b" * 40,
+                     "merged_at": "2026-10-26T00:00:00Z", "safe_merge": True, "source": "shipyard",
+                     "required_checks": ["test"], "gate_receipt_sha256": "c" * 64, "evidence": "sha256:r-1"}
+            handoff.write_text(json.dumps(value) + "\n")
+            payload = handoff.read_bytes()
+            generated = MOD.receipt_handoff.health_payload(
+                repo="owner/repo", file=handoff, checked_at=dt.datetime.now(dt.timezone.utc),
+                status="fresh", exported_at=dt.datetime.now(dt.timezone.utc),
+                source_imported_at=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                stale_after_seconds=7200,
+                receipts=[value], payload=payload,
+                producer={"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64})
+            health.write_text(json.dumps(generated))
+            handoff.write_text(json.dumps({**value, "evidence": "sha256:tampered"}) + "\n")
+            with self.assertRaisesRegex(RuntimeError, "(byte count|digest) does not match"):
+                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+
+    def test_merge_receipt_health_rejects_stale_before_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handoff = root / "receipts.jsonl"
+            health = root / "receipts.health.json"
+            value = {"schema": "shipyard-merge-receipt/v1", "receipt_id": "r-1", "repo": "owner/repo",
+                     "project": "repo", "base_branch": "main", "pr": 1, "head_sha": "a" * 40,
+                     "validated_head_sha": "a" * 40, "merge_commit_sha": "b" * 40,
+                     "merged_at": "2026-10-26T00:00:00Z", "safe_merge": True, "source": "shipyard",
+                     "required_checks": ["test"], "gate_receipt_sha256": "c" * 64, "evidence": "sha256:r-1"}
+            handoff.write_text(json.dumps(value) + "\n")
+            payload = handoff.read_bytes()
+            old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
+            generated = MOD.receipt_handoff.health_payload(
+                repo="owner/repo", file=handoff, checked_at=old, status="fresh", exported_at=old,
+                source_imported_at=old.isoformat().replace("+00:00", "Z"),
+                stale_after_seconds=7200,
+                receipts=[value], payload=payload,
+                producer={"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64})
+            health.write_text(json.dumps(generated))
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+
+    def test_merge_receipt_health_rejects_unknown_fields_and_wrong_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handoff = root / "receipts.jsonl"
+            health = root / "receipts.health.json"
+            value = {"schema": "shipyard-merge-receipt/v1", "receipt_id": "r-1", "repo": "owner/repo",
+                     "project": "repo", "base_branch": "main", "pr": 1, "head_sha": "a" * 40,
+                     "validated_head_sha": "a" * 40, "merge_commit_sha": "b" * 40,
+                     "merged_at": "2026-10-26T00:00:00Z", "safe_merge": True, "source": "shipyard",
+                     "required_checks": ["test"], "gate_receipt_sha256": "c" * 64, "evidence": "sha256:r-1"}
+            handoff.write_text(json.dumps(value) + "\n")
+            payload = handoff.read_bytes()
+            generated = MOD.receipt_handoff.health_payload(
+                repo="owner/repo", file=handoff, checked_at=dt.datetime.now(dt.timezone.utc),
+                status="fresh", exported_at=dt.datetime.now(dt.timezone.utc), receipts=[value], payload=payload,
+                source_imported_at=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                stale_after_seconds=7200,
+                producer={"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64})
+            generated["unexpected"] = True
+            health.write_text(json.dumps(generated))
+            with self.assertRaisesRegex(RuntimeError, "unknown fields"):
+                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+            generated.pop("unexpected")
+            generated["base_branch"] = "develop"
+            health.write_text(json.dumps(generated))
+            with self.assertRaisesRegex(RuntimeError, "base branch"):
+                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+
+    def test_import_uses_immutable_validated_handoff_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handoff = root / "receipts.jsonl"
+            health = root / "receipts.health.json"
+            value = {"schema": "shipyard-merge-receipt/v1", "receipt_id": "r-1", "repo": "owner/repo",
+                     "project": "repo", "base_branch": "main", "pr": 1, "head_sha": "a" * 40,
+                     "validated_head_sha": "a" * 40, "merge_commit_sha": "b" * 40,
+                     "merged_at": "2026-10-26T00:00:00Z", "safe_merge": True, "source": "shipyard",
+                     "required_checks": ["test"], "gate_receipt_sha256": "c" * 64, "evidence": "sha256:r-1"}
+            handoff.write_text(json.dumps(value) + "\n")
+            payload = handoff.read_bytes()
+            generated = MOD.receipt_handoff.health_payload(
+                repo="owner/repo", file=handoff, checked_at=dt.datetime.now(dt.timezone.utc),
+                status="fresh", exported_at=dt.datetime.now(dt.timezone.utc), receipts=[value], payload=payload,
+                source_imported_at=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                stale_after_seconds=7200,
+                producer={"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64})
+            health.write_text(json.dumps(generated))
+            args = type("Args", (), {"db": root / "metrics" / "metrics.db", "state": root / "state.json",
+                "project": "repo", "repo": "owner/repo", "shipyard": "shipyard", "tartci": "tartci",
+                "limit": 1, "since_days": 5, "timeout_seconds": 5, "merge_receipts": handoff,
+                "merge_receipt_health": health})()
+            args.state.write_text("{}")
+            observed_snapshot: list[Path] = []
+            original_run = MOD.run
+            def fake_run(command, *, stdin=None, timeout=300):
+                if "metrics" in command and "import" in command and "merge-receipt" in command:
+                    snapshot = Path(command[command.index("--file") + 1]); observed_snapshot.append(snapshot)
+                    self.assertEqual(snapshot.read_bytes(), payload)
+                    return subprocess.CompletedProcess(command, 0, '{"imported": 1}', "")
+                if command[:1] == ["tartci"]:
+                    handoff.write_text("tampered after preflight\n")
+                    return subprocess.CompletedProcess(command, 0,
+                        '{"project":"repo","repo":"owner/repo","provider":"tart","external_id":"id-1"}', "")
+                handoff.write_text("tampered after preflight\n")
+                return subprocess.CompletedProcess(command, 0, '{"imported": 1}', "")
+            MOD.run = fake_run
+            try:
+                events = MOD.import_organic(args)
+            finally:
+                MOD.run = original_run
+            self.assertEqual(len(observed_snapshot), 1)
+            self.assertFalse(observed_snapshot[0].exists())
+            self.assertEqual(events[2]["source"], "merge-receipt")
 
     def test_collect_rejects_merge_receipt_for_another_repository(self):
         with tempfile.TemporaryDirectory() as directory:

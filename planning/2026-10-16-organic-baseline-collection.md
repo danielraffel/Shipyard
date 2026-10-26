@@ -12,6 +12,7 @@ python3 scripts/collect_baseline.py \
   --status-markdown "$SHIPYARD_STATE_DIR/baseline-status.md" \
   --tartci-host m5s \
   --merge-receipts "$SHIPYARD_STATE_DIR/merge-receipts.jsonl" \
+  --merge-receipt-health "$SHIPYARD_STATE_DIR/merge-receipts.health.json" \
   --collect
 ```
 
@@ -31,13 +32,34 @@ outside the repository. A missing merge-receipt handoff remains unavailable in
 the scorecard; the collector never turns it into zero.
 
 The producer-side handoff is explicit and read-only. On the Shipyard state
-directory that records protected merges, run:
+directory that records protected merges, install the supervised exporter (dry-run
+first):
+
+```sh
+scripts/install_merge_receipt_handoff.sh \
+  --repo Generous-Corp/pulp \
+  --state-dir "$PRODUCER_STATE_DIR" \
+  --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl" \
+  --health-file "$SHIPYARD_HANDOFF_DIR/merge-receipts.health.json"
+scripts/install_merge_receipt_handoff.sh \
+  --repo Generous-Corp/pulp \
+  --state-dir "$PRODUCER_STATE_DIR" \
+  --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl" \
+  --health-file "$SHIPYARD_HANDOFF_DIR/merge-receipts.health.json" \
+  --install
+```
+
+The managed job invokes the same explicit export command:
 
 ```sh
 shipyard --state-dir "$PRODUCER_STATE_DIR" metrics export merge-receipt \
   --repo Generous-Corp/pulp \
   --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
 ```
+
+Its health sidecar is checked with `python3 scripts/merge_receipt_handoff.py
+check ... --stale-after 2h`; a stale, malformed, failed, or empty handoff is
+unavailable, never zero.
 
 The observer then passes that file as `--merge-receipts`. The export reads only
 validated receipts already persisted by Shipyard, scopes them to the exact
