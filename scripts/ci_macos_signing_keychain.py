@@ -120,7 +120,11 @@ def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
     failures: list[str] = []
     state: dict[str, Any] | None = None
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        parsed_state = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(parsed_state, dict):
+            state = parsed_state
+        else:
+            failures.append("saved keychain state is invalid")
     except (OSError, json.JSONDecodeError):
         failures.append("saved keychain state is unavailable")
 

@@ -108,6 +108,18 @@ class SigningKeychainTests(unittest.TestCase):
                 subject.restore(keychain, state, root / "home")
             security.assert_not_called()
 
+    def test_malformed_state_still_attempts_cleanup_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.write_text("[]")
+            keychain = root / "ephemeral"
+            keychain.touch()
+            with mock.patch.object(subject, "_security", return_value=completed()) as security:
+                with self.assertRaisesRegex(RuntimeError, "saved keychain state is invalid"):
+                    subject.restore(keychain, state, root / "home")
+            self.assertEqual(security.call_args_list, [mock.call("delete-keychain", str(keychain))])
+
     def test_creation_started_retries_cleanup_even_before_completion_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
