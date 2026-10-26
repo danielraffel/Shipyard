@@ -545,9 +545,10 @@ commit gets no carrier action until a reviewer approves that head.
 
 Three guardrails bound every carry, in the guard and in `head_approval`:
 - **Excluded paths:** a PR touching `[auto_merge] carry_excluded_paths` never
-  carries. The default list is workflows, `.agents/contract.toml`,
-  `tools/ci/**`, the guards and Shipyard's arm code, and signing and release
-  automation.
+  carries, and never joins a rollup. The default list is workflows,
+  `.agents/contract.toml`, `tools/ci/**`, `.shipyard/**` (the review, carry
+  and train policy itself), the guards and Shipyard's arm code, and signing
+  and release automation.
 - **`carry: no`:** a `carry: no` line in the APPROVE keeps it to its exact
   head.
 - **A cap:** at most 3 base merges or 48 hours since the verdict.

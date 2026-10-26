@@ -61,8 +61,9 @@
 //! require_counted_approval = true
 //! ```
 //!
-//! `SHIPYARD_TRAIN=off` (or `0`/`false`, optionally `:owner/repo`) and a
-//! `train.pause` file in the guards directory stop it on a host.
+//! The merge train's kill switch stops it on a host: `SHIPYARD_TRAIN=off`
+//! (or `0`/`false`), `off:owner/repo` for one repository, or a `train.pause`
+//! file in the guards directory ([`crate::merge_train::kill_switch`]).
 //!
 //! Both landings need the merge method MERGE ([`merge_method_refusal`]):
 //! squash or rebase would flatten the member merges into one commit. With
@@ -78,6 +79,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::head_approval::{self, Approval, HeadGate, RunGh};
+use crate::merge_train;
 use crate::required_check_policy::encode_path_segment;
 
 /// The rollup branch prefix; [`accept`] judges only these heads.
@@ -86,10 +88,8 @@ pub const BRANCH_PREFIX: &str = "shipyard-train/rollup-";
 pub const TABLE: &str = "train";
 /// No rollup has more members than this, whatever the config says.
 pub const MEMBER_CAP: usize = 4;
-/// The host kill switch: `off`, `0` or `false`, optionally `:<owner/repo>`.
-pub const KILL_ENV: &str = "SHIPYARD_TRAIN";
-/// The pause file in the guards directory.
-pub const PAUSE_FILE: &str = "train.pause";
+/// The merge train's kill switch, which stops rollups too.
+pub use crate::merge_train::{KILL_ENV, PAUSE_FILE};
 /// The notice-comment line naming one member.
 pub const NOTICE_PREFIX: &str = "rollup-of:";
 /// The direct-landing record, in Shipyard's state directory.
@@ -257,23 +257,14 @@ impl Config {
     }
 }
 
-/// Why this host's train is stopped for `repo`, or `None`: the kill switch
-/// `kill` ([`KILL_ENV`]'s value) or a [`PAUSE_FILE`] in `guards_dir`.
+/// Why this host's train is stopped for `repo`, or `None`: the merge
+/// train's own kill switch ([`merge_train::kill_switch`]), from `kill`
+/// ([`KILL_ENV`]'s value) and a [`PAUSE_FILE`] in `guards_dir`.
 #[must_use]
 pub fn stopped(repo: &str, kill: Option<&str>, guards_dir: Option<&Path>) -> Option<String> {
-    if let Some(value) = kill.map(str::trim).filter(|value| !value.is_empty()) {
-        let (switch, scope) = value.split_once(':').unwrap_or((value, ""));
-        let off = ["off", "0", "false"]
-            .iter()
-            .any(|word| switch.trim().eq_ignore_ascii_case(word));
-        if off && (scope.trim().is_empty() || scope.trim().eq_ignore_ascii_case(repo)) {
-            return Some(format!("{KILL_ENV}={value} stops the train on this host"));
-        }
-    }
-    let pause = guards_dir?.join(PAUSE_FILE);
-    pause
-        .exists()
-        .then(|| format!("the train is paused ({})", pause.display()))
+    let pause = guards_dir.and_then(|dir| merge_train::read_pause(&dir.join(PAUSE_FILE)));
+    merge_train::kill_switch(kill, pause, repo)
+        .map(|by| merge_train::TrainSwitch::Off { by }.explain())
 }
 
 /// [`stopped`] from this process's environment and guards directory.
@@ -1077,7 +1068,11 @@ pub fn land_direct(
         .ok_or_else(|| "GitHub's merge answer names no commit".to_owned())?;
     let landed_on = parents(run_gh, repo, &merge_commit)?;
     let untested = match landed_on.as_slice() {
-        [first, second] if *first == tip && second.eq_ignore_ascii_case(&rollup.head) => None,
+        [first, second]
+            if first.eq_ignore_ascii_case(&tip) && second.eq_ignore_ascii_case(&rollup.head) =>
+        {
+            None
+        }
         _ => Some(format!(
             "merge commit {} has parents {:?}, not [{}, {}]: the base moved between the re-read \
              and the merge, so the landed tree was never tested as a whole",

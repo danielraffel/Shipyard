@@ -528,7 +528,8 @@ Three guardrails apply to every carry, merge-only or across a rebase:
   matching `[auto_merge] carry_excluded_paths` in the base's
   `.shipyard/config.toml` needs a verdict naming its exact head. Without the
   key, the defaults are:
-  * `.github/workflows/**`, `.agents/contract.toml` and `tools/ci/**`;
+  * `.github/workflows/**`, `.agents/contract.toml`, `tools/ci/**`, and
+    `.shipyard/**`, whose config is the review, carry and train policy itself;
   * the guards and Shipyard's own arm code: `scripts/ghapp*`,
     `src/head_approval*` and `src/head_approval/**`, `src/queue_arm_gate*`,
     `src/auto_arm*` and `src/auto_arm/**`, `src/ghapp_guards*`,

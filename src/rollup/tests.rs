@@ -532,10 +532,11 @@ fn the_train_table_is_off_by_default_and_refuses_bad_values() {
 
 #[test]
 fn the_kill_switch_and_pause_file_stop_the_train() {
-    for value in ["off", "0", "false", "OFF", "off:o/r", "false:O/R"] {
+    for value in ["off", "0", "false", "OFF", "off:o/r", "OFF:O/R"] {
         assert!(stopped(REPO, Some(value), None).is_some(), "{value}");
     }
-    for value in ["on", "", "off:other/repo"] {
+    // The merge train's switch scopes only `off:`.
+    for value in ["on", "", "off:other/repo", "false:o/r"] {
         assert!(stopped(REPO, Some(value), None).is_none(), "{value}");
     }
     let dir = tempfile::tempdir().expect("tempdir");
@@ -825,6 +826,25 @@ fn excluded_and_hot_paths_are_refused() {
     )
     .expect_err("carry exclusion");
     assert!(error.contains(".github/workflows/ci.yml"), "{error}");
+    // The base's own config is excluded too: a member never changes the
+    // policy its rollup is judged by.
+    let config_change = git.commit(Some(&base), &[(".shipyard/config.toml", Some("[train]\n"))]);
+    let config_merges = git.build(&base, &[(13, config_change.clone())]);
+    let config_hub = Hub::new(&git);
+    config_hub.pull(13, "f3", &config_change);
+    config_hub.pull(20, "shipyard-train/rollup-13", &config_merges[0]);
+    let config_run = |args: &[String]| config_hub.run(args);
+    let error = accept(
+        &config_run,
+        REPO,
+        20,
+        &config_merges[0],
+        &config(),
+        &carry_excluded,
+        &approved,
+    )
+    .expect_err("config exclusion");
+    assert!(error.contains(".shipyard/config.toml"), "{error}");
     // The train's own exclusions, empty by default, apply too.
     assert!(accept(&run, REPO, 20, &merges[1], &config(), &[], &approved).is_ok());
     let excluding = Config {

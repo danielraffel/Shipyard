@@ -2818,6 +2818,8 @@ fn every_default_exclusion_names_the_paths_it_means() {
     for path in [
         ".github/workflows/build.yml",
         ".agents/contract.toml",
+        ".shipyard/config.toml",
+        ".shipyard/changed-surface-families.toml",
         "tools/ci/run_gate.py",
         "scripts/ghapp_queue_arm_guard.py",
         "src/head_approval.rs",

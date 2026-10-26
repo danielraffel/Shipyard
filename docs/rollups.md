@@ -34,8 +34,15 @@ hot_files = []             # globs no two members may both change (empty by defa
 require_counted_approval = true
 ```
 
-Shipyard ships no paths, check names or cadence for any repository. A
-repository lists its own `exclude_paths` and `hot_files`.
+The train's own lists ship empty: Shipyard names no repository's paths,
+check names or cadence, so a repository lists its own `exclude_paths` and
+`hot_files`. A rollup is still a carry, though, so the guard's carry
+exclusions apply to every member on top of `exclude_paths`: the base's
+`[auto_merge] carry_excluded_paths`, or by default
+`DEFAULT_CARRY_EXCLUDED_PATHS` (workflows, `tools/ci/**`, `.shipyard/**`, the
+guard and arm code, signing and release automation; see
+docs/ghapp-guards.md). A member that changes one of those lands on its own,
+never in a rollup.
 
 On a host, `SHIPYARD_TRAIN=off` (or `0` or `false`), optionally scoped as
 `off:owner/repo`, stops rollups, and so does a `train.pause` file in the

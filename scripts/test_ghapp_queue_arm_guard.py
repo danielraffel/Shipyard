@@ -2790,7 +2790,7 @@ class ReviewBeforeArm(unittest.TestCase):
 
     def test_a_pull_request_touching_an_excluded_path_never_carries(self) -> None:
         for path in (".github/workflows/ci.yml", ".agents/contract.toml", "tools/ci/run.sh",
-                     "scripts/ghapp_queue_arm_guard.py"):
+                     "scripts/ghapp_queue_arm_guard.py", ".shipyard/config.toml"):
             with self.subTest(path=path):
                 history = CarryHistory(self.root / f"repo-{abs(hash(path))}", extra={path: b"x\n"})
                 result = self.land(history, history.merge())
