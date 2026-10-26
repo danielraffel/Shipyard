@@ -1077,7 +1077,11 @@ pub fn land_direct(
         .ok_or_else(|| "GitHub's merge answer names no commit".to_owned())?;
     let landed_on = parents(run_gh, repo, &merge_commit)?;
     let untested = match landed_on.as_slice() {
-        [first, second] if *first == tip && second.eq_ignore_ascii_case(&rollup.head) => None,
+        [first, second]
+            if first.eq_ignore_ascii_case(&tip) && second.eq_ignore_ascii_case(&rollup.head) =>
+        {
+            None
+        }
         _ => Some(format!(
             "merge commit {} has parents {:?}, not [{}, {}]: the base moved between the re-read \
              and the merge, so the landed tree was never tested as a whole",
