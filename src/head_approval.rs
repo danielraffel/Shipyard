@@ -987,6 +987,12 @@ pub enum Approval {
         #[serde(default)]
         rebase: bool,
     },
+    /// A rollup ([`crate::rollup`]): every merge on its first-parent chain
+    /// merges a member's exact approved head, and nothing else changed.
+    Rollup {
+        /// The members, oldest first.
+        members: Vec<crate::rollup::Member>,
+    },
     /// A `reviewed:<sha>` comment from an allowlisted reviewer.
     Marker {
         /// Commenter login.
@@ -1006,7 +1012,7 @@ impl Approval {
     pub fn comment_id(&self) -> Option<u64> {
         match self {
             Self::Marker { comment_id, .. } => *comment_id,
-            Self::Review { .. } => None,
+            Self::Review { .. } | Self::Rollup { .. } => None,
             Self::Carried { approval, .. } => approval.comment_id(),
         }
     }
@@ -1023,6 +1029,7 @@ impl Approval {
                 performed_via_github_app_id,
                 ..
             } => *performed_via_github_app_id,
+            Self::Rollup { .. } => None,
             Self::Carried { approval, .. } => approval.app_id(),
         }
     }
@@ -1033,6 +1040,14 @@ impl Approval {
         match self {
             Self::Review { login, .. } => format!("an approving review by {login}"),
             Self::Marker { login, .. } => format!("a reviewed:<sha> marker by {login}"),
+            Self::Rollup { members } => format!(
+                "a rollup of {}, each merged at the exact head its own approval names",
+                members
+                    .iter()
+                    .map(|member| format!("#{}@{}", member.pr, short(&member.head)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Self::Carried {
                 from_head,
                 approval,
@@ -1908,19 +1923,17 @@ pub fn evaluate_excusing(
         latest_was_interruption,
         author.as_deref(),
     );
-    Ok(with_carry(
-        run_gh,
-        &CarryInput {
-            repo,
-            pr,
-            head,
-            reviews: &reviews,
-            comments: &comments,
-            policy: &policy,
-            author: author.as_deref(),
-        },
-        gate,
-    ))
+    let input = CarryInput {
+        repo,
+        pr,
+        head,
+        reviews: &reviews,
+        comments: &comments,
+        policy: &policy,
+        author: author.as_deref(),
+    };
+    let gate = with_carry(run_gh, &input, gate);
+    Ok(with_rollup(run_gh, &input, gate))
 }
 
 /// The pull request's author, read when the policy turns on it: with no
@@ -1989,6 +2002,22 @@ pub fn evaluate_with_policy_for_author_with_events(
     queue: &Value,
     author: Option<&str>,
 ) -> Result<(HeadGate, Vec<String>), String> {
+    evaluate_events(run_gh, repo, pr, head, policy, queue, author, true)
+}
+
+/// [`evaluate_with_policy_for_author_with_events`]; `rollups` is false for a
+/// rollup's own member, which is never itself a rollup.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_events(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    policy: &ApprovalPolicy,
+    queue: &Value,
+    author: Option<&str>,
+    rollups: bool,
+) -> Result<(HeadGate, Vec<String>), String> {
     if !policy.required {
         return Ok((HeadGate::NotRequired, Vec::new()));
     }
@@ -2038,10 +2067,71 @@ pub fn evaluate_with_policy_for_author_with_events(
         policy,
         author,
     };
+    let gate = refuse_self_approval(with_carry(run_gh, &carry, gate), head, &comments);
     Ok((
-        refuse_self_approval(with_carry(run_gh, &carry, gate), head, &comments),
+        if rollups {
+            with_rollup(run_gh, &carry, gate)
+        } else {
+            gate
+        },
         events,
     ))
+}
+
+/// One rollup member's gate ([`crate::rollup`]): this rule at its own exact
+/// head, never as a rollup itself, and without logging a carry.
+///
+/// # Errors
+///
+/// When a needed fact cannot be read.
+pub(crate) fn evaluate_member(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    policy: &ApprovalPolicy,
+) -> Result<HeadGate, String> {
+    let mut policy = policy.clone();
+    policy.dry_run = true;
+    evaluate_events(run_gh, repo, pr, head, &policy, &Value::Null, None, false)
+        .map(|(gate, _)| gate)
+}
+
+/// `gate`, or the acceptance of a rollup ([`crate::rollup::guard_accept`])
+/// when no verdict names this head at all (so no HOLD either). Each member
+/// is judged by this same rule at its own exact head, without logging a
+/// carry. A refusal, or anything unreadable, leaves `gate`.
+fn with_rollup(run_gh: RunGh<'_>, input: &CarryInput<'_>, gate: HeadGate) -> HeadGate {
+    if !matches!(gate, HeadGate::NotApproved { .. })
+        || latest_verdict(
+            input.head,
+            input.reviews,
+            input.comments,
+            input.policy,
+            input.author,
+        )
+        .is_some()
+    {
+        return gate;
+    }
+    let member_gate = |number: u64, member_head: &str| {
+        evaluate_member(run_gh, input.repo, number, member_head, input.policy)
+    };
+    match crate::rollup::guard_accept(
+        run_gh,
+        input.repo,
+        input.pr,
+        input.head,
+        input.policy,
+        &member_gate,
+    ) {
+        Ok(Some(rollup)) => HeadGate::Approved {
+            approval: Approval::Rollup {
+                members: rollup.members,
+            },
+        },
+        _ => gate,
+    }
 }
 
 /// What [`with_carry`] reads about one pull request.
@@ -2282,13 +2372,13 @@ const COMPARE_FILE_CAP: usize = 300;
 
 /// `filename -> (status, blob sha, has a text patch)` of one comparison, its
 /// merge base, and `filename -> previous_filename` for every rename in it.
-type PrFiles = (
+pub(crate) type PrFiles = (
     std::collections::BTreeMap<String, (String, String, bool)>,
     String,
     std::collections::BTreeMap<String, String>,
 );
 
-fn compare_files(run_gh: RunGh<'_>, repo: &str, range: &str) -> Result<PrFiles, String> {
+pub(crate) fn compare_files(run_gh: RunGh<'_>, repo: &str, range: &str) -> Result<PrFiles, String> {
     let value = gh_json(
         run_gh,
         &[
@@ -2588,7 +2678,7 @@ const TREE_BATCH: usize = 50;
 
 /// Each of `names`' git mode at `commit` (absent when the file is), read from
 /// its directory's tree.
-fn tree_modes(
+pub(crate) fn tree_modes(
     run_gh: RunGh<'_>,
     repo: &str,
     commit: &str,

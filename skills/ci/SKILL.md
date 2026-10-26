@@ -563,6 +563,13 @@ is bound to that job (repo, head, run, attempt, job name) and names the cause
 the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
 <file>` (append-only, one file per month, ids never duplicated).
 
+**A rollup lands on its members' approvals.** On a base with `[train]
+mode = "rollup"`, a `shipyard-train/rollup-*` head with no verdict of its own
+lands only when each merge on its first-parent chain merges a member's exact
+approved head and changes nothing else (docs/rollups.md); `shipyard rollup
+verify --pr N` says whether it would. Do not approve a rollup head instead:
+approve each member.
+
 **"May this head land?" is `shipyard review-verdict --pr N --json`.** It is
 the repository-side review rule with no host switch in it: exit 0 when an
 approval names the head or carries to it (merge-only, or across a rebase that

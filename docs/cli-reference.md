@@ -125,6 +125,23 @@ shipyard review-verdict --pr 123 [--repo OWNER/REPO] [--head SHA] [--no-rebase-c
                                              #   1 refused, 2 unreadable; JSON names the approval or carry,
                                              #   excluded human approvals, and the fix
 shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all
+shipyard rollup plan [--repo OWNER/REPO] [--base BRANCH]
+                                             # which open PRs form the next rollup (oldest ready, disjoint files,
+                                             #   no excluded or shared hot paths) and why each other one does not
+shipyard rollup build --members 11,12 [--base BRANCH] [--apply]
+                                             # merge each member's exact head onto the base tip (merge-tree +
+                                             #   commit-tree; the work tree is untouched); --apply pushes
+                                             #   shipyard-train/rollup-<n> and opens its PR with a notice comment
+shipyard rollup verify --pr N                # does this rollup head land, by the guard's rollup rule
+shipyard rollup land --pr N [--apply]        # merge method MERGE only; merge-queue: prints the steward handoff;
+                                             #   direct: required checks green, base re-read, PR merge API with
+                                             #   sha= bound; closes members GitHub did not mark merged
+shipyard rollup reconcile [--base BRANCH] --apply
+                                             # close members of landed rollups GitHub did not mark merged, each only
+                                             #   once its head is proven on the base (the steward runs this too)
+shipyard rollup split --members 11,12,13,14 [--passed] [--first-passed BOOL --second-passed BOOL]
+                                             # next bisect step: land, eject one member, or test each half
+                                             #   (docs/rollups.md); all rollup commands exit 0/1 refused/2 unreadable
 
 # Keep the fleet on the latest release (controller only)
 shipyard runner fleet-update --to vX.Y.Z --all-hosts          # plan

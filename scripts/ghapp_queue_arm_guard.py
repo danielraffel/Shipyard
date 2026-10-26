@@ -1607,6 +1607,268 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str,
     return None
 
 
+# Rollups: same rule as src/rollup.rs ``accept``. A rollup head has no verdict
+# of its own; it lands only when every merge on its first-parent chain merges a
+# member's exact approved head and nothing else changed.
+ROLLUP_BRANCH_PREFIX = "shipyard-train/rollup-"
+ROLLUP_MEMBER_CAP = 4
+TRAIN_KILL_ENV = "SHIPYARD_TRAIN"
+TRAIN_PAUSE_FILE = "train.pause"
+
+
+def train_config(config_text: str | None) -> dict[str, Any]:
+    """The base's ``[train]`` table with its defaults (off). A value of the wrong
+    type or out of range raises GuardError: it never turns rollups on."""
+    config: dict[str, Any] = {"enabled": False, "mode": "off", "landing": "merge-queue",
+                              "max_members": ROLLUP_MEMBER_CAP, "exclude_paths": [],
+                              "hot_files": [], "require_counted_approval": True}
+    if config_text is None:
+        return config
+    try:
+        import tomllib
+        section = tomllib.loads(config_text).get("train")
+    except (ImportError, ValueError) as error:
+        raise GuardError(f"the base's [train] cannot be read: {error}") from error
+    if section is None:
+        return config
+    if not isinstance(section, dict):
+        raise GuardError("the base's [train] is not a table")
+    for key in ("enabled", "require_counted_approval"):
+        if key in section:
+            if not isinstance(section[key], bool):
+                raise GuardError(f"[train] {key} is not true or false")
+            config[key] = section[key]
+    for key, allowed in (("mode", ("off", "burst", "rollup")),
+                         ("landing", ("merge-queue", "direct"))):
+        if key in section:
+            if section[key] not in allowed:
+                raise GuardError(f"[train] {key} {section[key]!r} is not one of {allowed}")
+            config[key] = section[key]
+    if "max_members" in section:
+        members = section["max_members"]
+        if (not isinstance(members, int) or isinstance(members, bool)
+                or not 1 <= members <= ROLLUP_MEMBER_CAP):
+            raise GuardError(f"[train] max_members must be a whole number from 1 to "
+                             f"{ROLLUP_MEMBER_CAP}")
+        config["max_members"] = members
+    for key in ("exclude_paths", "hot_files"):
+        if key in section:
+            value = section[key]
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise GuardError(f"[train] {key} is not a list of strings")
+            config[key] = value
+    return config
+
+
+def train_stopped(repo: str, kill: str | None, guards_dir: pathlib.Path | None) -> str | None:
+    """Why this host's train is stopped for ``repo``: ``SHIPYARD_TRAIN`` is
+    ``off``, ``0`` or ``false`` (optionally ``:<owner/repo>``), or a
+    ``train.pause`` file is in the guards directory."""
+    value = (kill or "").strip()
+    if value:
+        switch, _, scope = value.partition(":")
+        if (switch.strip().lower() in ("off", "0", "false")
+                and (not scope.strip() or scope.strip().lower() == repo.lower())):
+            return f"{TRAIN_KILL_ENV}={value} stops the train on this host"
+    if guards_dir is not None and (guards_dir / TRAIN_PAUSE_FILE).exists():
+        return f"the train is paused ({guards_dir / TRAIN_PAUSE_FILE})"
+    return None
+
+
+def _compare_files(repo: str, range_: str) -> tuple[dict[str, tuple[str, str, bool]], str,
+                                                       dict[str, str]]:
+    compare = run_real_gh(["api", f"repos/{repo}/compare/{range_}"])
+    if not isinstance(compare, dict):
+        raise GuardError(f"compare/{range_} is unreadable")
+    merge_base = (compare.get("merge_base_commit") or {}).get("sha")
+    if not isinstance(merge_base, str):
+        raise GuardError(f"compare/{range_}: no merge base")
+    return _pr_files(compare, f"compare/{range_}"), merge_base.lower(), _rename_sources(compare)
+
+
+def _touched(files: dict[str, Any], sources: dict[str, str]) -> set[str]:
+    return set(files) | set(sources.values())
+
+
+def _same_change(what: str, expected: dict[str, tuple[str, str, bool]],
+                 expected_sources: dict[str, str], found: dict[str, tuple[str, str, bool]],
+                 found_sources: dict[str, str]) -> str | None:
+    differ = sorted(set(expected) ^ set(found))
+    if differ:
+        return f"{what} changes {differ[0]}, which the member does not, or misses it"
+    for name, (status, sha, _) in sorted(expected.items()):
+        found_status, found_sha, _ = found[name]
+        if status != found_status or sha.lower() != found_sha.lower():
+            return (f"{what} leaves {name} {found_status} at blob {found_sha[:12]}, not the "
+                    f"member's approved {status} at {sha[:12]}")
+        if expected_sources.get(name) != found_sources.get(name):
+            return f"{what} renames {name} from somewhere else"
+    return None
+
+
+def member_review(repo: str, number: int, head: str, policy: dict[str, Any],
+                  counted: bool) -> str | None:
+    """Why rollup member ``#number`` at ``head`` does not count, or None: the
+    same review rule as any landing, at its own exact head; a carried approval
+    counts only when ``counted`` (``require_counted_approval``) is off."""
+    pull = run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
+    if not isinstance(pull, dict):
+        raise GuardError(f"member #{number} is unreadable")
+    author = (pull.get("user") or {}).get("login")
+    author = author if isinstance(author, str) else None
+    comments = _rest_pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
+    reviews = _rest_pages(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+    allowed, why = review_verdict(head, author, comments, reviews, policy)
+    approved = head
+    if not allowed:
+        approved = approved_earlier_head(head, author, comments, reviews, policy)
+        base = ((pull.get("base") or {}).get("ref"))
+        if counted or approved is None or not isinstance(base, str):
+            return f"member #{number}: {why}"
+        refusal = (carry_limits(approved, author, comments, reviews, policy)
+                   or merge_only_carry(repo, base, approved, head,
+                                       policy.get("carry_excluded",
+                                                  list(DEFAULT_CARRY_EXCLUDED_PATHS))))
+        if refusal is not None:
+            return f"member #{number}: {why} The approval of {approved[:12]} does not carry: {refusal}"
+    own = self_approval(approved, author, comments, reviews, policy)
+    if own is not None:
+        return f"member #{number}: {own}"
+    return None
+
+
+def rollup_acceptance(repo: str, number: int, head: str, pull: dict[str, Any],
+                      config: dict[str, Any], policy: dict[str, Any],
+                      review: Any = member_review) -> tuple[str | None, list[dict[str, Any]]]:
+    """``(refusal, members)``: whether rollup ``#number`` at ``head`` lands.
+
+    Same rule as src/rollup.rs ``accept``: (a) each member head is the current
+    head of an open pull request on the base whose own review counts at that
+    head; (b) the first-parent chain back to the base commit is only merges
+    whose second parents are those heads, each changing exactly its member's
+    files to the member's blobs; (c) members change disjoint files, the head
+    keeps every member blob and mode, and the base touched no member file
+    since the member's merge base nor since the rollup was formed; (d) no
+    member changes an excluded path, and no two a hot one."""
+    members: list[dict[str, Any]] = []
+    if not (config["enabled"] and config["mode"] == "rollup"):
+        return ('the base does not take rollups ([train] enabled = true, mode = "rollup")',
+                members)
+    stopped = train_stopped(repo, os.environ.get(TRAIN_KILL_ENV), _guards_dir())
+    if stopped is not None:
+        return stopped, members
+    head = head.lower()
+    if not str((pull.get("head") or {}).get("ref") or "").startswith(ROLLUP_BRANCH_PREFIX):
+        return f"PR #{number}'s branch is not a {ROLLUP_BRANCH_PREFIX}* rollup", members
+    head_repo = (((pull.get("head") or {}).get("repo") or {}).get("full_name") or "")
+    if str(head_repo).lower() != repo.lower():
+        return f"PR #{number}'s rollup branch is not in {repo}", members
+    base = str((pull.get("base") or {}).get("ref") or "")
+    union, base_sha, union_sources = _compare_files(repo, f"{base}...{head}")
+    ref = run_real_gh(["api", f"repos/{repo}/git/ref/heads/{base}"])
+    tip = str(((ref or {}).get("object") or {}).get("sha") or "").lower() \
+        if isinstance(ref, dict) else ""
+    if len(tip) != 40:
+        raise GuardError(f"the tip of {base} is unreadable")
+    links: list[tuple[str, str]] = []
+    sha = head
+    while sha != base_sha:
+        if len(links) == config["max_members"]:
+            return (f"the first-parent chain from {head[:12]} does not reach the base commit "
+                    f"{base_sha[:12]} within {config['max_members']} merges"), members
+        commit = run_real_gh(["api", f"repos/{repo}/commits/{sha}"])
+        parents = [str(parent.get("sha")).lower() for parent in
+                   (commit.get("parents") if isinstance(commit, dict) else None) or []]
+        if len(parents) != 2:
+            return (f"commit {sha[:12]} on the rollup's first-parent chain is not a two-parent "
+                    "merge: a rollup is only merges of member heads"), members
+        links.append((sha, parents[1]))
+        sha = parents[0]
+    if not links:
+        return "the rollup merges no member", members
+    links.reverse()
+    seen: dict[str, int] = {}
+    expected: dict[str, tuple[str, str, bool]] = {}
+    expected_sources: dict[str, str] = {}
+    previous = base_sha
+    for merge, member_head in links:
+        pulls = run_real_gh(["api", f"repos/{repo}/commits/{member_head}/pulls"])
+        drafts = [item.get("number") for item in pulls or [] if isinstance(item, dict)
+                  and item.get("state") == "open" and item.get("draft") is True
+                  and str((item.get("head") or {}).get("sha") or "").lower() == member_head
+                  ] if isinstance(pulls, list) else []
+        if drafts:
+            return f"member #{drafts[0]} is a draft; a draft never joins a rollup", members
+        open_heads = [item.get("number") for item in pulls or [] if isinstance(item, dict)
+                      and item.get("state") == "open"
+                      and str((item.get("head") or {}).get("sha") or "").lower() == member_head
+                      and (item.get("base") or {}).get("ref") == base
+                      and item.get("number") != number] if isinstance(pulls, list) else []
+        if len(open_heads) != 1 or not isinstance(open_heads[0], int):
+            return (f"{member_head[:12]} is not the current head of exactly one open pull "
+                    f"request on {base}"), members
+        member = open_heads[0]
+        if any(entry["pr"] == member for entry in members):
+            return f"member #{member} is merged more than once", members
+        refusal = review(repo, member, member_head, policy, config["require_counted_approval"])
+        if refusal is not None:
+            return refusal, members
+        own, own_base, own_sources = _compare_files(repo, f"{base_sha}...{member_head}")
+        files = _touched(own, own_sources)
+        for name in sorted(files):
+            if name in seen:
+                return (f"members #{seen[name]} and #{member} both change {name}; rollup "
+                        "members change disjoint files"), members
+            seen[name] = member
+        if own_base != base_sha:
+            moved, _, moved_sources = _compare_files(repo, f"{own_base}...{base_sha}")
+            both = sorted(_touched(moved, moved_sources) & files)
+            if both:
+                return (f"the base changed {both[0]} after member #{member}'s merge base "
+                        f"{own_base[:12]}; the member must be updated and approved again before "
+                        "it joins a rollup"), members
+        step, _, step_sources = _compare_files(repo, f"{previous}...{merge}")
+        refusal = _same_change(f"the rollup's merge {merge[:12]} of #{member}", own, own_sources,
+                               step, step_sources)
+        if refusal is not None:
+            return refusal, members
+        expected.update(own)
+        expected_sources.update(own_sources)
+        members.append({"pr": member, "head": member_head, "merge": merge,
+                        "files": sorted(files)})
+        previous = merge
+    refusal = _same_change(f"the rollup head {head[:12]}", expected, expected_sources, union,
+                           union_sources)
+    if refusal is not None:
+        return refusal, members
+    excluded = list(config["exclude_paths"]) + list(
+        policy.get("carry_excluded", list(DEFAULT_CARRY_EXCLUDED_PATHS)))
+    excluded_path = carry_excluded(set(seen), excluded)
+    if excluded_path is not None:
+        return f"a rollup member cannot land this way: {excluded_path}", members
+    for pattern in config["hot_files"]:
+        hot = sorted({owner for name, owner in seen.items() if glob_match(pattern, name)})
+        if len(hot) > 1:
+            return (f"members {hot} each change a hot file ({pattern}); at most one member of a "
+                    "rollup may"), members
+    present = sorted(name for name, (status, _, _) in union.items() if status != "removed")
+    head_modes = tree_modes(repo, head, present) if present else {}
+    for entry in members:
+        names = [name for name in entry["files"] if name in present]
+        modes = tree_modes(repo, entry["head"], names) if names else {}
+        for name in names:
+            if head_modes.get(name) != modes.get(name):
+                return (f"{name} has mode {head_modes.get(name)} at the rollup head and "
+                        f"{modes.get(name)} at member #{entry['pr']}'s approved head"), members
+    if tip != base_sha:
+        moved, _, moved_sources = _compare_files(repo, f"{base_sha}...{tip}")
+        both = sorted(_touched(moved, moved_sources) & set(seen))
+        if both:
+            return (f"the base changed {both[0]}, which a member changes, after the rollup was "
+                    f"formed on {base_sha[:12]}; form it again"), members
+    return None, members
+
+
 def rebase_carry_enabled() -> bool:
     """Whether this host carries approvals across a rebase (off unless turned on)."""
     switch = os.environ.get(REBASE_CARRY_ENV)
@@ -2430,7 +2692,8 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         base = ((pull.get("base") or {}).get("ref")) if isinstance(pull, dict) else None
         if not isinstance(base, str) or not base:
             raise GuardError("the pull request carries no base branch")
-        policy = review_policy(base_config_text(repo, base), repo, True)
+        config_text = base_config_text(repo, base)
+        policy = review_policy(config_text, repo, True)
         if not policy["required"]:
             return True, f"{repo} does not require a review before arming", None
         live_head = ((pull.get("head") or {}).get("sha") or "").lower()
@@ -2469,6 +2732,27 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         classification["approval"] = deciding_approval(head, author, comments, reviews, policy)
         return True, f"{label} ({repo}): {why}", None
     cause = "hold" if "is HOLD" in why or "HOLD naming" in why else "unreviewed"
+    head_ref = str((pull.get("head") or {}).get("ref") or "")
+    if cause == "unreviewed" and head_ref.startswith(ROLLUP_BRANCH_PREFIX) and _latest_on(
+            counting_verdicts(author, comments, reviews, policy), head.lower()) is None:
+        try:
+            config = train_config(config_text)
+            refusal, members = (rollup_acceptance(repo, number, head, pull, config, policy)
+                                if config["enabled"] and config["mode"] == "rollup"
+                                else (None, None))
+        except GuardError as error:
+            refusal, members = f"it cannot be checked ({error})", []
+        if refusal is None and members:
+            classification["approval"] = {"approved_head": head.lower(), "rollup": [
+                {"pr": entry["pr"], "head": entry["head"]} for entry in members]}
+            named = ", ".join("#{}@{}".format(entry["pr"], entry["head"][:12]) for entry in members)
+            return True, (
+                f"{label} ({repo}): a rollup of {named}: "
+                "every merge on its first-parent chain merges a member's exact approved head, "
+                "and every file keeps that member's blob and mode"
+            ), None
+        if refusal is not None:
+            why += f" As a rollup it does not land: {refusal}."
     approved = approved_earlier_head(head, author, comments, reviews, policy)
     if approved is not None:
         excluded = policy.get("carry_excluded", list(DEFAULT_CARRY_EXCLUDED_PATHS))
