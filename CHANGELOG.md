@@ -3,6 +3,11 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03640"></a>
+## [0.364.0] - 2026-10-26
+
+- feat(train): generic rollup batching, off by default (#935) ([#940](https://github.com/danielraffel/Shipyard/pull/940))
+
 <a id="v03630"></a>
 ## [0.363.0] - 2026-10-26
 
@@ -2611,6 +2616,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.364.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.364.0
 [0.363.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.363.0
 [0.362.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.362.0
 [0.361.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.361.0
