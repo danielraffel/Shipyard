@@ -2054,6 +2054,8 @@ does not admit native `--clobber`, release creation/deletion, or tag
 retargeting. Its explicit `--replace-existing` flag is translated to native
 `--clobber` only after those checks, for workflows that replace a staged
 checksum or signed asset in an existing draft release.
+`scripts/release_macos_local.py` must invoke the installed `ghapp` wrapper for
+those uploads; native `gh` rejects the wrapper-only replacement flag.
 The wrapper snapshots each operand through no-follow descriptors into a private
 staging directory before token mint; native `gh` must never reopen the original
 workspace path.
