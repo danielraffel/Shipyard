@@ -729,6 +729,28 @@ fn annotate_required_checks(
         }
     }
 
+    // `gh pr checks --required` can report both a skipped check from an older
+    // attempt and the successful replacement from a rerun under the same
+    // context.  Treat that pair as one materialized producer.  Keep every
+    // other conflicting pair intact so a failure or pending attempt still
+    // fails closed below instead of being silently replaced by a success.
+    for entries in materialized_by_name.values_mut() {
+        let has_success = entries.iter().any(|entry| {
+            entry
+                .get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|state| state.eq_ignore_ascii_case("SUCCESS"))
+        });
+        if has_success {
+            entries.retain(|entry| {
+                !entry
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .is_some_and(|state| state.eq_ignore_ascii_case("SKIPPED"))
+            });
+        }
+    }
+
     for required in policy {
         let observed = materialized_by_name
             .get_mut(&required.context)
@@ -2000,6 +2022,71 @@ mod tests {
         assert_eq!(snapshot["statusCheckRollup"][2]["name"], "macos");
         assert_eq!(snapshot["statusCheckRollup"][2]["isRequired"], true);
         assert_eq!(snapshot["statusCheckRollup"][2]["conclusion"], "SUCCESS");
+    }
+
+    #[test]
+    fn required_check_annotation_coalesces_skipped_rerun_with_success() {
+        let mut snapshot = serde_json::json!({"statusCheckRollup": []});
+        annotate_required_checks(
+            &mut snapshot,
+            &[RequiredCheck {
+                context: "Vellum trusted freeze".to_owned(),
+                app_id: Some(15368),
+            }],
+            &[
+                serde_json::json!({
+                    "name": "Vellum trusted freeze",
+                    "state": "SKIPPED",
+                    "bucket": "skipping",
+                    "link": "https://github.test/check/old"
+                }),
+                serde_json::json!({
+                    "name": "Vellum trusted freeze",
+                    "state": "SUCCESS",
+                    "bucket": "pass",
+                    "link": "https://github.test/check/rerun"
+                }),
+            ],
+        );
+
+        let rollup = snapshot["statusCheckRollup"].as_array().expect("rollup");
+        assert_eq!(rollup.len(), 1);
+        assert_eq!(rollup[0]["name"], "Vellum trusted freeze");
+        assert_eq!(rollup[0]["state"], "SUCCESS");
+        assert_eq!(rollup[0]["conclusion"], "SUCCESS");
+        assert_eq!(rollup[0]["isRequired"], true);
+    }
+
+    #[test]
+    fn required_check_annotation_keeps_conflicting_non_skipped_attempts_fail_closed() {
+        let mut snapshot = serde_json::json!({"statusCheckRollup": []});
+        annotate_required_checks(
+            &mut snapshot,
+            &[RequiredCheck {
+                context: "macos".to_owned(),
+                app_id: Some(15368),
+            }],
+            &[
+                serde_json::json!({
+                    "name": "macos",
+                    "state": "FAILURE",
+                    "bucket": "fail",
+                    "link": "https://github.test/check/failure"
+                }),
+                serde_json::json!({
+                    "name": "macos",
+                    "state": "SUCCESS",
+                    "bucket": "pass",
+                    "link": "https://github.test/check/success"
+                }),
+            ],
+        );
+
+        let rollup = snapshot["statusCheckRollup"].as_array().expect("rollup");
+        assert_eq!(rollup.len(), 2);
+        assert_eq!(rollup[0]["name"], "macos");
+        assert_eq!(rollup[1]["name"], "macos");
+        assert_eq!(rollup[1]["isRequired"], true);
     }
 
     #[test]

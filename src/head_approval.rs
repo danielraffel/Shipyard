@@ -108,6 +108,36 @@ pub const HUMAN_REVIEWERS_KEY: &str = "human_reviewers";
 /// Who may sign the fleet App's APPROVE, set by the protected base; it takes
 /// precedence over a host's [`SIGNERS_FILE`].
 pub const SIGNERS_KEY: &str = "reviewer_signers";
+/// `[auto_merge]` key replacing [`DEFAULT_CARRY_EXCLUDED_PATHS`].
+pub const CARRY_EXCLUDED_KEY: &str = "carry_excluded_paths";
+/// Paths whose change means an approval never carries to a new head: a carry
+/// must never be the way a workflow, the CI contract, the guards or
+/// Shipyard's own arm code, or signing and release automation lands
+/// unreviewed. The Python guard (`DEFAULT_CARRY_EXCLUDED_PATHS` in
+/// `scripts/ghapp_queue_arm_guard.py`) holds the same list.
+pub const DEFAULT_CARRY_EXCLUDED_PATHS: &[&str] = &[
+    ".github/workflows/**",
+    ".agents/contract.toml",
+    "tools/ci/**",
+    "scripts/ghapp*",
+    "src/head_approval*",
+    "src/head_approval/**",
+    "src/queue_arm_gate*",
+    "src/auto_arm*",
+    "src/auto_arm/**",
+    "src/ghapp_guards*",
+    "src/app/ship_cmd/auto_arm*",
+    "src/app/merge_steward_cmd/native_arm*",
+    "release-please-config.json",
+    ".release-please-manifest.json",
+    "**/*codesign*",
+    "**/*notariz*",
+    "**/*signing*",
+];
+/// An approval carries across at most this many base merges.
+pub const MAX_CARRY_MERGES: usize = 3;
+/// An approval carries for at most this long after its verdict.
+pub const MAX_CARRY_AGE_HOURS: i64 = 48;
 /// Tracked config file the setting is read from on the protected base.
 pub const CONFIG_PATH: &str = ".shipyard/config.toml";
 /// Repositories that require an approval of the exact head when their base
@@ -796,10 +826,15 @@ pub struct ApprovalPolicy {
     /// listed an App APPROVE does not count.
     #[serde(default)]
     pub signer_source: SignerSource,
+    /// The base's [`CARRY_EXCLUDED_KEY`]; `None` is
+    /// [`DEFAULT_CARRY_EXCLUDED_PATHS`]. A value that is not a list of strings
+    /// is `["**"]`: no carry at all.
+    #[serde(default)]
+    pub carry_excluded: Option<Vec<String>>,
     /// Evaluate without side effects: a carry is judged but never appended to
-    /// the carry log. Read-only callers (`shipyard train status`) set it, so
-    /// a report can never pass for a real carry; it is never read from a
-    /// config.
+    /// the carry log. Read-only callers (`shipyard review-verdict`'s status,
+    /// `shipyard train status`) set it, so only a landing ever logs a carry;
+    /// it is never read from a config.
     #[serde(skip)]
     pub dry_run: bool,
 }
@@ -867,7 +902,29 @@ impl ApprovalPolicy {
             rebase_carry: false,
             signer_source: SignerSource::Host,
             dry_run: false,
+            carry_excluded: section.get(CARRY_EXCLUDED_KEY).map(|value| {
+                value
+                    .as_array()
+                    .and_then(|paths| {
+                        paths
+                            .iter()
+                            .map(|path| path.as_str().map(str::to_owned))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .unwrap_or_else(|| vec!["**".to_owned()])
+            }),
         }
+    }
+
+    /// The globs whose change keeps an approval from carrying.
+    #[must_use]
+    pub fn carry_excluded_paths(&self) -> Vec<String> {
+        self.carry_excluded.clone().unwrap_or_else(|| {
+            DEFAULT_CARRY_EXCLUDED_PATHS
+                .iter()
+                .map(|path| (*path).to_owned())
+                .collect()
+        })
     }
 
     /// [`Self::from_table`] for `repo`: on a host that turns the default on,
@@ -2074,21 +2131,38 @@ fn with_carry(run_gh: RunGh<'_>, input: &CarryInput<'_>, gate: HeadGate) -> Head
     ) else {
         return gate;
     };
-    let rebase = match merge_only_carry(run_gh, input.repo, input.pr, &from, input.head) {
-        Ok(()) => false,
-        Err(_) if input.policy.rebase_carry || host_rebase_carry() => {
-            match rebase_carry(run_gh, input.repo, input.pr, &from, input.head) {
-                Ok(record) => {
-                    if !input.policy.dry_run {
-                        rebase::log_carry(input.repo, input.pr, &from, input.head, &record);
-                    }
-                    true
+    if carry_limits(&from, input, Utc::now()).is_some() {
+        return gate;
+    }
+    let excluded = input.policy.carry_excluded_paths();
+    let rebase =
+        match merge_only_carry_record(run_gh, input.repo, input.pr, &from, input.head, &excluded) {
+            Ok(carry) => {
+                if !input.policy.dry_run {
+                    rebase::log_merge_carry(
+                        input.repo,
+                        input.pr,
+                        &from,
+                        input.head,
+                        &carry,
+                        approval.comment_id(),
+                    );
                 }
-                Err(_) => return gate,
+                false
             }
-        }
-        Err(_) => return gate,
-    };
+            Err(_) if input.policy.rebase_carry || host_rebase_carry() => {
+                match rebase_carry(run_gh, input.repo, input.pr, &from, input.head, &excluded) {
+                    Ok(record) => {
+                        if !input.policy.dry_run {
+                            rebase::log_carry(input.repo, input.pr, &from, input.head, &record);
+                        }
+                        true
+                    }
+                    Err(_) => return gate,
+                }
+            }
+            Err(_) => return gate,
+        };
     HeadGate::Approved {
         approval: Approval::Carried {
             from_head: from,
@@ -2096,6 +2170,56 @@ fn with_carry(run_gh: RunGh<'_>, input: &CarryInput<'_>, gate: HeadGate) -> Head
             rebase,
         },
     }
+}
+
+/// Why the approval of `from` may not carry at all, or `None`: its deciding
+/// verdict says `carry: no`, or is older than [`MAX_CARRY_AGE_HOURS`]. The
+/// Python guard's `carry_limits` is the same.
+fn carry_limits(from: &str, input: &CarryInput<'_>, now: DateTime<Utc>) -> Option<String> {
+    let deciding = input
+        .reviews
+        .iter()
+        .filter(|review| {
+            review
+                .get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|state| state.eq_ignore_ascii_case("APPROVED"))
+                && review
+                    .get("commit_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|commit| commit.eq_ignore_ascii_case(from))
+        })
+        .chain(input.comments.iter().filter(|comment| {
+            comment
+                .get("body")
+                .and_then(Value::as_str)
+                .and_then(marker_verdict)
+                .is_some_and(|(verdict, head)| {
+                    verdict == Verdict::Approve && head.eq_ignore_ascii_case(from)
+                })
+        }))
+        .filter(|record| reviewer_allowed(record, input.policy, input.author))
+        .max_by_key(|record| at(record));
+    let Some(record) = deciding else {
+        return Some("its verdict cannot be found".to_owned());
+    };
+    let Some(when) = at(record) else {
+        return Some("the time of its verdict is unknown".to_owned());
+    };
+    if now - when > chrono::Duration::hours(MAX_CARRY_AGE_HOURS) {
+        return Some(format!(
+            "its verdict is older than {MAX_CARRY_AGE_HOURS}h ({})",
+            when.format("%Y-%m-%dT%H:%M:%SZ")
+        ));
+    }
+    let body = record.get("body").and_then(Value::as_str).unwrap_or("");
+    body.lines()
+        .any(|line| {
+            line.split_once(':').is_some_and(|(key, value)| {
+                key.trim().eq_ignore_ascii_case("carry") && value.trim().eq_ignore_ascii_case("no")
+            })
+        })
+        .then(|| "its verdict says `carry: no`".to_owned())
 }
 
 fn gh_json(run_gh: RunGh<'_>, args: &[String]) -> Result<Value, String> {
@@ -2271,6 +2395,42 @@ pub fn merge_only_carry(
     from: &str,
     to: &str,
 ) -> Result<(), String> {
+    let excluded: Vec<String> = DEFAULT_CARRY_EXCLUDED_PATHS
+        .iter()
+        .map(|path| (*path).to_owned())
+        .collect();
+    merge_only_carry_record(run_gh, repo, pr, from, to, &excluded).map(|_| ())
+}
+
+/// What a merge-only carry checked, for the carry log.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MergeCarry {
+    /// Base merges between the approved head and the new one.
+    pub merges: usize,
+    /// The approved head's merge base.
+    pub old_base: String,
+    /// The new head's merge base.
+    pub new_base: String,
+    /// Files the pull request changes.
+    pub files: usize,
+}
+
+/// [`merge_only_carry`] with the pull request's excluded paths, returning
+/// what it checked. It also refuses a pull request that changes a path
+/// `excluded` matches ([`carry_excluded`]), and a chain of more than
+/// [`MAX_CARRY_MERGES`] base merges.
+///
+/// # Errors
+///
+/// Why the approval does not carry.
+pub fn merge_only_carry_record(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    pr: u64,
+    from: &str,
+    to: &str,
+    excluded: &[String],
+) -> Result<MergeCarry, String> {
     let base = run_gh(&[
         "api".to_owned(),
         format!("repos/{repo}/pulls/{pr}"),
@@ -2282,11 +2442,21 @@ pub fn merge_only_carry(
     if base.is_empty() {
         return Err("the pull request has no base branch".to_owned());
     }
-    first_parent_merges(run_gh, repo, &base, from, to)?;
+    let merges = first_parent_merges(run_gh, repo, &base, from, to)?;
     let (before, base_before, before_sources) =
         compare_files(run_gh, repo, &format!("{base}...{from}"))?;
     let (after, base_after, after_sources) =
         compare_files(run_gh, repo, &format!("{base}...{to}"))?;
+    let changed: std::collections::BTreeSet<&str> = before
+        .keys()
+        .chain(after.keys())
+        .chain(before_sources.values())
+        .chain(after_sources.values())
+        .map(String::as_str)
+        .collect();
+    if let Some(why) = carry_excluded(changed, excluded) {
+        return Err(why);
+    }
     for (name, (_, sha, patch)) in &before {
         if !patch && blob_is_binary(run_gh, repo, sha)? {
             return Err(format!("the pull request changes a binary file ({name})"));
@@ -2356,7 +2526,61 @@ pub fn merge_only_carry(
             ));
         }
     }
-    Ok(())
+    Ok(MergeCarry {
+        merges,
+        old_base: base_before,
+        new_base: base_after,
+        files: before.len(),
+    })
+}
+
+/// Whether `path` matches `pattern`: `**` is any number of whole path
+/// segments, `*` any run of characters within one segment, `?` one. The
+/// Python guard's `glob_match` is the same.
+#[must_use]
+pub fn glob_match(pattern: &str, path: &str) -> bool {
+    fn segments(patterns: &[&str], parts: &[&str]) -> bool {
+        match patterns.split_first() {
+            None => parts.is_empty(),
+            Some((&"**", rest)) => (0..=parts.len()).any(|index| segments(rest, &parts[index..])),
+            Some((first, rest)) => parts.split_first().is_some_and(|(part, others)| {
+                segment_match(first.as_bytes(), part.as_bytes()) && segments(rest, others)
+            }),
+        }
+    }
+    fn segment_match(pattern: &[u8], text: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some((b'*', rest)) => (0..=text.len()).any(|index| segment_match(rest, &text[index..])),
+            Some((first, rest)) => text.split_first().is_some_and(|(byte, others)| {
+                (*first == b'?' || first == byte) && segment_match(rest, others)
+            }),
+        }
+    }
+    let patterns: Vec<&str> = pattern.split('/').collect();
+    let parts: Vec<&str> = path.split('/').collect();
+    segments(&patterns, &parts)
+}
+
+/// Why a pull request changing `paths` never carries an approval, or `None`.
+#[must_use]
+pub fn carry_excluded<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    excluded: &[String],
+) -> Option<String> {
+    let mut sorted: Vec<&str> = paths.into_iter().collect();
+    sorted.sort_unstable();
+    sorted.into_iter().find_map(|path| {
+        excluded
+            .iter()
+            .find(|pattern| glob_match(pattern, path))
+            .map(|pattern| {
+                format!(
+                    "it changes {path} ({pattern}), and a change there always needs a verdict \
+                     naming its exact head"
+                )
+            })
+    })
 }
 
 /// Directories read per GraphQL query by [`tree_modes`].
@@ -2443,7 +2667,7 @@ fn first_parent_merges(
     base: &str,
     from: &str,
     to: &str,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let range = gh_json(
         run_gh,
         &[
@@ -2485,7 +2709,15 @@ fn first_parent_merges(
         })
         .collect();
     let mut sha = to.to_ascii_lowercase();
+    let mut walked = 0;
     while sha != from.to_ascii_lowercase() {
+        walked += 1;
+        if walked > MAX_CARRY_MERGES {
+            return Err(format!(
+                "it would carry across more than {MAX_CARRY_MERGES} base merges; the head needs \
+                 a new verdict"
+            ));
+        }
         let parents = parents_of
             .get(&sha)
             .ok_or_else(|| format!("commit {} is outside the comparison", short(&sha)))?;
@@ -2503,7 +2735,7 @@ fn first_parent_merges(
         }
         sha.clone_from(first);
     }
-    Ok(())
+    Ok(walked)
 }
 
 #[cfg(test)]

@@ -276,7 +276,7 @@ fn jump(actions: &GitHubActions, repo: &str, pr: u64) -> String {
         return "failed: the pull request carried no base branch".to_owned();
     }
     let run_gh = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
-    match crate::deferred_tier::deferred_tier_checks(&run_gh, repo, &base, &head) {
+    match crate::deferred_tier::deferred_tier_checks(&run_gh, repo, pr, &base, &head) {
         Ok(checks) => {
             if let Some(detail) = crate::deferred_tier::explain_all(&checks) {
                 return format!("refused: {detail}");
@@ -434,7 +434,7 @@ esac
         let outcome = jump(&actions, "o/r", 8933);
         assert!(outcome.starts_with("refused: "), "{outcome}");
         assert!(
-            outcome.contains("dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"),
+            outcome.contains("dispatch `build.yml` with `pr_number=8933` as the fleet App and wait for the full lane"),
             "{outcome}"
         );
         let calls = std::fs::read_to_string(&log).expect("log");

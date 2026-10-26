@@ -392,7 +392,8 @@ fn armable_stage(
     } else {
         "this repository does not require head approval".to_owned()
     };
-    match crate::deferred_tier::deferred_tier_checks(run_gh, repo, &observation.base, head) {
+    match crate::deferred_tier::deferred_tier_checks(run_gh, repo, number, &observation.base, head)
+    {
         Ok(checks) => crate::deferred_tier::explain_all(&checks)
             .map_or((Stage::Ready, approved), |detail| {
                 (Stage::TierBlocked, detail)

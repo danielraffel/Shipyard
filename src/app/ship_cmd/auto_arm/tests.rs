@@ -133,7 +133,10 @@ fn tiered(status: &str, tier: Option<&str>) -> FakeGh {
             "app": {"slug": "pulp-tier-records"},
             "output": {"title": tier, "summary": serde_json::json!({
                 "schema": "shipyard-test-tier/v1", "check": "macos", "tier": tier,
-                "run_id": 700, "run_attempt": 1, "trigger": "pull_request", "actor": "author", "full_lane_workflow": "build.yml"}).to_string()}}));
+                "run_id": 700, "run_attempt": 1, "trigger": "pull_request", "actor": "author", "full_lane_workflow": "build.yml",
+                "tested_ref": "refs/pull/7/merge",
+                "tested_sha": "cccccccccccccccccccccccccccccccccccccccc",
+                "merged_base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}).to_string()}}));
     }
     let listing = serde_json::json!([{"total_count": runs.len(), "check_runs": runs}]);
     FakeGh::new(vec![
@@ -144,6 +147,14 @@ fn tiered(status: &str, tier: Option<&str>) -> FakeGh {
             Ok("[queue]\ntiered_required_checks = [\"macos\"]\ntier_record_app = \"pulp-tier-records\"\n".to_owned()),
         ),
         ("/check-runs?per_page=100", Ok(listing.to_string())),
+        (
+            "compare/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb...main",
+            Ok(r#"{"status":"identical"}"#.to_owned()),
+        ),
+        (
+            "commits/cccccccccccccccccccccccccccccccccccccccc",
+            Ok(r#"{"parents":[{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#.to_owned()),
+        ),
         (
             "actions/jobs/9/logs",
             Ok("2026-10-24T10:00:00.1Z ##[group]GITHUB_TOKEN Permissions\n\
@@ -168,7 +179,7 @@ fn a_deferred_tiered_check_is_never_armed() {
     assert!(!outcome.armed, "{}", outcome.line);
     assert!(
         outcome.line.contains(
-            "dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"
+            "dispatch `build.yml` with `pr_number=7` as the fleet App and wait for the full lane"
         ),
         "{}",
         outcome.line

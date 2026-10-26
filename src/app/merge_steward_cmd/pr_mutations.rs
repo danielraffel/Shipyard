@@ -193,6 +193,7 @@ fn enqueue_pull_request_with_recovery(
         match crate::deferred_tier::deferred_tier_checks(
             &run_gh,
             &context.observation.repo,
+            pr.fact.number,
             &context.observation.base,
             &pr.fact.head_sha,
         ) {

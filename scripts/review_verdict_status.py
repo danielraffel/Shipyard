@@ -90,8 +90,9 @@ def describe(allowed: bool, message: str) -> str:
 
 def decide(guard: ModuleType, repo: str, number: int, head: str) -> tuple[bool, str]:
     """The guard's review-before-arm decision for ``head``, bound to it."""
+    # A status is read-only: it judges a carry but never logs one.
     allowed, message, _ = guard.review_gate(
-        {"repo": repo, "pr": number, "head": head, "bound_head": head}, repo
+        {"repo": repo, "pr": number, "head": head, "bound_head": head}, repo, dry_run=True
     )
     return allowed, message
 

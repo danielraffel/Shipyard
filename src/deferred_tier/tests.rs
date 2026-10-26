@@ -10,6 +10,10 @@ use super::{
 
 const REPO: &str = "owner/repo";
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const PR: u64 = 42;
+/// `refs/pull/42/merge` at the current head: parents `HEAD` and `BASE_TIP`.
+const MERGE: &str = "cccccccccccccccccccccccccccccccccccccccc";
+const BASE_TIP: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const TIERED: &str =
     "[queue]\ntiered_required_checks = [\"macos\"]\ntier_record_app = \"pulp-tier-records\"\n";
 
@@ -29,7 +33,9 @@ fn record(tier: &str, run_id: u64, run_attempt: u64) -> Value {
         "output": {"title": tier, "summary": json!({
             "schema": "shipyard-test-tier/v1", "check": "macos", "tier": tier,
             "run_id": run_id, "run_attempt": run_attempt, "selector": "pr-fast+pr-guard",
-            "trigger": "pull_request", "actor": "author", "full_lane_workflow": "build.yml", "full_suite_runs_in": "merge_group"}).to_string()}
+            "trigger": "pull_request", "actor": "author", "full_lane_workflow": "build.yml",
+            "tested_ref": "refs/pull/42/merge", "tested_sha": MERGE, "merged_base": BASE_TIP,
+            "full_suite_runs_in": "merge_group"}).to_string()}
     })
 }
 
@@ -78,7 +84,36 @@ fn answers(runs: &[Value]) -> BTreeMap<String, Result<String, String>> {
             Ok(json!({"id": 9, "run_id": 700, "run_attempt": 1}).to_string()),
         ),
         (log_path(), Ok(job_log("read"))),
+        (
+            commit_path(MERGE),
+            // GitHub's merge ref: the base first, the head second.
+            Ok(json!({"sha": MERGE, "parents": [{"sha": BASE_TIP}, {"sha": HEAD}]}).to_string()),
+        ),
+        (
+            format!("repos/{REPO}/compare/{BASE_TIP}...main"),
+            Ok(json!({"status": "identical"}).to_string()),
+        ),
     ])
+}
+
+fn commit_path(sha: &str) -> String {
+    format!("repos/{REPO}/commits/{sha}")
+}
+
+/// `record("full", ...)` with its summary fields replaced by `change`.
+fn tested(tier: &str, change: &Value) -> Value {
+    let mut record = record(tier, 700, 1);
+    let mut summary: Value =
+        serde_json::from_str(record["output"]["summary"].as_str().expect("summary")).expect("json");
+    for (key, value) in change.as_object().expect("object") {
+        if value.is_null() {
+            summary.as_object_mut().expect("object").remove(key);
+        } else {
+            summary[key] = value.clone();
+        }
+    }
+    record["output"]["summary"] = json!(summary.to_string());
+    record
 }
 
 fn with(mut runs: Vec<Value>, extra: Vec<Value>) -> Vec<Value> {
@@ -98,7 +133,7 @@ fn read(
             .cloned()
             .unwrap_or_else(|| panic!("unexpected gh call {args:?}"))
     };
-    let result = deferred_tier_checks(&run_gh, REPO, "main", HEAD);
+    let result = deferred_tier_checks(&run_gh, REPO, PR, "main", HEAD);
     (result, calls.into_inner())
 }
 
@@ -122,7 +157,7 @@ fn a_deferred_record_refuses_and_names_the_label() {
     assert!(matches!(checks[0].blocker, Blocker::Deferred { .. }));
     assert_eq!(
         checks[0].fix(),
-        "dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"
+        "dispatch `build.yml` with `pr_number=42` as the fleet App and wait for the full lane"
     );
     let detail = explain_all(&checks).expect("a refusal");
     assert!(
@@ -154,7 +189,7 @@ fn the_fix_dispatches_the_full_lane_and_never_names_a_label() {
         .expect("readable");
     assert_eq!(
         checks[0].fix(),
-        "dispatch the workflow of `macos` on head aaaaaaaaaaaa as the fleet App and wait for \
+        "dispatch the workflow of `macos` with `pr_number=42` as the fleet App and wait for \
          the full lane"
     );
     assert!(!checks[0].explain().contains("macos-ci"));
@@ -252,6 +287,7 @@ fn a_check_that_has_not_completed_or_not_run_refuses() {
     assert!(
         DeferredCheck {
             check: "macos".to_owned(),
+            pr: PR,
             head: HEAD.to_owned(),
             blocker: missing[0].clone(),
         }
@@ -414,4 +450,200 @@ fn the_checks_scope_is_read_from_the_header_group_only() {
     let unlisted = job_log("read").replace("2026-10-24T10:00:00.1000000Z Checks: read\n", "");
     assert!(!unlisted.contains("Checks: read"), "{unlisted}");
     assert_eq!(checks_scope(&unlisted), Ok("none".to_owned()));
+}
+
+/// A log with no `GITHUB_TOKEN Permissions` group proves nothing about the
+/// job's token, even when scope-shaped lines appear elsewhere in it, so the
+/// head is refused rather than read as `none`.
+#[test]
+fn a_log_without_the_token_permissions_group_refuses() {
+    let headless = "2026-10-24T10:00:00.1000000Z Checks: read\n\
+                    2026-10-24T10:00:00.2000000Z Secret source: Actions\n";
+    assert_eq!(
+        checks_scope(headless),
+        Err("its log has no `GITHUB_TOKEN Permissions` group".to_owned())
+    );
+    let mut answers = answers(&with(macos("completed"), vec![record("full", 700, 1)]));
+    answers.insert(log_path(), Ok(headless.to_owned()));
+    assert!(matches!(
+        &blockers(&answers)[..],
+        [Blocker::Unreadable { reason }] if reason.contains("has no `GITHUB_TOKEN Permissions` group")
+    ));
+}
+
+/// A group cut off before `##[endgroup]` may have been about to list
+/// `Checks: write`, so a truncated header refuses rather than reporting the
+/// scopes read so far.
+#[test]
+fn a_token_permissions_group_that_never_closes_refuses() {
+    let truncated = "2026-10-24T10:00:00.1000000Z ##[group]GITHUB_TOKEN Permissions\n\
+                     2026-10-24T10:00:00.1000000Z Actions: read\n\
+                     2026-10-24T10:00:00.1000000Z Checks: read\n";
+    assert_eq!(
+        checks_scope(truncated),
+        Err("its `GITHUB_TOKEN Permissions` group never closes".to_owned())
+    );
+    let mut answers = answers(&with(macos("completed"), vec![record("full", 700, 1)]));
+    answers.insert(log_path(), Ok(truncated.to_owned()));
+    assert!(matches!(
+        &blockers(&answers)[..],
+        [Blocker::Unreadable { reason }] if reason.contains("group never closes")
+    ));
+}
+
+/// A full lane that checked out the bare branch tested the head alone, not
+/// what the queue would merge, so it never counts as full.
+#[test]
+fn a_full_record_that_tested_the_bare_branch_refuses() {
+    for change in [
+        json!({"tested_ref": "refs/heads/feature", "tested_sha": HEAD}),
+        json!({"tested_ref": "refs/pull/42/merge", "tested_sha": HEAD}),
+    ] {
+        let found = blockers(&answers(&with(
+            macos("completed"),
+            vec![tested("full", &change)],
+        )));
+        assert!(
+            matches!(&found[..], [Blocker::UntestedMerge { reason, .. }] if reason.contains("bare branch")),
+            "{change}: {found:?}"
+        );
+    }
+}
+
+/// A merge built for an older head says nothing about the current one, even
+/// when it names this pull request's merge ref.
+#[test]
+fn a_full_record_that_tested_a_stale_merge_refuses() {
+    const OLD_HEAD: &str = "dddddddddddddddddddddddddddddddddddddddd";
+    const STALE: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let mut answers = answers(&with(
+        macos("completed"),
+        vec![tested("full", &json!({"tested_sha": STALE}))],
+    ));
+    answers.insert(
+        commit_path(STALE),
+        Ok(json!({"sha": STALE, "parents": [{"sha": BASE_TIP}, {"sha": OLD_HEAD}]}).to_string()),
+    );
+    let found = blockers(&answers);
+    assert!(
+        matches!(&found[..], [Blocker::UntestedMerge { reason, .. }]
+            if reason.contains("is not a merge of the current head aaaaaaaaaaaa (its parents are \
+                                bbbbbbbbbbbb and dddddddddddd): a stale merge")),
+        "{found:?}"
+    );
+    assert!(
+        DeferredCheck {
+            check: "macos".to_owned(),
+            pr: PR,
+            head: HEAD.to_owned(),
+            blocker: found[0].clone(),
+        }
+        .fix()
+        .contains("with `pr_number=42`")
+    );
+}
+
+#[test]
+fn a_full_record_without_a_tested_merge_refuses() {
+    for change in [
+        json!({"tested_sha": null}),
+        json!({"tested_sha": "not-a-sha"}),
+    ] {
+        let found = blockers(&answers(&with(
+            macos("completed"),
+            vec![tested("full", &change)],
+        )));
+        assert!(
+            matches!(&found[..], [Blocker::UntestedMerge { reason, .. }] if reason.contains("no `tested_sha`")),
+            "{change}: {found:?}"
+        );
+    }
+    let mut single = answers(&with(macos("completed"), vec![record("full", 700, 1)]));
+    single.insert(
+        commit_path(MERGE),
+        Ok(json!({"sha": MERGE, "parents": [{"sha": HEAD}]}).to_string()),
+    );
+    assert!(matches!(
+        &blockers(&single)[..],
+        [Blocker::UntestedMerge { reason, .. }] if reason.contains("1 parent(s)")
+    ));
+    let mut unreadable = answers(&with(macos("completed"), vec![record("full", 700, 1)]));
+    unreadable.insert(commit_path(MERGE), Err("HTTP 404".to_owned()));
+    assert!(matches!(
+        &blockers(&unreadable)[..],
+        [Blocker::UntestedMerge { reason, .. }] if reason.contains("unreadable")
+    ));
+}
+
+/// The record must name this pull request's merge ref: another ref, or none,
+/// is not what the queue would merge.
+#[test]
+fn a_full_record_must_name_this_pull_requests_merge_ref() {
+    for (tested_ref, why) in [
+        (Value::Null, "names no `tested_ref` (refs/pull/42/merge)"),
+        (
+            json!("refs/heads/feature"),
+            "tested `refs/heads/feature`, not this pull request's",
+        ),
+        (
+            json!("refs/pull/41/merge"),
+            "tested `refs/pull/41/merge`, not this pull request's",
+        ),
+    ] {
+        let found = blockers(&answers(&with(
+            macos("completed"),
+            vec![tested("full", &json!({"tested_ref": tested_ref}))],
+        )));
+        assert!(
+            matches!(&found[..], [Blocker::UntestedMerge { reason, .. }] if reason.contains(why)),
+            "{why}: {found:?}"
+        );
+    }
+}
+
+/// Only GitHub's parent order counts: the base first, the head second.
+#[test]
+fn a_merge_with_the_head_first_refuses() {
+    let mut reversed = answers(&with(macos("completed"), vec![record("full", 700, 1)]));
+    reversed.insert(
+        commit_path(MERGE),
+        Ok(json!({"sha": MERGE, "parents": [{"sha": HEAD}, {"sha": BASE_TIP}]}).to_string()),
+    );
+    assert!(matches!(
+        &blockers(&reversed)[..],
+        [Blocker::UntestedMerge { reason, .. }]
+            if reason.contains("has the head as its first parent, the reverse of GitHub's merge ref")
+    ));
+}
+
+/// `merged_base` must be named, be the first parent, and be on the base.
+#[test]
+fn the_merged_base_must_be_the_first_parent_and_on_the_base() {
+    for change in [
+        json!({"merged_base": "ffffffffffffffffffffffffffffffffffffffff"}),
+        json!({"merged_base": null}),
+    ] {
+        let found = blockers(&answers(&with(
+            macos("completed"),
+            vec![tested("full", &change)],
+        )));
+        assert!(
+            matches!(&found[..], [Blocker::UntestedMerge { reason, .. }] if reason.contains("merged_base")),
+            "{change}: {found:?}"
+        );
+    }
+    let mut off_base = answers(&with(macos("completed"), vec![record("full", 700, 1)]));
+    off_base.insert(
+        format!("repos/{REPO}/compare/{BASE_TIP}...main"),
+        Ok(json!({"status": "diverged"}).to_string()),
+    );
+    assert!(matches!(
+        &blockers(&off_base)[..],
+        [Blocker::UntestedMerge { reason, .. }] if reason.contains("which is not on `main`")
+    ));
+    off_base.insert(
+        format!("repos/{REPO}/compare/{BASE_TIP}...main"),
+        Ok(json!({"status": "ahead"}).to_string()),
+    );
+    assert_eq!(blockers(&off_base), Vec::new());
 }

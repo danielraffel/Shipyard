@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest import mock
 
@@ -78,6 +79,13 @@ def scratch_home(case: unittest.TestCase) -> str:
     return home
 
 FIXTURES = pathlib.Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "github"
+
+
+def recent(minutes_ago: int) -> str:
+    """A verdict time this many minutes ago: a carry needs a verdict younger
+    than the guard's MAX_CARRY_AGE."""
+    at = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+    return at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def review_fixture(name: str) -> Any:
@@ -657,15 +665,32 @@ TIERED_CONFIG = ('[queue]\ntiered_required_checks = ["macos"]\n'
                  'tier_record_app = "pulp-tier-records"\n')
 
 
-def tier_record(tier: str, run_id: int = 700, run_attempt: int = 1, **change: Any) -> dict[str, Any]:
-    """A ``shipyard-test-tier/macos`` check run, as the base's record App creates it."""
+# refs/pull/8672/merge at the current head: parents BASE_TIP then HEAD, as GitHub
+# orders a merge ref.
+TESTED_MERGE = "c" * 40
+BASE_TIP = "b" * 40
+
+
+def tier_record(tier: str, run_id: int = 700, run_attempt: int = 1,
+                summary: dict[str, Any] | None = None, **change: Any) -> dict[str, Any]:
+    """A ``shipyard-test-tier/macos`` check run, as the base's record App creates it.
+    ``summary`` replaces summary fields; a ``None`` value drops one."""
+    fields = {
+        "schema": "shipyard-test-tier/v1", "check": "macos", "tier": tier,
+        "run_id": run_id, "run_attempt": run_attempt, "selector": "pr-fast+pr-guard",
+        "trigger": "pull_request", "actor": "author", "full_lane_workflow": "build.yml",
+        "tested_ref": "refs/pull/8672/merge", "tested_sha": TESTED_MERGE,
+        "merged_base": BASE_TIP,
+        "full_suite_runs_in": "merge_group"}
+    for key, value in (summary or {}).items():
+        if value is None:
+            fields.pop(key, None)
+        else:
+            fields[key] = value
     record = {
         "id": 50 + run_id, "name": "shipyard-test-tier/macos", "status": "completed",
         "conclusion": "neutral", "app": {"slug": "pulp-tier-records"},
-        "output": {"title": tier, "summary": json.dumps({
-            "schema": "shipyard-test-tier/v1", "check": "macos", "tier": tier,
-            "run_id": run_id, "run_attempt": run_attempt, "selector": "pr-fast+pr-guard",
-            "trigger": "pull_request", "actor": "author", "full_lane_workflow": "build.yml", "full_suite_runs_in": "merge_group"})},
+        "output": {"title": tier, "summary": json.dumps(fields)},
     }
     record.update(change)
     return record
@@ -714,6 +739,9 @@ class TieredRequiredChecks(unittest.TestCase):
             self.listing(): [{"total_count": len(runs), "check_runs": runs}],
             f"repos/{self.REPO}/actions/jobs/9": {"id": 9, "run_id": 700, "run_attempt": 1},
             self.log_path(): job_log("read"),
+            f"repos/{self.REPO}/commits/{TESTED_MERGE}": {
+                "sha": TESTED_MERGE, "parents": [{"sha": BASE_TIP}, {"sha": self.HEAD}]},
+            f"repos/{self.REPO}/compare/{BASE_TIP}...main": {"status": "identical"},
         }
 
     def log_path(self) -> str:
@@ -771,7 +799,7 @@ class TieredRequiredChecks(unittest.TestCase):
         self.assertIn("required check `macos` on 788ba84d0325 ran only the deferred tier "
                       "(selector pr-fast+pr-guard; full suite runs in merge_group)", message)
         fix = self.fix(message)
-        self.assertEqual(fix["command"], "dispatch `build.yml` on head 788ba84d0325 as the "
+        self.assertEqual(fix["command"], "dispatch `build.yml` with `pr_number=8672` as the "
                          "fleet App and wait for the full lane")
         self.assertEqual(fix["cause"], "tier_deferred")
 
@@ -787,9 +815,84 @@ class TieredRequiredChecks(unittest.TestCase):
         code, message, _ = self.run_guard(self.answers([record]))
         self.assertEqual(code, 1, message)
         self.assertEqual(self.fix(message)["command"],
-                         "dispatch the workflow of `macos` on head 788ba84d0325 as the fleet "
+                         "dispatch the workflow of `macos` with `pr_number=8672` as the fleet "
                          "App and wait for the full lane")
         self.assertNotIn("macos-ci", message)
+
+    def test_a_full_record_that_tested_the_bare_branch_is_refused(self) -> None:
+        for summary in ({"tested_ref": "refs/heads/feature", "tested_sha": self.HEAD},
+                        {"tested_ref": "refs/pull/8672/merge", "tested_sha": self.HEAD}):
+            with self.subTest(summary=summary):
+                code, message, _ = self.run_guard(
+                    self.answers([tier_record("full", summary=summary)]))
+                self.assertEqual(code, 1, message)
+                self.assertIn("tested the bare branch at 788ba84d0325", message)
+                self.assertEqual(self.fix(message)["cause"], "tier_untested_merge")
+                self.assertIn("with `pr_number=8672`", self.fix(message)["command"])
+
+    def test_a_full_record_that_tested_a_stale_merge_is_refused(self) -> None:
+        # A merge built for an older head says nothing about the current one,
+        # even when it names this pull request's merge ref.
+        stale, old_head = "e" * 40, "d" * 40
+        answers = self.answers([tier_record("full", summary={"tested_sha": stale})])
+        answers[f"repos/{self.REPO}/commits/{stale}"] = {
+            "sha": stale, "parents": [{"sha": BASE_TIP}, {"sha": old_head}]}
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("is not a merge of the current head 788ba84d0325 (its parents are "
+                      "bbbbbbbbbbbb and dddddddddddd): a stale merge", message)
+
+    def test_a_full_record_must_name_this_pull_requests_merge_ref(self) -> None:
+        for tested_ref, why in (
+            (None, "names no `tested_ref` (refs/pull/8672/merge)"),
+            ("refs/heads/feature", "tested `refs/heads/feature`, not this pull request's"),
+            ("refs/pull/8671/merge", "tested `refs/pull/8671/merge`, not this pull request's"),
+        ):
+            with self.subTest(tested_ref=tested_ref):
+                code, message, _ = self.run_guard(self.answers(
+                    [tier_record("full", summary={"tested_ref": tested_ref})]))
+                self.assertEqual(code, 1, message)
+                self.assertIn(why, message)
+
+    def test_a_merge_with_the_head_first_is_refused(self) -> None:
+        # Only GitHub's order counts: base first, head second.
+        answers = self.answers([tier_record("full")])
+        answers[f"repos/{self.REPO}/commits/{TESTED_MERGE}"] = {
+            "sha": TESTED_MERGE, "parents": [{"sha": self.HEAD}, {"sha": BASE_TIP}]}
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("has the head as its first parent, the reverse of GitHub's merge ref",
+                      message)
+
+    def test_the_merged_base_must_be_the_first_parent_and_on_the_base(self) -> None:
+        for summary in ({"merged_base": "f" * 40}, {"merged_base": None}):
+            with self.subTest(summary=summary):
+                code, message, _ = self.run_guard(self.answers(
+                    [tier_record("full", summary=summary)]))
+                self.assertEqual(code, 1, message)
+                self.assertIn("merged_base", message)
+        answers = self.answers([tier_record("full")])
+        answers[f"repos/{self.REPO}/compare/{BASE_TIP}...main"] = {"status": "diverged"}
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("which is not on `main`", message)
+        answers[f"repos/{self.REPO}/compare/{BASE_TIP}...main"] = {"status": "ahead"}
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 0, message)
+
+    def test_a_full_record_without_a_tested_merge_is_refused(self) -> None:
+        for summary in ({"tested_sha": None}, {"tested_sha": "not-a-sha"}):
+            with self.subTest(summary=summary):
+                code, message, _ = self.run_guard(
+                    self.answers([tier_record("full", summary=summary)]))
+                self.assertEqual(code, 1, message)
+                self.assertIn("names no `tested_sha`", message)
+        answers = self.answers([tier_record("full")])
+        answers[f"repos/{self.REPO}/commits/{TESTED_MERGE}"] = {
+            "sha": TESTED_MERGE, "parents": [{"sha": self.HEAD}]}
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("1 parent(s)", message)
 
     def test_no_override_lands_a_deferred_head(self) -> None:
         code, message, _ = self.run_guard(self.answers([tier_record("deferred")]),
@@ -874,6 +977,23 @@ class TieredRequiredChecks(unittest.TestCase):
                 code, message, _ = self.run_guard(answers)
                 self.assertEqual(code, 1, message)
                 self.assertIn("cannot be read", message)
+
+    def test_a_missing_or_unclosed_token_permissions_group_refuses(self) -> None:
+        stamp = "2026-10-24T10:00:00.1000000Z"
+        headless = f"{stamp} Checks: read\n{stamp} Secret source: Actions\n"
+        truncated = (f"{stamp} ##[group]GITHUB_TOKEN Permissions\n{stamp} Actions: read\n"
+                     f"{stamp} Checks: read\n")
+        for log, why in ((headless, "has no `GITHUB_TOKEN Permissions` group"),
+                         (truncated, "group never closes")):
+            with self.subTest(why=why):
+                with self.assertRaises(guard.GuardError) as raised:
+                    guard.checks_scope(log)
+                self.assertIn(why, str(raised.exception))
+                answers = self.answers([tier_record("full")])
+                answers[self.log_path()] = log
+                code, message, _ = self.run_guard(answers)
+                self.assertEqual(code, 1, message)
+                self.assertIn(why, message)
 
     def test_the_checks_scope_is_read_from_the_header_group_only(self) -> None:
         self.assertEqual(guard.checks_scope(job_log("none")), "none")
@@ -2570,8 +2690,8 @@ class ReviewBeforeArm(unittest.TestCase):
     # A merge-only update of an approved head, over real crafted git histories
     # (the cases of the reviewer's carry_probe.sh).
 
-    def carry_answers(self, history: "CarryHistory", head: str, comments: list | None = None
-                      ) -> list[tuple[str, dict[str, Any]]]:
+    def carry_answers(self, history: "CarryHistory", head: str, comments: list | None = None,
+                      config: str | None = None) -> list[tuple[str, dict[str, Any]]]:
         graphql = opened(review_fixture("shipyard-784-graphql.json"))
         graphql["data"]["repository"]["pullRequest"]["headRefOid"] = head
         pull = copy.deepcopy(review_fixture("shipyard-784-pull.json"))
@@ -2579,9 +2699,10 @@ class ReviewBeforeArm(unittest.TestCase):
         approve = next(c for c in review_fixture("shipyard-784-comments.json")[0]
                        if c["id"] == APPROVE_784_COMMENT)
         trail = comments if comments is not None else [comment_like(
-            approve, created_at="2026-10-12T15:00:00Z",
+            approve, created_at=recent(2),
             body=f"verdict: APPROVE head:{history.approved}")]
-        answers = self.case("shipyard-784", graphql=graphql, queue=False, comments=[trail])
+        answers = self.case("shipyard-784", graphql=graphql, queue=False, comments=[trail],
+                            config=config)
         answers.insert(0, ("compare/", {"git": str(history.path)}))
         answers.insert(0, ("/git/blobs/", {"git_blob": str(history.path)}))
         answers.insert(0, ("raw.githubusercontent.com", {"git_raw": str(history.path)}))
@@ -2589,10 +2710,129 @@ class ReviewBeforeArm(unittest.TestCase):
         return [(needle, {"json": pull}) if needle == "/pulls/" else (needle, answer)
                 for needle, answer in answers]
 
-    def land(self, history: "CarryHistory", head: str, comments: list | None = None
-             ) -> subprocess.CompletedProcess:
+    def land(self, history: "CarryHistory", head: str, comments: list | None = None,
+             config: str | None = None) -> subprocess.CompletedProcess:
         return self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", head],
-                              self.carry_answers(history, head, comments), "danielraffel/Shipyard")
+                              self.carry_answers(history, head, comments, config),
+                              "danielraffel/Shipyard")
+
+    def approve_with(self, history: "CarryHistory", body: str, minutes_ago: int = 2
+                     ) -> list[dict[str, Any]]:
+        approve = next(c for c in review_fixture("shipyard-784-comments.json")[0]
+                       if c["id"] == APPROVE_784_COMMENT)
+        return [comment_like(approve, created_at=recent(minutes_ago),
+                             body=f"{body}verdict: APPROVE head:{history.approved}")]
+
+    def logged_carries(self) -> list[dict[str, Any]]:
+        log = self.guards / "carries.jsonl"
+        if not log.is_file():
+            return []
+        return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+    def test_a_merge_carry_is_logged_with_its_verdict_and_both_merge_bases(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.merge()
+        result = self.land(history, head)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [record] = self.logged_carries()
+        self.assertEqual((record["kind"], record["approved"], record["head"], record["pr"],
+                          record["merges"]), ("merge", history.approved, head, 784, 1))
+        self.assertEqual(record["verdict_comment_id"], APPROVE_784_COMMENT)
+        self.assertEqual(record["old_base"], history.git("merge-base", "main", history.approved))
+        self.assertEqual(record["new_base"], history.git("merge-base", "main", head))
+        self.assertNotEqual(record["old_base"], record["new_base"])
+
+    def test_a_read_only_review_judges_a_carry_without_logging_it(self) -> None:
+        # Only a landing logs a carry: the review-verdict status (dry_run) judges
+        # the same honest merge as carried and leaves carries.jsonl untouched.
+        history = CarryHistory(self.root / "repo")
+        head = history.merge()
+        fake = self.install(self.carry_answers(history, head))
+        log = self.guards / "carries.jsonl"
+        log.write_text('{"kind": "rebase", "earlier": true}\n', encoding="utf-8")
+        before = log.read_bytes()
+        target = {"repo": "danielraffel/Shipyard", "pr": 784, "head": head, "bound_head": head}
+        env = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake),
+               "GH_REPO": "danielraffel/Shipyard", "SHIPYARD_GHAPP_GUARDS_DIR": str(self.guards),
+               "HOME": str(self.root), "SHIPYARD_REVIEW_BEFORE_ARM": "1"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                contextlib.redirect_stderr(io.StringIO()):
+            allowed, message, _ = guard.review_gate(dict(target), "danielraffel/Shipyard",
+                                                    dry_run=True)
+            self.assertTrue(allowed, message)
+            self.assertIn("carries to", message)
+            self.assertEqual(log.read_bytes(), before)
+            # Control: the same judgement as a landing logs it.
+            allowed, message, _ = guard.review_gate(dict(target), "danielraffel/Shipyard")
+        self.assertTrue(allowed, message)
+        self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_a_read_only_review_judges_a_rebase_carry_without_logging_it(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.rebase()
+        fake = self.install(self.rebase_answers(history, head))
+        log = self.guards / "carries.jsonl"
+        target = {"repo": "danielraffel/Shipyard", "pr": 784, "head": head, "bound_head": head}
+        env = {"PATH": "/usr/bin:/bin", "GHAPP_REAL_GH": str(fake),
+               "GH_REPO": "danielraffel/Shipyard", "SHIPYARD_GHAPP_GUARDS_DIR": str(self.guards),
+               "HOME": str(self.root), "SHIPYARD_REVIEW_BEFORE_ARM": "1",
+               "SHIPYARD_REBASE_CARRY": "1"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                contextlib.redirect_stderr(io.StringIO()):
+            allowed, message, _ = guard.review_gate(dict(target), "danielraffel/Shipyard",
+                                                    dry_run=True)
+            self.assertTrue(allowed, message)
+            self.assertIn("carries across the rebase", message)
+            self.assertFalse(log.exists())
+            allowed, message, _ = guard.review_gate(dict(target), "danielraffel/Shipyard")
+        self.assertTrue(allowed, message)
+        self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_a_pull_request_touching_an_excluded_path_never_carries(self) -> None:
+        for path in (".github/workflows/ci.yml", ".agents/contract.toml", "tools/ci/run.sh",
+                     "scripts/ghapp_queue_arm_guard.py"):
+            with self.subTest(path=path):
+                history = CarryHistory(self.root / f"repo-{abs(hash(path))}", extra={path: b"x\n"})
+                result = self.land(history, history.merge())
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"it changes {path}", result.stderr)
+                self.assertEqual(self.logged_carries(), [])
+        # The base's own list replaces the defaults; an empty one excludes nothing.
+        history = CarryHistory(self.root / "repo-config", extra={"tools/ci/run.sh": b"x\n"})
+        result = self.land(history, history.merge(),
+                           config="[auto_merge]\ncarry_excluded_paths = []\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_carry_no_keeps_an_approval_to_its_exact_head(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.merge()
+        result = self.land(history, head, self.approve_with(history, "Reviewed.\ncarry: no\n"))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("its verdict says `carry: no`", result.stderr)
+        # Control: the same verdict without the line carries.
+        result = self.land(history, head, self.approve_with(history, "Reviewed.\n"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_approval_older_than_48h_never_carries(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        head = history.merge()
+        result = self.land(history, head, self.approve_with(history, "", 49 * 60))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("its verdict is older than 48h", result.stderr)
+        result = self.land(history, head, self.approve_with(history, "", 47 * 60))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_approval_carries_across_at_most_three_base_merges(self) -> None:
+        history = CarryHistory(self.root / "repo")
+        heads = [history.merge()]
+        for n in range(3):
+            history.on_base(lambda n=n: history.append("other.txt", f"more {n}\n"))
+            heads.append(history.merge_again())
+        result = self.land(history, heads[2])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.land(history, heads[3])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("more than 3 base merges", result.stderr)
 
     def test_an_honest_merge_of_the_base_carries_the_approval(self) -> None:
         history = CarryHistory(self.root / "repo")
@@ -2709,9 +2949,9 @@ class ReviewBeforeArm(unittest.TestCase):
         approve = next(c for c in review_fixture("shipyard-784-comments.json")[0]
                        if c["id"] == APPROVE_784_COMMENT)
         trail = [
-            comment_like(approve, created_at="2026-10-12T15:00:00Z",
+            comment_like(approve, created_at=recent(2),
                          body=f"verdict: APPROVE head:{history.approved}"),
-            comment_like(approve, id=approve["id"] + 1, created_at="2026-10-12T16:00:00Z",
+            comment_like(approve, id=approve["id"] + 1, created_at=recent(1),
                          body=f"verdict: HOLD head:{head}"),
         ]
         result = self.land(history, head, trail)
@@ -2855,6 +3095,14 @@ class ReviewBeforeArm(unittest.TestCase):
         # Control: a receipt the job refused leaves the check run in full.
         refused = self.land_rebased(history, head, receipt="refuse")
         self.assertEqual(refused.returncode, 0, refused.stderr)
+
+    def test_a_rebase_carry_refuses_a_pull_request_touching_an_excluded_path(self) -> None:
+        history = CarryHistory(self.root / "repo", extra={".github/workflows/ci.yml": b"x\n"})
+        head = history.rebase()
+        result = self.land_rebased(history, head)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("it changes .github/workflows/ci.yml (.github/workflows/**)", result.stderr)
+        self.assertEqual(self.carries(), [])
 
     def test_a_commit_that_is_not_a_merge_needs_a_new_verdict(self) -> None:
         history = CarryHistory(self.root / "repo")
@@ -3204,7 +3452,8 @@ class CarryHistory:
     (and optionally changes a binary), its approved head, and a base commit
     since; with the updates the carry rule judges."""
 
-    def __init__(self, path: pathlib.Path, binary: bool = False, large_text: bool = False) -> None:
+    def __init__(self, path: pathlib.Path, binary: bool = False, large_text: bool = False,
+                 extra: dict[str, bytes] | None = None) -> None:
         self.path = path
         path.mkdir(parents=True)
         self.git("init", "-q", "-b", "main")
@@ -3225,6 +3474,10 @@ class CarryHistory:
             self.write("fixture.json", ('{"rows": [' + ",".join(['{"k": "v"}'] * 40_000)
                                         + "]}").encode())
             self.git("add", "fixture.json")
+        for name, data in (extra or {}).items():
+            (self.path / name).parent.mkdir(parents=True, exist_ok=True)
+            self.write(name, data)
+            self.git("add", name)
         self.git("commit", "-qam", "pr: add guard")
         self.approved = self.git("rev-parse", "HEAD")
         self.git("checkout", "-q", "main")
@@ -3265,6 +3518,12 @@ class CarryHistory:
             edit()
         self.git("add", "-A")
         self.git("commit", "-qm", "Merge branch 'main' into pr")
+        return self.git("rev-parse", "HEAD")
+
+    def merge_again(self) -> str:
+        """Merge the base into the current merged head, one more clean update."""
+        self.git("checkout", "-q", "head")
+        self.git("merge", "-q", "--no-edit", "-m", "Merge branch 'main' into pr", "main")
         return self.git("rev-parse", "HEAD")
 
     def replace_line(self, number: int, text: str) -> None:

@@ -327,8 +327,10 @@ document:
   full lane before the head is armed, here, at T5's validated arm and classic
   merge, and in every steward path: its latest run on the head must have
   completed and carry a `shipyard-test-tier/<check>` record that is not
-  `deferred`, and its job's token may not have held `checks: write` (see `docs/ghapp-guards.md`, A tiered required check must prove
-  its full lane). Arm-on-open usually runs before that check completes, so
+  `deferred` and that tested this pull request's merge at the current head
+  (never the bare branch or a stale merge), and its job's token may not have
+  held `checks: write` (see `docs/ghapp-guards.md`, A tiered required check
+  must prove its full lane). Arm-on-open usually runs before that check completes, so
   on such a repository it reports the refusal and the `--arm-unqueued`
   backstop arms the head later. At T5 the refusal fails the merge phase the
   same way an unapproved head does. Nothing overrides it.

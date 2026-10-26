@@ -253,6 +253,14 @@ counts, which is how the review App approves. The fleet author App
 `shipyard-local[bot]`, which opens every fleet PR, never counts and is refused
 in the list, and no identity can approve a PR it authored.
 
+A carried approval (a clean base merge, or a rebase where switched on) never
+reaches a PR touching `[auto_merge] carry_excluded_paths` (by default
+workflows, `.agents/contract.toml`, `tools/ci/**`, the guards and Shipyard's
+arm code, and signing and release automation). It also never reaches one whose
+APPROVE has a `carry: no` line, one more than 3 base merges past its verdict,
+or one more than 48 hours after it. Those heads need a fresh exact-head
+verdict.
+
 To give a verdict as a reviewer, prefer a PR Review from the review App: state
 `APPROVE`, or `REQUEST_CHANGES` to hold. GitHub binds the review to the head it
 was submitted on. A comment works too, but only its last non-empty line is read,
@@ -319,7 +327,8 @@ Two things not to conclude from it:
   `macos`), the arm is refused while it has not completed, or while its
   `shipyard-test-tier/<check>` record (from the base's `tier_record_app`, never
   `github-actions`) is missing or says `deferred`, or the job's token held
-  `checks: write`: dispatch `build.yml` on the head as the
+  `checks: write`, or its full lane did not test `refs/pull/<n>/merge` at the
+  head: dispatch `build.yml` with `pr_number=<n>` as the
   fleet App and wait for the full lane. The steward's native-arm backstop arms
   it later. See the shipyard skill.
 - **`shipyard train status` shows why an approved PR is not in the queue.**

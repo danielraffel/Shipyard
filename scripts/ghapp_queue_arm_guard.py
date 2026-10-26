@@ -207,6 +207,36 @@ def noncanonical_stamp(body: str) -> bool:
 REBASE_CARRY_ENV = "SHIPYARD_REBASE_CARRY"
 REBASE_CARRY_FILE = "rebase-carry"
 REBASE_CARRY_LOG = "carries.jsonl"
+# Paths whose change means an approval never carries to a new head: a carry
+# must never be the way a workflow, the CI contract, the guards or Shipyard's
+# own arm code, or signing and release automation lands unreviewed. The base's
+# `[auto_merge] carry_excluded_paths` replaces the list. Same as
+# src/head_approval.rs DEFAULT_CARRY_EXCLUDED_PATHS.
+DEFAULT_CARRY_EXCLUDED_PATHS = (
+    ".github/workflows/**",
+    ".agents/contract.toml",
+    "tools/ci/**",
+    "scripts/ghapp*",
+    "src/head_approval*",
+    "src/head_approval/**",
+    "src/queue_arm_gate*",
+    "src/auto_arm*",
+    "src/auto_arm/**",
+    "src/ghapp_guards*",
+    "src/app/ship_cmd/auto_arm*",
+    "src/app/merge_steward_cmd/native_arm*",
+    "release-please-config.json",
+    ".release-please-manifest.json",
+    "**/*codesign*",
+    "**/*notariz*",
+    "**/*signing*",
+)
+# An approval carries across at most this many base merges, and for at most
+# this long after its verdict; past either, the head needs a new verdict.
+MAX_CARRY_MERGES = 3
+MAX_CARRY_AGE = timedelta(hours=48)
+# A line in an APPROVE that keeps its approval to the exact head named.
+_NO_CARRY_LINE = re.compile(r"^[ \t]*carry[ \t]*:[ \t]*no[ \t]*$", re.MULTILINE | re.IGNORECASE)
 # The guards directory's override audit log.
 OVERRIDES_LOG = "overrides.jsonl"
 # A required check that concluded one of these on the new head did not run in full.
@@ -223,6 +253,9 @@ ACTIONS_APP = "github-actions"
 DEFERRED_TIER = "deferred"
 # The log group the runner prints in "Set up job" listing the token's scopes.
 TOKEN_PERMISSIONS_HEADER = "GITHUB_TOKEN Permissions"
+# The workflow_dispatch input naming the pull request whose merge ref
+# (refs/pull/<n>/merge) the full lane checks out.
+FULL_LANE_PR_INPUT = "pr_number"
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
 MERGE_MUTATIONS = ("mergepullrequest",)
 # Same pattern as src/head_approval.rs marker_verdict.
@@ -903,7 +936,15 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
                          f"be a list of reviewer names, not {configured!r}")
     configured_signers = ([name.lower() for name in configured]
                           if configured is not None else None)
+    excluded = section.get("carry_excluded_paths")
+    if excluded is not None and not (
+            isinstance(excluded, list) and all(isinstance(path, str) for path in excluded)):
+        # Not a list of globs: no carry at all, as src/head_approval.rs reads it.
+        excluded = ["**"]
     return {
+        # Paths whose change keeps an approval from carrying (see carry_excluded).
+        "carry_excluded": (list(excluded) if excluded is not None
+                           else list(DEFAULT_CARRY_EXCLUDED_PATHS)),
         "required": required if isinstance(required, bool) else default,
         "reviewers": [str(login).lower() for login in reviewers if isinstance(login, str)],
         # Required by REVIEW_REQUIRED_REPOS, not by the repository's own key.
@@ -1407,7 +1448,64 @@ def _pr_files(compare: dict[str, Any], what: str) -> dict[str, tuple[str, str, b
     return out
 
 
-def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | None:
+def glob_match(pattern: str, path: str) -> bool:
+    """Whether ``path`` matches ``pattern``: ``**`` is any number of whole path
+    segments, ``*`` any run of characters within one segment, ``?`` one.
+    Same as src/head_approval.rs ``glob_match``."""
+    def segments(pats: list[str], parts: list[str]) -> bool:
+        if not pats:
+            return not parts
+        if pats[0] == "**":
+            return any(segments(pats[1:], parts[index:]) for index in range(len(parts) + 1))
+        return bool(parts) and _segment_match(pats[0], parts[0]) and segments(pats[1:], parts[1:])
+
+    return segments(pattern.split("/"), path.split("/"))
+
+
+def _segment_match(pattern: str, text: str) -> bool:
+    if not pattern:
+        return not text
+    if pattern[0] == "*":
+        return any(_segment_match(pattern[1:], text[index:]) for index in range(len(text) + 1))
+    return bool(text) and (pattern[0] in ("?", text[0])) and _segment_match(pattern[1:], text[1:])
+
+
+def carry_excluded(paths: set[str] | list[str], excluded: list[str]) -> str | None:
+    """Why a pull request changing ``paths`` never carries an approval, or None."""
+    for path in sorted(paths):
+        for pattern in excluded:
+            if glob_match(pattern, path):
+                return (f"it changes {path} ({pattern}), and a change there always needs a "
+                        "verdict naming its exact head")
+    return None
+
+
+def carry_limits(approved: str, author: str | None, comments: list[dict[str, Any]],
+                 reviews: list[dict[str, Any]], policy: dict[str, Any],
+                 now: datetime | None = None) -> str | None:
+    """Why the approval of ``approved`` may not carry at all, or None: its
+    verdict has a ``carry: no`` line, or it is older than MAX_CARRY_AGE."""
+    latest = _latest_on(counting_verdicts(author, comments, reviews, policy), approved.lower())
+    at = latest[0] if latest is not None else None
+    if at is None:
+        return "the time of its verdict is unknown"
+    if (now or datetime.now(timezone.utc)) - at > MAX_CARRY_AGE:
+        return (f"its verdict is older than {int(MAX_CARRY_AGE.total_seconds() // 3600)}h "
+                f"({at.strftime('%Y-%m-%dT%H:%M:%SZ')})")
+    record = _deciding_approval_comment(approved, author, comments, reviews, policy)
+    if record is None:
+        record = next((review for review in reviews
+                       if str(review.get("state") or "").upper() == "APPROVED"
+                       and str(review.get("commit_id") or "").lower() == approved.lower()
+                       and _timestamp(review.get("submitted_at")) == at), None)
+    if record is not None and _NO_CARRY_LINE.search(str(record.get("body") or "")):
+        return "its verdict says `carry: no`"
+    return None
+
+
+def merge_only_carry(repo: str, base: str, approved: str, head: str,
+                     excluded: list[str] | tuple[str, ...] = DEFAULT_CARRY_EXCLUDED_PATHS,
+                     record: dict[str, Any] | None = None) -> str | None:
     """``None`` when the approval of ``approved`` carries to ``head``; else why not.
 
     It carries only when every commit on the first-parent chain from ``head``
@@ -1435,7 +1533,12 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
         # The update's own commits are the first-parent chain from the new head
         # back to the approved one; the rest arrived through merged parents.
         sha = head.lower()
+        merges = 0
         while sha != approved.lower():
+            merges += 1
+            if merges > MAX_CARRY_MERGES:
+                return (f"it would carry across more than {MAX_CARRY_MERGES} base merges; "
+                        "the head needs a new verdict")
             parents = parents_of.get(sha)
             if parents is None:
                 return f"commit {sha[:12]} is outside the comparison"
@@ -1451,6 +1554,11 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
             return "the pull request's files are unreadable"
         before = _pr_files(before_compare, f"compare/{base}...{approved[:12]}")
         after = _pr_files(after_compare, f"compare/{base}...{head[:12]}")
+        excluded_path = carry_excluded(
+            set(before) | set(after) | set(_rename_sources(before_compare).values())
+            | set(_rename_sources(after_compare).values()), list(excluded))
+        if excluded_path is not None:
+            return excluded_path
         binary = binary_files(repo, before, approved)
         if binary:
             return f"the pull request changes a binary file ({binary[0]})"
@@ -1491,6 +1599,9 @@ def merge_only_carry(repo: str, base: str, approved: str, head: str) -> str | No
             both = sorted(pr_paths & _base_touched(moved))
             if both:
                 return f"{both[0]} was changed by both the pull request and the base"
+        if record is not None:
+            record.update(kind="merge", approved=approved, head=head, old_base=base_before,
+                          new_base=base_after, merges=merges, files=len(before))
     except GuardError as error:
         return f"the carry cannot be checked ({error})"
     return None
@@ -1679,7 +1790,67 @@ def checks_scope(log: str) -> str:
     raise GuardError(f"its `{TOKEN_PERMISSIONS_HEADER}` group never closes")
 
 
+def _tested_merge(repo: str, pr: int, base: str, head: str, record: dict[str, Any],
+                  api_json: Any) -> str | None:
+    """Why a full-lane record does not prove it tested this pull request's
+    merge ref at the current head, or ``None`` when it does.
+
+    All of these must hold: ``tested_ref`` is ``refs/pull/<n>/merge`` for this
+    pull request; ``tested_sha``'s parents are exactly ``[merged_base, head]``,
+    in GitHub's order (base first, head second); and ``merged_base`` is on the
+    base branch. A bare branch, a merge of an older head, the reversed order,
+    another ref, or a record missing any of the three fields is not. Same as
+    src/deferred_tier.rs ``tested_merge``.
+    """
+    def is_sha(value: Any) -> bool:
+        return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
+
+    tested = record.get("tested_sha")
+    if not is_sha(tested):
+        return "its record names no `tested_sha`"
+    if tested.lower() == head.lower():
+        return f"it tested the bare branch at {head[:12]}, not a merge with the base"
+    merge_ref = f"refs/pull/{pr}/merge"
+    tested_ref = record.get("tested_ref")
+    if not isinstance(tested_ref, str):
+        return f"its record names no `tested_ref` ({merge_ref})"
+    if tested_ref != merge_ref:
+        return f"it tested `{tested_ref}`, not this pull request's `{merge_ref}`"
+    merged_base = record.get("merged_base")
+    if not is_sha(merged_base):
+        return "its record names no `merged_base`"
+    try:
+        commit = api_json(["api", f"repos/{repo}/commits/{tested}"])
+    except GuardError as error:
+        return f"tested commit {tested[:12]} is unreadable: {error}"
+    parents = [parent.get("sha") for parent in (commit.get("parents") or [])
+               if isinstance(parent, dict) and isinstance(parent.get("sha"), str)
+               ] if isinstance(commit, dict) else []
+    if len(parents) != 2:
+        return (f"tested commit {tested[:12]} has {len(parents)} parent(s), so it is not "
+                "a merge")
+    first, second = parents
+    # GitHub's refs/pull/<n>/merge puts the base first and the head second.
+    if second.lower() != head.lower():
+        if first.lower() == head.lower():
+            return (f"tested commit {tested[:12]} has the head as its first parent, the "
+                    f"reverse of GitHub's merge ref, so it is not {merge_ref}")
+        return (f"tested commit {tested[:12]} is not a merge of the current head {head[:12]} "
+                f"(its parents are {first[:12]} and {second[:12]}): a stale merge")
+    if first.lower() != merged_base.lower():
+        return (f"its record names `merged_base` {merged_base[:12]} but tested commit "
+                f"{tested[:12]} merged {first[:12]}")
+    try:
+        compare = api_json(["api", f"repos/{repo}/compare/{merged_base}...{base}"])
+    except GuardError as error:
+        return f"whether {merged_base[:12]} is on `{base}` is unreadable: {error}"
+    if isinstance(compare, dict) and compare.get("status") in ("identical", "ahead"):
+        return None
+    return f"tested commit {tested[:12]} merged {merged_base[:12]}, which is not on `{base}`"
+
+
 def tier_blockers(repo: str, head: str, tiered: list[str], record_app: str,
+                  pr: int, base: str,
                   api_json: Any = None, api_text: Any = None) -> list[dict[str, Any]]:
     """What holds ``head`` back for each tiered check, as ``{check, blocker, ...}``.
 
@@ -1687,8 +1858,10 @@ def tier_blockers(repo: str, head: str, tiered: list[str], record_app: str,
     print. Per tiered check, its latest check run on the head must be a
     completed GitHub Actions job, and the tier records bound to that job's run
     attempt, created by ``record_app`` (never the Actions app, whose records a
-    pull request job could PATCH), must exist and none may say ``deferred``. Then, as defence in depth, the
-    job's own token may not have been able to write check runs. Raises
+    pull request job could PATCH), must exist and none may say ``deferred``. Each
+    must show it tested this pull request's merge at the current head
+    (:func:`_tested_merge`). Then, as defence in depth, the job's own token may
+    not have been able to write check runs. Raises
     :class:`GuardError` when the check runs cannot be read in full.
     """
     api_json = api_json or run_real_gh
@@ -1702,7 +1875,7 @@ def tier_blockers(repo: str, head: str, tiered: list[str], record_app: str,
                 latest[name] = run
     blockers = []
     for check in tiered:
-        found = {"check": check, "head": head}
+        found = {"check": check, "head": head, "pr": pr}
         run = latest.get(check)
         if run is None:
             blockers.append({**found, "blocker": "pending", "status": "missing"})
@@ -1737,6 +1910,13 @@ def tier_blockers(repo: str, head: str, tiered: list[str], record_app: str,
         if deferred is not None:
             blockers.append({**found, "blocker": "deferred", "record": deferred})
             continue
+        untested = next(((record, why) for record in records
+                         if (why := _tested_merge(repo, pr, base, head, record, api_json))),
+                        None)
+        if untested is not None:
+            blockers.append({**found, "blocker": "untested_merge", "record": untested[0],
+                             "reason": untested[1]})
+            continue
         # Read only when the records would allow: a refusal needs no log.
         try:
             level = checks_scope(api_text(["api", f"repos/{repo}/actions/jobs/{run['id']}/logs"]))
@@ -1764,6 +1944,9 @@ def _explain_blocker(blocker: dict[str, Any]) -> tuple[str, str]:
                f"{record.get('selector') or 'unknown'}"
                + (f"; full suite runs in {runs_in}" if runs_in else "")
                + "); its success is not a full-suite result")
+    elif kind == "untested_merge":
+        why = (f"the full lane of tiered required check `{check}` on {head} did not test this "
+               f"pull request's merge with its base ({blocker['reason']})")
     elif kind == "checks_writable":
         why = (f"the job of tiered required check `{check}` on {head} ran with "
                f"`checks: {blocker['level']}`, so it could have rewritten its own tier record")
@@ -1776,12 +1959,13 @@ def _explain_blocker(blocker: dict[str, Any]) -> tuple[str, str]:
     if kind == "pending":
         fix = (f"wait for `{check}` to complete; the steward's native-arm backstop arms the "
                "head once it is green and its tier is full")
-    elif kind == "deferred":
-        record = blocker["record"]
+    elif kind in ("deferred", "untested_merge"):
+        record, pr = blocker["record"], blocker["pr"]
         workflow = record.get("full_lane_workflow")
         what = (f"`{workflow}`" if isinstance(workflow, str) and workflow.strip()
                 else f"the workflow of `{check}`")
-        fix = f"dispatch {what} on head {head} as the fleet App and wait for the full lane"
+        fix = (f"dispatch {what} with `{FULL_LANE_PR_INPUT}={pr}` as the fleet App and wait "
+               "for the full lane")
     elif kind == "checks_writable":
         fix = (f"give the `{check}` job `checks: read` or `checks: none` in its workflow "
                "permissions and rerun it")
@@ -1804,13 +1988,14 @@ def deferred_tier_refusal(targets: list[dict[str, Any]], repo: str | None) -> bo
         target_repo = target.get("repo") or repo
         number, head, base = target.get("pr"), target.get("head"), target.get("base")
         label = f"PR #{number}"
-        if not target_repo or not isinstance(head, str) or not head or not base:
+        if (not target_repo or not isinstance(head, str) or not head or not base
+                or not isinstance(number, int)):
             refused.append((f"{label}: cannot tell which head and base would land, so its "
                             "test tier cannot be checked", None))
             continue
         try:
             tiered, record_app = tier_policy(base_config_text(target_repo, base))
-            found = (tier_blockers(target_repo, head, tiered, record_app)
+            found = (tier_blockers(target_repo, head, tiered, record_app, number, base)
                      if tiered and record_app else [])
         except GuardError as error:
             refused.append((f"{label}: cannot read the test tier of its tiered required checks "
@@ -2027,7 +2212,9 @@ def _reapplies_exactly(repo: str, approved: str, head: str,
     return None
 
 
-def rebase_carry(repo: str, base: str, approved: str, head: str) -> tuple[str | None, dict[str, Any]]:
+def rebase_carry(repo: str, base: str, approved: str, head: str,
+                 excluded: list[str] | tuple[str, ...] = DEFAULT_CARRY_EXCLUDED_PATHS
+                 ) -> tuple[str | None, dict[str, Any]]:
     """``(None, record)`` when the approval of ``approved`` carries across a
     rebase to ``head``; else ``(why not, record)``.
 
@@ -2068,6 +2255,11 @@ def rebase_carry(repo: str, base: str, approved: str, head: str) -> tuple[str | 
         after_sources = _rename_sources(after_compare)
         base_touched = _base_touched(moved) if moved.get("status") == "ahead" else set()
         record["files"] = len(before)
+        excluded_path = carry_excluded(
+            set(before) | set(after) | set(before_sources.values()) | set(after_sources.values()),
+            list(excluded))
+        if excluded_path is not None:
+            return excluded_path, record
         diff_header = ["-H", "Accept: application/vnd.github.diff"]
         old_diff = run_real_gh_text(["api", *diff_header, f"repos/{repo}/compare/{old_base}...{approved}"])
         new_diff = run_real_gh_text(["api", *diff_header, f"repos/{repo}/compare/{new_base}...{head}"])
@@ -2086,7 +2278,8 @@ def rebase_carry(repo: str, base: str, approved: str, head: str) -> tuple[str | 
 def log_carry(record: dict[str, Any]) -> None:
     """Append one carry to the guards directory's carry log. Never raises."""
     entry = dict(record, at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                 kind="rebase", argv=sys.argv[1:], **writer_identity())
+                 argv=sys.argv[1:], **writer_identity())
+    entry.setdefault("kind", "rebase")
     try:
         directory = _guards_dir()
         directory.mkdir(parents=True, exist_ok=True)
@@ -2195,13 +2388,15 @@ def _note_same_session(classification: dict[str, Any], label: str, repo: str,
     print(f"queue-arm-guard: warning: {label} ({repo}): {note}", file=sys.stderr)
 
 
-def review_gate(classification: dict[str, Any], repo: str | None
+def review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool = False
                 ) -> tuple[bool, str, dict[str, Any] | None]:
     """``(allowed, message, fix)``: the review-before-arm rule for one target,
     with every human approval it excluded printed and kept on the target for
-    the arms ledger."""
+    the arms ledger. ``dry_run`` judges a carry without appending it to the
+    carry log: read-only callers (the review-verdict status) pass it, so only
+    a landing ever logs a carry. Same as src/head_approval.rs ``dry_run``."""
     EXCLUDED_APPROVALS.clear()
-    result = _review_gate(classification, repo)
+    result = _review_gate(classification, repo, dry_run)
     excluded = sorted(set(EXCLUDED_APPROVALS))
     if excluded:
         classification["excluded_approvals"] = excluded
@@ -2212,7 +2407,7 @@ def review_gate(classification: dict[str, Any], repo: str | None
     return result
 
 
-def _review_gate(classification: dict[str, Any], repo: str | None
+def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool = False
                  ) -> tuple[bool, str, dict[str, Any] | None]:
     """``(allowed, message, fix)``: the review-before-arm rule for one target.
 
@@ -2276,7 +2471,10 @@ def _review_gate(classification: dict[str, Any], repo: str | None
     cause = "hold" if "is HOLD" in why or "HOLD naming" in why else "unreviewed"
     approved = approved_earlier_head(head, author, comments, reviews, policy)
     if approved is not None:
-        refusal = merge_only_carry(repo, base, approved, head)
+        excluded = policy.get("carry_excluded", list(DEFAULT_CARRY_EXCLUDED_PATHS))
+        limited = carry_limits(approved, author, comments, reviews, policy)
+        merge_record: dict[str, Any] = {}
+        refusal = limited or merge_only_carry(repo, base, approved, head, excluded, merge_record)
         own = self_approval(approved, author, comments, reviews, policy)
         if own is not None:
             return False, f"{label} ({repo}): {own}", review_fix(
@@ -2288,16 +2486,21 @@ def _review_gate(classification: dict[str, Any], repo: str | None
             _note_same_session(classification, label, repo, carry_note)
             classification["approval"] = deciding_approval(approved, author, comments, reviews,
                                                            policy)
+            if not dry_run:
+                log_carry(dict(merge_record, repo=repo, pr=number, **{
+                    key: value for key, value in classification["approval"].items()
+                    if key in ("verdict_comment_id", "verdict_review_id", "signer")}))
             return True, (
                 f"{label} ({repo}): the approval of {approved[:12]} carries to {head[:12]}: "
                 "every commit since is a merge of the base and every file the pull request "
                 "changes keeps its approved blob and mode"
             ), None
-        if cause == "unreviewed" and rebase_carry_enabled():
-            rebase_refusal, record = rebase_carry(repo, base, approved, head)
+        if limited is None and cause == "unreviewed" and rebase_carry_enabled():
+            rebase_refusal, record = rebase_carry(repo, base, approved, head, excluded)
             if rebase_refusal is None:
                 record["pr"] = number
-                log_carry(record)
+                if not dry_run:
+                    log_carry(record)
                 print(f"ghapp: {label} ({repo}): approval of {approved[:12]} carried across a "
                       f"rebase to {head[:12]} (logged to {REBASE_CARRY_LOG})", file=sys.stderr)
                 _note_same_session(classification, label, repo, carry_note)

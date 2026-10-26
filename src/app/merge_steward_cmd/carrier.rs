@@ -1021,9 +1021,14 @@ fn rearm(
     // guard's tier rule is applied here: a carried head whose checks have not
     // run yet is left disarmed for the native-arm backstop.
     let run_gh = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
-    let checks =
-        crate::deferred_tier::deferred_tier_checks(&run_gh, &state.repo, &state.base_branch, head)
-            .map_err(|detail| format!("test tier unreadable, left disarmed: {detail}"))?;
+    let checks = crate::deferred_tier::deferred_tier_checks(
+        &run_gh,
+        &state.repo,
+        state.pr,
+        &state.base_branch,
+        head,
+    )
+    .map_err(|detail| format!("test tier unreadable, left disarmed: {detail}"))?;
     if let Some(detail) = crate::deferred_tier::explain_all(&checks) {
         return Err(format!("left disarmed: {detail}"));
     }

@@ -542,6 +542,19 @@ mismatch after it leaves the pull request disarmed with
 head is not approval: a head that is a GitHub `Merge branch '<base>' into`
 commit gets no carrier action until a reviewer approves that head.
 
+
+Three guardrails bound every carry, in the guard and in `head_approval`:
+- **Excluded paths:** a PR touching `[auto_merge] carry_excluded_paths` never
+  carries. The default list is workflows, `.agents/contract.toml`,
+  `tools/ci/**`, the guards and Shipyard's arm code, and signing and release
+  automation.
+- **`carry: no`:** a `carry: no` line in the APPROVE keeps it to its exact
+  head.
+- **A cap:** at most 3 base merges or 48 hours since the verdict.
+
+Every merge carry a landing accepts is logged to `carries.jsonl` with its
+verdict id and both merge bases. Read-only evaluations (`dry_run`: the
+`review-verdict` status, `train status`) never append a row.
 ## A transient rerun needs the interruption signature, not a conclusion
 
 The steward's bounded rerun and the carrier's `redispatch` both rerun only a
@@ -568,9 +581,13 @@ unparseable group refuses. The
 `ghapp` arm guard and every Shipyard arm, enqueue and merge path
 (`src/deferred_tier.rs`, the twin of `tier_blockers` in
 `scripts/ghapp_queue_arm_guard.py`) refuse while that check is missing or not
-completed, its record is missing, or any bound record says `deferred`. The
-fix for a deferred tier: dispatch the record's `full_lane_workflow` on the
-head as the fleet App and wait for the full lane. No override lands it, neither
+completed, its record is missing, any bound record says `deferred`, or a full
+record did not test this pull request's merge at the current head
+(`tested_ref` this PR's `refs/pull/<n>/merge`, `tested_sha` with parents
+exactly `[merged_base, head]` in GitHub's order, and `merged_base` on the
+base; never the bare branch, a stale merge or the reversed order). The fix: dispatch the record's
+`full_lane_workflow` with `pr_number=<n>` as the fleet App and wait for the
+full lane. No override lands it, neither
 `GHAPP_ALLOW_QUEUE_REARM` nor anything else, and arm-on-open leaves such a head to
 the steward's native-arm backstop. Do not dispatch or label it yourself to
 get past it. See `docs/ghapp-guards.md`.

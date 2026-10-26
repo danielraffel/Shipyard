@@ -299,7 +299,7 @@ fn tier_verdict(
     number: u64,
     head_sha: &str,
 ) -> Result<ArmVerdict, Box<NativeArmResult>> {
-    match crate::deferred_tier::deferred_tier_checks(run_gh, repo, base, head_sha) {
+    match crate::deferred_tier::deferred_tier_checks(run_gh, repo, number, base, head_sha) {
         Ok(checks) => Ok(crate::deferred_tier::explain_all(&checks)
             .map_or(ArmVerdict::Arm, |detail| {
                 ArmVerdict::Skip(ArmSkip::DeferredTier { detail })
