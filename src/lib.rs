@@ -170,6 +170,9 @@ pub mod merge_queue_control;
 pub mod merge_queue_liveness;
 /// Conservative cross-repository merge and queued-run stewardship.
 pub mod merge_steward;
+/// The merge train: an off-by-default switch, per-PR stages on the way into
+/// the merge queue, and throughput and latency metrics.
+pub mod merge_train;
 pub mod metadata_authority;
 /// Runner and CI timing metrics store and analysis helpers.
 pub mod metrics;

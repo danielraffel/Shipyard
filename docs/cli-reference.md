@@ -67,6 +67,16 @@ shipyard base-health --workflow FILE         # detector workflow (default base_h
 shipyard base-health --act                   # apply base_health.auto_jump: off (default; reads nothing) | dry-run (records "would jump PR #n"
                                              #   once per episode in <state>/base-health/jump-decisions.jsonl) | on (dequeue + enqueue jump:true)
 
+# Is the merge queue fed? The merge train (off unless the base config sets `[train] enabled = true`)
+shipyard train status [--repo R] [--base main]  # switch + each open PR's stage and why (approval is head_approval's, carry included)
+shipyard train status --record                # also append this pass to <state>/train/<owner>__<repo>.jsonl (for metrics)
+shipyard train metrics [--since-hours 24]     # merges/h, approved->merged p50/p95, queue-empty minutes while a PR was ready, batch sizes, heads/merged PR
+shipyard train pause --reason "..."           # host kill switch: writes <guards dir>/train.pause; SHIPYARD_TRAIN=off|0|false (or off:owner/repo) also kills
+shipyard train resume --reason "..."          # removes the pause file: only the operator who paused, never while SHIPYARD_TRAIN kills
+                                              #   (both audited in <guards dir>/train-pauses.jsonl)
+# Off (absent, false, unreadable, or killed): status makes at most the one config read (none when killed) and records nothing.
+# status never writes the carry log: approvals are evaluated dry (a carried approval is reported, not logged).
+
 # Why is it red? Bounded diagnosis instead of reading a 10 MB job log (shipyard.diagnose/v1)
 shipyard diagnose 123                        # PR head: per failing REQUIRED check the step, tests, <=5 evidence groups,
                                              #   runner, class (infra | interrupted | stale_base | flake_candidate | real),
