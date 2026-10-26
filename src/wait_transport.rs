@@ -904,12 +904,18 @@ pub fn synthesize_pr_snapshot_from_rest(pr_number: u64, pr: &Value, check_runs: 
         .unwrap_or("")
         .to_uppercase();
     let merged = pr.get("merged").and_then(Value::as_bool).unwrap_or(false);
-    let merge_commit = pr
-        .get("merge_commit_sha")
-        .and_then(Value::as_str)
-        .map(|oid| serde_json::json!({"oid": oid}))
-        .unwrap_or(Value::Null);
-    let merged_at = pr.get("merged_at").cloned().unwrap_or(Value::Null);
+    let merge_commit = if merged {
+        pr.get("merge_commit_sha")
+            .and_then(Value::as_str)
+            .map_or(Value::Null, |oid| serde_json::json!({"oid": oid}))
+    } else {
+        Value::Null
+    };
+    let merged_at = if merged {
+        pr.get("merged_at").cloned().unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
     let mergeable = pr.get("mergeable").cloned().unwrap_or(Value::Null);
     let mergeable_state = pr
         .get("mergeable_state")
@@ -1959,8 +1965,10 @@ mod tests {
         assert_eq!(snapshot["state"], "OPEN");
         assert_eq!(snapshot["mergeStateStatus"], "CLEAN");
         assert_eq!(snapshot["merged"], false);
-        assert_eq!(snapshot["mergedAt"], "2026-10-25T12:00:00Z");
-        assert_eq!(snapshot["mergeCommit"]["oid"], "fedcba9876543210");
+        // GitHub's REST `merge_commit_sha` is a test-merge SHA while an open
+        // PR is unmerged; the GraphQL shape must stay null until merge.
+        assert_eq!(snapshot["mergedAt"], Value::Null);
+        assert_eq!(snapshot["mergeCommit"], Value::Null);
         assert_eq!(snapshot["mergeable"], true);
         assert_eq!(snapshot["_rest_fallback"], true);
         assert_eq!(snapshot["_required_checks_known"], false);
@@ -1970,6 +1978,24 @@ mod tests {
         assert_eq!(rollup[0]["state"], "completed");
         assert_eq!(rollup[0]["conclusion"], "success");
         assert_eq!(rollup[0]["isRequired"], true);
+    }
+
+    #[test]
+    fn rest_fallback_synthesis_preserves_merge_fields_for_merged_pr() {
+        let pr = serde_json::json!({
+            "number": 288,
+            "state": "closed",
+            "merged": true,
+            "merged_at": "2026-10-26T12:00:00Z",
+            "merge_commit_sha": "0123456789abcdef",
+            "mergeable": null,
+            "mergeable_state": "unknown",
+            "head": { "sha": "abc123" },
+        });
+        let snapshot = synthesize_pr_snapshot_from_rest(288, &pr, &serde_json::json!({}));
+        assert_eq!(snapshot["merged"], true);
+        assert_eq!(snapshot["mergedAt"], "2026-10-26T12:00:00Z");
+        assert_eq!(snapshot["mergeCommit"]["oid"], "0123456789abcdef");
     }
 
     #[test]
