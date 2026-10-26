@@ -309,7 +309,7 @@ def upload_artifact_and_checksums(
 ) -> Path:
     runner.run(
         [
-            "gh",
+            "ghapp",
             "release",
             "upload",
             "--repo",
@@ -322,7 +322,7 @@ def upload_artifact_and_checksums(
     checksums = merge_release_checksum(config, artifact, runner)
     runner.run(
         [
-            "gh",
+            "ghapp",
             "release",
             "upload",
             "--repo",

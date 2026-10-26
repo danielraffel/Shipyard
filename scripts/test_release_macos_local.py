@@ -587,7 +587,7 @@ class ReleaseMacosLocalTests(unittest.TestCase):
 
             uploads = [
                 command for command in runner.commands
-                if command[:3] == ["gh", "release", "upload"]
+                if command[:3] == ["ghapp", "release", "upload"]
             ]
             self.assertEqual(len(uploads), 2)
             self.assertTrue(all("--replace-existing" in command for command in uploads))
