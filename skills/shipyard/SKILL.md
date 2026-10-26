@@ -2050,7 +2050,10 @@ GitHub permission change from a mismatch line. See `docs/github-app-quota.md`.
 
 The one bounded asset-publication exception is `ghapp release upload`: require
 an explicit exact repository, tag, and existing non-symlink regular files. It
-does not admit `--clobber`, release creation/deletion, or tag retargeting.
+does not admit native `--clobber`, release creation/deletion, or tag
+retargeting. Its explicit `--replace-existing` flag is translated to native
+`--clobber` only after those checks, for workflows that replace a staged
+checksum or signed asset in an existing draft release.
 The wrapper snapshots each operand through no-follow descriptors into a private
 staging directory before token mint; native `gh` must never reopen the original
 workspace path.

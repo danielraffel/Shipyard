@@ -356,8 +356,10 @@ for interactive operator commands outside it.
 `release upload` is a deliberately narrower publication surface than native
 `gh`: it requires exactly one explicit `--repo OWNER/REPO`, one exact tag, and
 one or more existing non-symlink regular-file operands. It cannot create or
-delete a release, retarget a tag, or use `--clobber`; an existing same-name
-asset fails closed instead of being overwritten.
+delete a release or retarget a tag. The explicit `--replace-existing` flag is
+the only overwrite capability; it is translated to native `--clobber` only
+after the same exact-tag, repository, and stable-file checks, while native
+`--clobber` remains outside the privileged grammar.
 Before token mint, the wrapper opens every source through no-follow directory
 descriptors, copies it into an owner-only staging directory, and rejects any
 source identity change during the copy. Native `gh` receives only those stable

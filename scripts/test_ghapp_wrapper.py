@@ -1200,6 +1200,29 @@ class GhappWrapperTests(unittest.TestCase):
         self.assertFalse(self.helper_log.exists())
         self.assertFalse(self.gh_log.exists())
 
+    def test_release_upload_replace_existing_is_narrow_and_explicit(self) -> None:
+        package = self.root / "sequencer.pkg"
+        package.write_bytes(b"pkg fixture")
+
+        result = self.run_wrapper(
+            "release",
+            "upload",
+            "v0.1.0",
+            str(package),
+            "--replace-existing",
+            "--repo",
+            "Generous-Corp/forge-sequencer",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        gh_arguments = self.gh_log.read_text().strip()
+        self.assertRegex(
+            gh_arguments,
+            r"^release upload v0\.1\.0 "
+            r"/tmp/shipyard-ghapp-release-upload\.[^/]+/sequencer\.pkg "
+            r"--repo Generous-Corp/forge-sequencer --clobber$",
+        )
+
     def test_release_upload_rejects_option_injection_through_tag(self) -> None:
         package = self.root / "sequencer.pkg"
         package.write_bytes(b"pkg fixture")

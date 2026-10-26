@@ -566,6 +566,33 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             self.assertTrue(any(line.endswith("  shipyard-linux-x64") for line in lines))
             self.assertTrue(any(line.endswith("  shipyard-macos-arm64.dmg") for line in lines))
 
+    def test_upload_uses_the_bounded_ghapp_publication_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            artifact = Path(temp) / "shipyard-macos-arm64.dmg"
+            artifact.write_text("new dmg", encoding="utf-8")
+            config = release_macos_local.ReleaseConfig(
+                tag="v0.1.0",
+                repo="danielraffel/Shipyard",
+                artifact_prefix="shipyard",
+                dist_dir=Path(temp),
+                upload=True,
+                ci_mode=True,
+                skip_build=True,
+                binary=None,
+                cargo_target=None,
+            )
+            runner = FakeRunner(assets=[])
+
+            release_macos_local.upload_artifact_and_checksums(config, artifact, runner)
+
+            uploads = [
+                command for command in runner.commands
+                if command[:3] == ["gh", "release", "upload"]
+            ]
+            self.assertEqual(len(uploads), 2)
+            self.assertTrue(all("--replace-existing" in command for command in uploads))
+            self.assertTrue(all("--clobber" not in command for command in uploads))
+
 
 class FleetRolloutStageTests(unittest.TestCase):
     def config(self, **overrides: object) -> release_macos_local.ReleaseConfig:
