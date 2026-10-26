@@ -470,6 +470,17 @@ fn scrub_removes_private_hosts_and_paths_but_keeps_urls() {
     );
 }
 
+#[test]
+fn scrub_redacts_compiler_temp_paths_without_removing_the_flag() {
+    let row = scrub(json!({
+        "detail": " objective-c++ -ivfsstatcache /var/folders/hy/6y23234/T/cache",
+        "private": "/private/var/folders/zz/abc123/T/cache"
+    }));
+
+    assert_eq!(row["detail"], " objective-c++ -ivfsstatcache <path>");
+    assert_eq!(row["private"], "<path>");
+}
+
 /// One red run (`red`, with its job 1000 failing on the drift log), then a
 /// later pass in which `fix_runs` are the green runs on `feat/x` and `extra`
 /// answers the rest. Returns the second pass's report, the fix-links, and

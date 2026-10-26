@@ -122,7 +122,7 @@ fn log_absent(error: &str) -> bool {
 static SCRUB: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     [
         (
-            r"/(?:Users|Volumes|private/tmp|tmp|home)/[^\s'\x22]*",
+            r"/(?:Users|Volumes|private/(?:tmp|var/folders)|var/folders|tmp|home)/[^\s'\x22]*",
             "<path>",
         ),
         (r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "<email>"),
