@@ -3,6 +3,16 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03662"></a>
+## [0.366.2] - 2026-10-26
+
+- fix/release upload grammar 20261026 ([#947](https://github.com/danielraffel/Shipyard/pull/947))
+
+<a id="v03661"></a>
+## [0.366.1] - 2026-10-26
+
+- fix(release): bind signing snapshot to runner home ([#946](https://github.com/danielraffel/Shipyard/pull/946))
+
 <a id="v03660"></a>
 ## [0.366.0] - 2026-10-26
 
@@ -2637,6 +2647,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.366.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.366.2
+[0.366.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.366.1
 [0.366.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.366.0
 [0.365.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.365.0
 [0.364.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.364.2
