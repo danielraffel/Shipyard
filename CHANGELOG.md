@@ -3,6 +3,16 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03630"></a>
+## [0.363.0] - 2026-10-26
+
+- feat(train): an off-by-default merge train switch with read-only stages and metrics ([#937](https://github.com/danielraffel/Shipyard/pull/937))
+
+<a id="v03620"></a>
+## [0.362.0] - 2026-10-26
+
+- feat(guard): carry guardrails: excluded paths, carry: no, a cap, and a landing-only carry log ([#939](https://github.com/danielraffel/Shipyard/pull/939))
+
 <a id="v03610"></a>
 ## [0.361.0] - 2026-10-26
 
@@ -2601,6 +2611,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.363.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.363.0
+[0.362.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.362.0
 [0.361.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.361.0
 [0.359.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.359.0
 [0.358.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.358.0
