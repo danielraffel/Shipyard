@@ -66,6 +66,8 @@ def prepare(keychain: Path, state_path: Path, signing_home: Path) -> None:
     """Snapshot user keychain state before installing the ephemeral keychain."""
     state: dict[str, Any] = {
         "snapshot_complete": False,
+        "keychain_creation_started": False,
+        "keychain_created": False,
         "keychain": str(keychain),
     }
     _write_state(state_path, state)
@@ -95,7 +97,11 @@ def prepare(keychain: Path, state_path: Path, signing_home: Path) -> None:
     )
     _write_state(state_path, state)
 
+    state["keychain_creation_started"] = True
+    _write_state(state_path, state)
     _require_security("create-keychain", "-p", "ci", str(keychain))
+    state["keychain_created"] = True
+    _write_state(state_path, state)
     (signing_home / "Library" / "Preferences").mkdir(parents=True, exist_ok=True)
     _require_security(
         "list-keychains", "-d", "user", "-s", str(keychain), home=signing_home
@@ -148,11 +154,16 @@ def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
 
     # The path is generated from RUNNER_TEMP and GITHUB_RUN_ID. Deletion is
     # safe to retry and must not be skipped when setup failed partway through.
-    # A failed snapshot writes `snapshot_complete=false` before any ephemeral
-    # keychain is created. Avoid reporting a misleading cleanup failure for a
-    # path that was never created; if a keychain exists, deletion remains
-    # mandatory and fail-closed.
-    if keychain.exists():
+    # The state records whether creation started and completed. This avoids
+    # deleting a stale path when snapshot failed before creation, while still
+    # retrying cleanup after a crash during or after `create-keychain`.
+    creation_started = state is None or state.get("keychain_creation_started") is True
+    keychain_created = state is None or state.get("keychain_created") is True
+    # State from older runs predates the explicit creation markers; a complete
+    # snapshot was always followed by creation in that version.
+    if state and "keychain_created" not in state and state.get("snapshot_complete") is True:
+        keychain_created = True
+    if (creation_started or keychain_created) and keychain.exists():
         deletion = _security("delete-keychain", str(keychain))
         if deletion.returncode != 0:
             failures.append("could not delete the ephemeral signing keychain")

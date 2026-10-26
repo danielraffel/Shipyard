@@ -51,6 +51,7 @@ class SigningKeychainTests(unittest.TestCase):
             with mock.patch.object(subject, "_user_home", return_value=root / "user home"):
                 with mock.patch.object(subject, "_security", side_effect=responses) as security:
                     subject.prepare(keychain, state, root / "signing home")
+            self.assertTrue(json.loads(state.read_text())["keychain_created"])
             calls = security.call_args_list
             self.assertTrue((root / "signing home/Library/Preferences").is_dir())
             self.assertFalse(
@@ -101,9 +102,28 @@ class SigningKeychainTests(unittest.TestCase):
             root = Path(directory)
             state = root / "state"
             state.write_text(json.dumps({"snapshot_complete": False}))
+            keychain = root / "stale.keychain"
+            keychain.touch()
             with mock.patch.object(subject, "_security") as security:
-                subject.restore(root / "never-created.keychain", state, root / "home")
+                subject.restore(keychain, state, root / "home")
             security.assert_not_called()
+
+    def test_creation_started_retries_cleanup_even_before_completion_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.write_text(json.dumps({
+                "snapshot_complete": False,
+                "keychain_creation_started": True,
+                "keychain_created": False,
+                "default_keychain": "/original",
+                "search_list": ["/original"],
+            }))
+            keychain = root / "ephemeral"
+            keychain.touch()
+            with mock.patch.object(subject, "_security", return_value=completed()) as security:
+                subject.restore(keychain, state, root / "home")
+            self.assertEqual(security.call_args_list, [mock.call("delete-keychain", str(keychain))])
 
     def test_unavailable_snapshot_fails_before_keychain_creation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
