@@ -53,6 +53,7 @@ instead of importing stale data. This status is observational only;
 it cannot authorize, undo, or infer a merge.
 
 The producer and observer bind each receipt to the explicit protected base
-branch (default `main`) and repository basename. Freshness measures the time
-since the handoff export (`freshness_basis=handoff_export`), not the age of a
+branch (default `main`) and repository basename. Freshness requires both the
+handoff export and the producer store's newest `imported_at` timestamp
+(`freshness_basis=handoff_export_and_source_import`), not the age of a
 historical receipt.

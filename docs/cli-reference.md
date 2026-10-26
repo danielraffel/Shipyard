@@ -554,7 +554,9 @@ and provider-neutral:
   byte/record counts, exact receipt schema, producer identity, and duplicate/
   conflict rules. An empty producer store remains unavailable; the baseline
   collector uses `--merge-receipt-health` to preserve that unavailable state. `scripts/install_merge_receipt_handoff.sh` installs
-  the producer export as a managed per-user launchd job. These helpers are
+  the producer export as a managed per-user launchd job. The sidecar also binds
+  the producer DB's newest `imported_at` for the exact repository/base branch;
+  missing or stale source metadata is unavailable. These helpers are
   observational and never authorize or infer a merge.
 
 GitHub imports retain the workflow event, provider run ID, run attempt, and

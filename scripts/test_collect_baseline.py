@@ -392,6 +392,7 @@ class CollectorInvocationTests(unittest.TestCase):
             generated = MOD.receipt_handoff.health_payload(
                 repo="owner/repo", file=handoff, checked_at=dt.datetime.now(dt.timezone.utc),
                 status="fresh", exported_at=dt.datetime.now(dt.timezone.utc),
+                source_imported_at=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
                 receipts=[value], payload=payload,
                 producer={"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64})
             health.write_text(json.dumps(generated))
@@ -414,6 +415,7 @@ class CollectorInvocationTests(unittest.TestCase):
             old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
             generated = MOD.receipt_handoff.health_payload(
                 repo="owner/repo", file=handoff, checked_at=old, status="fresh", exported_at=old,
+                source_imported_at=old.isoformat().replace("+00:00", "Z"),
                 receipts=[value], payload=payload,
                 producer={"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64})
             health.write_text(json.dumps(generated))
@@ -435,6 +437,7 @@ class CollectorInvocationTests(unittest.TestCase):
             generated = MOD.receipt_handoff.health_payload(
                 repo="owner/repo", file=handoff, checked_at=dt.datetime.now(dt.timezone.utc),
                 status="fresh", exported_at=dt.datetime.now(dt.timezone.utc), receipts=[value], payload=payload,
+                source_imported_at=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
                 producer={"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64})
             generated["unexpected"] = True
             health.write_text(json.dumps(generated))
@@ -461,6 +464,7 @@ class CollectorInvocationTests(unittest.TestCase):
             generated = MOD.receipt_handoff.health_payload(
                 repo="owner/repo", file=handoff, checked_at=dt.datetime.now(dt.timezone.utc),
                 status="fresh", exported_at=dt.datetime.now(dt.timezone.utc), receipts=[value], payload=payload,
+                source_imported_at=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
                 producer={"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64})
             health.write_text(json.dumps(generated))
             args = type("Args", (), {"db": root / "metrics" / "metrics.db", "state": root / "state.json",

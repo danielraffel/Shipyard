@@ -42,13 +42,24 @@ class MergeReceiptHandoffTests(unittest.TestCase):
         value: dict[str, object] = {
             "schema": "shipyard-merge-receipt-handoff/v1", "repo": "owner/repo", "project": "repo",
             "base_branch": "main", "file": str(handoff), "status": "fresh",
-            "freshness_basis": "handoff_export", "checked_at": observed.isoformat().replace("+00:00", "Z"),
-            "exported_at": observed.isoformat().replace("+00:00", "Z"), "receipt_count": 1,
+            "freshness_basis": "handoff_export_and_source_import", "checked_at": observed.isoformat().replace("+00:00", "Z"),
+            "exported_at": observed.isoformat().replace("+00:00", "Z"),
+            "latest_merged_at": "2026-10-26T00:00:00Z", "source_imported_at": observed.isoformat().replace("+00:00", "Z"),
+            "receipt_count": 1,
             "handoff_bytes": len(payload), "handoff_sha256": hashlib.sha256(payload).hexdigest(),
             "producer": {"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64},
         }
         value.update(overrides)
         return value
+
+    def producer_db(self, root: pathlib.Path, imported_at: str = "2026-10-26T00:01:00Z") -> None:
+        database = root / "state" / "metrics" / "metrics.db"
+        database.parent.mkdir(parents=True)
+        import sqlite3
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE merge_receipts (repo TEXT, project TEXT, base_branch TEXT, imported_at TEXT)")
+            connection.execute("INSERT INTO merge_receipts VALUES (?, ?, ?, ?)", ("owner/repo", "repo", "main", imported_at))
+            connection.commit()
 
     def fake_shipyard(self, directory: pathlib.Path, output: pathlib.Path, *, fail: bool = False, malformed: bool = False) -> pathlib.Path:
         executable = directory / "shipyard"
@@ -75,6 +86,7 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             shipyard = self.fake_shipyard(root, root / "handoff.jsonl")
             handoff = root / "handoff.jsonl"
             health = root / "handoff.health.json"
+            self.producer_db(root)
             result = self.invoke("export", "--shipyard", str(shipyard), "--state-dir", str(root / "state"),
                               "--repo", "owner/repo", "--file", str(handoff), "--health-file", str(health))
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -90,6 +102,7 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             shipyard = self.fake_shipyard(root, root / "handoff.jsonl", fail=True)
             handoff = root / "handoff.jsonl"
             health = root / "handoff.health.json"
+            self.producer_db(root)
             handoff.write_text("previous\n")
             result = self.invoke("export", "--shipyard", str(shipyard), "--state-dir", str(root / "state"),
                               "--repo", "owner/repo", "--file", str(handoff), "--health-file", str(health))
@@ -208,6 +221,38 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
             self.assertEqual(result.returncode, 3)
             self.assertIn("unknown fields", json.loads(result.stdout)["error"])
+
+    def test_check_rejects_unknown_producer_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp); handoff = root / "handoff.jsonl"; health = root / "health.json"
+            handoff.write_text(json.dumps(receipt()) + "\n")
+            sidecar = self.health(handoff)
+            sidecar["producer"] = {**sidecar["producer"], "unexpected": True}
+            health.write_text(json.dumps(sidecar))
+            result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("producer contains unknown fields", json.loads(result.stdout)["error"])
+
+    def test_check_requires_freshness_metadata_and_matches_latest_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp); handoff = root / "handoff.jsonl"; health = root / "health.json"
+            handoff.write_text(json.dumps(receipt()) + "\n")
+            for field in ("checked_at", "latest_merged_at", "source_imported_at"):
+                sidecar = self.health(handoff); sidecar.pop(field); health.write_text(json.dumps(sidecar))
+                result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
+                self.assertEqual(result.returncode, 3)
+                self.assertIn("missing required fields", json.loads(result.stdout)["error"])
+            sidecar = self.health(handoff, latest_merged_at="2026-10-26T00:02:00Z")
+            health.write_text(json.dumps(sidecar))
+            result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("latest_merged_at", json.loads(result.stdout)["error"])
+            old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
+            sidecar = self.health(handoff, source_imported_at=old.isoformat().replace("+00:00", "Z"))
+            health.write_text(json.dumps(sidecar))
+            result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health), "--stale-after", "2h")
+            self.assertEqual(result.returncode, 3)
+            self.assertEqual(json.loads(result.stdout)["status"], "stale")
 
     def test_check_rejects_wrong_project_or_base_branch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -24,12 +25,19 @@ SCHEMA = "shipyard-merge-receipt-handoff/v1"
 EXIT_STALE = 3
 MAX_FUTURE_SKEW_SECS = 300
 DEFAULT_BASE_BRANCH = "main"
+FRESHNESS_BASIS = "handoff_export_and_source_import"
 _REPO = re.compile(r"^[^/\s]+/[^/\s]+$")
 HEALTH_FIELDS = frozenset({
     "schema", "repo", "project", "base_branch", "file", "status", "checked_at",
-    "exported_at", "latest_merged_at", "freshness_basis", "receipt_count",
+    "exported_at", "latest_merged_at", "source_imported_at", "freshness_basis", "receipt_count",
     "handoff_bytes", "handoff_sha256", "producer", "error",
 })
+REQUIRED_HEALTH_FIELDS = frozenset({
+    "schema", "repo", "project", "base_branch", "file", "status", "checked_at",
+    "exported_at", "latest_merged_at", "source_imported_at", "freshness_basis",
+    "receipt_count", "handoff_bytes", "handoff_sha256", "producer",
+})
+PRODUCER_FIELDS = frozenset({"identity", "version", "executable_sha256"})
 
 
 def now() -> dt.datetime:
@@ -201,9 +209,33 @@ def producer_identity(shipyard: pathlib.Path) -> dict[str, str]:
     return {"identity": "shipyard", "version": version[0], "executable_sha256": digest}
 
 
+def source_imported_at(state_dir: pathlib.Path, repo: str, base_branch: str) -> str:
+    """Read the producer DB's newest receipt import time without mutating it."""
+    database = state_dir / "metrics" / "metrics.db"
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            columns = {row[1] for row in connection.execute("pragma table_info(merge_receipts)")}
+            if "imported_at" not in columns:
+                raise RuntimeError("producer merge receipt store has no imported_at column")
+            value = connection.execute(
+                "SELECT max(imported_at) FROM merge_receipts "
+                "WHERE lower(trim(repo)) = lower(trim(?1)) AND project = ?2 AND base_branch = ?3",
+                (repo, repo.rsplit("/", 1)[-1], base_branch),
+            ).fetchone()[0]
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeError(f"producer merge receipt source is unreadable: {exc}") from exc
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("producer merge receipt source has no imported_at for repository/base branch")
+    try:
+        return timestamp(parse_timestamp(value, field="source_imported_at"))
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
 def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
                    base_branch: str = DEFAULT_BASE_BRANCH,
                    status: str, exported_at: dt.datetime | None = None,
+                   source_imported_at: str | None = None,
                    receipts: list[dict[str, Any]] | None = None,
                    payload: bytes | None = None, producer: dict[str, str] | None = None,
                    error: str | None = None) -> dict[str, Any]:
@@ -214,7 +246,7 @@ def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
         "base_branch": base_branch,
         "file": str(file),
         "status": status,
-        "freshness_basis": "handoff_export",
+        "freshness_basis": FRESHNESS_BASIS,
         "checked_at": timestamp(checked_at),
         "receipt_count": len(receipts or []),
         "handoff_bytes": len(payload) if payload is not None else None,
@@ -223,6 +255,8 @@ def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
     }
     if exported_at is not None:
         payload["exported_at"] = timestamp(exported_at)
+    if source_imported_at is not None:
+        payload["source_imported_at"] = source_imported_at
     if receipts:
         payload["latest_merged_at"] = max(
             (parse_timestamp(record["merged_at"], field="merged_at") for record in receipts),
@@ -262,10 +296,12 @@ def export(args: argparse.Namespace) -> int:
         exported = now()
         receipts, payload = read_handoff(staged_path, args.repo, base_branch=args.base_branch,
                                          now_value=exported)
+        imported_at = source_imported_at(state_dir, args.repo, args.base_branch)
         producer = producer_identity(shipyard)
         health = health_payload(repo=args.repo, file=file, base_branch=args.base_branch,
                                 checked_at=exported, status="fresh",
-                                exported_at=exported, receipts=receipts, payload=payload,
+                                exported_at=exported, source_imported_at=imported_at,
+                                receipts=receipts, payload=payload,
                                 producer=producer)
         # Validation completed against the staged payload; publish only after
         # both the exact receipt set and producer identity are known-good.
@@ -305,6 +341,8 @@ def check(args: argparse.Namespace) -> int:
             raise RuntimeError("health sidecar has an unsupported schema")
         if health.get("status") != "fresh":
             raise RuntimeError(f"health sidecar status is {health.get('status', 'unknown')}")
+        if not REQUIRED_HEALTH_FIELDS.issubset(health):
+            raise RuntimeError("health sidecar is missing required fields")
         repo = health.get("repo")
         if not isinstance(repo, str) or not _REPO.fullmatch(repo):
             raise RuntimeError("health sidecar has no valid repo")
@@ -317,15 +355,25 @@ def check(args: argparse.Namespace) -> int:
             raise RuntimeError("health sidecar is bound to a different handoff file")
         if set(health) - HEALTH_FIELDS:
             raise RuntimeError("health sidecar contains unknown fields")
-        if health.get("freshness_basis") != "handoff_export":
+        if health.get("freshness_basis") != FRESHNESS_BASIS:
             raise RuntimeError("health sidecar has an unsupported freshness basis")
         expected_base = health.get("base_branch")
         if not isinstance(expected_base, str) or expected_base != args.base_branch:
             raise RuntimeError("health sidecar base branch does not match requested base")
         records, handoff_payload = read_handoff(file, repo, base_branch=expected_base, now_value=checked)
+        checked_at = parse_timestamp(health.get("checked_at"), field="checked_at")
+        if checked_at > checked + dt.timedelta(seconds=MAX_FUTURE_SKEW_SECS):
+            raise RuntimeError("health sidecar checked_at is in the future")
         exported_at = parse_timestamp(health.get("exported_at"), field="exported_at")
+        source_at = parse_timestamp(health.get("source_imported_at"), field="source_imported_at")
         if exported_at > checked + dt.timedelta(seconds=MAX_FUTURE_SKEW_SECS):
             raise RuntimeError("health sidecar exported_at is in the future")
+        if source_at > checked + dt.timedelta(seconds=MAX_FUTURE_SKEW_SECS):
+            raise RuntimeError("health sidecar source_imported_at is in the future")
+        latest = parse_timestamp(health.get("latest_merged_at"), field="latest_merged_at")
+        expected_latest = max(parse_timestamp(record["merged_at"], field="merged_at") for record in records)
+        if latest != expected_latest:
+            raise RuntimeError("health sidecar latest_merged_at does not match handoff")
         expected_bytes = health.get("handoff_bytes")
         expected_sha = health.get("handoff_sha256")
         if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or expected_bytes != len(handoff_payload):
@@ -335,6 +383,8 @@ def check(args: argparse.Namespace) -> int:
         if health.get("receipt_count") != len(records):
             raise RuntimeError("health sidecar record count does not match handoff")
         producer = health.get("producer")
+        if isinstance(producer, dict) and set(producer) != PRODUCER_FIELDS:
+            raise RuntimeError("health sidecar producer contains unknown fields")
         producer_digest = producer.get("executable_sha256") if isinstance(producer, dict) else None
         producer_version = producer.get("version") if isinstance(producer, dict) else None
         if (not isinstance(producer, dict) or producer.get("identity") != "shipyard"
@@ -345,10 +395,11 @@ def check(args: argparse.Namespace) -> int:
                 or not all(char in "0123456789abcdef" for char in producer_digest)
                 or set(producer_digest) == {"0"}):
             raise RuntimeError("health sidecar has an unavailable or invalid producer identity")
-        status = "fresh" if (checked - exported_at).total_seconds() <= threshold else "stale"
+        freshness_at = min(exported_at, source_at)
+        status = "fresh" if (checked - freshness_at).total_seconds() <= threshold else "stale"
         payload = dict(health)
         payload.update({"status": status, "checked_at": timestamp(checked),
-                        "age_seconds": max(0, int((checked - exported_at).total_seconds())),
+                        "age_seconds": max(0, int((checked - freshness_at).total_seconds())),
                         "stale_after_seconds": threshold,
                         "receipt_count": len(records)})
     except (OSError, json.JSONDecodeError, RuntimeError, ValueError) as exc:
