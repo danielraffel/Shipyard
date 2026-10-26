@@ -176,7 +176,7 @@ def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
     # snapshot was always followed by creation in that version.
     if state and "keychain_created" not in state and state.get("snapshot_complete") is True:
         keychain_created = True
-    if creation_started or keychain_created:
+    if (creation_started or keychain_created) and keychain.exists():
         deletion = _security("delete-keychain", str(keychain))
         if deletion.returncode != 0:
             failures.append("could not delete the ephemeral signing keychain")

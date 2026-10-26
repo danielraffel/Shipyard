@@ -66,9 +66,11 @@ class SigningKeychainTests(unittest.TestCase):
                 "snapshot_mode": "none",
                 "keychain_created": True,
             }))
+            keychain = root / "ephemeral.keychain"
+            keychain.touch()
             with mock.patch.object(subject, "_security", return_value=completed()) as security:
-                subject.restore(root / "ephemeral.keychain", state, root / "home")
-            security.assert_called_once_with("delete-keychain", str(root / "ephemeral.keychain"))
+                subject.restore(keychain, state, root / "home")
+            security.assert_called_once_with("delete-keychain", str(keychain))
 
     def test_default_failure_with_nonempty_search_list_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -185,6 +187,19 @@ class SigningKeychainTests(unittest.TestCase):
             with mock.patch.object(subject, "_security", return_value=completed()) as security:
                 subject.restore(keychain, state, root / "home")
             self.assertEqual(security.call_args_list, [mock.call("delete-keychain", str(keychain))])
+
+    def test_creation_started_without_a_path_does_not_invent_cleanup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.write_text(json.dumps({
+                "snapshot_complete": False,
+                "keychain_creation_started": True,
+                "keychain_created": False,
+            }))
+            with mock.patch.object(subject, "_security") as security:
+                subject.restore(root / "not-created.keychain", state, root / "home")
+            security.assert_not_called()
 
     def test_unavailable_snapshot_fails_before_keychain_creation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
