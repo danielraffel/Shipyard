@@ -40,8 +40,10 @@ check names or cadence, so a repository lists its own `exclude_paths` and
 exclusions apply to every member on top of `exclude_paths`: the base's
 `[auto_merge] carry_excluded_paths`, or by default
 `DEFAULT_CARRY_EXCLUDED_PATHS` (workflows, `tools/ci/**`, `.shipyard/**`, the
-guard and arm code, signing and release automation; see
-docs/ghapp-guards.md). A member that changes one of those lands on its own,
+guard and arm code, signing and release automation), with
+`carry_excluded_paths_extra` and `carry_excluded_paths_allow` applied (see
+docs/ghapp-guards.md). The two lists are checked apart, so a carry allow
+never re-includes a path in `exclude_paths`. A member that changes one of those lands on its own,
 never in a rollup.
 
 On a host, `SHIPYARD_TRAIN=off` (or `0` or `false`), optionally scoped as

@@ -538,9 +538,26 @@ Three guardrails apply to every carry, merge-only or across a rebase:
     `.release-please-manifest.json`, `**/*codesign*`, `**/*notariz*` and
     `**/*signing*`.
 
-  The key replaces the list, so `[]` excludes nothing. A value that is not a
-  list of globs means no carry at all. In a glob, `**` is any number of whole
-  path segments, `*` any run of characters within one segment, and `?` one
+  The key replaces the list, so `[]` excludes nothing; a list that replaces
+  must restate every default it keeps. Two more keys adjust the list without
+  restating it:
+  * `carry_excluded_paths_extra` adds globs (to the defaults, or to the
+    replacing list when `carry_excluded_paths` is set);
+  * `carry_excluded_paths_allow` re-includes paths the defaults exclude. Each
+    entry is a repository path or `<directory>/**` that falls under a default
+    glob, and never one overlapping `.github/workflows/**`,
+    `.agents/contract.toml`, `.shipyard/config.toml`, `tools/ci/**`, the
+    guards and arm code, or a signing name (`**/*codesign*`, `**/*notariz*`,
+    `**/*signing*`). A signing name under an allowed directory still never
+    carries, and an allow never re-includes a rollup's own `exclude_paths`.
+    For example, `carry_excluded_paths_allow = [".shipyard/notes/**"]` lets
+    a PR changing only `.shipyard/notes/` carry while `.shipyard/config.toml`
+    still needs an exact-head verdict.
+
+  A value that is not a list of globs, a `!` entry in the first two keys, or
+  an allow entry refused by the rule above means no carry at all; the guard
+  names the refused entry. In a glob, `**` is any number of whole path
+  segments, `*` any run of characters within one segment, and `?` one
   character.
 * **`carry: no`.** An APPROVE (comment or review body) with a line
   `carry: no` approves its exact head only.

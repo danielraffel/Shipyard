@@ -256,8 +256,10 @@ in the list, and no identity can approve a PR it authored.
 A carried approval (a clean base merge, or a rebase where switched on) never
 reaches a PR touching `[auto_merge] carry_excluded_paths` (by default
 workflows, `.agents/contract.toml`, `tools/ci/**`, `.shipyard/**`, the guards
-and Shipyard's arm code, and signing and release automation), and such a PR
-never rides a rollup either. It also never reaches one whose
+and Shipyard's arm code, and signing and release automation; add with
+`carry_excluded_paths_extra`, re-include a default path other than workflows,
+`tools/ci/**`, guard, arm or signing paths with `carry_excluded_paths_allow`),
+and such a PR never rides a rollup either. It also never reaches one whose
 APPROVE has a `carry: no` line, one more than 3 base merges past its verdict,
 or one more than 48 hours after it. Those heads need a fresh exact-head
 verdict.

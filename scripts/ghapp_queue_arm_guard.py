@@ -210,8 +210,10 @@ REBASE_CARRY_LOG = "carries.jsonl"
 # Paths whose change means an approval never carries to a new head: a carry
 # must never be the way a workflow, the CI contract, the guards or Shipyard's
 # own arm code, or signing and release automation lands unreviewed. The base's
-# `[auto_merge] carry_excluded_paths` replaces the list. Same as
-# src/head_approval.rs DEFAULT_CARRY_EXCLUDED_PATHS.
+# `[auto_merge] carry_excluded_paths` replaces the list,
+# `carry_excluded_paths_extra` adds to it, and `carry_excluded_paths_allow`
+# re-includes default paths outside PROTECTED_CARRY_PATHS (see carry_paths).
+# Same as src/head_approval.rs DEFAULT_CARRY_EXCLUDED_PATHS.
 DEFAULT_CARRY_EXCLUDED_PATHS = (
     ".github/workflows/**",
     ".agents/contract.toml",
@@ -228,6 +230,29 @@ DEFAULT_CARRY_EXCLUDED_PATHS = (
     "src/app/merge_steward_cmd/native_arm*",
     "release-please-config.json",
     ".release-please-manifest.json",
+    "**/*codesign*",
+    "**/*notariz*",
+    "**/*signing*",
+)
+# Default exclusions no `carry_excluded_paths_allow` entry re-includes:
+# workflows, the CI contract, the carry policy itself, the guards and
+# Shipyard's arm code, and signing. A `**/` name glob is enforced on every match
+# (see carry_excluded) rather than when the allow list is read. Same as
+# src/head_approval.rs PROTECTED_CARRY_PATHS.
+PROTECTED_CARRY_PATHS = (
+    ".github/workflows/**",
+    ".agents/contract.toml",
+    ".shipyard/config.toml",
+    "tools/ci/**",
+    "scripts/ghapp*",
+    "src/head_approval*",
+    "src/head_approval/**",
+    "src/queue_arm_gate*",
+    "src/auto_arm*",
+    "src/auto_arm/**",
+    "src/ghapp_guards*",
+    "src/app/ship_cmd/auto_arm*",
+    "src/app/merge_steward_cmd/native_arm*",
     "**/*codesign*",
     "**/*notariz*",
     "**/*signing*",
@@ -937,15 +962,17 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
                          f"be a list of reviewer names, not {configured!r}")
     configured_signers = ([name.lower() for name in configured]
                           if configured is not None else None)
-    excluded = section.get("carry_excluded_paths")
-    if excluded is not None and not (
-            isinstance(excluded, list) and all(isinstance(path, str) for path in excluded)):
-        # Not a list of globs: no carry at all, as src/head_approval.rs reads it.
-        excluded = ["**"]
+    try:
+        excluded, carry_error = carry_paths(section), None
+    except GuardError as error:
+        # A refused configuration: no carry at all, as src/head_approval.rs reads it.
+        excluded, carry_error = ["**"], str(error)
     return {
         # Paths whose change keeps an approval from carrying (see carry_excluded).
-        "carry_excluded": (list(excluded) if excluded is not None
+        "carry_excluded": (excluded if excluded is not None
                            else list(DEFAULT_CARRY_EXCLUDED_PATHS)),
+        # Why the base's carry configuration was refused, or None.
+        "carry_error": carry_error,
         "required": required if isinstance(required, bool) else default,
         "reviewers": [str(login).lower() for login in reviewers if isinstance(login, str)],
         # Required by REVIEW_REQUIRED_REPOS, not by the repository's own key.
@@ -1472,12 +1499,90 @@ def _segment_match(pattern: str, text: str) -> bool:
 
 
 def carry_excluded(paths: set[str] | list[str], excluded: list[str]) -> str | None:
-    """Why a pull request changing ``paths`` never carries an approval, or None."""
+    """Why a pull request changing ``paths`` never carries an approval, or None.
+
+    An ``excluded`` entry starting with ``!`` is an allow (see carry_paths): a
+    path it matches carries unless a PROTECTED_CARRY_PATHS glob matches it."""
+    allowed = [pattern[1:] for pattern in excluded if pattern.startswith("!")]
+    blocked = [pattern for pattern in excluded if not pattern.startswith("!")]
     for path in sorted(paths):
-        for pattern in excluded:
-            if glob_match(pattern, path):
-                return (f"it changes {path} ({pattern}), and a change there always needs a "
-                        "verdict naming its exact head")
+        pattern = next((pattern for pattern in blocked if glob_match(pattern, path)), None)
+        if pattern is None:
+            continue
+        protected = any(glob_match(glob, path) for glob in PROTECTED_CARRY_PATHS)
+        if not protected and any(glob_match(allow, path) for allow in allowed):
+            continue
+        return (f"it changes {path} ({pattern}), and a change there always needs a "
+                "verdict naming its exact head")
+    return None
+
+
+def carry_paths(section: dict[str, Any]) -> list[str] | None:
+    """The carry exclusions an ``[auto_merge]`` table sets: None when it sets
+    none of carry_excluded_paths, carry_excluded_paths_extra and
+    carry_excluded_paths_allow. The list is carry_excluded_paths (which
+    replaces the defaults) or DEFAULT_CARRY_EXCLUDED_PATHS, then the extra
+    globs, then each allow as a ``!`` entry (see carry_excluded). Raises
+    GuardError for a value that is not a list of strings, a ``!`` outside the
+    allow list, or an allow carry_allow_error refuses. Same as
+    src/head_approval.rs ``carry_paths``."""
+    def globs(key: str) -> list[str] | None:
+        value = section.get(key)
+        if value is None:
+            return None
+        if not (isinstance(value, list) and all(isinstance(path, str) for path in value)):
+            raise GuardError(f"[auto_merge] {key} must be a list of globs")
+        return list(value)
+
+    replace = globs("carry_excluded_paths")
+    extra = globs("carry_excluded_paths_extra")
+    allow = globs("carry_excluded_paths_allow")
+    if replace is None and extra is None and allow is None:
+        return None
+    for key, paths in (("carry_excluded_paths", replace), ("carry_excluded_paths_extra", extra)):
+        bang = next((path for path in paths or [] if path.startswith("!")), None)
+        if bang is not None:
+            raise GuardError(f"[auto_merge] {key} entry {bang} may not start with !")
+    out = (replace if replace is not None else list(DEFAULT_CARRY_EXCLUDED_PATHS)) + (extra or [])
+    for entry in allow or []:
+        why = carry_allow_error(entry)
+        if why is not None:
+            raise GuardError(f"[auto_merge] carry_excluded_paths_allow entry {entry} {why}")
+        out.append(f"!{entry}")
+    return out
+
+
+def carry_allow_error(entry: str) -> str | None:
+    """Why ``entry`` may not be a carry_excluded_paths_allow entry, or None. An
+    entry is a repository path or ``<directory>/**``, under a
+    DEFAULT_CARRY_EXCLUDED_PATHS glob, and overlapping no PROTECTED_CARRY_PATHS
+    glob. A directory is not checked against a ``**/`` name glob, which
+    carry_excluded enforces under it. Same as src/head_approval.rs
+    ``carry_allow_error``."""
+    tree = entry.endswith("/**")
+    path = entry[:-3] if tree else entry
+    segments = path.split("/")
+    if any(segment in ("", ".", "..") for segment in segments) or any(
+            char in path for char in "*?[\\!"):
+        return "is not a repository path or <directory>/**"
+    ancestors = ["/".join(segments[:count]) for count in range(1, len(segments) + 1)]
+    if tree:
+        covered = any(default.endswith("/**") and any(
+            glob_match(default[:-3], ancestor) for ancestor in ancestors)
+            for default in DEFAULT_CARRY_EXCLUDED_PATHS)
+    else:
+        covered = any(glob_match(default, path) for default in DEFAULT_CARRY_EXCLUDED_PATHS)
+    if not covered:
+        return "is not under a default carry exclusion; the allow list only re-includes defaults"
+    for protected in PROTECTED_CARRY_PATHS:
+        if tree and protected.startswith("**/"):
+            continue
+        parts = protected.split("/")
+        head = parts[:len(segments)]
+        if any(glob_match(protected, ancestor) for ancestor in ancestors) or (
+                tree and len(parts) > len(segments) and "**" not in head
+                and glob_match("/".join(head), path)):
+            return f"overlaps {protected}, which always needs a verdict naming its exact head"
     return None
 
 
@@ -1843,9 +1948,9 @@ def rollup_acceptance(repo: str, number: int, head: str, pull: dict[str, Any],
                            union_sources)
     if refusal is not None:
         return refusal, members
-    excluded = list(config["exclude_paths"]) + list(
-        policy.get("carry_excluded", list(DEFAULT_CARRY_EXCLUDED_PATHS)))
-    excluded_path = carry_excluded(set(seen), excluded)
+    # Checked apart, so a carry allow never re-includes a rollup exclusion.
+    excluded_path = carry_excluded(set(seen), list(config["exclude_paths"])) or carry_excluded(
+        set(seen), list(policy.get("carry_excluded", list(DEFAULT_CARRY_EXCLUDED_PATHS))))
     if excluded_path is not None:
         return f"a rollup member cannot land this way: {excluded_path}", members
     for pattern in config["hot_files"]:
@@ -2758,7 +2863,9 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
     approved = approved_earlier_head(head, author, comments, reviews, policy)
     if approved is not None:
         excluded = policy.get("carry_excluded", list(DEFAULT_CARRY_EXCLUDED_PATHS))
-        limited = carry_limits(approved, author, comments, reviews, policy)
+        limited = (f"the base's carry configuration is refused ({policy['carry_error']})"
+                   if policy.get("carry_error")
+                   else carry_limits(approved, author, comments, reviews, policy))
         merge_record: dict[str, Any] = {}
         refusal = limited or merge_only_carry(repo, base, approved, head, excluded, merge_record)
         own = self_approval(approved, author, comments, reviews, policy)
