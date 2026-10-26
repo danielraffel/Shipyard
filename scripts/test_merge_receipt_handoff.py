@@ -113,6 +113,21 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             self.assertEqual(result.returncode, 3)
             self.assertEqual(json.loads(result.stdout)["status"], "error")
 
+    def test_check_rejects_minimal_tampered_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            handoff = root / "handoff.jsonl"
+            health = root / "handoff.health.json"
+            handoff.write_text(json.dumps({"repo": "owner/repo", "receipt_id": "tampered", "merged_at": "2026-10-26T00:00:00Z"}) + "\n")
+            health.write_text(json.dumps({
+                "schema": "shipyard-merge-receipt-handoff/v1", "repo": "owner/repo",
+                "file": str(handoff), "status": "fresh",
+                "exported_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            }))
+            result = self.invoke("check", "--file", str(handoff), "--health-file", str(health))
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("fields mismatch", json.loads(result.stdout)["error"])
+
     def test_check_rejects_sidecar_bound_to_another_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)

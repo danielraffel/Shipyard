@@ -82,6 +82,49 @@ def atomic_write(path: pathlib.Path, payload: str) -> None:
         raise
 
 
+RECEIPT_FIELDS = frozenset({
+    "schema", "receipt_id", "repo", "project", "base_branch", "pr", "head_sha",
+    "validated_head_sha", "merge_commit_sha", "merged_at", "safe_merge", "source",
+    "required_checks", "gate_receipt_sha256", "evidence",
+})
+
+
+def validate_receipt_record(value: dict[str, Any], *, line_number: int, repo: str) -> None:
+    if set(value) != RECEIPT_FIELDS:
+        missing = sorted(RECEIPT_FIELDS - set(value))
+        extra = sorted(set(value) - RECEIPT_FIELDS)
+        raise RuntimeError(f"handoff line {line_number} fields mismatch (missing={missing}, extra={extra})")
+    if value["schema"] != "shipyard-merge-receipt/v1":
+        raise RuntimeError(f"handoff line {line_number} has an unsupported receipt schema")
+    if str(value["repo"]).strip().casefold() != repo.strip().casefold():
+        raise RuntimeError(f"handoff line {line_number} names a repository other than {repo}")
+    for field in ("receipt_id", "repo", "project", "base_branch", "source", "evidence"):
+        if not isinstance(value[field], str) or not value[field].strip():
+            raise RuntimeError(f"handoff line {line_number} has an empty {field}")
+    if isinstance(value["pr"], bool) or not isinstance(value["pr"], int) or value["pr"] <= 0:
+        raise RuntimeError(f"handoff line {line_number} has an invalid pr")
+    for field in ("head_sha", "validated_head_sha", "merge_commit_sha"):
+        sha = value[field]
+        if (not isinstance(sha, str) or len(sha) != 40 or sha.lower() != sha
+                or not all(char in "0123456789abcdef" for char in sha)
+                or set(sha) == {"0"}):
+            raise RuntimeError(f"handoff line {line_number} has an invalid {field}")
+    if value["head_sha"] != value["validated_head_sha"]:
+        raise RuntimeError(f"handoff line {line_number} has a head mismatch")
+    if value["safe_merge"] is not True or value["source"] != "shipyard":
+        raise RuntimeError(f"handoff line {line_number} is not a Shipyard safe merge")
+    checks = value["required_checks"]
+    if (not isinstance(checks, list) or not checks
+            or any(not isinstance(check, str) or not check.strip() for check in checks)):
+        raise RuntimeError(f"handoff line {line_number} has no required checks")
+    digest = value["gate_receipt_sha256"]
+    if (not isinstance(digest, str) or len(digest) != 64 or digest.lower() != digest
+            or not all(char in "0123456789abcdef" for char in digest)
+            or set(digest) == {"0"}):
+        raise RuntimeError(f"handoff line {line_number} has an invalid gate receipt hash")
+    parse_timestamp(value["merged_at"], field="merged_at")
+
+
 def read_receipts(path: pathlib.Path, repo: str) -> list[dict[str, Any]]:
     try:
         text = path.read_text(encoding="utf-8")
@@ -97,11 +140,7 @@ def read_receipts(path: pathlib.Path, repo: str) -> list[dict[str, Any]]:
             raise RuntimeError(f"handoff line {line_number} is not JSON: {exc.msg}") from exc
         if not isinstance(value, dict):
             raise RuntimeError(f"handoff line {line_number} is not an object")
-        if str(value.get("repo", "")).strip().casefold() != repo.strip().casefold():
-            raise RuntimeError(f"handoff line {line_number} names a repository other than {repo}")
-        parse_timestamp(value.get("merged_at"), field="merged_at")
-        if not isinstance(value.get("receipt_id"), str) or not value["receipt_id"].strip():
-            raise RuntimeError(f"handoff line {line_number} has no receipt_id")
+        validate_receipt_record(value, line_number=line_number, repo=repo)
         records.append(value)
     if not records:
         raise RuntimeError("handoff is empty")

@@ -57,8 +57,8 @@ shipyard --state-dir "$PRODUCER_STATE_DIR" metrics export merge-receipt \
 ```
 
 Its health sidecar is checked with `python3 scripts/merge_receipt_handoff.py
-check ... --stale-after 2h`; a stale or malformed handoff is unavailable, never
-zero.
+check ... --stale-after 2h`; a stale, malformed, failed, or empty handoff is
+unavailable, never zero.
 
 The observer then passes that file as `--merge-receipts`. The export reads only
 validated receipts already persisted by Shipyard, scopes them to the exact
