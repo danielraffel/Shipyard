@@ -137,7 +137,26 @@ def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
     except (OSError, json.JSONDecodeError):
         failures.append("saved keychain state is unavailable")
 
-    if state and state.get("snapshot_complete") is True and state.get("snapshot_mode", "user") != "none":
+    if state and state.get("snapshot_complete") is True and state.get("snapshot_mode", "user") == "none":
+        user_home = _user_home()
+        verified_list = _security("list-keychains", "-d", "user", home=user_home)
+        verified_default = _security("default-keychain", "-d", "user", home=user_home)
+        if verified_list.returncode != 0:
+            failures.append("could not verify the empty user keychain search list")
+        else:
+            try:
+                actual_list = _parse_keychain_output(verified_list.stdout)
+            except RuntimeError:
+                failures.append("empty user keychain search list output was malformed")
+            else:
+                if actual_list:
+                    failures.append("user keychain search list changed during signing")
+        if not (
+            verified_default.returncode != 0
+            and "default keychain could not be found" in verified_default.stderr.lower()
+        ):
+            failures.append("user default keychain appeared during signing")
+    elif state and state.get("snapshot_complete") is True:
         search_list = state.get("search_list")
         default_keychain = state.get("default_keychain")
         if not isinstance(search_list, list) or not all(

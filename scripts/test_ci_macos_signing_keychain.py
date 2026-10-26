@@ -68,9 +68,21 @@ class SigningKeychainTests(unittest.TestCase):
             }))
             keychain = root / "ephemeral.keychain"
             keychain.touch()
-            with mock.patch.object(subject, "_security", return_value=completed()) as security:
+            responses = [
+                completed(),
+                completed(returncode=1, stderr="A default keychain could not be found."),
+                completed(),
+            ]
+            with mock.patch.object(subject, "_security", side_effect=responses) as security:
                 subject.restore(keychain, state, root / "home")
-            security.assert_called_once_with("delete-keychain", str(keychain))
+            self.assertEqual(
+                security.call_args_list,
+                [
+                    mock.call("list-keychains", "-d", "user", home=subject._user_home()),
+                    mock.call("default-keychain", "-d", "user", home=subject._user_home()),
+                    mock.call("delete-keychain", str(keychain)),
+                ],
+            )
 
     def test_default_failure_with_nonempty_search_list_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
