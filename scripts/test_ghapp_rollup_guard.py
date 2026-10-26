@@ -341,6 +341,15 @@ class RollupAcceptance(unittest.TestCase):
         # The guard's carry exclusions apply to a rollup member.
         refusal, _ = self.accept(hub, merges[-1], policy=self.policy)
         self.assertIn(".github/workflows/ci.yml", refusal)
+        # So do they for the base's own config: a member never changes the
+        # policy its rollup is judged by.
+        config = self.scratch.on(self.base, {".shipyard/config.toml": "[train]\n"})
+        merges = self.scratch.build(self.base, [config])
+        hub = Hub(self.scratch)
+        hub.pull(11, "f1", config)
+        hub.pull(20, "shipyard-train/rollup-11", merges[-1])
+        refusal, _ = self.accept(hub, merges[-1], policy=self.policy)
+        self.assertIn(".shipyard/config.toml", refusal)
 
     def test_a_fork_or_a_non_rollup_branch_is_refused(self) -> None:
         hub, _, merges = self.rollup(["a.txt"])

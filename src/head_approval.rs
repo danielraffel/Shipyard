@@ -118,6 +118,7 @@ pub const CARRY_EXCLUDED_KEY: &str = "carry_excluded_paths";
 pub const DEFAULT_CARRY_EXCLUDED_PATHS: &[&str] = &[
     ".github/workflows/**",
     ".agents/contract.toml",
+    ".shipyard/**",
     "tools/ci/**",
     "scripts/ghapp*",
     "src/head_approval*",

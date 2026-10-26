@@ -215,6 +215,7 @@ REBASE_CARRY_LOG = "carries.jsonl"
 DEFAULT_CARRY_EXCLUDED_PATHS = (
     ".github/workflows/**",
     ".agents/contract.toml",
+    ".shipyard/**",
     "tools/ci/**",
     "scripts/ghapp*",
     "src/head_approval*",
