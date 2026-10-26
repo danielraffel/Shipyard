@@ -26,4 +26,5 @@ PLIST="$HOME/Library/LaunchAgents/com.danielraffel.shipyard.merge-receipt-handof
 /usr/bin/plutil -lint "$PLIST" >/dev/null
 grep -q 'bootstrap gui/' "$TMP/launchctl.log"
 grep -q 'owner/repo' "$PLIST"
+grep -q -- '--base-branch' "$PLIST"
 echo "merge receipt handoff installer checks passed"

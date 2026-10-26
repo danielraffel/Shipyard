@@ -19,6 +19,7 @@ import subprocess
 import sqlite3
 import tempfile
 import sys
+from contextlib import contextmanager
 from typing import Any, Sequence
 
 try:
@@ -83,10 +84,39 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
         health_path = getattr(args, "merge_receipt_health", None)
         if health_path is None:
             raise RuntimeError("merge receipt health sidecar is required with --merge-receipts")
-        validate_merge_receipt_health(
+        _, handoff_payload = validate_merge_receipt_health(
             pathlib.Path(health_path).expanduser(), receipt_path, args.repo,
             getattr(args, "merge_receipt_stale_after", "2h"),
+            getattr(args, "merge_receipt_base_branch", "main"),
         )
+        with immutable_handoff_snapshot(receipt_path, handoff_payload) as snapshot:
+            return _import_organic_after_preflight(args, state_dir, snapshot)
+    return _import_organic_after_preflight(args, state_dir, None)
+
+
+@contextmanager
+def immutable_handoff_snapshot(path: pathlib.Path, payload: bytes):
+    """Give the importer a private immutable copy of the validated bytes."""
+    staged = tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=f".{path.name}.", delete=False)
+    snapshot = pathlib.Path(staged.name)
+    try:
+        staged.write(payload)
+        staged.flush()
+        os.fsync(staged.fileno())
+        os.chmod(snapshot, 0o600)
+    finally:
+        staged.close()
+    try:
+        yield snapshot
+    finally:
+        snapshot.unlink(missing_ok=True)
+
+
+def _import_organic_after_preflight(args: argparse.Namespace, state_dir: str,
+                                    receipt_snapshot: pathlib.Path | None) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    merge_receipts = getattr(args, "merge_receipts", None)
+    receipt_path = receipt_snapshot
     before = count_jobs(args.db, args.project, args.repo)
     github = run([args.shipyard, "--state-dir", state_dir, "metrics", "import", "github", "--repo", args.repo,
                   "--project", args.project, "--limit", str(args.limit), "--json"], timeout=args.timeout_seconds)
@@ -216,7 +246,7 @@ def prepare_tartci_export(text: str, repo: str, project: str) -> tuple[str, int]
 
 
 def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, repo: str,
-                                  stale_after: str) -> dict[str, Any]:
+                                  stale_after: str, base_branch: str = "main") -> tuple[dict[str, Any], bytes]:
     """Require a producer health sidecar before importing its handoff."""
     if receipt_handoff is None:
         raise RuntimeError("merge receipt health validation is unavailable")
@@ -227,12 +257,20 @@ def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, rep
         raise RuntimeError(f"merge receipt health is unreadable: {exc}") from exc
     if not isinstance(health, dict) or health.get("schema") != receipt_handoff.SCHEMA:
         raise RuntimeError("merge receipt health has an unsupported schema")
+    if set(health) - receipt_handoff.HEALTH_FIELDS:
+        raise RuntimeError("merge receipt health contains unknown fields")
     if health.get("status") != "fresh":
         raise RuntimeError(f"merge receipt health is {health.get('status', 'unknown')}")
     health_repo = health.get("repo")
     if (not isinstance(health_repo, str)
             or health_repo.strip().casefold() != repo.strip().casefold()):
         raise RuntimeError(f"merge receipt health names a repository other than {repo}")
+    if health.get("project") != repo.rsplit("/", 1)[-1]:
+        raise RuntimeError("merge receipt health project is not bound to repository")
+    if health.get("base_branch") != base_branch:
+        raise RuntimeError(f"merge receipt health base branch is not {base_branch}")
+    if health.get("freshness_basis") != "handoff_export":
+        raise RuntimeError("merge receipt health has an unsupported freshness basis")
     recorded_file = health.get("file")
     if not isinstance(recorded_file, str) or pathlib.Path(recorded_file).resolve() != handoff.resolve():
         raise RuntimeError("merge receipt health is bound to a different handoff file")
@@ -247,7 +285,8 @@ def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, rep
     if age > threshold:
         raise RuntimeError(f"merge receipt handoff is stale ({int(age)}s; threshold {threshold}s)")
     try:
-        records, payload = receipt_handoff.read_handoff(handoff, repo, now_value=checked)
+        records, payload = receipt_handoff.read_handoff(handoff, repo, base_branch=base_branch,
+                                                         now_value=checked)
     except (OSError, RuntimeError, ValueError) as exc:
         raise RuntimeError(f"merge receipt handoff failed health validation: {exc}") from exc
     if health.get("handoff_bytes") != len(payload):
@@ -267,7 +306,7 @@ def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, rep
             or not all(char in "0123456789abcdef" for char in producer_digest)
             or set(producer_digest) == {"0"}):
         raise RuntimeError("merge receipt health has an unavailable or invalid producer identity")
-    return health
+    return health, payload
 
 
 def validate_merge_receipt_scope(path: pathlib.Path, repo: str) -> None:
@@ -689,6 +728,8 @@ def main() -> int:
                         help="producer health sidecar required before importing --merge-receipts")
     parser.add_argument("--merge-receipt-stale-after", default="2h",
                         help="maximum producer handoff age when --merge-receipt-health is supplied")
+    parser.add_argument("--merge-receipt-base-branch", default="main",
+                        help="protected base branch bound to producer receipts")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--since-days", type=int, default=5)
     parser.add_argument("--collect", action="store_true", help="run provider imports")

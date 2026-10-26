@@ -6,6 +6,7 @@
 <string>@PYTHON@</string><string>@SCRIPT@</string><string>export</string>
 <string>--shipyard</string><string>@SHIPYARD@</string><string>--state-dir</string><string>@STATE_DIR@</string>
 <string>--repo</string><string>@REPO@</string><string>--file</string><string>@FILE@</string>
+<string>--base-branch</string><string>@BASE_BRANCH@</string>
 <string>--health-file</string><string>@HEALTH_FILE@</string>
 </array>
 <key>WorkingDirectory</key><string>@HOME@</string>

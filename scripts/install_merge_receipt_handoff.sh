@@ -19,24 +19,26 @@ STATE_DIR="$MANAGED_DIR"
 REPO=""
 FILE="$MANAGED_DIR/merge-receipts.jsonl"
 HEALTH_FILE="$MANAGED_DIR/merge-receipts.health.json"
+BASE_BRANCH="main"
 INTERVAL=900
 INSTALL=0
 LAUNCHCTL="${SHIPYARD_LAUNCHCTL_BIN:-/bin/launchctl}"
 PLUTIL="${SHIPYARD_PLUTIL_BIN:-/usr/bin/plutil}"
 
 usage() {
-  echo "usage: $0 --repo OWNER/REPO [--shipyard ABS] [--python ABS] [--state-dir ABS] [--file ABS] [--health-file ABS] [--interval SECONDS] [--install]"
+  echo "usage: $0 --repo OWNER/REPO [--base-branch BRANCH] [--shipyard ABS] [--python ABS] [--state-dir ABS] [--file ABS] [--health-file ABS] [--interval SECONDS] [--install]"
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo) REPO="${2:-}"; shift 2;; --shipyard) SHIPYARD="${2:-}"; shift 2;;
     --python) PYTHON="${2:-}"; shift 2;; --state-dir) STATE_DIR="${2:-}"; shift 2;;
-    --file) FILE="${2:-}"; shift 2;; --health-file) HEALTH_FILE="${2:-}"; shift 2;;
+    --file) FILE="${2:-}"; shift 2;; --health-file) HEALTH_FILE="${2:-}"; shift 2;; --base-branch) BASE_BRANCH="${2:-}"; shift 2;;
     --interval) INTERVAL="${2:-}"; shift 2;; --install) INSTALL=1; shift;;
     -h|--help) usage; exit 0;; *) echo "unknown argument: $1" >&2; usage >&2; exit 2;;
   esac
 done
 [ -n "$REPO" ] || { echo "--repo is required" >&2; usage >&2; exit 2; }
+[ -n "$BASE_BRANCH" ] || { echo "--base-branch must not be empty" >&2; exit 2; }
 case "$REPO" in */*/*|/*|*/|*\ *|"") echo "--repo must be OWNER/REPO" >&2; exit 2;; */*) ;; *) echo "--repo must be OWNER/REPO" >&2; exit 2;; esac
 case "$INTERVAL" in ''|*[!0-9]*) echo "--interval must be a positive integer" >&2; exit 2;; esac
 [ "$INTERVAL" -ge 300 ] || { echo "--interval must be at least 300 seconds" >&2; exit 2; }
@@ -49,7 +51,7 @@ done
 "$PYTHON" "$SOURCE_SCRIPT" --help >/dev/null
 for path in "$STATE_DIR" "$FILE" "$HEALTH_FILE"; do case "$path" in /*) ;; *) echo "paths must be absolute: $path" >&2; exit 2;; esac; done
 PLIST_DIR="$HOME/Library/LaunchAgents"; PLIST="$PLIST_DIR/$LABEL.plist"; LOG="$HOME/Library/Logs/shipyard-merge-receipt-handoff.log"
-echo "Shipyard merge-receipt handoff install plan:"; echo "  repo=$REPO interval=${INTERVAL}s"; echo "  shipyard=$SHIPYARD"; echo "  state_dir=$STATE_DIR"; echo "  handoff=$FILE"; echo "  health=$HEALTH_FILE"; echo "  launch_agent=$PLIST"; echo "  action=$( [ "$INSTALL" = 1 ] && echo install || echo dry-run )"
+echo "Shipyard merge-receipt handoff install plan:"; echo "  repo=$REPO base_branch=$BASE_BRANCH interval=${INTERVAL}s"; echo "  shipyard=$SHIPYARD"; echo "  state_dir=$STATE_DIR"; echo "  handoff=$FILE"; echo "  health=$HEALTH_FILE"; echo "  launch_agent=$PLIST"; echo "  action=$( [ "$INSTALL" = 1 ] && echo install || echo dry-run )"
 [ "$INSTALL" = 1 ] || exit 0
 umask 077
 mkdir -p "$PLIST_DIR" "$HOME/Library/Logs" "$MANAGED_DIR" "$(dirname "$FILE")" "$(dirname "$HEALTH_FILE")"
@@ -59,6 +61,7 @@ escape() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
 sed -e "s|@PYTHON@|$(escape "$PYTHON")|g" -e "s|@SCRIPT@|$(escape "$SCRIPT")|g" \
     -e "s|@SHIPYARD@|$(escape "$SHIPYARD")|g" -e "s|@STATE_DIR@|$(escape "$STATE_DIR")|g" \
     -e "s|@REPO@|$(escape "$REPO")|g" -e "s|@FILE@|$(escape "$FILE")|g" \
+    -e "s|@BASE_BRANCH@|$(escape "$BASE_BRANCH")|g" \
     -e "s|@HEALTH_FILE@|$(escape "$HEALTH_FILE")|g" -e "s|@INTERVAL@|$INTERVAL|g" \
     -e "s|@HOME@|$(escape "$HOME")|g" -e "s|@LOG@|$(escape "$LOG")|g" "$TEMPLATE" > "$STAGED"
 if grep -q '@[A-Z_]*@' "$STAGED"; then echo "template left an unrendered placeholder" >&2; exit 1; fi

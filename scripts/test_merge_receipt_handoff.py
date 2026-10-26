@@ -36,6 +36,20 @@ def receipt(repo: str = "owner/repo") -> dict[str, object]:
 
 
 class MergeReceiptHandoffTests(unittest.TestCase):
+    def health(self, handoff: pathlib.Path, *, now: dt.datetime | None = None, **overrides: object) -> dict[str, object]:
+        observed = now or dt.datetime.now(dt.timezone.utc)
+        payload = handoff.read_bytes()
+        value: dict[str, object] = {
+            "schema": "shipyard-merge-receipt-handoff/v1", "repo": "owner/repo", "project": "repo",
+            "base_branch": "main", "file": str(handoff), "status": "fresh",
+            "freshness_basis": "handoff_export", "checked_at": observed.isoformat().replace("+00:00", "Z"),
+            "exported_at": observed.isoformat().replace("+00:00", "Z"), "receipt_count": 1,
+            "handoff_bytes": len(payload), "handoff_sha256": hashlib.sha256(payload).hexdigest(),
+            "producer": {"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64},
+        }
+        value.update(overrides)
+        return value
+
     def fake_shipyard(self, directory: pathlib.Path, output: pathlib.Path, *, fail: bool = False, malformed: bool = False) -> pathlib.Path:
         executable = directory / "shipyard"
         body = "#!/bin/sh\n"
@@ -105,26 +119,20 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             handoff.write_text(json.dumps(receipt()) + "\n")
             now = dt.datetime.now(dt.timezone.utc)
             handoff_payload = handoff.read_bytes()
-            health.write_text(json.dumps({
-                "schema": "shipyard-merge-receipt-handoff/v1", "repo": "owner/repo",
-                "file": str(handoff), "status": "fresh", "checked_at": now.isoformat().replace("+00:00", "Z"),
-                "exported_at": now.isoformat().replace("+00:00", "Z"), "receipt_count": 1,
-                "handoff_bytes": len(handoff_payload), "handoff_sha256": hashlib.sha256(handoff_payload).hexdigest(),
-                "producer": {"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64},
-            }))
-            fresh = self.invoke("check", "--file", str(handoff), "--health-file", str(health), "--stale-after", "2h")
+            health.write_text(json.dumps(self.health(handoff, now=now)))
+            fresh = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health), "--stale-after", "2h")
             self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
             future = json.loads(health.read_text())
             future["exported_at"] = (now + dt.timedelta(hours=1)).isoformat().replace("+00:00", "Z")
             health.write_text(json.dumps(future))
-            future_result = self.invoke("check", "--file", str(handoff), "--health-file", str(health), "--stale-after", "2h")
+            future_result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health), "--stale-after", "2h")
             self.assertEqual(future_result.returncode, 3)
             self.assertIn("future", json.loads(future_result.stdout)["error"])
             bad_producer = json.loads(health.read_text())
             bad_producer["exported_at"] = now.isoformat().replace("+00:00", "Z")
             bad_producer["producer"] = {"identity": 7, "version": "shipyard 0.366.4", "executable_sha256": "a" * 64}
             health.write_text(json.dumps(bad_producer))
-            bad_result = self.invoke("check", "--file", str(handoff), "--health-file", str(health), "--stale-after", "2h")
+            bad_result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health), "--stale-after", "2h")
             self.assertEqual(bad_result.returncode, 3)
             self.assertIn("producer", json.loads(bad_result.stdout)["error"])
             old = now - dt.timedelta(hours=3)
@@ -132,7 +140,7 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             value["exported_at"] = old.isoformat().replace("+00:00", "Z")
             value["producer"] = {"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64}
             health.write_text(json.dumps(value))
-            stale = self.invoke("check", "--file", str(handoff), "--health-file", str(health), "--stale-after", "2h")
+            stale = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health), "--stale-after", "2h")
             self.assertEqual(stale.returncode, 3, stale.stdout + stale.stderr)
             self.assertEqual(json.loads(stale.stdout)["status"], "stale")
 
@@ -142,7 +150,7 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             handoff = root / "handoff.jsonl"
             health = root / "handoff.health.json"
             handoff.write_text(json.dumps(receipt("other/repo")) + "\n")
-            result = self.invoke("check", "--file", str(handoff), "--health-file", str(health))
+            result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
             self.assertEqual(result.returncode, 3)
             self.assertEqual(json.loads(result.stdout)["status"], "error")
 
@@ -155,14 +163,11 @@ class MergeReceiptHandoffTests(unittest.TestCase):
                 handoff = root / "handoff.jsonl"
                 handoff.write_text(json.dumps(receipt()) + "\n" + json.dumps(second) + "\n")
                 now = dt.datetime.now(dt.timezone.utc)
-                health.write_text(json.dumps({"schema": "shipyard-merge-receipt-handoff/v1",
-                    "repo": "owner/repo", "file": str(handoff), "status": "fresh",
-                    "exported_at": now.isoformat().replace("+00:00", "Z"),
-                    "handoff_bytes": len(handoff.read_bytes()),
-                    "handoff_sha256": hashlib.sha256(handoff.read_bytes()).hexdigest(),
-                    "receipt_count": 2,
-                    "producer": {"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64}}))
-                result = self.invoke("check", "--file", str(handoff), "--health-file", str(health))
+                sidecar = self.health(handoff, now=now, receipt_count=2)
+                sidecar["handoff_bytes"] = len(handoff.read_bytes())
+                sidecar["handoff_sha256"] = hashlib.sha256(handoff.read_bytes()).hexdigest()
+                health.write_text(json.dumps(sidecar))
+                result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
                 self.assertEqual(result.returncode, 3)
                 self.assertRegex(json.loads(result.stdout)["error"], "duplicates receipt_id|conflicts")
 
@@ -172,12 +177,9 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             handoff = root / "handoff.jsonl"
             health = root / "handoff.health.json"
             handoff.write_text(json.dumps({"repo": "owner/repo", "receipt_id": "tampered", "merged_at": "2026-10-26T00:00:00Z"}) + "\n")
-            health.write_text(json.dumps({
-                "schema": "shipyard-merge-receipt-handoff/v1", "repo": "owner/repo",
-                "file": str(handoff), "status": "fresh",
-                "exported_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
-            }))
-            result = self.invoke("check", "--file", str(handoff), "--health-file", str(health))
+            health.write_text(json.dumps(self.health(handoff)))
+            handoff.write_text(json.dumps({"repo": "owner/repo", "receipt_id": "tampered", "merged_at": "2026-10-26T00:00:00Z"}) + "\n")
+            result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
             self.assertEqual(result.returncode, 3)
             self.assertIn("fields mismatch", json.loads(result.stdout)["error"])
 
@@ -188,19 +190,34 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             other = root / "other.jsonl"
             health = root / "handoff.health.json"
             handoff.write_text(json.dumps(receipt()) + "\n")
-            health.write_text(json.dumps({
-                "schema": "shipyard-merge-receipt-handoff/v1", "repo": "owner/repo",
-                "file": str(other), "status": "fresh",
-                "exported_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
-            }))
-            result = self.invoke("check", "--file", str(handoff), "--health-file", str(health))
+            health.write_text(json.dumps(self.health(handoff, file=str(other))))
+            result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
             self.assertEqual(result.returncode, 3)
             self.assertIn("different handoff file", json.loads(result.stdout)["error"])
 
     def test_arguments_require_absolute_paths(self) -> None:
-        result = self.invoke("check", "--file", "relative", "--health-file", "/tmp/health")
+        result = self.invoke("check", "--file", "relative", "--repo", "owner/repo", "--health-file", "/tmp/health")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("absolute", result.stderr)
+
+    def test_check_rejects_unknown_health_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp); handoff = root / "handoff.jsonl"; health = root / "health.json"
+            handoff.write_text(json.dumps(receipt()) + "\n")
+            sidecar = self.health(handoff); sidecar["unexpected"] = True; health.write_text(json.dumps(sidecar))
+            result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("unknown fields", json.loads(result.stdout)["error"])
+
+    def test_check_rejects_wrong_project_or_base_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp); handoff = root / "handoff.jsonl"; health = root / "health.json"
+            handoff.write_text(json.dumps(receipt()) + "\n")
+            for field, value, message in (("project", "wrong", "project"), ("base_branch", "develop", "base branch")):
+                sidecar = self.health(handoff, **{field: value}); health.write_text(json.dumps(sidecar))
+                result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
+                self.assertEqual(result.returncode, 3)
+                self.assertIn(message, json.loads(result.stdout)["error"])
 
 
 if __name__ == "__main__":

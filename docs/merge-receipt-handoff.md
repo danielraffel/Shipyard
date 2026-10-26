@@ -11,6 +11,7 @@ python3 scripts/merge_receipt_handoff.py export \
   --shipyard "$(command -v shipyard)" \
   --state-dir "$HOME/Library/Application Support/shipyard" \
   --repo Generous-Corp/pulp \
+  --base-branch main \
   --file "$HOME/Library/Application Support/shipyard/merge-receipts.jsonl" \
   --health-file "$HOME/Library/Application Support/shipyard/merge-receipts.health.json"
 ```
@@ -38,6 +39,8 @@ A monitoring agent can fail closed when the producer stops exporting:
 ```sh
 python3 scripts/merge_receipt_handoff.py check \
   --file "$HOME/Library/Application Support/shipyard/merge-receipts.jsonl" \
+  --repo Generous-Corp/pulp \
+  --base-branch main \
   --health-file "$HOME/Library/Application Support/shipyard/merge-receipts.health.json" \
   --stale-after 2h
 ```
@@ -48,3 +51,8 @@ The baseline collector requires and verifies this sidecar when
 `--merge-receipt-health` is supplied, preserving an unavailable denominator
 instead of importing stale data. This status is observational only;
 it cannot authorize, undo, or infer a merge.
+
+The producer and observer bind each receipt to the explicit protected base
+branch (default `main`) and repository basename. Freshness measures the time
+since the handoff export (`freshness_basis=handoff_export`), not the age of a
+historical receipt.

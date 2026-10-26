@@ -23,7 +23,13 @@ from typing import Any
 SCHEMA = "shipyard-merge-receipt-handoff/v1"
 EXIT_STALE = 3
 MAX_FUTURE_SKEW_SECS = 300
+DEFAULT_BASE_BRANCH = "main"
 _REPO = re.compile(r"^[^/\s]+/[^/\s]+$")
+HEALTH_FIELDS = frozenset({
+    "schema", "repo", "project", "base_branch", "file", "status", "checked_at",
+    "exported_at", "latest_merged_at", "freshness_basis", "receipt_count",
+    "handoff_bytes", "handoff_sha256", "producer", "error",
+})
 
 
 def now() -> dt.datetime:
@@ -91,7 +97,9 @@ RECEIPT_FIELDS = frozenset({
 })
 
 
-def validate_receipt_record(value: dict[str, Any], *, line_number: int, repo: str, now_value: dt.datetime | None = None) -> None:
+def validate_receipt_record(value: dict[str, Any], *, line_number: int, repo: str,
+                            base_branch: str = DEFAULT_BASE_BRANCH,
+                            now_value: dt.datetime | None = None) -> None:
     if set(value) != RECEIPT_FIELDS:
         missing = sorted(RECEIPT_FIELDS - set(value))
         extra = sorted(set(value) - RECEIPT_FIELDS)
@@ -100,6 +108,11 @@ def validate_receipt_record(value: dict[str, Any], *, line_number: int, repo: st
         raise RuntimeError(f"handoff line {line_number} has an unsupported receipt schema")
     if str(value["repo"]).strip().casefold() != repo.strip().casefold():
         raise RuntimeError(f"handoff line {line_number} names a repository other than {repo}")
+    expected_project = repo.rsplit("/", 1)[-1].strip().casefold()
+    if not isinstance(value["project"], str) or value["project"].strip().casefold() != expected_project:
+        raise RuntimeError(f"handoff line {line_number} project is not bound to repository {repo}")
+    if value["base_branch"] != base_branch:
+        raise RuntimeError(f"handoff line {line_number} base_branch is not {base_branch}")
     for field in ("receipt_id", "repo", "project", "base_branch", "source", "evidence"):
         if not isinstance(value[field], str) or not value[field].strip():
             raise RuntimeError(f"handoff line {line_number} has an empty {field}")
@@ -129,7 +142,8 @@ def validate_receipt_record(value: dict[str, Any], *, line_number: int, repo: st
         raise RuntimeError(f"handoff line {line_number} merged_at is in the future")
 
 
-def read_handoff(path: pathlib.Path, repo: str, *, now_value: dt.datetime | None = None) -> tuple[list[dict[str, Any]], bytes]:
+def read_handoff(path: pathlib.Path, repo: str, *, base_branch: str = DEFAULT_BASE_BRANCH,
+                 now_value: dt.datetime | None = None) -> tuple[list[dict[str, Any]], bytes]:
     try:
         payload = path.read_bytes()
         text = payload.decode("utf-8")
@@ -147,7 +161,8 @@ def read_handoff(path: pathlib.Path, repo: str, *, now_value: dt.datetime | None
             raise RuntimeError(f"handoff line {line_number} is not JSON: {exc.msg}") from exc
         if not isinstance(value, dict):
             raise RuntimeError(f"handoff line {line_number} is not an object")
-        validate_receipt_record(value, line_number=line_number, repo=repo, now_value=now_value)
+        validate_receipt_record(value, line_number=line_number, repo=repo, base_branch=base_branch,
+                                now_value=now_value)
         receipt_id = value["receipt_id"]
         if receipt_id in seen_ids:
             raise RuntimeError(f"handoff line {line_number} duplicates receipt_id {receipt_id}")
@@ -164,8 +179,9 @@ def read_handoff(path: pathlib.Path, repo: str, *, now_value: dt.datetime | None
     return records, payload
 
 
-def read_receipts(path: pathlib.Path, repo: str, *, now_value: dt.datetime | None = None) -> list[dict[str, Any]]:
-    return read_handoff(path, repo, now_value=now_value)[0]
+def read_receipts(path: pathlib.Path, repo: str, *, base_branch: str = DEFAULT_BASE_BRANCH,
+                  now_value: dt.datetime | None = None) -> list[dict[str, Any]]:
+    return read_handoff(path, repo, base_branch=base_branch, now_value=now_value)[0]
 
 
 def payload_digest(payload: bytes) -> str:
@@ -186,6 +202,7 @@ def producer_identity(shipyard: pathlib.Path) -> dict[str, str]:
 
 
 def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
+                   base_branch: str = DEFAULT_BASE_BRANCH,
                    status: str, exported_at: dt.datetime | None = None,
                    receipts: list[dict[str, Any]] | None = None,
                    payload: bytes | None = None, producer: dict[str, str] | None = None,
@@ -193,8 +210,11 @@ def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
     payload: dict[str, Any] = {
         "schema": SCHEMA,
         "repo": repo,
+        "project": repo.rsplit("/", 1)[-1],
+        "base_branch": base_branch,
         "file": str(file),
         "status": status,
+        "freshness_basis": "handoff_export",
         "checked_at": timestamp(checked_at),
         "receipt_count": len(receipts or []),
         "handoff_bytes": len(payload) if payload is not None else None,
@@ -240,9 +260,11 @@ def export(args: argparse.Namespace) -> int:
             error = detail[-1] if detail else f"Shipyard export exited {completed.returncode}"
             raise RuntimeError(error)
         exported = now()
-        receipts, payload = read_handoff(staged_path, args.repo, now_value=exported)
+        receipts, payload = read_handoff(staged_path, args.repo, base_branch=args.base_branch,
+                                         now_value=exported)
         producer = producer_identity(shipyard)
-        health = health_payload(repo=args.repo, file=file, checked_at=exported, status="fresh",
+        health = health_payload(repo=args.repo, file=file, base_branch=args.base_branch,
+                                checked_at=exported, status="fresh",
                                 exported_at=exported, receipts=receipts, payload=payload,
                                 producer=producer)
         # Validation completed against the staged payload; publish only after
@@ -276,6 +298,8 @@ def check(args: argparse.Namespace) -> int:
     threshold = parse_duration(args.stale_after)
     checked = now()
     try:
+        if not _REPO.fullmatch(args.repo):
+            raise RuntimeError("requested repository must be OWNER/REPO")
         health = json.loads(health_file.read_text(encoding="utf-8"))
         if not isinstance(health, dict) or health.get("schema") != SCHEMA:
             raise RuntimeError("health sidecar has an unsupported schema")
@@ -284,10 +308,21 @@ def check(args: argparse.Namespace) -> int:
         repo = health.get("repo")
         if not isinstance(repo, str) or not _REPO.fullmatch(repo):
             raise RuntimeError("health sidecar has no valid repo")
+        if repo.casefold() != args.repo.casefold():
+            raise RuntimeError("health sidecar repository does not match requested repository")
+        if health.get("project") != repo.rsplit("/", 1)[-1]:
+            raise RuntimeError("health sidecar project is not bound to repository")
         recorded_file = health.get("file")
         if not isinstance(recorded_file, str) or pathlib.Path(recorded_file).resolve() != file.resolve():
             raise RuntimeError("health sidecar is bound to a different handoff file")
-        records, handoff_payload = read_handoff(file, repo, now_value=checked)
+        if set(health) - HEALTH_FIELDS:
+            raise RuntimeError("health sidecar contains unknown fields")
+        if health.get("freshness_basis") != "handoff_export":
+            raise RuntimeError("health sidecar has an unsupported freshness basis")
+        expected_base = health.get("base_branch")
+        if not isinstance(expected_base, str) or expected_base != args.base_branch:
+            raise RuntimeError("health sidecar base branch does not match requested base")
+        records, handoff_payload = read_handoff(file, repo, base_branch=expected_base, now_value=checked)
         exported_at = parse_timestamp(health.get("exported_at"), field="exported_at")
         if exported_at > checked + dt.timedelta(seconds=MAX_FUTURE_SKEW_SECS):
             raise RuntimeError("health sidecar exported_at is in the future")
@@ -333,12 +368,15 @@ def parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--shipyard", type=pathlib.Path, required=True)
     export_parser.add_argument("--state-dir", type=pathlib.Path, required=True)
     export_parser.add_argument("--repo", required=True)
+    export_parser.add_argument("--base-branch", default=DEFAULT_BASE_BRANCH)
     export_parser.add_argument("--file", type=pathlib.Path, required=True)
     export_parser.add_argument("--health-file", type=pathlib.Path, required=True)
     export_parser.add_argument("--timeout-seconds", type=int, default=300)
     export_parser.set_defaults(handler=export)
     check_parser = commands.add_parser("check", help="check a handoff and its producer health sidecar")
     check_parser.add_argument("--file", type=pathlib.Path, required=True)
+    check_parser.add_argument("--repo", required=True)
+    check_parser.add_argument("--base-branch", default=DEFAULT_BASE_BRANCH)
     check_parser.add_argument("--health-file", type=pathlib.Path, required=True)
     check_parser.add_argument("--stale-after", default="2h")
     check_parser.set_defaults(handler=check)
