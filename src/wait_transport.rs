@@ -744,7 +744,19 @@ fn annotate_required_checks(
         },
     );
 
-    for (name, entries) in materialized_by_name.iter_mut() {
+    // The materialized endpoint intentionally omits producer identity. When
+    // policy names the same context for more than one producer, a successful
+    // row cannot be assigned to either producer safely: two successes may be
+    // two attempts from one app, while the other app is still pending or
+    // failed. Keep those rows as blockers below and synthesize PENDING for
+    // every policy entry in the ambiguous context.
+    let ambiguous_contexts: BTreeSet<String> = policy_app_ids_by_context
+        .iter()
+        .filter(|(_, app_ids)| app_ids.len() > 1)
+        .map(|(context, _)| (*context).to_owned())
+        .collect();
+
+    for (name, entries) in &mut materialized_by_name {
         let has_success = entries.iter().any(|entry| {
             entry
                 .get("state")
@@ -769,9 +781,13 @@ fn annotate_required_checks(
     }
 
     for required in policy {
-        let observed = materialized_by_name
-            .get_mut(&required.context)
-            .and_then(Vec::pop);
+        let observed = if ambiguous_contexts.contains(&required.context) {
+            None
+        } else {
+            materialized_by_name
+                .get_mut(&required.context)
+                .and_then(Vec::pop)
+        };
         let state = observed
             .as_ref()
             .and_then(|entry| entry.get("state"))
@@ -2186,9 +2202,65 @@ mod tests {
         );
 
         let rollup = snapshot["statusCheckRollup"].as_array().expect("rollup");
-        assert_eq!(rollup.len(), 2);
+        assert_eq!(rollup.len(), 4);
+        let policy_rows: Vec<&Value> = rollup
+            .iter()
+            .filter(|entry| entry.get("app_id").and_then(Value::as_u64).is_some())
+            .collect();
+        assert_eq!(policy_rows.len(), 2);
+        assert!(policy_rows.iter().all(|entry| entry["state"] == "PENDING"));
         assert!(rollup.iter().any(|entry| entry["state"] == "SKIPPED"));
         assert!(rollup.iter().any(|entry| entry["state"] == "SUCCESS"));
+    }
+
+    #[test]
+    fn required_check_annotation_does_not_assign_duplicate_successes_to_distinct_apps() {
+        let mut snapshot = serde_json::json!({"statusCheckRollup": []});
+        annotate_required_checks(
+            &mut snapshot,
+            &[
+                RequiredCheck {
+                    context: "shared".to_owned(),
+                    app_id: Some(10),
+                },
+                RequiredCheck {
+                    context: "shared".to_owned(),
+                    app_id: Some(11),
+                },
+            ],
+            &[
+                serde_json::json!({
+                    "name": "shared",
+                    "state": "SUCCESS",
+                    "bucket": "pass",
+                    "link": "https://github.test/check/one"
+                }),
+                serde_json::json!({
+                    "name": "shared",
+                    "state": "SUCCESS",
+                    "bucket": "pass",
+                    "link": "https://github.test/check/two"
+                }),
+            ],
+        );
+
+        let rollup = snapshot["statusCheckRollup"].as_array().expect("rollup");
+        // Neither app can be credited with an identity-free success. The two
+        // original successes remain as unassigned required blockers, while
+        // both policy entries stay pending.
+        assert_eq!(rollup.len(), 4);
+        let policy_rows: Vec<&Value> = rollup
+            .iter()
+            .filter(|entry| entry.get("app_id").and_then(Value::as_u64).is_some())
+            .collect();
+        assert_eq!(policy_rows.len(), 2);
+        assert!(policy_rows.iter().all(|entry| entry["state"] == "PENDING"));
+        assert!(
+            rollup
+                .iter()
+                .filter(|entry| entry.get("app_id").is_some_and(Value::is_null))
+                .all(|entry| entry["state"] == "SUCCESS")
+        );
     }
 
     #[test]
