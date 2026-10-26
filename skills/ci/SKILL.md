@@ -1592,6 +1592,8 @@ flag, translated to native `--clobber` only after those checks; native
 the privileged grammar.
 The local macOS release script calls `ghapp` for both signed-asset and
 checksum uploads; native `gh` rejects the wrapper-only replacement flag.
+It resolves the absolute wrapper from the runner process account's home, not
+an inherited `HOME` that may point at another user's private checkout.
 
 ## Supervised-Push Signal (`SHIPYARD_PR_RUNNING=1`)
 

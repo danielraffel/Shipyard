@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 import shutil
 import stat
 import subprocess
@@ -21,6 +22,7 @@ import release_env
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO = "danielraffel/Shipyard"
+GHAPP_PATH = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local" / "bin" / "ghapp"
 DEFAULT_LOCAL_ENV_FILES = (
     Path.home() / ".config" / "pulp" / "secrets" / "keychain.env",
     Path.home() / ".config" / "pulp" / "secrets" / "notary.env",
@@ -123,6 +125,16 @@ def ci_prepared_signing_keychain() -> bool:
         os.environ.get("CI") == "true"
         and os.environ.get("SHIPYARD_SIGNING_KEYCHAIN_READY") == "1"
     )
+
+
+def require_ghapp() -> str:
+    """Return the installed App wrapper for the account running this process."""
+    if not GHAPP_PATH.is_file() or not os.access(GHAPP_PATH, os.X_OK):
+        raise SystemExit(
+            "the installed ghapp wrapper is missing or not executable for the "
+            f"release runner account: {GHAPP_PATH}"
+        )
+    return str(GHAPP_PATH)
 
 
 def resolve_environment_files(requested: list[Path]) -> list[Path]:
@@ -307,9 +319,10 @@ def upload_artifact_and_checksums(
     artifact: Path,
     runner: CommandRunner,
 ) -> Path:
+    ghapp = require_ghapp()
     runner.run(
         [
-            "ghapp",
+            ghapp,
             "release",
             "upload",
             "--repo",
@@ -322,7 +335,7 @@ def upload_artifact_and_checksums(
     checksums = merge_release_checksum(config, artifact, runner)
     runner.run(
         [
-            "ghapp",
+            ghapp,
             "release",
             "upload",
             "--repo",
