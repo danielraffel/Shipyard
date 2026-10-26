@@ -125,6 +125,11 @@ struct RepoReport {
     stale_pr_run_wedge: StalePrRunWedgeRepoStatus,
     native_auto_merge_backstop: native_arm::NativeArmRepoStatus,
     errors: Vec<String>,
+    /// Members of rollups that landed lately (merge queue included), closed
+    /// or left open ([`crate::rollup::reconcile`]). Absent unless the base
+    /// takes rollups.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rollup_reconciliation: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1127,6 +1132,9 @@ pub(super) fn steward_command<W: Write>(
                 if let Some(cancellations) = recovery_cancellations.remove(&observation.repo) {
                     report.cancellations.extend(cancellations);
                 }
+                if args.apply {
+                    reconcile_rollups(actions, &observation.repo, &args.base, &mut report);
+                }
                 remaining_preemptions = remaining_preemptions.saturating_sub(planned_preemptions);
                 unhealthy |= failed || !report.errors.is_empty();
                 reports.push(report);
@@ -1162,6 +1170,19 @@ pub(super) fn steward_command<W: Write>(
     })
 }
 
+/// Close the members of rollups that landed on `base` lately, however they
+/// landed ([`crate::rollup::reconcile_if_enabled`]); nothing on a base that
+/// does not take rollups.
+fn reconcile_rollups(actions: &GitHubActions, repo: &str, base: &str, report: &mut RepoReport) {
+    let run_gh = |gh_args: &[String]| actions.run_gh(gh_args).map_err(|error| error.to_string());
+    match crate::rollup::reconcile_if_enabled(&run_gh, repo, base, chrono::Utc::now()) {
+        Ok(lines) => report.rollup_reconciliation = lines,
+        Err(error) => report
+            .errors
+            .push(format!("rollup reconciliation: {error}")),
+    }
+}
+
 fn unreadable_repo_report(
     repo: &str,
     base: &str,
@@ -1169,6 +1190,7 @@ fn unreadable_repo_report(
     error: String,
 ) -> RepoReport {
     RepoReport {
+        rollup_reconciliation: Vec::new(),
         repo: repo.to_owned(),
         base: base.to_owned(),
         allow_auto_merge: false,
@@ -1240,6 +1262,7 @@ fn append_unmatched_recovery_errors(
             .find(|pending| pending.repo == repo)
             .map_or_else(|| default_base.to_owned(), |pending| pending.base.clone());
         reports.push(RepoReport {
+            rollup_reconciliation: Vec::new(),
             repo: repo.clone(),
             base,
             allow_auto_merge: false,
@@ -1271,6 +1294,7 @@ fn persist_final_ledger(
         report.errors.push(message);
     } else {
         reports.push(RepoReport {
+            rollup_reconciliation: Vec::new(),
             repo: "steward".to_owned(),
             base: base.to_owned(),
             allow_auto_merge: false,

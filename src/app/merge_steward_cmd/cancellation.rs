@@ -206,6 +206,7 @@ pub(super) fn apply_repo_plan(
     }
     (
         RepoReport {
+            rollup_reconciliation: Vec::new(),
             repo: observation.repo.clone(),
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,

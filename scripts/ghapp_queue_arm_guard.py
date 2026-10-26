@@ -1793,6 +1793,12 @@ def rollup_acceptance(repo: str, number: int, head: str, pull: dict[str, Any],
     previous = base_sha
     for merge, member_head in links:
         pulls = run_real_gh(["api", f"repos/{repo}/commits/{member_head}/pulls"])
+        drafts = [item.get("number") for item in pulls or [] if isinstance(item, dict)
+                  and item.get("state") == "open" and item.get("draft") is True
+                  and str((item.get("head") or {}).get("sha") or "").lower() == member_head
+                  ] if isinstance(pulls, list) else []
+        if drafts:
+            return f"member #{drafts[0]} is a draft; a draft never joins a rollup", members
         open_heads = [item.get("number") for item in pulls or [] if isinstance(item, dict)
                       and item.get("state") == "open"
                       and str((item.get("head") or {}).get("sha") or "").lower() == member_head

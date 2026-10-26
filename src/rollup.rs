@@ -449,9 +449,25 @@ fn member_pr(
         run_gh,
         &api(
             format!("repos/{repo}/commits/{head}/pulls"),
-            "[.[] | {number, state, sha: .head.sha, base: .base.ref}]",
+            "[.[] | {number, state, draft, sha: .head.sha, base: .base.ref}]",
         ),
     )?;
+    if let Some(draft) = value.as_array().into_iter().flatten().find(|pull| {
+        pull.get("draft").and_then(Value::as_bool) == Some(true)
+            && pull.get("state").and_then(Value::as_str) == Some("open")
+            && pull
+                .get("sha")
+                .and_then(Value::as_str)
+                .is_some_and(|sha| sha.eq_ignore_ascii_case(head))
+    }) {
+        return Err(format!(
+            "member #{} is a draft; a draft never joins a rollup",
+            draft
+                .get("number")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        ));
+    }
     let open: Vec<u64> = value
         .as_array()
         .into_iter()
@@ -847,47 +863,63 @@ pub fn merge_method_refusal(
     }
 }
 
-/// The base's required check names (rulesets and branch protection).
+/// One required check: its name, and the GitHub App that must report it
+/// when the rule names one.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct RequiredCheck {
+    /// The check's name.
+    pub context: String,
+    /// The App the rule binds it to (a ruleset's `integration_id`, branch
+    /// protection's `app_id`), when it binds one.
+    pub app_id: Option<u64>,
+}
+
+fn required_from(value: &Value, app_key: &str) -> Vec<RequiredCheck> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|check| {
+            Some(RequiredCheck {
+                context: check.get("context")?.as_str()?.to_owned(),
+                app_id: check.get(app_key).and_then(Value::as_u64),
+            })
+        })
+        .collect()
+}
+
+/// The base's required checks (rulesets and branch protection), with the
+/// App each is bound to.
 ///
 /// # Errors
 ///
 /// When the rules cannot be read.
-pub fn required_checks(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<Vec<String>, String> {
-    let mut names = BTreeSet::new();
+pub fn required_checks(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+) -> Result<Vec<RequiredCheck>, String> {
+    let mut checks = BTreeSet::new();
     let rules = gh_json(
         run_gh,
         &api(
             format!("repos/{repo}/rules/branches/{}", encode_path_segment(base)),
             "[.[] | select(.type == \"required_status_checks\") | \
-             .parameters.required_status_checks[].context]",
+             .parameters.required_status_checks[] | {context, integration_id}]",
         ),
     )?;
-    names.extend(
-        rules
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_owned),
-    );
+    checks.extend(required_from(&rules, "integration_id"));
     match run_gh(&api(
         format!(
             "repos/{repo}/branches/{}/protection/required_status_checks",
             encode_path_segment(base)
         ),
-        "[.contexts[]]",
+        "[(.checks // [])[] | {context, app_id}]",
     )) {
         Ok(raw) => {
             let value: Value = serde_json::from_str(raw.trim())
                 .map_err(|error| format!("invalid JSON: {error}"))?;
-            names.extend(
-                value
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned),
-            );
+            checks.extend(required_from(&value, "app_id"));
         }
         Err(detail) if detail.contains("404") || detail.contains("Not Found") => {}
         Err(detail) => {
@@ -896,10 +928,16 @@ pub fn required_checks(run_gh: RunGh<'_>, repo: &str, base: &str) -> Result<Vec<
             ));
         }
     }
-    Ok(names.into_iter().collect())
+    Ok(checks.into_iter().collect())
 }
 
 /// Why the required checks have not all passed on `head`, or `None`.
+///
+/// Each required check counts only as a check run: the latest one with its
+/// name, from the App the rule binds it to when it binds one, completed as
+/// success, neutral or skipped. A commit status never counts, because any
+/// token with `statuses: write`, a pull request's own workflow included, can
+/// post one under any name.
 ///
 /// # Errors
 ///
@@ -908,7 +946,7 @@ pub fn checks_refusal(
     run_gh: RunGh<'_>,
     repo: &str,
     head: &str,
-    required: &[String],
+    required: &[RequiredCheck],
 ) -> Result<Option<String>, String> {
     if required.is_empty() {
         return Ok(Some(
@@ -921,32 +959,36 @@ pub fn checks_refusal(
         run_gh,
         &api(
             format!("repos/{repo}/commits/{head}/check-runs?per_page=100"),
-            "[.check_runs[] | {name, status, conclusion}]",
+            "[.check_runs[] | {id, name, status, conclusion, app: .app.id}]",
         ),
     )?;
-    let statuses = gh_json(
-        run_gh,
-        &api(
-            format!("repos/{repo}/commits/{head}/status"),
-            "[.statuses[] | {context, state}]",
-        ),
-    )?;
-    for name in required {
-        let run_passed = runs.as_array().into_iter().flatten().any(|run| {
-            run.get("name").and_then(Value::as_str) == Some(name)
-                && run.get("status").and_then(Value::as_str) == Some("completed")
+    for check in required {
+        let latest = runs
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|run| {
+                run.get("name").and_then(Value::as_str) == Some(check.context.as_str())
+                    && check
+                        .app_id
+                        .is_none_or(|app| run.get("app").and_then(Value::as_u64) == Some(app))
+            })
+            .max_by_key(|run| run.get("id").and_then(Value::as_u64));
+        let passed = latest.is_some_and(|run| {
+            run.get("status").and_then(Value::as_str) == Some("completed")
                 && matches!(
                     run.get("conclusion").and_then(Value::as_str),
                     Some("success" | "neutral" | "skipped")
                 )
         });
-        let status_passed = statuses.as_array().into_iter().flatten().any(|status| {
-            status.get("context").and_then(Value::as_str) == Some(name)
-                && status.get("state").and_then(Value::as_str) == Some("success")
-        });
-        if !run_passed && !status_passed {
+        if !passed {
+            let from = check
+                .app_id
+                .map_or_else(String::new, |app| format!(" from App {app}"));
             return Ok(Some(format!(
-                "required check {name} has not passed on the rollup head {}",
+                "required check {}{from} has not passed as a check run on the rollup head {} \
+                 (a commit status does not count)",
+                check.context,
                 short(head)
             )));
         }
@@ -971,9 +1013,23 @@ pub fn tested_record(repo: &str, rollup: &Rollup) -> Value {
     })
 }
 
+/// What a direct landing merged.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Landed {
+    /// The merge commit on the base.
+    pub merge_commit: String,
+    /// Set when the merge commit's first parent is not the base commit the
+    /// rollup was tested on: the base moved between the re-read and the
+    /// merge, so what landed was never tested as a whole.
+    pub untested: Option<String>,
+}
+
 /// Land an accepted rollup directly: record what was tested, re-read the
 /// base and refuse on any move, then merge the pull request with its head
-/// bound and the merge method MERGE. Returns the merge commit.
+/// bound and the merge method MERGE. Afterwards the merge commit's first
+/// parent must be that re-read tip; when it is not, the base moved in
+/// between, so the landing is recorded as untested and announced on the
+/// rollup pull request.
 ///
 /// The merge goes through `run_gh`, so the guard judges it like any other
 /// landing. Nothing here pushes to the base.
@@ -986,7 +1042,7 @@ pub fn land_direct(
     repo: &str,
     rollup: &Rollup,
     record: &mut dyn FnMut(&Value) -> Result<(), String>,
-) -> Result<String, String> {
+) -> Result<Landed, String> {
     record(&tested_record(repo, rollup))?;
     let tip = base_tip(run_gh, repo, &rollup.base)?;
     if tip != rollup.base_sha {
@@ -1014,15 +1070,73 @@ pub fn land_direct(
     if merged.get("merged").and_then(Value::as_bool) != Some(true) {
         return Err(format!("GitHub did not merge PR #{}: {merged}", rollup.pr));
     }
-    merged
+    let merge_commit = merged
         .get("sha")
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| "GitHub's merge answer names no commit".to_owned())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| "GitHub's merge answer names no commit".to_owned())?;
+    let landed_on = parents(run_gh, repo, &merge_commit)?;
+    let untested = match landed_on.as_slice() {
+        [first, second] if *first == tip && second.eq_ignore_ascii_case(&rollup.head) => None,
+        _ => Some(format!(
+            "merge commit {} has parents {:?}, not [{}, {}]: the base moved between the re-read \
+             and the merge, so the landed tree was never tested as a whole",
+            short(&merge_commit),
+            landed_on.iter().map(|sha| short(sha)).collect::<Vec<_>>(),
+            short(&tip),
+            short(&rollup.head)
+        )),
+    };
+    if let Some(why) = &untested {
+        let mut alert = tested_record(repo, rollup);
+        alert["untested"] = Value::Bool(true);
+        alert["merge_commit"] = Value::String(merge_commit.clone());
+        alert["landed_on"] = serde_json::json!(landed_on);
+        alert["why"] = Value::String(why.clone());
+        record(&alert)?;
+        run_gh(&[
+            "api".to_owned(),
+            "-X".to_owned(),
+            "POST".to_owned(),
+            format!("repos/{repo}/issues/{}/comments", rollup.pr),
+            "-f".to_owned(),
+            format!(
+                "body=**Untested landing.** This rollup landed as {merge_commit}, but {why}. \
+                 Run the base's full checks on {} now.",
+                rollup.base
+            ),
+        ])?;
+    }
+    Ok(Landed {
+        merge_commit,
+        untested,
+    })
 }
 
-/// Close each member GitHub did not mark merged, saying which merge commit
-/// landed it. Returns the members closed.
+/// How long [`close_landed_members`] lets GitHub mark members merged itself.
+pub const MERGED_SETTLE: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// One landed member to reconcile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LandedMember {
+    /// The member pull request.
+    pub pr: u64,
+    /// Its head the rollup merged.
+    pub head: String,
+    /// The rollup's merge commit of that head.
+    pub merge: String,
+}
+
+/// The members [`close_landed_members`] closed, and each it left open with why.
+pub type Reconciled = (Vec<u64>, Vec<(u64, String)>);
+
+/// After a rollup landed, close each member GitHub did not mark merged,
+/// saying which merge commit landed it. `settle` is asked while a member is
+/// still open and unmarked: it waits and returns `true` to read again, or
+/// `false` once [`MERGED_SETTLE`] has passed. A member is closed only when
+/// its exact head is proven on the base (`compare <base>...<head>` is
+/// `ahead_by` 0); an unreachable head is never closed. Returns the members
+/// closed and, for each left open, why.
 ///
 /// # Errors
 ///
@@ -1030,10 +1144,12 @@ pub fn land_direct(
 pub fn close_landed_members(
     run_gh: RunGh<'_>,
     repo: &str,
-    rollup: &Rollup,
-) -> Result<Vec<u64>, String> {
-    let mut closed = Vec::new();
-    for member in &rollup.members {
+    base: &str,
+    rollup_pr: u64,
+    members: &[LandedMember],
+    settle: &mut dyn FnMut() -> bool,
+) -> Result<Reconciled, String> {
+    let open = |member: &LandedMember| -> Result<bool, String> {
         let state = gh_json(
             run_gh,
             &api(
@@ -1041,9 +1157,40 @@ pub fn close_landed_members(
                 "{state, merged}",
             ),
         )?;
-        if state.get("merged").and_then(Value::as_bool) == Some(true)
-            || state.get("state").and_then(Value::as_str) != Some("open")
-        {
+        Ok(state.get("merged").and_then(Value::as_bool) != Some(true)
+            && state.get("state").and_then(Value::as_str) == Some("open"))
+    };
+    let mut pending: Vec<&LandedMember> = Vec::new();
+    for member in members {
+        if open(member)? {
+            pending.push(member);
+        }
+    }
+    while !pending.is_empty() && settle() {
+        let mut still = Vec::new();
+        for member in pending {
+            if open(member)? {
+                still.push(member);
+            }
+        }
+        pending = still;
+    }
+    let mut closed = Vec::new();
+    let mut left = Vec::new();
+    for member in pending {
+        let ahead = run_gh(&api(
+            format!("repos/{repo}/compare/{base}...{}", member.head),
+            ".ahead_by",
+        ))?;
+        if ahead.trim() != "0" {
+            left.push((
+                member.pr,
+                format!(
+                    "its head {} is not on {base} ({} commits ahead); never closed unproven",
+                    short(&member.head),
+                    ahead.trim()
+                ),
+            ));
             continue;
         }
         run_gh(&[
@@ -1053,8 +1200,8 @@ pub fn close_landed_members(
             format!("repos/{repo}/issues/{}/comments", member.pr),
             "-f".to_owned(),
             format!(
-                "body=Landed via rollup #{} (merge commit {} of head {}).",
-                rollup.pr, member.merge, member.head
+                "body=Landed via rollup #{rollup_pr} (merge commit {} of head {}).",
+                member.merge, member.head
             ),
         ])?;
         run_gh(&[
@@ -1067,7 +1214,157 @@ pub fn close_landed_members(
         ])?;
         closed.push(member.pr);
     }
-    Ok(closed)
+    Ok((closed, left))
+}
+
+/// The members a landed rollup head merged, read from its commits: walking
+/// the first-parent chain from `head`, each two-parent rollup merge whose
+/// second parent is the head of a pull request on `base`, at most
+/// [`MEMBER_CAP`]. The walk stops at the first commit that is not one.
+/// Nothing here trusts the notice comment; [`close_landed_members`] still
+/// proves each head is on the base before closing anything.
+///
+/// # Errors
+///
+/// When a commit or its pull requests cannot be read.
+pub fn landed_members(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    rollup_pr: u64,
+    head: &str,
+) -> Result<Vec<LandedMember>, String> {
+    let mut found = Vec::new();
+    let mut sha = head.to_ascii_lowercase();
+    while found.len() < MEMBER_CAP {
+        let parents = parents(run_gh, repo, &sha)?;
+        let [first, member] = parents.as_slice() else {
+            break;
+        };
+        // The pull request whose head this is, in any state: GitHub may
+        // already have marked it merged.
+        let pulls = gh_json(
+            run_gh,
+            &api(
+                format!("repos/{repo}/commits/{member}/pulls"),
+                "[.[] | {number, sha: .head.sha, base: .base.ref}]",
+            ),
+        )?;
+        let Some(pr) = pulls
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|pull| {
+                pull.get("sha")
+                    .and_then(Value::as_str)
+                    .is_some_and(|sha| sha.eq_ignore_ascii_case(member))
+                    && pull.get("base").and_then(Value::as_str) == Some(base)
+            })
+            .filter_map(|pull| pull.get("number").and_then(Value::as_u64))
+            .find(|number| *number != rollup_pr)
+        else {
+            break;
+        };
+        // Only the merges `build_commits` wrote: the walk ends at the base
+        // commit the rollup was formed on, never in older history.
+        let message = run_gh(&api(
+            format!("repos/{repo}/commits/{sha}"),
+            ".commit.message",
+        ))?;
+        if !message.starts_with(&format!("Merge #{pr} into the rollup")) {
+            break;
+        }
+        found.push(LandedMember {
+            pr,
+            head: member.clone(),
+            merge: sha.clone(),
+        });
+        sha.clone_from(first);
+    }
+    found.reverse();
+    Ok(found)
+}
+
+/// Reconcile the rollups that landed on `base` lately, however they landed
+/// (the merge queue included): for each merged `shipyard-train/rollup-*`
+/// pull request among the last 20 closed, close the members GitHub did not
+/// mark merged ([`close_landed_members`]), once [`MERGED_SETTLE`] has passed
+/// since it merged. Returns one line per member closed or left open.
+///
+/// # Errors
+///
+/// When the closed pull requests cannot be read.
+pub fn reconcile(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, String> {
+    let closed = gh_json(
+        run_gh,
+        &api(
+            format!(
+                "repos/{repo}/pulls?state=closed&base={base}&sort=updated&direction=desc&per_page=20"
+            ),
+            "[.[] | {number, ref: .head.ref, sha: .head.sha, merged_at}]",
+        ),
+    )?;
+    let mut lines = Vec::new();
+    for pull in closed.as_array().into_iter().flatten() {
+        let (Some(pr), Some(head), Some(merged_at)) = (
+            pull.get("number").and_then(Value::as_u64),
+            pull.get("sha").and_then(Value::as_str),
+            pull.get("merged_at")
+                .and_then(Value::as_str)
+                .and_then(|at| at.parse::<chrono::DateTime<chrono::Utc>>().ok()),
+        ) else {
+            continue;
+        };
+        if !pull
+            .get("ref")
+            .and_then(Value::as_str)
+            .is_some_and(|branch| branch.starts_with(BRANCH_PREFIX))
+            || now - merged_at < chrono::Duration::from_std(MERGED_SETTLE).unwrap_or_default()
+        {
+            continue;
+        }
+        let members = landed_members(run_gh, repo, base, pr, head)?;
+        let (shut, left) = close_landed_members(run_gh, repo, base, pr, &members, &mut || false)?;
+        lines.extend(
+            shut.iter()
+                .map(|member| format!("closed #{member}: landed via rollup #{pr}")),
+        );
+        lines.extend(
+            left.iter()
+                .map(|(member, why)| format!("left #{member} open (rollup #{pr}): {why}")),
+        );
+    }
+    Ok(lines)
+}
+
+/// [`reconcile`] when `base` takes rollups and this host's train is not
+/// stopped; nothing, and no error, otherwise. A base config that cannot be
+/// read is not a rollup base here: this runs on every steward pass, and the
+/// guard refuses rollups on such a base anyway.
+///
+/// # Errors
+///
+/// When a rollup base's closed pull requests cannot be read.
+pub fn reconcile_if_enabled(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, String> {
+    let Ok(text) = base_config_text(run_gh, repo, base) else {
+        return Ok(Vec::new());
+    };
+    if !Config::from_text(text.as_deref()).is_ok_and(|config| config.rolls_up())
+        || host_stopped(repo).is_some()
+    {
+        return Ok(Vec::new());
+    }
+    reconcile(run_gh, repo, base, now)
 }
 
 /// The notice comment on a rollup pull request. People read it; the guard

@@ -126,6 +126,9 @@ shipyard rollup verify --pr N                # does this rollup head land, by th
 shipyard rollup land --pr N [--apply]        # merge method MERGE only; merge-queue: prints the steward handoff;
                                              #   direct: required checks green, base re-read, PR merge API with
                                              #   sha= bound; closes members GitHub did not mark merged
+shipyard rollup reconcile [--base BRANCH] --apply
+                                             # close members of landed rollups GitHub did not mark merged, each only
+                                             #   once its head is proven on the base (the steward runs this too)
 shipyard rollup split --members 11,12,13,14 [--passed] [--first-passed BOOL --second-passed BOOL]
                                              # next bisect step: land, eject one member, or test each half
                                              #   (docs/rollups.md); all rollup commands exit 0/1 refused/2 unreadable

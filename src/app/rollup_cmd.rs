@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -22,6 +22,8 @@ use crate::rollup::{self, Config, Landing};
 
 /// Each GitHub call's own deadline.
 const GITHUB_TIMEOUT: Duration = Duration::from_mins(2);
+/// How often a direct landing re-reads whether GitHub marked members merged.
+const SETTLE_POLL: Duration = Duration::from_secs(15);
 /// How many open pull requests `plan` judges.
 const PLAN_LIMIT: usize = 30;
 
@@ -90,6 +92,23 @@ pub(super) fn rollup_command<W: Write>(
         RollupCommand::Land { pr, apply, .. } => {
             ("rollup land", land(run_gh, &repo, pr, apply, state_dir)?)
         }
+        RollupCommand::Reconcile {
+            base: given, apply, ..
+        } => {
+            let base = base(given)?;
+            if !apply {
+                return Err(CliFailure::new(
+                    2,
+                    "rollup reconcile closes pull requests; pass --apply",
+                ));
+            }
+            let lines =
+                rollup::reconcile(run_gh, &repo, &base, chrono::Utc::now()).map_err(unreadable)?;
+            (
+                "rollup reconcile",
+                json!({"repo": repo, "base": base, "members": lines}),
+            )
+        }
         RollupCommand::Split {
             members,
             passed,
@@ -101,6 +120,9 @@ pub(super) fn rollup_command<W: Write>(
             split(&members, passed, first_passed, second_passed)?,
         ),
     };
+    // A landing that went through untested still landed: report it, then
+    // fail so nothing reads it as a clean landing.
+    let untested = data.get("untested").is_some_and(|value| !value.is_null());
     if json {
         let mut envelope = BTreeMap::new();
         envelope.insert("rollup".to_owned(), data);
@@ -113,7 +135,11 @@ pub(super) fn rollup_command<W: Write>(
         )
         .map_err(unreadable)?;
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(if untested {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn base_config(
@@ -409,14 +435,35 @@ fn land(
             .map_err(|error| format!("{}: {error}", log.display()))?;
         writeln!(file, "{line}").map_err(|error| format!("{}: {error}", log.display()))
     };
-    let merged = rollup::land_direct(run_gh, repo, &rollup, &mut record).map_err(refused)?;
-    let closed = rollup::close_landed_members(run_gh, repo, &rollup).map_err(unreadable)?;
+    let landed = rollup::land_direct(run_gh, repo, &rollup, &mut record).map_err(refused)?;
+    let members: Vec<rollup::LandedMember> = rollup
+        .members
+        .iter()
+        .map(|member| rollup::LandedMember {
+            pr: member.pr,
+            head: member.head.clone(),
+            merge: member.merge.clone(),
+        })
+        .collect();
+    let deadline = Instant::now() + rollup::MERGED_SETTLE;
+    let mut settle = || {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(SETTLE_POLL);
+        true
+    };
+    let (closed, left) =
+        rollup::close_landed_members(run_gh, repo, &rollup.base, pr, &members, &mut settle)
+            .map_err(unreadable)?;
     Ok(json!({
         "rollup": accepted,
         "landing": "direct",
         "applied": true,
-        "merge_commit": merged,
+        "merge_commit": landed.merge_commit,
+        "untested": landed.untested,
         "closed_members": closed,
+        "left_open": left.iter().map(|(pr, why)| json!({"pr": pr, "why": why})).collect::<Vec<_>>(),
         "record": log.display().to_string(),
     }))
 }

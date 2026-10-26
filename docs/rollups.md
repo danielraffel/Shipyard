@@ -66,7 +66,7 @@ own gate (`crate::rollup::accept`, reached from `crate::head_approval`)
 apply the same rule. A rollup lands only when all of these hold:
 
 - **(a) Members.** Each `H_i` is the current head of exactly one open pull
-  request on the same base. Each member passes the review rule at its own
+  request on the same base, and none is a draft. Each member passes the review rule at its own
   exact head, with no later HOLD. With `require_counted_approval` (the
   default) a carried approval does not count: the verdict must name `H_i`.
 - **(b) Chain and replay.** The first-parent chain from the rollup head back
@@ -115,8 +115,11 @@ Nothing in `shipyard rollup` enqueues directly.
 **`landing = "direct"`.** Shipyard lands the rollup itself. `land --apply`:
 
 1. requires every required check of the base (rulesets and branch
-   protection) to have passed on the rollup head, and refuses when the base
-   requires none;
+   protection) to have passed on the rollup head as a check run: the latest
+   run with that name, from the App the rule binds it to (`integration_id`,
+   `app_id`) when it binds one. A commit status never counts, because a pull
+   request's own workflow can post one under any name. A base that requires
+   no checks refuses;
 2. appends the tested record (`merged_base` = `B`, `tested_sha` = the rollup
    head, the members) to `rollup-landings.jsonl` in Shipyard's state
    directory;
@@ -126,10 +129,29 @@ Nothing in `shipyard rollup` enqueues directly.
 4. merges only through the pull request merge API, with `sha=` bound to the
    rollup head and `merge_method=merge`, through the same guarded `gh` as any
    landing, so the guard judges it. Nothing pushes to the base or
-   fast-forwards it.
+   fast-forwards it;
+5. checks that the merge commit's parents are exactly the re-read tip and
+   the rollup head. If the base moved between the re-read and the merge, the
+   landed tree was never tested as a whole: the landing is recorded with
+   `"untested": true`, a comment on the rollup pull request says so, and
+   `land` exits 1.
 
-After landing, each member GitHub did not mark merged gets a comment naming
-the rollup and its merge commit, and is closed.
+## Members after landing
+
+However a rollup landed, its members are reconciled. `land` does it after a
+direct landing; the merge steward does it on every `--apply` pass for a
+base that takes rollups, which covers a merge-queue landing; and `shipyard
+rollup reconcile --apply` does it by hand. Members are read from the landed
+head's own merge commits, not from the notice comment. Each member GitHub
+has not marked merged within two minutes of the landing is closed with a
+comment naming the rollup and its merge commit, and only once its exact head
+is proven on the base (`compare <base>...<head>` is `ahead_by` 0). A head
+that is not on the base is never closed.
+
+Whether GitHub marks members merged by itself when their heads become
+reachable has not been tested live yet; the close above is the fallback
+either way. Test it on a scratch repository before turning rollups on for a
+real one.
 
 ## When the rollup fails
 
@@ -154,6 +176,7 @@ shipyard rollup plan [--repo OWNER/REPO] [--base BRANCH]
 shipyard rollup build --members 11,12 [--base BRANCH] [--apply]
 shipyard rollup verify --pr N
 shipyard rollup land --pr N [--apply]
+shipyard rollup reconcile [--base BRANCH] --apply
 shipyard rollup split --members 11,12,13,14 [--passed] [--first-passed BOOL --second-passed BOOL]
 ```
 

@@ -641,7 +641,7 @@ A rollup head (branch `shipyard-train/rollup-*`, on a base whose
 has no verdict of its own. When no verdict names it, the guard
 (`rollup_acceptance`) and Shipyard's gate (`crate::rollup::accept`) accept it
 only when every merge on its first-parent chain merges the exact head of an
-open member pull request whose own review counts at that head (a carried
+open, non-draft member pull request whose own review counts at that head (a carried
 approval does not, by default), each merge changes exactly that member's
 files to its approved blobs and modes, the members change disjoint files,
 the base touched none of them since, and no member changes an excluded path.

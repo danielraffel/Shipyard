@@ -125,7 +125,7 @@ class Hub:
         self.pulls: list[dict[str, Any]] = []
 
     def pull(self, number: int, branch: str, head: str, head_repo: str = REPO) -> None:
-        self.pulls.append({"number": number, "state": "open", "head": {
+        self.pulls.append({"number": number, "state": "open", "draft": False, "head": {
             "ref": branch, "sha": head, "repo": {"full_name": head_repo}},
             "base": {"ref": "main"}, "user": {"login": "author"}})
 
@@ -255,6 +255,28 @@ class RollupAcceptance(unittest.TestCase):
             self.assertIsNone(guard.member_review(REPO, 11, heads[0], policy, True))
             comment["body"] = f"verdict: HOLD head:{heads[0]}"
             self.assertIsNotNone(guard.member_review(REPO, 11, heads[0], policy, True))
+
+    def test_a_merge_that_carries_another_members_change_is_refused(self) -> None:
+        # Merge 1 already brings both changes and merge 2 changes nothing: the
+        # head's tree is right, so only the per-merge replay check refuses.
+        hub, heads, merges = self.rollup(["a.txt", "b.txt"])
+        first = self.scratch.commit([self.base, heads[0]], merges[-1], {})
+        second = self.scratch.commit([first, heads[1]], merges[-1], {})
+        refusal, _ = self.accept(hub, second)
+        self.assertIn("the rollup's merge", refusal)
+        self.assertIn("b.txt", refusal)
+
+    def test_a_member_head_shared_by_two_open_pull_requests_is_refused(self) -> None:
+        hub, heads, merges = self.rollup(["a.txt", "b.txt"])
+        hub.pull(30, "feature-copy", heads[1])
+        refusal, _ = self.accept(hub, merges[-1])
+        self.assertIn("exactly one open pull request", refusal)
+
+    def test_a_draft_member_is_refused(self) -> None:
+        hub, _, merges = self.rollup(["a.txt", "b.txt"])
+        hub.find(12)["draft"] = True
+        refusal, _ = self.accept(hub, merges[-1])
+        self.assertIn("member #12 is a draft", refusal)
 
     def test_a_moved_member_head_or_a_stray_merge_is_refused(self) -> None:
         hub, _, merges = self.rollup(["a.txt", "b.txt"])

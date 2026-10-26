@@ -227,6 +227,8 @@ struct Pull {
     head_repo: String,
     state: &'static str,
     merged: bool,
+    draft: bool,
+    merged_at: Option<String>,
 }
 
 struct Hub<'a> {
@@ -235,8 +237,11 @@ struct Hub<'a> {
     config: Option<String>,
     allow_merge_commit: bool,
     rules: Value,
-    required: Vec<String>,
+    required: Value,
     checks: Value,
+    /// Moved onto by the merge call itself, before it merges: the base moving
+    /// between the re-read and the merge.
+    race: RefCell<Option<String>>,
     comments: BTreeMap<u64, Vec<Value>>,
     writes: RefCell<Vec<Vec<String>>>,
     /// Run once just before the base tip is read, to move it under a reader.
@@ -253,8 +258,10 @@ impl<'a> Hub<'a> {
             config: Some(ROLLUP_CONFIG.to_owned()),
             allow_merge_commit: true,
             rules: json!([]),
-            required: vec!["build".to_owned()],
-            checks: json!([{"name": "build", "status": "completed", "conclusion": "success"}]),
+            required: json!([{"context": "build", "integration_id": null}]),
+            checks: json!([{"id": 1, "name": "build", "status": "completed",
+                            "conclusion": "success", "app": 15368}]),
+            race: RefCell::new(None),
             comments: BTreeMap::new(),
             writes: RefCell::new(Vec::new()),
             before_tip: RefCell::new(None),
@@ -269,6 +276,8 @@ impl<'a> Hub<'a> {
             head_repo: REPO.to_owned(),
             state: "open",
             merged: false,
+            draft: false,
+            merged_at: None,
         });
     }
 
@@ -313,7 +322,17 @@ impl<'a> Hub<'a> {
                     .borrow_mut()
                     .push(args.iter().map(|arg| (*arg).to_owned()).collect());
                 if *method == "PUT" && path.ends_with("/merge") {
-                    return Ok(json!({"merged": true, "sha": "f".repeat(40)}).to_string());
+                    let head = args
+                        .iter()
+                        .find_map(|arg| arg.strip_prefix("sha="))
+                        .expect("sha bound");
+                    if let Some(moved) = self.race.borrow_mut().take() {
+                        self.git.run(&["update-ref", "refs/heads/main", &moved]);
+                    }
+                    let main = self.git.sha("main");
+                    let merge = self.git.commit_with(&[&main, head], Some(head), &[], &[]);
+                    self.git.run(&["update-ref", "refs/heads/main", &merge]);
+                    return Ok(json!({"merged": true, "sha": merge}).to_string());
                 }
                 Ok("{}".to_owned())
             }
@@ -357,7 +376,23 @@ impl<'a> Hub<'a> {
                           "state": pull.state, "head_repo": pull.head_repo})
                 .to_string())
             }
+            ["compare", range] if jq == ".ahead_by" => {
+                let (from, to) = range.split_once("...").expect("range");
+                Ok(self
+                    .git
+                    .run(&["rev-list", "--count", &format!("{from}..{to}")]))
+            }
             ["compare", range] => Ok(self.git.compare(range).to_string()),
+            [list] if list.starts_with("pulls?state=closed") => Ok(json!(
+                self.pulls
+                    .borrow()
+                    .iter()
+                    .filter(|pull| pull.state == "closed")
+                    .map(|pull| json!({"number": pull.number, "ref": pull.branch,
+                                    "sha": pull.head, "merged_at": pull.merged_at}))
+                    .collect::<Vec<_>>()
+            )
+            .to_string()),
             ["git", "ref", "heads", "main"] => {
                 if let Some(hook) = self.before_tip.borrow_mut().take() {
                     hook();
@@ -369,6 +404,9 @@ impl<'a> Hub<'a> {
                 let parents: Vec<&str> = line.split(' ').skip(1).collect();
                 Ok(json!(parents).to_string())
             }
+            ["commits", sha] if jq.contains("message") => {
+                Ok(self.git.run(&["log", "-1", "--format=%B", sha]))
+            }
             ["commits", _] => Ok(DATE.to_owned()),
             ["commits", sha, "pulls"] => Ok(json!(
                 self.pulls
@@ -376,12 +414,11 @@ impl<'a> Hub<'a> {
                     .iter()
                     .filter(|pull| pull.head == *sha)
                     .map(|pull| json!({"number": pull.number, "state": pull.state,
-                                    "sha": pull.head, "base": "main"}))
+                                    "draft": pull.draft, "sha": pull.head, "base": "main"}))
                     .collect::<Vec<_>>()
             )
             .to_string()),
             ["commits", _, check] if check.starts_with("check-runs") => Ok(self.checks.to_string()),
-            ["commits", _, "status"] => Ok("[]".to_owned()),
             ["rules", "branches", "main"] if jq.contains("required_status_checks") => {
                 Ok(json!(self.required).to_string())
             }
@@ -965,9 +1002,11 @@ fn a_direct_landing_binds_the_head_and_the_merge_method() {
     let hub = fixture.hub();
     let rollup = accept_at(&hub, fixture.head(), &config()).expect("accepted");
     let run = |args: &[String]| hub.run(args);
-    let merged = land_direct(&run, REPO, &rollup, &mut |_| Ok(())).expect("lands");
-    assert_eq!(merged, "f".repeat(40));
+    let landed = land_direct(&run, REPO, &rollup, &mut |_| Ok(())).expect("lands");
+    assert_eq!(landed.untested, None);
+    assert_eq!(landed.merge_commit, fixture.git.sha("main"));
     let writes = hub.writes.borrow();
+    assert_eq!(writes.len(), 1, "no alert on a tested landing");
     assert_eq!(
         writes[0],
         vec![
@@ -984,7 +1023,35 @@ fn a_direct_landing_binds_the_head_and_the_merge_method() {
 }
 
 #[test]
-fn required_checks_must_all_pass_on_the_rollup_head() {
+fn a_base_that_moves_between_the_re_read_and_the_merge_is_an_untested_landing() {
+    let fixture = Fixture::new(&["a.txt", "b.txt"]);
+    let hub = fixture.hub();
+    let rollup = accept_at(&hub, fixture.head(), &config()).expect("accepted");
+    let moved = fixture
+        .git
+        .commit(Some(&fixture.base), &[("d.txt", Some("raced\n"))]);
+    *hub.race.borrow_mut() = Some(moved.clone());
+    let run = |args: &[String]| hub.run(args);
+    let mut records = Vec::new();
+    let landed = land_direct(&run, REPO, &rollup, &mut |record| {
+        records.push(record.clone());
+        Ok(())
+    })
+    .expect("it still landed");
+    let why = landed.untested.expect("untested");
+    assert!(why.contains("never tested"), "{why}");
+    // Recorded as untested, after the tested record, naming where it landed.
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1]["untested"], json!(true));
+    assert_eq!(records[1]["landed_on"][0], json!(moved));
+    // And announced on the rollup pull request.
+    let writes = hub.writes.borrow();
+    assert_eq!(writes[1][3], "repos/o/r/issues/20/comments");
+    assert!(writes[1][5].contains("Untested landing"));
+}
+
+#[test]
+fn required_checks_count_only_the_latest_check_run_from_the_bound_app() {
     let git = Git::new();
     let mut hub = Hub::new(&git);
     let head = git.sha("main");
@@ -994,11 +1061,35 @@ fn required_checks_must_all_pass_on_the_rollup_head() {
         checks_refusal(&run, REPO, &head, &required).expect("reads")
     };
     assert!(refusal(&hub).is_none());
-    hub.checks = json!([{"name": "build", "status": "completed", "conclusion": "failure"}]);
+    hub.checks = json!([{"id": 1, "name": "build", "status": "completed",
+                         "conclusion": "failure", "app": 15368}]);
     assert!(refusal(&hub).expect("failed").contains("build"));
-    hub.checks = json!([{"name": "build", "status": "in_progress", "conclusion": null}]);
+    hub.checks = json!([{"id": 1, "name": "build", "status": "in_progress",
+                         "conclusion": null, "app": 15368}]);
     assert!(refusal(&hub).is_some());
-    hub.required.clear();
+    // A later failed run outweighs an earlier success.
+    hub.checks = json!([
+        {"id": 1, "name": "build", "status": "completed", "conclusion": "success", "app": 15368},
+        {"id": 2, "name": "build", "status": "completed", "conclusion": "failure", "app": 15368},
+    ]);
+    assert!(refusal(&hub).is_some());
+    // Bound to an App: only that App's run counts.
+    hub.required = json!([{"context": "build", "integration_id": 42}]);
+    hub.checks = json!([{"id": 3, "name": "build", "status": "completed",
+                         "conclusion": "success", "app": 7}]);
+    let why = refusal(&hub).expect("wrong app");
+    assert!(why.contains("from App 42"), "{why}");
+    hub.checks = json!([{"id": 3, "name": "build", "status": "completed",
+                         "conclusion": "success", "app": 42}]);
+    assert!(refusal(&hub).is_none());
+    // A commit status is never read as a check run.
+    hub.checks = json!([]);
+    assert!(
+        refusal(&hub)
+            .expect("status only")
+            .contains("commit status")
+    );
+    hub.required = json!([]);
     assert!(
         refusal(&hub)
             .expect("none required")
@@ -1006,19 +1097,159 @@ fn required_checks_must_all_pass_on_the_rollup_head() {
     );
 }
 
+fn landed_members_of(fixture: &Fixture) -> Vec<LandedMember> {
+    (11..)
+        .zip(fixture.heads.iter().zip(&fixture.merges))
+        .map(|(pr, (head, merge))| LandedMember {
+            pr,
+            head: head.clone(),
+            merge: merge.clone(),
+        })
+        .collect()
+}
+
+/// Land the fixture's rollup on main the way a merge queue would.
+fn land_by_queue(fixture: &Fixture, hub: &Hub<'_>, merged_at: &str) {
+    let main = fixture.git.sha("main");
+    let merge = fixture
+        .git
+        .commit_with(&[&main, fixture.head()], Some(fixture.head()), &[], &[]);
+    fixture.git.run(&["update-ref", "refs/heads/main", &merge]);
+    let mut pulls = hub.pulls.borrow_mut();
+    let rollup = pulls
+        .iter_mut()
+        .find(|pull| pull.number == 20)
+        .expect("rollup");
+    rollup.state = "closed";
+    rollup.merged = true;
+    rollup.merged_at = Some(merged_at.to_owned());
+}
+
 #[test]
-fn members_github_did_not_mark_merged_are_closed_with_their_merge_commit() {
+fn members_are_closed_only_once_their_heads_are_proven_on_the_base() {
     let fixture = Fixture::new(&["a.txt", "b.txt"]);
     let hub = fixture.hub();
-    let rollup = accept_at(&hub, fixture.head(), &config()).expect("accepted");
+    let members = landed_members_of(&fixture);
+    let run = |args: &[String]| hub.run(args);
+    // Not landed yet: neither head is on main, so nothing is closed.
+    let (closed, left) =
+        close_landed_members(&run, REPO, "main", 20, &members, &mut || false).expect("reads");
+    assert!(closed.is_empty());
+    assert_eq!(left.len(), 2);
+    assert!(left[0].1.contains("never closed unproven"), "{}", left[0].1);
+    assert!(hub.writes.borrow().is_empty());
+    land_by_queue(&fixture, &hub, DATE);
     hub.pulls.borrow_mut()[0].merged = true;
     hub.pulls.borrow_mut()[0].state = "closed";
-    let run = |args: &[String]| hub.run(args);
-    assert_eq!(close_landed_members(&run, REPO, &rollup), Ok(vec![12]));
+    let (closed, left) =
+        close_landed_members(&run, REPO, "main", 20, &members, &mut || false).expect("reads");
+    assert_eq!((closed, left), (vec![12], vec![]));
     let writes = hub.writes.borrow();
     assert_eq!(writes.len(), 2);
     assert!(writes[0][5].contains(&format!("merge commit {}", fixture.merges[1])));
     assert_eq!(writes[1][3], "repos/o/r/pulls/12");
+}
+
+#[test]
+fn closing_waits_for_github_to_mark_members_merged() {
+    let fixture = Fixture::new(&["a.txt", "b.txt"]);
+    let hub = fixture.hub();
+    land_by_queue(&fixture, &hub, DATE);
+    let members = landed_members_of(&fixture);
+    let run = |args: &[String]| hub.run(args);
+    let mut waits = 0;
+    let mut settle = || {
+        waits += 1;
+        // GitHub marks both merged during the second wait.
+        if waits == 2 {
+            for pull in hub.pulls.borrow_mut().iter_mut().take(2) {
+                pull.merged = true;
+                pull.state = "closed";
+            }
+        }
+        waits < 5
+    };
+    let (closed, left) =
+        close_landed_members(&run, REPO, "main", 20, &members, &mut settle).expect("reads");
+    assert_eq!((closed, left), (vec![], vec![]));
+    assert_eq!(waits, 2);
+    assert!(hub.writes.borrow().is_empty());
+}
+
+#[test]
+fn a_queue_landing_is_reconciled_by_the_steward_after_the_settle_time() {
+    let fixture = Fixture::new(&["a.txt", "b.txt"]);
+    let hub = fixture.hub();
+    land_by_queue(&fixture, &hub, "2026-10-26T10:00:00Z");
+    let run = |args: &[String]| hub.run(args);
+    let at = |text: &str| text.parse::<chrono::DateTime<chrono::Utc>>().expect("time");
+    // Within the settle time GitHub may still mark them: nothing yet.
+    let early = reconcile_if_enabled(&run, REPO, "main", at("2026-10-26T10:01:00Z"));
+    assert_eq!(early, Ok(vec![]));
+    assert!(hub.writes.borrow().is_empty());
+    let lines =
+        reconcile_if_enabled(&run, REPO, "main", at("2026-10-26T10:03:00Z")).expect("reconciles");
+    assert_eq!(
+        lines,
+        vec![
+            "closed #11: landed via rollup #20".to_owned(),
+            "closed #12: landed via rollup #20".to_owned()
+        ]
+    );
+    assert_eq!(hub.writes.borrow().len(), 4);
+}
+
+#[test]
+fn reconciliation_does_nothing_on_a_base_that_does_not_take_rollups() {
+    let fixture = Fixture::new(&["a.txt"]);
+    let mut hub = fixture.hub();
+    hub.config = Some("[train]\nenabled = false\n".to_owned());
+    land_by_queue(&fixture, &hub, DATE);
+    let run = |args: &[String]| hub.run(args);
+    assert_eq!(
+        reconcile_if_enabled(&run, REPO, "main", chrono::Utc::now()),
+        Ok(vec![])
+    );
+    assert!(hub.writes.borrow().is_empty());
+}
+
+#[test]
+fn a_merge_that_carries_another_members_change_is_refused() {
+    // The first merge already brings both members' changes and the second
+    // merge changes nothing: the head's tree is exactly right, so only the
+    // per-merge replay check sees that merge 1 is not member #11 alone.
+    let fixture = Fixture::new(&["a.txt", "b.txt"]);
+    let git = &fixture.git;
+    let first = git.commit_with(
+        &[&fixture.base, &fixture.heads[0]],
+        Some(fixture.head()),
+        &[],
+        &[],
+    );
+    let second = git.commit_with(&[&first, &fixture.heads[1]], Some(fixture.head()), &[], &[]);
+    let hub = fixture.hub();
+    hub.pulls.borrow_mut()[2].head.clone_from(&second);
+    let error = accept_at(&hub, &second, &config()).expect_err("replay");
+    assert!(error.contains("the rollup's merge"), "{error}");
+    assert!(error.contains("b.txt"), "{error}");
+}
+
+#[test]
+fn a_member_head_shared_by_two_open_pull_requests_is_refused() {
+    let fixture = Fixture::new(&["a.txt", "b.txt"]);
+    let hub = fixture.hub();
+    hub.pull(30, "feature-copy", &fixture.heads[1]);
+    let error = accept_at(&hub, fixture.head(), &config()).expect_err("two PRs");
+    assert!(error.contains("more than one open pull request"), "{error}");
+}
+
+#[test]
+fn a_draft_member_is_refused() {
+    let fixture = Fixture::new(&["a.txt", "b.txt"]);
+    let hub = fixture.hub();
+    hub.pulls.borrow_mut()[1].draft = true;
+    let error = accept_at(&hub, fixture.head(), &config()).expect_err("draft");
+    assert!(error.contains("member #12 is a draft"), "{error}");
 }
 
 fn candidate(pr: u64, files: &[&str]) -> Candidate {

@@ -3081,6 +3081,21 @@ pub(super) enum RollupCommand {
         #[arg(long)]
         apply: bool,
     },
+    /// Close the members of rollups that landed lately (by the merge queue
+    /// or directly) that GitHub did not mark merged, each only once its
+    /// exact head is proven on the base. The merge steward runs this on
+    /// every `--apply` pass for a base that takes rollups.
+    Reconcile {
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Base branch. Defaults to the repository's default branch.
+        #[arg(long, value_name = "BRANCH")]
+        base: Option<String>,
+        /// Close them.
+        #[arg(long)]
+        apply: bool,
+    },
     /// The next bisect step after a rollup's run: land, eject one member, or
     /// test each half. Read-only.
     Split {
@@ -3109,6 +3124,7 @@ impl RollupCommand {
             | Self::Build { repo, .. }
             | Self::Verify { repo, .. }
             | Self::Land { repo, .. }
+            | Self::Reconcile { repo, .. }
             | Self::Split { repo, .. } => repo.clone(),
         }
     }
