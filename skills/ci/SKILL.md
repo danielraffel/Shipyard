@@ -5,6 +5,13 @@ description: "Cross-platform CI coordination with Shipyard: validates, ships, ma
 
 # CI Operations with Shipyard
 
+## Required-check producer identity
+
+When CI code consumes required-check materialization, preserve producer
+identity (`app_id`) when policy distinguishes checks that share a context name.
+If the materialized endpoint omits that identity, retain ambiguous skipped
+attempts so a success from one producer cannot satisfy another producer.
+
 ## Adopting Shipyard, or checking what a repository already has
 
 Before wiring any CI machinery into a repository (a PR gate, a merge queue, a
