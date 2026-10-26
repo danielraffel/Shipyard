@@ -522,6 +522,42 @@ Anything else, or anything the guard cannot read (including a comparison at
 GitHub's 300-file cap), needs a new verdict. A HOLD naming the new head is
 never overridden by a carry.
 
+Three guardrails apply to every carry, merge-only or across a rebase:
+
+* **Excluded paths never carry.** A PR that changes (or renames from) a path
+  matching `[auto_merge] carry_excluded_paths` in the base's
+  `.shipyard/config.toml` needs a verdict naming its exact head. Without the
+  key, the defaults are:
+  * `.github/workflows/**`, `.agents/contract.toml` and `tools/ci/**`;
+  * the guards and Shipyard's own arm code: `scripts/ghapp*`,
+    `src/head_approval*` and `src/head_approval/**`, `src/queue_arm_gate*`,
+    `src/auto_arm*` and `src/auto_arm/**`, `src/ghapp_guards*`,
+    `src/app/ship_cmd/auto_arm*` and `src/app/merge_steward_cmd/native_arm*`;
+  * signing and release automation: `release-please-config.json`,
+    `.release-please-manifest.json`, `**/*codesign*`, `**/*notariz*` and
+    `**/*signing*`.
+
+  The key replaces the list, so `[]` excludes nothing. A value that is not a
+  list of globs means no carry at all. In a glob, `**` is any number of whole
+  path segments, `*` any run of characters within one segment, and `?` one
+  character.
+* **`carry: no`.** An APPROVE (comment or review body) with a line
+  `carry: no` approves its exact head only.
+* **A cap.** An approval carries across at most 3 base merges, and for at most
+  48 hours after its verdict. Past either, the head needs a new verdict.
+
+Every merge-only carry a landing accepts is appended to the guards directory's
+`carries.jsonl`, as rebase carries already were, with `kind: merge`:
+`approved` and `head`, both merge bases (`old_base`, `new_base`), the number
+of `merges`, and the deciding verdict's `verdict_comment_id` (or
+`verdict_review_id`) and `signer`. The Rust twin (`head_approval`) applies the
+same three guardrails and logs its merge carries the same way. Only landings
+log: a read-only evaluation judges the carry without appending a row, rebase
+or merge. Such evaluations include the `review-verdict` status, through
+`review_gate(..., dry_run=True)` in Python and `ApprovalPolicy::dry_run` in
+Rust, and `shipyard train status`. So the log holds only carries that
+actually armed or merged.
+
 **Rebases (separate switch, off by default).** A rebased head does not descend
 from the approved one, so the rule above never carries to it. On a host that
 turns the rebase carry on (`SHIPYARD_REBASE_CARRY=1`, `0` forces it off, or a

@@ -53,6 +53,24 @@ pub fn rebase_carry_enabled() -> bool {
     super::guards_dir().is_some_and(|dir| dir.join(REBASE_CARRY_FILE).is_file())
 }
 
+/// Why a pull request whose files are `files` (and renamed from `sources`)
+/// never carries ([`super::carry_excluded`]).
+fn excluded_change(
+    files: [&Files; 2],
+    sources: [&BTreeMap<String, String>; 2],
+    excluded: &[String],
+) -> Result<(), String> {
+    super::carry_excluded(
+        files
+            .iter()
+            .flat_map(|map| map.keys())
+            .chain(sources.iter().flat_map(|map| map.values()))
+            .map(String::as_str),
+        excluded,
+    )
+    .map_or(Ok(()), Err)
+}
+
 /// What a carry across a rebase checked, for the carry log.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct CarryRecord {
@@ -80,6 +98,7 @@ pub fn rebase_carry(
     pr: u64,
     from: &str,
     to: &str,
+    excluded: &[String],
 ) -> Result<CarryRecord, String> {
     let unreadable = |error: String| format!("the rebase carry cannot be checked ({error})");
     let base = run_gh(&[
@@ -98,6 +117,11 @@ pub fn rebase_carry(
         compare_files(run_gh, repo, &format!("{base}...{from}")).map_err(unreadable)?;
     let (after, new_base, after_sources) =
         compare_files(run_gh, repo, &format!("{base}...{to}")).map_err(unreadable)?;
+    excluded_change(
+        [&before, &after],
+        [&before_sources, &after_sources],
+        excluded,
+    )?;
     let status = run_gh(&[
         "api".to_owned(),
         format!("repos/{repo}/compare/{old_base}...{new_base}"),
@@ -492,6 +516,52 @@ fn run_patch_id(input: &[u8]) -> Result<std::process::Output, String> {
 /// Append one carry to the guards directory's carry log. Never fails: the
 /// log records carries, it does not gate them.
 pub fn log_carry(repo: &str, pr: u64, from: &str, to: &str, record: &CarryRecord) {
+    append_carry(&carry_entry(repo, pr, from, to, record));
+}
+
+/// Append one merge carry to the guards directory's carry log, with the
+/// verdict it carried and both merge bases. Never fails.
+pub fn log_merge_carry(
+    repo: &str,
+    pr: u64,
+    from: &str,
+    to: &str,
+    carry: &super::MergeCarry,
+    verdict: Option<u64>,
+) {
+    append_carry(&merge_carry_entry(repo, pr, from, to, carry, verdict));
+}
+
+/// One merge-carry log row, with the writer's identity.
+fn merge_carry_entry(
+    repo: &str,
+    pr: u64,
+    from: &str,
+    to: &str,
+    carry: &super::MergeCarry,
+    verdict: Option<u64>,
+) -> Value {
+    let mut entry = serde_json::json!({
+        "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "kind": "merge",
+        "by": "shipyard",
+        "repo": repo,
+        "pr": pr,
+        "approved": from,
+        "head": to,
+        "old_base": carry.old_base,
+        "new_base": carry.new_base,
+        "merges": carry.merges,
+        "files": carry.files,
+        "verdict_comment_id": verdict,
+    });
+    if let Some(map) = entry.as_object_mut() {
+        map.extend(super::writer_identity());
+    }
+    entry
+}
+
+fn append_carry(entry: &Value) {
     let Some(dir) = super::guards_dir() else {
         return;
     };
@@ -502,7 +572,7 @@ pub fn log_carry(repo: &str, pr: u64, from: &str, to: &str, record: &CarryRecord
         .open(dir.join(REBASE_CARRY_LOG))
     {
         use std::io::Write as _;
-        let _ = writeln!(file, "{}", carry_entry(repo, pr, from, to, record));
+        let _ = writeln!(file, "{entry}");
     }
 }
 
