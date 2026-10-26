@@ -36,7 +36,7 @@ def receipt(repo: str = "owner/repo") -> dict[str, object]:
 
 
 class MergeReceiptHandoffTests(unittest.TestCase):
-    def fake_shipyard(self, directory: pathlib.Path, output: pathlib.Path, *, fail: bool = False) -> pathlib.Path:
+    def fake_shipyard(self, directory: pathlib.Path, output: pathlib.Path, *, fail: bool = False, malformed: bool = False) -> pathlib.Path:
         executable = directory / "shipyard"
         body = "#!/bin/sh\n"
         if fail:
@@ -44,8 +44,9 @@ class MergeReceiptHandoffTests(unittest.TestCase):
         else:
             # The fake accepts the same argv shape and writes the receipt at the
             # value following --file, just as the real export does.
+            body += "case \"$*\" in *--version*) echo 'shipyard 0.366.4'; exit 0;; esac\n"
             body += "while [ \"$#\" -gt 0 ]; do if [ \"$1\" = \"--file\" ]; then shift; file=\"$1\"; fi; shift; done\n"
-            body += f"printf '%s\\n' '{json.dumps(receipt())}' > \"$file\"\n"
+            body += f"printf '%s\\n' '{'not json' if malformed else json.dumps(receipt())}' > \"$file\"\n"
         executable.write_text(body)
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
         return executable
@@ -82,6 +83,20 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             self.assertEqual(handoff.read_text(), "previous\n")
             self.assertEqual(json.loads(health.read_text())["status"], "error")
 
+    def test_malformed_staged_export_preserves_previous_payload_and_health(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            handoff = root / "handoff.jsonl"
+            health = root / "handoff.health.json"
+            handoff.write_text(json.dumps(receipt()) + "\n")
+            health.write_text("previous-health\n")
+            shipyard = self.fake_shipyard(root, handoff, malformed=True)
+            result = self.invoke("export", "--shipyard", str(shipyard), "--state-dir", str(root / "state"),
+                                 "--repo", "owner/repo", "--file", str(handoff), "--health-file", str(health))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(json.loads(handoff.read_text())["receipt_id"], "r-1")
+            self.assertEqual(health.read_text(), "previous-health\n")
+
     def test_check_reports_fresh_then_stale(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
@@ -95,13 +110,27 @@ class MergeReceiptHandoffTests(unittest.TestCase):
                 "file": str(handoff), "status": "fresh", "checked_at": now.isoformat().replace("+00:00", "Z"),
                 "exported_at": now.isoformat().replace("+00:00", "Z"), "receipt_count": 1,
                 "handoff_bytes": len(handoff_payload), "handoff_sha256": hashlib.sha256(handoff_payload).hexdigest(),
-                "producer": {"identity": "shipyard", "version": "unavailable", "executable_sha256": "unavailable"},
+                "producer": {"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64},
             }))
             fresh = self.invoke("check", "--file", str(handoff), "--health-file", str(health), "--stale-after", "2h")
             self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+            future = json.loads(health.read_text())
+            future["exported_at"] = (now + dt.timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+            health.write_text(json.dumps(future))
+            future_result = self.invoke("check", "--file", str(handoff), "--health-file", str(health), "--stale-after", "2h")
+            self.assertEqual(future_result.returncode, 3)
+            self.assertIn("future", json.loads(future_result.stdout)["error"])
+            bad_producer = json.loads(health.read_text())
+            bad_producer["exported_at"] = now.isoformat().replace("+00:00", "Z")
+            bad_producer["producer"] = {"identity": 7, "version": "shipyard 0.366.4", "executable_sha256": "a" * 64}
+            health.write_text(json.dumps(bad_producer))
+            bad_result = self.invoke("check", "--file", str(handoff), "--health-file", str(health), "--stale-after", "2h")
+            self.assertEqual(bad_result.returncode, 3)
+            self.assertIn("producer", json.loads(bad_result.stdout)["error"])
             old = now - dt.timedelta(hours=3)
             value = json.loads(health.read_text())
             value["exported_at"] = old.isoformat().replace("+00:00", "Z")
+            value["producer"] = {"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64}
             health.write_text(json.dumps(value))
             stale = self.invoke("check", "--file", str(handoff), "--health-file", str(health), "--stale-after", "2h")
             self.assertEqual(stale.returncode, 3, stale.stdout + stale.stderr)
@@ -132,7 +161,7 @@ class MergeReceiptHandoffTests(unittest.TestCase):
                     "handoff_bytes": len(handoff.read_bytes()),
                     "handoff_sha256": hashlib.sha256(handoff.read_bytes()).hexdigest(),
                     "receipt_count": 2,
-                    "producer": {"identity": "shipyard", "version": "unavailable", "executable_sha256": "unavailable"}}))
+                    "producer": {"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64}}))
                 result = self.invoke("check", "--file", str(handoff), "--health-file", str(health))
                 self.assertEqual(result.returncode, 3)
                 self.assertRegex(json.loads(result.stdout)["error"], "duplicates receipt_id|conflicts")

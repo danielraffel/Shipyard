@@ -175,9 +175,14 @@ def payload_digest(payload: bytes) -> str:
 def producer_identity(shipyard: pathlib.Path) -> dict[str, str]:
     try:
         digest = payload_digest(shipyard.read_bytes())
-    except OSError:
-        digest = "unavailable"
-    return {"identity": "shipyard", "version": "unavailable", "executable_sha256": digest}
+        completed = subprocess.run([str(shipyard), "--version"], text=True,
+                                   capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"could not identify Shipyard producer: {exc}") from exc
+    version = (completed.stdout or "").strip().splitlines()
+    if completed.returncode != 0 or not version:
+        raise RuntimeError("could not identify Shipyard producer version")
+    return {"identity": "shipyard", "version": version[0], "executable_sha256": digest}
 
 
 def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
@@ -222,31 +227,48 @@ def export(args: argparse.Namespace) -> int:
     if not _REPO.fullmatch(args.repo):
         raise ValueError("--repo must be OWNER/REPO")
     started = now()
+    file.parent.mkdir(parents=True, exist_ok=True)
+    staged = tempfile.NamedTemporaryFile("wb", dir=file.parent, prefix=f".{file.name}.", delete=False)
+    staged_path = pathlib.Path(staged.name)
+    staged.close()
     command = [str(shipyard), "--state-dir", str(state_dir), "metrics", "export",
-               "merge-receipt", "--repo", args.repo, "--file", str(file)]
+               "merge-receipt", "--repo", args.repo, "--file", str(staged_path)]
     try:
         completed = subprocess.run(command, text=True, capture_output=True,
                                    timeout=args.timeout_seconds, check=False)
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip().splitlines()
+            error = detail[-1] if detail else f"Shipyard export exited {completed.returncode}"
+            raise RuntimeError(error)
+        exported = now()
+        receipts, payload = read_handoff(staged_path, args.repo, now_value=exported)
+        producer = producer_identity(shipyard)
+        health = health_payload(repo=args.repo, file=file, checked_at=exported, status="fresh",
+                                exported_at=exported, receipts=receipts, payload=payload,
+                                producer=producer)
+        # Validation completed against the staged payload; publish only after
+        # both the exact receipt set and producer identity are known-good.
+        os.replace(staged_path, file)
+        write_health(health_file, health)
+        print(json.dumps(health, sort_keys=True))
+        return 0
     except subprocess.TimeoutExpired as exc:
         error = f"export timed out after {args.timeout_seconds}s"
         write_health(health_file, health_payload(repo=args.repo, file=file,
                                                   checked_at=now(), status="error", error=error))
         raise RuntimeError(error) from exc
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip().splitlines()
-        error = detail[-1] if detail else f"Shipyard export exited {completed.returncode}"
-        write_health(health_file, health_payload(repo=args.repo, file=file,
-                                                  checked_at=now(), status="error", error=error))
-        raise RuntimeError(error)
-    exported = now()
-    receipts, payload = read_handoff(file, args.repo, now_value=exported)
-    producer = producer_identity(shipyard)
-    health = health_payload(repo=args.repo, file=file, checked_at=exported, status="fresh",
-                            exported_at=exported, receipts=receipts, payload=payload,
-                            producer=producer)
-    write_health(health_file, health)
-    print(json.dumps(health, sort_keys=True))
-    return 0
+    except (RuntimeError, ValueError) as exc:
+        # A non-zero producer command is an observed producer error and gets
+        # a durable error sidecar. A zero-exit command whose staged payload or
+        # producer identity is malformed leaves the prior payload and health
+        # untouched, so observers cannot mistake a rejected refresh for a new
+        # handoff.
+        if "completed" in locals() and completed.returncode != 0:
+            write_health(health_file, health_payload(repo=args.repo, file=file,
+                                                      checked_at=now(), status="error", error=str(exc)))
+        raise
+    finally:
+        staged_path.unlink(missing_ok=True)
 
 
 def check(args: argparse.Namespace) -> int:
@@ -258,6 +280,8 @@ def check(args: argparse.Namespace) -> int:
         health = json.loads(health_file.read_text(encoding="utf-8"))
         if not isinstance(health, dict) or health.get("schema") != SCHEMA:
             raise RuntimeError("health sidecar has an unsupported schema")
+        if health.get("status") != "fresh":
+            raise RuntimeError(f"health sidecar status is {health.get('status', 'unknown')}")
         repo = health.get("repo")
         if not isinstance(repo, str) or not _REPO.fullmatch(repo):
             raise RuntimeError("health sidecar has no valid repo")
@@ -277,9 +301,17 @@ def check(args: argparse.Namespace) -> int:
         if health.get("receipt_count") != len(records):
             raise RuntimeError("health sidecar record count does not match handoff")
         producer = health.get("producer")
-        if not isinstance(producer, dict) or producer.get("identity") != "shipyard":
-            raise RuntimeError("health sidecar has no producer identity")
-        status = "fresh" if health.get("status") == "fresh" and (checked - exported_at).total_seconds() <= threshold else "stale"
+        producer_digest = producer.get("executable_sha256") if isinstance(producer, dict) else None
+        producer_version = producer.get("version") if isinstance(producer, dict) else None
+        if (not isinstance(producer, dict) or producer.get("identity") != "shipyard"
+                or not isinstance(producer_version, str) or not producer_version.strip()
+                or producer_version == "unavailable"
+                or not isinstance(producer_digest, str) or len(producer_digest) != 64
+                or producer_digest.lower() != producer_digest
+                or not all(char in "0123456789abcdef" for char in producer_digest)
+                or set(producer_digest) == {"0"}):
+            raise RuntimeError("health sidecar has an unavailable or invalid producer identity")
+        status = "fresh" if (checked - exported_at).total_seconds() <= threshold else "stale"
         payload = dict(health)
         payload.update({"status": status, "checked_at": timestamp(checked),
                         "age_seconds": max(0, int((checked - exported_at).total_seconds())),

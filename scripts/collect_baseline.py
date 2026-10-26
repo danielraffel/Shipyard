@@ -77,6 +77,16 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     validate_project_repo(args.project, args.repo)
     validate_state_identity(args.state, args.project, args.repo, args.db)
     state_dir = str(validate_state_layout(args.db))
+    merge_receipts = getattr(args, "merge_receipts", None)
+    if merge_receipts is not None:
+        receipt_path = pathlib.Path(merge_receipts).expanduser()
+        health_path = getattr(args, "merge_receipt_health", None)
+        if health_path is None:
+            raise RuntimeError("merge receipt health sidecar is required with --merge-receipts")
+        validate_merge_receipt_health(
+            pathlib.Path(health_path).expanduser(), receipt_path, args.repo,
+            getattr(args, "merge_receipt_stale_after", "2h"),
+        )
     before = count_jobs(args.db, args.project, args.repo)
     github = run([args.shipyard, "--state-dir", state_dir, "metrics", "import", "github", "--repo", args.repo,
                   "--project", args.project, "--limit", str(args.limit), "--json"], timeout=args.timeout_seconds)
@@ -95,17 +105,7 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
         tartci_event["excluded_unjoinable"] = excluded
         tartci_event["exclusion_reason"] = "missing external_id cannot be joined to a GitHub job"
     events.append(tartci_event)
-    merge_receipts = getattr(args, "merge_receipts", None)
     if merge_receipts is not None:
-        receipt_path = pathlib.Path(merge_receipts).expanduser()
-        health_path = getattr(args, "merge_receipt_health", None)
-        if health_path is not None:
-            validate_merge_receipt_health(
-                pathlib.Path(health_path).expanduser(), receipt_path, args.repo,
-                getattr(args, "merge_receipt_stale_after", "2h"),
-            )
-        else:
-            validate_merge_receipt_scope(receipt_path, args.repo)
         imported_receipts = run([
             args.shipyard, "--state-dir", state_dir, "metrics", "import", "merge-receipt",
             "--file", str(receipt_path), "--json",
@@ -229,7 +229,9 @@ def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, rep
         raise RuntimeError("merge receipt health has an unsupported schema")
     if health.get("status") != "fresh":
         raise RuntimeError(f"merge receipt health is {health.get('status', 'unknown')}")
-    if health.get("repo", "").strip().casefold() != repo.strip().casefold():
+    health_repo = health.get("repo")
+    if (not isinstance(health_repo, str)
+            or health_repo.strip().casefold() != repo.strip().casefold()):
         raise RuntimeError(f"merge receipt health names a repository other than {repo}")
     recorded_file = health.get("file")
     if not isinstance(recorded_file, str) or pathlib.Path(recorded_file).resolve() != handoff.resolve():
@@ -255,8 +257,16 @@ def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, rep
     if health.get("receipt_count") != len(records):
         raise RuntimeError("merge receipt health record count does not match handoff")
     producer = health.get("producer")
-    if not isinstance(producer, dict) or producer.get("identity") != "shipyard":
-        raise RuntimeError("merge receipt health has no producer identity")
+    producer_digest = producer.get("executable_sha256") if isinstance(producer, dict) else None
+    producer_version = producer.get("version") if isinstance(producer, dict) else None
+    if (not isinstance(producer, dict) or producer.get("identity") != "shipyard"
+            or not isinstance(producer_version, str) or not producer_version.strip()
+            or producer_version == "unavailable"
+            or not isinstance(producer_digest, str) or len(producer_digest) != 64
+            or producer_digest.lower() != producer_digest
+            or not all(char in "0123456789abcdef" for char in producer_digest)
+            or set(producer_digest) == {"0"}):
+        raise RuntimeError("merge receipt health has an unavailable or invalid producer identity")
     return health
 
 
