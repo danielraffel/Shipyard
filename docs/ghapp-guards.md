@@ -125,6 +125,8 @@ created by the `tier_record_app` App through the Checks API, whose
 {"schema":"shipyard-test-tier/v1","check":"macos","tier":"deferred",
  "run_id":123,"run_attempt":1,"trigger":"pull_request","actor":"<author>",
  "selector":"pr-fast+pr-guard","full_lane_workflow":"build.yml",
+ "tested_ref":"refs/pull/42/merge","tested_sha":"<40-hex merge commit>",
+ "merged_base":"<its base parent>",
  "full_suite_runs_in":"merge_group"}
 ```
 
@@ -138,6 +140,26 @@ fleet App, runs the full lane. A label is not a full-lane path: a `labeled`
 run of the workflow shadows the required check the merge queue reads (Pulp
 #11044 removed `labeled` from `build.yml` for that reason). The record carries
 no label.
+
+`tested_ref`, `tested_sha` and `merged_base` say what the lane checked out: the
+ref (expected `refs/pull/<n>/merge`), the merge commit actually tested, and its
+base parent (GitHub's merge ref puts the base first and the head second). A
+full lane counts only when all of these hold:
+
+- `tested_ref` is `refs/pull/<n>/merge` for this pull request;
+- `repos/<o>/<r>/commits/<tested_sha>` has parents exactly
+  `[merged_base, head]`, in that order (GitHub's), with `head` the pull
+  request's current head;
+- `merged_base` is on the base branch (`compare <merged_base>...<base>` is
+  `identical` or `ahead`).
+
+A lane that checked out the bare branch (`tested_sha` is the head itself)
+tested the head alone, not what the queue would merge; a merge whose second
+parent is an older head is stale; a merge with the head first is not GitHub's
+merge ref. All refuse, as does a full record missing `tested_ref`,
+`tested_sha` or `merged_base`. A dispatch runs on a branch ref,
+so the full-lane dispatch names the pull request with the `pr_number` input
+and checks out `refs/pull/<n>/merge`.
 
 **Why a dedicated App, not the workflow's own token.** GitHub lets a check run
 be updated only by the app that created it. Every job's `GITHUB_TOKEN` acts as
@@ -217,7 +239,9 @@ jobs:
         # or anything it cannot place publishes `deferred` or nothing. Then
         # creates the shipyard-test-tier/macos check run on HEAD_SHA,
         # completed, with output.title = tier and output.summary = the JSON
-        # above, `full_lane_workflow` included.
+        # above: `full_lane_workflow`, plus the `tested_ref`, `tested_sha` and
+        # `merged_base` the lane checked out (the runner-recorded checkout,
+        # never the head unless that is what it tested).
         run: ./.github/scripts/publish-tier-record.sh
 ```
 {% endraw %}
@@ -236,14 +260,18 @@ that name on the exact head (highest id):
    naming the check): any `deferred` refuses, and none at all refuses. A later
    record cannot widen an earlier `deferred` one, so a forged record can only
    refuse.
-4. The tiered job's token held `checks: write`, or its `GITHUB_TOKEN
+4. Every remaining record must have tested this pull request's merge ref at
+   the current head (`tested_ref`, `tested_sha` parents `[merged_base, head]`,
+   `merged_base` on the base, all above): a bare branch, a stale merge, the
+   reversed order or a missing field refuses.
+5. The tiered job's token held `checks: write`, or its `GITHUB_TOKEN
    Permissions` log group cannot be read or parsed: refuse.
 
 An unreadable config or a partial check-run listing refuses. The refusal
-prints a `queue-arm-guard: fix:` line: for a deferred tier, "dispatch
-`build.yml` on head <sha> as the fleet App and wait for the full lane" (the
-record's `full_lane_workflow`; without one, "dispatch the workflow of
-`<check>`").
+prints a `queue-arm-guard: fix:` line: for a deferred tier or an untested
+merge, "dispatch `build.yml` with `pr_number=<n>` as the fleet App and wait
+for the full lane" (the record's
+`full_lane_workflow`; without one, "dispatch the workflow of `<check>`").
 
 No override applies: `GHAPP_ALLOW_QUEUE_REARM=1` does not land such a head.
 

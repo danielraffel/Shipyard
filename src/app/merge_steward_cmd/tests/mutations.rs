@@ -1115,7 +1115,7 @@ fn tiered_enqueue_actions(
     tier: &str,
 ) -> GitHubActions {
     let summary = format!(
-        r#"{{\"schema\":\"shipyard-test-tier/v1\",\"check\":\"macos\",\"tier\":\"{tier}\",\"run_id\":700,\"run_attempt\":1,\"trigger\":\"pull_request\",\"actor\":\"author\",\"full_lane_workflow\":\"build.yml\"}}"#
+        r#"{{\"schema\":\"shipyard-test-tier/v1\",\"check\":\"macos\",\"tier\":\"{tier}\",\"run_id\":700,\"run_attempt\":1,\"trigger\":\"pull_request\",\"actor\":\"author\",\"full_lane_workflow\":\"build.yml\",\"tested_ref\":\"refs/pull/42/merge\",\"tested_sha\":\"cccccccccccccccccccccccccccccccccccccccc\",\"merged_base\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}"#
     );
     fake_gh(
         temp,
@@ -1126,6 +1126,8 @@ printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *contents/.shipyard/config.toml*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = false' '[queue]' 'tiered_required_checks = ["macos"]' 'tier_record_app = "pulp-tier-records"' ;;
   *"commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs"*) printf '%s' '[{{"total_count":2,"check_runs":[{{"id":9,"name":"macos","status":"completed","app":{{"slug":"github-actions"}}}},{{"id":750,"name":"shipyard-test-tier/macos","status":"completed","app":{{"slug":"pulp-tier-records"}},"output":{{"summary":"{summary}"}}}}]}}]' ;;
+  *"compare/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb...main"*) printf '%s' '{{"status":"identical"}}' ;;
+  *"commits/cccccccccccccccccccccccccccccccccccccccc"*) printf '%s' '{{"parents":[{{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},{{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]}}' ;;
   *actions/jobs/9/logs*) printf '%s\n' '2026-10-24T10:00:00.1Z ##[group]GITHUB_TOKEN Permissions' '2026-10-24T10:00:00.1Z Checks: read' '2026-10-24T10:00:00.1Z ##[endgroup]' ;;
   *actions/jobs/9*) printf '%s' '{{"id":9,"run_id":700,"run_attempt":1}}' ;;
   *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
@@ -1178,7 +1180,7 @@ fn managed_enqueue_waits_on_a_deferred_tier_and_enqueues_a_full_one() {
         if tier == "deferred" {
             let detail = error.expect("the refusal says why");
             assert!(
-                detail.contains("dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"),
+                detail.contains("dispatch `build.yml` with `pr_number=42` as the fleet App and wait for the full lane"),
                 "{detail}"
             );
             assert!(!calls.contains("enqueuePullRequest"), "{calls}");

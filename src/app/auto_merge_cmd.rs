@@ -2307,6 +2307,7 @@ fn head_approval_verdict(
     let checks = crate::deferred_tier::deferred_tier_checks(
         run_gh,
         &state.repo,
+        state.pr,
         &state.base_branch,
         &state.head_sha,
     )
@@ -5489,7 +5490,7 @@ exit 91
         };
         let error = head_approval_verdict(&gh, &state).expect_err("refused");
         assert!(
-            error.contains("dispatch `build.yml` on head aaaaaaaaaaaa as the fleet App and wait for the full lane"),
+            error.contains("dispatch `build.yml` with `pr_number=42` as the fleet App and wait for the full lane"),
             "{error}"
         );
     }

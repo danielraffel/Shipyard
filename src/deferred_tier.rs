@@ -35,8 +35,15 @@
 //! ```json
 //! {"schema":"shipyard-test-tier/v1","check":"macos","tier":"deferred",
 //!  "run_id":123,"run_attempt":1,"trigger":"pull_request","actor":"author",
-//!  "full_lane_workflow":"build.yml","full_suite_runs_in":"merge_group"}
+//!  "full_lane_workflow":"build.yml","tested_ref":"refs/pull/42/merge",
+//!  "tested_sha":"<merge commit>","merged_base":"<its base parent>",
+//!  "full_suite_runs_in":"merge_group"}
 //! ```
+//!
+//! `tested_ref`, `tested_sha` and `merged_base` say what the lane checked
+//! out. A full lane counts only for this pull request's merge ref at the
+//! current head ([`FULL_LANE_PR_INPUT`] names the pull request in the
+//! dispatch).
 //!
 //! `trigger` and `actor` say which event and account started the run (a full
 //! lane is a `workflow_dispatch` by `shipyard-local[bot]`); they are reported,
@@ -87,6 +94,11 @@
 //! 3. Among the tier records bound to that run attempt, any `deferred`
 //!    refuses, and none at all refuses. A later record cannot widen an
 //!    earlier `deferred` one, so a forged record can only refuse.
+//! 4. Every remaining record must name `tested_ref` `refs/pull/<n>/merge`
+//!    for this pull request, a `tested_sha` whose parents are exactly
+//!    `[merged_base, head]` (GitHub's order), and a `merged_base` on the base
+//!    branch: a bare branch, a stale merge or the reversed order refuses.
+//! 5. The tiered job's token may not have held `checks: write`.
 //!
 //! The `ghapp` queue-arm guard applies the same rule (`tier_blockers` in
 //! `scripts/ghapp_queue_arm_guard.py`); keep the two in lockstep. No override
@@ -102,6 +114,9 @@ use serde_json::Value;
 pub const DEFERRED_TIER: &str = "deferred";
 /// The log group the runner prints listing the job's token scopes.
 pub const TOKEN_PERMISSIONS_HEADER: &str = "GITHUB_TOKEN Permissions";
+/// The `workflow_dispatch` input naming the pull request whose merge ref
+/// (`refs/pull/<n>/merge`) the full lane checks out.
+pub const FULL_LANE_PR_INPUT: &str = "pr_number";
 /// Name prefix of a tier record check run; the check's name follows it.
 pub const TIER_RECORD_PREFIX: &str = "shipyard-test-tier/";
 /// Schema identifier inside a tier record's `output.summary`.
@@ -131,6 +146,8 @@ pub type RunGh<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
 pub struct DeferredCheck {
     /// Check name, as the base's config lists it.
     pub check: String,
+    /// The pull request the head belongs to.
+    pub pr: u64,
     /// The head the check was read on.
     pub head: String,
     /// Why it holds the head back.
@@ -162,6 +179,15 @@ pub enum Blocker {
         run_id: u64,
         /// Its attempt.
         run_attempt: u64,
+    },
+    /// A full-lane record that does not prove it tested this pull request's
+    /// merge with its base at the current head: a bare branch, or a merge of
+    /// an older head.
+    UntestedMerge {
+        /// What the record tested instead.
+        reason: String,
+        /// The workflow whose dispatch runs the full lane, when given.
+        full_lane_workflow: Option<String>,
     },
     /// The tiered job's token could write check runs, so it could have
     /// rewritten its own tier record.
@@ -210,6 +236,10 @@ impl DeferredCheck {
                 "tiered required check `{check}` on {head} has no `{TIER_RECORD_PREFIX}{check}` \
                  record for run {run_id} attempt {run_attempt}, so its tier is unproven"
             ),
+            Blocker::UntestedMerge { reason, .. } => format!(
+                "the full lane of tiered required check `{check}` on {head} did not test this \
+                 pull request's merge with its base ({reason})"
+            ),
             Blocker::ChecksWritable { level } => format!(
                 "the job of tiered required check `{check}` on {head} ran with `checks: {level}`, \
                  so it could have rewritten its own tier record"
@@ -231,18 +261,11 @@ impl DeferredCheck {
                 self.check
             ),
             Blocker::Deferred {
-                full_lane_workflow: Some(workflow),
-                ..
-            } => format!(
-                "dispatch `{workflow}` on head {} as the fleet App and wait for the full lane",
-                short(&self.head)
-            ),
-            Blocker::Deferred { .. } => format!(
-                "dispatch the workflow of `{}` on head {} as the fleet App and wait for the \
-                 full lane",
-                self.check,
-                short(&self.head)
-            ),
+                full_lane_workflow, ..
+            }
+            | Blocker::UntestedMerge {
+                full_lane_workflow, ..
+            } => self.dispatch(full_lane_workflow.as_deref()),
             Blocker::MissingRecord { .. } => format!(
                 "the workflow publishes a `{TIER_RECORD_PREFIX}{}` check run for this run \
                  attempt (docs/ghapp-guards.md)",
@@ -255,6 +278,22 @@ impl DeferredCheck {
             ),
             Blocker::Unreadable { .. } => "read it again once GitHub answers".to_owned(),
         }
+    }
+}
+
+impl DeferredCheck {
+    /// The full-lane request: a fleet-App dispatch that tests this pull
+    /// request's merge ref at the current head.
+    fn dispatch(&self, workflow: Option<&str>) -> String {
+        let what = workflow.map_or_else(
+            || format!("the workflow of `{}`", self.check),
+            |workflow| format!("`{workflow}`"),
+        );
+        format!(
+            "dispatch {what} with `{FULL_LANE_PR_INPUT}={}` as the fleet App and wait for the \
+             full lane",
+            self.pr
+        )
     }
 }
 
@@ -279,6 +318,7 @@ pub fn explain_all(checks: &[DeferredCheck]) -> Option<String> {
 pub fn deferred_tier_checks(
     run_gh: RunGh<'_>,
     repo: &str,
+    pr: u64,
     base: &str,
     head: &str,
 ) -> Result<Vec<DeferredCheck>, String> {
@@ -286,7 +326,16 @@ pub fn deferred_tier_checks(
     if policy.checks.is_empty() {
         return Ok(Vec::new());
     }
-    tier_blockers(run_gh, repo, head, &policy)
+    tier_blockers(
+        run_gh,
+        &Landing {
+            repo,
+            pr,
+            base,
+            head,
+        },
+        &policy,
+    )
 }
 
 /// The [`TierPolicy`] of `base`'s `.shipyard/config.toml`. A missing file or
@@ -381,11 +430,10 @@ pub fn tier_policy_from_config(text: &str) -> Result<TierPolicy, String> {
 /// When the head's check runs cannot be read in full.
 pub fn tier_blockers(
     run_gh: RunGh<'_>,
-    repo: &str,
-    head: &str,
+    landing: &Landing<'_>,
     policy: &TierPolicy,
 ) -> Result<Vec<DeferredCheck>, String> {
-    let listed = check_runs(run_gh, repo, head)?;
+    let listed = check_runs(run_gh, landing.repo, landing.head)?;
     let mut latest = BTreeMap::<&str, &Value>::new();
     for run in &listed {
         let (Some(name), Some(id)) = (
@@ -408,12 +456,13 @@ pub fn tier_blockers(
             None => Some(Blocker::Pending {
                 status: "missing".to_owned(),
             }),
-            Some(run) => blocker_for(run_gh, repo, check, run, &listed, &policy.record_app),
+            Some(run) => blocker_for(run_gh, landing, check, run, &listed, &policy.record_app),
         };
         if let Some(blocker) = blocker {
             blockers.push(DeferredCheck {
                 check: check.clone(),
-                head: head.to_owned(),
+                pr: landing.pr,
+                head: landing.head.to_owned(),
                 blocker,
             });
         }
@@ -421,10 +470,22 @@ pub fn tier_blockers(
     Ok(blockers)
 }
 
+/// The pull request a landing would land, at the head it would land.
+pub struct Landing<'a> {
+    /// `OWNER/REPO`.
+    pub repo: &'a str,
+    /// The pull request number.
+    pub pr: u64,
+    /// Its base branch.
+    pub base: &'a str,
+    /// Its current head.
+    pub head: &'a str,
+}
+
 /// What holds back one tiered check whose latest run is `run`, if anything.
 fn blocker_for(
     run_gh: RunGh<'_>,
-    repo: &str,
+    landing: &Landing<'_>,
     check: &str,
     run: &Value,
     listed: &[Value],
@@ -442,6 +503,7 @@ fn blocker_for(
                 .to_owned(),
         });
     }
+    let repo = landing.repo;
     let (run_id, run_attempt) = match job_run(run_gh, repo, run) {
         Ok(bound) => bound,
         Err(reason) => return Some(Blocker::Unreadable { reason }),
@@ -498,6 +560,16 @@ fn blocker_for(
             full_lane_workflow: text(summary, "full_lane_workflow"),
             full_suite_runs_in: text(summary, "full_suite_runs_in"),
         });
+    }
+    // Every full-lane record must show it tested this pull request's merge
+    // with its base at the current head, never the bare branch.
+    for summary in &records {
+        if let Err(reason) = tested_merge(run_gh, landing, summary) {
+            return Some(Blocker::UntestedMerge {
+                reason,
+                full_lane_workflow: text(summary, "full_lane_workflow"),
+            });
+        }
     }
     // Read only when the records would allow: a refusal needs no log.
     let Some(id) = run.get("id").and_then(Value::as_u64) else {
@@ -563,6 +635,119 @@ pub fn checks_scope(log: &str) -> Result<String, String> {
     Err(format!(
         "its `{TOKEN_PERMISSIONS_HEADER}` group never closes"
     ))
+}
+
+/// Whether a full-lane record proves it tested this pull request's merge ref
+/// at the current head. All of these must hold: `tested_ref` is
+/// `refs/pull/<n>/merge` for this pull request; `tested_sha`'s parents are
+/// exactly `[merged_base, head]`, in GitHub's order (base first, head
+/// second); and `merged_base` is on the base branch. A bare branch (the head
+/// itself), a merge of an older head, the reversed order, another ref, or a
+/// record missing any of the three fields is not.
+fn tested_merge(
+    run_gh: RunGh<'_>,
+    landing: &Landing<'_>,
+    summary: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let Landing {
+        repo,
+        pr,
+        base,
+        head,
+    } = *landing;
+    let tested = summary
+        .get("tested_sha")
+        .and_then(Value::as_str)
+        .filter(|sha| is_sha(sha))
+        .ok_or_else(|| "its record names no `tested_sha`".to_owned())?;
+    if tested.eq_ignore_ascii_case(head) {
+        return Err(format!(
+            "it tested the bare branch at {}, not a merge with the base",
+            short(head)
+        ));
+    }
+    let merge_ref = format!("refs/pull/{pr}/merge");
+    match summary.get("tested_ref").and_then(Value::as_str) {
+        Some(tested_ref) if tested_ref == merge_ref => {}
+        Some(other) => {
+            return Err(format!(
+                "it tested `{other}`, not this pull request's `{merge_ref}`"
+            ));
+        }
+        None => return Err(format!("its record names no `tested_ref` ({merge_ref})")),
+    }
+    let merged_base = summary
+        .get("merged_base")
+        .and_then(Value::as_str)
+        .filter(|sha| is_sha(sha))
+        .ok_or_else(|| "its record names no `merged_base`".to_owned())?;
+    let commit: Value = run_gh(&["api".to_owned(), format!("repos/{repo}/commits/{tested}")])
+        .and_then(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
+        .map_err(|error| format!("tested commit {} is unreadable: {error}", short(tested)))?;
+    let parents: Vec<&str> = commit
+        .get("parents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|parent| parent.get("sha").and_then(Value::as_str))
+        .collect();
+    let [first, second] = parents[..] else {
+        return Err(format!(
+            "tested commit {} has {} parent(s), so it is not a merge",
+            short(tested),
+            parents.len()
+        ));
+    };
+    // GitHub's `refs/pull/<n>/merge` puts the base first and the head second.
+    if !second.eq_ignore_ascii_case(head) {
+        return Err(if first.eq_ignore_ascii_case(head) {
+            format!(
+                "tested commit {} has the head as its first parent, the reverse of GitHub's \
+                 merge ref, so it is not {merge_ref}",
+                short(tested)
+            )
+        } else {
+            format!(
+                "tested commit {} is not a merge of the current head {} (its parents are {} \
+                 and {}): a stale merge",
+                short(tested),
+                short(head),
+                short(first),
+                short(second)
+            )
+        });
+    }
+    if !first.eq_ignore_ascii_case(merged_base) {
+        return Err(format!(
+            "its record names `merged_base` {} but tested commit {} merged {}",
+            short(merged_base),
+            short(tested),
+            short(first)
+        ));
+    }
+    let compare: Value = run_gh(&[
+        "api".to_owned(),
+        format!("repos/{repo}/compare/{merged_base}...{base}"),
+    ])
+    .and_then(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
+    .map_err(|error| {
+        format!(
+            "whether {} is on `{base}` is unreadable: {error}",
+            short(merged_base)
+        )
+    })?;
+    match compare.get("status").and_then(Value::as_str) {
+        Some("identical" | "ahead") => Ok(()),
+        _ => Err(format!(
+            "tested commit {} merged {}, which is not on `{base}`",
+            short(tested),
+            short(merged_base)
+        )),
+    }
+}
+
+fn is_sha(text: &str) -> bool {
+    text.len() == 40 && text.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// `(run_id, run_attempt)` of the Actions job behind a check run (a job's id

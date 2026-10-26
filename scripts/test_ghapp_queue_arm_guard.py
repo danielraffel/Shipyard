@@ -657,15 +657,32 @@ TIERED_CONFIG = ('[queue]\ntiered_required_checks = ["macos"]\n'
                  'tier_record_app = "pulp-tier-records"\n')
 
 
-def tier_record(tier: str, run_id: int = 700, run_attempt: int = 1, **change: Any) -> dict[str, Any]:
-    """A ``shipyard-test-tier/macos`` check run, as the base's record App creates it."""
+# refs/pull/8672/merge at the current head: parents BASE_TIP then HEAD, as GitHub
+# orders a merge ref.
+TESTED_MERGE = "c" * 40
+BASE_TIP = "b" * 40
+
+
+def tier_record(tier: str, run_id: int = 700, run_attempt: int = 1,
+                summary: dict[str, Any] | None = None, **change: Any) -> dict[str, Any]:
+    """A ``shipyard-test-tier/macos`` check run, as the base's record App creates it.
+    ``summary`` replaces summary fields; a ``None`` value drops one."""
+    fields = {
+        "schema": "shipyard-test-tier/v1", "check": "macos", "tier": tier,
+        "run_id": run_id, "run_attempt": run_attempt, "selector": "pr-fast+pr-guard",
+        "trigger": "pull_request", "actor": "author", "full_lane_workflow": "build.yml",
+        "tested_ref": "refs/pull/8672/merge", "tested_sha": TESTED_MERGE,
+        "merged_base": BASE_TIP,
+        "full_suite_runs_in": "merge_group"}
+    for key, value in (summary or {}).items():
+        if value is None:
+            fields.pop(key, None)
+        else:
+            fields[key] = value
     record = {
         "id": 50 + run_id, "name": "shipyard-test-tier/macos", "status": "completed",
         "conclusion": "neutral", "app": {"slug": "pulp-tier-records"},
-        "output": {"title": tier, "summary": json.dumps({
-            "schema": "shipyard-test-tier/v1", "check": "macos", "tier": tier,
-            "run_id": run_id, "run_attempt": run_attempt, "selector": "pr-fast+pr-guard",
-            "trigger": "pull_request", "actor": "author", "full_lane_workflow": "build.yml", "full_suite_runs_in": "merge_group"})},
+        "output": {"title": tier, "summary": json.dumps(fields)},
     }
     record.update(change)
     return record
@@ -714,6 +731,9 @@ class TieredRequiredChecks(unittest.TestCase):
             self.listing(): [{"total_count": len(runs), "check_runs": runs}],
             f"repos/{self.REPO}/actions/jobs/9": {"id": 9, "run_id": 700, "run_attempt": 1},
             self.log_path(): job_log("read"),
+            f"repos/{self.REPO}/commits/{TESTED_MERGE}": {
+                "sha": TESTED_MERGE, "parents": [{"sha": BASE_TIP}, {"sha": self.HEAD}]},
+            f"repos/{self.REPO}/compare/{BASE_TIP}...main": {"status": "identical"},
         }
 
     def log_path(self) -> str:
@@ -771,7 +791,7 @@ class TieredRequiredChecks(unittest.TestCase):
         self.assertIn("required check `macos` on 788ba84d0325 ran only the deferred tier "
                       "(selector pr-fast+pr-guard; full suite runs in merge_group)", message)
         fix = self.fix(message)
-        self.assertEqual(fix["command"], "dispatch `build.yml` on head 788ba84d0325 as the "
+        self.assertEqual(fix["command"], "dispatch `build.yml` with `pr_number=8672` as the "
                          "fleet App and wait for the full lane")
         self.assertEqual(fix["cause"], "tier_deferred")
 
@@ -787,9 +807,84 @@ class TieredRequiredChecks(unittest.TestCase):
         code, message, _ = self.run_guard(self.answers([record]))
         self.assertEqual(code, 1, message)
         self.assertEqual(self.fix(message)["command"],
-                         "dispatch the workflow of `macos` on head 788ba84d0325 as the fleet "
+                         "dispatch the workflow of `macos` with `pr_number=8672` as the fleet "
                          "App and wait for the full lane")
         self.assertNotIn("macos-ci", message)
+
+    def test_a_full_record_that_tested_the_bare_branch_is_refused(self) -> None:
+        for summary in ({"tested_ref": "refs/heads/feature", "tested_sha": self.HEAD},
+                        {"tested_ref": "refs/pull/8672/merge", "tested_sha": self.HEAD}):
+            with self.subTest(summary=summary):
+                code, message, _ = self.run_guard(
+                    self.answers([tier_record("full", summary=summary)]))
+                self.assertEqual(code, 1, message)
+                self.assertIn("tested the bare branch at 788ba84d0325", message)
+                self.assertEqual(self.fix(message)["cause"], "tier_untested_merge")
+                self.assertIn("with `pr_number=8672`", self.fix(message)["command"])
+
+    def test_a_full_record_that_tested_a_stale_merge_is_refused(self) -> None:
+        # A merge built for an older head says nothing about the current one,
+        # even when it names this pull request's merge ref.
+        stale, old_head = "e" * 40, "d" * 40
+        answers = self.answers([tier_record("full", summary={"tested_sha": stale})])
+        answers[f"repos/{self.REPO}/commits/{stale}"] = {
+            "sha": stale, "parents": [{"sha": BASE_TIP}, {"sha": old_head}]}
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("is not a merge of the current head 788ba84d0325 (its parents are "
+                      "bbbbbbbbbbbb and dddddddddddd): a stale merge", message)
+
+    def test_a_full_record_must_name_this_pull_requests_merge_ref(self) -> None:
+        for tested_ref, why in (
+            (None, "names no `tested_ref` (refs/pull/8672/merge)"),
+            ("refs/heads/feature", "tested `refs/heads/feature`, not this pull request's"),
+            ("refs/pull/8671/merge", "tested `refs/pull/8671/merge`, not this pull request's"),
+        ):
+            with self.subTest(tested_ref=tested_ref):
+                code, message, _ = self.run_guard(self.answers(
+                    [tier_record("full", summary={"tested_ref": tested_ref})]))
+                self.assertEqual(code, 1, message)
+                self.assertIn(why, message)
+
+    def test_a_merge_with_the_head_first_is_refused(self) -> None:
+        # Only GitHub's order counts: base first, head second.
+        answers = self.answers([tier_record("full")])
+        answers[f"repos/{self.REPO}/commits/{TESTED_MERGE}"] = {
+            "sha": TESTED_MERGE, "parents": [{"sha": self.HEAD}, {"sha": BASE_TIP}]}
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("has the head as its first parent, the reverse of GitHub's merge ref",
+                      message)
+
+    def test_the_merged_base_must_be_the_first_parent_and_on_the_base(self) -> None:
+        for summary in ({"merged_base": "f" * 40}, {"merged_base": None}):
+            with self.subTest(summary=summary):
+                code, message, _ = self.run_guard(self.answers(
+                    [tier_record("full", summary=summary)]))
+                self.assertEqual(code, 1, message)
+                self.assertIn("merged_base", message)
+        answers = self.answers([tier_record("full")])
+        answers[f"repos/{self.REPO}/compare/{BASE_TIP}...main"] = {"status": "diverged"}
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("which is not on `main`", message)
+        answers[f"repos/{self.REPO}/compare/{BASE_TIP}...main"] = {"status": "ahead"}
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 0, message)
+
+    def test_a_full_record_without_a_tested_merge_is_refused(self) -> None:
+        for summary in ({"tested_sha": None}, {"tested_sha": "not-a-sha"}):
+            with self.subTest(summary=summary):
+                code, message, _ = self.run_guard(
+                    self.answers([tier_record("full", summary=summary)]))
+                self.assertEqual(code, 1, message)
+                self.assertIn("names no `tested_sha`", message)
+        answers = self.answers([tier_record("full")])
+        answers[f"repos/{self.REPO}/commits/{TESTED_MERGE}"] = {
+            "sha": TESTED_MERGE, "parents": [{"sha": self.HEAD}]}
+        code, message, _ = self.run_guard(answers)
+        self.assertEqual(code, 1, message)
+        self.assertIn("1 parent(s)", message)
 
     def test_no_override_lands_a_deferred_head(self) -> None:
         code, message, _ = self.run_guard(self.answers([tier_record("deferred")]),
@@ -874,6 +969,23 @@ class TieredRequiredChecks(unittest.TestCase):
                 code, message, _ = self.run_guard(answers)
                 self.assertEqual(code, 1, message)
                 self.assertIn("cannot be read", message)
+
+    def test_a_missing_or_unclosed_token_permissions_group_refuses(self) -> None:
+        stamp = "2026-10-24T10:00:00.1000000Z"
+        headless = f"{stamp} Checks: read\n{stamp} Secret source: Actions\n"
+        truncated = (f"{stamp} ##[group]GITHUB_TOKEN Permissions\n{stamp} Actions: read\n"
+                     f"{stamp} Checks: read\n")
+        for log, why in ((headless, "has no `GITHUB_TOKEN Permissions` group"),
+                         (truncated, "group never closes")):
+            with self.subTest(why=why):
+                with self.assertRaises(guard.GuardError) as raised:
+                    guard.checks_scope(log)
+                self.assertIn(why, str(raised.exception))
+                answers = self.answers([tier_record("full")])
+                answers[self.log_path()] = log
+                code, message, _ = self.run_guard(answers)
+                self.assertEqual(code, 1, message)
+                self.assertIn(why, message)
 
     def test_the_checks_scope_is_read_from_the_header_group_only(self) -> None:
         self.assertEqual(guard.checks_scope(job_log("none")), "none")

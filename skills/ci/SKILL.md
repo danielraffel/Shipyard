@@ -319,7 +319,8 @@ Two things not to conclude from it:
   `macos`), the arm is refused while it has not completed, or while its
   `shipyard-test-tier/<check>` record (from the base's `tier_record_app`, never
   `github-actions`) is missing or says `deferred`, or the job's token held
-  `checks: write`: dispatch `build.yml` on the head as the
+  `checks: write`, or its full lane did not test `refs/pull/<n>/merge` at the
+  head: dispatch `build.yml` with `pr_number=<n>` as the
   fleet App and wait for the full lane. The steward's native-arm backstop arms
   it later. See the shipyard skill.
 - **Armed is not merged.** GitHub still waits for the repository's required

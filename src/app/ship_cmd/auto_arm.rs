@@ -338,7 +338,7 @@ fn tier_gate(
                 .base
                 .as_deref()
                 .ok_or_else(|| "the pull request carried no base branch".to_owned())?;
-            crate::deferred_tier::deferred_tier_checks(run_gh, repo, base, head)
+            crate::deferred_tier::deferred_tier_checks(run_gh, repo, pr, base, head)
         });
     match read {
         Ok(checks) => crate::deferred_tier::explain_all(&checks).map_or(Ok(()), |detail| {
