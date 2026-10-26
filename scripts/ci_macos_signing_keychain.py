@@ -127,6 +127,7 @@ def prepare(keychain: Path, state_path: Path, signing_home: Path) -> None:
 def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
     """Verify global state stayed unchanged and delete the ephemeral keychain."""
     failures: list[str] = []
+    verified_snapshot = True
     state: dict[str, Any] | None = None
     try:
         parsed_state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -143,19 +144,23 @@ def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
         verified_default = _security("default-keychain", "-d", "user", home=user_home)
         if verified_list.returncode != 0:
             failures.append("could not verify the empty user keychain search list")
+            verified_snapshot = False
         else:
             try:
                 actual_list = _parse_keychain_output(verified_list.stdout)
             except RuntimeError:
                 failures.append("empty user keychain search list output was malformed")
+                verified_snapshot = False
             else:
                 if actual_list:
                     failures.append("user keychain search list changed during signing")
+                    verified_snapshot = False
         if not (
             verified_default.returncode != 0
             and "default keychain could not be found" in verified_default.stderr.lower()
         ):
             failures.append("user default keychain appeared during signing")
+            verified_snapshot = False
     elif state and state.get("snapshot_complete") is True:
         search_list = state.get("search_list")
         default_keychain = state.get("default_keychain")
@@ -163,26 +168,32 @@ def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
             isinstance(item, str) for item in search_list
         ):
             failures.append("saved keychain search list is invalid")
+            verified_snapshot = False
 
         if not isinstance(default_keychain, str) or not default_keychain:
             failures.append("saved default keychain is invalid")
+            verified_snapshot = False
 
         user_home = _user_home()
         verified_list = _security("list-keychains", "-d", "user", home=user_home)
         verified_default = _security("default-keychain", "-d", "user", home=user_home)
         if verified_list.returncode != 0 or verified_default.returncode != 0:
             failures.append("could not verify the user keychain configuration")
+            verified_snapshot = False
         else:
             try:
                 actual_list = _parse_keychain_output(verified_list.stdout)
                 actual_defaults = _parse_keychain_output(verified_default.stdout)
             except RuntimeError:
                 failures.append("keychain verification output was malformed")
+                verified_snapshot = False
             else:
                 if actual_list != search_list:
                     failures.append("user keychain search list changed during signing")
+                    verified_snapshot = False
                 if actual_defaults != [default_keychain]:
                     failures.append("user default keychain changed during signing")
+                    verified_snapshot = False
 
     # The path is generated from RUNNER_TEMP and GITHUB_RUN_ID. Deletion is
     # safe to retry and must not be skipped when setup failed partway through.
@@ -195,7 +206,14 @@ def restore(keychain: Path, state_path: Path, signing_home: Path) -> None:
     # snapshot was always followed by creation in that version.
     if state and "keychain_created" not in state and state.get("snapshot_complete") is True:
         keychain_created = True
-    if (creation_started or keychain_created) and keychain.exists():
+    # Preserve a keychain when a valid snapshot cannot be re-established: it
+    # may still be referenced by a persistent search list and must remain
+    # available for manual recovery. State-loss cleanup remains best effort
+    # because no trustworthy snapshot can establish a persistent reference.
+    snapshot_requires_proof = bool(state and state.get("snapshot_complete") is True)
+    if (creation_started or keychain_created) and keychain.exists() and (
+        not snapshot_requires_proof or verified_snapshot
+    ):
         deletion = _security("delete-keychain", str(keychain))
         if deletion.returncode != 0:
             failures.append("could not delete the ephemeral signing keychain")

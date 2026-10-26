@@ -242,11 +242,14 @@ class SigningKeychainTests(unittest.TestCase):
                 "default_keychain": "/original",
                 "search_list": ["/original", "/signing"],
             }))
+            keychain = root / "ephemeral"
+            keychain.touch()
             responses = [completed('"/changed"'), completed('"/changed"'), completed()]
             with mock.patch.object(subject, "_security", side_effect=responses) as security:
                 with self.assertRaisesRegex(RuntimeError, "changed during signing"):
-                    subject.restore(root / "ephemeral", state, root / "home")
+                    subject.restore(keychain, state, root / "home")
             self.assertFalse(any("-s" in call.args for call in security.call_args_list))
+            self.assertTrue(keychain.exists())
 
     def test_failed_ephemeral_deletion_is_a_cleanup_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
