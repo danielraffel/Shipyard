@@ -1662,13 +1662,14 @@ def train_config(config_text: str | None) -> dict[str, Any]:
 
 def train_stopped(repo: str, kill: str | None, guards_dir: pathlib.Path | None) -> str | None:
     """Why this host's train is stopped for ``repo``: ``SHIPYARD_TRAIN`` is
-    ``off``, ``0`` or ``false`` (optionally ``:<owner/repo>``), or a
-    ``train.pause`` file is in the guards directory."""
+    ``off``, ``0`` or ``false``, or ``off:<owner/repo>``, or a ``train.pause``
+    file is in the guards directory. Same as src/merge_train.rs
+    ``kill_switch``."""
     value = (kill or "").strip()
     if value:
-        switch, _, scope = value.partition(":")
-        if (switch.strip().lower() in ("off", "0", "false")
-                and (not scope.strip() or scope.strip().lower() == repo.lower())):
+        word, _, target = value.partition(":")
+        if value.lower() in ("off", "0", "false") or (
+                target and word.lower() == "off" and target.strip().lower() == repo.lower()):
             return f"{TRAIN_KILL_ENV}={value} stops the train on this host"
     if guards_dir is not None and (guards_dir / TRAIN_PAUSE_FILE).exists():
         return f"the train is paused ({guards_dir / TRAIN_PAUSE_FILE})"

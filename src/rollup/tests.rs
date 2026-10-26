@@ -532,10 +532,11 @@ fn the_train_table_is_off_by_default_and_refuses_bad_values() {
 
 #[test]
 fn the_kill_switch_and_pause_file_stop_the_train() {
-    for value in ["off", "0", "false", "OFF", "off:o/r", "false:O/R"] {
+    for value in ["off", "0", "false", "OFF", "off:o/r", "OFF:O/R"] {
         assert!(stopped(REPO, Some(value), None).is_some(), "{value}");
     }
-    for value in ["on", "", "off:other/repo"] {
+    // The merge train's switch scopes only `off:`.
+    for value in ["on", "", "off:other/repo", "false:o/r"] {
         assert!(stopped(REPO, Some(value), None).is_none(), "{value}");
     }
     let dir = tempfile::tempdir().expect("tempdir");
