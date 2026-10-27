@@ -5307,3 +5307,7 @@ atomic sidecar. Readiness requires observed continuity; historical activity
 counts and status-only runs must not be used to manufacture prospective
 coverage. Sidecars are keyed by repository, source identity, cadence, and
 configuration so changing collection policy cannot mix incompatible history.
+The collector is report-only by default; callers that gate an optimization may
+pass `--require-ready`, which writes the same state and status first and then
+returns exit 3 unless `optimization_eligible` is true. Keep the scheduled
+collector without that flag so collection continues while the baseline grows.
