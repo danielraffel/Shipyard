@@ -328,9 +328,20 @@ class CollectorInvocationTests(unittest.TestCase):
     def test_require_ready_subprocess_persists_state_and_status_but_default_stays_green(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fake_shipyard = root / "shipyard"
-            fake_shipyard.write_text("#!/bin/sh\nprintf '%s\\n' '{}'\n")
-            fake_shipyard.chmod(0o755)
+            fake_implementation = root / "fake_shipyard.py"
+            fake_implementation.write_text("import sys\nprint('{}')\n")
+            if sys.platform == "win32":
+                fake_shipyard = root / "shipyard.cmd"
+                fake_shipyard.write_text(
+                    f'@"{sys.executable}" "{fake_implementation}" %*\n'
+                )
+            else:
+                fake_shipyard = root / "shipyard"
+                fake_shipyard.write_text(
+                    f"#!/usr/bin/env python3\nexec(compile(open({str(fake_implementation)!r}).read(), "
+                    f"{str(fake_implementation)!r}, 'exec'))\n"
+                )
+                fake_shipyard.chmod(0o755)
             db = root / "metrics" / "metrics.db"
             state = root / "state.json"
             status = root / "status.md"
