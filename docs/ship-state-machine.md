@@ -102,11 +102,11 @@ real ship-state write from overlapping that audit.
 | `evidence_snapshot` | `{target: "pass" | "fail"}` written by `_update_ship_state_from_job` (cli.py:4576). No other values are ever written by the normal path — `"pending"` is accepted by `_ship_terminal_verdict` but never produced. |
 | `attempt`           | Monotonic attempt counter bumped on `--no-resume`; the value is carried into the replacement state so old attempts do not reattach. |
 | `reviewer_claim_epoch` | Monotonic fence for reviewer ownership claims. It advances on claim and revocation, and also when an attempt is replaced, so a late verdict cannot reuse an older claim epoch. Defaults to `0` for legacy state. |
-| `active_reviewer_claim` | Optional exact-head `ReviewerClaim` (`head_sha`, `epoch`, `reviewer`, `claimed_at`, `deadline_at`). A claim must be revoked before another claim is acquired; verdict acceptance requires the current head, matching epoch, and an unexpired deadline. Defaults to absent for legacy state. |
+| `active_reviewer_claim` | Optional exact-head `ReviewerClaim` (`head_sha`, `epoch`, `reviewer`, `claimed_at`, `deadline_at`). An unexpired claim remains exclusive; an expired claim may be reclaimed with a new epoch. Verdict acceptance requires the current head, matching epoch and reviewer, and an unexpired deadline. Defaults to absent for legacy state. |
 | `pr_url`, `pr_title`, `commit_subject` | Human context. Refreshed by the `ship` resume path (cli.py:2679) on each invocation; NOT refreshed by add-lane's `save` (cli.py:2359) or by `_update_ship_state_from_job`. Test coverage: `ship-state show` after a force-push + `shipyard ship` resume should see updated fields; after a `cloud add-lane` against the same state, should not. |
 | `created_at`        | Attempt-scoped: stable for the life of an attempt.                                  |
 | `updated_at`        | Last `touch()` — bumped after every mutation helper.                                |
-| `schema_version`    | `SCHEMA_VERSION` (currently 1). `from_dict` defaults to `SCHEMA_VERSION` when reading older files that omit it.                                                                 |
+| `schema_version`    | `SCHEMA_VERSION` (currently 2). v1 files remain readable for non-claim state; claim checks require v2 and a consistent epoch. `from_dict` defaults to `SCHEMA_VERSION` when reading files that omit it. |
 
 `DispatchedRun` is the per-dispatch record (not strictly per-target — see
 `dispatched_runs` note above):

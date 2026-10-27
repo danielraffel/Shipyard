@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::evidence::canonical_repository;
 
 /// Schema version for durable ship-state files.
-pub const SHIP_STATE_SCHEMA_VERSION: u32 = 1;
+pub const SHIP_STATE_SCHEMA_VERSION: u32 = 2;
 
 /// A single dispatched run tracked as part of an in-flight ship.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -280,19 +280,32 @@ impl ShipState {
     ///
     /// Callers must hold the repository-scoped ship-state lock while invoking
     /// this method and persisting the returned state. A claim for another head
-    /// or a non-forward deadline is rejected without mutation.
+    /// or a non-forward deadline is rejected without mutation. An unexpired
+    /// active claim remains exclusive; an expired claim is reclaimed with a
+    /// new epoch. `now` is the caller's observation time and prevents a
+    /// future-dated `claimed_at` from bypassing an unexpired claim.
     pub fn claim_reviewer(
         &mut self,
         head_sha: &str,
         reviewer: impl Into<String>,
         claimed_at: DateTime<Utc>,
         deadline_at: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> Option<ReviewerClaim> {
-        if head_sha != self.head_sha
-            || deadline_at <= claimed_at
-            || self.active_reviewer_claim.is_some()
-        {
+        if head_sha != self.head_sha || deadline_at <= claimed_at || claimed_at > now {
             return None;
+        }
+        match self.active_reviewer_claim.as_ref() {
+            None => {}
+            Some(active) => {
+                if self.schema_version < SHIP_STATE_SCHEMA_VERSION
+                    || active.epoch == 0
+                    || self.reviewer_claim_epoch != active.epoch
+                    || now < active.deadline_at
+                {
+                    return None;
+                }
+            }
         }
         let epoch = self.reviewer_claim_epoch.checked_add(1)?;
         let claim = ReviewerClaim {
@@ -302,19 +315,30 @@ impl ShipState {
             claimed_at,
             deadline_at,
         };
+        self.schema_version = SHIP_STATE_SCHEMA_VERSION;
         self.reviewer_claim_epoch = epoch;
         self.active_reviewer_claim = Some(claim.clone());
         self.touch();
         Some(claim)
     }
 
-    /// Revoke an active reviewer claim when its exact head and epoch match.
+    /// Revoke an active reviewer claim when its exact head, epoch, and
+    /// reviewer identity match.
     ///
     /// Revocation advances the epoch even though it clears the active claim,
     /// fencing a late verdict from the revoked reviewer.
-    pub fn revoke_reviewer_claim(&mut self, head_sha: &str, epoch: u64) -> bool {
+    pub fn revoke_reviewer_claim(&mut self, head_sha: &str, epoch: u64, reviewer: &str) -> bool {
+        if self.schema_version < SHIP_STATE_SCHEMA_VERSION
+            || epoch == 0
+            || self.reviewer_claim_epoch != epoch
+        {
+            return false;
+        }
         let matches = self.active_reviewer_claim.as_ref().is_some_and(|claim| {
-            claim.head_sha == head_sha && claim.epoch == epoch && self.head_sha == head_sha
+            claim.head_sha == head_sha
+                && claim.epoch == epoch
+                && claim.reviewer == reviewer
+                && self.head_sha == head_sha
         });
         if !matches {
             return false;
@@ -338,6 +362,7 @@ impl ShipState {
         let Some(next_epoch) = self.reviewer_claim_epoch.checked_add(1) else {
             return false;
         };
+        self.schema_version = SHIP_STATE_SCHEMA_VERSION;
         self.reviewer_claim_epoch = next_epoch;
         self.active_reviewer_claim = None;
         self.touch();
@@ -353,12 +378,18 @@ impl ShipState {
         &self,
         head_sha: &str,
         epoch: u64,
+        reviewer: &str,
         now: DateTime<Utc>,
     ) -> bool {
+        if self.schema_version < SHIP_STATE_SCHEMA_VERSION || epoch == 0 {
+            return false;
+        }
         self.active_reviewer_claim.as_ref().is_some_and(|claim| {
             self.head_sha == head_sha
                 && claim.head_sha == head_sha
                 && claim.epoch == epoch
+                && claim.reviewer == reviewer
+                && self.reviewer_claim_epoch == epoch
                 && claim.claimed_at <= now
                 && now < claim.deadline_at
         })
@@ -806,6 +837,7 @@ impl ShipStateStore {
         let _ = self.archive_scoped_locked(&state.repo, state.pr, lock)?;
         let now = Utc::now();
         Ok(ShipState {
+            schema_version: SHIP_STATE_SCHEMA_VERSION,
             attempt: new_attempt.unwrap_or(state.attempt + 1),
             source_job_id: None,
             dispatched_runs: Vec::new(),
@@ -1213,8 +1245,8 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        AbandonRecord, DispatchedRun, ShipState, ShipStateStore, compute_policy_signature,
-        same_repository,
+        AbandonRecord, DispatchedRun, SHIP_STATE_SCHEMA_VERSION, ShipState, ShipStateStore,
+        compute_policy_signature, same_repository,
     };
     use fs2::FileExt;
 
@@ -1465,13 +1497,9 @@ mod tests {
         state.merge_queue_attempt_started_at = Some(Utc::now());
         state.merge_queue_enqueue_succeeded_at = Some(Utc::now());
         state.merge_queue_enqueue_started_at = Some(Utc::now());
+        let now = Utc::now();
         let claim = state
-            .claim_reviewer(
-                "abc",
-                "reviewer",
-                Utc::now(),
-                Utc::now() + Duration::minutes(5),
-            )
+            .claim_reviewer("abc", "reviewer", now, now + Duration::minutes(5), now)
             .expect("claim current head");
         store.save(&state).expect("save");
 
@@ -1533,22 +1561,82 @@ mod tests {
     }
 
     #[test]
+    fn schema_v2_claim_fence_preserves_v1_loads_and_rejects_missing_epoch() {
+        let legacy_value = serde_json::json!({
+            "schema_version": 1,
+            "pr": 227,
+            "repo": "danielraffel/pulp",
+            "branch": "feature/test",
+            "base_branch": "main",
+            "head_sha": "legacy-head",
+            "policy_signature": "policy0001",
+            "dispatched_runs": [],
+            "evidence_snapshot": {},
+            "attempt": 1,
+            "created_at": "2026-04-15T10:00:00+00:00",
+            "updated_at": "2026-04-15T10:00:00+00:00"
+        });
+        let legacy: ShipState = serde_json::from_value(legacy_value).expect("v1 state loads");
+        assert_eq!(legacy.schema_version, 1);
+        assert!(!legacy.reviewer_claim_is_current("legacy-head", 1, "reviewer", Utc::now()));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let fresh = sample_state(228, "fresh-head");
+        store.save(&fresh).expect("save v2 state");
+        let saved: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(store.state_path(228)).expect("saved legacy mirror"),
+        )
+        .expect("saved JSON");
+        assert_eq!(saved["schema_version"], SHIP_STATE_SCHEMA_VERSION);
+        assert_eq!(SHIP_STATE_SCHEMA_VERSION, 2);
+
+        let claimed_at = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
+        let mut claimed = fresh;
+        let claim = claimed
+            .claim_reviewer(
+                "fresh-head",
+                "reviewer",
+                claimed_at,
+                claimed_at + Duration::minutes(5),
+                claimed_at,
+            )
+            .expect("claim current v2 head");
+        let mut missing_epoch = serde_json::to_value(&claimed).expect("serialize claimed state");
+        missing_epoch
+            .as_object_mut()
+            .expect("state object")
+            .remove("reviewer_claim_epoch");
+        let malformed: ShipState =
+            serde_json::from_value(missing_epoch).expect("v2 state with omitted field loads");
+        assert_eq!(malformed.schema_version, 2);
+        assert_eq!(malformed.reviewer_claim_epoch, 0);
+        assert!(!malformed.reviewer_claim_is_current(
+            "fresh-head",
+            claim.epoch,
+            "reviewer",
+            claimed_at + Duration::minutes(1)
+        ));
+    }
+
+    #[test]
     fn reviewer_claim_fences_timeout_late_verdict_and_stale_epoch() {
         let claimed_at = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
         let deadline_at = claimed_at + Duration::minutes(5);
         let mut state = sample_state(225, "head-a");
 
         let first = state
-            .claim_reviewer("head-a", "reviewer-a", claimed_at, deadline_at)
+            .claim_reviewer("head-a", "reviewer-a", claimed_at, deadline_at, claimed_at)
             .expect("current head can be claimed");
         assert_eq!(first.epoch, 1);
         assert!(state.reviewer_claim_is_current(
             "head-a",
             first.epoch,
+            "reviewer-a",
             claimed_at + Duration::minutes(1)
         ));
         assert!(
-            !state.reviewer_claim_is_current("head-a", first.epoch, deadline_at),
+            !state.reviewer_claim_is_current("head-a", first.epoch, "reviewer-a", deadline_at),
             "a verdict at the exclusive deadline is late"
         );
 
@@ -1557,38 +1645,59 @@ mod tests {
                 .claim_reviewer(
                     "head-a",
                     "reviewer-b",
-                    deadline_at + Duration::seconds(1),
+                    deadline_at - Duration::seconds(1),
                     deadline_at + Duration::minutes(5),
+                    deadline_at - Duration::seconds(1),
                 )
                 .is_none()
         );
-        assert!(state.revoke_reviewer_claim("head-a", first.epoch));
-        assert_eq!(state.reviewer_claim_epoch, 2);
+        assert!(
+            state
+                .claim_reviewer(
+                    "head-a",
+                    "reviewer-b",
+                    deadline_at + Duration::seconds(1),
+                    deadline_at + Duration::minutes(5),
+                    deadline_at - Duration::seconds(1),
+                )
+                .is_none(),
+            "a future-dated claim cannot bypass an unexpired claim"
+        );
         let second = state
             .claim_reviewer(
                 "head-a",
                 "reviewer-b",
                 deadline_at + Duration::seconds(1),
                 deadline_at + Duration::minutes(5),
+                deadline_at + Duration::seconds(1),
             )
-            .expect("a claim after revocation advances the epoch");
-        assert_eq!(second.epoch, 3);
+            .expect("an expired claim can be reclaimed");
+        assert_eq!(second.epoch, 2);
         assert!(
-            !state.reviewer_claim_is_current("head-a", first.epoch, deadline_at),
+            !state.reviewer_claim_is_current("head-a", first.epoch, "reviewer-a", deadline_at),
             "the replaced reviewer cannot publish a late verdict"
         );
         assert!(state.reviewer_claim_is_current(
             "head-a",
             second.epoch,
+            "reviewer-b",
             deadline_at + Duration::minutes(1)
         ));
-        assert!(!state.revoke_reviewer_claim("head-a", first.epoch));
-        assert!(state.revoke_reviewer_claim("head-a", second.epoch));
-        assert_eq!(state.reviewer_claim_epoch, 4);
+        assert!(!state.reviewer_claim_is_current(
+            "head-a",
+            second.epoch,
+            "reviewer-a",
+            deadline_at + Duration::minutes(1)
+        ));
+        assert!(!state.revoke_reviewer_claim("head-a", first.epoch, "reviewer-a"));
+        assert!(!state.revoke_reviewer_claim("head-a", second.epoch, "reviewer-a"));
+        assert!(state.revoke_reviewer_claim("head-a", second.epoch, "reviewer-b"));
+        assert_eq!(state.reviewer_claim_epoch, 3);
         assert!(state.active_reviewer_claim.is_none());
         assert!(!state.reviewer_claim_is_current(
             "head-a",
             second.epoch,
+            "reviewer-b",
             deadline_at + Duration::minutes(1)
         ));
     }
@@ -1599,7 +1708,18 @@ mod tests {
         let mut state = sample_state(226, "head-a");
         assert!(
             state
-                .claim_reviewer("head-b", "reviewer", now, now + Duration::minutes(5))
+                .claim_reviewer("head-b", "reviewer", now, now + Duration::minutes(5), now)
+                .is_none()
+        );
+        assert!(
+            state
+                .claim_reviewer(
+                    "head-a",
+                    "reviewer",
+                    now + Duration::seconds(1),
+                    now + Duration::minutes(5),
+                    now,
+                )
                 .is_none()
         );
         assert_eq!(state.reviewer_claim_epoch, 0);
