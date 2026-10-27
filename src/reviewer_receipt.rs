@@ -17,7 +17,7 @@ use crate::ship_state::ReviewerClaim;
 use chrono::{DateTime, Utc};
 use wait_timeout::ChildExt;
 
-const GH_RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
+const GH_RECEIPT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Immutable identity and fence carried by one reviewer check run.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -440,6 +440,20 @@ mod tests {
         }
     }
 
+    struct Unreadable;
+
+    impl CheckRunTransport for Unreadable {
+        type Error = &'static str;
+
+        fn find(&mut self, _: &ReceiptRequest) -> Result<Option<ReviewerReceipt>, Self::Error> {
+            Err("offline")
+        }
+
+        fn create(&mut self, _: &ReceiptRequest) -> Result<ReviewerReceipt, Self::Error> {
+            Err("reset")
+        }
+    }
+
     fn request() -> ReceiptRequest {
         let claim = ReviewerClaim {
             head_sha: "a".repeat(40),
@@ -483,16 +497,6 @@ mod tests {
     #[test]
     fn ambiguous_create_without_readback_stays_explicit() {
         let request = request();
-        struct Unreadable;
-        impl CheckRunTransport for Unreadable {
-            type Error = &'static str;
-            fn find(&mut self, _: &ReceiptRequest) -> Result<Option<ReviewerReceipt>, Self::Error> {
-                Err("offline")
-            }
-            fn create(&mut self, _: &ReceiptRequest) -> Result<ReviewerReceipt, Self::Error> {
-                Err("reset")
-            }
-        }
         assert!(matches!(
             publish_or_reconcile(&mut Unreadable, &request),
             Err(ReceiptError::Transport(_))

@@ -141,6 +141,7 @@ fn live_head(
     Ok(live.to_ascii_lowercase())
 }
 
+#[allow(clippy::too_many_arguments)] // The CLI boundary keeps every claim input explicit.
 fn acquire<W: Write>(
     store: &ShipStateStore,
     actions: &GitHubActions,
@@ -224,6 +225,7 @@ fn acquire<W: Write>(
     Ok(ExitCode::SUCCESS)
 }
 
+#[allow(clippy::too_many_arguments)] // The CLI boundary keeps every claim input explicit.
 fn validate<W: Write>(
     store: &ShipStateStore,
     config: &LoadedConfig,
