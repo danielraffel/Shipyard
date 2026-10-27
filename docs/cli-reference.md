@@ -619,6 +619,18 @@ successfully merged change; distinct PR count is never treated as a safe-merge
 denominator. A baseline receipt must therefore carry that merge join before
 reporting the per-change value.
 
+The primary throughput metric is
+`safely_merged_changes_per_eligible_slot_hour`. Its numerator is the number of
+distinct safe merge receipt heads, and its denominator is the observation-only
+`fleet_capacity.eligible_slot_hours`. It is `unavailable` when either side is
+missing or the denominator is zero. When capacity coverage is partial because
+of unknown samples or gaps, the metric remains visible as `partial` and its
+reason states that the denominator is a lower bound, so the reported rate is
+an upper-bound estimate. Distinct pull requests are never used as a substitute.
+The value is an imported-observation metric; it does not prove that the local
+merge-receipt handoff is complete. Baseline promotion still requires the
+collector's merge-receipt health gate.
+
 ### Project keys
 
 `--project` accepts either the GitHub slug (`Generous-Corp/pulp`) or the short

@@ -515,7 +515,7 @@ pub(super) fn metrics_command<W: Write>(
                 };
                 text.push_str(&scorecard_proxy_lines(&scorecard));
                 let coverage = format!(
-                    "{}: {} jobs, {:.2} worker-minutes, {} PRs over {}d; worker-minutes coverage={} ({}); PR coverage={} ({}); submit-to-receipt={} ({}); model-tokens={} ({})",
+                    "{}: {} jobs, {:.2} worker-minutes, {} PRs over {}d; worker-minutes coverage={} ({}); PR coverage={} ({}); safe-merge-rate={}={} ({}); submit-to-receipt={} ({}); model-tokens={} ({})",
                     scorecard.project,
                     scorecard.job_samples,
                     scorecard.worker_minutes,
@@ -525,6 +525,16 @@ pub(super) fn metrics_command<W: Write>(
                     scorecard.worker_minutes_coverage.reason,
                     scorecard.pull_request_throughput.status,
                     scorecard.pull_request_throughput.reason,
+                    scorecard
+                        .safely_merged_changes_per_eligible_slot_hour
+                        .status,
+                    scorecard
+                        .safely_merged_changes_per_eligible_slot_hour
+                        .value
+                        .map_or_else(|| "n/a".to_owned(), |value| format!("{value:.6}")),
+                    scorecard
+                        .safely_merged_changes_per_eligible_slot_hour
+                        .reason,
                     scorecard.submit_to_receipt.status,
                     scorecard.submit_to_receipt.reason,
                     scorecard.model_token_use.status,
@@ -1093,6 +1103,7 @@ mod tests {
             "cache_hit_rate",
             "submit_to_receipt",
             "model_token_use",
+            "safely_merged_changes_per_eligible_slot_hour",
             "basis",
             "proxies",
             "comparison",
@@ -1334,6 +1345,7 @@ mod tests {
 
         assert!(output.contains("PR coverage=unavailable"));
         assert!(output.contains("worker-minutes coverage=unavailable"));
+        assert!(output.contains("safe-merge-rate=unavailable=n/a"));
         assert!(output.contains("submit-to-receipt=unavailable"));
         assert!(output.contains("model-tokens=unavailable"));
     }
