@@ -731,6 +731,26 @@ impl ShipStateStore {
         }
     }
 
+    /// Claim and publish through the authenticated App transport.
+    ///
+    /// This typed entrypoint prevents callers in the reviewer path from
+    /// accidentally supplying an ambient-token or arbitrary HTTP publisher.
+    /// The generic storage primitive remains available for deterministic unit
+    /// tests and non-GitHub integrations.
+    pub fn claim_reviewer_and_publish_app(
+        &self,
+        request: ReviewerClaimRequest<'_>,
+        transport: &mut crate::reviewer_receipt::GhAppCheckRunTransport,
+    ) -> Result<crate::reviewer_receipt::ReviewerReceipt, Box<dyn std::error::Error>> {
+        let repository = request.repository.to_owned();
+        let pr = request.pr;
+        self.claim_reviewer_and_publish(request, |claim| {
+            let receipt_request =
+                crate::reviewer_receipt::request_from_claim(&repository, pr, claim);
+            crate::reviewer_receipt::publish_or_reconcile(transport, &receipt_request)
+        })
+    }
+
     /// Delete an active state file.
     pub fn delete(&self, pr: u64) -> Result<(), std::io::Error> {
         let states = self.states_for_pr(pr);

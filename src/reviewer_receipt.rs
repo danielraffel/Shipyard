@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use crate::evidence::canonical_repository;
 use crate::gh::{GhClient, GhPrepareError, GhSupervision};
 use crate::ship_state::ReviewerClaim;
 use chrono::{DateTime, Utc};
@@ -67,6 +68,7 @@ pub struct GhAppCheckRunTransport {
     cwd: PathBuf,
     repository: String,
     app_slug: String,
+    app_id: u64,
 }
 
 impl GhAppCheckRunTransport {
@@ -76,12 +78,14 @@ impl GhAppCheckRunTransport {
         cwd: impl AsRef<Path>,
         repository: &str,
         app_slug: &str,
+        app_id: u64,
     ) -> Result<Self, GhPrepareError> {
         Ok(Self {
             client: client.with_repo_override(repository)?,
             cwd: cwd.as_ref().to_path_buf(),
             repository: repository.to_owned(),
             app_slug: app_slug.to_owned(),
+            app_id,
         })
     }
 
@@ -121,29 +125,31 @@ impl CheckRunTransport for GhAppCheckRunTransport {
             "repos/{}/commits/{}/check-runs?per_page=100",
             self.repository, request.receipt.head_sha
         );
-        let value = self.run_json(&["api".to_owned(), path], None)?;
-        let runs = value
-            .get("check_runs")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| "check-runs response missing check_runs".to_owned())?;
-        for run in runs {
-            if run.get("name").and_then(serde_json::Value::as_str) != Some(&request.name) {
-                continue;
+        let pages = self.run_json(
+            &[
+                "api".to_owned(),
+                path,
+                "--paginate".to_owned(),
+                "--slurp".to_owned(),
+            ],
+            None,
+        )?;
+        let pages = pages
+            .as_array()
+            .ok_or_else(|| "check-runs pagination was not an array".to_owned())?;
+        for page in pages {
+            let runs = page
+                .get("check_runs")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "check-runs page missing check_runs".to_owned())?;
+            for run in runs {
+                if run.get("external_id").and_then(serde_json::Value::as_str)
+                    != Some(request.receipt.external_id.as_str())
+                {
+                    continue;
+                }
+                return validate_run(run, request, &self.app_slug, self.app_id).map(Some);
             }
-            if run.get("external_id").and_then(serde_json::Value::as_str)
-                != Some(request.receipt.external_id.as_str())
-            {
-                continue;
-            }
-            if run
-                .get("app")
-                .and_then(|app| app.get("slug"))
-                .and_then(serde_json::Value::as_str)
-                != Some(self.app_slug.as_str())
-            {
-                return Err("review receipt was published by an unexpected App".to_owned());
-            }
-            return decode_receipt(run).map(Some);
         }
         Ok(None)
     }
@@ -162,27 +168,69 @@ impl CheckRunTransport for GhAppCheckRunTransport {
         });
         let bytes = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
         let path = format!("repos/{}/check-runs", self.repository);
-        let value = self.run_json(
-            &[
-                "api".to_owned(),
-                path,
-                "--method".to_owned(),
-                "POST".to_owned(),
-                "--input".to_owned(),
-                "-".to_owned(),
-            ],
-            Some(&bytes),
-        )?;
-        if value
-            .get("app")
-            .and_then(|app| app.get("slug"))
-            .and_then(serde_json::Value::as_str)
-            != Some(self.app_slug.as_str())
-        {
-            return Err("review receipt response came from an unexpected App".to_owned());
-        }
-        decode_receipt(&value)
+        let value = self.run_json(&create_check_run_args(path), Some(&bytes))?;
+        validate_run(&value, request, &self.app_slug, self.app_id)
     }
+}
+
+fn create_check_run_args(path: String) -> Vec<String> {
+    vec![
+        "api".to_owned(),
+        path,
+        "--method".to_owned(),
+        "POST".to_owned(),
+        // Keep the payload on stdin. A user-controlled body-file path would
+        // bypass the authenticated command boundary and read arbitrary files.
+        "--input".to_owned(),
+        "-".to_owned(),
+    ]
+}
+
+fn validate_run(
+    run: &serde_json::Value,
+    request: &ReceiptRequest,
+    app_slug: &str,
+    app_id: u64,
+) -> Result<ReviewerReceipt, String> {
+    if run.get("name").and_then(serde_json::Value::as_str) != Some(request.name.as_str()) {
+        return Err("review receipt has an unexpected check name".to_owned());
+    }
+    if run.get("external_id").and_then(serde_json::Value::as_str)
+        != Some(request.receipt.external_id.as_str())
+    {
+        return Err("review receipt has an unexpected external_id".to_owned());
+    }
+    if run.get("head_sha").and_then(serde_json::Value::as_str)
+        != Some(request.receipt.head_sha.as_str())
+    {
+        return Err("review receipt has an unexpected head".to_owned());
+    }
+    if run
+        .get("app")
+        .and_then(|app| app.get("slug"))
+        .and_then(serde_json::Value::as_str)
+        != Some(app_slug)
+    {
+        return Err("review receipt was published by an unexpected App".to_owned());
+    }
+    if run
+        .get("app")
+        .and_then(|app| app.get("id"))
+        .and_then(serde_json::Value::as_u64)
+        != Some(app_id)
+    {
+        return Err("review receipt was published by an unexpected App id".to_owned());
+    }
+    if run.get("status").and_then(serde_json::Value::as_str) != Some("completed")
+        || run.get("conclusion").and_then(serde_json::Value::as_str) != Some("success")
+    {
+        return Err("review receipt is not a completed successful check".to_owned());
+    }
+    let decoded = decode_receipt(run)?;
+    if decoded != request.receipt {
+        return Err("review receipt summary does not match its external identity".to_owned());
+    }
+    Ok(decoded)
 }
 
 fn decode_receipt(run: &serde_json::Value) -> Result<ReviewerReceipt, String> {
@@ -233,14 +281,16 @@ impl std::error::Error for ReceiptError {}
 /// Convert a persisted claim into an externally publishable request.
 #[must_use]
 pub fn request_from_claim(repository: &str, pr: u64, claim: &ReviewerClaim) -> ReceiptRequest {
+    let repository = canonical_repository(repository);
+    let reviewer = claim.reviewer.trim().to_ascii_lowercase();
     ReceiptRequest {
         name: "reviewer-claim".to_owned(),
         receipt: ReviewerReceipt {
-            external_id: claim.receipt_id(repository, pr),
-            repository: repository.to_owned(),
+            external_id: claim.receipt_id(&repository, pr),
+            repository,
             pr,
             head_sha: claim.head_sha.clone(),
-            reviewer: claim.reviewer.clone(),
+            reviewer,
             epoch: claim.epoch,
             claimed_at: claim.claimed_at,
             deadline_at: claim.deadline_at,
@@ -402,5 +452,36 @@ mod tests {
         let run = serde_json::json!({"output": {"summary": receipt.to_string()}});
         let decoded = decode_receipt(&run).expect("well-formed receipt");
         assert_ne!(decoded.external_id, request.receipt.external_id);
+    }
+
+    #[test]
+    fn run_identity_rejects_wrong_app_head_or_external_id() {
+        let request = request();
+        let summary = serde_json::to_string(&request.receipt).expect("receipt serializes");
+        let base = || {
+            serde_json::json!({
+                "name": request.name,
+                "external_id": request.receipt.external_id,
+                "head_sha": request.receipt.head_sha,
+            "app": {"slug": "shipyard-review", "id": 42},
+                "output": {"summary": summary}
+            })
+        };
+        let mut wrong = base();
+        wrong["app"]["slug"] = serde_json::Value::String("ambient-gh".to_owned());
+        assert!(validate_run(&wrong, &request, "shipyard-review", 42).is_err());
+        let mut wrong = base();
+        wrong["head_sha"] = serde_json::Value::String("b".repeat(40));
+        assert!(validate_run(&wrong, &request, "shipyard-review", 42).is_err());
+        let mut wrong = base();
+        wrong["external_id"] = serde_json::Value::String("stale".to_owned());
+        assert!(validate_run(&wrong, &request, "shipyard-review", 42).is_err());
+    }
+
+    #[test]
+    fn create_payload_is_stdin_only() {
+        let args = create_check_run_args("repos/o/r/check-runs".to_owned());
+        assert!(args.windows(2).any(|pair| pair == ["--input", "-"]));
+        assert!(!args.iter().any(|arg| arg == "--body-file"));
     }
 }
