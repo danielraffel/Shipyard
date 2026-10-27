@@ -9,11 +9,15 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::time::Duration;
 
 use crate::evidence::canonical_repository;
 use crate::gh::{GhClient, GhPrepareError, GhSupervision};
 use crate::ship_state::ReviewerClaim;
 use chrono::{DateTime, Utc};
+use wait_timeout::ChildExt;
+
+const GH_RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Immutable identity and fence carried by one reviewer check run.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -106,6 +110,21 @@ impl GhAppCheckRunTransport {
                 .ok_or_else(|| "gh stdin unavailable".to_owned())?
                 .write_all(input)
                 .map_err(|error| error.to_string())?;
+        }
+        // Never leave a per-PR claim lock held behind a wedged gh/token helper.
+        // `wait_with_output` alone has no deadline and made a provider outage
+        // indistinguishable from an active reviewer.  Kill and reap the child
+        // before returning so a retry can reconcile the deterministic receipt.
+        let completed = child
+            .wait_timeout(GH_RECEIPT_TIMEOUT)
+            .map_err(|error| error.to_string())?;
+        if completed.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "gh reviewer receipt command timed out after {}s",
+                GH_RECEIPT_TIMEOUT.as_secs()
+            ));
         }
         let output: Output = child
             .wait_with_output()
