@@ -182,7 +182,16 @@ impl CheckRunTransport for GhAppCheckRunTransport {
             "conclusion": "success",
             "output": {
                 "title": "Reviewer claim receipt",
-                "summary": serde_json::to_string(&request.receipt).map_err(|error| error.to_string())?
+                "summary": serde_json::to_string(&serde_json::json!({
+                    "schema": "shipyard-reviewer-claim/v1",
+                    "repo": request.receipt.repository,
+                    "pr": request.receipt.pr,
+                    "head_sha": request.receipt.head_sha,
+                    "reviewer": request.receipt.reviewer,
+                    "epoch": request.receipt.epoch,
+                    "claimed_at": request.receipt.claimed_at,
+                    "deadline_at": request.receipt.deadline_at,
+                })).map_err(|error| error.to_string())?
             }
         });
         let bytes = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
@@ -258,7 +267,28 @@ fn decode_receipt(run: &serde_json::Value) -> Result<ReviewerReceipt, String> {
         .and_then(|output| output.get("summary"))
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "review receipt has no output summary".to_owned())?;
-    serde_json::from_str(summary).map_err(|error| format!("malformed reviewer receipt: {error}"))
+    let mut value: serde_json::Value = serde_json::from_str(summary)
+        .map_err(|error| format!("malformed reviewer receipt: {error}"))?;
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some("shipyard-reviewer-claim/v1")
+    {
+        return Err("reviewer receipt has an unexpected schema".to_owned());
+    }
+    let repo = value
+        .get("repo")
+        .cloned()
+        .ok_or_else(|| "reviewer receipt has no repo".to_owned())?;
+    let external_id = run
+        .get("external_id")
+        .cloned()
+        .ok_or_else(|| "reviewer receipt has no external_id".to_owned())?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "reviewer receipt summary is not an object".to_owned())?;
+    object.remove("schema");
+    object.remove("repo");
+    object.insert("repository".to_owned(), repo);
+    object.insert("external_id".to_owned(), external_id);
+    serde_json::from_value(value).map_err(|error| format!("malformed reviewer receipt: {error}"))
 }
 
 /// Fail-closed publication and reconciliation errors.
@@ -364,6 +394,20 @@ pub fn publish_or_reconcile<T: CheckRunTransport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary(receipt: &ReviewerReceipt) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "schema": "shipyard-reviewer-claim/v1",
+            "repo": receipt.repository,
+            "pr": receipt.pr,
+            "head_sha": receipt.head_sha,
+            "reviewer": receipt.reviewer,
+            "epoch": receipt.epoch,
+            "claimed_at": receipt.claimed_at,
+            "deadline_at": receipt.deadline_at,
+        }))
+        .expect("receipt summary serializes")
+    }
     use chrono::{Duration, Utc};
     use std::collections::BTreeMap;
 
@@ -458,7 +502,8 @@ mod tests {
     #[test]
     fn malformed_timestamp_and_receipt_id_are_rejected() {
         let request = request();
-        let mut receipt = serde_json::to_value(&request.receipt).expect("receipt serializes");
+        let mut receipt: serde_json::Value =
+            serde_json::from_str(&summary(&request.receipt)).expect("receipt serializes");
         receipt["claimed_at"] = serde_json::Value::String("not-a-timezone".to_owned());
         let run = serde_json::json!({
             "external_id": request.receipt.external_id,
@@ -466,9 +511,13 @@ mod tests {
         });
         assert!(decode_receipt(&run).is_err());
 
-        let mut receipt = serde_json::to_value(&request.receipt).expect("receipt serializes");
+        let mut receipt: serde_json::Value =
+            serde_json::from_str(&summary(&request.receipt)).expect("receipt serializes");
         receipt["external_id"] = serde_json::Value::String("stale".to_owned());
-        let run = serde_json::json!({"output": {"summary": receipt.to_string()}});
+        let run = serde_json::json!({
+            "external_id": "stale",
+            "output": {"summary": receipt.to_string()}
+        });
         let decoded = decode_receipt(&run).expect("well-formed receipt");
         assert_ne!(decoded.external_id, request.receipt.external_id);
     }
@@ -476,7 +525,7 @@ mod tests {
     #[test]
     fn run_identity_rejects_wrong_app_head_or_external_id() {
         let request = request();
-        let summary = serde_json::to_string(&request.receipt).expect("receipt serializes");
+        let summary = summary(&request.receipt);
         let base = || {
             serde_json::json!({
                 "name": request.name,
