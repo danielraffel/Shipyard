@@ -2,6 +2,7 @@
 
 pub mod freshness;
 pub mod github_import;
+pub mod github_merge_receipts;
 pub mod import_schedule;
 pub mod job_name;
 pub mod merge_receipt;
