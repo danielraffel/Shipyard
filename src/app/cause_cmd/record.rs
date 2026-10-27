@@ -396,6 +396,7 @@ fn may_hold_red(run: &Value) -> bool {
 }
 
 /// One pass: causes for new red jobs, then fix-links for reds now green.
+#[allow(clippy::too_many_lines)]
 pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<RecordReport, String> {
     fs::create_dir_all(&query.dir).map_err(|error| error.to_string())?;
     let lock = OpenOptions::new()
@@ -408,6 +409,7 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
 
     let mut report = RecordReport::default();
     let mut pulls = BTreeMap::new();
+    let mut incomplete_reds = BTreeSet::new();
     let archived = archived_causes(&query.dir);
     let recorded: BTreeSet<(String, u64)> = archived
         .iter()
@@ -431,6 +433,7 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
             Ok(jobs) => jobs,
             Err(error) => {
                 report.unreadable.push(format!("run {run_id}: {error}"));
+                incomplete_reds.insert((run_id, run["run_attempt"].as_u64().unwrap_or(1)));
                 continue;
             }
         };
@@ -438,6 +441,12 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
         let mut run_rows = Vec::new();
         for value in jobs {
             let Ok(job) = serde_json::from_value::<Job>(value.clone()) else {
+                incomplete_reds.insert((
+                    run_id,
+                    value["run_attempt"]
+                        .as_u64()
+                        .unwrap_or(run["run_attempt"].as_u64().unwrap_or(1)),
+                ));
                 continue;
             };
             match job.conclusion.as_deref() {
@@ -458,7 +467,14 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
             match cause_row(gh, query, run, &job, &owner) {
                 Ok(Some(row)) => run_rows.push(row),
                 Ok(None) => {}
-                Err(error) => report.unreadable.push(error),
+                Err(error) => {
+                    incomplete_reds.insert((
+                        run_id,
+                        job.run_attempt
+                            .unwrap_or(run["run_attempt"].as_u64().unwrap_or(1)),
+                    ));
+                    report.unreadable.push(error);
+                }
             }
         }
         report.inherited += labels::inherit_from_summarised(&mut run_rows, &archived);
@@ -481,7 +497,14 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
             rows,
         )?;
     }
-    let fixlinks = fixlinks(gh, query, &run_index, &mut pulls, &mut report)?;
+    let fixlinks = fixlinks(
+        gh,
+        query,
+        &run_index,
+        &incomplete_reds,
+        &mut pulls,
+        &mut report,
+    )?;
     append(&query.dir.join("fixlinks.jsonl"), &fixlinks)?;
     report.fixlinks_written = fixlinks.len();
     Ok(report)
@@ -698,7 +721,6 @@ fn own_by_first_parent(
 struct Fix {
     head_sha: String,
     run_id: u64,
-    attempt: u64,
     pushed_at: String,
     derivation: &'static str,
 }
@@ -740,9 +762,9 @@ fn created(run: &Value) -> String {
     run["created_at"].as_str().unwrap_or_default().to_owned()
 }
 
-/// The rerun fix (a later attempt of the red run, else the earliest later
-/// green on the red head) and the push fix (the earliest later green on
-/// another head), when they exist.
+/// Candidate fixes in deterministic time order: a later attempt of the red
+/// run, later green runs on the same head, then later green pushes on another
+/// head. The caller verifies each candidate before accepting the first one.
 fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> Vec<Fix> {
     if !super::advice::valid_sha(&red.head_sha) {
         return Vec::new();
@@ -753,44 +775,36 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
             .is_some_and(super::advice::valid_sha)
             && run["head_sha"].as_str() == Some(red.head_sha.as_str())
     };
-    let rerun = run_index
-        .get(&red.run_id)
-        .filter(|run| {
-            run["conclusion"] == "success"
-                && run["run_attempt"].as_u64().unwrap_or(1) > red.attempt
-                && run["head_sha"].as_str() == Some(red.head_sha.as_str())
-                && run["head_sha"]
-                    .as_str()
-                    .is_some_and(super::advice::valid_sha)
-        })
-        .and_then(|run| {
-            Some((
-                red.run_id,
-                run["run_started_at"].as_str()?.to_owned(),
-                run["run_attempt"].as_u64()?,
-            ))
-        })
-        .or_else(|| {
-            later
-                .iter()
-                .filter(on_red_head)
-                .min_by_key(|run| created(run))
-                .map(|run| {
-                    (
-                        run["id"].as_u64().unwrap_or_default(),
-                        created(run),
-                        run["run_attempt"].as_u64().unwrap_or(1),
-                    )
-                })
-        })
-        .map(|(run_id, pushed_at, attempt)| Fix {
+    let mut fixes = Vec::new();
+    if let Some(run) = run_index.get(&red.run_id).filter(|run| {
+        run["conclusion"] == "success"
+            && run["run_attempt"].as_u64().unwrap_or(1) > red.attempt
+            && run["head_sha"].as_str() == Some(red.head_sha.as_str())
+            && run["head_sha"]
+                .as_str()
+                .is_some_and(super::advice::valid_sha)
+    }) && let Some(pushed_at) = run["run_started_at"].as_str()
+    {
+        fixes.push(Fix {
             head_sha: red.head_sha.clone(),
-            run_id,
-            attempt,
-            pushed_at,
+            run_id: red.run_id,
+            pushed_at: pushed_at.to_owned(),
             derivation: "rerun_green",
         });
-    let push = later
+    }
+    let mut same_head: Vec<Fix> = later
+        .iter()
+        .filter(|run| on_red_head(run))
+        .map(|run| Fix {
+            head_sha: red.head_sha.clone(),
+            run_id: run["id"].as_u64().unwrap_or_default(),
+            pushed_at: created(run),
+            derivation: "rerun_green",
+        })
+        .collect();
+    same_head.sort_by(|left, right| left.pushed_at.cmp(&right.pushed_at));
+    fixes.extend(same_head);
+    let mut pushes: Vec<Fix> = later
         .iter()
         .filter(|run| {
             run["head_sha"]
@@ -798,15 +812,16 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
                 .is_some_and(super::advice::valid_sha)
                 && !on_red_head(run)
         })
-        .min_by_key(|run| created(run))
         .map(|run| Fix {
             head_sha: run["head_sha"].as_str().unwrap_or_default().to_owned(),
             run_id: run["id"].as_u64().unwrap_or_default(),
-            attempt: run["run_attempt"].as_u64().unwrap_or(1),
             pushed_at: created(run),
             derivation: "compare_red_head_to_fix_head",
-        });
-    rerun.into_iter().chain(push).collect()
+        })
+        .collect();
+    pushes.sort_by(|left, right| left.pushed_at.cmp(&right.pushed_at));
+    fixes.extend(pushes);
+    fixes
 }
 
 /// Longest a force-pushed red waits for its pull request's next green push.
@@ -986,25 +1001,45 @@ fn fix_row(red: &Red, fix: &Fix, branch: &str, files: &FileSets) -> Value {
     scrub(Value::Object(row))
 }
 
-/// A successful workflow run is only a fix for this red when the failed job
-/// itself ran and passed in the same run attempt. A workflow can be green
-/// while skipping that job because of path filters or job conditions.
+/// A successful workflow run is only a fix for this red when every failed job
+/// has a successful record in the fix run. GitHub's selective reruns can make
+/// those records span multiple attempts; a workflow can also be green while
+/// skipping the failed job because of path filters or job conditions.
 fn run_passed_job(
     gh: &SyncGhReader<'_>,
     query: &RecordQuery,
     red: &Red,
     fix: &Fix,
+    jobs_cache: &mut BTreeMap<u64, Vec<Value>>,
 ) -> Result<bool, String> {
     if red.jobs.is_empty() || fix.run_id == 0 {
         return Ok(false);
     }
-    let jobs = list_run_jobs(gh, query, fix.run_id)?;
+    let jobs = if let Some(jobs) = jobs_cache.get(&fix.run_id) {
+        jobs.clone()
+    } else {
+        let jobs = list_run_jobs(gh, query, fix.run_id)?;
+        jobs_cache.insert(fix.run_id, jobs.clone());
+        jobs
+    };
     Ok(!jobs.is_empty() && {
         red.jobs.iter().all(|failed_job| {
-            jobs.iter().any(|job| {
-                job["name"].as_str() == Some(failed_job.as_str())
-                    && job["conclusion"].as_str() == Some("success")
-                    && job["run_attempt"].as_u64() == Some(fix.attempt)
+            let passed_attempt = jobs
+                .iter()
+                .filter(|job| {
+                    job["name"].as_str() == Some(failed_job.as_str())
+                        && job["conclusion"].as_str() == Some("success")
+                })
+                .filter_map(|job| job["run_attempt"].as_u64())
+                .max();
+            passed_attempt.is_some_and(|attempt| {
+                if fix.run_id == red.run_id {
+                    attempt > red.attempt
+                } else {
+                    // A push fix may be a selective rerun: a job that passed
+                    // in an earlier attempt remains part of the green run.
+                    true
+                }
             })
         })
     })
@@ -1025,6 +1060,7 @@ fn fixlinks(
     gh: &SyncGhReader<'_>,
     query: &RecordQuery,
     run_index: &BTreeMap<u64, Value>,
+    incomplete_reds: &BTreeSet<(u64, u64)>,
     pulls: &mut BTreeMap<String, Vec<Value>>,
     report: &mut RecordReport,
 ) -> Result<Vec<Value>, String> {
@@ -1040,9 +1076,14 @@ fn fixlinks(
         })
         .collect();
     let mut greens: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut jobs_cache = BTreeMap::new();
     let mut out = Vec::new();
     for red in pending_reds(&query.dir, &query.since, &linked) {
         if red.repo != query.repo {
+            continue;
+        }
+        if incomplete_reds.contains(&(red.run_id, red.attempt)) {
+            pending(report, &red, &query.now);
             continue;
         }
         let branch = fix_branch(gh, query, &red, pulls);
@@ -1067,24 +1108,25 @@ fn fixlinks(
             .filter(|run| created(run).as_str() > red.time.as_str())
             .collect();
         let fixes = fixes_for(&red, &later, run_index);
-        let mut verified_fixes = Vec::new();
+        let mut verified_fix = None;
         for fix in fixes {
-            match run_passed_job(gh, query, &red, &fix) {
-                Ok(true) => verified_fixes.push(fix),
+            match run_passed_job(gh, query, &red, &fix, &mut jobs_cache) {
+                Ok(true) => {
+                    verified_fix = Some(fix);
+                    break;
+                }
                 Ok(false) => {}
                 Err(error) => report
                     .unreadable
                     .push(format!("jobs for fix run {}: {error}", fix.run_id)),
             }
         }
-        if verified_fixes.is_empty() {
+        let Some(fix) = verified_fix else {
             pending(report, &red, &query.now);
             continue;
-        }
-        for fix in &verified_fixes {
-            let sets = file_sets(gh, query, &red, fix, &branch)?;
-            out.push(fix_row(&red, fix, &branch, &sets));
-        }
+        };
+        let sets = file_sets(gh, query, &red, &fix, &branch)?;
+        out.push(fix_row(&red, &fix, &branch, &sets));
     }
     Ok(out)
 }
