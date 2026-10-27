@@ -59,6 +59,11 @@ github-merge-receipt` consumes a normalized `job.json`, one workflow-run and
 pull-request snapshot, and a complete check-runs snapshot (`complete: true`).
 The command requires the observed run URL and exact queue-ref identity to bind
 the artifact to the PR; it accepts GitHub's normal empty `pull_requests` array
+and accepts the artifact's `refs/heads/` spelling when the normalized run uses
+the corresponding bare branch name. The run projection also carries the exact
+merge-group commit's ordered parent SHAs. The importer requires exactly two
+parents, with the protected base SHA first and the artifact PR head second, so
+batched groups with a synthetic second parent remain unavailable.
 and requires each selected check to carry non-null `run_id`/`run_attempt`
 matching the observed workflow run. A commit-wide check-runs response with
 null per-check identity is rejected unless an upstream collector first

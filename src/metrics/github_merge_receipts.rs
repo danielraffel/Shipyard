@@ -40,6 +40,10 @@ pub struct RunObservation {
     pub conclusion: Option<String>,
     pub head_sha: String,
     pub head_branch: Option<String>,
+    /// Parents of the exact merge-group commit, in GitHub's order. A
+    /// single-PR merge group has the protected base first and that PR head
+    /// second; a batched group has a synthetic second parent and is refused.
+    pub head_commit_parents: Vec<String>,
     pub html_url: Option<String>,
     /// Required in the normalized projection. GitHub's `merge_group` payload
     /// legitimately supplies an empty array, so omission is not equivalent.
@@ -227,10 +231,21 @@ pub fn reconcile(
     if queue_identity.pr != pr {
         return Err("merge-group queue ref does not identify the artifact PR".to_owned());
     }
+    if artifact.base_sha.as_deref() != Some(queue_identity.base_sha.as_str()) {
+        return Err("reuse artifact base SHA does not match the merge-group queue ref".to_owned());
+    }
+    if run.head_commit_parents.len() != 2
+        || run.head_commit_parents[0] != queue_identity.base_sha
+        || run.head_commit_parents[1] != head_sha
+    {
+        return Err(
+            "merge-group commit parents do not prove a single-PR group for the artifact".to_owned(),
+        );
+    }
     if let (Some(artifact_ref), Some(run_ref)) = (
         artifact.merge_group_head_ref.as_deref(),
         run.head_branch.as_deref(),
-    ) && artifact_ref != run_ref
+    ) && canonical_queue_ref(artifact_ref) != canonical_queue_ref(run_ref)
     {
         return Err("artifact and GitHub run queue refs do not match".to_owned());
     }
@@ -385,9 +400,11 @@ pub fn reconcile(
 
 struct QueueIdentity {
     pr: i64,
+    base_sha: String,
 }
 
 fn parse_queue_ref(reference: &str, base_branch: &str) -> Result<QueueIdentity, String> {
+    let reference = canonical_queue_ref(reference);
     let prefix = format!("gh-readonly-queue/{base_branch}/pr-");
     let rest = reference
         .strip_prefix(&prefix)
@@ -407,7 +424,14 @@ fn parse_queue_ref(reference: &str, base_branch: &str) -> Result<QueueIdentity, 
     {
         return Err("merge-group queue ref has an invalid commit suffix".to_owned());
     }
-    Ok(QueueIdentity { pr })
+    Ok(QueueIdentity {
+        pr,
+        base_sha: suffix.to_owned(),
+    })
+}
+
+fn canonical_queue_ref(reference: &str) -> &str {
+    reference.strip_prefix("refs/heads/").unwrap_or(reference)
 }
 
 fn nonempty<'a>(value: &'a str, label: &str) -> Result<&'a str, String> {
@@ -547,7 +571,10 @@ mod tests {
             head_sha: Some(head.clone()),
             base_sha: Some("c".repeat(40)),
             merge_sha: Some(merge.clone()),
-            merge_group_head_ref: Some(format!("gh-readonly-queue/main/pr-42-{}", "c".repeat(40))),
+            merge_group_head_ref: Some(format!(
+                "refs/heads/gh-readonly-queue/main/pr-42-{}",
+                "c".repeat(40)
+            )),
         };
         let run = RunObservation {
             id: 7,
@@ -557,6 +584,7 @@ mod tests {
             conclusion: Some("success".to_owned()),
             head_sha: merge.clone(),
             head_branch: Some(format!("gh-readonly-queue/main/pr-42-{}", "c".repeat(40))),
+            head_commit_parents: vec!["c".repeat(40), "a".repeat(40)],
             html_url: Some("https://github.com/Generous-Corp/pulp/actions/runs/7".to_owned()),
             pull_requests: vec![RunPullRequest {
                 number: 42,

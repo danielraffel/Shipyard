@@ -543,7 +543,10 @@ and provider-neutral:
   `job.json` with complete, caller-captured **normalized** GitHub run,
   pull-request, and check-run snapshots before importing a gate-bound receipt.
   The normalized run projection must include `pull_requests` (an empty array is
-  valid), and the check snapshot must carry `complete: true`, an exact
+  valid) and `head_commit_parents` for the exact merge-group commit. It must
+  contain the protected base SHA followed by the artifact PR head SHA; a
+  synthetic second parent therefore refuses batched groups. The check snapshot
+  must carry `complete: true`, an exact
   `total_count`, plus the provider-scoped `snapshot_run_id` and
   `snapshot_run_attempt` matching the observed run. Required checks must carry
   their own non-null matching run identity; commit-wide check-runs with null

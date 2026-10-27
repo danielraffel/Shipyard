@@ -1237,7 +1237,7 @@ mod tests {
         let head = "a".repeat(40);
         let merge = "b".repeat(40);
         let merge_commit = "d".repeat(40);
-        let queue_ref = format!("gh-readonly-queue/main/pr-42-{}", "c".repeat(40));
+        let queue_ref = format!("refs/heads/gh-readonly-queue/main/pr-42-{}", "c".repeat(40));
         let artifact_path = temp.path().join("job.json");
         let run_path = temp.path().join("run.json");
         let pr_path = temp.path().join("pr.json");
@@ -1251,7 +1251,7 @@ mod tests {
                 "run_kind": "merge_group",
                 "pr": 42,
                 "head_sha": head,
-                "base_sha": "e".repeat(40),
+                "base_sha": "c".repeat(40),
                 "merge_sha": merge,
                 "merge_group_head_ref": queue_ref,
             })
@@ -1268,6 +1268,7 @@ mod tests {
                 "conclusion": "success",
                 "head_sha": "b".repeat(40),
                 "head_branch": format!("gh-readonly-queue/main/pr-42-{}", "c".repeat(40)),
+                "head_commit_parents": ["c".repeat(40), "a".repeat(40)],
                 "html_url": "https://github.com/owner/repo/actions/runs/7",
                 "pull_requests": [],
             })
