@@ -932,6 +932,45 @@ fn a_selective_rerun_can_pass_failed_jobs_across_multiple_attempts() {
 }
 
 #[test]
+fn an_earlier_success_cannot_prove_a_later_failed_attempt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(dir.path())).expect("red pass");
+
+    let mut earlier_success = job(2000, "success");
+    earlier_success["run_id"] = json!(200);
+    earlier_success["head_sha"] = json!("fedcba9876543210fedcba9876543210fedcba98");
+    earlier_success["run_attempt"] = json!(1);
+    let mut latest_failure = earlier_success.clone();
+    latest_failure["id"] = json!(2001);
+    latest_failure["conclusion"] = json!("failure");
+    latest_failure["run_attempt"] = json!(2);
+    let mut routes = red_routes();
+    routes.retain(|(needle, _)| {
+        !needle.starts_with("runs?branch=") && !needle.contains("runs/200/jobs")
+    });
+    routes.extend([
+        (
+            "runs?branch=feat%2Fx&status=success",
+            json!({"workflow_runs": [{
+                "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
+                "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
+            }]}),
+        ),
+        (
+            "runs/200/jobs",
+            json!({"jobs": [earlier_success, latest_failure]}),
+        ),
+    ]);
+    let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    let report = record(&gh, &query(dir.path())).expect("candidate pass");
+    assert_eq!((report.fixlinks_written, report.reds_pending), (0, 1));
+    assert!(!dir.path().join("fixlinks.jsonl").exists());
+}
+
+#[test]
 fn a_green_workflow_run_that_skips_the_failed_job_is_not_a_fix() {
     let dir = tempfile::tempdir().expect("tempdir");
     let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
