@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import contextlib
+import io
+import os
 import pathlib
 import sys
 import unittest
+from unittest import mock
 from typing import Any
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -444,6 +448,71 @@ class EndToEnd(unittest.TestCase):
             self.assertIn(out.tier.capitalize(), check["output"]["title"])
 
 
+FORGED_PATH = ".github/workflows/x\n::error::forged path.yml"
+FORGED_LOCK = LOCK_BASE + (
+    '\n[[package]]\nname = "evil\\n::add-mask::secret\\r\\n::stop-commands::t"\n'
+    'version = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n')
+
+
+class UntrustedText(unittest.TestCase):
+    """Paths and package names come from the pull request and may hold a
+    newline; none may start a line of output, a status or a check run."""
+
+    def run_main(self, files: list[dict[str, Any]], raw: dict, *extra: str,
+                 env: dict[str, str] | None = None) -> tuple[str, FakeGitHub]:
+        github = FakeGitHub({"repos/o/r/pulls/7": pull(changed_files=len(files)),
+                             "repos/o/r/pulls/7/files": files,
+                             "repos/o/r/pulls/7/commits": [{"commit": {"message": "fix: x"}}]},
+                            raw)
+        out = io.StringIO()
+        with mock.patch.object(rt, "GitHub", lambda *_: github), \
+                mock.patch.dict(os.environ, env or {"GITHUB_ACTIONS": ""}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            self.assertEqual(rt.main(["--repo", "o/r", "--pr", "7", "--post", "--check-run",
+                                      *extra]), 0)
+        return out.getvalue(), github
+
+    def assert_inert(self, output: str, github: FakeGitHub, *, fenced: bool = False) -> None:
+        lines = output.splitlines()
+        if fenced:
+            self.assertRegex(lines[0], r"^::stop-commands::[0-9a-f]{32}$")
+            token = lines[0].split("::")[2]
+            self.assertEqual(lines[-1], f"::{token}::")
+            lines = lines[1:-1]
+        self.assertEqual([line for line in lines if line.lstrip().startswith("::")], [])
+        (_, status), (_, check) = github.posted
+        self.assertIsNone(rt._CONTROL.search(status["description"]), status["description"])
+        self.assertIsNone(rt._CONTROL.search(check["output"]["title"]))
+        self.assertEqual([line for line in check["output"]["summary"].splitlines()
+                          if line.lstrip().startswith("::")], [])
+
+    def test_a_path_with_a_newline(self) -> None:
+        output, github = self.run_main(changed(FORGED_PATH), {})
+        self.assert_inert(output, github)
+        self.assertIn("x\\n::error::forged path.yml", output)
+
+    def test_a_lockfile_package_name_with_a_newline(self) -> None:
+        files = [{"filename": "Cargo.lock", "status": "modified", "additions": 5, "deletions": 0}]
+        raw = {("Cargo.lock", "b" * 40): LOCK_BASE, ("Cargo.lock", "h" * 40): FORGED_LOCK}
+        output, github = self.run_main(files, raw)
+        self.assert_inert(output, github)
+        self.assertIn("evil\\n::add-mask::secret\\r\\n::stop-commands::t", output)
+
+    def test_json_output_and_a_job_are_inert_too(self) -> None:
+        files = changed(FORGED_PATH) + [
+            {"filename": "Cargo.lock", "status": "modified", "additions": 5, "deletions": 0}]
+        raw = {("Cargo.lock", "b" * 40): LOCK_BASE, ("Cargo.lock", "h" * 40): FORGED_LOCK}
+        output, github = self.run_main(files, raw, "--json")
+        self.assert_inert(output, github)
+        output, github = self.run_main(files, raw, env={"GITHUB_ACTIONS": "true"})
+        self.assert_inert(output, github, fenced=True)
+
+    def test_a_backtick_cannot_end_its_code_span(self) -> None:
+        self.assertEqual(rt.code("a`b"), "``a`b``")
+        self.assertEqual(rt.code("``x"), "``` ``x ```")
+        self.assertEqual(rt.code("a\nb"), "`a\\nb`")
+
+
 class Workflow(unittest.TestCase):
     def test_it_runs_the_default_branchs_rule_and_never_checks_out_the_pull_request(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -451,6 +520,7 @@ class Workflow(unittest.TestCase):
         self.assertIn("pull_request_target:", on)
         self.assertNotIn("pull_request:", on.replace("pull_request_target:", ""))
         self.assertNotIn("workflow_run", on)
+        self.assertNotIn("edited", on)
         self.assertIn("ref: ${{ github.event.repository.default_branch }}", text)
         self.assertIn("persist-credentials: false", text)
         self.assertNotIn("github.event.pull_request.head", text)

@@ -48,6 +48,7 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import subprocess
 import sys
 import tomllib
@@ -160,6 +161,28 @@ DEFAULT_MAX_FILES = 15
 
 class TierError(Exception):
     """The pull request cannot be read well enough to classify."""
+
+
+# Every reason can carry text from the pull request (a path, a package name,
+# a label), and a path or a TOML string may hold a newline. A line of job
+# output that starts with ``::`` is a workflow command (``::error``,
+# ``::add-mask``, ``::stop-commands``), so no control character from them may
+# reach output, a status or a check run unescaped.
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def clean(text: str) -> str:
+    """``text`` with every control character written as its escape
+    (``\\n``, ``\\x1b``), so it stays on one line."""
+    return _CONTROL.sub(lambda match: repr(match.group())[1:-1], str(text))
+
+
+def code(text: str) -> str:
+    """``text`` as one Markdown code span, whatever backticks it holds."""
+    text = clean(text)
+    fence = "`" * (max((len(run) for run in re.findall("`+", text)), default=0) + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
 
 
 # ── Rules ───────────────────────────────────────────────────────────────
@@ -572,10 +595,16 @@ class Assessment:
     files: int = 0
 
     def add(self, tier: str, reason: str) -> None:
+        reason = clean(reason)
         if reason not in self.reasons[tier]:
             self.reasons[tier].append(reason)
         if TIERS.index(tier) > TIERS.index(self.tier):
             self.tier = tier
+
+    def add_owner(self, reason: str) -> None:
+        reason = clean(reason)
+        if reason not in self.owner:
+            self.owner.append(reason)
 
     def requires(self) -> str:
         text = REQUIRES[self.tier]
@@ -609,16 +638,16 @@ def assess(files: list[dict[str, Any]], labels: list[str], rules: Rules, *,
         for path in paths:
             if first_match(path, rules.high_paths):
                 out.add(HIGH, path)
-                if first_match(path, rules.owner_paths) and path not in out.owner:
-                    out.owner.append(path)
+                if first_match(path, rules.owner_paths):
+                    out.add_owner(path)
             elif first_match(path, rules.moderate_paths):
                 out.add(MODERATE, path)
         if not first_match(item["filename"], rules.size_excluded_paths):
             out.lines += int(item.get("additions") or 0) + int(item.get("deletions") or 0)
     for finding in dependencies:
         out.add(finding.tier, finding.reason)
-        if finding.owner and finding.reason not in out.owner:
-            out.owner.append(finding.reason)
+        if finding.owner:
+            out.add_owner(finding.reason)
     level, surface = version
     if level in ("minor", "major"):
         out.add(MODERATE, f"{level} version bump ({surface})")
@@ -672,10 +701,10 @@ def summary(assessment: Assessment, pr: int, head: str) -> str:
     for tier in reversed(TIERS):
         if assessment.reasons[tier]:
             lines.append(f"{tier.capitalize()}:")
-            lines += [f"- `{reason}`" for reason in assessment.reasons[tier]]
+            lines += [f"- {code(reason)}" for reason in assessment.reasons[tier]]
             lines.append("")
     if assessment.owner:
-        lines.append("Owner subset: " + ", ".join(f"`{r}`" for r in assessment.owner))
+        lines.append("Owner subset: " + ", ".join(code(r) for r in assessment.owner))
     lines.append(f"Counted {assessment.lines} changed lines in {assessment.files} files.")
     return "\n".join(lines)
 
@@ -781,6 +810,20 @@ def publish(github: GitHub, pull: dict[str, Any], assessment: Assessment,
 
 
 def main(argv: list[str] | None = None) -> int:
+    # In a job, nothing this script prints is a workflow command: reasons are
+    # already escaped by ``clean``, and stop-commands is the second fence.
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return _main(argv)
+    token = secrets.token_hex(16)
+    print(f"::stop-commands::{token}", flush=True)
+    try:
+        return _main(argv)
+    finally:
+        sys.stderr.flush()
+        print(f"::{token}::", flush=True)
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--repo", help="OWNER/NAME (default: GITHUB_REPOSITORY)")
     parser.add_argument("--pr", type=int, help="pull request (default: the event's)")
@@ -805,10 +848,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         pull, assessment = evaluate(github, number)
     except TierError as error:
-        print(f"risk-tier: PR #{number}: {error}", file=sys.stderr)
+        print(f"risk-tier: PR #{number}: {clean(error)}", file=sys.stderr)
         return 1
     if pull.get("state") != "open" and (args.post or in_actions):
-        print(f"risk-tier: PR #{number} is {pull.get('state')}; nothing to post")
+        print(f"risk-tier: PR #{number} is {clean(pull.get('state'))}; nothing to post")
         return 0
     if args.json:
         print(json.dumps({"pr": number, "head": pull["head"]["sha"], **assessment.to_json(),
@@ -823,7 +866,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             publish(github, pull, assessment, run_url, args.check_run)
         except TierError as error:
-            print(f"risk-tier: {error}", file=sys.stderr)
+            print(f"risk-tier: {clean(error)}", file=sys.stderr)
             return 1
         print(f"risk-tier: posted success ({assessment.tier}) on {pull['head']['sha']}")
     return 0

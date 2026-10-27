@@ -73,6 +73,19 @@ branch, never the pull request's code. The script reads the pull request
 through the API; the only head content it reads is the dependency files it
 changed, as data.
 
+Everything it prints, posts as a status or writes to the check run escapes
+control characters first (`clean` in the script): a path or a lockfile package
+name can hold a newline, and a job output line starting with `::` is a
+workflow command (`::error`, `::add-mask`, `::stop-commands`). In a job the
+script also brackets its output with `::stop-commands::<random token>`.
+Reasons in the check run are Markdown code spans sized past any backticks
+they hold.
+
+The workflow does not run on `edited`, so retargeting a pull request to a new
+base is reassessed on its next push or label change. A malformed file on the
+base (for example an unparseable `versioning.json`) fails the job without
+posting; while the status is report-only that is a visible, harmless failure.
+
 **A `GITHUB_TOKEN` status is not proof of who posted it.** Any workflow in the
 repository can post a `risk-tier` status, and a same-repository pull request
 can add one that does. That is acceptable for a report. Before a repository
