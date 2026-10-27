@@ -202,9 +202,12 @@ impl FleetCapacitySample {
             if evidence_verdict != "ok" || evidence_pool != "on" {
                 return Err("verified fleet capacity requires ok/on evidence".to_owned());
             }
-            if evidence_object.get("inventory").and_then(Value::as_str) == Some("unavailable") {
+            if evidence_object
+                .get("inventory")
+                .is_some_and(|inventory| inventory.as_str() != Some("tart"))
+            {
                 return Err(
-                    "verified fleet capacity requires available capacity inventory".to_owned(),
+                    "verified fleet capacity requires a recognized capacity inventory".to_owned(),
                 );
             }
             for (name, expected) in [
@@ -464,6 +467,11 @@ mod tests {
         assert!(value.validate().is_err());
         let mut value = sample();
         value.evidence["inventory"] = Value::String("unavailable".to_owned());
+        value.evidence_sha256 = digest_value(&value.evidence).unwrap();
+        value.sample_id = canonical_digest(&value, true).unwrap();
+        assert!(value.validate().is_err());
+        let mut value = sample();
+        value.evidence["inventory"] = Value::String("unknown".to_owned());
         value.evidence_sha256 = digest_value(&value.evidence).unwrap();
         value.sample_id = canonical_digest(&value, true).unwrap();
         assert!(value.validate().is_err());
