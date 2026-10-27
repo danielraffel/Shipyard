@@ -4290,6 +4290,13 @@ class ReviewerClaimReceipt(unittest.TestCase):
             "claimed_at": "2026-10-27T20:00:00Z", "deadline_at": "2099-10-27T21:00:00Z",
         }
 
+    def rust_receipt(self) -> dict[str, object]:
+        value = self.receipt()
+        value.pop("schema")
+        value["repository"] = value.pop("repo")
+        value["external_id"] = "shipyard-reviewer-claim/v1/" + "a" * 64
+        return value
+
     def test_policy_is_default_off_and_requires_both_fields(self) -> None:
         self.assertIsNone(guard.review_policy(None, "danielraffel/Shipyard", True)["claim_receipt"])
         policy = guard.review_policy(
@@ -4309,6 +4316,19 @@ class ReviewerClaimReceipt(unittest.TestCase):
         with self.assertRaises(guard.GuardError):
             guard.parse_claim_receipt(self.run_fixture(bad), "danielraffel/Shipyard", 974, self.head,
                                       "reviewer-claim", "shipyard-review")
+
+    def test_parser_accepts_authenticated_rust_receipt_wire_shape(self) -> None:
+        summary = self.rust_receipt()
+        parsed = guard.parse_claim_receipt(
+            self.run_fixture(summary, external_id=summary["external_id"]),
+            "danielraffel/Shipyard", 974, self.head, "reviewer-claim", "shipyard-review")
+        self.assertEqual(parsed["epoch"], 3)
+        bad = dict(summary)
+        bad["external_id"] = "stale"
+        with self.assertRaises(guard.GuardError):
+            guard.parse_claim_receipt(
+                self.run_fixture(bad, external_id=summary["external_id"]),
+                "danielraffel/Shipyard", 974, self.head, "reviewer-claim", "shipyard-review")
         bad = self.receipt(); bad["extra"] = True
         with self.assertRaises(guard.GuardError):
             guard.parse_claim_receipt(self.run_fixture(bad), "danielraffel/Shipyard", 974, self.head,

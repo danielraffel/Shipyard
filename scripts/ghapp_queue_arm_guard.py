@@ -2171,11 +2171,26 @@ def parse_claim_receipt(
         raise GuardError(f"claim receipt `{context}` summary is not JSON") from error
     if not isinstance(value, dict):
         raise GuardError(f"claim receipt `{context}` summary is not an object")
-    required = {"schema", "repo", "pr", "head_sha", "epoch", "reviewer",
-                "claimed_at", "deadline_at"}
-    if set(value) != required or value.get("schema") != CLAIM_RECEIPT_SCHEMA:
+    schema_fields = {"schema", "repo", "pr", "head_sha", "epoch", "reviewer",
+                     "claimed_at", "deadline_at"}
+    rust_fields = {"external_id", "repository", "pr", "head_sha", "epoch", "reviewer",
+                   "claimed_at", "deadline_at"}
+    if set(value) == schema_fields and value.get("schema") == CLAIM_RECEIPT_SCHEMA:
+        receipt_repo = value.get("repo")
+    elif set(value) == rust_fields:
+        # The authenticated Rust producer serializes ReviewerReceipt directly.
+        # Its stable v1 external id is the schema/version fence; retain the
+        # exact run external id check below instead of trusting a mutable slug.
+        external_id = value.get("external_id")
+        if not isinstance(external_id, str) or not external_id.startswith(
+                "shipyard-reviewer-claim/v1/"):
+            raise GuardError(f"claim receipt `{context}` has an unexpected schema")
+        if external_id != run.get("external_id"):
+            raise GuardError(f"claim receipt `{context}` external identity does not match its run")
+        receipt_repo = value.get("repository")
+    else:
         raise GuardError(f"claim receipt `{context}` has an unexpected schema")
-    if value.get("repo") != repo or value.get("pr") != pr:
+    if receipt_repo != repo or value.get("pr") != pr:
         raise GuardError(f"claim receipt `{context}` is bound to another pull request")
     receipt_head = value.get("head_sha")
     if not isinstance(receipt_head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", receipt_head):
