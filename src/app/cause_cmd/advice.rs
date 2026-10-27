@@ -366,6 +366,7 @@ fn valid_fixlink(value: &Value) -> bool {
         || value["fix_run_id"].as_u64().is_none_or(|id| id == 0)
         || !value["head_sha"].as_str().is_some_and(valid_sha)
         || !value["fix_head_sha"].as_str().is_some_and(valid_sha)
+        || !valid_producer_metadata(value)
         || !safe(value)
     {
         return false;
@@ -378,6 +379,7 @@ fn valid_fixlink(value: &Value) -> bool {
                     .as_array()
                     .is_some_and(|files| files.iter().all(Value::is_string))
                 && value["files_truncated"].as_bool() == Some(false)
+                && valid_own_files_evidence(value)
         }
         "rerun_green" => {
             value["head_sha"] == value["fix_head_sha"]
@@ -389,6 +391,52 @@ fn valid_fixlink(value: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// Validate the producer fields that establish when and why a link was made.
+/// A link with valid-looking SHAs but no timestamps or collector rule is not
+/// enough provenance to present as a historical fix.
+fn valid_producer_metadata(value: &Value) -> bool {
+    let Some(red_time) = value["red_time"].as_str() else {
+        return false;
+    };
+    let Some(pushed_at) = value["pushed_at"].as_str() else {
+        return false;
+    };
+    let (Ok(red_time), Ok(pushed_at)) = (
+        DateTime::parse_from_rfc3339(red_time),
+        DateTime::parse_from_rfc3339(pushed_at),
+    ) else {
+        return false;
+    };
+    if pushed_at <= red_time
+        || value["branch"].as_str().is_none_or(str::is_empty)
+        || value["rule"].as_str().is_none_or(str::is_empty)
+        || value["collector"].as_str().is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    let Some(pr) = value.get("pr") else {
+        return false;
+    };
+    pr.is_null() || pr.as_u64().is_some_and(|number| number > 0)
+}
+
+/// Compare-derived links may legitimately have unknown own-file ownership
+/// (`null`), but the producer must state that fact and its method explicitly.
+fn valid_own_files_evidence(value: &Value) -> bool {
+    let own_files = value.get("own_files");
+    let own_files_shape = own_files.is_some_and(|files| {
+        files.is_null()
+            || files
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string))
+    });
+    let method = value["own_files_method"].as_str();
+    let truncated = value.get("own_files_truncated");
+    own_files_shape
+        && method.is_some_and(|text| !text.is_empty())
+        && truncated.is_some_and(|value| value.is_null() || value.is_boolean())
 }
 
 static SENSITIVE_MARKER: LazyLock<Regex> = LazyLock::new(|| {
@@ -578,6 +626,8 @@ mod tests {
                 "head_sha": "b".repeat(40),
                 "fix_head_sha": sha.repeat(40),
                 "derivation": "compare_red_head_to_fix_head",
+                "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+                "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
                 "files_raw": [], "files_truncated": false,
                 "own_files": [], "own_files_method": "first_parent_non_merge_commits",
                 "own_files_truncated": false,
@@ -669,6 +719,8 @@ mod tests {
                 "head_sha": "c".repeat(40),
                 "fix_head_sha": "c".repeat(40),
                 "derivation": "rerun_green",
+                "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+                "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
                 "files_raw": [],
                 "files_truncated": false,
                 "own_files": [],
@@ -723,6 +775,8 @@ mod tests {
             "head_sha": "a".repeat(40),
             "fix_head_sha": "c".repeat(40),
             "derivation": "compare_red_head_to_fix_head",
+                "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+                "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
             "files_raw": [],
             "files_truncated": false,
             "own_files": [],
@@ -734,6 +788,46 @@ mod tests {
             format!("{malformed}\n{conflicting}\n"),
         )
         .unwrap();
+
+        let mut query = args(dir.path());
+        query.pr = None;
+        let candidates = advise(&query, &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn incomplete_compare_provenance_is_not_attached() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        // The identity fields look plausible, but without producer timestamps
+        // this record cannot prove that the green push came after the red.
+        let incomplete = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "pr": 8,
+            "branch": "feat/x",
+            "rule": "test rule",
+            "collector": "test",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 2,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "c".repeat(40),
+            "derivation": "compare_red_head_to_fix_head",
+            "files_raw": ["src/lib.rs"],
+            "files_truncated": false,
+            "own_files": ["src/lib.rs"],
+            "own_files_method": "first_parent_non_merge_commits",
+            "own_files_truncated": false
+        });
+        fs::write(dir.path().join("fixlinks.jsonl"), incomplete.to_string()).unwrap();
 
         let mut query = args(dir.path());
         query.pr = None;
@@ -762,6 +856,8 @@ mod tests {
                 "head_sha": "b".repeat(40),
                 "fix_head_sha": fix_head_sha.repeat(40),
                 "derivation": "compare_red_head_to_fix_head",
+                "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+                "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
                 "files_raw": [],
                 "files_truncated": false,
                 "own_files": [],
@@ -801,6 +897,8 @@ mod tests {
             "head_sha": "b".repeat(40),
             "fix_head_sha": "b".repeat(40),
             "derivation": "rerun_green",
+            "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+            "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
             "files_raw": [],
             "files_truncated": false,
             "own_files": [],
@@ -817,6 +915,8 @@ mod tests {
             "head_sha": "b".repeat(40),
             "fix_head_sha": "c".repeat(40),
             "derivation": "compare_red_head_to_fix_head",
+                "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+                "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
             "files_raw": ["src/lib.rs"],
             "files_truncated": false,
             "own_files": ["src/lib.rs"],
