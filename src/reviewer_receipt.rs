@@ -6,11 +6,16 @@
 //! without accidentally introducing an ambient-token or direct-merge path.
 
 use std::fmt;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Output;
 
+use crate::gh::{GhClient, GhPrepareError, GhSupervision};
 use crate::ship_state::ReviewerClaim;
+use chrono::{DateTime, Utc};
 
 /// Immutable identity and fence carried by one reviewer check run.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ReviewerReceipt {
     /// Stable external check-run identity.
     pub external_id: String,
@@ -24,6 +29,10 @@ pub struct ReviewerReceipt {
     pub reviewer: String,
     /// Monotonic claim epoch.
     pub epoch: u64,
+    /// Claim acquisition timestamp, serialized with an explicit UTC offset.
+    pub claimed_at: DateTime<Utc>,
+    /// Exclusive claim deadline, serialized with an explicit UTC offset.
+    pub deadline_at: DateTime<Utc>,
 }
 
 /// Request passed to an authenticated check-run transport.
@@ -47,6 +56,142 @@ pub trait CheckRunTransport {
     /// Create one completed receipt. A conflict means another dispatcher won;
     /// the publisher must reconcile by calling `find` again.
     fn create(&mut self, request: &ReceiptRequest) -> Result<ReviewerReceipt, Self::Error>;
+}
+
+/// Authenticated GitHub App check-run transport.
+///
+/// This uses Shipyard's privileged, token-helper-backed `GhClient` command
+/// boundary. It never falls back to ambient credentials or a direct merge API.
+pub struct GhAppCheckRunTransport {
+    client: GhClient,
+    cwd: PathBuf,
+    repository: String,
+    app_slug: String,
+}
+
+impl GhAppCheckRunTransport {
+    /// Construct a transport bound to one canonical repository and App slug.
+    pub fn new(
+        client: GhClient,
+        cwd: impl AsRef<Path>,
+        repository: &str,
+        app_slug: &str,
+    ) -> Result<Self, GhPrepareError> {
+        Ok(Self {
+            client: client.with_repo_override(repository)?,
+            cwd: cwd.as_ref().to_path_buf(),
+            repository: repository.to_owned(),
+            app_slug: app_slug.to_owned(),
+        })
+    }
+
+    fn run_json(&self, args: &[String], input: Option<&[u8]>) -> Result<serde_json::Value, String> {
+        let mut command = self
+            .client
+            .prepare_privileged_command(&self.cwd, GhSupervision::Supervised)
+            .map_err(|error| error.to_string())?;
+        command.current_dir(&self.cwd).args(args);
+        if input.is_some() {
+            command.stdin(std::process::Stdio::piped());
+        }
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| "gh stdin unavailable".to_owned())?
+                .write_all(input)
+                .map_err(|error| error.to_string())?;
+        }
+        let output: Output = child
+            .wait_with_output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
+    }
+}
+
+impl CheckRunTransport for GhAppCheckRunTransport {
+    type Error = String;
+
+    fn find(&mut self, request: &ReceiptRequest) -> Result<Option<ReviewerReceipt>, Self::Error> {
+        let path = format!(
+            "repos/{}/commits/{}/check-runs?per_page=100",
+            self.repository, request.receipt.head_sha
+        );
+        let value = self.run_json(&["api".to_owned(), path], None)?;
+        let runs = value
+            .get("check_runs")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "check-runs response missing check_runs".to_owned())?;
+        for run in runs {
+            if run.get("name").and_then(serde_json::Value::as_str) != Some(&request.name) {
+                continue;
+            }
+            if run.get("external_id").and_then(serde_json::Value::as_str)
+                != Some(request.receipt.external_id.as_str())
+            {
+                continue;
+            }
+            if run
+                .get("app")
+                .and_then(|app| app.get("slug"))
+                .and_then(serde_json::Value::as_str)
+                != Some(self.app_slug.as_str())
+            {
+                return Err("review receipt was published by an unexpected App".to_owned());
+            }
+            return decode_receipt(run).map(Some);
+        }
+        Ok(None)
+    }
+
+    fn create(&mut self, request: &ReceiptRequest) -> Result<ReviewerReceipt, Self::Error> {
+        let body = serde_json::json!({
+            "name": request.name,
+            "head_sha": request.receipt.head_sha,
+            "external_id": request.receipt.external_id,
+            "status": "completed",
+            "conclusion": "success",
+            "output": {
+                "title": "Reviewer claim receipt",
+                "summary": serde_json::to_string(&request.receipt).map_err(|error| error.to_string())?
+            }
+        });
+        let bytes = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
+        let path = format!("repos/{}/check-runs", self.repository);
+        let value = self.run_json(
+            &[
+                "api".to_owned(),
+                path,
+                "--method".to_owned(),
+                "POST".to_owned(),
+                "--input".to_owned(),
+                "-".to_owned(),
+            ],
+            Some(&bytes),
+        )?;
+        if value
+            .get("app")
+            .and_then(|app| app.get("slug"))
+            .and_then(serde_json::Value::as_str)
+            != Some(self.app_slug.as_str())
+        {
+            return Err("review receipt response came from an unexpected App".to_owned());
+        }
+        decode_receipt(&value)
+    }
+}
+
+fn decode_receipt(run: &serde_json::Value) -> Result<ReviewerReceipt, String> {
+    let summary = run
+        .get("output")
+        .and_then(|output| output.get("summary"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "review receipt has no output summary".to_owned())?;
+    serde_json::from_str(summary).map_err(|error| format!("malformed reviewer receipt: {error}"))
 }
 
 /// Fail-closed publication and reconciliation errors.
@@ -96,6 +241,8 @@ pub fn request_from_claim(repository: &str, pr: u64, claim: &ReviewerClaim) -> R
             head_sha: claim.head_sha.clone(),
             reviewer: claim.reviewer.clone(),
             epoch: claim.epoch,
+            claimed_at: claim.claimed_at,
+            deadline_at: claim.deadline_at,
         },
     }
 }
@@ -236,5 +383,23 @@ mod tests {
             publish_or_reconcile(&mut Unreadable, &request),
             Err(ReceiptError::Transport(_))
         ));
+    }
+
+    #[test]
+    fn malformed_timestamp_and_receipt_id_are_rejected() {
+        let request = request();
+        let mut receipt = serde_json::to_value(&request.receipt).expect("receipt serializes");
+        receipt["claimed_at"] = serde_json::Value::String("not-a-timezone".to_owned());
+        let run = serde_json::json!({
+            "external_id": request.receipt.external_id,
+            "output": {"summary": receipt.to_string()}
+        });
+        assert!(decode_receipt(&run).is_err());
+
+        let mut receipt = serde_json::to_value(&request.receipt).expect("receipt serializes");
+        receipt["external_id"] = serde_json::Value::String("stale".to_owned());
+        let run = serde_json::json!({"output": {"summary": receipt.to_string()}});
+        let decoded = decode_receipt(&run).expect("well-formed receipt");
+        assert_ne!(decoded.external_id, request.receipt.external_id);
     }
 }
