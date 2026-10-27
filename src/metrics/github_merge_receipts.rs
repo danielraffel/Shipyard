@@ -648,6 +648,58 @@ mod tests {
         assert_eq!(receipt.head_sha, "a".repeat(40));
         assert_eq!(receipt.merge_commit_sha, "d".repeat(40));
     }
+
+    #[test]
+    fn reconciles_real_merge_group_shape_without_pull_request_array() {
+        // GitHub's merge_group workflow-run payload normally omits membership
+        // from pull_requests[]. The queue ref is the authoritative binding.
+        let (job, mut run, pr, checks, required) = fixture();
+        run.pull_requests.clear();
+        let receipt = reconcile(
+            "Generous-Corp/pulp",
+            "pulp",
+            "main",
+            "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+            "https://github.com/Generous-Corp/pulp/actions/runs/7",
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"c".repeat(64),
+            &job,
+            &run,
+            &pr,
+            &checks,
+            &required,
+        )
+        .expect("real-shaped merge-group payload reconciles");
+        assert_eq!(receipt.pr, 42);
+    }
+
+    #[test]
+    fn rejects_empty_membership_when_queue_ref_names_another_pr() {
+        let (mut job, mut run, pr, checks, required) = fixture();
+        let queue_ref = "gh-readonly-queue/main/pr-43-cccccccccccccccccccccccccccccccccccccccc";
+        job.merge_group_head_ref = Some(queue_ref.to_owned());
+        run.head_branch = Some(queue_ref.to_owned());
+        run.pull_requests.clear();
+        let error = reconcile(
+            "Generous-Corp/pulp",
+            "pulp",
+            "main",
+            "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+            "https://github.com/Generous-Corp/pulp/actions/runs/7",
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"c".repeat(64),
+            &job,
+            &run,
+            &pr,
+            &checks,
+            &required,
+        )
+        .expect_err("queue ref must bind the artifact PR");
+        assert!(error.contains("queue ref does not identify"), "{error}");
+    }
+
     #[test]
     fn rejects_run_identity_and_check_ambiguity() {
         let (mut job, run, pr, checks, required) = fixture();
