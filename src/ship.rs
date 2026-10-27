@@ -2781,6 +2781,11 @@ fn load_or_create_state(
             existing.dispatched_runs.clear();
             existing.evidence_snapshot.clear();
             existing.merge_queue_observed_at = None;
+            if !existing.fence_reviewer_claim() {
+                return Err(ShipExecutionError::ShipState(
+                    "reviewer claim epoch exhausted".to_owned(),
+                ));
+            }
             // Establish a fresh authority epoch for the adopted head. This is
             // deliberately not ownership by itself; it only prevents removal
             // events from the previous SHA from governing the new validation.

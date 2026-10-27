@@ -328,6 +328,22 @@ impl ShipState {
         true
     }
 
+    /// Fence all reviewer claims when the validation identity changes.
+    ///
+    /// This is used by explicit head/base adoption. The epoch still advances
+    /// when no claim is active so every validation identity gets a distinct
+    /// authority generation. Returns `false` only after the monotonic fence is
+    /// exhausted, in which case callers must fail closed.
+    pub fn fence_reviewer_claim(&mut self) -> bool {
+        let Some(next_epoch) = self.reviewer_claim_epoch.checked_add(1) else {
+            return false;
+        };
+        self.reviewer_claim_epoch = next_epoch;
+        self.active_reviewer_claim = None;
+        self.touch();
+        true
+    }
+
     /// Return whether a reviewer claim may still publish a verdict now.
     ///
     /// The claim must name the current exact head, match the active epoch, and
