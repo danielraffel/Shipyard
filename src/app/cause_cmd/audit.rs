@@ -375,15 +375,27 @@ mod tests {
             "repo": "o/r",
             "red_run_id": red_run_id,
             "red_attempt": 1,
-            "fix_run_id": if derivation == "rerun_green" { red_run_id } else { 2 },
+            "fix_run_id": if derivation == "rerun_green" {
+                red_run_id
+            } else {
+                red_run_id + 1
+            },
             "head_sha": "a".repeat(40),
-            "fix_head_sha": "a".repeat(40),
+            "fix_head_sha": if derivation == "rerun_green" {
+                "a".repeat(40)
+            } else {
+                "b".repeat(40)
+            },
             "derivation": derivation,
             "files_raw": [],
             "own_files": [],
             "files_truncated": false,
             "own_files_truncated": false,
-            "own_files_method": if derivation == "rerun_green" { "rerun_same_head" } else { "compare" },
+            "own_files_method": if derivation == "rerun_green" {
+                "rerun_same_head"
+            } else {
+                "first_parent_non_merge_commits"
+            },
         })
     }
 
