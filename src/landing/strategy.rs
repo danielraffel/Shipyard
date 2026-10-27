@@ -96,9 +96,11 @@ mod tests {
     }
     #[test]
     fn rollup_queue_is_two_stage() {
-        let mut c = Config::default();
-        c.enabled = true;
-        c.mode = Mode::Rollup;
+        let c = Config {
+            enabled: true,
+            mode: Mode::Rollup,
+            ..Config::default()
+        };
         assert_eq!(
             batching_guidance(&queue(Some(true)), &c).action,
             BatchingAction::RollupThenEnqueue
@@ -106,9 +108,11 @@ mod tests {
     }
     #[test]
     fn queue_landing_without_queue_fails_closed() {
-        let mut c = Config::default();
-        c.enabled = true;
-        c.mode = Mode::Rollup;
+        let c = Config {
+            enabled: true,
+            mode: Mode::Rollup,
+            ..Config::default()
+        };
         assert_eq!(
             batching_guidance(&queue(None), &c).action,
             BatchingAction::Unknown
