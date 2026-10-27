@@ -32,8 +32,6 @@ use crate::runner_provision::{
 /// streams each runner object (newline-delimited) across pages.
 fn fetch_all_runners(actions: &GitHubActions, slug: &str) -> Result<Vec<ApiRunner>, CliFailure> {
     let raw = actions
-        .clone()
-        .with_repo_override(slug)
         .run_gh(&[
             "api".to_owned(),
             "--paginate".to_owned(),
@@ -1143,8 +1141,6 @@ pub(super) fn register_command<W: Write>(
 
             let token = args
                 .actions
-                .clone()
-                .with_repo_override(&slug)
                 .run_gh(&[
                     "api".to_owned(),
                     "-X".to_owned(),
@@ -1824,8 +1820,6 @@ pub(super) fn remove_command<W: Write>(
     }
 
     let token = actions
-        .clone()
-        .with_repo_override(&slug)
         .run_gh(&[
             "api".to_owned(),
             "-X".to_owned(),

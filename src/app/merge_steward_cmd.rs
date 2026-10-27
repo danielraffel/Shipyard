@@ -1115,10 +1115,6 @@ pub(super) fn steward_command<W: Write>(
     let mut remaining_preemptions =
         usize::from(!recovery_owned_preemption_budget && ledger.pending_cancellations.is_empty());
     for repo in repos {
-        // One App token per repository: a repository-scoped token routed to
-        // the checkout would refuse every other repository's calls.
-        let repo_actions = actions.clone().with_repo_override(&repo);
-        let actions = &repo_actions;
         match observe_repo(actions, &repo, &args.base, args.preempt_capacity) {
             Ok(observation) => {
                 let (mut report, failed, planned_preemptions) = apply_repo_plan(
