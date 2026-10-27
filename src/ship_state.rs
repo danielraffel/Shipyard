@@ -92,6 +92,25 @@ pub struct ReviewerClaim {
     pub deadline_at: DateTime<Utc>,
 }
 
+/// Inputs for an atomic reviewer claim and external receipt publication.
+#[derive(Clone, Copy, Debug)]
+pub struct ReviewerClaimRequest<'a> {
+    /// Repository slug owning the pull request.
+    pub repository: &'a str,
+    /// Pull request number.
+    pub pr: u64,
+    /// Exact current pull request head.
+    pub head_sha: &'a str,
+    /// Stable reviewer identity.
+    pub reviewer: &'a str,
+    /// Claim acquisition time.
+    pub claimed_at: DateTime<Utc>,
+    /// Exclusive claim deadline.
+    pub deadline_at: DateTime<Utc>,
+    /// Trusted current observation time.
+    pub now: DateTime<Utc>,
+}
+
 /// Durable state for a single in-flight PR ship.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ShipState {
@@ -642,26 +661,34 @@ impl ShipStateStore {
     /// supplied exact head and epoch and use authenticated App credentials.
     pub fn claim_reviewer_and_publish<T, E>(
         &self,
-        repository: &str,
-        pr: u64,
-        head_sha: &str,
-        reviewer: &str,
-        claimed_at: DateTime<Utc>,
-        deadline_at: DateTime<Utc>,
-        now: DateTime<Utc>,
+        request: ReviewerClaimRequest<'_>,
         publisher: impl FnOnce(&ReviewerClaim) -> Result<T, E>,
     ) -> Result<T, Box<dyn std::error::Error>>
     where
         E: Display,
     {
-        let lock = self.lock_pr_scoped(repository, pr)?;
+        let lock = self.lock_pr_scoped(request.repository, request.pr)?;
         let mut state = self
-            .get_locked_scoped(repository, pr, &lock)
-            .ok_or_else(|| format!("no active ship state for {repository} PR #{pr}"))?;
-        let claim = state
-            .claim_reviewer(head_sha, reviewer, claimed_at, deadline_at, now)
+            .get_locked_scoped(request.repository, request.pr, &lock)
             .ok_or_else(|| {
-                format!("cannot claim reviewer {reviewer} for {repository} PR #{pr} at {head_sha}")
+                format!(
+                    "no active ship state for {} PR #{}",
+                    request.repository, request.pr
+                )
+            })?;
+        let claim = state
+            .claim_reviewer(
+                request.head_sha,
+                request.reviewer,
+                request.claimed_at,
+                request.deadline_at,
+                request.now,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "cannot claim reviewer {} for {} PR #{} at {}",
+                    request.reviewer, request.repository, request.pr, request.head_sha
+                )
             })?;
         self.save_scoped_locked(&state, &lock)?;
 
@@ -669,7 +696,7 @@ impl ShipStateStore {
             Ok(value) => Ok(value),
             Err(error) => {
                 let publish_error = error.to_string();
-                if !state.revoke_reviewer_claim(head_sha, claim.epoch, reviewer) {
+                if !state.revoke_reviewer_claim(request.head_sha, claim.epoch, request.reviewer) {
                     return Err(format!(
                         "reviewer receipt publication failed ({publish_error}) and claim revocation failed"
                     )
@@ -1507,13 +1534,15 @@ mod tests {
         let now = Utc::now();
         let observed = store
             .claim_reviewer_and_publish(
-                &state.repo,
-                state.pr,
-                &state.head_sha,
-                "pulp-review",
-                now,
-                now + Duration::minutes(5),
-                now,
+                ReviewerClaimRequest {
+                    repository: &state.repo,
+                    pr: state.pr,
+                    head_sha: &state.head_sha,
+                    reviewer: "pulp-review",
+                    claimed_at: now,
+                    deadline_at: now + Duration::minutes(5),
+                    now,
+                },
                 |claim| {
                     assert_eq!(claim.head_sha, state.head_sha);
                     assert_eq!(claim.reviewer, "pulp-review");
@@ -1541,13 +1570,15 @@ mod tests {
         let now = Utc::now();
         let error = store
             .claim_reviewer_and_publish(
-                &state.repo,
-                state.pr,
-                &state.head_sha,
-                "pulp-review",
-                now,
-                now + Duration::minutes(5),
-                now,
+                ReviewerClaimRequest {
+                    repository: &state.repo,
+                    pr: state.pr,
+                    head_sha: &state.head_sha,
+                    reviewer: "pulp-review",
+                    claimed_at: now,
+                    deadline_at: now + Duration::minutes(5),
+                    now,
+                },
                 |_claim| Err::<(), _>("check-run refused"),
             )
             .expect_err("publication failure");
