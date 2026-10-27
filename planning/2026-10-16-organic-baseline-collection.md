@@ -78,3 +78,11 @@ remains unavailable without `--merge-receipts`; failed or cancelled jobs are
 never treated as merged changes. A receipt import failure fails the collection
 pass. Synthetic provenance is not asserted by this wrapper; use only the
 organic provider exports intended for the baseline.
+
+Collection remains report-only by default: it writes the state and status files
+and exits successfully even while the baseline is still accumulating. A
+downstream optimization gate can opt into fail-closed readiness with
+`--require-ready`; the collector still writes its observation and status, then
+exits `3` unless `baseline_readiness.optimization_eligible` is true. This keeps
+hourly collection alive while preventing an experiment from starting on an
+immature or incomplete baseline.

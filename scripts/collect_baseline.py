@@ -635,6 +635,13 @@ def baseline_readiness(card: dict[str, Any], started: dt.datetime,
             "reasons": reasons, "optimization_reasons": eligibility_reasons}
 
 
+def readiness_gate_exit(readiness: dict[str, Any], require_ready: bool) -> int:
+    """Return the opt-in gate exit code without changing collection semantics."""
+    if require_ready and readiness.get("optimization_eligible") is not True:
+        return 3
+    return 0
+
+
 def update_state(path: pathlib.Path, project: str, started: dt.datetime,
                  card: dict[str, Any], events: list[dict[str, Any]],
                  observed_at: dt.datetime | None = None, repo: str | None = None,
@@ -763,6 +770,8 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--since-days", type=int, default=5)
     parser.add_argument("--collect", action="store_true", help="run provider imports")
+    parser.add_argument("--require-ready", action="store_true",
+                        help="exit 3 after writing state unless the baseline is optimization-eligible")
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--pass-history", type=pathlib.Path,
                         help="prospective pass history sidecar (defaults beside --state)")
@@ -829,7 +838,8 @@ def main() -> int:
               "baseline": {"source_activity_days_observed": state["source_activity_days_observed"],
                            "collection_days_observed": state.get("collection_days_observed", 0),
                            "readiness": state.get("baseline_readiness", {"status": "unavailable"}),
-                           "exit": state["baseline_exit"]}, "events": events}
+                           "exit": state["baseline_exit"],
+                           "required": args.require_ready}, "events": events}
     if args.status_markdown:
         args.status_markdown.write_text(
             "# Organic baseline status\n\n"
@@ -845,7 +855,7 @@ def main() -> int:
             "Synthetic provenance, unavailable phases, and merge denominators are not imputed.\n"
         )
     print(json.dumps(output, indent=2, sort_keys=True))
-    return 0
+    return readiness_gate_exit(state.get("baseline_readiness", {}), args.require_ready)
 
 
 if __name__ == "__main__":

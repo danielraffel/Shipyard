@@ -13,6 +13,13 @@ import baseline_pass_history as history
 
 
 class BaselineScorecardTests(unittest.TestCase):
+    def test_readiness_gate_is_opt_in_and_requires_optimization_eligibility(self):
+        self.assertEqual(MOD.readiness_gate_exit({"status": "insufficient", "optimization_eligible": False}, False), 0)
+        self.assertEqual(MOD.readiness_gate_exit({"status": "insufficient", "optimization_eligible": False}, True), 3)
+        self.assertEqual(MOD.readiness_gate_exit({"status": "complete_insufficient", "optimization_eligible": False}, True), 3)
+        self.assertEqual(MOD.readiness_gate_exit({"status": "ready", "optimization_eligible": True}, True), 0)
+        self.assertEqual(MOD.readiness_gate_exit({}, True), 3)
+
     def test_readiness_rejects_nonfinite_instrumentation_and_separates_lane_eligibility(self):
         started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
         observed = started + dt.timedelta(days=5)
