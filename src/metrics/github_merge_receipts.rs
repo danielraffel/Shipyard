@@ -729,6 +729,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_batched_or_reordered_merge_group_parents() {
+        for parents in [
+            vec!["a".repeat(40), "c".repeat(40)],
+            vec!["c".repeat(40), "b".repeat(40)],
+        ] {
+            let (job, mut run, pr, checks, required) = fixture();
+            run.pull_requests.clear();
+            run.head_commit_parents = parents;
+            let error = reconcile(
+                "Generous-Corp/pulp",
+                "pulp",
+                "main",
+                "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+                "https://github.com/Generous-Corp/pulp/actions/runs/7",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                &job,
+                &run,
+                &pr,
+                &checks,
+                &required,
+            )
+            .expect_err("only the exact single-PR parent order is accepted");
+            assert!(error.contains("commit parents"), "{error}");
+        }
+    }
+
+    #[test]
     fn rejects_run_identity_and_check_ambiguity() {
         let (mut job, run, pr, checks, required) = fixture();
         job.run_attempt = 2;
