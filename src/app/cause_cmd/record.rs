@@ -1109,27 +1109,29 @@ fn run_passed_job(
     if !terminal_job_names_are_unambiguous(&jobs) {
         return Ok(false);
     }
-    Ok(!jobs.is_empty() && {
-        failed_job_names.iter().all(|failed_job| {
-            let passed_attempt = jobs
-                .iter()
-                .filter(|job| {
-                    job["name"].as_str() == Some(failed_job.as_str())
-                        && job["conclusion"].as_str() == Some("success")
-                })
-                .filter_map(|job| job["run_attempt"].as_u64())
-                .max();
-            passed_attempt.is_some_and(|attempt| {
-                if fix.run_id == red.run_id {
-                    attempt > red.attempt
-                } else {
-                    // A push fix may be a selective rerun: a job that passed
-                    // in an earlier attempt remains part of the green run.
-                    true
-                }
-            })
-        })
-    })
+    Ok(failed_job_names.iter().all(|failed_job| {
+        let mut attempts: BTreeMap<u64, Vec<&Value>> = BTreeMap::new();
+        for job in jobs
+            .iter()
+            .filter(|job| job["name"].as_str() == Some(failed_job.as_str()))
+        {
+            let Some(attempt) = job["run_attempt"].as_u64() else {
+                return false;
+            };
+            attempts.entry(attempt).or_default().push(job);
+        }
+        let Some((&latest_attempt, latest_jobs)) = attempts.last_key_value() else {
+            return false;
+        };
+        if fix.run_id == red.run_id && latest_attempt <= red.attempt {
+            return false;
+        }
+        // A duplicate raw name in one attempt cannot identify which matrix
+        // leg passed. A later selective rerun may leave earlier successes in
+        // the listing, but the latest record for this name must be singular
+        // and successful.
+        latest_jobs.len() == 1 && latest_jobs[0]["conclusion"].as_str() == Some("success")
+    }))
 }
 
 fn red_jobs_complete(
@@ -1146,6 +1148,13 @@ fn red_jobs_complete(
         jobs
     };
     if jobs.is_empty() || !job_list_complete(&jobs) {
+        return Ok(None);
+    }
+    if jobs.iter().any(|job| {
+        matches!(job["conclusion"].as_str(), Some("failure" | "timed_out"))
+            && (job["run_attempt"].as_u64().is_none()
+                || job["name"].as_str().is_none_or(str::is_empty))
+    }) {
         return Ok(None);
     }
     if !terminal_job_names_are_unambiguous(&jobs) {
