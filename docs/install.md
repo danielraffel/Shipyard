@@ -614,8 +614,10 @@ rustup toolchain install 1.97.1 --profile minimal --component rustfmt --componen
 
 The hook requires `rustc` on `PATH` to be the rustup proxy (`~/.cargo/bin`;
 a symlink, hardlink, or copy of `rustup`) before it runs Cargo. It sets
-`RUSTUP_AUTO_INSTALL=0` and refuses at once, without running Cargo, when the
-pinned toolchain is not installed, so a host that cannot download the pin is
-not left waiting on rustup. On m3 it refuses Cargo and prints the m1 command
-instead; set `SHIPYARD_M1_CHECKOUT` to the m1 path of the branch to have the
-command name it.
+`RUSTUP_AUTO_INSTALL=0`, selects the pinned channel explicitly, and refuses at
+once without running Cargo when the pinned toolchain is not installed. Any
+fleet host with the pinned compiler, rustfmt, and clippy components may run
+this local gate, so a slow m1 does not serialize source pushes. m1 remains the
+fallback for a host that lacks the capability. These local checks do not grant
+merge authority: GitHub CI, branch protection, and the configured Shipyard
+mutation machine remain authoritative.

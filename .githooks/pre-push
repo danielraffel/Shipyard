@@ -82,8 +82,7 @@ assert_rustup_proxy() {
     return 1
 }
 check_pinned_toolchain() {
-    local channel
-    channel="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml 2>/dev/null)"
+    local channel="$1"
     if [ -z "$channel" ] || ! command -v rustup >/dev/null 2>&1; then
         return 0
     fi
@@ -97,22 +96,17 @@ check_pinned_toolchain() {
         return 1
     fi
 }
-is_m3() { [[ "${SHIPYARD_HOST:-}" == "m3" || "$(uname -n 2>/dev/null)" == *m3* ]]; }
-# The m1 checkout of this branch lives at a different path than this one.
-m1_cmd="ssh m1 'cd ${SHIPYARD_M1_CHECKOUT:-<m1 checkout of $(basename "$ROOT")>} && cargo"
+channel="$(sed -n 's/^channel = "\([^\"]*\)"/\1/p' rust-toolchain.toml 2>/dev/null)"
 assert_rustup_proxy || blocking_fail=1
 pin_installed=1
-check_pinned_toolchain || { blocking_fail=1; pin_installed=0; }
+check_pinned_toolchain "$channel" || { blocking_fail=1; pin_installed=0; }
 if [ "$pin_installed" = "0" ]; then
     echo "[pre-push] skipping cargo gates until the pinned toolchain is installed." >&2
-elif is_m3; then
-    echo "[pre-push] Rust gates require m1; Cargo is forbidden on m3." >&2
-    echo "[pre-push] Run on m1: $m1_cmd fmt --all --check'" >&2
-    if echo "$changed_files" | grep -Eq '^(src|tests)/'; then
-      echo "[pre-push] Run on m1: $m1_cmd clippy --all-targets --locked -- -D warnings'" >&2
-    fi
-    blocking_fail=1
 else
+    # The pinned toolchain is the capability boundary. A faster host may run
+    # this local gate; m1 remains a fallback for hosts lacking the capability.
+    # GitHub CI and branch protection remain the merge authority.
+    export RUSTUP_TOOLCHAIN="$channel"
     cargo fmt --all --check || {
         echo "[pre-push] cargo fmt --check failed." >&2
         blocking_fail=1

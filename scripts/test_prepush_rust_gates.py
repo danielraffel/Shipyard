@@ -136,16 +136,14 @@ class PrePushRustGateTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, f"{kind}: {proc.stderr}")
             self.assertNotIn("must be the rustup proxy", proc.stderr)
 
-    def test_the_m1_hint_does_not_embed_this_checkout_path(self) -> None:
+    def test_a_faster_host_can_run_the_pinned_gate_without_m1(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             env = provision(Path(td))
             env["SHIPYARD_HOST"] = "m3"
             proc = run_hook(env)
-            env["SHIPYARD_M1_CHECKOUT"] = "~/sy-branch"
-            named = run_hook(env)
-        self.assertIn("Run on m1: ssh m1 'cd <m1 checkout of", proc.stderr)
-        self.assertNotIn(f"cd {ROOT} ", proc.stderr)
-        self.assertIn("ssh m1 'cd ~/sy-branch && cargo fmt", named.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("Rust gates require m1", proc.stderr)
+        self.assertIn("gates clean", proc.stderr)
 
     def test_a_longer_channel_with_the_pin_as_prefix_is_not_the_pin(self) -> None:
         with tempfile.TemporaryDirectory() as td:
