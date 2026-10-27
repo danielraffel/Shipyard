@@ -492,6 +492,6 @@ mod tests {
         })
         .expect("audit");
         assert!(!report.ok);
-        assert_eq!(report.findings[0].kind, "invalid_fixlink");
+        assert_eq!(report.findings[0].kind, "orphan_fixlink");
     }
 }

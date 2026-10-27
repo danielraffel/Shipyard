@@ -303,8 +303,7 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
             Some("compare_red_head_to_fix_head" | "rerun_green")
         )
         && (derivation != Some("rerun_green")
-            || (value["fix_run_id"] == value["red_run_id"]
-                && value["head_sha"] == value["fix_head_sha"]
+            || (value["head_sha"] == value["fix_head_sha"]
                 && value["head_sha"].as_str().is_some_and(valid_sha)
                 && value["files_raw"].as_array().is_some_and(Vec::is_empty)
                 && value["own_files"].as_array().is_some_and(Vec::is_empty)
@@ -627,6 +626,42 @@ mod tests {
         let candidates = advise(&args(dir.path()), &[]).unwrap().0;
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn rerun_green_later_run_on_same_head_is_attached() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            serde_json::json!({
+                "schema": SCHEMA,
+                "source": "fix-link",
+                "repo": "o/r",
+                "red_run_id": 1,
+                "red_attempt": 1,
+                "fix_run_id": 2,
+                "head_sha": "c".repeat(40),
+                "fix_head_sha": "c".repeat(40),
+                "derivation": "rerun_green",
+                "files_raw": [],
+                "own_files": [],
+                "files_truncated": false,
+                "own_files_truncated": false,
+                "own_files_method": "rerun_same_head"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let candidates = advise(&args(dir.path()), &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].fix_link.is_some());
     }
 
     #[test]
