@@ -105,6 +105,30 @@ fn rows(path: &Path) -> Vec<Value> {
 }
 
 #[test]
+fn run_jobs_are_paginated_with_a_bounded_page_count() {
+    let first_page = Value::Array((0..100).map(|id| json!({"id": id})).collect());
+    let fake = Fake::new(&[
+        (
+            "runs/100/jobs?filter=all&per_page=100&page=1",
+            json!({"jobs": first_page}),
+        ),
+        (
+            "runs/100/jobs?filter=all&per_page=100&page=2",
+            json!({"jobs": [{"id": 100}]}),
+        ),
+    ]);
+    let gh = |args: &[String]| fake.read(args);
+    let jobs = list_run_jobs(
+        &gh,
+        &query(tempfile::tempdir().expect("tempdir").path()),
+        100,
+    )
+    .expect("jobs");
+    assert_eq!(jobs.len(), 101);
+    assert_eq!(jobs[100]["id"], 100);
+}
+
+#[test]
 fn a_red_drift_job_gets_one_record_naming_its_generator() {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
@@ -502,8 +526,7 @@ fn a_green_workflow_run_that_skips_the_failed_job_is_not_a_fix() {
     let gh = |args: &[String]| first.read(args);
     record(&gh, &query(dir.path())).expect("red pass");
 
-    let mut skipped = job(2000, "success");
-    skipped["name"] = json!("docs-only");
+    let skipped = job(2000, "skipped");
     let mut routes = red_routes();
     routes.retain(|(needle, _)| {
         !needle.starts_with("runs?branch=") && !needle.contains("runs/200/jobs")
@@ -519,6 +542,43 @@ fn a_green_workflow_run_that_skips_the_failed_job_is_not_a_fix() {
         ("runs/200/jobs", json!({"jobs": [skipped]})),
     ]);
     let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    let report = record(&gh, &query(dir.path())).expect("green pass");
+    assert_eq!((report.fixlinks_written, report.reds_pending), (0, 1));
+    assert!(!dir.path().join("fixlinks.jsonl").exists());
+}
+
+#[test]
+fn a_green_run_must_pass_every_failed_job_before_writing_a_fix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut red_jobs = vec![job(1000, "failure"), job(1001, "failure")];
+    red_jobs[1]["name"] = json!("linux");
+    let mut routes = red_routes();
+    routes[1] = ("runs/100/jobs", json!({"jobs": red_jobs}));
+    let first = Fake::new(&routes)
+        .with_log("jobs/1000/logs", &drift_log())
+        .with_log("jobs/1001/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    let red_report = record(&gh, &query(dir.path())).expect("red pass");
+    assert_eq!(red_report.causes_written, 2);
+
+    let mut routes = red_routes();
+    routes.retain(|(needle, _)| {
+        !needle.starts_with("runs?branch=") && !needle.contains("runs/200/jobs")
+    });
+    routes.extend([
+        (
+            "runs?branch=feat%2Fx&status=success",
+            json!({"workflow_runs": [{
+                "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
+                "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
+            }]}),
+        ),
+        ("runs/200/jobs", json!({"jobs": [job(2000, "success")] })),
+    ]);
+    let second = Fake::new(&routes)
+        .with_log("jobs/1000/logs", &drift_log())
+        .with_log("jobs/1001/logs", &drift_log());
     let gh = |args: &[String]| second.read(args);
     let report = record(&gh, &query(dir.path())).expect("green pass");
     assert_eq!((report.fixlinks_written, report.reds_pending), (0, 1));
@@ -761,7 +821,7 @@ fn malformed_green_head_is_not_emitted_as_a_fix_link() {
         repo: "Generous-Corp/pulp".to_owned(),
         run_id: 100,
         attempt: 1,
-        job: "macos".to_owned(),
+        jobs: ["macos".to_owned()].into_iter().collect(),
         head_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
         time: "2026-10-14T10:30:00Z".to_owned(),
         pr: Some(42),
