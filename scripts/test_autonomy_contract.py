@@ -14,6 +14,7 @@ class AutonomyContractTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("A1-A12", result.stdout)
+        self.assertIn("enforcement surfaces", result.stdout)
 
 if __name__ == "__main__":
     unittest.main()
