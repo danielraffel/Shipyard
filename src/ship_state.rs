@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::evidence::canonical_repository;
 
 /// Schema version for durable ship-state files.
-pub const SHIP_STATE_SCHEMA_VERSION: u32 = 2;
+pub const SHIP_STATE_SCHEMA_VERSION: u32 = 3;
 
 /// A single dispatched run tracked as part of an in-flight ship.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -134,6 +134,84 @@ pub struct ReviewerClaimRequest<'a> {
     pub now: DateTime<Utc>,
 }
 
+/// The durable compare-and-swap identity for one ShipState record.
+///
+/// `generation` changes when a ship attempt or validation identity is
+/// replaced, `state_version` changes for every persisted mutation, and
+/// `claim_epoch` fences reviewer ownership. The exact head is included so a
+/// caller that changes it without first touching the state still cannot reuse
+/// an older worker snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShipStateCas {
+    /// Monotonic ship-attempt/validation generation.
+    pub generation: u64,
+    /// Monotonic persisted state version.
+    pub state_version: u64,
+    /// Monotonic reviewer-claim epoch.
+    pub claim_epoch: u64,
+    /// Exact PR head bound to this state identity.
+    pub head_sha: String,
+}
+
+/// Why an opt-in ShipState CAS save was refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShipStateCasError {
+    /// The state disappeared before the compare-and-swap.
+    MissingState,
+    /// Another worker committed a newer identity first.
+    Conflict {
+        /// Snapshot the caller read before doing its work.
+        expected: ShipStateCas,
+        /// Identity currently persisted under the lock.
+        actual: ShipStateCas,
+    },
+    /// A candidate did not advance the durable version.
+    VersionNotAdvanced {
+        /// Snapshot version supplied by the caller.
+        expected: u64,
+        /// Candidate version supplied for the write.
+        candidate: u64,
+    },
+    /// State identity fields are malformed or still legacy.
+    InvalidIdentity(String),
+    /// The durable write failed after the CAS passed.
+    Io(String),
+}
+
+impl Display for ShipStateCasError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingState => formatter.write_str("ship state disappeared during CAS"),
+            Self::Conflict { expected, actual } => write!(
+                formatter,
+                "ship state CAS conflict (expected generation={} version={} claim_epoch={} head={}, actual generation={} version={} claim_epoch={} head={})",
+                expected.generation,
+                expected.state_version,
+                expected.claim_epoch,
+                expected.head_sha,
+                actual.generation,
+                actual.state_version,
+                actual.claim_epoch,
+                actual.head_sha,
+            ),
+            Self::VersionNotAdvanced {
+                expected,
+                candidate,
+            } => write!(
+                formatter,
+                "ship state CAS candidate did not advance state_version (expected {}, candidate {})",
+                expected, candidate
+            ),
+            Self::InvalidIdentity(reason) => {
+                write!(formatter, "invalid ship state identity: {reason}")
+            }
+            Self::Io(reason) => write!(formatter, "ship state CAS write failed: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ShipStateCasError {}
+
 /// Durable state for a single in-flight PR ship.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ShipState {
@@ -171,6 +249,19 @@ pub struct ShipState {
     /// Attempt number for this PR ship.
     #[serde(default = "default_attempt")]
     pub attempt: u32,
+    /// Monotonic ship-attempt/validation generation.
+    ///
+    /// This is separate from `attempt` so future retry accounting can change
+    /// without weakening the durable identity fence. Legacy records migrate
+    /// to generation one on their next save.
+    #[serde(default)]
+    pub generation: u64,
+    /// Monotonic state version used by opt-in compare-and-swap writers.
+    ///
+    /// Zero is reserved for a legacy or malformed record and is rejected by
+    /// CAS saves until the record has been migrated by a normal save.
+    #[serde(default)]
+    pub state_version: u64,
     /// Queue job that owns the current ship attempt.
     ///
     /// Queue-absence recovery requires this exact identity; older state files
@@ -211,6 +302,13 @@ pub struct ShipState {
     /// Monotonic reviewer-claim fence for this PR state.
     #[serde(default)]
     pub reviewer_claim_epoch: u64,
+    /// Canonical monotonic reviewer-claim fence.
+    ///
+    /// `reviewer_claim_epoch` remains as a serialized compatibility mirror for
+    /// v2 readers. New code must use this field; the two values are required to
+    /// agree once a v3 record has been written.
+    #[serde(default)]
+    pub claim_epoch: u64,
     /// Active reviewer claim, if one currently owns this exact head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_reviewer_claim: Option<ReviewerClaim>,
@@ -242,6 +340,8 @@ impl ShipState {
             dispatched_runs: Vec::new(),
             evidence_snapshot: BTreeMap::new(),
             attempt: default_attempt(),
+            generation: 1,
+            state_version: 1,
             source_job_id: None,
             created_at: now,
             updated_at: now,
@@ -251,8 +351,71 @@ impl ShipState {
             merge_queue_enqueue_started_at: None,
             abandoned: None,
             reviewer_claim_epoch: 0,
+            claim_epoch: 0,
             active_reviewer_claim: None,
         }
+    }
+
+    /// Return this record's durable CAS identity.
+    #[must_use]
+    pub fn cas(&self) -> ShipStateCas {
+        ShipStateCas {
+            generation: self.generation,
+            state_version: self.state_version,
+            claim_epoch: self.effective_claim_epoch(),
+            head_sha: self.head_sha.clone(),
+        }
+    }
+
+    /// Return the canonical claim epoch, accepting a v2 compatibility mirror
+    /// while the record is still in memory.
+    #[must_use]
+    pub fn effective_claim_epoch(&self) -> u64 {
+        if self.schema_version < SHIP_STATE_SCHEMA_VERSION {
+            self.claim_epoch.max(self.reviewer_claim_epoch)
+        } else if self.claim_epoch == self.reviewer_claim_epoch {
+            self.claim_epoch
+        } else {
+            // A malformed v3 record must fail closed in every claim/CAS path.
+            0
+        }
+    }
+
+    /// Return whether all CAS identity fields are usable for a v3 write.
+    #[must_use]
+    pub fn has_valid_cas_identity(&self) -> bool {
+        self.schema_version == SHIP_STATE_SCHEMA_VERSION
+            && self.generation > 0
+            && self.state_version > 0
+            && (self.claim_epoch == self.reviewer_claim_epoch)
+    }
+
+    /// Upgrade a legacy record's additive identity fields before persistence.
+    fn migrate_identity_for_save(&mut self) -> Result<(), ShipStateCasError> {
+        if self.schema_version > SHIP_STATE_SCHEMA_VERSION {
+            return Err(ShipStateCasError::InvalidIdentity(format!(
+                "schema {} is newer than supported schema {}",
+                self.schema_version, SHIP_STATE_SCHEMA_VERSION
+            )));
+        }
+        if self.generation == 0 {
+            self.generation = 1;
+        }
+        if self.state_version == 0 {
+            self.state_version = 1;
+        }
+        let claim_epoch = self.effective_claim_epoch();
+        if self.schema_version == SHIP_STATE_SCHEMA_VERSION
+            && self.claim_epoch != self.reviewer_claim_epoch
+        {
+            return Err(ShipStateCasError::InvalidIdentity(
+                "claim_epoch and reviewer_claim_epoch disagree".to_owned(),
+            ));
+        }
+        self.claim_epoch = claim_epoch;
+        self.reviewer_claim_epoch = claim_epoch;
+        self.schema_version = SHIP_STATE_SCHEMA_VERSION;
+        Ok(())
     }
 
     /// Whether this state has been terminally abandoned by the resume sweep.
@@ -269,6 +432,14 @@ impl ShipState {
 
     /// Update the `updated_at` timestamp.
     pub fn touch(&mut self) {
+        if self.generation == 0 {
+            self.generation = 1;
+        }
+        self.state_version = self.state_version.saturating_add(1).max(1);
+        let claim_epoch = self.effective_claim_epoch();
+        self.claim_epoch = claim_epoch;
+        self.reviewer_claim_epoch = claim_epoch;
+        self.schema_version = SHIP_STATE_SCHEMA_VERSION;
         self.updated_at = Utc::now();
     }
 
@@ -335,21 +506,24 @@ impl ShipState {
         deadline_at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Option<ReviewerClaim> {
-        if head_sha != self.head_sha || deadline_at <= claimed_at || claimed_at > now {
+        if !self.has_valid_cas_identity()
+            || head_sha != self.head_sha
+            || deadline_at <= claimed_at
+            || claimed_at > now
+        {
             return None;
         }
         match self.active_reviewer_claim.as_ref() {
             Some(active)
-                if self.schema_version < SHIP_STATE_SCHEMA_VERSION
-                    || active.epoch == 0
-                    || self.reviewer_claim_epoch != active.epoch
+                if active.epoch == 0
+                    || self.claim_epoch != active.epoch
                     || now < active.deadline_at =>
             {
                 return None;
             }
             _ => {}
         }
-        let epoch = self.reviewer_claim_epoch.checked_add(1)?;
+        let epoch = self.claim_epoch.checked_add(1)?;
         let claim = ReviewerClaim {
             head_sha: head_sha.to_owned(),
             epoch,
@@ -358,6 +532,7 @@ impl ShipState {
             deadline_at,
         };
         self.schema_version = SHIP_STATE_SCHEMA_VERSION;
+        self.claim_epoch = epoch;
         self.reviewer_claim_epoch = epoch;
         self.active_reviewer_claim = Some(claim.clone());
         self.touch();
@@ -370,10 +545,7 @@ impl ShipState {
     /// Revocation advances the epoch even though it clears the active claim,
     /// fencing a late verdict from the revoked reviewer.
     pub fn revoke_reviewer_claim(&mut self, head_sha: &str, epoch: u64, reviewer: &str) -> bool {
-        if self.schema_version < SHIP_STATE_SCHEMA_VERSION
-            || epoch == 0
-            || self.reviewer_claim_epoch != epoch
-        {
+        if !self.has_valid_cas_identity() || epoch == 0 || self.claim_epoch != epoch {
             return false;
         }
         let matches = self.active_reviewer_claim.as_ref().is_some_and(|claim| {
@@ -385,9 +557,10 @@ impl ShipState {
         if !matches {
             return false;
         }
-        let Some(next_epoch) = self.reviewer_claim_epoch.checked_add(1) else {
+        let Some(next_epoch) = self.claim_epoch.checked_add(1) else {
             return false;
         };
+        self.claim_epoch = next_epoch;
         self.reviewer_claim_epoch = next_epoch;
         self.active_reviewer_claim = None;
         self.touch();
@@ -401,10 +574,18 @@ impl ShipState {
     /// authority generation. Returns `false` only after the monotonic fence is
     /// exhausted, in which case callers must fail closed.
     pub fn fence_reviewer_claim(&mut self) -> bool {
-        let Some(next_epoch) = self.reviewer_claim_epoch.checked_add(1) else {
+        if !self.has_valid_cas_identity() {
+            return false;
+        }
+        let Some(next_epoch) = self.claim_epoch.checked_add(1) else {
+            return false;
+        };
+        let Some(next_generation) = self.generation.checked_add(1) else {
             return false;
         };
         self.schema_version = SHIP_STATE_SCHEMA_VERSION;
+        self.generation = next_generation;
+        self.claim_epoch = next_epoch;
         self.reviewer_claim_epoch = next_epoch;
         self.active_reviewer_claim = None;
         self.touch();
@@ -423,7 +604,7 @@ impl ShipState {
         reviewer: &str,
         now: DateTime<Utc>,
     ) -> bool {
-        if self.schema_version < SHIP_STATE_SCHEMA_VERSION || epoch == 0 {
+        if !self.has_valid_cas_identity() || epoch == 0 {
             return false;
         }
         self.active_reviewer_claim.as_ref().is_some_and(|claim| {
@@ -431,7 +612,7 @@ impl ShipState {
                 && claim.head_sha == head_sha
                 && claim.epoch == epoch
                 && claim.reviewer == reviewer
-                && self.reviewer_claim_epoch == epoch
+                && self.claim_epoch == epoch
                 && claim.claimed_at <= now
                 && now < claim.deadline_at
         })
@@ -650,8 +831,10 @@ impl ShipStateStore {
         state: &ShipState,
         _lock: &ShipStatePrLock,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = state.clone();
+        state.migrate_identity_for_save()?;
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
-        crate::durable_file::replace_json(&self.state_path(state.pr), state, true)?;
+        crate::durable_file::replace_json(&self.state_path(state.pr), &state, true)?;
         Ok(())
     }
 
@@ -662,11 +845,56 @@ impl ShipStateStore {
         state: &ShipState,
         _lock: &ShipStatePrLock,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = state.clone();
+        state.migrate_identity_for_save()?;
         self.ensure_legacy_is_preserved(state.pr)?;
         let path = self.state_path_scoped(&state.repo, state.pr);
-        Self::persist_state_at(state, &path)?;
+        Self::persist_state_at(&state, &path)?;
         self.sync_legacy_mirror_for_pr(state.pr)?;
         Ok(())
+    }
+
+    /// Save a state only when the caller still owns the exact snapshot it read.
+    ///
+    /// This path is intentionally opt-in: existing workers retain their
+    /// historical unconditional save behavior until they adopt this method.
+    /// A caller must mutate the candidate through a method that advances
+    /// `state_version` (or explicitly advance it) before retrying the write.
+    pub fn save_scoped_locked_cas(
+        &self,
+        state: &ShipState,
+        expected: &ShipStateCas,
+        lock: &ShipStatePrLock,
+    ) -> Result<(), ShipStateCasError> {
+        let current = self
+            .get_locked_scoped(&state.repo, state.pr, lock)
+            .ok_or(ShipStateCasError::MissingState)?;
+        let actual = current.cas();
+        if &actual != expected {
+            return Err(ShipStateCasError::Conflict {
+                expected: expected.clone(),
+                actual,
+            });
+        }
+        if !state.has_valid_cas_identity() {
+            return Err(ShipStateCasError::InvalidIdentity(
+                "candidate is legacy or has mismatched claim epochs".to_owned(),
+            ));
+        }
+        if state.state_version <= expected.state_version {
+            return Err(ShipStateCasError::VersionNotAdvanced {
+                expected: expected.state_version,
+                candidate: state.state_version,
+            });
+        }
+        if state.generation < expected.generation || state.claim_epoch < expected.claim_epoch {
+            return Err(ShipStateCasError::Conflict {
+                expected: expected.clone(),
+                actual: state.cas(),
+            });
+        }
+        self.save_scoped_locked(state, lock)
+            .map_err(|error| ShipStateCasError::Io(error.to_string()))
     }
 
     /// Claim an exact reviewer head, persist that claim, and invoke a
@@ -798,8 +1026,10 @@ impl ShipStateStore {
         if !source.exists() {
             return Ok(None);
         }
-        let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
-        let dest = self.archive_dir().join(format!("{pr}-{stamp}.json"));
+        let state = Self::get_unlocked_path(&source);
+        let generation = state.as_ref().map_or(0, |state| state.generation);
+        let state_version = state.as_ref().map_or(0, |state| state.state_version);
+        let dest = self.unique_archive_path(&self.archive_dir(), pr, generation, state_version);
         fs::rename(source, &dest)?;
         Ok(Some(dest))
     }
@@ -823,19 +1053,43 @@ impl ShipStateStore {
             }
             legacy
         };
+        let source_state = Self::get_unlocked_path(&source);
         let dest = {
             let _writer_domain =
                 crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
             let archive_dir = self.archive_dir().join(repository_key(repository));
             fs::create_dir_all(&archive_dir)?;
-            let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
-            let dest = archive_dir.join(format!("{pr}-{stamp}.json"));
+            let generation = source_state.as_ref().map_or(0, |state| state.generation);
+            let state_version = source_state.as_ref().map_or(0, |state| state.state_version);
+            let dest = self.unique_archive_path(&archive_dir, pr, generation, state_version);
             fs::rename(source, &dest)?;
             self.remove_matching_legacy(repository, pr)?;
             dest
         };
         self.sync_legacy_mirror_for_pr(pr)?;
         Ok(Some(dest))
+    }
+
+    /// Pick a collision-free archive filename while the caller holds the PR
+    /// lock. Generation and state version make discard/reship identity visible;
+    /// the suffix guards same-tick retries from older callers.
+    fn unique_archive_path(
+        &self,
+        archive_dir: &Path,
+        pr: u64,
+        generation: u64,
+        state_version: u64,
+    ) -> PathBuf {
+        let stamp = Utc::now().format("%Y%m%dT%H%M%S%fZ");
+        let base = format!("{pr}-g{generation}-v{state_version}-{stamp}");
+        let first = archive_dir.join(format!("{base}.json"));
+        if !first.exists() {
+            return first;
+        }
+        (1_u64..)
+            .map(|suffix| archive_dir.join(format!("{base}-{suffix}.json")))
+            .find(|path| !path.exists())
+            .expect("archive suffix space is effectively unbounded")
     }
 
     /// Return active states sorted by PR number.
@@ -934,15 +1188,45 @@ impl ShipStateStore {
         new_attempt: Option<u32>,
         lock: &ShipStatePrLock,
     ) -> Result<ShipState, Box<dyn std::error::Error>> {
-        let reviewer_claim_epoch = state
-            .reviewer_claim_epoch
+        let current = self
+            .get_locked_scoped(&state.repo, state.pr, lock)
+            .ok_or(ShipStateCasError::MissingState)?;
+        let expected = state.cas();
+        let actual = current.cas();
+        if expected != actual {
+            return Err(ShipStateCasError::Conflict { expected, actual }.into());
+        }
+        if !current.has_valid_cas_identity() {
+            return Err(ShipStateCasError::InvalidIdentity(
+                "cannot discard/reship a legacy or malformed state".to_owned(),
+            )
+            .into());
+        }
+        let reviewer_claim_epoch = current
+            .claim_epoch
             .checked_add(1)
             .ok_or_else(|| io::Error::other("reviewer claim epoch exhausted"))?;
-        let _ = self.archive_scoped_locked(&state.repo, state.pr, lock)?;
+        let generation = current
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("ship state generation exhausted"))?;
+        let state_version = current
+            .state_version
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("ship state version exhausted"))?;
+        let attempt = new_attempt.unwrap_or(
+            current
+                .attempt
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("ship attempt exhausted"))?,
+        );
+        let _ = self.archive_scoped_locked(&current.repo, current.pr, lock)?;
         let now = Utc::now();
         Ok(ShipState {
             schema_version: SHIP_STATE_SCHEMA_VERSION,
-            attempt: new_attempt.unwrap_or(state.attempt + 1),
+            attempt,
+            generation,
+            state_version,
             source_job_id: None,
             dispatched_runs: Vec::new(),
             evidence_snapshot: BTreeMap::new(),
@@ -958,8 +1242,9 @@ impl ShipStateStore {
             // A fresh attempt must fence every claim from the archived
             // attempt, even when it reuses the same exact head.
             reviewer_claim_epoch,
+            claim_epoch: reviewer_claim_epoch,
             active_reviewer_claim: None,
-            ..state.clone()
+            ..current
         })
     }
 
@@ -1017,8 +1302,12 @@ impl ShipStateStore {
     }
 
     fn persist_state_at(state: &ShipState, path: &Path) -> io::Result<()> {
+        let mut state = state.clone();
+        state
+            .migrate_identity_for_save()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
-        crate::durable_file::replace_json(path, state, true)
+        crate::durable_file::replace_json(path, &state, true)
     }
 
     fn legacy_is_preserved(&self, legacy: &ShipState) -> bool {
@@ -1781,7 +2070,7 @@ mod tests {
         )
         .expect("saved JSON");
         assert_eq!(saved["schema_version"], SHIP_STATE_SCHEMA_VERSION);
-        assert_eq!(SHIP_STATE_SCHEMA_VERSION, 2);
+        assert_eq!(SHIP_STATE_SCHEMA_VERSION, 3);
 
         let claimed_at = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
         let mut claimed = fresh;
@@ -1801,7 +2090,7 @@ mod tests {
             .remove("reviewer_claim_epoch");
         let malformed: ShipState =
             serde_json::from_value(missing_epoch).expect("v2 state with omitted field loads");
-        assert_eq!(malformed.schema_version, 2);
+        assert_eq!(malformed.schema_version, SHIP_STATE_SCHEMA_VERSION);
         assert_eq!(malformed.reviewer_claim_epoch, 0);
         assert!(!malformed.reviewer_claim_is_current(
             "fresh-head",
@@ -1916,6 +2205,158 @@ mod tests {
         );
         assert_eq!(state.reviewer_claim_epoch, 0);
         assert!(state.active_reviewer_claim.is_none());
+    }
+
+    #[test]
+    fn cas_refuses_a_stale_worker_after_a_concurrent_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let original = sample_state(230, "head-a");
+        store.save(&original).expect("save original");
+        let snapshot = store
+            .get_scoped(&original.repo, original.pr)
+            .expect("snapshot");
+        let expected = snapshot.cas();
+
+        let mut winner = snapshot.clone();
+        winner.update_evidence("linux", "pass");
+        let winner_lock = store
+            .lock_pr_scoped(&winner.repo, winner.pr)
+            .expect("winner lock");
+        store
+            .save_scoped_locked_cas(&winner, &expected, &winner_lock)
+            .expect("first worker commits");
+        drop(winner_lock);
+
+        let mut stale = snapshot;
+        stale.update_evidence("macos", "pass");
+        let stale_lock = store
+            .lock_pr_scoped(&stale.repo, stale.pr)
+            .expect("stale lock");
+        let error = store
+            .save_scoped_locked_cas(&stale, &expected, &stale_lock)
+            .expect_err("stale worker must be refused");
+        assert!(matches!(error, super::ShipStateCasError::Conflict { .. }));
+        drop(stale_lock);
+
+        let persisted = store
+            .get_scoped(&original.repo, original.pr)
+            .expect("winner state");
+        assert_eq!(
+            persisted.evidence_snapshot.get("linux"),
+            Some(&"pass".to_owned())
+        );
+        assert!(!persisted.evidence_snapshot.contains_key("macos"));
+    }
+
+    #[test]
+    fn cas_fences_a_push_or_force_push_head_change() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let mut state = sample_state(231, "head-a");
+        let now = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
+        let old_claim = state
+            .claim_reviewer("head-a", "reviewer", now, now + Duration::minutes(5), now)
+            .expect("claim old head");
+        store.save(&state).expect("save old head");
+        let stale = store
+            .get_scoped(&state.repo, state.pr)
+            .expect("stale snapshot");
+        let expected = stale.cas();
+
+        let mut adopted = stale.clone();
+        adopted.head_sha = "head-b".to_owned();
+        assert!(
+            adopted.fence_reviewer_claim(),
+            "head adoption must advance fence"
+        );
+        let lock = store
+            .lock_pr_scoped(&adopted.repo, adopted.pr)
+            .expect("adoption lock");
+        store
+            .save_scoped_locked_cas(&adopted, &expected, &lock)
+            .expect("new head commit");
+        drop(lock);
+
+        assert!(!adopted.reviewer_claim_is_current(
+            "head-a",
+            old_claim.epoch,
+            "reviewer",
+            now + Duration::minutes(1)
+        ));
+        assert!(adopted.generation > stale.generation);
+        assert!(adopted.state_version > stale.state_version);
+
+        let mut stale_force_push = stale;
+        stale_force_push.head_sha = "head-c".to_owned();
+        assert!(stale_force_push.fence_reviewer_claim());
+        let lock = store
+            .lock_pr_scoped(&stale_force_push.repo, stale_force_push.pr)
+            .expect("stale force-push lock");
+        let error = store
+            .save_scoped_locked_cas(&stale_force_push, &expected, &lock)
+            .expect_err("pre-push worker must not overwrite adopted head");
+        assert!(matches!(error, super::ShipStateCasError::Conflict { .. }));
+    }
+
+    #[test]
+    fn discard_and_reship_same_head_cannot_reuse_receipt_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let mut original = sample_state(232, "same-head");
+        let now = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
+        let old_claim = original
+            .claim_reviewer(
+                "same-head",
+                "reviewer",
+                now,
+                now + Duration::minutes(5),
+                now,
+            )
+            .expect("claim original attempt");
+        store.save(&original).expect("save original");
+
+        let mut first_reship = store
+            .archive_and_replace(&original, None)
+            .expect("first discard/reship");
+        store.save(&first_reship).expect("save first reship");
+        let first_claim = first_reship
+            .claim_reviewer(
+                "same-head",
+                "reviewer",
+                now,
+                now + Duration::minutes(5),
+                now,
+            )
+            .expect("claim first reship");
+        store.save(&first_reship).expect("save first claim");
+
+        let second_reship = store
+            .archive_and_replace(&first_reship, None)
+            .expect("second discard/reship");
+        store.save(&second_reship).expect("save second reship");
+        let mut second_reship = second_reship;
+        let second_claim = second_reship
+            .claim_reviewer(
+                "same-head",
+                "reviewer",
+                now,
+                now + Duration::minutes(5),
+                now,
+            )
+            .expect("claim second reship");
+
+        assert_ne!(
+            old_claim.receipt_id(&original.repo, original.pr),
+            first_claim.receipt_id(&first_reship.repo, first_reship.pr)
+        );
+        assert_ne!(
+            first_claim.receipt_id(&first_reship.repo, first_reship.pr),
+            second_claim.receipt_id(&second_reship.repo, second_reship.pr)
+        );
+        assert_eq!(first_reship.generation, original.generation + 1);
+        assert_eq!(second_reship.generation, first_reship.generation + 1);
+        assert_eq!(store.list_archived().len(), 2);
     }
 
     #[test]

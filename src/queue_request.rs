@@ -4584,6 +4584,8 @@ mod tests {
             dispatched_runs: Vec::<DispatchedRun>::new(),
             evidence_snapshot: BTreeMap::new(),
             attempt: 1,
+            generation: 1,
+            state_version: 1,
             source_job_id: Some(envelope.job_id.clone()),
             schema_version: crate::ship_state::SHIP_STATE_SCHEMA_VERSION,
             merge_queue_observed_at: None,
@@ -4592,6 +4594,7 @@ mod tests {
             merge_queue_enqueue_started_at: None,
             abandoned: None,
             reviewer_claim_epoch: 0,
+            claim_epoch: 0,
             active_reviewer_claim: None,
         };
         let disposition = QueuedShipDisposition::new(

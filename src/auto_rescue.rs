@@ -462,6 +462,8 @@ mod tests {
                 .into_iter()
                 .collect::<std::collections::BTreeMap<String, String>>(),
             attempt: 1,
+            generation: 1,
+            state_version: 1,
             source_job_id: None,
             created_at: now,
             updated_at: now,
@@ -471,6 +473,7 @@ mod tests {
             merge_queue_enqueue_started_at: None,
             abandoned: None,
             reviewer_claim_epoch: 0,
+            claim_epoch: 0,
             active_reviewer_claim: None,
         };
         state
