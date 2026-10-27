@@ -527,7 +527,9 @@ fn terminal_job_names_are_unambiguous(jobs: &[Value]) -> bool {
         ) {
             continue;
         }
-        let attempt = job["run_attempt"].as_u64().unwrap_or(1);
+        let Some(attempt) = job["run_attempt"].as_u64().filter(|attempt| *attempt > 0) else {
+            return false;
+        };
         let Some(raw_name) = job["name"].as_str().map(str::trim) else {
             if matches!(conclusion, "failure" | "timed_out") {
                 return false;
@@ -553,6 +555,12 @@ fn terminal_job_names_are_unambiguous(jobs: &[Value]) -> bool {
 /// Whether a run's jobs can hold a red: it failed, or a rerun turned it green
 /// after an earlier attempt failed (GitHub lists that run as a success).
 fn may_hold_red(run: &Value) -> bool {
+    if run["run_attempt"]
+        .as_u64()
+        .is_none_or(|attempt| attempt == 0)
+    {
+        return false;
+    }
     match run["conclusion"].as_str() {
         Some("failure" | "timed_out") => true,
         Some("success") => run["run_attempt"].as_u64().unwrap_or(1) > 1,
@@ -797,7 +805,11 @@ fn pending_reds(rows: &[Value], since: &str, linked: &BTreeSet<(String, u64, u64
         if !super::advice::valid_sha(head_sha) || completed < since {
             continue;
         }
-        let attempt = row["attempt"].as_u64().unwrap_or(1);
+        let attempt = match row["attempt"].as_u64() {
+            Some(attempt) if attempt > 0 => attempt,
+            Some(_) => continue,
+            None => 1,
+        };
         let key = (repo.to_owned(), run_id, attempt);
         if linked.contains(&key) {
             continue;
@@ -968,15 +980,21 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
         return Vec::new();
     }
     let on_red_head = |run: &&&Value| {
-        run["head_sha"]
-            .as_str()
-            .is_some_and(super::advice::valid_sha)
+        run["run_attempt"]
+            .as_u64()
+            .is_some_and(|attempt| attempt > 0)
+            && run["id"].as_u64().is_some_and(|id| id > 0)
+            && run["head_sha"]
+                .as_str()
+                .is_some_and(super::advice::valid_sha)
             && run["head_sha"].as_str() == Some(red.head_sha.as_str())
     };
     let mut fixes = Vec::new();
     if let Some(run) = run_index.get(&red.run_id).filter(|run| {
         run["conclusion"] == "success"
-            && run["run_attempt"].as_u64().unwrap_or(1) > red.attempt
+            && run["run_attempt"]
+                .as_u64()
+                .is_some_and(|attempt| attempt > red.attempt)
             && run["head_sha"].as_str() == Some(red.head_sha.as_str())
             && run["head_sha"]
                 .as_str()
@@ -1005,9 +1023,13 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
     let mut pushes: Vec<Fix> = later
         .iter()
         .filter(|run| {
-            run["head_sha"]
-                .as_str()
-                .is_some_and(super::advice::valid_sha)
+            run["run_attempt"]
+                .as_u64()
+                .is_some_and(|attempt| attempt > 0)
+                && run["id"].as_u64().is_some_and(|id| id > 0)
+                && run["head_sha"]
+                    .as_str()
+                    .is_some_and(super::advice::valid_sha)
                 && !on_red_head(run)
         })
         .map(|run| Fix {
@@ -1282,7 +1304,9 @@ fn red_jobs_complete(
     }
     if jobs.iter().any(|job| {
         matches!(job["conclusion"].as_str(), Some("failure" | "timed_out"))
-            && (job["run_attempt"].as_u64().is_none()
+            && (job["run_attempt"]
+                .as_u64()
+                .is_none_or(|attempt| attempt == 0)
                 || job["name"].as_str().is_none_or(str::is_empty))
     }) {
         return Ok(None);
@@ -1292,7 +1316,7 @@ fn red_jobs_complete(
     }
     let raw_names = jobs
         .iter()
-        .filter(|job| job["run_attempt"].as_u64().unwrap_or(1) == red.attempt)
+        .filter(|job| job["run_attempt"].as_u64() == Some(red.attempt))
         .filter(|job| matches!(job["conclusion"].as_str(), Some("failure" | "timed_out")))
         .filter_map(|job| job["name"].as_str().map(str::to_owned))
         .collect::<Vec<_>>();
