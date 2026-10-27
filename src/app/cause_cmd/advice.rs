@@ -347,6 +347,10 @@ static CREDENTIAL_MARKER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:token|api[_-]?key|secret|password)\s*[:=]\s*(\S+)")
         .expect("credential marker pattern compiles")
 });
+static SENSITIVE_FIELD_MARKER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:token|api[_-]?key|secret|password|authorization|credentials?)$")
+        .expect("sensitive field marker pattern compiles")
+});
 
 fn safe(value: &Value) -> bool {
     let safe_text = |text: &str| {
@@ -368,9 +372,17 @@ fn safe(value: &Value) -> bool {
     match value {
         Value::String(text) => safe_text(text),
         Value::Array(items) => items.iter().all(safe),
-        Value::Object(fields) => fields
-            .iter()
-            .all(|(key, value)| safe_text(key) && safe(value)),
+        Value::Object(fields) => fields.iter().all(|(key, value)| {
+            safe_text(key)
+                && if SENSITIVE_FIELD_MARKER.is_match(key) {
+                    // A scrubbed credential field is allowed only as a plain
+                    // redacted string; structured or unredacted values stay
+                    // rejected even when their key is otherwise harmless.
+                    matches!(value, Value::String(text) if text.contains("<secret>") && safe_text(text))
+                } else {
+                    safe(value)
+                }
+        }),
         _ => true,
     }
 }
@@ -525,6 +537,15 @@ mod tests {
             let candidates = advise(&args(dir.path()), &[]).unwrap().0;
             assert_eq!(candidates.len(), 1);
             assert!(candidates[0].fix_link.is_none(), "{private}");
+        }
+        for field in ["token", "api_key", "secret", "password", "authorization"] {
+            let mut unsafe_row = clean.clone();
+            unsafe_row[field] = serde_json::json!("unredacted");
+            fs::write(&archive, unsafe_row.to_string()).unwrap();
+            assert!(
+                advise(&args(dir.path()), &[]).unwrap().0.is_empty(),
+                "{field}"
+            );
         }
     }
 

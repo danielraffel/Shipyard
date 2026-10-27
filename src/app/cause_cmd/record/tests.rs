@@ -599,6 +599,47 @@ fn distinct_raw_job_names_that_scrub_alike_cannot_prove_a_fix() {
 }
 
 #[test]
+fn duplicate_raw_job_names_cannot_prove_a_fix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let failed_a = job(1000, "failure");
+    let mut failed_b = job(1001, "failure");
+    failed_b["id"] = json!(1001);
+    let mut routes = red_routes();
+    routes[1] = (
+        "runs/100/jobs",
+        json!({"jobs": [failed_a.clone(), failed_b.clone()]}),
+    );
+    let first = Fake::new(&routes)
+        .with_log("jobs/1000/logs", &drift_log())
+        .with_log("jobs/1001/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(dir.path())).expect("red pass");
+
+    let mut green = job(2000, "success");
+    green["run_id"] = json!(200);
+    green["head_sha"] = json!("fedcba9876543210fedcba9876543210fedcba98");
+    let mut routes = red_routes();
+    routes[1] = ("runs/100/jobs", json!({"jobs": [failed_a, failed_b]}));
+    routes.retain(|(needle, _)| {
+        !needle.starts_with("runs?branch=") && !needle.contains("runs/200/jobs")
+    });
+    routes.extend([
+        (
+            "runs?branch=feat%2Fx&status=success",
+            json!({"workflow_runs": [{
+                "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
+                "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
+            }]}),
+        ),
+        ("runs/200/jobs", json!({"jobs": [green]})),
+    ]);
+    let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    let report = record(&gh, &query(dir.path())).expect("ambiguous red remains pending");
+    assert_eq!((report.fixlinks_written, report.reds_pending), (0, 1));
+}
+
+#[test]
 fn a_selective_rerun_can_pass_failed_jobs_across_multiple_attempts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut rerun = red_run();
