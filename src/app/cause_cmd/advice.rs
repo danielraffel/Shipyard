@@ -238,11 +238,7 @@ fn advise(
                         && red_run_id == cause_run_id
                         && red_attempt.is_some()
                         && red_attempt == cause_attempt
-                        && f.get("head_sha").is_none_or(|head_sha| {
-                            head_sha
-                                .as_str()
-                                .is_some_and(|head_sha| head_sha == row["head_sha"])
-                        })
+                        && f["head_sha"] == row["head_sha"]
                 })
                 .cloned(),
             cause: row,
@@ -296,6 +292,7 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
     link_identity_complete(value)
         && safe(value)
         && value["repo"].as_str().is_some_and(|repo| !repo.is_empty())
+        && value["head_sha"].as_str().is_some_and(valid_sha)
         && value["fix_head_sha"].as_str().is_some_and(valid_sha)
         && matches!(
             derivation,
@@ -323,10 +320,9 @@ pub(super) fn link_identity_complete(value: &Value) -> bool {
         && value["red_attempt"]
             .as_u64()
             .is_some_and(|attempt| attempt > 0)
+        && value["head_sha"].as_str().is_some_and(valid_sha)
         && value["fix_run_id"].as_u64().is_some_and(|id| id > 0)
-        && value["fix_head_sha"]
-            .as_str()
-            .is_some_and(|sha| !sha.is_empty())
+        && value["fix_head_sha"].as_str().is_some_and(valid_sha)
         && matches!(
             value["derivation"].as_str(),
             Some("compare_red_head_to_fix_head" | "rerun_green")
@@ -502,6 +498,7 @@ mod tests {
                 "red_run_id": 1,
                 "red_attempt": 1,
                 "fix_run_id": 2,
+                "head_sha": "b".repeat(40),
                 "fix_head_sha": "c".repeat(40),
                 "derivation": "compare_red_head_to_fix_head",
             });
@@ -557,6 +554,7 @@ mod tests {
             serde_json::json!({
                 "schema": SCHEMA, "source": "fix-link",
                 "repo": "o/r", "red_run_id": 1, "red_attempt": 1,
+                "head_sha": "b".repeat(40),
                 "fix_head_sha": sha.repeat(40), "fix_run_id": 2,
                 "derivation": "compare_red_head_to_fix_head",
             })
@@ -635,6 +633,36 @@ mod tests {
                 "repo": "o/r",
                 "red_run_id": 1,
                 "red_attempt": 1,
+                "derivation": "compare_red_head_to_fix_head"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let candidates = advise(&args(dir.path()), &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn fixlink_without_red_head_sha_is_not_attached() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            serde_json::json!({
+                "schema": SCHEMA,
+                "source": "fix-link",
+                "repo": "o/r",
+                "red_run_id": 1,
+                "red_attempt": 1,
+                "fix_run_id": 2,
+                "fix_head_sha": "d".repeat(40),
                 "derivation": "compare_red_head_to_fix_head"
             })
             .to_string(),
