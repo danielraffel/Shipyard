@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 
 use crate::app::cli::{
     MetricsCommand, MetricsExportCommand, MetricsExportMergeReceiptArgs, MetricsFreshnessArgs,
-    MetricsGroupBy, MetricsImportCommand, MetricsImportGithubArgs, MetricsImportTartciArgs,
-    MetricsRecordArgs,
+    MetricsGroupBy, MetricsImportCommand, MetricsImportGithubArgs,
+    MetricsImportGithubMergeReceiptArgs, MetricsImportTartciArgs, MetricsRecordArgs,
 };
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::config::LoadedConfig;
@@ -24,6 +24,7 @@ use crate::metrics::github_import::{self, GithubImportReport, GithubImportReques
 use crate::metrics::github_import::{
     github_jobs_api_path, github_runs_api_path, workflow_run_single_pr,
 };
+use crate::metrics::github_merge_receipts;
 use crate::metrics::proxy::{Basis, ProxyValue, WALL_CONTEXT_LABEL};
 use crate::metrics::{
     AuthenticatedStrataReceipt, GateClass, MetricRecordInput, MetricsFinding, MetricsJobRow,
@@ -304,6 +305,23 @@ pub(super) fn metrics_command<W: Write>(
                     format!("imported {imported} merge receipts")
                 })?;
             }
+            MetricsImportCommand::GithubMergeReceipt(args) => {
+                let receipt = reconcile_github_merge_receipt(&args)?;
+                let imported = store
+                    .import_merge_receipts(std::slice::from_ref(&receipt))
+                    .map_err(|error| {
+                        CliFailure::new(1, format!("GitHub merge receipt import failed: {error}"))
+                    })?;
+                let output = MetricsImportOutput {
+                    database: store.path().display().to_string(),
+                    source: "github-merge-receipt".to_owned(),
+                    imported,
+                    skipped_runs: None,
+                };
+                write_output(stdout, json_output, &output, || {
+                    format!("imported {imported} GitHub merge receipt")
+                })?;
+            }
             MetricsImportCommand::Github(args) => {
                 let report = import_github(&store, &args)?;
                 let output = MetricsImportOutput {
@@ -544,6 +562,52 @@ pub(super) fn metrics_command<W: Write>(
         }
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+fn reconcile_github_merge_receipt(
+    args: &MetricsImportGithubMergeReceiptArgs,
+) -> Result<crate::metrics::merge_receipt::MergeReceipt, CliFailure> {
+    let artifact = github_merge_receipts::read_job(&args.artifact).map_err(|error| {
+        CliFailure::new(2, format!("GitHub merge receipt input failed: {error}"))
+    })?;
+    let run: github_merge_receipts::RunObservation =
+        github_merge_receipts::read_json(&args.run, "GitHub run snapshot").map_err(|error| {
+            CliFailure::new(2, format!("GitHub merge receipt input failed: {error}"))
+        })?;
+    let pull_request: github_merge_receipts::PullRequestObservation =
+        github_merge_receipts::read_json(&args.pull_request, "GitHub pull-request snapshot")
+            .map_err(|error| {
+                CliFailure::new(2, format!("GitHub merge receipt input failed: {error}"))
+            })?;
+    let checks: github_merge_receipts::CheckRunsResponse =
+        github_merge_receipts::read_json(&args.checks, "GitHub check-runs snapshot").map_err(
+            |error| CliFailure::new(2, format!("GitHub merge receipt input failed: {error}")),
+        )?;
+    let artifact_sha256 =
+        github_merge_receipts::sha256_file(&args.artifact, "GitHub reuse artifact").map_err(
+            |error| CliFailure::new(2, format!("GitHub merge receipt input failed: {error}")),
+        )?;
+    github_merge_receipts::reconcile(
+        &args.repo,
+        &args.project,
+        &args.base_branch,
+        &args.artifact_url,
+        &args.run_url,
+        &artifact_sha256,
+        &args.policy_sha256,
+        &args.collector_sha256,
+        &artifact,
+        &run,
+        &pull_request,
+        &checks,
+        &args.required_checks,
+    )
+    .map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("GitHub merge receipt reconciliation failed: {error}"),
+        )
+    })
 }
 
 fn record_input(args: MetricsRecordArgs) -> Result<MetricRecordInput, CliFailure> {
@@ -976,7 +1040,8 @@ fn _json_debug(value: &impl Serialize) -> Value {
 mod tests {
     use super::*;
     use crate::app::cli::{
-        MetricsExportCommand, MetricsExportMergeReceiptArgs, MetricsImportMergeReceiptArgs,
+        MetricsExportCommand, MetricsExportMergeReceiptArgs, MetricsImportGithubMergeReceiptArgs,
+        MetricsImportMergeReceiptArgs,
     };
 
     fn no_freshness_flags() -> MetricsFreshnessArgs {
@@ -1163,6 +1228,118 @@ mod tests {
         changed["evidence"] = serde_json::json!("sha256:changed");
         std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
         assert_eq!(run(Some(path)).unwrap_err().code, 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn github_merge_receipt_cli_reconciles_and_imports_real_shape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let head = "a".repeat(40);
+        let merge = "b".repeat(40);
+        let merge_commit = "d".repeat(40);
+        let queue_ref = format!("gh-readonly-queue/main/pr-42-{}", "c".repeat(40));
+        let artifact_path = temp.path().join("job.json");
+        let run_path = temp.path().join("run.json");
+        let pr_path = temp.path().join("pr.json");
+        let checks_path = temp.path().join("checks.json");
+        std::fs::write(
+            &artifact_path,
+            serde_json::json!({
+                "schema": "pulp-reuse-record/v1",
+                "run_id": 7,
+                "run_attempt": 1,
+                "run_kind": "merge_group",
+                "pr": 42,
+                "head_sha": head,
+                "base_sha": "e".repeat(40),
+                "merge_sha": merge,
+                "merge_group_head_ref": queue_ref,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &run_path,
+            serde_json::json!({
+                "id": 7,
+                "run_attempt": 1,
+                "event": "merge_group",
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": "b".repeat(40),
+                "head_branch": format!("gh-readonly-queue/main/pr-42-{}", "c".repeat(40)),
+                "html_url": "https://github.com/owner/repo/actions/runs/7",
+                "pull_requests": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &pr_path,
+            serde_json::json!({
+                "number": 42,
+                "state": "closed",
+                "merged_at": "2026-10-25T00:00:00Z",
+                "merge_commit_sha": merge_commit,
+                "head": {"sha": "a".repeat(40)},
+                "base": {"ref": "main", "repo": {"full_name": "owner/repo"}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &checks_path,
+            serde_json::json!({
+                "total_count": 1,
+                "complete": true,
+                "snapshot_run_id": 7,
+                "snapshot_run_attempt": 1,
+                "check_runs": [{
+                    "id": 8,
+                    "name": "macos",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "head_sha": "b".repeat(40),
+                    "html_url": null,
+                    "details_url": null,
+                    "run_id": null,
+                    "run_attempt": null,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        let result = metrics_command(
+            MetricsCommand::Import {
+                source: MetricsImportCommand::GithubMergeReceipt(
+                    MetricsImportGithubMergeReceiptArgs {
+                        repo: "owner/repo".to_owned(),
+                        project: "repo".to_owned(),
+                        base_branch: "main".to_owned(),
+                        artifact: artifact_path,
+                        run: run_path,
+                        pull_request: pr_path,
+                        checks: checks_path,
+                        artifact_url: "https://github.com/owner/repo/actions/artifacts/1"
+                            .to_owned(),
+                        run_url: "https://github.com/owner/repo/actions/runs/7".to_owned(),
+                        policy_sha256: "f".repeat(64),
+                        collector_sha256: "1".repeat(64),
+                        required_checks: vec!["macos".to_owned()],
+                    },
+                ),
+            },
+            temp.path(),
+            None,
+            true,
+            &mut output,
+        )
+        .expect("GitHub merge receipt import");
+        assert_eq!(result, std::process::ExitCode::SUCCESS);
+        let json: Value = serde_json::from_slice(&output).expect("output JSON");
+        assert_eq!(json["source"], "github-merge-receipt");
+        assert_eq!(json["imported"], 1);
     }
 
     #[test]

@@ -1,15 +1,23 @@
 //! Read-only reconciliation of Pulp merge-group reuse artifacts with GitHub.
+//!
+//! The provider adapter owns pagination and captures a complete snapshot before
+//! calling [`reconcile`]. Check-run snapshots therefore carry an explicit
+//! `complete: true` marker; this module never treats a partial page as a green
+//! gate. The `metrics import github-merge-receipt` command is the production
+//! entry point and remains observational: it imports a receipt but cannot merge.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 use super::merge_receipt::{MergeReceipt, SCHEMA};
 
 const REUSE_SCHEMA: &str = "pulp-reuse-record/v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReuseJob {
     pub schema: String,
     pub run_id: i64,
@@ -23,6 +31,7 @@ pub struct ReuseJob {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunObservation {
     pub id: i64,
     pub run_attempt: i64,
@@ -30,18 +39,21 @@ pub struct RunObservation {
     pub status: String,
     pub conclusion: Option<String>,
     pub head_sha: String,
+    pub head_branch: Option<String>,
     pub html_url: Option<String>,
     #[serde(default)]
     pub pull_requests: Vec<RunPullRequest>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunPullRequest {
     pub number: i64,
     pub head_sha: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PullRequestObservation {
     pub number: i64,
     pub state: String,
@@ -52,11 +64,13 @@ pub struct PullRequestObservation {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PullRequestHead {
     pub sha: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PullRequestBase {
     pub ref_name: Option<String>,
     #[serde(rename = "ref")]
@@ -65,16 +79,27 @@ pub struct PullRequestBase {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PullRequestRepository {
     pub full_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckRunsResponse {
+    #[serde(default)]
+    pub total_count: Option<usize>,
     pub check_runs: Vec<CheckRunObservation>,
+    /// True only when the provider transport has exhausted every page.
+    pub complete: bool,
+    /// Provider-scoped run identity for this complete snapshot. GitHub may
+    /// omit the identity on individual check-run objects.
+    pub snapshot_run_id: i64,
+    pub snapshot_run_attempt: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckRunObservation {
     pub id: i64,
     pub name: String,
@@ -92,6 +117,9 @@ struct GateEvidence<'a> {
     artifact: &'a ReuseJob,
     run: &'a RunObservation,
     pull_request: &'a PullRequestObservation,
+    checks_snapshot: &'a CheckRunsResponse,
+    artifact_url: &'a str,
+    run_url: &'a str,
     required_checks: &'a [String],
     checks: &'a [CheckRunObservation],
     artifact_sha256: &'a str,
@@ -121,6 +149,27 @@ pub fn reconcile(
     let base_branch = nonempty(base_branch, "base branch")?;
     let artifact_url = nonempty(artifact_url, "artifact URL")?;
     let run_url = nonempty(run_url, "run URL")?;
+    let artifact_prefix = format!("https://github.com/{repo}/actions/artifacts/");
+    let artifact_id = artifact_url
+        .strip_prefix(&artifact_prefix)
+        .unwrap_or_default();
+    if artifact_id.is_empty()
+        || !artifact_id.bytes().all(|byte| byte.is_ascii_digit())
+        || artifact_id.parse::<u64>().ok().is_none_or(|id| id == 0)
+    {
+        return Err("artifact URL is not bound to the requested repository artifact".to_owned());
+    }
+    let observed_run_url = run
+        .html_url
+        .as_deref()
+        .ok_or("GitHub run URL is unavailable")?;
+    if run_url != observed_run_url {
+        return Err("run URL does not match the observed GitHub run".to_owned());
+    }
+    let run_prefix = format!("https://github.com/{repo}/actions/runs/");
+    if !run_url.starts_with(&run_prefix) || run_url[run_prefix.len()..] != run.id.to_string() {
+        return Err("run URL is not bound to the observed run identity".to_owned());
+    }
     valid_sha256(artifact_sha256, "artifact SHA-256")?;
     valid_sha256(policy_sha256, "policy SHA-256")?;
     valid_sha256(collector_sha256, "collector SHA-256")?;
@@ -153,9 +202,6 @@ pub fn reconcile(
     if run.head_sha != merge_sha {
         return Err("merge-group run head SHA does not match artifact merge SHA".to_owned());
     }
-    if run.pull_requests.len() != 1 {
-        return Err("merge-group membership is missing or contains multiple PRs".to_owned());
-    }
     let head_sha = artifact
         .head_sha
         .as_deref()
@@ -170,14 +216,30 @@ pub fn reconcile(
     if pr <= 0 || pull_request.number != pr {
         return Err("pull request number does not match reuse artifact".to_owned());
     }
-    let member = &run.pull_requests[0];
-    if member.number != pr || member.head_sha.as_deref() != Some(head_sha) {
-        return Err("merge-group member identity does not match artifact and PR".to_owned());
+    let queue_ref = artifact
+        .merge_group_head_ref
+        .as_deref()
+        .or(run.head_branch.as_deref())
+        .ok_or("merge-group queue ref is unavailable")?;
+    let queue_identity = parse_queue_ref(queue_ref, base_branch)?;
+    if queue_identity.pr != pr {
+        return Err("merge-group queue ref does not identify the artifact PR".to_owned());
     }
-    if let Some(reference) = artifact.merge_group_head_ref.as_deref()
-        && !reference.contains(&format!("/pr-{pr}-"))
+    if let (Some(artifact_ref), Some(run_ref)) = (
+        artifact.merge_group_head_ref.as_deref(),
+        run.head_branch.as_deref(),
+    ) && artifact_ref != run_ref
     {
-        return Err("merge-group ref does not identify the artifact PR".to_owned());
+        return Err("artifact and GitHub run queue refs do not match".to_owned());
+    }
+    if run.pull_requests.is_empty() {
+        // GitHub's merge_group run payload normally has no pull_requests array;
+        // the exact queue ref is the authoritative PR binding in that shape.
+    } else if run.pull_requests.len() != 1
+        || run.pull_requests[0].number != pr
+        || run.pull_requests[0].head_sha.as_deref() != Some(head_sha)
+    {
+        return Err("merge-group member identity does not match artifact and PR".to_owned());
     }
     if pull_request.state != "closed" || pull_request.merged_at.is_none() {
         return Err("pull request is not confirmed merged".to_owned());
@@ -214,6 +276,28 @@ pub fn reconcile(
     if required_checks.is_empty() {
         return Err("required checks must be explicit and non-empty".to_owned());
     }
+    if !checks.complete {
+        return Err("required check snapshot is incomplete".to_owned());
+    }
+    if checks
+        .total_count
+        .is_some_and(|total_count| total_count != checks.check_runs.len())
+    {
+        return Err("required check snapshot count is incomplete".to_owned());
+    }
+    if checks.snapshot_run_id <= 0 || checks.snapshot_run_attempt <= 0 {
+        return Err("required check snapshot run identity is invalid".to_owned());
+    }
+    if checks.snapshot_run_id != run.id || checks.snapshot_run_attempt != run.run_attempt {
+        return Err("required check snapshot is bound to another run attempt".to_owned());
+    }
+    let mut required_names = HashSet::with_capacity(required_checks.len());
+    for required in required_checks {
+        let required = nonempty(required, "required check")?;
+        if !required_names.insert(required) {
+            return Err(format!("required check {required:?} is duplicated"));
+        }
+    }
     let mut selected = Vec::with_capacity(required_checks.len());
     for required in required_checks {
         let required = nonempty(required, "required check")?;
@@ -238,9 +322,13 @@ pub fn reconcile(
                 "required check {required:?} is bound to another SHA"
             ));
         }
-        if check.run_id != Some(run.id) || check.run_attempt != Some(run.run_attempt) {
+        if check.run_id.is_some_and(|run_id| run_id != run.id)
+            || check
+                .run_attempt
+                .is_some_and(|run_attempt| run_attempt != run.run_attempt)
+        {
             return Err(format!(
-                "required check {required:?} is not bound to this run attempt"
+                "required check {required:?} is bound to another run attempt"
             ));
         }
         selected.push(check.clone());
@@ -249,6 +337,9 @@ pub fn reconcile(
         artifact,
         run,
         pull_request,
+        checks_snapshot: checks,
+        artifact_url,
+        run_url,
         required_checks,
         checks: &selected,
         artifact_sha256,
@@ -284,6 +375,33 @@ pub fn reconcile(
         .validate()
         .map_err(|error| format!("reconciled receipt invalid: {error}"))?;
     Ok(receipt)
+}
+
+struct QueueIdentity {
+    pr: i64,
+}
+
+fn parse_queue_ref(reference: &str, base_branch: &str) -> Result<QueueIdentity, String> {
+    let prefix = format!("gh-readonly-queue/{base_branch}/pr-");
+    let rest = reference
+        .strip_prefix(&prefix)
+        .ok_or("merge-group queue ref does not match the expected base branch")?;
+    let (pr_text, suffix) = rest
+        .split_once('-')
+        .ok_or("merge-group queue ref is missing its commit suffix")?;
+    let pr = pr_text
+        .parse::<i64>()
+        .map_err(|_| "merge-group queue ref has an invalid PR number".to_owned())?;
+    if pr <= 0
+        || suffix.len() != 40
+        || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || suffix.chars().any(|ch| ch.is_ascii_uppercase())
+        || suffix.chars().all(|ch| ch == '0')
+        || suffix.contains('/')
+    {
+        return Err("merge-group queue ref has an invalid commit suffix".to_owned());
+    }
+    Ok(QueueIdentity { pr })
 }
 
 fn nonempty<'a>(value: &'a str, label: &str) -> Result<&'a str, String> {
@@ -362,7 +480,7 @@ mod tests {
             head_sha: Some(head.clone()),
             base_sha: Some("c".repeat(40)),
             merge_sha: Some(merge.clone()),
-            merge_group_head_ref: Some("gh-readonly-queue/main/pr-42-c".to_owned()),
+            merge_group_head_ref: Some(format!("gh-readonly-queue/main/pr-42-{}", "c".repeat(40))),
         };
         let run = RunObservation {
             id: 7,
@@ -371,6 +489,7 @@ mod tests {
             status: "completed".to_owned(),
             conclusion: Some("success".to_owned()),
             head_sha: merge.clone(),
+            head_branch: Some(format!("gh-readonly-queue/main/pr-42-{}", "c".repeat(40))),
             html_url: Some("https://github.com/Generous-Corp/pulp/actions/runs/7".to_owned()),
             pull_requests: vec![RunPullRequest {
                 number: 42,
@@ -392,6 +511,7 @@ mod tests {
             },
         };
         let checks = CheckRunsResponse {
+            total_count: Some(1),
             check_runs: vec![CheckRunObservation {
                 id: 8,
                 name: "macos".to_owned(),
@@ -403,6 +523,9 @@ mod tests {
                 run_id: Some(7),
                 run_attempt: Some(1),
             }],
+            complete: true,
+            snapshot_run_id: 7,
+            snapshot_run_attempt: 1,
         };
         (job, run, pr, checks, vec!["macos".to_owned()])
     }
@@ -468,6 +591,166 @@ mod tests {
                 &pr,
                 &checks,
                 &required
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_real_merge_group_shape_with_empty_pull_requests_and_null_check_identity() {
+        let (job, mut run, pr, mut checks, required) = fixture();
+        run.pull_requests.clear();
+        checks.check_runs[0].run_id = None;
+        checks.check_runs[0].run_attempt = None;
+        let receipt = reconcile(
+            "Generous-Corp/pulp",
+            "pulp",
+            "main",
+            "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+            "https://github.com/Generous-Corp/pulp/actions/runs/7",
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"c".repeat(64),
+            &job,
+            &run,
+            &pr,
+            &checks,
+            &required,
+        )
+        .expect("real merge-group shape reconciles");
+        assert_eq!(receipt.pr, 42);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rejects_queue_ref_and_required_check_contract_violations() {
+        let (mut job, run, pr, checks, required) = fixture();
+        job.merge_group_head_ref = Some(
+            "gh-readonly-queue/release/pr-42-cccccccccccccccccccccccccccccccccccccccc".to_owned(),
+        );
+        assert!(
+            reconcile(
+                "Generous-Corp/pulp",
+                "pulp",
+                "main",
+                "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+                "https://github.com/Generous-Corp/pulp/actions/runs/7",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                &job,
+                &run,
+                &pr,
+                &checks,
+                &required,
+            )
+            .is_err()
+        );
+
+        let (job, run, pr, mut checks, _) = fixture();
+        checks.complete = false;
+        assert!(
+            reconcile(
+                "Generous-Corp/pulp",
+                "pulp",
+                "main",
+                "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+                "https://github.com/Generous-Corp/pulp/actions/runs/7",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                &job,
+                &run,
+                &pr,
+                &checks,
+                &["macos".to_owned()],
+            )
+            .is_err()
+        );
+
+        let (job, run, pr, mut checks, _) = fixture();
+        checks.total_count = Some(2);
+        assert!(
+            reconcile(
+                "Generous-Corp/pulp",
+                "pulp",
+                "main",
+                "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+                "https://github.com/Generous-Corp/pulp/actions/runs/7",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                &job,
+                &run,
+                &pr,
+                &checks,
+                &["macos".to_owned()],
+            )
+            .is_err()
+        );
+
+        let (job, run, pr, checks, _) = fixture();
+        assert!(
+            reconcile(
+                "Generous-Corp/pulp",
+                "pulp",
+                "main",
+                "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+                "https://github.com/Generous-Corp/pulp/actions/runs/7",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                &job,
+                &run,
+                &pr,
+                &checks,
+                &["macos".to_owned(), "macos".to_owned()],
+            )
+            .is_err()
+        );
+
+        let (job, run, pr, mut checks, _) = fixture();
+        checks.snapshot_run_attempt = 2;
+        assert!(
+            reconcile(
+                "Generous-Corp/pulp",
+                "pulp",
+                "main",
+                "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+                "https://github.com/Generous-Corp/pulp/actions/runs/7",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                &job,
+                &run,
+                &pr,
+                &checks,
+                &["macos".to_owned()],
+            )
+            .is_err()
+        );
+
+        let (job, run, pr, checks, _) = fixture();
+        let mut run = run;
+        run.pull_requests.push(RunPullRequest {
+            number: 43,
+            head_sha: Some("e".repeat(40)),
+        });
+        assert!(
+            reconcile(
+                "Generous-Corp/pulp",
+                "pulp",
+                "main",
+                "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+                "https://github.com/Generous-Corp/pulp/actions/runs/7",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                &job,
+                &run,
+                &pr,
+                &checks,
+                &["macos".to_owned()],
             )
             .is_err()
         );

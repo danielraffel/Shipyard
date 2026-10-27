@@ -180,6 +180,7 @@ shipyard evidence command --list
 # Runner metrics
 shipyard metrics record --project pulp --job linux-arm64 --step compile --duration 18.4s --target linux-arm64 --backend local --provider tart-linux --host macstudio
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
+shipyard metrics import github-merge-receipt --repo Generous-Corp/pulp --project pulp --artifact job.json --run run.json --pull-request pr.json --checks checks.json --artifact-url https://github.com/Generous-Corp/pulp/actions/artifacts/123 --run-url https://github.com/Generous-Corp/pulp/actions/runs/456 --policy-sha256 <sha256> --collector-sha256 <sha256> --required-check macos
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics export merge-receipt --repo Generous-Corp/pulp --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
 shipyard metrics summary --project pulp --json
@@ -538,6 +539,12 @@ and provider-neutral:
   stores command evidence.
 - `shipyard metrics import github` imports recent GitHub Actions job timings
   through `gh api`.
+- `shipyard metrics import github-merge-receipt` reconciles one extracted Pulp
+  `job.json` with complete, caller-captured **normalized** GitHub run,
+  pull-request, and check-run snapshots before importing a gate-bound receipt.
+  The check snapshot must carry `complete: true` plus the provider-scoped
+  `snapshot_run_id` and `snapshot_run_attempt` matching the observed run; the
+  command never calls GitHub or merges.
 - `shipyard metrics import tartci` imports JSON/JSONL from
   `tartci runtime export` when a project uses tartci VM lanes.
 - `shipyard metrics import merge-receipt --file <path>` imports validated `shipyard-merge-receipt/v1` JSON/JSONL; invalid or unavailable provenance stays fail-closed.

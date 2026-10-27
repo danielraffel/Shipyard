@@ -53,3 +53,15 @@ receives no safe-merge receipt. The producer is observational: a receipt-store
 failure is surfaced as a cleanup warning after the merge and never authorizes
 or undoes the merge.
 The GitHub API importer remains read-only and does not manufacture receipts.
+
+For the Pulp merge-group reuse path, `shipyard metrics import
+github-merge-receipt` consumes a normalized `job.json`, one workflow-run and
+pull-request snapshot, and a complete check-runs snapshot (`complete: true`).
+The command requires the observed run URL and exact queue-ref identity to bind
+the artifact to the PR; it accepts GitHub's normal empty `pull_requests` array
+and nullable per-check `run_id`/`run_attempt` fields only when the normalized
+check snapshot itself carries a positive `snapshot_run_id` and
+`snapshot_run_attempt` matching the observed workflow run. That snapshot
+binding is included in the gate evidence hash. Partial pages, duplicate
+required checks, ambiguous multi-PR arrays, mismatched URLs, and unknown
+snapshot fields remain unavailable rather than becoming receipts.
