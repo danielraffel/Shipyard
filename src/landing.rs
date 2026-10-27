@@ -204,6 +204,7 @@ impl LandingReport {
     pub fn has_unknown(&self) -> bool {
         self.merge_queue.verdict.is_unknown()
             || self.strict.verdict.is_unknown()
+            || self.enqueue.action == "unknown"
             || self.batching.action == strategy::BatchingAction::Unknown
     }
 }

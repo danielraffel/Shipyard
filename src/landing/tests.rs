@@ -7,14 +7,17 @@
 
 use serde_json::{Value, json};
 
+use crate::base_health::BaseHealthFinding;
+use crate::base_health::tip::{TipHealth, TipVerdict};
 use crate::fleet_service::Boundary;
 use crate::landing::backlog;
 use crate::landing::placement::{self, JobObservation, Placement};
 use crate::landing::queue::{
-    MergeQueueConfig, Payload, QueueFinding, QueueInputs, determine_queue, determine_strict,
-    enqueue_guidance,
+    EnqueueGuidance, MergeQueueConfig, Payload, QueueFinding, QueueInputs, StrictFinding,
+    determine_queue, determine_strict, enqueue_guidance,
 };
-use crate::landing::{SurfaceOutcome, SurfaceRead, Verdict};
+use crate::landing::strategy::{BatchingAction, BatchingGuidance};
+use crate::landing::{LandingReport, SurfaceOutcome, SurfaceRead, Verdict};
 
 /// A ruleset carrying an active merge queue on the default branch.
 ///
@@ -583,6 +586,64 @@ fn queue_with_unfamiliar_merge_method_refuses_to_name_a_command() {
     let guidance = enqueue_guidance(&finding);
     assert_eq!(guidance.action, "unknown");
     assert!(guidance.command.is_none());
+}
+
+#[test]
+fn unknown_enqueue_guidance_is_a_headline_unknown() {
+    let report = LandingReport {
+        schema_version: 1,
+        repo: "owner/repo".to_owned(),
+        base: "main".to_owned(),
+        merge_queue: QueueFinding {
+            verdict: Verdict::Present(MergeQueueConfig {
+                enforcement: Some("active".to_owned()),
+                merge_method: None,
+                ..Default::default()
+            }),
+            disagreements: Vec::new(),
+        },
+        strict: StrictFinding {
+            verdict: Verdict::Absent,
+            implication: "no strict protection".to_owned(),
+        },
+        enqueue: EnqueueGuidance {
+            action: "unknown".to_owned(),
+            command: None,
+            rationale: "merge method unavailable".to_owned(),
+        },
+        batching: BatchingGuidance {
+            action: BatchingAction::Disabled,
+            command: None,
+            max_members: None,
+            rationale: "no train".to_owned(),
+        },
+        required_checks: placement::PlacementFinding {
+            contexts_source: "none".to_owned(),
+            checks: Vec::new(),
+            notes: Vec::new(),
+        },
+        backlog: backlog::unreadable(Boundary::Parse, "not read".to_owned()),
+        base_tip: TipHealth {
+            base: "main".to_owned(),
+            tip_sha: None,
+            verdict: TipVerdict::Unproven {
+                detail: "not read".to_owned(),
+            },
+            required_contexts: Vec::new(),
+            runs: Vec::new(),
+            jobs: Vec::new(),
+            api_calls: 0,
+        },
+        base_health: BaseHealthFinding::NoSignal {
+            detail: "not read".to_owned(),
+        },
+        base_jump: None,
+        surfaces: Vec::new(),
+        warnings: Vec::new(),
+        api_calls: 0,
+        opt_in_targets: Vec::new(),
+    };
+    assert!(report.has_unknown());
 }
 
 // ---------------------------------------------------------------------------
