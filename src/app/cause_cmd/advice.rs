@@ -86,21 +86,31 @@ pub(super) fn command<W: Write>(
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
-        writeln!(out, "score\tjob\tsignature\tclass\tfix")
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        writeln!(
+            out,
+            "score\tjob\tsignature\tclass\tfix_head\tfix_derivation"
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
         for c in &result.candidates {
+            let (fix_head, fix_derivation) = c
+                .fix_link
+                .as_ref()
+                .map(|link| {
+                    (
+                        link["fix_head_sha"].as_str().unwrap_or("unknown"),
+                        link["derivation"].as_str().unwrap_or("unknown"),
+                    )
+                })
+                .unwrap_or(("none", "none"));
             writeln!(
                 out,
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}",
                 c.match_score,
                 c.cause["job"].as_str().unwrap_or(""),
                 c.cause["signature"].as_str().unwrap_or(""),
                 c.cause["failure_class"].as_str().unwrap_or(""),
-                if c.fix_link.is_some() {
-                    "available"
-                } else {
-                    "none"
-                }
+                fix_head,
+                fix_derivation,
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
@@ -530,5 +540,38 @@ mod tests {
         a.head_sha = "abc".into();
         let mut out = Vec::new();
         assert_eq!(command(&a, true, &mut out).unwrap_err().code, 2);
+    }
+
+    #[test]
+    fn human_output_names_the_fix_head_and_derivation() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            serde_json::json!({
+                "schema": SCHEMA,
+                "source": "fix-link",
+                "repo": "o/r",
+                "red_run_id": 1,
+                "red_attempt": 1,
+                "fix_head_sha": "c".repeat(40),
+                "derivation": "rerun_green"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut query = args(dir.path());
+        query.pr = None;
+        let mut out = Vec::new();
+        command(&query, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("fix_head\tfix_derivation"));
+        assert!(text.contains(&format!("{}\trerun_green", "c".repeat(40))));
     }
 }
