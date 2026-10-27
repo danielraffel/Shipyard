@@ -129,6 +129,11 @@ pub struct SurfaceRead {
 pub enum SurfaceOutcome {
     /// The surface answered and the answer was parsed.
     Read,
+    /// The surface answered with a confirmed absence.
+    Absent {
+        /// Why the absence is authoritative.
+        detail: String,
+    },
     /// The surface answered, and the answer structurally cannot carry the
     /// fact being sought. Deliberately not `Read`: a surface that cannot
     /// express a queue must never be counted as having found no queue.
@@ -197,6 +202,8 @@ impl LandingReport {
     /// are large enough to time out.
     #[must_use]
     pub fn has_unknown(&self) -> bool {
-        self.merge_queue.verdict.is_unknown() || self.strict.verdict.is_unknown()
+        self.merge_queue.verdict.is_unknown()
+            || self.strict.verdict.is_unknown()
+            || self.batching.action == strategy::BatchingAction::Unknown
     }
 }

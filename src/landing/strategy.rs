@@ -62,6 +62,15 @@ fn queue_is_enforcing(queue: &QueueFinding) -> Option<&MergeQueueConfig> {
 /// Select a batching strategy from measured queue state and repository config.
 #[must_use]
 pub fn batching_guidance(queue: &QueueFinding, train: &Config) -> BatchingGuidance {
+    if queue.verdict.is_unknown() {
+        return BatchingGuidance {
+            action: BatchingAction::Unknown,
+            command: None,
+            max_members: (train.enabled && train.mode == Mode::Rollup)
+                .then_some(train.max_members),
+            rationale: "The repository's merge-queue state is unreadable; do not recommend a landing or batching command until GitHub queue authority can be measured.".to_owned(),
+        };
+    }
     if !train.enabled || train.mode != Mode::Rollup {
         return if queue_is_enforcing(queue).is_some() {
             BatchingGuidance { action: BatchingAction::QueueOnly, command: Some("shipyard ship --pr <number>".to_owned()), max_members: None, rationale: "No rollup train is enabled; use the repository's merge queue, which can batch merge groups itself.".to_owned() }
@@ -83,6 +92,7 @@ pub fn batching_guidance(queue: &QueueFinding, train: &Config) -> BatchingGuidan
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet_service::Boundary;
     fn queue(active: Option<bool>) -> QueueFinding {
         QueueFinding {
             verdict: active.map_or(Verdict::Absent, |on| {
@@ -117,5 +127,36 @@ mod tests {
             batching_guidance(&queue(None), &c).action,
             BatchingAction::Unknown
         );
+    }
+
+    fn unknown_queue() -> QueueFinding {
+        QueueFinding {
+            verdict: Verdict::Unknown {
+                boundary: Boundary::Transport,
+                detail: "rulesets unavailable".to_owned(),
+            },
+            disagreements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unreadable_queue_with_train_disabled_has_no_command() {
+        let guidance = batching_guidance(&unknown_queue(), &Config::default());
+        assert_eq!(guidance.action, BatchingAction::Unknown);
+        assert_eq!(guidance.command, None);
+    }
+
+    #[test]
+    fn unreadable_queue_with_direct_rollup_has_no_command() {
+        let c = Config {
+            enabled: true,
+            mode: Mode::Rollup,
+            landing: Landing::Direct,
+            ..Config::default()
+        };
+        let guidance = batching_guidance(&unknown_queue(), &c);
+        assert_eq!(guidance.action, BatchingAction::Unknown);
+        assert_eq!(guidance.command, None);
+        assert_eq!(guidance.max_members, Some(c.max_members));
     }
 }

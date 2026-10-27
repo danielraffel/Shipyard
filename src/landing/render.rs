@@ -259,6 +259,14 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &LandingReport) -> std::io:
                     surface.surface, surface.query
                 )?;
             }
+            SurfaceOutcome::Absent { detail } => {
+                writeln!(
+                    stdout,
+                    "  absent        {}  {}",
+                    surface.surface, surface.query
+                )?;
+                writeln!(stdout, "                {detail}")?;
+            }
             SurfaceOutcome::Inexpressible { detail } => {
                 writeln!(
                     stdout,

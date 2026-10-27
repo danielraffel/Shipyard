@@ -25,42 +25,98 @@ use crate::landability::gate;
 use crate::landing::gather::{DEFAULT_MAX_JOB_READS, DEFAULT_RUN_SAMPLE, GatherOptions};
 use crate::landing::{EXIT_LANDING_UNKNOWN, gather, pr_state, render};
 
+struct RepositoryTrainConfigError {
+    surface: crate::landing::SurfaceRead,
+    message: String,
+}
+
+fn repository_train_query(repo: &str, base: &str) -> String {
+    format!(
+        "repos/{repo}/contents/.shipyard/config.toml?ref={}",
+        crate::required_check_policy::encode_path_segment(base)
+    )
+}
+
 fn repository_train_config(
     actions: &crate::cloud::GitHubActions,
     repo: &str,
     base: &str,
-) -> Result<crate::rollup::Config, CliFailure> {
+) -> Result<(crate::rollup::Config, crate::landing::SurfaceRead), RepositoryTrainConfigError> {
+    let query = repository_train_query(repo, base);
+    let surface_query = format!("GET /{query}");
     let raw = match actions.run_gh(&[
         "api".to_owned(),
         "-H".to_owned(),
         "Accept: application/vnd.github.raw+json".to_owned(),
-        format!("repos/{repo}/contents/.shipyard/config.toml?ref={base}"),
+        query,
     ]) {
         Ok(raw) => raw,
         Err(error)
             if error.to_string().contains("404") || error.to_string().contains("Not Found") =>
         {
-            return Ok(crate::rollup::Config::default());
+            return Ok((
+                crate::rollup::Config::default(),
+                crate::landing::SurfaceRead {
+                    surface: "repository_train_config".to_owned(),
+                    query: surface_query,
+                    outcome: crate::landing::SurfaceOutcome::Absent {
+                        detail: "no .shipyard/config.toml exists on the base; train defaults apply"
+                            .to_owned(),
+                    },
+                },
+            ));
         }
         Err(error) => {
-            return Err(CliFailure::new(
-                EXIT_LANDING_UNKNOWN,
-                format!(".shipyard/config.toml on {repo}@{base} is unreadable: {error}"),
-            ));
+            let detail = format!(".shipyard/config.toml on {repo}@{base} is unreadable: {error}");
+            return Err(RepositoryTrainConfigError {
+                surface: crate::landing::SurfaceRead {
+                    surface: "repository_train_config".to_owned(),
+                    query: surface_query,
+                    outcome: crate::landing::SurfaceOutcome::Unreadable {
+                        boundary: crate::fleet_service::Boundary::Transport,
+                        detail: detail.clone(),
+                    },
+                },
+                message: detail,
+            });
         }
     };
     let table = raw.parse::<toml::Table>().map_err(|error| {
-        CliFailure::new(
-            EXIT_LANDING_UNKNOWN,
-            format!(".shipyard/config.toml on {repo}@{base} does not parse: {error}"),
-        )
+        let detail = format!(".shipyard/config.toml on {repo}@{base} does not parse: {error}");
+        RepositoryTrainConfigError {
+            surface: crate::landing::SurfaceRead {
+                surface: "repository_train_config".to_owned(),
+                query: surface_query.clone(),
+                outcome: crate::landing::SurfaceOutcome::Unreadable {
+                    boundary: crate::fleet_service::Boundary::Parse,
+                    detail: detail.clone(),
+                },
+            },
+            message: detail,
+        }
     })?;
-    crate::rollup::Config::from_table(&table).map_err(|error| {
-        CliFailure::new(
-            EXIT_LANDING_UNKNOWN,
-            format!("[train] in {repo}@{base} is invalid: {error}"),
-        )
-    })
+    let config = crate::rollup::Config::from_table(&table).map_err(|error| {
+        let detail = format!("[train] in {repo}@{base} is invalid: {error}");
+        RepositoryTrainConfigError {
+            surface: crate::landing::SurfaceRead {
+                surface: "repository_train_config".to_owned(),
+                query: surface_query.clone(),
+                outcome: crate::landing::SurfaceOutcome::Unreadable {
+                    boundary: crate::fleet_service::Boundary::Parse,
+                    detail: detail.clone(),
+                },
+            },
+            message: detail,
+        }
+    })?;
+    Ok((
+        config,
+        crate::landing::SurfaceRead {
+            surface: "repository_train_config".to_owned(),
+            query: surface_query,
+            outcome: crate::landing::SurfaceOutcome::Read,
+        },
+    ))
 }
 
 /// What the caller asked for, as parsed from the command line.
@@ -83,6 +139,7 @@ pub(super) struct LandingArgs {
 }
 
 /// Run `shipyard landing`.
+#[allow(clippy::too_many_lines)] // Keep the read-only landing command's evidence order auditable.
 pub(super) fn landing_command<W: Write>(
     mode: RuntimeMode,
     cwd: &Path,
@@ -161,8 +218,23 @@ pub(super) fn landing_command<W: Write>(
         },
     );
 
-    let train = repository_train_config(&actions, &repo, &base)?;
-    report.batching = crate::landing::strategy::batching_guidance(&report.merge_queue, &train);
+    report.api_calls += 1;
+    match repository_train_config(&actions, &repo, &base) {
+        Ok((train, surface)) => {
+            report.surfaces.push(surface);
+            report.batching =
+                crate::landing::strategy::batching_guidance(&report.merge_queue, &train);
+        }
+        Err(error) => {
+            report.surfaces.push(error.surface);
+            report.batching = crate::landing::strategy::BatchingGuidance {
+                action: crate::landing::strategy::BatchingAction::Unknown,
+                command: None,
+                max_members: None,
+                rationale: error.message,
+            };
+        }
+    }
 
     report.opt_in_targets = crate::opt_in_targets::from_config(&config);
 
@@ -182,4 +254,17 @@ pub(super) fn landing_command<W: Write>(
         ));
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repository_train_query;
+
+    #[test]
+    fn repository_train_query_encodes_the_base_ref() {
+        assert_eq!(
+            repository_train_query("owner/repo", "release/1.0?x=y&z"),
+            "repos/owner/repo/contents/.shipyard/config.toml?ref=release%2F1.0%3Fx%3Dy%26z"
+        );
+    }
 }
