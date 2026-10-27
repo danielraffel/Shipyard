@@ -59,9 +59,23 @@ github-merge-receipt` consumes a normalized `job.json`, one workflow-run and
 pull-request snapshot, and a complete check-runs snapshot (`complete: true`).
 The command requires the observed run URL and exact queue-ref identity to bind
 the artifact to the PR; it accepts GitHub's normal empty `pull_requests` array
-and nullable per-check `run_id`/`run_attempt` fields only when the normalized
-check snapshot itself carries a positive `snapshot_run_id` and
-`snapshot_run_attempt` matching the observed workflow run. That snapshot
-binding is included in the gate evidence hash. Partial pages, duplicate
-required checks, ambiguous multi-PR arrays, mismatched URLs, and unknown
-snapshot fields remain unavailable rather than becoming receipts.
+and requires each selected check to carry non-null `run_id`/`run_attempt`
+matching the observed workflow run. A commit-wide check-runs response with
+null per-check identity is rejected unless an upstream collector first
+enriches it from the authoritative run jobs. The normalized check snapshot
+also carries a positive `snapshot_run_id` and `snapshot_run_attempt` matching
+the observed workflow run; that binding is included in the gate evidence hash.
+Partial pages, duplicate required checks, ambiguous multi-PR arrays, mismatched
+URLs, and unknown snapshot fields remain unavailable rather than becoming
+receipts.
+
+The run projection must include `pull_requests`, even when GitHub supplies the
+legitimate empty array for a merge-group run. The check projection must include
+`total_count`, accepted only when it equals the captured `check_runs` length
+after pagination. These are normalized, schema-defined inputs; the importer
+intentionally rejects raw GitHub objects with unrelated fields. The artifact
+URL is a caller-provided locator and is not proof of artifact object identity;
+the SHA-256 of the supplied `job.json` bytes is the content binding recorded in
+the receipt. The Pulp `job.json` projection is the one exception for producer
+metadata: extra producer fields are ignored after the nine binding fields are
+strictly normalized, including a decimal-string `run_id`.

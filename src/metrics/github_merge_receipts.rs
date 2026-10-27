@@ -41,7 +41,8 @@ pub struct RunObservation {
     pub head_sha: String,
     pub head_branch: Option<String>,
     pub html_url: Option<String>,
-    #[serde(default)]
+    /// Required in the normalized projection. GitHub's `merge_group` payload
+    /// legitimately supplies an empty array, so omission is not equivalent.
     pub pull_requests: Vec<RunPullRequest>,
 }
 
@@ -87,13 +88,12 @@ pub struct PullRequestRepository {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckRunsResponse {
-    #[serde(default)]
-    pub total_count: Option<usize>,
+    /// Provider-reported total after pagination; must equal `check_runs.len()`.
+    pub total_count: usize,
     pub check_runs: Vec<CheckRunObservation>,
     /// True only when the provider transport has exhausted every page.
     pub complete: bool,
-    /// Provider-scoped run identity for this complete snapshot. GitHub may
-    /// omit the identity on individual check-run objects.
+    /// Provider-scoped run identity for this complete snapshot.
     pub snapshot_run_id: i64,
     pub snapshot_run_attempt: i64,
 }
@@ -108,6 +108,8 @@ pub struct CheckRunObservation {
     pub head_sha: Option<String>,
     pub html_url: Option<String>,
     pub details_url: Option<String>,
+    /// Nullable in raw GitHub commit-wide responses; reconciliation rejects
+    /// null values unless an upstream collector enriches them from run jobs.
     pub run_id: Option<i64>,
     pub run_attempt: Option<i64>,
 }
@@ -279,10 +281,7 @@ pub fn reconcile(
     if !checks.complete {
         return Err("required check snapshot is incomplete".to_owned());
     }
-    if checks
-        .total_count
-        .is_some_and(|total_count| total_count != checks.check_runs.len())
-    {
+    if checks.total_count != checks.check_runs.len() {
         return Err("required check snapshot count is incomplete".to_owned());
     }
     if checks.snapshot_run_id <= 0 || checks.snapshot_run_attempt <= 0 {
@@ -322,14 +321,21 @@ pub fn reconcile(
                 "required check {required:?} is bound to another SHA"
             ));
         }
-        if check.run_id.is_some_and(|run_id| run_id != run.id)
-            || check
-                .run_attempt
-                .is_some_and(|run_attempt| run_attempt != run.run_attempt)
-        {
+        if check.run_id != Some(run.id) || check.run_attempt != Some(run.run_attempt) {
             return Err(format!(
-                "required check {required:?} is bound to another run attempt"
+                "required check {required:?} is not bound to this run attempt"
             ));
+        }
+        for url in [check.html_url.as_deref(), check.details_url.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let run_url_prefix = format!("https://github.com/{repo}/actions/runs/{}", run.id);
+            if !(url == run_url_prefix || url.starts_with(&format!("{run_url_prefix}/"))) {
+                return Err(format!(
+                    "required check {required:?} URL is bound to another run"
+                ));
+            }
         }
         selected.push(check.clone());
     }
@@ -448,10 +454,71 @@ pub fn read_json<T: for<'de> serde::Deserialize<'de>>(
 /// Decode an extracted `job.json`, rejecting top-level arrays.
 pub fn read_job(path: &std::path::Path) -> Result<ReuseJob, String> {
     let value: Value = read_json(path, "reuse artifact")?;
-    if !value.is_object() {
-        return Err("reuse artifact job.json must be an object".to_owned());
+    let object = value
+        .as_object()
+        .ok_or("reuse artifact job.json must be an object")?;
+    let artifact = ReuseJob {
+        schema: required_string(object, "schema")?,
+        run_id: required_i64(object, "run_id")?,
+        run_attempt: required_i64(object, "run_attempt")?,
+        run_kind: required_string(object, "run_kind")?,
+        pr: optional_i64(object, "pr")?,
+        head_sha: optional_string(object, "head_sha")?,
+        base_sha: optional_string(object, "base_sha")?,
+        merge_sha: optional_string(object, "merge_sha")?,
+        merge_group_head_ref: optional_string(object, "merge_group_head_ref")?,
+    };
+    Ok(artifact)
+}
+
+fn required_string(object: &serde_json::Map<String, Value>, key: &str) -> Result<String, String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("reuse artifact field {key:?} must be a string"))
+}
+
+fn optional_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| format!("reuse artifact field {key:?} must be a string or null")),
     }
-    serde_json::from_value(value).map_err(|error| format!("reuse artifact decode failed: {error}"))
+}
+
+fn required_i64(object: &serde_json::Map<String, Value>, key: &str) -> Result<i64, String> {
+    match object.get(key) {
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .ok_or_else(|| format!("reuse artifact field {key:?} must be an integer")),
+        Some(Value::String(value)) => value
+            .parse::<i64>()
+            .map_err(|_| format!("reuse artifact field {key:?} must be an integer")),
+        _ => Err(format!("reuse artifact field {key:?} must be an integer")),
+    }
+}
+
+fn optional_i64(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option<i64>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("reuse artifact field {key:?} must be an integer or null")),
+        Some(Value::String(value)) => value
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| format!("reuse artifact field {key:?} must be an integer or null")),
+        Some(_) => Err(format!(
+            "reuse artifact field {key:?} must be an integer or null"
+        )),
+    }
 }
 
 pub fn sha256_file(path: &std::path::Path, label: &str) -> Result<String, String> {
@@ -511,7 +578,7 @@ mod tests {
             },
         };
         let checks = CheckRunsResponse {
-            total_count: Some(1),
+            total_count: 1,
             check_runs: vec![CheckRunObservation {
                 id: 8,
                 name: "macos".to_owned(),
@@ -529,6 +596,35 @@ mod tests {
         };
         (job, run, pr, checks, vec!["macos".to_owned()])
     }
+
+    #[test]
+    fn read_job_projects_producer_shape_and_numeric_string_run_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("job.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": REUSE_SCHEMA,
+                "run_id": "7",
+                "run_attempt": 1,
+                "run_kind": "merge_group",
+                "pr": 42,
+                "head_sha": "a".repeat(40),
+                "base_sha": "c".repeat(40),
+                "merge_sha": "b".repeat(40),
+                "merge_group_head_ref": "gh-readonly-queue/main/pr-42-cccccccccccccccccccccccccccccccccccccccc",
+                "identity": {"usable": true},
+                "runner_image": {"digest": "sha256:example"},
+                "problems": [],
+            })
+            .to_string(),
+        )
+        .expect("job artifact");
+        let job = read_job(&path).expect("producer-shaped job artifact");
+        assert_eq!(job.run_id, 7);
+        assert_eq!(job.pr, Some(42));
+    }
+
     #[test]
     fn reconciles_exact_successful_merge_group() {
         let (job, run, pr, checks, required) = fixture();
@@ -597,28 +693,29 @@ mod tests {
     }
 
     #[test]
-    fn accepts_real_merge_group_shape_with_empty_pull_requests_and_null_check_identity() {
+    fn rejects_commit_wide_check_shape_with_null_check_identity() {
         let (job, mut run, pr, mut checks, required) = fixture();
         run.pull_requests.clear();
         checks.check_runs[0].run_id = None;
         checks.check_runs[0].run_attempt = None;
-        let receipt = reconcile(
-            "Generous-Corp/pulp",
-            "pulp",
-            "main",
-            "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
-            "https://github.com/Generous-Corp/pulp/actions/runs/7",
-            &"a".repeat(64),
-            &"b".repeat(64),
-            &"c".repeat(64),
-            &job,
-            &run,
-            &pr,
-            &checks,
-            &required,
-        )
-        .expect("real merge-group shape reconciles");
-        assert_eq!(receipt.pr, 42);
+        assert!(
+            reconcile(
+                "Generous-Corp/pulp",
+                "pulp",
+                "main",
+                "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+                "https://github.com/Generous-Corp/pulp/actions/runs/7",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                &job,
+                &run,
+                &pr,
+                &checks,
+                &required,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -669,7 +766,7 @@ mod tests {
         );
 
         let (job, run, pr, mut checks, _) = fixture();
-        checks.total_count = Some(2);
+        checks.total_count = 2;
         assert!(
             reconcile(
                 "Generous-Corp/pulp",
@@ -689,6 +786,22 @@ mod tests {
             .is_err()
         );
 
+        let missing_count = serde_json::json!({
+            "complete": true,
+            "snapshot_run_id": 7,
+            "snapshot_run_attempt": 1,
+            "check_runs": []
+        });
+        assert!(serde_json::from_value::<CheckRunsResponse>(missing_count).is_err());
+
+        let (_, run, _, _, _) = fixture();
+        let mut missing_membership = serde_json::to_value(run).expect("run JSON");
+        missing_membership
+            .as_object_mut()
+            .expect("run object")
+            .remove("pull_requests");
+        assert!(serde_json::from_value::<RunObservation>(missing_membership).is_err());
+
         let (job, run, pr, checks, _) = fixture();
         assert!(
             reconcile(
@@ -705,6 +818,28 @@ mod tests {
                 &pr,
                 &checks,
                 &["macos".to_owned(), "macos".to_owned()],
+            )
+            .is_err()
+        );
+
+        let (job, run, pr, mut checks, _) = fixture();
+        checks.check_runs[0].details_url =
+            Some("https://github.com/Generous-Corp/pulp/actions/runs/99/job/8".to_owned());
+        assert!(
+            reconcile(
+                "Generous-Corp/pulp",
+                "pulp",
+                "main",
+                "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+                "https://github.com/Generous-Corp/pulp/actions/runs/7",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &"c".repeat(64),
+                &job,
+                &run,
+                &pr,
+                &checks,
+                &["macos".to_owned()],
             )
             .is_err()
         );

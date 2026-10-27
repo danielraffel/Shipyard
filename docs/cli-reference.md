@@ -542,9 +542,16 @@ and provider-neutral:
 - `shipyard metrics import github-merge-receipt` reconciles one extracted Pulp
   `job.json` with complete, caller-captured **normalized** GitHub run,
   pull-request, and check-run snapshots before importing a gate-bound receipt.
-  The check snapshot must carry `complete: true` plus the provider-scoped
-  `snapshot_run_id` and `snapshot_run_attempt` matching the observed run; the
-  command never calls GitHub or merges.
+  The normalized run projection must include `pull_requests` (an empty array is
+  valid), and the check snapshot must carry `complete: true`, an exact
+  `total_count`, plus the provider-scoped `snapshot_run_id` and
+  `snapshot_run_attempt` matching the observed run. Required checks must carry
+  their own non-null matching run identity; commit-wide check-runs with null
+  identities are rejected unless enriched from the authoritative run jobs.
+  The producer `job.json` may contain additional metadata; the importer
+  projects only the binding fields and accepts numeric-string run IDs. These
+  projections are caller-produced inputs; raw GitHub payloads must be reduced
+  to this schema before import. The command never calls GitHub or merges.
 - `shipyard metrics import tartci` imports JSON/JSONL from
   `tartci runtime export` when a project uses tartci VM lanes.
 - `shipyard metrics import merge-receipt --file <path>` imports validated `shipyard-merge-receipt/v1` JSON/JSONL; invalid or unavailable provenance stays fail-closed.

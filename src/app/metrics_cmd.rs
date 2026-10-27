@@ -1302,8 +1302,8 @@ mod tests {
                     "head_sha": "b".repeat(40),
                     "html_url": null,
                     "details_url": null,
-                    "run_id": null,
-                    "run_attempt": null,
+                    "run_id": 7,
+                    "run_attempt": 1,
                 }],
             })
             .to_string(),
