@@ -1095,13 +1095,41 @@ struct CheckoutIdentity<'a> {
     head: &'a str,
 }
 
+fn push_pr_branch(
+    config: &LoadedConfig,
+    cwd: &Path,
+    branch: &str,
+    mut prospective_push: Option<&mut prepush_changed_surface::ProspectivePush>,
+) -> Result<(), CliFailure> {
+    let mut environment = crate::pr::scoped_push_environment(&config.global_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    environment.extend(
+        prospective_push
+            .as_deref_mut()
+            .map_or_else(Vec::new, |push| {
+                let environment = push.environment();
+                push.handoff_writer_domain_to_child();
+                environment
+            }),
+    );
+    push_branch_with_env(cwd, branch, environment)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    if let Some(push) = prospective_push {
+        // This private state transition is the pass authority. The hook result
+        // is identity telemetry only; untrusted test descendants cannot turn a
+        // nonzero/aborted git push into this parent-observed state.
+        push.mark_supervised_push_succeeded();
+    }
+    Ok(())
+}
+
 fn resolve_pr_context(
     config: &LoadedConfig,
     args: &ShipCommandArgs,
     cwd: &Path,
     checkout: CheckoutIdentity<'_>,
     lane_policy: &LanePolicy,
-    mut prospective_push: Option<&mut prepush_changed_surface::ProspectivePush>,
+    prospective_push: Option<&mut prepush_changed_surface::ProspectivePush>,
 ) -> Result<ResolvedPrContext, CliFailure> {
     if let Some(number) = args.pr {
         if let Some(path) = args.pr_snapshot_file.as_deref() {
@@ -1165,21 +1193,7 @@ fn resolve_pr_context(
         });
     }
 
-    let environment = prospective_push
-        .as_deref_mut()
-        .map_or_else(Vec::new, |push| {
-            let environment = push.environment();
-            push.handoff_writer_domain_to_child();
-            environment
-        });
-    push_branch_with_env(cwd, checkout.branch, environment)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    if let Some(push) = prospective_push {
-        // This private state transition is the pass authority. The hook result
-        // is identity telemetry only; untrusted test descendants cannot turn a
-        // nonzero/aborted git push into this parent-observed state.
-        push.mark_supervised_push_succeeded();
-    }
+    push_pr_branch(config, cwd, checkout.branch, prospective_push)?;
     let info = find_pr_for_branch(config, cwd, args.gh_command.as_deref(), checkout.branch)
         .map_err(|error| CliFailure::new(1, error.to_string()))?
         .map_or_else(

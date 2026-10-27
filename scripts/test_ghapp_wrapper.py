@@ -171,6 +171,7 @@ class GhappWrapperTests(unittest.TestCase):
             "if mode == 'oversize': payload['credential_argv'][1] = '1' * 17000\n"
             "if mode and mode.startswith('app-id:'): payload['credential_argv'][1] = mode.split(':', 1)[1]\n"
             "if mode and mode.startswith('private-key:'): payload['credential_argv'][3] = mode.split(':', 1)[1]\n"
+            "if mode and mode.startswith('fifth:'): payload['credential_argv'].append(mode.split(':', 1)[1])\n"
             "print(json.dumps(payload, separators=(',', ':')))\n",
             encoding="utf-8",
         )
@@ -953,6 +954,26 @@ class GhappWrapperTests(unittest.TestCase):
                 result = self.run_wrapper(
                     "api", "repos/Generous-Corp/pulp/hooks"
                 )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("malformed JSON", result.stderr)
+                self.assertFalse(self.helper_log.exists())
+                self.assertFalse(self.gh_log.exists())
+
+    def test_cli_mode_passes_repository_scope_to_the_helper(self) -> None:
+        self.environment["RESOLVER_MODE"] = "fifth:--scope-repository"
+
+        result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        helper_args = self.helper_log.read_text()
+        self.assertIn("--scope-repository", helper_args)
+        self.assertIn("--repo Generous-Corp/pulp", helper_args)
+
+    def test_cli_mode_rejects_any_other_fifth_resolver_argument(self) -> None:
+        for fifth in ("--permission", "contents=write", "--cache-dir", ""):
+            with self.subTest(fifth=fifth):
+                self.environment["RESOLVER_MODE"] = f"fifth:{fifth}"
+                result = self.run_wrapper("api", "repos/Generous-Corp/pulp/hooks")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("malformed JSON", result.stderr)
                 self.assertFalse(self.helper_log.exists())

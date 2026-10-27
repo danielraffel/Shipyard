@@ -62,6 +62,47 @@ git push --dry-run https://github.com/danielraffel/Shipyard.git HEAD:refs/heads/
 
 `git push --dry-run` authenticates for write without changing anything.
 
+## `shipyard pr` pushes
+
+`shipyard pr` and `shipyard ship` push with plain `git push`, so by default
+they use whatever credentials the host's git config holds (today the owner's
+SSH key). With the machine-global
+
+```toml
+[git_credential]
+shipyard_push = true
+```
+
+the push runs with `GIT_CONFIG_*` entries that rewrite `git@github.com:` to
+HTTPS, drop every inherited github.com credential helper, and use
+`shipyard auth git-credential`. That holds whatever the host's git config says.
+The pushed repository must be in `git_credential.repositories`. Repository
+pre-push hooks still run.
+
+## Every ghapp token scoped to its repository
+
+`ghapp` and Shipyard's own `gh` calls mint installation tokens that cover every
+repository the App is installed on. With the machine-global
+
+```toml
+[github.auth]
+scope_to_repository = true
+```
+
+each token covers only the repository the call is routed to (`--repo`, or the
+checkout's remote), and keeps the App's permissions there.
+- `auth helper-argv` adds `--scope-repository` to the arguments it hands
+  `ghapp`.
+- Shipyard appends it to `token_command`, so its in-memory token cache key
+  includes the scope.
+- The helper caches repository-scoped and unscoped tokens under separate keys,
+  and refuses an entry whose recorded scope differs.
+
+Organisation endpoints such as `orgs/{org}/actions/runners` and
+`runner-groups` keep working with a repository-scoped token. A call routed to
+one repository that reads or writes a different private repository gets a 404.
+Public repositories stay readable.
+
 ## Rollback
 
 Remove the helper lines (or restore the previous credential config). Removing

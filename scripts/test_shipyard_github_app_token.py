@@ -296,6 +296,127 @@ class GitHubAppTokenHelperTests(unittest.TestCase):
             self.assertEqual(cache_dir.stat().st_mode & 0o777, 0o700)
             self.assertTrue(all(entry.stat().st_mode & 0o777 == 0o600 for entry in entries))
 
+    def test_repository_and_installation_scoped_tokens_never_share_a_cache_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cache_dir = Path(temp) / "cache"
+            expires = (
+                shipyard_github_app_token.datetime.datetime.now(
+                    shipyard_github_app_token.datetime.timezone.utc
+                )
+                + shipyard_github_app_token.datetime.timedelta(minutes=30)
+            ).isoformat().replace("+00:00", "Z")
+            repo = "danielraffel/Shipyard"
+            for scope, token in (("installation", "ghs_broad"), ("repository", "ghs_narrow")):
+                shipyard_github_app_token.store_cached_token(
+                    cache_dir,
+                    "https://api.github.com",
+                    "3878000",
+                    repo,
+                    "135929628",
+                    {
+                        "token": token,
+                        "kind": "github-app-installation",
+                        "expires_at": expires,
+                        "api_url": "https://api.github.com",
+                        "app_id": "3878000",
+                        "installation_id": "135929628",
+                        "repository": repo,
+                        "scope": scope,
+                    },
+                    scope,
+                )
+
+            def load(scope: str) -> str:
+                return shipyard_github_app_token.load_cached_token(
+                    cache_dir, "https://api.github.com", "3878000", repo, None, None, scope
+                )["token"]
+
+            self.assertEqual(load("installation"), "ghs_broad")
+            self.assertEqual(load("repository"), "ghs_narrow")
+            self.assertEqual(len(list(cache_dir.glob("installation-token-*.json"))), 2)
+
+            # An entry whose recorded scope disagrees with its key is refused.
+            narrow_path = shipyard_github_app_token.cache_file(
+                cache_dir,
+                "https://api.github.com",
+                "3878000",
+                shipyard_github_app_token.cache_route(repo, None, None, "repository")[0],
+            )
+            broad_path = shipyard_github_app_token.cache_file(
+                cache_dir,
+                "https://api.github.com",
+                "3878000",
+                shipyard_github_app_token.cache_route(repo, None, None)[0],
+            )
+            narrow_path.write_bytes(broad_path.read_bytes())
+            with self.assertRaises(shipyard_github_app_token.HelperError) as ctx:
+                load("repository")
+            self.assertIn("scope", str(ctx.exception))
+
+    def test_repository_only_scope_keeps_app_permissions_and_is_cacheable(self) -> None:
+        scope = shipyard_github_app_token.token_scope("danielraffel/Shipyard", True, [])
+        self.assertEqual(scope, {"repositories": ["Shipyard"]})
+        self.assertEqual(shipyard_github_app_token.token_cache_scope(scope), "repository")
+        self.assertEqual(shipyard_github_app_token.token_cache_scope(None), "installation")
+        self.assertIsNone(
+            shipyard_github_app_token.token_cache_scope(
+                {"repositories": ["Shipyard"], "permissions": {"contents": "write"}}
+            )
+        )
+        token = {
+            "token": "ghs_test",
+            "repositories": [{"name": "Shipyard"}],
+            "permissions": {"contents": "write", "pull_requests": "write", "metadata": "read"},
+        }
+        with mock.patch.object(shipyard_github_app_token, "api_post", return_value=token) as post:
+            shipyard_github_app_token.create_installation_token(
+                "https://api.github.com", "jwt", "456", scope
+            )
+        self.assertEqual(post.call_args.args[3], {"repositories": ["Shipyard"]})
+        with mock.patch.object(
+            shipyard_github_app_token,
+            "api_post",
+            return_value={**token, "repositories": [{"name": "Shipyard"}, {"name": "pulp"}]},
+        ), self.assertRaises(shipyard_github_app_token.HelperError):
+            shipyard_github_app_token.create_installation_token(
+                "https://api.github.com", "jwt", "456", scope
+            )
+
+    def test_main_caches_a_repository_scoped_token_under_its_own_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            key_path = Path(temp) / "app.pem"
+            key_path.write_text("fake-key", encoding="utf-8")
+            if os.name != "nt":
+                key_path.chmod(0o600)
+            cache = Path(temp) / "cache"
+            argv = [
+                "shipyard-github-app-token",
+                "--app-id", "123",
+                "--private-key", str(key_path),
+                "--repo", "danielraffel/Shipyard",
+                "--scope-repository",
+                "--cache-dir", str(cache),
+            ]
+            with mock.patch("sys.argv", argv), mock.patch.object(
+                shipyard_github_app_token, "build_jwt", return_value="jwt"
+            ), mock.patch.object(
+                shipyard_github_app_token, "resolve_installation_id", return_value="456"
+            ), mock.patch.object(
+                shipyard_github_app_token, "load_cached_token", return_value=None
+            ) as load, mock.patch.object(
+                shipyard_github_app_token, "store_cached_token"
+            ) as store, mock.patch.object(
+                shipyard_github_app_token,
+                "create_installation_token",
+                return_value={"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"},
+            ), redirect_stdout(StringIO()):
+                self.assertEqual(shipyard_github_app_token.main(), 0)
+
+        self.assertEqual(load.call_args.args[0], cache)
+        self.assertEqual(load.call_args.args[6], "repository")
+        self.assertEqual(store.call_args.args[6], "repository")
+        self.assertEqual(store.call_args.args[5]["scope"], "repository")
+
     @unittest.skipIf(os.name == "nt", "POSIX symlink invariant")
     def test_disk_cache_refuses_symlink_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -784,7 +905,6 @@ class GitHubAppTokenHelperTests(unittest.TestCase):
             (None, True, ["contents=write"]),
             ("danielraffel", True, ["contents=write"]),
             ("o/r/x", True, ["contents=write"]),
-            ("o/r", True, []),
             ("o/r", True, ["contents"]),
             ("o/r", True, ["contents=admin"]),
             ("o/r", True, ["Contents=write"]),

@@ -93,6 +93,76 @@ fn rejects_empty_command_auth_config() {
     assert!(error.to_string().contains("token_command"));
 }
 
+#[test]
+fn scope_to_repository_appends_the_helper_flag_and_partitions_the_cache_key() {
+    let config = |scope: &str| {
+        config_from_toml(&format!(
+            r#"
+            [github.auth]
+            source = "command"
+            token_command = ["/bin/ghapp", "token", "--repo", "{{repo_slug}}"]
+            {scope}
+            "#
+        ))
+    };
+    let command = |config: &LoadedConfig| match GhClient::from_loaded_config(config)
+        .expect("client")
+        .auth
+        .source
+    {
+        GhAuthSource::Command { token_command, .. } => token_command,
+        other => panic!("unexpected source {other:?}"),
+    };
+    let scoped = command(&config("scope_to_repository = true"));
+    assert_eq!(
+        scoped,
+        [
+            "/bin/ghapp",
+            "token",
+            "--repo",
+            "{repo_slug}",
+            "--scope-repository"
+        ]
+    );
+    for unscoped in ["", "scope_to_repository = false"] {
+        assert_eq!(command(&config(unscoped)).len(), 4);
+    }
+
+    let slug = RepoIdentity::from_exact_slug("owner/one").expect("slug");
+    let unscoped_key =
+        token_cache_key(&command(&config("")), Path::new("/"), None, Some(&slug)).expect("key");
+    let scoped_key = token_cache_key(&scoped, Path::new("/"), None, Some(&slug)).expect("key");
+    assert_ne!(unscoped_key, scoped_key);
+}
+
+#[test]
+fn scope_to_repository_requires_a_repository_placeholder_and_a_command_source() {
+    for (contents, expected) in [
+        (
+            r#"
+            [github.auth]
+            source = "command"
+            token_command = ["/bin/ghapp", "token"]
+            scope_to_repository = true
+            "#,
+            "{repo_slug}",
+        ),
+        (
+            r#"
+            [github.auth]
+            source = "env"
+            token_env = "SHIPYARD_GITHUB_TOKEN"
+            scope_to_repository = true
+            "#,
+            "requires source",
+        ),
+    ] {
+        let error =
+            GhClient::from_loaded_config(&config_from_toml(contents)).expect_err("invalid config");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn bounded_command_preparation_times_out_token_helper() {

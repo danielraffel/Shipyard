@@ -2008,6 +2008,11 @@ and on refusal it prints `quit=1`, so git never falls through to a personal
 helper. `shipyard-github-app-token --scope-repository --permission NAME=LEVEL`
 does the mint, refuses any broader token, and never caches it. Setup, checks and
 rollback: `docs/git-credential.md`.
+Two machine-global switches extend the same scoping. `github.auth.scope_to_repository = true` makes every
+`ghapp` and Shipyard App token cover only its routed repository; organisation
+endpoints keep working, and a cross-repository private call gets a 404.
+`git_credential.shipyard_push = true` makes `shipyard pr` and `ship` push over
+HTTPS through the scoped helper, whatever the host's git credentials are.
 
 `shipyard update` reads public release metadata, so it works with no auth — but
 unauthenticated GitHub API calls are capped at 60/hr. As of v0.68.0 `update`
