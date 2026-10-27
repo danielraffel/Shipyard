@@ -92,6 +92,29 @@ pub struct ReviewerClaim {
     pub deadline_at: DateTime<Utc>,
 }
 
+impl ReviewerClaim {
+    /// Return the deterministic external identity for this handoff.
+    ///
+    /// A restarted dispatcher uses this key to reconcile an already-created
+    /// check run instead of publishing a duplicate. The key includes the
+    /// canonical repository, PR, exact head, reviewer, and claim epoch; any
+    /// ownership or head change therefore gets a new identity.
+    #[must_use]
+    pub fn receipt_id(&self, repository: &str, pr: u64) -> String {
+        let material = format!(
+            "shipyard-reviewer-claim/v1:{}:{pr}:{}:{}:{}",
+            canonical_repository(repository),
+            self.head_sha,
+            self.epoch,
+            self.reviewer,
+        );
+        format!(
+            "shipyard-reviewer-claim/v1/{:x}",
+            Sha256::digest(material.as_bytes())
+        )
+    }
+}
+
 /// Inputs for an atomic reviewer claim and external receipt publication.
 #[derive(Clone, Copy, Debug)]
 pub struct ReviewerClaimRequest<'a> {
@@ -1326,8 +1349,9 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        AbandonRecord, DispatchedRun, ReviewerClaimRequest, SHIP_STATE_SCHEMA_VERSION, ShipState,
-        ShipStateStore, compute_policy_signature, same_repository,
+        AbandonRecord, DispatchedRun, ReviewerClaim, ReviewerClaimRequest,
+        SHIP_STATE_SCHEMA_VERSION, ShipState, ShipStateStore, compute_policy_signature,
+        same_repository,
     };
     use fs2::FileExt;
 
@@ -1547,6 +1571,10 @@ mod tests {
                     assert_eq!(claim.head_sha, state.head_sha);
                     assert_eq!(claim.reviewer, "pulp-review");
                     assert!(claim.claimed_at <= now && now < claim.deadline_at);
+                    assert_eq!(
+                        claim.receipt_id(&state.repo, state.pr),
+                        claim.receipt_id(&state.repo.to_ascii_uppercase(), state.pr)
+                    );
                     Ok::<_, String>(claim.epoch)
                 },
             )
@@ -1586,6 +1614,26 @@ mod tests {
         let persisted = store.get_scoped(&state.repo, state.pr).expect("persisted");
         assert_eq!(persisted.reviewer_claim_epoch, 2);
         assert!(persisted.active_reviewer_claim.is_none());
+    }
+
+    #[test]
+    fn reviewer_receipt_id_changes_when_epoch_or_head_changes() {
+        let now = Utc::now();
+        let claim = ReviewerClaim {
+            head_sha: "head-a".to_owned(),
+            epoch: 1,
+            reviewer: "pulp-review".to_owned(),
+            claimed_at: now,
+            deadline_at: now + Duration::minutes(5),
+        };
+        let same = claim.receipt_id("Generous-Corp/Pulp", 9);
+        assert_eq!(same, claim.receipt_id("generous-corp/pulp", 9));
+        let mut next_epoch = claim.clone();
+        next_epoch.epoch = 2;
+        assert_ne!(same, next_epoch.receipt_id("generous-corp/pulp", 9));
+        let mut next_head = claim;
+        next_head.head_sha = "head-b".to_owned();
+        assert_ne!(same, next_head.receipt_id("generous-corp/pulp", 9));
     }
 
     #[test]
