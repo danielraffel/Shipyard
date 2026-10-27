@@ -51,7 +51,9 @@ pub(super) fn rollup_command<W: Write>(
         .filter(|value| !value.trim().is_empty())
         .or_else(|| gate::resolve_repo(&loaded, cwd))
         .ok_or_else(|| CliFailure::new(2, "No repo detected. Pass --repo OWNER/REPO."))?;
-    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &loaded);
+    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &loaded)
+        // Route the App token to the repository asked about, not the checkout's.
+        .with_repo_override(&repo);
     let run_gh = |args: &[String]| {
         actions
             .run_gh_with_timeout(args, GITHUB_TIMEOUT)
