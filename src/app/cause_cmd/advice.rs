@@ -120,7 +120,7 @@ pub(super) fn command<W: Write>(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-fn valid_sha(s: &str) -> bool {
+pub(super) fn valid_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 fn tokens(s: &str) -> Vec<String> {
