@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("collect_baseline", Path(__file__).with_name("collect_baseline.py"))
 MOD = importlib.util.module_from_spec(SPEC)
@@ -343,6 +344,21 @@ class CollectorInvocationTests(unittest.TestCase):
             events = MOD.import_organic(args)
             self.assertEqual(events[-1], {"source": "merge-receipt", "status": "unavailable",
                                           "reason": "producer handoff not present"})
+
+    def test_collect_deduplicates_unavailable_event_from_newer_supervisor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p",
+                "repo": "o/p", "merge_receipts": root / "missing-receipts.jsonl"})()
+            args.state.write_text("{}")
+            provider_events = [
+                {"source": "github", "imported": 1},
+                {"source": "merge-receipt", "status": "unavailable", "reason": "wrapper"},
+            ]
+            with mock.patch.object(MOD, "_import_organic_after_preflight", return_value=provider_events):
+                events = MOD.import_organic(args)
+            self.assertEqual(sum(event.get("source") == "merge-receipt" for event in events), 1)
+            self.assertEqual(events[-1]["reason"], "wrapper")
 
     def test_collect_does_not_treat_dangling_merge_receipt_link_as_absent(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -90,8 +90,13 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
             os.lstat(receipt_path)
         except FileNotFoundError:
             events = _import_organic_after_preflight(args, state_dir, None)
-            events.append({"source": "merge-receipt", "status": "unavailable",
-                           "reason": "producer handoff not present"})
+            # A newer supervisor may already record the unavailable handoff
+            # while collecting the provider rows.  Keep the older direct
+            # invocation compatible without emitting a duplicate event when
+            # both versions are combined during a staged rollout.
+            if not any(event.get("source") == "merge-receipt" for event in events):
+                events.append({"source": "merge-receipt", "status": "unavailable",
+                               "reason": "producer handoff not present"})
             return events
         except OSError as exc:
             raise RuntimeError(f"merge receipt handoff is unreadable: {exc}") from exc
