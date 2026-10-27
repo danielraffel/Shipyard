@@ -1231,24 +1231,22 @@ impl MetricsStore {
             let mut previous = None;
             let mut covered_until = window_start;
             for (time, changes) in events {
-                if let Some(start) = previous {
-                    if time > start {
-                        if let Some((_, _, _, index)) = active.iter().next_back() {
-                            let (_, _, _, _, verification, slots) = &intervals[*index];
-                            let slots: i64 = (verification == "verified")
-                                .then_some(*slots)
-                                .flatten()
-                                .filter(|slots| *slots >= 0)
-                                .unwrap_or(0);
-                            eligible_slot_seconds = eligible_slot_seconds.saturating_add(
-                                slots.saturating_mul((time - start).num_seconds().max(0)),
-                            );
-                            if start > covered_until {
-                                coverage_gap = true;
-                            }
-                            covered_until = time;
-                        }
+                if let Some(start) = previous
+                    && time > start
+                    && let Some((_, _, _, index)) = active.iter().next_back()
+                {
+                    let (_, _, _, _, verification, slots) = &intervals[*index];
+                    let slots: i64 = (verification == "verified")
+                        .then_some(*slots)
+                        .flatten()
+                        .filter(|slots| *slots >= 0)
+                        .unwrap_or(0);
+                    eligible_slot_seconds = eligible_slot_seconds
+                        .saturating_add(slots.saturating_mul((time - start).num_seconds().max(0)));
+                    if start > covered_until {
+                        coverage_gap = true;
                     }
+                    covered_until = time;
                 }
                 for (is_start, index) in changes {
                     if is_start {
