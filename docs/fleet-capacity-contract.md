@@ -46,3 +46,5 @@ receipt heads by `eligible_slot_hours`. It is unavailable without both durable
 safe merge receipts and positive measured capacity. A partial capacity
 denominator produces a partial result and an explicit upper-bound reason;
 unknown capacity is never treated as zero or silently omitted.
+The scorecard binds the numerator to safe merges on the measured protected
+`main` branch, matching the baseline collector's merge-receipt health gate.
