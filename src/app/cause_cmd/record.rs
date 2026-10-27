@@ -40,6 +40,10 @@ const COMPARE_FILE_CAP: usize = 300;
 const COMPARE_COMMIT_PAGES: usize = 10;
 /// Most pages of runs one pass lists.
 const MAX_RUN_PAGES: usize = 10;
+/// Most pages of jobs one run lists. A run with more jobs than this is
+/// treated as bounded input; the recorder never follows an unbounded API
+/// pagination chain.
+const MAX_JOB_PAGES: usize = 10;
 
 pub(super) const OWN_FILES_RULE: &str = "own_files = the union of the files of the non-merge \
     commits on fix_head's first-parent chain back to red_head (commits and parents from compare \
@@ -454,6 +458,30 @@ fn list_runs(
     Ok(runs)
 }
 
+fn list_run_jobs(
+    gh: &SyncGhReader<'_>,
+    query: &RecordQuery,
+    run_id: u64,
+) -> Result<Vec<Value>, String> {
+    let mut jobs = Vec::new();
+    for page in 1..=MAX_JOB_PAGES {
+        let data = api(
+            gh,
+            &format!(
+                "repos/{}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page={page}",
+                query.repo
+            ),
+        )?;
+        let items = data["jobs"].as_array().cloned().unwrap_or_default();
+        let full = items.len() == 100;
+        jobs.extend(items);
+        if !full {
+            break;
+        }
+    }
+    Ok(jobs)
+}
+
 /// Whether a run's jobs can hold a red: it failed, or a rerun turned it green
 /// after an earlier attempt failed (GitHub lists that run as a success).
 fn may_hold_red(run: &Value) -> bool {
@@ -498,14 +526,8 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
         };
         run_index.insert(run_id, run.clone());
         report.runs_read += 1;
-        let jobs = match api(
-            gh,
-            &format!(
-                "repos/{}/actions/runs/{run_id}/jobs?filter=all&per_page=100",
-                query.repo
-            ),
-        ) {
-            Ok(jobs) => jobs["jobs"].as_array().cloned().unwrap_or_default(),
+        let jobs = match list_run_jobs(gh, query, run_id) {
+            Ok(jobs) => jobs,
             Err(error) => {
                 report.unreadable.push(format!("run {run_id}: {error}"));
                 continue;
@@ -656,7 +678,7 @@ struct Red {
     repo: String,
     run_id: u64,
     attempt: u64,
-    job: String,
+    jobs: BTreeSet<String>,
     head_sha: String,
     time: String,
     pr: Option<u64>,
@@ -689,12 +711,15 @@ fn pending_reds(rows: &[Value], since: &str, linked: &BTreeSet<(String, u64, u64
             repo: repo.to_owned(),
             run_id,
             attempt,
-            job: row["job"].as_str().unwrap_or_default().to_owned(),
+            jobs: BTreeSet::new(),
             head_sha: head_sha.to_owned(),
             time: completed.to_owned(),
             pr: row["pr"].as_u64(),
             branch: row["head_branch"].as_str().unwrap_or_default().to_owned(),
         });
+        if let Some(job) = row["job"].as_str().filter(|job| !job.is_empty()) {
+            red.jobs.insert(job.to_owned());
+        }
         if completed > red.time.as_str() {
             completed.clone_into(&mut red.time);
         }
@@ -1096,23 +1121,19 @@ fn run_passed_job(
     red: &Red,
     fix: &Fix,
 ) -> Result<bool, String> {
-    if red.job.is_empty() || fix.run_id == 0 {
+    if red.jobs.is_empty() || fix.run_id == 0 {
         return Ok(false);
     }
-    let jobs = api(
-        gh,
-        &format!(
-            "repos/{}/actions/runs/{}/jobs?filter=all&per_page=100",
-            query.repo, fix.run_id
-        ),
-    )?;
-    Ok(jobs["jobs"].as_array().is_some_and(|jobs| {
-        jobs.iter().any(|job| {
-            job["name"].as_str() == Some(red.job.as_str())
-                && job["conclusion"].as_str() == Some("success")
-                && job["run_attempt"].as_u64() == Some(fix.attempt)
+    let jobs = list_run_jobs(gh, query, fix.run_id)?;
+    Ok(!jobs.is_empty() && {
+        red.jobs.iter().all(|failed_job| {
+            jobs.iter().any(|job| {
+                job["name"].as_str() == Some(failed_job.as_str())
+                    && job["conclusion"].as_str() == Some("success")
+                    && job["run_attempt"].as_u64() == Some(fix.attempt)
+            })
         })
-    }))
+    })
 }
 
 /// Count a red still without a fix, by how long ago it went red.
