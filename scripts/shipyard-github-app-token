@@ -720,11 +720,20 @@ def check_scoped_token(payload: dict[str, Any], scope: dict[str, Any]) -> None:
     """Refuse a token broader than the request: one repository, and no
     permission beyond those asked for plus the implicit metadata read."""
     repositories = payload.get("repositories")
-    names = (
-        [item.get("name") for item in repositories if isinstance(item, dict)]
-        if isinstance(repositories, list)
-        else None
-    )
+    names = None
+    if isinstance(repositories, list):
+        # Do not silently discard malformed entries. A response that cannot be
+        # proven to contain exactly the requested repositories must fail closed
+        # before its token is handed to a caller.
+        parsed_names: list[str] = []
+        if all(
+            isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and bool(item["name"].strip())
+            for item in repositories
+        ):
+            parsed_names = [item["name"] for item in repositories]
+            names = parsed_names
     permissions = payload.get("permissions")
     if "permissions" in scope:
         allowed = {"metadata": "read", **scope["permissions"]}

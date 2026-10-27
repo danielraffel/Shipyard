@@ -940,6 +940,8 @@ class GitHubAppTokenHelperTests(unittest.TestCase):
         for broader in (
             {**exact, "repositories": [{"name": "Shipyard"}, {"name": "pulp"}]},
             {**exact, "repositories": None},
+            {**exact, "repositories": [{"name": "Shipyard"}, {"id": 123}]},
+            {**exact, "repositories": [{"name": "Shipyard"}, "pulp"]},
             {**exact, "permissions": {"contents": "write", "administration": "write"}},
             {**exact, "permissions": {"contents": "admin"}},
         ):
