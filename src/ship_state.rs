@@ -372,7 +372,14 @@ impl ShipState {
     #[must_use]
     pub fn effective_claim_epoch(&self) -> u64 {
         if self.schema_version < SHIP_STATE_SCHEMA_VERSION {
-            self.claim_epoch.max(self.reviewer_claim_epoch)
+            match (self.claim_epoch, self.reviewer_claim_epoch) {
+                (0, reviewer_claim_epoch) => reviewer_claim_epoch,
+                (claim_epoch, 0) => claim_epoch,
+                (claim_epoch, reviewer_claim_epoch) if claim_epoch == reviewer_claim_epoch => {
+                    claim_epoch
+                }
+                _ => 0,
+            }
         } else if self.claim_epoch == self.reviewer_claim_epoch {
             self.claim_epoch
         } else {
@@ -397,6 +404,15 @@ impl ShipState {
                 "schema {} is newer than supported schema {}",
                 self.schema_version, SHIP_STATE_SCHEMA_VERSION
             )));
+        }
+        if self.schema_version < SHIP_STATE_SCHEMA_VERSION
+            && self.claim_epoch != 0
+            && self.reviewer_claim_epoch != 0
+            && self.claim_epoch != self.reviewer_claim_epoch
+        {
+            return Err(ShipStateCasError::InvalidIdentity(
+                "legacy claim epochs disagree".to_owned(),
+            ));
         }
         if self.generation == 0 {
             self.generation = 1;
@@ -590,6 +606,11 @@ impl ShipState {
     /// authority generation. Returns `false` only after the monotonic fence is
     /// exhausted, in which case callers must fail closed.
     pub fn fence_reviewer_claim(&mut self) -> bool {
+        if self.schema_version < SHIP_STATE_SCHEMA_VERSION
+            && self.migrate_identity_for_save().is_err()
+        {
+            return false;
+        }
         if !self.has_valid_cas_identity() {
             return false;
         }
@@ -2295,6 +2316,31 @@ mod tests {
         let before = exhausted.clone();
         exhausted.touch();
         assert_eq!(exhausted, before, "state-version overflow must stay fenced");
+    }
+
+    #[test]
+    fn legacy_state_migrates_before_head_adoption_fence() {
+        let mut legacy = sample_state(235, "head-a");
+        legacy.schema_version = 2;
+        legacy.generation = 0;
+        legacy.state_version = 0;
+        assert!(legacy.fence_reviewer_claim());
+        assert_eq!(legacy.schema_version, SHIP_STATE_SCHEMA_VERSION);
+        assert_eq!(legacy.generation, 2);
+        assert_eq!(legacy.state_version, 2);
+        assert_eq!(legacy.claim_epoch, 1);
+        assert_eq!(legacy.reviewer_claim_epoch, legacy.claim_epoch);
+    }
+
+    #[test]
+    fn malformed_legacy_claim_epochs_refuse_head_adoption() {
+        let mut legacy = sample_state(236, "head-a");
+        legacy.schema_version = 2;
+        legacy.claim_epoch = 1;
+        legacy.reviewer_claim_epoch = 2;
+        let before = legacy.clone();
+        assert!(!legacy.fence_reviewer_claim());
+        assert_eq!(legacy, before);
     }
 
     #[test]
