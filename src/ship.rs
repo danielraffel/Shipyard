@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use crate::capacity::{gather_configured_host_capacities, total_free};
+use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::evidence::{
     EvidenceRecord, EvidenceStore, canonical_repository, run_evidence_scope, ship_evidence_scope,
@@ -737,6 +738,20 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
     let resumed_existing_state = ship_state
         .get_locked_scoped(&request.repo, request.pr, &ship_state_lock)
         .is_some();
+    if request.adopt_head
+        && let Some(existing) =
+            ship_state.get_locked_scoped(&request.repo, request.pr, &ship_state_lock)
+        && existing.head_sha.eq_ignore_ascii_case(&request.sha)
+        && existing.base_branch != request.base_branch
+        && existing.active_reviewer_claim.is_some()
+    {
+        let actions = GitHubActions::from_loaded_config(cwd, config);
+        if let Err(error) = invalidate_adopted_reviewer_receipts(&actions, request) {
+            let execution_error = ShipExecutionError::ShipState(error);
+            cancel_refused_job(queue, &job, &execution_error)?;
+            return Err(execution_error);
+        }
+    }
     let mut state = match load_or_create_state(
         request,
         &job.target_names,
@@ -2716,6 +2731,99 @@ fn maybe_reclassify_on_host_incident(
     });
 }
 
+/// Invalidate external claim receipts before adopting a changed validation
+/// identity. A same-head base adoption fences the local epoch, but the queue
+/// guard also consumes the GitHub check-run receipt; every matching receipt
+/// must therefore be marked failed before the new state can proceed.
+fn invalidate_adopted_reviewer_receipts(
+    actions: &GitHubActions,
+    request: &ShipExecutionRequest,
+) -> Result<(), String> {
+    let raw = actions
+        .run_gh_with_timeout(
+            &[
+                "api".to_owned(),
+                "--paginate".to_owned(),
+                "--slurp".to_owned(),
+                format!(
+                    "repos/{}/commits/{}/check-runs?per_page=100",
+                    request.repo, request.sha
+                ),
+            ],
+            Duration::from_mins(1),
+        )
+        .map_err(|error| format!("read adopted reviewer claim receipts: {error}"))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("parse adopted reviewer claim receipts: {error}"))?;
+    let pages: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Array(pages) => pages.iter().collect(),
+        serde_json::Value::Object(_) => vec![&value],
+        _ => Vec::new(),
+    };
+    if pages.is_empty() {
+        return Err("adopted reviewer claim check-runs response omitted check_runs".to_owned());
+    }
+    let runs = pages
+        .into_iter()
+        .flat_map(|page| page.get("check_runs").and_then(serde_json::Value::as_array))
+        .flatten();
+    for run in runs.filter(|run| adopted_receipt_matches(run, request)) {
+        let id = run
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "adopted reviewer claim receipt has no id".to_owned())?;
+        let body = serde_json::to_string(&serde_json::json!({
+            "status": "completed",
+            "conclusion": "failure",
+            "output": {
+                "title": "Reviewer claim superseded",
+                "summary": "The validation identity was adopted; the prior reviewer claim is no longer current.",
+            }
+        }))
+        .map_err(|error| format!("serialize adopted reviewer claim invalidation: {error}"))?;
+        let mut file = tempfile::NamedTempFile::new()
+            .map_err(|error| format!("create adopted reviewer claim request: {error}"))?;
+        std::io::Write::write_all(&mut file, body.as_bytes())
+            .map_err(|error| format!("write adopted reviewer claim request: {error}"))?;
+        actions
+            .run_gh_with_timeout(
+                &[
+                    "api".to_owned(),
+                    "--method".to_owned(),
+                    "PATCH".to_owned(),
+                    format!("repos/{}/check-runs/{id}", request.repo),
+                    "--input".to_owned(),
+                    file.path().to_string_lossy().into_owned(),
+                ],
+                Duration::from_mins(1),
+            )
+            .map_err(|error| format!("invalidate adopted reviewer claim receipt: {error}"))?;
+    }
+    Ok(())
+}
+
+fn adopted_receipt_matches(run: &serde_json::Value, request: &ShipExecutionRequest) -> bool {
+    let Some(summary) = run
+        .get("output")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|output| output.get("summary"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(summary) else {
+        return false;
+    };
+    value.get("schema").and_then(serde_json::Value::as_str) == Some("shipyard-reviewer-claim/v1")
+        && value.get("repo").and_then(serde_json::Value::as_str) == Some(request.repo.as_str())
+        && value.get("pr").and_then(serde_json::Value::as_u64) == Some(request.pr)
+        && value
+            .get("head_sha")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|head| head.eq_ignore_ascii_case(&request.sha))
+        && run.get("id").and_then(serde_json::Value::as_u64).is_some()
+}
+
 fn apply_progress_event(
     job: &mut Job,
     target: &ResolvedTarget,
@@ -3251,7 +3359,7 @@ mod tests {
         CooperativeDrainOptions, QueueRequestError, QueuedExecutionOwner, RunExecutionRequest,
         RunStores, RuntimeMode, ShipExecutionError, ShipExecutionRequest, ShipStores,
         ShipTargetDispatcher, TargetExecOptions, TargetExecutionOutcome, WarmPoolUpdate,
-        apply_warm_reuse, cap_admit_pass_workers, drain_or_wait_run,
+        adopted_receipt_matches, apply_warm_reuse, cap_admit_pass_workers, drain_or_wait_run,
         drain_or_wait_run_with_options, drain_or_wait_ship_awaited_only,
         drain_or_wait_ship_with_scope, envelope_matches_foreground_job, execute_run,
         execute_run_worker, execute_ship, execute_ship_worker, execute_targets_with_options,
@@ -6266,6 +6374,54 @@ mod tests {
         );
         assert_eq!(reconciled.merge_queue_observed_at, None);
         assert_eq!(reconciled.merge_queue_enqueue_succeeded_at, None);
+    }
+
+    #[test]
+    fn adopted_receipt_matches_only_bound_claim_summaries() {
+        let request = ShipExecutionRequest {
+            pr: 42,
+            repo: "danielraffel/pulp".to_owned(),
+            sha: "a".repeat(40),
+            ..ship_request(vec![ssh_target()])
+        };
+        let summary = serde_json::json!({
+            "schema": "shipyard-reviewer-claim/v1",
+            "repo": request.repo.clone(),
+            "pr": request.pr,
+            "head_sha": request.sha.clone(),
+            "epoch": 3,
+            "reviewer": "pulp-review",
+            "claimed_at": "2026-10-27T20:00:00Z",
+            "deadline_at": "2099-10-27T21:00:00Z",
+        });
+        let valid = serde_json::json!({
+            "id": 10,
+            "output": {"summary": summary.to_string()},
+        });
+        assert!(adopted_receipt_matches(&valid, &request));
+
+        for (field, value) in [
+            ("repo", serde_json::json!("other/repo")),
+            ("pr", serde_json::json!(43)),
+            ("head_sha", serde_json::json!("b".repeat(40))),
+            ("schema", serde_json::json!("other/v1")),
+        ] {
+            let mut altered = summary.clone();
+            altered[field] = value;
+            let run = serde_json::json!({"id": 10, "output": {"summary": altered.to_string()}});
+            assert!(
+                !adopted_receipt_matches(&run, &request),
+                "{field} must bind"
+            );
+        }
+        assert!(!adopted_receipt_matches(
+            &serde_json::json!({"id": 10}),
+            &request,
+        ));
+        assert!(!adopted_receipt_matches(
+            &serde_json::json!({"id": 10, "output": {"summary": "not-json"}}),
+            &request,
+        ));
     }
 
     #[test]

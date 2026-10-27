@@ -4319,10 +4319,18 @@ class ReviewerClaimReceipt(unittest.TestCase):
             guard.parse_claim_receipt(self.run_fixture(self.receipt(), app={"slug": "other"}),
                                       "danielraffel/Shipyard", 974, self.head,
                                       "reviewer-claim", "shipyard-review")
-        with self.assertRaises(guard.GuardError):
-            guard.parse_claim_receipt(self.run_fixture(self.receipt(), conclusion="failure"),
-                                      "danielraffel/Shipyard", 974, self.head,
-                                      "reviewer-claim", "shipyard-review")
+        self.assertIsNone(guard.parse_claim_receipt(
+            self.run_fixture(self.receipt(), conclusion="failure"),
+            "danielraffel/Shipyard", 974, self.head,
+            "reviewer-claim", "shipyard-review"))
+
+    def test_parser_ignores_expired_history(self) -> None:
+        expired = self.receipt()
+        expired["claimed_at"] = "2020-10-27T20:00:00Z"
+        expired["deadline_at"] = "2020-10-27T21:00:00Z"
+        self.assertIsNone(guard.parse_claim_receipt(
+            self.run_fixture(expired), "danielraffel/Shipyard", 974,
+            self.head, "reviewer-claim", "shipyard-review"))
 
     def test_consumers_require_one_receipt_and_deciding_reviewer(self) -> None:
         policy = {"claim_receipt": "reviewer-claim", "claim_app": "shipyard-review"}
@@ -4346,6 +4354,18 @@ class ReviewerClaimReceipt(unittest.TestCase):
             with self.assertRaises(guard.GuardError):
                 guard.reviewer_claim_receipt(
                     "danielraffel/Shipyard", 974, self.head, policy, approval)
+
+    def test_latest_failed_receipt_supersedes_older_success(self) -> None:
+        policy = {"claim_receipt": "reviewer-claim", "claim_app": "shipyard-review"}
+        listing = [{"total_count": 2, "check_runs": [
+            self.run_fixture(self.receipt(), id=10),
+            self.run_fixture(self.receipt(), id=11, conclusion="failure"),
+        ]}]
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head,
+                    policy, {"signer": "pulp-review"})
 
     def test_consumers_reject_partial_pages(self) -> None:
         policy = {"claim_receipt": "reviewer-claim", "claim_app": "shipyard-review"}

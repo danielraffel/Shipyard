@@ -2027,6 +2027,16 @@ if [[ "$ghapp_stamp_check" == 1 ]]; then
 fi
 unset ghapp_stamp_check
 
+# When the protected base enables durable reviewer claims, a verdict must be
+# published only by the reviewer that currently owns the exact-head claim.
+# This runs after the stamper has rewritten the body and before native gh sees
+# it. The guard is optional for older installations; `shipyard guards install`
+# installs the exact copy bundled with this release.
+if [[ -x "$guards/reviewer-claim-guard" ]]; then
+    PATH="$trusted_path" SHIPYARD_GHAPP_SHIPYARD_BINARY="$shipyard_binary" \
+        "$guards/reviewer-claim-guard" "$@" || exit 1
+fi
+
 if [[ "${1:-}" == "release" && "${2:-}" == "upload" && \
       -n "${release_upload_stage_dir:-}" ]]; then
     release_upload_args=(release upload "$release_upload_canonical_tag" \

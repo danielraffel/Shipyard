@@ -66,6 +66,7 @@ mod rescue_cmd;
 mod reuse_cmd;
 mod reuse_rederive;
 mod review_verdict_cmd;
+mod reviewer_claim_cmd;
 mod rollup_cmd;
 mod run_cmd;
 mod runner_cmd;
@@ -570,6 +571,16 @@ where
                 stdout,
             );
         }
+        Command::ReviewerClaim { command } => {
+            return reviewer_claim_cmd::reviewer_claim_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                cli.json,
+                stdout,
+            );
+        }
         Command::Who { pr, repo } => {
             return who_cmd::who_command(
                 cli.mode.into(),
@@ -941,6 +952,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Landing { .. }
         | Command::Inspect { .. }
         | Command::ReviewVerdict { .. }
+        | Command::ReviewerClaim { .. }
         | Command::Rollup { .. }
         | Command::Who { .. }
         | Command::BaseHealth { .. }

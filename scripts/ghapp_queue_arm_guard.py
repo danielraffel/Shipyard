@@ -2150,8 +2150,11 @@ def parse_claim_receipt(
         return None
     if not _claim_receipt_app_matches(run, app):
         raise GuardError(f"claim receipt `{context}` was produced by an unexpected GitHub App")
+    # Failed, cancelled, queued and in-progress rows are historical or
+    # revoked receipts. They do not certify the head; a current success is
+    # selected below, while malformed successful rows still fail closed.
     if run.get("status") != "completed" or run.get("conclusion") != "success":
-        raise GuardError(f"claim receipt `{context}` is not a completed success")
+        return None
     output = run.get("output")
     summary = output.get("summary") if isinstance(output, dict) else None
     if not isinstance(summary, str) or not summary.strip():
@@ -2189,8 +2192,12 @@ def parse_claim_receipt(
         raise GuardError(f"claim receipt `{context}` is future-dated")
     if deadline <= claimed:
         raise GuardError(f"claim receipt `{context}` has a non-forward deadline")
+    # Expired receipts are normal history after a reviewer handoff. They do
+    # not certify the head, but they must not poison a later valid receipt for
+    # the same check name; malformed, future-dated and wrong-identity rows
+    # still fail closed above.
     if deadline <= now:
-        raise GuardError(f"claim receipt `{context}` has expired")
+        return None
     return value
 
 
@@ -2205,7 +2212,18 @@ def reviewer_claim_receipt(
     if not isinstance(context, str) or not context or app is None:
         raise GuardError("reviewer claim receipt policy is incomplete")
     listed = _check_runs(repo, head, run_real_gh)
-    matches = [parse_claim_receipt(run, repo, pr, head, context, app) for run in listed]
+    candidates = [run for run in listed if run.get("name") == context]
+    # A newer check-run with the same protected name is the revocation or
+    # replacement record for its older success. Real GitHub rows always carry
+    # numeric ids; fixtures and older API shims may not, so retain the strict
+    # exactly-one behavior when no ids are available.
+    run_ids = [run.get("id") for run in candidates]
+    if candidates and all(isinstance(run_id, int) for run_id in run_ids):
+        latest = max(candidates, key=lambda run: run["id"])
+        matches = [parse_claim_receipt(latest, repo, pr, head, context, app)]
+    else:
+        matches = [parse_claim_receipt(run, repo, pr, head, context, app)
+                   for run in candidates]
     receipts = [receipt for receipt in matches if receipt is not None]
     if len(receipts) != 1:
         raise GuardError(f"expected exactly one valid reviewer claim receipt `{context}` on {head[:12]}")

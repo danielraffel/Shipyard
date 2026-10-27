@@ -4200,3 +4200,11 @@ heartbeat timeout or explicit revocation, the standby lane receives a new epoch
 and the old reviewer cannot make its late verdict count. Agents should use the
 repository's configured handoff and native merge mechanism and must not wake or
 wait on an interactive team-lead tab.
+
+Acquire a claim with `shipyard reviewer-claim acquire --pr N --repo OWNER/REPO
+--head SHA --reviewer NAME`. This persists the claim before publishing the
+`shipyard-reviewer-claim/v1` check-run receipt. When the protected base enables
+`[auto_merge] reviewer_claim_receipt` and `reviewer_claim_app`, the managed
+`reviewer-claim-guard` calls `shipyard reviewer-claim validate` immediately
+before a verdict write; expired, revoked, replaced, legacy, or wrong-head state
+is refused. Use `shipyard reviewer-claim revoke` for an explicit release.

@@ -498,6 +498,14 @@ pub(super) enum Command {
         #[arg(long)]
         no_rebase_carry: bool,
     },
+    /// Acquire, validate, or revoke a durable reviewer claim for one exact
+    /// pull-request head. Claim acquisition publishes the configured
+    /// `shipyard-reviewer-claim/v1` check-run receipt through the App client.
+    ReviewerClaim {
+        /// Reviewer claim operation.
+        #[command(subcommand)]
+        command: ReviewerClaimCommand,
+    },
     /// Land several approved pull requests as one tested merge: a rollup.
     ///
     /// Off unless the base's `.shipyard/config.toml` sets `[train]
@@ -975,6 +983,68 @@ pub(super) enum Command {
         /// Runner subcommand.
         #[command(subcommand)]
         command: RunnerCommand,
+    },
+}
+
+/// Durable reviewer claim operations.
+#[derive(Clone, Debug, Subcommand)]
+pub(super) enum ReviewerClaimCommand {
+    /// Claim the exact current head and publish its receipt.
+    Acquire {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the origin remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Exact 40-character pull-request head.
+        #[arg(long)]
+        head: String,
+        /// Stable reviewer identity. This must match the later verdict signer.
+        #[arg(long)]
+        reviewer: String,
+        /// Claim lifetime in seconds.
+        #[arg(long, default_value_t = 1800)]
+        deadline_seconds: i64,
+        /// Protected check-run name configured by `[auto_merge]`.
+        #[arg(long, default_value = "shipyard-reviewer-claim")]
+        check_name: String,
+    },
+    /// Check whether a reviewer may publish a verdict now.
+    Validate {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the origin remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Exact 40-character pull-request head.
+        #[arg(long)]
+        head: String,
+        /// Stable reviewer identity.
+        #[arg(long)]
+        reviewer: String,
+    },
+    /// Explicitly revoke a current reviewer claim.
+    Revoke {
+        /// Pull request number.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the origin remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Exact 40-character pull-request head.
+        #[arg(long)]
+        head: String,
+        /// Claim epoch returned by `acquire`.
+        #[arg(long)]
+        epoch: u64,
+        /// Stable reviewer identity.
+        #[arg(long)]
+        reviewer: String,
+        /// Protected check-run name to invalidate with the claim.
+        #[arg(long, default_value = "shipyard-reviewer-claim")]
+        check_name: String,
     },
 }
 
