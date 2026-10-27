@@ -274,7 +274,7 @@ pub(super) fn metrics_command<W: Write>(
                 format!("recorded job {job_id}")
             })?;
         }
-        MetricsCommand::Import { source } => match source {
+        MetricsCommand::Import { source } => match *source {
             MetricsImportCommand::Tartci(args) => {
                 let imported = import_tartci(&store, &args)?;
                 let output = MetricsImportOutput {
@@ -1203,9 +1203,9 @@ mod tests {
             let mut out = Vec::new();
             metrics_command(
                 MetricsCommand::Import {
-                    source: MetricsImportCommand::MergeReceipt(MetricsImportMergeReceiptArgs {
-                        file,
-                    }),
+                    source: Box::new(MetricsImportCommand::MergeReceipt(
+                        MetricsImportMergeReceiptArgs { file },
+                    )),
                 },
                 temp.path(),
                 None,
@@ -1312,7 +1312,7 @@ mod tests {
         let mut output = Vec::new();
         let result = metrics_command(
             MetricsCommand::Import {
-                source: MetricsImportCommand::GithubMergeReceipt(
+                source: Box::new(MetricsImportCommand::GithubMergeReceipt(Box::new(
                     MetricsImportGithubMergeReceiptArgs {
                         repo: "owner/repo".to_owned(),
                         project: "repo".to_owned(),
@@ -1328,7 +1328,7 @@ mod tests {
                         collector_sha256: "1".repeat(64),
                         required_checks: vec!["macos".to_owned()],
                     },
-                ),
+                ))),
             },
             temp.path(),
             None,

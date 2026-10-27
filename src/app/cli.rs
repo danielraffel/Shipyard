@@ -1265,7 +1265,7 @@ pub(crate) enum MetricsCommand {
     Import {
         /// Import source.
         #[command(subcommand)]
-        source: MetricsImportCommand,
+        source: Box<MetricsImportCommand>,
     },
     /// Export producer-bound records for an explicit handoff.
     Export {
@@ -2022,7 +2022,7 @@ pub(crate) enum MetricsImportCommand {
     /// Import producer-self-asserted, format-validated protected-branch merge receipts (JSON/JSONL).
     MergeReceipt(MetricsImportMergeReceiptArgs),
     /// Reconcile one Pulp merge-group artifact with complete GitHub snapshots and import its receipt.
-    GithubMergeReceipt(MetricsImportGithubMergeReceiptArgs),
+    GithubMergeReceipt(Box<MetricsImportGithubMergeReceiptArgs>),
 }
 
 #[derive(Debug, Subcommand)]
