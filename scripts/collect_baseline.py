@@ -548,9 +548,17 @@ def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
 def force_receipt_metrics_unavailable(card: dict[str, Any], reason: str) -> None:
     """Prevent stale local receipts from becoming a current denominator."""
     unavailable = {"status": "unavailable", "value": None, "reason": reason}
-    card["safely_merged_changes"] = dict(unavailable)
-    card["collector_safe_merge_denominator"] = dict(unavailable)
-    card["wasted_compute_per_safely_merged_change"] = dict(unavailable)
+    for key in (
+        "safely_merged_changes",
+        "collector_safe_merge_denominator",
+        "wasted_compute_per_safely_merged_change",
+        # Added by the fleet-capacity/safe-merge-rate slice. Keep this
+        # compatibility mask conditional so the baseline gate remains
+        # wire-compatible while that slice is still stacked separately.
+        "safely_merged_changes_per_eligible_slot_hour",
+    ):
+        if key in card:
+            card[key] = dict(unavailable)
 
 
 def baseline_readiness(card: dict[str, Any], started: dt.datetime,
