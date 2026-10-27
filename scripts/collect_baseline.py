@@ -834,12 +834,14 @@ def main() -> int:
                 print(f"prospective pass history unavailable: {history_error}", file=sys.stderr)
         print(f"baseline collection failed: {exc}", file=sys.stderr)
         return 1
+    gate_exit = readiness_gate_exit(state.get("baseline_readiness", {}), args.require_ready)
     output = {"project": args.project, "database": "configured metrics store", "scorecard": card,
               "baseline": {"source_activity_days_observed": state["source_activity_days_observed"],
                            "collection_days_observed": state.get("collection_days_observed", 0),
                            "readiness": state.get("baseline_readiness", {"status": "unavailable"}),
                            "exit": state["baseline_exit"],
-                           "required": args.require_ready}, "events": events}
+                           "required": args.require_ready,
+                           "gate_exit": gate_exit}, "events": events}
     if args.status_markdown:
         args.status_markdown.write_text(
             "# Organic baseline status\n\n"
@@ -855,7 +857,7 @@ def main() -> int:
             "Synthetic provenance, unavailable phases, and merge denominators are not imputed.\n"
         )
     print(json.dumps(output, indent=2, sort_keys=True))
-    return readiness_gate_exit(state.get("baseline_readiness", {}), args.require_ready)
+    return gate_exit
 
 
 if __name__ == "__main__":

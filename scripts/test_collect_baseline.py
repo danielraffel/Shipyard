@@ -1,10 +1,14 @@
+import contextlib
 import datetime as dt
 import importlib.util
+import io
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("collect_baseline", Path(__file__).with_name("collect_baseline.py"))
 MOD = importlib.util.module_from_spec(SPEC)
@@ -287,6 +291,38 @@ class BaselineScorecardTests(unittest.TestCase):
 
 
 class CollectorInvocationTests(unittest.TestCase):
+    def test_require_ready_writes_state_and_status_before_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = root / "metrics" / "metrics.db"
+            state = root / "state.json"
+            status = root / "status.md"
+            argv = ["collect_baseline.py", "--db", str(db), "--project", "pulp",
+                    "--repo", "owner/pulp", "--state", str(state),
+                    "--status-markdown", str(status), "--require-ready"]
+            card = {"strata": {}}
+            output = io.StringIO()
+            with mock.patch.object(MOD, "authoritative_scorecard", return_value=card), \
+                    mock.patch.object(sys, "argv", argv), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(MOD.main(), 3)
+            self.assertTrue(state.exists())
+            self.assertTrue(status.exists())
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["baseline"]["required"])
+            self.assertEqual(payload["baseline"]["gate_exit"], 3)
+            self.assertFalse(payload["baseline"]["exit"])
+
+            output = io.StringIO()
+            argv = [item for item in argv if item != "--require-ready"]
+            with mock.patch.object(MOD, "authoritative_scorecard", return_value=card), \
+                    mock.patch.object(sys, "argv", argv), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(MOD.main(), 0)
+            payload = json.loads(output.getvalue())
+            self.assertFalse(payload["baseline"]["required"])
+            self.assertEqual(payload["baseline"]["gate_exit"], 0)
+
     def test_project_repo_scope_requires_owner_and_matching_short_name(self):
         for project, repo in [("pulp", "pulp"), ("pulp", "/pulp"), ("pulp", "a/b/pulp"), ("other", "o/pulp")]:
             with self.assertRaises(ValueError):
