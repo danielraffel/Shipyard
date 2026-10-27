@@ -1681,6 +1681,12 @@ Repositories that require signed bot commits should set
 `release.post_tag_hook.ssh_signing_setup_script` to a safe repository-relative
 helper path. Hook installation then regenerates the required secret-backed SSH
 signing step instead of relying on edits to the owned workflow.
+Repositories that keep release secrets in a GitHub environment limited to
+`main` and release tags set `release.post_tag_hook.environment` (letters,
+digits, `.`, `_`, `-`); hook installation puts the generated job in that
+environment with `deployment: false`. `release-bot status` and `doctor` find
+`RELEASE_BOT_TOKEN` in an environment when there is no repository secret, and
+`status --json` reports it as `secret_environment`.
 
 ## Unconsumed terminal verdicts (`shipyard verdicts`)
 

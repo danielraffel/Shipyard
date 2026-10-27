@@ -45,6 +45,9 @@ trailers = [
 ]
 only_for_tag_pattern = "v*"
 max_push_attempts    = 5
+# The job reads RELEASE_BOT_TOKEN from this environment, which only main and
+# v* tags may use.
+environment          = "release"
 # Shipyard dogfoods its hook while the triggering release is still a draft,
 # so it builds the CLI from the tagged checkout instead of racing the new
 # tag's assets or trusting whatever release is `latest`. Only this repository

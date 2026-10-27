@@ -61,6 +61,8 @@ Run `shipyard doctor` to check whether the secret is configured. If it shows `RE
 
    Or via the web UI: github.com/<owner>/<repo>/settings/secrets/actions → **New repository secret** → name `RELEASE_BOT_TOKEN`, paste value.
 
+   **Shipyard's own repository keeps release secrets in the `release` environment, not as repository secrets.** A repository secret is readable by a workflow on any branch, including one an agent pushes. The `release` environment admits only `main` and `v*` tags (Settings → Environments → release → Deployment branches and tags), and every job that needs `RELEASE_BOT_TOKEN` or the macOS signing secrets names it with `environment: { name: release, deployment: false }`. Store the token there with `gh secret set RELEASE_BOT_TOKEN --env release --repo <owner>/<repo>`. A `v*` tag ruleset keeps arbitrary tags from reaching the environment. Consumer repositories can do the same and set `release.post_tag_hook.environment = "release"` so the generated post-tag workflow follows. `shipyard doctor` and `shipyard release-bot status` find the token in either place.
+
 **If auto-release is failing with `fatal: could not read Username`,** there are two independent causes to check:
 
 1. **PAT scope:** edit the existing token at https://github.com/settings/personal-access-tokens → add the failing repo to **Selected repositories** → **Update**. No secret re-set needed; the stored value stays valid.

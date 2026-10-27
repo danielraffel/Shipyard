@@ -120,6 +120,8 @@ struct ReleaseBotState {
     repo_slug: String,
     secret_present: bool,
     secret_updated_at: Option<DateTime<Utc>>,
+    // The GitHub environment holding the secret, when it is not a repository secret.
+    secret_environment: Option<String>,
     last_auto_release_conclusion: Option<String>,
     last_auto_release_error_signature: Option<String>,
     other_repos_with_secret: Vec<String>,
@@ -130,23 +132,19 @@ fn detect_state(
     siblings: &[String],
     gh_command: Option<&Path>,
 ) -> ReleaseBotState {
-    let secrets = list_secrets(repo_slug, gh_command);
-    let (secret_present, secret_updated_at) = secrets
-        .as_ref()
-        .and_then(|items| {
-            items.iter().find(|secret| {
-                secret.get("name").and_then(Value::as_str) == Some("RELEASE_BOT_TOKEN")
-            })
-        })
-        .map_or((false, None), |secret| {
-            (
-                true,
-                secret
-                    .get("updated_at")
-                    .and_then(Value::as_str)
-                    .and_then(parse_time),
-            )
-        });
+    let (secret_present, secret_updated_at, secret_environment) = find_release_bot_secret(
+        repo_slug, gh_command,
+    )
+    .map_or((false, None, None), |(secret, environment)| {
+        (
+            true,
+            secret
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .and_then(parse_time),
+            environment,
+        )
+    });
     let last_run = last_workflow_run(repo_slug, "auto-release.yml", gh_command);
     let last_auto_release_conclusion = last_run
         .as_ref()
@@ -181,6 +179,7 @@ fn detect_state(
         repo_slug: repo_slug.to_owned(),
         secret_present,
         secret_updated_at,
+        secret_environment,
         last_auto_release_conclusion,
         last_auto_release_error_signature,
         other_repos_with_secret,
@@ -204,6 +203,10 @@ fn render_status<W: Write>(
             state
                 .secret_updated_at
                 .map_or(Value::Null, |time| Value::from(time.to_rfc3339())),
+        );
+        data.insert(
+            "secret_environment".to_owned(),
+            optional_string(state.secret_environment.as_deref()),
         );
         data.insert(
             "last_auto_release_conclusion".to_owned(),
@@ -372,6 +375,12 @@ fn hook_install<W: Write>(
         .map(validate_workflow_script_path)
         .transpose()
         .map_err(|error| CliFailure::new(1, error))?;
+    let environment = hook_config
+        .environment
+        .as_deref()
+        .map(validate_workflow_environment)
+        .transpose()
+        .map_err(|error| CliFailure::new(1, error))?;
     let trusted_config = LoadedConfig::load_machine_global_from_dir(config.global_dir.clone())
         .map_err(|error| {
             CliFailure::new(
@@ -397,7 +406,13 @@ fn hook_install<W: Write>(
     };
     fs::write(
         &target,
-        render_workflow(tag_pattern, shipyard_version, &runner, signing_setup_script),
+        render_workflow(
+            tag_pattern,
+            shipyard_version,
+            &runner,
+            signing_setup_script,
+            environment,
+        ),
     )
     .map_err(|error| {
         CliFailure::new(1, format!("failed to write {}: {error}", target.display()))
@@ -577,7 +592,12 @@ fn describe_state(state: &ReleaseBotState) -> Vec<String> {
             || String::from("unknown"),
             |time| time.format("%Y-%m-%d").to_string(),
         );
-        lines.push(format!("RELEASE_BOT_TOKEN: configured (set {when})"));
+        match &state.secret_environment {
+            Some(environment) => lines.push(format!(
+                "RELEASE_BOT_TOKEN: configured in environment `{environment}` (set {when})"
+            )),
+            None => lines.push(format!("RELEASE_BOT_TOKEN: configured (set {when})")),
+        }
     } else {
         lines.push(String::from("RELEASE_BOT_TOKEN: missing"));
     }
@@ -663,6 +683,20 @@ fn validate_workflow_script_path(path: &str) -> Result<&str, String> {
     Ok(path)
 }
 
+fn validate_workflow_environment(name: &str) -> Result<&str, String> {
+    let valid = !name.is_empty()
+        && name.len() <= 255
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
+    if !valid {
+        return Err(format!(
+            "release.post_tag_hook.environment must be a GitHub environment name of letters, digits, `.`, `_` or `-`, got {name:?}"
+        ));
+    }
+    Ok(name)
+}
+
 fn validate_workflow_shipyard_version(value: &str) -> Result<&str, String> {
     let stable = value.strip_prefix('v').unwrap_or(value);
     let mut components = stable.split('.');
@@ -714,12 +748,27 @@ fn ensure_checkout_builds_shipyard(cwd: &Path) -> Result<(), String> {
     }
 }
 
+// A GitHub environment limited to the release refs keeps the push token
+// out of reach of workflows on any other branch.
+fn environment_block(name: &str) -> String {
+    format!(
+        r"    # Release secrets live in the `{name}` environment, which only main and
+    # release tags can use.
+    environment:
+      name: {name}
+      deployment: false
+"
+    )
+}
+
 fn render_workflow(
     tag_pattern: &str,
     shipyard_version: &str,
     runner: &str,
     ssh_signing_setup_script: Option<&str>,
+    environment: Option<&str>,
 ) -> String {
+    let environment = environment.map_or_else(String::new, environment_block);
     let signing_setup = ssh_signing_setup_script.map_or_else(String::new, |script| {
         format!(
             r"      - name: Configure release bot SSH signing
@@ -797,7 +846,7 @@ jobs:
   sync:
     name: Regenerate docs for ${{{{ github.ref_name }}}}
     runs-on: {runner}
-    steps:
+{environment}    steps:
       - name: Checkout release tag with full history
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -840,6 +889,8 @@ struct HookConfig {
     remote: String,
     branch: String,
     ssh_signing_setup_script: Option<String>,
+    // GitHub environment that holds the release secrets for the workflow job.
+    environment: Option<String>,
     workflow_shipyard_version: Result<Option<String>, String>,
     // How the bot commit lands on `branch`:
     //   "direct" (default) — push --ff-only straight to `branch` (today's
@@ -867,6 +918,7 @@ impl Default for HookConfig {
             remote: String::from("origin"),
             branch: String::from("main"),
             ssh_signing_setup_script: None,
+            environment: None,
             workflow_shipyard_version: Ok(None),
             push_mode: String::from("direct"),
             pr_branch_prefix: String::from("release/post-tag-sync"),
@@ -927,6 +979,10 @@ fn load_hook_config(config: &LoadedConfig) -> HookConfig {
             .to_owned(),
         ssh_signing_setup_script: section
             .get("ssh_signing_setup_script")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned),
+        environment: section
+            .get("environment")
             .and_then(toml::Value::as_str)
             .map(str::to_owned),
         workflow_shipyard_version: match section.get("workflow_shipyard_version") {
@@ -1656,6 +1712,65 @@ fn list_secrets(repo_slug: &str, gh_command: Option<&Path>) -> Option<Vec<Value>
     data.get("secrets")?.as_array().cloned()
 }
 
+// A repository secret wins; otherwise the first environment that holds the
+// token (release workflows read it from a `main`-only environment).
+fn find_release_bot_secret(
+    repo_slug: &str,
+    gh_command: Option<&Path>,
+) -> Option<(Value, Option<String>)> {
+    let is_token =
+        |secret: &Value| secret.get("name").and_then(Value::as_str) == Some("RELEASE_BOT_TOKEN");
+    if let Some(secret) = list_secrets(repo_slug, gh_command)
+        .and_then(|items| items.into_iter().find(|secret| is_token(secret)))
+    {
+        return Some((secret, None));
+    }
+    list_environments(repo_slug, gh_command)
+        .into_iter()
+        .find_map(|environment| {
+            list_environment_secrets(repo_slug, &environment, gh_command)
+                .and_then(|items| items.into_iter().find(|secret| is_token(secret)))
+                .map(|secret| (secret, Some(environment)))
+        })
+}
+
+fn list_environments(repo_slug: &str, gh_command: Option<&Path>) -> Vec<String> {
+    let Some(data) = gh_api_json(&format!("repos/{repo_slug}/environments"), gh_command) else {
+        return Vec::new();
+    };
+    data.get("environments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|environment| environment.get("name").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn list_environment_secrets(
+    repo_slug: &str,
+    environment: &str,
+    gh_command: Option<&Path>,
+) -> Option<Vec<Value>> {
+    let data = gh_api_json(
+        &format!(
+            "repos/{repo_slug}/environments/{}/secrets",
+            // Path segment: spaces as %20, not the query-string `+`.
+            url_component(environment).replace('+', "%20")
+        ),
+        gh_command,
+    )?;
+    data.get("secrets")?.as_array().cloned()
+}
+
+fn gh_api_json(endpoint: &str, gh_command: Option<&Path>) -> Option<Value> {
+    let output = gh(gh_command).args(["api", endpoint]).output().ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    serde_json::from_slice::<Value>(&output.stdout).ok()
+}
+
 fn last_workflow_run(repo_slug: &str, workflow: &str, gh_command: Option<&Path>) -> Option<Value> {
     let output = gh(gh_command)
         .args([
@@ -2122,6 +2237,14 @@ fn main() {
         "{\"secrets\":[{\"name\":\"RELEASE_BOT_TOKEN\",\"updated_at\":\"2026-04-25T09:30:00Z\"}]}\n"
     } else if args.starts_with("api repos/owner/other/actions/secrets") {
         "{\"secrets\":[{\"name\":\"RELEASE_BOT_TOKEN\",\"updated_at\":\"2026-04-25T08:00:00Z\"}]}\n"
+    } else if args.starts_with("api repos/owner/envrepo/actions/secrets") {
+        "{\"secrets\":[]}\n"
+    } else if args.starts_with("api repos/owner/envrepo/environments/github-pages/secrets") {
+        "{\"secrets\":[]}\n"
+    } else if args.starts_with("api repos/owner/envrepo/environments/release/secrets") {
+        "{\"secrets\":[{\"name\":\"RELEASE_BOT_TOKEN\",\"updated_at\":\"2026-10-26T09:00:00Z\"}]}\n"
+    } else if args.starts_with("api repos/owner/envrepo/environments") {
+        "{\"environments\":[{\"name\":\"github-pages\"},{\"name\":\"release\"}]}\n"
     } else if args.starts_with("run list --workflow auto-release.yml --repo owner/repo") {
         "[{\"databaseId\":123,\"status\":\"completed\",\"conclusion\":\"failure\",\"createdAt\":\"2026-04-25T10:00:00Z\"}]\n"
     } else if args.starts_with("run view 123 --repo owner/repo --log-failed") {
@@ -2158,6 +2281,7 @@ fn main() {
             repo_slug: String::from("owner/repo"),
             secret_present: true,
             secret_updated_at: Some(Utc.with_ymd_and_hms(2026, 4, 25, 9, 30, 0).unwrap()),
+            secret_environment: None,
             last_auto_release_conclusion: Some(String::from("failure")),
             last_auto_release_error_signature: Some(String::from("auth")),
             other_repos_with_secret: vec![String::from("owner/other")],
@@ -2182,6 +2306,7 @@ fn main() {
             repo_slug: String::from("owner/repo"),
             secret_present: true,
             secret_updated_at: None,
+            secret_environment: None,
             last_auto_release_conclusion: Some(String::from("failure")),
             last_auto_release_error_signature: Some(String::from("auth")),
             other_repos_with_secret: Vec::new(),
@@ -2391,13 +2516,14 @@ workflow_shipyard_version = "latest"
                 configured,
                 "ubuntu-latest",
                 hook.ssh_signing_setup_script.as_deref(),
+                hook.environment.as_deref(),
             )
         );
     }
 
     #[test]
     fn render_workflow_uses_release_bot_token_fallback() {
-        let workflow = render_workflow("v*", "v0.51.0", "ubuntu-latest", None);
+        let workflow = render_workflow("v*", "v0.51.0", "ubuntu-latest", None, None);
 
         assert!(workflow.contains("secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN"));
         assert!(workflow.contains(r#"SHIPYARD_VERSION: "v0.51.0""#));
@@ -2415,7 +2541,7 @@ workflow_shipyard_version = "latest"
     #[test]
     fn render_workflow_scopes_the_push_token_to_the_sync_step() {
         for version in ["v0.51.0", "0.51.0", "latest", CHECKOUT_SHIPYARD_VERSION] {
-            let workflow = render_workflow("v*", version, "ubuntu-latest", None);
+            let workflow = render_workflow("v*", version, "ubuntu-latest", None, None);
             assert!(!workflow.contains("generouscorp.com"), "{version}");
             assert!(!workflow.contains("persist-credentials: true"), "{version}");
             assert!(workflow.contains("persist-credentials: false"), "{version}");
@@ -2453,7 +2579,7 @@ workflow_shipyard_version = "latest"
             ("0.51.0", "Shipyard/v0.51.0/install.sh"),
             ("latest", "Shipyard/main/install.sh"),
         ] {
-            let workflow = render_workflow("v*", version, "ubuntu-latest", None);
+            let workflow = render_workflow("v*", version, "ubuntu-latest", None, None);
             assert!(
                 workflow.contains(&format!(
                     "curl -fsSL \"https://raw.githubusercontent.com/danielraffel/{installer}\""
@@ -2467,7 +2593,8 @@ workflow_shipyard_version = "latest"
 
     #[test]
     fn render_workflow_checkout_builds_the_release_tag_itself() {
-        let workflow = render_workflow("v*", CHECKOUT_SHIPYARD_VERSION, "ubuntu-latest", None);
+        let workflow =
+            render_workflow("v*", CHECKOUT_SHIPYARD_VERSION, "ubuntu-latest", None, None);
         assert!(workflow.contains(r#"SHIPYARD_VERSION: "${{ github.ref_name }}""#));
         assert!(workflow.contains("cargo build --release --locked --bin shipyard"));
         assert!(workflow.contains("ref: ${{ github.ref }}"));
@@ -2539,11 +2666,39 @@ workflow_shipyard_version = "latest"
     }
 
     #[test]
+    fn render_workflow_puts_the_job_in_the_configured_environment() {
+        let workflow = render_workflow("v*", "v0.52.0", "ubuntu-latest", None, Some("release"));
+        let runs_on = workflow
+            .find("    runs-on: ubuntu-latest\n")
+            .expect("runs-on");
+        let environment = workflow
+            .find("    environment:\n      name: release\n      deployment: false\n")
+            .expect("environment block");
+        let steps = workflow.find("    steps:\n").expect("steps");
+        assert!(runs_on < environment && environment < steps);
+
+        let without = render_workflow("v*", "v0.52.0", "ubuntu-latest", None, None);
+        assert!(!without.contains("environment:"));
+    }
+
+    #[test]
+    fn workflow_environment_names_are_validated() {
+        assert_eq!(validate_workflow_environment("release"), Ok("release"));
+        assert_eq!(
+            validate_workflow_environment("release-v2.1_x"),
+            Ok("release-v2.1_x")
+        );
+        for bad in ["", "rel ease", "release\n    steps:", "a:b", "${{ x }}"] {
+            assert!(validate_workflow_environment(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn render_workflow_configures_repository_ssh_signing() {
         let script =
             validate_workflow_script_path("tools/scripts/configure_release_bot_ssh_signing.sh")
                 .expect("safe script path");
-        let workflow = render_workflow("v*", "v0.52.0", "ubuntu-latest", Some(script));
+        let workflow = render_workflow("v*", "v0.52.0", "ubuntu-latest", Some(script), None);
 
         assert!(workflow.contains("name: Configure release bot SSH signing"));
         assert!(
@@ -2630,6 +2785,7 @@ max_push_attempts = 2
 remote = "upstream"
 branch = "stable"
 ssh_signing_setup_script = "tools/configure-signing.sh"
+environment = "release"
 workflow_shipyard_version = "latest"
 
 [release.post_tag_hook.bot_identity]
@@ -2661,6 +2817,7 @@ email = "bot@example.com"
             parsed.ssh_signing_setup_script.as_deref(),
             Some("tools/configure-signing.sh")
         );
+        assert_eq!(parsed.environment.as_deref(), Some("release"));
         assert_eq!(
             parsed
                 .workflow_shipyard_version
@@ -2995,6 +3152,36 @@ enabled = true
 
     #[cfg(unix)]
     #[test]
+    fn detect_state_finds_the_token_in_a_release_environment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = fake_gh(temp.path());
+
+        let state = detect_state("owner/envrepo", &[], Some(&gh));
+
+        assert!(state.secret_present);
+        assert_eq!(state.secret_environment.as_deref(), Some("release"));
+        assert_eq!(
+            state.secret_updated_at.expect("updated").to_rfc3339(),
+            "2026-10-26T09:00:00+00:00"
+        );
+        assert!(describe_state(&state).iter().any(|line| line
+            == "RELEASE_BOT_TOKEN: configured in environment `release` (set 2026-10-26)"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_state_prefers_the_repository_secret() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gh = fake_gh(temp.path());
+
+        let state = detect_state("owner/repo", &[], Some(&gh));
+
+        assert!(state.secret_present);
+        assert_eq!(state.secret_environment, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn setup_existing_secret_without_reconfigure_exits_before_prompt() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gh = fake_gh(temp.path());
@@ -3028,6 +3215,7 @@ enabled = true
             repo_slug: String::from("owner/repo"),
             secret_present: false,
             secret_updated_at: None,
+            secret_environment: None,
             last_auto_release_conclusion: None,
             last_auto_release_error_signature: None,
             other_repos_with_secret: vec![String::from("owner/other")],

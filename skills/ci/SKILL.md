@@ -971,7 +971,7 @@ PRs are gone.
 | Drain a backed-up PR CI queue | `shipyard queue triage --repo OWNER/REPO --apply --json`, then later `shipyard queue resume --repo OWNER/REPO --apply --json` (see [Draining a GitHub CI backlog](#draining-a-github-ci-backlog-triage-prioritize-the-fix-resume)) |
 | Move one PR's waiting jobs to the front | `shipyard queue prioritize --pr <n> --repo OWNER/REPO --apply --json` |
 | Merge on green (cron-safe one-shot) | `shipyard auto-merge <pr>` (0=merged, 1=fail, 2=not-found, 3=in-flight, 10=automatic classic merge refused) |
-| Diagnose RELEASE_BOT_TOKEN | `shipyard release-bot status --json` |
+| Diagnose RELEASE_BOT_TOKEN | `shipyard release-bot status --json` (`secret_environment` names the environment holding it, `null` for a repository secret) |
 | Configure RELEASE_BOT_TOKEN | `shipyard release-bot setup` (guided) |
 | Re-paste token after rotation | `shipyard release-bot setup --paste` |
 | Opt in to post-release docs sync | `shipyard changelog init` then `shipyard release-bot hook install` |

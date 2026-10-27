@@ -626,15 +626,9 @@ fn enumerate_path_binaries(binary_name: &str, path_env: &str) -> Vec<PathBuf> {
 
 fn check_release_bot_token(mode: RuntimeMode, cwd: &Path) -> Option<DoctorEntry> {
     let repo = detect_repo_slug(cwd)?;
-    check_release_bot_token_with(Some(&repo), |repo_slug| {
+    check_release_bot_token_with(Some(&repo), |endpoint, jq| {
         let output = gh_command(mode, cwd)?
-            .args([
-                "api",
-                &format!("repos/{repo_slug}/actions/secrets"),
-                "--paginate",
-                "--jq",
-                ".secrets[].name",
-            ])
+            .args(["api", endpoint, "--paginate", "--jq", jq])
             .output()
             .ok()?;
         if !output.status.success() {
@@ -1306,22 +1300,45 @@ fn daemon_version_entry(relation: DaemonVersionRelation) -> DoctorEntry {
     }
 }
 
-fn check_release_bot_token_with<F>(
-    repo_slug: Option<&str>,
-    mut secret_names: F,
-) -> Option<DoctorEntry>
+// `api_names(endpoint, jq)` returns one name per line of `gh api` output.
+// The token counts as a repository secret or as a secret of any environment
+// (release workflows read it from a `main`-only environment).
+fn check_release_bot_token_with<F>(repo_slug: Option<&str>, mut api_names: F) -> Option<DoctorEntry>
 where
-    F: FnMut(&str) -> Option<Vec<String>>,
+    F: FnMut(&str, &str) -> Option<Vec<String>>,
 {
     let repo_slug = repo_slug?;
-    let secrets = secret_names(repo_slug)?;
-    if secrets.iter().any(|name| name == "RELEASE_BOT_TOKEN") {
+    let has_token = |names: &[String]| names.iter().any(|name| name == "RELEASE_BOT_TOKEN");
+    let secrets = api_names(
+        &format!("repos/{repo_slug}/actions/secrets"),
+        ".secrets[].name",
+    )?;
+    let mut location = has_token(&secrets).then(String::new);
+    if location.is_none() {
+        let environments = api_names(
+            &format!("repos/{repo_slug}/environments"),
+            ".environments[].name",
+        )
+        .unwrap_or_default();
+        location = environments.into_iter().find_map(|environment| {
+            api_names(
+                &format!(
+                    "repos/{repo_slug}/environments/{}/secrets",
+                    environment.replace(' ', "%20")
+                ),
+                ".secrets[].name",
+            )
+            .filter(|names| has_token(names))
+            .map(|_| format!(" (environment `{environment}`)"))
+        });
+    }
+    if let Some(location) = location {
         return Some(DoctorEntry {
             ok: true,
             version: Some("configured".to_owned()),
-            detail: Some(
-                "auto-release.yml will use this for tag pushes; downstream release.yml fires on its own.".to_owned(),
-            ),
+            detail: Some(format!(
+                "auto-release.yml will use this{location} for tag pushes; downstream release.yml fires on its own."
+            )),
             error: None,
         });
     }
@@ -1330,7 +1347,7 @@ where
         ok: false,
         version: Some("missing".to_owned()),
         detail: Some(format!(
-            "Auto-release will fall back to GITHUB_TOKEN; tag pushes won't trigger release.yml. Fix: github.com/{repo_slug}/settings/secrets/actions -> add repository secret RELEASE_BOT_TOKEN. See RELEASING.md for the full walkthrough."
+            "Auto-release will fall back to GITHUB_TOKEN; tag pushes won't trigger release.yml. Fix: github.com/{repo_slug}/settings/secrets/actions -> add RELEASE_BOT_TOKEN to an environment limited to main (or as a repository secret). See RELEASING.md for the full walkthrough."
         )),
         error: None,
     })
@@ -2119,15 +2136,40 @@ mod tests {
 
     #[test]
     fn release_bot_token_check_reports_configured_or_missing() {
-        let configured = check_release_bot_token_with(Some("owner/repo"), |_| {
-            Some(vec!["RELEASE_BOT_TOKEN".to_owned(), "OTHER".to_owned()])
+        let configured = check_release_bot_token_with(Some("owner/repo"), |endpoint, _| {
+            (endpoint == "repos/owner/repo/actions/secrets")
+                .then(|| vec!["RELEASE_BOT_TOKEN".to_owned(), "OTHER".to_owned()])
         })
         .expect("entry");
         assert!(configured.ok);
         assert_eq!(configured.version.as_deref(), Some("configured"));
 
+        let in_environment = check_release_bot_token_with(Some("owner/repo"), |endpoint, _| {
+            Some(match endpoint {
+                "repos/owner/repo/environments" => {
+                    vec!["github-pages".to_owned(), "release".to_owned()]
+                }
+                "repos/owner/repo/environments/release/secrets" => {
+                    vec!["RELEASE_BOT_TOKEN".to_owned()]
+                }
+                _ => vec![],
+            })
+        })
+        .expect("entry");
+        assert!(in_environment.ok);
+        assert!(
+            in_environment
+                .detail
+                .as_deref()
+                .expect("detail")
+                .contains("environment `release`")
+        );
+
+        let unreadable = check_release_bot_token_with(Some("owner/repo"), |_, _| None);
+        assert!(unreadable.is_none());
+
         let missing =
-            check_release_bot_token_with(Some("owner/repo"), |_| Some(vec![])).expect("entry");
+            check_release_bot_token_with(Some("owner/repo"), |_, _| Some(vec![])).expect("entry");
         assert!(!missing.ok);
         assert_eq!(missing.version.as_deref(), Some("missing"));
         assert!(
