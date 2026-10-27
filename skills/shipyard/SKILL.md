@@ -5307,3 +5307,13 @@ atomic sidecar. Readiness requires observed continuity; historical activity
 counts and status-only runs must not be used to manufacture prospective
 coverage. Sidecars are keyed by repository, source identity, cadence, and
 configuration so changing collection policy cannot mix incompatible history.
+
+### Durable reviewer handoff
+
+Shipyard's reviewer handoff is generic across repository landing models. Each
+claim names the exact PR head and a monotonic epoch; only the current unexpired
+claim can publish a counted verdict. The standby reviewer is failover capacity,
+not a second approval. A changed head, revoked claim, or expired deadline
+requires a fresh claim. Landing still follows the repository adapter: native
+merge queues are admitted through their queue, while serial repositories keep
+their guarded path.

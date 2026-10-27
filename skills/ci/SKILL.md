@@ -4190,3 +4190,13 @@ At the protected merge boundary, Shipyard may produce that receipt only after
 GitHub confirms the exact validated head is merged and supplies a nonzero merge
 commit and merge timestamp. Queue admission or auto-merge activation is not a
 merge receipt; queue supervision must wait for the later merged observation.
+
+### Durable reviewer claims
+
+Reviewer dispatch is head-bound and lease-like. Shipyard records the exact PR
+head, reviewer identity, deadline, and a monotonic claim epoch in durable
+ship-state. A reviewer must publish only while its claim is current; after a
+heartbeat timeout or explicit revocation, the standby lane receives a new epoch
+and the old reviewer cannot make its late verdict count. Agents should use the
+repository's configured handoff and native merge mechanism and must not wake or
+wait on an interactive team-lead tab.
