@@ -309,14 +309,33 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
             derivation,
             Some("compare_red_head_to_fix_head" | "rerun_green")
         )
-        && (derivation != Some("rerun_green")
-            || (value["head_sha"] == value["fix_head_sha"]
+        && ((derivation == Some("compare_red_head_to_fix_head")
+            && compare_file_evidence_complete(value))
+            || (derivation == Some("rerun_green")
+                && value["head_sha"] == value["fix_head_sha"]
                 && value["head_sha"].as_str().is_some_and(valid_sha)
                 && value["files_raw"].as_array().is_some_and(Vec::is_empty)
                 && value["own_files"].as_array().is_some_and(Vec::is_empty)
                 && value["files_truncated"].as_bool() == Some(false)
                 && value["own_files_truncated"].as_bool() == Some(false)
                 && value["own_files_method"].as_str() == Some("rerun_same_head")))
+}
+
+/// Compare links are only useful when their file evidence is complete. A
+/// producer may legitimately have no pull-request-owned file set (for
+/// example, a default-branch fix or a non-ancestor), but it must still record
+/// the raw compare and the reason for that null result without truncation.
+fn compare_file_evidence_complete(value: &Value) -> bool {
+    value["files_raw"].as_array().is_some()
+        && value["files_truncated"].as_bool() == Some(false)
+        && value["own_files_method"]
+            .as_str()
+            .is_some_and(|method| !method.is_empty())
+        && match &value["own_files"] {
+            Value::Array(_) => value["own_files_truncated"].as_bool() == Some(false),
+            Value::Null => value["own_files_truncated"].is_null(),
+            _ => false,
+        }
 }
 
 /// Structural identity fields required before a producer treats a fix-link as
@@ -351,6 +370,22 @@ static SENSITIVE_FIELD_MARKER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:token|api[_-]?key|secret|password|authorization|credentials?)$")
         .expect("sensitive field marker pattern compiles")
 });
+static SCRUBBED_CREDENTIAL_FIELD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)^(?:token|api[_-]?key|secret|password)\s*[:=]\s*<secret>['\",;\)\]}]?$"#)
+        .expect("scrubbed credential field pattern compiles")
+});
+
+fn sensitive_field(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase().replace('-', "_");
+    SENSITIVE_FIELD_MARKER.is_match(&normalized)
+        || normalized.split('_').any(|part| {
+            matches!(
+                part,
+                "token" | "secret" | "password" | "authorization" | "credential" | "credentials"
+            )
+        })
+        || normalized == "apikey"
+}
 
 fn safe(value: &Value) -> bool {
     let safe_text = |text: &str| {
@@ -374,11 +409,11 @@ fn safe(value: &Value) -> bool {
         Value::Array(items) => items.iter().all(safe),
         Value::Object(fields) => fields.iter().all(|(key, value)| {
             safe_text(key)
-                && if SENSITIVE_FIELD_MARKER.is_match(key) {
+                && if sensitive_field(key) {
                     // A scrubbed credential field is allowed only as a plain
                     // redacted string; structured or unredacted values stay
                     // rejected even when their key is otherwise harmless.
-                    matches!(value, Value::String(text) if text.contains("<secret>") && safe_text(text))
+                    matches!(value, Value::String(text) if text == "<secret>" || SCRUBBED_CREDENTIAL_FIELD.is_match(text) && safe_text(text))
                 } else {
                     safe(value)
                 }
@@ -390,6 +425,7 @@ fn safe(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::tempdir;
 
     fn args(dir: &Path) -> CauseAdviseArgs {
@@ -524,6 +560,11 @@ mod tests {
                 "head_sha": "b".repeat(40),
                 "fix_head_sha": "c".repeat(40),
                 "derivation": "compare_red_head_to_fix_head",
+                "files_raw": [],
+                "files_truncated": false,
+                "own_files": [],
+                "own_files_method": "first_parent_non_merge_commits",
+                "own_files_truncated": false,
             });
             assert!(valid_fixlink(&valid_link));
             fs::write(dir.path().join("fixlinks.jsonl"), valid_link.to_string()).unwrap();
@@ -541,6 +582,19 @@ mod tests {
         for field in ["token", "api_key", "secret", "password", "authorization"] {
             let mut unsafe_row = clean.clone();
             unsafe_row[field] = serde_json::json!("unredacted");
+            fs::write(&archive, unsafe_row.to_string()).unwrap();
+            assert!(
+                advise(&args(dir.path()), &[]).unwrap().0.is_empty(),
+                "{field}"
+            );
+        }
+        for (field, value) in [
+            ("access_token", "unredacted"),
+            ("client_secret", "leaked<secret>"),
+            ("token ", "prefix<secret>"),
+        ] {
+            let mut unsafe_row = clean.clone();
+            unsafe_row[field] = serde_json::json!(value);
             fs::write(&archive, unsafe_row.to_string()).unwrap();
             assert!(
                 advise(&args(dir.path()), &[]).unwrap().0.is_empty(),
@@ -589,6 +643,9 @@ mod tests {
                 "head_sha": "b".repeat(40),
                 "fix_head_sha": sha.repeat(40), "fix_run_id": 2,
                 "derivation": "compare_red_head_to_fix_head",
+                "files_raw": [], "files_truncated": false,
+                "own_files": [], "own_files_method": "first_parent_non_merge_commits",
+                "own_files_truncated": false,
             })
         });
         let mut query = args(dir.path());
@@ -674,6 +731,35 @@ mod tests {
         let candidates = advise(&args(dir.path()), &[]).unwrap().0;
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn compare_fixlinks_require_complete_file_evidence() {
+        let mut link = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 2,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "c".repeat(40),
+            "derivation": "compare_red_head_to_fix_head",
+            "files_raw": [],
+            "files_truncated": false,
+            "own_files": null,
+            "own_files_method": "branch_is_default",
+            "own_files_truncated": null,
+        });
+        assert!(valid_fixlink(&link));
+        link["files_truncated"] = true.into();
+        assert!(!valid_fixlink(&link));
+        link["files_truncated"] = false.into();
+        link["own_files"] = json!(["a.cpp"]);
+        link["own_files_truncated"] = true.into();
+        assert!(!valid_fixlink(&link));
+        link["own_files_truncated"] = false.into();
+        assert!(valid_fixlink(&link));
     }
 
     #[test]

@@ -95,6 +95,10 @@ fn job(id: u64, conclusion: &str) -> Value {
 }
 
 fn red_routes() -> Vec<(&'static str, Value)> {
+    let mut cancelled = job(1001, "cancelled");
+    cancelled["name"] = json!("linux");
+    let mut successful = job(1002, "success");
+    successful["name"] = json!("windows");
     vec![
         (
             "runs?status=completed",
@@ -102,7 +106,7 @@ fn red_routes() -> Vec<(&'static str, Value)> {
         ),
         (
             "runs/100/jobs",
-            json!({"jobs": [job(1000, "failure"), job(1001, "cancelled"), job(1002, "success")]}),
+            json!({"jobs": [job(1000, "failure"), cancelled, successful]}),
         ),
         (
             "runs?branch=feat%2Fx&status=success",
@@ -138,6 +142,30 @@ fn run_jobs_are_paginated_with_a_bounded_page_count() {
     .expect("jobs");
     assert_eq!(jobs.len(), 101);
     assert_eq!(jobs[100]["id"], 100);
+}
+
+#[test]
+fn run_listing_fails_closed_on_malformed_or_bounded_input() {
+    let malformed = Fake::new(&[("runs?", json!({"workflow_runs": {}}))]);
+    let gh = |args: &[String]| malformed.read(args);
+    let error = list_runs(
+        &gh,
+        &query(tempfile::tempdir().expect("tempdir").path()),
+        "status=completed",
+    )
+    .expect_err("malformed run listing");
+    assert!(error.contains("workflow_runs[]"), "{error}");
+
+    let full_page = Value::Array((0..100).map(|id| json!({"id": id})).collect());
+    let bounded = Fake::new(&[("runs?", json!({"workflow_runs": full_page}))]);
+    let gh = |args: &[String]| bounded.read(args);
+    let error = list_runs(
+        &gh,
+        &query(tempfile::tempdir().expect("tempdir").path()),
+        "status=completed",
+    )
+    .expect_err("bounded run listing");
+    assert!(error.contains("10-page run listing bound"), "{error}");
 }
 
 #[test]
@@ -640,6 +668,59 @@ fn duplicate_raw_job_names_cannot_prove_a_fix() {
 }
 
 #[test]
+fn mixed_duplicate_job_names_cannot_prove_a_fix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let failed = job(1000, "failure");
+    let mut routes = red_routes();
+    routes[1] = (
+        "runs/100/jobs",
+        json!({"jobs": [failed.clone(), job(1001, "success")]}),
+    );
+    let first = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(dir.path())).expect("red pass");
+
+    let mut green = job(2000, "success");
+    green["run_id"] = json!(200);
+    green["head_sha"] = json!("fedcba9876543210fedcba9876543210fedcba98");
+    let mut routes = red_routes();
+    routes[1] = (
+        "runs/100/jobs",
+        json!({"jobs": [failed, job(1001, "success")]}),
+    );
+    routes.retain(|(needle, _)| {
+        !needle.starts_with("runs?branch=") && !needle.contains("runs/200/jobs")
+    });
+    routes.extend([
+        (
+            "runs?branch=feat%2Fx&status=success",
+            json!({"workflow_runs": [{
+                "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
+                "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
+            }]}),
+        ),
+        ("runs/200/jobs", json!({"jobs": [green]})),
+    ]);
+    let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    let report = record(&gh, &query(dir.path())).expect("ambiguous red remains pending");
+    assert_eq!((report.fixlinks_written, report.reds_pending), (0, 1));
+}
+
+#[test]
+fn unnamed_failed_jobs_cannot_prove_a_fix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut unnamed = job(1000, "failure");
+    unnamed["name"] = Value::Null;
+    let mut routes = red_routes();
+    routes[1] = ("runs/100/jobs", json!({"jobs": [unnamed]}));
+    let fake = Fake::new(&routes);
+    let gh = |args: &[String]| fake.read(args);
+    let report = record(&gh, &query(dir.path())).expect("unnamed red pass");
+    assert_eq!(report.causes_written, 0);
+}
+
+#[test]
 fn a_selective_rerun_can_pass_failed_jobs_across_multiple_attempts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut rerun = red_run();
@@ -901,7 +982,9 @@ fn second_pass(
     let dir = tempfile::tempdir().expect("tempdir");
     let mut routes = red_routes();
     // A job runs on its run's head: a merge-queue job on the queue's commit.
-    let jobs: Vec<Value> = [job(1000, "failure"), job(1001, "cancelled")]
+    let mut cancelled = job(1001, "cancelled");
+    cancelled["name"] = json!("linux");
+    let jobs: Vec<Value> = [job(1000, "failure"), cancelled]
         .into_iter()
         .map(|mut job| {
             job["head_sha"] = red["head_sha"].clone();
@@ -1036,6 +1119,44 @@ fn a_force_pushed_red_is_not_matched_after_72_hours_or_once_the_fix_is_gone() {
     );
     assert_eq!(gone["own_files_method"], "post_force_push_superseded");
     assert_eq!(gone["own_files"], Value::Null);
+}
+
+#[test]
+fn a_full_force_push_commit_listing_is_reported_as_truncated() {
+    let full_page = Value::Array(
+        (0..100)
+            .map(|id| json!({"sha": format!("c{id}")}))
+            .collect(),
+    );
+    let fake = Fake::new(&[("pulls/42/commits", full_page)]);
+    let gh = |args: &[String]| fake.read(args);
+    let red = Red {
+        repo: "Generous-Corp/pulp".to_owned(),
+        run_id: 100,
+        attempt: 1,
+        jobs: BTreeSet::from(["macos".to_owned()]),
+        head_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        time: "2026-10-14T10:30:00Z".to_owned(),
+        pr: Some(42),
+        branch: "feat/x".to_owned(),
+    };
+    let fix = Fix {
+        head_sha: "fedcba9876543210fedcba9876543210fedcba98".to_owned(),
+        run_id: 200,
+        pushed_at: "2026-10-14T11:00:00Z".to_owned(),
+        derivation: "compare_red_head_to_fix_head",
+    };
+    let (own, method, truncated) = post_force_push(
+        &gh,
+        &query(tempfile::tempdir().expect("tempdir").path()),
+        &red,
+        &fix,
+    )
+    .expect("bounded force-push read");
+    assert_eq!(
+        (own, method, truncated),
+        (None, "post_force_push_truncated", None)
+    );
 }
 
 #[test]
