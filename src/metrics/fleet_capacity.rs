@@ -103,9 +103,25 @@ impl FleetCapacitySample {
             ) else {
                 return Err("verified fleet capacity must include all slot counts".to_owned());
             };
+            let eligible_u = u128::try_from(eligible)
+                .map_err(|_| "fleet capacity eligible_slots is negative".to_owned())?;
+            let free_u = u128::try_from(free)
+                .map_err(|_| "fleet capacity free_slots is negative".to_owned())?;
+            let occupied_u = u128::try_from(occupied)
+                .map_err(|_| "fleet capacity occupied_slots is negative".to_owned())?;
+            let in_flight_u = u128::try_from(in_flight)
+                .map_err(|_| "fleet capacity in_flight_slots is negative".to_owned())?;
+            let unknown_u = u128::try_from(self.unknown_slots)
+                .map_err(|_| "fleet capacity unknown_slots is negative".to_owned())?;
+            let configured_u = u128::try_from(self.configured_slots)
+                .map_err(|_| "fleet capacity configured_slots is negative".to_owned())?;
+            let slot_sum = free_u
+                .checked_add(occupied_u)
+                .and_then(|sum| sum.checked_add(in_flight_u));
+            let partition_sum = eligible_u.checked_add(unknown_u);
             if eligible > self.configured_slots
-                || free + occupied + in_flight != eligible
-                || self.unknown_slots != self.configured_slots - eligible
+                || slot_sum != Some(eligible_u)
+                || partition_sum != Some(configured_u)
             {
                 return Err("fleet capacity slot counts are inconsistent".to_owned());
             }
@@ -185,6 +201,11 @@ impl FleetCapacitySample {
         if self.verification == "verified" {
             if evidence_verdict != "ok" || evidence_pool != "on" {
                 return Err("verified fleet capacity requires ok/on evidence".to_owned());
+            }
+            if evidence_object.get("inventory").and_then(Value::as_str) == Some("unavailable") {
+                return Err(
+                    "verified fleet capacity requires available capacity inventory".to_owned(),
+                );
             }
             for (name, expected) in [
                 ("free", self.free_slots),
@@ -416,6 +437,35 @@ mod tests {
     fn rejects_tampering_unknown_fields_and_long_intervals() {
         let mut value = sample();
         value.free_slots = Some(2);
+        assert!(value.validate().is_err());
+        let mut value = sample();
+        value.configured_slots = 0;
+        value.eligible_slots = Some(0);
+        value.free_slots = Some(i64::MAX);
+        value.occupied_slots = Some(i64::MAX);
+        value.in_flight_slots = Some(2);
+        value.unknown_slots = 0;
+        let evidence = value.evidence.as_object_mut().unwrap();
+        evidence.insert("free".to_owned(), Value::from(i64::MAX));
+        evidence.insert("occupied".to_owned(), Value::from(i64::MAX));
+        evidence.insert("in_flight".to_owned(), Value::from(2));
+        evidence.insert("lanes".to_owned(), Value::Array(Vec::new()));
+        value.evidence_sha256 = digest_value(&value.evidence).unwrap();
+        value.census_sha256 = digest_value(&Value::Object(
+            [
+                "schema", "host", "repo", "class", "verdict", "pool", "lanes",
+            ]
+            .into_iter()
+            .map(|key| (key.to_owned(), value.evidence[key].clone()))
+            .collect(),
+        ))
+        .unwrap();
+        value.sample_id = canonical_digest(&value, true).unwrap();
+        assert!(value.validate().is_err());
+        let mut value = sample();
+        value.evidence["inventory"] = Value::String("unavailable".to_owned());
+        value.evidence_sha256 = digest_value(&value.evidence).unwrap();
+        value.sample_id = canonical_digest(&value, true).unwrap();
         assert!(value.validate().is_err());
         let mut value = sample();
         value.profile_sha256 = "d".repeat(64);
