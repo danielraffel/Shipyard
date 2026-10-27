@@ -325,6 +325,42 @@ class CollectorInvocationTests(unittest.TestCase):
             self.assertFalse(payload["baseline"]["required"])
             self.assertEqual(payload["baseline"]["gate_exit"], 0)
 
+    def test_require_ready_subprocess_persists_state_and_status_but_default_stays_green(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_shipyard = root / "shipyard"
+            fake_shipyard.write_text("#!/bin/sh\nprintf '%s\\n' '{}'\n")
+            fake_shipyard.chmod(0o755)
+            db = root / "metrics" / "metrics.db"
+            state = root / "state.json"
+            status = root / "status.md"
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("collect_baseline.py")),
+                "--shipyard", str(fake_shipyard),
+                "--db", str(db),
+                "--project", "pulp",
+                "--repo", "owner/pulp",
+                "--state", str(state),
+                "--status-markdown", str(status),
+            ]
+
+            gated = subprocess.run(
+                [*command, "--require-ready"], capture_output=True, text=True, check=False
+            )
+            self.assertEqual(gated.returncode, 3, gated.stderr)
+            self.assertTrue(state.exists())
+            self.assertTrue(status.exists())
+            gated_output = json.loads(gated.stdout)
+            persisted = json.loads(state.read_text())
+            self.assertEqual(gated_output["baseline"]["gate_exit"], 3)
+            self.assertFalse(persisted["baseline_readiness"]["optimization_eligible"])
+            self.assertIn("Optimization eligibility: **no**", status.read_text())
+
+            default = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(default.returncode, 0, default.stderr)
+            self.assertEqual(json.loads(default.stdout)["baseline"]["gate_exit"], 0)
+
     def test_project_repo_scope_requires_owner_and_matching_short_name(self):
         for project, repo in [("pulp", "pulp"), ("pulp", "/pulp"), ("pulp", "a/b/pulp"), ("other", "o/pulp")]:
             with self.assertRaises(ValueError):
