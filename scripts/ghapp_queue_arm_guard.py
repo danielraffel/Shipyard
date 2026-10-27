@@ -492,7 +492,13 @@ def _timestamp(value: Any) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # A timezone-less timestamp cannot be compared safely with the UTC
+        # clock used by receipt expiry checks. Treat it as malformed rather
+        # than allowing a TypeError to escape the fail-closed parser.
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed
     except ValueError:
         return None
 

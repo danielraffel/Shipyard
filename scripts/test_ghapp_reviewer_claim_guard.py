@@ -29,7 +29,16 @@ class FakePolicyGuard:
         return "base"
 
     def review_policy(self, _config: str | None, _repo: str, _default: bool) -> dict[str, object]:
-        return {"claim_receipt": "shipyard-reviewer-claim" if self.enabled else None}
+        return {
+            "claim_receipt": "shipyard-reviewer-claim" if self.enabled else None,
+            "claim_app": 15368 if self.enabled else None,
+        }
+
+    def reviewer_claim_receipt(self, _repo: str, _pr: int, _head: str,
+                               _policy: dict[str, object], approval: dict[str, object]) -> str:
+        if approval.get("signer") != "reviewer-a":
+            raise RuntimeError("receipt reviewer mismatch")
+        return "ok"
 
 
 class ReviewerClaimGuard(unittest.TestCase):
@@ -69,6 +78,29 @@ class ReviewerClaimGuard(unittest.TestCase):
                 f"verdict: HOLD head:{HEAD}\n",
                 guard._body_values(["pr", "comment", "42", "-F", str(path)]),
             )
+
+    def test_body_file_sources_fail_closed_when_not_inspectable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = pathlib.Path(directory) / "missing"
+            fifo = pathlib.Path(directory) / "pipe"
+            os.mkfifo(fifo)
+            for option, path in (("--body-file", "-"), ("--comment-file", "-"),
+                                 ("--body-file", str(missing)),
+                                 ("--comment-file", str(missing)),
+                                 ("--body-file", str(fifo))):
+                with self.subTest(option=option, path=path):
+                    self.assertTrue(guard._opaque_body_source(
+                        ["pr", "comment", "42", option, path]))
+                    self.assertEqual(guard.main(
+                        ["pr", "comment", "42", option, path]), 1)
+
+    def test_comment_file_is_read_and_verdict_is_not_inert(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "comment.md"
+            path.write_text(f"verdict: HOLD head:{HEAD}\n", encoding="utf-8")
+            args = ["pr", "comment", "42", "--comment-file", str(path)]
+            self.assertFalse(guard._opaque_body_source(args))
+            self.assertIn(f"verdict: HOLD head:{HEAD}\n", guard._body_values(args))
 
     def test_default_off_policy_does_not_need_a_local_claim(self) -> None:
         with mock.patch.object(guard, "_live_pull", return_value=(HEAD, "main")), \
@@ -113,6 +145,25 @@ class ReviewerClaimGuard(unittest.TestCase):
                 self.assertEqual(
                     guard.main(["pr", "comment", "42", "--body", f"verdict: APPROVE head:{HEAD}"]), 1
                 )
+
+    def test_enabled_policy_requires_immutable_app_id(self) -> None:
+        policy = FakePolicyGuard(True)
+        policy.review_policy = lambda *_args: {
+            "claim_receipt": "shipyard-reviewer-claim", "claim_app": "mutable-slug"
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            binary = pathlib.Path(directory) / "shipyard"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+            with mock.patch.object(guard, "_live_pull", return_value=(HEAD, "main")), \
+                 mock.patch.object(guard, "_guard_module", return_value=policy), \
+                 mock.patch.dict(os.environ, {
+                     "GH_REPO": "o/r", "SHIPYARD_AGENT_ID": "reviewer-a",
+                     "SHIPYARD_GHAPP_SHIPYARD_BINARY": str(binary),
+                 }, clear=False):
+                self.assertEqual(guard.main([
+                    "pr", "comment", "42", "--body", f"verdict: APPROVE head:{HEAD}"
+                ]), 1)
 
     def test_enabled_policy_gates_bodyless_review_actions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

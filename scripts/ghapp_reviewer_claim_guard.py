@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from typing import Any
@@ -33,6 +34,28 @@ PR_ENDPOINT = re.compile(
 PR_URL = re.compile(r"/(?:pull|issues)/([1-9][0-9]*)(?:/|$)")
 PULL_REVIEW_ENDPOINT = re.compile(r"^repos/[^/]+/[^/]+/pulls/([1-9][0-9]*)/reviews(?:/.*)?/?$")
 COMMENT_ENDPOINT = re.compile(r"^repos/[^/]+/[^/]+/issues/comments/([1-9][0-9]*)/?$")
+
+
+def _readable_regular_file(path: str) -> bool:
+    """Whether *path* is a directly readable regular file."""
+    try:
+        info = pathlib.Path(path).lstat()
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        with pathlib.Path(path).open("rb"):
+            return True
+    except OSError:
+        return False
+
+
+def _body_file_argument(previous: str, argument: str, command: str | None) -> str | None:
+    if previous in {"--body-file", "--comment-file"}:
+        return argument
+    if previous == "-F" and command in {"pr comment", "pr review", "issue comment"}:
+        return argument
+    if argument.startswith(("--body-file=", "--comment-file=")):
+        return argument.split("=", 1)[1]
+    return None
 
 
 def _input_paths(args: list[str]) -> list[str]:
@@ -66,8 +89,15 @@ def _input_payloads(args: list[str]) -> list[dict[str, Any]]:
 
 def _opaque_body_source(args: list[str]) -> bool:
     """Whether a verdict-capable request carries text this guard cannot read."""
+    command = " ".join(args[:2]) if len(args) >= 2 else None
+    previous = ""
+    for argument in args:
+        path = _body_file_argument(previous, argument, command)
+        if path is not None and not _readable_regular_file(path):
+            return True
+        previous = argument
     for path in _input_paths(args):
-        if path == "-" or not pathlib.Path(path).is_file():
+        if path == "-" or not _readable_regular_file(path):
             return True
     previous = ""
     for argument in args:
@@ -77,15 +107,15 @@ def _opaque_body_source(args: list[str]) -> bool:
         elif argument.startswith("--field=body="):
             value = argument.split("=", 2)[2]
         if value is not None and value.startswith("@"):
-            if value == "@-" or not pathlib.Path(value[1:]).is_file():
+            if value == "@-" or not _readable_regular_file(value[1:]):
                 return True
         if previous in {"-f", "-F", "--field", "--raw-field"} and argument.startswith("query="):
             value = argument[len("query="):]
-            if value.startswith("@") and (value == "@-" or not pathlib.Path(value[1:]).is_file()):
+            if value.startswith("@") and (value == "@-" or not _readable_regular_file(value[1:])):
                 return True
         elif argument.startswith(("--field=query=", "--raw-field=query=")):
             value = argument.split("=", 2)[2]
-            if value.startswith("@") and (value == "@-" or not pathlib.Path(value[1:]).is_file()):
+            if value.startswith("@") and (value == "@-" or not _readable_regular_file(value[1:])):
                 return True
         previous = argument
     return False
@@ -119,15 +149,16 @@ def _guard_module() -> Any:
 def _body_values(args: list[str]) -> list[str]:
     values: list[str] = []
     previous = ""
+    command = " ".join(args[:2]) if len(args) >= 2 else None
     for index, argument in enumerate(args):
         if previous in {"--body", "-b", "--comment", "-c"}:
             values.append(argument)
-        elif (previous == "--body-file"
-              or (previous == "-F" and args[:2] in (["pr", "comment"], ["pr", "review"],
-                                                     ["issue", "comment"]))) \
+        elif (previous in {"--body-file", "--comment-file"}
+              or (previous == "-F" and command in {"pr comment", "pr review", "issue comment"})) \
                 and argument != "-":
             try:
-                values.append(pathlib.Path(argument).read_text(encoding="utf-8", errors="surrogateescape"))
+                if _readable_regular_file(argument):
+                    values.append(pathlib.Path(argument).read_text(encoding="utf-8", errors="surrogateescape"))
             except OSError:
                 pass
         elif argument.startswith(("--body=", "--comment=")):
@@ -375,6 +406,10 @@ def main(argv: list[str]) -> int:
                  for payload in input_payloads
              )
     opaque_body = _opaque_body_source(argv) and _potential_verdict_target(argv)
+    if opaque_body:
+        print("reviewer-claim-guard: refused: verdict body source is stdin, missing, unreadable, or not a regular file",
+              file=sys.stderr)
+        return 1
     if not verdicts and not bodyless_review and not rest_review and not graphql_review and not opaque_body:
         return 0
     if verdicts and len(set(head.lower() for head in verdicts)) != 1:
@@ -397,6 +432,9 @@ def main(argv: list[str]) -> int:
         policy = guard.review_policy(guard.base_config_text(repo, base), repo, True)
         if policy.get("claim_receipt") is None:
             return 0
+        claim_app = policy.get("claim_app")
+        if type(claim_app) is not int or claim_app <= 0:
+            raise RuntimeError("reviewer claim policy must bind an immutable positive App id")
         reviewer = os.environ.get("SHIPYARD_AGENT_ID", "").strip()
         if not reviewer or any(char.isspace() for char in reviewer):
             raise RuntimeError("SHIPYARD_AGENT_ID is required when reviewer claims are enabled")
@@ -410,6 +448,10 @@ def main(argv: list[str]) -> int:
         if result.returncode != 0:
             detail = (result.stderr.strip() or result.stdout.strip())[-400:]
             raise RuntimeError(detail or "reviewer claim is not current")
+        receipt_check = getattr(guard, "reviewer_claim_receipt", None)
+        if not callable(receipt_check):
+            raise RuntimeError("reviewer claim receipt checker is unavailable")
+        receipt_check(repo, pr, live_head, policy, {"signer": reviewer})
     except Exception as error:  # noqa: BLE001 - a verdict must fail closed
         print(f"reviewer-claim-guard: refused: {error}", file=sys.stderr)
         return 1
