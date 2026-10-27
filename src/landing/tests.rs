@@ -11,7 +11,8 @@ use crate::fleet_service::Boundary;
 use crate::landing::backlog;
 use crate::landing::placement::{self, JobObservation, Placement};
 use crate::landing::queue::{
-    Payload, QueueInputs, determine_queue, determine_strict, enqueue_guidance,
+    MergeQueueConfig, Payload, QueueFinding, QueueInputs, determine_queue, determine_strict,
+    enqueue_guidance,
 };
 use crate::landing::{SurfaceOutcome, SurfaceRead, Verdict};
 
@@ -507,6 +508,34 @@ fn no_queue_says_merge_directly() {
     let guidance = enqueue_guidance(&queue_finding(false));
     assert_eq!(guidance.action, "merge");
     assert!(guidance.command.is_some());
+}
+
+#[test]
+fn evaluate_queue_is_report_only_and_merges_directly() {
+    let finding = QueueFinding {
+        verdict: Verdict::Present(MergeQueueConfig {
+            enforcement: Some("evaluate".to_owned()),
+            ..Default::default()
+        }),
+        disagreements: Vec::new(),
+    };
+    let guidance = enqueue_guidance(&finding);
+    assert_eq!(guidance.action, "merge");
+    assert_eq!(
+        guidance.command.as_deref(),
+        Some("gh pr merge <number> --merge")
+    );
+}
+
+#[test]
+fn queue_without_enforcement_refuses_to_name_a_command() {
+    let finding = QueueFinding {
+        verdict: Verdict::Present(MergeQueueConfig::default()),
+        disagreements: Vec::new(),
+    };
+    let guidance = enqueue_guidance(&finding);
+    assert_eq!(guidance.action, "unknown");
+    assert!(guidance.command.is_none());
 }
 
 // ---------------------------------------------------------------------------
