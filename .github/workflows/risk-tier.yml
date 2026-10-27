@@ -1,0 +1,50 @@
+# Posts the `risk-tier` commit status on a pull request's head: how much review
+# the pull request would need by its changed paths, dependencies, version bump,
+# size and labels (see docs/risk-tier.md). REPORT-ONLY: the status is always
+# `success`, and it is not a required check.
+#
+# pull_request_target runs the default branch's definition of this file, and
+# the job checks out the default branch, never the pull request's code. The
+# script reads the pull request through the API; the only head content it
+# reads is the dependency manifests and lockfiles it changed, parsed as TOML.
+#
+# To copy into another repository: this file plus scripts/risk_tier.py (set
+# SCRIPT if it lives elsewhere), and optionally a `[review.tiers]` table in
+# the base branch's .shipyard/config.toml.
+name: Risk tier
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+  checks: write
+
+concurrency:
+  group: risk-tier-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  risk-tier:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      SCRIPT: scripts/risk_tier.py
+    steps:
+      - name: Check out the default branch's rule
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12.12'
+      - name: Post risk-tier
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: '"${{ steps.python.outputs.python-path }}" "$SCRIPT" --check-run'

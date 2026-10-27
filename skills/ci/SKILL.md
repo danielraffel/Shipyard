@@ -531,6 +531,13 @@ guard's own decision posted on the head; it is report-only until a
 repository requires it. A red `review-verdict` means the guard would refuse
 that head; fix the verdict, not the status.
 
+**The `risk-tier` status says how much review a head would need.**
+`scripts/risk_tier.py` (`.github/workflows/risk-tier.yml`, docs/risk-tier.md)
+classifies a pull request Low, Moderate or High from its paths, dependency
+changes, version bump, size and `risk:*` labels, with path lists from the
+base's `[review.tiers]`. It is report-only: always `success`, never required.
+Run it locally with `python3 scripts/risk_tier.py --repo R --pr N --gh ghapp`.
+
 **Shipyard's own CI names its reds.** When any job in a `ci.yml` run fails,
 the advisory `ci-cause` job reads the failed jobs' finished logs and prints one
 `ci.cause/v1` record per job as a `::notice title=ci-cause::` annotation
