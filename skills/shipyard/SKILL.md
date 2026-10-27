@@ -5307,3 +5307,11 @@ atomic sidecar. Readiness requires observed continuity; historical activity
 counts and status-only runs must not be used to manufacture prospective
 coverage. Sidecars are keyed by repository, source identity, cadence, and
 configuration so changing collection policy cannot mix incompatible history.
+# Local Rust gate placement
+
+The pre-push hook selects the repository-pinned Rust channel on the current
+host. Any fleet host with that channel plus rustfmt and clippy may run local
+formatting and lint gates; m1 is a fallback, not a universal gate. Local gates
+do not grant merge authority: GitHub CI, branch protection, and the configured
+Shipyard mutation machine remain authoritative.
+
