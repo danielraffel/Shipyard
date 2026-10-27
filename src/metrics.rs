@@ -397,6 +397,11 @@ pub struct StewardshipScorecard {
 pub struct FleetCapacityDenominator {
     pub status: String,
     pub reason: String,
+    /// Currentness of the newest producer validity interval. This is separate
+    /// from `status`, which describes historical window coverage.
+    pub freshness_status: String,
+    pub latest_valid_until: Option<DateTime<Utc>>,
+    pub freshness_reason: String,
     pub sample_count: usize,
     pub verified_samples: usize,
     pub unknown_samples: usize,
@@ -1172,6 +1177,10 @@ impl MetricsStore {
             ));
         }
         let sample_count = samples.len();
+        let latest_valid_until = samples
+            .iter()
+            .map(|(_, _, valid_until, _, _, _, _, _)| *valid_until)
+            .max();
         let verified_samples = samples
             .iter()
             .filter(|(_, _, _, _, _, _, verification, _)| verification == "verified")
@@ -1284,9 +1293,26 @@ impl MetricsStore {
         } else {
             format!("{verified_samples} verified fleet-capacity samples")
         };
+        let (freshness_status, freshness_reason) = match latest_valid_until {
+            None => (
+                "unavailable",
+                "no fleet-capacity validity interval is available".to_owned(),
+            ),
+            Some(valid_until) if valid_until > window_end => (
+                "fresh",
+                format!("latest fleet-capacity evidence is valid until {valid_until}"),
+            ),
+            Some(valid_until) => (
+                "stale",
+                format!("latest fleet-capacity evidence expired at {valid_until}"),
+            ),
+        };
         Ok(FleetCapacityDenominator {
             status: status.to_owned(),
             reason,
+            freshness_status: freshness_status.to_owned(),
+            latest_valid_until,
+            freshness_reason,
             sample_count,
             verified_samples,
             unknown_samples,
@@ -3950,7 +3976,39 @@ mod tests {
         assert_eq!(scorecard.fleet_capacity.sample_count, 2);
         assert_eq!(scorecard.fleet_capacity.verified_samples, 1);
         assert_eq!(scorecard.fleet_capacity.unknown_samples, 1);
+        assert_eq!(scorecard.fleet_capacity.freshness_status, "fresh");
+        assert!(scorecard.fleet_capacity.latest_valid_until.is_some());
         assert!(scorecard.fleet_capacity.eligible_slot_hours.is_some());
+    }
+
+    #[test]
+    fn expired_capacity_evidence_is_marked_stale_without_erasing_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let expired = test_capacity_sample(Utc::now() - Duration::hours(2), "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&expired).unwrap())
+            .unwrap();
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.freshness_status, "stale");
+        assert!(
+            scorecard
+                .fleet_capacity
+                .freshness_reason
+                .contains("expired at")
+        );
+        assert_eq!(scorecard.fleet_capacity.sample_count, 1);
+    }
+
+    #[test]
+    fn no_capacity_evidence_is_explicitly_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.freshness_status, "unavailable");
+        assert_eq!(scorecard.fleet_capacity.latest_valid_until, None);
     }
 
     #[test]

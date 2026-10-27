@@ -585,6 +585,16 @@ def baseline_readiness(card: dict[str, Any], started: dt.datetime,
             or instrumentation.get("continuous_days") < 5:
         reasons.append({"status": "unavailable", "reason": "continuous instrumentation coverage is unavailable"})
 
+    capacity = card.get("fleet_capacity")
+    if not isinstance(capacity, dict):
+        reasons.append({"status": "unavailable", "reason": "fleet-capacity freshness is unavailable"})
+    elif capacity.get("freshness_status") != "fresh":
+        detail = capacity.get("freshness_reason")
+        reason = "fleet-capacity evidence is not fresh"
+        if isinstance(detail, str) and detail.strip():
+            reason = f"{reason}: {detail}"
+        reasons.append({"status": "unavailable", "reason": reason})
+
     eligibility_reasons: list[dict[str, str]] = []
     for field, minimum, label in (("important_lanes", 30, "important lane"),
                                   ("host_generations", 10, "host generation")):
