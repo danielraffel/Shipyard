@@ -550,7 +550,7 @@ fn pending_reds(dir: &Path, since: &str, linked: &BTreeSet<(String, u64, u64)>) 
         ) else {
             continue;
         };
-        if completed < since {
+        if !super::advice::valid_sha(head_sha) || completed < since {
             continue;
         }
         let attempt = row["attempt"].as_u64().unwrap_or(1);
@@ -716,11 +716,24 @@ fn created(run: &Value) -> String {
 /// green on the red head) and the push fix (the earliest later green on
 /// another head), when they exist.
 fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> Vec<Fix> {
-    let on_red_head = |run: &&&Value| run["head_sha"].as_str() == Some(red.head_sha.as_str());
+    if !super::advice::valid_sha(&red.head_sha) {
+        return Vec::new();
+    }
+    let on_red_head = |run: &&&Value| {
+        run["head_sha"]
+            .as_str()
+            .is_some_and(super::advice::valid_sha)
+            && run["head_sha"].as_str() == Some(red.head_sha.as_str())
+    };
     let rerun = run_index
         .get(&red.run_id)
         .filter(|run| {
-            run["conclusion"] == "success" && run["run_attempt"].as_u64().unwrap_or(1) > red.attempt
+            run["conclusion"] == "success"
+                && run["run_attempt"].as_u64().unwrap_or(1) > red.attempt
+                && run["head_sha"].as_str() == Some(red.head_sha.as_str())
+                && run["head_sha"]
+                    .as_str()
+                    .is_some_and(super::advice::valid_sha)
         })
         .and_then(|run| run["run_started_at"].as_str())
         .map(|at| (red.run_id, at.to_owned()))
@@ -739,7 +752,12 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
         });
     let push = later
         .iter()
-        .filter(|run| !on_red_head(run))
+        .filter(|run| {
+            run["head_sha"]
+                .as_str()
+                .is_some_and(super::advice::valid_sha)
+                && !on_red_head(run)
+        })
         .min_by_key(|run| created(run))
         .map(|run| Fix {
             head_sha: run["head_sha"].as_str().unwrap_or_default().to_owned(),
