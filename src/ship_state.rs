@@ -935,9 +935,11 @@ impl ShipStateStore {
             .claim_epoch
             .checked_add(1)
             .is_some_and(|next| state.claim_epoch == next);
+        let head_changed = state.head_sha != expected.head_sha;
         if state.state_version != expected_version
             || state.generation < expected.generation
             || (state.generation != expected.generation && !generation_advanced)
+            || (head_changed && !generation_advanced)
             || state.claim_epoch < expected.claim_epoch
             || (state.claim_epoch != expected.claim_epoch && !claim_epoch_advanced)
         {
@@ -2380,6 +2382,18 @@ mod tests {
         ));
         assert!(adopted.generation > stale.generation);
         assert!(adopted.state_version > stale.state_version);
+
+        let adopted_expected = adopted.cas();
+        let mut unguarded_head_change = adopted.clone();
+        unguarded_head_change.head_sha = "head-c".to_owned();
+        unguarded_head_change.touch();
+        let lock = store
+            .lock_pr_scoped(&adopted.repo, adopted.pr)
+            .expect("unguarded head lock");
+        let error = store
+            .save_scoped_locked_cas(&unguarded_head_change, &adopted_expected, &lock)
+            .expect_err("head changes must advance generation through the fence");
+        assert!(matches!(error, super::ShipStateCasError::Conflict { .. }));
 
         let mut stale_force_push = stale;
         stale_force_push.head_sha = "head-c".to_owned();
