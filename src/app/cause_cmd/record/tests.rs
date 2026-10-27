@@ -735,6 +735,46 @@ fn scrubbed_job_names_still_match_the_api_when_proving_a_fix() {
 }
 
 #[test]
+fn distinct_raw_job_names_that_scrub_alike_cannot_prove_a_fix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut failed = job(1000, "failure");
+    failed["name"] = json!("test-m1");
+    let mut routes = red_routes();
+    routes[1] = ("runs/100/jobs", json!({"jobs": [failed.clone()]}));
+    let first = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(dir.path())).expect("red pass");
+
+    let mut skipped = job(2000, "skipped");
+    skipped["run_id"] = json!(200);
+    skipped["head_sha"] = json!("fedcba9876543210fedcba9876543210fedcba98");
+    skipped["name"] = json!("test-m1");
+    let mut other_host = job(2001, "success");
+    other_host["run_id"] = json!(200);
+    other_host["head_sha"] = json!("fedcba9876543210fedcba9876543210fedcba98");
+    other_host["name"] = json!("test-m3");
+    let mut routes = red_routes();
+    routes[1] = ("runs/100/jobs", json!({"jobs": [failed]}));
+    routes.retain(|(needle, _)| {
+        !needle.starts_with("runs?branch=") && !needle.contains("runs/200/jobs")
+    });
+    routes.extend([
+        (
+            "runs?branch=feat%2Fx&status=success",
+            json!({"workflow_runs": [{
+                "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
+                "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
+            }]}),
+        ),
+        ("runs/200/jobs", json!({"jobs": [skipped, other_host]})),
+    ]);
+    let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    let report = record(&gh, &query(dir.path())).expect("same scrubbed host");
+    assert_eq!((report.fixlinks_written, report.reds_pending), (0, 1));
+}
+
+#[test]
 fn a_selective_rerun_can_pass_failed_jobs_across_multiple_attempts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut rerun = red_run();
@@ -886,7 +926,7 @@ fn an_unreadable_failed_sibling_keeps_the_red_pending_for_fixing() {
     assert_eq!(first_report.causes_written, 1);
 
     let mut routes = red_routes();
-    routes[1] = ("runs/100/jobs", json!({"jobs": red_jobs}));
+    routes[1] = ("runs/100/jobs", json!({"jobs": red_jobs.clone()}));
     routes.retain(|(needle, _)| {
         !needle.starts_with("runs?branch=") && !needle.contains("runs/200/jobs")
     });
@@ -915,7 +955,7 @@ fn a_green_run_must_pass_every_failed_job_before_writing_a_fix() {
     let mut red_jobs = vec![job(1000, "failure"), job(1001, "failure")];
     red_jobs[1]["name"] = json!("linux");
     let mut routes = red_routes();
-    routes[1] = ("runs/100/jobs", json!({"jobs": red_jobs}));
+    routes[1] = ("runs/100/jobs", json!({"jobs": red_jobs.clone()}));
     let first = Fake::new(&routes)
         .with_log("jobs/1000/logs", &drift_log())
         .with_log("jobs/1001/logs", &drift_log());
@@ -924,6 +964,7 @@ fn a_green_run_must_pass_every_failed_job_before_writing_a_fix() {
     assert_eq!(red_report.causes_written, 2);
 
     let mut routes = red_routes();
+    routes[1] = ("runs/100/jobs", json!({"jobs": red_jobs}));
     routes.retain(|(needle, _)| {
         !needle.starts_with("runs?branch=") && !needle.contains("runs/200/jobs")
     });

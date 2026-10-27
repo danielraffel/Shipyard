@@ -119,11 +119,12 @@ Each pass:
    three days ago);
 2. for every red job not yet in the archive, writes one `ci.cause/v1` row to
    `<dir>/causes/YYYY-MM.jsonl`, by the job's completion time;
-3. for every red run attempt without a fix-link, looks for the earliest later
-   successful run of the same workflow on the same pull request or branch.
-   When it finds one, it writes a fix-link to `<dir>/fixlinks.jsonl`: the red
-   run, the fixing commit, and the files it changed. A rerun that turned the
-   same run green is recorded as `rerun_green`.
+3. for every red run attempt without a fix-link, considers a later attempt of
+   the red run, then later successful runs on the same head, then later
+   successful runs on another head. It accepts the first candidate whose
+   complete job listing proves every failed job passed, and writes a fix-link
+   to `<dir>/fixlinks.jsonl`: the red run, the fixing commit, and the files it
+   changed. A same-head run is recorded as `rerun_green`.
 
 A bare exit that C2 cannot name gets one of two labels. A summary job, such
 as `linux` checking the jobs it needs, takes the cause of the named job in
@@ -201,11 +202,11 @@ making it a prerequisite for CI execution or merge decisions.
 `cause advise` reads only the local archive. It requires a full current head
 SHA, excludes that head and the current pull request, ignores unnamed/unknown
 rows and incomplete or malformed fix-links, and uses case-insensitive lexical
-token overlap with stable tie breaks. A fix-link is attached only when the
-failed job itself passed in the recorded green run attempt. Human-readable
+token overlap with stable tie breaks. Human-readable
 output names the derivation (`compare_red_head_to_fix_head` for a code-change
 fix, or `rerun_green` for a same-head rerun); code-change links rank ahead of
-same-head reruns when both exist.
+same-head reruns when both exist. A fix-link is only attached when every
+failed job passed in the recorded green run or its selective rerun attempts.
 It can take newline-delimited outage windows (`start`, `end`, optional
 `reason`) and suppresses rows completed inside a declared window. It never
 contacts GitHub, executes `fix_hint`, or writes the archive. Rows containing

@@ -60,7 +60,8 @@ const FIXLINK_RULE: &str = "candidate order is a later attempt of the red run, t
     runs on the same head, then later successful runs on another head; accept the first candidate \
     whose job listing proves every failed job passed. Candidates are on the red pull request branch \
     (or branch) and created after the red attempt's last failed job completed; a later attempt of the \
-    red run is rerun_green with pushed_at = its run_started_at; files_raw = compare red head...fix head";
+    red run is rerun_green with pushed_at = its run_started_at; a later same-head run is rerun_green \
+    with pushed_at = its created_at; files_raw = compare red head...fix head";
 
 /// One observer pass.
 #[derive(Clone, Debug)]
@@ -1151,10 +1152,11 @@ fn run_passed_job(
     gh: &SyncGhReader<'_>,
     query: &RecordQuery,
     red: &Red,
+    failed_job_names: &BTreeSet<String>,
     fix: &Fix,
     jobs_cache: &mut BTreeMap<u64, Vec<Value>>,
 ) -> Result<bool, String> {
-    if red.jobs.is_empty() || fix.run_id == 0 {
+    if failed_job_names.is_empty() || fix.run_id == 0 {
         return Ok(false);
     }
     let jobs = if let Some(jobs) = jobs_cache.get(&fix.run_id) {
@@ -1164,6 +1166,9 @@ fn run_passed_job(
         jobs_cache.insert(fix.run_id, jobs.clone());
         jobs
     };
+    if jobs.is_empty() {
+        return Err(format!("jobs for fix run {} were empty", fix.run_id));
+    }
     if !job_list_complete(&jobs) {
         return Err(format!(
             "jobs for fix run {} reached the {}-page bound",
@@ -1171,13 +1176,11 @@ fn run_passed_job(
         ));
     }
     Ok(!jobs.is_empty() && {
-        red.jobs.iter().all(|failed_job| {
+        failed_job_names.iter().all(|failed_job| {
             let passed_attempt = jobs
                 .iter()
                 .filter(|job| {
-                    job["name"]
-                        .as_str()
-                        .is_some_and(|name| canonical_job_name(name) == *failed_job)
+                    job["name"].as_str() == Some(failed_job.as_str())
                         && job["conclusion"].as_str() == Some("success")
                 })
                 .filter_map(|job| job["run_attempt"].as_u64())
@@ -1200,7 +1203,7 @@ fn red_jobs_complete(
     query: &RecordQuery,
     red: &Red,
     jobs_cache: &mut BTreeMap<u64, Vec<Value>>,
-) -> Result<bool, String> {
+) -> Result<Option<BTreeSet<String>>, String> {
     let jobs = if let Some(jobs) = jobs_cache.get(&red.run_id) {
         jobs.clone()
     } else {
@@ -1209,15 +1212,32 @@ fn red_jobs_complete(
         jobs
     };
     if jobs.is_empty() || !job_list_complete(&jobs) {
-        return Ok(false);
+        return Ok(None);
     }
-    let observed = jobs
+    let raw_names = jobs
         .iter()
         .filter(|job| job["run_attempt"].as_u64().unwrap_or(1) == red.attempt)
         .filter(|job| matches!(job["conclusion"].as_str(), Some("failure" | "timed_out")))
-        .filter_map(|job| job["name"].as_str().map(canonical_job_name))
+        .filter_map(|job| job["name"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    Ok(!observed.is_empty() && observed.is_subset(&red.jobs))
+    if raw_names.is_empty() {
+        return Ok(None);
+    }
+    let mut scrubbed_to_raw: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for raw in &raw_names {
+        scrubbed_to_raw
+            .entry(canonical_job_name(raw))
+            .or_default()
+            .insert(raw.clone());
+    }
+    if scrubbed_to_raw.values().any(|names| names.len() > 1) {
+        return Ok(None);
+    }
+    let observed = scrubbed_to_raw.keys().cloned().collect::<BTreeSet<_>>();
+    if !observed.is_subset(&red.jobs) {
+        return Ok(None);
+    }
+    Ok(Some(raw_names))
 }
 
 /// Count a red still without a fix, by how long ago it went red.
@@ -1252,9 +1272,9 @@ fn fixlinks(
             pending(report, &red, &query.now);
             continue;
         }
-        match red_jobs_complete(gh, query, &red, &mut jobs_cache) {
-            Ok(true) => {}
-            Ok(false) => {
+        let failed_job_names = match red_jobs_complete(gh, query, &red, &mut jobs_cache) {
+            Ok(Some(names)) => names,
+            Ok(None) => {
                 pending(report, &red, &query.now);
                 continue;
             }
@@ -1265,7 +1285,7 @@ fn fixlinks(
                 pending(report, &red, &query.now);
                 continue;
             }
-        }
+        };
         let branch = fix_branch(gh, query, &red, pulls);
         if branch.is_empty() {
             pending(report, &red, &query.now);
@@ -1291,7 +1311,7 @@ fn fixlinks(
         let mut verified_fix = None;
         let mut candidate_unreadable = false;
         for fix in fixes {
-            match run_passed_job(gh, query, &red, &fix, &mut jobs_cache) {
+            match run_passed_job(gh, query, &red, &failed_job_names, &fix, &mut jobs_cache) {
                 Ok(true) => {
                     verified_fix = Some(fix);
                     break;
