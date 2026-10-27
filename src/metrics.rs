@@ -389,6 +389,9 @@ pub struct StewardshipScorecard {
     /// Observation-only eligible `TartCI` slot-hours in this window. Unknown
     /// samples remain visible and make the denominator partial.
     pub fleet_capacity: FleetCapacityDenominator,
+    /// Safely merged changes per eligible fleet-hour. This is unavailable
+    /// without both durable safe-merge receipts and measured capacity.
+    pub safely_merged_changes_per_eligible_slot_hour: ScorecardCoverage,
     /// Basis of `comparison.verdict`.
     pub basis: &'static str,
     /// Load-independent proxies over this window (project-wide).
@@ -1179,36 +1182,48 @@ impl MetricsStore {
         let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
         let project_filter = crate::metrics::project_key::sql_filter("project", "repo");
         let safe: Vec<(String, String, i64)> = {
-            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4)"))?;
-            q.query_map(rusqlite::params![any, short, full, cutoff], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
+            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4) AND julianday(merged_at) < julianday(?5)"))?;
+            q.query_map(
+                rusqlite::params![any, short, full, cutoff, Utc::now().to_rfc3339()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
             .collect::<Result<_, _>>()?
         };
-        let unique = safe.into_iter().collect::<std::collections::BTreeSet<_>>();
+        let mut unique =
+            std::collections::BTreeMap::<(String, String), std::collections::BTreeSet<i64>>::new();
+        for (repo, head, pr) in safe {
+            unique.entry((repo, head)).or_default().insert(pr);
+        }
         let total = unique.len();
         let mut joined = 0_usize;
         let mut wasted = 0_i64;
         let mut samples = 0_usize;
         let mut duration_gaps = 0_usize;
-        for (repo, head, pr) in unique {
+        for ((repo, head), prs) in unique {
             let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND run.sha = ?2 AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
-            let mut matched = false;
-            let mut invalid_duration = false;
-            for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
-            })? {
-                let (_, ms) = row?;
-                if ms.is_none_or(|v| v < 0) {
-                    // A completed row with NULL/negative duration cannot
-                    // substantiate a cost join. Keep the merge unjoined so
-                    // the scorecard cannot report a zero-cost claim.
-                    invalid_duration = true;
-                    continue;
+            let mut matched_pr = None;
+            for pr in prs {
+                let mut pr_matched = false;
+                let mut pr_invalid_duration = false;
+                for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+                })? {
+                    let (_, ms) = row?;
+                    if ms.is_none_or(|v| v < 0) {
+                        // A completed row with NULL/negative duration cannot
+                        // substantiate a cost join. Keep the merge unjoined so
+                        // the scorecard cannot report a zero-cost claim.
+                        pr_invalid_duration = true;
+                        continue;
+                    }
+                    pr_matched = true;
                 }
-                matched = true;
+                if pr_matched && !pr_invalid_duration {
+                    matched_pr = Some(pr);
+                    break;
+                }
             }
-            if matched && !invalid_duration {
+            if let Some(pr) = matched_pr {
                 // The merged head proved the join; the change's waste is every
                 // failed or cancelled job of its pull request, earlier pushes
                 // included, not only the jobs on the head that merged.
@@ -2130,6 +2145,8 @@ impl MetricsStore {
         let now = Utc::now();
         let fleet_capacity =
             self.fleet_capacity_denominator(project, &cutoff, &now.to_rfc3339())?;
+        let safely_merged_changes_per_eligible_slot_hour =
+            safe_merge_rate(safe_merge_count, &fleet_capacity);
         let (proxies, comparison) = proxy_store::scorecard_window(
             &proxy_store::load_samples(&conn, Some(project))?,
             now,
@@ -2228,6 +2245,7 @@ impl MetricsStore {
                 value: None,
             },
             fleet_capacity,
+            safely_merged_changes_per_eligible_slot_hour,
             basis: basis.as_str(),
             proxies,
             comparison,
@@ -2714,6 +2732,51 @@ fn unavailable_merge_coverage() -> ScorecardCoverage {
         status: "unavailable".to_owned(),
         reason: "no durable merge receipt joins a PR head to a safely merged change".to_owned(),
         value: None,
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn safe_merge_rate(
+    safe_merge_count: usize,
+    capacity: &FleetCapacityDenominator,
+) -> ScorecardCoverage {
+    let Some(hours) = capacity.eligible_slot_hours.filter(|value| *value > 0.0) else {
+        let reason = if safe_merge_count == 0 {
+            "no durable safe-merge receipt heads or positive eligible fleet-hours"
+        } else if capacity.eligible_slot_hours == Some(0.0) {
+            "eligible fleet-hours are zero; safely merged changes per eligible fleet-hour is undefined"
+        } else {
+            "eligible fleet-hours are unavailable; safely merged changes per eligible fleet-hour is unavailable"
+        };
+        return ScorecardCoverage {
+            status: "unavailable".to_owned(),
+            reason: reason.to_owned(),
+            value: None,
+        };
+    };
+    if safe_merge_count == 0 {
+        return ScorecardCoverage {
+            status: "unavailable".to_owned(),
+            reason: "no durable safe-merge receipt heads in the scorecard window".to_owned(),
+            value: None,
+        };
+    }
+
+    let rate = safe_merge_count as f64 / hours;
+    let partial = capacity.status != "available";
+    let reason = if partial {
+        format!(
+            "{safe_merge_count} distinct safe merge receipt heads / {hours:.6} eligible fleet-hours; denominator is a verified lower bound, so this rate is an upper-bound estimate"
+        )
+    } else {
+        format!(
+            "{safe_merge_count} distinct safe merge receipt heads / {hours:.6} eligible fleet-hours"
+        )
+    };
+    ScorecardCoverage {
+        status: if partial { "partial" } else { "available" }.to_owned(),
+        reason,
+        value: Some(rate),
     }
 }
 
@@ -4015,6 +4078,98 @@ mod tests {
         assert!(scorecard.fleet_capacity.eligible_slot_hours.is_some());
     }
 
+    fn test_capacity_denominator(
+        status: &str,
+        eligible_slot_hours: Option<f64>,
+    ) -> FleetCapacityDenominator {
+        FleetCapacityDenominator {
+            status: status.to_owned(),
+            reason: String::new(),
+            sample_count: 1,
+            verified_samples: usize::from(status == "available"),
+            unknown_samples: usize::from(status == "partial"),
+            host_target_count: 1,
+            eligible_slot_hours,
+        }
+    }
+
+    #[test]
+    fn safe_merge_rate_is_fail_closed_without_capacity_or_receipts() {
+        let no_capacity = safe_merge_rate(2, &test_capacity_denominator("unavailable", None));
+        assert_eq!(no_capacity.status, "unavailable");
+        assert_eq!(no_capacity.value, None);
+
+        let no_receipts = safe_merge_rate(0, &test_capacity_denominator("available", Some(4.0)));
+        assert_eq!(no_receipts.status, "unavailable");
+        assert!(no_receipts.reason.contains("no durable safe-merge"));
+    }
+
+    #[test]
+    fn safe_merge_rate_marks_partial_capacity_as_upper_bound() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("partial", Some(6.0)));
+        assert_eq!(result.status, "partial");
+        assert_eq!(result.value, Some(0.5));
+        assert!(result.reason.contains("lower bound"));
+        assert!(result.reason.contains("upper-bound estimate"));
+    }
+
+    #[test]
+    fn safe_merge_rate_reports_fully_verified_capacity() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("available", Some(6.0)));
+        assert_eq!(result.status, "available");
+        assert_eq!(result.value, Some(0.5));
+        assert!(!result.reason.contains("upper-bound"));
+    }
+
+    #[test]
+    fn safe_merge_rate_rejects_zero_eligible_hours() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("partial", Some(0.0)));
+        assert_eq!(result.status, "unavailable");
+        assert_eq!(result.value, None);
+        assert!(result.reason.contains("zero"));
+    }
+
+    #[test]
+    fn scorecard_reports_safe_merge_rate_from_receipts_and_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 41, "success", 1_000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo = 'danielraffel/Shipyard', sha = ?1 WHERE pr = 41",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        let observed = Utc::now() - Duration::minutes(1);
+        let capacity = test_capacity_sample(observed, "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&capacity).unwrap())
+            .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt(
+                "rate-41",
+                "danielraffel/Shipyard",
+                "shipyard",
+                41,
+                'a',
+            )])
+            .unwrap();
+
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        let rate = &scorecard.safely_merged_changes_per_eligible_slot_hour;
+        assert_eq!(rate.status, "partial");
+        assert!(rate.value.is_some_and(|value| value > 0.0));
+        assert!(rate.reason.contains("eligible fleet-hours"));
+        assert!(rate.reason.contains("upper-bound estimate"));
+        let json = serde_json::to_value(&scorecard).unwrap();
+        assert!(
+            json.get("safely_merged_changes_per_eligible_slot_hour")
+                .and_then(|value| value.get("value"))
+                .and_then(serde_json::Value::as_f64)
+                .is_some()
+        );
+    }
+
     #[test]
     fn unknown_latest_capacity_observation_suppresses_overlapping_verified_capacity() {
         let temp = tempfile::tempdir().unwrap();
@@ -4222,6 +4377,46 @@ mod tests {
         );
         let scorecard = store.stewardship_scorecard("repo", 2).unwrap();
         assert_eq!(scorecard.safely_merged_changes.value, Some(1.0));
+    }
+
+    #[test]
+    fn safe_merge_rate_deduplicates_one_head_across_pr_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 30, "success", 1_000, 0, false);
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET repo='owner/repo', sha=?1 WHERE pr=30",
+                [&"a".repeat(40)],
+            )
+            .unwrap();
+        let first = test_receipt("head-pr-30", "owner/repo", "repo", 30, 'a');
+        let mut second = first.clone();
+        second.receipt_id = "head-pr-31".into();
+        second.pr = 31;
+        store.import_merge_receipts(&[first, second]).unwrap();
+        let (total, joined, _, _, _) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((total, joined), (1, 1));
+    }
+
+    #[test]
+    fn safe_merge_summary_excludes_future_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let mut future = test_receipt("future-merge", "owner/repo", "repo", 1, 'a');
+        future.merged_at = Utc::now() + Duration::hours(1);
+        store.import_merge_receipts(&[future]).unwrap();
+        assert_eq!(
+            store
+                .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            0
+        );
     }
 
     #[test]
