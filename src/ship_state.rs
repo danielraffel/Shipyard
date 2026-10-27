@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -624,6 +625,60 @@ impl ShipStateStore {
         Self::persist_state_at(state, &path)?;
         self.sync_legacy_mirror_for_pr(state.pr)?;
         Ok(())
+    }
+
+    /// Claim an exact reviewer head, persist that claim, and invoke a
+    /// publisher while the repository-scoped lock remains held.
+    ///
+    /// The publisher is expected to create the authenticated external receipt
+    /// using the supplied claim. A claim is persisted before publication so a
+    /// process crash cannot lose ownership evidence; if publication returns an
+    /// error, the claim is revoked and that fence is persisted before the
+    /// error is returned. A successful publication intentionally leaves the
+    /// claim active until the normal verdict/expiry path clears it.
+    ///
+    /// This is the storage primitive for a reviewer dispatcher. It does not
+    /// perform GitHub I/O itself, so callers must bind the receipt to the
+    /// supplied exact head and epoch and use authenticated App credentials.
+    pub fn claim_reviewer_and_publish<T, E>(
+        &self,
+        repository: &str,
+        pr: u64,
+        head_sha: &str,
+        reviewer: &str,
+        claimed_at: DateTime<Utc>,
+        deadline_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+        publisher: impl FnOnce(&ReviewerClaim) -> Result<T, E>,
+    ) -> Result<T, Box<dyn std::error::Error>>
+    where
+        E: Display,
+    {
+        let lock = self.lock_pr_scoped(repository, pr)?;
+        let mut state = self
+            .get_locked_scoped(repository, pr, &lock)
+            .ok_or_else(|| format!("no active ship state for {repository} PR #{pr}"))?;
+        let claim = state
+            .claim_reviewer(head_sha, reviewer, claimed_at, deadline_at, now)
+            .ok_or_else(|| {
+                format!("cannot claim reviewer {reviewer} for {repository} PR #{pr} at {head_sha}")
+            })?;
+        self.save_scoped_locked(&state, &lock)?;
+
+        match publisher(&claim) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let publish_error = error.to_string();
+                if !state.revoke_reviewer_claim(head_sha, claim.epoch, reviewer) {
+                    return Err(format!(
+                        "reviewer receipt publication failed ({publish_error}) and claim revocation failed"
+                    )
+                    .into());
+                }
+                self.save_scoped_locked(&state, &lock)?;
+                Err(publish_error.into())
+            }
+        }
     }
 
     /// Delete an active state file.
@@ -1441,6 +1496,65 @@ mod tests {
         assert!(archived.exists());
         assert!(store.get(42).is_none());
         assert_eq!(store.list_archived().len(), 1);
+    }
+
+    #[test]
+    fn claim_reviewer_and_publish_persists_claim_before_publisher() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let state = sample_state(43, "claim-head");
+        store.save(&state).expect("save");
+        let now = Utc::now();
+        let observed = store
+            .claim_reviewer_and_publish(
+                &state.repo,
+                state.pr,
+                &state.head_sha,
+                "pulp-review",
+                now,
+                now + Duration::minutes(5),
+                now,
+                |claim| {
+                    assert_eq!(claim.head_sha, state.head_sha);
+                    assert_eq!(claim.reviewer, "pulp-review");
+                    assert!(claim.claimed_at <= now && now < claim.deadline_at);
+                    Ok::<_, String>(claim.epoch)
+                },
+            )
+            .expect("publish");
+        assert_eq!(observed, 1);
+        assert_eq!(
+            store
+                .get_scoped(&state.repo, state.pr)
+                .unwrap()
+                .reviewer_claim_epoch,
+            1
+        );
+    }
+
+    #[test]
+    fn claim_reviewer_and_publish_revokes_and_fences_on_publish_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let state = sample_state(44, "claim-head");
+        store.save(&state).expect("save");
+        let now = Utc::now();
+        let error = store
+            .claim_reviewer_and_publish(
+                &state.repo,
+                state.pr,
+                &state.head_sha,
+                "pulp-review",
+                now,
+                now + Duration::minutes(5),
+                now,
+                |_claim| Err::<(), _>("check-run refused"),
+            )
+            .expect_err("publication failure");
+        assert_eq!(error.to_string(), "check-run refused");
+        let persisted = store.get_scoped(&state.repo, state.pr).expect("persisted");
+        assert_eq!(persisted.reviewer_claim_epoch, 2);
+        assert!(persisted.active_reviewer_claim.is_none());
     }
 
     #[test]
