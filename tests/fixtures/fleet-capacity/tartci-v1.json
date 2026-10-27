@@ -8,7 +8,17 @@
     "free": 1,
     "host": "m3",
     "in_flight": 1,
-    "lanes": [{"state": "free"}, {"state": "occupied"}, {"state": "occupied"}],
+    "lanes": [
+      {
+        "state": "free"
+      },
+      {
+        "state": "occupied"
+      },
+      {
+        "state": "occupied"
+      }
+    ],
     "occupied": 1,
     "pool": "on",
     "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

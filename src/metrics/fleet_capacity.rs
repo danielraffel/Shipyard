@@ -164,6 +164,44 @@ impl FleetCapacitySample {
                 "fleet capacity evidence identity or profile does not match sample".to_owned(),
             );
         }
+        let evidence_verdict = evidence_object
+            .get("verdict")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "fleet capacity evidence verdict is missing".to_owned())?;
+        let evidence_pool = evidence_object
+            .get("pool")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "fleet capacity evidence pool is missing".to_owned())?;
+        if self.pool_state != evidence_pool {
+            return Err("fleet capacity pool_state does not match evidence pool".to_owned());
+        }
+        let lanes = evidence_object
+            .get("lanes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "fleet capacity evidence lanes must be an array".to_owned())?;
+        if self.configured_slots != i64::try_from(lanes.len()).unwrap_or(i64::MAX) {
+            return Err("fleet capacity configured_slots does not match evidence lanes".to_owned());
+        }
+        if self.verification == "verified" {
+            if evidence_verdict != "ok" || evidence_pool != "on" {
+                return Err("verified fleet capacity requires ok/on evidence".to_owned());
+            }
+            for (name, expected) in [
+                ("free", self.free_slots),
+                ("occupied", self.occupied_slots),
+                ("in_flight", self.in_flight_slots),
+            ] {
+                let actual = evidence_object
+                    .get(name)
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| format!("verified fleet capacity evidence {name} is missing"))?;
+                if Some(actual) != expected {
+                    return Err(format!(
+                        "fleet capacity evidence {name} does not match sample"
+                    ));
+                }
+            }
+        }
         let census = self
             .evidence
             .as_object()
@@ -301,7 +339,10 @@ mod tests {
                 "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "verdict": "ok",
                 "pool": "on",
-                "lanes": []
+                "free": 1,
+                "occupied": 1,
+                "in_flight": 1,
+                "lanes": [{"lane": "a"}, {"lane": "b"}, {"lane": "c"}]
             }),
             evidence_sha256: "b".repeat(64),
             census_sha256: "c".repeat(64),
@@ -360,6 +401,15 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn accepts_a_producer_edge_case_fixture_with_utf8_float_and_large_integer() {
+        let text = include_str!("../../tests/fixtures/fleet-capacity/tartci-v1-edge.json");
+        let parsed = parse_reader(text.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].evidence["label"], "café");
+        assert_eq!(parsed[0].evidence["large"], 9_007_199_254_740_993_i64);
     }
 
     #[test]

@@ -1137,10 +1137,10 @@ impl MetricsStore {
         let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
         let project_filter = crate::metrics::project_key::sql_filter("repo", "repo");
         let mut statement = conn.prepare(&format!(
-            "SELECT observed_at, valid_until, sample_id, host_id, target, verification, eligible_slots
+            "SELECT repo, observed_at, valid_until, sample_id, host_id, target, verification, eligible_slots
                FROM fleet_capacity_samples
               WHERE {project_filter} AND valid_until > ?4 AND observed_at < ?5
-              ORDER BY host_id, target, observed_at"
+              ORDER BY repo, host_id, target, observed_at"
         ))?;
         let rows = statement.query_map(params![any, short, full, cutoff, until], |row| {
             Ok((
@@ -1150,15 +1150,18 @@ impl MetricsStore {
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(7)?,
             ))
         })?;
         let mut samples = Vec::new();
         for row in rows {
-            let (observed, valid_until, sample_id, host, target, verification, eligible) = row?;
+            let (repo, observed, valid_until, sample_id, host, target, verification, eligible) =
+                row?;
             let observed = DateTime::parse_from_rfc3339(&observed)?.with_timezone(&Utc);
             let valid_until = DateTime::parse_from_rfc3339(&valid_until)?.with_timezone(&Utc);
             samples.push((
+                repo,
                 observed,
                 valid_until,
                 sample_id,
@@ -1171,11 +1174,11 @@ impl MetricsStore {
         let sample_count = samples.len();
         let verified_samples = samples
             .iter()
-            .filter(|(_, _, _, _, _, verification, _)| verification == "verified")
+            .filter(|(_, _, _, _, _, _, verification, _)| verification == "verified")
             .count();
         let unknown_samples = sample_count.saturating_sub(verified_samples);
         let mut groups: BTreeMap<
-            (String, String),
+            (String, String, String),
             Vec<(
                 DateTime<Utc>,
                 DateTime<Utc>,
@@ -1188,12 +1191,14 @@ impl MetricsStore {
         let window_start = DateTime::parse_from_rfc3339(cutoff)?.with_timezone(&Utc);
         let window_end = DateTime::parse_from_rfc3339(until)?.with_timezone(&Utc);
         let mut hosts = BTreeSet::new();
-        for (observed, valid_until, sample_id, host, target, verification, eligible) in samples {
-            hosts.insert((host.clone(), target.clone()));
+        for (repo, observed, valid_until, sample_id, host, target, verification, eligible) in
+            samples
+        {
+            hosts.insert((repo.clone(), host.clone(), target.clone()));
             let start = observed.max(window_start);
             let end = valid_until.min(window_end);
             if end > start {
-                groups.entry((host, target)).or_default().push((
+                groups.entry((repo, host, target)).or_default().push((
                     start,
                     end,
                     observed,
@@ -1204,41 +1209,80 @@ impl MetricsStore {
             }
         }
         let mut eligible_slot_seconds = 0_i64;
+        let mut coverage_gap = false;
         for intervals in groups.values() {
-            let mut boundaries = intervals
-                .iter()
-                .flat_map(|(start, end, _, _, _, _)| [*start, *end])
-                .collect::<Vec<_>>();
-            boundaries.sort_unstable();
-            boundaries.dedup();
-            for pair in boundaries.windows(2) {
-                let (start, end) = (pair[0], pair[1]);
-                let latest = intervals
-                    .iter()
-                    .filter(|(left, right, _, _, _, _)| *left <= start && *right >= end)
-                    .max_by_key(|(_, _, observed, sample_id, _, _)| (*observed, sample_id));
-                let slots = latest
-                    .filter(|(_, _, _, _, verification, _)| verification == "verified")
-                    .and_then(|(_, _, _, _, _, slots)| *slots)
-                    .filter(|slots| *slots >= 0)
-                    .unwrap_or(0);
-                eligible_slot_seconds = eligible_slot_seconds
-                    .saturating_add(slots.saturating_mul((end - start).num_seconds().max(0)));
+            // Sweep interval boundaries once instead of scanning every interval
+            // for every segment. Unknown observations win equal-timestamp ties.
+            let mut events: BTreeMap<DateTime<Utc>, Vec<(bool, usize)>> = BTreeMap::new();
+            let mut keys = Vec::with_capacity(intervals.len());
+            for (index, (start, end, observed, sample_id, verification, _)) in
+                intervals.iter().enumerate()
+            {
+                events.entry(*start).or_default().push((true, index));
+                events.entry(*end).or_default().push((false, index));
+                keys.push((
+                    *observed,
+                    *verification == "unknown",
+                    sample_id.clone(),
+                    index,
+                ));
+            }
+            let mut active = std::collections::BTreeSet::new();
+            let mut previous = None;
+            let mut covered_until = window_start;
+            for (time, changes) in events {
+                if let Some(start) = previous {
+                    if time > start {
+                        if let Some((_, _, _, index)) = active.iter().next_back() {
+                            let (_, _, _, _, verification, slots) = &intervals[*index];
+                            let slots: i64 = (verification == "verified")
+                                .then_some(*slots)
+                                .flatten()
+                                .filter(|slots| *slots >= 0)
+                                .unwrap_or(0);
+                            eligible_slot_seconds = eligible_slot_seconds.saturating_add(
+                                slots.saturating_mul((time - start).num_seconds().max(0)),
+                            );
+                            if start > covered_until {
+                                coverage_gap = true;
+                            }
+                            covered_until = time;
+                        }
+                    }
+                }
+                for (is_start, index) in changes {
+                    if is_start {
+                        active.insert(keys[index].clone());
+                    } else {
+                        active.remove(&keys[index]);
+                    }
+                }
+                previous = Some(time);
+            }
+            if covered_until < window_end {
+                coverage_gap = true;
             }
         }
         let status = if sample_count == 0 {
             "unavailable"
-        } else if unknown_samples > 0 {
+        } else if unknown_samples > 0 || coverage_gap {
             "partial"
         } else {
             "available"
         };
         let reason = if sample_count == 0 {
             "no fleet-capacity samples overlap the scorecard window".to_owned()
-        } else if unknown_samples > 0 {
-            format!(
-                "{verified_samples} verified and {unknown_samples} unknown fleet-capacity samples; denominator is a lower bound"
-            )
+        } else if unknown_samples > 0 || coverage_gap {
+            let mut reasons = Vec::new();
+            if unknown_samples > 0 {
+                reasons.push(format!(
+                    "{verified_samples} verified and {unknown_samples} unknown fleet-capacity samples; denominator is a lower bound"
+                ));
+            }
+            if coverage_gap {
+                reasons.push("capacity coverage has gaps in the scorecard window".to_owned());
+            }
+            reasons.join("; ")
         } else {
             format!("{verified_samples} verified fleet-capacity samples")
         };
@@ -3858,7 +3902,10 @@ mod tests {
                 "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "verdict": "ok",
                 "pool": "on",
-                "lanes": []
+                "free": 1,
+                "occupied": 1,
+                "in_flight": 1,
+                "lanes": [{"state": "free"}, {"state": "occupied"}, {"state": "occupied"}]
             }),
             evidence_sha256: String::new(),
             census_sha256: String::new(),
@@ -3930,6 +3977,26 @@ mod tests {
             .eligible_slot_hours
             .expect("verified interval before unknown interval remains measurable");
         assert!((hours - (3.0 / 60.0)).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn unknown_equal_timestamp_wins_capacity_reduction_tie() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let observed = Utc::now() - Duration::minutes(1);
+        let verified = test_capacity_sample(observed, "m3", "verified");
+        let unknown = test_capacity_sample(observed, "m3", "unknown");
+        store
+            .import_fleet_capacity(&format!(
+                "{}\n{}\n",
+                serde_json::to_string(&verified).unwrap(),
+                serde_json::to_string(&unknown).unwrap()
+            ))
+            .unwrap();
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.status, "partial");
+        assert_eq!(scorecard.fleet_capacity.eligible_slot_hours, Some(0.0));
     }
 
     #[test]
