@@ -824,6 +824,36 @@ fn a_green_workflow_run_that_skips_the_failed_job_is_not_a_fix() {
 }
 
 #[test]
+fn a_zero_attempt_success_cannot_prove_a_fix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(dir.path())).expect("red pass");
+
+    let mut malformed = job(2000, "success");
+    malformed["run_attempt"] = json!(0);
+    let mut routes = red_routes();
+    routes.retain(|(needle, _)| {
+        !needle.starts_with("runs?branch=") && !needle.contains("runs/200/jobs")
+    });
+    routes.extend([
+        (
+            "runs?branch=feat%2Fx&status=success",
+            json!({"workflow_runs": [{
+                "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
+                "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
+            }]}),
+        ),
+        ("runs/200/jobs", json!({"jobs": [malformed]})),
+    ]);
+    let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    let report = record(&gh, &query(dir.path())).expect("malformed green pass");
+    assert_eq!((report.fixlinks_written, report.reds_pending), (0, 1));
+    assert!(!dir.path().join("fixlinks.jsonl").exists());
+}
+
+#[test]
 fn a_later_green_run_is_used_when_the_earliest_candidate_skips_the_failed_job() {
     let dir = tempfile::tempdir().expect("tempdir");
     let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
