@@ -199,7 +199,7 @@ fn acquire<W: Write>(
     let claim = result.map_err(|error| CliFailure::new(1, error.to_string()))?;
     if json_output {
         let mut data = BTreeMap::new();
-        data.insert("repo".to_owned(), Value::String(repo));
+        data.insert("repo".to_owned(), Value::String(repo.clone()));
         data.insert("pr".to_owned(), Value::from(pr));
         data.insert("head".to_owned(), Value::String(head));
         data.insert(
@@ -238,16 +238,30 @@ fn validate<W: Write>(
     validate_sha(head)?;
     let repo = resolve_repo(config, cwd, requested_repo)?;
     let reviewer = reviewer.trim();
-    let current = store.get_scoped(&repo, pr).is_some_and(|state| {
+    let state = store.get_scoped(&repo, pr);
+    let claim = state
+        .as_ref()
+        .and_then(|state| state.active_reviewer_claim.as_ref());
+    let current = state.as_ref().is_some_and(|state| {
         state.reviewer_claim_is_current(head, state.reviewer_claim_epoch, reviewer, Utc::now())
     });
     if json_output {
         let mut data = BTreeMap::new();
-        data.insert("repo".to_owned(), Value::String(repo));
+        data.insert("repo".to_owned(), Value::String(repo.clone()));
         data.insert("pr".to_owned(), Value::from(pr));
         data.insert("head".to_owned(), Value::String(head.to_ascii_lowercase()));
         data.insert("reviewer".to_owned(), Value::String(reviewer.to_owned()));
         data.insert("current".to_owned(), Value::Bool(current));
+        data.insert(
+            "claim_epoch".to_owned(),
+            claim.map_or(Value::Null, |claim| Value::from(claim.epoch)),
+        );
+        data.insert(
+            "external_id".to_owned(),
+            claim.map_or(Value::Null, |claim| {
+                Value::String(claim.receipt_id(&repo, pr))
+            }),
+        );
         write_json_envelope(stdout, "reviewer-claim", data)
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     } else {
