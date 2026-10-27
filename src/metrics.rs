@@ -14,6 +14,10 @@ mod proxy_store;
 // and samples with missing or invalid durations, respectively.
 type SafeMergeSummary = (usize, usize, i64, usize, usize);
 
+/// The baseline throughput stream is the protected default branch. The
+/// collector's merge-receipt health gate is bound to this same branch.
+const SCORECARD_BASE_BRANCH: &str = "main";
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1072,8 +1076,9 @@ impl MetricsStore {
         Ok(receipts)
     }
 
-    /// Count safe merged heads and the failed/cancelled compute attached to
-    /// those exact PR identities in the scorecard window.
+    /// Count safe merged heads on the measured protected branch and the
+    /// failed/cancelled compute attached to those exact PR identities in the
+    /// scorecard window.
     pub(crate) fn safe_merge_summary(
         &self,
         project: &str,
@@ -1084,9 +1089,16 @@ impl MetricsStore {
         let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
         let project_filter = crate::metrics::project_key::sql_filter("project", "repo");
         let safe: Vec<(String, String, i64)> = {
-            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4) AND julianday(merged_at) < julianday(?5)"))?;
+            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND base_branch = ?5 AND julianday(merged_at) >= julianday(?4) AND julianday(merged_at) < julianday(?6)"))?;
             q.query_map(
-                rusqlite::params![any, short, full, cutoff, Utc::now().to_rfc3339()],
+                rusqlite::params![
+                    any,
+                    short,
+                    full,
+                    cutoff,
+                    SCORECARD_BASE_BRANCH,
+                    Utc::now().to_rfc3339()
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?
             .collect::<Result<_, _>>()?
@@ -4355,6 +4367,21 @@ mod tests {
                 .0,
             0
         );
+    }
+
+    #[test]
+    fn safe_merge_summary_counts_only_the_measured_main_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let main = test_receipt("main-merge", "owner/repo", "repo", 1, 'a');
+        let mut release = test_receipt("release-merge", "owner/repo", "repo", 2, 'd');
+        release.base_branch = "release".to_owned();
+        store.import_merge_receipts(&[main, release]).unwrap();
+
+        let (total, joined, _, _, _) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((total, joined), (1, 0));
     }
 
     #[test]

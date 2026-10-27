@@ -153,6 +153,7 @@ class BaselineScorecardTests(unittest.TestCase):
                 MOD.run = original
             self.assertTrue(result["provenance_status"])
             self.assertEqual(result["collector_safe_merge_denominator"]["status"], "unavailable")
+            self.assertEqual(result["collector_safe_merge_rate"]["status"], "unavailable")
             self.assertEqual(result["strata"]["rerun"]["status"], "unavailable")
             self.assertEqual(commands[0][commands[0].index("--project") + 1], "Generous-Corp/pulp")
 
@@ -168,6 +169,21 @@ class BaselineScorecardTests(unittest.TestCase):
             finally:
                 MOD.run = original
             self.assertEqual(result["collector_safe_merge_denominator"], {"status": "available", "value": 2})
+            self.assertEqual(result["collector_safe_merge_rate"]["status"], "unavailable")
+
+    def test_scorecard_preserves_producer_safe_merge_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = type("Args", (), {"db": Path(directory) / "metrics" / "metrics.db", "project": "pulp", "repo": "Generous-Corp/pulp",
+                                      "shipyard": "shipyard", "since_days": 5, "timeout_seconds": 300})()
+            original = MOD.run
+            rate = {"status": "partial", "value": 0.25, "reason": "capacity lower bound"}
+            MOD.run = lambda *a, **k: subprocess.CompletedProcess(
+                a[0], 0, json.dumps({"safely_merged_changes_per_eligible_slot_hour": rate}), "")
+            try:
+                result = MOD.authoritative_scorecard(args)
+            finally:
+                MOD.run = original
+            self.assertEqual(result["collector_safe_merge_rate"], rate)
 
     def test_unknown_contract_keeps_all_strata_unavailable(self):
         card = {"strata": {"schema": "shipyard-metrics-strata/v0"}}
