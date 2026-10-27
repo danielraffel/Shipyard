@@ -657,8 +657,12 @@ impl Registrar {
         {
             let client = GhClient::from_cwd(self.mode, &self.cwd)
                 .map_err(|error| RegistrarError::GhUnavailable(error.to_string()))?;
+            // An override, not a hint: a hint loses to the daemon's cwd
+            // checkout, which would route another repository's token here.
             let client = match repo {
-                Some(slug) => client.with_repo_hint(slug),
+                Some(slug) => client
+                    .with_repo_override(slug)
+                    .map_err(|error| RegistrarError::GhUnavailable(error.to_string()))?,
                 None => client,
             };
             Ok(Some(client))
