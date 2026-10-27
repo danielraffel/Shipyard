@@ -3153,8 +3153,23 @@ pub fn apply_warm_reuse(
         return miss(target, host_key, resume_from);
     }
 
+    let warmed_target = if target.backend_name.trim().eq_ignore_ascii_case("host-pool") {
+        let Some(member_id) = entry.member_id.as_deref() else {
+            return miss(target, host_key, resume_from);
+        };
+        let Some(warmed_target) = target
+            .clone()
+            .with_host_pool_member(member_id, entry.workdir.clone())
+        else {
+            return miss(target, host_key, resume_from);
+        };
+        warmed_target
+    } else {
+        target.clone().with_workdir(entry.workdir)
+    };
+
     WarmReuseDecision {
-        target: target.clone().with_workdir(entry.workdir),
+        target: warmed_target,
         host_key,
         warm_hit: true,
         resume_from: Some(effective_warm_resume(requested_resume_from).to_owned()),
@@ -3179,13 +3194,39 @@ pub fn update_warm_pool_after_run(
         {
             return Ok(WarmPoolUpdate::Noop);
         }
+        let member_id = if target.backend_name.trim().eq_ignore_ascii_case("host-pool") {
+            let Some(member_id) = result.host_pool_member_id.as_deref() else {
+                return Ok(WarmPoolUpdate::Noop);
+            };
+            Some(member_id)
+        } else {
+            None
+        };
+        let workdir = if let Some(member_id) = member_id {
+            let ResolvedBackend::HostPool(pool_config) = &target.backend else {
+                return Ok(WarmPoolUpdate::Noop);
+            };
+            let Some(member) = pool_config
+                .members
+                .iter()
+                .find(|member| member.id == member_id)
+            else {
+                return Ok(WarmPoolUpdate::Noop);
+            };
+            member
+                .target
+                .workdir()
+                .unwrap_or_else(|| DEFAULT_WORKDIR.to_owned())
+        } else {
+            target
+                .workdir()
+                .unwrap_or_else(|| DEFAULT_WORKDIR.to_owned())
+        };
         let entry = PoolEntry::new(
             target.name.clone(),
             host,
             target.backend_name.clone(),
-            target
-                .workdir()
-                .unwrap_or_else(|| DEFAULT_WORKDIR.to_owned()),
+            workdir,
             sha.to_owned(),
             compute_expires_at(target.warm_keepalive_seconds, now),
             now,
@@ -3263,7 +3304,7 @@ mod tests {
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::evidence::EvidenceStore;
     use crate::executor::dispatch::{
-        DispatchValidationRequest, ResolvedTarget, resolve_targets_from_table,
+        DispatchValidationRequest, ResolvedBackend, ResolvedTarget, resolve_targets_from_table,
     };
     use crate::executor::streaming::{ProgressAction, ProgressEvent};
     use crate::host_pool::HostPoolLease;
@@ -3459,6 +3500,43 @@ mod tests {
             platform = "linux-x64"
             host = "vm"
             repo_path = "~/repo"
+            warm_keepalive_seconds = 600
+            "#,
+        );
+        resolve_targets_from_table(&config, ValidationMode::Full)
+            .expect("targets")
+            .remove(0)
+    }
+
+    fn host_pool_target() -> ResolvedTarget {
+        let config = table(
+            r#"
+            [validation.default]
+            command = "true"
+
+            [host_pools.local_macs]
+            lease_stale_seconds = 120
+            heartbeat_interval_seconds = 5
+
+            [[host_pools.local_macs.members]]
+            id = "studio-a"
+            type = "ssh"
+            host = "studio-a"
+            repo_path = "/srv/studio-a/repo"
+            capabilities = ["linux-x64"]
+
+            [[host_pools.local_macs.members]]
+            id = "studio-b"
+            type = "ssh"
+            host = "studio-b"
+            repo_path = "/srv/studio-b/repo"
+            capabilities = ["linux-x64"]
+
+            [targets.ubuntu]
+            backend = "host-pool"
+            pool = "local_macs"
+            platform = "linux-x64"
+            requires = ["linux-x64"]
             warm_keepalive_seconds = 600
             "#,
         );
@@ -4112,6 +4190,61 @@ mod tests {
     }
 
     #[test]
+    fn host_pool_warm_hit_restricts_to_recorded_member() {
+        let target = host_pool_target();
+        let (_temp, pool) = pool_with(
+            PoolEntry::new(
+                "ubuntu",
+                "local",
+                "host-pool",
+                "/srv/studio-b/warm",
+                "abc",
+                100.0,
+                10.0,
+            )
+            .with_member_id("studio-b"),
+        );
+
+        let decision = apply_warm_reuse(&pool, &target, "abc", None, false, 20.0);
+
+        assert!(decision.warm_hit);
+        let ResolvedBackend::HostPool(pool) = &decision.target.backend else {
+            panic!("host-pool target");
+        };
+        assert_eq!(pool.members.len(), 1);
+        assert_eq!(pool.members[0].id, "studio-b");
+        assert_eq!(
+            decision.target.workdir().as_deref(),
+            Some("/srv/studio-b/warm")
+        );
+    }
+
+    #[test]
+    fn host_pool_warm_hit_misses_when_recorded_member_is_gone() {
+        let target = host_pool_target();
+        let (_temp, pool) = pool_with(
+            PoolEntry::new(
+                "ubuntu",
+                "local",
+                "host-pool",
+                "/srv/gone",
+                "abc",
+                100.0,
+                10.0,
+            )
+            .with_member_id("gone"),
+        );
+
+        let decision = apply_warm_reuse(&pool, &target, "abc", None, false, 20.0);
+
+        assert!(!decision.warm_hit);
+        assert_eq!(
+            decision.target.workdir().as_deref(),
+            Some("/srv/studio-a/repo")
+        );
+    }
+
+    #[test]
     fn pass_upserts_warm_pool_entry() {
         let target = ssh_target();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -4130,25 +4263,29 @@ mod tests {
 
     #[test]
     fn host_pool_pass_records_the_selected_member_for_warm_status() {
-        let target = ssh_target();
+        let target = host_pool_target();
         let temp = tempfile::tempdir().expect("tempdir");
         let pool = WarmPool::new(temp.path().join("warm_pool.json"));
         let mut result = TargetResult::new(
             "ubuntu",
             "linux-x64",
             TargetStatus::Pass,
-            "host-pool:local_macs/studio-a-failover",
+            "host-pool:local_macs/studio-b-failover",
         );
-        result.host_pool_member_id = Some("studio/a".to_owned());
+        result.host_pool_member_id = Some("studio-b".to_owned());
 
         update_warm_pool_after_run(&pool, &target, "abc", &result, false, false, 20.0)
             .expect("update");
         assert_eq!(
-            pool.get("ubuntu", "vm", 21.0)
+            pool.get("ubuntu", "local", 21.0)
                 .expect("entry")
                 .member_id
                 .as_deref(),
-            Some("studio/a")
+            Some("studio-b")
+        );
+        assert_eq!(
+            pool.get("ubuntu", "local", 21.0).expect("entry").workdir,
+            "/srv/studio-b/repo"
         );
     }
 

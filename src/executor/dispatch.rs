@@ -120,6 +120,30 @@ impl ResolvedTarget {
         self
     }
 
+    /// Return a host-pool target restricted to one previously warmed member.
+    ///
+    /// Warm reuse must not apply one member's workdir to another member. A
+    /// missing member is a cache miss rather than a fallback to the pool's
+    /// first member.
+    #[must_use]
+    pub fn with_host_pool_member(
+        mut self,
+        member_id: &str,
+        workdir: impl Into<String>,
+    ) -> Option<Self> {
+        let ResolvedBackend::HostPool(pool) = &mut self.backend else {
+            return None;
+        };
+        let position = pool
+            .members
+            .iter()
+            .position(|member| member.id == member_id)?;
+        let mut member = pool.members[position].clone();
+        member.target = Box::new(member.target.as_ref().clone().with_workdir(workdir));
+        pool.members = vec![member];
+        Some(self)
+    }
+
     /// Return a copy whose local backends use `cwd` when they do not declare
     /// an explicit working directory.
     ///

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// Canonical warm-pool JSON filename.
 pub const DEFAULT_POOL_FILENAME: &str = "warm_pool.json";
 
-const ELIGIBLE_BACKENDS: [&str; 3] = ["ssh", "ssh-windows", "local"];
+const ELIGIBLE_BACKENDS: [&str; 4] = ["ssh", "ssh-windows", "local", "host-pool"];
 
 /// A single warm-pool record.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
