@@ -745,7 +745,8 @@ fn execute_ship_worker_with_options<D: ShipTargetDispatcher>(
         && existing.base_branch != request.base_branch
         && existing.active_reviewer_claim.is_some()
     {
-        let actions = GitHubActions::from_loaded_config(cwd, config);
+        let actions =
+            GitHubActions::from_loaded_config(cwd, config).with_repo_override(&request.repo);
         if let Err(error) = invalidate_adopted_reviewer_receipts(&actions, request) {
             let execution_error = ShipExecutionError::ShipState(error);
             cancel_refused_job(queue, &job, &execution_error)?;
