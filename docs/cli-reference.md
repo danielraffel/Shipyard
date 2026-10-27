@@ -180,7 +180,7 @@ shipyard evidence command --list
 # Runner metrics
 shipyard metrics record --project pulp --job linux-arm64 --step compile --duration 18.4s --target linux-arm64 --backend local --provider tart-linux --host macstudio
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
-shipyard metrics import github-merge-receipt --repo Generous-Corp/pulp --project pulp --artifact job.json --run run.json --pull-request pr.json --checks checks.json --artifact-url https://github.com/Generous-Corp/pulp/actions/artifacts/123 --run-url https://github.com/Generous-Corp/pulp/actions/runs/456 --policy-sha256 <sha256> --collector-sha256 <sha256> --required-check macos
+shipyard metrics import github-merge-receipt --repo Generous-Corp/pulp --project pulp --artifact job.json --run run.json --pull-request pr.json --checks checks.json --required-check-policy policy.json --artifact-url https://github.com/Generous-Corp/pulp/actions/artifacts/123 --run-url https://github.com/Generous-Corp/pulp/actions/runs/456 --policy-sha256 <sha256> --collector-sha256 <sha256> --required-check macos
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics export merge-receipt --repo Generous-Corp/pulp --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
 shipyard metrics summary --project pulp --json
@@ -551,7 +551,11 @@ and provider-neutral:
   `snapshot_run_attempt` matching the observed run. Required checks must carry
   their own non-null matching run identity; commit-wide check-runs with null
   identities are rejected unless enriched from the authoritative run jobs.
-  The producer `job.json` may contain additional metadata; the importer
+  `--required-check-policy` is a normalized `shipyard.required-check-policy/v1`
+  branch-protection/ruleset snapshot whose repository, base branch, and exact
+  required-check list must match the arguments. `--policy-sha256` must be the
+  SHA-256 of its canonical JSON, so a caller cannot omit a required gate and
+  still obtain a safe-merge receipt. The producer `job.json` may contain additional metadata; the importer
   projects only the binding fields and accepts numeric-string run IDs. These
   projections are caller-produced inputs; raw GitHub payloads must be reduced
   to this schema before import. The command never calls GitHub or merges.

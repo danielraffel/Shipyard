@@ -84,3 +84,11 @@ the SHA-256 of the supplied `job.json` bytes is the content binding recorded in
 the receipt. The Pulp `job.json` projection is the one exception for producer
 metadata: extra producer fields are ignored after the nine binding fields are
 strictly normalized, including a decimal-string `run_id`.
+
+The required-check list is not trusted merely because it was supplied on the
+command line. The caller must provide a normalized
+`shipyard.required-check-policy/v1` branch-protection/ruleset snapshot whose
+repository, protected base branch, and exact ordered check list match the
+reconciliation arguments. `--policy-sha256` is the SHA-256 of that canonical
+snapshot. A missing, mismatched, or unverifiable policy refuses the receipt;
+safe-merge metrics never use a caller-selected subset of checks.

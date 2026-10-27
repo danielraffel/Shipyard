@@ -15,6 +15,21 @@ use std::collections::HashSet;
 use super::merge_receipt::{MergeReceipt, SCHEMA};
 
 const REUSE_SCHEMA: &str = "pulp-reuse-record/v1";
+const POLICY_SCHEMA: &str = "shipyard.required-check-policy/v1";
+
+/// Normalized branch-protection/ruleset evidence captured by the caller.
+///
+/// A bare list of required names is not authoritative: a caller could omit a
+/// required gate and still manufacture a safe-merge metric. The policy object
+/// is bound to the repository, base branch, and policy digest in the receipt.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequiredCheckPolicy {
+    pub schema: String,
+    pub repo: String,
+    pub base_branch: String,
+    pub required_checks: Vec<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -124,6 +139,7 @@ struct GateEvidence<'a> {
     run: &'a RunObservation,
     pull_request: &'a PullRequestObservation,
     checks_snapshot: &'a CheckRunsResponse,
+    policy: &'a RequiredCheckPolicy,
     artifact_url: &'a str,
     run_url: &'a str,
     required_checks: &'a [String],
@@ -148,6 +164,7 @@ pub fn reconcile(
     run: &RunObservation,
     pull_request: &PullRequestObservation,
     checks: &CheckRunsResponse,
+    policy: &RequiredCheckPolicy,
     required_checks: &[String],
 ) -> Result<MergeReceipt, String> {
     let repo = nonempty(repo, "repo")?;
@@ -179,6 +196,23 @@ pub fn reconcile(
     valid_sha256(artifact_sha256, "artifact SHA-256")?;
     valid_sha256(policy_sha256, "policy SHA-256")?;
     valid_sha256(collector_sha256, "collector SHA-256")?;
+    if policy.schema != POLICY_SCHEMA {
+        return Err("required-check policy schema is unsupported".to_owned());
+    }
+    if policy.repo != repo || policy.base_branch != base_branch {
+        return Err(
+            "required-check policy is bound to another repository or base branch".to_owned(),
+        );
+    }
+    if policy.required_checks != required_checks {
+        return Err("required checks do not match the authoritative policy snapshot".to_owned());
+    }
+    let policy_bytes = serde_json::to_vec(policy)
+        .map_err(|error| format!("required-check policy encode failed: {error}"))?;
+    let expected_policy_sha256 = format!("{:x}", Sha256::digest(policy_bytes));
+    if expected_policy_sha256 != policy_sha256 {
+        return Err("policy SHA-256 does not match the normalized policy snapshot".to_owned());
+    }
     if artifact.schema != REUSE_SCHEMA {
         return Err(format!(
             "unsupported reuse artifact schema {:?}",
@@ -359,6 +393,7 @@ pub fn reconcile(
         run,
         pull_request,
         checks_snapshot: checks,
+        policy,
         artifact_url,
         run_url,
         required_checks,
@@ -553,11 +588,20 @@ pub fn sha256_file(path: &std::path::Path, label: &str) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy_sha256(policy: &RequiredCheckPolicy) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(policy).expect("policy JSON"))
+        )
+    }
+
     fn fixture() -> (
         ReuseJob,
         RunObservation,
         PullRequestObservation,
         CheckRunsResponse,
+        RequiredCheckPolicy,
         Vec<String>,
     ) {
         let head = "a".repeat(40);
@@ -622,7 +666,14 @@ mod tests {
             snapshot_run_id: 7,
             snapshot_run_attempt: 1,
         };
-        (job, run, pr, checks, vec!["macos".to_owned()])
+        let required = vec!["macos".to_owned()];
+        let policy = RequiredCheckPolicy {
+            schema: POLICY_SCHEMA.to_owned(),
+            repo: "Generous-Corp/pulp".to_owned(),
+            base_branch: "main".to_owned(),
+            required_checks: required.clone(),
+        };
+        (job, run, pr, checks, policy, required)
     }
 
     #[test]
@@ -655,7 +706,7 @@ mod tests {
 
     #[test]
     fn reconciles_exact_successful_merge_group() {
-        let (job, run, pr, checks, required) = fixture();
+        let (job, run, pr, checks, policy, required) = fixture();
         let receipt = reconcile(
             "Generous-Corp/pulp",
             "pulp",
@@ -663,12 +714,13 @@ mod tests {
             "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
             "https://github.com/Generous-Corp/pulp/actions/runs/7",
             &"a".repeat(64),
-            &"b".repeat(64),
+            &policy_sha256(&policy),
             &"c".repeat(64),
             &job,
             &run,
             &pr,
             &checks,
+            &policy,
             &required,
         )
         .unwrap();
@@ -678,10 +730,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_required_check_subset_not_in_policy_snapshot() {
+        let (job, run, pr, checks, mut policy, required) = fixture();
+        policy.required_checks = vec!["macos".to_owned(), "linux".to_owned()];
+        let error = reconcile(
+            "Generous-Corp/pulp",
+            "pulp",
+            "main",
+            "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+            "https://github.com/Generous-Corp/pulp/actions/runs/7",
+            &"a".repeat(64),
+            &policy_sha256(&policy),
+            &"c".repeat(64),
+            &job,
+            &run,
+            &pr,
+            &checks,
+            &policy,
+            &required,
+        )
+        .expect_err("a caller-selected subset must not become a safe merge");
+        assert!(error.contains("do not match"), "{error}");
+    }
+
+    #[test]
     fn reconciles_real_merge_group_shape_without_pull_request_array() {
         // GitHub's merge_group workflow-run payload normally omits membership
         // from pull_requests[]. The queue ref is the authoritative binding.
-        let (job, mut run, pr, checks, required) = fixture();
+        let (job, mut run, pr, checks, policy, required) = fixture();
         run.pull_requests.clear();
         let receipt = reconcile(
             "Generous-Corp/pulp",
@@ -690,12 +766,13 @@ mod tests {
             "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
             "https://github.com/Generous-Corp/pulp/actions/runs/7",
             &"a".repeat(64),
-            &"b".repeat(64),
+            &policy_sha256(&policy),
             &"c".repeat(64),
             &job,
             &run,
             &pr,
             &checks,
+            &policy,
             &required,
         )
         .expect("real-shaped merge-group payload reconciles");
@@ -704,7 +781,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_membership_when_queue_ref_names_another_pr() {
-        let (mut job, mut run, pr, checks, required) = fixture();
+        let (mut job, mut run, pr, checks, policy, required) = fixture();
         let queue_ref = "gh-readonly-queue/main/pr-43-cccccccccccccccccccccccccccccccccccccccc";
         job.merge_group_head_ref = Some(queue_ref.to_owned());
         run.head_branch = Some(queue_ref.to_owned());
@@ -716,12 +793,13 @@ mod tests {
             "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
             "https://github.com/Generous-Corp/pulp/actions/runs/7",
             &"a".repeat(64),
-            &"b".repeat(64),
+            &policy_sha256(&policy),
             &"c".repeat(64),
             &job,
             &run,
             &pr,
             &checks,
+            &policy,
             &required,
         )
         .expect_err("queue ref must bind the artifact PR");
@@ -734,7 +812,7 @@ mod tests {
             vec!["a".repeat(40), "c".repeat(40)],
             vec!["c".repeat(40), "b".repeat(40)],
         ] {
-            let (job, mut run, pr, checks, required) = fixture();
+            let (job, mut run, pr, checks, policy, required) = fixture();
             run.pull_requests.clear();
             run.head_commit_parents = parents;
             let error = reconcile(
@@ -744,12 +822,13 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &required,
             )
             .expect_err("only the exact single-PR parent order is accepted");
@@ -759,7 +838,7 @@ mod tests {
 
     #[test]
     fn rejects_run_identity_and_check_ambiguity() {
-        let (mut job, run, pr, checks, required) = fixture();
+        let (mut job, run, pr, checks, policy, required) = fixture();
         job.run_attempt = 2;
         assert!(
             reconcile(
@@ -769,17 +848,18 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &required
             )
             .is_err()
         );
-        let (job, run, pr, mut checks, required) = fixture();
+        let (job, run, pr, mut checks, policy, required) = fixture();
         checks.check_runs.push(checks.check_runs[0].clone());
         assert!(
             reconcile(
@@ -789,12 +869,13 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &required
             )
             .is_err()
@@ -803,7 +884,7 @@ mod tests {
 
     #[test]
     fn rejects_commit_wide_check_shape_with_null_check_identity() {
-        let (job, mut run, pr, mut checks, required) = fixture();
+        let (job, mut run, pr, mut checks, policy, required) = fixture();
         run.pull_requests.clear();
         checks.check_runs[0].run_id = None;
         checks.check_runs[0].run_attempt = None;
@@ -815,12 +896,13 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &required,
             )
             .is_err()
@@ -830,7 +912,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn rejects_queue_ref_and_required_check_contract_violations() {
-        let (mut job, run, pr, checks, required) = fixture();
+        let (mut job, run, pr, checks, policy, required) = fixture();
         job.merge_group_head_ref = Some(
             "gh-readonly-queue/release/pr-42-cccccccccccccccccccccccccccccccccccccccc".to_owned(),
         );
@@ -842,18 +924,19 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &required,
             )
             .is_err()
         );
 
-        let (job, run, pr, mut checks, _) = fixture();
+        let (job, run, pr, mut checks, policy, _) = fixture();
         checks.complete = false;
         assert!(
             reconcile(
@@ -863,18 +946,19 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &["macos".to_owned()],
             )
             .is_err()
         );
 
-        let (job, run, pr, mut checks, _) = fixture();
+        let (job, run, pr, mut checks, policy, _) = fixture();
         checks.total_count = 2;
         assert!(
             reconcile(
@@ -884,12 +968,13 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &["macos".to_owned()],
             )
             .is_err()
@@ -903,7 +988,7 @@ mod tests {
         });
         assert!(serde_json::from_value::<CheckRunsResponse>(missing_count).is_err());
 
-        let (_, run, _, _, _) = fixture();
+        let (_, run, _, _, _policy, _) = fixture();
         let mut missing_membership = serde_json::to_value(run).expect("run JSON");
         missing_membership
             .as_object_mut()
@@ -911,7 +996,7 @@ mod tests {
             .remove("pull_requests");
         assert!(serde_json::from_value::<RunObservation>(missing_membership).is_err());
 
-        let (job, run, pr, checks, _) = fixture();
+        let (job, run, pr, checks, policy, _) = fixture();
         assert!(
             reconcile(
                 "Generous-Corp/pulp",
@@ -920,18 +1005,19 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &["macos".to_owned(), "macos".to_owned()],
             )
             .is_err()
         );
 
-        let (job, run, pr, mut checks, _) = fixture();
+        let (job, run, pr, mut checks, policy, _) = fixture();
         checks.check_runs[0].details_url =
             Some("https://github.com/Generous-Corp/pulp/actions/runs/99/job/8".to_owned());
         assert!(
@@ -942,18 +1028,19 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &["macos".to_owned()],
             )
             .is_err()
         );
 
-        let (job, run, pr, mut checks, _) = fixture();
+        let (job, run, pr, mut checks, policy, _) = fixture();
         checks.snapshot_run_attempt = 2;
         assert!(
             reconcile(
@@ -963,18 +1050,19 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &["macos".to_owned()],
             )
             .is_err()
         );
 
-        let (job, run, pr, checks, _) = fixture();
+        let (job, run, pr, checks, policy, _) = fixture();
         let mut run = run;
         run.pull_requests.push(RunPullRequest {
             number: 43,
@@ -988,12 +1076,13 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &["macos".to_owned()],
             )
             .is_err()
@@ -1001,7 +1090,7 @@ mod tests {
     }
     #[test]
     fn rejects_non_merge_group_and_unmerged_pr() {
-        let (mut job, run, pr, checks, required) = fixture();
+        let (mut job, run, pr, checks, policy, required) = fixture();
         job.run_kind = "pr_head".to_owned();
         assert!(
             reconcile(
@@ -1011,17 +1100,18 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &required
             )
             .is_err()
         );
-        let (job, run, mut pr, checks, required) = fixture();
+        let (job, run, mut pr, checks, policy, required) = fixture();
         pr.merged_at = None;
         assert!(
             reconcile(
@@ -1031,12 +1121,13 @@ mod tests {
                 "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
                 "https://github.com/Generous-Corp/pulp/actions/runs/7",
                 &"a".repeat(64),
-                &"b".repeat(64),
+                &policy_sha256(&policy),
                 &"c".repeat(64),
                 &job,
                 &run,
                 &pr,
                 &checks,
+                &policy,
                 &required
             )
             .is_err()

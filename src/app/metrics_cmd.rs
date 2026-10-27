@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 
 use crate::app::cli::{
     MetricsCommand, MetricsExportCommand, MetricsExportMergeReceiptArgs, MetricsFreshnessArgs,
@@ -583,6 +585,11 @@ fn reconcile_github_merge_receipt(
         github_merge_receipts::read_json(&args.checks, "GitHub check-runs snapshot").map_err(
             |error| CliFailure::new(2, format!("GitHub merge receipt input failed: {error}")),
         )?;
+    let policy: github_merge_receipts::RequiredCheckPolicy = github_merge_receipts::read_json(
+        &args.required_check_policy,
+        "required-check policy snapshot",
+    )
+    .map_err(|error| CliFailure::new(2, format!("GitHub merge receipt input failed: {error}")))?;
     let artifact_sha256 =
         github_merge_receipts::sha256_file(&args.artifact, "GitHub reuse artifact").map_err(
             |error| CliFailure::new(2, format!("GitHub merge receipt input failed: {error}")),
@@ -600,6 +607,7 @@ fn reconcile_github_merge_receipt(
         &run,
         &pull_request,
         &checks,
+        &policy,
         &args.required_checks,
     )
     .map_err(|error| {
@@ -1242,6 +1250,7 @@ mod tests {
         let run_path = temp.path().join("run.json");
         let pr_path = temp.path().join("pr.json");
         let checks_path = temp.path().join("checks.json");
+        let policy_path = temp.path().join("required-check-policy.json");
         std::fs::write(
             &artifact_path,
             serde_json::json!({
@@ -1310,6 +1319,15 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+        let policy = github_merge_receipts::RequiredCheckPolicy {
+            schema: "shipyard.required-check-policy/v1".to_owned(),
+            repo: "owner/repo".to_owned(),
+            base_branch: "main".to_owned(),
+            required_checks: vec!["macos".to_owned()],
+        };
+        let policy_bytes = serde_json::to_vec(&policy).unwrap();
+        let policy_sha256 = format!("{:x}", Sha256::digest(&policy_bytes));
+        std::fs::write(&policy_path, policy_bytes).unwrap();
         let mut output = Vec::new();
         let result = metrics_command(
             MetricsCommand::Import {
@@ -1322,10 +1340,11 @@ mod tests {
                         run: run_path,
                         pull_request: pr_path,
                         checks: checks_path,
+                        required_check_policy: policy_path,
                         artifact_url: "https://github.com/owner/repo/actions/artifacts/1"
                             .to_owned(),
                         run_url: "https://github.com/owner/repo/actions/runs/7".to_owned(),
-                        policy_sha256: "f".repeat(64),
+                        policy_sha256,
                         collector_sha256: "1".repeat(64),
                         required_checks: vec!["macos".to_owned()],
                     },

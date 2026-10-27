@@ -2169,6 +2169,9 @@ pub(crate) struct MetricsImportGithubMergeReceiptArgs {
     /// Complete check-runs snapshot with `complete: true`.
     #[arg(long)]
     pub(crate) checks: PathBuf,
+    /// Normalized branch-protection/ruleset required-check policy snapshot.
+    #[arg(long)]
+    pub(crate) required_check_policy: PathBuf,
     /// Immutable GitHub artifact URL.
     #[arg(long)]
     pub(crate) artifact_url: String,
