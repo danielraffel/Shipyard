@@ -48,6 +48,14 @@ pub fn write_human<W: Write>(stdout: &mut W, report: &LandingReport) -> std::io:
     writeln!(stdout, "  {}", report.enqueue.rationale)?;
     writeln!(stdout)?;
 
+    writeln!(stdout, "BATCHING")?;
+    writeln!(stdout, "  {}", report.batching.action.label())?;
+    if let Some(command) = &report.batching.command {
+        writeln!(stdout, "  {command}")?;
+    }
+    writeln!(stdout, "  {}", report.batching.rationale)?;
+    writeln!(stdout)?;
+
     writeln!(stdout, "MERGE QUEUE")?;
     match &report.merge_queue.verdict {
         Verdict::Present(config) => {

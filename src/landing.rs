@@ -54,6 +54,7 @@ pub mod placement;
 pub mod pr_state;
 pub mod queue;
 pub mod render;
+pub mod strategy;
 pub mod verdict;
 pub mod verdict_gather;
 
@@ -160,6 +161,8 @@ pub struct LandingReport {
     pub strict: queue::StrictFinding,
     /// How a pull request is put on the path to merge here.
     pub enqueue: queue::EnqueueGuidance,
+    /// Whether a configured rollup train should batch before landing.
+    pub batching: strategy::BatchingGuidance,
     /// Where each required context was last observed executing.
     pub required_checks: placement::PlacementFinding,
     /// Open pull requests grouped by mergeability.

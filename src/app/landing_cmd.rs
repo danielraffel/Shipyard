@@ -25,6 +25,44 @@ use crate::landability::gate;
 use crate::landing::gather::{DEFAULT_MAX_JOB_READS, DEFAULT_RUN_SAMPLE, GatherOptions};
 use crate::landing::{EXIT_LANDING_UNKNOWN, gather, pr_state, render};
 
+fn repository_train_config(
+    actions: &crate::cloud::GitHubActions,
+    repo: &str,
+    base: &str,
+) -> Result<crate::rollup::Config, CliFailure> {
+    let raw = match actions.run_gh(&[
+        "api".to_owned(),
+        "-H".to_owned(),
+        "Accept: application/vnd.github.raw+json".to_owned(),
+        format!("repos/{repo}/contents/.shipyard/config.toml?ref={base}"),
+    ]) {
+        Ok(raw) => raw,
+        Err(error)
+            if error.to_string().contains("404") || error.to_string().contains("Not Found") =>
+        {
+            return Ok(crate::rollup::Config::default());
+        }
+        Err(error) => {
+            return Err(CliFailure::new(
+                EXIT_LANDING_UNKNOWN,
+                format!(".shipyard/config.toml on {repo}@{base} is unreadable: {error}"),
+            ));
+        }
+    };
+    let table = raw.parse::<toml::Table>().map_err(|error| {
+        CliFailure::new(
+            EXIT_LANDING_UNKNOWN,
+            format!(".shipyard/config.toml on {repo}@{base} does not parse: {error}"),
+        )
+    })?;
+    crate::rollup::Config::from_table(&table).map_err(|error| {
+        CliFailure::new(
+            EXIT_LANDING_UNKNOWN,
+            format!("[train] in {repo}@{base} is invalid: {error}"),
+        )
+    })
+}
+
 /// What the caller asked for, as parsed from the command line.
 pub(super) struct LandingArgs {
     /// Exact `OWNER/REPO`, when given.
@@ -122,6 +160,9 @@ pub(super) fn landing_command<W: Write>(
                 .unwrap_or(crate::base_health::DEFAULT_WORKFLOW),
         },
     );
+
+    let train = repository_train_config(&actions, &repo, &base)?;
+    report.batching = crate::landing::strategy::batching_guidance(&report.merge_queue, &train);
 
     report.opt_in_targets = crate::opt_in_targets::from_config(&config);
 

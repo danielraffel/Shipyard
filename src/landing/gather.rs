@@ -148,6 +148,10 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         finding
     };
     let base_jump = crate::base_health::jump_advice(repo, &base_health, chrono::Utc::now());
+    let batching = crate::landing::strategy::batching_guidance(
+        &merge_queue,
+        &crate::rollup::Config::default(),
+    );
 
     LandingReport {
         schema_version: SCHEMA_VERSION,
@@ -156,6 +160,7 @@ pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingRe
         merge_queue,
         strict,
         enqueue,
+        batching,
         required_checks: placement::PlacementFinding {
             contexts_source,
             checks,
