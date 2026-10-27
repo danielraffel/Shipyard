@@ -296,16 +296,15 @@ impl ShipState {
             return None;
         }
         match self.active_reviewer_claim.as_ref() {
-            None => {}
-            Some(active) => {
+            Some(active)
                 if self.schema_version < SHIP_STATE_SCHEMA_VERSION
                     || active.epoch == 0
                     || self.reviewer_claim_epoch != active.epoch
-                    || now < active.deadline_at
-                {
-                    return None;
-                }
+                    || now < active.deadline_at =>
+            {
+                return None;
             }
+            _ => {}
         }
         let epoch = self.reviewer_claim_epoch.checked_add(1)?;
         let claim = ReviewerClaim {
