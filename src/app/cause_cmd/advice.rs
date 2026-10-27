@@ -310,6 +310,8 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
             Some("compare_red_head_to_fix_head" | "rerun_green")
         )
         && ((derivation == Some("compare_red_head_to_fix_head")
+            && value["red_run_id"] != value["fix_run_id"]
+            && value["head_sha"] != value["fix_head_sha"]
             && compare_file_evidence_complete(value))
             || (derivation == Some("rerun_green")
                 && value["head_sha"] == value["fix_head_sha"]
@@ -326,16 +328,39 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
 /// example, a default-branch fix or a non-ancestor), but it must still record
 /// the raw compare and the reason for that null result without truncation.
 fn compare_file_evidence_complete(value: &Value) -> bool {
-    value["files_raw"].as_array().is_some()
-        && value["files_truncated"].as_bool() == Some(false)
-        && value["own_files_method"]
-            .as_str()
-            .is_some_and(|method| !method.is_empty())
-        && match &value["own_files"] {
-            Value::Array(_) => value["own_files_truncated"].as_bool() == Some(false),
-            Value::Null => value["own_files_truncated"].is_null(),
-            _ => false,
+    let Some(files_raw) = value["files_raw"].as_array() else {
+        return false;
+    };
+    if !files_raw.iter().all(|file| file.as_str().is_some())
+        || value["files_truncated"].as_bool() != Some(false)
+    {
+        return false;
+    }
+    let Some(method) = value["own_files_method"].as_str() else {
+        return false;
+    };
+    match &value["own_files"] {
+        Value::Array(files) => {
+            matches!(
+                method,
+                "first_parent_non_merge_commits" | "merge_queue_pr_head" | "post_force_push"
+            ) && files.iter().all(|file| file.as_str().is_some())
+                && value["own_files_truncated"].as_bool() == Some(false)
         }
+        Value::Null => {
+            matches!(
+                method,
+                "branch_is_default"
+                    | "red_not_ancestor"
+                    | "too_many_commits"
+                    | "chain_broken"
+                    | "post_force_push_superseded"
+                    | "post_force_push_truncated"
+                    | "post_force_push_too_late"
+            ) && value["own_files_truncated"].is_null()
+        }
+        _ => false,
+    }
 }
 
 /// Structural identity fields required before a producer treats a fix-link as
@@ -381,7 +406,15 @@ fn sensitive_field(key: &str) -> bool {
         || normalized.split('_').any(|part| {
             matches!(
                 part,
-                "token" | "secret" | "password" | "authorization" | "credential" | "credentials"
+                "token"
+                    | "secret"
+                    | "password"
+                    | "authorization"
+                    | "credential"
+                    | "credentials"
+                    | "key"
+                    | "private"
+                    | "cookie"
             )
         })
         || normalized == "apikey"
@@ -592,6 +625,8 @@ mod tests {
             ("access_token", "unredacted"),
             ("client_secret", "leaked<secret>"),
             ("token ", "prefix<secret>"),
+            ("private_key", "unredacted"),
+            ("set_cookie", "unredacted"),
         ] {
             let mut unsafe_row = clean.clone();
             unsafe_row[field] = serde_json::json!(value);
@@ -759,7 +794,27 @@ mod tests {
         link["own_files_truncated"] = true.into();
         assert!(!valid_fixlink(&link));
         link["own_files_truncated"] = false.into();
+        link["own_files_method"] = json!("first_parent_non_merge_commits");
         assert!(valid_fixlink(&link));
+        link["own_files_method"] = json!("garbage");
+        assert!(!valid_fixlink(&link));
+        link["own_files_method"] = json!("branch_is_default");
+        link["own_files"] = json!(["a.cpp"]);
+        assert!(!valid_fixlink(&link));
+        link["own_files"] = Value::Null;
+        link["own_files_truncated"] = Value::Null;
+        link["files_raw"] = json!([{"filename": "a.cpp"}]);
+        assert!(!valid_fixlink(&link));
+        link["files_raw"] = json!([]);
+        link["own_files"] = json!([]);
+        link["own_files_method"] = json!("first_parent_non_merge_commits");
+        link["own_files_truncated"] = false.into();
+        assert!(valid_fixlink(&link));
+        link["fix_run_id"] = 1.into();
+        assert!(!valid_fixlink(&link));
+        link["fix_run_id"] = 2.into();
+        link["fix_head_sha"] = link["head_sha"].clone();
+        assert!(!valid_fixlink(&link));
     }
 
     #[test]
