@@ -608,6 +608,17 @@ def baseline_readiness(card: dict[str, Any], started: dt.datetime,
             or instrumentation.get("continuous_days") < 5:
         reasons.append({"status": "unavailable", "reason": "continuous instrumentation coverage is unavailable"})
 
+    safe_merge = card.get("collector_safe_merge_denominator")
+    if not isinstance(safe_merge, dict) or safe_merge.get("status") != "available" \
+            or isinstance(safe_merge.get("value"), bool) \
+            or not isinstance(safe_merge.get("value"), (int, float)) \
+            or not math.isfinite(float(safe_merge.get("value", float("nan")))) \
+            or safe_merge.get("value") < 0:
+        reasons.append({
+            "status": "unavailable",
+            "reason": "authenticated safe-merge denominator is unavailable",
+        })
+
     eligibility_reasons: list[dict[str, str]] = []
     for field, minimum, label in (("important_lanes", 30, "important lane"),
                                   ("host_generations", 10, "host generation")):

@@ -56,6 +56,7 @@ class BaselineScorecardTests(unittest.TestCase):
         complete_card = {
             "instrumentation_coverage": {"status": "available", "continuous": True,
                                           "continuous_days": 5.0},
+            "collector_safe_merge_denominator": {"status": "available", "value": 1},
             "important_lanes": {"lane-a": {"status": "insufficient", "completed_jobs": 2}},
             "host_generations": {"host-a": {"status": "insufficient", "completed_jobs": 2}},
             "strata": {name: {"provenance": "authenticated", "coverage": "complete", "qualified_jobs": 1}
@@ -68,6 +69,29 @@ class BaselineScorecardTests(unittest.TestCase):
         self.assertTrue(readiness["exit"])
         self.assertFalse(readiness["optimization_eligible"])
         self.assertEqual(readiness["status"], "complete_insufficient")
+
+    def test_readiness_rejects_missing_safe_merge_denominator(self):
+        started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
+        observed = started + dt.timedelta(days=5)
+        card = {
+            "instrumentation_coverage": {"status": "available", "continuous": True,
+                                          "continuous_days": 5.0},
+            "important_lanes": {"lane-a": {"status": "available", "completed_jobs": 30}},
+            "host_generations": {"host-a": {"status": "available", "completed_jobs": 10}},
+            "strata": {name: {"provenance": "authenticated", "coverage": "complete", "qualified_jobs": 1}
+                       for name in MOD.REQUIRED_STRATA},
+            "missing_strata": [],
+            "strata_sufficiency": {name: {"status": "sufficient"} for name in MOD.REQUIRED_STRATA},
+        }
+        history_summary = {"five_continuous_24h_days": True, "missing_intervals": [], "failing_intervals": [],
+                           "window_until": observed.isoformat(), "expected_interval_secs": 3600,
+                           "cadence_slack_secs": 300}
+        readiness = MOD.baseline_readiness(card, started, observed, history_summary)
+        self.assertFalse(readiness["report_complete"])
+        self.assertFalse(readiness["optimization_eligible"])
+        self.assertEqual(readiness["status"], "unavailable")
+        self.assertIn("authenticated safe-merge denominator is unavailable",
+                      [reason["reason"] for reason in readiness["reasons"]])
 
     def test_readiness_rejects_stale_pass_history_summary(self):
         started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
