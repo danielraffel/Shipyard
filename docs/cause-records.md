@@ -170,7 +170,11 @@ on stderr. Run it on a schedule you choose; Shipyard does not schedule it.
 `cause advise` reads only the local archive. It requires a full current head
 SHA, excludes that head and the current pull request, ignores unnamed/unknown
 rows and incomplete or malformed fix-links, and uses case-insensitive lexical
-token overlap with stable tie breaks.
+token overlap with stable tie breaks. A fix-link is attached only when the
+failed job itself passed in the recorded green run attempt. Human-readable
+output names the derivation (`compare_red_head_to_fix_head` for a code-change
+fix, or `rerun_green` for a same-head rerun); code-change links rank ahead of
+same-head reruns when both exist.
 It can take newline-delimited outage windows (`start`, `end`, optional
 `reason`) and suppresses rows completed inside a declared window. It never
 contacts GitHub, executes `fix_hint`, or writes the archive. Rows containing

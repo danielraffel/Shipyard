@@ -530,6 +530,7 @@ struct Red {
     repo: String,
     run_id: u64,
     attempt: u64,
+    job: String,
     head_sha: String,
     time: String,
     pr: Option<u64>,
@@ -562,6 +563,7 @@ fn pending_reds(dir: &Path, since: &str, linked: &BTreeSet<(String, u64, u64)>) 
             repo: repo.to_owned(),
             run_id,
             attempt,
+            job: row["job"].as_str().unwrap_or_default().to_owned(),
             head_sha: head_sha.to_owned(),
             time: completed.to_owned(),
             pr: row["pr"].as_u64(),
@@ -671,6 +673,7 @@ fn own_by_first_parent(
 struct Fix {
     head_sha: String,
     run_id: u64,
+    attempt: u64,
     pushed_at: String,
     derivation: &'static str,
 }
@@ -735,18 +738,30 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
                     .as_str()
                     .is_some_and(super::advice::valid_sha)
         })
-        .and_then(|run| run["run_started_at"].as_str())
-        .map(|at| (red.run_id, at.to_owned()))
+        .and_then(|run| {
+            Some((
+                red.run_id,
+                run["run_started_at"].as_str()?.to_owned(),
+                run["run_attempt"].as_u64()?,
+            ))
+        })
         .or_else(|| {
             later
                 .iter()
                 .filter(on_red_head)
                 .min_by_key(|run| created(run))
-                .map(|run| (run["id"].as_u64().unwrap_or_default(), created(run)))
+                .map(|run| {
+                    (
+                        run["id"].as_u64().unwrap_or_default(),
+                        created(run),
+                        run["run_attempt"].as_u64().unwrap_or(1),
+                    )
+                })
         })
-        .map(|(run_id, pushed_at)| Fix {
+        .map(|(run_id, pushed_at, attempt)| Fix {
             head_sha: red.head_sha.clone(),
             run_id,
+            attempt,
             pushed_at,
             derivation: "rerun_green",
         });
@@ -762,6 +777,7 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
         .map(|run| Fix {
             head_sha: run["head_sha"].as_str().unwrap_or_default().to_owned(),
             run_id: run["id"].as_u64().unwrap_or_default(),
+            attempt: run["run_attempt"].as_u64().unwrap_or(1),
             pushed_at: created(run),
             derivation: "compare_red_head_to_fix_head",
         });
@@ -945,6 +961,34 @@ fn fix_row(red: &Red, fix: &Fix, branch: &str, files: &FileSets) -> Value {
     scrub(Value::Object(row))
 }
 
+/// A successful workflow run is only a fix for this red when the failed job
+/// itself ran and passed in the same run attempt. A workflow can be green
+/// while skipping that job because of path filters or job conditions.
+fn run_passed_job(
+    gh: &SyncGhReader<'_>,
+    query: &RecordQuery,
+    red: &Red,
+    fix: &Fix,
+) -> Result<bool, String> {
+    if red.job.is_empty() || fix.run_id == 0 {
+        return Ok(false);
+    }
+    let jobs = api(
+        gh,
+        &format!(
+            "repos/{}/actions/runs/{}/jobs?filter=all&per_page=100",
+            query.repo, fix.run_id
+        ),
+    )?;
+    Ok(jobs["jobs"].as_array().is_some_and(|jobs| {
+        jobs.iter().any(|job| {
+            job["name"].as_str() == Some(red.job.as_str())
+                && job["conclusion"].as_str() == Some("success")
+                && job["run_attempt"].as_u64() == Some(fix.attempt)
+        })
+    }))
+}
+
 /// Count a red still without a fix, by how long ago it went red.
 fn pending(report: &mut RecordReport, red: &Red, now: &str) {
     report.reds_pending += 1;
@@ -1002,11 +1046,21 @@ fn fixlinks(
             .filter(|run| created(run).as_str() > red.time.as_str())
             .collect();
         let fixes = fixes_for(&red, &later, run_index);
-        if fixes.is_empty() {
+        let mut verified_fixes = Vec::new();
+        for fix in fixes {
+            match run_passed_job(gh, query, &red, &fix) {
+                Ok(true) => verified_fixes.push(fix),
+                Ok(false) => {}
+                Err(error) => report
+                    .unreadable
+                    .push(format!("jobs for fix run {}: {error}", fix.run_id)),
+            }
+        }
+        if verified_fixes.is_empty() {
             pending(report, &red, &query.now);
             continue;
         }
-        for fix in &fixes {
+        for fix in &verified_fixes {
             let sets = file_sets(gh, query, &red, fix, &branch)?;
             out.push(fix_row(&red, fix, &branch, &sets));
         }

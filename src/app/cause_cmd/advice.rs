@@ -96,11 +96,10 @@ pub(super) fn command<W: Write>(
                 c.cause["job"].as_str().unwrap_or(""),
                 c.cause["signature"].as_str().unwrap_or(""),
                 c.cause["failure_class"].as_str().unwrap_or(""),
-                if c.fix_link.is_some() {
-                    "available"
-                } else {
-                    "none"
-                }
+                c.fix_link
+                    .as_ref()
+                    .and_then(|fix| fix["derivation"].as_str())
+                    .unwrap_or("none")
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
@@ -281,10 +280,22 @@ fn read_fixlinks(path: &Path) -> Result<Vec<Value>, CliFailure> {
         // row as a usable fix.
         .filter(valid_fixlink)
         .collect();
-    // If an archive contains several links for one red attempt, choose the
-    // same link regardless of append order.
-    links.sort_by_cached_key(Value::to_string);
+    // Prefer a code-change link over a same-head rerun (which usually records
+    // a flake or outage), then use the complete row as a stable tie-breaker.
+    links.sort_by(|a, b| {
+        fix_priority(a)
+            .cmp(&fix_priority(b))
+            .then_with(|| a.to_string().cmp(&b.to_string()))
+    });
     Ok(links)
+}
+
+fn fix_priority(value: &Value) -> u8 {
+    match value["derivation"].as_str() {
+        Some("compare_red_head_to_fix_head") => 0,
+        Some("rerun_green") => 1,
+        _ => 2,
+    }
 }
 
 pub(super) fn valid_fixlink(value: &Value) -> bool {

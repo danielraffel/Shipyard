@@ -96,6 +96,7 @@ fn red_routes() -> Vec<(&'static str, Value)> {
             "runs?branch=feat%2Fx&status=success",
             json!({"workflow_runs": []}),
         ),
+        ("runs/200/jobs", json!({"jobs": [job(2000, "success")]})),
     ]
 }
 
@@ -211,6 +212,7 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
         ("commits/c1", json!({"files": [{"filename": "test/ctest_script_inputs.json"}]})),
         ("commits/m1", json!({"files": [{"filename": "docs/main-only.md"}]})),
         ("compare/main...", json!({"merge_base_commit": {"sha": "0123456789abcdef0123456789abcdef01234567"}})),
+        ("runs/200/jobs", json!({"jobs": [job(2000, "success")]})),
     ]);
     let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
     let gh = |args: &[String]| second.read(args);
@@ -232,6 +234,7 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
         (json!(100), json!(1))
     );
     assert_eq!(link["fix_run_id"], 200);
+    assert!(super::super::advice::valid_fixlink(link));
     assert_eq!(link["pushed_at"], "2026-10-14T11:00:00Z");
     assert_eq!(link["red_time"], "2026-10-14T10:30:00Z");
     assert_eq!(link["pr"], 42);
@@ -471,6 +474,12 @@ fn a_rerun_that_passes_links_the_red_attempt_to_its_own_head() {
     rerun["run_started_at"] = json!("2026-10-14T10:45:00Z");
     let mut routes = red_routes();
     routes[0] = ("runs?status=completed", json!({"workflow_runs": [rerun]}));
+    let mut passed = job(1000, "success");
+    passed["run_attempt"] = json!(2);
+    routes[1] = (
+        "runs/100/jobs",
+        json!({"jobs": [job(1000, "failure"), passed]}),
+    );
     let fake = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
     let gh = |args: &[String]| fake.read(args);
     let report = record(&gh, &query(dir.path())).expect("pass");
@@ -483,6 +492,37 @@ fn a_rerun_that_passes_links_the_red_attempt_to_its_own_head() {
     );
     assert_eq!(link["pushed_at"], "2026-10-14T10:45:00Z");
     assert_eq!(link["own_files"], json!([]));
+    assert!(super::super::advice::valid_fixlink(link));
+}
+
+#[test]
+fn a_green_workflow_run_that_skips_the_failed_job_is_not_a_fix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(dir.path())).expect("red pass");
+
+    let mut skipped = job(2000, "success");
+    skipped["name"] = json!("docs-only");
+    let mut routes = red_routes();
+    routes.retain(|(needle, _)| {
+        !needle.starts_with("runs?branch=") && !needle.contains("runs/200/jobs")
+    });
+    routes.extend([
+        (
+            "runs?branch=feat%2Fx&status=success",
+            json!({"workflow_runs": [{
+                "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
+                "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
+            }]}),
+        ),
+        ("runs/200/jobs", json!({"jobs": [skipped]})),
+    ]);
+    let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    let report = record(&gh, &query(dir.path())).expect("green pass");
+    assert_eq!((report.fixlinks_written, report.reds_pending), (0, 1));
+    assert!(!dir.path().join("fixlinks.jsonl").exists());
 }
 
 #[test]
@@ -549,6 +589,7 @@ fn second_pass(
     record(&gh, &query(dir.path())).expect("red pass");
     routes.retain(|(needle, _)| !needle.starts_with("runs?branch="));
     routes.push(("runs?branch=feat%2Fx&status=success", fix_runs));
+    routes.push(("runs/200/jobs", json!({"jobs": [job(2000, "success")]})));
     routes.extend(extra);
     let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
     let gh = |args: &[String]| second.read(args);
@@ -720,6 +761,7 @@ fn malformed_green_head_is_not_emitted_as_a_fix_link() {
         repo: "Generous-Corp/pulp".to_owned(),
         run_id: 100,
         attempt: 1,
+        job: "macos".to_owned(),
         head_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
         time: "2026-10-14T10:30:00Z".to_owned(),
         pr: Some(42),
