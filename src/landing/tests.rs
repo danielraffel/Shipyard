@@ -250,6 +250,22 @@ fn unreadable_rulesets_report_unknown_not_absent() {
 }
 
 #[test]
+fn malformed_rulesets_shape_reports_unknown_not_absent() {
+    let inputs = QueueInputs {
+        rulesets: None,
+        rulesets_error: Some((
+            Boundary::Parse,
+            "rulesets response was not an array".to_owned(),
+        )),
+        protection: Payload::Json(protection_payload(true)),
+        graphql_queue: Payload::NotConsulted,
+    };
+    let mut surfaces = Vec::new();
+    let finding = determine_queue(&inputs, "main", Some("main"), &mut surfaces);
+    assert_eq!(verdict_name(&finding.verdict), "unknown");
+}
+
+#[test]
 fn readable_rulesets_with_a_failed_detail_call_report_unknown() {
     // Half a ruleset read is an unread one: the rule that matters may be in
     // the ruleset whose detail call failed.
@@ -515,6 +531,7 @@ fn evaluate_queue_is_report_only_and_merges_directly() {
     let finding = QueueFinding {
         verdict: Verdict::Present(MergeQueueConfig {
             enforcement: Some("evaluate".to_owned()),
+            merge_method: Some("MERGE".to_owned()),
             ..Default::default()
         }),
         disagreements: Vec::new(),
@@ -531,6 +548,36 @@ fn evaluate_queue_is_report_only_and_merges_directly() {
 fn queue_without_enforcement_refuses_to_name_a_command() {
     let finding = QueueFinding {
         verdict: Verdict::Present(MergeQueueConfig::default()),
+        disagreements: Vec::new(),
+    };
+    let guidance = enqueue_guidance(&finding);
+    assert_eq!(guidance.action, "unknown");
+    assert!(guidance.command.is_none());
+}
+
+#[test]
+fn queue_without_merge_method_refuses_to_name_a_command() {
+    let finding = QueueFinding {
+        verdict: Verdict::Present(MergeQueueConfig {
+            enforcement: Some("active".to_owned()),
+            merge_method: None,
+            ..Default::default()
+        }),
+        disagreements: Vec::new(),
+    };
+    let guidance = enqueue_guidance(&finding);
+    assert_eq!(guidance.action, "unknown");
+    assert!(guidance.command.is_none());
+}
+
+#[test]
+fn queue_with_unfamiliar_merge_method_refuses_to_name_a_command() {
+    let finding = QueueFinding {
+        verdict: Verdict::Present(MergeQueueConfig {
+            enforcement: Some("active".to_owned()),
+            merge_method: Some("FAST_FORWARD".to_owned()),
+            ..Default::default()
+        }),
         disagreements: Vec::new(),
     };
     let guidance = enqueue_guidance(&finding);

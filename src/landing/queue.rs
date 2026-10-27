@@ -604,11 +604,17 @@ pub fn determine_strict(protection: &Payload, queue: &QueueFinding) -> StrictFin
 pub fn enqueue_guidance(queue: &QueueFinding) -> EnqueueGuidance {
     match &queue.verdict {
         Verdict::Present(config) => {
-            let method = config.merge_method.as_deref().unwrap_or("MERGE");
-            let flag = match method.to_ascii_uppercase().as_str() {
-                "SQUASH" => "--squash",
-                "REBASE" => "--rebase",
-                _ => "--merge",
+            let (method, flag) = match config.merge_method.as_deref() {
+                Some(value) if value.eq_ignore_ascii_case("MERGE") => ("MERGE", "--merge"),
+                Some(value) if value.eq_ignore_ascii_case("SQUASH") => ("SQUASH", "--squash"),
+                Some(value) if value.eq_ignore_ascii_case("REBASE") => ("REBASE", "--rebase"),
+                _ => {
+                    return EnqueueGuidance {
+                        action: "unknown".to_owned(),
+                        command: None,
+                        rationale: "A merge queue was observed but its merge method was not supplied or was unfamiliar; do not name a merge command until GitHub's queue method can be measured.".to_owned(),
+                    };
+                }
             };
             let Some(enforcing) = config.enforcing() else {
                 return EnqueueGuidance {

@@ -201,6 +201,7 @@ mod tests {
         let queue = QueueFinding {
             verdict: Verdict::Present(MergeQueueConfig {
                 enforcement: Some("evaluate".to_owned()),
+                merge_method: Some("MERGE".to_owned()),
                 ..Default::default()
             }),
             disagreements: Vec::new(),

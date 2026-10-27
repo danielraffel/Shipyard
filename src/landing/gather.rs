@@ -217,16 +217,27 @@ fn read_rulesets(actions: &GitHubActions, repo: &str, inputs: &mut QueueInputs) 
             return calls;
         }
     };
-    let ids: Vec<u64> = list
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| item.get("target").and_then(Value::as_str) != Some("tag"))
-                .filter_map(|item| item.get("id").and_then(Value::as_u64))
-                .collect()
-        })
-        .unwrap_or_default();
+    let Some(items) = list.as_array() else {
+        inputs.rulesets_error = Some((
+            Boundary::Parse,
+            "rulesets response was not an array".to_owned(),
+        ));
+        return calls;
+    };
+    let mut ids = Vec::new();
+    for item in items {
+        if item.get("target").and_then(Value::as_str) == Some("tag") {
+            continue;
+        }
+        let Some(id) = item.get("id").and_then(Value::as_u64) else {
+            inputs.rulesets_error = Some((
+                Boundary::Parse,
+                "rulesets response contained a non-tag entry without a numeric id".to_owned(),
+            ));
+            return calls;
+        };
+        ids.push(id);
+    }
     let mut details = Vec::new();
     let mut detail_error: Option<(Boundary, String)> = None;
     for id in ids {
