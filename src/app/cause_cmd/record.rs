@@ -44,6 +44,8 @@ const MAX_RUN_PAGES: usize = 10;
 /// treated as bounded input; the recorder never follows an unbounded API
 /// pagination chain.
 const MAX_JOB_PAGES: usize = 10;
+/// Most pages of pull-request commits the force-push recovery path reads.
+const MAX_PULL_COMMIT_PAGES: usize = 3;
 
 pub(super) const OWN_FILES_RULE: &str = "own_files = the union of the files of the non-merge \
     commits on fix_head's first-parent chain back to red_head (commits and parents from compare \
@@ -54,7 +56,8 @@ pub(super) const OWN_FILES_RULE: &str = "own_files = the union of the files of t
     (branch_is_default). When the red is not an ancestor: a merge-queue red walks the fix back to the \
     pull request head the queue merged (merge_queue_pr_head); else, within 72 hours, own_files are the \
     non-merge commits up to the fix in the pull request's commit list (post_force_push), null when the \
-    fix is no longer in that list (post_force_push_superseded) or came later (post_force_push_too_late). \
+    fix is no longer in that list (post_force_push_superseded), the bounded commit listing is \
+    truncated (post_force_push_truncated), or came later (post_force_push_too_late). \
     own_files_truncated when a commit lists 300 or more files";
 const FIXLINK_RULE: &str = "candidate order is a later attempt of the red run, then later successful \
     runs on the same head, then later successful runs on another head; accept the first candidate \
@@ -450,11 +453,16 @@ fn list_runs(
         let items = data["workflow_runs"]
             .as_array()
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| format!("{filter}: page {page} did not contain workflow_runs[]"))?;
         let full = items.len() == 100;
         runs.extend(items);
         if !full {
             break;
+        }
+        if page == MAX_RUN_PAGES {
+            return Err(format!(
+                "{filter}: reached the {MAX_RUN_PAGES}-page run listing bound"
+            ));
         }
     }
     Ok(runs)
@@ -474,11 +482,19 @@ fn list_run_jobs(
                 query.repo
             ),
         )?;
-        let items = data["jobs"].as_array().cloned().unwrap_or_default();
+        let items = data["jobs"]
+            .as_array()
+            .cloned()
+            .ok_or_else(|| format!("jobs for run {run_id}: page {page} did not contain jobs[]"))?;
         let full = items.len() == 100;
         jobs.extend(items);
         if !full {
             break;
+        }
+        if page == MAX_JOB_PAGES {
+            return Err(format!(
+                "jobs for run {run_id} reached the {MAX_JOB_PAGES}-page bound"
+            ));
         }
     }
     Ok(jobs)
@@ -493,6 +509,45 @@ fn canonical_job_name(name: &str) -> String {
         Value::String(name) => name,
         _ => name.to_owned(),
     }
+}
+
+/// A display name is only a usable identity when it occurs once per run
+/// attempt among terminal jobs. Matrix and reusable-workflow jobs can expose
+/// the same display name for different jobs; a name-only match must fail
+/// closed rather than claiming that one success fixed all of them.
+fn terminal_job_names_are_unambiguous(jobs: &[Value]) -> bool {
+    let mut names_by_attempt: BTreeMap<u64, BTreeMap<String, usize>> = BTreeMap::new();
+    for job in jobs {
+        let Some(conclusion) = job["conclusion"].as_str() else {
+            continue;
+        };
+        if !matches!(
+            conclusion,
+            "success" | "failure" | "timed_out" | "cancelled" | "skipped"
+        ) {
+            continue;
+        }
+        let attempt = job["run_attempt"].as_u64().unwrap_or(1);
+        let Some(raw_name) = job["name"].as_str().map(str::trim) else {
+            if matches!(conclusion, "failure" | "timed_out") {
+                return false;
+            }
+            continue;
+        };
+        if raw_name.is_empty() {
+            if matches!(conclusion, "failure" | "timed_out") {
+                return false;
+            }
+            continue;
+        }
+        let names = names_by_attempt.entry(attempt).or_default();
+        let count = names.entry(canonical_job_name(raw_name)).or_default();
+        *count += 1;
+        if *count > 1 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether a run's jobs can hold a red: it failed, or a rerun turned it green
@@ -1028,7 +1083,7 @@ fn post_force_push(
         return Ok((None, "post_force_push_too_late", None));
     }
     let mut commits = Vec::new();
-    for page in 1..=3 {
+    for page in 1..=MAX_PULL_COMMIT_PAGES {
         let listed = api(
             gh,
             &format!(
@@ -1036,11 +1091,17 @@ fn post_force_push(
                 query.repo
             ),
         )?;
-        let more = listed.as_array().cloned().unwrap_or_default();
+        let more = listed
+            .as_array()
+            .cloned()
+            .ok_or_else(|| format!("pull request {pr} commits page {page} was not an array"))?;
         let full = more.len() == 100;
         commits.extend(more);
         if !full {
             break;
+        }
+        if page == MAX_PULL_COMMIT_PAGES {
+            return Ok((None, "post_force_push_truncated", None));
         }
     }
     let Some(at) = commits
@@ -1175,6 +1236,9 @@ fn run_passed_job(
             fix.run_id, MAX_JOB_PAGES
         ));
     }
+    if !terminal_job_names_are_unambiguous(&jobs) {
+        return Ok(false);
+    }
     Ok(!jobs.is_empty() && {
         failed_job_names.iter().all(|failed_job| {
             let passed_attempt = jobs
@@ -1212,6 +1276,9 @@ fn red_jobs_complete(
         jobs
     };
     if jobs.is_empty() || !job_list_complete(&jobs) {
+        return Ok(None);
+    }
+    if !terminal_job_names_are_unambiguous(&jobs) {
         return Ok(None);
     }
     let raw_names = jobs
@@ -1299,18 +1366,28 @@ fn fixlinks(
             pending(report, &red, &query.now);
             continue;
         }
-        let listed = greens.entry(branch.clone()).or_insert_with(|| {
-            list_runs(
-                gh,
-                query,
-                &format!(
+        let listed = match greens.entry(branch.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let filter = format!(
                     "branch={}&status=success&created=%3E%3D{}",
                     percent_encode(&branch),
                     query.since
-                ),
-            )
-            .unwrap_or_default()
-        });
+                );
+                let listed = match list_runs(gh, query, &filter) {
+                    Ok(listed) => listed,
+                    Err(error) => {
+                        report
+                            .unreadable
+                            .push(format!("green runs for {branch}: {error}"));
+                        pending(report, &red, &query.now);
+                        entry.insert(Vec::new());
+                        continue;
+                    }
+                };
+                entry.insert(listed)
+            }
+        };
         let later: Vec<&Value> = listed
             .iter()
             .filter(|run| created(run).as_str() > red.time.as_str())
