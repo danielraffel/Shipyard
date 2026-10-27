@@ -106,7 +106,7 @@ impl ReviewerClaim {
             canonical_repository(repository),
             self.head_sha,
             self.epoch,
-            self.reviewer,
+            self.reviewer.trim().to_ascii_lowercase(),
         );
         format!(
             "shipyard-reviewer-claim/v1/{:x}",
