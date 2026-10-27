@@ -3972,7 +3972,9 @@ the same reason. When the protected base enables `reviewer_claim_receipt` and
 `reviewer_claim_app`, acquire a claim with `shipyard reviewer-claim acquire`
 before the verdict; the managed `reviewer-claim-guard` validates the exact
 head, reviewer, epoch and deadline immediately before the ghapp write. Use
-`shipyard reviewer-claim revoke` for an explicit release. A merge-only update carries the approval only when every file the PR
+`shipyard reviewer-claim revoke` is intentionally unavailable until
+authenticated App receipt invalidation is exposed; claims expire or are
+superseded by exact-head adoption fencing in the meantime. A merge-only update carries the approval only when every file the PR
 changes keeps its approved blob and mode (the compare API lists no mode, so
 both twins read the files' directory trees), the base changed none of them
 (a rename counts under both names, so a base edit to a file the PR renames

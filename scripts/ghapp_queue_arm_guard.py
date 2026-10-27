@@ -282,6 +282,10 @@ CLAIM_RECEIPT_KEY = "reviewer_claim_receipt"
 CLAIM_APP_KEY = "reviewer_claim_app"
 CLAIM_RECEIPT_SCHEMA = "shipyard-reviewer-claim/v1"
 ACTIONS_APP = "github-actions"
+# GitHub Actions' App id is shared by every workflow and cannot be used as a
+# durable reviewer authority.  A claim policy naming it is refused at parse
+# time rather than silently turning the optional gate into a shared token.
+SHARED_CLAIM_APP_ID = 15368
 DEFERRED_TIER = "deferred"
 # The log group the runner prints in "Set up job" listing the token's scopes.
 TOKEN_PERMISSIONS_HEADER = "GITHUB_TOKEN Permissions"
@@ -979,6 +983,12 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
               or (type(claim_app) is int and claim_app > 0)):
         raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {CLAIM_APP_KEY} "
                          "must be a non-empty app slug or positive app id when claim receipts are enabled")
+    if isinstance(claim_app, str) and claim_app.strip().lower() in {ACTIONS_APP, FLEET_AUTHOR}:
+        raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {CLAIM_APP_KEY} "
+                         f"may not name the shared `{claim_app}` App")
+    if type(claim_app) is int and claim_app == SHARED_CLAIM_APP_ID:
+        raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {CLAIM_APP_KEY} "
+                         f"may not name shared GitHub Actions App id {SHARED_CLAIM_APP_ID}")
     try:
         excluded, carry_error = carry_paths(section), None
     except GuardError as error:
@@ -1400,12 +1410,14 @@ def deciding_approval(
     if comment is not None:
         signed = _SIGNER_LINE.findall(comment.get("body") or "")
         return {"verdict_comment_id": comment.get("id"),
-                "signer": signed[-1].lower() if signed else None, "approved_head": head}
+                "signer": signed[-1].lower() if signed else None, "approved_head": head,
+                "approved_at": comment.get("created_at")}
     for review in reviews:
         if (str(review.get("state") or "").upper() == "APPROVED"
                 and str(review.get("commit_id") or "").lower() == head):
             return {"verdict_review_id": review.get("id"),
-                    "signer": (review.get("user") or {}).get("login"), "approved_head": head}
+                    "signer": (review.get("user") or {}).get("login"), "approved_head": head,
+                    "approved_at": review.get("submitted_at")}
     return {"approved_head": head}
 
 
@@ -2228,8 +2240,17 @@ def reviewer_claim_receipt(
     if len(receipts) != 1:
         raise GuardError(f"expected exactly one valid reviewer claim receipt `{context}` on {head[:12]}")
     signer = approval.get("signer") if isinstance(approval, dict) else None
-    if isinstance(signer, str) and signer and receipts[0]["reviewer"].lower() != signer.lower():
+    if not isinstance(signer, str) or not signer.strip():
+        raise GuardError("the deciding approval has no signer identity")
+    if receipts[0]["reviewer"].lower() != signer.lower():
         raise GuardError("reviewer claim receipt identity does not match the deciding approval")
+    approved_at = _timestamp(approval.get("approved_at")) if isinstance(approval, dict) else None
+    if approved_at is None:
+        raise GuardError("the deciding approval has no readable timestamp")
+    claimed_at = _timestamp(receipts[0]["claimed_at"])
+    deadline_at = _timestamp(receipts[0]["deadline_at"])
+    if claimed_at is None or deadline_at is None or not (claimed_at <= approved_at < deadline_at):
+        raise GuardError("the deciding approval was outside the reviewer claim window")
     return (f"reviewer claim epoch {receipts[0]['epoch']} by {receipts[0]['reviewer']} "
             f"consumed for head {head[:12]}")
 

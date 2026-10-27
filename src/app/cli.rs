@@ -1025,7 +1025,8 @@ pub(super) enum ReviewerClaimCommand {
         #[arg(long)]
         reviewer: String,
     },
-    /// Explicitly revoke a current reviewer claim.
+    /// Explicitly revoke a current reviewer claim (currently unavailable until
+    /// authenticated App receipt invalidation is exposed).
     Revoke {
         /// Pull request number.
         #[arg(long)]

@@ -36,6 +36,20 @@ class ReviewerClaimGuard(unittest.TestCase):
     def test_non_verdict_requests_are_inert(self) -> None:
         self.assertEqual(guard.main(["pr", "comment", "42", "--body", "status only"]), 0)
 
+    def test_installed_layout_loads_managed_queue_arm_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            reviewer = root / "reviewer-claim-guard"
+            managed = root / "queue-arm-guard"
+            reviewer.write_text((ROOT / "ghapp_reviewer_claim_guard.py").read_text(encoding="utf-8"),
+                                encoding="utf-8")
+            managed.write_text((ROOT / "ghapp_queue_arm_guard.py").read_text(encoding="utf-8"),
+                               encoding="utf-8")
+            with mock.patch.object(guard, "__file__", str(reviewer)):
+                module = guard._guard_module()
+            self.assertEqual(module.__name__, "shipyard_queue_arm_guard")
+            self.assertIsNone(module.review_policy(None, "o/r", False)["claim_receipt"])
+
     def test_body_files_and_api_fields_are_inspected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "body.txt"
@@ -68,6 +82,32 @@ class ReviewerClaimGuard(unittest.TestCase):
             self.assertIn(
                 f"verdict: HOLD head:{HEAD}\n",
                 guard._body_values(["pr", "comment", "42", "-F", str(path)]),
+            )
+
+            # gh's raw fields keep @mentions literal; only typed -F/--field
+            # expands @<file>.  Treating -f as a file would let a body escape
+            # inspection and would also corrupt ordinary @mentions.
+            self.assertEqual(
+                guard._body_values(["api", "repos/o/r/issues/42/comments", "-f", "body=@daniel"]),
+                ["@daniel"],
+            )
+
+    def test_endpoint_repository_must_agree_with_binding(self) -> None:
+        with mock.patch.object(guard, "_live_pull", return_value=(HEAD, "main")), \
+             mock.patch.dict(os.environ, {"GH_REPO": "o/r"}, clear=False):
+            self.assertEqual(
+                guard.main(["api", "repos/other/repo/issues/42/comments", "-f",
+                            f"body=verdict: APPROVE head:{HEAD}" ]),
+                1,
+            )
+
+    def test_policy_off_short_circuits_head_marker_refusal(self) -> None:
+        with mock.patch.object(guard, "_live_pull", return_value=(HEAD, "main")), \
+             mock.patch.object(guard, "_guard_module", return_value=FakePolicyGuard(False)), \
+             mock.patch.dict(os.environ, {"GH_REPO": "o/r"}, clear=False):
+            self.assertEqual(
+                guard.main(["pr", "comment", "42", "--body", "verdict: APPROVE head:" + "b" * 40]),
+                0,
             )
 
     def test_default_off_policy_does_not_need_a_local_claim(self) -> None:
@@ -209,7 +249,7 @@ class ReviewerClaimGuard(unittest.TestCase):
                  }, clear=False), \
                  mock.patch.object(guard.subprocess, "run", wraps=guard.subprocess.run) as run:
                 self.assertEqual(guard.main([
-                    "api", "graphql", "-f", f"query=@{query}", "-f", "id=PR_kwDO123",
+                    "api", "graphql", "-F", f"query=@{query}", "-f", "id=PR_kwDO123",
                 ]), 0)
                 self.assertTrue(any(call.args[0][0] == str(binary) for call in run.call_args_list))
 
@@ -270,6 +310,7 @@ class ReviewerClaimGuard(unittest.TestCase):
 
     def test_live_head_mismatch_refuses(self) -> None:
         with mock.patch.object(guard, "_live_pull", return_value=("b" * 40, "main")), \
+             mock.patch.object(guard, "_guard_module", return_value=FakePolicyGuard(True)), \
              mock.patch.dict(os.environ, {"GH_REPO": "o/r"}, clear=False):
             self.assertEqual(
                 guard.main(["pr", "comment", "42", "--body", f"verdict: APPROVE head:{HEAD}"]), 1

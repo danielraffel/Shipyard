@@ -11,6 +11,7 @@ fail closed.
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -27,12 +28,12 @@ VERDICT = re.compile(
     re.IGNORECASE,
 )
 PR_ENDPOINT = re.compile(
-    r"^(?:https?://[^/]+/(?:api/v3/)?)?repos/[^/]+/[^/]+/issues/"
+    r"^(?:https?://[^/]+/(?:api/v3/)?)?repos/([^/]+)/([^/]+)/issues/"
     r"([1-9][0-9]*)/comments(?:/([1-9][0-9]*))?/?$"
 )
 PR_URL = re.compile(r"/(?:pull|issues)/([1-9][0-9]*)(?:/|$)")
-PULL_REVIEW_ENDPOINT = re.compile(r"^repos/[^/]+/[^/]+/pulls/([1-9][0-9]*)/reviews(?:/.*)?/?$")
-COMMENT_ENDPOINT = re.compile(r"^repos/[^/]+/[^/]+/issues/comments/([1-9][0-9]*)/?$")
+PULL_REVIEW_ENDPOINT = re.compile(r"^repos/([^/]+)/([^/]+)/pulls/([1-9][0-9]*)/reviews(?:/.*)?/?$")
+COMMENT_ENDPOINT = re.compile(r"^repos/([^/]+)/([^/]+)/issues/comments/([1-9][0-9]*)/?$")
 
 
 def _input_paths(args: list[str]) -> list[str]:
@@ -72,18 +73,18 @@ def _opaque_body_source(args: list[str]) -> bool:
     previous = ""
     for argument in args:
         value = None
-        if previous in {"-f", "-F", "--field", "--raw-field"} and argument.startswith("body="):
+        if previous in {"-F", "--field"} and argument.startswith("body="):
             value = argument[len("body="):]
         elif argument.startswith("--field=body="):
             value = argument.split("=", 2)[2]
         if value is not None and value.startswith("@"):
             if value == "@-" or not pathlib.Path(value[1:]).is_file():
                 return True
-        if previous in {"-f", "-F", "--field", "--raw-field"} and argument.startswith("query="):
+        if previous in {"-F", "--field"} and argument.startswith("query="):
             value = argument[len("query="):]
             if value.startswith("@") and (value == "@-" or not pathlib.Path(value[1:]).is_file()):
                 return True
-        elif argument.startswith(("--field=query=", "--raw-field=query=")):
+        elif argument.startswith("--field=query="):
             value = argument.split("=", 2)[2]
             if value.startswith("@") and (value == "@-" or not pathlib.Path(value[1:]).is_file()):
                 return True
@@ -107,13 +108,25 @@ def _potential_verdict_target(args: list[str]) -> bool:
 
 
 def _guard_module() -> Any:
-    path = pathlib.Path(__file__).with_name("ghapp_queue_arm_guard.py")
-    spec = importlib.util.spec_from_file_location("shipyard_queue_arm_guard", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    # Source checkouts keep the Python source name; `shipyard guards install`
+    # publishes the managed executable as `queue-arm-guard`.  The reviewer
+    # guard must use the same policy parser in either layout.
+    here = pathlib.Path(__file__).resolve().parent
+    candidates = (here / "ghapp_queue_arm_guard.py", here / "queue-arm-guard")
+    for path in candidates:
+        if not path.is_file():
+            continue
+        loader = importlib.machinery.SourceFileLoader("shipyard_queue_arm_guard", str(path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        try:
+            loader.exec_module(module)
+        except Exception:  # noqa: BLE001 - fail closed below
+            continue
+        return module
+    raise RuntimeError(f"cannot load managed queue-arm-guard from {here}")
 
 
 def _body_values(args: list[str]) -> list[str]:
@@ -147,7 +160,7 @@ def _body_values(args: list[str]) -> list[str]:
                 except OSError:
                     value = ""
             values.append(value)
-        elif argument.startswith(("--field=body=", "--raw-field=body=")):
+        elif argument.startswith("--field=body="):
             value = argument.split("=", 2)[2]
             if argument.startswith("--field=body=@") and value != "@-":
                 try:
@@ -176,7 +189,7 @@ def _body_values(args: list[str]) -> list[str]:
         query = None
         if previous in {"-f", "-F", "--field", "--raw-field"} and argument.startswith("query="):
             query = argument[len("query="):]
-        elif argument.startswith(("--field=query=", "--raw-field=query=")):
+        elif argument.startswith("--field=query="):
             query = argument.split("=", 2)[2]
         if query is not None and query.startswith("@") and query != "@-":
             try:
@@ -194,7 +207,7 @@ def _body_values(args: list[str]) -> list[str]:
     return values
 
 
-def _target(args: list[str], repo: str) -> tuple[int | None, str | None]:
+def _target(args: list[str], repo: str | None) -> tuple[int | None, str | None]:
     if len(args) >= 2 and args[0] in {"pr", "issue"} and args[1] in {"comment", "review", "close"}:
         for argument in args[2:]:
             if argument.isdigit() and int(argument) > 0:
@@ -224,20 +237,21 @@ def _target(args: list[str], repo: str) -> tuple[int | None, str | None]:
         endpoint = argument.split("?", 1)[0].strip("/")
         match = PR_ENDPOINT.match(endpoint) or PULL_REVIEW_ENDPOINT.match(endpoint)
         if match:
-            return int(match.group(1)), repo
+            return int(match.group(3)), f"{match.group(1)}/{match.group(2)}"
         comment = COMMENT_ENDPOINT.match(endpoint)
         if comment:
+            endpoint_repo = f"{comment.group(1)}/{comment.group(2)}"
             gh = os.environ.get("GHAPP_REAL_GH") or shutil.which("gh")
             if gh:
                 result = subprocess.run(
-                    [gh, "api", f"repos/{repo}/issues/comments/{comment.group(1)}", "--jq", ".issue_url"],
+                    [gh, "api", f"repos/{endpoint_repo}/issues/comments/{comment.group(3)}", "--jq", ".issue_url"],
                     check=False, capture_output=True, text=True, timeout=30,
                     env=os.environ.copy(),
                 )
                 if result.returncode == 0:
                     issue = PR_URL.search(result.stdout.strip())
                     if issue:
-                        return int(issue.group(1)), repo
+                        return int(issue.group(1)), endpoint_repo
         for pattern in (r"(?:pullRequest|issue)\s*\(\s*number\s*:\s*([1-9][0-9]*)",):
             query = re.search(pattern, argument, re.IGNORECASE)
             if query:
@@ -248,7 +262,7 @@ def _target(args: list[str], repo: str) -> tuple[int | None, str | None]:
     return None, None
 
 
-def _graphql_target(args: list[str], repo: str) -> int | None:
+def _graphql_target(args: list[str], repo: str | None) -> int | None:
     """Resolve a GraphQL review mutation's PullRequest ID to its number."""
     query_values: list[str] = []
     ids: list[str] = []
@@ -257,7 +271,7 @@ def _graphql_target(args: list[str], repo: str) -> int | None:
         if previous in {"-f", "-F", "--field", "--raw-field"}:
             if argument.startswith("query="):
                 query = argument[len("query="):]
-                if query.startswith("@") and query != "@-":
+                if previous in {"-F", "--field"} and query.startswith("@") and query != "@-":
                     try:
                         query = pathlib.Path(query[1:]).read_text(
                             encoding="utf-8", errors="surrogateescape")
@@ -269,7 +283,7 @@ def _graphql_target(args: list[str], repo: str) -> int | None:
                 ids.append(argument.split("=", 1)[1])
         elif argument.startswith(("--field=query=", "--raw-field=query=")):
             query = argument.split("=", 2)[2]
-            if query.startswith("@") and query != "@-":
+            if argument.startswith("--field=") and query.startswith("@") and query != "@-":
                 try:
                     query = pathlib.Path(query[1:]).read_text(
                         encoding="utf-8", errors="surrogateescape")
@@ -304,7 +318,7 @@ def _graphql_target(args: list[str], repo: str) -> int | None:
                     variables = value.get("variables")
                     if isinstance(variables, dict) and isinstance(variables.get(variable.group(1)), str):
                         ids.append(variables[variable.group(1)])
-    if not ids:
+    if not ids or not repo:
         return None
     gh = os.environ.get("GHAPP_REAL_GH") or shutil.which("gh")
     if not gh:
@@ -380,23 +394,30 @@ def main(argv: list[str]) -> int:
     if verdicts and len(set(head.lower() for head in verdicts)) != 1:
         print("reviewer-claim-guard: refused: verdict bodies name multiple heads", file=sys.stderr)
         return 1
-    repo = os.environ.get("GH_REPO", "").strip()
-    if not re.fullmatch(r"[^/\s]+/[^/\s]+", repo):
-        print("reviewer-claim-guard: refused: exact repository binding is missing", file=sys.stderr)
+    bound_repo = os.environ.get("GH_REPO", "").strip()
+    if bound_repo and not re.fullmatch(r"[^/\s]+/[^/\s]+", bound_repo):
+        print("reviewer-claim-guard: refused: exact repository binding is malformed", file=sys.stderr)
         return 1
-    pr, _ = _target(argv, repo)
+    pr, endpoint_repo = _target(argv, bound_repo or None)
     if pr is None:
         print("reviewer-claim-guard: refused: verdict target is not a pull request", file=sys.stderr)
         return 1
+    if bound_repo and endpoint_repo and bound_repo.lower() != endpoint_repo.lower():
+        print("reviewer-claim-guard: refused: endpoint repository disagrees with GH_REPO", file=sys.stderr)
+        return 1
+    repo = bound_repo or endpoint_repo
+    if not repo:
+        print("reviewer-claim-guard: refused: exact repository binding is missing", file=sys.stderr)
+        return 1
     try:
         live_head, base = _live_pull(repo, pr)
-        marker_head = verdicts[0].lower() if verdicts else live_head
-        if marker_head != live_head:
-            raise RuntimeError(f"verdict names {marker_head}, live head is {live_head}")
         guard = _guard_module()
         policy = guard.review_policy(guard.base_config_text(repo, base), repo, True)
         if policy.get("claim_receipt") is None:
             return 0
+        marker_head = verdicts[0].lower() if verdicts else live_head
+        if marker_head != live_head:
+            raise RuntimeError(f"verdict names {marker_head}, live head is {live_head}")
         reviewer = os.environ.get("SHIPYARD_AGENT_ID", "").strip()
         if not reviewer or any(char.isspace() for char in reviewer):
             raise RuntimeError("SHIPYARD_AGENT_ID is required when reviewer claims are enabled")

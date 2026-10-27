@@ -4207,4 +4207,6 @@ Acquire a claim with `shipyard reviewer-claim acquire --pr N --repo OWNER/REPO
 `[auto_merge] reviewer_claim_receipt` and `reviewer_claim_app`, the managed
 `reviewer-claim-guard` calls `shipyard reviewer-claim validate` immediately
 before a verdict write; expired, revoked, replaced, legacy, or wrong-head state
-is refused. Use `shipyard reviewer-claim revoke` for an explicit release.
+is refused. `shipyard reviewer-claim revoke` is intentionally unavailable until
+authenticated App receipt invalidation is exposed; claims expire or are
+superseded by exact-head adoption fencing in the meantime.

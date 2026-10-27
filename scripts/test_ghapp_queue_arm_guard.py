@@ -4300,6 +4300,16 @@ class ReviewerClaimReceipt(unittest.TestCase):
         with self.assertRaises(guard.GuardError):
             guard.review_policy("[auto_merge]\nreviewer_claim_receipt = 'reviewer-claim'\n",
                                 "danielraffel/Shipyard", True)
+        with self.assertRaises(guard.GuardError):
+            guard.review_policy(
+                "[auto_merge]\nreviewer_claim_receipt = 'reviewer-claim'\n"
+                "reviewer_claim_app = 'github-actions'\n",
+                "danielraffel/Shipyard", True)
+        with self.assertRaises(guard.GuardError):
+            guard.review_policy(
+                "[auto_merge]\nreviewer_claim_receipt = 'reviewer-claim'\n"
+                "reviewer_claim_app = 15368\n",
+                "danielraffel/Shipyard", True)
 
     def test_parser_requires_exact_schema_and_binds_identity(self) -> None:
         parsed = guard.parse_claim_receipt(self.run_fixture(self.receipt()), "danielraffel/Shipyard", 974,
@@ -4334,7 +4344,7 @@ class ReviewerClaimReceipt(unittest.TestCase):
 
     def test_consumers_require_one_receipt_and_deciding_reviewer(self) -> None:
         policy = {"claim_receipt": "reviewer-claim", "claim_app": "shipyard-review"}
-        approval = {"signer": "pulp-review"}
+        approval = {"signer": "pulp-review", "approved_at": "2026-10-27T20:30:00Z"}
         listing = [{"total_count": 1, "check_runs":
                     [self.run_fixture(self.receipt())]}]
         with mock.patch.object(guard, "run_real_gh", return_value=listing):
@@ -4342,7 +4352,18 @@ class ReviewerClaimReceipt(unittest.TestCase):
                 "danielraffel/Shipyard", 974, self.head, policy, approval)
         self.assertIn("epoch 3", note)
 
-        wrong_reviewer = {"signer": "infra-review2"}
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head, policy,
+                    {"signer": "pulp-review"})
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head, policy,
+                    {"signer": "pulp-review", "approved_at": "2020-01-01T00:00:00Z"})
+
+        wrong_reviewer = {"signer": "infra-review2", "approved_at": "2026-10-27T20:30:00Z"}
         with mock.patch.object(guard, "run_real_gh", return_value=listing):
             with self.assertRaises(guard.GuardError):
                 guard.reviewer_claim_receipt(
@@ -4365,7 +4386,7 @@ class ReviewerClaimReceipt(unittest.TestCase):
             with self.assertRaises(guard.GuardError):
                 guard.reviewer_claim_receipt(
                     "danielraffel/Shipyard", 974, self.head,
-                    policy, {"signer": "pulp-review"})
+                    policy, {"signer": "pulp-review", "approved_at": "2026-10-27T20:30:00Z"})
 
     def test_consumers_reject_partial_pages(self) -> None:
         policy = {"claim_receipt": "reviewer-claim", "claim_app": "shipyard-review"}
@@ -4374,4 +4395,4 @@ class ReviewerClaimReceipt(unittest.TestCase):
             with self.assertRaises(guard.GuardError):
                 guard.reviewer_claim_receipt(
                     "danielraffel/Shipyard", 974, self.head,
-                    policy, {"signer": "pulp-review"})
+                    policy, {"signer": "pulp-review", "approved_at": "2026-10-27T20:30:00Z"})
