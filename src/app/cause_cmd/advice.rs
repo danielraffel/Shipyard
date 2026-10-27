@@ -274,12 +274,43 @@ fn read_fixlinks(path: &Path) -> Result<Vec<Value>, CliFailure> {
         .map_err(|e| CliFailure::new(2, e.to_string()))?
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
-        .filter(safe)
+        // A safe row is not necessarily a fix-link: archives can be copied
+        // from hand-written or partially written JSONL.  Only attach the
+        // producer's complete identity so advice cannot present a malformed
+        // row as a usable fix.
+        .filter(valid_fixlink)
         .collect();
     // If an archive contains several links for one red attempt, choose the
     // same link regardless of append order.
     links.sort_by_cached_key(Value::to_string);
     Ok(links)
+}
+
+pub(super) fn valid_fixlink(value: &Value) -> bool {
+    let derivation = value["derivation"].as_str();
+    value["schema"] == SCHEMA
+        && value["source"] == "fix-link"
+        && safe(value)
+        && value["repo"].as_str().is_some_and(|repo| !repo.is_empty())
+        && value["red_run_id"].as_u64().is_some_and(|id| id > 0)
+        && value["red_attempt"]
+            .as_u64()
+            .is_some_and(|attempt| attempt > 0)
+        && value["fix_run_id"].as_u64().is_some_and(|id| id > 0)
+        && value["fix_head_sha"].as_str().is_some_and(valid_sha)
+        && matches!(
+            derivation,
+            Some("compare_red_head_to_fix_head" | "rerun_green")
+        )
+        && (derivation != Some("rerun_green")
+            || (value["fix_run_id"] == value["red_run_id"]
+                && value["head_sha"] == value["fix_head_sha"]
+                && value["head_sha"].as_str().is_some_and(valid_sha)
+                && value["files_raw"].as_array().is_some_and(Vec::is_empty)
+                && value["own_files"].as_array().is_some_and(Vec::is_empty)
+                && value["files_truncated"].as_bool() == Some(false)
+                && value["own_files_truncated"].as_bool() == Some(false)
+                && value["own_files_method"].as_str() == Some("rerun_same_head")))
 }
 static SENSITIVE_MARKER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:github_pat_|\bgh[oprsu]_[A-Za-z0-9]{20,}|(?:token|api[_-]?key|secret|password)\s*[:=])")
@@ -425,11 +456,25 @@ mod tests {
             );
 
             fs::write(&archive, clean.to_string()).unwrap();
-            let unsafe_link = serde_json::json!({
-                "repo": "o/r", "red_run_id": 1, "red_attempt": 1,
-                "extra": {"nested": [private]},
+            let mut valid_link = serde_json::json!({
+                "schema": SCHEMA,
+                "source": "fix-link",
+                "repo": "o/r",
+                "red_run_id": 1,
+                "red_attempt": 1,
+                "fix_run_id": 2,
+                "fix_head_sha": "c".repeat(40),
+                "derivation": "compare_red_head_to_fix_head",
             });
-            fs::write(dir.path().join("fixlinks.jsonl"), unsafe_link.to_string()).unwrap();
+            assert!(valid_fixlink(&valid_link));
+            fs::write(dir.path().join("fixlinks.jsonl"), valid_link.to_string()).unwrap();
+            assert!(
+                advise(&args(dir.path()), &[]).unwrap().0[0]
+                    .fix_link
+                    .is_some()
+            );
+            valid_link["extra"] = serde_json::json!({"nested": [private]});
+            fs::write(dir.path().join("fixlinks.jsonl"), valid_link.to_string()).unwrap();
             let candidates = advise(&args(dir.path()), &[]).unwrap().0;
             assert_eq!(candidates.len(), 1);
             assert!(candidates[0].fix_link.is_none(), "{private}");
@@ -463,8 +508,10 @@ mod tests {
             .collect();
         let links = ["c", "d"].map(|sha| {
             serde_json::json!({
+                "schema": SCHEMA, "source": "fix-link",
                 "repo": "o/r", "red_run_id": 1, "red_attempt": 1,
-                "fix_head_sha": sha.repeat(40),
+                "fix_head_sha": sha.repeat(40), "fix_run_id": 2,
+                "derivation": "compare_red_head_to_fix_head",
             })
         });
         let mut query = args(dir.path());
@@ -516,6 +563,64 @@ mod tests {
         fs::write(
             dir.path().join("fixlinks.jsonl"),
             serde_json::json!({"repo":"o/r"}).to_string(),
+        )
+        .unwrap();
+
+        let candidates = advise(&args(dir.path()), &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn partial_fixlinks_are_not_attached() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            serde_json::json!({
+                "schema": SCHEMA,
+                "source": "fix-link",
+                "repo": "o/r",
+                "red_run_id": 1,
+                "red_attempt": 1,
+                "derivation": "compare_red_head_to_fix_head"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let candidates = advise(&args(dir.path()), &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn malformed_fix_head_sha_is_not_attached() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            serde_json::json!({
+                "schema": SCHEMA,
+                "source": "fix-link",
+                "repo": "o/r",
+                "red_run_id": 1,
+                "red_attempt": 1,
+                "fix_run_id": 2,
+                "fix_head_sha": "not-a-sha",
+                "derivation": "compare_red_head_to_fix_head"
+            })
+            .to_string(),
         )
         .unwrap();
 
