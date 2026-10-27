@@ -18,6 +18,10 @@ import version_bump_check  # noqa: E402
 spec = importlib.util.spec_from_file_location("risk_tier", HERE / "risk_tier.py")
 assert spec is not None and spec.loader is not None
 rt = importlib.util.module_from_spec(spec)
+# Register dynamically loaded modules before execution. Python 3.14's
+# dataclass decorator resolves the module through sys.modules while processing
+# postponed annotations.
+sys.modules[spec.name] = rt
 spec.loader.exec_module(rt)
 
 WORKFLOW = HERE.parent / ".github" / "workflows" / "risk-tier.yml"
