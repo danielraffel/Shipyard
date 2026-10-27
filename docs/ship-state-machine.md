@@ -123,10 +123,12 @@ real ship-state write from overlapping that audit.
 ### Warm-pool member attribution
 
 When a successful host-pool run is retained for warm reuse, the pool entry
-records the selected member from the authoritative `host-pool:<pool>/<member>`
-backend label. The optional `member_id` is preserved for older entries and is
-reported by `shipyard targets warm status --json` when known; it does not alter
-warm-pool eligibility or routing.
+records the selected member from the dispatch result's structural
+`host_pool_member_id` field. The backend display label may carry `-failover` or
+`-exhausted` suffixes and is not parsed for attribution. The optional
+`member_id` is preserved for older entries and is reported by
+`shipyard targets warm status --json` when known; it does not alter warm-pool
+eligibility or routing.
 
 ## State diagram (textual)
 

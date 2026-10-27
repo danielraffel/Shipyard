@@ -775,6 +775,7 @@ impl ExecutorDispatcher {
             // cancelled; busy, deferred, and probe-only paths never reach
             // this point and remain unattributed.
             let outcome = result.status;
+            result.host_pool_member_id = Some(member.id.clone());
             // `member` is a filtered view borrowed from `pool.members`.
             // Pointer identity recovers the original configured position
             // without parsing member labels or changing host-pool authority.
@@ -3822,6 +3823,7 @@ backend = "local"
 
         assert_eq!(result.status, TargetStatus::Pass);
         assert_eq!(result.backend, "host-pool:local_macs/local");
+        assert_eq!(result.host_pool_member_id.as_deref(), Some("local"));
         assert_eq!(result.primary_backend, None);
         assert_eq!(result.failover_reason, None);
         assert_eq!(
@@ -3876,6 +3878,7 @@ backend = "local"
         });
 
         assert_ne!(result.status, TargetStatus::Pass);
+        assert_eq!(result.host_pool_member_id.as_deref(), Some("local"));
         assert_eq!(
             result.route_attempts.as_ref().unwrap()[0].route_id,
             "host-pool:local_macs:local"
@@ -3951,6 +3954,7 @@ backend = "local"
 
         assert_eq!(result.status, TargetStatus::Pass);
         assert_eq!(result.backend, "host-pool:local_macs/local-failover");
+        assert_eq!(result.host_pool_member_id.as_deref(), Some("local"));
         assert_eq!(
             result.primary_backend.as_deref(),
             Some("host-pool:local_macs/mac-studio")

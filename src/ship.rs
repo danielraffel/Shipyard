@@ -3190,7 +3190,7 @@ pub fn update_warm_pool_after_run(
             compute_expires_at(target.warm_keepalive_seconds, now),
             now,
         );
-        let entry = if let Some(member_id) = member_id_from_backend(&result.backend) {
+        let entry = if let Some(member_id) = result.host_pool_member_id.clone() {
             entry.with_member_id(member_id)
         } else {
             entry
@@ -3204,14 +3204,6 @@ pub fn update_warm_pool_after_run(
         return Ok(WarmPoolUpdate::Evicted);
     }
     Ok(WarmPoolUpdate::Noop)
-}
-
-/// Extract the authoritative host-pool member from a target result label.
-/// Other backends intentionally return `None`, preserving legacy entries.
-fn member_id_from_backend(backend: &str) -> Option<String> {
-    let suffix = backend.strip_prefix("host-pool:")?;
-    let (_, member_id) = suffix.rsplit_once('/')?;
-    (!member_id.is_empty()).then(|| member_id.to_owned())
 }
 
 fn miss(
@@ -3265,9 +3257,8 @@ mod tests {
         drain_or_wait_ship_with_scope, envelope_matches_foreground_job, execute_run,
         execute_run_worker, execute_ship, execute_ship_worker, execute_targets_with_options,
         leases_not_covered_by_running_reservations, load_run_outcome, load_ship_outcome,
-        member_id_from_backend, recover_foreground_running_jobs_for_drain, retry_attempt_log_path,
-        run_drain_worker_cycle, stale_head_reason, submit_run, submit_ship, target_log_path,
-        update_warm_pool_after_run,
+        recover_foreground_running_jobs_for_drain, retry_attempt_log_path, run_drain_worker_cycle,
+        stale_head_reason, submit_run, submit_ship, target_log_path, update_warm_pool_after_run,
     };
     use crate::config::{LoadedConfig, LocalOverlaySource};
     use crate::evidence::EvidenceStore;
@@ -4139,12 +4130,26 @@ mod tests {
 
     #[test]
     fn host_pool_pass_records_the_selected_member_for_warm_status() {
-        assert_eq!(
-            member_id_from_backend("host-pool:local_macs/studio-a"),
-            Some("studio-a".to_owned())
+        let target = ssh_target();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        let mut result = TargetResult::new(
+            "ubuntu",
+            "linux-x64",
+            TargetStatus::Pass,
+            "host-pool:local_macs/studio-a-failover",
         );
-        assert_eq!(member_id_from_backend("ssh"), None);
-        assert_eq!(member_id_from_backend("host-pool:local_macs/"), None);
+        result.host_pool_member_id = Some("studio/a".to_owned());
+
+        update_warm_pool_after_run(&pool, &target, "abc", &result, false, false, 20.0)
+            .expect("update");
+        assert_eq!(
+            pool.get("ubuntu", "vm", 21.0)
+                .expect("entry")
+                .member_id
+                .as_deref(),
+            Some("studio/a")
+        );
     }
 
     #[test]
