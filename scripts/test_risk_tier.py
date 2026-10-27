@@ -233,6 +233,17 @@ class Dependencies(unittest.TestCase):
         self.assertEqual(self.findings("Cargo.lock", LOCK_BASE, LOCK_BASE + crates),
                          [(rt.HIGH, "7 new packages in Cargo.lock: c0, c1, c2 +4")])
 
+    def test_newline_in_package_name_is_safe_when_rendered(self) -> None:
+        head = CARGO_BASE + '"evil\\n::error title=spoof::forged" = "1"\n'
+        found = self.findings("Cargo.toml", CARGO_BASE, head)
+        self.assertEqual(found, [(rt.HIGH,
+                                  "new dependency evil\n::error title=spoof::forged (Cargo.toml)")])
+        out = rt.assess([], [], rt.Rules(), dependencies=rt.dependency_findings(
+            "Cargo.toml", CARGO_BASE, head))
+        rendered = rt.summary(out, 7, "h" * 40)
+        self.assertNotIn("\n::error", rendered)
+        self.assertIn(r"evil\n::error title=spoof::forged", rendered)
+
     def test_pyproject(self) -> None:
         base = ('[project]\nname = "x"\ndependencies = ["requests>=2.31", "PyYAML==6.0"]\n'
                 '[dependency-groups]\ndev = ["pytest>=8"]\n')
@@ -369,6 +380,16 @@ class Description(unittest.TestCase):
         self.assertTrue(rt.describe(out).startswith(
             "report-only: High (label risk:high, new dependency tar (Cargo.toml)"),
             rt.describe(out))
+
+    def test_newline_and_markdown_controls_are_escaped_in_rendered_reasons(self) -> None:
+        out = rt.assess([{"filename": ".github/workflows/a\n::error title=spoof::forged`", "additions": 1,
+                           "deletions": 0}], [], rt.Rules())
+        description = rt.describe(out)
+        summary = rt.summary(out, 7, "h" * 40)
+        for rendered in (description, summary):
+            self.assertNotIn("\n::error", rendered)
+            self.assertIn(r"a\n::error title=spoof::forged\`", rendered)
+            self.assertNotIn("\x00", rendered)
 
 
 class FakeGitHub(rt.GitHub):

@@ -641,6 +641,33 @@ def _priority(reason: str) -> int:
     return 1
 
 
+def _display_text(value: str) -> str:
+    """Render untrusted labels, paths, and dependency names as one safe line.
+
+    These values can come from a pull request's filenames or dependency
+    manifests.  They are printed both to Actions stdout (where a newline can
+    become a workflow command) and inside Markdown inline-code spans.  Escape
+    C0 controls and DEL visibly, and escape backticks so a reason cannot close
+    the surrounding Markdown span.
+    """
+    out: list[str] = []
+    for char in value:
+        code = ord(char)
+        if char == "`":
+            out.append(r"\`")
+        elif char == "\n":
+            out.append(r"\n")
+        elif char == "\r":
+            out.append(r"\r")
+        elif char == "\t":
+            out.append(r"\t")
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\x{code:02x}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
 def describe(assessment: Assessment) -> str:
     """A status description of at most 140 characters: the tier, as many of
     its reasons as fit, and what the tier would require."""
@@ -651,13 +678,15 @@ def describe(assessment: Assessment) -> str:
     shown: list[str] = []
     for index, reason in enumerate(reasons):
         rest = len(reasons) - index - 1
-        candidate = ", ".join(shown + [reason]) + (f" +{rest}" if rest else "")
+        display_reason = _display_text(reason)
+        candidate = ", ".join(shown + [display_reason]) + (f" +{rest}" if rest else "")
         if len(candidate) <= budget:
-            shown.append(reason)
+            shown.append(display_reason)
             continue
         if not shown:
             more = f" +{rest}" if rest else ""
-            shown.append(reason[: max(1, budget - len(more) - 1)] + "…")
+            display_reason = _display_text(reason)
+            shown.append(display_reason[: max(1, budget - len(more) - 1)] + "…")
             return f"{head} ({shown[0]}{more}){tail}"[:DESCRIPTION_LIMIT]
         return f"{head} ({', '.join(shown)} +{rest + 1}){tail}"[:DESCRIPTION_LIMIT]
     inner = f" ({', '.join(shown)})" if shown else ""
@@ -672,10 +701,10 @@ def summary(assessment: Assessment, pr: int, head: str) -> str:
     for tier in reversed(TIERS):
         if assessment.reasons[tier]:
             lines.append(f"{tier.capitalize()}:")
-            lines += [f"- `{reason}`" for reason in assessment.reasons[tier]]
+            lines += [f"- `{_display_text(reason)}`" for reason in assessment.reasons[tier]]
             lines.append("")
     if assessment.owner:
-        lines.append("Owner subset: " + ", ".join(f"`{r}`" for r in assessment.owner))
+        lines.append("Owner subset: " + ", ".join(f"`{_display_text(r)}`" for r in assessment.owner))
     lines.append(f"Counted {assessment.lines} changed lines in {assessment.files} files.")
     return "\n".join(lines)
 
