@@ -432,10 +432,26 @@ impl ShipState {
 
     /// Update the `updated_at` timestamp.
     pub fn touch(&mut self) {
+        if self.schema_version > SHIP_STATE_SCHEMA_VERSION
+            || (self.schema_version == SHIP_STATE_SCHEMA_VERSION
+                && (self.state_version == 0 || self.claim_epoch != self.reviewer_claim_epoch))
+        {
+            // A malformed current record must remain fenced. In particular,
+            // do not silently repair a split claim epoch while a stale worker
+            // is holding an in-memory copy.
+            return;
+        }
         if self.generation == 0 {
             self.generation = 1;
         }
-        self.state_version = self.state_version.saturating_add(1).max(1);
+        self.state_version = if self.state_version == 0 {
+            1
+        } else {
+            let Some(next) = self.state_version.checked_add(1) else {
+                return;
+            };
+            next
+        };
         let claim_epoch = self.effective_claim_epoch();
         self.claim_epoch = claim_epoch;
         self.reviewer_claim_epoch = claim_epoch;
@@ -887,7 +903,23 @@ impl ShipStateStore {
                 candidate: state.state_version,
             });
         }
-        if state.generation < expected.generation || state.claim_epoch < expected.claim_epoch {
+        let expected_version = expected.state_version.checked_add(1).ok_or_else(|| {
+            ShipStateCasError::InvalidIdentity("state_version exhausted".to_owned())
+        })?;
+        let generation_advanced = expected
+            .generation
+            .checked_add(1)
+            .is_some_and(|next| state.generation == next);
+        let claim_epoch_advanced = expected
+            .claim_epoch
+            .checked_add(1)
+            .is_some_and(|next| state.claim_epoch == next);
+        if state.state_version != expected_version
+            || state.generation < expected.generation
+            || (state.generation != expected.generation && !generation_advanced)
+            || state.claim_epoch < expected.claim_epoch
+            || (state.claim_epoch != expected.claim_epoch && !claim_epoch_advanced)
+        {
             return Err(ShipStateCasError::Conflict {
                 expected: expected.clone(),
                 actual: state.cas(),
@@ -2247,6 +2279,22 @@ mod tests {
             Some(&"pass".to_owned())
         );
         assert!(!persisted.evidence_snapshot.contains_key("macos"));
+    }
+
+    #[test]
+    fn touch_fails_closed_for_malformed_or_exhausted_identity() {
+        let mut malformed = sample_state(233, "head-a");
+        malformed.claim_epoch = 4;
+        malformed.reviewer_claim_epoch = 3;
+        let before = malformed.clone();
+        malformed.touch();
+        assert_eq!(malformed, before, "split claim epochs must stay fenced");
+
+        let mut exhausted = sample_state(234, "head-a");
+        exhausted.state_version = u64::MAX;
+        let before = exhausted.clone();
+        exhausted.touch();
+        assert_eq!(exhausted, before, "state-version overflow must stay fenced");
     }
 
     #[test]
