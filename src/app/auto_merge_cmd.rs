@@ -4125,6 +4125,49 @@ mod tests {
         assert!(error.contains("refusing direct merge"), "{error}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn repository_probe_refuses_private_free_rules_ambiguity_before_direct_merge() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // The auth layer intentionally rejects scripts as configured binaries.
+        // Use the native Python interpreter as the binary and place its script
+        // at argv[1] (`api`) in the test cwd, so this exercises the real
+        // repository probe without weakening that production guard.
+        std::fs::write(
+            temp.path().join("api"),
+            r#"import json, sys
+args = " ".join(sys.argv[1:])
+if "graphql" in args:
+    print(json.dumps({"data": {"repository": {"mergeQueue": None}}}))
+elif "rules/branches/main" in args:
+    print("gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)", file=sys.stderr)
+    raise SystemExit(1)
+else:
+    print(f"unexpected gh call: {args}", file=sys.stderr)
+    raise SystemExit(3)
+"#,
+        )
+        .expect("fake gh script");
+        let config = crate::config::LoadedConfig {
+            data: format!(
+                "[github.auth]\nambient_gh_binary = {}\n",
+                toml::Value::String("/usr/bin/python3".to_owned())
+            )
+            .parse::<toml::Table>()
+            .expect("config TOML"),
+            global_dir: temp.path().to_path_buf(),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: crate::config::LocalOverlaySource::None,
+        };
+        let client = GhClient::from_loaded_config(&config).expect("configured fake gh");
+        let error = crate::gh::allow_bare_gh_for_test(|| {
+            repository_requires_merge_queue(&client, temp.path(), "owner/repo", "main")
+        })
+        .expect_err("rules ambiguity must refuse the direct path");
+        assert!(error.contains("refusing direct merge"), "{error}");
+    }
+
     #[test]
     fn classic_and_rest_merge_commands_keep_server_side_head_guards() {
         let state = ShipState::new(
