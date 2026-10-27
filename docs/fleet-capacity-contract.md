@@ -39,3 +39,10 @@ target. Coverage gaps also make the denominator `partial`. With no overlapping
 samples the denominator is `unavailable`. The normal metrics
 retention setting removes old capacity samples along with raw job samples;
 merge receipts remain durable provenance.
+
+The scorecard's primary throughput metric,
+`safely_merged_changes_per_eligible_slot_hour`, divides distinct safe merge
+receipt heads by `eligible_slot_hours`. It is unavailable without both durable
+safe merge receipts and positive measured capacity. A partial capacity
+denominator produces a partial result and an explicit upper-bound reason;
+unknown capacity is never treated as zero or silently omitted.
