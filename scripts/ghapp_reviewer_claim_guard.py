@@ -94,6 +94,12 @@ def _input_payloads(args: list[str]) -> list[dict[str, Any]]:
 def _opaque_body_source(args: list[str]) -> bool:
     """Whether a verdict-capable request carries text this guard cannot read."""
     command = " ".join(args[:2]) if len(args) >= 2 else None
+    for index, argument in enumerate(args):
+        if argument in {"--body-file", "--comment-file", "--input"} and index + 1 >= len(args):
+            return True
+        if argument == "-F" and command in {"pr comment", "pr review", "issue comment"} \
+                and index + 1 >= len(args):
+            return True
     previous = ""
     for argument in args:
         path = _body_file_argument(previous, argument, command)

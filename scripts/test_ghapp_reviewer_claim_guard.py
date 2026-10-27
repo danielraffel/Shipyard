@@ -100,6 +100,8 @@ class ReviewerClaimGuard(unittest.TestCase):
 
     def test_api_stdin_and_pipe_field_sources_fail_closed(self) -> None:
         for args in (
+            ["pr", "comment", "42", "--body-file"],
+            ["pr", "comment", "42", "--comment-file"],
             ["api", "repos/o/r/issues/42/comments", "--input", "-"],
             ["api", "repos/o/r/issues/42/comments", "--input", "/dev/stdin"],
             ["api", "repos/o/r/issues/42/comments", "-f", "body=@/dev/stdin"],
