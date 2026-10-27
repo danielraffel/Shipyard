@@ -35,6 +35,12 @@ pub struct PoolEntry {
     pub expires_at: f64,
     /// UNIX epoch seconds when the entry was created.
     pub created_at: f64,
+    /// Host-pool member that produced this entry, when the run used a pool.
+    ///
+    /// This is optional so entries written before host-pool attribution remain
+    /// readable and retain their existing JSON shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_id: Option<String>,
 }
 
 impl PoolEntry {
@@ -57,7 +63,15 @@ impl PoolEntry {
             sha: sha.into(),
             expires_at,
             created_at,
+            member_id: None,
         }
+    }
+
+    /// Attach the selected host-pool member to this entry.
+    #[must_use]
+    pub fn with_member_id(mut self, member_id: impl Into<String>) -> Self {
+        self.member_id = Some(member_id.into());
+        self
     }
 
     /// Return true if `now` is at or past expiry.
@@ -384,6 +398,25 @@ mod tests {
         let entries = pool.all_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].target, "mac");
+    }
+
+    #[test]
+    fn warm_pool_preserves_optional_member_id_and_omits_it_when_unknown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        pool.save_entries(&[
+            PoolEntry::new("local", "runner", "ssh", "/repo", "abc", 20.0, 10.0),
+            PoolEntry::new("mac", "local", "host-pool", "/repo", "def", 20.0, 10.0)
+                .with_member_id("studio-a"),
+        ])
+        .expect("save");
+        let raw = std::fs::read_to_string(pool.path()).expect("raw");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(json["entries"][1]["member_id"], "studio-a");
+        assert!(json["entries"][0].get("member_id").is_none());
+        let entries = pool.all_entries();
+        assert_eq!(entries[0].member_id, None);
+        assert_eq!(entries[1].member_id.as_deref(), Some("studio-a"));
     }
 
     #[test]
