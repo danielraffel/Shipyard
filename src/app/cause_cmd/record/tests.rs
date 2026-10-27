@@ -294,6 +294,12 @@ fn run_jobs_are_paginated_with_a_bounded_page_count() {
 }
 
 #[test]
+fn a_full_bounded_job_listing_is_not_treated_as_complete() {
+    assert!(job_list_complete(&vec![json!({}); 999]));
+    assert!(!job_list_complete(&vec![json!({}); 1000]));
+}
+
+#[test]
 fn a_red_drift_job_gets_one_record_naming_its_generator() {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
@@ -708,6 +714,27 @@ fn a_rerun_that_passes_links_the_red_attempt_to_its_own_head() {
 }
 
 #[test]
+fn scrubbed_job_names_still_match_the_api_when_proving_a_fix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut failed = job(1000, "failure");
+    failed["name"] = json!("test-m1");
+    let mut passed = job(1000, "success");
+    passed["name"] = json!("test-m1");
+    passed["run_attempt"] = json!(2);
+    let mut rerun = red_run();
+    rerun["conclusion"] = json!("success");
+    rerun["run_attempt"] = json!(2);
+    rerun["run_started_at"] = json!("2026-10-14T10:45:00Z");
+    let mut routes = red_routes();
+    routes[0] = ("runs?status=completed", json!({"workflow_runs": [rerun]}));
+    routes[1] = ("runs/100/jobs", json!({"jobs": [failed, passed]}));
+    let fake = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| fake.read(args);
+    let report = record(&gh, &query(dir.path())).expect("scrubbed rerun");
+    assert_eq!((report.causes_written, report.fixlinks_written), (1, 1));
+}
+
+#[test]
 fn a_selective_rerun_can_pass_failed_jobs_across_multiple_attempts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut rerun = red_run();
@@ -811,6 +838,37 @@ fn a_later_green_run_is_used_when_the_earliest_candidate_skips_the_failed_job() 
         rows(&dir.path().join("fixlinks.jsonl"))[0]["fix_run_id"],
         201
     );
+}
+
+#[test]
+fn an_unreadable_earliest_candidate_keeps_the_red_pending() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(dir.path())).expect("red pass");
+
+    let mut routes = red_routes();
+    routes.retain(|(needle, _)| {
+        !needle.starts_with("runs?branch=") && !needle.contains("runs/200/jobs")
+    });
+    routes.extend([
+        (
+            "runs?branch=feat%2Fx&status=success",
+            json!({"workflow_runs": [
+                {"id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98", "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1},
+                {"id": 201, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98", "created_at": "2026-10-14T12:00:00Z", "run_attempt": 1}
+            ]}),
+        ),
+        ("runs/200/jobs", json!({"jobs": [job(2000, "success")] })),
+        ("runs/201/jobs", json!({"jobs": [job(2010, "success")] })),
+    ]);
+    let second = Fake::new(&routes)
+        .with_error("runs/200/jobs", "HTTP 500: unavailable")
+        .with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    let report = record(&gh, &query(dir.path())).expect("unreadable candidate");
+    assert_eq!((report.fixlinks_written, report.reds_pending), (0, 1));
+    assert!(!dir.path().join("fixlinks.jsonl").exists());
 }
 
 #[test]
