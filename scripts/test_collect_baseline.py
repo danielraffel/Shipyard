@@ -85,6 +85,15 @@ class BaselineScorecardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(len(calls), 2)
         sleep.assert_called_once_with(5)
+    def test_coverage_value_text_is_fail_closed_for_unavailable(self):
+        self.assertEqual(
+            MOD.coverage_value_text({"status": "unavailable", "value": None}),
+            "n/a",
+        )
+        self.assertEqual(
+            MOD.coverage_value_text({"status": "available", "value": 0.25}),
+            "0.25",
+        )
 
     def test_readiness_rejects_nonfinite_instrumentation_and_separates_lane_eligibility(self):
         started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
