@@ -937,6 +937,60 @@ fn command_token_cache_is_partitioned_by_expanded_repository() {
 
 #[cfg(unix)]
 #[test]
+fn uncached_command_token_appends_arguments_and_mints_every_time() {
+    let temp = TempDir::new().expect("tempdir");
+    let helper = temp.path().join("scoped-token-helper");
+    let calls = temp.path().join("calls");
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '{{\"token\":\"ghs_scoped\",\"expires_at\":\"2099-01-01T00:00:00Z\"}}\\n'\n",
+            calls.display(),
+        ),
+    );
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["{}", "--repo", "{{repo_slug}}"]
+            "#,
+        helper.display()
+    ));
+    let client = GhClient::from_loaded_config(&config)
+        .expect("client")
+        .with_repo_override("owner/one")
+        .expect("repo");
+    let extra = [
+        "--scope-repository".to_owned(),
+        "--permission".to_owned(),
+        "contents=write".to_owned(),
+    ];
+
+    for _ in 0..2 {
+        let (token, expires_at) = client
+            .mint_uncached_command_token(temp.path(), &extra, Duration::from_secs(10))
+            .expect("mint")
+            .expect("command source");
+        assert_eq!(token, "ghs_scoped");
+        assert_eq!(
+            expires_at.map(|time| time.to_rfc3339()).as_deref(),
+            Some("2099-01-01T00:00:00+00:00")
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(calls).expect("calls"),
+        "--repo owner/one --scope-repository --permission contents=write\n".repeat(2)
+    );
+
+    let ambient = GhClient::from_loaded_config(&config_from_toml(""))
+        .expect("ambient client")
+        .mint_uncached_command_token(temp.path(), &extra, Duration::from_secs(10))
+        .expect("ambient");
+    assert!(ambient.is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn explicit_repo_override_resolves_ambiguous_checkout_without_exposing_token() {
     let repo = TempDir::new().expect("tempdir");
     git(repo.path(), &["init", "--quiet", "--initial-branch=main"]);

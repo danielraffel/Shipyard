@@ -3286,6 +3286,14 @@ pub(super) enum AuthCommand {
         #[arg(long)]
         repo: String,
     },
+    /// Git credential helper: answer `get` with a short-lived GitHub App token
+    /// for one allowed github.com repository. Set it as
+    /// `credential.https://github.com.helper` with `useHttpPath = true`.
+    #[command(name = "git-credential")]
+    GitCredential {
+        /// Action git passes: `get`, `store` or `erase`.
+        action: String,
+    },
     /// Show the effective GitHub auth source Shipyard will use.
     Doctor {
         /// Exact OWNER/REPO used to resolve configured auth token placeholders.
