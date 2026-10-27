@@ -92,16 +92,12 @@ pub(super) fn command<W: Write>(
         )
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
         for c in &result.candidates {
-            let (fix_head, fix_derivation) = c
-                .fix_link
-                .as_ref()
-                .map(|link| {
-                    (
-                        link["fix_head_sha"].as_str().unwrap_or("unknown"),
-                        link["derivation"].as_str().unwrap_or("unknown"),
-                    )
-                })
-                .unwrap_or(("none", "none"));
+            let (fix_head, fix_derivation) = c.fix_link.as_ref().map_or(("none", "none"), |link| {
+                (
+                    link["fix_head_sha"].as_str().unwrap_or("unknown"),
+                    link["derivation"].as_str().unwrap_or("unknown"),
+                )
+            });
             writeln!(
                 out,
                 "{}\t{}\t{}\t{}\t{}\t{}",
