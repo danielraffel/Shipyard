@@ -1575,18 +1575,18 @@ mod tests {
                         claim.receipt_id(&state.repo, state.pr),
                         claim.receipt_id(&state.repo.to_ascii_uppercase(), state.pr)
                     );
-                    Ok::<_, String>(claim.epoch)
+                    Ok::<_, String>((claim.epoch, claim.receipt_id(&state.repo, state.pr)))
                 },
             )
             .expect("publish");
-        assert_eq!(observed, 1);
-        assert_eq!(
-            store
-                .get_scoped(&state.repo, state.pr)
-                .unwrap()
-                .reviewer_claim_epoch,
-            1
-        );
+        assert_eq!(observed.0, 1);
+        let restarted = ShipStateStore::new(temp.path().join("ship")).expect("reopen store");
+        let persisted = restarted
+            .get_scoped(&state.repo, state.pr)
+            .expect("persisted");
+        assert_eq!(persisted.reviewer_claim_epoch, 1);
+        let claim = persisted.active_reviewer_claim.expect("active claim");
+        assert_eq!(observed.1, claim.receipt_id(&state.repo, state.pr));
     }
 
     #[test]
