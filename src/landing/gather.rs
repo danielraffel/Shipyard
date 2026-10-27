@@ -54,6 +54,7 @@ pub struct GatherOptions<'a> {
 
 /// Read every surface and assemble the report.
 #[must_use]
+#[allow(clippy::too_many_lines)] // Keep the read-only landing evidence assembly in one auditable order.
 pub fn gather(actions: &GitHubActions, options: &GatherOptions<'_>) -> LandingReport {
     let mut surfaces: Vec<SurfaceRead> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
