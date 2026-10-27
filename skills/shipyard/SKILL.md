@@ -2013,6 +2013,11 @@ Two machine-global switches extend the same scoping. `github.auth.scope_to_repos
 endpoints keep working, and a cross-repository private call gets a 404.
 `git_credential.shipyard_push = true` makes `shipyard pr` and `ship` push over
 HTTPS through the scoped helper, whatever the host's git credentials are.
+A `GitHubActions` command routes its App token to the repository it names
+(`--repo`/`-R`, or an `api repos/OWNER/REPO/...` endpoint) unless the client has an
+explicit `with_repo_override` or a pinned token. A bare `GhClient` built for
+another repository must call `.with_repo_override(repo)` itself, because a
+`with_repo_hint` loses to the cwd checkout.
 
 `shipyard update` reads public release metadata, so it works with no auth — but
 unauthenticated GitHub API calls are capped at 60/hr. As of v0.68.0 `update`

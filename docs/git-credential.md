@@ -98,6 +98,11 @@ checkout's remote), and keeps the App's permissions there.
 - The helper caches repository-scoped and unscoped tokens under separate keys,
   and refuses an entry whose recorded scope differs.
 
+Shipyard routes each `gh` command's token to the repository the command
+names: `--repo`/`-R`, or `api repos/OWNER/REPO/...`. An explicit
+`with_repo_override` or a pinned token takes precedence. The daemon's webhook
+registrar and the merge steward route per repository explicitly.
+
 Organisation endpoints such as `orgs/{org}/actions/runners` and
 `runner-groups` keep working with a repository-scoped token. A call routed to
 one repository that reads or writes a different private repository gets a 404.

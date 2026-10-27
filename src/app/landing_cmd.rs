@@ -76,7 +76,9 @@ pub(super) fn landing_command<W: Write>(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| gate::resolve_base(&config));
 
-    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config);
+    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, &config)
+        // Route the App token to the repository asked about, not the checkout's.
+        .with_repo_override(&repo);
     if let Some(pr) = pr {
         let environment_opt_in = config
             .get(crate::environment_requeue::CONFIG_KEY)

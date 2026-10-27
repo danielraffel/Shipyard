@@ -29,8 +29,10 @@ pub(super) fn resume_pending_cancellations(
     let mut errors = BTreeMap::<String, Vec<String>>::new();
     let mut cancellations = BTreeMap::<String, Vec<CancellationReport>>::new();
     for (key, cancellation) in pending {
+        // The ledger spans repositories: route each run's token to its own.
+        let repo_actions = actions.clone().with_repo_override(&cancellation.repo);
         match resume_pending_cancellation(
-            actions,
+            &repo_actions,
             ledger_path,
             ledger,
             mutation_control,

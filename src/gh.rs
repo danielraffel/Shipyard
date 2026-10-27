@@ -211,6 +211,16 @@ impl GhClient {
         self
     }
 
+    /// This client routed to `slug` for one command whose arguments name that
+    /// repository. `None` when the caller already chose (an explicit override
+    /// or a pinned token wins) or `slug` is not an exact `OWNER/REPO`.
+    pub(crate) fn routed_for_target(&self, slug: &str) -> Option<Self> {
+        if self.repo_override.is_some() || self.pinned_token.is_some() {
+            return None;
+        }
+        self.clone().with_repo_override(slug).ok()
+    }
+
     /// Force token-command repository placeholders to use an explicit target.
     pub fn with_repo_override(mut self, slug: &str) -> Result<Self, GhPrepareError> {
         self.repo_override = Some(RepoIdentity::from_exact_slug(slug).ok_or_else(|| {

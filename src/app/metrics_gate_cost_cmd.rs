@@ -42,7 +42,9 @@ pub(super) fn gate_cost_command<W: Write>(
     } else {
         ReadCache::open(&cache_dir(state_dir, &query.repo), SystemTime::now())
     };
-    let actions = GitHubActions::from_loaded_config(cwd, &config);
+    let actions = GitHubActions::from_loaded_config(cwd, &config)
+        // Route the App token to the repository asked about, not the checkout's.
+        .with_repo_override(&query.repo);
     let reader = |gh_args: &[String]| {
         actions
             .run_gh_with_timeout(gh_args, GITHUB_READ_TIMEOUT)

@@ -641,8 +641,8 @@ impl Registrar {
             .ok_or_else(|| RegistrarError::GhUnavailable("gh CLI not found on PATH".to_owned()))
     }
 
-    /// Build the configured `gh` client, hinting `repo` for a `{repo_slug}`
-    /// token-command placeholder (the daemon's CWD isn't a GitHub checkout).
+    /// Build the configured `gh` client with its `{repo_slug}` token-command
+    /// placeholder pinned to `repo`, whatever checkout the daemon's CWD is.
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn configured_gh_client_optional(
         &self,
