@@ -1326,8 +1326,8 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        AbandonRecord, DispatchedRun, SHIP_STATE_SCHEMA_VERSION, ShipState, ShipStateStore,
-        compute_policy_signature, same_repository,
+        AbandonRecord, DispatchedRun, ReviewerClaimRequest, SHIP_STATE_SCHEMA_VERSION, ShipState,
+        ShipStateStore, compute_policy_signature, same_repository,
     };
     use fs2::FileExt;
 
