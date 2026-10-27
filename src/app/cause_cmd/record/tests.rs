@@ -64,7 +64,7 @@ fn query(dir: &Path) -> RecordQuery {
 fn red_run() -> Value {
     json!({
         "id": 100, "name": "Build", "run_attempt": 1, "conclusion": "failure",
-        "event": "pull_request", "head_sha": "abc123", "head_branch": "feat/x",
+        "event": "pull_request", "head_sha": "0123456789abcdef0123456789abcdef01234567", "head_branch": "feat/x",
         "pull_requests": [{"number": 42}], "created_at": "2026-10-14T10:00:00Z",
         "run_started_at": "2026-10-14T10:00:00Z",
         "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/100"
@@ -74,7 +74,7 @@ fn red_run() -> Value {
 fn job(id: u64, conclusion: &str) -> Value {
     json!({
         "id": id, "name": "macos", "status": "completed", "conclusion": conclusion,
-        "run_id": 100, "run_attempt": 1, "head_sha": "abc123", "head_branch": "feat/x",
+        "run_id": 100, "run_attempt": 1, "head_sha": "0123456789abcdef0123456789abcdef01234567", "head_branch": "feat/x",
         "completed_at": "2026-10-14T10:30:00Z",
         "html_url": format!("https://github.com/Generous-Corp/pulp/actions/runs/100/job/{id}"),
         "steps": [{"name": "Run ctest", "conclusion": conclusion, "number": 5,
@@ -278,7 +278,7 @@ fn a_red_drift_job_gets_one_record_naming_its_generator() {
         ),
         "{row}"
     );
-    assert_eq!(row["head_sha"], "abc123");
+    assert_eq!(row["head_sha"], "0123456789abcdef0123456789abcdef01234567");
     assert_eq!(
         (row["run_id"].clone(), row["job_id"].clone()),
         (json!(100), json!(1000))
@@ -364,7 +364,7 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
         (
             "runs?branch=feat%2Fx&status=success",
             json!({"workflow_runs": [{
-                "id": 200, "conclusion": "success", "head_sha": "def456",
+                "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
                 "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
             }]}),
         ),
@@ -373,20 +373,20 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
         // already in main, as they are once the pull request has landed, so
         // a merge base taken against today's main would erase every file.
         (
-            "compare/abc123...def456",
+            "compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98",
             json!({
                 "status": "ahead", "total_commits": 3,
                 "files": [{"filename": "test/ctest_script_inputs.json"}, {"filename": "docs/main-only.md"}],
                 "commits": [
-                    {"sha": "c1", "parents": [{"sha": "abc123"}]},
+                    {"sha": "c1", "parents": [{"sha": "0123456789abcdef0123456789abcdef01234567"}]},
                     {"sha": "m1", "parents": [{"sha": "main0"}]},
-                    {"sha": "def456", "parents": [{"sha": "c1"}, {"sha": "m1"}]}
+                    {"sha": "fedcba9876543210fedcba9876543210fedcba98", "parents": [{"sha": "c1"}, {"sha": "m1"}]}
                 ]
             }),
         ),
         ("commits/c1", json!({"files": [{"filename": "test/ctest_script_inputs.json"}]})),
         ("commits/m1", json!({"files": [{"filename": "docs/main-only.md"}]})),
-        ("compare/main...", json!({"merge_base_commit": {"sha": "abc123"}})),
+        ("compare/main...", json!({"merge_base_commit": {"sha": "0123456789abcdef0123456789abcdef01234567"}})),
     ]);
     let second = Fake::new(&routes).with_log("jobs/1000/logs", &drift_log());
     let gh = |args: &[String]| second.read(args);
@@ -398,7 +398,10 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
     assert_eq!(link["derivation"], "compare_red_head_to_fix_head");
     assert_eq!(
         (link["head_sha"].clone(), link["fix_head_sha"].clone()),
-        (json!("abc123"), json!("def456"))
+        (
+            json!("0123456789abcdef0123456789abcdef01234567"),
+            json!("fedcba9876543210fedcba9876543210fedcba98")
+        )
     );
     assert_eq!(
         (link["red_run_id"].clone(), link["red_attempt"].clone()),
@@ -419,7 +422,7 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
     assert!(
         asked.iter().all(|path| !path.contains("compare/main...")
             && !path.contains("commits/m1")
-            && !path.contains("commits/def456")),
+            && !path.contains("commits/fedcba9876543210fedcba9876543210fedcba98")),
         "{asked:?}"
     );
 
@@ -445,7 +448,9 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
             "repo": "Generous-Corp/pulp",
             "red_run_id": 100,
             "red_attempt": 1,
-            "fix_head_sha": "def456",
+            // A nonempty but malformed identity must not suppress producer backfill.
+            "head_sha": "malformed",
+            "fix_head_sha": "fedcba9876543210fedcba9876543210fedcba98",
             "derivation": "compare_red_head_to_fix_head"
         })
         .to_string()
@@ -468,9 +473,9 @@ fn a_long_range_is_read_page_by_page() {
     let gh = |args: &[String]| first.read(args);
     record(&gh, &query(dir.path())).expect("red pass");
     let chain = json!([
-        {"sha": "c1", "parents": [{"sha": "abc123"}]},
+        {"sha": "c1", "parents": [{"sha": "0123456789abcdef0123456789abcdef01234567"}]},
         {"sha": "m1", "parents": [{"sha": "main0"}]},
-        {"sha": "def456", "parents": [{"sha": "c1"}, {"sha": "m1"}]}
+        {"sha": "fedcba9876543210fedcba9876543210fedcba98", "parents": [{"sha": "c1"}, {"sha": "m1"}]}
     ]);
     let mut routes = red_routes();
     routes.retain(|(needle, _)| !needle.starts_with("runs?branch="));
@@ -478,25 +483,25 @@ fn a_long_range_is_read_page_by_page() {
         (
             "runs?branch=feat%2Fx&status=success",
             json!({"workflow_runs": [{
-                "id": 200, "conclusion": "success", "head_sha": "def456",
+                "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
                 "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
             }]}),
         ),
         // Paged reads first: the unpaged needle is a prefix of theirs.
         (
-            "compare/abc123...def456?per_page=100&page=1",
+            "compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98?per_page=100&page=1",
             json!({"status": "ahead", "total_commits": 3, "commits": chain}),
         ),
         (
-            "compare/abc123...def456?per_page=100&page=2",
+            "compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98?per_page=100&page=2",
             json!({"status": "ahead", "total_commits": 3, "commits": []}),
         ),
         // Unpaged, the listing stops short of the range.
         (
-            "compare/abc123...def456",
+            "compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98",
             json!({"status": "ahead", "total_commits": 3,
                    "files": [{"filename": "a.cpp"}, {"filename": "docs/main-only.md"}],
-                   "commits": [{"sha": "c1", "parents": [{"sha": "abc123"}]}]}),
+                   "commits": [{"sha": "c1", "parents": [{"sha": "0123456789abcdef0123456789abcdef01234567"}]}]}),
         ),
         ("commits/c1", json!({"files": [{"filename": "a.cpp"}]})),
     ]);
@@ -508,7 +513,7 @@ fn a_long_range_is_read_page_by_page() {
     assert_eq!(link["own_files"], json!(["a.cpp"]));
 }
 
-/// A red recorded, then a green push to `def456` whose compare answers with
+/// A red recorded, then a green push to `fedcba9876543210fedcba9876543210fedcba98` whose compare answers with
 /// `compare` routes; returns the fix-link and every path asked.
 fn fix_link_with(compare: Vec<(&'static str, Value)>) -> (Value, Vec<String>) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -520,7 +525,7 @@ fn fix_link_with(compare: Vec<(&'static str, Value)>) -> (Value, Vec<String>) {
     routes.push((
         "runs?branch=feat%2Fx&status=success",
         json!({"workflow_runs": [{
-            "id": 200, "conclusion": "success", "head_sha": "def456",
+            "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
             "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
         }]}),
     ));
@@ -544,11 +549,11 @@ fn hundred_commits() -> Value {
 fn a_range_past_the_paging_cap_is_too_many_commits() {
     let (link, asked) = fix_link_with(vec![
         (
-            "compare/abc123...def456?per_page=100",
+            "compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98?per_page=100",
             json!({"status": "ahead", "total_commits": 1001, "commits": hundred_commits()}),
         ),
         (
-            "compare/abc123...def456",
+            "compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98",
             json!({"status": "ahead", "total_commits": 1001,
                    "files": [{"filename": "a.cpp"}], "commits": []}),
         ),
@@ -558,7 +563,7 @@ fn a_range_past_the_paging_cap_is_too_many_commits() {
     assert_eq!(link["files_raw"], json!(["a.cpp"]));
     let pages = asked
         .iter()
-        .filter(|path| path.contains("compare/abc123...def456?per_page=100"))
+        .filter(|path| path.contains("compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98?per_page=100"))
         .count();
     assert_eq!(pages, COMPARE_COMMIT_PAGES, "{asked:?}");
     assert!(
@@ -571,15 +576,15 @@ fn a_range_past_the_paging_cap_is_too_many_commits() {
 fn pages_that_run_out_before_the_total_are_too_many_commits() {
     let (link, _) = fix_link_with(vec![
         (
-            "compare/abc123...def456?per_page=100&page=1",
+            "compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98?per_page=100&page=1",
             json!({"status": "ahead", "total_commits": 300, "commits": hundred_commits()}),
         ),
         (
-            "compare/abc123...def456?per_page=100",
+            "compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98?per_page=100",
             json!({"status": "ahead", "total_commits": 300, "commits": []}),
         ),
         (
-            "compare/abc123...def456",
+            "compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98",
             json!({"status": "ahead", "total_commits": 300,
                    "files": [{"filename": "a.cpp"}], "commits": []}),
         ),
@@ -615,12 +620,12 @@ fn a_force_pushed_fix_has_no_own_files() {
         (
             "runs?branch=feat%2Fx&status=success",
             json!({"workflow_runs": [{
-                "id": 200, "conclusion": "success", "head_sha": "def456",
+                "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
                 "created_at": "2026-10-14T11:00:00Z", "run_attempt": 1
             }]}),
         ),
         (
-            "compare/abc123...def456",
+            "compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98",
             json!({"status": "diverged", "files": [{"filename": "a.cpp"}], "commits": []}),
         ),
     ]);
@@ -648,7 +653,10 @@ fn a_rerun_that_passes_links_the_red_attempt_to_its_own_head() {
     assert_eq!((report.causes_written, report.fixlinks_written), (1, 1));
     let link = &rows(&dir.path().join("fixlinks.jsonl"))[0];
     assert_eq!(link["derivation"], "rerun_green");
-    assert_eq!(link["fix_head_sha"], "abc123");
+    assert_eq!(
+        link["fix_head_sha"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
     assert_eq!(link["pushed_at"], "2026-10-14T10:45:00Z");
     assert_eq!(link["own_files"], json!([]));
 }
@@ -682,7 +690,7 @@ fn scrub_removes_private_hosts_and_paths_but_keeps_urls() {
 fn scrub_redacts_compiler_temp_paths_without_removing_the_flag() {
     let row = scrub(json!({
         "detail": " objective-c++ -ivfsstatcache /var/folders/hy/6y23234/T/cache",
-        "private": "/private/var/folders/zz/abc123/T/cache"
+        "private": "/private/var/folders/zz/0123456789abcdef0123456789abcdef01234567/T/cache"
     }));
 
     assert_eq!(row["detail"], " objective-c++ -ivfsstatcache <path>");
@@ -732,7 +740,7 @@ fn second_pass(
 
 fn green(created: &str) -> Value {
     json!({"workflow_runs": [{
-        "id": 200, "conclusion": "success", "head_sha": "def456",
+        "id": 200, "conclusion": "success", "head_sha": "fedcba9876543210fedcba9876543210fedcba98",
         "created_at": created, "run_attempt": 1
     }]})
 }
@@ -740,7 +748,7 @@ fn green(created: &str) -> Value {
 #[test]
 fn a_merge_queue_red_is_walked_back_to_the_pull_request_head_it_queued() {
     let mut red = red_run();
-    red["head_sha"] = json!("q1");
+    red["head_sha"] = json!("1111111111111111111111111111111111111111");
     red["head_branch"] = json!("gh-readonly-queue/main/pr-42-base0");
     red["pull_requests"] = json!([]);
     red["event"] = json!("merge_group");
@@ -750,22 +758,25 @@ fn a_merge_queue_red_is_walked_back_to_the_pull_request_head_it_queued() {
         vec![
             ("pulls/42", json!({"number": 42, "head": {"ref": "feat/x"}})),
             (
-                "compare/q1...def456",
+                "compare/1111111111111111111111111111111111111111...fedcba9876543210fedcba9876543210fedcba98",
                 json!({"status": "diverged", "files": [{"filename": "a.cpp"}]}),
             ),
             (
-                "commits/q1",
-                json!({"parents": [{"sha": "base0"}, {"sha": "prhead"}]}),
+                "commits/1111111111111111111111111111111111111111",
+                json!({"parents": [{"sha": "base0"}, {"sha": "2222222222222222222222222222222222222222"}]}),
             ),
             (
-                "compare/prhead...def456",
+                "compare/2222222222222222222222222222222222222222...fedcba9876543210fedcba9876543210fedcba98",
                 json!({"status": "ahead", "total_commits": 2, "commits": [
-                    {"sha": "c1", "parents": [{"sha": "prhead"}]},
-                    {"sha": "def456", "parents": [{"sha": "c1"}]}
+                    {"sha": "c1", "parents": [{"sha": "2222222222222222222222222222222222222222"}]},
+                    {"sha": "fedcba9876543210fedcba9876543210fedcba98", "parents": [{"sha": "c1"}]}
                 ]}),
             ),
             ("commits/c1", json!({"files": [{"filename": "a.cpp"}]})),
-            ("commits/def456", json!({"files": [{"filename": "b.cpp"}]})),
+            (
+                "commits/fedcba9876543210fedcba9876543210fedcba98",
+                json!({"files": [{"filename": "b.cpp"}]}),
+            ),
         ],
         "2026-10-14T12:00:00Z",
     );
@@ -783,12 +794,15 @@ fn force_pushed(commits: Value, fix_created: &str) -> (Value, Vec<String>) {
         green(fix_created),
         vec![
             (
-                "compare/abc123...def456",
+                "compare/0123456789abcdef0123456789abcdef01234567...fedcba9876543210fedcba9876543210fedcba98",
                 json!({"status": "diverged", "files": [{"filename": "y.cpp"}]}),
             ),
             ("pulls/42/commits?per_page=100&page=1", commits),
             ("commits/p1", json!({"files": [{"filename": "x.cpp"}]})),
-            ("commits/def456", json!({"files": [{"filename": "y.cpp"}]})),
+            (
+                "commits/fedcba9876543210fedcba9876543210fedcba98",
+                json!({"files": [{"filename": "y.cpp"}]}),
+            ),
             ("commits/after", json!({"files": [{"filename": "z.cpp"}]})),
         ],
         "2026-10-20T12:00:00Z",
@@ -802,8 +816,8 @@ fn a_force_pushed_red_takes_the_pull_requests_commits_up_to_the_fix() {
         json!([
             {"sha": "p1", "parents": [{"sha": "base"}]},
             {"sha": "merge", "parents": [{"sha": "p1"}, {"sha": "main9"}]},
-            {"sha": "def456", "parents": [{"sha": "merge"}]},
-            {"sha": "after", "parents": [{"sha": "def456"}]}
+            {"sha": "fedcba9876543210fedcba9876543210fedcba98", "parents": [{"sha": "merge"}]},
+            {"sha": "after", "parents": [{"sha": "fedcba9876543210fedcba9876543210fedcba98"}]}
         ]),
         "2026-10-14T11:00:00Z",
     );
@@ -819,7 +833,8 @@ fn a_force_pushed_red_takes_the_pull_requests_commits_up_to_the_fix() {
 
 #[test]
 fn a_force_pushed_red_is_not_matched_after_72_hours_or_once_the_fix_is_gone() {
-    let commits = json!([{"sha": "def456", "parents": [{"sha": "base"}]}]);
+    let commits =
+        json!([{"sha": "fedcba9876543210fedcba9876543210fedcba98", "parents": [{"sha": "base"}]}]);
     let (late, _) = force_pushed(commits.clone(), "2026-10-17T11:00:00Z");
     assert_eq!(late["own_files_method"], "post_force_push_too_late");
     assert_eq!(late["own_files"], Value::Null);
