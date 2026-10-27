@@ -98,6 +98,17 @@ class ReviewerClaimGuard(unittest.TestCase):
                     self.assertEqual(guard.main(
                         ["pr", "comment", "42", option, path]), 1)
 
+    def test_api_stdin_and_pipe_field_sources_fail_closed(self) -> None:
+        for args in (
+            ["api", "repos/o/r/issues/42/comments", "--input", "-"],
+            ["api", "repos/o/r/issues/42/comments", "--input", "/dev/stdin"],
+            ["api", "repos/o/r/issues/42/comments", "-f", "body=@/dev/stdin"],
+            ["api", "graphql", "-f", "query=@/dev/stdin"],
+        ):
+            with self.subTest(args=args):
+                self.assertTrue(guard._opaque_body_source(args))
+                self.assertEqual(guard.main(args), 1)
+
     def test_comment_file_is_read_and_verdict_is_not_inert(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "comment.md"

@@ -106,7 +106,7 @@ def _opaque_body_source(args: list[str]) -> bool:
     previous = ""
     for argument in args:
         value = None
-        if previous in {"-F", "--field"} and argument.startswith("body="):
+        if previous in {"-f", "-F", "--field", "--raw-field"} and argument.startswith("body="):
             value = argument[len("body="):]
         elif argument.startswith("--field=body="):
             value = argument.split("=", 2)[2]
