@@ -83,11 +83,15 @@ class ReviewerClaimGuard(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             missing = pathlib.Path(directory) / "missing"
             fifo = pathlib.Path(directory) / "pipe"
+            unreadable = pathlib.Path(directory) / "unreadable"
+            unreadable.write_text("verdict: APPROVE head:" + HEAD, encoding="utf-8")
+            unreadable.chmod(0)
             os.mkfifo(fifo)
             for option, path in (("--body-file", "-"), ("--comment-file", "-"),
                                  ("--body-file", str(missing)),
                                  ("--comment-file", str(missing)),
-                                 ("--body-file", str(fifo))):
+                                 ("--body-file", str(fifo)),
+                                 ("--body-file", str(unreadable))):
                 with self.subTest(option=option, path=path):
                     self.assertTrue(guard._opaque_body_source(
                         ["pr", "comment", "42", option, path]))
