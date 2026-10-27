@@ -350,7 +350,10 @@ fn safe(value: &Value) -> bool {
                     let value = value.as_str();
                     !(value == "<secret>"
                         || value.strip_prefix("<secret>").is_some_and(|suffix| {
-                            suffix.chars().all(|ch| ch.is_ascii_punctuation())
+                            suffix.chars().count() == 1
+                                && suffix.chars().all(|ch| {
+                                    matches!(ch, '\'' | '"' | ',' | ';' | ')' | ']' | '}')
+                                })
                         }))
                 })
             })
@@ -529,6 +532,10 @@ mod tests {
         for secret in ["password=abc", "token: \"abcdefghij\"", "token=<secret>x"] {
             assert!(!safe(&serde_json::json!({"detail": secret})), "{secret}");
         }
+        let trailing = super::super::record::scrub(serde_json::json!({
+            "credentials": "password=hunter2hunter2!@#",
+        }));
+        assert!(!safe(&trailing));
         // Advice checks even URL fields from externally supplied archives.
         assert!(!safe(
             &serde_json::json!({"job_url": "https://macmini/private"})
