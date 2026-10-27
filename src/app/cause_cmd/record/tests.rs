@@ -423,6 +423,18 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
         "{asked:?}"
     );
 
+    // A structurally complete row is still deduplicated even if advice will
+    // reject its unsafely named branch.
+    let mut unsafe_link = link.clone();
+    unsafe_link["branch"] = json!("fix/drop-github_pat_x");
+    std::fs::write(
+        dir.path().join("fixlinks.jsonl"),
+        unsafe_link.to_string() + "\n",
+    )
+    .expect("unsafe complete fix-link");
+    let unsafe_again = record(&gh, &query(dir.path())).expect("unsafe idempotence pass");
+    assert_eq!(unsafe_again.fixlinks_written, 0);
+
     // A structurally incomplete row must not suppress backfill of the same
     // red attempt; once a complete row is written, the next pass is idempotent.
     std::fs::write(
