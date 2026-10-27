@@ -629,7 +629,9 @@ reason states that the denominator is a lower bound, so the reported rate is
 an upper-bound estimate. Distinct pull requests are never used as a substitute.
 The value is an imported-observation metric; it does not prove that the local
 merge-receipt handoff is complete. Baseline promotion still requires the
-collector's merge-receipt health gate.
+collector's merge-receipt health gate. The authoritative baseline collector
+preserves this coverage object as `collector_safe_merge_rate` and includes its
+status and value in the status markdown; missing fields remain unavailable.
 
 ### Project keys
 
