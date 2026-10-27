@@ -669,20 +669,7 @@ fn import_tartci(
     store: &MetricsStore,
     args: &MetricsImportTartciArgs,
 ) -> Result<usize, CliFailure> {
-    let mut text = String::new();
-    match args.file.as_ref().and_then(|path| path.to_str()) {
-        None | Some("-") => {
-            std::io::stdin()
-                .read_to_string(&mut text)
-                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
-        }
-        Some(_) => {
-            let path = args.file.as_ref().expect("file path");
-            text = std::fs::read_to_string(path).map_err(|error| {
-                CliFailure::new(1, format!("could not read {}: {error}", path.display()))
-            })?;
-        }
-    }
+    let text = read_metrics_import_text(args.file.as_deref())?;
     store
         .import_tartci(&text)
         .map_err(|error| CliFailure::new(1, format!("tartci import failed: {error}")))
@@ -692,23 +679,32 @@ fn import_fleet_capacity(
     store: &MetricsStore,
     args: &MetricsImportFleetCapacityArgs,
 ) -> Result<usize, CliFailure> {
-    let mut text = String::new();
-    match args.file.as_ref().and_then(|path| path.to_str()) {
-        None | Some("-") => {
-            std::io::stdin()
-                .read_to_string(&mut text)
-                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
-        }
-        Some(_) => {
-            let path = args.file.as_ref().expect("file path");
-            text = std::fs::read_to_string(path).map_err(|error| {
-                CliFailure::new(1, format!("could not read {}: {error}", path.display()))
-            })?;
-        }
-    }
+    let text = read_metrics_import_text(args.file.as_deref())?;
     store
         .import_fleet_capacity(&text)
         .map_err(|error| CliFailure::new(1, format!("fleet-capacity import failed: {error}")))
+}
+
+fn read_metrics_import_text(file: Option<&Path>) -> Result<String, CliFailure> {
+    match file {
+        None => {
+            let mut text = String::new();
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
+            Ok(text)
+        }
+        Some(path) if path == Path::new("-") => {
+            let mut text = String::new();
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
+            Ok(text)
+        }
+        Some(path) => std::fs::read_to_string(path).map_err(|error| {
+            CliFailure::new(1, format!("could not read {}: {error}", path.display()))
+        }),
+    }
 }
 
 fn import_github(
@@ -1064,6 +1060,21 @@ mod tests {
         let error = gh_json_with_timeout(&helper, &[], Duration::from_millis(50))
             .expect_err("hung helper must time out");
         assert!(error.message().contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metrics_import_non_utf8_path_does_not_fall_back_to_stdin() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path_bytes = OsString::from_vec(vec![
+            b'm', b'i', b's', b's', b'i', b'n', b'g', b'-', 0xff, b'.', b'j', b's', b'o', b'n',
+        ]);
+        let path = Path::new(&path_bytes);
+        let error = read_metrics_import_text(Some(path)).expect_err("path read must fail");
+        assert_eq!(error.code, 1);
+        assert!(error.message().contains("could not read"));
     }
 
     #[test]
