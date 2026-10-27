@@ -2018,6 +2018,11 @@ A `GitHubActions` command routes its App token to the repository it names
 explicit `with_repo_override` or a pinned token. A bare `GhClient` built for
 another repository must call `.with_repo_override(repo)` itself, because a
 `with_repo_hint` loses to the cwd checkout.
+`release-bot status`, `setup` and `hook install` use the configured client (the
+App token on fleet hosts), routed to each repository they read or write, never
+the owner's `gh` login. `setup` stores the secret with `gh secret set`, which
+needs the App's `secrets: write`. Only the post-tag hook's PR route, which runs
+inside the release workflow, keeps the ambient `gh`.
 
 `shipyard update` reads public release metadata, so it works with no auth — but
 unauthenticated GitHub API calls are capped at 60/hr. As of v0.68.0 `update`

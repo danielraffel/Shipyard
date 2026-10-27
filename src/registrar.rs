@@ -333,6 +333,9 @@ impl Registrar {
     }
 
     /// Idempotently create or update a webhook with an explicit `gh` binary.
+    /// Test seam: the ambient `gh` with no App token, so production webhook
+    /// calls never depend on the owner's `gh` login.
+    #[cfg(test)]
     pub fn ensure_registered_with_gh(
         &mut self,
         repo: &str,
@@ -400,6 +403,9 @@ impl Registrar {
     }
 
     /// Unregister a repo with an explicit `gh` binary.
+    /// Test seam: the ambient `gh` with no App token, so production webhook
+    /// calls never depend on the owner's `gh` login.
+    #[cfg(test)]
     pub fn unregister_with_gh(
         &mut self,
         repo: &str,
@@ -530,6 +536,9 @@ impl Registrar {
     }
 
     /// Observe with an explicit `gh` binary.
+    /// Test seam: the ambient `gh` with no App token, so production webhook
+    /// calls never depend on the owner's `gh` login.
+    #[cfg(test)]
     pub fn observe_with_gh(
         &self,
         repo: &str,
@@ -1306,6 +1315,7 @@ fn run_gh_once(
     })
 }
 
+#[cfg(test)]
 fn validate_gh_binary(path: &Path) -> Result<(), RegistrarError> {
     let metadata = fs::metadata(path).map_err(|_| {
         RegistrarError::GhUnavailable(format!("gh CLI not executable: {}", path.display()))
