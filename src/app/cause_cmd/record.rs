@@ -947,6 +947,7 @@ fn fixlinks(
 ) -> Result<Vec<Value>, String> {
     let linked: BTreeSet<(String, u64, u64)> = read_jsonl(&query.dir.join("fixlinks.jsonl"))
         .iter()
+        .filter(|row| super::advice::link_identity_complete(row))
         .filter_map(|row| {
             Some((
                 row["repo"].as_str()?.to_owned(),

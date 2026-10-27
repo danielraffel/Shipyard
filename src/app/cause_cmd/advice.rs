@@ -238,6 +238,9 @@ fn advise(
                         && red_run_id == cause_run_id
                         && red_attempt.is_some()
                         && red_attempt == cause_attempt
+                        && f["head_sha"]
+                            .as_str()
+                            .is_none_or(|head_sha| head_sha == row["head_sha"])
                 })
                 .cloned(),
             cause: row,
@@ -288,15 +291,8 @@ fn read_fixlinks(path: &Path) -> Result<Vec<Value>, CliFailure> {
 
 pub(super) fn valid_fixlink(value: &Value) -> bool {
     let derivation = value["derivation"].as_str();
-    value["schema"] == SCHEMA
-        && value["source"] == "fix-link"
-        && safe(value)
+    link_identity_complete(value)
         && value["repo"].as_str().is_some_and(|repo| !repo.is_empty())
-        && value["red_run_id"].as_u64().is_some_and(|id| id > 0)
-        && value["red_attempt"]
-            .as_u64()
-            .is_some_and(|attempt| attempt > 0)
-        && value["fix_run_id"].as_u64().is_some_and(|id| id > 0)
         && value["fix_head_sha"].as_str().is_some_and(valid_sha)
         && matches!(
             derivation,
@@ -311,13 +307,48 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
                 && value["own_files_truncated"].as_bool() == Some(false)
                 && value["own_files_method"].as_str() == Some("rerun_same_head")))
 }
+
+/// Identity fields required before a producer treats a fix-link as already
+/// recorded. This deliberately stops short of the full advice predicate so
+/// fixture archives with short SHAs can still be replaced by a fresh row
+/// instead of suppressing collection.
+pub(super) fn link_identity_complete(value: &Value) -> bool {
+    value["schema"] == SCHEMA
+        && value["source"] == "fix-link"
+        && safe(value)
+        && value["repo"].as_str().is_some_and(|repo| !repo.is_empty())
+        && value["red_run_id"].as_u64().is_some_and(|id| id > 0)
+        && value["red_attempt"]
+            .as_u64()
+            .is_some_and(|attempt| attempt > 0)
+        && value["fix_run_id"].as_u64().is_some_and(|id| id > 0)
+        && value["fix_head_sha"]
+            .as_str()
+            .is_some_and(|sha| !sha.is_empty())
+        && matches!(
+            value["derivation"].as_str(),
+            Some("compare_red_head_to_fix_head" | "rerun_green")
+        )
+}
 static SENSITIVE_MARKER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:github_pat_|\bgh[oprsu]_[A-Za-z0-9]{20,}|(?:token|api[_-]?key|secret|password)\s*[:=])")
+    Regex::new(r"(?i)(?:github_pat_|\bgh[oprsu]_[A-Za-z0-9]{20,})")
         .expect("sensitive marker pattern compiles")
+});
+static CREDENTIAL_MARKER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:token|api[_-]?key|secret|password)\s*[:=]\s*(\S+)")
+        .expect("credential marker pattern compiles")
 });
 
 fn safe(value: &Value) -> bool {
-    let safe_text = |text: &str| !needs_scrub(text) && !SENSITIVE_MARKER.is_match(text);
+    let safe_text = |text: &str| {
+        !needs_scrub(text)
+            && !SENSITIVE_MARKER.is_match(text)
+            && !CREDENTIAL_MARKER.captures_iter(text).any(|capture| {
+                capture
+                    .get(1)
+                    .is_some_and(|value| value.as_str() != "<secret>")
+            })
+    };
     match value {
         Value::String(text) => safe_text(text),
         Value::Array(items) => items.iter().all(safe),
@@ -484,6 +515,7 @@ mod tests {
     fn scrubbed_text_and_public_provenance_urls_are_safe() {
         let clean = super::super::record::scrub(serde_json::json!({
             "detail": "/tmp/private/source.cpp private@example.com Daniels-Mac-Studio-m3.local",
+            "credentials": "password=abcdefghij",
             "run_url": "https://github.com/o/r/actions/runs/1",
             "job_url": "https://github.com/o/r/actions/runs/1/job/2",
         }));
@@ -646,8 +678,8 @@ mod tests {
                 "red_run_id": 1,
                 "red_attempt": 1,
                 "fix_run_id": 2,
-                "head_sha": "c".repeat(40),
-                "fix_head_sha": "c".repeat(40),
+                "head_sha": "b".repeat(40),
+                "fix_head_sha": "b".repeat(40),
                 "derivation": "rerun_green",
                 "files_raw": [],
                 "own_files": [],
@@ -662,6 +694,37 @@ mod tests {
         let candidates = advise(&args(dir.path()), &[]).unwrap().0;
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].fix_link.is_some());
+    }
+
+    #[test]
+    fn fixlink_for_a_different_red_head_is_not_attached() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            serde_json::json!({
+                "schema": SCHEMA,
+                "source": "fix-link",
+                "repo": "o/r",
+                "red_run_id": 1,
+                "red_attempt": 1,
+                "fix_run_id": 2,
+                "head_sha": "c".repeat(40),
+                "fix_head_sha": "d".repeat(40),
+                "derivation": "compare_red_head_to_fix_head"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let candidates = advise(&args(dir.path()), &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].fix_link.is_none());
     }
 
     #[test]
