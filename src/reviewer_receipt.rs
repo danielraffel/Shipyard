@@ -231,6 +231,7 @@ impl fmt::Display for ReceiptError {
 impl std::error::Error for ReceiptError {}
 
 /// Convert a persisted claim into an externally publishable request.
+#[must_use]
 pub fn request_from_claim(repository: &str, pr: u64, claim: &ReviewerClaim) -> ReceiptRequest {
     ReceiptRequest {
         name: "reviewer-claim".to_owned(),
