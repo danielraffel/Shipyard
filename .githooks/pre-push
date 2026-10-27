@@ -64,16 +64,18 @@ if [ -n "$changed_files" ]; then
     "$PYTHON" "$ROOT/scripts/check_test_include_str.py" --base "$BASE" $changed_files || blocking_fail=1
 fi
 assert_rustup_proxy() {
-    local rustc_path target proxy
+    local rustc_path proxy
     rustc_path="$(command -v rustc 2>/dev/null || true)"
     case "$rustc_path" in
         "$HOME/.cargo/bin/rustc")
-            target="$(readlink "$rustc_path" 2>/dev/null || true)"
-            case "$target" in rustup|*/rustup) return 0 ;; esac
             # rustup installs its proxies as hardlinks or copies on some
             # platforms: the same file, or the same bytes, as rustup itself.
-            proxy="$HOME/.cargo/bin/rustup"
-            if [ -f "$proxy" ] && { [ "$rustc_path" -ef "$proxy" ] || cmp -s "$rustc_path" "$proxy"; }; then
+            # Require the target to be executable as well. A dangling or
+            # non-executable symlink must not make the later Cargo branch run
+            # against an unrelated compiler found elsewhere on PATH.
+            proxy="$(command -v rustup 2>/dev/null || true)"
+            if [ -n "$proxy" ] && [ -x "$proxy" ] && \
+               { [ "$rustc_path" -ef "$proxy" ] || cmp -s "$rustc_path" "$proxy"; }; then
                 return 0
             fi
             ;;
@@ -97,11 +99,14 @@ check_pinned_toolchain() {
     fi
 }
 channel="$(sed -n 's/^channel = "\([^\"]*\)"/\1/p' rust-toolchain.toml 2>/dev/null)"
-assert_rustup_proxy || blocking_fail=1
+rustup_proxy_ok=1
+assert_rustup_proxy || { blocking_fail=1; rustup_proxy_ok=0; }
 pin_installed=1
 check_pinned_toolchain "$channel" || { blocking_fail=1; pin_installed=0; }
 if [ "$pin_installed" = "0" ]; then
     echo "[pre-push] skipping cargo gates until the pinned toolchain is installed." >&2
+elif [ "$rustup_proxy_ok" = "0" ]; then
+    echo "[pre-push] skipping cargo gates until the rustup proxy is configured." >&2
 else
     # The pinned toolchain is the capability boundary. A faster host may run
     # this local gate; m1 remains a fallback for hosts lacking the capability.
