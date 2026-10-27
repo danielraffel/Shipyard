@@ -1484,36 +1484,48 @@ impl MetricsStore {
             } else {
                 ""
             };
-            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4){auth_filter}"))?;
-            q.query_map(rusqlite::params![any, short, full, cutoff], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
+            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4) AND julianday(merged_at) < julianday(?5){auth_filter}"))?;
+            q.query_map(
+                rusqlite::params![any, short, full, cutoff, Utc::now().to_rfc3339()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
             .collect::<Result<_, _>>()?
         };
-        let unique = safe.into_iter().collect::<std::collections::BTreeSet<_>>();
+        let mut unique =
+            std::collections::BTreeMap::<(String, String), std::collections::BTreeSet<i64>>::new();
+        for (repo, head, pr) in safe {
+            unique.entry((repo, head)).or_default().insert(pr);
+        }
         let total = unique.len();
         let mut joined = 0_usize;
         let mut wasted = 0_i64;
         let mut samples = 0_usize;
         let mut duration_gaps = 0_usize;
-        for (repo, head, pr) in unique {
+        for ((repo, head), prs) in unique {
             let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND run.sha = ?2 AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
-            let mut matched = false;
-            let mut invalid_duration = false;
-            for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
-            })? {
-                let (_, ms) = row?;
-                if ms.is_none_or(|v| v < 0) {
-                    // A completed row with NULL/negative duration cannot
-                    // substantiate a cost join. Keep the merge unjoined so
-                    // the scorecard cannot report a zero-cost claim.
-                    invalid_duration = true;
-                    continue;
+            let mut matched_pr = None;
+            for pr in prs {
+                let mut pr_matched = false;
+                let mut pr_invalid_duration = false;
+                for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+                })? {
+                    let (_, ms) = row?;
+                    if ms.is_none_or(|v| v < 0) {
+                        // A completed row with NULL/negative duration cannot
+                        // substantiate a cost join. Keep the merge unjoined so
+                        // the scorecard cannot report a zero-cost claim.
+                        pr_invalid_duration = true;
+                        continue;
+                    }
+                    pr_matched = true;
                 }
-                matched = true;
+                if pr_matched && !pr_invalid_duration {
+                    matched_pr = Some(pr);
+                    break;
+                }
             }
-            if matched && !invalid_duration {
+            if let Some(pr) = matched_pr {
                 // The merged head proved the join; the change's waste is every
                 // failed or cancelled job of its pull request, earlier pushes
                 // included, not only the jobs on the head that merged.
