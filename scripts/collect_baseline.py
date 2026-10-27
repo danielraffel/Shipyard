@@ -650,6 +650,13 @@ def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
             "reason": "scorecard did not report a safe-merge denominator",
         }
     )
+    safe_merge_rate = card.get("safely_merged_changes_per_eligible_slot_hour")
+    card["collector_safe_merge_rate"] = (
+        dict(safe_merge_rate) if isinstance(safe_merge_rate, dict) else {
+            "status": "unavailable", "value": None,
+            "reason": "scorecard did not report a safe-merge rate",
+        }
+    )
     card.pop("database", None)
     return consume_authenticated_strata(card, repo=args.repo, since_days=args.since_days,
                                         reference_at=dt.datetime.now(dt.timezone.utc))
@@ -1054,6 +1061,7 @@ def main() -> int:
             f"- Baseline report complete: **{'yes' if state['baseline_readiness'].get('report_complete') else 'no'}**\n"
             f"- Optimization eligibility: **{'yes' if state['baseline_readiness'].get('optimization_eligible') else 'no'}**\n"
             f"- Safely merged denominator: **{card.get('collector_safe_merge_denominator', {}).get('status', 'unavailable')}**\n"
+            f"- Safely merged changes per eligible slot-hour: **{card.get('collector_safe_merge_rate', {}).get('status', 'unavailable')}** ({card.get('collector_safe_merge_rate', {}).get('value', 'n/a')})\n"
             f"- Provenance: **{card.get('provenance_status', 'unverified_organic_input')}**.\n"
             f"- Strata: **{len(REQUIRED_STRATA) - len(card.get('missing_strata', REQUIRED_STRATA))}/{len(REQUIRED_STRATA)} sufficient**; authenticated producer records only.\n\n"
             "Synthetic provenance, unavailable phases, and merge denominators are not imputed.\n"
