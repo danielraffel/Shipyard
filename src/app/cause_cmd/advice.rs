@@ -336,6 +336,7 @@ fn valid_fixlink(value: &Value) -> bool {
                     .as_array()
                     .is_some_and(|files| files.iter().all(Value::is_string))
                 && value["files_truncated"].as_bool() == Some(false)
+                && valid_own_file_provenance(value)
         }
         "rerun_green" => {
             value["head_sha"] == value["fix_head_sha"]
@@ -344,6 +345,36 @@ fn valid_fixlink(value: &Value) -> bool {
                 && value["files_truncated"].as_bool() == Some(false)
                 && value["own_files_truncated"].as_bool() == Some(false)
                 && value["own_files_method"].as_str() == Some("rerun_same_head")
+        }
+        _ => false,
+    }
+}
+
+/// Validate the provenance describing the pull request's own share of a fix.
+///
+/// A compare link may legitimately have no own-file set when the red is not
+/// an ancestor (or the recovery window/list is unavailable), but that absence
+/// must be accompanied by one of the recorder's explicit reasons.  Complete
+/// own-file sets use the same fail-closed shape as `files_raw`: an array of
+/// strings and an explicit, non-truncated flag.
+fn valid_own_file_provenance(value: &Value) -> bool {
+    let Some(method) = value["own_files_method"].as_str() else {
+        return false;
+    };
+    match method {
+        "first_parent_non_merge_commits" | "merge_queue_pr_head" | "post_force_push" => {
+            value["own_files"]
+                .as_array()
+                .is_some_and(|files| files.iter().all(Value::is_string))
+                && value["own_files_truncated"].as_bool() == Some(false)
+        }
+        "branch_is_default"
+        | "red_not_ancestor"
+        | "chain_broken"
+        | "too_many_commits"
+        | "post_force_push_superseded"
+        | "post_force_push_too_late" => {
+            value["own_files"].is_null() && value["own_files_truncated"].is_null()
         }
         _ => false,
     }
@@ -738,5 +769,48 @@ mod tests {
         let candidates = advise(&query, &[]).unwrap().0;
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn compare_fixlinks_require_own_file_provenance() {
+        let base = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 2,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "c".repeat(40),
+            "derivation": "compare_red_head_to_fix_head",
+            "files_raw": ["src/lib.rs"],
+            "files_truncated": false,
+            "own_files": ["src/lib.rs"],
+            "own_files_method": "first_parent_non_merge_commits",
+            "own_files_truncated": false
+        });
+        assert!(valid_fixlink(&base));
+
+        for (field, replacement) in [
+            ("own_files", serde_json::json!("copied-from-elsewhere")),
+            ("own_files_method", serde_json::json!("unverified")),
+            ("own_files_truncated", serde_json::json!(true)),
+        ] {
+            let mut malformed = base.clone();
+            malformed[field] = replacement;
+            assert!(!valid_fixlink(&malformed), "malformed {field} was accepted");
+        }
+
+        // Null own-file evidence is valid only with an explicit recorder
+        // reason and a null truncation marker.
+        let mut unavailable = base.clone();
+        unavailable["own_files"] = Value::Null;
+        unavailable["own_files_method"] = "post_force_push_too_late".into();
+        unavailable["own_files_truncated"] = Value::Null;
+        assert!(valid_fixlink(&unavailable));
+
+        let mut copied_null = unavailable.clone();
+        copied_null["own_files_method"] = "first_parent_non_merge_commits".into();
+        assert!(!valid_fixlink(&copied_null));
     }
 }
