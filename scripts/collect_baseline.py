@@ -625,6 +625,12 @@ def validate_state_layout(db: pathlib.Path) -> pathlib.Path:
     return state_dir
 
 
+def coverage_value_text(coverage: Any) -> str:
+    """Render an optional scorecard value without turning unavailable into None."""
+    value = coverage.get("value") if isinstance(coverage, dict) else None
+    return "n/a" if value is None else str(value)
+
+
 def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
     validate_project_repo(args.project, args.repo)
     state_dir = validate_state_layout(args.db)
@@ -965,7 +971,7 @@ def main() -> int:
             f"- Baseline report complete: **{'yes' if state['baseline_readiness'].get('report_complete') else 'no'}**\n"
             f"- Optimization eligibility: **{'yes' if state['baseline_readiness'].get('optimization_eligible') else 'no'}**\n"
             f"- Safely merged denominator: **{card.get('collector_safe_merge_denominator', {}).get('status', 'unavailable')}**\n"
-            f"- Safely merged changes per eligible slot-hour: **{card.get('collector_safe_merge_rate', {}).get('status', 'unavailable')}** ({card.get('collector_safe_merge_rate', {}).get('value', 'n/a')})\n"
+            f"- Safely merged changes per eligible slot-hour: **{card.get('collector_safe_merge_rate', {}).get('status', 'unavailable')}** ({coverage_value_text(card.get('collector_safe_merge_rate'))})\n"
             f"- Provenance: **{card.get('provenance_status', 'unverified_organic_input')}**.\n"
             f"- Strata: **{len(REQUIRED_STRATA) - len(card.get('missing_strata', REQUIRED_STRATA))}/{len(REQUIRED_STRATA)} sufficient**; authenticated producer records only.\n\n"
             "Synthetic provenance, unavailable phases, and merge denominators are not imputed.\n"
