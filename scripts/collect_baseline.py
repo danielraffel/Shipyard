@@ -594,6 +594,17 @@ def baseline_readiness(card: dict[str, Any], started: dt.datetime,
         if isinstance(detail, str) and detail.strip():
             reason = f"{reason}: {detail}"
         reasons.append({"status": "unavailable", "reason": reason})
+    else:
+        eligible_hours = capacity.get("eligible_slot_hours")
+        if capacity.get("status") != "available" or (
+                isinstance(eligible_hours, bool)
+                or not isinstance(eligible_hours, (int, float))
+                or not math.isfinite(float(eligible_hours))
+                or eligible_hours <= 0):
+            reasons.append({
+                "status": "unavailable",
+                "reason": "fleet-capacity usable verified denominator is unavailable",
+            })
 
     eligibility_reasons: list[dict[str, str]] = []
     for field, minimum, label in (("important_lanes", 30, "important lane"),

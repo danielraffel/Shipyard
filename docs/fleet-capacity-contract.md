@@ -49,6 +49,10 @@ merge receipts remain durable provenance.
 The scorecard also reports `freshness_status`, `latest_valid_until`, and
 `freshness_reason`. Historical coverage can remain measurable after the latest
 receipt expires, but `freshness_status` is then `stale`; no receipt is current
-unless its producer validity interval extends past the scorecard check time.
-Baseline readiness requires `freshness_status = "fresh"` and reports missing or
-expired capacity evidence as unavailable.
+unless its producer validity interval extends strictly past the scorecard check
+time. A validity interval alone is not enough: freshness is `unavailable` when
+the current evidence has no verified positive eligible slot-hours (for example,
+when it contains only unknown observations or a zero-capacity result).
+Baseline readiness requires `freshness_status = "fresh"`, an available
+denominator, and positive `eligible_slot_hours`; missing, unusable, or expired
+capacity evidence is reported as unavailable.

@@ -1135,7 +1135,7 @@ impl MetricsStore {
         &self,
         project: &str,
         cutoff: &str,
-        until: &str,
+        check_time: &str,
     ) -> Result<FleetCapacityDenominator, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
         let key = crate::metrics::project_key::ProjectKey::parse(project);
@@ -1147,7 +1147,7 @@ impl MetricsStore {
               WHERE {project_filter} AND valid_until > ?4 AND observed_at < ?5
               ORDER BY repo, host_id, target, observed_at"
         ))?;
-        let rows = statement.query_map(params![any, short, full, cutoff, until], |row| {
+        let rows = statement.query_map(params![any, short, full, cutoff, check_time], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1198,14 +1198,14 @@ impl MetricsStore {
             )>,
         > = BTreeMap::new();
         let window_start = DateTime::parse_from_rfc3339(cutoff)?.with_timezone(&Utc);
-        let window_end = DateTime::parse_from_rfc3339(until)?.with_timezone(&Utc);
+        let check_time = DateTime::parse_from_rfc3339(check_time)?.with_timezone(&Utc);
         let mut hosts = BTreeSet::new();
         for (repo, observed, valid_until, sample_id, host, target, verification, eligible) in
             samples
         {
             hosts.insert((repo.clone(), host.clone(), target.clone()));
             let start = observed.max(window_start);
-            let end = valid_until.min(window_end);
+            let end = valid_until.min(check_time);
             if end > start {
                 groups.entry((repo, host, target)).or_default().push((
                     start,
@@ -1266,7 +1266,7 @@ impl MetricsStore {
                 }
                 previous = Some(time);
             }
-            if covered_until < window_end {
+            if covered_until < check_time {
                 coverage_gap = true;
             }
         }
@@ -1293,20 +1293,9 @@ impl MetricsStore {
         } else {
             format!("{verified_samples} verified fleet-capacity samples")
         };
-        let (freshness_status, freshness_reason) = match latest_valid_until {
-            None => (
-                "unavailable",
-                "no fleet-capacity validity interval is available".to_owned(),
-            ),
-            Some(valid_until) if valid_until > window_end => (
-                "fresh",
-                format!("latest fleet-capacity evidence is valid until {valid_until}"),
-            ),
-            Some(valid_until) => (
-                "stale",
-                format!("latest fleet-capacity evidence expired at {valid_until}"),
-            ),
-        };
+        let usable_verified_capacity = verified_samples > 0 && eligible_slot_seconds > 0;
+        let (freshness_status, freshness_reason) =
+            fleet_capacity_freshness(latest_valid_until, check_time, usable_verified_capacity);
         Ok(FleetCapacityDenominator {
             status: status.to_owned(),
             reason,
@@ -2681,6 +2670,36 @@ fn unavailable_merge_coverage() -> ScorecardCoverage {
     }
 }
 
+fn fleet_capacity_freshness(
+    latest_valid_until: Option<DateTime<Utc>>,
+    check_time: DateTime<Utc>,
+    usable_verified_capacity: bool,
+) -> (&'static str, String) {
+    let Some(valid_until) = latest_valid_until else {
+        return (
+            "unavailable",
+            "no fleet-capacity validity interval is available".to_owned(),
+        );
+    };
+    if !usable_verified_capacity {
+        return (
+            "unavailable",
+            "current fleet-capacity evidence has no verified eligible slot-hours".to_owned(),
+        );
+    }
+    if valid_until > check_time {
+        (
+            "fresh",
+            format!("latest fleet-capacity evidence is valid until {valid_until}"),
+        )
+    } else {
+        (
+            "stale",
+            format!("latest fleet-capacity evidence expired at {valid_until}"),
+        )
+    }
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn pull_requests_per_day(distinct_pull_requests: usize, since_days: i64) -> f64 {
     distinct_pull_requests as f64 / since_days as f64
@@ -4009,6 +4028,24 @@ mod tests {
         let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
         assert_eq!(scorecard.fleet_capacity.freshness_status, "unavailable");
         assert_eq!(scorecard.fleet_capacity.latest_valid_until, None);
+    }
+
+    #[test]
+    fn fleet_capacity_freshness_requires_usable_verified_capacity_and_strictly_future_validity() {
+        let check_time: DateTime<Utc> = "2026-10-27T12:00:00Z".parse().unwrap();
+        let equal: DateTime<Utc> = "2026-10-27T12:00:00Z".parse().unwrap();
+        let future: DateTime<Utc> = "2026-10-27T12:00:01Z".parse().unwrap();
+
+        let (status, reason) = fleet_capacity_freshness(Some(equal), check_time, true);
+        assert_eq!(status, "stale");
+        assert!(reason.contains("expired at"));
+
+        let (status, _) = fleet_capacity_freshness(Some(future), check_time, true);
+        assert_eq!(status, "fresh");
+
+        let (status, reason) = fleet_capacity_freshness(Some(future), check_time, false);
+        assert_eq!(status, "unavailable");
+        assert!(reason.contains("no verified eligible slot-hours"));
     }
 
     #[test]
