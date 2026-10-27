@@ -482,10 +482,16 @@ mod tests {
                 "name": request.name,
                 "external_id": request.receipt.external_id,
                 "head_sha": request.receipt.head_sha,
-            "app": {"slug": "shipyard-review", "id": 42},
+                "app": {"slug": "shipyard-review", "id": 42},
+                "status": "completed",
+                "conclusion": "success",
                 "output": {"summary": summary}
             })
         };
+        assert_eq!(
+            validate_run(&base(), &request, "shipyard-review", 42),
+            Ok(request.receipt.clone())
+        );
         let mut wrong = base();
         wrong["app"]["slug"] = serde_json::Value::String("ambient-gh".to_owned());
         assert!(validate_run(&wrong, &request, "shipyard-review", 42).is_err());
@@ -494,6 +500,12 @@ mod tests {
         assert!(validate_run(&wrong, &request, "shipyard-review", 42).is_err());
         let mut wrong = base();
         wrong["external_id"] = serde_json::Value::String("stale".to_owned());
+        assert!(validate_run(&wrong, &request, "shipyard-review", 42).is_err());
+        let mut wrong = base();
+        wrong["status"] = serde_json::Value::String("in_progress".to_owned());
+        assert!(validate_run(&wrong, &request, "shipyard-review", 42).is_err());
+        let mut wrong = base();
+        wrong["conclusion"] = serde_json::Value::String("failure".to_owned());
         assert!(validate_run(&wrong, &request, "shipyard-review", 42).is_err());
     }
 
