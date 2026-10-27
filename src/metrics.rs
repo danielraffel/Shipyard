@@ -1177,8 +1177,49 @@ impl MetricsStore {
             ));
         }
         let sample_count = samples.len();
-        let latest_valid_until = samples
+        let check_time = DateTime::parse_from_rfc3339(check_time)?.with_timezone(&Utc);
+        // Freshness is about the evidence that is current at the scorecard
+        // boundary, not the longest validity interval anywhere in the
+        // historical window.  Keep a per host/target latest observation so a
+        // current unknown result cannot inherit an older verified interval.
+        let mut current_observations: BTreeMap<
+            (String, String, String),
+            (DateTime<Utc>, DateTime<Utc>, String, Option<i64>),
+        > = BTreeMap::new();
+        for (repo, observed, valid_until, _, host, target, verification, eligible) in &samples {
+            if *observed > check_time || *valid_until <= check_time {
+                continue;
+            }
+            let key = (repo.clone(), host.clone(), target.clone());
+            let candidate = (*observed, *valid_until, verification.clone(), *eligible);
+            let replace = current_observations.get(&key).is_none_or(|existing| {
+                candidate.0 > existing.0
+                    || (candidate.0 == existing.0
+                        && (candidate.2 == "unknown")
+                        && (existing.2 != "unknown"))
+            });
+            if replace {
+                current_observations.insert(key, candidate);
+            }
+        }
+        let current_verified_positive =
+            current_observations
+                .values()
+                .any(|(_, _, verification, eligible)| {
+                    verification == "verified" && eligible.is_some_and(|slots| slots > 0)
+                });
+        let current_latest_valid_until = current_observations
+            .values()
+            .filter(|(_, _, verification, eligible)| {
+                verification == "verified" && eligible.is_some_and(|slots| slots > 0)
+            })
+            .map(|(_, valid_until, _, _)| *valid_until)
+            .max();
+        let latest_verified_valid_until = samples
             .iter()
+            .filter(|(_, _, _, _, _, _, verification, eligible)| {
+                verification == "verified" && eligible.is_some_and(|slots| slots > 0)
+            })
             .map(|(_, _, valid_until, _, _, _, _, _)| *valid_until)
             .max();
         let verified_samples = samples
@@ -1198,7 +1239,6 @@ impl MetricsStore {
             )>,
         > = BTreeMap::new();
         let window_start = DateTime::parse_from_rfc3339(cutoff)?.with_timezone(&Utc);
-        let check_time = DateTime::parse_from_rfc3339(check_time)?.with_timezone(&Utc);
         let mut hosts = BTreeSet::new();
         for (repo, observed, valid_until, sample_id, host, target, verification, eligible) in
             samples
@@ -1294,8 +1334,27 @@ impl MetricsStore {
             format!("{verified_samples} verified fleet-capacity samples")
         };
         let usable_verified_capacity = verified_samples > 0 && eligible_slot_seconds > 0;
-        let (freshness_status, freshness_reason) =
-            fleet_capacity_freshness(latest_valid_until, check_time, usable_verified_capacity);
+        let (freshness_status, freshness_reason, latest_valid_until) = if current_observations
+            .is_empty()
+        {
+            // No current observation means historical coverage may still
+            // be measurable, but it cannot be fresh.  Preserve the
+            // verified interval for an honest stale explanation.
+            let (status, reason) = fleet_capacity_freshness(
+                latest_verified_valid_until,
+                check_time,
+                usable_verified_capacity,
+            );
+            (status, reason, latest_verified_valid_until)
+        } else {
+            let freshness_valid_until = current_latest_valid_until.or(latest_verified_valid_until);
+            let (status, reason) = fleet_capacity_freshness(
+                freshness_valid_until,
+                check_time,
+                current_verified_positive,
+            );
+            (status, reason, freshness_valid_until)
+        };
         Ok(FleetCapacityDenominator {
             status: status.to_owned(),
             reason,
@@ -4055,7 +4114,7 @@ mod tests {
         insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
         let now = Utc::now();
         let verified = test_capacity_sample(now - Duration::minutes(2), "m3", "verified");
-        let unknown = test_capacity_sample(now - Duration::minutes(1), "m3", "unknown");
+        let unknown = test_capacity_sample(now - Duration::seconds(10), "m3", "unknown");
         store
             .import_fleet_capacity(&format!(
                 "{}\n{}\n",
@@ -4065,11 +4124,47 @@ mod tests {
             .unwrap();
         let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
         assert_eq!(scorecard.fleet_capacity.status, "partial");
+        assert_eq!(scorecard.fleet_capacity.freshness_status, "unavailable");
+        assert!(
+            scorecard
+                .fleet_capacity
+                .freshness_reason
+                .contains("no verified eligible slot-hours"),
+            "{}",
+            scorecard.fleet_capacity.freshness_reason
+        );
         let hours = scorecard
             .fleet_capacity
             .eligible_slot_hours
             .expect("verified interval before unknown interval remains measurable");
-        assert!((hours - (3.0 / 60.0)).abs() < 0.000_001);
+        assert!((hours - (5.5 / 60.0)).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn current_unknown_capacity_cannot_inherit_expired_verified_freshness() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let now = Utc::now();
+        let expired = test_capacity_sample(now - Duration::hours(2), "m3", "verified");
+        let unknown = test_capacity_sample(now - Duration::seconds(10), "m3", "unknown");
+        store
+            .import_fleet_capacity(&format!(
+                "{}\n{}\n",
+                serde_json::to_string(&expired).unwrap(),
+                serde_json::to_string(&unknown).unwrap()
+            ))
+            .unwrap();
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.freshness_status, "unavailable");
+        assert!(
+            scorecard
+                .fleet_capacity
+                .freshness_reason
+                .contains("no verified eligible slot-hours"),
+            "{}",
+            scorecard.fleet_capacity.freshness_reason
+        );
     }
 
     #[test]
