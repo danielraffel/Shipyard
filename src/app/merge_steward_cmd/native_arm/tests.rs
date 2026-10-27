@@ -945,6 +945,7 @@ fn a_host_without_mutation_authority_fails_the_pass() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unreadable_machine_policy_refuses_at_the_production_arm_call_site() {
     let temp = tempfile::tempdir().expect("temp");
