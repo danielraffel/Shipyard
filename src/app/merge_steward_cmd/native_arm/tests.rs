@@ -944,3 +944,47 @@ fn a_host_without_mutation_authority_fails_the_pass() {
         "{refusal:?}"
     );
 }
+
+#[test]
+fn an_unreadable_machine_policy_refuses_at_the_production_arm_call_site() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = crate::app::merge_steward_cmd::tests::mutation_control(&temp, "studio", "studio");
+    // Keep the path present but unreadable as a regular config file. This
+    // exercises the same `arming_authority` closure passed by the steward's
+    // production arm path, rather than testing the preflight helper in
+    // isolation.
+    std::fs::remove_file(control.global_dir.join("config.toml")).expect("remove policy");
+    std::fs::create_dir(control.global_dir.join("config.toml"))
+        .expect("replace policy with directory");
+
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
+    let observation = observation(pr_row(&serde_json::json!({})), true);
+    let (status, unhealthy) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &report(StewardDecision::Unmanaged),
+        "shipyard:no-auto-merge",
+        true,
+        || super::arming_authority(&control, "owner/repo", "main"),
+    );
+
+    assert!(
+        unhealthy,
+        "an unreadable policy is a real failure: {status:?}"
+    );
+    assert!(
+        status.results.is_empty(),
+        "the refusal must precede candidate mutation: {status:?}"
+    );
+    assert!(
+        status
+            .policy
+            .contains("failed to load merge-queue mutation policy"),
+        "{status:?}"
+    );
+    assert!(
+        !log.exists(),
+        "the backstop reached GitHub past the policy refusal"
+    );
+}
