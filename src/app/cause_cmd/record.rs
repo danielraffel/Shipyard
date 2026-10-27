@@ -1219,12 +1219,20 @@ fn red_jobs_complete(
         .filter(|job| job["run_attempt"].as_u64().unwrap_or(1) == red.attempt)
         .filter(|job| matches!(job["conclusion"].as_str(), Some("failure" | "timed_out")))
         .filter_map(|job| job["name"].as_str().map(str::to_owned))
-        .collect::<BTreeSet<_>>();
+        .collect::<Vec<_>>();
     if raw_names.is_empty() {
         return Ok(None);
     }
+    // GitHub can expose two failed jobs with the same display name (for
+    // example, repeated reusable-workflow or matrix entries). A name-only
+    // identity cannot prove that a later green run passed both jobs, so keep
+    // the red pending rather than risk a false fix-link.
+    let unique_raw = raw_names.iter().cloned().collect::<BTreeSet<_>>();
+    if unique_raw.len() != raw_names.len() {
+        return Ok(None);
+    }
     let mut scrubbed_to_raw: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for raw in &raw_names {
+    for raw in &unique_raw {
         scrubbed_to_raw
             .entry(canonical_job_name(raw))
             .or_default()
@@ -1237,7 +1245,7 @@ fn red_jobs_complete(
     if !observed.is_subset(&red.jobs) {
         return Ok(None);
     }
-    Ok(Some(raw_names))
+    Ok(Some(unique_raw))
 }
 
 /// Count a red still without a fix, by how long ago it went red.
