@@ -2763,10 +2763,14 @@ fn invalidate_adopted_reviewer_receipts(
     if pages.is_empty() {
         return Err("adopted reviewer claim check-runs response omitted check_runs".to_owned());
     }
-    let runs = pages
-        .into_iter()
-        .flat_map(|page| page.get("check_runs").and_then(serde_json::Value::as_array))
-        .flatten();
+    let mut run_values = Vec::new();
+    for page in pages {
+        let Some(check_runs) = page.get("check_runs").and_then(serde_json::Value::as_array) else {
+            return Err("adopted reviewer claim check-runs response omitted check_runs".to_owned());
+        };
+        run_values.extend(check_runs.iter());
+    }
+    let runs = run_values.into_iter();
     for run in runs.filter(|run| adopted_receipt_matches(run, request)) {
         let id = run
             .get("id")
