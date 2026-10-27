@@ -2820,7 +2820,10 @@ fn adopted_receipt_matches(run: &serde_json::Value, request: &ShipExecutionReque
         return false;
     };
     value.get("schema").and_then(serde_json::Value::as_str) == Some("shipyard-reviewer-claim/v1")
-        && value.get("repo").and_then(serde_json::Value::as_str) == Some(request.repo.as_str())
+        && value
+            .get("repo")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|repo| canonical_repository(repo) == canonical_repository(&request.repo))
         && value.get("pr").and_then(serde_json::Value::as_u64) == Some(request.pr)
         && value
             .get("head_sha")
