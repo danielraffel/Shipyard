@@ -55,9 +55,10 @@ pub struct RunObservation {
     pub conclusion: Option<String>,
     pub head_sha: String,
     pub head_branch: Option<String>,
-    /// Parents of the exact merge-group commit, in GitHub's order. A
-    /// single-PR merge group has the protected base first and that PR head
-    /// second; a batched group has a synthetic second parent and is refused.
+    /// Parents of the exact merge-group commit, in GitHub's order. The first
+    /// parent is the queue entry's base (the protected base or the previous
+    /// queue entry), and the second is this PR's head. A batched group has a
+    /// different second parent and is refused.
     pub head_commit_parents: Vec<String>,
     pub html_url: Option<String>,
     /// Required in the normalized projection. GitHub's `merge_group` payload
@@ -273,7 +274,7 @@ pub fn reconcile(
         || run.head_commit_parents[1] != head_sha
     {
         return Err(
-            "merge-group commit parents do not prove a single-PR group for the artifact".to_owned(),
+            "merge-group commit parents do not bind the queue base and artifact PR head".to_owned(),
         );
     }
     if let (Some(artifact_ref), Some(run_ref)) = (
@@ -306,6 +307,12 @@ pub fn reconcile(
         .as_deref()
         .ok_or("merged pull request has no merge commit SHA")?;
     valid_sha(merge_commit_sha, "merge commit SHA")?;
+    if merge_commit_sha != merge_sha {
+        return Err(
+            "merged pull request commit SHA does not match the successful merge-group commit"
+                .to_owned(),
+        );
+    }
     let branch = pull_request
         .base
         .branch
@@ -639,7 +646,7 @@ mod tests {
             number: 42,
             state: "closed".to_owned(),
             merged_at: Some("2026-10-25T00:00:00Z".to_owned()),
-            merge_commit_sha: Some("d".repeat(40)),
+            merge_commit_sha: Some("b".repeat(40)),
             head: PullRequestHead { sha: head },
             base: PullRequestBase {
                 ref_name: None,
@@ -726,7 +733,34 @@ mod tests {
         .unwrap();
         assert_eq!(receipt.pr, 42);
         assert_eq!(receipt.head_sha, "a".repeat(40));
-        assert_eq!(receipt.merge_commit_sha, "d".repeat(40));
+        assert_eq!(receipt.merge_commit_sha, "b".repeat(40));
+    }
+
+    #[test]
+    fn rejects_merged_pull_request_commit_different_from_merge_group_run() {
+        let (job, run, mut pr, checks, policy, required) = fixture();
+        pr.merge_commit_sha = Some("d".repeat(40));
+        let error = reconcile(
+            "Generous-Corp/pulp",
+            "pulp",
+            "main",
+            "https://github.com/Generous-Corp/pulp/actions/artifacts/1",
+            "https://github.com/Generous-Corp/pulp/actions/runs/7",
+            &"a".repeat(64),
+            &policy_sha256(&policy),
+            &"c".repeat(64),
+            &job,
+            &run,
+            &pr,
+            &checks,
+            &policy,
+            &required,
+        )
+        .expect_err("receipt must bind the commit that actually landed");
+        assert!(
+            error.contains("does not match the successful merge-group commit"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -1244,7 +1244,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let head = "a".repeat(40);
         let merge = "b".repeat(40);
-        let merge_commit = "d".repeat(40);
+        let merge_commit = "b".repeat(40);
         let queue_ref = format!("refs/heads/gh-readonly-queue/main/pr-42-{}", "c".repeat(40));
         let artifact_path = temp.path().join("job.json");
         let run_path = temp.path().join("run.json");
