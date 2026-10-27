@@ -2657,29 +2657,18 @@ fn repository_requires_merge_queue(
         .map_err(|error| format!("failed to inspect evaluated branch rules: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return match merge_queue_requirement_from_observations(&queue_body, Err(&stderr)).map_err(
-            |error| {
+        let requirement = merge_queue_requirement_from_observations(&queue_body, Err(&stderr))
+            .map_err(|error| {
                 format!(
                     "failed to inspect evaluated branch rules for {repo}:{base_branch}: {error}"
                 )
-            },
-        )? {
-            MergeQueueRequirement::Required => Ok(true),
-            MergeQueueRequirement::Classic => Ok(false),
-            MergeQueueRequirement::PrivateFreeClassicFallback => {
-                let _ = crate::writer_domain_lease::write_stderr(format_args!(
-                    "shipyard: evaluated branch rules are unavailable on this private-free repository; the authoritative mergeQueue query returned null, so classifying the branch as classic before refusing automatic direct merge"
-                ));
-                Ok(false)
-            }
-        };
+            })?;
+        return merge_queue_requirement_for_merge(requirement, repo, base_branch);
     }
     let body: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("evaluated branch rules returned invalid JSON: {error}"))?;
-    Ok(matches!(
-        merge_queue_requirement_from_observations(&queue_body, Ok(&body))?,
-        MergeQueueRequirement::Required
-    ))
+    let requirement = merge_queue_requirement_from_observations(&queue_body, Ok(&body))?;
+    merge_queue_requirement_for_merge(requirement, repo, base_branch)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2687,6 +2676,26 @@ enum MergeQueueRequirement {
     Required,
     Classic,
     PrivateFreeClassicFallback,
+}
+
+/// Decide whether the built-in merge may proceed with the observed governance.
+///
+/// A private-free entitlement error is not evidence that the branch is classic:
+/// GitHub withheld the rules response, while the queue probe returned null. Treat
+/// that ambiguity as a refusal so the caller cannot fall through to a direct
+/// merge outside the queue.
+fn merge_queue_requirement_for_merge(
+    requirement: MergeQueueRequirement,
+    repo: &str,
+    base_branch: &str,
+) -> Result<bool, String> {
+    match requirement {
+        MergeQueueRequirement::Required => Ok(true),
+        MergeQueueRequirement::Classic => Ok(false),
+        MergeQueueRequirement::PrivateFreeClassicFallback => Err(format!(
+            "cannot determine whether {repo}:{base_branch} requires a merge queue: GitHub withheld evaluated branch rules on a private-free repository; refusing direct merge"
+        )),
+    }
 }
 
 fn merge_queue_requirement_from_observations(
@@ -4103,6 +4112,17 @@ mod tests {
         assert!(
             merge_queue_requirement_from_observations(&queue_null, Ok(&malformed_rules)).is_err()
         );
+    }
+
+    #[test]
+    fn private_free_fallback_refuses_direct_merge() {
+        let error = merge_queue_requirement_for_merge(
+            MergeQueueRequirement::PrivateFreeClassicFallback,
+            "owner/repo",
+            "main",
+        )
+        .expect_err("governance ambiguity must never select direct merge");
+        assert!(error.contains("refusing direct merge"), "{error}");
     }
 
     #[test]
