@@ -265,8 +265,15 @@ fn advise(
     Ok((out, suppressed))
 }
 
-/// Return a fix-link only when the red run has one unambiguous derivation.
+/// Return the useful fix-link for a red run when its derivation is unambiguous.
 /// Duplicate archive rows are harmless; independently derived fixes are not.
+///
+/// A red attempt can legitimately have both a same-head green rerun and a
+/// later green run on a different fixing head. `cause audit` permits that pair
+/// because the rerun is evidence that the original head recovered while the
+/// compare link identifies the push that fixed the underlying failure. Advice
+/// presents the compare link, preserving the actionable fixing push without
+/// discarding either archived record.
 fn matching_fixlink(fixlinks: &[Value], repo: &str, cause: &Value) -> Option<Value> {
     let cause_run_id = cause["run_id"].as_u64()?;
     let cause_attempt = cause["attempt"].as_u64()?;
@@ -283,12 +290,47 @@ fn matching_fixlink(fixlinks: &[Value], repo: &str, cause: &Value) -> Option<Val
         .iter()
         .map(|fix| {
             (
-                fix["fix_head_sha"].as_str().unwrap_or_default().to_owned(),
+                fix_identity(fix),
                 fix["derivation"].as_str().unwrap_or_default().to_owned(),
             )
         })
         .collect();
-    (keys.len() == 1).then(|| matches.first().map(|fix| (*fix).clone()))?
+    if keys.len() == 1 {
+        return matches.first().map(|fix| (*fix).clone());
+    }
+
+    let has_rerun = keys
+        .iter()
+        .any(|(_, derivation)| derivation == "rerun_green");
+    let compare = keys
+        .iter()
+        .filter(|(_, derivation)| derivation == "compare_red_head_to_fix_head")
+        .count();
+    if has_rerun && compare == 1 && keys.len() == 2 {
+        return matches
+            .iter()
+            .find(|fix| fix["derivation"] == "compare_red_head_to_fix_head")
+            .map(|fix| (*fix).clone());
+    }
+
+    None
+}
+
+/// Identity for a validated link's producer evidence. Archive duplicates may
+/// reorder JSON fields, but a different run or evidence must remain a conflict.
+fn fix_identity(fix: &Value) -> String {
+    serde_json::json!({
+        "fix_run_id": fix["fix_run_id"],
+        "fix_head_sha": fix["fix_head_sha"],
+        "derivation": fix["derivation"],
+        "pushed_at": fix["pushed_at"],
+        "files_raw": fix["files_raw"],
+        "files_truncated": fix["files_truncated"],
+        "own_files": fix["own_files"],
+        "own_files_method": fix["own_files_method"],
+        "own_files_truncated": fix["own_files_truncated"],
+    })
+    .to_string()
 }
 
 fn read_fixlinks(path: &Path) -> Result<Vec<Value>, CliFailure> {
@@ -729,7 +771,7 @@ mod tests {
         };
         fs::write(
             dir.path().join("fixlinks.jsonl"),
-            format!("{}\n{}\n", link(2, "c"), link(3, "d")),
+            format!("{}\n{}\n", link(2, "c"), link(3, "c")),
         )
         .unwrap();
 
@@ -738,5 +780,66 @@ mod tests {
         let candidates = advise(&query, &[]).unwrap().0;
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn valid_rerun_and_compare_pair_prefers_the_fixing_push() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        let rerun = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 1,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "b".repeat(40),
+            "derivation": "rerun_green",
+            "files_raw": [],
+            "files_truncated": false,
+            "own_files": [],
+            "own_files_truncated": false,
+            "own_files_method": "rerun_same_head"
+        });
+        let compare = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 2,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "c".repeat(40),
+            "derivation": "compare_red_head_to_fix_head",
+            "files_raw": ["src/lib.rs"],
+            "files_truncated": false,
+            "own_files": ["src/lib.rs"],
+            "own_files_truncated": false,
+            "own_files_method": "first_parent_non_merge_commits"
+        });
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            format!("{rerun}\n{compare}\n"),
+        )
+        .unwrap();
+
+        let mut query = args(dir.path());
+        query.pr = None;
+        let candidates = advise(&query, &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].fix_link.as_ref().unwrap()["derivation"],
+            "compare_red_head_to_fix_head"
+        );
+        assert_eq!(
+            candidates[0].fix_link.as_ref().unwrap()["fix_head_sha"],
+            "c".repeat(40)
+        );
     }
 }
