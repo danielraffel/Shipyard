@@ -147,6 +147,10 @@ def _import_organic_after_preflight(args: argparse.Namespace, state_dir: str,
         if not isinstance(imported_count, int) or isinstance(imported_count, bool) or imported_count < 0:
             raise RuntimeError("merge receipt import count unavailable; refusing to record a successful pass")
         events.append(receipt_event)
+    else:
+        events.append({"source": "merge-receipt", "status": "unavailable",
+                       "reason": getattr(args, "merge_receipt_unavailable_reason", None)
+                       or "fresh authenticated producer handoff is unavailable"})
     unknown_imports = [event["source"] for event in events
                        if event.get("source") in {"github", "tartci"}
                        and (not isinstance(event.get("imported"), int)
@@ -541,6 +545,14 @@ def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
                                         reference_at=dt.datetime.now(dt.timezone.utc))
 
 
+def force_receipt_metrics_unavailable(card: dict[str, Any], reason: str) -> None:
+    """Prevent stale local receipts from becoming a current denominator."""
+    unavailable = {"status": "unavailable", "value": None, "reason": reason}
+    card["safely_merged_changes"] = dict(unavailable)
+    card["collector_safe_merge_denominator"] = dict(unavailable)
+    card["wasted_compute_per_safely_merged_change"] = dict(unavailable)
+
+
 def baseline_readiness(card: dict[str, Any], started: dt.datetime,
                        observed_at: dt.datetime,
                        pass_history: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -746,6 +758,8 @@ def main() -> int:
                         help="maximum producer handoff age when --merge-receipt-health is supplied")
     parser.add_argument("--merge-receipt-base-branch", default="main",
                         help="protected base branch bound to producer receipts")
+    parser.add_argument("--merge-receipt-unavailable-reason",
+                        help="explicit reason the authenticated producer handoff was unavailable")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--since-days", type=int, default=5)
     parser.add_argument("--collect", action="store_true", help="run provider imports")
@@ -772,6 +786,14 @@ def main() -> int:
     try:
         events = import_organic(args) if args.collect else []
         card = authoritative_scorecard(args)
+        if args.collect:
+            receipt_events = [event for event in events if event.get("source") == "merge-receipt"]
+            unavailable = next((event for event in receipt_events if event.get("status") == "unavailable"), None)
+            if unavailable is not None:
+                force_receipt_metrics_unavailable(
+                    card,
+                    str(unavailable.get("reason") or "fresh authenticated producer handoff is unavailable"),
+                )
         completed_at = dt.datetime.now(dt.timezone.utc)
         if args.collect:
             counts = [event.get("imported") for event in events if event.get("source") in {"github", "tartci"}]
