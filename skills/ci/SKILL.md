@@ -50,6 +50,13 @@ host whose tailnet name changed kept a registration under the old name; every
 delivery failed to connect, and because nothing was subscribed to the feed its
 failure produced no symptom at all.
 
+Cancelled foreground work is reconciled without a model: after an aged
+cancellation, the supervisor requires exact foreground ownership, no local
+child or receipt, and a successful OS process scan before releasing claims.
+An unreadable or ambiguous scan keeps the job running so recovery never races
+a live worker. This lets the queue tick clear abandoned handoffs while leaving
+code-repair and other judgment calls to an optional bounded agent escalation.
+
 The repo list it prints is the same kind of claim. `--repo` on `daemon
 start` / `run` / `refresh` sets only what the daemon ADVERTISES from its status
 endpoint; it is not the set of repositories the daemon acts on. Status therefore
