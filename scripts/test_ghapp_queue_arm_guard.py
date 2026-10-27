@@ -4323,3 +4323,35 @@ class ReviewerClaimReceipt(unittest.TestCase):
             guard.parse_claim_receipt(self.run_fixture(self.receipt(), conclusion="failure"),
                                       "danielraffel/Shipyard", 974, self.head,
                                       "reviewer-claim", "shipyard-review")
+
+    def test_consumers_require_one_receipt_and_deciding_reviewer(self) -> None:
+        policy = {"claim_receipt": "reviewer-claim", "claim_app": "shipyard-review"}
+        approval = {"signer": "pulp-review"}
+        listing = [{"total_count": 1, "check_runs":
+                    [self.run_fixture(self.receipt())]}]
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            note = guard.reviewer_claim_receipt(
+                "danielraffel/Shipyard", 974, self.head, policy, approval)
+        self.assertIn("epoch 3", note)
+
+        wrong_reviewer = {"signer": "infra-review2"}
+        with mock.patch.object(guard, "run_real_gh", return_value=listing):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head, policy, wrong_reviewer)
+
+        duplicate = [{"total_count": 2, "check_runs": [
+            self.run_fixture(self.receipt()), self.run_fixture(self.receipt())]}]
+        with mock.patch.object(guard, "run_real_gh", return_value=duplicate):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head, policy, approval)
+
+    def test_consumers_reject_partial_pages(self) -> None:
+        policy = {"claim_receipt": "reviewer-claim", "claim_app": "shipyard-review"}
+        with mock.patch.object(guard, "run_real_gh", return_value=[
+            {"total_count": 2, "check_runs": [self.run_fixture(self.receipt())]}]):
+            with self.assertRaises(guard.GuardError):
+                guard.reviewer_claim_receipt(
+                    "danielraffel/Shipyard", 974, self.head,
+                    policy, {"signer": "pulp-review"})
