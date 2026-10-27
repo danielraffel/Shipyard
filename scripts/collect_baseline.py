@@ -556,6 +556,9 @@ def force_receipt_metrics_unavailable(card: dict[str, Any], reason: str) -> None
         # compatibility mask conditional so the baseline gate remains
         # wire-compatible while that slice is still stacked separately.
         "safely_merged_changes_per_eligible_slot_hour",
+        # The authoritative collector projects the rate under this key;
+        # stale local receipts must not survive that projection either.
+        "collector_safe_merge_rate",
     ):
         if key in card:
             card[key] = dict(unavailable)
