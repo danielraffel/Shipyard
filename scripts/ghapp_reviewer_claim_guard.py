@@ -42,6 +42,10 @@ def _readable_regular_file(path: str) -> bool:
         info = pathlib.Path(path).lstat()
         if not stat.S_ISREG(info.st_mode):
             return False
+        # Root can open mode-000 files, but native gh running under the
+        # reviewer account cannot. Treat missing read bits as unreadable.
+        if info.st_mode & 0o444 == 0:
+            return False
         with pathlib.Path(path).open("rb"):
             return True
     except OSError:
