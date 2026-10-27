@@ -238,9 +238,11 @@ fn advise(
                         && red_run_id == cause_run_id
                         && red_attempt.is_some()
                         && red_attempt == cause_attempt
-                        && f["head_sha"]
-                            .as_str()
-                            .is_none_or(|head_sha| head_sha == row["head_sha"])
+                        && f.get("head_sha").is_none_or(|head_sha| {
+                            head_sha
+                                .as_str()
+                                .is_some_and(|head_sha| head_sha == row["head_sha"])
+                        })
                 })
                 .cloned(),
             cause: row,
@@ -292,6 +294,7 @@ fn read_fixlinks(path: &Path) -> Result<Vec<Value>, CliFailure> {
 pub(super) fn valid_fixlink(value: &Value) -> bool {
     let derivation = value["derivation"].as_str();
     link_identity_complete(value)
+        && safe(value)
         && value["repo"].as_str().is_some_and(|repo| !repo.is_empty())
         && value["fix_head_sha"].as_str().is_some_and(valid_sha)
         && matches!(
@@ -308,14 +311,13 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
                 && value["own_files_method"].as_str() == Some("rerun_same_head")))
 }
 
-/// Identity fields required before a producer treats a fix-link as already
-/// recorded. This deliberately stops short of the full advice predicate so
-/// fixture archives with short SHAs can still be replaced by a fresh row
-/// instead of suppressing collection.
+/// Structural identity fields required before a producer treats a fix-link as
+/// already recorded. This deliberately stops short of the full advice
+/// predicate so a row that is structurally complete but unsafe is not written
+/// again on every collection pass.
 pub(super) fn link_identity_complete(value: &Value) -> bool {
     value["schema"] == SCHEMA
         && value["source"] == "fix-link"
-        && safe(value)
         && value["repo"].as_str().is_some_and(|repo| !repo.is_empty())
         && value["red_run_id"].as_u64().is_some_and(|id| id > 0)
         && value["red_attempt"]
@@ -344,9 +346,13 @@ fn safe(value: &Value) -> bool {
         !needs_scrub(text)
             && !SENSITIVE_MARKER.is_match(text)
             && !CREDENTIAL_MARKER.captures_iter(text).any(|capture| {
-                capture
-                    .get(1)
-                    .is_some_and(|value| value.as_str() != "<secret>")
+                capture.get(1).is_some_and(|value| {
+                    let value = value.as_str();
+                    !(value == "<secret>"
+                        || value.strip_prefix("<secret>").is_some_and(|suffix| {
+                            suffix.chars().all(|ch| ch.is_ascii_punctuation())
+                        }))
+                })
             })
     };
     match value {
@@ -520,6 +526,9 @@ mod tests {
             "job_url": "https://github.com/o/r/actions/runs/1/job/2",
         }));
         assert!(safe(&clean));
+        for secret in ["password=abc", "token: \"abcdefghij\"", "token=<secret>x"] {
+            assert!(!safe(&serde_json::json!({"detail": secret})), "{secret}");
+        }
         // Advice checks even URL fields from externally supplied archives.
         assert!(!safe(
             &serde_json::json!({"job_url": "https://macmini/private"})

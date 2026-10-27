@@ -247,10 +247,30 @@ fn a_later_green_push_writes_a_fix_link_with_its_own_files() {
         "{asked:?}"
     );
 
+    // A structurally incomplete row must not suppress backfill of the same
+    // red attempt; once a complete row is written, the next pass is idempotent.
+    std::fs::write(
+        dir.path().join("fixlinks.jsonl"),
+        json!({
+            "schema": cause::SCHEMA,
+            "source": "fix-link",
+            "repo": "Generous-Corp/pulp",
+            "red_run_id": 100,
+            "red_attempt": 1,
+            "fix_head_sha": "def456",
+            "derivation": "compare_red_head_to_fix_head"
+        })
+        .to_string()
+            + "\n",
+    )
+    .expect("partial fix-link");
+    let recovered = record(&gh, &query(dir.path())).expect("backfill pass");
+    assert_eq!(recovered.fixlinks_written, 1);
+
     // Linked once: the next pass does not link it again.
     let again = record(&gh, &query(dir.path())).expect("pass");
     assert_eq!(again.fixlinks_written, 0);
-    assert_eq!(rows(&dir.path().join("fixlinks.jsonl")).len(), 1);
+    assert_eq!(rows(&dir.path().join("fixlinks.jsonl")).len(), 2);
 }
 
 #[test]
