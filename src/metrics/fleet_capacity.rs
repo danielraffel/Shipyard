@@ -202,6 +202,9 @@ impl FleetCapacitySample {
             if evidence_verdict != "ok" || evidence_pool != "on" {
                 return Err("verified fleet capacity requires ok/on evidence".to_owned());
             }
+            if lanes.iter().any(|lane| !lane.is_object()) {
+                return Err("verified fleet capacity requires object lane entries".to_owned());
+            }
             if evidence_object
                 .get("inventory")
                 .is_some_and(|inventory| inventory.as_str() != Some("tart"))
@@ -473,6 +476,20 @@ mod tests {
         let mut value = sample();
         value.evidence["inventory"] = Value::String("unknown".to_owned());
         value.evidence_sha256 = digest_value(&value.evidence).unwrap();
+        value.sample_id = canonical_digest(&value, true).unwrap();
+        assert!(value.validate().is_err());
+        let mut value = sample();
+        value.evidence["lanes"] = Value::Array(vec![Value::String("garbage".to_owned())]);
+        value.evidence_sha256 = digest_value(&value.evidence).unwrap();
+        value.census_sha256 = digest_value(&Value::Object(
+            [
+                "schema", "host", "repo", "class", "verdict", "pool", "lanes",
+            ]
+            .into_iter()
+            .map(|key| (key.to_owned(), value.evidence[key].clone()))
+            .collect(),
+        ))
+        .unwrap();
         value.sample_id = canonical_digest(&value, true).unwrap();
         assert!(value.validate().is_err());
         let mut value = sample();
