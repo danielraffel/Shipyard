@@ -275,6 +275,12 @@ RECEIPT_DECISION_TITLE = "shipyard-receipt-decision"
 # PATCH, nor the fleet App every agent posts as. Same as src/deferred_tier.rs.
 TIER_RECORD_PREFIX = "shipyard-test-tier/"
 TIER_RECORD_SCHEMA = "shipyard-test-tier/v1"
+# Optional repository-side proof that a durable reviewer claim was consumed.
+# Both the queue-arm guard and the review-verdict workflow call the parser
+# below, so enabling this policy cannot make the two decisions diverge.
+CLAIM_RECEIPT_KEY = "reviewer_claim_receipt"
+CLAIM_APP_KEY = "reviewer_claim_app"
+CLAIM_RECEIPT_SCHEMA = "shipyard-reviewer-claim/v1"
 ACTIONS_APP = "github-actions"
 DEFERRED_TIER = "deferred"
 # The log group the runner prints in "Set up job" listing the token's scopes.
@@ -962,6 +968,17 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
                          f"be a list of reviewer names, not {configured!r}")
     configured_signers = ([name.lower() for name in configured]
                           if configured is not None else None)
+    claim_receipt = section.get(CLAIM_RECEIPT_KEY)
+    claim_app = section.get(CLAIM_APP_KEY)
+    if claim_receipt is None and claim_app is None:
+        claim_receipt = claim_app = None
+    elif not (isinstance(claim_receipt, str) and claim_receipt.strip()):
+        raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {CLAIM_RECEIPT_KEY} "
+                         "must be a non-empty check-run name when claim receipts are enabled")
+    elif not ((isinstance(claim_app, str) and claim_app.strip())
+              or (type(claim_app) is int and claim_app > 0)):
+        raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {CLAIM_APP_KEY} "
+                         "must be a non-empty app slug or positive app id when claim receipts are enabled")
     try:
         excluded, carry_error = carry_paths(section), None
     except GuardError as error:
@@ -994,6 +1011,10 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
         # The repository-side rule (review-verdict status): no host's file,
         # and a default-mode repository with no list admits no App APPROVE.
         "signers_required": from_base_only and from_default and not reviewers,
+        # Optional and default-off: existing stamped reviewer rules remain the
+        # authority until both protected-base fields are present.
+        "claim_receipt": claim_receipt.strip() if isinstance(claim_receipt, str) else None,
+        "claim_app": claim_app.strip() if isinstance(claim_app, str) else claim_app,
     }
 
 
@@ -2103,6 +2124,98 @@ def _check_runs(repo: str, head: str, api_json: Any) -> list[dict[str, Any]]:
     return listed
 
 
+def _claim_receipt_app_matches(run: dict[str, Any], configured: str | int) -> bool:
+    """Match the check-run's immutable GitHub App identity to the base policy."""
+    app = run.get("app")
+    if not isinstance(app, dict):
+        return False
+    if isinstance(configured, int):
+        return app.get("id") == configured
+    return app.get("slug") == configured
+
+
+def parse_claim_receipt(
+    run: dict[str, Any], repo: str, pr: int, head: str,
+    context: str, app: str | int,
+) -> dict[str, Any] | None:
+    """Return a strict, head-bound durable reviewer-claim receipt.
+
+    A receipt is a completed successful check run with the protected context
+    and App identity. Its summary is a closed JSON object; unknown fields,
+    malformed timestamps/epoch, or a mismatched repository/PR/head are all
+    rejected. ``None`` means this run is not the configured receipt, while a
+    malformed matching run raises ``GuardError`` so callers fail closed.
+    """
+    if run.get("name") != context:
+        return None
+    if not _claim_receipt_app_matches(run, app):
+        raise GuardError(f"claim receipt `{context}` was produced by an unexpected GitHub App")
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        raise GuardError(f"claim receipt `{context}` is not a completed success")
+    output = run.get("output")
+    summary = output.get("summary") if isinstance(output, dict) else None
+    if not isinstance(summary, str) or not summary.strip():
+        raise GuardError(f"claim receipt `{context}` has no JSON summary")
+    try:
+        value = json.loads(summary)
+    except json.JSONDecodeError as error:
+        raise GuardError(f"claim receipt `{context}` summary is not JSON") from error
+    if not isinstance(value, dict):
+        raise GuardError(f"claim receipt `{context}` summary is not an object")
+    required = {"schema", "repo", "pr", "head_sha", "epoch", "reviewer",
+                "claimed_at", "deadline_at"}
+    if set(value) != required or value.get("schema") != CLAIM_RECEIPT_SCHEMA:
+        raise GuardError(f"claim receipt `{context}` has an unexpected schema")
+    if value.get("repo") != repo or value.get("pr") != pr:
+        raise GuardError(f"claim receipt `{context}` is bound to another pull request")
+    receipt_head = value.get("head_sha")
+    if not isinstance(receipt_head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", receipt_head):
+        raise GuardError(f"claim receipt `{context}` has an invalid head")
+    if receipt_head.lower() != head.lower():
+        raise GuardError(f"claim receipt `{context}` names another head")
+    if type(value.get("epoch")) is not int or value["epoch"] <= 0:
+        raise GuardError(f"claim receipt `{context}` has an invalid epoch")
+    reviewer = value.get("reviewer")
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        raise GuardError(f"claim receipt `{context}` has no reviewer identity")
+    for key in ("claimed_at", "deadline_at"):
+        parsed = _timestamp(value.get(key))
+        if parsed is None:
+            raise GuardError(f"claim receipt `{context}` has an invalid {key} timestamp")
+    deadline = _timestamp(value["deadline_at"])
+    claimed = _timestamp(value["claimed_at"])
+    now = datetime.now(timezone.utc)
+    if claimed > now:
+        raise GuardError(f"claim receipt `{context}` is future-dated")
+    if deadline <= claimed:
+        raise GuardError(f"claim receipt `{context}` has a non-forward deadline")
+    if deadline <= now:
+        raise GuardError(f"claim receipt `{context}` has expired")
+    return value
+
+
+def reviewer_claim_receipt(
+    repo: str, pr: int, head: str, policy: dict[str, Any], approval: dict[str, Any],
+) -> str | None:
+    """Validate the optional configured claim receipt for a deciding approval."""
+    context = policy.get("claim_receipt")
+    app = policy.get("claim_app")
+    if context is None and app is None:
+        return None
+    if not isinstance(context, str) or not context or app is None:
+        raise GuardError("reviewer claim receipt policy is incomplete")
+    listed = _check_runs(repo, head, run_real_gh)
+    matches = [parse_claim_receipt(run, repo, pr, head, context, app) for run in listed]
+    receipts = [receipt for receipt in matches if receipt is not None]
+    if len(receipts) != 1:
+        raise GuardError(f"expected exactly one valid reviewer claim receipt `{context}` on {head[:12]}")
+    signer = approval.get("signer") if isinstance(approval, dict) else None
+    if isinstance(signer, str) and signer and receipts[0]["reviewer"].lower() != signer.lower():
+        raise GuardError("reviewer claim receipt identity does not match the deciding approval")
+    return (f"reviewer claim epoch {receipts[0]['epoch']} by {receipts[0]['reviewer']} "
+            f"consumed for head {head[:12]}")
+
+
 def _app_slug(run: dict[str, Any]) -> Any:
     return (run.get("app") or {}).get("slug") if isinstance(run.get("app"), dict) else None
 
@@ -2834,6 +2947,17 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
                 "self_approval", own, repo, number, head,
                 f"another agent reviews head {head} and posts "
                 f"`verdict: APPROVE head:{head}` on https://github.com/{repo}/pull/{number}", False)
+        try:
+            receipt_note = reviewer_claim_receipt(
+                repo, number, head, policy,
+                deciding_approval(head, author, comments, reviews, policy),
+            )
+        except GuardError as error:
+            return False, f"{label} ({repo}): reviewer claim receipt refused ({error})", review_fix(
+                "unreviewed", f"the reviewer claim receipt for {label} could not be proved: {error}",
+                repo, number, head, read_pull, True)
+        if receipt_note is not None:
+            why = f"{why}; {receipt_note}"
         _note_same_session(classification, label, repo,
                            same_session_note(head, author, comments, reviews, policy))
         classification["approval"] = deciding_approval(head, author, comments, reviews, policy)

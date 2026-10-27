@@ -4270,3 +4270,56 @@ class ReviewIdentity(unittest.TestCase):
         self.assertEqual(len(rust), 4)
         trusted = source.split("pub const TRUSTED_ASSOCIATIONS", 1)[1].split("];", 1)[0]
         self.assertEqual(tuple(re.findall(r'"([^"]+)"', trusted)), guard.TRUSTED_ASSOCIATIONS)
+
+class ReviewerClaimReceipt(unittest.TestCase):
+    head = "a" * 40
+
+    def run_fixture(self, summary: object, **overrides: object) -> dict[str, object]:
+        value: dict[str, object] = {
+            "name": "reviewer-claim", "status": "completed", "conclusion": "success",
+            "app": {"slug": "shipyard-review", "id": 42},
+            "output": {"summary": json.dumps(summary)},
+        }
+        value.update(overrides)
+        return value
+
+    def receipt(self) -> dict[str, object]:
+        return {
+            "schema": "shipyard-reviewer-claim/v1", "repo": "danielraffel/Shipyard",
+            "pr": 974, "head_sha": self.head, "epoch": 3, "reviewer": "pulp-review",
+            "claimed_at": "2026-10-27T20:00:00Z", "deadline_at": "2099-10-27T21:00:00Z",
+        }
+
+    def test_policy_is_default_off_and_requires_both_fields(self) -> None:
+        self.assertIsNone(guard.review_policy(None, "danielraffel/Shipyard", True)["claim_receipt"])
+        policy = guard.review_policy(
+            "[auto_merge]\nreviewer_claim_receipt = 'reviewer-claim'\n"
+            "reviewer_claim_app = 'shipyard-review'\n", "danielraffel/Shipyard", True)
+        self.assertEqual(policy["claim_receipt"], "reviewer-claim")
+        self.assertEqual(policy["claim_app"], "shipyard-review")
+        with self.assertRaises(guard.GuardError):
+            guard.review_policy("[auto_merge]\nreviewer_claim_receipt = 'reviewer-claim'\n",
+                                "danielraffel/Shipyard", True)
+
+    def test_parser_requires_exact_schema_and_binds_identity(self) -> None:
+        parsed = guard.parse_claim_receipt(self.run_fixture(self.receipt()), "danielraffel/Shipyard", 974,
+                                           self.head, "reviewer-claim", "shipyard-review")
+        self.assertEqual(parsed["epoch"], 3)
+        bad = self.receipt(); bad["head_sha"] = "b" * 40
+        with self.assertRaises(guard.GuardError):
+            guard.parse_claim_receipt(self.run_fixture(bad), "danielraffel/Shipyard", 974, self.head,
+                                      "reviewer-claim", "shipyard-review")
+        bad = self.receipt(); bad["extra"] = True
+        with self.assertRaises(guard.GuardError):
+            guard.parse_claim_receipt(self.run_fixture(bad), "danielraffel/Shipyard", 974, self.head,
+                                      "reviewer-claim", "shipyard-review")
+
+    def test_parser_refuses_wrong_app_or_non_success(self) -> None:
+        with self.assertRaises(guard.GuardError):
+            guard.parse_claim_receipt(self.run_fixture(self.receipt(), app={"slug": "other"}),
+                                      "danielraffel/Shipyard", 974, self.head,
+                                      "reviewer-claim", "shipyard-review")
+        with self.assertRaises(guard.GuardError):
+            guard.parse_claim_receipt(self.run_fixture(self.receipt(), conclusion="failure"),
+                                      "danielraffel/Shipyard", 974, self.head,
+                                      "reviewer-claim", "shipyard-review")
