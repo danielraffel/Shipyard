@@ -104,6 +104,13 @@ pub(super) fn apply_repo_plan(
             &reports,
             &args.opt_out_label,
             args.apply,
+            || {
+                super::native_arm::arming_authority(
+                    mutation_control.expect("apply mode requires mutation control"),
+                    &observation.repo,
+                    &observation.base,
+                )
+            },
         )
     } else {
         (

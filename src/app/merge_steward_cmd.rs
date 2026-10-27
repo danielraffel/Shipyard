@@ -1115,6 +1115,11 @@ pub(super) fn steward_command<W: Write>(
     let mut remaining_preemptions =
         usize::from(!recovery_owned_preemption_budget && ledger.pending_cancellations.is_empty());
     for repo in repos {
+        // Scope the token helper to this exact repository: a scheduled pass
+        // runs from a directory that is not a checkout, and one checkout's
+        // remote must never mint the token for another repository.
+        let scoped_actions = actions.clone().with_repo_override(&repo);
+        let actions = &scoped_actions;
         match observe_repo(actions, &repo, &args.base, args.preempt_capacity) {
             Ok(observation) => {
                 let (mut report, failed, planned_preemptions) = apply_repo_plan(

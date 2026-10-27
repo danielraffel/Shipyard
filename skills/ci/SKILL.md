@@ -346,9 +346,11 @@ Two things not to conclude from it:
 The periodic counterpart for pull requests that slipped through anyway — opened
 by another route, or ejected and left unarmed — is
 `shipyard runner steward --arm-unqueued` (audit-only without `--apply`), with
-`scripts/install_arm_unqueued.sh` to run it on a timer. It acts only on pull
+`scripts/install_arm_unqueued.sh` to run it on a timer (install it only on the
+`[merge_queue].mutation_machine` host; each run is bounded by `/usr/bin/timeout`,
+and `--status` / `--uninstall` inspect or remove it). It acts only on pull
 requests the steward itself declines to own, so it cannot contend with the
-enqueue path. See the shipyard skill's
+enqueue path, and it honours the central HOLD before arming. See the shipyard skill's
 [merge-steward reference](../shipyard/references/merge-steward.md).
 
 ## The unattended carrier: `runner carrier`
