@@ -337,7 +337,7 @@ fn valid_fixlink_evidence(value: &Value) -> bool {
     }
     if let Some(pr) = value.get("pr")
         && !pr.is_null()
-        && !pr.as_u64().is_some_and(|number| number > 0)
+        && pr.as_u64().is_none_or(|number| number == 0)
     {
         return false;
     }
