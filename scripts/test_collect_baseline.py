@@ -374,8 +374,13 @@ class CollectorInvocationTests(unittest.TestCase):
                 "timeout_seconds": 5, "merge_receipts": root / "missing-receipts.jsonl"})()
             args.state.write_text("{}")
             events = MOD.import_organic(args)
-            self.assertEqual(events[-1], {"source": "merge-receipt", "status": "unavailable",
-                                          "reason": "producer handoff not present"})
+            # The unavailable handoff is recorded before the final collection
+            # event.  Assert the semantic event directly so this test remains
+            # stable when collection adds its own completion telemetry.
+            receipt = next(event for event in events if event["source"] == "merge-receipt")
+            self.assertEqual(receipt, {"source": "merge-receipt", "status": "unavailable",
+                                       "reason": "fresh authenticated producer handoff is unavailable"})
+            self.assertEqual(events[-1]["source"], "collection")
 
     def test_collect_deduplicates_unavailable_event_from_newer_supervisor(self):
         with tempfile.TemporaryDirectory() as directory:
