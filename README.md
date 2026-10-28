@@ -19,6 +19,8 @@ parts of CI:
 
 Tart provides the VM runtime; TartCI adds the CI pool around it: managed images,
 capacity leases, ephemeral runner registration, job cleanup, and metrics.
+On a managed fleet, TartCI is the supported pool path; Orchard is retired and
+should be disabled so two schedulers do not claim the same jobs or capacity.
 
 Use Shipyard without TartCI for local, SSH, or hosted checks. Add TartCI when
 those checks need isolated Mac VM capacity. GitHub remains the authority for
