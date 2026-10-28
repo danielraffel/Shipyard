@@ -1009,6 +1009,11 @@ machine-global config or an untracked `.shipyard.local/config.toml`: every
 `.shipyard.local/config.toml`, naming the file, before anything runs. See
 [`docs/pr-watch.md`](../../docs/pr-watch.md).
 
+Green-unarmed screening uses the existing bounded worker pool for its capped
+candidate set and keeps deterministic input order. A slow GitHub read therefore
+cannot serialize the whole watcher pass, while ambiguous or failed reads still
+remain fail-closed.
+
 `shipyard pr-watch rules` is the rules-first watcher: one JSONL event per new
 condition (READY or new head unreviewed, verdict to route, armed or queued
 without an approval of the head, red required check naming its failing tests,
