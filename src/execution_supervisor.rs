@@ -578,7 +578,6 @@ impl ExecutionSupervisor {
 
     fn terminate_cancelled_workers(&mut self) -> Result<(), SupervisorError> {
         let mut queue = Queue::new(&self.state_dir)?;
-        let request_store = QueueRequestStore::new(&self.state_dir)?;
         let jobs = queue.get_all()?;
         let requested = jobs
             .iter()
@@ -591,18 +590,6 @@ impl ExecutionSupervisor {
             {
                 self.acknowledge_cancelled_job(&mut queue, job_id)?;
                 self.cleanup_termination_transaction(&transaction)?;
-            } else if let Some(job) = queue.get(job_id)?
-                && self.can_finalize_stale_foreground_cancellation(&job, &request_store)?
-            {
-                // A foreground owner may have vanished before publishing its
-                // receipt.  Once the cancellation is old enough, exact
-                // foreground provenance is present, and the OS scan proves
-                // that no matching worker process exists, release its claims
-                // and acknowledge the already-requested cancellation.  A
-                // failed or ambiguous scan leaves the job Running so a live
-                // foreground worker can never be raced by the daemon.
-                self.release_host_pool_leases(job_id)?;
-                self.acknowledge_cancelled_job(&mut queue, job_id)?;
             }
         }
 
@@ -621,37 +608,6 @@ impl ExecutionSupervisor {
             }
         }
         Ok(())
-    }
-
-    fn can_finalize_stale_foreground_cancellation(
-        &self,
-        job: &Job,
-        request_store: &QueueRequestStore,
-    ) -> Result<bool, SupervisorError> {
-        if job.status != JobStatus::Running
-            || job.cancel_requested_at.is_none()
-            || !job.is_stale_running(
-                Utc::now(),
-                Duration::seconds(DEFAULT_RUNNING_JOB_STALE_SECONDS),
-            )
-        {
-            return Ok(false);
-        }
-        let foreground = matches!(
-            request_store.load(&job.id),
-            Ok(Some(envelope))
-                if envelope.job_id == job.id && envelope.is_foreground_owned()
-        );
-        if !foreground
-            || self.children.contains_key(&job.id)
-            || self.read_exact_receipt(&job.id)?.is_some()
-        {
-            return Ok(false);
-        }
-        Ok(matches!(
-            foreground_worker_process_liveness(&self.state_dir, &job.id)?,
-            ProcessLiveness::Dead
-        ))
     }
 
     fn terminate_deferred_workers(&mut self) -> Result<(), SupervisorError> {
@@ -1524,46 +1480,6 @@ fn process_liveness(receipt: &WorkerReceipt) -> ProcessLiveness {
         let _ = receipt;
         ProcessLiveness::Unknown
     }
-}
-
-/// Inspect detached workers when a foreground owner disappeared before it
-/// could publish a receipt.  This is deliberately a read-only, fail-closed
-/// probe: a matching command keeps the claim alive, while an OS inspection
-/// error returns `Unknown` and therefore preserves the job.
-#[cfg(unix)]
-fn foreground_worker_process_liveness(
-    state_dir: &Path,
-    job_id: &str,
-) -> io::Result<ProcessLiveness> {
-    let output = Command::new("/bin/ps")
-        .args(["-axo", "pid=,stat=,command="])
-        .output()?;
-    if !output.status.success() {
-        return Ok(ProcessLiveness::Unknown);
-    }
-    let state_arg = format!("--state-dir {}", state_dir.display());
-    let job_arg = format!("--job-id {job_id}");
-    let matching = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-        !line.contains("<defunct>")
-            && line.contains("execution-worker")
-            && line.contains(&state_arg)
-            && line.contains(&job_arg)
-    });
-    Ok(if matching {
-        ProcessLiveness::Alive
-    } else {
-        ProcessLiveness::Dead
-    })
-}
-
-#[cfg(windows)]
-fn foreground_worker_process_liveness(
-    _state_dir: &Path,
-    _job_id: &str,
-) -> io::Result<ProcessLiveness> {
-    // Do not claim to identify a detached foreground worker without a native
-    // process-identity probe. The caller preserves the Running claim.
-    Ok(ProcessLiveness::Unknown)
 }
 
 /// Remove one unchanged receipt only when its exact process generation is
@@ -3401,44 +3317,6 @@ mod tests {
                 .expect("job")
                 .status,
             JobStatus::Running
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stale_cancelled_foreground_without_worker_receipt_releases_claim() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let job = queued_foreground_job(temp.path(), "foreground-cancelled");
-        let mut queue = Queue::new(temp.path()).expect("queue");
-        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
-        let mut running = queue
-            .start_pending_jobs_for_drain(&lock, std::slice::from_ref(&job.id))
-            .expect("start")
-            .remove(0);
-        let stale = Utc::now() - Duration::seconds(DEFAULT_RUNNING_JOB_STALE_SECONDS + 60);
-        running.started_at = Some(stale);
-        running.cancel_requested_at = Some(stale);
-        queue.update(&running).expect("persist cancellation");
-        drop(lock);
-
-        let mut supervisor = ExecutionSupervisor::new(
-            PathBuf::from("/does/not/exist"),
-            RuntimeMode::Isolated,
-            temp.path().into(),
-            temp.path().into(),
-        );
-        supervisor
-            .terminate_cancelled_workers()
-            .expect("reconcile stale foreground cancellation");
-
-        assert_eq!(
-            Queue::new(temp.path())
-                .expect("queue")
-                .get(&job.id)
-                .expect("read")
-                .expect("job")
-                .status,
-            JobStatus::Cancelled
         );
     }
 
