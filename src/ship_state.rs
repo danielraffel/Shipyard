@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::evidence::canonical_repository;
+use crate::record_identity::is_valid_repository_slug;
 
 /// Schema version for durable ship-state files.
 pub const SHIP_STATE_SCHEMA_VERSION: u32 = 1;
@@ -380,14 +381,17 @@ impl ShipStateStore {
         idempotency_key: impl Into<String>,
         now: DateTime<Utc>,
     ) -> Result<WorkItem, Box<dyn std::error::Error>> {
+        validate_work_item_key(&key)?;
         let protocol_version = protocol_version.into();
         let capability_version = capability_version.into();
+        let idempotency_key = idempotency_key.into();
         let path = self.work_item_path(&key);
         let lock = self.lock_work_item(&key)?;
-        if let Some(existing) = Self::get_unlocked_work_item(&path) {
+        if let Some(existing) = Self::get_unlocked_work_item(&path)? {
             if existing.key != key
                 || existing.protocol_version != protocol_version
                 || existing.capability_version != capability_version
+                || existing.idempotency_key != idempotency_key
             {
                 return Err("work item identity or protocol mismatch".into());
             }
@@ -402,7 +406,7 @@ impl ShipStateStore {
             state: "planned".to_owned(),
             protocol_version,
             capability_version,
-            idempotency_key: idempotency_key.into(),
+            idempotency_key,
             owner: None,
             checkpoint: None,
             created_at: now,
@@ -415,8 +419,10 @@ impl ShipStateStore {
 
     /// Read a registered work item without treating lock contention as absence.
     pub fn get_work_item(&self, key: &WorkItemKey) -> io::Result<Option<WorkItem>> {
+        validate_work_item_key(key)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let _lock = self.lock_work_item(key)?;
-        Ok(Self::get_unlocked_work_item(&self.work_item_path(key)))
+        Self::get_unlocked_work_item(&self.work_item_path(key))
     }
 
     /// Claim a registered item, advancing its fencing epoch on every new
@@ -425,13 +431,22 @@ impl ShipStateStore {
         &self,
         key: &WorkItemKey,
         mut owner: WorkItemOwner,
+        expected_state_version: u64,
         now: DateTime<Utc>,
     ) -> Result<WorkItem, Box<dyn std::error::Error>> {
+        validate_work_item_key(key)?;
         let path = self.work_item_path(key);
         let _lock = self.lock_work_item(key)?;
-        let mut item = Self::get_unlocked_work_item(&path).ok_or("work item is not registered")?;
+        let mut item = Self::get_unlocked_work_item(&path)?.ok_or("work item is not registered")?;
         if item.key != *key {
             return Err("work item identity mismatch".into());
+        }
+        validate_work_item_schema(&item)?;
+        if item.state_version != expected_state_version {
+            return Err("work item state version conflict".into());
+        }
+        if owner.capability_version != item.capability_version {
+            return Err("work item owner capability mismatch".into());
         }
         if let Some(current) = &item.owner {
             if current.expires_at > now {
@@ -455,13 +470,26 @@ impl ShipStateStore {
         key: &WorkItemKey,
         epoch: u64,
         checkpoint: WorkItemCheckpoint,
+        expected_state_version: u64,
         now: DateTime<Utc>,
     ) -> Result<WorkItem, Box<dyn std::error::Error>> {
+        validate_work_item_key(key)?;
         let path = self.work_item_path(key);
         let _lock = self.lock_work_item(key)?;
-        let mut item = Self::get_unlocked_work_item(&path).ok_or("work item is not registered")?;
+        let mut item = Self::get_unlocked_work_item(&path)?.ok_or("work item is not registered")?;
         if item.key != *key || item.owner.as_ref().is_none_or(|owner| owner.epoch != epoch) {
             return Err("stale or missing work-item owner epoch".into());
+        }
+        validate_work_item_schema(&item)?;
+        if item.state_version != expected_state_version {
+            return Err("work item state version conflict".into());
+        }
+        if item
+            .owner
+            .as_ref()
+            .is_some_and(|owner| now >= owner.expires_at)
+        {
+            return Err("work item owner lease has expired".into());
         }
         if checkpoint.generation != item.generation {
             return Err("checkpoint generation is stale".into());
@@ -967,9 +995,16 @@ impl ShipStateStore {
         crate::durable_file::replace_json(path, item, true)
     }
 
-    fn get_unlocked_work_item(path: &Path) -> Option<WorkItem> {
-        let contents = fs::read_to_string(path).ok()?;
-        serde_json::from_str(&contents).ok()
+    fn get_unlocked_work_item(path: &Path) -> io::Result<Option<WorkItem>> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let item = serde_json::from_str(&contents)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        validate_work_item_schema(&item)?;
+        Ok(Some(item))
     }
 
     fn legacy_is_preserved(&self, legacy: &ShipState) -> bool {
@@ -1266,6 +1301,31 @@ pub fn compute_policy_signature(
     hasher.update(mode.as_bytes());
     let digest = hasher.finalize();
     hex::encode(&digest[..8])
+}
+
+fn validate_work_item_key(key: &WorkItemKey) -> Result<(), &'static str> {
+    if !is_valid_repository_slug(&key.repository)
+        || key.repository != canonical_repository(&key.repository)
+    {
+        return Err("work item repository must be a canonical owner/repository slug");
+    }
+    for value in [&key.base, &key.work_kind, &key.external_id] {
+        if value.is_empty() || value.chars().any(char::is_control) || value.trim() != value {
+            return Err("work item key fields must be non-empty and whitespace-free");
+        }
+    }
+    Ok(())
+}
+
+fn validate_work_item_schema(item: &WorkItem) -> io::Result<()> {
+    if item.schema_version != WORK_ITEM_SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported work-item schema {}", item.schema_version),
+        ));
+    }
+    validate_work_item_key(&item.key)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn default_attempt() -> u32 {
@@ -2070,6 +2130,124 @@ mod tests {
     }
 
     #[test]
+    fn work_item_registration_rejects_idempotency_drift_and_preserves_corruption() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-idem".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem-a", now)
+            .expect("register");
+        assert!(
+            store
+                .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem-b", now)
+                .is_err()
+        );
+        let path = store.work_item_path(&key);
+        fs::write(&path, b"{not-json").expect("corrupt record");
+        assert!(
+            store
+                .register_work_item(key, "work-item/v1", "fleet/v1", "idem-a", now)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(path).expect("record remains"),
+            "{not-json"
+        );
+    }
+
+    #[test]
+    fn work_item_claim_requires_matching_capability_and_cas_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "review".to_owned(),
+            external_id: "task-cap".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let owner = WorkItemOwner {
+            host: "m3".to_owned(),
+            session: "session".to_owned(),
+            epoch: 0,
+            expires_at: now + chrono::Duration::minutes(5),
+            capability_version: "fleet/old".to_owned(),
+        };
+        assert!(store.claim_work_item(&key, owner.clone(), 1, now).is_err());
+        assert!(
+            store
+                .claim_work_item(
+                    &key,
+                    WorkItemOwner {
+                        capability_version: "fleet/v1".to_owned(),
+                        ..owner
+                    },
+                    2,
+                    now
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expired_owner_cannot_checkpoint_until_reclaimed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-expiry".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let claimed = store
+            .claim_work_item(
+                &key,
+                WorkItemOwner {
+                    host: "m3".to_owned(),
+                    session: "session".to_owned(),
+                    epoch: 0,
+                    expires_at: now + chrono::Duration::seconds(1),
+                    capability_version: "fleet/v1".to_owned(),
+                },
+                1,
+                now,
+            )
+            .expect("claim");
+        let checkpoint = WorkItemCheckpoint {
+            generation: claimed.generation,
+            head_or_input_digest: "sha256:input".to_owned(),
+            completed_steps: vec!["registered".to_owned()],
+            next_action: "continue".to_owned(),
+            blockers: vec![],
+            remote_receipt: None,
+        };
+        assert!(
+            store
+                .checkpoint_work_item(
+                    &key,
+                    claimed.owner.expect("owner").epoch,
+                    checkpoint,
+                    claimed.state_version,
+                    now + chrono::Duration::seconds(2),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn work_item_checkpoint_rejects_stale_owner_after_reclaim() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
@@ -2093,6 +2271,7 @@ mod tests {
                     expires_at: now,
                     capability_version: "fleet/v1".to_owned(),
                 },
+                1,
                 now,
             )
             .expect("first claim");
@@ -2107,6 +2286,7 @@ mod tests {
                     expires_at: now + chrono::Duration::minutes(5),
                     capability_version: "fleet/v1".to_owned(),
                 },
+                2,
                 now + chrono::Duration::seconds(1),
             )
             .expect("reclaim after expiry");
@@ -2122,12 +2302,12 @@ mod tests {
         };
         assert!(
             store
-                .checkpoint_work_item(&key, first_epoch, checkpoint.clone(), now)
+                .checkpoint_work_item(&key, first_epoch, checkpoint.clone(), 2, now)
                 .is_err()
         );
         assert!(
             store
-                .checkpoint_work_item(&key, second_epoch, checkpoint, now)
+                .checkpoint_work_item(&key, second_epoch, checkpoint, 3, now)
                 .is_ok()
         );
     }

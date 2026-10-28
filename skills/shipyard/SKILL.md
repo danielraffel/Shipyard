@@ -18,6 +18,12 @@ Shipyard records intent and ownership only. Autonomous cross-host takeover is
 not enabled until real concurrent-reconciler and lost-acknowledgment tests
 prove idempotent, authorized recovery.
 
+The store rejects corrupt or unsupported records rather than treating them as
+absent. Claims and checkpoints use expected state versions, verify the worker
+capability, compare idempotency keys on replay, and reject checkpoints after
+lease expiry. These are local safety guards; authenticated cross-host identity
+and takeover still require a separate reviewed boundary and failure canary.
+
 Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
 commit-to-pull-requests API, but zero or multiple matches remain unknown.

@@ -26,6 +26,13 @@ and fencing primitive, not autonomous takeover: cross-host reconciliation and
 privileged recovery remain default-off until shared fencing and failure
 injection evidence land.
 
+Work-item reads fail closed on corrupt or unsupported records. Registration
+compares the idempotency key, claims and checkpoints require an expected
+`state_version` and matching capability, and an expired owner cannot checkpoint
+until a fenced reclaim occurs. These checks protect intent from silent
+replacement and lost acknowledgements; they still do not authenticate a host
+or session by themselves.
+
 **Phase B** (transition tests, see below) and **Phase C** (pre-merge
 doc-sync hook, dedicated CI lane) land in follow-up PRs.
 

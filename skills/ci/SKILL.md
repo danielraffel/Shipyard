@@ -15,7 +15,9 @@ version, and stale owners are rejected on checkpoint. A host-loss recovery
 must rediscover the item from shared ShipState and obtain a new fenced claim;
 local files or conversation history are not recovery state. This contract is
 observation-only until the cross-host failure canary proves concurrent
-reconcilers cannot duplicate privileged effects.
+reconcilers cannot duplicate privileged effects. Work-item records fail closed
+on corruption or schema drift; idempotency keys, capability versions, lease
+expiry, and expected state versions are checked before checkpoint or claim.
 
 ## Required-check producer identity
 
