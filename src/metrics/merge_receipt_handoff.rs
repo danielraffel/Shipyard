@@ -277,20 +277,43 @@ impl AuthenticatedHandoffEnvelope {
     }
 }
 
+/// Serialize the receipt vector in the cross-repository canonical form.
+///
+/// The bytes are compact UTF-8 JSON with no trailing newline. `MergeReceipt`
+/// fields are emitted in declaration order, timestamps use UTC RFC3339 with
+/// Chrono's necessary fractional precision, and receipt IDs must already be
+/// strictly ascending. Producers in other languages must reproduce these
+/// bytes exactly; the golden vector in this module is the interoperability
+/// fixture.
+pub fn canonical_payload_bytes(
+    receipts: &[super::merge_receipt::MergeReceipt],
+) -> Result<Vec<u8>, HandoffError> {
+    let mut previous: Option<&str> = None;
+    for receipt in receipts {
+        receipt
+            .validate()
+            .map_err(|_| HandoffError::Invalid("receipt"))?;
+        if previous.is_some_and(|id| id >= receipt.receipt_id.as_str()) {
+            return Err(HandoffError::NonCanonical("receipts"));
+        }
+        previous = Some(&receipt.receipt_id);
+    }
+    serde_json::to_vec(receipts).map_err(|_| HandoffError::Serialization)
+}
+
 /// Compute the domain-separated digest that an envelope must carry for its
-/// canonical receipt vector. Receipt ordering is checked by `validate`; this
-/// function preserves the exact bytes that will later be imported.
+/// canonical receipt vector.
 pub fn digest_receipts(
     receipts: &[super::merge_receipt::MergeReceipt],
 ) -> Result<Sha256Digest, HandoffError> {
-    let bytes = serde_json::to_vec(receipts).map_err(|_| HandoffError::Serialization)?;
+    let bytes = canonical_payload_bytes(receipts)?;
     Ok(domain_digest(PAYLOAD_DIGEST_DOMAIN, &bytes))
 }
 
 pub(crate) fn digest_receipt(
     receipt: &super::merge_receipt::MergeReceipt,
 ) -> Result<Sha256Digest, HandoffError> {
-    let bytes = serde_json::to_vec(receipt).map_err(|_| HandoffError::Serialization)?;
+    let bytes = canonical_payload_bytes(std::slice::from_ref(receipt))?;
     Ok(domain_digest(PAYLOAD_DIGEST_DOMAIN, &bytes))
 }
 
@@ -541,6 +564,23 @@ mod tests {
         assert_eq!(
             mixed_case.validate(),
             Err(HandoffError::Invalid("repository"))
+        );
+    }
+
+    #[test]
+    fn canonical_payload_golden_vector_preserves_fractional_timestamp() {
+        let mut golden = receipt("golden-1", "owner/repo");
+        golden.pr = 7;
+        golden.merged_at = "2026-10-28T01:02:03.123456789Z".parse().unwrap();
+        golden.required_checks = vec!["linux".to_owned(), "macos".to_owned()];
+        golden.evidence = "sha256:golden".to_owned();
+        let bytes = canonical_payload_bytes(std::slice::from_ref(&golden)).unwrap();
+        let expected = r#"[{"schema":"shipyard-merge-receipt/v1","receipt_id":"golden-1","repo":"owner/repo","project":"repo","base_branch":"main","pr":7,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","validated_head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","merge_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","merged_at":"2026-10-28T01:02:03.123456789Z","safe_merge":true,"source":"shipyard","required_checks":["linux","macos"],"gate_receipt_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","evidence":"sha256:golden"}]"#;
+        assert_eq!(bytes.len(), 544);
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), expected);
+        assert_eq!(
+            digest_receipts(&[golden]).unwrap().as_str(),
+            "803522944ceb0338f1d79cfd6029af08b03b484b608bc084d08560f986d7de77"
         );
     }
 }
