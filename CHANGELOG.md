@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03710"></a>
+## [0.371.0] - 2026-10-28
+
+- feat/repo aware landing coordinator 20261026 ([#962](https://github.com/danielraffel/Shipyard/pull/962))
+- feat/risk tier report only ([#955](https://github.com/danielraffel/Shipyard/pull/955))
+
 <a id="v03700"></a>
 ## [0.370.0] - 2026-10-28
 
@@ -2691,6 +2697,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.371.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.371.0
 [0.370.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.370.0
 [0.369.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.369.1
 [0.369.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.369.0
