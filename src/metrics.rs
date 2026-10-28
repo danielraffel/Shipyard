@@ -6,6 +6,7 @@ pub mod github_import;
 pub mod import_schedule;
 pub mod job_name;
 pub mod merge_receipt;
+pub mod merge_receipt_handoff;
 pub mod project_key;
 pub mod proxy;
 mod proxy_store;
@@ -84,6 +85,24 @@ struct ExistingMergeReceipt {
     required_checks_json: String,
     gate_receipt_sha256: String,
     evidence: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // The durable handoff row is consumed by the staged authenticated importer surface.
+struct ExistingMergeReceiptHandoff {
+    schema: String,
+    repo: String,
+    project: String,
+    base_branch: String,
+    payload_sha256: String,
+    producer_host_id: String,
+    producer_session_generation: i64,
+    route: String,
+    destination: String,
+    known_hosts_sha256: String,
+    executable_sha256: String,
+    issued_at: String,
+    expires_at: String,
 }
 
 /// Input for a low-friction `shipyard metrics record` call.
@@ -847,6 +866,31 @@ impl MetricsStore {
             );
             CREATE INDEX IF NOT EXISTS merge_receipts_project_merged
               ON merge_receipts(project, merged_at);
+            CREATE TABLE IF NOT EXISTS merge_receipt_handoffs (
+              envelope_id TEXT PRIMARY KEY,
+              schema TEXT NOT NULL,
+              repo TEXT NOT NULL,
+              project TEXT NOT NULL,
+              base_branch TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              producer_host_id TEXT NOT NULL,
+              producer_session_generation INTEGER NOT NULL,
+              route TEXT NOT NULL,
+              destination TEXT NOT NULL,
+              known_hosts_sha256 TEXT NOT NULL,
+              executable_sha256 TEXT NOT NULL,
+              issued_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              imported_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS merge_receipt_handoff_receipts (
+              envelope_id TEXT NOT NULL REFERENCES merge_receipt_handoffs(envelope_id),
+              receipt_id TEXT NOT NULL,
+              receipt_sha256 TEXT NOT NULL,
+              PRIMARY KEY(envelope_id, receipt_id)
+            );
+            CREATE INDEX IF NOT EXISTS merge_receipt_handoff_receipts_receipt
+              ON merge_receipt_handoff_receipts(receipt_id);
             CREATE TABLE IF NOT EXISTS fleet_capacity_samples (
               sample_id TEXT PRIMARY KEY,
               schema TEXT NOT NULL,
@@ -936,6 +980,70 @@ impl MetricsStore {
 
     /// Import validated merge receipts atomically. Duplicate receipt IDs are
     /// idempotent only when the payload is byte-for-byte equivalent.
+    fn insert_merge_receipt_tx(
+        tx: &rusqlite::Transaction<'_>,
+        receipt: &crate::metrics::merge_receipt::MergeReceipt,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        receipt
+            .validate()
+            .map_err(|e| format!("invalid merge receipt: {e}"))?;
+        // Repository and project are durable ownership keys. Normalize them
+        // before both conflict checks and storage so case/outer whitespace
+        // cannot create a second identity for one PR.
+        let repo = crate::evidence::canonical_repository(&receipt.repo);
+        let project_input = crate::evidence::canonical_repository(&receipt.project);
+        let (project, _) =
+            crate::metrics::project_key::normalize_for_write(&project_input, Some(&repo));
+        let existing: Option<ExistingMergeReceipt> = tx.query_row(
+            "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
+            [&receipt.receipt_id],
+            |row| Ok(ExistingMergeReceipt {
+                schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?, pr: row.get(4)?,
+                head_sha: row.get(5)?, validated_head_sha: row.get(6)?, merge_commit_sha: row.get(7)?, merged_at: row.get(8)?,
+                source: row.get(9)?, required_checks_json: row.get(10)?, gate_receipt_sha256: row.get(11)?, evidence: row.get(12)?,
+            }),
+        ).optional()?;
+        if let Some(existing) = existing {
+            let incoming = ExistingMergeReceipt {
+                schema: receipt.schema.clone(),
+                repo: repo.clone(),
+                project: project.clone(),
+                base_branch: receipt.base_branch.clone(),
+                pr: receipt.pr,
+                head_sha: receipt.head_sha.clone(),
+                validated_head_sha: receipt.validated_head_sha.clone(),
+                merge_commit_sha: receipt.merge_commit_sha.clone(),
+                merged_at: receipt.merged_at.to_rfc3339(),
+                source: receipt.source.clone(),
+                required_checks_json: serde_json::to_string(&receipt.required_checks)?,
+                gate_receipt_sha256: receipt.gate_receipt_sha256.clone(),
+                evidence: receipt.evidence.clone(),
+            };
+            if existing != incoming {
+                return Err(format!(
+                    "merge receipt {} conflicts with existing payload",
+                    receipt.receipt_id
+                )
+                .into());
+            }
+            return Ok(false);
+        }
+        let semantic_conflict: Option<String> = tx.query_row(
+            "SELECT receipt_id FROM merge_receipts WHERE lower(trim(repo)) = ?1 AND pr = ?2 AND receipt_id <> ?3 AND (lower(trim(project)) <> ?4 OR base_branch <> ?5 OR head_sha <> ?6 OR merge_commit_sha <> ?7)",
+            rusqlite::params![repo, receipt.pr, receipt.receipt_id, project, receipt.base_branch, receipt.head_sha, receipt.merge_commit_sha],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(other) = semantic_conflict {
+            return Err(format!(
+                "merge receipt {} conflicts with semantic receipt {other}",
+                receipt.receipt_id
+            )
+            .into());
+        }
+        tx.execute("INSERT INTO merge_receipts (receipt_id,schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,?15)", rusqlite::params![receipt.receipt_id, receipt.schema, repo, project, receipt.base_branch, receipt.pr, receipt.head_sha, receipt.validated_head_sha, receipt.merge_commit_sha, receipt.merged_at.to_rfc3339(), receipt.source, serde_json::to_string(&receipt.required_checks)?, receipt.gate_receipt_sha256, receipt.evidence, Utc::now().to_rfc3339()])?;
+        Ok(true)
+    }
+
     pub fn import_merge_receipts(
         &self,
         receipts: &[crate::metrics::merge_receipt::MergeReceipt],
@@ -945,64 +1053,136 @@ impl MetricsStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut imported = 0;
         for receipt in receipts {
-            receipt
-                .validate()
-                .map_err(|e| format!("invalid merge receipt: {e}"))?;
-            // Repository and project are durable ownership keys. Normalize
-            // them before both conflict checks and storage so case/outer
-            // whitespace cannot create a second identity for one PR.
-            let repo = crate::evidence::canonical_repository(&receipt.repo);
-            let project_input = crate::evidence::canonical_repository(&receipt.project);
-            let (project, _) =
-                crate::metrics::project_key::normalize_for_write(&project_input, Some(&repo));
-            let existing: Option<ExistingMergeReceipt> = tx.query_row(
-                "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
-                [&receipt.receipt_id],
-                |row| Ok(ExistingMergeReceipt {
-                    schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?, pr: row.get(4)?,
-                    head_sha: row.get(5)?, validated_head_sha: row.get(6)?, merge_commit_sha: row.get(7)?, merged_at: row.get(8)?,
-                    source: row.get(9)?, required_checks_json: row.get(10)?, gate_receipt_sha256: row.get(11)?, evidence: row.get(12)?,
+            imported += usize::from(Self::insert_merge_receipt_tx(&tx, receipt)?);
+        }
+        tx.commit()?;
+        Ok(imported)
+    }
+
+    /// Import one authenticated handoff atomically with its provenance links.
+    /// Legacy v1 imports remain valid but do not acquire provenance merely by
+    /// being present in `merge_receipts`.
+    #[allow(dead_code)] // Transport/CLI wiring lands separately; keep this atomic persistence API ready.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn import_authenticated_merge_receipt_handoff(
+        &self,
+        envelope: &crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope,
+        context: &crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        use crate::metrics::merge_receipt_handoff::{HandoffError, digest_receipt};
+
+        // Validate all envelope-level invariants and the trusted transport
+        // fence before taking the writer lease or opening a write transaction.
+        envelope
+            .validate()
+            .map_err(|error| format!("invalid authenticated handoff: {error}"))?;
+        // A fresh envelope must pass the full trusted-fence check before any
+        // write. An exact envelope already persisted may be replayed after its
+        // expiry so periodic exports remain idempotent; the durable identity
+        // comparison below is the only freshness exception.
+        let verification_error = envelope
+            .verify(context, &BTreeSet::new(), &BTreeMap::new())
+            .err();
+        let stale_replay = matches!(verification_error.as_ref(), Some(HandoffError::Stale));
+        if let Some(error) = verification_error
+            && !stale_replay
+        {
+            return Err(format!("authenticated handoff verification failed: {error}").into());
+        }
+
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let mut conn = self.connect()?;
+        let existing: Option<ExistingMergeReceiptHandoff> = conn
+            .query_row(
+                "SELECT schema,repo,project,base_branch,payload_sha256,producer_host_id,producer_session_generation,route,destination,known_hosts_sha256,executable_sha256,issued_at,expires_at FROM merge_receipt_handoffs WHERE envelope_id=?1",
+                [&envelope.envelope_id],
+                |row| Ok(ExistingMergeReceiptHandoff {
+                    schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?,
+                    payload_sha256: row.get(4)?, producer_host_id: row.get(5)?, producer_session_generation: row.get(6)?,
+                    route: row.get(7)?, destination: row.get(8)?, known_hosts_sha256: row.get(9)?, executable_sha256: row.get(10)?,
+                    issued_at: row.get(11)?, expires_at: row.get(12)?,
                 }),
-            ).optional()?;
-            if let Some(existing) = existing {
-                let incoming = ExistingMergeReceipt {
-                    schema: receipt.schema.clone(),
-                    repo: repo.clone(),
-                    project: project.clone(),
-                    base_branch: receipt.base_branch.clone(),
-                    pr: receipt.pr,
-                    head_sha: receipt.head_sha.clone(),
-                    validated_head_sha: receipt.validated_head_sha.clone(),
-                    merge_commit_sha: receipt.merge_commit_sha.clone(),
-                    merged_at: receipt.merged_at.to_rfc3339(),
-                    source: receipt.source.clone(),
-                    required_checks_json: serde_json::to_string(&receipt.required_checks)?,
-                    gate_receipt_sha256: receipt.gate_receipt_sha256.clone(),
-                    evidence: receipt.evidence.clone(),
-                };
-                if existing != incoming {
-                    return Err(format!(
-                        "merge receipt {} conflicts with existing payload",
-                        receipt.receipt_id
-                    )
-                    .into());
-                }
-                continue;
-            }
-            let semantic_conflict: Option<String> = tx.query_row(
-                "SELECT receipt_id FROM merge_receipts WHERE lower(trim(repo)) = ?1 AND pr = ?2 AND receipt_id <> ?3 AND (lower(trim(project)) <> ?4 OR base_branch <> ?5 OR head_sha <> ?6 OR merge_commit_sha <> ?7)",
-                rusqlite::params![repo, receipt.pr, receipt.receipt_id, project, receipt.base_branch, receipt.head_sha, receipt.merge_commit_sha],
+            )
+            .optional()?;
+        let route = serde_json::to_string(&envelope.route)?;
+        let incoming = ExistingMergeReceiptHandoff {
+            schema: envelope.schema.clone(),
+            repo: envelope.repository.clone(),
+            project: envelope.project.clone(),
+            base_branch: envelope.base_branch.clone(),
+            payload_sha256: envelope.payload_sha256.as_str().to_owned(),
+            producer_host_id: envelope.producer_host_id.clone(),
+            producer_session_generation: i64::try_from(envelope.producer_session_generation)
+                .map_err(|_| HandoffError::Invalid("session generation"))?,
+            route: route.clone(),
+            destination: envelope.destination.clone(),
+            known_hosts_sha256: envelope.known_hosts_sha256.as_str().to_owned(),
+            executable_sha256: envelope.executable_sha256.as_str().to_owned(),
+            issued_at: envelope.issued_at.to_rfc3339(),
+            expires_at: envelope.expires_at.to_rfc3339(),
+        };
+        let had_existing = existing.is_some();
+        if let Some(existing) = existing.as_ref()
+            && existing != &incoming
+        {
+            return Err(format!(
+                "authenticated handoff {} conflicts with existing envelope",
+                envelope.envelope_id
+            )
+            .into());
+        }
+        if stale_replay && existing.as_ref() != Some(&incoming) {
+            return Err(format!(
+                "authenticated handoff verification failed: {}",
+                HandoffError::Stale
+            )
+            .into());
+        }
+
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !had_existing {
+            tx.execute(
+                "INSERT INTO merge_receipt_handoffs (envelope_id,schema,repo,project,base_branch,payload_sha256,producer_host_id,producer_session_generation,route,destination,known_hosts_sha256,executable_sha256,issued_at,expires_at,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![
+                    envelope.envelope_id,
+                    envelope.schema,
+                    envelope.repository,
+                    envelope.project,
+                    envelope.base_branch,
+                    envelope.payload_sha256.as_str(),
+                    envelope.producer_host_id,
+                    incoming.producer_session_generation,
+                    route,
+                    envelope.destination,
+                    envelope.known_hosts_sha256.as_str(),
+                    envelope.executable_sha256.as_str(),
+                    envelope.issued_at.to_rfc3339(),
+                    envelope.expires_at.to_rfc3339(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+        let mut imported = 0;
+        for receipt in &envelope.receipts {
+            imported += usize::from(Self::insert_merge_receipt_tx(&tx, receipt)?);
+            let receipt_sha256 = digest_receipt(receipt)
+                .map_err(|error| format!("authenticated receipt digest failed: {error}"))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO merge_receipt_handoff_receipts (envelope_id,receipt_id,receipt_sha256) VALUES (?1,?2,?3)",
+                params![envelope.envelope_id, receipt.receipt_id, receipt_sha256.as_str()],
+            )?;
+            let stored: String = tx.query_row(
+                "SELECT receipt_sha256 FROM merge_receipt_handoff_receipts WHERE envelope_id=?1 AND receipt_id=?2",
+                params![envelope.envelope_id, receipt.receipt_id],
                 |row| row.get(0),
-            ).optional()?;
-            if let Some(other) = semantic_conflict {
+            )?;
+            if stored != receipt_sha256.as_str() {
                 return Err(format!(
-                    "merge receipt {} conflicts with semantic receipt {other}",
-                    receipt.receipt_id
+                    "authenticated handoff {} conflicts with receipt provenance",
+                    envelope.envelope_id
                 )
                 .into());
             }
-            tx.execute("INSERT INTO merge_receipts (receipt_id,schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,?15)", rusqlite::params![receipt.receipt_id, receipt.schema, repo, project, receipt.base_branch, receipt.pr, receipt.head_sha, receipt.validated_head_sha, receipt.merge_commit_sha, receipt.merged_at.to_rfc3339(), receipt.source, serde_json::to_string(&receipt.required_checks)?, receipt.gate_receipt_sha256, receipt.evidence, Utc::now().to_rfc3339()])?;
-            imported += 1;
         }
         tx.commit()?;
         Ok(imported)
@@ -1076,12 +1256,46 @@ impl MetricsStore {
         project: &str,
         cutoff: &str,
     ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
+        self.safe_merge_summary_filtered(project, cutoff, false)
+    }
+
+    /// Count only safe merges joined to an authenticated handoff envelope.
+    /// Legacy v1 rows remain queryable through `safe_merge_summary` but are
+    /// excluded from this opt-in denominator until provenance is attached.
+    #[allow(dead_code)] // Callers opt into authenticated denominators when transport wiring is enabled.
+    pub(crate) fn authenticated_safe_merge_summary(
+        &self,
+        project: &str,
+        cutoff: &str,
+    ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
+        self.safe_merge_summary_filtered(project, cutoff, true)
+    }
+
+    fn safe_merge_summary_filtered(
+        &self,
+        project: &str,
+        cutoff: &str,
+        authenticated_only: bool,
+    ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
         let key = crate::metrics::project_key::ProjectKey::parse(project);
         let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
         let project_filter = crate::metrics::project_key::sql_filter("project", "repo");
         let safe: Vec<(String, String, i64)> = {
-            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4)"))?;
+            let auth_filter = if authenticated_only {
+                " AND EXISTS (
+                    SELECT 1
+                    FROM merge_receipt_handoff_receipts hhr
+                    JOIN merge_receipt_handoffs h ON h.envelope_id = hhr.envelope_id
+                    WHERE hhr.receipt_id = merge_receipts.receipt_id
+                      AND lower(trim(h.repo)) = lower(trim(merge_receipts.repo))
+                      AND h.project = merge_receipts.project
+                      AND h.base_branch = merge_receipts.base_branch
+                )"
+            } else {
+                ""
+            };
+            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4){auth_filter}"))?;
             q.query_map(rusqlite::params![any, short, full, cutoff], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
@@ -4026,6 +4240,179 @@ mod tests {
         let mut changed = first;
         changed.evidence = "sha256:changed".into();
         assert!(store.import_merge_receipts(&[changed]).is_err());
+    }
+
+    #[test]
+    fn authenticated_handoff_persists_fence_and_is_replay_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let repository = "owner/repo";
+        let receipts = vec![
+            test_receipt("auth-1", repository, "repo", 1, 'a'),
+            test_receipt("auth-2", repository, "repo", 2, 'b'),
+        ];
+        let envelope = crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
+            schema: crate::metrics::merge_receipt_handoff::SCHEMA.to_owned(),
+            envelope_id: "auth-envelope-1".to_owned(),
+            repository: repository.to_owned(),
+            project: "repo".to_owned(),
+            base_branch: "main".to_owned(),
+            payload_sha256: crate::metrics::merge_receipt_handoff::digest_receipts(&receipts)
+                .unwrap(),
+            receipts,
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            issued_at: "2026-10-28T00:00:00Z".parse().unwrap(),
+            expires_at: "2026-10-28T00:10:00Z".parse().unwrap(),
+        };
+        let context = crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
+            repository: repository.to_owned(),
+            project: "repo".to_owned(),
+            base_branch: "main".to_owned(),
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            now: "2026-10-28T00:05:00Z".parse().unwrap(),
+            max_age: Duration::minutes(15),
+            max_future_skew: Duration::minutes(2),
+        };
+        assert_eq!(
+            store
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
+                .unwrap(),
+            0
+        );
+        let mut expired_context = context.clone();
+        expired_context.now = "2026-10-28T01:00:00Z".parse().unwrap();
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &expired_context)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            2
+        );
+        let conn = store.connect().unwrap();
+        let counts: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM merge_receipt_handoffs), (SELECT count(*) FROM merge_receipt_handoff_receipts), (SELECT count(*) FROM merge_receipts)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 2, 2));
+        conn.execute(
+            "UPDATE merge_receipt_handoffs SET project='other' WHERE envelope_id='auth-envelope-1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            0
+        );
+        conn.execute(
+            "UPDATE merge_receipt_handoffs SET project='repo' WHERE envelope_id='auth-envelope-1'",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn authenticated_handoff_attaches_to_legacy_rows_and_rejects_conflicts_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let repository = "owner/repo";
+        let receipt = test_receipt("auth-legacy", repository, "repo", 1, 'a');
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .unwrap();
+        let envelope = crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
+            schema: crate::metrics::merge_receipt_handoff::SCHEMA.to_owned(),
+            envelope_id: "auth-envelope-legacy".to_owned(),
+            repository: repository.to_owned(),
+            project: "repo".to_owned(),
+            base_branch: "main".to_owned(),
+            payload_sha256: crate::metrics::merge_receipt_handoff::digest_receipts(
+                std::slice::from_ref(&receipt),
+            )
+            .unwrap(),
+            receipts: vec![receipt.clone()],
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            issued_at: "2026-10-28T00:00:00Z".parse().unwrap(),
+            expires_at: "2026-10-28T00:10:00Z".parse().unwrap(),
+        };
+        let context = crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
+            repository: repository.to_owned(),
+            project: "repo".to_owned(),
+            base_branch: "main".to_owned(),
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            now: "2026-10-28T00:05:00Z".parse().unwrap(),
+            max_age: Duration::minutes(15),
+            max_future_skew: Duration::minutes(2),
+        };
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
+                .unwrap(),
+            0
+        );
+        let mut conflicting = envelope.clone();
+        conflicting.envelope_id = "auth-envelope-conflict".to_owned();
+        conflicting.receipts[0].evidence = "sha256:changed".to_owned();
+        conflicting.payload_sha256 =
+            crate::metrics::merge_receipt_handoff::digest_receipts(&conflicting.receipts).unwrap();
+        assert!(
+            store
+                .import_authenticated_merge_receipt_handoff(&conflicting, &context)
+                .is_err()
+        );
+        let conn = store.connect().unwrap();
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM merge_receipt_handoffs), (SELECT count(*) FROM merge_receipt_handoff_receipts)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1));
     }
 
     #[test]
