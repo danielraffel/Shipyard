@@ -576,12 +576,13 @@ associations remain `NULL`. Only an authenticated `production` or `synthetic` la
 provenance-qualified scorecard populations; unknown rows remain visible in the
 `scorecard.provenance` counts and are excluded from promotion decisions.
 
-The current GitHub importer does not assign authenticated `production` or
-`synthetic` provenance, so imported GitHub rows normally remain `unknown` and
-`qualified_jobs` is expected to be zero. That is an honest unavailable
-measurement, not evidence that no production jobs exist. A future producer
-must attach verified provenance at the producer boundary; the importer does
-not infer it from event names, repository, workflow, or runner identity.
+GitHub imports made through Shipyard's machine-global GitHub App command helper
+are now marked `production` only when the helper returns the verified
+`github-app-installation` token kind and is bound to the exact `--repo` target.
+Ambient `gh` auth, arbitrary token helpers, and fixture callers remain
+`unknown`. This keeps the promotion denominator tied to the authenticated
+producer boundary; the importer still does not infer provenance from event
+names, repository, workflow, or runner identity.
 
 The agent-facing queries are `summary`, `scorecard`, `slowest`, `watch`,
 `advise`, and `compare`. `scorecard` returns one bounded project-level view of

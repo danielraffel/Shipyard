@@ -15,11 +15,14 @@ use crate::app::cli::{
 };
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::config::LoadedConfig;
+use crate::gh::{GhAuthPolicy, GhAuthSourceSummary, GhAuthSummary, GhClient, GhSupervision};
 use crate::identity::RuntimeMode;
 use crate::metrics::freshness::{
     DEFAULT_STALE_AFTER_HOURS, Freshness, FreshnessStatus, parse_stale_after,
 };
-use crate::metrics::github_import::{self, GithubImportReport, GithubImportRequest};
+use crate::metrics::github_import::{
+    self, GithubImportProvenance, GithubImportReport, GithubImportRequest,
+};
 #[cfg(test)]
 use crate::metrics::github_import::{
     github_jobs_api_path, github_runs_api_path, workflow_run_single_pr,
@@ -317,7 +320,7 @@ pub(super) fn metrics_command<W: Write>(
                 })?;
             }
             MetricsImportCommand::Github(args) => {
-                let report = import_github(&store, &args)?;
+                let report = import_github(&store, &args, config_cwd)?;
                 let output = MetricsImportOutput {
                     database: store.path().display().to_string(),
                     source: "github".to_owned(),
@@ -685,6 +688,7 @@ fn import_fleet_capacity(
 fn import_github(
     store: &MetricsStore,
     args: &MetricsImportGithubArgs,
+    config_cwd: Option<(RuntimeMode, &Path)>,
 ) -> Result<GithubImportReport, CliFailure> {
     let request = GithubImportRequest {
         repo: args.repo.clone(),
@@ -693,14 +697,69 @@ fn import_github(
         branch: args.branch.clone(),
         limit: args.limit,
     };
-    let mut gh = |argv: &[String]| gh_json(argv);
-    github_import::import_github_report(store, &request, &mut gh, &|message| {
-        CliFailure::new(1, message)
-    })
+    let Some((mode, cwd)) = config_cwd else {
+        let mut gh = |argv: &[String]| gh_json(argv);
+        return github_import::import_github_report(store, &request, &mut gh, &|message| {
+            CliFailure::new(1, message)
+        });
+    };
+
+    // Metrics observation must use the same machine-global GitHub auth as the
+    // rest of Shipyard. Bind token-command helpers to this exact repository,
+    // pin one helper result for the whole import, and qualify rows only when
+    // the helper identifies a GitHub App installation token. Ambient `gh`
+    // auth remains useful for observation but cannot enter promotion strata.
+    let mut client = GhClient::from_cwd(mode, cwd)
+        .map_err(|error| CliFailure::new(1, format!("GitHub auth config failed: {error}")))?
+        .with_repo_override(&request.repo)
+        .map_err(|error| {
+            CliFailure::new(1, format!("GitHub repository binding failed: {error}"))
+        })?;
+    let auth = client
+        .pin_command_auth(cwd)
+        .map_err(|error| CliFailure::new(1, format!("GitHub auth resolution failed: {error}")))?;
+    let provenance = github_import_provenance(&auth);
+    let mut gh = |argv: &[String]| gh_json_with_client(&client, cwd, argv);
+    github_import::import_github_report_with_provenance(
+        store,
+        &request,
+        &mut gh,
+        &|message| CliFailure::new(1, message),
+        provenance,
+    )
+}
+
+fn github_import_provenance(auth: &GhAuthSummary) -> GithubImportProvenance {
+    if matches!(auth.source, GhAuthSourceSummary::Command)
+        && auth.token_kind.as_deref() == Some("github-app-installation")
+    {
+        GithubImportProvenance::Production
+    } else {
+        GithubImportProvenance::Unknown
+    }
 }
 
 fn gh_json(args: &[String]) -> Result<Value, CliFailure> {
     gh_json_with_timeout("gh", args, GITHUB_METRICS_OBSERVATION_TIMEOUT)
+}
+
+fn gh_json_with_client(
+    client: &GhClient,
+    cwd: &Path,
+    args: &[String],
+) -> Result<Value, CliFailure> {
+    let mut command = client
+        .prepare_command(
+            cwd,
+            None,
+            GhSupervision::Unsupervised,
+            GhAuthPolicy::Default,
+        )
+        .map_err(|error| {
+            CliFailure::new(1, format!("GitHub command preparation failed: {error}"))
+        })?;
+    command.args(args);
+    gh_json_command(command, GITHUB_METRICS_OBSERVATION_TIMEOUT)
 }
 
 fn gh_json_with_timeout(
@@ -714,6 +773,14 @@ fn gh_json_with_timeout(
     // complete process tree under one fixed deadline.
     let mut command = Command::new(program.as_ref());
     command.args(args);
+    gh_json_command(command, timeout)
+}
+
+fn gh_json_command(mut command: Command, timeout: Duration) -> Result<Value, CliFailure> {
+    // Metrics import is observational and must never strand the invoking
+    // agent behind an unbounded gh subprocess. Capture to regular files so an
+    // escaped descendant cannot keep a pipe reader blocked, and supervise the
+    // complete process tree under one fixed deadline.
     let deadline = Instant::now() + timeout;
     let output =
         crate::process::run_output_until(&mut command, deadline, "metrics GitHub observation")
@@ -1018,6 +1085,37 @@ mod tests {
         MetricsFreshnessArgs {
             stale_after: None,
             fail_on_stale: false,
+        }
+    }
+
+    #[test]
+    fn github_import_provenance_requires_the_app_helper_kind() {
+        let app = GhAuthSummary {
+            source: GhAuthSourceSummary::Command,
+            token_kind: Some("github-app-installation".to_owned()),
+            expires_at: None,
+        };
+        assert_eq!(
+            github_import_provenance(&app),
+            GithubImportProvenance::Production
+        );
+
+        for summary in [
+            GhAuthSummary {
+                source: GhAuthSourceSummary::Command,
+                token_kind: Some("personal-access-token".to_owned()),
+                expires_at: None,
+            },
+            GhAuthSummary {
+                source: GhAuthSourceSummary::GhCli,
+                token_kind: None,
+                expires_at: None,
+            },
+        ] {
+            assert_eq!(
+                github_import_provenance(&summary),
+                GithubImportProvenance::Unknown
+            );
         }
     }
 

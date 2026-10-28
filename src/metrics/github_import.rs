@@ -35,6 +35,20 @@ pub struct GithubImportReport {
     pub skipped_runs: usize,
 }
 
+/// Provenance attached by the caller that owns the provider authentication
+/// boundary. The importer deliberately defaults to [`Unknown`]; event shape,
+/// repository name, and runner labels are not evidence of production data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GithubImportProvenance {
+    /// The provider call was not made through an authenticated production
+    /// boundary, so scorecard promotion must exclude the rows.
+    #[default]
+    Unknown,
+    /// The provider call used a verified GitHub App installation token scoped
+    /// to the exact repository being imported.
+    Production,
+}
+
 impl GithubImportRequest {
     /// The project key rows are stored under.
     #[must_use]
@@ -113,6 +127,26 @@ pub fn import_github_report<E>(
     request: &GithubImportRequest,
     gh: &mut dyn FnMut(&[String]) -> Result<Value, E>,
     store_error: &dyn Fn(String) -> E,
+) -> Result<GithubImportReport, E> {
+    import_github_report_with_provenance(
+        store,
+        request,
+        gh,
+        store_error,
+        GithubImportProvenance::Unknown,
+    )
+}
+
+/// Import GitHub jobs with provenance supplied by the authenticated provider
+/// boundary. This is separate from [`import_github_report`] so fixture and
+/// offline callers cannot accidentally become promotion-qualified.
+#[allow(clippy::too_many_lines)]
+pub fn import_github_report_with_provenance<E>(
+    store: &MetricsStore,
+    request: &GithubImportRequest,
+    gh: &mut dyn FnMut(&[String]) -> Result<Value, E>,
+    store_error: &dyn Fn(String) -> E,
+    provenance: GithubImportProvenance,
 ) -> Result<GithubImportReport, E> {
     let mut run_args = vec![
         "api".to_owned(),
@@ -247,7 +281,7 @@ pub fn import_github_report<E>(
                 if job.completed_at.is_none() {
                     continue;
                 }
-                let input = github_job_to_record_with_run(
+                let mut input = github_job_to_record_with_run(
                     &request.repo,
                     request.workflow.as_deref(),
                     &project,
@@ -255,6 +289,10 @@ pub fn import_github_report<E>(
                     &job,
                     &metadata,
                 );
+                if provenance == GithubImportProvenance::Production {
+                    input.provenance = Some("production".to_owned());
+                    input.provenance_verified = true;
+                }
                 pending_inputs.push(input);
             }
             observed = observed.saturating_add(job_values.len() as u64);
@@ -361,6 +399,50 @@ mod tests {
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
         assert_eq!(identity.4, None);
+    }
+
+    #[test]
+    fn production_provenance_is_only_attached_when_caller_supplies_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let request = GithubImportRequest {
+            repo: "Generous-Corp/pulp".to_owned(),
+            project: None,
+            workflow: Some("build.yml".to_owned()),
+            branch: None,
+            limit: 5,
+        };
+        let mut gh = |argv: &[String]| -> Result<Value, String> {
+            if argv[3].ends_with("/runs") {
+                Ok(json!({"workflow_runs": [{"id": 7, "event": "pull_request",
+                    "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "head_branch": "feature/test", "pull_requests": [{"number": 9}]}]}))
+            } else {
+                Ok(
+                    json!({"jobs": [{"id": 1, "name": "macos", "conclusion": "success",
+                    "started_at": "2026-09-30T10:00:00Z",
+                    "completed_at": "2026-09-30T10:10:00Z"}]}),
+                )
+            }
+        };
+        import_github_report_with_provenance(
+            &store,
+            &request,
+            &mut gh,
+            &|error| error,
+            GithubImportProvenance::Production,
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(store.path()).unwrap();
+        let provenance: (Option<String>, bool) = conn
+            .query_row(
+                "SELECT provenance, provenance_verified FROM runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(provenance.0.as_deref(), Some("production"));
+        assert!(provenance.1);
     }
 
     #[test]
