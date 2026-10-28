@@ -3517,6 +3517,187 @@ mod tests {
         assert!(current.cancellation_proof.is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn receiptless_merge_cancellation_with_related_process_stays_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "related-process", "exact-head");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut request = store
+            .load("related-process")
+            .expect("load")
+            .expect("request");
+        request.execution_owner = QueuedExecutionOwner::Foreground;
+        store.save(&request).expect("foreground request");
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, &["related-process".to_owned()])
+            .expect("start");
+        drop(lock);
+        let proof = CancellationProof {
+            cause: CancellationCause::AlreadyMerged,
+            repository: "owner/repo".to_owned(),
+            pull_request: 438,
+            head_sha: "exact-head".to_owned(),
+        };
+        let mut running = queue
+            .request_cancel_with_proof(
+                "related-process",
+                Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                Some(proof),
+            )
+            .expect("cancel request")
+            .expect("running");
+        running.started_at = Some(Utc::now() - Duration::minutes(4));
+        queue.update(&running).expect("stale running");
+
+        // A process with this job's checkout as cwd is enough to keep the
+        // negative inventory from proving that the worker tree is gone.
+        let mut related = Command::new("/bin/sleep")
+            .arg("30")
+            .current_dir(temp.path())
+            .spawn()
+            .expect("related process");
+        let supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor
+            .reconcile_receiptless_merged_cancellations()
+            .expect("reconciliation");
+        let current = Queue::new(temp.path())
+            .expect("queue")
+            .get("related-process")
+            .expect("read")
+            .expect("job");
+        assert_eq!(current.status, JobStatus::Running);
+        related.kill().expect("kill related process");
+        related.wait().expect("reap related process");
+    }
+
+    #[test]
+    fn receiptless_merge_cancellation_with_mismatched_proof_stays_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "wrong-proof", "exact-head");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut request = store.load("wrong-proof").expect("load").expect("request");
+        request.execution_owner = QueuedExecutionOwner::Foreground;
+        store.save(&request).expect("foreground request");
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, &["wrong-proof".to_owned()])
+            .expect("start");
+        drop(lock);
+        let proof = CancellationProof {
+            cause: CancellationCause::AlreadyMerged,
+            repository: "owner/repo".to_owned(),
+            pull_request: 438,
+            head_sha: "different-head".to_owned(),
+        };
+        let mut running = queue
+            .request_cancel_with_proof(
+                "wrong-proof",
+                Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                Some(proof),
+            )
+            .expect("cancel request")
+            .expect("running");
+        running.started_at = Some(Utc::now() - Duration::minutes(4));
+        queue.update(&running).expect("stale running");
+
+        let supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor
+            .reconcile_receiptless_merged_cancellations()
+            .expect("reconciliation");
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get("wrong-proof")
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Running
+        );
+    }
+
+    #[test]
+    fn receiptless_merge_cancellation_with_worker_receipt_stays_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        queued_ship_job(temp.path(), "present-receipt", "exact-head");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        let mut request = store
+            .load("present-receipt")
+            .expect("load")
+            .expect("request");
+        request.execution_owner = QueuedExecutionOwner::Foreground;
+        store.save(&request).expect("foreground request");
+
+        let mut queue = Queue::new(temp.path()).expect("queue");
+        let lock = queue.acquire_drain_lock().expect("lock").expect("owned");
+        queue
+            .start_pending_jobs_for_drain(&lock, &["present-receipt".to_owned()])
+            .expect("start");
+        drop(lock);
+        let proof = CancellationProof {
+            cause: CancellationCause::AlreadyMerged,
+            repository: "owner/repo".to_owned(),
+            pull_request: 438,
+            head_sha: "exact-head".to_owned(),
+        };
+        let mut running = queue
+            .request_cancel_with_proof(
+                "present-receipt",
+                Some(crate::queue::ALREADY_MERGED_CANCEL_REASON.to_owned()),
+                Some(proof),
+            )
+            .expect("cancel request")
+            .expect("running");
+        running.started_at = Some(Utc::now() - Duration::minutes(4));
+        queue.update(&running).expect("stale running");
+        fs::create_dir_all(temp.path().join("queue-workers")).expect("worker dir");
+        write_json_atomic(
+            &temp.path().join("queue-workers/present-receipt.json"),
+            &WorkerReceipt {
+                job_id: "present-receipt".to_owned(),
+                generation: "unresolved-generation".to_owned(),
+                pid: std::process::id(),
+                started_at: Utc::now(),
+                boot_id: None,
+            },
+        )
+        .expect("worker receipt");
+
+        let supervisor = ExecutionSupervisor::new(
+            PathBuf::from("/does/not/exist"),
+            RuntimeMode::Isolated,
+            temp.path().into(),
+            temp.path().into(),
+        );
+        supervisor
+            .reconcile_receiptless_merged_cancellations()
+            .expect("reconciliation");
+        assert_eq!(
+            Queue::new(temp.path())
+                .expect("queue")
+                .get("present-receipt")
+                .expect("read")
+                .expect("job")
+                .status,
+            JobStatus::Running
+        );
+    }
+
     #[test]
     fn stale_running_without_worker_becomes_uncertain_and_durable() {
         let temp = tempfile::tempdir().expect("tempdir");
