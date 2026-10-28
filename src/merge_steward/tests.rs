@@ -75,6 +75,55 @@ fn explicit_management_requires_label_and_current_head_receipt() {
 }
 
 #[test]
+fn app_bound_skipped_check_accepts_only_matching_success_status() {
+    let required = RequiredCheck {
+        context: "Vellum trusted freeze".to_owned(),
+        app_id: Some(15368),
+    };
+    let skipped = StewardCheck {
+        name: required.context.clone(),
+        source: StewardCheckSource::CheckRun,
+        app_id: Some(15368),
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SKIPPED".to_owned()),
+        run_id: Some(42),
+        observed_at: Some("2026-10-28T00:00:00Z".to_owned()),
+    };
+    let success = StewardCheck {
+        name: required.context.clone(),
+        source: StewardCheckSource::StatusContext,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SUCCESS".to_owned()),
+        run_id: Some(42),
+        observed_at: Some("2026-10-28T00:00:01Z".to_owned()),
+    };
+    assert_eq!(
+        selected_required_check(&[skipped.clone(), success], &required)
+            .unwrap()
+            .source,
+        StewardCheckSource::StatusContext
+    );
+
+    let wrong_run = skipped;
+    let wrong_status = StewardCheck {
+        name: required.context.clone(),
+        source: StewardCheckSource::StatusContext,
+        app_id: None,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SUCCESS".to_owned()),
+        run_id: Some(43),
+        observed_at: Some("2026-10-28T00:00:01Z".to_owned()),
+    };
+    assert_eq!(
+        selected_required_check(&[wrong_run, wrong_status], &required)
+            .unwrap()
+            .source,
+        StewardCheckSource::CheckRun
+    );
+}
+
+#[test]
 fn fleet_management_uses_author_and_branch_quadrants() {
     let mut policy = queue_policy();
     policy.managed_label = Some("shipyard:managed".to_owned());
