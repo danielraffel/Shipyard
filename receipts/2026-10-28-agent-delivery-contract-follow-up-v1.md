@@ -77,6 +77,43 @@ reassigned.
 
 **Disposition:** `ACTIVE — contract reconciled; ownership and authorization preserved; durable authenticated persistence validated; PR #998 is parked at the review gate pending an allowed exact-head review and completion of its current validation run.`
 
+## Superseding exact-head reconciliation — 2026-10-28T16:35:00Z
+
+- The delivery contract remains authoritative at branch tip
+  `1b4df0f470d5dcce2a56d125bd0ff6068b02dc6a`, document blob
+  `e5e9b8fa791a543867276949626532844307e78b`, and requires GitHub review,
+  required checks, and native queue state to remain the landing authority.
+- The current Shipyard `main` head is still
+  `d7dfff57de91929bd7176593caf166ad8799792d`. The source worktree is clean at
+  branch `codex/metrics-auth-envelope-schema-20261028`, exact head
+  `d17125aca2cc0c66e40c8e0947fcac0cfe3186f7`, and the branch has not been
+  reassigned or force-pushed.
+- PR #998 is open at that exact head, based on the current `main`, and remains
+  `MERGEABLE`/`UNSTABLE`. Its resolver, Linux, macOS ARM64, Windows, sandbox,
+  coverage, version/skill-sync, risk-tier, and advisory cause checks succeeded
+  in run `40724196095`. The Python helper check failed at
+  `test_collect_allows_missing_merge_receipt_handoff`; that assertion belongs
+  to the separately owned #996 repair and is not duplicated here. The
+  `review-verdict` status context remains failed closed because #998 has no
+  counted allowed exact-head review, even though the workflow check itself
+  completed successfully.
+- PR #996 remains open at exact head
+  `c470ba62ff27124344c5e59aa4a18dade5138c1a`, with its required checks green,
+  but it also has no counted allowed review. It remains the owner of the
+  Python helper assertion; #998 must not absorb or duplicate that fix.
+- No approval, reviewer verdict, steward handoff, arm, enqueue, merge, or merge
+  API call was made. The branch remains parked at the review gate. The
+  authenticated importer/transport slice remains a separate follow-up until
+  the adversarial review preconditions and a fresh exact-head review are
+  satisfied.
+
+**Next safe action:** submit the unchanged branch through
+`shipyard pr --no-arm --no-steward-handoff` for a fresh bounded validation
+receipt, then leave #998 parked for an allowed reviewer. After #996 is reviewed
+and lands, refresh #998 against the new `main`, rerun all required checks, and
+obtain a fresh exact-head review before any queue action by the authorized
+team-lead.
+
 ## Live refresh — 2026-10-28T15:57:58Z
 
 - The contract branch is still at exact tip
