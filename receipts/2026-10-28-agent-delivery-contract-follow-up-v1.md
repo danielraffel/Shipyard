@@ -114,6 +114,25 @@ and lands, refresh #998 against the new `main`, rerun all required checks, and
 obtain a fresh exact-head review before any queue action by the authorized
 team-lead.
 
+## Current-head validation result — 2026-10-28T16:53:24Z
+
+- The new validation run `40728162675` completed against exact PR head
+  `4621e3dc8d90e368037dc0b347e9272c31ab5a5d`. Linux, macOS ARM64, Windows,
+  sandbox, coverage, resolver, version/skill-sync, and advisory cause checks
+  passed. The only failing lane was `Python helper tests [github-hosted]`,
+  reproducing `CollectorInvocationTests.test_collect_allows_missing_merge_receipt_handoff`;
+  this remains the separately owned #996 repair.
+- PR #998 remains open, `MERGEABLE`/`UNSTABLE`, with no counted allowed
+  exact-head review. The `review-verdict` status context is still failed
+  closed; no queue admission or landing authorization exists.
+- This run is complete evidence for `4621e3dc` only. Any later branch change,
+  including this receipt update, invalidates it and requires a fresh exact-head
+  validation before the review gate can be reconsidered.
+
+**Disposition:** `HOLD/PARK — current code and all non-Python required lanes are
+green, but #996's helper failure and the absence of an allowed exact-head review
+keep #998 ineligible for review approval or queue admission.`
+
 ## Live refresh — 2026-10-28T15:57:58Z
 
 - The contract branch is still at exact tip
