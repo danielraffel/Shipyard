@@ -290,6 +290,15 @@ It does not alter routing or queue behavior. The per-safely-merged-change
 denominator is unavailable until a durable merge receipt joins the PR head;
 distinct PRs are not a safe-merge proxy.
 
+The optional authenticated handoff schema is
+`shipyard-merge-receipt-handoff-auth/v1`. Its importer must verify the
+canonical payload digest and the authenticated producer fence (repository,
+project, base branch, session generation, route, destination, known-host and
+executable digests, freshness, and replay) before an atomic/idempotent write.
+Legacy v1 receipts stay readable but are excluded from
+`authenticated_safe_merge_summary`; this telemetry boundary grants no queue or
+merge authority.
+
 ## `inspect --profile`: what checks apply to comes from the repo
 
 `shipyard inspect --profile` reads what a project builds with, pins, runs on

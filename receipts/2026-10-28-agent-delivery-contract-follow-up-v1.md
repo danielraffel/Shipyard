@@ -2,7 +2,8 @@
 
 - **Observed:** 2026-10-28T14:38:35Z
 - **Contract:** https://github.com/danielraffel/pulp-planning/blob/codex/live-drain-refresh-20261028/2026-10-28-agent-delivery-contract.md
-- **Contract branch tip:** `2b1cb7be3c0ee828dce886122ba67eacf63687ed`
+- **Contract branch tip at reconciliation:** `8e87f86cdc23c3aec65c41479446ea036fbc0c49`
+- **Contract document blob:** `e5e9b8fa791a543867276949626532844307e78b`
 - **Shipyard main:** `d7dfff57de91929bd7176593caf166ad8799792d`
 - **Worktree:** `/Users/danielraffel/Code/Shipyard-metrics-auth-envelope-20261028`
 - **Branch:** `codex/metrics-auth-envelope-schema-20261028`
@@ -30,16 +31,16 @@ reassigned.
   unarmed/unqueued.
 - Shipyard #997 (https://github.com/danielraffel/Shipyard/pull/997) is open at
   exact head `e59e1fd53529f441758bbb072eb0de42df36ade5`, based on the same main
-  head. Its Python helper check failed on the assertion owned by #996; its other
-  checks succeeded. It has no counted review and remains unarmed/unqueued.
+  head. Its Python helper check is now green. It has no counted review and
+  remains unarmed/unqueued.
 - Shipyard review-verdict refused both heads because no allowed exact-head review
   exists. No approval, arm, enqueue, merge, or merge API call was made.
 - Merged dependency: #950 at `cdb17438` supplies the existing v1 handoff health
   sidecar and freshness contract. Open follow-ups #989 (`6222b149`), #994
   (`6f84359c`), #996 (`c470ba62`), and #997 (`e59e1fd`) remain separate and are
-  not treated as prerequisites for this telemetry slice; #989/#994 lack a counted
-  exact-head review, #996 owns the baseline assertion repair, and #997 has the
-  related Python helper failure.
+  not treated as prerequisites for this telemetry slice; #989/#994/#996/#997 lack
+  a counted exact-head review, #996 owns the baseline assertion repair, and #997
+  now has green checks.
 
 ## Work and follow-up
 
