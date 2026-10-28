@@ -860,6 +860,17 @@ def stamped_agent(body: Any) -> str | None:
     return (found[-1][2] or None) if found else None
 
 
+def stamped_identity(body: Any) -> str | None:
+    """The provider-neutral ``host agent:id`` identity in a ghapp stamp."""
+    if not isinstance(body, str):
+        return None
+    found = _SESSION_STAMP.findall(body)
+    if not found or not found[-1][2]:
+        return None
+    host, _session, agent = found[-1]
+    return f"{host} agent:{agent}".lower()
+
+
 def writer_identity() -> dict[str, str]:
     """``session`` (and ``agent`` when set) for every row a guard writes, so a
     row says which process wrote it."""
@@ -962,6 +973,19 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
                          f"be a list of reviewer names, not {configured!r}")
     configured_signers = ([name.lower() for name in configured]
                           if configured is not None else None)
+    identity_map = section.get("reviewer_signer_identities")
+    if identity_map is not None:
+        if not isinstance(identity_map, dict) or any(
+                not isinstance(name, str) or not isinstance(values, list)
+                or not values or not all(isinstance(value, str) and value.strip() for value in values)
+                for name, values in identity_map.items()):
+            raise GuardError("the base's .shipyard/config.toml [auto_merge] "
+                             "reviewer_signer_identities must map reviewer names to non-empty "
+                             "lists of host agent identities")
+        identity_map = {
+            name.lower(): [value.strip().lower() for value in values]
+            for name, values in identity_map.items()
+        }
     try:
         excluded, carry_error = carry_paths(section), None
     except GuardError as error:
@@ -984,6 +1008,7 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
         # reviewer_signers); None when the host has no signers file.
         "signers": (configured_signers if configured_signers is not None or from_base_only
                     else reviewer_signers(repo)),
+        "signer_identities": identity_map or {},
         # The `session:` lines this host accepts on an App APPROVE (see
         # reviewer_sessions); None when the host lists none. Host-local only, so
         # the repository-side rule never reads it.
@@ -1002,6 +1027,7 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
 SIGNERS_FILE = "reviewer-signers.json"
 # `1`: signers only from the base config (the server-side status pins it).
 SIGNERS_FROM_BASE_ENV = "SHIPYARD_SIGNERS_FROM_BASE"
+SIGNER_IDENTITIES_KEY = "reviewer_signer_identities"
 _SIGNER_LINE = re.compile(r"^[ \t]*reviewer:[ \t]*([A-Za-z0-9._-]+)[ \t]*$", re.MULTILINE)
 
 
@@ -1183,8 +1209,22 @@ def app_approval_refusal(body: Any, policy: dict[str, Any]) -> str | None:
     signed = [name.lower() for name in _SIGNER_LINE.findall(text)]
     if not signed:
         return "it has no `reviewer: <name>` line"
-    if not any(name in signers for name in signed):
+    matching = [name for name in signed if name in signers]
+    if not matching:
         return f"its signer {signed[-1]} is not one of {', '.join(signers) or 'nobody'}"
+    identities = policy.get("signer_identities") or {}
+    if identities:
+        stamp_identity = stamped_identity(text)
+        if stamp_identity is None:
+            return "its ghapp stamp has no reviewer agent identity"
+        bound = next((name for name in matching
+                      if name in identities and stamp_identity in identities[name]), None)
+        if bound is None:
+            name = matching[-1]
+            if name not in identities:
+                return f"its signer {name} has no base identity binding"
+            return (f"its signer {name} is not bound to stamped identity "
+                    f"{stamp_identity}")
     return None
 
 
