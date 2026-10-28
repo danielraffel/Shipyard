@@ -4,7 +4,10 @@
 //! lifecycle policy. Callers must prove their own typed authority before using
 //! these primitives.
 
+#[cfg(unix)]
+use std::fs;
 use std::io;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 #[cfg(unix)]
 use std::thread;
@@ -26,6 +29,72 @@ pub(crate) enum ProcessLiveness {
     Alive,
     Dead,
     Unknown,
+}
+
+/// Inventory worker processes associated with an exact job and checkout.
+///
+/// A missing receipt is not by itself proof that a worker tree is gone. This
+/// bounded negative inventory is the final fence used before releasing a
+/// receiptless cancellation whose external effect is already authenticated.
+#[cfg(unix)]
+pub(crate) fn related_process_inventory(job_id: &str, cwd: &Path) -> io::Result<Vec<String>> {
+    let mut related = Vec::new();
+    let ps = Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()?;
+    if !ps.status.success() {
+        return Err(io::Error::other("process inventory ps failed"));
+    }
+    for line in String::from_utf8_lossy(&ps.stdout).lines() {
+        if line.contains("execution-worker") && line.contains(job_id) {
+            related.push(line.trim().to_owned());
+        }
+    }
+    let lsof_path = ["/usr/sbin/lsof", "/usr/bin/lsof"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "lsof executable not found"))?;
+    let lsof = Command::new(lsof_path)
+        .args(["-a", "-d", "cwd", "-Fn"])
+        .output()?;
+    if !lsof.status.success() {
+        return Err(io::Error::other("process cwd inventory lsof failed"));
+    }
+    let canonical = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    if !canonical.is_absolute() {
+        return Err(io::Error::other("durable worker cwd is not absolute"));
+    }
+    let canonical_text = canonical.to_string_lossy();
+    let current_pid = std::process::id().to_string();
+    let mut pid = None::<String>;
+    for line in String::from_utf8_lossy(&lsof.stdout).lines() {
+        if let Some(value) = line.strip_prefix('p') {
+            pid = Some(value.to_owned());
+        } else if let Some(value) = line.strip_prefix('n') {
+            let path = Path::new(value);
+            let deleted_or_descendant =
+                value
+                    .strip_prefix(canonical_text.as_ref())
+                    .is_some_and(|suffix| {
+                        suffix.is_empty() || suffix.starts_with('/') || suffix.starts_with(' ')
+                    });
+            if (path == canonical || path.starts_with(&canonical) || deleted_or_descendant)
+                && pid.as_deref() != Some(current_pid.as_str())
+            {
+                related.push(format!("pid={} cwd={value}", pid.as_deref().unwrap_or("?")));
+            }
+        }
+    }
+    related.sort();
+    related.dedup();
+    Ok(related)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn related_process_inventory(_job_id: &str, _cwd: &Path) -> io::Result<Vec<String>> {
+    Err(io::Error::other(
+        "receiptless orphan process inventory is unsupported on this platform",
+    ))
 }
 
 /// Capture the platform start identity for an exact live process.
