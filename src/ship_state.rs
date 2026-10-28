@@ -72,6 +72,87 @@ pub struct AbandonRecord {
     pub abandoned_at: DateTime<Utc>,
 }
 
+/// Stable identity for work initiated by an external agent.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub struct WorkItemKey {
+    /// Canonical owner/repository slug.
+    pub repository: String,
+    /// Protected base branch.
+    pub base: String,
+    /// Work category, such as repair or review.
+    pub work_kind: String,
+    /// Stable PR, release, or task identifier.
+    pub external_id: String,
+}
+
+/// Fenced owner of a work item. Expiry is a reconciliation signal only;
+/// takeover must advance `epoch` while holding the work-item lock.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkItemOwner {
+    /// Host currently holding the claim.
+    pub host: String,
+    /// Independent agent session identifier.
+    pub session: String,
+    /// Fencing epoch for this claim.
+    pub epoch: u64,
+    /// Lease expiry; expiry alone never authorizes takeover.
+    pub expires_at: DateTime<Utc>,
+    /// Capability contract used by the worker.
+    pub capability_version: String,
+}
+
+/// Context another agent needs to continue without the original filesystem.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkItemCheckpoint {
+    /// Work-item generation this checkpoint describes.
+    pub generation: u64,
+    /// Exact source head or input digest.
+    pub head_or_input_digest: String,
+    /// Steps completed durably.
+    pub completed_steps: Vec<String>,
+    /// Next action for a replacement worker.
+    pub next_action: String,
+    /// Known blockers and dependencies.
+    pub blockers: Vec<String>,
+    /// Remote commit or artifact receipt, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_receipt: Option<String>,
+}
+
+/// Minimal durable work record stored beside existing ShipState files.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkItem {
+    /// Work-item schema revision.
+    pub schema_version: u32,
+    /// Stable work identity.
+    pub key: WorkItemKey,
+    /// Generation invalidating stale checkpoints and claims.
+    pub generation: u64,
+    /// CAS version for serialized updates.
+    pub state_version: u64,
+    /// Lifecycle state.
+    pub state: String,
+    /// Protocol revision required by the worker.
+    pub protocol_version: String,
+    /// Fleet capability revision required by the worker.
+    pub capability_version: String,
+    /// Idempotency key for external effects.
+    pub idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Current fenced owner, if claimed.
+    pub owner: Option<WorkItemOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Last durable continuation context.
+    pub checkpoint: Option<WorkItemCheckpoint>,
+    /// Creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Last durable update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Schema revision for work-item records.
+pub const WORK_ITEM_SCHEMA_VERSION: u32 = 1;
+
 /// Durable state for a single in-flight PR ship.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ShipState {
@@ -286,6 +367,64 @@ impl ShipStateStore {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Register an external-agent work item idempotently in the same durable
+    /// state root used by ships. This is observation/intent state only; it
+    /// does not authorize a GitHub mutation.
+    pub fn register_work_item(
+        &self,
+        key: WorkItemKey,
+        protocol_version: impl Into<String>,
+        capability_version: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        now: DateTime<Utc>,
+    ) -> Result<WorkItem, Box<dyn std::error::Error>> {
+        let protocol_version = protocol_version.into();
+        let capability_version = capability_version.into();
+        let path = self.work_item_path(&key);
+        let lock = self.lock_work_item(&key)?;
+        if let Some(existing) = Self::get_unlocked_work_item(&path) {
+            if existing.key != key
+                || existing.protocol_version != protocol_version
+                || existing.capability_version != capability_version
+            {
+                return Err("work item identity or protocol mismatch".into());
+            }
+            drop(lock);
+            return Ok(existing);
+        }
+        let item = WorkItem {
+            schema_version: WORK_ITEM_SCHEMA_VERSION,
+            key,
+            generation: 1,
+            state_version: 1,
+            state: "planned".to_owned(),
+            protocol_version,
+            capability_version,
+            idempotency_key: idempotency_key.into(),
+            owner: None,
+            checkpoint: None,
+            created_at: now,
+            updated_at: now,
+        };
+        Self::persist_work_item_at(&item, &path)?;
+        drop(lock);
+        Ok(item)
+    }
+
+    /// Read a registered work item without treating lock contention as absence.
+    pub fn get_work_item(&self, key: &WorkItemKey) -> io::Result<Option<WorkItem>> {
+        let _lock = self.lock_work_item(key)?;
+        Ok(Self::get_unlocked_work_item(&self.work_item_path(key)))
+    }
+
+    fn work_item_path(&self, key: &WorkItemKey) -> PathBuf {
+        self.path.join("work-items").join(format!("{}.json", work_item_digest(key)))
+    }
+
+    fn lock_work_item(&self, key: &WorkItemKey) -> io::Result<ShipStatePrLock> {
+        ShipStatePrLock::acquire(self.path.join("work-items").join(format!("{}.lock", work_item_digest(key))))
     }
 
     /// Return the active state path for a PR.
@@ -762,6 +901,16 @@ impl ShipStateStore {
         crate::durable_file::replace_json(path, state, true)
     }
 
+    fn persist_work_item_at(item: &WorkItem, path: &Path) -> io::Result<()> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
+        crate::durable_file::replace_json(path, item, true)
+    }
+
+    fn get_unlocked_work_item(path: &Path) -> Option<WorkItem> {
+        let contents = fs::read_to_string(path).ok()?;
+        serde_json::from_str(&contents).ok()
+    }
+
     fn legacy_is_preserved(&self, legacy: &ShipState) -> bool {
         if self.collision_marker_path(legacy.pr).exists() {
             return true;
@@ -1011,6 +1160,11 @@ pub(crate) fn repository_key(repository: &str) -> String {
     format!("{readable}--{}", hex::encode(digest))
 }
 
+fn work_item_digest(key: &WorkItemKey) -> String {
+    let bytes = serde_json::to_vec(key).expect("work-item key must serialize");
+    hex::encode(Sha256::digest(bytes))
+}
+
 fn collect_json_files(directory: &Path, output: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
@@ -1091,7 +1245,7 @@ mod tests {
 
     use super::{
         AbandonRecord, DispatchedRun, ShipState, ShipStateStore, compute_policy_signature,
-        same_repository,
+        same_repository, WorkItemKey,
     };
     use fs2::FileExt;
 
@@ -1796,5 +1950,57 @@ mod tests {
             !fresh.is_abandoned(),
             "a fresh attempt must not inherit the abandonment marker"
         );
+    }
+
+    #[test]
+    fn work_item_registration_is_durable_and_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-1".to_owned(),
+        };
+        let now = Utc::now();
+        let first = store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem-1", now)
+            .expect("register");
+        let second = store
+            .register_work_item(
+                key.clone(),
+                "work-item/v1",
+                "fleet/v1",
+                "idem-1",
+                now + chrono::Duration::seconds(1),
+            )
+            .expect("idempotent register");
+        assert_eq!(first, second);
+
+        // A fresh store instance models a controller restart.
+        let restarted = ShipStateStore::new(temp.path().join("ship")).expect("restart");
+        assert_eq!(restarted.get_work_item(&key).expect("load"), Some(first));
+    }
+
+    #[test]
+    fn work_item_registration_rejects_protocol_or_capability_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "review".to_owned(),
+            external_id: "pr-42".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem-42", now)
+            .expect("register");
+        assert!(store
+            .register_work_item(key.clone(), "work-item/v2", "fleet/v1", "idem-42", now)
+            .is_err());
+        assert!(store
+            .register_work_item(key, "work-item/v1", "fleet/v2", "idem-42", now)
+            .is_err());
     }
 }
