@@ -176,6 +176,8 @@ pub struct RepeatedWorkShadowInput {
     pub target_config: String,
     pub mode: String,
     pub job_id: String,
+    /// Authenticated queue identity for the surviving job.
+    pub queue_identity: String,
     pub superseded_job_id: String,
     pub superseded_sha: String,
 }
@@ -190,6 +192,7 @@ pub struct RepeatedWorkShadowRow {
     pub target_config: String,
     pub mode: String,
     pub job_id: String,
+    pub queue_identity: String,
     pub superseded_job_id: String,
     pub superseded_sha: String,
 }
@@ -208,7 +211,7 @@ pub struct RepeatedWorkCostSummary {
     /// Unique survivors whose terminal timing was explicitly excluded.
     pub excluded_uncertain: usize,
     pub excluded_cancelled: usize,
-    /// Unique survivors with no timing row.
+    /// Unique survivors with no usable timing row or matching identity.
     pub unmatched: usize,
     /// Unique survivors contributing a clean duration (same as `matched_clean`).
     pub joined_durations: usize,
@@ -648,7 +651,7 @@ impl MetricsStore {
         limit: usize,
     ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id")?;
+        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id, queue_identity FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id, queue_identity FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id AND s.queue_identity <> '' AND t.queue_identity=s.queue_identity")?;
         let mut out = RepeatedWorkSurvivorTiming {
             shadow_rows: 0,
             distinct_survivors: 0,
@@ -898,6 +901,7 @@ impl MetricsStore {
               target_config TEXT NOT NULL,
               mode TEXT NOT NULL,
               job_id TEXT NOT NULL,
+              queue_identity TEXT NOT NULL DEFAULT '',
               superseded_job_id TEXT NOT NULL,
               superseded_sha TEXT NOT NULL
             );
@@ -908,6 +912,12 @@ impl MetricsStore {
         add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
         add_column_if_missing(&conn, "jobs", "labels_json", "TEXT")?;
         add_column_if_missing(&conn, "jobs", "correlation_id", "TEXT")?;
+        add_column_if_missing(
+            &conn,
+            "repeated_work_shadow",
+            "queue_identity",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
         add_column_if_missing(&conn, "runs", "event", "TEXT")?;
         add_column_if_missing(&conn, "fleet_capacity_samples", "evidence_json", "TEXT")?;
         add_column_if_missing(&conn, "runs", "provider_run_id", "INTEGER")?;
@@ -1358,8 +1368,8 @@ impl MetricsStore {
         conn.execute(
             "INSERT INTO repeated_work_shadow
              (observed_at, kind, branch, sha, target_config, mode, job_id,
-              superseded_job_id, superseded_sha)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              queue_identity, superseded_job_id, superseded_sha)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 Utc::now().to_rfc3339(),
                 input.kind.as_str(),
@@ -1368,6 +1378,7 @@ impl MetricsStore {
                 input.target_config,
                 input.mode,
                 input.job_id,
+                input.queue_identity,
                 input.superseded_job_id,
                 input.superseded_sha,
             ],
@@ -1383,7 +1394,7 @@ impl MetricsStore {
         let conn = self.connect()?;
         let mut statement = conn.prepare(
             "SELECT observed_at, kind, branch, sha, target_config, mode, job_id,
-                    superseded_job_id, superseded_sha
+                    queue_identity, superseded_job_id, superseded_sha
              FROM repeated_work_shadow
              ORDER BY observed_at DESC, id DESC
              LIMIT ?1",
@@ -1398,8 +1409,9 @@ impl MetricsStore {
                 target_config: row.get(4)?,
                 mode: row.get(5)?,
                 job_id: row.get(6)?,
-                superseded_job_id: row.get(7)?,
-                superseded_sha: row.get(8)?,
+                queue_identity: row.get(7)?,
+                superseded_job_id: row.get(8)?,
+                superseded_sha: row.get(9)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -2705,11 +2717,18 @@ fn migrate_repeated_work_shadow(conn: &Connection) -> Result<(), rusqlite::Error
            target_config TEXT NOT NULL,
            mode TEXT NOT NULL,
            job_id TEXT NOT NULL,
+           queue_identity TEXT NOT NULL DEFAULT '',
            superseded_job_id TEXT NOT NULL,
            superseded_sha TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
            ON repeated_work_shadow(observed_at DESC);",
+    )?;
+    add_column_if_missing(
+        conn,
+        "repeated_work_shadow",
+        "queue_identity",
+        "TEXT NOT NULL DEFAULT ''",
     )
 }
 
@@ -5627,6 +5646,7 @@ mod tests {
             target_config: "{}".to_owned(),
             mode: "full".to_owned(),
             job_id: "new".to_owned(),
+            queue_identity: "identity-new".to_owned(),
             superseded_job_id: "old".to_owned(),
             superseded_sha: "head".to_owned(),
         };
@@ -5703,6 +5723,7 @@ mod tests {
                 target_config: "cfg".into(),
                 mode: "normal".into(),
                 job_id: id.into(),
+                queue_identity: String::new(),
                 superseded_job_id: "old".into(),
                 superseded_sha: "oldsha".into(),
             };
@@ -5856,6 +5877,7 @@ mod tests {
                     target_config: "t".into(),
                     mode: "m".into(),
                     job_id: id.into(),
+                    queue_identity: format!("i-{id}"),
                     superseded_job_id: "o".into(),
                     superseded_sha: "o".into(),
                 })
@@ -5879,6 +5901,45 @@ mod tests {
         assert_eq!(c.joined_durations, 1);
         assert_eq!(c.unknown_durations, 3);
         assert_eq!(c.duration_ms, Some(10));
+    }
+
+    #[test]
+    fn repeated_work_join_requires_exact_queue_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &QueueTerminalTiming {
+                    queue_job_id: "same".into(),
+                    queue_identity: "i-a".into(),
+                    disposition: "clean".into(),
+                    started_at: Some(Utc::now()),
+                    completed_at: Some(Utc::now()),
+                    total_ms: Some(7),
+                },
+            )
+            .unwrap();
+        for identity in ["i-a", "i-b"] {
+            store
+                .record_repeated_work_shadow(&RepeatedWorkShadowInput {
+                    kind: RepeatedWorkKind::SupersededExactHead,
+                    branch: "b".into(),
+                    sha: "s".into(),
+                    target_config: "t".into(),
+                    mode: "m".into(),
+                    job_id: "same".into(),
+                    queue_identity: identity.into(),
+                    superseded_job_id: "o".into(),
+                    superseded_sha: "o".into(),
+                })
+                .unwrap();
+        }
+        let summary = store.repeated_work_survivor_timing(100).unwrap();
+        assert_eq!(summary.distinct_survivors, 2);
+        assert_eq!(summary.matched_clean, 1);
+        assert_eq!(summary.unmatched, 1);
+        assert_eq!(summary.avoided_survivor_ms, Some(7));
     }
     #[test]
     fn queue_timing_contract_rejects_identity_and_downgrades() {

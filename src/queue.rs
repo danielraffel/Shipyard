@@ -1132,6 +1132,7 @@ fn repeated_work_observations(jobs: &[Job], job: &Job) -> Vec<RepeatedWorkShadow
             target_config: target_config.clone(),
             mode: mode.clone(),
             job_id: job.id.clone(),
+            queue_identity: queue_timing_identity(job),
             superseded_job_id: queued.id.clone(),
             superseded_sha: queued.sha.clone(),
         })
