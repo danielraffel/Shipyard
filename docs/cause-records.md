@@ -175,7 +175,15 @@ It can take newline-delimited outage windows (`start`, `end`, optional
 contacts GitHub, executes `fix_hint`, or writes the archive. Rows containing
 unscrubbed paths, addresses, private hosts, or credential-like values are
 discarded. JSON output uses `shipyard.cause-advice/v1`; human output is a
-stable table intended for review, not an automatic decision.
+stable table intended for review, not an automatic decision; when a matching
+fix-link exists, that table names the fixing head and how the link was derived
+(`rerun_green` or `compare_red_head_to_fix_head`).
+
+When one red attempt has both the valid same-head `rerun_green` link and a
+valid `compare_red_head_to_fix_head` link, advice selects the compare link so
+the table names the later push that fixed the failure. The rerun remains in the
+archive as recovery evidence; a second distinct compare link still suppresses
+the fix as ambiguous.
 
 - [CLI reference](cli-reference.md): every flag of `diagnose` and `cause`.
 - The scorecard's `--export-cases` rows carry the same record in their
