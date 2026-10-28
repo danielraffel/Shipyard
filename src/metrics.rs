@@ -210,7 +210,7 @@ pub struct RepeatedWorkCostSummary {
     pub excluded_cancelled: usize,
     /// Unique survivors with no timing row.
     pub unmatched: usize,
-    /// Unique survivors contributing a clean duration (same as matched_clean).
+    /// Unique survivors contributing a clean duration (same as `matched_clean`).
     pub joined_durations: usize,
     /// Unique survivors excluded or missing timing (not shadow-row count).
     pub unknown_durations: usize,
