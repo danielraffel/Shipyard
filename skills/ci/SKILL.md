@@ -1146,7 +1146,7 @@ writer custody before mutation.
 | Dispatch only if remote matches HEAD | `shipyard cloud run build --require-sha HEAD --json` |
 | Opt a target into cross-PR reuse | set `reuse_if_paths_unchanged = ["src/backend/**"]` under `[targets.<name>]` |
 | Opt a target into warm-pool reuse | set `warm_keepalive_seconds = 600` under `[targets.<name>]` (see "Warm-pool reuse" below) |
-| Inspect warm-pool entries | `shipyard targets warm status --json` |
+| Inspect warm-pool entries | `shipyard targets warm status --json` (host-pool entries include the selected `member_id` when known) |
 | Drain the warm-pool (force cold-start everywhere) | `shipyard targets warm drain --yes` |
 | Force cold-start for one ship only | `shipyard ship --no-warm` (or `shipyard run --no-warm`) |
 | Global warm-pool kill switch | `SHIPYARD_NO_WARM_POOL=1` in the environment |
