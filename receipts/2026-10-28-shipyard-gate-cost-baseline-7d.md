@@ -6,6 +6,7 @@
 - **Window:** 2026-10-21T17:11:13Z through 2026-10-28T17:11:13Z
 - **Collector:** `shipyard metrics gate-cost --json`
 - **Evidence:** [`2026-10-28-shipyard-gate-cost-baseline-7d.json`](2026-10-28-shipyard-gate-cost-baseline-7d.json)
+- **Delivery scorecard:** [`2026-10-28-shipyard-gate-cost-scorecard-7d.json`](2026-10-28-shipyard-gate-cost-scorecard-7d.json)
 
 ## Observed baseline
 
@@ -43,4 +44,18 @@ equal seven-day window after one controlled repeated-work or supersession
 experiment, then compare the count-based proxies. Promote only if wasted
 attempts per merged PR and wasted gate minutes fall without a regression in
 successful merged PRs or required-gate reliability.
+
+## Delivery outcome baseline
+
+The companion scorecard reports open-to-merge latency by ISO week:
+
+| Week | Merged PRs | Median | P90 |
+| --- | ---: | ---: | ---: |
+| 2026-W43 | 41 | 1.23 hours | 17.80 hours |
+| 2026-W44 (partial) | 29 | 6.37 hours | 26.35 hours |
+
+The week-over-week latency increase is an outcome signal to preserve in the
+next comparison. The scorecard found no merge-queue runs, no queue ejections,
+and no required branch-protection contexts, so it cannot attribute that change
+to queue admission or required-check regressions.
 

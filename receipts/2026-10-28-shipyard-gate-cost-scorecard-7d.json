@@ -1,0 +1,224 @@
+{
+  "schema": "shipyard-gate-cost-scorecard/v1",
+  "repo": "danielraffel/Shipyard",
+  "base_branch": "main",
+  "workflow": "ci.yml",
+  "gate_job": "Test macOS ARM64 [local]",
+  "from": "2026-10-21T17:25:51Z",
+  "to": "2026-10-28T17:25:51Z",
+  "required_contexts": [],
+  "required_source": "the base branch is not protected",
+  "scopes": {
+    "merge_queue": "every required check, as GitHub's removal reason reports it",
+    "merge_group_gate": "job `Test macOS ARM64 [local]` of ci.yml in merge-group runs only",
+    "red_after_push": "none: no required contexts"
+  },
+  "weeks": [
+    {
+      "week": "2026-W43",
+      "from": "2026-10-21T17:25:51Z",
+      "to": "2026-10-26T00:00:00Z",
+      "merged_prs": 41,
+      "open_to_merge": {
+        "median_hours": 1.23,
+        "p90_hours": 17.8
+      },
+      "merge_queue": {
+        "entries": 0,
+        "ejections": 0,
+        "ejection_rate": null,
+        "removals": {}
+      },
+      "merge_group_gate": {
+        "runs": 0,
+        "gated_runs": 0,
+        "failures": 0,
+        "by_cause": {},
+        "failure_rate": null,
+        "gate_failed_rate": null,
+        "run_failed_gate_passed": 0
+      },
+      "red_after_push": null,
+      "repeat_failures": [
+        {
+          "name": "review-verdict",
+          "required": false,
+          "prs": [
+            879,
+            881,
+            887,
+            890,
+            891,
+            892,
+            893,
+            921,
+            924,
+            927,
+            932,
+            933
+          ]
+        },
+        {
+          "name": "Test Windows [github-hosted]",
+          "required": false,
+          "prs": [
+            887,
+            891,
+            899,
+            924,
+            927,
+            932,
+            933
+          ]
+        },
+        {
+          "name": "Enforce version & skill sync",
+          "required": false,
+          "prs": [
+            887,
+            893,
+            901,
+            924,
+            932,
+            933
+          ]
+        },
+        {
+          "name": "Sandbox macOS ARM64 [local]",
+          "required": false,
+          "prs": [
+            890,
+            891,
+            893,
+            900
+          ]
+        },
+        {
+          "name": "Test Linux [github-hosted]",
+          "required": false,
+          "prs": [
+            881,
+            887,
+            927,
+            933
+          ]
+        },
+        {
+          "name": "Test macOS ARM64 [local]",
+          "required": false,
+          "prs": [
+            887,
+            927,
+            933
+          ]
+        }
+      ],
+      "merge_verdicts": {
+        "approve": 40,
+        "hold": 0,
+        "none": 1,
+        "unread": 0,
+        "held_merged": []
+      },
+      "capped_prs": []
+    },
+    {
+      "week": "2026-W44",
+      "from": "2026-10-26T00:00:00Z",
+      "to": "2026-10-28T17:25:51Z",
+      "merged_prs": 29,
+      "open_to_merge": {
+        "median_hours": 6.37,
+        "p90_hours": 26.35
+      },
+      "merge_queue": {
+        "entries": 0,
+        "ejections": 0,
+        "ejection_rate": null,
+        "removals": {}
+      },
+      "merge_group_gate": {
+        "runs": 0,
+        "gated_runs": 0,
+        "failures": 0,
+        "by_cause": {},
+        "failure_rate": null,
+        "gate_failed_rate": null,
+        "run_failed_gate_passed": 0
+      },
+      "red_after_push": null,
+      "repeat_failures": [
+        {
+          "name": "review-verdict",
+          "required": false,
+          "prs": [
+            938,
+            942,
+            951,
+            952,
+            955,
+            957,
+            962,
+            966,
+            971,
+            972,
+            975
+          ]
+        },
+        {
+          "name": "Test Windows [github-hosted]",
+          "required": false,
+          "prs": [
+            942,
+            951,
+            952,
+            957,
+            971,
+            979
+          ]
+        },
+        {
+          "name": "Test Linux [github-hosted]",
+          "required": false,
+          "prs": [
+            942,
+            951,
+            953,
+            957,
+            971
+          ]
+        },
+        {
+          "name": "Test macOS ARM64 [local]",
+          "required": false,
+          "prs": [
+            942,
+            951,
+            953,
+            957,
+            971
+          ]
+        },
+        {
+          "name": "Enforce version & skill sync",
+          "required": false,
+          "prs": [
+            946,
+            950,
+            951,
+            975
+          ]
+        }
+      ],
+      "merge_verdicts": {
+        "approve": 29,
+        "hold": 0,
+        "none": 0,
+        "unread": 0,
+        "held_merged": []
+      },
+      "capped_prs": []
+    }
+  ],
+  "gaps": []
+}
