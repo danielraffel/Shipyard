@@ -17,8 +17,10 @@ parts of CI:
   Silicon, it turns their Macs into GitHub Actions capacity with clean macOS,
   Linux, and Windows VM lanes that are removed after each job.
 
-Tart provides the VM runtime; TartCI adds the CI pool around it: managed images,
-capacity leases, ephemeral runner registration, job cleanup, and metrics.
+Tart provides the VM runtime; it does not by itself schedule GitHub jobs or
+manage their runner lifecycle. TartCI adds that CI pool around it: managed
+images, capacity leases, ephemeral runner registration, job cleanup, and
+metrics.
 On a managed fleet, TartCI is the supported pool path; Orchard is retired and
 should be disabled so two schedulers do not claim the same jobs or capacity.
 
