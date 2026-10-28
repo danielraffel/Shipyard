@@ -2248,6 +2248,54 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_claims_allow_only_one_expected_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("ship");
+        let store = ShipStateStore::new(root.clone()).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "review".to_owned(),
+            external_id: "task-race".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for session in ["a", "b"] {
+            let store = ShipStateStore::new(root.clone()).expect("store");
+            let key = key.clone();
+            let barrier = Arc::clone(&barrier);
+            let session = session.to_owned();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                store
+                    .claim_work_item(
+                        &key,
+                        WorkItemOwner {
+                            host: "m3".to_owned(),
+                            session,
+                            epoch: 0,
+                            expires_at: now + chrono::Duration::minutes(5),
+                            capability_version: "fleet/v1".to_owned(),
+                        },
+                        1,
+                        now,
+                    )
+                    .is_ok()
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("claim thread"))
+            .collect();
+        assert_eq!(results.iter().filter(|result| **result).count(), 1);
+        assert_eq!(results.iter().filter(|result| !**result).count(), 1);
+    }
+
+    #[test]
     fn work_item_checkpoint_rejects_stale_owner_after_reclaim() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
