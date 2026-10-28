@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03670"></a>
+## [0.367.0] - 2026-10-28
+
+- fix(steward): hydrate implicit fleet pull request checks ([#979](https://github.com/danielraffel/Shipyard/pull/979))
+- feat(metrics): supervise merge receipt handoff freshness ([#950](https://github.com/danielraffel/Shipyard/pull/950))
+
 <a id="v03664"></a>
 ## [0.366.4] - 2026-10-26
 
@@ -2657,6 +2663,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.367.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.367.0
 [0.366.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.366.4
 [0.366.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.366.3
 [0.366.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.366.2
