@@ -3584,12 +3584,12 @@ fn compare_findings(
     now: DateTime<Utc>,
 ) -> Vec<MetricsFinding> {
     let split = now - Duration::days(split_days_ago.max(1));
-    let before_start = before_days
-        .map(|days| split - Duration::days(days.max(1)))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
-    let after_end = after_days
-        .map(|days| split + Duration::days(days.max(1)))
-        .unwrap_or(now + Duration::seconds(1));
+    let before_start = before_days.map_or(DateTime::<Utc>::MIN_UTC, |days| {
+        split - Duration::days(days.max(1))
+    });
+    let after_end = after_days.map_or(now + Duration::seconds(1), |days| {
+        split + Duration::days(days.max(1))
+    });
     let mut groups: BTreeMap<String, (Vec<i64>, Vec<i64>)> = BTreeMap::new();
     for row in rows {
         if !(row.status == "pass" || row.status == "success") {
