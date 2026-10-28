@@ -9,6 +9,10 @@ Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
 commit-to-pull-requests API, but zero or multiple matches remain unknown.
 
+Metrics promotion provenance is attached only at the authenticated provider
+boundary: an exact-repository GitHub App installation helper may qualify its
+rows as `production`; ambient or arbitrary token imports stay unknown.
+
 The read-only `queue-digest` surface reports `queue_idle` and emits
 `merge_queue_idle_with_pending_work` for an armed-but-not-enqueued PR, or the
 separate `merge_queue_idle_with_green_unarmed_work` handoff alert for a green

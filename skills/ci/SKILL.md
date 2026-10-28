@@ -114,6 +114,11 @@ metrics importer resolves those rows only through the exact commit's
 authoritative pull-request API response, and keeps the identity unknown when
 that response is empty or ambiguous.
 
+GitHub metrics imports use the machine-global `GhClient` boundary. They mark
+rows `production` only for an exact-repository GitHub App installation token
+whose helper reports `github-app-installation`; ambient `gh` auth and arbitrary
+helpers remain unknown and cannot enter promotion denominators.
+
 ## Version-only release bumps
 
 The CLI version is part of the CI surface map. Even a release-only
