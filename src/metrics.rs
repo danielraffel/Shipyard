@@ -891,6 +891,15 @@ impl MetricsStore {
             );
             CREATE INDEX IF NOT EXISTS merge_receipt_handoff_receipts_receipt
               ON merge_receipt_handoff_receipts(receipt_id);
+            CREATE TRIGGER IF NOT EXISTS merge_receipt_authenticated_immutable
+              BEFORE UPDATE ON merge_receipts
+              WHEN EXISTS (
+                SELECT 1 FROM merge_receipt_handoff_receipts
+                WHERE receipt_id = OLD.receipt_id
+              )
+            BEGIN
+              SELECT RAISE(ABORT, 'authenticated merge receipt is immutable');
+            END;
             CREATE TABLE IF NOT EXISTS fleet_capacity_samples (
               sample_id TEXT PRIMARY KEY,
               schema TEXT NOT NULL,
@@ -4331,6 +4340,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (1, 2, 2, "repo".to_owned()));
+        assert!(
+            conn.execute(
+                "UPDATE merge_receipts SET safe_merge=0 WHERE receipt_id='auth-1'",
+                [],
+            )
+            .is_err()
+        );
         conn.execute(
             "UPDATE merge_receipt_handoffs SET project='other' WHERE envelope_id='auth-envelope-1'",
             [],
