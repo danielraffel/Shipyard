@@ -1,13 +1,14 @@
 # Agent delivery contract follow-up — authenticated metrics handoff
 
-- **Observed:** 2026-10-28T15:22:53Z (reconciled against the live contract branch, PRs, and exact-head validation)
+- **Observed:** 2026-10-28T15:27:32Z (reconciled against the live contract branch, PRs, and exact-head validation)
 - **Contract:** https://github.com/danielraffel/pulp-planning/blob/codex/live-drain-refresh-20261028/2026-10-28-agent-delivery-contract.md
 - **Contract branch tip at reconciliation:** `1b4df0f470d5dcce2a56d125bd0ff6068b02dc6a`
 - **Contract document blob:** `e5e9b8fa791a543867276949626532844307e78b`
 - **Shipyard main:** `d7dfff57de91929bd7176593caf166ad8799792d`
 - **Worktree:** `/Users/danielraffel/Code/Shipyard-metrics-auth-envelope-20261028`
 - **Branch:** `codex/metrics-auth-envelope-schema-20261028`
-- **Implementation/validation head:** `5114947addb5362b1d88b16aaaf5bc5a159b0bb9`
+- **Source implementation/validation head:** `5114947addb5362b1d88b16aaaf5bc5a159b0bb9`
+- **PR head at this receipt snapshot:** `3e483e1111052b5ec80b4eada52bc2afcd769e08`
 - **PR:** https://github.com/danielraffel/Shipyard/pull/998
 
 ## Contract application
@@ -36,8 +37,8 @@ reassigned.
   and remains unarmed/unqueued.
 - Shipyard review-verdict refused both heads because no allowed exact-head review
   exists. No approval, arm, enqueue, merge, or merge API call was made.
-- PR #998 is open at the implementation/validation head above, based on Shipyard
-  `main`. Resolver, version/skill, sandbox Linux, Linux, macOS ARM64, coverage,
+- PR #998 was open at snapshot head `3e483e11`, based on Shipyard `main`.
+  Resolver, version/skill, sandbox Linux, Linux, macOS ARM64, coverage,
   and risk checks are successful; Windows was still running at this observation
   boundary; `Python helper tests [github-hosted]` failed in `Run packaging helper
   tests`. The PR has no counted review, steward handoff, or queue admission.
@@ -49,7 +50,7 @@ reassigned.
   (`6f84359c`), #996 (`c470ba62`), and #997 (`e59e1fd`) remain separate and are
   not treated as prerequisites for this telemetry slice; #989/#994/#996/#997 lack
   a counted exact-head review, #996 owns the baseline assertion repair, and #997
-  now has green checks.
+  currently has its own failing Python helper check.
 
 ## Work and follow-up
 
