@@ -935,7 +935,8 @@ impl MetricsStore {
     }
 
     /// Import validated merge receipts atomically. Duplicate receipt IDs are
-    /// idempotent only when the payload is byte-for-byte equivalent.
+    /// idempotent when the payload is equivalent after ownership-key
+    /// canonicalization, preserving compatibility with legacy mixed-case rows.
     pub fn import_merge_receipts(
         &self,
         receipts: &[crate::metrics::merge_receipt::MergeReceipt],
@@ -958,11 +959,28 @@ impl MetricsStore {
             let existing: Option<ExistingMergeReceipt> = tx.query_row(
                 "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
                 [&receipt.receipt_id],
-                |row| Ok(ExistingMergeReceipt {
-                    schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?, pr: row.get(4)?,
-                    head_sha: row.get(5)?, validated_head_sha: row.get(6)?, merge_commit_sha: row.get(7)?, merged_at: row.get(8)?,
-                    source: row.get(9)?, required_checks_json: row.get(10)?, gate_receipt_sha256: row.get(11)?, evidence: row.get(12)?,
-                }),
+                |row| {
+                    let existing_repo: String = row.get(1)?;
+                    let existing_repo = crate::evidence::canonical_repository(&existing_repo);
+                    let existing_project_raw: String = row.get(2)?;
+                    let (existing_project, _) =
+                        crate::metrics::project_key::normalize_for_write(&existing_project_raw, Some(&existing_repo));
+                    Ok(ExistingMergeReceipt {
+                        schema: row.get(0)?,
+                        repo: existing_repo,
+                        project: existing_project,
+                        base_branch: row.get(3)?,
+                        pr: row.get(4)?,
+                        head_sha: row.get(5)?,
+                        validated_head_sha: row.get(6)?,
+                        merge_commit_sha: row.get(7)?,
+                        merged_at: row.get(8)?,
+                        source: row.get(9)?,
+                        required_checks_json: row.get(10)?,
+                        gate_receipt_sha256: row.get(11)?,
+                        evidence: row.get(12)?,
+                    })
+                },
             ).optional()?;
             if let Some(existing) = existing {
                 let incoming = ExistingMergeReceipt {
@@ -4026,6 +4044,33 @@ mod tests {
         let mut changed = first;
         changed.evidence = "sha256:changed".into();
         assert!(store.import_merge_receipts(&[changed]).is_err());
+    }
+
+    #[test]
+    fn merge_receipt_reimport_accepts_legacy_mixed_case_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let receipt = test_receipt("legacy-project-case", "owner/repo", "repo", 1, 'a');
+        assert_eq!(
+            store
+                .import_merge_receipts(std::slice::from_ref(&receipt))
+                .unwrap(),
+            1
+        );
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_receipts SET repo = 'OWNER/REPO', project = 'REPO' WHERE receipt_id = 'legacy-project-case'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .import_merge_receipts(std::slice::from_ref(&receipt))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
