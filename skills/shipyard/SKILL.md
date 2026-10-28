@@ -969,7 +969,9 @@ server-owned queue order and merge-group checks, mutation ownership, and
 nothing and back off through 15/30/60/120/300 seconds. The observer writes an
 atomic canonical cursor plus an append-only transition log under the Shipyard
 state root and takes an exclusive per-cursor lock. It exposes no mutation flag,
-does not acquire a mutation lease, and needs no write credential. See
+does not acquire a mutation lease, and needs no write credential. If a cursor
+uses an older integrity schema, the live observer reboots from a fresh
+authenticated snapshot instead of trusting the stale cursor. See
 [`docs/queue-observer.md`](../../docs/queue-observer.md).
 
 The read-only `shipyard queue-digest` command renders an inventory from those
