@@ -73,6 +73,11 @@ MAX_PROVIDER_RETRIES = 5
 MAX_PROVIDER_RETRY_DELAY_SECONDS = 300.0
 
 
+def canonical_project(project: str) -> str:
+    """Return the case-insensitive short project key used by metrics storage."""
+    return project.strip().casefold()
+
+
 def run(command: Sequence[str], *, stdin: str | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(command, input=stdin, text=True, capture_output=True, check=False, timeout=timeout)
@@ -127,12 +132,13 @@ def run_provider_with_retry(command: Sequence[str], *, stdin: str | None = None,
 
 
 def state_identity(path: pathlib.Path, project: str, repo: str, db: pathlib.Path) -> dict[str, str]:
-    return {"project": project, "repo": repo, "database": str(db.expanduser().resolve(strict=False))}
+    return {"project": canonical_project(project), "repo": repo,
+            "database": str(db.expanduser().resolve(strict=False))}
 
 
 def validate_project_repo(project: str, repo: str) -> None:
     parts = repo.split("/")
-    if len(parts) != 2 or not all(parts) or project.casefold() != parts[1].casefold():
+    if len(parts) != 2 or not all(parts) or canonical_project(project) != parts[1].casefold():
         raise ValueError("--project must be the repository short name for exact scorecard scoping")
 
 
@@ -155,6 +161,7 @@ def validate_state_identity(path: pathlib.Path, project: str, repo: str, db: pat
 
 def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
+    args.project = canonical_project(args.project)
     validate_project_repo(args.project, args.repo)
     validate_state_identity(args.state, args.project, args.repo, args.db)
     state_dir = str(validate_state_layout(args.db))
@@ -174,14 +181,14 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
             # direct callers. Replace only its generic event with the more
             # precise missing-handoff reason and leave it last. A newer
             # supervisor may already have a more specific reason; preserve it.
-            generic = next((event for event in events
-                            if event.get("source") == "merge-receipt"
-                            and event.get("reason") == "fresh authenticated producer handoff is unavailable"), None)
-            if generic is not None:
+            receipt_events = [event for event in events if event.get("source") == "merge-receipt"]
+            generic = next((event for event in receipt_events
+                            if event.get("reason") == "fresh authenticated producer handoff is unavailable"), None)
+            if generic is not None and len(receipt_events) == 1:
                 events.remove(generic)
                 events.append({"source": "merge-receipt", "status": "unavailable",
                                "reason": "producer handoff not present"})
-            elif not any(event.get("source") == "merge-receipt" for event in events):
+            elif not receipt_events:
                 events.append({"source": "merge-receipt", "status": "unavailable",
                                "reason": "producer handoff not present"})
             return events
@@ -289,7 +296,7 @@ def count_jobs(db: pathlib.Path, project: str, repo: str) -> int | None:
     try:
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
             return int(connection.execute("""select count(*) from jobs j join runs r on r.id=j.run_id
-                where r.project=? and r.repo=?""", (project, repo)).fetchone()[0])
+                where lower(r.project)=? and r.repo=?""", (canonical_project(project), repo)).fetchone()[0])
     except sqlite3.Error:
         return None
 
@@ -306,7 +313,7 @@ def source_activity_dates(db: pathlib.Path, project: str, repo: str) -> set[str]
             timestamp_sql = "coalesce(" + ",".join("j." + name for name in timestamps) + ")"
             rows = connection.execute(
                 f"select {timestamp_sql} from jobs j join runs r on r.id=j.run_id "
-                "where r.project=? and r.repo=?", (project, repo))
+                "where lower(r.project)=? and r.repo=?", (canonical_project(project), repo))
             dates = set()
             for (value,) in rows:
                 if isinstance(value, str):
@@ -347,7 +354,10 @@ def prepare_tartci_export(text: str, repo: str, project: str) -> tuple[str, int]
     A malformed record, wrong project, or invalid provider remains fatal.
     """
     records = _tartci_records(text)
-    invalid = [record for record in records if record.get("repo") != repo or record.get("project") != project
+    expected_project = canonical_project(project)
+    invalid = [record for record in records if record.get("repo") != repo
+               or not isinstance(record.get("project"), str)
+               or canonical_project(record["project"]) != expected_project
                or not isinstance(record.get("provider"), str) or not record["provider"].strip()
                or ("external_id" in record and not isinstance(record.get("external_id"), str))]
     if invalid:
