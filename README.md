@@ -30,7 +30,8 @@ Use Shipyard if you:
 - want a pull request to land only after the exact head passes every required
   platform;
 - run local Macs or private VMs alongside GitHub-hosted runners;
-- want unattended monitoring that records a clear reason when it must stop.
+- want monitoring that can run unattended and records a specific reason when
+  progress cannot continue.
 
 Shipyard is useful for people and coding tools. It does not choose what your
 product should do or edit code on its own.
