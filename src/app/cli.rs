@@ -2017,6 +2017,8 @@ pub(crate) struct PrWatchDigestArgs {
 pub(crate) enum MetricsImportCommand {
     /// Import tartci runtime export JSON/JSONL.
     Tartci(MetricsImportTartciArgs),
+    /// Import `TartCI` observation-only fleet-capacity receipts.
+    FleetCapacity(MetricsImportFleetCapacityArgs),
     /// Import GitHub Actions jobs for recent workflow runs.
     Github(MetricsImportGithubArgs),
     /// Import producer-self-asserted, format-validated protected-branch merge receipts (JSON/JSONL).
@@ -2133,6 +2135,13 @@ pub(crate) struct MetricsRecordArgs {
 #[derive(Debug, Args)]
 pub(crate) struct MetricsImportTartciArgs {
     /// Read tartci runtime export JSON/JSONL from this file. Omit or pass `-` for stdin.
+    #[arg(long)]
+    pub(crate) file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct MetricsImportFleetCapacityArgs {
+    /// Read a `TartCI` capacity receipt JSON/JSONL file. Omit or pass `-` for stdin.
     #[arg(long)]
     pub(crate) file: Option<PathBuf>,
 }

@@ -2,7 +2,8 @@ use super::{
     BTreeMap, CapacityPreemptionPolicy, CliFailure, Duration, GitHubActions, Instant,
     MergeQueueSnapshot, ObservedPr, Path, RepoObservation, RequiredCheck, StewardCheck, StewardJob,
     StewardPullRequest, StewardRun, Value, is_admin_protection_denied,
-    is_capacity_preemption_workflow, is_full_sha, is_private_free_entitlement,
+    is_capacity_preemption_workflow, is_full_sha, is_implicitly_managed,
+    is_private_free_entitlement,
 };
 use crate::required_check_policy::{
     classic_required_checks, encode_path_segment as encode_policy_path_segment,
@@ -538,58 +539,57 @@ pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<Ob
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let rollup = row.get("statusCheckRollup").and_then(Value::as_array);
+    let checks = rollup.map_or_else(Vec::new, |rollup| {
+        rollup.iter().filter_map(parse_check).collect()
+    });
+    let fact = StewardPullRequest {
+        number,
+        head_sha: row
+            .get("headRefOid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        head_branch: row
+            .get("headRefName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        author: row
+            .get("author")
+            .and_then(|author| author.get("login"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        draft: row.get("isDraft").and_then(Value::as_bool).unwrap_or(true),
+        merge_state: row
+            .get("mergeStateStatus")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN")
+            .to_owned(),
+        auto_merge_active: row
+            .get("autoMergeRequest")
+            .is_some_and(|request| !request.is_null()),
+        queue_position: positions.get(&number).copied(),
+        labels,
+        checks,
+    };
     // A rollup that is present but at the page cap may be incomplete. A rollup
     // that is absent entirely was never observed, which is not the same as a
     // head with no checks -- so it must not be reported as a complete empty set.
-    // Only a managed pull request ever has its checks consulted: every consumer
-    // is gated behind the managed label, so marking just those reconstructs the
-    // full check set for them while leaving the rest free of a per-PR fetch.
+    // Implicitly managed fleet pull requests consult checks just like explicit
+    // handoffs, so they must also be marked for per-head hydration.
     let check_rollup_maybe_truncated = rollup.map_or_else(
         || {
-            labels
+            fact.labels
                 .iter()
                 .any(|label| label.eq_ignore_ascii_case(super::MANAGED_LABEL))
+                || is_implicitly_managed(&fact)
         },
         |checks| checks.len() == 100,
     );
-    let checks = rollup
-        .into_iter()
-        .flatten()
-        .filter_map(parse_check)
-        .collect();
     Ok(ObservedPr {
         node_id,
         owner: observed_owner(row),
-        fact: StewardPullRequest {
-            number,
-            head_sha: row
-                .get("headRefOid")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            head_branch: row
-                .get("headRefName")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            author: row
-                .get("author")
-                .and_then(|author| author.get("login"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            draft: row.get("isDraft").and_then(Value::as_bool).unwrap_or(true),
-            merge_state: row
-                .get("mergeStateStatus")
-                .and_then(Value::as_str)
-                .unwrap_or("UNKNOWN")
-                .to_owned(),
-            auto_merge_active: row
-                .get("autoMergeRequest")
-                .is_some_and(|request| !request.is_null()),
-            queue_position: positions.get(&number).copied(),
-            labels,
-            checks,
-        },
+        fact,
         check_rollup_maybe_truncated,
     })
 }
@@ -736,17 +736,18 @@ fn hydrate_required_check_identities_with_deadline(
 
 /// Whether this pull request's check set can reach a decision.
 ///
-/// Every consumer of `StewardPullRequest::checks` is gated behind the managed
-/// label: an unmanaged pull request is classified `Unmanaged` before its checks
-/// are weighed, and `pull_request_is_managed` conjoins the label with the
-/// handoff status. Hydrating a head whose checks cannot change an outcome costs
-/// a round trip per open pull request, which is the cost that must not scale
-/// with the backlog.
+/// Every consumer of `StewardPullRequest::checks` is gated behind explicit or
+/// implicit management: an ordinary unmanaged pull request is classified
+/// `Unmanaged` before its checks are weighed, while fleet-authored pull
+/// requests are managed before the label handoff is copied. Hydrating a head
+/// whose checks cannot change an outcome costs a round trip per open pull
+/// request, which is the cost that must not scale with the backlog.
 fn checks_are_consulted(pr: &ObservedPr) -> bool {
     pr.fact
         .labels
         .iter()
         .any(|label| label.eq_ignore_ascii_case(super::MANAGED_LABEL))
+        || is_implicitly_managed(&pr.fact)
 }
 
 fn hydrate_complete_head_checks(

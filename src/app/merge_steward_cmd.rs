@@ -23,7 +23,7 @@ use crate::merge_steward::{
     CapacityPreemptionPolicy, QueueFrontPressure, RequiredCheck, RunCancellation,
     RunCancellationReason, StalePrRunWedgeCandidate, StewardCheck, StewardDecision, StewardJob,
     StewardPolicy, StewardPullRequest, StewardRun, classify_pr, coalescing_reason_authorizes,
-    has_successful_status, is_capacity_preemption_workflow, is_full_sha,
+    has_successful_status, is_capacity_preemption_workflow, is_full_sha, is_implicitly_managed,
     is_safe_capacity_preemption, plan_capacity_preemptions, plan_run_coalescing,
     plan_stale_pr_run_wedges, preemption_key, queue_front_waits_for_pool,
 };
@@ -1115,6 +1115,11 @@ pub(super) fn steward_command<W: Write>(
     let mut remaining_preemptions =
         usize::from(!recovery_owned_preemption_budget && ledger.pending_cancellations.is_empty());
     for repo in repos {
+        // Scope the token helper to this exact repository: a scheduled pass
+        // runs from a directory that is not a checkout, and one checkout's
+        // remote must never mint the token for another repository.
+        let scoped_actions = actions.clone().with_repo_override(&repo);
+        let actions = &scoped_actions;
         match observe_repo(actions, &repo, &args.base, args.preempt_capacity) {
             Ok(observation) => {
                 let (mut report, failed, planned_preemptions) = apply_repo_plan(

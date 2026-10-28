@@ -540,6 +540,9 @@ and provider-neutral:
   through `gh api`.
 - `shipyard metrics import tartci` imports JSON/JSONL from
   `tartci runtime export` when a project uses tartci VM lanes.
+- `shipyard metrics import fleet-capacity --file <path>` imports validated
+  `tartci.fleet-capacity/v1` observation receipts; see
+  [`fleet-capacity-contract.md`](fleet-capacity-contract.md).
 - `shipyard metrics import merge-receipt --file <path>` imports validated `shipyard-merge-receipt/v1` JSON/JSONL; invalid or unavailable provenance stays fail-closed.
 - `shipyard metrics export merge-receipt --repo <owner/repo> --file <path>` writes the
   producer's already-validated receipts for exactly that repository as an atomic

@@ -4053,7 +4053,10 @@ only thing between it and re-arming a queued or ejected head. `src/auto_arm.rs`
 refuses every state the guard refuses (a unit test asserts that agreement), and
 `GHAPP_ALLOW_QUEUE_REARM` is never set by Shipyard. The periodic counterpart is
 `shipyard runner steward --arm-unqueued`, which arms only pull requests the
-steward declines to own; see
+steward declines to own. Under `--apply` it takes the central HOLD,
+`mutation_machine` authority and control lock before arming (a HOLD is reported,
+not a failure), and each `--repo` mints its own token, so it runs from launchd's
+`$HOME`. See
 [references/merge-steward.md](references/merge-steward.md).
 
 Branch refreshes are the third guarded mutation, and the only one whose
@@ -5322,3 +5325,11 @@ atomic sidecar. Readiness requires observed continuity; historical activity
 counts and status-only runs must not be used to manufacture prospective
 coverage. Sidecars are keyed by repository, source identity, cadence, and
 configuration so changing collection policy cannot mix incompatible history.
+# Local Rust gate placement
+
+The pre-push hook selects the repository-pinned Rust channel on the current
+host. Any fleet host with that channel plus rustfmt and clippy may run local
+formatting and lint gates; m1 is a fallback, not a universal gate. Local gates
+do not grant merge authority: GitHub CI, branch protection, and the configured
+Shipyard mutation machine remain authoritative.
+

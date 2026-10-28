@@ -131,13 +131,18 @@ pub fn scoped_push_environment(global_dir: &Path) -> Result<Vec<(OsString, OsStr
         shell_single_quote(&binary.to_string_lossy())?,
         shell_single_quote(&global_dir.to_string_lossy())?,
     );
+    Ok(scoped_push_git_config(&helper))
+}
+
+/// The `GIT_CONFIG_*` entries routing github.com through `helper` alone.
+fn scoped_push_git_config(helper: &str) -> Vec<(OsString, OsString)> {
     let entries = [
         ("url.https://github.com/.insteadOf", "git@github.com:"),
         ("url.https://github.com/.insteadOf", "ssh://git@github.com/"),
         // The empty helper drops every inherited one, such as a personal
         // `gh auth git-credential`, before adding the scoped helper.
         ("credential.https://github.com.helper", ""),
-        ("credential.https://github.com.helper", helper.as_str()),
+        ("credential.https://github.com.helper", helper),
         ("credential.https://github.com.useHttpPath", "true"),
         ("credential.interactive", "never"),
     ];
@@ -150,7 +155,7 @@ pub fn scoped_push_environment(global_dir: &Path) -> Result<Vec<(OsString, OsStr
         environment.push((format!("GIT_CONFIG_VALUE_{index}").into(), (*value).into()));
     }
     environment.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
-    Ok(environment)
+    environment
 }
 
 fn shell_single_quote(value: &str) -> Result<String, PrError> {
@@ -837,8 +842,8 @@ mod tests {
         PrInfo, is_graphql_pr_create_integration_blocked, is_graphql_rate_limited,
         is_integration_blocked, parse_github_remote_slug, parse_pr_checkout_info,
         parse_pr_checkout_rest_info, parse_pr_info, parse_pr_list, parse_pr_rest_info,
-        parse_pr_rest_list, scoped_push_environment, select_unique_head_match, selector_pr_number,
-        shell_single_quote, url_encode,
+        parse_pr_rest_list, scoped_push_environment, scoped_push_git_config,
+        select_unique_head_match, selector_pr_number, shell_single_quote, url_encode,
     };
     use std::process::Command;
 
@@ -908,6 +913,94 @@ mod tests {
             .trim(),
             "true"
         );
+    }
+
+    /// `git credential fill` for github.com under the scoped push config, with
+    /// ambient helpers (generic and github.com-specific) in the global config
+    /// that would answer AMBIENT.
+    #[cfg(unix)]
+    fn fill_password(environment: &[(std::ffi::OsString, std::ffi::OsString)]) -> String {
+        use std::io::Write as _;
+        let home = tempfile::tempdir().expect("home");
+        let ambient = "!f() { test \"$1\" = get && printf 'username=x\\npassword=AMBIENT\\n'; }; f";
+        let global = home.path().join("gitconfig");
+        std::fs::write(
+            &global,
+            format!(
+                "[credential]\n\thelper = \"{ambient}\"\n\
+                 [credential \"https://github.com\"]\n\thelper = \"{ambient}\"\n"
+            ),
+        )
+        .expect("global config");
+        let mut child = Command::new("git")
+            .args(["credential", "fill"])
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", home.path())
+            .envs(environment.iter().map(|(key, value)| (key, value)))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("git credential fill");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"url=https://github.com/owner/repo.git\n\n")
+            .expect("request");
+        let output = child.wait_with_output().expect("git");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout)
+            .expect("utf8")
+            .lines()
+            .find_map(|line| line.strip_prefix("password="))
+            .expect("password")
+            .to_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_push_config_drops_every_ambient_github_helper() {
+        let scoped = "!f() { test \"$1\" = get && printf 'username=x-access-token\\npassword=SCOPED\\n'; }; f";
+        let environment = scoped_push_git_config(scoped);
+        assert_eq!(fill_password(&environment), "SCOPED");
+
+        // Control: the same entries minus the empty-helper reset. The ambient
+        // helpers, read first from the global config, then answer instead,
+        // which proves the fixture tells the two apart.
+        let lookup = |name: String| {
+            environment
+                .iter()
+                .find(|(key, _)| *key == std::ffi::OsString::from(&name))
+                .map(|(_, value)| value.clone())
+                .expect("config entry")
+        };
+        let count: usize = lookup("GIT_CONFIG_COUNT".to_owned())
+            .to_string_lossy()
+            .parse()
+            .expect("count");
+        let kept = (0..count)
+            .map(|index| {
+                (
+                    lookup(format!("GIT_CONFIG_KEY_{index}")),
+                    lookup(format!("GIT_CONFIG_VALUE_{index}")),
+                )
+            })
+            .filter(|(key, value)| {
+                !(key == "credential.https://github.com.helper" && value.is_empty())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kept.len(), count - 1, "exactly one reset entry");
+        let mut without_reset = vec![(
+            std::ffi::OsString::from("GIT_CONFIG_COUNT"),
+            std::ffi::OsString::from(kept.len().to_string()),
+        )];
+        for (index, (key, value)) in kept.into_iter().enumerate() {
+            without_reset.push((format!("GIT_CONFIG_KEY_{index}").into(), key));
+            without_reset.push((format!("GIT_CONFIG_VALUE_{index}").into(), value));
+        }
+        assert_eq!(fill_password(&without_reset), "AMBIENT");
     }
 
     #[test]

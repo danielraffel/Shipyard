@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 
 use crate::app::cli::{
     MetricsCommand, MetricsExportCommand, MetricsExportMergeReceiptArgs, MetricsFreshnessArgs,
-    MetricsGroupBy, MetricsImportCommand, MetricsImportGithubArgs, MetricsImportTartciArgs,
-    MetricsRecordArgs,
+    MetricsGroupBy, MetricsImportCommand, MetricsImportFleetCapacityArgs, MetricsImportGithubArgs,
+    MetricsImportTartciArgs, MetricsRecordArgs,
 };
 use crate::app::{CliFailure, WAIT_EXIT_INVALID};
 use crate::config::LoadedConfig;
@@ -284,6 +284,18 @@ pub(super) fn metrics_command<W: Write>(
                 };
                 write_output(stdout, json_output, &output, || {
                     format!("imported {imported} tartci metric rows")
+                })?;
+            }
+            MetricsImportCommand::FleetCapacity(args) => {
+                let imported = import_fleet_capacity(&store, &args)?;
+                let output = MetricsImportOutput {
+                    database: store.path().display().to_string(),
+                    source: "fleet-capacity".to_owned(),
+                    imported,
+                    skipped_runs: None,
+                };
+                write_output(stdout, json_output, &output, || {
+                    format!("imported {imported} fleet-capacity samples")
                 })?;
             }
             MetricsImportCommand::MergeReceipt(args) => {
@@ -645,6 +657,29 @@ fn import_tartci(
     store
         .import_tartci(&text)
         .map_err(|error| CliFailure::new(1, format!("tartci import failed: {error}")))
+}
+
+fn import_fleet_capacity(
+    store: &MetricsStore,
+    args: &MetricsImportFleetCapacityArgs,
+) -> Result<usize, CliFailure> {
+    let mut text = String::new();
+    match args.file.as_ref().and_then(|path| path.to_str()) {
+        None | Some("-") => {
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|error| CliFailure::new(1, format!("stdin read failed: {error}")))?;
+        }
+        Some(_) => {
+            let path = args.file.as_ref().expect("file path");
+            text = std::fs::read_to_string(path).map_err(|error| {
+                CliFailure::new(1, format!("could not read {}: {error}", path.display()))
+            })?;
+        }
+    }
+    store
+        .import_fleet_capacity(&text)
+        .map_err(|error| CliFailure::new(1, format!("fleet-capacity import failed: {error}")))
 }
 
 fn import_github(
