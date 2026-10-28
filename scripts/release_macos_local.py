@@ -321,7 +321,12 @@ def verify_release_identity_manifest(
     expected_assets: tuple[str, ...],
     runner: CommandRunner,
 ) -> None:
-    """Require release assets to be bound to the exact tag and commit."""
+    """Require the published bytes to match the exact tag and commit manifest.
+
+    The manifest is useful only if it is checked against the bytes that GitHub
+    will serve.  Checking names and source metadata alone would allow a
+    replaced asset to pass the publication gate.
+    """
     temp = Path(tempfile.mkdtemp(prefix="shipyard-release-manifest-proof-")) / "manifest.json"
     runner.run(
         [
@@ -352,17 +357,88 @@ def verify_release_identity_manifest(
         or source.get("commit") != expected_commit
     ):
         raise SystemExit("release identity manifest does not match this tag and commit")
-    files = {
-        entry.get("name")
-        for artifact in document.get("artifacts", [])
-        if isinstance(artifact, dict)
-        for entry in artifact.get("files", [])
-        if isinstance(entry, dict)
-    }
+    manifest_files: dict[str, dict[str, object]] = {}
+    for artifact in document.get("artifacts", []):
+        if not isinstance(artifact, dict):
+            raise SystemExit("release identity manifest has a malformed artifact")
+        for entry in artifact.get("files", []):
+            if not isinstance(entry, dict):
+                raise SystemExit("release identity manifest has a malformed file")
+            name = entry.get("name")
+            size = entry.get("bytes")
+            digest = entry.get("sha256")
+            if (
+                not isinstance(name, str)
+                or Path(name).name != name
+                or not isinstance(size, int)
+                or size < 0
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise SystemExit("release identity manifest has an invalid file entry")
+            if name in manifest_files:
+                raise SystemExit(f"release identity manifest repeats asset: {name}")
+            manifest_files[name] = {"bytes": size, "sha256": digest}
     required = set(expected_assets) - {"checksums.sha256", "shipyard-release-manifest.json"}
-    missing = sorted(required - files)
+    missing = sorted(required - set(manifest_files))
     if missing:
         raise SystemExit("release identity manifest is missing: " + ", ".join(missing))
+
+    with tempfile.TemporaryDirectory(prefix="shipyard-release-assets-proof-") as directory:
+        root = Path(directory)
+        for name, expected in sorted(manifest_files.items()):
+            output = root / name
+            runner.run(
+                [
+                    "gh",
+                    "release",
+                    "download",
+                    "--repo",
+                    config.repo,
+                    config.tag,
+                    "--pattern",
+                    name,
+                    "--output",
+                    str(output),
+                    "--clobber",
+                ]
+            )
+            if not output.is_file():
+                raise SystemExit(f"release asset download produced no file: {name}")
+            actual_size = output.stat().st_size
+            actual_digest = release_artifact_manifest.sha256(output)
+            if actual_size != expected["bytes"] or actual_digest != expected["sha256"]:
+                raise SystemExit(
+                    f"release asset does not match identity manifest: {name}"
+                )
+
+        checksums = root / "checksums.sha256"
+        runner.run(
+            [
+                "gh",
+                "release",
+                "download",
+                "--repo",
+                config.repo,
+                config.tag,
+                "--pattern",
+                "checksums.sha256",
+                "--output",
+                str(checksums),
+                "--clobber",
+            ]
+        )
+        if not checksums.is_file():
+            raise SystemExit("release checksum asset download produced no file")
+        checksum_entries: dict[str, str] = {}
+        for line in checksums.read_text(encoding="utf-8").splitlines():
+            fields = line.split(maxsplit=1)
+            if len(fields) == 2 and len(fields[0]) == 64:
+                checksum_entries[fields[1].lstrip("*")] = fields[0].lower()
+        for name, expected in manifest_files.items():
+            if checksum_entries.get(name) != expected["sha256"]:
+                raise SystemExit(f"release checksum does not match manifest: {name}")
 
 
 def upload_artifact_and_checksums(
@@ -562,11 +638,12 @@ def publish_if_ready(config: ReleaseConfig, runner: CommandRunner) -> str:
         if name not in assets
     ]
     if not missing:
-        verify_release_identity_manifest(config, expected_assets, runner)
         missing = [
             f"checksum:{name}"
             for name in missing_release_checksums(config, expected_assets, runner)
         ]
+        if not missing:
+            verify_release_identity_manifest(config, expected_assets, runner)
     if missing:
         if not release_is_draft(config, runner):
             runner.run(

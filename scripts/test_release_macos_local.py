@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -30,6 +31,11 @@ class FakeRunner(release_macos_local.CommandRunner):
         self.checksum_names = checksum_names or [
             name for name in assets if name != "checksums.sha256"
         ]
+        self.payloads = {
+            name: f"fixture:{name}\n".encode("utf-8")
+            for name in assets
+            if name not in {"checksums.sha256", "shipyard-release-manifest.json"}
+        }
         self.commands: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
 
@@ -49,12 +55,21 @@ class FakeRunner(release_macos_local.CommandRunner):
             return "true" if self.draft else "false"
         if args[:4] == ["gh", "release", "download", "--repo"]:
             output = Path(args[args.index("--output") + 1])
-            if args[args.index("--pattern") + 1] == "shipyard-release-manifest.json":
+            pattern = args[args.index("--pattern") + 1]
+            if pattern == "shipyard-release-manifest.json":
                 names = sorted(
                     name
                     for name in self.assets
                     if name not in {"checksums.sha256", "shipyard-release-manifest.json"}
                 )
+                files = [
+                    {
+                        "name": name,
+                        "bytes": len(self.payloads[name]),
+                        "sha256": hashlib.sha256(self.payloads[name]).hexdigest(),
+                    }
+                    for name in names
+                ]
                 output.write_text(
                     json.dumps(
                         {
@@ -75,10 +90,7 @@ class FakeRunner(release_macos_local.CommandRunner):
                                     "target": "fixture",
                                     "artifact_id": "fixture",
                                     "artifact_digest": "0" * 64,
-                                    "files": [
-                                        {"name": name, "bytes": 0, "sha256": "0" * 64}
-                                        for name in names
-                                    ],
+                                    "files": files,
                                 }
                             ],
                         }
@@ -86,11 +98,28 @@ class FakeRunner(release_macos_local.CommandRunner):
                     encoding="utf-8",
                 )
                 return ""
-            names = sorted({"shipyard-linux-x64", *self.checksum_names})
-            output.write_text(
-                "".join(f"{'0' * 64}  {name}\n" for name in names),
-                encoding="utf-8",
-            )
+            if pattern == "checksums.sha256":
+                names = sorted(
+                    {
+                        "shipyard-linux-x64",
+                        *{
+                            name
+                            for name in self.checksum_names
+                            if name != "shipyard-release-manifest.json"
+                        },
+                    }
+                )
+                payloads = dict(self.payloads)
+                payloads.setdefault("shipyard-linux-x64", b"fixture:shipyard-linux-x64\n")
+                output.write_text(
+                    "".join(
+                        f"{hashlib.sha256(payloads[name]).hexdigest()}  {name}\n"
+                        for name in names
+                    ),
+                    encoding="utf-8",
+                )
+            elif pattern in self.payloads:
+                output.write_bytes(self.payloads[pattern])
             return ""
         if args[:4] == ["gh", "release", "edit", "--repo"]:
             self.draft = "--draft=true" in args
@@ -432,6 +461,37 @@ class ReleaseMacosLocalTests(unittest.TestCase):
 
         self.assertEqual(outcome, "partial")
         self.assertIn(f"checksum:{missing_name}", stdout.getvalue())
+
+    def test_manifest_byte_mismatch_is_fail_closed(self) -> None:
+        class TamperedRunner(FakeRunner):
+            def run(self, args: list[str], **kwargs: object) -> str:
+                if (
+                    args[:4] == ["gh", "release", "download", "--repo"]
+                    and args[args.index("--pattern") + 1] == "shipyard-linux-x64"
+                ):
+                    output = Path(args[args.index("--output") + 1])
+                    output.write_bytes(b"tampered release bytes\n")
+                    return ""
+                return super().run(args, **kwargs)
+
+        config = release_macos_local.ReleaseConfig(
+            tag="v0.127.0",
+            repo="danielraffel/Shipyard",
+            artifact_prefix="shipyard",
+            dist_dir=Path("dist"),
+            upload=True,
+            ci_mode=True,
+            skip_build=True,
+            binary=None,
+            cargo_target=None,
+        )
+        runner = TamperedRunner(assets=complete_release_assets())
+
+        with self.assertRaises(SystemExit) as ctx:
+            release_macos_local.publish_if_ready(config, runner)
+
+        self.assertIn("does not match identity manifest", str(ctx.exception))
+        self.assertTrue(runner.draft)
 
     def test_public_release_asset_visibility_can_retry(self) -> None:
         class EventuallyVisibleRunner(FakeRunner):
