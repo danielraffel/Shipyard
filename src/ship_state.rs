@@ -419,12 +419,73 @@ impl ShipStateStore {
         Ok(Self::get_unlocked_work_item(&self.work_item_path(key)))
     }
 
+    /// Claim a registered item, advancing its fencing epoch on every new
+    /// owner. A live owner cannot be replaced by lease expiry alone.
+    pub fn claim_work_item(
+        &self,
+        key: &WorkItemKey,
+        mut owner: WorkItemOwner,
+        now: DateTime<Utc>,
+    ) -> Result<WorkItem, Box<dyn std::error::Error>> {
+        let path = self.work_item_path(key);
+        let _lock = self.lock_work_item(key)?;
+        let mut item = Self::get_unlocked_work_item(&path).ok_or("work item is not registered")?;
+        if item.key != *key {
+            return Err("work item identity mismatch".into());
+        }
+        if let Some(current) = &item.owner {
+            if current.expires_at > now {
+                return Err("work item is already claimed".into());
+            }
+            owner.epoch = current.epoch.saturating_add(1);
+        } else {
+            owner.epoch = item.generation;
+        }
+        item.owner = Some(owner);
+        item.state = "claimed".to_owned();
+        item.state_version = item.state_version.saturating_add(1);
+        item.updated_at = now;
+        Self::persist_work_item_at(&item, &path)?;
+        Ok(item)
+    }
+
+    /// Persist a continuation checkpoint only for the current fenced owner.
+    pub fn checkpoint_work_item(
+        &self,
+        key: &WorkItemKey,
+        epoch: u64,
+        checkpoint: WorkItemCheckpoint,
+        now: DateTime<Utc>,
+    ) -> Result<WorkItem, Box<dyn std::error::Error>> {
+        let path = self.work_item_path(key);
+        let _lock = self.lock_work_item(key)?;
+        let mut item = Self::get_unlocked_work_item(&path).ok_or("work item is not registered")?;
+        if item.key != *key || item.owner.as_ref().is_none_or(|owner| owner.epoch != epoch) {
+            return Err("stale or missing work-item owner epoch".into());
+        }
+        if checkpoint.generation != item.generation {
+            return Err("checkpoint generation is stale".into());
+        }
+        item.checkpoint = Some(checkpoint);
+        item.state = "checkpointed".to_owned();
+        item.state_version = item.state_version.saturating_add(1);
+        item.updated_at = now;
+        Self::persist_work_item_at(&item, &path)?;
+        Ok(item)
+    }
+
     fn work_item_path(&self, key: &WorkItemKey) -> PathBuf {
-        self.path.join("work-items").join(format!("{}.json", work_item_digest(key)))
+        self.path
+            .join("work-items")
+            .join(format!("{}.json", work_item_digest(key)))
     }
 
     fn lock_work_item(&self, key: &WorkItemKey) -> io::Result<ShipStatePrLock> {
-        ShipStatePrLock::acquire(self.path.join("work-items").join(format!("{}.lock", work_item_digest(key))))
+        ShipStatePrLock::acquire(
+            self.path
+                .join("work-items")
+                .join(format!("{}.lock", work_item_digest(key))),
+        )
     }
 
     /// Return the active state path for a PR.
@@ -1244,8 +1305,8 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        AbandonRecord, DispatchedRun, ShipState, ShipStateStore, compute_policy_signature,
-        same_repository, WorkItemKey,
+        AbandonRecord, DispatchedRun, ShipState, ShipStateStore, WorkItemCheckpoint, WorkItemKey,
+        WorkItemOwner, compute_policy_signature, same_repository,
     };
     use fs2::FileExt;
 
@@ -1996,11 +2057,78 @@ mod tests {
         store
             .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem-42", now)
             .expect("register");
-        assert!(store
-            .register_work_item(key.clone(), "work-item/v2", "fleet/v1", "idem-42", now)
-            .is_err());
-        assert!(store
-            .register_work_item(key, "work-item/v1", "fleet/v2", "idem-42", now)
-            .is_err());
+        assert!(
+            store
+                .register_work_item(key.clone(), "work-item/v2", "fleet/v1", "idem-42", now)
+                .is_err()
+        );
+        assert!(
+            store
+                .register_work_item(key, "work-item/v1", "fleet/v2", "idem-42", now)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn work_item_checkpoint_rejects_stale_owner_after_reclaim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-epoch".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let first = store
+            .claim_work_item(
+                &key,
+                WorkItemOwner {
+                    host: "m1".to_owned(),
+                    session: "a".to_owned(),
+                    epoch: 0,
+                    expires_at: now,
+                    capability_version: "fleet/v1".to_owned(),
+                },
+                now,
+            )
+            .expect("first claim");
+        let first_epoch = first.owner.as_ref().expect("owner").epoch;
+        let second = store
+            .claim_work_item(
+                &key,
+                WorkItemOwner {
+                    host: "m3".to_owned(),
+                    session: "b".to_owned(),
+                    epoch: 0,
+                    expires_at: now + chrono::Duration::minutes(5),
+                    capability_version: "fleet/v1".to_owned(),
+                },
+                now + chrono::Duration::seconds(1),
+            )
+            .expect("reclaim after expiry");
+        let second_epoch = second.owner.as_ref().expect("owner").epoch;
+        assert!(second_epoch > first_epoch);
+        let checkpoint = WorkItemCheckpoint {
+            generation: second.generation,
+            head_or_input_digest: "sha256:input".to_owned(),
+            completed_steps: vec!["registered".to_owned()],
+            next_action: "continue".to_owned(),
+            blockers: vec![],
+            remote_receipt: None,
+        };
+        assert!(
+            store
+                .checkpoint_work_item(&key, first_epoch, checkpoint.clone(), now)
+                .is_err()
+        );
+        assert!(
+            store
+                .checkpoint_work_item(&key, second_epoch, checkpoint, now)
+                .is_ok()
+        );
     }
 }
