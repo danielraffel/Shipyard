@@ -53,13 +53,14 @@ class MergeReceiptHandoffTests(unittest.TestCase):
         value.update(overrides)
         return value
 
-    def producer_db(self, root: pathlib.Path, imported_at: str = "2026-10-26T00:01:00Z") -> None:
+    def producer_db(self, root: pathlib.Path, imported_at: str = "2026-10-26T00:01:00Z",
+                    project: str = "repo") -> None:
         database = root / "state" / "metrics" / "metrics.db"
         database.parent.mkdir(parents=True)
         import sqlite3
         with sqlite3.connect(database) as connection:
             connection.execute("CREATE TABLE merge_receipts (repo TEXT, project TEXT, base_branch TEXT, imported_at TEXT)")
-            connection.execute("INSERT INTO merge_receipts VALUES (?, ?, ?, ?)", ("owner/repo", "repo", "main", imported_at))
+            connection.execute("INSERT INTO merge_receipts VALUES (?, ?, ?, ?)", ("owner/repo", project, "main", imported_at))
             connection.commit()
 
     def fake_shipyard(self, directory: pathlib.Path, output: pathlib.Path, *, fail: bool = False, malformed: bool = False) -> pathlib.Path:
@@ -96,6 +97,20 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             self.assertEqual(value["status"], "fresh")
             self.assertEqual(value["receipt_count"], 1)
             self.assertEqual(json.loads(handoff.read_text())["repo"], "owner/repo")
+
+    def test_export_accepts_legacy_mixed_case_project_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            shipyard = self.fake_shipyard(root, root / "handoff.jsonl")
+            handoff = root / "handoff.jsonl"
+            health = root / "handoff.health.json"
+            self.producer_db(root, project="REPO")
+            result = self.invoke("export", "--shipyard", str(shipyard), "--state-dir", str(root / "state"),
+                                 "--repo", "owner/repo", "--file", str(handoff), "--health-file", str(health))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            value = json.loads(health.read_text())
+            self.assertEqual(value["status"], "fresh")
+            self.assertEqual(value["source_imported_at"], "2026-10-26T00:01:00Z")
 
     def test_export_failure_marks_health_and_does_not_claim_freshness(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
