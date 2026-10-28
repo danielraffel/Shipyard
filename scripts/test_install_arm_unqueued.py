@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import plistlib
 import stat
 import subprocess
@@ -50,6 +51,14 @@ class InstallArmUnqueuedTests(unittest.TestCase):
             self.root / "launchctl", f'printf "%s\\n" "$*" >> "{self.calls}"\n'
         )
         self.plutil = executable(self.root / "plutil", "exit 0\n")
+        # A /usr/bin/timeout stand-in that records its bound, then runs the
+        # command it wraps: `-k <kill-after> <seconds> <command...>`.
+        self.timeout_args = self.root / "timeout-args"
+        self.timeout = executable(
+            self.root / "timeout",
+            f'printf "%s %s %s\\n" "$1" "$2" "$3" > "{self.timeout_args}"\n'
+            'shift 3\nexec "$@"\n',
+        )
         self.env = {
             "HOME": str(self.home),
             "PATH": "/usr/bin:/bin",
@@ -60,6 +69,7 @@ class InstallArmUnqueuedTests(unittest.TestCase):
             # rejects the malformed XML that plutil -lint accepted (a double
             # hyphen inside the template's XML comment).
             "SHIPYARD_PLUTIL_BIN": str(self.plutil),
+            "SHIPYARD_TIMEOUT_BIN": str(self.timeout),
         }
 
     def tearDown(self) -> None:
@@ -141,7 +151,7 @@ class InstallArmUnqueuedTests(unittest.TestCase):
         with plist.open("rb") as stream:
             parsed = plistlib.load(stream)
         argv = parsed["ProgramArguments"]
-        self.assertEqual(argv[0], str(self.shipyard))
+        self.assertEqual(argv[:5], [str(self.timeout), "-k", "30", "840", str(self.shipyard)])
         self.assertEqual(parsed["Label"], LABEL)
         self.assertEqual(parsed["StartInterval"], 900)
         for repo in ("Owner/one", "Owner/two"):
@@ -188,8 +198,71 @@ class InstallArmUnqueuedTests(unittest.TestCase):
 
     def test_the_template_declares_every_placeholder_the_installer_renders(self) -> None:
         template = TEMPLATE.read_text(encoding="utf-8")
-        for placeholder in ("@SHIPYARD@", "@HOME@", "@BASE@", "@INTERVAL@", "@REPO_ARGS@"):
+        for placeholder in (
+            "@SHIPYARD@",
+            "@HOME@",
+            "@BASE@",
+            "@INTERVAL@",
+            "@REPO_ARGS@",
+            "@TIMEOUT_BIN@",
+            "@KILL_AFTER@",
+            "@TIMEOUT@",
+        ):
             self.assertIn(placeholder, template)
+
+    # -- bounded runs -----------------------------------------------------
+
+    def test_every_run_and_the_rehearsal_are_bounded_below_the_interval(self) -> None:
+        result = self.run_installer(
+            "--repo", "o/r", "--interval", "600", "--timeout", "420", "--install"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with self.plist_path().open("rb") as stream:
+            argv = plistlib.load(stream)["ProgramArguments"]
+        self.assertEqual(argv[:4], [str(self.timeout), "-k", "30", "420"])
+        # The rehearsal ran under the same bound, and still reached Shipyard.
+        self.assertEqual(self.timeout_args.read_text(encoding="utf-8"), "-k 30 420\n")
+        self.assertTrue(self.rehearsal_args.exists())
+
+    def test_the_default_bound_leaves_a_minute_before_the_next_tick(self) -> None:
+        result = self.run_installer("--repo", "o/r", "--interval", "600")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("interval=600s timeout=540s", result.stdout)
+
+    def test_a_bound_that_reaches_the_next_tick_is_refused(self) -> None:
+        for bad in ["600", "900", "30", "abc"]:
+            result = self.run_installer("--repo", "o/r", "--interval", "600", "--timeout", bad)
+            self.assertEqual(result.returncode, 2, f"{bad}: {result.stdout}")
+            self.assertIn("--timeout must be", result.stderr, bad)
+
+    def test_a_missing_timeout_executable_is_refused(self) -> None:
+        self.env["SHIPYARD_TIMEOUT_BIN"] = str(self.root / "absent")
+        result = self.run_installer("--repo", "o/r", "--install")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("timeout executable is unavailable", result.stderr)
+        self.assertFalse(self.plist_path().exists())
+
+    # -- status and uninstall ---------------------------------------------
+
+    def test_status_reads_and_changes_nothing(self) -> None:
+        result = self.run_installer("--status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("(absent)", result.stdout)
+        self.assertIn("log=", result.stdout)
+        calls = self.calls.read_text(encoding="utf-8") if self.calls.exists() else ""
+        self.assertNotIn("bootout", calls)
+        self.assertNotIn("bootstrap", calls)
+
+    def test_uninstall_unloads_the_agent_and_removes_its_plist(self) -> None:
+        self.assertEqual(self.run_installer("--repo", "o/r", "--install").returncode, 0)
+        self.assertTrue(self.plist_path().exists())
+        self.calls.unlink()
+        result = self.run_installer("--uninstall")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.plist_path().exists())
+        calls = self.calls.read_text(encoding="utf-8")
+        self.assertIn(f"bootout gui/{os.getuid()}/{LABEL}", calls)
+        self.assertNotIn("bootstrap", calls)
 
 
 if __name__ == "__main__":

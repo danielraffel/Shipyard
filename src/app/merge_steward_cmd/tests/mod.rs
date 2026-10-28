@@ -25,7 +25,11 @@ fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(path)
 }
 
-fn mutation_control(temp: &tempfile::TempDir, authority: &str, machine: &str) -> MutationControl {
+pub(super) fn mutation_control(
+    temp: &tempfile::TempDir,
+    authority: &str,
+    machine: &str,
+) -> MutationControl {
     let global_dir = temp.path().join("global");
     let state_dir = temp.path().join("state");
     fs::create_dir_all(&global_dir).expect("global config");
