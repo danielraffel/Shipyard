@@ -311,12 +311,13 @@ impl ExecutionSupervisor {
             {
                 continue;
             }
-            let related = related_process_inventory(&job.id, &envelope.cwd).map_err(|error| {
-                SupervisorError::Outcome(format!(
-                    "receiptless merged cancellation process inventory failed for {}: {error}",
-                    job.id
-                ))
-            })?;
+            let Ok(related) = related_process_inventory(&job.id, &envelope.cwd) else {
+                // A failed inventory is not evidence that the worker tree is
+                // gone. Leave the cancellation running and retry on the next
+                // supervisor tick; one unavailable OS probe must not prevent
+                // unrelated heartbeats, termination, or admission work.
+                continue;
+            };
             if !related.is_empty() {
                 continue;
             }
@@ -393,6 +394,7 @@ impl ExecutionSupervisor {
         let mut queue = Queue::new(&self.state_dir)?;
         let mut jobs_by_cwd =
             BTreeMap::<PathBuf, Vec<(Job, crate::queue_request::ExecutionProvenance)>>::new();
+        let mut foreground_jobs_by_cwd = BTreeMap::<PathBuf, Vec<Job>>::new();
         for job in queue
             .get_all()?
             .into_iter()
@@ -411,11 +413,19 @@ impl ExecutionSupervisor {
             let Some(provenance) = envelope.provenance.as_ref() else {
                 continue;
             };
-            if provenance.config_signature.is_none()
-                || envelope.cwd != provenance.canonical_cwd
+            if envelope.cwd != provenance.canonical_cwd
                 || provenance.validate(&provenance.canonical_cwd).is_err()
                 || !matches!(envelope.request, QueuedExecutionRequest::Ship(_))
             {
+                continue;
+            }
+            if provenance.config_signature.is_none() {
+                if foreground_cancelled {
+                    foreground_jobs_by_cwd
+                        .entry(provenance.canonical_cwd.clone())
+                        .or_default()
+                        .push(job);
+                }
                 continue;
             }
             jobs_by_cwd
@@ -423,7 +433,7 @@ impl ExecutionSupervisor {
                 .or_default()
                 .push((job, provenance.clone()));
         }
-        if jobs_by_cwd.is_empty() {
+        if jobs_by_cwd.is_empty() && foreground_jobs_by_cwd.is_empty() {
             self.merge_observers.clear();
             return Ok(());
         }
@@ -472,6 +482,18 @@ impl ExecutionSupervisor {
                 .collect::<Vec<_>>();
             pending.extend(observer.observe_pending(&scoped_jobs, &request_store, &cwd, None));
             running.extend(observer.observe_running(&scoped_jobs, &request_store, &cwd, None));
+        }
+        for (cwd, jobs) in foreground_jobs_by_cwd {
+            let Ok(config) = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
+                self.mode,
+                &cwd,
+                self.global_dir.clone(),
+            ) else {
+                continue;
+            };
+            let mut observer = AlreadyMergedObserver::from_config(&config);
+            pending.extend(observer.observe_pending(&jobs, &request_store, &cwd, None));
+            running.extend(observer.observe_running(&jobs, &request_store, &cwd, None));
         }
         self.apply_merge_cancellations(pending, running)
     }
