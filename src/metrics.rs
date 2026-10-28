@@ -1080,9 +1080,7 @@ impl MetricsStore {
         // write. An exact envelope already persisted may be replayed after its
         // expiry so periodic exports remain idempotent; the durable identity
         // comparison below is the only freshness exception.
-        let verification_error = envelope
-            .verify(context, &BTreeSet::new(), &BTreeMap::new())
-            .err();
+        let verification_error = envelope.verify(context).err();
         let stale_replay = matches!(verification_error.as_ref(), Some(HandoffError::Stale));
         if let Some(error) = verification_error
             && !stale_replay
@@ -1092,23 +1090,18 @@ impl MetricsStore {
 
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
         let mut conn = self.connect()?;
-        let existing: Option<ExistingMergeReceiptHandoff> = conn
-            .query_row(
-                "SELECT schema,repo,project,base_branch,payload_sha256,producer_host_id,producer_session_generation,route,destination,known_hosts_sha256,executable_sha256,issued_at,expires_at FROM merge_receipt_handoffs WHERE envelope_id=?1",
-                [&envelope.envelope_id],
-                |row| Ok(ExistingMergeReceiptHandoff {
-                    schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?,
-                    payload_sha256: row.get(4)?, producer_host_id: row.get(5)?, producer_session_generation: row.get(6)?,
-                    route: row.get(7)?, destination: row.get(8)?, known_hosts_sha256: row.get(9)?, executable_sha256: row.get(10)?,
-                    issued_at: row.get(11)?, expires_at: row.get(12)?,
-                }),
-            )
-            .optional()?;
+        let repository = crate::evidence::canonical_repository(&envelope.repository);
+        let project_input = crate::evidence::canonical_repository(&envelope.project);
+        if project_input.contains('/') && project_input != repository {
+            return Err("authenticated handoff project is not bound to repository".into());
+        }
+        let (project, _) =
+            crate::metrics::project_key::normalize_for_write(&project_input, Some(&repository));
         let route = serde_json::to_string(&envelope.route)?;
         let incoming = ExistingMergeReceiptHandoff {
             schema: envelope.schema.clone(),
-            repo: envelope.repository.clone(),
-            project: envelope.project.clone(),
+            repo: repository.clone(),
+            project: project.clone(),
             base_branch: envelope.base_branch.clone(),
             payload_sha256: envelope.payload_sha256.as_str().to_owned(),
             producer_host_id: envelope.producer_host_id.clone(),
@@ -1121,6 +1114,19 @@ impl MetricsStore {
             issued_at: envelope.issued_at.to_rfc3339(),
             expires_at: envelope.expires_at.to_rfc3339(),
         };
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<ExistingMergeReceiptHandoff> = tx
+            .query_row(
+                "SELECT schema,repo,project,base_branch,payload_sha256,producer_host_id,producer_session_generation,route,destination,known_hosts_sha256,executable_sha256,issued_at,expires_at FROM merge_receipt_handoffs WHERE envelope_id=?1",
+                [&envelope.envelope_id],
+                |row| Ok(ExistingMergeReceiptHandoff {
+                    schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?,
+                    payload_sha256: row.get(4)?, producer_host_id: row.get(5)?, producer_session_generation: row.get(6)?,
+                    route: row.get(7)?, destination: row.get(8)?, known_hosts_sha256: row.get(9)?, executable_sha256: row.get(10)?,
+                    issued_at: row.get(11)?, expires_at: row.get(12)?,
+                }),
+            )
+            .optional()?;
         let had_existing = existing.is_some();
         if let Some(existing) = existing.as_ref()
             && existing != &incoming
@@ -1139,15 +1145,14 @@ impl MetricsStore {
             .into());
         }
 
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !had_existing {
             tx.execute(
                 "INSERT INTO merge_receipt_handoffs (envelope_id,schema,repo,project,base_branch,payload_sha256,producer_host_id,producer_session_generation,route,destination,known_hosts_sha256,executable_sha256,issued_at,expires_at,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     envelope.envelope_id,
                     envelope.schema,
-                    envelope.repository,
-                    envelope.project,
+                    repository,
+                    project,
                     envelope.base_branch,
                     envelope.payload_sha256.as_str(),
                     envelope.producer_host_id,
@@ -1288,20 +1293,8 @@ impl MetricsStore {
                     FROM merge_receipt_handoff_receipts hhr
                     JOIN merge_receipt_handoffs h ON h.envelope_id = hhr.envelope_id
                     WHERE hhr.receipt_id = merge_receipts.receipt_id
-                      AND lower(trim(h.repo)) = lower(trim(merge_receipts.repo))
-                      AND (
-                        lower(trim(h.project)) = lower(trim(merge_receipts.project))
-                        OR (
-                          instr(h.project, '/') > 0
-                          AND lower(trim(h.project)) = lower(trim(h.repo))
-                          AND lower(trim(substr(h.project, instr(h.project, '/') + 1))) = lower(trim(merge_receipts.project))
-                        )
-                        OR (
-                          instr(merge_receipts.project, '/') > 0
-                          AND lower(trim(merge_receipts.project)) = lower(trim(merge_receipts.repo))
-                          AND lower(trim(substr(merge_receipts.project, instr(merge_receipts.project, '/') + 1))) = lower(trim(h.project))
-                        )
-                      )
+                      AND h.repo = merge_receipts.repo
+                      AND h.project = merge_receipts.project
                       AND h.base_branch = merge_receipts.base_branch
                 )"
             } else {
@@ -4330,14 +4323,14 @@ mod tests {
             2
         );
         let conn = store.connect().unwrap();
-        let counts: (i64, i64, i64) = conn
+        let counts: (i64, i64, i64, String) = conn
             .query_row(
-                "SELECT (SELECT count(*) FROM merge_receipt_handoffs), (SELECT count(*) FROM merge_receipt_handoff_receipts), (SELECT count(*) FROM merge_receipts)",
+                "SELECT (SELECT count(*) FROM merge_receipt_handoffs), (SELECT count(*) FROM merge_receipt_handoff_receipts), (SELECT count(*) FROM merge_receipts), (SELECT project FROM merge_receipt_handoffs WHERE envelope_id='auth-envelope-1')",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(counts, (1, 2, 2));
+        assert_eq!(counts, (1, 2, 2, "repo".to_owned()));
         conn.execute(
             "UPDATE merge_receipt_handoffs SET project='other' WHERE envelope_id='auth-envelope-1'",
             [],

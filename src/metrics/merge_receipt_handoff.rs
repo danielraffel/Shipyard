@@ -8,7 +8,7 @@
 //! until [`AuthenticatedHandoffEnvelope::verify`] compares them with that
 //! trusted context.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{BufRead, Read};
 use std::path::Path;
@@ -121,7 +121,6 @@ pub enum HandoffError {
     AuthorityMismatch(&'static str),
     Stale,
     Future,
-    Replayed(&'static str),
     Serialization,
 }
 
@@ -138,7 +137,6 @@ impl fmt::Display for HandoffError {
             }
             Self::Stale => formatter.write_str("handoff is stale or expired"),
             Self::Future => formatter.write_str("handoff is issued too far in the future"),
-            Self::Replayed(field) => write!(formatter, "handoff replayed {field}"),
             Self::Serialization => formatter.write_str("handoff payload serialization failed"),
         }
     }
@@ -207,31 +205,15 @@ impl AuthenticatedHandoffEnvelope {
         Ok(())
     }
 
-    /// Compare claims against an authenticated producer fence and replay
-    /// state. Call this before opening the database write transaction.
-    ///
-    /// `seen_receipt_digests` is keyed by durable receipt ID. An identical
-    /// receipt is idempotent so a periodic full export can be reprocessed and
-    /// can attach authenticated provenance to an existing legacy row. A
-    /// changed payload under an existing ID is rejected as a conflict.
+    /// Compare claims against an authenticated producer fence. Durable replay
+    /// and receipt-payload conflict checks belong to the metrics-store
+    /// transaction, so this method performs no in-memory replay bookkeeping.
     #[allow(dead_code)] // Wired by the authenticated importer slice.
     pub(crate) fn verify<'a>(
         &'a self,
         context: &AuthenticatedProducerContext,
-        seen_envelope_ids: &BTreeSet<String>,
-        seen_receipt_digests: &BTreeMap<String, Sha256Digest>,
     ) -> Result<VerifiedAuthenticatedHandoff<'a>, HandoffError> {
         self.validate()?;
-        if seen_envelope_ids.contains(&self.envelope_id) {
-            return Err(HandoffError::Replayed("envelope_id"));
-        }
-        for receipt in &self.receipts {
-            if let Some(existing) = seen_receipt_digests.get(&receipt.receipt_id)
-                && *existing != digest_receipt(receipt)?
-            {
-                return Err(HandoffError::Replayed("receipt_id_conflict"));
-            }
-        }
         if self.repository != context.repository {
             return Err(HandoffError::RepositoryMismatch);
         }
@@ -454,11 +436,7 @@ mod tests {
     #[test]
     fn validates_and_verifies_against_trusted_fence() {
         let envelope = envelope();
-        let seen_envelopes = BTreeSet::new();
-        let seen_receipts = BTreeMap::new();
-        let verified = envelope
-            .verify(&context(), &seen_envelopes, &seen_receipts)
-            .unwrap();
+        let verified = envelope.verify(&context()).unwrap();
         assert_eq!(verified.envelope_id, "env-1");
         assert_eq!(verified.receipts.len(), 2);
     }
@@ -492,43 +470,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_replay_authority_drift_and_freshness_failures() {
-        let mut seen_envelopes = BTreeSet::new();
-        seen_envelopes.insert("env-1".to_owned());
-        assert_eq!(
-            envelope().verify(&context(), &seen_envelopes, &BTreeMap::new()),
-            Err(HandoffError::Replayed("envelope_id"))
-        );
-
-        let mut seen_receipts = BTreeMap::new();
-        seen_receipts.insert(
-            "r-1".to_owned(),
-            digest_receipt(&envelope().receipts[0]).unwrap(),
-        );
-        assert!(
-            envelope()
-                .verify(&context(), &BTreeSet::new(), &seen_receipts)
-                .is_ok()
-        );
-
-        let mut conflict = BTreeMap::new();
-        conflict.insert("r-1".to_owned(), Sha256Digest::of_bytes(b"different"));
-        assert_eq!(
-            envelope().verify(&context(), &BTreeSet::new(), &conflict),
-            Err(HandoffError::Replayed("receipt_id_conflict"))
-        );
-
+    fn rejects_authority_drift_and_freshness_failures() {
         let mut zero_age = context();
         zero_age.max_age = Duration::zero();
         assert_eq!(
-            envelope().verify(&zero_age, &BTreeSet::new(), &BTreeMap::new()),
+            envelope().verify(&zero_age),
             Err(HandoffError::Invalid("freshness policy"))
         );
 
         let mut drifted = context();
         drifted.producer_session_generation = 8;
         assert_eq!(
-            envelope().verify(&drifted, &BTreeSet::new(), &BTreeMap::new()),
+            envelope().verify(&drifted),
             Err(HandoffError::AuthorityMismatch(
                 "producer_session_generation"
             ))
@@ -536,17 +489,11 @@ mod tests {
 
         let mut future = context();
         future.now = "2026-10-27T23:00:00Z".parse().unwrap();
-        assert_eq!(
-            envelope().verify(&future, &BTreeSet::new(), &BTreeMap::new()),
-            Err(HandoffError::Future)
-        );
+        assert_eq!(envelope().verify(&future), Err(HandoffError::Future));
 
         let mut stale = context();
         stale.now = "2026-10-28T01:00:00Z".parse().unwrap();
-        assert_eq!(
-            envelope().verify(&stale, &BTreeSet::new(), &BTreeMap::new()),
-            Err(HandoffError::Stale)
-        );
+        assert_eq!(envelope().verify(&stale), Err(HandoffError::Stale));
     }
 
     #[test]
