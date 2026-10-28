@@ -404,9 +404,17 @@ pub(super) fn metrics_command<W: Write>(
                 CliFailure::new(1, format!("metrics repeated-work-cost failed: {error}"))
             })?;
             write_output(stdout, json_output, &summary, || {
+                let duration = summary
+                    .duration_ms
+                    .map_or_else(|| "unavailable".to_owned(), |ms| format!("{ms}ms"));
                 format!(
-                    "{} repeated-work observations; avoided cost unavailable ({} unjoined)",
-                    summary.observations, summary.unknown_durations
+                    "{} repeated-work observations; avoided survivor runtime {}; {} clean of {} distinct survivors ({} excluded, {} unmatched)",
+                    summary.observations,
+                    duration,
+                    summary.matched_clean,
+                    summary.distinct_survivors,
+                    summary.excluded_uncertain + summary.excluded_cancelled,
+                    summary.unmatched,
                 )
             })?;
         }
