@@ -7,6 +7,7 @@
 - **Collector:** `shipyard metrics gate-cost --json`
 - **Evidence:** [`2026-10-28-shipyard-gate-cost-baseline-7d.json`](2026-10-28-shipyard-gate-cost-baseline-7d.json)
 - **Delivery scorecard:** [`2026-10-28-shipyard-gate-cost-scorecard-7d.json`](2026-10-28-shipyard-gate-cost-scorecard-7d.json)
+- **Repeated-work shadow:** [`2026-10-28-repeated-work-shadow-cost.json`](2026-10-28-repeated-work-shadow-cost.json)
 
 ## Observed baseline
 
@@ -58,4 +59,14 @@ The week-over-week latency increase is an outcome signal to preserve in the
 next comparison. The scorecard found no merge-queue runs, no queue ejections,
 and no required branch-protection contexts, so it cannot attribute that change
 to queue admission or required-check regressions.
+
+## Repeated-work shadow observation
+
+The local repeated-work shadow store currently contains 14 observations: 3
+`superseded_exact_head` and 11 `duplicate_exact_head_config`. None joins to a
+survivor duration yet, so avoided compute is currently unknown rather than
+reported as zero. This is useful evidence that the shadow path is observing
+work, but it is not a promotion result. The next experiment must preserve the
+shadow classifications and add a joinable terminal timing witness before
+claiming compute savings.
 

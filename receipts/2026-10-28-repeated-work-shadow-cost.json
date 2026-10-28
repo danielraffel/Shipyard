@@ -1,0 +1,9 @@
+{
+  "cost_basis": "avoided_repeated_work",
+  "observations": 14,
+  "superseded_exact_head": 3,
+  "duplicate_exact_head_config": 11,
+  "joined_durations": 0,
+  "unknown_durations": 14,
+  "duration_ms": null
+}
