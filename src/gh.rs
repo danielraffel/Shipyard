@@ -681,6 +681,48 @@ impl GhClient {
             .map(|cached| cached.token.clone()))
     }
 
+    /// Mint a fresh token from the configured token command with `extra_args`
+    /// appended, bypassing every cache. `None` when auth is not a token
+    /// command. The caller keeps the token out of argv and logs.
+    pub(crate) fn mint_uncached_command_token(
+        &self,
+        cwd: &Path,
+        extra_args: &[String],
+        timeout: Duration,
+    ) -> Result<Option<MintedToken>, GhPrepareError> {
+        let GhAuthSource::Command { token_command, .. } = &self.auth.source else {
+            return Ok(None);
+        };
+        let mut expanded = expand_token_command(
+            token_command,
+            cwd,
+            self.repo_hint.as_ref(),
+            self.repo_override.as_ref(),
+        )?;
+        expanded.extend(extra_args.iter().cloned());
+        let (program, args) = expanded
+            .split_first()
+            .ok_or(GhPrepareError::EmptyTokenCommand)?;
+        let mut command = Command::new(program);
+        crate::queue_arm_gate::strip_queue_authority(&mut command);
+        command.args(args).current_dir(cwd);
+        let output = run_helper_with_timeout(&mut command, program, timeout)?;
+        if !output.status.success() {
+            return Err(GhPrepareError::HelperFailed {
+                program: program.clone(),
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let token = parse_helper_stdout(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            Utc::now(),
+            None,
+            self.auth.refresh_skew_seconds,
+        )?;
+        Ok(Some((token.token, token.expires_at)))
+    }
+
     /// Drop the cached token this client would use in `cwd`, so the next
     /// command mints afresh. For a token GitHub has rejected (HTTP 401)
     /// before its recorded expiry.
@@ -732,6 +774,9 @@ impl GhClient {
         Ok(())
     }
 }
+
+/// A freshly minted token and its expiry, from [`GhClient::mint_uncached_command_token`].
+pub(crate) type MintedToken = (String, Option<DateTime<Utc>>);
 
 /// Validate an explicit GitHub repository identity without consulting remotes.
 pub fn validate_repo_slug(slug: &str) -> Result<(), GhPrepareError> {

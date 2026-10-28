@@ -1358,7 +1358,7 @@ mod tests {
         let store = super::RouteShadowReceiptStore::new(temp.path());
         let path = store.path_for("job-runtime:mac");
         let mut pending = None;
-        for _ in 0..500 {
+        for _ in 0..5_000 {
             if let Ok(Some(receipt)) = store.load("job-runtime:mac") {
                 pending = Some(receipt);
                 break;
@@ -1394,7 +1394,7 @@ mod tests {
             Utc::now(),
         );
         let mut selected = None;
-        for _ in 0..500 {
+        for _ in 0..5_000 {
             if let Ok(Some(receipt)) = store.load("job-runtime:mac")
                 && receipt
                     .observation

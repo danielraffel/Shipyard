@@ -1999,6 +1999,16 @@ are injected only into child `gh` commands as `GH_TOKEN`; Shipyard must never
 write raw tokens, GitHub App private keys, Keychain items, 1Password sessions,
 or token caches to config, state, logs, or release artifacts.
 
+Agent git over HTTPS uses `shipyard auth git-credential` as the github.com
+credential helper (`useHttpPath = true`). Each `get` mints a fresh App token
+limited to that one repository and to `git_credential.permissions` (default
+`contents=write`; add `workflows=write` to push workflow files). It serves only
+the repositories listed in the machine-global `git_credential.repositories`,
+and on refusal it prints `quit=1`, so git never falls through to a personal
+helper. `shipyard-github-app-token --scope-repository --permission NAME=LEVEL`
+does the mint, refuses any broader token, and never caches it. Setup, checks and
+rollback: `docs/git-credential.md`.
+
 `shipyard update` reads public release metadata, so it works with no auth — but
 unauthenticated GitHub API calls are capped at 60/hr. As of v0.68.0 `update`
 opportunistically authenticates: it uses `SHIPYARD_GITHUB_TOKEN` / `GH_TOKEN` /
