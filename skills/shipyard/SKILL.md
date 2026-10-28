@@ -9,6 +9,11 @@ Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
 commit-to-pull-requests API, but zero or multiple matches remain unknown.
 
+The producer-side merge-receipt export supports an explicit `--stdout` stream
+mode for a governed transport. It emits canonical JSONL receipt records only;
+`--file` remains the atomic handoff mode, and `--stdout` cannot be combined
+with `--file` or `--json`.
+
 The read-only `queue-digest` surface reports `queue_idle` and emits
 `merge_queue_idle_with_pending_work` for an armed-but-not-enqueued PR, or the
 separate `merge_queue_idle_with_green_unarmed_work` handoff alert for a green

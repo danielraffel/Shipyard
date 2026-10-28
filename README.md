@@ -220,7 +220,9 @@ Merge receipts are retained as durable provenance. A producer can hand them to
 an observer with `shipyard metrics export merge-receipt --repo <owner/repo>
 --file <handoff.jsonl>`; the export is repository-scoped, atomic, and reads
 only receipts already persisted by Shipyard. It fails without replacing the
-handoff when no receipt exists.
+handoff when no receipt exists. A governed transport can instead use
+`--stdout`; that mode emits only canonical JSONL receipt records and writes no
+summary to stdout.
 
 ## This repository uses Shipyard
 

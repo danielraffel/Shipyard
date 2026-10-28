@@ -114,6 +114,11 @@ metrics importer resolves those rows only through the exact commit's
 authoritative pull-request API response, and keeps the identity unknown when
 that response is empty or ambiguous.
 
+For a governed receipt transport, `shipyard metrics export merge-receipt
+--repo <owner/repo> --stdout` emits only canonical JSONL records. It is
+mutually exclusive with `--file` and `--json`; keep health or transport status
+on a separate channel so stdout remains machine-readable handoff bytes.
+
 ## Version-only release bumps
 
 The CLI version is part of the CI surface map. Even a release-only
