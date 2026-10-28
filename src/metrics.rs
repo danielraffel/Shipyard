@@ -827,6 +827,11 @@ impl MetricsStore {
               cache_hit INTEGER,
               artifact_path TEXT
             );
+            -- Freshness classifies each job by whether it has a github_job
+            -- step. Keep that existence probe bounded as the metrics store
+            -- grows; without this index a scorecard scans steps once per job.
+            CREATE INDEX IF NOT EXISTS steps_job_step
+              ON steps(job_id, step);
             CREATE TABLE IF NOT EXISTS merge_receipts (
               receipt_id TEXT PRIMARY KEY,
               schema TEXT NOT NULL,
@@ -3818,6 +3823,42 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn metrics_migration_indexes_freshness_step_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = Connection::open(store.path()).unwrap();
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'steps_job_step'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1);
+        let mut plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT 1 FROM jobs
+                 WHERE EXISTS (SELECT 1 FROM steps
+                               WHERE steps.job_id = jobs.id
+                                 AND steps.step = 'github_job')",
+            )
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("steps_job_step")),
+            "freshness probe plan did not use steps_job_step: {details:?}"
+        );
+    }
 
     fn insert_scorecard_sample(
         store: &MetricsStore,

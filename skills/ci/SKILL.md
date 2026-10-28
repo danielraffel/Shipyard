@@ -102,6 +102,10 @@ minutes. Treat these as cost proxies only. A safely-merged-change denominator
 requires a durable merge receipt and remains unavailable when the local metrics
 store has only PR/job observations; never substitute distinct PR count.
 
+The freshness query classifies jobs through their `github_job` step marker.
+Keep the metrics-store `(steps.job_id, steps.step)` lookup index in migrations;
+without it, a growing store turns every scorecard into a per-job steps scan.
+
 `shipyard queue-digest --json` exposes `queue_idle` and deterministic `alerts`.
 Treat `merge_queue_idle_with_pending_work` as a supervisor notification for an
 armed-but-not-enqueued PR, and

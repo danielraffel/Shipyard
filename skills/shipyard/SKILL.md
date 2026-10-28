@@ -284,6 +284,10 @@ invalid timestamps produce unavailable queue coverage; do not synthesize
 submit-to-receipt, cache, or model-token measurements. New providers must bind
 those values to authenticated durable events before they are imported.
 
+The freshness query classifies jobs through their `github_job` step marker and
+must retain the `(steps.job_id, steps.step)` migration index. Without it, a
+large metrics store makes an observational scorecard scan steps once per job.
+
 `metrics scorecard` also reports failed/cancelled compute waste, queue-wait
 coordination cost, and failed-attempt rework as observational baseline metrics.
 It does not alter routing or queue behavior. The per-safely-merged-change
