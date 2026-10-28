@@ -483,6 +483,23 @@ impl ExecutionSupervisor {
             pending.extend(observer.observe_pending(&scoped_jobs, &request_store, &cwd, None));
             running.extend(observer.observe_running(&scoped_jobs, &request_store, &cwd, None));
         }
+        let (foreground_pending, foreground_running) =
+            self.observe_foreground_merged_ship_jobs(foreground_jobs_by_cwd, &request_store);
+        pending.extend(foreground_pending);
+        running.extend(foreground_running);
+        self.apply_merge_cancellations(pending, running)
+    }
+
+    fn observe_foreground_merged_ship_jobs(
+        &self,
+        foreground_jobs_by_cwd: BTreeMap<PathBuf, Vec<Job>>,
+        request_store: &QueueRequestStore,
+    ) -> (
+        Vec<AlreadyMergedCancellation>,
+        Vec<AlreadyMergedCancellation>,
+    ) {
+        let mut pending = Vec::new();
+        let mut running = Vec::new();
         for (cwd, jobs) in foreground_jobs_by_cwd {
             let Ok(config) = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
                 self.mode,
@@ -492,10 +509,10 @@ impl ExecutionSupervisor {
                 continue;
             };
             let mut observer = AlreadyMergedObserver::from_config(&config);
-            pending.extend(observer.observe_pending(&jobs, &request_store, &cwd, None));
-            running.extend(observer.observe_running(&jobs, &request_store, &cwd, None));
+            pending.extend(observer.observe_pending(jobs.as_slice(), request_store, &cwd, None));
+            running.extend(observer.observe_running(jobs.as_slice(), request_store, &cwd, None));
         }
-        self.apply_merge_cancellations(pending, running)
+        (pending, running)
     }
 
     fn apply_merge_cancellations(
