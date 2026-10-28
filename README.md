@@ -13,9 +13,9 @@ parts of CI:
 - **Shipyard coordinates the work.** It sends an exact commit to the targets
   you choose, records the results, watches pull requests, and hands a verified
   head to GitHub for landing.
-- **TartCI runs the work in disposable VMs.** It turns Apple Silicon Macs into
-  GitHub Actions capacity by booting clean macOS, Linux, or Windows VMs for
-  jobs and removing them afterward.
+- **TartCI runs the work in disposable VMs.** For teams using Tart on Apple
+  Silicon, it turns their Macs into GitHub Actions capacity by booting clean
+  macOS, Linux, or Windows VMs for jobs and removing them afterward.
 
 Use Shipyard without TartCI for local, SSH, or hosted checks. Add TartCI when
 those checks need isolated Mac VM capacity. GitHub remains the authority for
