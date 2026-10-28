@@ -191,15 +191,18 @@ fn denominator(previous: &[&ProxySample], current: &[&ProxySample]) -> Denominat
 pub(super) fn compare_findings(
     samples: &[ProxySample],
     split_days_ago: i64,
+    before_days: Option<i64>,
+    after_days: Option<i64>,
     now: DateTime<Utc>,
 ) -> Vec<MetricsFinding> {
     let split = now - Duration::days(split_days_ago.max(1));
-    let lanes = split_by_lane(
-        samples,
-        DateTime::<Utc>::MIN_UTC,
-        split,
-        now + Duration::seconds(1),
-    );
+    let before_start = before_days
+        .map(|days| split - Duration::days(days.max(1)))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let after_end = after_days
+        .map(|days| split + Duration::days(days.max(1)))
+        .unwrap_or(now + Duration::seconds(1));
+    let lanes = split_by_lane(samples, before_start, split, after_end);
     lanes
         .into_iter()
         .filter(|(_, (before, after))| !before.is_empty() && !after.is_empty())
@@ -421,6 +424,26 @@ mod tests {
         assert_eq!(wall[0].severity, "investigate");
         assert_eq!(wall[0].signal, "p50_total_ms_compare");
         assert_eq!(wall[0].basis, "wall_time");
+    }
+
+    #[test]
+    fn compare_honors_explicit_before_and_after_windows() {
+        let now = Utc::now();
+        let sample = |days_ago: i64| ProxySample {
+            lane: "macos".to_owned(),
+            job: "macos".to_owned(),
+            status: "success".to_owned(),
+            completed_at: Some(now - Duration::days(days_ago)),
+            total_ms: Some(60_000),
+            ..ProxySample::default()
+        };
+        let samples = vec![sample(10), sample(8), sample(6), sample(1)];
+
+        let findings = compare_findings(&samples, 7, Some(2), Some(2), now);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let context = &findings[0].comparison.as_ref().expect("comparison").context;
+        assert_eq!(context.before_sample, 1);
+        assert_eq!(context.after_sample, 1);
     }
 
     #[test]

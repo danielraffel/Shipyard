@@ -1925,16 +1925,37 @@ impl MetricsStore {
         split_days_ago: i64,
         basis: proxy::Basis,
     ) -> Result<Vec<MetricsFinding>, Box<dyn std::error::Error>> {
+        self.compare_with_windows(project, split_days_ago, None, None, basis)
+    }
+
+    /// Compare before/after windows with optional bounded sides.
+    pub fn compare_with_windows(
+        &self,
+        project: &str,
+        split_days_ago: i64,
+        before_days: Option<i64>,
+        after_days: Option<i64>,
+        basis: proxy::Basis,
+    ) -> Result<Vec<MetricsFinding>, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
+        let now = Utc::now();
         if basis == proxy::Basis::WallTime {
             let rows = load_summary_inputs(&conn, Some(project))?;
-            return Ok(compare_findings(rows, split_days_ago));
+            return Ok(compare_findings(
+                rows,
+                split_days_ago,
+                before_days,
+                after_days,
+                now,
+            ));
         }
         let samples = proxy_store::load_samples(&conn, Some(project))?;
         Ok(proxy_store::compare_findings(
             &samples,
             split_days_ago,
-            Utc::now(),
+            before_days,
+            after_days,
+            now,
         ))
     }
 
@@ -3555,8 +3576,20 @@ fn advise_findings(rows: Vec<SummaryInput>) -> Vec<MetricsFinding> {
     findings
 }
 
-fn compare_findings(rows: Vec<SummaryInput>, split_days_ago: i64) -> Vec<MetricsFinding> {
-    let split = Utc::now() - Duration::days(split_days_ago.max(1));
+fn compare_findings(
+    rows: Vec<SummaryInput>,
+    split_days_ago: i64,
+    before_days: Option<i64>,
+    after_days: Option<i64>,
+    now: DateTime<Utc>,
+) -> Vec<MetricsFinding> {
+    let split = now - Duration::days(split_days_ago.max(1));
+    let before_start = before_days
+        .map(|days| split - Duration::days(days.max(1)))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let after_end = after_days
+        .map(|days| split + Duration::days(days.max(1)))
+        .unwrap_or(now + Duration::seconds(1));
     let mut groups: BTreeMap<String, (Vec<i64>, Vec<i64>)> = BTreeMap::new();
     for row in rows {
         if !(row.status == "pass" || row.status == "success") {
@@ -3569,9 +3602,9 @@ fn compare_findings(rows: Vec<SummaryInput>, split_days_ago: i64) -> Vec<Metrics
             continue;
         };
         let lane = format!("{}/{}/{}", row.target, row.backend, row.host);
-        if completed_at < split {
+        if completed_at >= before_start && completed_at < split {
             groups.entry(lane).or_default().0.push(total_ms);
-        } else {
+        } else if completed_at >= split && completed_at < after_end {
             groups.entry(lane).or_default().1.push(total_ms);
         }
     }
