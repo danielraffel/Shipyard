@@ -20,6 +20,15 @@ REQUIRED_FAILURES = (
     "authoritative post-remediation progress read",
 )
 REQUIRED_FAILURE_CASES = [f"F{i}" for i in range(1, 9)]
+REQUIRED_BLOCKED_MARKERS = (
+    "## Blocked-state invariants",
+    "a deliberate `HOLD`, owner-held PR, or unresolved exact-head approval",
+    "a queue-removal or merge-group guard",
+    "missing, stale, contradictory, or unauthenticated provider evidence",
+    "uncertain worker liveness, request identity, or host ownership",
+    "Re-admission or redispatch is permitted only after a fresh authoritative read",
+    "reconciliation preserves `blocked` and records the next deadline",
+)
 REQUIRED_EVIDENCE_SYMBOLS = (
     "dead_receipt_retirement_serializes_concurrent_replacement",
     "daemon_restart_adopts_exact_live_worker_without_replay",
@@ -30,23 +39,95 @@ REQUIRED_EVIDENCE_SYMBOLS = (
 )
 
 
-def main() -> int:
-    if not CONTRACT.is_file():
-        raise SystemExit("missing docs/autonomy-contract.md")
-    text = CONTRACT.read_text(encoding="utf-8")
+def _evidence_rows(text: str) -> list[tuple[str, str]]:
+    rows = []
+    for line in text.splitlines():
+        match = re.match(r"^\| (A(?:[1-9]|1[0-2])) \|", line)
+        if not match:
+            continue
+        columns = [column.strip() for column in line.strip().strip("|").split("|")]
+        if len(columns) == 6:
+            rows.append((match.group(1), columns[5]))
+    return rows
+
+
+def _validate_evidence_rows(text: str, root: Path) -> None:
+    """Require every evidence cell to name a real test or an explicit gap."""
+    rows = _evidence_rows(text)
+    if len(rows) != len(REQUIRED_IDS):
+        raise SystemExit("every A1-A12 row must have an executable evidence cell")
+    source_cache = {
+        path.relative_to(root).as_posix(): path.read_text(encoding="utf-8", errors="replace")
+        for path in root.joinpath("src").rglob("*.rs")
+    }
+    seen_symbols = set()
+    for row_id, cell in rows:
+        entries = [entry.strip() for entry in cell.split(";") if entry.strip()]
+        if not entries:
+            raise SystemExit(f"{row_id} executable evidence cell is empty")
+        for entry in entries:
+            if entry.startswith("gap:"):
+                if not entry[4:].strip():
+                    raise SystemExit(f"{row_id} has an empty gap evidence tag")
+                continue
+            if not entry.startswith("test:"):
+                raise SystemExit(
+                    f"{row_id} evidence must use 'test: path::symbol' or 'gap: reason': {entry}"
+                )
+            reference = entry[5:].strip()
+            path_text, separator, symbol = reference.partition("::")
+            if not separator or not path_text or not symbol or not re.fullmatch(r"[A-Za-z0-9_]+", symbol):
+                raise SystemExit(f"{row_id} has malformed test evidence reference: {reference}")
+            source = source_cache.get(path_text)
+            if source is None:
+                raise SystemExit(f"{row_id} cites missing evidence source: {path_text}")
+            _validate_test_reference(row_id, path_text, symbol, source)
+            seen_symbols.add(symbol)
+    missing = [symbol for symbol in REQUIRED_EVIDENCE_SYMBOLS if symbol not in seen_symbols]
+    if missing:
+        raise SystemExit(
+            "required evidence symbols must be cited in an A-row evidence cell: "
+            + ", ".join(missing)
+        )
+
+
+def _validate_test_reference(row_id: str, path_text: str, symbol: str, source: str) -> None:
+    function_match = re.search(
+        rf"(?P<attrs>(?:\s*#\[[^\]]+\]\s*)*)"
+        rf"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+{re.escape(symbol)}\s*\(",
+        source,
+    )
+    if function_match is None:
+        raise SystemExit(f"{row_id} cites missing evidence test: {path_text}::{symbol}")
+    attrs = function_match.group("attrs")
+    if not re.search(r"#\[(?:[A-Za-z_][A-Za-z0-9_]*::)?test(?:\s*=|\])", attrs):
+        raise SystemExit(f"{row_id} cites a non-test function: {path_text}::{symbol}")
+    if re.search(r"#\[ignore(?:\s*=|\])", attrs):
+        raise SystemExit(f"{row_id} cites an ignored test: {path_text}::{symbol}")
+
+
+def validate_contract(text: str, root: Path = ROOT) -> None:
+    """Validate the contract against its source tree; raises SystemExit on drift."""
     folded = re.sub(r"\s+", " ", text.lower())
     missing = [item for item in REQUIRED_IDS if not re.search(rf"\b{item}\b", text)]
     if missing:
         raise SystemExit(f"missing autonomy invariant(s): {', '.join(missing)}")
-    for path in (ROOT / "AGENTS.md", ROOT / "CLAUDE.md"):
+    missing_blocked = [marker for marker in REQUIRED_BLOCKED_MARKERS if marker not in text]
+    if missing_blocked:
+        raise SystemExit(
+            "blocked-state contract is missing required invariant(s): "
+            + ", ".join(missing_blocked)
+        )
+    for path in (root / "AGENTS.md", root / "CLAUDE.md"):
         if "docs/autonomy-contract.md" not in path.read_text(encoding="utf-8"):
             raise SystemExit(f"{path} does not reference docs/autonomy-contract.md")
-    for surface in REQUIRED_SURFACES:
+    for relative_surface in REQUIRED_SURFACES:
+        surface = root / relative_surface.relative_to(ROOT)
         if not surface.is_file():
-            raise SystemExit(f"contract names missing enforcement surface: {surface.relative_to(ROOT)}")
+            raise SystemExit(f"contract names missing enforcement surface: {relative_surface.relative_to(ROOT)}")
     rust_sources = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
-        for path in (ROOT / "src").rglob("*.rs")
+        for path in (root / "src").rglob("*.rs")
     )
     missing_symbols = [
         symbol for symbol in REQUIRED_EVIDENCE_SYMBOLS
@@ -77,6 +158,14 @@ def main() -> int:
     for phrase in REQUIRED_FAILURES + ("authoritative post-remediation progress", "controller restart", "duplicate effects"):
         if phrase not in folded:
             raise SystemExit(f"contract missing required recovery proof: {phrase}")
+    _validate_evidence_rows(text, root)
+
+
+def main() -> int:
+    if not CONTRACT.is_file():
+        raise SystemExit("missing docs/autonomy-contract.md")
+    text = CONTRACT.read_text(encoding="utf-8")
+    validate_contract(text)
     print("autonomy contract: OK (A1-A12, enforcement surfaces, evidence rows, F1-F8 liveness matrix, recovery proof requirements)")
     return 0
 
