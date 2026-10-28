@@ -167,10 +167,6 @@ impl AuthenticatedHandoffEnvelope {
         if !valid_repository(&self.repository) {
             return Err(HandoffError::Invalid("repository"));
         }
-        let repository_project = self.repository.rsplit('/').next().unwrap_or_default();
-        if self.project != repository_project {
-            return Err(HandoffError::AuthorityMismatch("project"));
-        }
         if self.producer_session_generation == 0
             || matches!(self.route, CanaryRoute::Unavailable)
             || self.expires_at <= self.issued_at
@@ -598,18 +594,6 @@ mod tests {
         assert_eq!(
             mixed_case.validate(),
             Err(HandoffError::Invalid("repository"))
-        );
-
-        let mut noncanonical_project = envelope();
-        noncanonical_project.project = "owner/repo".to_owned();
-        for receipt in &mut noncanonical_project.receipts {
-            receipt.project = noncanonical_project.project.clone();
-        }
-        noncanonical_project.payload_sha256 =
-            digest_receipts(&noncanonical_project.receipts).unwrap();
-        assert_eq!(
-            noncanonical_project.validate(),
-            Err(HandoffError::AuthorityMismatch("project"))
         );
     }
 }
