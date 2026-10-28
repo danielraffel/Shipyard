@@ -23,7 +23,7 @@ use crate::merge_steward::{
     CapacityPreemptionPolicy, QueueFrontPressure, RequiredCheck, RunCancellation,
     RunCancellationReason, StalePrRunWedgeCandidate, StewardCheck, StewardDecision, StewardJob,
     StewardPolicy, StewardPullRequest, StewardRun, classify_pr, coalescing_reason_authorizes,
-    has_successful_status, is_capacity_preemption_workflow, is_full_sha,
+    has_successful_status, is_capacity_preemption_workflow, is_full_sha, is_implicitly_managed,
     is_safe_capacity_preemption, plan_capacity_preemptions, plan_run_coalescing,
     plan_stale_pr_run_wedges, preemption_key, queue_front_waits_for_pool,
 };

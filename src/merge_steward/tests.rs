@@ -111,6 +111,21 @@ fn fleet_management_uses_author_and_branch_quadrants() {
         classify_pr(&dependabot, &policy, &BTreeMap::new()),
         StewardDecision::Unmanaged
     );
+
+    let mut foreign_app = green_pr();
+    foreign_app.head_branch = "feature/fleet".to_owned();
+    foreign_app.author = Some("app/other-automation".to_owned());
+    assert_eq!(
+        classify_pr(&foreign_app, &policy, &BTreeMap::new()),
+        StewardDecision::Unmanaged
+    );
+
+    let mut foreign_bot = foreign_app;
+    foreign_bot.author = Some("other-automation[bot]".to_owned());
+    assert_eq!(
+        classify_pr(&foreign_bot, &policy, &BTreeMap::new()),
+        StewardDecision::Unmanaged
+    );
 }
 
 #[test]
