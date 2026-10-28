@@ -3,6 +3,34 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03700"></a>
+## [0.370.0] - 2026-10-28
+
+- fix(steward): run the scheduled arming pass from launchd under HOLD ([#952](https://github.com/danielraffel/Shipyard/pull/952))
+
+<a id="v03691"></a>
+## [0.369.1] - 2026-10-28
+
+- fix(wait): preserve required checks across app identities ([#951](https://github.com/danielraffel/Shipyard/pull/951))
+
+<a id="v03690"></a>
+## [0.369.0] - 2026-10-28
+
+- feat(auth): repository-scoped git credential helper ([#957](https://github.com/danielraffel/Shipyard/pull/957))
+- metrics: import TartCI fleet capacity receipts ([#953](https://github.com/danielraffel/Shipyard/pull/953))
+- fix(baseline): keep collecting when receipt handoff is unavailable ([#965](https://github.com/danielraffel/Shipyard/pull/965))
+
+<a id="v03680"></a>
+## [0.368.0] - 2026-10-28
+
+- feat: show fixing push in human cause advice ([#971](https://github.com/danielraffel/Shipyard/pull/971))
+- fix: run pinned Rust gates on capable hosts ([#975](https://github.com/danielraffel/Shipyard/pull/975))
+
+<a id="v03671"></a>
+## [0.367.1] - 2026-10-28
+
+- fix(merge): fail closed on private queue ambiguity ([#972](https://github.com/danielraffel/Shipyard/pull/972))
+
 <a id="v03670"></a>
 ## [0.367.0] - 2026-10-28
 
@@ -2663,6 +2691,11 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.370.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.370.0
+[0.369.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.369.1
+[0.369.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.369.0
+[0.368.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.368.0
+[0.367.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.367.1
 [0.367.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.367.0
 [0.366.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.366.4
 [0.366.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.366.3
