@@ -48,12 +48,18 @@ def main() -> int:
         path.read_text(encoding="utf-8", errors="replace")
         for path in (ROOT / "src").rglob("*.rs")
     )
-    missing_symbols = [symbol for symbol in REQUIRED_EVIDENCE_SYMBOLS if symbol not in rust_sources]
+    missing_symbols = [
+        symbol for symbol in REQUIRED_EVIDENCE_SYMBOLS
+        if not re.search(rf"\b(?:async\s+)?fn\s+{re.escape(symbol)}\s*\(", rust_sources)
+    ]
     if missing_symbols:
         raise SystemExit(f"contract references missing executable evidence: {', '.join(missing_symbols)}")
     rows = [line for line in text.splitlines() if re.match(r"^\| A(?:[1-9]|1[0-2]) \|", line)]
     if len(rows) != len(REQUIRED_IDS):
         raise SystemExit(f"expected one evidence row per invariant, found {len(rows)}")
+    row_ids = [row.split("|", 2)[1].strip() for row in rows]
+    if set(row_ids) != set(REQUIRED_IDS) or len(row_ids) != len(set(row_ids)):
+        raise SystemExit(f"invariant evidence rows must contain each A1-A12 exactly once: {row_ids}")
     for row in rows:
         columns = [column.strip() for column in row.strip().strip("|").split("|")]
         if len(columns) != 6 or any(not column for column in columns[1:]):
@@ -61,6 +67,9 @@ def main() -> int:
     matrix_rows = [line for line in text.splitlines() if re.match(r"^\| F[1-8] \|", line)]
     if len(matrix_rows) != len(REQUIRED_FAILURE_CASES):
         raise SystemExit(f"expected one integrated failure row per case, found {len(matrix_rows)}")
+    matrix_ids = [row.split("|", 2)[1].strip() for row in matrix_rows]
+    if set(matrix_ids) != set(REQUIRED_FAILURE_CASES) or len(matrix_ids) != len(set(matrix_ids)):
+        raise SystemExit(f"failure matrix must contain each F1-F8 exactly once: {matrix_ids}")
     for row in matrix_rows:
         columns = [column.strip() for column in row.strip().strip("|").split("|")]
         if len(columns) != 5 or any(not column for column in columns[1:]):
