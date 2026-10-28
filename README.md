@@ -2,6 +2,11 @@
 
 [![CI](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml/badge.svg)](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml)
 
+**Local-first engineering orchestration and governance for coding agents.**
+Shipyard coordinates builds, tests, reviews, merges, and bounded recovery across
+local machines, SSH-reachable VMs, and cloud runners. GitHub remains
+authoritative for pull requests and merge order.
+
 Shipyard and [TartCI](https://github.com/danielraffel/tartci) solve different
 parts of CI:
 
