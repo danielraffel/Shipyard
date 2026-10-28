@@ -119,7 +119,7 @@ pub struct WorkItemCheckpoint {
     pub remote_receipt: Option<String>,
 }
 
-/// Minimal durable work record stored beside existing ShipState files.
+/// Minimal durable work record stored beside existing `ShipState` files.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkItem {
     /// Work-item schema revision.
@@ -442,7 +442,7 @@ impl ShipStateStore {
             owner.epoch = item.generation;
         }
         item.owner = Some(owner);
-        item.state = "claimed".to_owned();
+        "claimed".clone_into(&mut item.state);
         item.state_version = item.state_version.saturating_add(1);
         item.updated_at = now;
         Self::persist_work_item_at(&item, &path)?;
@@ -467,7 +467,7 @@ impl ShipStateStore {
             return Err("checkpoint generation is stale".into());
         }
         item.checkpoint = Some(checkpoint);
-        item.state = "checkpointed".to_owned();
+        "checkpointed".clone_into(&mut item.state);
         item.state_version = item.state_version.saturating_add(1);
         item.updated_at = now;
         Self::persist_work_item_at(&item, &path)?;
