@@ -642,6 +642,12 @@ The layout and fields are the 90-day backfill's, so live and backfilled rows
 join. Its rows are live: `named_at` is the pass that named the red and
 `retrospective` is false, so `named_at - completed_at` is the time to cause.
 A red with no green yet stays pending and is retried on the next pass.
+A fix-link is emitted only when bounded job evidence proves every failed job
+passed in the candidate's latest attempt; malformed, ambiguous, incomplete, or
+non-positive-attempt records remain pending and are never presented as a fix.
+Run, job, and force-push commit reads are capped and fail closed at their page
+limits, so an archive pass cannot grow without bound or turn partial API data
+into advice.
 A generated-file drift check (`<generator>: N drift problem(s)` or
 `<generator>: the <file> no longer matches <source>`) is C2's
 `generated_drift`, class `drift`, high confidence. Its `signature` is the

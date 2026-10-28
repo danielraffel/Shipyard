@@ -14,6 +14,12 @@ The read-only `queue-digest` surface reports `queue_idle` and emits
 separate `merge_queue_idle_with_green_unarmed_work` handoff alert for a green
 unarmed PR. These are alerts for the queue owner, never mutation permissions.
 
+The deterministic `cause record` observer is bounded and fail-closed: it emits
+fix-links only when the candidate's latest job attempts prove every failed job
+passed. Ambiguous, malformed, incomplete, and non-positive-attempt evidence is
+left pending, and run/job/commit pagination stops at explicit caps rather than
+turning partial API data into a fix recommendation.
+
 `shipyard queue triage|prioritize|resume` drains a backed-up pull-request CI
 backlog: cancel runs that cannot land at their head, move the fix for a red base
 ahead of other pull requests' waiting jobs, and later re-run what was cancelled
