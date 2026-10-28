@@ -1289,7 +1289,19 @@ impl MetricsStore {
                     JOIN merge_receipt_handoffs h ON h.envelope_id = hhr.envelope_id
                     WHERE hhr.receipt_id = merge_receipts.receipt_id
                       AND lower(trim(h.repo)) = lower(trim(merge_receipts.repo))
-                      AND h.project = merge_receipts.project
+                      AND (
+                        lower(trim(h.project)) = lower(trim(merge_receipts.project))
+                        OR (
+                          instr(h.project, '/') > 0
+                          AND lower(trim(h.project)) = lower(trim(h.repo))
+                          AND lower(trim(substr(h.project, instr(h.project, '/') + 1))) = lower(trim(merge_receipts.project))
+                        )
+                        OR (
+                          instr(merge_receipts.project, '/') > 0
+                          AND lower(trim(merge_receipts.project)) = lower(trim(merge_receipts.repo))
+                          AND lower(trim(substr(merge_receipts.project, instr(merge_receipts.project, '/') + 1))) = lower(trim(h.project))
+                        )
+                      )
                       AND h.base_branch = merge_receipts.base_branch
                 )"
             } else {
@@ -4248,14 +4260,14 @@ mod tests {
         let store = MetricsStore::open(temp.path()).unwrap();
         let repository = "owner/repo";
         let receipts = vec![
-            test_receipt("auth-1", repository, "repo", 1, 'a'),
-            test_receipt("auth-2", repository, "repo", 2, 'b'),
+            test_receipt("auth-1", repository, "owner/repo", 1, 'a'),
+            test_receipt("auth-2", repository, "owner/repo", 2, 'b'),
         ];
         let envelope = crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
             schema: crate::metrics::merge_receipt_handoff::SCHEMA.to_owned(),
             envelope_id: "auth-envelope-1".to_owned(),
             repository: repository.to_owned(),
-            project: "repo".to_owned(),
+            project: "owner/repo".to_owned(),
             base_branch: "main".to_owned(),
             payload_sha256: crate::metrics::merge_receipt_handoff::digest_receipts(&receipts)
                 .unwrap(),
@@ -4271,7 +4283,7 @@ mod tests {
         };
         let context = crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
             repository: repository.to_owned(),
-            project: "repo".to_owned(),
+            project: "owner/repo".to_owned(),
             base_branch: "main".to_owned(),
             producer_host_id: "m1".to_owned(),
             producer_session_generation: 7,
