@@ -540,6 +540,13 @@ guard's own decision posted on the head; it is report-only until a
 repository requires it. A red `review-verdict` means the guard would refuse
 that head; fix the verdict, not the status.
 
+**The `risk-tier` status says how much review a head would need.**
+`scripts/risk_tier.py` (`.github/workflows/risk-tier.yml`, docs/risk-tier.md)
+classifies a pull request Low, Moderate or High from its paths, dependency
+changes, version bump, size and `risk:*` labels, with path lists from the
+base's `[review.tiers]`. It is report-only: always `success`, never required.
+Run it locally with `python3 scripts/risk_tier.py --repo R --pr N --gh ghapp`.
+
 **Shipyard's own CI names its reds.** When any job in a `ci.yml` run fails,
 the advisory `ci-cause` job reads the failed jobs' finished logs and prints one
 `ci.cause/v1` record per job as a `::notice title=ci-cause::` annotation
@@ -1139,7 +1146,7 @@ writer custody before mutation.
 | Dispatch only if remote matches HEAD | `shipyard cloud run build --require-sha HEAD --json` |
 | Opt a target into cross-PR reuse | set `reuse_if_paths_unchanged = ["src/backend/**"]` under `[targets.<name>]` |
 | Opt a target into warm-pool reuse | set `warm_keepalive_seconds = 600` under `[targets.<name>]` (see "Warm-pool reuse" below) |
-| Inspect warm-pool entries | `shipyard targets warm status --json` |
+| Inspect warm-pool entries | `shipyard targets warm status --json` (host-pool entries include the selected `member_id` when known) |
 | Drain the warm-pool (force cold-start everywhere) | `shipyard targets warm drain --yes` |
 | Force cold-start for one ship only | `shipyard ship --no-warm` (or `shipyard run --no-warm`) |
 | Global warm-pool kill switch | `SHIPYARD_NO_WARM_POOL=1` in the environment |

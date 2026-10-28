@@ -4041,6 +4041,11 @@ on every pull request's head from a workflow, so a repository can require it
 and stop landings that never pass through `ghapp`
 (docs/review-verdict-status.md).
 
+The report-only `risk-tier` status (`scripts/risk_tier.py`,
+docs/risk-tier.md) posts the review tier a pull request would need: Low (CI
+only), Moderate (one review-App approval) or High (two, plus the owner for
+workflows, credentials, signing and new dependencies).
+
 Unlike Shipyard's validated enqueue, these requests deliberately do **not**
 carry `SHIPYARD_INTERNAL_QUEUE_MUTATION`, so the arm guard judges them — an
 arm-on-open request is not bound to a validated head, so its live read is the
