@@ -1302,6 +1302,9 @@ pub(crate) enum MetricsCommand {
     /// `queue_wait_per_job_ahead_ms` = median of wait / (1 + jobs of the same
     /// lane queued earlier and still waiting).
     /// `cache_hit_rate` = jobs whose every reported step hit / jobs reporting.
+    /// `--before` bounds the earlier side to [split-before, split), while
+    /// `--after` bounds the later side to [split, split+after); neither moves
+    /// the `--split-days-ago` point. Both intervals are half-open.
     #[command(verbatim_doc_comment)]
     Compare(MetricsCompareArgs),
     /// Show recent rows plus each job class's earlier-half vs later-half

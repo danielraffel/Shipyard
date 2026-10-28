@@ -3583,13 +3583,11 @@ fn compare_findings(
     after_days: Option<i64>,
     now: DateTime<Utc>,
 ) -> Vec<MetricsFinding> {
-    let split = now - Duration::days(split_days_ago.max(1));
-    let before_start = before_days.map_or(DateTime::<Utc>::MIN_UTC, |days| {
-        split - Duration::days(days.max(1))
-    });
-    let after_end = after_days.map_or(now + Duration::seconds(1), |days| {
-        split + Duration::days(days.max(1))
-    });
+    let Some((before_start, split, after_end)) =
+        compare_window_bounds(split_days_ago, before_days, after_days, now)
+    else {
+        return Vec::new();
+    };
     let mut groups: BTreeMap<String, (Vec<i64>, Vec<i64>)> = BTreeMap::new();
     for row in rows {
         if !(row.status == "pass" || row.status == "success") {
@@ -3643,6 +3641,35 @@ fn compare_findings(
         });
     }
     findings
+}
+
+/// Return the half-open bounds used by both proxy and wall-time comparisons.
+///
+/// Extremely large public-API windows must not panic while constructing a
+/// `chrono::Duration` or moving a timestamp. Saturating the optional side
+/// keeps a valid split useful; an unrepresentable split yields no findings.
+pub(super) fn compare_window_bounds(
+    split_days_ago: i64,
+    before_days: Option<i64>,
+    after_days: Option<i64>,
+    now: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> {
+    let split = now.checked_sub_signed(Duration::try_days(split_days_ago.max(1))?)?;
+    let before_start = match before_days {
+        Some(days) => Duration::try_days(days.max(1))
+            .and_then(|duration| split.checked_sub_signed(duration))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC),
+        None => DateTime::<Utc>::MIN_UTC,
+    };
+    let after_end = match after_days {
+        Some(days) => Duration::try_days(days.max(1))
+            .and_then(|duration| split.checked_add_signed(duration))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC),
+        None => now
+            .checked_add_signed(Duration::seconds(1))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC),
+    };
+    Some((before_start, split, after_end))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -3961,6 +3988,46 @@ mod tests {
         sample.sample_id = crate::metrics::fleet_capacity::canonical_digest(&sample, true)
             .expect("capacity sample digest");
         sample
+    }
+
+    #[test]
+    fn wall_time_compare_uses_the_same_half_open_windows() {
+        let now = Utc::now();
+        let row = |days_ago: i64| SummaryInput {
+            project: "p".to_owned(),
+            target: "macos".to_owned(),
+            backend: "local".to_owned(),
+            host: "m3".to_owned(),
+            provider: "tart".to_owned(),
+            status: "success".to_owned(),
+            total_ms: Some(60_000),
+            completed_at: Some(now - Duration::days(days_ago)),
+            repo: None,
+            labels: Vec::new(),
+        };
+        let findings = compare_findings(vec![row(9), row(7), row(5)], 7, Some(2), Some(2), now);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].sample_count, 2);
+    }
+
+    #[test]
+    fn wall_time_compare_rejects_unrepresentable_public_window_without_panicking() {
+        assert!(
+            compare_findings(
+                Vec::new(),
+                i64::MAX,
+                Some(i64::MAX),
+                Some(i64::MAX),
+                Utc::now(),
+            )
+            .is_empty()
+        );
+        let (before_start, split, after_end) =
+            compare_window_bounds(1, Some(i64::MAX), Some(i64::MAX), Utc::now())
+                .expect("representable split");
+        assert_eq!(before_start, DateTime::<Utc>::MIN_UTC);
+        assert_eq!(after_end, DateTime::<Utc>::MAX_UTC);
+        assert!(before_start < split && split < after_end);
     }
 
     #[test]

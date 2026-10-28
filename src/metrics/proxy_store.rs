@@ -12,7 +12,7 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, params};
 
 use super::proxy::{self, Basis, Comparison, ProxySample, ProxyValue, Verdict};
-use super::{Denominator, GateClass, MetricsFinding, job_name};
+use super::{Denominator, GateClass, MetricsFinding, compare_window_bounds, job_name};
 
 fn parse_time(raw: Option<&str>) -> Option<DateTime<Utc>> {
     raw.and_then(|value| DateTime::parse_from_rfc3339(value).ok())
@@ -195,13 +195,11 @@ pub(super) fn compare_findings(
     after_days: Option<i64>,
     now: DateTime<Utc>,
 ) -> Vec<MetricsFinding> {
-    let split = now - Duration::days(split_days_ago.max(1));
-    let before_start = before_days.map_or(DateTime::<Utc>::MIN_UTC, |days| {
-        split - Duration::days(days.max(1))
-    });
-    let after_end = after_days.map_or(now + Duration::seconds(1), |days| {
-        split + Duration::days(days.max(1))
-    });
+    let Some((before_start, split, after_end)) =
+        compare_window_bounds(split_days_ago, before_days, after_days, now)
+    else {
+        return Vec::new();
+    };
     let lanes = split_by_lane(samples, before_start, split, after_end);
     lanes
         .into_iter()
@@ -444,6 +442,31 @@ mod tests {
         let context = &findings[0].comparison.as_ref().expect("comparison").context;
         assert_eq!(context.before_sample, 1);
         assert_eq!(context.after_sample, 1);
+    }
+
+    #[test]
+    fn compare_windows_are_half_open_at_split_and_end() {
+        let now = Utc::now();
+        let sample = |days_ago: i64| ProxySample {
+            lane: "macos".to_owned(),
+            job: "macos".to_owned(),
+            status: "success".to_owned(),
+            completed_at: Some(now - Duration::days(days_ago)),
+            total_ms: Some(60_000),
+            ..ProxySample::default()
+        };
+        let samples = vec![sample(9), sample(7), sample(5)];
+
+        let findings = compare_findings(&samples, 7, Some(2), Some(2), now);
+        let context = &findings[0].comparison.as_ref().expect("comparison").context;
+        assert_eq!(context.before_sample, 1);
+        assert_eq!(context.after_sample, 1);
+    }
+
+    #[test]
+    fn compare_rejects_unrepresentable_public_window_without_panicking() {
+        let now = Utc::now();
+        assert!(compare_findings(&[], i64::MAX, Some(i64::MAX), Some(i64::MAX), now).is_empty());
     }
 
     #[test]
