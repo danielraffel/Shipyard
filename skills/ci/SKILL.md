@@ -4203,8 +4203,11 @@ value. Merge-group runs carry no PR number and are not counted, and the
 waste is not limited to the scorecard window.
 # Repeated-work cost
 
-`shipyard metrics repeated-work-cost` is read-only shadow accounting. Treat
-duration as unavailable until queue-to-metrics provenance is authenticated.
+`shipyard metrics repeated-work-cost` is read-only shadow accounting. It joins
+each distinct surviving queue job to authenticated `queue_timing` evidence and
+reports clean avoided runtime only for non-negative, non-cancelled rows.
+Uncertain, cancelled, and unmatched jobs remain separate and unavailable; the
+result is telemetry and never a scheduler, test selector, or merge gate.
 
 
 At the protected merge boundary, Shipyard may produce that receipt only after
