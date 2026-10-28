@@ -62,7 +62,11 @@ class FakeRunner(release_macos_local.CommandRunner):
                             "source": {
                                 "repository": "danielraffel/Shipyard",
                                 "tag": args[5],
-                                "commit": "",
+                                # GitHub Actions exposes GITHUB_SHA to the
+                                # release helper. Keep the fixture bound to the
+                                # same source identity so the tests remain
+                                # deterministic both locally and in CI.
+                                "commit": os.environ.get("GITHUB_SHA", ""),
                                 "run_id": 0,
                                 "run_attempt": 0,
                             },
