@@ -4170,6 +4170,10 @@ the digest rejects a PR URL whose repository path does not match its census.
 Malformed top-level GraphQL errors, required policy values, or label/assignee
 nodes are also fatal; they must not be filtered into an empty result.
 
+### Steward check hydration
+
+The merge steward implicitly manages fleet-authored pull requests before the explicit `shipyard:managed` handoff label is copied. Census observation must therefore hydrate required check identities for those exact heads, while ordinary human pull requests remain excluded from per-PR hydration. Keep this predicate shared with steward classification so green fleet work is not stranded as `waiting_required`.
+
 ### Merge receipt import provenance
 
 The metrics merge-receipt importer is telemetry only. It requires a

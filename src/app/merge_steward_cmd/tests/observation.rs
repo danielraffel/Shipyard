@@ -1,7 +1,8 @@
 use super::*;
 use crate::app::merge_steward_cmd::observation::{
     canonical_repo_name, encode_path_segment, evaluated_required_checks,
-    hydrate_required_check_identities, parse_check, parse_rest_check,
+    hydrate_census_check_identities, hydrate_required_check_identities, parse_check,
+    parse_rest_check,
 };
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::observation::{
@@ -817,45 +818,136 @@ fn open_pull_request_census_does_not_request_the_check_rollup() {
 }
 
 #[test]
-fn absent_check_rollup_marks_only_managed_pull_requests_for_hydration() {
+fn absent_check_rollup_marks_explicit_and_implicit_managed_pull_requests_for_hydration() {
     let positions = BTreeMap::new();
-    let row = |number: u64, labels: serde_json::Value| {
-        serde_json::json!({
+    let row = |number: u64, branch: &str, author: Option<&str>, labels: serde_json::Value| {
+        let mut row = serde_json::json!({
             "id": format!("PR_{number}"),
             "number": number,
             "isDraft": false,
             "baseRefName": "main",
             "headRefOid": format!("{number:040x}"),
-            "headRefName": format!("feature-{number}"),
+            "headRefName": branch,
             "mergeStateStatus": "CLEAN",
             "autoMergeRequest": null,
             "labels": labels
-        })
+        });
+        if let Some(author) = author {
+            row["author"] = serde_json::json!({"login": author});
+        }
+        row
     };
 
     let managed = parse_pr(
-        &row(1, serde_json::json!([{"name": "shipyard:managed"}])),
+        &row(
+            1,
+            "topic/managed",
+            Some("alice"),
+            serde_json::json!([{"name": "shipyard:managed"}]),
+        ),
         &positions,
     )
     .expect("managed PR");
-    let unmanaged = parse_pr(&row(2, serde_json::json!([])), &positions).expect("unmanaged PR");
+    let implicit = parse_pr(
+        &row(
+            2,
+            "feature/fleet",
+            Some("app/shipyard-local"),
+            serde_json::json!([]),
+        ),
+        &positions,
+    )
+    .expect("implicit fleet PR");
+    let ordinary = parse_pr(
+        &row(3, "feature/human", Some("alice"), serde_json::json!([])),
+        &positions,
+    )
+    .expect("ordinary PR");
 
     assert!(
         managed.check_rollup_maybe_truncated,
         "a managed PR whose rollup was never observed must be hydrated per head"
     );
     assert!(
-        !unmanaged.check_rollup_maybe_truncated,
-        "an unmanaged PR must not buy a per-head hydration round trip"
+        implicit.check_rollup_maybe_truncated,
+        "an unlabeled fleet PR is implicitly managed and must be hydrated per head"
+    );
+    assert!(
+        !ordinary.check_rollup_maybe_truncated,
+        "an ordinary human PR must not buy a per-head hydration round trip"
     );
     assert!(managed.fact.checks.is_empty());
+    assert!(implicit.fact.checks.is_empty());
 
     // An observed rollup keeps its existing meaning for the single-PR callers
     // that still request it: complete below the page cap, suspect at it.
-    let mut observed = row(3, serde_json::json!([]));
+    let mut observed = row(4, "feature/observed", Some("alice"), serde_json::json!([]));
     observed["statusCheckRollup"] = serde_json::json!([]);
     let observed = parse_pr(&observed, &positions).expect("observed rollup");
     assert!(!observed.check_rollup_maybe_truncated);
+}
+
+#[cfg(unix)]
+#[test]
+fn census_hydrates_unlabeled_fleet_checks_with_the_required_app_identity() {
+    let temp = tempfile::tempdir().expect("temp");
+    let calls_path = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"/check-runs?per_page=100&page=1"*) printf '%s' '{{"check_runs":[{{"name":"macos","app":{{"id":42}},"status":"completed","conclusion":"success"}}]}}' ;;
+  *"/statuses?per_page=100&page=1"*) printf '%s' '[]' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            calls_path.display()
+        ),
+    );
+    let row = |number: u64, sha: &str, branch: &str, author: &str| {
+        serde_json::json!({
+            "id": format!("PR_{number}"),
+            "number": number,
+            "isDraft": false,
+            "baseRefName": "main",
+            "headRefOid": sha,
+            "headRefName": branch,
+            "author": {"login": author},
+            "mergeStateStatus": "CLEAN",
+            "autoMergeRequest": null,
+            "labels": []
+        })
+    };
+    let mut prs = vec![
+        parse_pr(
+            &row(1, &"a".repeat(40), "feature/fleet", "app/shipyard-local"),
+            &BTreeMap::new(),
+        )
+        .expect("fleet PR"),
+        parse_pr(
+            &row(2, &"b".repeat(40), "feature/human", "alice"),
+            &BTreeMap::new(),
+        )
+        .expect("human PR"),
+    ];
+    hydrate_census_check_identities(
+        &actions,
+        "owner/repo",
+        &[RequiredCheck {
+            context: "macos".to_owned(),
+            app_id: Some(42),
+        }],
+        &mut prs,
+    )
+    .expect("census hydration");
+
+    assert_eq!(prs[0].fact.checks.len(), 1);
+    assert_eq!(prs[0].fact.checks[0].app_id, Some(42));
+    assert!(prs[1].fact.checks.is_empty());
+    let calls = fs::read_to_string(calls_path).expect("hydration calls");
+    assert!(calls.contains(&format!("commits/{}/check-runs", "a".repeat(40))));
+    assert!(!calls.contains(&format!("commits/{}/check-runs", "b".repeat(40))));
 }
 
 /// The bulk open-PR read must stay within GitHub's per-query node budget no
