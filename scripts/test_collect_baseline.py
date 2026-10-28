@@ -282,6 +282,24 @@ class BaselineScorecardTests(unittest.TestCase):
 
 
 class CollectorInvocationTests(unittest.TestCase):
+    def test_project_key_helpers_are_case_insensitive(self):
+        self.assertEqual(MOD.canonical_project(" Pulp "), "pulp")
+        self.assertEqual(MOD.state_identity(Path("state.json"), "Pulp", "o/pulp", Path("metrics.db"))["project"], "pulp")
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "metrics.db"
+            conn = __import__("sqlite3").connect(db)
+            conn.executescript("create table runs(id integer primary key, project text, repo text); create table jobs(id integer primary key, run_id integer, started_at text, completed_at text);")
+            conn.execute("insert into runs values (1, 'pulp', 'o/pulp')")
+            conn.execute("insert into jobs values (1, 1, '2026-10-16T12:00:00Z', '2026-10-16T12:30:00Z')")
+            conn.commit(); conn.close()
+            self.assertEqual(MOD.count_jobs(db, "Pulp", "o/pulp"), 1)
+            self.assertEqual(MOD.source_activity_dates(db, "Pulp", "o/pulp"), {"2026-10-16"})
+        payload, excluded = MOD.prepare_tartci_export(
+            json.dumps({"project": "Pulp", "repo": "o/pulp", "provider": "tart", "external_id": "job-1"}),
+            "o/pulp", "pulp")
+        self.assertEqual(excluded, 0)
+        self.assertEqual(json.loads(payload)[0]["project"], "Pulp")
+
     def test_project_repo_scope_requires_owner_and_matching_short_name(self):
         for project, repo in [("pulp", "pulp"), ("pulp", "/pulp"), ("pulp", "a/b/pulp"), ("other", "o/pulp")]:
             with self.assertRaises(ValueError):
