@@ -43,7 +43,7 @@ shipyard dependency pulp update           # qualify latest/stable/fixed and open
 shipyard dependency pulp verify           # fresh, cache-bypassing CI verification
 
 # Understand how a repo lands work (read-only)
-shipyard landing                             # merge queue, strict, enqueue, check placement, backlog, base tip health (HEALTHY/RED/PENDING/UNPROVEN from the tip's merge_group required jobs)
+shipyard landing                             # merge queue, strict, enqueue, batching strategy, check placement, backlog, base tip health (HEALTHY/RED/PENDING/UNPROVEN from the tip's merge_group required jobs)
 shipyard landing --repo OWNER/REPO --base main
 shipyard --json landing                      # machine-readable; exit 9 when any headline field is UNKNOWN
 shipyard landing --pr 123                    # one PR. First line: the VERDICT to quote, RED / PENDING / GREEN / UNKNOWN on the

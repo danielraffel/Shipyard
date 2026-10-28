@@ -7,13 +7,17 @@
 
 use serde_json::{Value, json};
 
+use crate::base_health::BaseHealthFinding;
+use crate::base_health::tip::{TipHealth, TipVerdict};
 use crate::fleet_service::Boundary;
 use crate::landing::backlog;
 use crate::landing::placement::{self, JobObservation, Placement};
 use crate::landing::queue::{
-    Payload, QueueInputs, determine_queue, determine_strict, enqueue_guidance,
+    EnqueueGuidance, MergeQueueConfig, Payload, QueueFinding, QueueInputs, StrictFinding,
+    determine_queue, determine_strict, enqueue_guidance,
 };
-use crate::landing::{SurfaceOutcome, SurfaceRead, Verdict};
+use crate::landing::strategy::{BatchingAction, BatchingGuidance};
+use crate::landing::{LandingReport, SurfaceOutcome, SurfaceRead, Verdict};
 
 /// A ruleset carrying an active merge queue on the default branch.
 ///
@@ -246,6 +250,22 @@ fn unreadable_rulesets_report_unknown_not_absent() {
             verdict_name(other)
         ),
     }
+}
+
+#[test]
+fn malformed_rulesets_shape_reports_unknown_not_absent() {
+    let inputs = QueueInputs {
+        rulesets: None,
+        rulesets_error: Some((
+            Boundary::Parse,
+            "rulesets response was not an array".to_owned(),
+        )),
+        protection: Payload::Json(protection_payload(true)),
+        graphql_queue: Payload::NotConsulted,
+    };
+    let mut surfaces = Vec::new();
+    let finding = determine_queue(&inputs, "main", Some("main"), &mut surfaces);
+    assert_eq!(verdict_name(&finding.verdict), "unknown");
 }
 
 #[test]
@@ -507,6 +527,123 @@ fn no_queue_says_merge_directly() {
     let guidance = enqueue_guidance(&queue_finding(false));
     assert_eq!(guidance.action, "merge");
     assert!(guidance.command.is_some());
+}
+
+#[test]
+fn evaluate_queue_is_report_only_and_merges_directly() {
+    let finding = QueueFinding {
+        verdict: Verdict::Present(MergeQueueConfig {
+            enforcement: Some("evaluate".to_owned()),
+            merge_method: Some("MERGE".to_owned()),
+            ..Default::default()
+        }),
+        disagreements: Vec::new(),
+    };
+    let guidance = enqueue_guidance(&finding);
+    assert_eq!(guidance.action, "merge");
+    assert_eq!(
+        guidance.command.as_deref(),
+        Some("gh pr merge <number> --merge")
+    );
+}
+
+#[test]
+fn queue_without_enforcement_refuses_to_name_a_command() {
+    let finding = QueueFinding {
+        verdict: Verdict::Present(MergeQueueConfig::default()),
+        disagreements: Vec::new(),
+    };
+    let guidance = enqueue_guidance(&finding);
+    assert_eq!(guidance.action, "unknown");
+    assert!(guidance.command.is_none());
+}
+
+#[test]
+fn queue_without_merge_method_refuses_to_name_a_command() {
+    let finding = QueueFinding {
+        verdict: Verdict::Present(MergeQueueConfig {
+            enforcement: Some("active".to_owned()),
+            merge_method: None,
+            ..Default::default()
+        }),
+        disagreements: Vec::new(),
+    };
+    let guidance = enqueue_guidance(&finding);
+    assert_eq!(guidance.action, "unknown");
+    assert!(guidance.command.is_none());
+}
+
+#[test]
+fn queue_with_unfamiliar_merge_method_refuses_to_name_a_command() {
+    let finding = QueueFinding {
+        verdict: Verdict::Present(MergeQueueConfig {
+            enforcement: Some("active".to_owned()),
+            merge_method: Some("FAST_FORWARD".to_owned()),
+            ..Default::default()
+        }),
+        disagreements: Vec::new(),
+    };
+    let guidance = enqueue_guidance(&finding);
+    assert_eq!(guidance.action, "unknown");
+    assert!(guidance.command.is_none());
+}
+
+#[test]
+fn unknown_enqueue_guidance_is_a_headline_unknown() {
+    let report = LandingReport {
+        schema_version: 1,
+        repo: "owner/repo".to_owned(),
+        base: "main".to_owned(),
+        merge_queue: QueueFinding {
+            verdict: Verdict::Present(MergeQueueConfig {
+                enforcement: Some("active".to_owned()),
+                merge_method: None,
+                ..Default::default()
+            }),
+            disagreements: Vec::new(),
+        },
+        strict: StrictFinding {
+            verdict: Verdict::Absent,
+            implication: "no strict protection".to_owned(),
+        },
+        enqueue: EnqueueGuidance {
+            action: "unknown".to_owned(),
+            command: None,
+            rationale: "merge method unavailable".to_owned(),
+        },
+        batching: BatchingGuidance {
+            action: BatchingAction::Disabled,
+            command: None,
+            max_members: None,
+            rationale: "no train".to_owned(),
+        },
+        required_checks: placement::PlacementFinding {
+            contexts_source: "none".to_owned(),
+            checks: Vec::new(),
+            notes: Vec::new(),
+        },
+        backlog: backlog::unreadable(Boundary::Parse, "not read".to_owned()),
+        base_tip: TipHealth {
+            base: "main".to_owned(),
+            tip_sha: None,
+            verdict: TipVerdict::Unproven {
+                detail: "not read".to_owned(),
+            },
+            required_contexts: Vec::new(),
+            runs: Vec::new(),
+            jobs: Vec::new(),
+            api_calls: 0,
+        },
+        base_health: BaseHealthFinding::NoSignal {
+            detail: "not read".to_owned(),
+        },
+        base_jump: None,
+        surfaces: Vec::new(),
+        warnings: Vec::new(),
+        api_calls: 0,
+        opt_in_targets: Vec::new(),
+    };
+    assert!(report.has_unknown());
 }
 
 // ---------------------------------------------------------------------------
