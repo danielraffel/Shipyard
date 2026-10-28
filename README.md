@@ -3,9 +3,9 @@
 [![CI](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml/badge.svg)](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml)
 
 **Local-first engineering orchestration and governance for coding agents.**
-Shipyard coordinates builds, tests, reviews, merges, and bounded recovery across
-local machines, SSH-reachable VMs, and cloud runners. GitHub remains
-authoritative for pull requests and merge order.
+Shipyard coordinates builds and tests, records review and merge gates, and
+supports bounded recovery across local machines, SSH-reachable VMs, and cloud
+runners. GitHub remains authoritative for pull requests and merge order.
 
 Shipyard and [TartCI](https://github.com/danielraffel/tartci) solve different
 parts of CI:
@@ -14,8 +14,8 @@ parts of CI:
   you choose, records the results, watches pull requests, and hands a verified
   head to GitHub for landing.
 - **TartCI runs the work in disposable VMs.** For teams using Tart on Apple
-  Silicon, it turns their Macs into GitHub Actions capacity by booting clean
-  macOS, Linux, or Windows VMs for jobs and removing them afterward.
+  Silicon, it turns their Macs into GitHub Actions capacity with clean macOS,
+  Linux, and Windows VM lanes that are removed after each job.
 
 Use Shipyard without TartCI for local, SSH, or hosted checks. Add TartCI when
 those checks need isolated Mac VM capacity. GitHub remains the authority for
