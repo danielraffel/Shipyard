@@ -733,6 +733,9 @@ v0.245.0 published with no attestation after one transient Sigstore TLS error,
 and every host's fleet-update refused it ("no acceptable build-provenance
 attestation"). If a release is stuck as a draft, rerun the failed
 `sign-and-upload-macos` job; do not publish it by hand without an attestation.
+The live GitHub smoke uses a dedicated read-only token when configured and
+otherwise the Actions job token; never route the write-capable release-bot
+credential to the binary under test. The smoke remains fail-closed.
 ## Leftover validation TMPDIRs: owner files, sweep, and `cleanup --validation-tmp`
 
 A killed validation run cannot run the Drop that removes its

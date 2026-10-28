@@ -171,8 +171,9 @@ jobs:
       - name: Run read-only admission and steward probes against real repositories
         shell: bash
         env:
-          # Public repositories only; a dedicated read token can replace the
-          # job token without changing the gate.
+          # Prefer a dedicated read-only token. The Actions token remains the
+          # fallback; never expose the write-capable release-bot credential to
+          # the binary under test.
           GH_TOKEN: ${{ secrets.RELEASE_SMOKE_GH_TOKEN || github.token }}
           SMOKE_REPOS: ${{ vars.RELEASE_SMOKE_REPOS || 'Generous-Corp/pulp' }}
         run: |

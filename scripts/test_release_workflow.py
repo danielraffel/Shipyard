@@ -43,6 +43,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("    permissions:\n      contents: read\n", live)
         self.assertNotIn("write", live.split("steps:", 1)[0])
 
+    def test_live_smoke_prefers_a_dedicated_read_token(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "secrets.RELEASE_SMOKE_GH_TOKEN || github.token",
+            text,
+        )
+        self.assertNotIn("secrets.RELEASE_BOT_TOKEN", text)
+
     def test_release_workflow_uses_current_ci_signing_secret_names_only(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("MACOS_SIGN_P12_BASE64", text)
