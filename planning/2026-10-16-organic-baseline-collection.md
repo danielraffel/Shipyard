@@ -23,13 +23,16 @@ they cannot contribute to safely merged throughput or wasted-compute metrics.
 
 On the observation controller, install the supervised hourly schedule with
 `scripts/install_baseline_collector.sh --install`. The installer is dry-run by
-default, validates the collector and its `baseline_pass_history.py` dependency
-before loading launchd, and copies both into the managed Shipyard state
-directory (`~/Library/Application Support/shipyard`). The launchd job executes
-that managed copy, so removing or replacing the checkout that performed the
-installation cannot silently break future runs. State and status files remain
-outside the repository. A missing merge-receipt handoff remains unavailable in
-the scorecard; the collector never turns it into zero.
+default, validates the collector, handoff checker, wrapper, and
+`baseline_pass_history.py` dependency before loading launchd, and copies them
+into the managed Shipyard state directory (`~/Library/Application
+Support/shipyard`). The launchd job executes that managed copy, so removing or
+replacing the checkout that performed the installation cannot silently break
+future runs. Before each collection the wrapper checks the producer handoff;
+when it is fresh and valid, receipt import is enabled. When it is missing,
+empty, stale, or failed, timing and queue proxies still collect and an explicit
+`merge-receipt: unavailable` event records the reason. The scorecard keeps the
+safe-merge denominator unavailable and never turns it into zero.
 
 The producer-side handoff is explicit and read-only. On the Shipyard state
 directory that records protected merges, install the supervised exporter (dry-run

@@ -2005,6 +2005,16 @@ are injected only into child `gh` commands as `GH_TOKEN`; Shipyard must never
 write raw tokens, GitHub App private keys, Keychain items, 1Password sessions,
 or token caches to config, state, logs, or release artifacts.
 
+Agent git over HTTPS uses `shipyard auth git-credential` as the github.com
+credential helper (`useHttpPath = true`). Each `get` mints a fresh App token
+limited to that one repository and to `git_credential.permissions` (default
+`contents=write`; add `workflows=write` to push workflow files). It serves only
+the repositories listed in the machine-global `git_credential.repositories`,
+and on refusal it prints `quit=1`, so git never falls through to a personal
+helper. `shipyard-github-app-token --scope-repository --permission NAME=LEVEL`
+does the mint, refuses any broader token, and never caches it. Setup, checks and
+rollback: `docs/git-credential.md`.
+
 `shipyard update` reads public release metadata, so it works with no auth — but
 unauthenticated GitHub API calls are capped at 60/hr. As of v0.68.0 `update`
 opportunistically authenticates: it uses `SHIPYARD_GITHUB_TOKEN` / `GH_TOKEN` /
@@ -4037,6 +4047,11 @@ on every pull request's head from a workflow, so a repository can require it
 and stop landings that never pass through `ghapp`
 (docs/review-verdict-status.md).
 
+The report-only `risk-tier` status (`scripts/risk_tier.py`,
+docs/risk-tier.md) posts the review tier a pull request would need: Low (CI
+only), Moderate (one review-App approval) or High (two, plus the owner for
+workflows, credentials, signing and new dependencies).
+
 Unlike Shipyard's validated enqueue, these requests deliberately do **not**
 carry `SHIPYARD_INTERNAL_QUEUE_MUTATION`, so the arm guard judges them — an
 arm-on-open request is not bound to a validated head, so its live read is the
@@ -4044,7 +4059,10 @@ only thing between it and re-arming a queued or ejected head. `src/auto_arm.rs`
 refuses every state the guard refuses (a unit test asserts that agreement), and
 `GHAPP_ALLOW_QUEUE_REARM` is never set by Shipyard. The periodic counterpart is
 `shipyard runner steward --arm-unqueued`, which arms only pull requests the
-steward declines to own; see
+steward declines to own. Under `--apply` it takes the central HOLD,
+`mutation_machine` authority and control lock before arming (a HOLD is reported,
+not a failure), and each `--repo` mints its own token, so it runs from launchd's
+`$HOME`. See
 [references/merge-steward.md](references/merge-steward.md).
 
 Branch refreshes are the third guarded mutation, and the only one whose
@@ -5313,3 +5331,11 @@ atomic sidecar. Readiness requires observed continuity; historical activity
 counts and status-only runs must not be used to manufacture prospective
 coverage. Sidecars are keyed by repository, source identity, cadence, and
 configuration so changing collection policy cannot mix incompatible history.
+# Local Rust gate placement
+
+The pre-push hook selects the repository-pinned Rust channel on the current
+host. Any fleet host with that channel plus rustfmt and clippy may run local
+formatting and lint gates; m1 is a fallback, not a universal gate. Local gates
+do not grant merge authority: GitHub CI, branch protection, and the configured
+Shipyard mutation machine remain authoritative.
+

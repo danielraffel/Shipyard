@@ -36,6 +36,7 @@ mod execution_worker_cmd;
 pub mod fleet_escalation_cmd;
 mod fleet_status_cmd;
 mod fleet_update_cmd;
+mod git_credential_cmd;
 mod governance_cmd;
 mod guards_cmd;
 mod init_cmd;

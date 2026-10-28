@@ -40,12 +40,15 @@
 
 use serde::Serialize;
 
-use super::{GitHubActions, ObservedPr, PrReport, RepoObservation, StewardDecision};
+use super::{
+    GitHubActions, MutationControl, ObservedPr, PrReport, RepoObservation, StewardDecision,
+};
 use crate::auto_arm::{
     ArmSkip, ArmVerdict, arm_mutation_args, arm_mutation_args_at_head, arm_response_accepted,
     decide_from_queue_state_with_environment, first_graphql_error, is_arm_guard_refusal,
     preselect_backstop_candidate,
 };
+use crate::merge_queue_control::{MergeQueueMutationPreflight, preflight_mutation_authority};
 use crate::pr_queue_state::{PR_QUEUE_STATE_QUERY, explain_pr_queue_state};
 
 /// What the backstop did for this repository on this pass.
@@ -101,16 +104,73 @@ fn steward_declines_ownership(decision: &StewardDecision) -> bool {
     )
 }
 
+/// Why arming may not proceed on this pass.
+#[derive(Debug)]
+pub(super) struct ArmAuthorityRefusal {
+    /// Reported as the repository's backstop policy.
+    pub(super) reason: String,
+    /// A real failure, as opposed to a deliberate HOLD.
+    pub(super) failed: bool,
+}
+
+/// Take the same central HOLD, machine authority and control lock every other
+/// merge-queue mutation takes, and keep it for the arming that follows.
+///
+/// Arming changes what the queue will admit, so an operator's HOLD, a host
+/// other than `[merge_queue].mutation_machine`, or an uncertain earlier
+/// mutation on this repository and base all stop it.
+pub(super) fn arming_authority(
+    control: &MutationControl,
+    repo: &str,
+    base: &str,
+) -> Result<MergeQueueMutationPreflight, ArmAuthorityRefusal> {
+    match crate::merge_queue_control::hold_status(&control.state_dir) {
+        Ok(Some(_)) => {
+            return Err(ArmAuthorityRefusal {
+                reason: format!(
+                    "held: merge-queue mutations are centrally held by {}, so nothing was armed",
+                    control
+                        .state_dir
+                        .join(crate::merge_queue_control::HOLD_FILE)
+                        .display()
+                ),
+                failed: false,
+            });
+        }
+        Ok(None) => {}
+        Err(reason) => {
+            return Err(ArmAuthorityRefusal {
+                reason,
+                failed: true,
+            });
+        }
+    }
+    preflight_mutation_authority(
+        &control.state_dir,
+        &control.cwd,
+        control.mode,
+        &control.global_dir,
+        repo,
+        base,
+    )
+    .map_err(|reason| ArmAuthorityRefusal {
+        reason: format!("declined: no merge-queue mutation authority: {reason}"),
+        failed: true,
+    })
+}
+
 /// Run the backstop over one repository's observation.
 ///
 /// Returns the status plus whether anything genuinely failed. A refusal is not
-/// a failure: the pass reports it and moves on.
-pub(super) fn apply_native_arm_backstop(
+/// a failure: the pass reports it and moves on. With `apply`, `authorize` runs
+/// once there is a candidate, and what it returns is held until the pass ends.
+pub(super) fn apply_native_arm_backstop<A>(
     actions: &GitHubActions,
     observation: &RepoObservation,
     pr_reports: &[PrReport],
     opt_out_label: &str,
     apply: bool,
+    authorize: impl FnOnce() -> Result<A, ArmAuthorityRefusal>,
 ) -> (NativeArmRepoStatus, bool) {
     if !observation.allow_auto_merge {
         return (
@@ -141,6 +201,22 @@ pub(super) fn apply_native_arm_backstop(
         );
     }
 
+    let _authority = if apply {
+        match authorize() {
+            Ok(authority) => Some(authority),
+            Err(refusal) => {
+                return (
+                    NativeArmRepoStatus {
+                        policy: refusal.reason,
+                        results: Vec::new(),
+                    },
+                    refusal.failed,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let mut unhealthy = false;
     let mut results = Vec::new();
     for pr in candidates {

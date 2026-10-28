@@ -30,7 +30,7 @@ pub(super) fn resume_pending_cancellations(
     let mut cancellations = BTreeMap::<String, Vec<CancellationReport>>::new();
     for (key, cancellation) in pending {
         match resume_pending_cancellation(
-            actions,
+            &actions.clone().with_repo_override(&cancellation.repo),
             ledger_path,
             ledger,
             mutation_control,

@@ -458,13 +458,7 @@ fn classify_management(pr: &StewardPullRequest, policy: &StewardPolicy) -> Optio
     // Fleet-authored branches are managed by default. The opt-out label is
     // checked by `classify_pr` before this function, so a fleet PR cannot sit
     // unmanaged merely because a handoff label was not copied yet.
-    let fleet_author = pr.author.as_deref().is_some_and(is_fleet_app);
-    let human_or_dependabot = pr.author.as_deref().is_none_or(is_human_or_dependabot);
-    let fleet_branch = ["codex/", "feature/", "fix/"]
-        .iter()
-        .any(|prefix| pr.head_branch.starts_with(prefix));
-    if (fleet_author || (fleet_branch && pr.author.is_some() && !human_or_dependabot)) && !labelled
-    {
+    if is_implicitly_managed(pr) && !labelled {
         return None;
     }
     if !labelled {
@@ -473,19 +467,24 @@ fn classify_management(pr: &StewardPullRequest, policy: &StewardPolicy) -> Optio
     (!has_successful_status(pr, &policy.handoff_context)).then_some(StewardDecision::HandoffMissing)
 }
 
+/// Whether this pull request is implicitly managed by the local fleet.
+///
+/// Fleet-authored pull requests are managed even before the explicit handoff
+/// label is copied. Keep this predicate shared with observation hydration so
+/// an unlabeled fleet pull request receives the same complete check set that
+/// classification will consult. Other bot or App authors must carry the
+/// explicit handoff label; a branch prefix is not an authority signal.
+#[must_use]
+pub fn is_implicitly_managed(pr: &StewardPullRequest) -> bool {
+    pr.author.as_deref().is_some_and(is_fleet_app)
+}
+
 fn normalized_app_login(author: &str) -> &str {
     author.strip_prefix("app/").unwrap_or(author)
 }
 
 fn is_fleet_app(author: &str) -> bool {
     normalized_app_login(author).eq_ignore_ascii_case("shipyard-local")
-}
-
-fn is_human_or_dependabot(author: &str) -> bool {
-    let normalized = normalized_app_login(author);
-    normalized.eq_ignore_ascii_case("dependabot")
-        || normalized.eq_ignore_ascii_case("dependabot[bot]")
-        || (!author.starts_with("app/") && !author.ends_with("[bot]"))
 }
 
 /// Whether the current immutable head carries a successful status context.
