@@ -187,13 +187,29 @@ jobs:
   release:
     needs: [build, live-smoke]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Run the gate even when live-smoke failed so a `gh run rerun --failed`
+    # retries both jobs. Successful build artifacts stay attached to this run;
+    # a later smoke pass can therefore reach publication without rebuilding.
+    # The first step below remains fail-closed and prevents any release write.
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     # Creates the draft release (contents) and signs its build provenance.
     permissions:
       attestations: write
       contents: write
       id-token: write
     steps:
+      - name: Require verified build and live smoke
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          LIVE_SMOKE_RESULT: ${{ needs.live-smoke.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_RESULT" != success || "$LIVE_SMOKE_RESULT" != success ]]; then
+            echo "release withheld: build=$BUILD_RESULT live-smoke=$LIVE_SMOKE_RESULT" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
@@ -265,7 +281,9 @@ jobs:
 
   sign-and-upload-macos:
     needs: [resolve-runners, release]
-    if: startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
+    # Keep this gate rerunnable with `gh run rerun --failed` when the release
+    # job withheld publication after a transient smoke failure.
+    if: always() && startsWith(github.ref, 'refs/tags/v') && vars.CI_MACOS_SIGNING_ENABLED == 'true'
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.macos_arm64_runs_on_json) }}
     # Uploads the DMG and publishes the release (contents) after attesting it.
     permissions:
@@ -273,6 +291,17 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - name: Require published non-macOS release gate
+        env:
+          RELEASE_RESULT: ${{ needs.release.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_RESULT" != success ]]; then
+            echo "macOS publication withheld: release=$RELEASE_RESULT" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false

@@ -34,6 +34,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("  live-smoke:\n    needs: build\n", text)
         self.assertIn("  release:\n    needs: [build, live-smoke]\n", text)
+        self.assertIn("if: always() && startsWith(github.ref, 'refs/tags/v')", text)
+        release = text.split("  release:\n", 1)[1].split("\n  sign-and-upload-macos:", 1)[0]
+        self.assertIn("name: Require verified build and live smoke", release)
+        self.assertIn('BUILD_RESULT: ${{ needs.build.result }}', release)
+        self.assertIn('LIVE_SMOKE_RESULT: ${{ needs.live-smoke.result }}', release)
+        self.assertIn('release withheld: build=$BUILD_RESULT live-smoke=$LIVE_SMOKE_RESULT', release)
         self.assertIn("scripts/release_live_smoke.py --binary", text)
         self.assertIn("name: release-linux-x64", text)
         self.assertIn("Generous-Corp/pulp", text)
@@ -42,6 +48,18 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", live)
         self.assertIn("    permissions:\n      contents: read\n", live)
         self.assertNotIn("write", live.split("steps:", 1)[0])
+
+    def test_macos_publication_retries_with_the_release_gate(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        signing = text.split("  sign-and-upload-macos:\n", 1)[1]
+        self.assertIn(
+            "if: always() && startsWith(github.ref, 'refs/tags/v') && "
+            "vars.CI_MACOS_SIGNING_ENABLED == 'true'",
+            signing,
+        )
+        self.assertIn("name: Require published non-macOS release gate", signing)
+        self.assertIn('RELEASE_RESULT: ${{ needs.release.result }}', signing)
+        self.assertIn('macOS publication withheld: release=$RELEASE_RESULT', signing)
 
     def test_release_workflow_uses_current_ci_signing_secret_names_only(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
