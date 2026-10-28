@@ -120,7 +120,7 @@ pub(super) fn command<W: Write>(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-fn valid_sha(s: &str) -> bool {
+pub(super) fn valid_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 fn tokens(s: &str) -> Vec<String> {
@@ -352,7 +352,28 @@ fn read_fixlinks(path: &Path) -> Result<Vec<Value>, CliFailure> {
 /// Only attach fix-links whose producer identity and evidence are complete.
 /// This prevents a copied, malformed, or cross-head row from being presented
 /// as a historical fix for an otherwise matching cause.
-fn valid_fixlink(value: &Value) -> bool {
+/// Structural identity fields required before a producer treats a fix-link as
+/// already recorded. This deliberately stops short of the full advice
+/// predicate so a row that is structurally complete but unsafe is not written
+/// again on every collection pass.
+pub(super) fn link_identity_complete(value: &Value) -> bool {
+    value["schema"] == SCHEMA
+        && value["source"] == "fix-link"
+        && value["repo"].as_str().is_some_and(|repo| !repo.is_empty())
+        && value["red_run_id"].as_u64().is_some_and(|id| id > 0)
+        && value["red_attempt"]
+            .as_u64()
+            .is_some_and(|attempt| attempt > 0)
+        && value["head_sha"].as_str().is_some_and(valid_sha)
+        && value["fix_run_id"].as_u64().is_some_and(|id| id > 0)
+        && value["fix_head_sha"].as_str().is_some_and(valid_sha)
+        && matches!(
+            value["derivation"].as_str(),
+            Some("compare_red_head_to_fix_head" | "rerun_green")
+        )
+}
+
+pub(super) fn valid_fixlink(value: &Value) -> bool {
     let Some(derivation) = value["derivation"].as_str() else {
         return false;
     };
