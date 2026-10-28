@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import package_release
+import release_artifact_manifest
 import release_env
 
 
@@ -204,6 +205,7 @@ def expected_release_assets(artifact_prefix: str) -> tuple[str, ...]:
         f"{artifact_prefix}-windows-x64.exe",
         f"{companion}-windows-x64.exe",
         f"{artifact_prefix}-macos-arm64.dmg",
+        "shipyard-release-manifest.json",
         "checksums.sha256",
     )
 
@@ -310,8 +312,57 @@ def missing_release_checksums(
     return [
         name
         for name in expected_assets
-        if name != "checksums.sha256" and name not in covered
+        if name not in {"checksums.sha256", "shipyard-release-manifest.json"} and name not in covered
     ]
+
+
+def verify_release_identity_manifest(
+    config: ReleaseConfig,
+    expected_assets: tuple[str, ...],
+    runner: CommandRunner,
+) -> None:
+    """Require release assets to be bound to the exact tag and commit."""
+    temp = Path(tempfile.mkdtemp(prefix="shipyard-release-manifest-proof-")) / "manifest.json"
+    runner.run(
+        [
+            "gh",
+            "release",
+            "download",
+            "--repo",
+            config.repo,
+            config.tag,
+            "--pattern",
+            "shipyard-release-manifest.json",
+            "--output",
+            str(temp),
+            "--clobber",
+        ]
+    )
+    try:
+        document = json.loads(temp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"invalid shipyard-release-manifest.json: {error}") from error
+    source = document.get("source")
+    expected_commit = _release_commit(config, runner)
+    if (
+        document.get("schema_version") != release_artifact_manifest.SCHEMA_VERSION
+        or not isinstance(source, dict)
+        or source.get("repository") != config.repo
+        or source.get("tag") != config.tag
+        or source.get("commit") != expected_commit
+    ):
+        raise SystemExit("release identity manifest does not match this tag and commit")
+    files = {
+        entry.get("name")
+        for artifact in document.get("artifacts", [])
+        if isinstance(artifact, dict)
+        for entry in artifact.get("files", [])
+        if isinstance(entry, dict)
+    }
+    required = set(expected_assets) - {"checksums.sha256", "shipyard-release-manifest.json"}
+    missing = sorted(required - files)
+    if missing:
+        raise SystemExit("release identity manifest is missing: " + ", ".join(missing))
 
 
 def upload_artifact_and_checksums(
@@ -332,6 +383,7 @@ def upload_artifact_and_checksums(
             "--replace-existing",
         ]
     )
+    merge_release_identity_manifest(config, artifact, runner)
     checksums = merge_release_checksum(config, artifact, runner)
     runner.run(
         [
@@ -346,6 +398,98 @@ def upload_artifact_and_checksums(
         ]
     )
     return checksums
+
+
+def _release_commit(config: ReleaseConfig, runner: CommandRunner) -> str:
+    return os.environ.get("GITHUB_SHA") or runner.run(
+        ["git", "rev-parse", f"{config.tag}^{{commit}}"], capture=True
+    )
+
+
+def merge_release_identity_manifest(
+    config: ReleaseConfig,
+    artifact: Path,
+    runner: CommandRunner,
+) -> None:
+    """Add the signed DMG to the immutable identity manifest before publish."""
+    assets = set(release_asset_names(config, runner))
+    current: dict[str, object]
+    if "shipyard-release-manifest.json" in assets:
+        temp = Path(tempfile.mkdtemp(prefix="shipyard-release-manifest-")) / "manifest.json"
+        runner.run(
+            [
+                "gh",
+                "release",
+                "download",
+                "--repo",
+                config.repo,
+                config.tag,
+                "--pattern",
+                "shipyard-release-manifest.json",
+                "--output",
+                str(temp),
+                "--clobber",
+            ]
+        )
+        current = json.loads(temp.read_text(encoding="utf-8"))
+        if current.get("schema_version") != release_artifact_manifest.SCHEMA_VERSION:
+            raise SystemExit("unsupported shipyard-release-manifest.json schema")
+        source = current.get("source")
+        expected = {
+            "repository": config.repo,
+            "tag": config.tag,
+            "commit": _release_commit(config, runner),
+        }
+        if not isinstance(source, dict) or any(source.get(k) != v for k, v in expected.items()):
+            raise SystemExit("release identity manifest does not name this tag and commit")
+    else:
+        current = {
+            "schema_version": release_artifact_manifest.SCHEMA_VERSION,
+            "source": {
+                "repository": config.repo,
+                "tag": config.tag,
+                "commit": _release_commit(config, runner),
+                "run_id": int(os.environ.get("GITHUB_RUN_ID", "0")),
+                "run_attempt": int(os.environ.get("GITHUB_RUN_ATTEMPT", "0")),
+            },
+            "artifacts": [],
+        }
+    artifacts = current.setdefault("artifacts", [])
+    if not isinstance(artifacts, list):
+        raise SystemExit("release identity manifest has malformed artifacts")
+    artifacts[:] = [
+        entry
+        for entry in artifacts
+        if isinstance(entry, dict) and entry.get("target") != "macos-arm64"
+    ]
+    artifacts.append(
+        {
+            "target": "macos-arm64",
+            "artifact_id": f"release-asset:{artifact.name}",
+            "artifact_digest": package_release.sha256(artifact),
+            "files": [
+                {
+                    "name": artifact.name,
+                    "bytes": artifact.stat().st_size,
+                    "sha256": package_release.sha256(artifact),
+                }
+            ],
+        }
+    )
+    manifest = Path(tempfile.mkdtemp(prefix="shipyard-release-manifest-")) / "shipyard-release-manifest.json"
+    manifest.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    runner.run(
+        [
+            require_ghapp(),
+            "release",
+            "upload",
+            "--repo",
+            config.repo,
+            config.tag,
+            str(manifest),
+            "--replace-existing",
+        ]
+    )
 
 
 def merge_release_checksum(
@@ -376,10 +520,28 @@ def merge_release_checksum(
             line
             for line in checksums.read_text(encoding="utf-8").splitlines()
             if not line.endswith(f"  {artifact.name}")
+            and not line.endswith("  shipyard-release-manifest.json")
         ]
     else:
         lines = []
     lines.append(checksum_line)
+    manifest = Path(tempfile.mkdtemp(prefix="shipyard-release-manifest-checksum-")) / "manifest.json"
+    runner.run(
+        [
+            "gh",
+            "release",
+            "download",
+            "--repo",
+            config.repo,
+            config.tag,
+            "--pattern",
+            "shipyard-release-manifest.json",
+            "--output",
+            str(manifest),
+            "--clobber",
+        ]
+    )
+    lines.append(f"{package_release.sha256(manifest)}  shipyard-release-manifest.json")
     checksums.write_text("\n".join(sorted(lines)) + "\n", encoding="utf-8")
     return checksums
 
@@ -400,6 +562,7 @@ def publish_if_ready(config: ReleaseConfig, runner: CommandRunner) -> str:
         if name not in assets
     ]
     if not missing:
+        verify_release_identity_manifest(config, expected_assets, runner)
         missing = [
             f"checksum:{name}"
             for name in missing_release_checksums(config, expected_assets, runner)

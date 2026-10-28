@@ -129,11 +129,39 @@ jobs:
             --dist-dir artifacts/release
 
       - name: Upload non-macOS artifact
+        id: upload_artifact
         if: matrix.package_target != 'macos-arm64'
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: release-${{ matrix.package_target }}
           path: artifacts/release/${{ github.ref_name }}/*
+          if-no-files-found: error
+
+      - name: Write non-macOS artifact identity manifest
+        if: matrix.package_target != 'macos-arm64'
+        env:
+          ARTIFACT_ID: ${{ steps.upload_artifact.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload_artifact.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_artifact_manifest.py write \
+            --output artifacts/release-manifest.json \
+            --root "artifacts/release/${GITHUB_REF_NAME}" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --target "${{ matrix.package_target }}" \
+            --artifact-id "$ARTIFACT_ID" \
+            --artifact-digest "$ARTIFACT_DIGEST"
+
+      - name: Upload non-macOS artifact identity manifest
+        if: matrix.package_target != 'macos-arm64'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: release-${{ matrix.package_target }}-manifest
+          path: artifacts/release-manifest.json
           if-no-files-found: error
 
       - name: macOS build health check only
@@ -224,7 +252,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          find artifacts -type f ! -name checksums.sha256 -print0 | while IFS= read -r -d '' file; do
+          mapfile -t manifests < <(find artifacts -path '*/release-manifest.json' -type f -print)
+          test "${#manifests[@]}" -gt 0
+          manifest_args=()
+          for manifest in "${manifests[@]}"; do
+            manifest_args+=(--manifest "$manifest")
+          done
+          python3 scripts/release_artifact_manifest.py aggregate \
+            --output release/shipyard-release-manifest.json \
+            --artifacts-root artifacts \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            "${manifest_args[@]}"
+          find artifacts -type f ! -name checksums.sha256 ! -name release-manifest.json -print0 | while IFS= read -r -d '' file; do
             cp "$file" release/
           done
           test "$(find release -type f | wc -l | tr -d ' ')" -gt 0

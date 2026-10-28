@@ -49,6 +49,39 @@ class FakeRunner(release_macos_local.CommandRunner):
             return "true" if self.draft else "false"
         if args[:4] == ["gh", "release", "download", "--repo"]:
             output = Path(args[args.index("--output") + 1])
+            if args[args.index("--pattern") + 1] == "shipyard-release-manifest.json":
+                names = sorted(
+                    name
+                    for name in self.assets
+                    if name not in {"checksums.sha256", "shipyard-release-manifest.json"}
+                )
+                output.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "source": {
+                                "repository": "danielraffel/Shipyard",
+                                "tag": args[5],
+                                "commit": "",
+                                "run_id": 0,
+                                "run_attempt": 0,
+                            },
+                            "artifacts": [
+                                {
+                                    "target": "fixture",
+                                    "artifact_id": "fixture",
+                                    "artifact_digest": "0" * 64,
+                                    "files": [
+                                        {"name": name, "bytes": 0, "sha256": "0" * 64}
+                                        for name in names
+                                    ],
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return ""
             names = sorted({"shipyard-linux-x64", *self.checksum_names})
             output.write_text(
                 "".join(f"{'0' * 64}  {name}\n" for name in names),
@@ -88,6 +121,7 @@ class ReleaseMacosLocalTests(unittest.TestCase):
         self.assertIn("shipyard-workstream-provider-linux-x64", assets)
         self.assertIn("shipyard-workstream-provider-linux-arm64", assets)
         self.assertIn("shipyard-workstream-provider-windows-x64.exe", assets)
+        self.assertIn("shipyard-release-manifest.json", assets)
         self.assertIn("checksums.sha256", assets)
 
     def test_missing_env_reports_all_required_names(self) -> None:
@@ -562,9 +596,10 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             )
 
             lines = checksums.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(lines), 2)
+            self.assertEqual(len(lines), 3)
             self.assertTrue(any(line.endswith("  shipyard-linux-x64") for line in lines))
             self.assertTrue(any(line.endswith("  shipyard-macos-arm64.dmg") for line in lines))
+            self.assertTrue(any(line.endswith("  shipyard-release-manifest.json") for line in lines))
 
     def test_upload_uses_the_bounded_ghapp_publication_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -594,9 +629,15 @@ class ReleaseMacosLocalTests(unittest.TestCase):
                 command for command in runner.commands
                 if command[:3] == ["/Users/tester/.local/bin/ghapp", "release", "upload"]
             ]
-            self.assertEqual(len(uploads), 2)
+            self.assertEqual(len(uploads), 3)
             self.assertTrue(all("--replace-existing" in command for command in uploads))
             self.assertTrue(all("--clobber" not in command for command in uploads))
+            self.assertTrue(
+                any(
+                    any("shipyard-release-manifest.json" in argument for argument in command)
+                    for command in uploads
+                )
+            )
 
 
 class FleetRolloutStageTests(unittest.TestCase):

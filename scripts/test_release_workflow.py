@@ -111,6 +111,15 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('--companion-binary "${{ matrix.companion_binary }}"', text)
         self.assertIn("target/release/shipyard-workstream-provider --version", text)
 
+    def test_release_workflow_binds_and_verifies_artifact_identity(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("scripts/release_artifact_manifest.py write", text)
+        self.assertIn("steps.upload_artifact.outputs.artifact-id", text)
+        self.assertIn("steps.upload_artifact.outputs.artifact-digest", text)
+        self.assertIn("scripts/release_artifact_manifest.py aggregate", text)
+        self.assertIn("shipyard-release-manifest.json", text)
+        self.assertIn("! -name release-manifest.json", text)
+
     def test_release_workflow_attests_every_executable_release_asset(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         dist_dir = package_release.DEFAULT_DIST_DIR.relative_to(ROOT).as_posix()
