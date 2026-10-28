@@ -75,4 +75,32 @@ reassigned.
 - Before opening a PR, use `shipyard pr --no-arm --no-steward-handoff`. Do not
   approve, arm, enqueue, or merge.
 
-**Disposition:** `ACTIVE — contract reconciled; ownership and authorization preserved; durable authenticated persistence validated; PR #998 is parked at a failed CI/review gate pending the separately owned baseline-helper repair and later authenticated transport/scorecard wiring.`
+**Disposition:** `ACTIVE — contract reconciled; ownership and authorization preserved; durable authenticated persistence validated; PR #998 is parked at the review gate pending an allowed exact-head review and completion of its current validation run.`
+
+## Live refresh — 2026-10-28T15:57:58Z
+
+- The contract branch is still at exact tip
+  `1b4df0f470d5dcce2a56d125bd0ff6068b02dc6a`; the contract document blob is
+  `e5e9b8fa791a543867276949626532844307e78b`.
+- Shipyard `main` remains `d7dfff57de91929bd7176593caf166ad8799792d`. The
+  worktree is clean, based on that exact head, and the source branch remains
+  `codex/metrics-auth-envelope-schema-20261028`.
+- PR #998 is open at exact head
+  `51817438b16ab187c5a40f95a6f3f014df5e96c9`, base
+  `d7dfff57de91929bd7176593caf166ad8799792d`, and is `MERGEABLE` but
+  `UNSTABLE`. It has no counted review, no review request, no auto-merge
+  request, and no queue admission.
+- The fresh validation has successful resolver, review-verdict workflow,
+  risk-tier, sandbox resolver, version/skill-sync, and risk-tier report
+  checks. The `review-verdict` status context is `FAILURE` because no allowed
+  exact-head approval exists; this is the expected fail-closed review gate.
+  Linux, Sandbox Linux, macOS ARM64, Windows, coverage, and Python helper
+  checks were still `IN_PROGRESS` at this observation boundary.
+- No approval, arm, enqueue, merge, merge API call, or reviewer verdict was
+  made. The separately owned #996 Python helper repair was not duplicated.
+
+**Next safe action:** run `shipyard pr --no-arm --no-steward-handoff` from
+this exact branch, then observe its bounded validation result. If checks are
+green, leave the PR parked for an allowed reviewer; if a real check fails,
+return the exact failure to its owning implementation work. Do not promote
+the authenticated importer/transport slice from this receipt alone.
