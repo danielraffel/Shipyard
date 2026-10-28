@@ -4194,3 +4194,11 @@ At the protected merge boundary, Shipyard may produce that receipt only after
 GitHub confirms the exact validated head is merged and supplies a nonzero merge
 commit and merge timestamp. Queue admission or auto-merge activation is not a
 merge receipt; queue supervision must wait for the later merged observation.
+# Local Rust gate placement
+
+Shipyard's pre-push hook selects the repository-pinned Rust channel on the
+current host. Any fleet host with that channel plus rustfmt and clippy may run
+the local formatting and lint gates; m1 is a fallback, not a universal gate.
+These checks are a push safeguard only. GitHub CI, branch protection, and the
+configured Shipyard mutation machine remain the landing authority.
+
