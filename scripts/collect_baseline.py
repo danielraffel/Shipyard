@@ -81,6 +81,25 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     merge_receipts = getattr(args, "merge_receipts", None)
     if merge_receipts is not None:
         receipt_path = pathlib.Path(merge_receipts).expanduser()
+        # The producer handoff is optional until Shipyard has emitted its first
+        # authenticated merge receipt.  An absent handoff must leave the
+        # safe-merge denominator unavailable while allowing the provider
+        # baseline to advance.  A present handoff still requires the health
+        # sidecar and all fail-closed validation below.
+        try:
+            os.lstat(receipt_path)
+        except FileNotFoundError:
+            events = _import_organic_after_preflight(args, state_dir, None)
+            # A newer supervisor may already record the unavailable handoff
+            # while collecting the provider rows.  Keep the older direct
+            # invocation compatible without emitting a duplicate event when
+            # both versions are combined during a staged rollout.
+            if not any(event.get("source") == "merge-receipt" for event in events):
+                events.append({"source": "merge-receipt", "status": "unavailable",
+                               "reason": "producer handoff not present"})
+            return events
+        except OSError as exc:
+            raise RuntimeError(f"merge receipt handoff is unreadable: {exc}") from exc
         health_path = getattr(args, "merge_receipt_health", None)
         if health_path is None:
             raise RuntimeError("merge receipt health sidecar is required with --merge-receipts")
@@ -115,7 +134,6 @@ def immutable_handoff_snapshot(path: pathlib.Path, payload: bytes):
 def _import_organic_after_preflight(args: argparse.Namespace, state_dir: str,
                                     receipt_snapshot: pathlib.Path | None) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
-    merge_receipts = getattr(args, "merge_receipts", None)
     receipt_path = receipt_snapshot
     before = count_jobs(args.db, args.project, args.repo)
     github = run([args.shipyard, "--state-dir", state_dir, "metrics", "import", "github", "--repo", args.repo,
@@ -135,7 +153,7 @@ def _import_organic_after_preflight(args: argparse.Namespace, state_dir: str,
         tartci_event["excluded_unjoinable"] = excluded
         tartci_event["exclusion_reason"] = "missing external_id cannot be joined to a GitHub job"
     events.append(tartci_event)
-    if merge_receipts is not None:
+    if receipt_path is not None:
         imported_receipts = run([
             args.shipyard, "--state-dir", state_dir, "metrics", "import", "merge-receipt",
             "--file", str(receipt_path), "--json",

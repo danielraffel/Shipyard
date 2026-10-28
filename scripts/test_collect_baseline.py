@@ -1,10 +1,12 @@
 import datetime as dt
 import importlib.util
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("collect_baseline", Path(__file__).with_name("collect_baseline.py"))
 MOD = importlib.util.module_from_spec(SPEC)
@@ -356,6 +358,50 @@ class CollectorInvocationTests(unittest.TestCase):
             receipt = next(event for event in events if event["source"] == "merge-receipt")
             self.assertEqual(receipt["status"], "unavailable")
             self.assertIn("source empty", receipt["reason"])
+
+    def test_collect_allows_missing_merge_receipt_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            conn = __import__("sqlite3").connect(db)
+            conn.executescript("create table runs(id integer primary key, project text, repo text); create table jobs(id integer primary key, run_id integer, started_at text, completed_at text);")
+            conn.commit(); conn.close()
+            shipyard = root / "shipyard"; tartci = root / "tartci"
+            shipyard.write_text("#!/bin/sh\ncase \"$*\" in *merge-receipt*) echo 'unexpected merge receipt import' >&2; exit 1;; *) echo '{\"imported\": 1}' ;; esac\n")
+            tartci.write_text("#!/bin/sh\necho '{\"project\":\"p\",\"repo\":\"o/p\",\"provider\":\"tart\",\"external_id\":\"fixture-1\"}'\n")
+            shipyard.chmod(0o755); tartci.chmod(0o755)
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p", "repo": "o/p",
+                "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5,
+                "timeout_seconds": 5, "merge_receipts": root / "missing-receipts.jsonl"})()
+            args.state.write_text("{}")
+            events = MOD.import_organic(args)
+            self.assertEqual(events[-1], {"source": "merge-receipt", "status": "unavailable",
+                                          "reason": "producer handoff not present"})
+
+    def test_collect_deduplicates_unavailable_event_from_newer_supervisor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p",
+                "repo": "o/p", "merge_receipts": root / "missing-receipts.jsonl"})()
+            args.state.write_text("{}")
+            provider_events = [
+                {"source": "github", "imported": 1},
+                {"source": "merge-receipt", "status": "unavailable", "reason": "wrapper"},
+            ]
+            with mock.patch.object(MOD, "_import_organic_after_preflight", return_value=provider_events):
+                events = MOD.import_organic(args)
+            self.assertEqual(sum(event.get("source") == "merge-receipt" for event in events), 1)
+            self.assertEqual(events[-1]["reason"], "wrapper")
+
+    def test_collect_does_not_treat_dangling_merge_receipt_link_as_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handoff = root / "missing-receipts.jsonl"
+            os.symlink(root / "does-not-exist.jsonl", handoff)
+            args = type("Args", (), {"db": root / "metrics" / "metrics.db", "state": root / "state.json",
+                "project": "p", "repo": "o/p", "merge_receipts": handoff})()
+            args.state.write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "health sidecar is required"):
+                MOD.import_organic(args)
 
     def test_collect_refuses_unknown_provider_counts(self):
         with tempfile.TemporaryDirectory() as directory:
