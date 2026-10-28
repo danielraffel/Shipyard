@@ -4094,6 +4094,53 @@ mod tests {
         }
     }
 
+    fn test_authenticated_envelope(
+        envelope_id: &str,
+        repository: &str,
+        project: &str,
+        receipts: Vec<crate::metrics::merge_receipt::MergeReceipt>,
+    ) -> crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
+        let payload_sha256 =
+            crate::metrics::merge_receipt_handoff::digest_receipts(&receipts).unwrap();
+        crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
+            schema: crate::metrics::merge_receipt_handoff::SCHEMA.to_owned(),
+            envelope_id: envelope_id.to_owned(),
+            repository: repository.to_owned(),
+            project: project.to_owned(),
+            base_branch: "main".to_owned(),
+            payload_sha256,
+            receipts,
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            issued_at: "2026-10-28T00:00:00Z".parse().unwrap(),
+            expires_at: "2026-10-28T00:10:00Z".parse().unwrap(),
+        }
+    }
+
+    fn test_authenticated_context(
+        repository: &str,
+        project: &str,
+    ) -> crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
+        crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
+            repository: repository.to_owned(),
+            project: project.to_owned(),
+            base_branch: "main".to_owned(),
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            now: "2026-10-28T00:05:00Z".parse().unwrap(),
+            max_age: Duration::minutes(15),
+            max_future_skew: Duration::minutes(2),
+        }
+    }
+
     fn test_capacity_sample(
         observed_at: DateTime<Utc>,
         host: &str,
@@ -4265,38 +4312,9 @@ mod tests {
             test_receipt("auth-1", repository, "owner/repo", 1, 'a'),
             test_receipt("auth-2", repository, "owner/repo", 2, 'b'),
         ];
-        let envelope = crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
-            schema: crate::metrics::merge_receipt_handoff::SCHEMA.to_owned(),
-            envelope_id: "auth-envelope-1".to_owned(),
-            repository: repository.to_owned(),
-            project: "owner/repo".to_owned(),
-            base_branch: "main".to_owned(),
-            payload_sha256: crate::metrics::merge_receipt_handoff::digest_receipts(&receipts)
-                .unwrap(),
-            receipts,
-            producer_host_id: "m1".to_owned(),
-            producer_session_generation: 7,
-            route: crate::parallel_proof_canary::CanaryRoute::Lan,
-            destination: "shipyard@m1.local".to_owned(),
-            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
-            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
-            issued_at: "2026-10-28T00:00:00Z".parse().unwrap(),
-            expires_at: "2026-10-28T00:10:00Z".parse().unwrap(),
-        };
-        let context = crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
-            repository: repository.to_owned(),
-            project: "owner/repo".to_owned(),
-            base_branch: "main".to_owned(),
-            producer_host_id: "m1".to_owned(),
-            producer_session_generation: 7,
-            route: crate::parallel_proof_canary::CanaryRoute::Lan,
-            destination: "shipyard@m1.local".to_owned(),
-            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
-            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
-            now: "2026-10-28T00:05:00Z".parse().unwrap(),
-            max_age: Duration::minutes(15),
-            max_future_skew: Duration::minutes(2),
-        };
+        let envelope =
+            test_authenticated_envelope("auth-envelope-1", repository, "owner/repo", receipts);
+        let context = test_authenticated_context(repository, "owner/repo");
         assert_eq!(
             store
                 .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
@@ -4375,40 +4393,13 @@ mod tests {
         store
             .import_merge_receipts(std::slice::from_ref(&receipt))
             .unwrap();
-        let envelope = crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
-            schema: crate::metrics::merge_receipt_handoff::SCHEMA.to_owned(),
-            envelope_id: "auth-envelope-legacy".to_owned(),
-            repository: repository.to_owned(),
-            project: "repo".to_owned(),
-            base_branch: "main".to_owned(),
-            payload_sha256: crate::metrics::merge_receipt_handoff::digest_receipts(
-                std::slice::from_ref(&receipt),
-            )
-            .unwrap(),
-            receipts: vec![receipt.clone()],
-            producer_host_id: "m1".to_owned(),
-            producer_session_generation: 7,
-            route: crate::parallel_proof_canary::CanaryRoute::Lan,
-            destination: "shipyard@m1.local".to_owned(),
-            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
-            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
-            issued_at: "2026-10-28T00:00:00Z".parse().unwrap(),
-            expires_at: "2026-10-28T00:10:00Z".parse().unwrap(),
-        };
-        let context = crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
-            repository: repository.to_owned(),
-            project: "repo".to_owned(),
-            base_branch: "main".to_owned(),
-            producer_host_id: "m1".to_owned(),
-            producer_session_generation: 7,
-            route: crate::parallel_proof_canary::CanaryRoute::Lan,
-            destination: "shipyard@m1.local".to_owned(),
-            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
-            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
-            now: "2026-10-28T00:05:00Z".parse().unwrap(),
-            max_age: Duration::minutes(15),
-            max_future_skew: Duration::minutes(2),
-        };
+        let envelope = test_authenticated_envelope(
+            "auth-envelope-legacy",
+            repository,
+            "repo",
+            vec![receipt.clone()],
+        );
+        let context = test_authenticated_context(repository, "repo");
         assert_eq!(
             store
                 .import_authenticated_merge_receipt_handoff(&envelope, &context)

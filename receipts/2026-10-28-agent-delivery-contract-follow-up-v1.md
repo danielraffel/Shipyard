@@ -104,3 +104,28 @@ this exact branch, then observe its bounded validation result. If checks are
 green, leave the PR parked for an allowed reviewer; if a real check fails,
 return the exact failure to its owning implementation work. Do not promote
 the authenticated importer/transport slice from this receipt alone.
+
+## Validation refresh — 2026-10-28T16:15:14Z
+
+- The receipt-only validation job `40721331065` ran at exact head
+  `36e6d740dc9f04e5017a0ab33576e4a7b62d9c4e`. Resolver, sandbox, version and
+  skill-sync, coverage, and advisory cause checks succeeded.
+- Linux, macOS ARM64, and Windows failed in the common `cargo clippy
+  --all-targets --locked -- -D warnings` step because the authenticated
+  persistence test in `src/metrics.rs` exceeded the repository's
+  `too_many_lines` lint. This was a real regression in this branch, not a
+  fleet failure. The test setup is now split into shared test helpers; local
+  authenticated handoff tests and `cargo clippy --locked --lib --all-features
+  -- -D warnings` pass (with only the repository's pre-existing unknown-lint
+  warning).
+- Python helper tests independently failed in the existing
+  `test_collect_allows_missing_merge_receipt_handoff` assertion: the test
+  expected an unavailable handoff event, while the collector returned a
+  completed collection event. That failure belongs to the separately owned
+  baseline-helper repair in PR #996 and was not duplicated here.
+- The review-verdict status remains fail-closed: PR #998 has no counted
+  allowed exact-head review. It has no auto-merge request or queue admission.
+
+**Disposition:** `ACTIVE — one branch-owned clippy regression is repaired
+locally; the unrelated Python helper failure remains with #996; the branch
+must be committed and revalidated before the review gate can be reconsidered.`
