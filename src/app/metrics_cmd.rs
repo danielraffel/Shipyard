@@ -365,7 +365,12 @@ pub(super) fn metrics_command<W: Write>(
                     write_merge_receipts_jsonl_to(stdout, &receipts)?;
                     return Ok(std::process::ExitCode::SUCCESS);
                 }
-                let file = file.expect("clap requires --file unless --stdout");
+                let file = file.ok_or_else(|| {
+                    CliFailure::new(
+                        2,
+                        "merge receipt export failed: --file or --stdout is required",
+                    )
+                })?;
                 let destination = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
                 let store_path = std::fs::canonicalize(store.path())
                     .unwrap_or_else(|_| store.path().to_path_buf());
