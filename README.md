@@ -17,6 +17,9 @@ parts of CI:
   Silicon, it turns their Macs into GitHub Actions capacity with clean macOS,
   Linux, and Windows VM lanes that are removed after each job.
 
+Tart provides the VM runtime; TartCI adds the CI pool around it: managed images,
+capacity leases, ephemeral runner registration, job cleanup, and metrics.
+
 Use Shipyard without TartCI for local, SSH, or hosted checks. Add TartCI when
 those checks need isolated Mac VM capacity. GitHub remains the authority for
 pull requests and merge order, and your existing build system remains the
