@@ -1,12 +1,11 @@
 use super::*;
 use crate::app::merge_steward_cmd::observation::{
     canonical_repo_name, encode_path_segment, evaluated_required_checks,
-    hydrate_census_check_identities, hydrate_required_check_identities, parse_check,
-    parse_rest_check,
+    hydrate_required_check_identities, parse_check, parse_rest_check,
 };
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::observation::{
-    check_runs_for_head, hydrate_preemption_jobs, required_checks,
+    check_runs_for_head, hydrate_census_check_identities, hydrate_preemption_jobs, required_checks,
 };
 
 #[test]
@@ -863,6 +862,16 @@ fn absent_check_rollup_marks_explicit_and_implicit_managed_pull_requests_for_hyd
         &positions,
     )
     .expect("ordinary PR");
+    let foreign_app = parse_pr(
+        &row(
+            4,
+            "feature/foreign-app",
+            Some("app/other-automation"),
+            serde_json::json!([]),
+        ),
+        &positions,
+    )
+    .expect("foreign App PR");
 
     assert!(
         managed.check_rollup_maybe_truncated,
@@ -876,12 +885,16 @@ fn absent_check_rollup_marks_explicit_and_implicit_managed_pull_requests_for_hyd
         !ordinary.check_rollup_maybe_truncated,
         "an ordinary human PR must not buy a per-head hydration round trip"
     );
+    assert!(
+        !foreign_app.check_rollup_maybe_truncated,
+        "a non-fleet App must not buy a per-head hydration round trip"
+    );
     assert!(managed.fact.checks.is_empty());
     assert!(implicit.fact.checks.is_empty());
 
     // An observed rollup keeps its existing meaning for the single-PR callers
     // that still request it: complete below the page cap, suspect at it.
-    let mut observed = row(4, "feature/observed", Some("alice"), serde_json::json!([]));
+    let mut observed = row(5, "feature/observed", Some("alice"), serde_json::json!([]));
     observed["statusCheckRollup"] = serde_json::json!([]);
     let observed = parse_pr(&observed, &positions).expect("observed rollup");
     assert!(!observed.check_rollup_maybe_truncated);
@@ -930,6 +943,16 @@ esac
             &BTreeMap::new(),
         )
         .expect("human PR"),
+        parse_pr(
+            &row(
+                3,
+                &"c".repeat(40),
+                "feature/foreign-app",
+                "app/other-automation",
+            ),
+            &BTreeMap::new(),
+        )
+        .expect("foreign App PR"),
     ];
     hydrate_census_check_identities(
         &actions,
@@ -945,9 +968,11 @@ esac
     assert_eq!(prs[0].fact.checks.len(), 1);
     assert_eq!(prs[0].fact.checks[0].app_id, Some(42));
     assert!(prs[1].fact.checks.is_empty());
+    assert!(prs[2].fact.checks.is_empty());
     let calls = fs::read_to_string(calls_path).expect("hydration calls");
     assert!(calls.contains(&format!("commits/{}/check-runs", "a".repeat(40))));
     assert!(!calls.contains(&format!("commits/{}/check-runs", "b".repeat(40))));
+    assert!(!calls.contains(&format!("commits/{}/check-runs", "c".repeat(40))));
 }
 
 /// The bulk open-PR read must stay within GitHub's per-query node budget no
