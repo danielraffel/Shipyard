@@ -2162,6 +2162,43 @@ mod tests {
     }
 
     #[test]
+    fn work_item_rejects_noncanonical_keys_and_unknown_schema() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let invalid = WorkItemKey {
+            repository: "Owner/Repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task".to_owned(),
+        };
+        assert!(
+            store
+                .register_work_item(invalid, "work-item/v1", "fleet/v1", "idem", Utc::now())
+                .is_err()
+        );
+
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-schema".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let path = store.work_item_path(&key);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("record")).expect("json");
+        value["schema_version"] = serde_json::json!(99);
+        fs::write(&path, serde_json::to_vec(&value).expect("json")).expect("unsupported schema");
+        let error = store
+            .get_work_item(&key)
+            .expect_err("unknown schema must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn work_item_claim_requires_matching_capability_and_cas_version() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
