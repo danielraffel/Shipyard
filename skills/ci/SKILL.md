@@ -5,6 +5,18 @@ description: "Cross-platform CI coordination with Shipyard: validates, ships, ma
 
 # CI Operations with Shipyard
 
+## Durable external work
+
+Agents may register CI preparation, repair, review, or release work through
+Shipyard's durable work-item store without being launched or supervised by
+Shipyard. Registration is idempotent; checkpoints must be written before a
+session hands off or exits. Claims carry a fencing epoch and protocol/capability
+version, and stale owners are rejected on checkpoint. A host-loss recovery
+must rediscover the item from shared ShipState and obtain a new fenced claim;
+local files or conversation history are not recovery state. This contract is
+observation-only until the cross-host failure canary proves concurrent
+reconcilers cannot duplicate privileged effects.
+
 ## Required-check producer identity
 
 When CI code consumes required-check materialization, preserve producer

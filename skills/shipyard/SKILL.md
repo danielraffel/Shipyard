@@ -5,6 +5,19 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+## Durable work-item contract
+
+Shipyard's existing ShipState/lease/receipt primitives are the source of
+durable intent for work started by independent Claude or Codex sessions. Each
+item has a canonical identity, protocol/capability version, checkpoint, owner,
+and fencing epoch. Register before claiming; checkpoint before handoff; after a
+process or host failure, rediscover from shared state and claim a new epoch.
+The previous owner must be fenced before any conflicting mutation. GitHub
+remains authoritative for PR, review, check, merge-queue, and release state;
+Shipyard records intent and ownership only. Autonomous cross-host takeover is
+not enabled until real concurrent-reconciler and lost-acknowledgment tests
+prove idempotent, authorized recovery.
+
 Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
 commit-to-pull-requests API, but zero or multiple matches remain unknown.
