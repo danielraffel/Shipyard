@@ -158,6 +158,15 @@ fn read_archive(dir: &Path) -> Result<ArchiveRows, CliFailure> {
                     ));
                     continue;
                 };
+                if !valid_fixlink_evidence(&value) {
+                    findings.push(finding(
+                        &path,
+                        dir,
+                        line_number,
+                        "invalid_fixlink",
+                        "fix-link lacks complete producer evidence",
+                    ));
+                }
                 fixlinks.push((
                     RedKey {
                         repo: repo.to_owned(),
@@ -280,22 +289,95 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
 }
 
 fn is_proven_rerun_green(value: &Value) -> bool {
-    let Some(head_sha) = value["head_sha"].as_str() else {
+    valid_fixlink_evidence(value) && value["derivation"] == "rerun_green"
+}
+
+fn valid_sha(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// Validate the producer evidence before an archive row participates in
+/// duplicate/orphan checks. The audit remains local and read-only; it does not
+/// contact GitHub or expose the malformed row's contents.
+fn valid_fixlink_evidence(value: &Value) -> bool {
+    let Some(derivation) = value["derivation"].as_str() else {
         return false;
     };
-    let Some(fix_head_sha) = value["fix_head_sha"].as_str() else {
+    let Some(red_time) = value["red_time"].as_str() else {
         return false;
     };
-    value["derivation"].as_str() == Some("rerun_green")
-        && value["fix_run_id"] == value["red_run_id"]
-        && head_sha == fix_head_sha
-        && head_sha.len() == 40
-        && head_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && value["files_raw"].as_array().is_some_and(Vec::is_empty)
-        && value["own_files"].as_array().is_some_and(Vec::is_empty)
-        && value["files_truncated"].as_bool() == Some(false)
-        && value["own_files_truncated"].as_bool() == Some(false)
-        && value["own_files_method"].as_str() == Some("rerun_same_head")
+    let Some(pushed_at) = value["pushed_at"].as_str() else {
+        return false;
+    };
+    let (Ok(red_time), Ok(pushed_at)) = (
+        chrono::DateTime::parse_from_rfc3339(red_time),
+        chrono::DateTime::parse_from_rfc3339(pushed_at),
+    ) else {
+        return false;
+    };
+    if pushed_at <= red_time
+        || value["repo"].as_str().is_none_or(str::is_empty)
+        || value["red_run_id"].as_u64().is_none_or(|id| id == 0)
+        || value["red_attempt"]
+            .as_u64()
+            .is_none_or(|attempt| attempt == 0)
+        || value["fix_run_id"].as_u64().is_none_or(|id| id == 0)
+        || !valid_sha(&value["head_sha"])
+        || !valid_sha(&value["fix_head_sha"])
+        || value["branch"].as_str().is_none_or(str::is_empty)
+        || value["rule"].as_str().is_none_or(str::is_empty)
+        || value["collector"].as_str().is_none_or(str::is_empty)
+        || value["files_truncated"].as_bool().is_none()
+        || value.get("own_files").is_none()
+        || value.get("own_files_truncated").is_none()
+    {
+        return false;
+    }
+    if let Some(pr) = value.get("pr")
+        && !pr.is_null()
+        && !pr.as_u64().is_some_and(|number| number > 0)
+    {
+        return false;
+    }
+    match derivation {
+        "rerun_green" => {
+            value["fix_run_id"] == value["red_run_id"]
+                && value["head_sha"] == value["fix_head_sha"]
+                && value["files_raw"].as_array().is_some_and(Vec::is_empty)
+                && value["own_files"].as_array().is_some_and(Vec::is_empty)
+                && value["files_truncated"] == false
+                && value["own_files_truncated"] == false
+                && value["own_files_method"] == "rerun_same_head"
+        }
+        "compare_red_head_to_fix_head" => {
+            value["files_raw"]
+                .as_array()
+                .is_some_and(|files| files.iter().all(Value::is_string))
+                && (value["own_files"].is_null()
+                    || value["own_files"]
+                        .as_array()
+                        .is_some_and(|files| files.iter().all(Value::is_string)))
+                && value["own_files_method"].as_str().is_some_and(|method| {
+                    matches!(
+                        method,
+                        "first_parent_non_merge_commits"
+                            | "merge_queue_pr_head"
+                            | "post_force_push"
+                            | "post_force_push_superseded"
+                            | "post_force_push_too_late"
+                            | "red_not_ancestor"
+                            | "branch_is_default"
+                            | "too_many_commits"
+                            | "chain_broken"
+                    )
+                })
+                && (value["own_files_truncated"].is_null()
+                    || value["own_files_truncated"].is_boolean())
+        }
+        _ => false,
+    }
 }
 
 fn allowed_fixlink_pair(first: Option<&str>, second: Option<&str>) -> bool {
@@ -429,8 +511,8 @@ mod tests {
         fs::write(dir.path().join("causes/2026-10.jsonl"), cause(1)).expect("cause");
         fs::write(
             dir.path().join("fixlinks.jsonl"),
-            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":1,"red_attempt":1,"derivation":"compare_red_head_to_fix_head"}
-{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":1,"red_attempt":1,"derivation":"rerun_green"}
+            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":1,"red_attempt":1,"fix_run_id":2,"head_sha":"0123456789abcdef0123456789abcdef01234567","fix_head_sha":"1234567890abcdef1234567890abcdef12345678","derivation":"compare_red_head_to_fix_head","pushed_at":"2026-10-14T11:00:00Z","red_time":"2026-10-14T10:30:00Z","files_raw":["src/lib.rs"],"files_truncated":false,"own_files":[],"own_files_method":"first_parent_non_merge_commits","own_files_truncated":false,"branch":"feature/x","pr":1,"rule":"test","collector":"test"}
+{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":1,"red_attempt":1,"fix_run_id":1,"head_sha":"0123456789abcdef0123456789abcdef01234567","fix_head_sha":"0123456789abcdef0123456789abcdef01234567","derivation":"rerun_green","pushed_at":"2026-10-14T11:00:00Z","red_time":"2026-10-14T10:30:00Z","files_raw":[],"files_truncated":false,"own_files":[],"own_files_method":"rerun_same_head","own_files_truncated":false,"branch":"feature/x","pr":1,"rule":"test","collector":"test"}
 "#,
         )
         .expect("fixlinks");
@@ -443,11 +525,33 @@ mod tests {
     }
 
     #[test]
+    fn reports_incomplete_compare_fixlink_evidence() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("causes")).expect("causes");
+        fs::write(dir.path().join("causes/2026-10.jsonl"), cause(1)).expect("cause");
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":1,"red_attempt":1,"derivation":"compare_red_head_to_fix_head"}
+"#,
+        )
+        .expect("fixlink");
+        let report = audit(&CauseAuditArgs {
+            dir: dir.path().to_path_buf(),
+        })
+        .expect("audit");
+        assert!(!report.ok);
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == "invalid_fixlink"
+                && finding.detail == "fix-link lacks complete producer evidence"
+        }));
+    }
+
+    #[test]
     fn accepts_rerun_fixlink_when_original_log_has_no_cause_row() {
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join("fixlinks.jsonl"),
-            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1,"derivation":"rerun_green","fix_run_id":2,"fix_head_sha":"0123456789abcdef0123456789abcdef01234567","head_sha":"0123456789abcdef0123456789abcdef01234567","files_raw":[],"own_files":[],"files_truncated":false,"own_files_truncated":false,"own_files_method":"rerun_same_head"}
+            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1,"derivation":"rerun_green","fix_run_id":2,"fix_head_sha":"0123456789abcdef0123456789abcdef01234567","head_sha":"0123456789abcdef0123456789abcdef01234567","pushed_at":"2026-10-14T11:00:00Z","red_time":"2026-10-14T10:30:00Z","branch":"feature/x","pr":2,"rule":"test","collector":"test","files_raw":[],"own_files":[],"files_truncated":false,"own_files_truncated":false,"own_files_method":"rerun_same_head"}
 "#,
         )
         .expect("fixlinks");
@@ -473,6 +577,17 @@ mod tests {
         })
         .expect("audit");
         assert!(!report.ok);
-        assert_eq!(report.findings[0].kind, "orphan_fixlink");
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "invalid_fixlink")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "orphan_fixlink")
+        );
     }
 }

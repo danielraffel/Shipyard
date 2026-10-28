@@ -101,7 +101,9 @@ and exits nonzero when it finds one. A structurally proven `rerun_green` link
 (same red and fix run/head, empty changed-file lists, and
 `own_files_method = rerun_same_head`) is allowed without a cause row because
 GitHub may have deleted the original failed log before the archive pass;
-compare-derived and malformed rerun links still require an archived cause.
+compare-derived and malformed rerun links still require an archived cause. A
+fix-link is malformed when its producer identity, timestamps, SHAs, or
+file-evidence shape is incomplete.
 Findings are sorted by archive path and line. It never rewrites the archive,
 contacts GitHub, or exposes invalid line contents.
 
