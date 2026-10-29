@@ -1668,6 +1668,7 @@ fn parse_github_repo_slug(remote: &str) -> Option<String> {
 mod tests {
     use std::path::Path;
 
+    #[cfg(unix)]
     use super::{CLEANUP_DEFAULT_INTERVAL_SECS, cleanup_stale_after};
 
     #[cfg(unix)]
