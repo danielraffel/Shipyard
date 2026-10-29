@@ -246,6 +246,18 @@ pub(super) enum Command {
         #[arg(long, requires = "apply")]
         confirm_no_worker_tree: bool,
     },
+    /// Quarantine one malformed raw queue row after an explicit dry run.
+    #[command(name = "queue-quarantine")]
+    QueueQuarantine {
+        /// Exact malformed queue job identifier.
+        job_id: String,
+        /// Why this row is being quarantined.
+        #[arg(long, default_value = "malformed queue row blocks safe cleanup")]
+        reason: String,
+        /// Move the row into queue-quarantine/<job-id>-<timestamp>.json.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Change the priority of a pending job.
     Bump {
         /// Job identifier.
@@ -407,6 +419,11 @@ pub(super) enum Command {
             requires = "validation_tmp"
         )]
         older_than_hours: u64,
+        /// With --validation-tmp: reclaim only directories with an owner file.
+        /// Scheduled cleanup uses this conservative mode; manual cleanup keeps
+        /// the historical unowned-directory scan unless this flag is supplied.
+        #[arg(long = "owned-only", requires = "validation_tmp")]
+        owned_only: bool,
     },
     /// List, add, remove, and test validation targets.
     Targets {

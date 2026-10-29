@@ -938,6 +938,14 @@ a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
 a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
 everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
 
+Fleet hosts can install the daily bounded-retention agent with
+`scripts/install_cleanup.sh --install`. It previews both passes, then runs log
+cleanup plus the conservative `cleanup --validation-tmp --owned-only --apply`
+pass every 24 hours, writes `cleanup/last-run.json`, and exposes refusals or
+interrupted runs through `shipyard doctor`. Use `--uninstall` to remove the
+launchd agent, wrapper, and receipt. Installation never edits queue state to
+bypass a refusal.
+
 ## Version-at-land
 
 A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest

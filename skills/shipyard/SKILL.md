@@ -744,6 +744,13 @@ a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
 a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
 everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
 
+Fleet hosts may install the daily launchd wrapper with
+`scripts/install_cleanup.sh --install`; it runs the bounded log pass and the
+conservative `--owned-only` TMP pass, records `cleanup/last-run.json`, and
+lets `shipyard doctor` report refusals or stale runs. A malformed queue row is
+named by ID; inspect `shipyard queue-quarantine JOB_ID` before using its
+explicit `--apply` remedy.
+
 ## Version-at-land
 
 A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest

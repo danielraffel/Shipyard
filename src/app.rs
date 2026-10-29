@@ -61,6 +61,7 @@ mod queue_cmd;
 mod queue_digest_cmd;
 mod queue_hold_cmd;
 mod queue_observer_cmd;
+mod queue_quarantine_cmd;
 mod release_bot_cmd;
 mod reroute_cmd;
 mod rescue_cmd;
@@ -127,6 +128,7 @@ use self::queue_cmd::{
 use self::queue_digest_cmd::queue_digest_command;
 use self::queue_hold_cmd::queue_hold_command;
 use self::queue_observer_cmd::{QueueObserverArgs, queue_observer_command};
+use self::queue_quarantine_cmd::queue_quarantine_command;
 use self::release_bot_cmd::release_bot_command;
 use self::rescue_cmd::rescue_command;
 use self::run_cmd::{
@@ -439,6 +441,7 @@ where
         | Command::Logs { .. }
         | Command::Cancel { .. }
         | Command::QueueReconcileOrphan { .. }
+        | Command::QueueQuarantine { .. }
         | Command::Bump { .. }
         | Command::Queue { command: None }
         | Command::Cleanup { .. }) => {
@@ -924,6 +927,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Logs { .. }
         | Command::Cancel { .. }
         | Command::QueueReconcileOrphan { .. }
+        | Command::QueueQuarantine { .. }
         | Command::Bump { .. }
         | Command::Queue { .. }
         | Command::QueueHold { .. }
@@ -1127,6 +1131,11 @@ fn handle_state_command<W: Write>(
             json,
             stdout,
         ),
+        Command::QueueQuarantine {
+            job_id,
+            reason,
+            apply,
+        } => queue_quarantine_command(&job_id, &reason, apply, state_dir, json, stdout),
         Command::Bump { job_id, priority } => {
             bump_command(&job_id, priority, state_dir, json, stdout)
         }
@@ -1136,10 +1145,12 @@ fn handle_state_command<W: Write>(
             dry_run,
             apply,
             older_than_hours,
+            owned_only,
             ..
         } => validation_tmp_cleanup(
             CleanupMode::from_flags(dry_run, apply),
             older_than_hours,
+            !owned_only,
             json,
             stdout,
         ),

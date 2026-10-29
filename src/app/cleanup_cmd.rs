@@ -125,6 +125,7 @@ pub(super) fn cleanup_command<W: Write>(
 pub(super) fn validation_tmp_cleanup<W: Write>(
     mode: CleanupMode,
     older_than_hours: u64,
+    include_unowned: bool,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -132,7 +133,7 @@ pub(super) fn validation_tmp_cleanup<W: Write>(
     let base = validation_tmp::default_base();
     let policy = ReclaimPolicy {
         min_age: std::time::Duration::from_hours(older_than_hours),
-        include_unowned: true,
+        include_unowned,
     };
     let candidates =
         validation_tmp::plan(&base, std::time::SystemTime::now(), policy, &SystemLiveness);
@@ -149,6 +150,10 @@ pub(super) fn validation_tmp_cleanup<W: Write>(
         data.insert(
             "older_than_hours".to_owned(),
             serde_json::json!(older_than_hours),
+        );
+        data.insert(
+            "include_unowned".to_owned(),
+            serde_json::json!(include_unowned),
         );
         data.insert("candidates".to_owned(), serde_json::json!(candidates));
         data.insert(
@@ -1517,8 +1522,8 @@ fn load_queue_job_retention(
         )
     })?;
     let mut parsed = BTreeMap::new();
-    for job in jobs {
-        let (id, state) = parse_queue_log_state(job, queue_file)?;
+    for (index, job) in jobs.iter().enumerate() {
+        let (id, state) = parse_queue_log_state(job, queue_file, index)?;
         if parsed.insert(id, state).is_some() {
             return Err(CliFailure::new(
                 1,
@@ -1535,6 +1540,7 @@ fn load_queue_job_retention(
 fn parse_queue_log_state(
     job: &Value,
     queue_file: &Path,
+    index: usize,
 ) -> Result<(String, QueueLogState), CliFailure> {
     let id = job
         .get("id")
@@ -1607,8 +1613,10 @@ fn parse_queue_log_state(
         return Err(CliFailure::new(
             1,
             format!(
-                "refusing log cleanup because queue state {} contains a malformed terminal job",
-                queue_file.display()
+                "refusing log cleanup because queue state {} contains malformed terminal job {} (array index {})",
+                queue_file.display(),
+                id,
+                index
             ),
         ));
     }
