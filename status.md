@@ -15,15 +15,17 @@ status commit.
   authoritative queue timing covers all completed jobs.
 - Added `rework_compute_coverage`. It reports whether failed attempts have
   valid measured duration.
+- Added `wasted_compute_coverage` and `coordination_rework_coverage`, so the
+  two aggregate cost proxies also carry explicit unavailable/partial states.
 - Human cost output now prints both coverage states.
 - Documented that cost totals remain proxies and that coverage is explicit.
-- Added a regression test proving missing timing yields `unavailable` coverage
-  rather than an apparently complete zero.
+- Added regression tests proving missing and partial timing yield explicit
+  coverage states and that all four envelopes survive JSON serialization.
 
 ## Validation
 
 - `cargo fmt --check`
-- `cargo test stewardship_scorecard --lib` — 10 passed
+- `cargo test stewardship_scorecard --lib` — 11 passed
 - `git diff --check`
 
 ## Current external state
