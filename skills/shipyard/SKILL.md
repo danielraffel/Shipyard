@@ -5338,7 +5338,9 @@ Shipyard mutation machine remain authoritative.
 
 When the steward reports `ghapp: exact repository provenance is required`, this is a
 Shipyard invocation defect, not an empty queue or a GitHub authorization verdict.
-Every GraphQL observation must pass the explicit `--repo OWNER/REPO` argument even
-when the query also carries owner/name variables. Verify with a bounded
+The steward must scope its GitHub client to the explicit repository so the
+authenticated `ghapp` wrapper receives `GH_REPO=OWNER/REPO`; do not add a
+`--repo` flag to native `gh api graphql`, which does not support that flag.
+Verify with a bounded
 `shipyard --json runner steward --repo OWNER/REPO --base main --arm-unqueued` dry run;
 an empty `prs` list with a repository error is failure, not a healthy idle feeder.
