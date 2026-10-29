@@ -287,14 +287,14 @@ those values to authenticated durable events before they are imported.
 `metrics scorecard` also reports failed/cancelled compute waste, queue-wait
 coordination cost, and failed-attempt rework as observational baseline metrics.
 
-When the direct baseline collector is given `--merge-receipts` but the handoff
-is missing, it emits the provider collection event before an unavailable
-merge-receipt handoff marker. Keep that ordering on this missing-handoff path:
-the marker is a provenance warning and must remain the final event consumed by
-scorecard readers.
 It does not alter routing or queue behavior. The per-safely-merged-change
 denominator is unavailable until a durable merge receipt joins the PR head;
 distinct PRs are not a safe-merge proxy.
+
+When the direct baseline collector is given `--merge-receipts` but the handoff
+is missing, it emits the provider collection event before an unavailable
+merge-receipt handoff marker. Keep that ordering on this missing-handoff path;
+the unavailable marker is emitted last.
 
 ## `inspect --profile`: what checks apply to comes from the repo
 
