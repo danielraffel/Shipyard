@@ -339,6 +339,11 @@ fn cleanup_retention(
         recover_retirement_quarantines(state_dir, dry_run, &mut items, &mut protected_items)?;
     reject_log_symlinks(&state_dir.join("logs"))?;
     if recovered {
+        // Recovery must not bypass the metrics safety check. A recovered
+        // quarantine is returned early so the restored evidence can remain
+        // protected for a separately previewed cleanup, but an unreadable
+        // metrics store still has to fail closed on this invocation.
+        prune_metrics(state_dir, dry_run, &mut items)?;
         let protected_bytes = protected_items.iter().map(|item| item.size_bytes).sum();
         let log_bytes =
             dir_size(&state_dir.join("logs")) + if dry_run { protected_bytes } else { 0 };
@@ -2482,6 +2487,23 @@ mod retention_tests {
 
         let error = cleanup_retention(temp.path(), true, LogRetentionPolicy::default())
             .expect_err("dry-run must validate the metrics database");
+        assert!(error.message.contains("metrics retention failed"));
+    }
+
+    #[test]
+    fn recovered_quarantine_does_not_bypass_metrics_validation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let quarantine = temp
+            .path()
+            .join("cleanup-staging/.shipyard-retire-interrupted");
+        write_terminal(&quarantine.join("success"), "success", false, 24 * 365);
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        fs::write(metrics_dir.join("metrics.db"), b"not a sqlite database")
+            .expect("invalid metrics db");
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("recovery must not bypass metrics validation");
         assert!(error.message.contains("metrics retention failed"));
     }
 
