@@ -52,11 +52,25 @@ pub(super) const OWN_FILES_RULE: &str = "own_files = the union of the files of t
     non-merge commits up to the fix in the pull request's commit list (post_force_push), null when the \
     fix is no longer in that list (post_force_push_superseded) or came later (post_force_push_too_late). \
     own_files_truncated when a commit lists 300 or more files";
-const FIXLINK_RULE: &str = "earliest successful run of the same workflow on the red's pull request \
+pub(super) const FIXLINK_RULE: &str = "earliest successful run of the same workflow on the red's pull request \
     branch (or branch) created after the red attempt's last failed job completed; a later attempt of \
     the red run itself is rerun_green, while a different successful run on the same head is \
     same_head_green; pushed_at = run_started_at for rerun_green and created_at for same_head_green \
     or compare_red_head_to_fix_head; files_raw = compare red head...fix head";
+
+/// Rule strings emitted before same-head green runs received their own
+/// derivation. They are part of the archive compatibility contract: rows with
+/// either rule and a distinct fix run ID used `created_at` for `pushed_at`.
+pub(super) const LEGACY_FIXLINK_RULE_V1: &str = "earliest successful run of the same workflow on the red's pull request \
+    branch (or branch) created after the red attempt's last failed job completed; a later attempt of \
+    the red run itself is rerun_green with pushed_at = its run_started_at; files_raw = compare red \
+    head...fix head";
+pub(super) const LEGACY_FIXLINK_RULE_V2: &str = "candidate order is a later attempt of the red run, then later successful \
+    runs on the same head, then later successful runs on another head; accept the first candidate \
+    whose job listing proves every failed job passed. Candidates are on the red pull request branch \
+    (or branch) and created after the red attempt's last failed job completed; a later attempt of the \
+    red run is rerun_green with pushed_at = its run_started_at; a later same-head run is rerun_green \
+    with pushed_at = its created_at; files_raw = compare red head...fix head";
 
 /// One observer pass.
 #[derive(Clone, Debug)]

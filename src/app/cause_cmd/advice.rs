@@ -15,7 +15,7 @@ use super::super::CliFailure;
 use super::super::cli::CauseAdviseArgs;
 use crate::diagnose::cause::SCHEMA;
 
-use super::record::needs_scrub;
+use super::record::{FIXLINK_RULE, LEGACY_FIXLINK_RULE_V1, LEGACY_FIXLINK_RULE_V2, needs_scrub};
 
 const ADVICE_SCHEMA: &str = "shipyard.cause-advice/v1";
 
@@ -416,7 +416,11 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
 /// use `same_head_green`; this compatibility path is intentionally limited to
 /// the same complete evidence required by the new derivation.
 fn legacy_same_head_green(value: &Value) -> bool {
-    value["red_run_id"] != value["fix_run_id"] && same_head_green_evidence(value)
+    value["red_run_id"] != value["fix_run_id"]
+        && value["rule"]
+            .as_str()
+            .is_some_and(|rule| matches!(rule, LEGACY_FIXLINK_RULE_V1 | LEGACY_FIXLINK_RULE_V2))
+        && same_head_green_evidence(value)
 }
 
 fn same_head_green_evidence(value: &Value) -> bool {
@@ -832,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_rerun_fixlink_with_distinct_run_is_consumed() {
+    fn current_rerun_fixlink_with_distinct_run_is_rejected() {
         let value = serde_json::json!({
             "schema": SCHEMA,
             "source": "fix-link",
@@ -847,7 +851,7 @@ mod tests {
             "red_time": "2026-10-13T00:00:00Z",
             "pr": 8,
             "branch": "feat/x",
-            "rule": "test rule",
+            "rule": super::FIXLINK_RULE,
             "collector": "test",
             "files_raw": [],
             "files_truncated": false,
@@ -856,7 +860,7 @@ mod tests {
             "own_files_method": "rerun_same_head"
         });
 
-        assert!(valid_fixlink(&value));
+        assert!(!valid_fixlink(&value));
     }
 
     #[test]
@@ -882,7 +886,7 @@ mod tests {
             "red_time": "2026-10-13T00:00:00Z",
             "pr": 8,
             "branch": "feat/x",
-            "rule": "legacy collector",
+            "rule": super::LEGACY_FIXLINK_RULE_V1,
             "collector": "shipyard cause record",
             "files_raw": [],
             "files_truncated": false,
