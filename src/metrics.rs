@@ -352,12 +352,20 @@ pub struct StewardshipScorecard {
     pub coordination_minutes: f64,
     /// Number of jobs contributing to [`Self::coordination_minutes`].
     pub coordination_samples: usize,
+    /// Coverage of authoritative queue timing across completed job samples.
+    /// This keeps a queue-wait total from being mistaken for a complete
+    /// coordination-cost measurement when some jobs have no queued timestamp.
+    pub coordination_coverage: ScorecardCoverage,
     /// Failed-attempt compute minutes. Cancellations are kept in
     /// `wasted_compute_minutes` but are not called rework without evidence
     /// that a replacement attempt ran.
     pub rework_compute_minutes: f64,
     /// Number of failed attempts contributing to rework compute.
     pub rework_compute_samples: usize,
+    /// Coverage of measured duration across failed attempts. Failed attempts
+    /// without a valid duration remain visible in the denominator and keep
+    /// this metric partial or unavailable.
+    pub rework_compute_coverage: ScorecardCoverage,
     /// Sum of measured queue and failed-attempt compute minutes.
     pub coordination_rework_minutes: f64,
     /// Merge receipts are not currently part of the local metrics schema.
@@ -2096,8 +2104,18 @@ impl MetricsStore {
             wasted_compute_samples: wasted_samples,
             coordination_minutes: millis_to_minutes(coordination_ms),
             coordination_samples: queues.len(),
+            coordination_coverage: coverage_for_samples(
+                queues.len(),
+                samples.len(),
+                "completed job samples include authoritative queue timing",
+            ),
             rework_compute_minutes: millis_to_minutes(rework_compute_ms),
             rework_compute_samples: rework_samples,
+            rework_compute_coverage: coverage_for_samples(
+                rework_samples,
+                failed_jobs,
+                "failed attempts include measured duration",
+            ),
             coordination_rework_minutes: millis_to_minutes(
                 rework_compute_ms.saturating_add(coordination_ms),
             ),
@@ -5088,8 +5106,10 @@ mod tests {
         assert_eq!(scorecard.wasted_compute_samples, 1);
         assert!((scorecard.coordination_minutes - 0.1).abs() < f64::EPSILON);
         assert_eq!(scorecard.coordination_samples, 3);
+        assert_eq!(scorecard.coordination_coverage.status, "available");
         assert!((scorecard.rework_compute_minutes - 2.0).abs() < f64::EPSILON);
         assert_eq!(scorecard.rework_compute_samples, 1);
+        assert_eq!(scorecard.rework_compute_coverage.status, "available");
         assert!((scorecard.coordination_rework_minutes - 2.1).abs() < f64::EPSILON);
         assert_eq!(scorecard.safely_merged_changes.status, "unavailable");
         assert_eq!(
@@ -5281,6 +5301,32 @@ mod tests {
         assert_eq!(scorecard.failure_rate, Some(2.0 / 3.0));
         assert_eq!(scorecard.wasted_compute_samples, 3);
         assert_eq!(scorecard.rework_compute_samples, 2);
+        assert_eq!(scorecard.coordination_coverage.status, "available");
+        assert_eq!(scorecard.rework_compute_coverage.status, "available");
+    }
+
+    #[test]
+    fn stewardship_scorecard_marks_cost_proxy_gaps_explicitly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "failure", 60_000, 1_000, false);
+        let conn = store.connect().expect("metrics connection");
+        conn.execute(
+            "UPDATE jobs SET total_ms = NULL, queue_ms = NULL WHERE run_id = (SELECT id FROM runs WHERE pr = 41)",
+            [],
+        )
+        .expect("remove timing evidence");
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.coordination_samples, 0);
+        assert_eq!(scorecard.coordination_coverage.status, "unavailable");
+        assert_eq!(scorecard.rework_compute_samples, 0);
+        assert_eq!(scorecard.rework_compute_coverage.status, "unavailable");
+        assert!(scorecard.coordination_coverage.reason.contains("0 of 1"));
+        assert!(scorecard.rework_compute_coverage.reason.contains("0 of 1"));
     }
 
     #[test]
