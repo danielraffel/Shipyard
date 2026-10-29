@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use serde_json::{Value, json};
@@ -443,6 +444,31 @@ fn a_rerun_that_passes_links_the_red_attempt_to_its_own_head() {
     assert_eq!(link["fix_head_sha"], "abc123");
     assert_eq!(link["pushed_at"], "2026-10-14T10:45:00Z");
     assert_eq!(link["own_files"], json!([]));
+}
+
+#[test]
+fn a_distinct_successful_same_head_run_is_not_mislabeled_as_rerun() {
+    let red = Red {
+        repo: "o/r".to_owned(),
+        run_id: 100,
+        attempt: 1,
+        head_sha: "abc123".to_owned(),
+        time: "2026-10-14T10:30:00Z".to_owned(),
+        pr: Some(42),
+        branch: "feat/x".to_owned(),
+    };
+    let later = json!({
+        "id": 200,
+        "conclusion": "success",
+        "head_sha": "abc123",
+        "created_at": "2026-10-14T11:00:00Z",
+        "run_attempt": 1
+    });
+
+    let fixes = fixes_for(&red, &[&later], &BTreeMap::new());
+    assert_eq!(fixes.len(), 1);
+    assert_eq!(fixes[0].run_id, 200);
+    assert_eq!(fixes[0].derivation, "same_head_green");
 }
 
 #[test]

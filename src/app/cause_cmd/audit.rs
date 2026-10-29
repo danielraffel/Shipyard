@@ -243,7 +243,10 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
     let mut seen_fixlinks = BTreeMap::<RedKey, Vec<(PathBuf, usize, Option<String>)>>::new();
     for (key, path, line, value) in fixlinks {
         let derivation = value["derivation"].as_str().map(str::to_owned);
-        let proven_rerun_green = derivation.as_deref() == Some("rerun_green");
+        let proven_same_head_green = matches!(
+            derivation.as_deref(),
+            Some("rerun_green" | "same_head_green")
+        );
         let previous = seen_fixlinks.entry(key.clone()).or_default();
         let duplicate = previous.iter().any(|(_, _, prior_derivation)| {
             !allowed_fixlink_pair(prior_derivation.as_deref(), derivation.as_deref())
@@ -272,7 +275,7 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
         // the later green rerun remains available as a fix-link. Keep the
         // stronger check for compare-derived links, which must point at an
         // archived red attempt.
-        if !red_keys.contains(&key) && !proven_rerun_green {
+        if !red_keys.contains(&key) && !proven_same_head_green {
             findings.push(finding(
                 &path,
                 &args.dir,
@@ -297,8 +300,13 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
 fn allowed_fixlink_pair(first: Option<&str>, second: Option<&str>) -> bool {
     matches!(
         (first, second),
-        (Some("compare_red_head_to_fix_head"), Some("rerun_green"))
-            | (Some("rerun_green"), Some("compare_red_head_to_fix_head"))
+        (
+            Some("compare_red_head_to_fix_head"),
+            Some("rerun_green" | "same_head_green")
+        ) | (
+            Some("rerun_green" | "same_head_green"),
+            Some("compare_red_head_to_fix_head")
+        )
     )
 }
 

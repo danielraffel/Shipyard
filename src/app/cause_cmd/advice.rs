@@ -299,14 +299,14 @@ fn matching_fixlink(fixlinks: &[Value], repo: &str, cause: &Value) -> Option<Val
         return matches.first().map(|fix| (*fix).clone());
     }
 
-    let has_rerun = keys
+    let has_same_head_green = keys
         .iter()
-        .any(|(_, derivation)| derivation == "rerun_green");
+        .any(|(_, derivation)| matches!(derivation.as_str(), "rerun_green" | "same_head_green"));
     let compare = keys
         .iter()
         .filter(|(_, derivation)| derivation == "compare_red_head_to_fix_head")
         .count();
-    if has_rerun && compare == 1 && keys.len() == 2 {
+    if has_same_head_green && compare == 1 && keys.len() == 2 {
         return matches
             .iter()
             .find(|fix| fix["derivation"] == "compare_red_head_to_fix_head")
@@ -397,6 +397,15 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
         }
         "rerun_green" => {
             value["red_run_id"] == value["fix_run_id"]
+                && value["head_sha"] == value["fix_head_sha"]
+                && value["files_raw"].as_array().is_some_and(Vec::is_empty)
+                && value["own_files"].as_array().is_some_and(Vec::is_empty)
+                && value["files_truncated"].as_bool() == Some(false)
+                && value["own_files_truncated"].as_bool() == Some(false)
+                && value["own_files_method"].as_str() == Some("rerun_same_head")
+        }
+        "same_head_green" => {
+            value["red_run_id"] != value["fix_run_id"]
                 && value["head_sha"] == value["fix_head_sha"]
                 && value["files_raw"].as_array().is_some_and(Vec::is_empty)
                 && value["own_files"].as_array().is_some_and(Vec::is_empty)
@@ -837,6 +846,34 @@ mod tests {
         });
 
         assert!(!valid_fixlink(&value));
+    }
+
+    #[test]
+    fn same_head_green_accepts_a_distinct_successful_run() {
+        let value = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 999,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "b".repeat(40),
+            "derivation": "same_head_green",
+            "pushed_at": "2026-10-13T01:00:00Z",
+            "red_time": "2026-10-13T00:00:00Z",
+            "pr": 8,
+            "branch": "feat/x",
+            "rule": "test rule",
+            "collector": "test",
+            "files_raw": [],
+            "files_truncated": false,
+            "own_files": [],
+            "own_files_truncated": false,
+            "own_files_method": "rerun_same_head"
+        });
+
+        assert!(valid_fixlink(&value));
     }
 
     #[test]

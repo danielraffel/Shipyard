@@ -100,11 +100,12 @@ fix-links, duplicate cause IDs, duplicate red run attempts, and fix-links with
 no archived cause, and exits nonzero when it finds one. A fix-link is counted
 only when it passes the same safety and evidence checks used by `cause advice`,
 so the audit cannot certify a row that advice would silently ignore. A
-structurally proven `rerun_green` link
-(same red and fix run/head, empty changed-file lists, and
-`own_files_method = rerun_same_head`) is allowed without a cause row because
-GitHub may have deleted the original failed log before the archive pass;
-compare-derived and malformed rerun links still require an archived cause.
+structurally proven same-head green link (`rerun_green` for a later attempt
+of the red run, or `same_head_green` for a different successful run on the same
+head; empty changed-file lists and `own_files_method = rerun_same_head`) is
+allowed without a cause row because GitHub may have deleted the original failed
+log before the archive pass; compare-derived and malformed links still require
+an archived cause.
 Findings are sorted by archive path and line. It never rewrites the archive,
 contacts GitHub, or exposes invalid line contents.
 
@@ -120,7 +121,8 @@ Each pass:
    successful run of the same workflow on the same pull request or branch.
    When it finds one, it writes a fix-link to `<dir>/fixlinks.jsonl`: the red
    run, the fixing commit, and the files it changed. A rerun that turned the
-   same run green is recorded as `rerun_green`.
+   same run green is recorded as `rerun_green`; a different successful run on
+   the same head is recorded as `same_head_green`.
 
 A bare exit that C2 cannot name gets one of two labels. A summary job, such
 as `linux` checking the jobs it needs, takes the cause of the named job in
@@ -182,9 +184,10 @@ file and line number instead of being silently ignored. JSON output uses
 `shipyard.cause-advice/v1`; human output is a
 stable table intended for review, not an automatic decision; when a matching
 fix-link exists, that table names the fixing head and how the link was derived
-(`rerun_green` or `compare_red_head_to_fix_head`).
+(`rerun_green`, `same_head_green`, or `compare_red_head_to_fix_head`).
 
-When one red attempt has both the valid same-head `rerun_green` link and a
+When one red attempt has both a valid same-head green link (`rerun_green` or
+`same_head_green`) and a
 valid `compare_red_head_to_fix_head` link, advice selects the compare link so
 the table names the later push that fixed the failure. The rerun remains in the
 archive as recovery evidence; a second distinct compare link still suppresses

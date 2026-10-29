@@ -54,8 +54,8 @@ pub(super) const OWN_FILES_RULE: &str = "own_files = the union of the files of t
     own_files_truncated when a commit lists 300 or more files";
 const FIXLINK_RULE: &str = "earliest successful run of the same workflow on the red's pull request \
     branch (or branch) created after the red attempt's last failed job completed; a later attempt of \
-    the red run itself is rerun_green with pushed_at = its run_started_at; files_raw = compare red \
-    head...fix head";
+    the red run itself is rerun_green, while a different successful run on the same head is \
+    same_head_green; pushed_at = the successful run's start time; files_raw = compare red head...fix head";
 
 /// One observer pass.
 #[derive(Clone, Debug)]
@@ -712,9 +712,9 @@ fn created(run: &Value) -> String {
     run["created_at"].as_str().unwrap_or_default().to_owned()
 }
 
-/// The rerun fix (a later attempt of the red run, else the earliest later
-/// green on the red head) and the push fix (the earliest later green on
-/// another head), when they exist.
+/// The rerun fix (a later attempt of the red run), a later green run on the
+/// same head, and the push fix (the earliest later green on another head),
+/// when they exist.
 fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> Vec<Fix> {
     let on_red_head = |run: &&&Value| run["head_sha"].as_str() == Some(red.head_sha.as_str());
     let rerun = run_index
@@ -723,19 +723,25 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
             run["conclusion"] == "success" && run["run_attempt"].as_u64().unwrap_or(1) > red.attempt
         })
         .and_then(|run| run["run_started_at"].as_str())
-        .map(|at| (red.run_id, at.to_owned()))
+        .map(|at| (red.run_id, at.to_owned(), "rerun_green"))
         .or_else(|| {
             later
                 .iter()
                 .filter(on_red_head)
                 .min_by_key(|run| created(run))
-                .map(|run| (run["id"].as_u64().unwrap_or_default(), created(run)))
+                .map(|run| {
+                    (
+                        run["id"].as_u64().unwrap_or_default(),
+                        created(run),
+                        "same_head_green",
+                    )
+                })
         })
-        .map(|(run_id, pushed_at)| Fix {
+        .map(|(run_id, pushed_at, derivation)| Fix {
             head_sha: red.head_sha.clone(),
             run_id,
             pushed_at,
-            derivation: "rerun_green",
+            derivation,
         });
     let push = later
         .iter()
@@ -860,7 +866,7 @@ fn file_sets(
     fix: &Fix,
     branch: &str,
 ) -> Result<FileSets, String> {
-    if fix.derivation == "rerun_green" {
+    if matches!(fix.derivation, "rerun_green" | "same_head_green") {
         return Ok(FileSets {
             raw: Vec::new(),
             raw_truncated: false,

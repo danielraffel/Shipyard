@@ -637,7 +637,8 @@ summarised_job`, `inherited_from_job_id`), evidence included
 under 24 h, 24 to 72 h, and over 72 h, which separates young reds from
 unfixed or unlinkable ones.
 It also writes
-`rerun_green` when a rerun of the red head passed.
+`rerun_green` when a later attempt of the red run passes and `same_head_green`
+when a different successful run passes on the same head.
 Cancelled jobs are counted and skipped; they belong to outage windows, not
 causes. Strings are scrubbed of local paths, addresses, credentials and private
 host names; run and job URLs are kept.
