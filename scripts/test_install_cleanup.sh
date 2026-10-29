@@ -91,6 +91,32 @@ grep -q 'another scheduled cleanup is already running' "$HOME_DIR/slow-second.lo
 wait "$slow_pid"
 test ! -e "${SLOW_STATUS%.json}.lock"
 
+# Delay the first owner's no-clobber publication. A concurrent starter must
+# fail closed on the owner-less lock; it must not reclaim and race the owner.
+DELAY_TOOLS="$HOME_DIR/delay-tools"
+mkdir -p "$DELAY_TOOLS"
+cat >"$DELAY_TOOLS/ln" <<'SH'
+#!/bin/sh
+sleep 2
+exec /bin/ln "$@"
+SH
+chmod +x "$DELAY_TOOLS/ln"
+RACE_STATE="$HOME_DIR/race-state"
+RACE_STATUS="$HOME_DIR/race-status.json"
+PATH="$DELAY_TOOLS:$PATH" "$WRAPPER" --shipyard "$SLOW_SHIPYARD" \
+  --state-dir "$RACE_STATE" --status "$RACE_STATUS" >"$HOME_DIR/race-first.log" 2>&1 &
+race_pid=$!
+sleep 0.2
+set +e
+"$WRAPPER" --shipyard "$SLOW_SHIPYARD" --state-dir "$RACE_STATE" \
+  --status "$RACE_STATUS" >"$HOME_DIR/race-second.log" 2>&1
+race_second_exit=$?
+set -e
+[ "$race_second_exit" -eq 1 ]
+grep -q 'another scheduled cleanup is already running' "$HOME_DIR/race-second.log"
+wait "$race_pid"
+test ! -e "${RACE_STATUS%.json}.lock"
+
 STALE_STATUS="$HOME_DIR/stale-status.json"
 mkdir -p "${STALE_STATUS%.json}.lock"
 printf '999999\n' >"${STALE_STATUS%.json}.lock/owner"
@@ -100,9 +126,14 @@ test ! -e "${STALE_STATUS%.json}.lock"
 
 EMPTY_STATUS="$HOME_DIR/empty-status.json"
 mkdir -p "${EMPTY_STATUS%.json}.lock"
+set +e
 "$WRAPPER" --shipyard "$SLOW_SHIPYARD" --state-dir "$HOME_DIR/empty-state" \
   --status "$EMPTY_STATUS" >"$HOME_DIR/empty.log" 2>&1
-test ! -e "${EMPTY_STATUS%.json}.lock"
+empty_exit=$?
+set -e
+[ "$empty_exit" -eq 1 ]
+grep -q 'another scheduled cleanup is already running' "$HOME_DIR/empty.log"
+test -d "${EMPTY_STATUS%.json}.lock"
 
 FAKE_LAUNCHCTL_LOG="$HOME_DIR/launchctl.log" HOME="$HOME_DIR" \
   SHIPYARD_LAUNCHCTL_BIN="$TOOLS/launchctl" "$INSTALLER" --uninstall >"$HOME_DIR/uninstall"
