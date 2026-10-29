@@ -337,12 +337,26 @@ fn read_fixlinks(path: &Path) -> Result<Vec<Value>, CliFailure> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let mut links: Vec<Value> = fs::read_to_string(path)
-        .map_err(|e| CliFailure::new(2, e.to_string()))?
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .filter(valid_fixlink)
-        .collect();
+    let text = fs::read_to_string(path).map_err(|e| CliFailure::new(2, e.to_string()))?;
+    let mut links = Vec::new();
+    for (line_number, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line).map_err(|error| {
+            CliFailure::new(
+                2,
+                format!(
+                    "invalid fix-link row at {}:{}: {error}",
+                    path.display(),
+                    line_number + 1
+                ),
+            )
+        })?;
+        if valid_fixlink(&value) {
+            links.push(value);
+        }
+    }
     // Keep a deterministic order for duplicate links; matching_fixlink
     // suppresses an ambiguous red attempt with conflicting valid links.
     links.sort_by_cached_key(Value::to_string);
@@ -794,6 +808,29 @@ mod tests {
         let candidates = advise(&query, &[]).unwrap().0;
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn malformed_fixlink_json_fails_closed_with_location() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            "{\"schema\":\"ci.cause/v1\"}\nnot-json\n",
+        )
+        .unwrap();
+
+        let mut query = args(dir.path());
+        query.pr = None;
+        let error = advise(&query, &[]).unwrap_err();
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("fixlinks.jsonl:2"));
+        assert!(error.message.contains("invalid fix-link row"));
     }
 
     #[test]
