@@ -95,9 +95,12 @@ step it runs in; only a missing or unreadable log exits non-zero.
 skipped, and nothing is rewritten.
 
 For a local integrity check, run `shipyard cause audit --dir DIR`. It reads
-the cause month files and `fixlinks.jsonl`, reports malformed rows, duplicate
-cause IDs, duplicate red run attempts, and fix-links with no archived cause,
-and exits nonzero when it finds one. A structurally proven `rerun_green` link
+the cause month files and `fixlinks.jsonl`, reports malformed rows, invalid
+fix-links, duplicate cause IDs, duplicate red run attempts, and fix-links with
+no archived cause, and exits nonzero when it finds one. A fix-link is counted
+only when it passes the same safety and evidence checks used by `cause advice`,
+so the audit cannot certify a row that advice would silently ignore. A
+structurally proven `rerun_green` link
 (same red and fix run/head, empty changed-file lists, and
 `own_files_method = rerun_same_head`) is allowed without a cause row because
 GitHub may have deleted the original failed log before the archive pass;

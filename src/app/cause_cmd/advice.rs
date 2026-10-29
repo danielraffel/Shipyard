@@ -352,7 +352,7 @@ fn read_fixlinks(path: &Path) -> Result<Vec<Value>, CliFailure> {
 /// Only attach fix-links whose producer identity and evidence are complete.
 /// This prevents a copied, malformed, or cross-head row from being presented
 /// as a historical fix for an otherwise matching cause.
-fn valid_fixlink(value: &Value) -> bool {
+pub(super) fn valid_fixlink(value: &Value) -> bool {
     let Some(derivation) = value["derivation"].as_str() else {
         return false;
     };
