@@ -709,9 +709,9 @@ impl MetricsStore {
         &self.path
     }
 
-    /// Delete raw run, job, step, and fleet-capacity samples older than
-    /// `retention_days`. Merge receipts are retained because they are durable
-    /// provenance.
+    /// Delete raw run, job, step, queue-timing, repeated-work, and
+    /// fleet-capacity samples older than `retention_days`. Merge receipts are
+    /// retained because they are durable provenance.
     pub fn prune_older_than(
         &self,
         retention_days: i64,
@@ -748,11 +748,35 @@ impl MetricsStore {
             tx.commit()?;
             deleted += ids.len();
         }
-        let conn = self.connect()?;
-        deleted += conn.execute(
-            "DELETE FROM fleet_capacity_samples WHERE valid_until < ?1",
-            [&cutoff],
-        )?;
+        deleted += self.prune_timestamped_rows("repeated_work_shadow", "observed_at", &cutoff)?;
+        deleted += self.prune_timestamped_rows("queue_timing", "recorded_at", &cutoff)?;
+        deleted += self.prune_timestamped_rows("fleet_capacity_samples", "valid_until", &cutoff)?;
+        Ok(deleted)
+    }
+
+    /// Delete at most one bounded batch per transaction so retention cleanup
+    /// yields between batches for metric writers.
+    fn prune_timestamped_rows(
+        &self,
+        table: &str,
+        column: &str,
+        cutoff: &str,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut deleted = 0;
+        loop {
+            let mut conn = self.connect()?;
+            conn.busy_timeout(std::time::Duration::from_millis(250))?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let query = format!(
+                "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {column} < ?1 LIMIT 250)"
+            );
+            let batch = tx.execute(&query, [cutoff])?;
+            tx.commit()?;
+            deleted += batch;
+            if batch == 0 {
+                break;
+            }
+        }
         Ok(deleted)
     }
 
@@ -829,6 +853,8 @@ impl MetricsStore {
               total_ms INTEGER,
               recorded_at TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS queue_timing_recorded_at
+              ON queue_timing(recorded_at);
             CREATE TABLE IF NOT EXISTS steps (
               id INTEGER PRIMARY KEY,
               job_id INTEGER NOT NULL REFERENCES jobs(id),
@@ -6023,6 +6049,119 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn metrics_retention_prunes_timing_and_shadow_but_keeps_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &QueueTerminalTiming {
+                    queue_job_id: "old-queue-job".into(),
+                    queue_identity: "old-queue-identity".into(),
+                    disposition: "clean".into(),
+                    started_at: Some(old),
+                    completed_at: Some(old),
+                    total_ms: Some(42),
+                },
+            )
+            .unwrap();
+        store
+            .record_repeated_work_shadow(&RepeatedWorkShadowInput {
+                kind: RepeatedWorkKind::SupersededExactHead,
+                branch: "main".into(),
+                sha: "new-head".into(),
+                target_config: "macos".into(),
+                mode: "normal_pr".into(),
+                job_id: "old-queue-job".into(),
+                queue_identity: "old-queue-identity".into(),
+                superseded_job_id: "superseded-job".into(),
+                superseded_sha: "old-head".into(),
+            })
+            .unwrap();
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &QueueTerminalTiming {
+                    queue_job_id: "recent-queue-job".into(),
+                    queue_identity: "recent-queue-identity".into(),
+                    disposition: "clean".into(),
+                    started_at: Some(Utc::now()),
+                    completed_at: Some(Utc::now()),
+                    total_ms: Some(7),
+                },
+            )
+            .unwrap();
+        store
+            .record_repeated_work_shadow(&RepeatedWorkShadowInput {
+                kind: RepeatedWorkKind::DuplicateExactHeadConfig,
+                branch: "main".into(),
+                sha: "recent-head".into(),
+                target_config: "macos".into(),
+                mode: "normal_pr".into(),
+                job_id: "recent-queue-job".into(),
+                queue_identity: "recent-queue-identity".into(),
+                superseded_job_id: "recent-superseded-job".into(),
+                superseded_sha: "recent-old-head".into(),
+            })
+            .unwrap();
+        let receipt = crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
+            receipt_id: "old-merge-receipt".to_owned(),
+            repo: "Generous-Corp/Shipyard".to_owned(),
+            project: "shipyard".to_owned(),
+            base_branch: "main".to_owned(),
+            pr: 1002,
+            head_sha: "a".repeat(40),
+            validated_head_sha: "a".repeat(40),
+            merge_commit_sha: "b".repeat(40),
+            merged_at: old,
+            safe_merge: true,
+            source: "shipyard".to_owned(),
+            required_checks: vec!["macos".to_owned()],
+            gate_receipt_sha256: "c".repeat(64),
+            evidence: "sha256:retention".to_owned(),
+        };
+        store.import_merge_receipts(&[receipt]).unwrap();
+
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE queue_timing SET recorded_at = ?1 WHERE queue_job_id = 'old-queue-job'",
+            [old.to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE repeated_work_shadow SET observed_at = ?1 WHERE job_id = 'old-queue-job'",
+            [old.to_rfc3339()],
+        )
+        .unwrap();
+
+        assert_eq!(store.prune_older_than(90).unwrap(), 2);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM queue_timing", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM repeated_work_shadow", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM merge_receipts", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 
