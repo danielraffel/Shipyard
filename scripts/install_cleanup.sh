@@ -18,6 +18,7 @@ STATE_DIR="$HOME/Library/Application Support/shipyard"
 STATUS="$STATE_DIR/cleanup/last-run.json"
 INSTALLED_WRAPPER="$STATE_DIR/cleanup/run_cleanup.sh"
 VALIDATION_TMP_BASE="${SHIPYARD_VALIDATION_TMP_BASE:-}"
+AGENT_PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 usage() {
   cat <<'USAGE'
@@ -65,7 +66,7 @@ if [ "$UNINSTALL" -eq 0 ] && ! "$SHIPYARD" cleanup --help 2>&1 | grep -q -- '--o
   echo "$SHIPYARD lacks the conservative --owned-only validation-TMP mode; update it before installing the agent" >&2
   exit 2
 fi
-if [ "$UNINSTALL" -eq 0 ] && ! command -v python3 >/dev/null 2>&1; then
+if [ "$UNINSTALL" -eq 0 ] && ! PATH="$AGENT_PATH" command -v python3 >/dev/null 2>&1; then
   echo "python3 is required for cleanup previews and receipts" >&2
   exit 2
 fi
@@ -100,7 +101,6 @@ mkdir -p "$PLIST_DIR" "$HOME/Library/Logs" "$(dirname "$STATUS")"
 
 # Show the same bounded plan the agent will apply. A refusal is printed but does
 # not block installation; the first scheduled run records it for `doctor`.
-AGENT_PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 set +e
 (cd / && /usr/bin/env -i HOME="$HOME" PATH="$AGENT_PATH" SHIPYARD_VALIDATION_TMP_BASE="$VALIDATION_TMP_BASE" \
   "$SHIPYARD" --state-dir "$STATE_DIR" --json cleanup --dry-run) >"$STATE_DIR/cleanup-preview.json" 2>&1
