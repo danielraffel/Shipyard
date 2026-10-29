@@ -96,6 +96,17 @@ def atomic_write(path: pathlib.Path, payload: str) -> None:
     except OSError:
         temporary.unlink(missing_ok=True)
         raise
+    # The file fsync makes the new contents durable; syncing the containing
+    # directory makes the rename durable as well. Some platforms do not
+    # expose O_DIRECTORY, so retain the existing atomic-replace guarantee
+    # there and use the stronger directory barrier where supported.
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if directory_flag:
+        directory_fd = os.open(path.parent, os.O_RDONLY | directory_flag)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 RECEIPT_FIELDS = frozenset({
