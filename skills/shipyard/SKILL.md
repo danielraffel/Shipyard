@@ -5333,3 +5333,12 @@ formatting and lint gates; m1 is a fallback, not a universal gate. Local gates
 do not grant merge authority: GitHub CI, branch protection, and the configured
 Shipyard mutation machine remain authoritative.
 
+
+## Pulp feeder provenance recovery
+
+When the steward reports `ghapp: exact repository provenance is required`, this is a
+Shipyard invocation defect, not an empty queue or a GitHub authorization verdict.
+Every GraphQL observation must pass the explicit `--repo OWNER/REPO` argument even
+when the query also carries owner/name variables. Verify with a bounded
+`shipyard --json runner steward --repo OWNER/REPO --base main --arm-unqueued` dry run;
+an empty `prs` list with a repository error is failure, not a healthy idle feeder.

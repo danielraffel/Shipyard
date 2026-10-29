@@ -294,6 +294,8 @@ fn load_merge_queue_snapshot_once(
         let mut args = vec![
             "api".to_owned(),
             "graphql".to_owned(),
+            "--repo".to_owned(),
+            repo.to_owned(),
             "-f".to_owned(),
             format!("query={query}"),
             "-F".to_owned(),
