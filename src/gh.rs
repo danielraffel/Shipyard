@@ -876,16 +876,19 @@ fn run_helper_with_timeout(
             source,
         }
     })?;
+    // Keep execution and descendant teardown under one absolute budget. A
+    // second `Instant::now() + timeout` here would let a wedged kill/reap
+    // consume another full timeout after the provider wait had expired.
+    let deadline = Instant::now() + timeout;
     #[cfg(unix)]
     let execution_deadline = {
-        let remaining = timeout;
-        (Instant::now() + timeout)
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        deadline
             .checked_sub(crate::process::DEADLINE_TEARDOWN_BUDGET.min(remaining / 4))
-            .unwrap_or_else(Instant::now)
+            .unwrap_or(deadline)
     };
     #[cfg(not(unix))]
-    let execution_deadline = Instant::now() + timeout;
-    let deadline = Instant::now() + timeout;
+    let execution_deadline = deadline;
     let status = match process_tree
         .wait_timeout(execution_deadline.saturating_duration_since(Instant::now()))
     {

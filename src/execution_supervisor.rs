@@ -374,14 +374,18 @@ impl ExecutionSupervisor {
             ) else {
                 continue;
             };
-            let Some(signature) = scoped_entries.iter().find_map(|(_, provenance)| {
+            let Some(trusted_provenance) = scoped_entries.iter().find_map(|(_, provenance)| {
                 provenance
                     .validate_with_config(&cwd, &config)
                     .ok()
-                    .and_then(|()| provenance.config_signature.clone())
+                    .map(|()| provenance.clone())
             }) else {
                 continue;
             };
+            let signature = trusted_provenance
+                .config_signature
+                .clone()
+                .expect("daemon-admissible provenance has a configuration signature");
             if self
                 .merge_observers
                 .get(&cwd)
@@ -392,15 +396,17 @@ impl ExecutionSupervisor {
                     (AlreadyMergedObserver::from_config(&config), signature),
                 );
             }
-            let (observer, trusted_signature) = self
+            let (observer, _) = self
                 .merge_observers
                 .get_mut(&cwd)
                 .expect("observer inserted for active cwd");
             let scoped_jobs = scoped_entries
                 .into_iter()
-                .filter(|(_, provenance)| {
-                    provenance.config_signature.as_ref() == Some(trusted_signature)
-                })
+                // A CWD can have requests captured at different heads or
+                // tree states. Only the exact provenance that passed the
+                // current checkout/config fence may reach the provider
+                // observer; a shared config signature is insufficient.
+                .filter(|(_, provenance)| provenance == &trusted_provenance)
                 .map(|(job, _)| job)
                 .collect::<Vec<_>>();
             pending.extend(
@@ -453,13 +459,20 @@ impl ExecutionSupervisor {
             let Some(provenance) = envelope.provenance.as_ref() else {
                 continue;
             };
+            let QueuedExecutionRequest::Ship(request) = &envelope.request else {
+                continue;
+            };
             // Keep indexing free of Git/filesystem probes. The per-CWD pass
             // below validates checkout identity once before any provider
-            // observation; probing once per job here made one wedged checkout
+            // observation; probing once per job made one wedged checkout
             // consume the entire observer budget and starve every repository.
+            // Bind the durable queue row to the immutable request snapshot as
+            // well, so a mixed or tampered envelope cannot substitute its own
+            // PR head/repository for the job being observed.
             if provenance.config_signature.is_none()
                 || envelope.cwd != provenance.canonical_cwd
-                || !matches!(envelope.request, QueuedExecutionRequest::Ship(_))
+                || job.sha != request.sha
+                || provenance.repo_slug.as_deref() != Some(request.repo.as_str())
             {
                 continue;
             }
