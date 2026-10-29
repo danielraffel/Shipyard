@@ -3,6 +3,24 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03740"></a>
+## [0.374.0] - 2026-10-29
+
+- fix(steward): preserve repository provenance for queue reads ([#1035](https://github.com/danielraffel/Shipyard/pull/1035))
+
+<a id="v03730"></a>
+## [0.373.0] - 2026-10-29
+
+- fix(merge-steward): fall back to REST for open PR census ([#1034](https://github.com/danielraffel/Shipyard/pull/1034))
+- test(metrics): align missing receipt event ordering ([#1031](https://github.com/danielraffel/Shipyard/pull/1031))
+- fix/receiptless merged cancel ([#982](https://github.com/danielraffel/Shipyard/pull/982))
+
+<a id="v03720"></a>
+## [0.372.0] - 2026-10-28
+
+- fix/baseline receipt optional 20261026 ([#963](https://github.com/danielraffel/Shipyard/pull/963))
+- codex/warm pool member observability ([#966](https://github.com/danielraffel/Shipyard/pull/966))
+
 <a id="v03710"></a>
 ## [0.371.0] - 2026-10-28
 
@@ -2697,6 +2715,9 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.374.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.374.0
+[0.373.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.373.0
+[0.372.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.372.0
 [0.371.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.371.0
 [0.370.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.370.0
 [0.369.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.369.1
