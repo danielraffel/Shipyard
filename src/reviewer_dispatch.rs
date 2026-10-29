@@ -324,6 +324,10 @@ pub fn append_observation(path: &Path, observation: &Reconciliation) -> Result<(
     fs::create_dir_all(parent).map_err(|error| format!("create observation directory: {error}"))?;
     let mut file = OpenOptions::new()
         .create(true)
+        // Windows requires a readable handle for fs2's exclusive lock. Keep
+        // this symmetric with the receipt store append path above; append-only
+        // handles work on Unix but fail with ERROR_ACCESS_DENIED on Windows.
+        .read(true)
         .append(true)
         .open(path)
         .map_err(|error| format!("open observation store {}: {error}", path.display()))?;
@@ -583,6 +587,25 @@ mod tests {
         append(&path, &receipt).unwrap();
         assert_eq!(read(&path).unwrap(), vec![receipt.clone()]);
         assert!(append(&path, &receipt).unwrap_err().contains("attempt_id"));
+    }
+
+    #[test]
+    fn observation_append_can_reopen_locked_store() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("nested/observations.jsonl");
+        let receipt = receipt(LaunchResult::Started);
+        let first = reconcile(&receipt, time(1), &receipt.head_sha, None, true);
+        let second = reconcile(&receipt, time(11), &receipt.head_sha, None, true);
+
+        append_observation(&path, &first).unwrap();
+        append_observation(&path, &second).unwrap();
+
+        let lines = std::fs::read_to_string(path).unwrap();
+        let rows: Vec<Reconciliation> = lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows, vec![first, second]);
     }
 
     #[test]
