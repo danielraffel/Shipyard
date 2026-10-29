@@ -182,7 +182,11 @@ fn unreadable_archive_refuses_before_github_or_new_records() {
     let gh = |args: &[String]| fake.read(args);
 
     let error = record(&gh, &query(dir.path())).expect_err("unreadable archive must fail closed");
-    assert!(error.contains(&archive.display().to_string()), "{error}");
+    // Windows and Unix format temporary paths differently (and Windows may
+    // report a directory read as `Access is denied` instead of `Is a
+    // directory`). Keep the assertion tied to the archive entry while making
+    // the diagnostic check portable across both platforms.
+    assert!(error.contains("2026-10.jsonl"), "{error}");
     assert!(
         fake.asked().is_empty(),
         "archive errors must precede API writes"
