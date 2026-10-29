@@ -124,6 +124,17 @@ shipyard review-verdict --pr 123 [--repo OWNER/REPO] [--head SHA] [--no-rebase-c
                                              #   switch); merge-only and rebase carries apply; exit 0 allowed,
                                              #   1 refused, 2 unreadable; JSON names the approval or carry,
                                              #   excluded human approvals, and the fix
+shipyard reviewer-dispatch record --repo OWNER/REPO --pr 123 --head SHA \
+  --reviewer infra-review2 --attempt-id ID --launcher-identity ID \
+  --dispatch-id ID --started-at TIME --deadline-at TIME \
+  --result requested|started|failed [--session-id ID] [--error TEXT] [--store PATH]
+                                             # append authenticated dispatch evidence; never posts a verdict
+shipyard reviewer-dispatch observe --repo OWNER/REPO --pr 123 \
+  --reviewer infra-review2 --head SHA [--now TIME] \
+  [--max-retries 1] [--store PATH] [--json]
+                                             # reconcile the latest exact-head attempt against a live review-verdict read;
+                                             # missing or stale evidence fails closed; launcher retry/escalation is a
+                                             # separate caller-owned follow-up
 shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all
 shipyard rollup plan [--repo OWNER/REPO] [--base BRANCH]
                                              # which open PRs form the next rollup (oldest ready, disjoint files,

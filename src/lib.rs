@@ -269,6 +269,8 @@ pub mod reuse_record_store;
 /// `shipyard review-verdict`: whether a pull request's head may land, by the
 /// repository-side rule.
 pub mod review_verdict;
+/// Fail-closed durable reviewer-dispatch receipts and exact-head liveness.
+pub mod reviewer_dispatch;
 /// Rollup batching: several approved pull requests landed as one tested merge.
 pub mod rollup;
 /// Shadow-only ordered route and capability receipts.
