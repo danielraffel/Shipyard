@@ -453,9 +453,12 @@ impl ExecutionSupervisor {
             let Some(provenance) = envelope.provenance.as_ref() else {
                 continue;
             };
+            // Keep indexing free of Git/filesystem probes. The per-CWD pass
+            // below validates checkout identity once before any provider
+            // observation; probing once per job here made one wedged checkout
+            // consume the entire observer budget and starve every repository.
             if provenance.config_signature.is_none()
                 || envelope.cwd != provenance.canonical_cwd
-                || provenance.validate(&provenance.canonical_cwd).is_err()
                 || !matches!(envelope.request, QueuedExecutionRequest::Ship(_))
             {
                 continue;

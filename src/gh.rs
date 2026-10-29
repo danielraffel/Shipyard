@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -876,10 +876,22 @@ fn run_helper_with_timeout(
             source,
         }
     })?;
-    let status = match process_tree.wait_timeout(timeout) {
+    #[cfg(unix)]
+    let execution_deadline = {
+        let remaining = timeout;
+        (Instant::now() + timeout)
+            .checked_sub(crate::process::DEADLINE_TEARDOWN_BUDGET.min(remaining / 4))
+            .unwrap_or_else(Instant::now)
+    };
+    #[cfg(not(unix))]
+    let execution_deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout;
+    let status = match process_tree
+        .wait_timeout(execution_deadline.saturating_duration_since(Instant::now()))
+    {
         Ok(status) => status,
         Err(source) => {
-            process_tree.terminate();
+            process_tree.terminate_until(deadline);
             return Err(GhPrepareError::HelperStart {
                 program: program.to_owned(),
                 source,
@@ -887,7 +899,7 @@ fn run_helper_with_timeout(
         }
     };
     let Some(status) = status else {
-        process_tree.terminate();
+        process_tree.terminate_until(deadline);
         return Err(GhPrepareError::HelperTimedOut {
             program: program.to_owned(),
             timeout_ms: timeout.as_millis(),
@@ -895,7 +907,7 @@ fn run_helper_with_timeout(
     };
     // A successful helper is a bounded operation, not a daemon launcher.
     // Reap descendants that detached their stdio before the leader exited.
-    process_tree.terminate();
+    process_tree.terminate_until(deadline);
     let read_output = |file: &mut std::fs::File| -> Result<Vec<u8>, GhPrepareError> {
         file.seek(SeekFrom::Start(0))
             .and_then(|_| {
