@@ -263,6 +263,11 @@ fn check_cleanup_status(state_dir: &Path) -> Option<DoctorEntry> {
         let marker = fs::read_to_string(&in_progress)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        let marker_schema_valid = marker
+            .as_ref()
+            .and_then(|value| value.get("schema"))
+            .and_then(Value::as_str)
+            == Some("shipyard-cleanup-progress/v1");
         let started_at = marker
             .as_ref()
             .and_then(|value| value.get("started_at"))
@@ -283,7 +288,7 @@ fn check_cleanup_status(state_dir: &Path) -> Option<DoctorEntry> {
             .and_then(Value::as_u64)
             .and_then(|pid| u32::try_from(pid).ok())
             .is_some_and(process_is_alive);
-        if marker.is_some()
+        if marker_schema_valid
             && let Some(started_at) = started_at
             && pid_alive
             && age.is_some_and(|value| value >= Duration::zero() && value <= stale_after)
@@ -1837,6 +1842,28 @@ mod tests {
                 "schema": "shipyard-cleanup-progress/v1",
                 "pid": std::process::id(),
                 "started_at": started_at.to_rfc3339(),
+                "interval_seconds": CLEANUP_DEFAULT_INTERVAL_SECS
+            })
+            .to_string(),
+        )
+        .expect("marker");
+        let entry = check_cleanup_status(temp.path()).expect("entry");
+        assert!(!entry.ok);
+        assert_eq!(entry.version.as_deref(), Some("interrupted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_status_rejects_an_unrecognised_progress_marker_schema() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("cleanup/last-run.in-progress");
+        std::fs::create_dir_all(marker.parent().expect("parent")).expect("directory");
+        std::fs::write(
+            &marker,
+            serde_json::json!({
+                "schema": "other-progress/v1",
+                "pid": std::process::id(),
+                "started_at": chrono::Utc::now().to_rfc3339(),
                 "interval_seconds": CLEANUP_DEFAULT_INTERVAL_SECS
             })
             .to_string(),

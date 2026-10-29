@@ -52,8 +52,13 @@ run_and_capture() {
 }
 
 mkdir -p "$(dirname "$STATUS")"
+LOCK_DIR="${STATUS%.json}.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "another scheduled cleanup is already running for $STATUS" >&2
+  exit 1
+fi
 started_tmp="$(mktemp "$(dirname "$STATUS")/.in-progress.XXXXXX")"
-trap 'rm -f "$started_tmp"' EXIT
+trap 'rm -f "$started_tmp"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 printf '{"schema":"shipyard-cleanup-progress/v1","pid":%s,"started_at":"%s","interval_seconds":%s}\n' \
   "$$" "$started_at" "$INTERVAL" >"$started_tmp"
@@ -64,6 +69,7 @@ cleanup_status_finish() {
   if [ "$status_written" -eq 1 ]; then
     rm -f "${STATUS%.json}.in-progress"
   fi
+  rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 trap cleanup_status_finish EXIT
 
@@ -79,7 +85,7 @@ run_and_capture validation_output validation_exit \
   --older-than-hours "$OLDER_THAN_HOURS" --owned-only
 
 status_tmp="$(mktemp "$(dirname "$STATUS")/.last-run.XXXXXX")"
-trap 'rm -f "$status_tmp"' EXIT
+trap 'rm -f "$status_tmp"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 observed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 status_cleanup_output="${cleanup_output:0:4000}"
 status_validation_output="${validation_output:0:4000}"
@@ -113,6 +119,7 @@ mv -f "$status_tmp" "$STATUS"
 status_written=1
 trap - EXIT
 rm -f "${STATUS%.json}.in-progress"
+rmdir "$LOCK_DIR"
 
 printf 'scheduled cleanup complete: cleanup_exit=%s validation_tmp_exit=%s\n' \
   "$cleanup_exit" "$validation_exit"

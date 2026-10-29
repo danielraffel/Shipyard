@@ -68,6 +68,28 @@ assert receipt["validation_tmp_exit"] == 0
 assert "malformed terminal job" in receipt["cleanup_output"]
 PY
 
+SLOW_SHIPYARD="$HOME_DIR/slow-shipyard"
+cat >"$SLOW_SHIPYARD" <<'SH'
+#!/bin/sh
+sleep 2
+echo '{"command":"cleanup.validation_tmp","candidates":[],"reclaimable_bytes":0}'
+SH
+chmod +x "$SLOW_SHIPYARD"
+SLOW_STATE="$HOME_DIR/slow-state"
+SLOW_STATUS="$HOME_DIR/slow-status.json"
+"$WRAPPER" --shipyard "$SLOW_SHIPYARD" --state-dir "$SLOW_STATE" \
+  --status "$SLOW_STATUS" >"$HOME_DIR/slow-first.log" 2>&1 &
+slow_pid=$!
+sleep 0.2
+set +e
+"$WRAPPER" --shipyard "$SLOW_SHIPYARD" --state-dir "$SLOW_STATE" \
+  --status "$SLOW_STATUS" >"$HOME_DIR/slow-second.log" 2>&1
+second_exit=$?
+set -e
+[ "$second_exit" -eq 1 ]
+grep -q 'another scheduled cleanup is already running' "$HOME_DIR/slow-second.log"
+wait "$slow_pid"
+
 FAKE_LAUNCHCTL_LOG="$HOME_DIR/launchctl.log" HOME="$HOME_DIR" \
   SHIPYARD_LAUNCHCTL_BIN="$TOOLS/launchctl" "$INSTALLER" --uninstall >"$HOME_DIR/uninstall"
 test ! -e "$PLIST"
