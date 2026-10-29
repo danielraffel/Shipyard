@@ -41,6 +41,18 @@ fn env_is_removed(command: &Command, key: &str) -> bool {
 }
 
 #[test]
+fn merged_observation_timeout_never_exceeds_provider_cap() {
+    assert_eq!(
+        bounded_pr_observation_timeout(std::time::Duration::from_secs(60)),
+        PR_OBSERVATION_TIMEOUT
+    );
+    assert_eq!(
+        bounded_pr_observation_timeout(std::time::Duration::from_secs(2)),
+        std::time::Duration::from_secs(2)
+    );
+}
+
+#[test]
 fn missing_config_uses_ambient_auth() {
     let config = config_from_toml("");
     let client = GhClient::from_loaded_config(&config).expect("client");
@@ -214,6 +226,37 @@ fn merged_pr_snapshot_never_invokes_external_github_command() {
     );
 
     assert_eq!(merged.as_deref(), Some("abc123"));
+}
+
+#[test]
+fn merged_observation_missing_state_is_unknown() {
+    let temp = TempDir::new().expect("temp");
+    let snapshot = temp.path().join("missing-state.json");
+    std::fs::write(&snapshot, r#"{"headRefOid":"abc123"}"#).expect("snapshot");
+
+    assert_eq!(
+        pr_merged_observation_with_timeout(
+            None,
+            "owner/repo",
+            42,
+            temp.path(),
+            Some(&snapshot),
+            Duration::from_secs(1),
+        ),
+        MergedPrObservation::Unknown
+    );
+    std::fs::write(&snapshot, r#"{"state":42}"#).expect("non-string state snapshot");
+    assert_eq!(
+        pr_merged_observation_with_timeout(
+            None,
+            "owner/repo",
+            42,
+            temp.path(),
+            Some(&snapshot),
+            Duration::from_secs(1),
+        ),
+        MergedPrObservation::Unknown
+    );
 }
 
 #[cfg(unix)]
