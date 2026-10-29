@@ -54,6 +54,12 @@ pub(super) fn queue_quarantine_command<W: Write>(
         };
         (index, jobs[index].clone())
     };
+    if !malformed_terminal_row(&job) {
+        return Err(CliFailure::new(
+            1,
+            format!("queue job {job_id} is not a malformed terminal row; quarantine refused"),
+        ));
+    }
     let quarantine_dir = state_dir.join("queue-quarantine");
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
     let quarantine_path = quarantine_dir.join(format!("{job_id}-{stamp}.json"));
@@ -96,6 +102,10 @@ pub(super) fn queue_quarantine_command<W: Write>(
         return Ok(ExitCode::SUCCESS);
     }
 
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(state_dir)
+        .map_err(|error| {
+            CliFailure::new(1, format!("cannot acquire queue writer lease: {error}"))
+        })?;
     let lock_path = state_dir.join("queue.state.lock");
     fs::create_dir_all(state_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
     let lock = OpenOptions::new()
@@ -110,10 +120,6 @@ pub(super) fn queue_quarantine_command<W: Write>(
             format!("queue state is busy; quarantine was not applied: {error}"),
         )
     })?;
-    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(state_dir)
-        .map_err(|error| {
-            CliFailure::new(1, format!("cannot acquire queue writer lease: {error}"))
-        })?;
     let current_raw = fs::read_to_string(&queue_path).map_err(|error| {
         CliFailure::new(
             1,
@@ -143,6 +149,12 @@ pub(super) fn queue_quarantine_command<W: Write>(
         return Err(CliFailure::new(
             1,
             format!("queue job {job_id} changed before quarantine; inspect and retry"),
+        ));
+    }
+    if !malformed_terminal_row(&jobs[current_index]) {
+        return Err(CliFailure::new(
+            1,
+            format!("queue job {job_id} is no longer malformed; quarantine refused"),
         ));
     }
     fs::create_dir_all(&quarantine_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
@@ -199,4 +211,89 @@ pub(super) fn queue_quarantine_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn malformed_terminal_row(job: &Value) -> bool {
+    let Some(status) = job.get("status").and_then(Value::as_str) else {
+        return false;
+    };
+    let terminal_at = job
+        .get("completed_at")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+    match status {
+        "cancelled" => terminal_at.is_none(),
+        "completed" => {
+            if terminal_at.is_none() {
+                return true;
+            }
+            let expected_targets =
+                job.get("targets")
+                    .and_then(Value::as_array)
+                    .and_then(|targets| {
+                        targets
+                            .iter()
+                            .map(Value::as_str)
+                            .collect::<Option<std::collections::BTreeSet<_>>>()
+                            .filter(|names| !names.is_empty() && names.len() == targets.len())
+                    });
+            let result_targets =
+                job.get("results")
+                    .and_then(Value::as_object)
+                    .and_then(|results| {
+                        let statuses = results
+                            .iter()
+                            .map(|(target, result)| {
+                                (result.get("target")?.as_str()? == target).then_some(())?;
+                                let status = result.get("status")?.as_str()?;
+                                matches!(
+                                    status,
+                                    "pass" | "fail" | "error" | "unreachable" | "cancelled"
+                                )
+                                .then_some(target.as_str())
+                            })
+                            .collect::<Option<Vec<_>>>()?;
+                        Some(
+                            statuses
+                                .into_iter()
+                                .collect::<std::collections::BTreeSet<_>>(),
+                        )
+                    });
+            match (expected_targets, result_targets) {
+                (Some(expected), Some(actual)) => expected != actual,
+                _ => true,
+            }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::malformed_terminal_row;
+    use serde_json::json;
+
+    #[test]
+    fn only_malformed_terminal_rows_are_eligible() {
+        assert!(!malformed_terminal_row(&json!({
+            "id": "running",
+            "status": "running"
+        })));
+        assert!(!malformed_terminal_row(&json!({
+            "id": "complete",
+            "status": "completed",
+            "completed_at": "2026-10-29T00:00:00Z",
+            "targets": ["mac"],
+            "results": {"mac": {"target": "mac", "status": "pass"}}
+        })));
+        assert!(malformed_terminal_row(&json!({
+            "id": "broken",
+            "status": "completed",
+            "completed_at": "2026-10-29T00:00:00Z"
+        })));
+        assert!(malformed_terminal_row(&json!({
+            "id": "broken-cancel",
+            "status": "cancelled"
+        })));
+    }
 }
