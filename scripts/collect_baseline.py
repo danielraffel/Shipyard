@@ -101,12 +101,15 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
             # invocation compatible without emitting a duplicate event when
             # both versions are combined during a staged rollout.
             if not receipt_events:
-                receipt_events.append({"source": "merge-receipt", "status": "unavailable",
-                                       "reason": "producer handoff not present"})
+                receipt_events = [{"source": "merge-receipt", "status": "unavailable",
+                                   "reason": "producer handoff not present"}]
             else:
-                for event in receipt_events:
-                    if event.get("reason") == "fresh authenticated producer handoff is unavailable":
-                        event["reason"] = "producer handoff not present"
+                # A staged rollout can expose both an older and newer
+                # supervisor marker. Keep the newest marker only so the event
+                # stream has one authoritative handoff status.
+                receipt_events = [receipt_events[-1]]
+                if receipt_events[0].get("reason") == "fresh authenticated producer handoff is unavailable":
+                    receipt_events[0]["reason"] = "producer handoff not present"
             events.extend(receipt_events)
             return events
         except OSError as exc:

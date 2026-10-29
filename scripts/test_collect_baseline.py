@@ -392,6 +392,23 @@ class CollectorInvocationTests(unittest.TestCase):
             self.assertEqual(sum(event.get("source") == "merge-receipt" for event in events), 1)
             self.assertEqual(events[-1]["reason"], "wrapper")
 
+    def test_collect_keeps_only_newest_duplicate_handoff_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p",
+                "repo": "o/p", "merge_receipts": root / "missing-receipts.jsonl"})()
+            args.state.write_text("{}")
+            provider_events = [
+                {"source": "github", "imported": 1},
+                {"source": "merge-receipt", "status": "unavailable", "reason": "older"},
+                {"source": "merge-receipt", "status": "unavailable", "reason": "newer"},
+            ]
+            with mock.patch.object(MOD, "_import_organic_after_preflight", return_value=provider_events):
+                events = MOD.import_organic(args)
+            receipts = [event for event in events if event.get("source") == "merge-receipt"]
+            self.assertEqual(receipts, [{"source": "merge-receipt", "status": "unavailable", "reason": "newer"}])
+            self.assertEqual(events[-1]["reason"], "newer")
+
     def test_collect_does_not_treat_dangling_merge_receipt_link_as_absent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
