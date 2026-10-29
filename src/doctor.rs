@@ -255,6 +255,7 @@ fn collect_report_with_github_auth(
 /// Read the last scheduled cleanup receipt when the fleet cleanup agent is installed.
 /// Missing state remains invisible so ordinary interactive installations do not fail
 /// doctor merely because they do not use the macOS fleet scheduler.
+#[allow(clippy::too_many_lines)] // Keep cleanup receipt states in one fail-closed decision chain.
 fn check_cleanup_status(state_dir: &Path) -> Option<DoctorEntry> {
     let path = state_dir.join(CLEANUP_STATUS_RELATIVE_PATH);
     let in_progress = state_dir.join("cleanup/last-run.in-progress");
@@ -280,14 +281,15 @@ fn check_cleanup_status(state_dir: &Path) -> Option<DoctorEntry> {
             .as_ref()
             .and_then(|value| value.get("pid"))
             .and_then(Value::as_u64)
-            .is_some_and(|pid| process_is_alive(pid as u32));
+            .and_then(|pid| u32::try_from(pid).ok())
+            .is_some_and(process_is_alive);
         if marker.is_some()
-            && started_at.is_some()
+            && let Some(started_at) = started_at
             && (pid_alive || age.is_some_and(|value| value <= stale_after))
         {
             return Some(DoctorEntry::ok(format!(
                 "scheduled cleanup is in progress ({}; pid {})",
-                started_at.unwrap().to_rfc3339(),
+                started_at.to_rfc3339(),
                 marker
                     .as_ref()
                     .and_then(|value| value.get("pid"))

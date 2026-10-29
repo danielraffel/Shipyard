@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::app::CliFailure;
 
+#[allow(clippy::too_many_lines)] // Keep the read/recheck/quarantine transaction in one auditable order.
 pub(super) fn queue_quarantine_command<W: Write>(
     job_id: &str,
     reason: &str,
@@ -110,6 +111,7 @@ pub(super) fn queue_quarantine_command<W: Write>(
     fs::create_dir_all(state_dir).map_err(|error| CliFailure::new(1, error.to_string()))?;
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
