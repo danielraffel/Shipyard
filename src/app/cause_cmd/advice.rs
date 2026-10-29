@@ -396,25 +396,36 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
                 && valid_own_files_evidence(value)
         }
         "rerun_green" => {
-            value["red_run_id"] == value["fix_run_id"]
-                && value["head_sha"] == value["fix_head_sha"]
-                && value["files_raw"].as_array().is_some_and(Vec::is_empty)
-                && value["own_files"].as_array().is_some_and(Vec::is_empty)
-                && value["files_truncated"].as_bool() == Some(false)
-                && value["own_files_truncated"].as_bool() == Some(false)
-                && value["own_files_method"].as_str() == Some("rerun_same_head")
+            // Before `same_head_green` was introduced, the observer used
+            // `rerun_green` for a later successful run on the same head. Those
+            // archived rows have a distinct `fix_run_id`; keep consuming them
+            // when their complete same-head evidence is intact. New rows are
+            // written as `same_head_green` by `cause record`.
+            (value["red_run_id"] == value["fix_run_id"] || legacy_same_head_green(value))
+                && same_head_green_evidence(value)
         }
         "same_head_green" => {
-            value["red_run_id"] != value["fix_run_id"]
-                && value["head_sha"] == value["fix_head_sha"]
-                && value["files_raw"].as_array().is_some_and(Vec::is_empty)
-                && value["own_files"].as_array().is_some_and(Vec::is_empty)
-                && value["files_truncated"].as_bool() == Some(false)
-                && value["own_files_truncated"].as_bool() == Some(false)
-                && value["own_files_method"].as_str() == Some("rerun_same_head")
+            value["red_run_id"] != value["fix_run_id"] && same_head_green_evidence(value)
         }
         _ => false,
     }
+}
+
+/// A later green run on the red head was historically written as
+/// `rerun_green`, even though it had a different run ID. New observer rows
+/// use `same_head_green`; this compatibility path is intentionally limited to
+/// the same complete evidence required by the new derivation.
+fn legacy_same_head_green(value: &Value) -> bool {
+    value["red_run_id"] != value["fix_run_id"] && same_head_green_evidence(value)
+}
+
+fn same_head_green_evidence(value: &Value) -> bool {
+    value["head_sha"] == value["fix_head_sha"]
+        && value["files_raw"].as_array().is_some_and(Vec::is_empty)
+        && value["own_files"].as_array().is_some_and(Vec::is_empty)
+        && value["files_truncated"].as_bool() == Some(false)
+        && value["own_files_truncated"].as_bool() == Some(false)
+        && value["own_files_method"].as_str() == Some("rerun_same_head")
 }
 
 /// Validate the producer fields that establish when and why a link was made.
@@ -821,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn rerun_fixlink_must_bind_to_the_red_run() {
+    fn legacy_rerun_fixlink_with_distinct_run_is_consumed() {
         let value = serde_json::json!({
             "schema": SCHEMA,
             "source": "fix-link",
@@ -845,7 +856,51 @@ mod tests {
             "own_files_method": "rerun_same_head"
         });
 
-        assert!(!valid_fixlink(&value));
+        assert!(valid_fixlink(&value));
+    }
+
+    #[test]
+    fn advice_consumes_legacy_rerun_fixlink_with_distinct_run() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        let legacy = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 999,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "b".repeat(40),
+            "derivation": "rerun_green",
+            "pushed_at": "2026-10-13T01:00:00Z",
+            "red_time": "2026-10-13T00:00:00Z",
+            "pr": 8,
+            "branch": "feat/x",
+            "rule": "legacy collector",
+            "collector": "shipyard cause record",
+            "files_raw": [],
+            "files_truncated": false,
+            "own_files": [],
+            "own_files_truncated": false,
+            "own_files_method": "rerun_same_head"
+        });
+        fs::write(dir.path().join("fixlinks.jsonl"), legacy.to_string()).unwrap();
+
+        let mut query = args(dir.path());
+        query.pr = None;
+        let candidates = advise(&query, &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].fix_link.as_ref().unwrap()["derivation"],
+            "rerun_green"
+        );
+        assert_eq!(candidates[0].fix_link.as_ref().unwrap()["fix_run_id"], 999);
     }
 
     #[test]

@@ -510,6 +510,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_legacy_rerun_fixlink_with_distinct_fix_run_id() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1,"derivation":"rerun_green","fix_run_id":99,"fix_head_sha":"0123456789abcdef0123456789abcdef01234567","head_sha":"0123456789abcdef0123456789abcdef01234567","red_time":"2026-10-13T00:00:00Z","pushed_at":"2026-10-13T00:30:00Z","branch":"main","rule":"legacy collector","collector":"shipyard cause record","pr":9,"files_raw":[],"own_files":[],"files_truncated":false,"own_files_truncated":false,"own_files_method":"rerun_same_head"}
+"#,
+        )
+        .expect("fixlinks");
+        let report = audit(&CauseAuditArgs {
+            dir: dir.path().to_path_buf(),
+        })
+        .expect("audit");
+        assert!(report.ok);
+        assert_eq!((report.cause_rows, report.fixlink_rows), (0, 1));
+    }
+
+    #[test]
     fn rejects_unproven_orphan_compare_fixlink() {
         let dir = tempdir().expect("tempdir");
         fs::write(

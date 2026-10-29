@@ -124,6 +124,13 @@ Each pass:
    same run green is recorded as `rerun_green`; a different successful run on
    the same head is recorded as `same_head_green`.
 
+   The historical `pushed_at` field retains its name for archive compatibility:
+   it is the successful attempt's `run_started_at` for `rerun_green`, and the
+   successful run's `created_at` for `same_head_green` and
+   `compare_red_head_to_fix_head`. Older archives may contain a distinct
+   `fix_run_id` under `rerun_green`; complete same-head evidence keeps those
+   rows consumable, while newly written rows use `same_head_green`.
+
 A bare exit that C2 cannot name gets one of two labels. A summary job, such
 as `linux` checking the jobs it needs, takes the cause of the named job in
 the same run attempt whose name it begins (`Linux (x64) [github-hosted]`),

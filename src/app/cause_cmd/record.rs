@@ -55,7 +55,8 @@ pub(super) const OWN_FILES_RULE: &str = "own_files = the union of the files of t
 const FIXLINK_RULE: &str = "earliest successful run of the same workflow on the red's pull request \
     branch (or branch) created after the red attempt's last failed job completed; a later attempt of \
     the red run itself is rerun_green, while a different successful run on the same head is \
-    same_head_green; pushed_at = the successful run's start time; files_raw = compare red head...fix head";
+    same_head_green; pushed_at = run_started_at for rerun_green and created_at for same_head_green \
+    or compare_red_head_to_fix_head; files_raw = compare red head...fix head";
 
 /// One observer pass.
 #[derive(Clone, Debug)]
