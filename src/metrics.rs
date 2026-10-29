@@ -651,6 +651,13 @@ impl MetricsStore {
         limit: usize,
     ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
+        Self::repeated_work_survivor_timing_from_conn(&conn, limit)
+    }
+
+    fn repeated_work_survivor_timing_from_conn(
+        conn: &Connection,
+        limit: usize,
+    ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
         let mut stmt = conn.prepare("WITH recent AS (SELECT job_id, queue_identity FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id, queue_identity FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id AND s.queue_identity <> '' AND t.queue_identity=s.queue_identity")?;
         let mut out = RepeatedWorkSurvivorTiming {
             shadow_rows: 0,
@@ -1448,12 +1455,16 @@ impl MetricsStore {
         &self,
         limit: usize,
     ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
-        let timing = self.repeated_work_survivor_timing(limit)?;
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT kind, job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
-        let ids = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let ids: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT kind, job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
+            stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        let timing = Self::repeated_work_survivor_timing_from_conn(&tx, limit)?;
         let mut out = RepeatedWorkCostSummary {
             cost_basis: "avoided_repeated_work",
             observations: timing.shadow_rows,
@@ -1471,14 +1482,14 @@ impl MetricsStore {
                 .saturating_add(timing.unmatched),
             survivor_runtime_proxy_ms: timing.survivor_runtime_proxy_ms,
         };
-        for item in ids {
-            let (kind, _job_id) = item?;
+        for (kind, _job_id) in ids {
             match kind.as_str() {
                 "superseded_exact_head" => out.superseded_exact_head += 1,
                 "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
                 _ => {}
             }
         }
+        tx.commit()?;
         Ok(out)
     }
 
