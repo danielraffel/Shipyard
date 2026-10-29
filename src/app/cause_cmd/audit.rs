@@ -207,6 +207,10 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
         fixlinks,
         mut findings,
     } = read_archive(&args.dir)?;
+    // Count complete evidence rows, not unique red-attempt keys: one red
+    // attempt may legitimately have both a same-head rerun and a later
+    // push-fix link. Invalid rows were rejected during archive parsing.
+    let fixlink_rows = fixlinks.len();
     let mut seen = BTreeMap::<String, (PathBuf, usize)>::new();
     let mut red_keys = BTreeSet::new();
     for (record, path, line) in &causes {
@@ -284,7 +288,7 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
         dir: args.dir.display().to_string(),
         files_scanned,
         cause_rows: causes.len(),
-        fixlink_rows: seen_fixlinks.len(),
+        fixlink_rows,
         ok: findings.is_empty(),
         findings,
     })
@@ -447,7 +451,7 @@ mod tests {
         })
         .expect("audit");
         assert!(report.ok);
-        assert_eq!((report.cause_rows, report.fixlink_rows), (1, 1));
+        assert_eq!((report.cause_rows, report.fixlink_rows), (1, 2));
     }
 
     #[test]
@@ -498,12 +502,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unproven_orphan_rerun_fixlink() {
+    fn rejects_unproven_orphan_compare_fixlink() {
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join("fixlinks.jsonl"),
-            r#"{"schema":"ci.cause/v1","source":"fix-link","repo":"o/r","red_run_id":2,"red_attempt":1,"derivation":"rerun_green"}
-"#,
+            serde_json::json!({
+                "schema": "ci.cause/v1", "source": "fix-link", "repo": "o/r",
+                "red_run_id": 2, "red_attempt": 1, "fix_run_id": 3,
+                "head_sha": "0123456789abcdef0123456789abcdef01234567",
+                "fix_head_sha": "abcdef0123456789abcdef0123456789abcdef01",
+                "derivation": "compare_red_head_to_fix_head",
+                "red_time": "2026-10-13T00:00:00Z", "pushed_at": "2026-10-13T00:30:00Z",
+                "branch": "main", "rule": "test", "collector": "test", "pr": 9,
+                "files_raw": ["src/lib.rs"], "files_truncated": false,
+                "own_files": ["src/lib.rs"], "own_files_method": "first_parent",
+                "own_files_truncated": false
+            })
+            .to_string(),
         )
         .expect("fixlinks");
         let report = audit(&CauseAuditArgs {
@@ -511,6 +526,6 @@ mod tests {
         })
         .expect("audit");
         assert!(!report.ok);
-        assert_eq!(report.findings[0].kind, "invalid_fixlink");
+        assert_eq!(report.findings[0].kind, "orphan_fixlink");
     }
 }

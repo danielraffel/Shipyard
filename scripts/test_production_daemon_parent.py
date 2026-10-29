@@ -114,7 +114,11 @@ class ClassifyParentTests(unittest.TestCase):
         info = pdp.read_process(os.getpid())
         self.assertIsNotNone(info)
         self.assertEqual(info.ppid, os.getppid())
-        self.assertIn("python", info.command)
+        # CPython's macOS launcher path is capitalized on some installs
+        # (``.../Python.app/.../Python``), while Homebrew uses lowercase.
+        # The contract is that this is a Python process, not a spelling of
+        # the executable path.
+        self.assertIn("python", info.command.lower())
 
 
 if __name__ == "__main__":
