@@ -414,14 +414,16 @@ mod tests {
         };
         let mut gh = |argv: &[String]| -> Result<Value, String> {
             if argv[3].ends_with("/runs") {
-                Ok(json!({"workflow_runs": [{"id": 7, "event": "pull_request",
+                Ok(
+                    json!({"workflow_runs": [{"id": 7, "run_attempt": 1, "event": "pull_request",
                     "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "head_branch": "feature/test", "pull_requests": [{"number": 9}]}]}))
+                    "head_branch": "feature/test", "pull_requests": [{"number": 9}]}]}),
+                )
             } else {
                 Ok(
                     json!({"jobs": [{"id": 1, "name": "macos", "conclusion": "success",
                     "started_at": "2026-09-30T10:00:00Z",
-                    "completed_at": "2026-09-30T10:10:00Z"}]}),
+                    "completed_at": "2026-09-30T10:10:00Z", "run_attempt": 1}]}),
                 )
             }
         };
