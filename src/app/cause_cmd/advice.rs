@@ -15,7 +15,7 @@ use super::super::CliFailure;
 use super::super::cli::CauseAdviseArgs;
 use crate::diagnose::cause::SCHEMA;
 
-use super::record::{FIXLINK_RULE, LEGACY_FIXLINK_RULE_V1, LEGACY_FIXLINK_RULE_V2, needs_scrub};
+use super::record::{LEGACY_FIXLINK_RULE_V1, LEGACY_FIXLINK_RULE_V2, needs_scrub};
 
 const ADVICE_SCHEMA: &str = "shipyard.cause-advice/v1";
 
@@ -851,7 +851,7 @@ mod tests {
             "red_time": "2026-10-13T00:00:00Z",
             "pr": 8,
             "branch": "feat/x",
-            "rule": super::FIXLINK_RULE,
+            "rule": super::super::record::FIXLINK_RULE,
             "collector": "test",
             "files_raw": [],
             "files_truncated": false,
