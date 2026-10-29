@@ -329,6 +329,32 @@ fn current_head_check_transport_preserves_producer_identity() {
 
 #[cfg(unix)]
 #[test]
+fn open_pr_list_falls_back_to_rest_after_gateway_failure() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"pr list"*) echo "HTTP 502 Bad Gateway" >&2; exit 1 ;;
+  *"repos/owner/repo/pulls?state=open&base=main&per_page=100&page=1"*)
+    printf '%s' '[{"node_id":"PR_kw","number":42,"draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature"},"mergeable_state":"clean","auto_merge":null,"labels":[{"name":"managed"}]}]' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let prs =
+        pull_requests(&actions, "owner/repo", "main", &BTreeMap::new()).expect("REST fallback");
+    assert_eq!(prs.len(), 1);
+    assert_eq!(prs[0].node_id, "PR_kw");
+    assert_eq!(prs[0].fact.number, 42);
+    assert_eq!(prs[0].fact.head_sha, "a".repeat(40));
+    assert_eq!(prs[0].fact.head_branch, "feature");
+    assert_eq!(prs[0].fact.labels, vec!["managed"]);
+    assert!(prs[0].check_rollup_maybe_truncated);
+}
+
+#[cfg(unix)]
+#[test]
 fn live_pr_revalidation_hydrates_required_check_identity() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(

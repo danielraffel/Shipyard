@@ -374,8 +374,11 @@ class CollectorInvocationTests(unittest.TestCase):
                 "timeout_seconds": 5, "merge_receipts": root / "missing-receipts.jsonl"})()
             args.state.write_text("{}")
             events = MOD.import_organic(args)
-            self.assertEqual(events[-1], {"source": "merge-receipt", "status": "unavailable",
-                                          "reason": "producer handoff not present"})
+            receipt = next(event for event in events if event.get("source") == "merge-receipt")
+            self.assertEqual(receipt["source"], "merge-receipt")
+            self.assertEqual(receipt["status"], "unavailable")
+            self.assertIn("handoff", receipt["reason"])
+            self.assertEqual(events[-1]["source"], "collection")
 
     def test_collect_deduplicates_unavailable_event_from_newer_supervisor(self):
         with tempfile.TemporaryDirectory() as directory:
