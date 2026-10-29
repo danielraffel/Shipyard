@@ -89,6 +89,7 @@ set -e
 [ "$second_exit" -eq 1 ]
 grep -q 'another scheduled cleanup is already running' "$HOME_DIR/slow-second.log"
 wait "$slow_pid"
+test ! -e "$SLOW_STATUS.lock"
 
 STALE_STATUS="$HOME_DIR/stale-status.json"
 mkdir -p "$STALE_STATUS.lock"
