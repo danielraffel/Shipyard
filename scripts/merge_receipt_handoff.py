@@ -324,11 +324,13 @@ def export(args: argparse.Namespace) -> int:
                                                   checked_at=now(), status="error", error=error))
         raise RuntimeError(error) from exc
     except (OSError, RuntimeError, ValueError) as exc:
-        # A non-zero producer command is an observed producer error and gets
-        # a durable error sidecar. A zero-exit command whose staged payload or
-        # producer identity is malformed leaves the prior payload and health
-        # untouched, so observers cannot mistake a rejected refresh for a new
-        # handoff.
+        # A launcher OSError or any preflight/source-database failure occurs
+        # before `completed` is assigned, so it gets a durable error sidecar.
+        # A non-zero producer command is also an observed producer error and
+        # gets a sidecar. A zero-exit command whose staged payload, producer
+        # identity, or post-export source validation is malformed leaves the
+        # prior payload and health untouched, so observers cannot mistake a
+        # rejected refresh for a new handoff.
         if completed is None or completed.returncode != 0:
             write_health(health_file, health_payload(repo=args.repo, file=file,
                                                       checked_at=now(), status="error", error=str(exc)))

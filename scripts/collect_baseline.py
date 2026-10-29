@@ -102,6 +102,11 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
             if not receipt_events:
                 receipt_events.append({"source": "merge-receipt", "status": "unavailable",
                                        "reason": "producer handoff not present"})
+            else:
+                # A staged rollout can expose more than one unavailable marker.
+                # Keep the newest marker as the sole authoritative status while
+                # preserving its reason and any authenticated provenance fields.
+                receipt_events = [receipt_events[-1]]
             events.extend(receipt_events)
             return events
         except OSError as exc:
