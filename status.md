@@ -5,8 +5,9 @@
 **Base:** `origin/main` at `d7dfff57de91929bd717659c3af166ad8799792d`
 **Implementation commits:** `e997c9dee8ae74982e87d7938da9ff0c70019ef5` plus the
 status records on this branch.
-**PR:** [#1024](https://github.com/danielraffel/Shipyard/pull/1024), currently at
-`7885233782679f25a4774cf2a3bb5b62edd520d0`
+**PR:** [#1024](https://github.com/danielraffel/Shipyard/pull/1024). The exact
+head is the tip of this branch and must be re-read from GitHub after every
+status commit.
 
 ## Completed
 
