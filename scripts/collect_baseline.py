@@ -19,6 +19,7 @@ import subprocess
 import sqlite3
 import tempfile
 import sys
+import time
 from contextlib import contextmanager
 from typing import Any, Sequence
 
@@ -37,6 +38,18 @@ from baseline_pass_history import (
 REQUIRED_STRATA = ("normal_pr", "merge_group", "rerun", "outage", "concurrent_agents")
 STRATA_CONTRACT = "shipyard-metrics-strata/v1"
 PRODUCER_STRATA = ("normal_pr", "merge_group", "rerun", "unclassified")
+TRANSIENT_PROVIDER_ERROR_MARKERS = (
+    "connection reset",
+    "connection refused",
+    "connection timed out",
+    "dial tcp",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "could not resolve host",
+    "tls handshake timeout",
+)
+DEFAULT_PROVIDER_RETRIES = 2
+DEFAULT_PROVIDER_RETRY_DELAY_SECONDS = 5.0
 
 
 def run(command: Sequence[str], *, stdin: str | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -44,6 +57,32 @@ def run(command: Sequence[str], *, stdin: str | None = None, timeout: int = 300)
         return subprocess.run(command, input=stdin, text=True, capture_output=True, check=False, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"command timed out after {timeout}s: {command[0]}") from exc
+
+
+def transient_provider_failure(result: subprocess.CompletedProcess[str]) -> bool:
+    """Recognize transport failures that are safe to retry with bounded backoff."""
+    if result.returncode == 0:
+        return False
+    text = f"{result.stdout or ''}\n{result.stderr or ''}".casefold()
+    return any(marker in text for marker in TRANSIENT_PROVIDER_ERROR_MARKERS)
+
+
+def run_provider_with_retry(command: Sequence[str], *, stdin: str | None = None,
+                            timeout: int = 300, retries: int = DEFAULT_PROVIDER_RETRIES,
+                            delay_seconds: float = DEFAULT_PROVIDER_RETRY_DELAY_SECONDS
+                            ) -> subprocess.CompletedProcess[str]:
+    """Retry only recognized provider transport failures."""
+    if retries < 0:
+        raise ValueError("provider retries must be non-negative")
+    if delay_seconds < 0:
+        raise ValueError("provider retry delay must be non-negative")
+    result = run(command, stdin=stdin, timeout=timeout)
+    for attempt in range(retries):
+        if not transient_provider_failure(result):
+            break
+        time.sleep(delay_seconds * (2 ** attempt))
+        result = run(command, stdin=stdin, timeout=timeout)
+    return result
 
 
 def state_identity(path: pathlib.Path, project: str, repo: str, db: pathlib.Path) -> dict[str, str]:
@@ -136,12 +175,20 @@ def _import_organic_after_preflight(args: argparse.Namespace, state_dir: str,
     events: list[dict[str, Any]] = []
     receipt_path = receipt_snapshot
     before = count_jobs(args.db, args.project, args.repo)
-    github = run([args.shipyard, "--state-dir", state_dir, "metrics", "import", "github", "--repo", args.repo,
-                  "--project", args.project, "--limit", str(args.limit), "--json"], timeout=args.timeout_seconds)
+    retries = getattr(args, "provider_retries", DEFAULT_PROVIDER_RETRIES)
+    delay_seconds = getattr(args, "provider_retry_delay_seconds", DEFAULT_PROVIDER_RETRY_DELAY_SECONDS)
+    github = run_provider_with_retry(
+        [args.shipyard, "--state-dir", state_dir, "metrics", "import", "github", "--repo", args.repo,
+         "--project", args.project, "--limit", str(args.limit), "--json"],
+        timeout=args.timeout_seconds, retries=retries, delay_seconds=delay_seconds,
+    )
     if github.returncode:
         raise RuntimeError(f"GitHub import failed: {github.stderr.strip()}")
     events.append(summarize_import("github", github.stdout))
-    tartci = run(tartci_export_command(args), timeout=args.timeout_seconds)
+    tartci = run_provider_with_retry(
+        tartci_export_command(args), timeout=args.timeout_seconds,
+        retries=retries, delay_seconds=delay_seconds,
+    )
     if tartci.returncode:
         raise RuntimeError(f"TartCI export failed: {tartci.stderr.strip()}")
     normalized, excluded = prepare_tartci_export(tartci.stdout, args.repo, args.project)
@@ -782,6 +829,11 @@ def main() -> int:
     parser.add_argument("--since-days", type=int, default=5)
     parser.add_argument("--collect", action="store_true", help="run provider imports")
     parser.add_argument("--timeout-seconds", type=int, default=300)
+    parser.add_argument("--provider-retries", type=int, default=DEFAULT_PROVIDER_RETRIES,
+                        help="bounded retries for recognized provider transport failures")
+    parser.add_argument("--provider-retry-delay-seconds", type=float,
+                        default=DEFAULT_PROVIDER_RETRY_DELAY_SECONDS,
+                        help="initial delay before a provider retry; doubles per attempt")
     parser.add_argument("--pass-history", type=pathlib.Path,
                         help="prospective pass history sidecar (defaults beside --state)")
     parser.add_argument("--source-identity", default="shipyard.collect_baseline:v1")
@@ -791,6 +843,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
+    if args.provider_retries < 0:
+        parser.error("--provider-retries must be non-negative")
+    if args.provider_retry_delay_seconds < 0:
+        parser.error("--provider-retry-delay-seconds must be non-negative")
     if args.expected_interval_secs <= 0:
         parser.error("--expected-interval-secs must be positive")
     if args.cadence_slack_secs < 0:

@@ -5325,6 +5325,10 @@ atomic sidecar. Readiness requires observed continuity; historical activity
 counts and status-only runs must not be used to manufacture prospective
 coverage. Sidecars are keyed by repository, source identity, cadence, and
 configuration so changing collection policy cannot mix incompatible history.
+Provider reads retry only recognized transport failures with bounded backoff;
+authentication, schema, malformed-data, and receipt-handoff failures stay
+terminal. Use `--provider-retries` and
+`--provider-retry-delay-seconds` only to tune that explicit bounded policy.
 # Local Rust gate placement
 
 The pre-push hook selects the repository-pinned Rust channel on the current

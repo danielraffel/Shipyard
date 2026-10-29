@@ -15,6 +15,28 @@ import baseline_pass_history as history
 
 
 class BaselineScorecardTests(unittest.TestCase):
+    def test_transient_provider_failure_classifier_does_not_retry_validation_errors(self):
+        transient = subprocess.CompletedProcess(
+            ["shipyard"], 1, "", "Get https://api.github.com: dial tcp 1.2.3.4:443: i/o timeout",
+        )
+        validation = subprocess.CompletedProcess(["shipyard"], 1, "", "invalid provider export")
+        self.assertTrue(MOD.transient_provider_failure(transient))
+        self.assertFalse(MOD.transient_provider_failure(validation))
+        self.assertFalse(MOD.transient_provider_failure(subprocess.CompletedProcess(["shipyard"], 0, "", "")))
+
+    def test_provider_import_retries_transient_failure_with_bounded_backoff(self):
+        results = [
+            subprocess.CompletedProcess(["provider"], 1, "", "dial tcp 1.2.3.4:443: i/o timeout"),
+            subprocess.CompletedProcess(["provider"], 0, '{"imported": 3}', ""),
+        ]
+        calls = []
+        with mock.patch.object(MOD, "run", side_effect=lambda command, **kwargs: calls.append(command) or results.pop(0)):
+            with mock.patch.object(MOD.time, "sleep") as sleep:
+                result = MOD.run_provider_with_retry(["provider"], retries=2, delay_seconds=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once_with(5)
+
     def test_readiness_rejects_nonfinite_instrumentation_and_separates_lane_eligibility(self):
         started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
         observed = started + dt.timedelta(days=5)
