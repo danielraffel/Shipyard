@@ -1,7 +1,7 @@
 //! Explicit, reversible quarantine for one malformed raw queue row.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -173,24 +173,16 @@ pub(super) fn queue_quarantine_command<W: Write>(
         .map_err(|error| {
             CliFailure::new(1, format!("cannot finalize quarantine record: {error}"))
         })?;
+    crate::durable_file::sync_parent_directory(&quarantine_path).map_err(|error| {
+        CliFailure::new(1, format!("cannot make quarantine record durable: {error}"))
+    })?;
     jobs.remove(current_index);
     let payload =
         serde_json::to_vec_pretty(&root).map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let temp_path = state_dir.join("queue.json.quarantine.tmp");
-    let write_result = (|| -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temp_path)?;
-        file.write_all(&payload)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(&temp_path, &queue_path)?;
-        Ok(())
-    })();
+    let mut durable_payload = payload;
+    durable_payload.push(b'\n');
+    let write_result = crate::durable_file::replace(&queue_path, &durable_payload);
     if let Err(error) = write_result {
-        let _ = fs::remove_file(&temp_path);
         return Err(CliFailure::new(
             1,
             format!("cannot rewrite queue after quarantine: {error}"),

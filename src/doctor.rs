@@ -285,7 +285,8 @@ fn check_cleanup_status(state_dir: &Path) -> Option<DoctorEntry> {
             .is_some_and(process_is_alive);
         if marker.is_some()
             && let Some(started_at) = started_at
-            && (pid_alive || age.is_some_and(|value| value <= stale_after))
+            && pid_alive
+            && age.is_some_and(|value| value >= Duration::zero() && value <= stale_after)
         {
             return Some(DoctorEntry::ok(format!(
                 "scheduled cleanup is in progress ({}; pid {})",
@@ -1662,6 +1663,8 @@ fn parse_github_repo_slug(remote: &str) -> Option<String> {
 mod tests {
     use std::path::Path;
 
+    use super::{CLEANUP_DEFAULT_INTERVAL_SECS, cleanup_stale_after};
+
     #[cfg(unix)]
     #[test]
     fn the_system_probe_refuses_gh_from_path_in_a_test() {
@@ -1791,6 +1794,54 @@ mod tests {
         let marker = temp.path().join("cleanup/last-run.in-progress");
         std::fs::create_dir_all(marker.parent().expect("parent")).expect("directory");
         std::fs::write(&marker, "2026-10-29T08:00:00Z\n").expect("marker");
+        let entry = check_cleanup_status(temp.path()).expect("entry");
+        assert!(!entry.ok);
+        assert_eq!(entry.version.as_deref(), Some("interrupted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_status_rejects_a_stale_marker_even_when_its_pid_is_reused() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("cleanup/last-run.in-progress");
+        std::fs::create_dir_all(marker.parent().expect("parent")).expect("directory");
+        let started_at = chrono::Utc::now()
+            - cleanup_stale_after(CLEANUP_DEFAULT_INTERVAL_SECS)
+            - chrono::Duration::minutes(1);
+        std::fs::write(
+            &marker,
+            serde_json::json!({
+                "schema": "shipyard-cleanup-progress/v1",
+                "pid": std::process::id(),
+                "started_at": started_at.to_rfc3339(),
+                "interval_seconds": CLEANUP_DEFAULT_INTERVAL_SECS
+            })
+            .to_string(),
+        )
+        .expect("marker");
+        let entry = check_cleanup_status(temp.path()).expect("entry");
+        assert!(!entry.ok);
+        assert_eq!(entry.version.as_deref(), Some("interrupted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_status_rejects_a_future_in_progress_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("cleanup/last-run.in-progress");
+        std::fs::create_dir_all(marker.parent().expect("parent")).expect("directory");
+        let started_at = chrono::Utc::now() + chrono::Duration::minutes(10);
+        std::fs::write(
+            &marker,
+            serde_json::json!({
+                "schema": "shipyard-cleanup-progress/v1",
+                "pid": std::process::id(),
+                "started_at": started_at.to_rfc3339(),
+                "interval_seconds": CLEANUP_DEFAULT_INTERVAL_SECS
+            })
+            .to_string(),
+        )
+        .expect("marker");
         let entry = check_cleanup_status(temp.path()).expect("entry");
         assert!(!entry.ok);
         assert_eq!(entry.version.as_deref(), Some("interrupted"));
