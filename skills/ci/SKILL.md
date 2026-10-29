@@ -945,6 +945,8 @@ pass every 24 hours, writes `cleanup/last-run.json`, and exposes refusals or
 interrupted runs through `shipyard doctor`. Use `--uninstall` to remove the
 launchd agent, wrapper, and receipt. Installation never edits queue state to
 bypass a refusal.
+The wrapper also rechecks and safely reclaims an owner-less stale lock after a
+brief grace period, while preserving live-owner locks.
 
 ## Version-at-land
 

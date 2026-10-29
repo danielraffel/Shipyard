@@ -98,6 +98,12 @@ printf '999999\n' >"${STALE_STATUS%.json}.lock/owner"
   --status "$STALE_STATUS" >"$HOME_DIR/stale.log" 2>&1
 test ! -e "${STALE_STATUS%.json}.lock"
 
+EMPTY_STATUS="$HOME_DIR/empty-status.json"
+mkdir -p "${EMPTY_STATUS%.json}.lock"
+"$WRAPPER" --shipyard "$SLOW_SHIPYARD" --state-dir "$HOME_DIR/empty-state" \
+  --status "$EMPTY_STATUS" >"$HOME_DIR/empty.log" 2>&1
+test ! -e "${EMPTY_STATUS%.json}.lock"
+
 FAKE_LAUNCHCTL_LOG="$HOME_DIR/launchctl.log" HOME="$HOME_DIR" \
   SHIPYARD_LAUNCHCTL_BIN="$TOOLS/launchctl" "$INSTALLER" --uninstall >"$HOME_DIR/uninstall"
 test ! -e "$PLIST"

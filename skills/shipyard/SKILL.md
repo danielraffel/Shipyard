@@ -750,6 +750,8 @@ conservative `--owned-only` TMP pass, records `cleanup/last-run.json`, and
 lets `shipyard doctor` report refusals or stale runs. A malformed queue row is
 named by ID; inspect `shipyard queue-quarantine JOB_ID` before using its
 explicit `--apply` remedy.
+The wrapper briefly rechecks an owner-less lock directory and reclaims it only
+when it remains empty, so a crashed scheduler cannot wedge future runs.
 
 ## Version-at-land
 
