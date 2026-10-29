@@ -608,9 +608,9 @@ fn merge_queue_transport_paginates_beyond_one_hundred_entries() {
         &temp,
         &format!(
             r#"
-if test "$#" -eq 10; then
+if test "$#" -eq 12; then
   cat '{}'
-elif test "$#" -eq 12 && test "${{11}}" = -F && test "${{12}}" = cursor=cursor-100; then
+elif test "$#" -eq 14 && test "${{13}}" = -F && test "${{14}}" = cursor=cursor-100; then
   cat '{}'
 else
   echo "unexpected pagination call: $*" >&2
@@ -638,7 +638,7 @@ fn merge_queue_transport_refuses_page_overlap() {
     let actions = fake_gh(
         &temp,
         r#"
-if test "$#" -eq 10; then
+if test "$#" -eq 12; then
   printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":1,"enqueuedAt":"2026-09-01T00:00:00Z","headCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"pullRequest":{"number":42}}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}}}}'
 else
   printf '%s' '{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[{"position":2,"enqueuedAt":"2026-09-01T00:00:01Z","headCommit":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"pullRequest":{"number":42}}],"pageInfo":{"hasNextPage":false,"endCursor":"done"}}}}}}'
