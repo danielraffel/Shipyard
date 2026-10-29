@@ -90,6 +90,13 @@ set -e
 grep -q 'another scheduled cleanup is already running' "$HOME_DIR/slow-second.log"
 wait "$slow_pid"
 
+STALE_STATUS="$HOME_DIR/stale-status.json"
+mkdir -p "$STALE_STATUS.lock"
+printf '999999\n' >"$STALE_STATUS.lock/owner"
+"$WRAPPER" --shipyard "$SLOW_SHIPYARD" --state-dir "$HOME_DIR/stale-state" \
+  --status "$STALE_STATUS" >"$HOME_DIR/stale.log" 2>&1
+test ! -e "$STALE_STATUS.lock"
+
 FAKE_LAUNCHCTL_LOG="$HOME_DIR/launchctl.log" HOME="$HOME_DIR" \
   SHIPYARD_LAUNCHCTL_BIN="$TOOLS/launchctl" "$INSTALLER" --uninstall >"$HOME_DIR/uninstall"
 test ! -e "$PLIST"

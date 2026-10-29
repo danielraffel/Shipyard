@@ -53,10 +53,38 @@ run_and_capture() {
 
 mkdir -p "$(dirname "$STATUS")"
 LOCK_DIR="${STATUS%.json}.lock"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+LOCK_OWNER="$LOCK_DIR/owner"
+lock_acquired=0
+for _lock_attempt in 1 2; do
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" >"$LOCK_OWNER"
+    chmod 600 "$LOCK_OWNER"
+    lock_acquired=1
+    break
+  fi
+  owner_pid="$(cat "$LOCK_OWNER" 2>/dev/null || true)"
+  owner_command=""
+  case "$owner_pid" in
+    ''|*[!0-9]*) ;;
+    *) owner_command="$(ps -p "$owner_pid" -o command= 2>/dev/null || true)" ;;
+  esac
+  case "$owner_command" in
+    *run_cleanup.sh*)
+      echo "another scheduled cleanup is already running for $STATUS" >&2
+      exit 1
+      ;;
+  esac
+  if [ -n "$owner_pid" ] && rm -f "$LOCK_OWNER" 2>/dev/null \
+    && rmdir "$LOCK_DIR" 2>/dev/null; then
+    continue
+  fi
   echo "another scheduled cleanup is already running for $STATUS" >&2
   exit 1
-fi
+done
+[ "$lock_acquired" -eq 1 ] || {
+  echo "could not acquire scheduled cleanup lock for $STATUS" >&2
+  exit 1
+}
 started_tmp="$(mktemp "$(dirname "$STATUS")/.in-progress.XXXXXX")"
 trap 'rm -f "$started_tmp"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
