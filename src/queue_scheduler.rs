@@ -298,6 +298,7 @@ impl AlreadyMergedObserver {
         )
     }
 
+    #[allow(clippy::too_many_lines)] // Keep the bounded observer decision chain auditable in one loop.
     fn observe_ship_with_status(
         &mut self,
         jobs: &[Job],
