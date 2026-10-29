@@ -3,7 +3,10 @@
 **Observed:** 2026-10-29 UTC
 **Branch:** `codex/scorecard-provenance-20261029`
 **Base:** `origin/main` at `d7dfff57de91929bd717659c3af166ad8799792d`
-**Implementation head:** `e997c9dee8ae74982e87d7938da9ff0c70019ef5`
+**Implementation commits:** `e997c9dee8ae74982e87d7938da9ff0c70019ef5` plus the
+status records on this branch.
+**PR:** [#1024](https://github.com/danielraffel/Shipyard/pull/1024), currently at
+`7885233782679f25a4774cf2a3bb5b62edd520d0`
 
 ## Completed
 
@@ -35,8 +38,13 @@ missing Mise installation. Shipyard invokes `python3` directly and has no Mise
 manifest. TartCI requires pinned Python 3.11+ with `tomllib`; its pinned Mise
 binary is optional and does not change lane PATH or interpreter selection.
 
+## Current gate
+
+PR #1024 is open and unarmed. Its executable checks are still running; no
+counted reviewer verdict exists. `review-verdict` is correctly fail-closed for
+the absence of an exact-head approval.
+
 ## Next action
 
-Open this branch as an unarmed PR with
-`shipyard pr --no-arm --no-steward-handoff`, then obtain an authorized exact-head
-review. Do not merge or arm from this workstream.
+Obtain an authorized exact-head review after checks settle. Do not merge or arm
+from this workstream.
