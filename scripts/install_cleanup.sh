@@ -65,6 +65,10 @@ if [ "$UNINSTALL" -eq 0 ] && ! "$SHIPYARD" cleanup --help 2>&1 | grep -q -- '--o
   echo "$SHIPYARD lacks the conservative --owned-only validation-TMP mode; update it before installing the agent" >&2
   exit 2
 fi
+if [ "$UNINSTALL" -eq 0 ] && ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required for cleanup previews and receipts" >&2
+  exit 2
+fi
 
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST="$PLIST_DIR/$LABEL.plist"

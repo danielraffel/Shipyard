@@ -38,6 +38,7 @@ case "$INTERVAL" in ''|*[!0-9]*) echo "--interval must be numeric" >&2; exit 2 ;
 [ "$OLDER_THAN_HOURS" -ge 1 ] || { echo "--older-than-hours must be at least 1" >&2; exit 2; }
 [ "$INTERVAL" -ge 900 ] || { echo "--interval must be at least 900 seconds" >&2; exit 2; }
 [ -x "$SHIPYARD" ] || { echo "Shipyard executable is unavailable: $SHIPYARD" >&2; exit 2; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 is required to write cleanup receipts" >&2; exit 2; }
 
 run_and_capture() {
   local output_var="$1" exit_var="$2"; shift 2
