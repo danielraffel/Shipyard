@@ -198,6 +198,9 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
         fixlinks,
         mut findings,
     } = read_archive(&args.dir)?;
+    // Count archive rows, not red-attempt keys: one red attempt may have both
+    // a rerun-green link and a later push-fix link, and both are useful evidence.
+    let fixlink_rows = fixlinks.len();
     let mut seen = BTreeMap::<String, (PathBuf, usize)>::new();
     let mut red_keys = BTreeSet::new();
     for (record, path, line) in &causes {
@@ -273,7 +276,7 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
         dir: args.dir.display().to_string(),
         files_scanned,
         cause_rows: causes.len(),
-        fixlink_rows: seen_fixlinks.len(),
+        fixlink_rows,
         ok: findings.is_empty(),
         findings,
     })
@@ -439,7 +442,7 @@ mod tests {
         })
         .expect("audit");
         assert!(report.ok);
-        assert_eq!((report.cause_rows, report.fixlink_rows), (1, 1));
+        assert_eq!((report.cause_rows, report.fixlink_rows), (1, 2));
     }
 
     #[test]
