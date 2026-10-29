@@ -347,6 +347,8 @@ pub struct StewardshipScorecard {
     /// Number of failed or cancelled jobs contributing to
     /// [`Self::wasted_compute_minutes`].
     pub wasted_compute_samples: usize,
+    /// Coverage of measured duration across failed or cancelled jobs.
+    pub wasted_compute_coverage: ScorecardCoverage,
     /// Queue wait minutes with an authoritative queued timestamp.
     /// This is the coordination-cost proxy.
     pub coordination_minutes: f64,
@@ -368,6 +370,9 @@ pub struct StewardshipScorecard {
     pub rework_compute_coverage: ScorecardCoverage,
     /// Sum of measured queue and failed-attempt compute minutes.
     pub coordination_rework_minutes: f64,
+    /// Combined coverage for the queue-wait and failed-attempt components.
+    /// The aggregate is partial when either component is incomplete.
+    pub coordination_rework_coverage: ScorecardCoverage,
     /// Merge receipts are not currently part of the local metrics schema.
     /// Keep this explicit instead of dividing by distinct PRs and calling
     /// those changes safely merged.
@@ -2009,6 +2014,10 @@ impl MetricsStore {
                     && (proxy::is_failure(status) || proxy::is_cancelled(status))
             })
             .count();
+        let wasted_candidates = samples
+            .iter()
+            .filter(|(status, _, _, _, _)| proxy::is_failure(status) || proxy::is_cancelled(status))
+            .count();
         let wasted_compute_ms = samples
             .iter()
             .filter(|(status, _, _, _, _)| proxy::is_failure(status) || proxy::is_cancelled(status))
@@ -2032,6 +2041,23 @@ impl MetricsStore {
             .filter_map(|(_, _, queue, _, _)| *queue)
             .filter(|value| *value >= 0)
             .fold(0_i64, i64::saturating_add);
+        let coordination_coverage = coverage_for_samples(
+            queues.len(),
+            samples.len(),
+            "completed job samples include authoritative queue timing",
+        );
+        let rework_coverage = coverage_for_samples(
+            rework_samples,
+            failed_jobs,
+            "failed attempts include measured duration",
+        );
+        let wasted_coverage = coverage_for_samples(
+            wasted_samples,
+            wasted_candidates,
+            "failed/cancelled jobs include measured duration",
+        );
+        let coordination_rework_coverage =
+            combine_cost_coverage(&coordination_coverage, &rework_coverage);
         let distinct_pull_requests = samples
             .iter()
             .filter_map(|(_, _, _, repo, pr)| Some((repo.as_deref()?, (*pr)?)))
@@ -2102,23 +2128,17 @@ impl MetricsStore {
             queue_p90_ms: percentile(&queues, 90),
             wasted_compute_minutes: millis_to_minutes(wasted_compute_ms),
             wasted_compute_samples: wasted_samples,
+            wasted_compute_coverage: wasted_coverage,
             coordination_minutes: millis_to_minutes(coordination_ms),
             coordination_samples: queues.len(),
-            coordination_coverage: coverage_for_samples(
-                queues.len(),
-                samples.len(),
-                "completed job samples include authoritative queue timing",
-            ),
+            coordination_coverage,
             rework_compute_minutes: millis_to_minutes(rework_compute_ms),
             rework_compute_samples: rework_samples,
-            rework_compute_coverage: coverage_for_samples(
-                rework_samples,
-                failed_jobs,
-                "failed attempts include measured duration",
-            ),
+            rework_compute_coverage: rework_coverage,
             coordination_rework_minutes: millis_to_minutes(
                 rework_compute_ms.saturating_add(coordination_ms),
             ),
+            coordination_rework_coverage,
             safely_merged_changes: ScorecardCoverage {
                 status: if joined_merge_count == 0 {
                     "unavailable"
@@ -2694,6 +2714,27 @@ fn coverage_for_samples(measured: usize, total: usize, description: &str) -> Sco
     ScorecardCoverage {
         status: status.to_owned(),
         reason: format!("{measured} of {total} {description}"),
+        value: None,
+    }
+}
+
+fn combine_cost_coverage(
+    coordination: &ScorecardCoverage,
+    rework: &ScorecardCoverage,
+) -> ScorecardCoverage {
+    let status = if coordination.status == "available" && rework.status == "available" {
+        "available"
+    } else if coordination.status == "unavailable" && rework.status == "unavailable" {
+        "unavailable"
+    } else {
+        "partial"
+    };
+    ScorecardCoverage {
+        status: status.to_owned(),
+        reason: format!(
+            "coordination timing: {}; rework timing: {}",
+            coordination.reason, rework.reason
+        ),
         value: None,
     }
 }
@@ -5300,9 +5341,11 @@ mod tests {
         assert_eq!(scorecard.other_jobs, 3);
         assert_eq!(scorecard.failure_rate, Some(2.0 / 3.0));
         assert_eq!(scorecard.wasted_compute_samples, 3);
+        assert_eq!(scorecard.wasted_compute_coverage.status, "available");
         assert_eq!(scorecard.rework_compute_samples, 2);
         assert_eq!(scorecard.coordination_coverage.status, "available");
         assert_eq!(scorecard.rework_compute_coverage.status, "available");
+        assert_eq!(scorecard.coordination_rework_coverage.status, "available");
     }
 
     #[test]
@@ -5323,10 +5366,47 @@ mod tests {
 
         assert_eq!(scorecard.coordination_samples, 0);
         assert_eq!(scorecard.coordination_coverage.status, "unavailable");
+        assert_eq!(scorecard.wasted_compute_coverage.status, "unavailable");
         assert_eq!(scorecard.rework_compute_samples, 0);
         assert_eq!(scorecard.rework_compute_coverage.status, "unavailable");
+        assert_eq!(scorecard.coordination_rework_coverage.status, "unavailable");
+        let json = serde_json::to_value(&scorecard).expect("scorecard JSON");
+        for field in [
+            "wasted_compute_coverage",
+            "coordination_coverage",
+            "rework_compute_coverage",
+            "coordination_rework_coverage",
+        ] {
+            assert_eq!(json[field]["status"], "unavailable", "{field}");
+        }
         assert!(scorecard.coordination_coverage.reason.contains("0 of 1"));
         assert!(scorecard.rework_compute_coverage.reason.contains("0 of 1"));
+    }
+
+    #[test]
+    fn stewardship_scorecard_marks_partial_cost_proxy_coverage_and_serializes_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "failure", 60_000, 1_000, false);
+        insert_scorecard_sample(&store, "shipyard", 42, "cancelled", 60_000, 1_000, false);
+        let conn = store.connect().expect("metrics connection");
+        conn.execute(
+            "UPDATE jobs SET total_ms = NULL, queue_ms = NULL WHERE run_id = (SELECT id FROM runs WHERE pr = 42)",
+            [],
+        )
+        .expect("remove one timing sample");
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.wasted_compute_coverage.status, "partial");
+        assert_eq!(scorecard.coordination_coverage.status, "partial");
+        assert_eq!(scorecard.rework_compute_coverage.status, "available");
+        assert_eq!(scorecard.coordination_rework_coverage.status, "partial");
+        let json = serde_json::to_value(&scorecard).expect("scorecard JSON");
+        assert_eq!(json["wasted_compute_coverage"]["status"], "partial");
+        assert_eq!(json["coordination_rework_coverage"]["status"], "partial");
     }
 
     #[test]
