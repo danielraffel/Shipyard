@@ -417,15 +417,40 @@ fn cleanup_retention(
 
 const DEFAULT_METRICS_RETENTION_DAYS: i64 = 90;
 
+fn parse_metrics_retention_days(value: Option<&str>) -> Result<i64, CliFailure> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_METRICS_RETENTION_DAYS);
+    };
+    let days = value.parse::<i64>().map_err(|_| {
+        CliFailure::new(
+            2,
+            format!(
+                "SHIPYARD_METRICS_RETENTION_DAYS must be a non-negative integer, got {value:?}"
+            ),
+        )
+    })?;
+    if days < 0 {
+        return Err(CliFailure::new(
+            2,
+            "SHIPYARD_METRICS_RETENTION_DAYS must be non-negative",
+        ));
+    }
+    if Duration::try_days(days).is_none() {
+        return Err(CliFailure::new(
+            2,
+            "SHIPYARD_METRICS_RETENTION_DAYS is too large",
+        ));
+    }
+    Ok(days)
+}
+
 fn prune_metrics(
     state_dir: &Path,
     dry_run: bool,
     items: &mut Vec<CleanupItem>,
 ) -> Result<(), CliFailure> {
-    let days = std::env::var("SHIPYARD_METRICS_RETENTION_DAYS")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(DEFAULT_METRICS_RETENTION_DAYS);
+    let configured_days = std::env::var("SHIPYARD_METRICS_RETENTION_DAYS").ok();
+    let days = parse_metrics_retention_days(configured_days.as_deref())?;
     if days <= 0 {
         return Ok(());
     }
@@ -435,18 +460,18 @@ fn prune_metrics(
     }
     let size = path.metadata().map_or(0, |metadata| metadata.len());
     let result = if dry_run {
-        Ok(0)
+        MetricsStore::validate_existing(state_dir).map(|()| 0)
     } else {
         MetricsStore::open(state_dir).and_then(|store| store.prune_older_than(days))
     };
     let (action, reason) = match result {
         Ok(_) if dry_run => (
             "would-delete".to_owned(),
-            format!("Raw samples older than {days} days would be pruned"),
+            format!("Metric rows older than {days} days would be pruned"),
         ),
         Ok(deleted) => (
             "delete".to_owned(),
-            format!("Pruned {deleted} raw runs older than {days} days"),
+            format!("Pruned {deleted} metric rows older than {days} days"),
         ),
         Err(error) => {
             items.push(CleanupItem {
@@ -2445,6 +2470,28 @@ mod retention_tests {
         let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
             .expect_err("metrics retention failure must fail cleanup");
         assert!(error.message.contains("metrics retention failed"));
+    }
+
+    #[test]
+    fn metrics_retention_dry_run_validates_existing_database() {
+        let temp = tempfile::tempdir().expect("temp");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        fs::write(metrics_dir.join("metrics.db"), b"not a sqlite database")
+            .expect("invalid metrics db");
+
+        let error = cleanup_retention(temp.path(), true, LogRetentionPolicy::default())
+            .expect_err("dry-run must validate the metrics database");
+        assert!(error.message.contains("metrics retention failed"));
+    }
+
+    #[test]
+    fn metrics_retention_setting_is_explicit_and_bounded() {
+        assert_eq!(parse_metrics_retention_days(None).unwrap(), 90);
+        assert_eq!(parse_metrics_retention_days(Some("0")).unwrap(), 0);
+        assert!(parse_metrics_retention_days(Some("-1")).is_err());
+        assert!(parse_metrics_retention_days(Some("not-a-number")).is_err());
+        assert!(parse_metrics_retention_days(Some("9223372036854775807")).is_err());
     }
 
     #[test]

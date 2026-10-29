@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -695,6 +695,19 @@ impl MetricsStore {
         &self.path
     }
 
+    /// Validate an existing metrics database without migrating or writing it.
+    /// Cleanup uses this for dry-run validation so an unreadable store cannot
+    /// be reported as a successful rotation plan.
+    pub fn validate_existing(state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let path = state_dir.join("metrics").join("metrics.db");
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let result: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if result != "ok" {
+            return Err(format!("metrics database integrity check failed: {result}").into());
+        }
+        Ok(())
+    }
+
     /// Delete raw run, job, step, and fleet-capacity samples older than
     /// `retention_days`. Merge receipts are retained because they are durable
     /// provenance.
@@ -706,7 +719,9 @@ impl MetricsStore {
             return Ok(0);
         }
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
-        let cutoff = (Utc::now() - Duration::days(retention_days)).to_rfc3339();
+        let retention =
+            Duration::try_days(retention_days).ok_or("metrics retention period is too large")?;
+        let cutoff = (Utc::now() - retention).to_rfc3339();
         let mut deleted = 0;
         loop {
             let mut conn = self.connect()?;
@@ -5924,6 +5939,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.prune_older_than(90).unwrap(), 1);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn metrics_retention_prunes_old_runs_in_bounded_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        for index in 0..501 {
+            store
+                .record(&MetricRecordInput {
+                    project: "pulp".into(),
+                    job: format!("old-{index}"),
+                    duration_ms: 10,
+                    status: "success".into(),
+                    completed_at: Some(old - Duration::seconds(i64::from(index))),
+                    external_id: Some(format!("fixture:{index}")),
+                    ..MetricRecordInput::default()
+                })
+                .unwrap();
+        }
+        assert_eq!(store.prune_older_than(90).unwrap(), 501);
         let conn = store.connect().unwrap();
         assert_eq!(
             conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
