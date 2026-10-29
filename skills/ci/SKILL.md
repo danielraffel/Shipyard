@@ -109,6 +109,13 @@ armed-but-not-enqueued PR, and
 for a green PR awaiting an arm decision. Neither authorizes enqueue, rerun,
 merge, or any other queue mutation.
 
+A stale local queue worker is normally protected by daemon ownership: heartbeat
+age alone must not reap it. The narrow exception is a daemon-owned job that
+already has an explicit cancellation request and then goes heartbeat-stale; the
+scheduler reaps that job to release its resource claim and admit later work.
+Treat this as queue recovery evidence, not permission to cancel a live worker or
+edit `queue.json` by hand.
+
 GitHub Actions can omit `pull_requests` on `pull_request_target` runs. The
 metrics importer resolves those rows only through the exact commit's
 authoritative pull-request API response, and keeps the identity unknown when

@@ -14,6 +14,14 @@ The read-only `queue-digest` surface reports `queue_idle` and emits
 separate `merge_queue_idle_with_green_unarmed_work` handoff alert for a green
 unarmed PR. These are alerts for the queue owner, never mutation permissions.
 
+Queue ownership remains fail-closed for daemon jobs: a stale heartbeat by
+itself does not release a daemon-owned worker claim. Once an owner has recorded
+an explicit cancellation request, a subsequently stale heartbeat is the safe
+terminal boundary; the scheduler reaps that cancelled job and releases the
+claim so unrelated pending work cannot be stranded behind a dead worker. Read
+`shipyard queue --json` and the cancellation evidence before escalating; never
+hand-edit queue state or infer permission to cancel a live worker.
+
 `shipyard queue triage|prioritize|resume` drains a backed-up pull-request CI
 backlog: cancel runs that cannot land at their head, move the fix for a red base
 ahead of other pull requests' waiting jobs, and later re-run what was cancelled
