@@ -117,6 +117,27 @@ grep -q 'another scheduled cleanup is already running' "$HOME_DIR/race-second.lo
 wait "$race_pid"
 test ! -e "${RACE_STATUS%.json}.lock"
 
+# If the atomic owner publication itself fails, the wrapper must reclaim the
+# lock directory it just created. Leaving it behind would permanently wedge
+# every later scheduled cleanup as an owner-less lock.
+PUBLISH_FAIL_TOOLS="$HOME_DIR/publish-fail-tools"
+mkdir -p "$PUBLISH_FAIL_TOOLS"
+cat >"$PUBLISH_FAIL_TOOLS/ln" <<'SH'
+#!/bin/sh
+exit 1
+SH
+chmod +x "$PUBLISH_FAIL_TOOLS/ln"
+PUBLISH_FAIL_STATUS="$HOME_DIR/publish-fail-status.json"
+set +e
+PATH="$PUBLISH_FAIL_TOOLS:$PATH" "$WRAPPER" --shipyard "$SLOW_SHIPYARD" \
+  --state-dir "$HOME_DIR/publish-fail-state" --status "$PUBLISH_FAIL_STATUS" \
+  >"$HOME_DIR/publish-fail.log" 2>&1
+publish_fail_exit=$?
+set -e
+[ "$publish_fail_exit" -eq 1 ]
+grep -q 'could not publish cleanup lock owner' "$HOME_DIR/publish-fail.log"
+test ! -e "${PUBLISH_FAIL_STATUS%.json}.lock"
+
 STALE_STATUS="$HOME_DIR/stale-status.json"
 mkdir -p "${STALE_STATUS%.json}.lock"
 printf '999999\n' >"${STALE_STATUS%.json}.lock/owner"

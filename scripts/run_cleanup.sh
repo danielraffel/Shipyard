@@ -62,6 +62,7 @@ for _lock_attempt in 1 2; do
     chmod 600 "$owner_tmp"
     if ! ln "$owner_tmp" "$LOCK_OWNER" 2>/dev/null; then
       rm -f "$owner_tmp"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
       echo "could not publish cleanup lock owner for $STATUS" >&2
       exit 1
     fi
