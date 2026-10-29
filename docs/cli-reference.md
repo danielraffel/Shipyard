@@ -821,7 +821,7 @@ inferred from a job total.
 
 `metrics repeated-work-cost` is read-only shadow accounting. It joins each
 surviving queue job to an authenticated `queue_timing` row with the exact
-queue identity when available and reports avoided survivor runtime once per
+queue identity when available and reports survivor runtime proxy once per
 distinct queue job. The JSON output keeps shadow observation counts separate
 from distinct-survivor coverage and shows clean, uncertain, cancelled, and
 unmatched timing populations. Missing, legacy, mismatched, or excluded timing

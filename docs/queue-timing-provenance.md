@@ -39,7 +39,7 @@ mode), not only the short queue ID.
 ## Aggregation semantics
 
 `repeated_work_shadow.job_id` identifies the surviving job. A matching timing
-row therefore measures **avoided survivor runtime**, not runtime that was
+row therefore measures **survivor runtime proxy**, not runtime that was
 actually wasted by a superseded job. Aggregation must use one timing row per
 queue job and must not multiply duration by the number of shadow rows or
 validation targets.

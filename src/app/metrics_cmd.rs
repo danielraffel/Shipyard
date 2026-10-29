@@ -405,10 +405,10 @@ pub(super) fn metrics_command<W: Write>(
             })?;
             write_output(stdout, json_output, &summary, || {
                 let duration = summary
-                    .duration_ms
+                    .survivor_runtime_proxy_ms
                     .map_or_else(|| "unavailable".to_owned(), |ms| format!("{ms}ms"));
                 format!(
-                    "{} repeated-work observations; avoided survivor runtime {}; {} clean of {} distinct survivors ({} excluded, {} unmatched)",
+                    "{} repeated-work observations; survivor runtime proxy {}; {} clean of {} distinct survivors ({} excluded, {} unmatched)",
                     summary.observations,
                     duration,
                     summary.matched_clean,

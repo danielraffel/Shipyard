@@ -59,7 +59,7 @@ pub struct RepeatedWorkSurvivorTiming {
     pub excluded_uncertain: usize,
     pub excluded_cancelled: usize,
     pub unmatched: usize,
-    pub avoided_survivor_ms: Option<i64>,
+    pub survivor_runtime_proxy_ms: Option<i64>,
     pub final_attempt_only: bool,
 }
 
@@ -217,8 +217,8 @@ pub struct RepeatedWorkCostSummary {
     pub joined_durations: usize,
     /// Unique survivors excluded or missing timing (not shadow-row count).
     pub unknown_durations: usize,
-    /// Sum of clean survivor durations, counted once per queue job.
-    pub duration_ms: Option<i64>,
+    /// Sum of clean survivor runtime proxies, counted once per queue job.
+    pub survivor_runtime_proxy_ms: Option<i64>,
 }
 
 /// One grouped timing summary row.
@@ -659,7 +659,7 @@ impl MetricsStore {
             excluded_uncertain: 0,
             excluded_cancelled: 0,
             unmatched: 0,
-            avoided_survivor_ms: None,
+            survivor_runtime_proxy_ms: None,
             final_attempt_only: true,
         };
         let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
@@ -677,8 +677,8 @@ impl MetricsStore {
             match disposition.as_deref() {
                 Some("clean") if total.is_some_and(|v| v >= 0) => {
                     out.matched_clean += 1;
-                    out.avoided_survivor_ms = Some(
-                        out.avoided_survivor_ms
+                    out.survivor_runtime_proxy_ms = Some(
+                        out.survivor_runtime_proxy_ms
                             .unwrap_or(0)
                             .saturating_add(total.unwrap()),
                     );
@@ -1443,7 +1443,7 @@ impl MetricsStore {
                 .excluded_uncertain
                 .saturating_add(timing.excluded_cancelled)
                 .saturating_add(timing.unmatched),
-            duration_ms: timing.avoided_survivor_ms,
+            survivor_runtime_proxy_ms: timing.survivor_runtime_proxy_ms,
         };
         for item in ids {
             let (kind, _job_id) = item?;
@@ -5732,7 +5732,7 @@ mod tests {
         let conn = Connection::open(store.path()).unwrap();
         conn.execute("INSERT INTO repeated_work_shadow (observed_at,kind,branch,sha,target_config,mode,job_id,superseded_job_id,superseded_sha) VALUES ('now','future_kind','main','sha','cfg','normal','7','old','oldsha')", []).unwrap();
         let summary = store.repeated_work_cost(100).unwrap();
-        assert_eq!(summary.duration_ms, None);
+        assert_eq!(summary.survivor_runtime_proxy_ms, None);
         assert_eq!(summary.joined_durations, 0);
         assert_eq!(summary.unknown_durations, 3);
         assert_eq!(summary.distinct_survivors, 3);
@@ -5744,7 +5744,7 @@ mod tests {
         assert_eq!(summary.duplicate_exact_head_config, 1);
         assert_eq!(store.repeated_work_cost(0).unwrap().observations, 0);
         assert_eq!(
-            serde_json::to_value(summary).unwrap()["duration_ms"],
+            serde_json::to_value(summary).unwrap()["survivor_runtime_proxy_ms"],
             serde_json::Value::Null
         );
     }
@@ -5887,7 +5887,7 @@ mod tests {
         assert_eq!(r.shadow_rows, 5);
         assert_eq!(r.distinct_survivors, 4);
         assert_eq!(r.matched_clean, 1);
-        assert_eq!(r.avoided_survivor_ms, Some(10));
+        assert_eq!(r.survivor_runtime_proxy_ms, Some(10));
         assert_eq!(r.excluded_uncertain, 1);
         assert_eq!(r.excluded_cancelled, 1);
         assert_eq!(r.unmatched, 1);
@@ -5900,7 +5900,7 @@ mod tests {
         assert_eq!(c.unmatched, 1);
         assert_eq!(c.joined_durations, 1);
         assert_eq!(c.unknown_durations, 3);
-        assert_eq!(c.duration_ms, Some(10));
+        assert_eq!(c.survivor_runtime_proxy_ms, Some(10));
     }
 
     #[test]
@@ -5939,7 +5939,7 @@ mod tests {
         assert_eq!(summary.distinct_survivors, 2);
         assert_eq!(summary.matched_clean, 1);
         assert_eq!(summary.unmatched, 1);
-        assert_eq!(summary.avoided_survivor_ms, Some(7));
+        assert_eq!(summary.survivor_runtime_proxy_ms, Some(7));
     }
     #[test]
     fn queue_timing_contract_rejects_identity_and_downgrades() {
