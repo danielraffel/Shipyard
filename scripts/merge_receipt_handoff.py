@@ -323,7 +323,7 @@ def export(args: argparse.Namespace) -> int:
         write_health(health_file, health_payload(repo=args.repo, file=file,
                                                   checked_at=now(), status="error", error=error))
         raise RuntimeError(error) from exc
-    except (RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         # A non-zero producer command is an observed producer error and gets
         # a durable error sidecar. A zero-exit command whose staged payload or
         # producer identity is malformed leaves the prior payload and health
