@@ -281,6 +281,10 @@ fn load_merge_queue_snapshot_once(
     base: &str,
     deadline: Option<Instant>,
 ) -> Result<(MergeQueueSnapshot, usize), String> {
+    // `gh api graphql` has no `--repo` flag. Scope the authenticated client
+    // instead so repository-specific token helpers still receive provenance
+    // while the argv remains valid for the native GitHub CLI.
+    let actions = actions.clone().with_repo_override(repo);
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
@@ -294,8 +298,6 @@ fn load_merge_queue_snapshot_once(
         let mut args = vec![
             "api".to_owned(),
             "graphql".to_owned(),
-            "--repo".to_owned(),
-            repo.to_owned(),
             "-f".to_owned(),
             format!("query={query}"),
             "-F".to_owned(),
@@ -308,7 +310,7 @@ fn load_merge_queue_snapshot_once(
         if let Some(cursor) = cursor.as_deref() {
             args.extend(["-F".to_owned(), format!("cursor={cursor}")]);
         }
-        let value = match gh_json_with_deadline(actions, &args, "merge-queue policy", deadline) {
+        let value = match gh_json_with_deadline(&actions, &args, "merge-queue policy", deadline) {
             Ok(value) => value,
             Err(error) if page == 1 && is_private_free_entitlement(&error) => {
                 return Ok((
