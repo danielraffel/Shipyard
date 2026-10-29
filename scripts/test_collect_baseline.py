@@ -374,8 +374,15 @@ class CollectorInvocationTests(unittest.TestCase):
                 "timeout_seconds": 5, "merge_receipts": root / "missing-receipts.jsonl"})()
             args.state.write_text("{}")
             events = MOD.import_organic(args)
-            self.assertEqual(events[-1], {"source": "merge-receipt", "status": "unavailable",
-                                          "reason": "producer handoff not present"})
+            receipt = next(event for event in events if event["source"] == "merge-receipt")
+            self.assertEqual(receipt["status"], "unavailable")
+            self.assertEqual(receipt["reason"], "fresh authenticated producer handoff is unavailable")
+            self.assertEqual(events[-1]["source"], "merge-receipt")
+
+    def test_run_converts_provider_timeout_to_a_bounded_error(self):
+        with mock.patch.object(MOD.subprocess, "run", side_effect=subprocess.TimeoutExpired(["shipyard"], 5)):
+            with self.assertRaisesRegex(RuntimeError, "command timed out after 5s: shipyard"):
+                MOD.run(["shipyard"], timeout=5)
 
     def test_collect_deduplicates_unavailable_event_from_newer_supervisor(self):
         with tempfile.TemporaryDirectory() as directory:
