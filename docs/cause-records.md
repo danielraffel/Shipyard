@@ -177,7 +177,9 @@ It can take newline-delimited outage windows (`start`, `end`, optional
 `reason`) and suppresses rows completed inside a declared window. It never
 contacts GitHub, executes `fix_hint`, or writes the archive. Rows containing
 unscrubbed paths, addresses, private hosts, or credential-like values are
-discarded. JSON output uses `shipyard.cause-advice/v1`; human output is a
+discarded. A malformed JSON line in `fixlinks.jsonl` fails closed with its
+file and line number instead of being silently ignored. JSON output uses
+`shipyard.cause-advice/v1`; human output is a
 stable table intended for review, not an automatic decision; when a matching
 fix-link exists, that table names the fixing head and how the link was derived
 (`rerun_green` or `compare_red_head_to_fix_head`).

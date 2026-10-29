@@ -611,6 +611,9 @@ read-only observer, never part of `ship`, `pr` or `run`. Each pass writes one
 `ci.cause/v1` row per red job not yet archived, to `causes/YYYY-MM.jsonl` by the
 job's `completed_at`. It adds `completed_at`, `workflow`, `head_branch`, `owner`
 (`pr:N`, else `branch:<name>`, else `sha:<head>`) and `provenance`.
+`shipyard cause advise` fails closed on malformed non-empty `fixlinks.jsonl`
+rows (exit 2 with the archive path and 1-based line); empty lines are skipped
+and valid rows use the same shared fix-link validator as `cause audit`.
 Then, for each red run attempt in the window without a fix-link, it looks for
 the earliest later green run on the same pull request branch and appends one row
 to `fixlinks.jsonl`: `files_raw` from compare red...fix, and `own_files`, the
