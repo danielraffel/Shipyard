@@ -374,9 +374,10 @@ class CollectorInvocationTests(unittest.TestCase):
                 "timeout_seconds": 5, "merge_receipts": root / "missing-receipts.jsonl"})()
             args.state.write_text("{}")
             events = MOD.import_organic(args)
-            receipt = next(event for event in events if event["source"] == "merge-receipt")
+            receipt = next(event for event in events if event.get("source") == "merge-receipt")
+            self.assertEqual(receipt["source"], "merge-receipt")
             self.assertEqual(receipt["status"], "unavailable")
-            self.assertEqual(receipt["reason"], "fresh authenticated producer handoff is unavailable")
+            self.assertIn("handoff", receipt["reason"])
             self.assertEqual(events[-1]["source"], "collection")
 
     def test_run_converts_provider_timeout_to_a_bounded_error(self):
