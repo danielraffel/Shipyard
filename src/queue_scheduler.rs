@@ -805,8 +805,14 @@ fn same_pr_ship_admission(
             // A running job only blocks pending same-PR work while its worker is
             // alive. One whose heartbeat has gone stale was abandoned (e.g. the
             // process was killed); set it aside for reaping so it never blocks
-            // forever.
-            JobStatus::Running if foreground_owned && job.is_stale_running(now, stale_after) => {
+            // forever. A daemon-owned job normally needs the supervisor's exact
+            // worker receipt before reaping, but an explicit cancellation request
+            // is already an owner-authorized stop boundary: once its heartbeat is
+            // stale, retaining it would strand every later job on the host.
+            JobStatus::Running
+                if job.is_stale_running(now, stale_after)
+                    && (foreground_owned || job.cancel_requested_at.is_some()) =>
+            {
                 group.stale_running.push(job.clone());
             }
             JobStatus::Running => group.running.push(job.clone()),
@@ -1846,6 +1852,40 @@ mod tests {
         // The stale running ship no longer blocks: the pending same-PR ship is
         // admitted, no running conflict is reported, and the dead worker is
         // surfaced for reaping (and so does not hold its pr-42 claim).
+        assert_eq!(pass.plan.admitted, ["pending"]);
+        assert!(pass.same_pr_ship_admission.running_conflicts.is_empty());
+        assert_eq!(
+            pass.same_pr_ship_admission.stale_running_cancellations,
+            [super::SamePrShipStaleRunningCancellation {
+                job_id: "stale-running".to_owned(),
+                repo: "danielraffel/shipyard".to_owned(),
+                pr: 42,
+                reason: super::STALE_RUNNING_CANCEL_REASON.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn request_backed_admit_pass_reaps_stale_cancelled_daemon_owned_running() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = QueueRequestStore::new(temp.path()).expect("store");
+        save_ship(&store, "stale-running", "danielraffel/shipyard", 42);
+        let mut daemon = store.load("stale-running").expect("load").expect("request");
+        daemon.execution_owner = crate::queue_request::QueuedExecutionOwner::Daemon;
+        store.save(&daemon).expect("save daemon owner");
+        save_ship(&store, "pending", "danielraffel/shipyard", 42);
+        let mut stale = job("stale-running", JobStatus::Running, Priority::Normal, -20);
+        stale.started_at =
+            Some(Utc::now() - Duration::seconds(super::DEFAULT_RUNNING_JOB_STALE_SECONDS + 60));
+        stale.cancel_requested_at =
+            Some(Utc::now() - Duration::seconds(super::DEFAULT_RUNNING_JOB_STALE_SECONDS + 30));
+        let jobs = vec![
+            stale,
+            job("pending", JobStatus::Pending, Priority::Normal, -10),
+        ];
+
+        let pass = plan_admit_pass_from_jobs(&jobs, &store, &[], &[], Utc::now());
+
         assert_eq!(pass.plan.admitted, ["pending"]);
         assert!(pass.same_pr_ship_admission.running_conflicts.is_empty());
         assert_eq!(
