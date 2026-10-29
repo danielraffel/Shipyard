@@ -46,7 +46,7 @@ import sys
 text = open(sys.argv[1], encoding="utf-8").read()
 assert '<key>RunAtLoad</key>\n    <true/>' in text
 PY
-grep -q -- '--owned-only' "$HOME_DIR/Library/Application Support/shipyard/cleanup/run_cleanup.sh" || true
+grep -q -- '--owned-only' "$HOME_DIR/Library/Application Support/shipyard/cleanup/run_cleanup.sh"
 grep -q 'preview=cleanup exit=1' "$HOME_DIR/install"
 grep -q 'preview=validation-tmp exit=0 count=0 bytes=0' "$HOME_DIR/install"
 
