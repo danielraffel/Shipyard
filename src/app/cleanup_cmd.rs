@@ -378,7 +378,7 @@ fn cleanup_retention(
     )?;
     scan_bundles(state_dir, dry_run, &mut items)?;
     scan_evidence(state_dir, dry_run, &mut items)?;
-    prune_metrics(state_dir, dry_run, &mut items);
+    prune_metrics(state_dir, dry_run, &mut items)?;
     if !dry_run {
         apply_cleanup_staging(&staging_candidates)?;
     }
@@ -417,17 +417,21 @@ fn cleanup_retention(
 
 const DEFAULT_METRICS_RETENTION_DAYS: i64 = 90;
 
-fn prune_metrics(state_dir: &Path, dry_run: bool, items: &mut Vec<CleanupItem>) {
+fn prune_metrics(
+    state_dir: &Path,
+    dry_run: bool,
+    items: &mut Vec<CleanupItem>,
+) -> Result<(), CliFailure> {
     let days = std::env::var("SHIPYARD_METRICS_RETENTION_DAYS")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(DEFAULT_METRICS_RETENTION_DAYS);
     if days <= 0 {
-        return;
+        return Ok(());
     }
     let path = state_dir.join("metrics").join("metrics.db");
     if !path.exists() {
-        return;
+        return Ok(());
     }
     let size = path.metadata().map_or(0, |metadata| metadata.len());
     let result = if dry_run {
@@ -444,7 +448,19 @@ fn prune_metrics(state_dir: &Path, dry_run: bool, items: &mut Vec<CleanupItem>) 
             "delete".to_owned(),
             format!("Pruned {deleted} raw runs older than {days} days"),
         ),
-        Err(error) => ("skip".to_owned(), format!("Metrics prune skipped: {error}")),
+        Err(error) => {
+            items.push(CleanupItem {
+                path: path.display().to_string(),
+                kind: "metrics".to_owned(),
+                action: "error".to_owned(),
+                size_bytes: 0,
+                reason: format!("Metrics prune failed: {error}"),
+            });
+            return Err(CliFailure::new(
+                1,
+                format!("metrics retention failed: {error}"),
+            ));
+        }
     };
     items.push(CleanupItem {
         path: path.display().to_string(),
@@ -453,6 +469,7 @@ fn prune_metrics(state_dir: &Path, dry_run: bool, items: &mut Vec<CleanupItem>) 
         size_bytes: if dry_run { size } else { 0 },
         reason,
     });
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2415,6 +2432,19 @@ mod retention_tests {
                 .iter()
                 .any(|item| item.category == "restart_recovery")
         );
+    }
+
+    #[test]
+    fn metrics_retention_failure_fails_cleanup_closed() {
+        let temp = tempfile::tempdir().expect("temp");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        fs::write(metrics_dir.join("metrics.db"), b"not a sqlite database")
+            .expect("invalid metrics db");
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("metrics retention failure must fail cleanup");
+        assert!(error.message.contains("metrics retention failed"));
     }
 
     #[test]

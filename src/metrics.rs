@@ -734,11 +734,26 @@ impl MetricsStore {
             tx.commit()?;
             deleted += ids.len();
         }
-        let conn = self.connect()?;
-        deleted += conn.execute(
-            "DELETE FROM fleet_capacity_samples WHERE valid_until < ?1",
-            [&cutoff],
-        )?;
+        loop {
+            let mut conn = self.connect()?;
+            conn.busy_timeout(std::time::Duration::from_millis(250))?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let removed = tx.execute(
+                "DELETE FROM fleet_capacity_samples
+                 WHERE sample_id IN (
+                   SELECT sample_id FROM fleet_capacity_samples
+                   WHERE valid_until < ?1
+                   ORDER BY valid_until, sample_id
+                   LIMIT 250
+                 )",
+                [&cutoff],
+            )?;
+            tx.commit()?;
+            deleted += removed;
+            if removed == 0 {
+                break;
+            }
+        }
         Ok(deleted)
     }
 
@@ -5932,6 +5947,34 @@ mod tests {
             conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn metrics_retention_prunes_capacity_samples_in_bounded_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        let records = (0..501)
+            .map(|index| {
+                serde_json::to_string(&test_capacity_sample(
+                    old - Duration::seconds(i64::from(index)),
+                    &format!("m{index}"),
+                    "verified",
+                ))
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(store.import_fleet_capacity(&records).unwrap(), 501);
+        assert_eq!(store.prune_older_than(90).unwrap(), 501);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
             0
         );
     }
