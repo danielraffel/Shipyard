@@ -396,7 +396,8 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
                 && valid_own_files_evidence(value)
         }
         "rerun_green" => {
-            value["head_sha"] == value["fix_head_sha"]
+            value["red_run_id"] == value["fix_run_id"]
+                && value["head_sha"] == value["fix_head_sha"]
                 && value["files_raw"].as_array().is_some_and(Vec::is_empty)
                 && value["own_files"].as_array().is_some_and(Vec::is_empty)
                 && value["files_truncated"].as_bool() == Some(false)
@@ -808,6 +809,34 @@ mod tests {
         let candidates = advise(&query, &[]).unwrap().0;
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn rerun_fixlink_must_bind_to_the_red_run() {
+        let value = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 999,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "b".repeat(40),
+            "derivation": "rerun_green",
+            "pushed_at": "2026-10-13T01:00:00Z",
+            "red_time": "2026-10-13T00:00:00Z",
+            "pr": 8,
+            "branch": "feat/x",
+            "rule": "test rule",
+            "collector": "test",
+            "files_raw": [],
+            "files_truncated": false,
+            "own_files": [],
+            "own_files_truncated": false,
+            "own_files_method": "rerun_same_head"
+        });
+
+        assert!(!valid_fixlink(&value));
     }
 
     #[test]
