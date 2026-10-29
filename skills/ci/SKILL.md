@@ -618,6 +618,9 @@ files of the non-merge commits on the fix's first-parent chain back to the red
 (a merge of main is a merge commit on that chain and is skipped). Never take a
 merge base against today's main for this: once the pull request has landed,
 both heads are main's ancestors and the subtraction erases every file.
+`shipyard cause audit` counts every valid fix-link row, including the legitimate
+pair of one `rerun_green` link and one later push-fix link for the same red
+attempt; it still rejects a repeated link of the same derivation.
 When the red is not an ancestor of the fix, a merge-queue red is walked
 back to the pull request head the queue merged (the queue commit's second
 parent; `merge_queue_pr_head`), and any other red, within 72 hours, takes the
