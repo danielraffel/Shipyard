@@ -291,6 +291,7 @@ def export(args: argparse.Namespace) -> int:
     command = [str(shipyard), "--state-dir", str(state_dir), "metrics", "export",
                "merge-receipt", "--repo", args.repo, "--file", str(staged_path)]
     completed: subprocess.CompletedProcess[str] | None = None
+    postflight_source_check_started = False
     try:
         source_before = source_imported_at(state_dir, args.repo, args.base_branch)
         completed = subprocess.run(command, text=True, capture_output=True,
@@ -302,6 +303,7 @@ def export(args: argparse.Namespace) -> int:
         exported = now()
         receipts, payload = read_handoff(staged_path, args.repo, base_branch=args.base_branch,
                                          now_value=exported)
+        postflight_source_check_started = True
         imported_at = source_imported_at(state_dir, args.repo, args.base_branch)
         if imported_at != source_before:
             raise RuntimeError("producer merge receipt source changed during export")
@@ -329,7 +331,7 @@ def export(args: argparse.Namespace) -> int:
         # producer identity is malformed leaves the prior payload and health
         # untouched, so observers cannot mistake a rejected refresh for a new
         # handoff.
-        if completed is None or completed.returncode != 0:
+        if completed is None or completed.returncode != 0 or postflight_source_check_started:
             write_health(health_file, health_payload(repo=args.repo, file=file,
                                                       checked_at=now(), status="error", error=str(exc)))
         raise

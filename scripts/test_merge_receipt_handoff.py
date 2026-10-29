@@ -62,7 +62,8 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             connection.execute("INSERT INTO merge_receipts VALUES (?, ?, ?, ?)", ("owner/repo", "repo", "main", imported_at))
             connection.commit()
 
-    def fake_shipyard(self, directory: pathlib.Path, output: pathlib.Path, *, fail: bool = False, malformed: bool = False) -> pathlib.Path:
+    def fake_shipyard(self, directory: pathlib.Path, output: pathlib.Path, *, fail: bool = False,
+                      malformed: bool = False, remove_source_after: pathlib.Path | None = None) -> pathlib.Path:
         executable = directory / "shipyard"
         body = "#!/bin/sh\n"
         if fail:
@@ -73,6 +74,8 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             body += "case \"$*\" in *--version*) echo 'shipyard 0.366.4'; exit 0;; esac\n"
             body += "while [ \"$#\" -gt 0 ]; do if [ \"$1\" = \"--file\" ]; then shift; file=\"$1\"; fi; shift; done\n"
             body += f"printf '%s\\n' '{'not json' if malformed else json.dumps(receipt())}' > \"$file\"\n"
+            if remove_source_after is not None:
+                body += f"rm -f {str(remove_source_after)!r}\n"
         executable.write_text(body)
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
         return executable
@@ -125,6 +128,25 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             self.assertEqual(value["status"], "error")
             self.assertIn("no imported_at", value["error"])
             self.assertFalse(handoff.exists())
+
+    def test_postflight_source_failure_marks_health_and_preserves_previous_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            handoff = root / "handoff.jsonl"
+            health = root / "handoff.health.json"
+            handoff.write_text("previous\\n")
+            health.write_text("previous-health\\n")
+            self.producer_db(root)
+            shipyard = self.fake_shipyard(
+                root, handoff, remove_source_after=root / "state" / "metrics" / "metrics.db"
+            )
+            result = self.invoke("export", "--shipyard", str(shipyard), "--state-dir", str(root / "state"),
+                                 "--repo", "owner/repo", "--file", str(handoff), "--health-file", str(health))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(handoff.read_text(), "previous\\n")
+            value = json.loads(health.read_text())
+            self.assertEqual(value["status"], "error")
+            self.assertIn("unreadable", value["error"])
 
     def test_malformed_staged_export_preserves_previous_payload_and_health(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
