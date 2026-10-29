@@ -105,6 +105,28 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             release_macos_local.require_arm64("x64")
         self.assertIn("arm64", str(ctx.exception))
 
+    def test_require_ghapp_uses_explicit_runner_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            wrapper = Path(temp) / "managed-ghapp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(0o700)
+            with mock.patch.dict(
+                os.environ,
+                {release_macos_local.GHAPP_ENV: str(wrapper)},
+                clear=False,
+            ):
+                self.assertEqual(release_macos_local.require_ghapp(), str(wrapper))
+
+    def test_require_ghapp_does_not_use_missing_service_home(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {release_macos_local.GHAPP_ENV: "/Users/ci/.local/bin/ghapp"},
+            clear=False,
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                release_macos_local.require_ghapp()
+        self.assertIn(release_macos_local.GHAPP_ENV, str(ctx.exception))
+
     def test_package_signed_dmg_forwards_both_existing_binaries(self) -> None:
         config = release_macos_local.ReleaseConfig(
             tag="v0.127.0",

@@ -348,6 +348,9 @@ jobs:
       - name: Sign, notarize, staple, and upload macOS DMG
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The managed wrapper may live outside the service account's home.
+          # Leave this empty to resolve the authenticated `ghapp` from PATH.
+          SHIPYARD_GHAPP_PATH: ${{ vars.SHIPYARD_GHAPP_PATH || '' }}
           SHIPYARD_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
           SHIPYARD_NOTARIZE_APP_PASSWORD: ${{ secrets.MACOS_NOTARIZE_APP_PASSWORD }}
           SHIPYARD_NOTARIZE_TEAM_ID: ${{ secrets.MACOS_NOTARIZE_TEAM_ID }}
@@ -398,6 +401,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ -z "${SHIPYARD_GHAPP_PATH}" ]]; then
+            SHIPYARD_GHAPP_PATH="$(command -v ghapp || true)"
+          fi
+          if [[ -z "${SHIPYARD_GHAPP_PATH}" || ! -x "${SHIPYARD_GHAPP_PATH}" ]]; then
+            echo "authenticated ghapp wrapper is unavailable; set SHIPYARD_GHAPP_PATH or install ghapp on PATH" >&2
+            exit 1
+          fi
+          export SHIPYARD_GHAPP_PATH
           scripts/release-macos-local.sh \
             --repo "${{ github.repository }}" \
             --tag "${{ github.ref_name }}" \

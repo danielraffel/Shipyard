@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import pwd
 import shutil
 import stat
 import subprocess
@@ -22,7 +21,7 @@ import release_env
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO = "danielraffel/Shipyard"
-GHAPP_PATH = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local" / "bin" / "ghapp"
+GHAPP_ENV = "SHIPYARD_GHAPP_PATH"
 DEFAULT_LOCAL_ENV_FILES = (
     Path.home() / ".config" / "pulp" / "secrets" / "keychain.env",
     Path.home() / ".config" / "pulp" / "secrets" / "notary.env",
@@ -128,13 +127,34 @@ def ci_prepared_signing_keychain() -> bool:
 
 
 def require_ghapp() -> str:
-    """Return the installed App wrapper for the account running this process."""
-    if not GHAPP_PATH.is_file() or not os.access(GHAPP_PATH, os.X_OK):
-        raise SystemExit(
-            "the installed ghapp wrapper is missing or not executable for the "
-            f"release runner account: {GHAPP_PATH}"
-        )
-    return str(GHAPP_PATH)
+    """Return the configured or PATH-resolved App wrapper.
+
+    Release runners may run under a service account whose home directory is
+    unrelated to the managed wrapper installation.  An explicit path wins;
+    otherwise resolve the command from the runner's authenticated PATH.  Do
+    not silently fall back to an owner's ambient ``gh`` login.
+    """
+    configured = os.environ.get(GHAPP_ENV)
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(configured))
+    else:
+        discovered = shutil.which("ghapp")
+        if discovered:
+            candidates.append(Path(discovered))
+    for candidate in candidates:
+        if not candidate.is_absolute():
+            continue
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            continue
+    detail = configured or "ghapp on PATH"
+    raise SystemExit(
+        "the configured authenticated ghapp wrapper is missing or not executable: "
+        f"{detail} (set {GHAPP_ENV} or install ghapp on PATH)"
+    )
 
 
 def resolve_environment_files(requested: list[Path]) -> list[Path]:
