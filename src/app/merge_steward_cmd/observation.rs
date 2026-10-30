@@ -532,7 +532,7 @@ pub(super) fn pull_requests(
                 );
             }
             let mut rows = rows.iter().map(rest_pull_request_row).collect::<Vec<_>>();
-            hydrate_rest_merge_states(actions, &repo, positions, &mut rows);
+            hydrate_rest_merge_states(actions, repo, positions, &mut rows);
             Value::Array(rows)
         }
         Err(error) => return Err(error),

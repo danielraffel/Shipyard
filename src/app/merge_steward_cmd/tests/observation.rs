@@ -348,13 +348,12 @@ fn open_pr_list_falls_back_to_rest_after_gateway_failure() {
 case "$*" in
   *"pr list"*) echo "HTTP 502 Bad Gateway" >&2; exit 1 ;;
   *"repos/owner/repo/pulls?state=open&base=main&per_page=100&page=1"*)
-    printf '%s' '{rows}' ;;
+    printf '%s' '{REST_LIST_ROWS}' ;;
   *"repos/owner/repo/pulls/42") printf '%s' '{{"number":42,"mergeable_state":"clean","head":{{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
             calls = calls_path.display(),
-            rows = REST_LIST_ROWS.replace('\n', ""),
         ),
     );
     let positions = BTreeMap::from([(44, 0)]);
@@ -389,12 +388,11 @@ fn rest_fallback_refuses_a_candidate_whose_merge_state_is_unreadable() {
         &format!(
             r#"case "$*" in
   *"pr list"*) echo "HTTP 502 Bad Gateway" >&2; exit 1 ;;
-  *"repos/owner/repo/pulls?state=open"*) printf '%s' '{rows}' ;;
+  *"repos/owner/repo/pulls?state=open"*) printf '%s' '{REST_LIST_ROWS}' ;;
   *"repos/owner/repo/pulls/42") echo "HTTP 500" >&2; exit 1 ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
-            rows = REST_LIST_ROWS,
         ),
     );
     let prs = pull_requests(&actions, "owner/repo", "main", &BTreeMap::from([(44, 0)]))
@@ -414,12 +412,11 @@ fn rest_fallback_refuses_a_candidate_whose_head_moved_before_the_state_read() {
         &format!(
             r#"case "$*" in
   *"pr list"*) echo "HTTP 502 Bad Gateway" >&2; exit 1 ;;
-  *"repos/owner/repo/pulls?state=open"*) printf '%s' '{rows}' ;;
+  *"repos/owner/repo/pulls?state=open"*) printf '%s' '{REST_LIST_ROWS}' ;;
   *"repos/owner/repo/pulls/42") printf '%s' '{{"mergeable_state":"clean","head":{{"sha":"dddddddddddddddddddddddddddddddddddddddd"}}}}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
-            rows = REST_LIST_ROWS,
         ),
     );
     let prs =
