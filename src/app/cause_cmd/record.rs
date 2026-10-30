@@ -466,25 +466,18 @@ fn may_hold_red(run: &Value) -> bool {
     }
 }
 
-/// One pass: causes for new red jobs, then fix-links for reds now green.
-pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<RecordReport, String> {
-    fs::create_dir_all(&query.dir).map_err(|error| error.to_string())?;
-    super::require_archive_parent(&query.dir)?;
-    // A pending prune is recoverable writer state, not a reason to abandon a
-    // scheduled collection pass. Recover it before taking the shared snapshot.
-    super::retention::ensure_not_frozen(&query.dir)?;
-    if super::retention::has_pending_transaction(&query.dir) {
-        let _lock = super::lock_archive(&query.dir, true)?;
-    }
-    // The GitHub observation pass can take minutes.  Hold only a shared
-    // snapshot lock while reading the archive, then release it before any
-    // network calls.  The final exclusive section re-reads and deduplicates
-    // against writers that finished while this pass was observing GitHub.
-    let (archived, linked) = {
-        let _lock = super::lock_archive(&query.dir, false)?;
-        super::require_archive_parent(&query.dir)?;
-        (archived_causes(&query.dir)?, linked_fixlinks(&query.dir)?)
-    };
+struct Observation {
+    report: RecordReport,
+    by_month: BTreeMap<String, Vec<Value>>,
+    fixlinks: Vec<Value>,
+}
+
+fn observe(
+    gh: &SyncGhReader<'_>,
+    query: &RecordQuery,
+    archived: &[Value],
+    linked: &BTreeSet<(String, u64, u64)>,
+) -> Result<Observation, String> {
     let mut report = RecordReport::default();
     let mut pulls = BTreeMap::new();
     let recorded: BTreeSet<(String, u64)> = archived
@@ -545,7 +538,7 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
                 Err(error) => report.unreadable.push(error),
             }
         }
-        report.inherited += labels::inherit_from_summarised(&mut run_rows, &archived);
+        report.inherited += labels::inherit_from_summarised(&mut run_rows, archived);
         for row in run_rows {
             if row["labelled_by"] == "step" {
                 report.labelled_by_step += 1;
@@ -556,12 +549,9 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
                 .unwrap_or("undated")
                 .to_owned();
             by_month.entry(month).or_default().push(row);
-            report.causes_written += 1;
         }
     }
-    // Fix-link discovery is also observational and must remain outside the
-    // exclusive archive lock.  Its candidates are filtered again below.
-    let mut all_observed_causes = archived.clone();
+    let mut all_observed_causes = archived.to_vec();
     for rows in by_month.values() {
         all_observed_causes.extend(rows.iter().cloned());
     }
@@ -571,9 +561,42 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
         &run_index,
         &mut pulls,
         &mut report,
-        &linked,
+        linked,
         &all_observed_causes,
     )?;
+    Ok(Observation {
+        report,
+        by_month,
+        fixlinks: observed_fixlinks,
+    })
+}
+
+/// One pass: causes for new red jobs, then fix-links for reds now green.
+pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<RecordReport, String> {
+    fs::create_dir_all(&query.dir).map_err(|error| error.to_string())?;
+    super::require_archive_parent(&query.dir)?;
+    // A pending prune is recoverable writer state, not a reason to abandon a
+    // scheduled collection pass. Recover it before taking the shared snapshot.
+    super::retention::ensure_not_frozen(&query.dir)?;
+    if super::retention::has_pending_transaction(&query.dir) {
+        let _lock = super::lock_archive(&query.dir, true)?;
+    }
+    // The GitHub observation pass can take minutes.  Hold only a shared
+    // snapshot lock while reading the archive, then release it before any
+    // network calls.  The final exclusive section re-reads and deduplicates
+    // against writers that finished while this pass was observing GitHub.
+    let (archived, linked) = {
+        let _lock = super::lock_archive(&query.dir, false)?;
+        super::require_archive_parent(&query.dir)?;
+        (archived_causes(&query.dir)?, linked_fixlinks(&query.dir)?)
+    };
+    // Fix-link discovery is observational and remains outside the exclusive
+    // archive lock; candidates are filtered against the final snapshot below.
+    let Observation {
+        mut report,
+        by_month,
+        fixlinks: observed_fixlinks,
+    } = observe(gh, query, &archived, &linked)?;
 
     let _lock = super::lock_archive(&query.dir, true)?;
     super::require_archive_parent(&query.dir)?;

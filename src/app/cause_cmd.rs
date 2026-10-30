@@ -95,10 +95,22 @@ pub(super) fn cause_command<W: Write>(
 }
 
 /// Hold a managed archive lock for the complete reader or writer operation.
-/// Unmanaged historical corpora can be read without creating files; they cannot
-/// be pruned. Readers refuse interrupted transactions without modifying data.
+/// A markerless archive with canonical `causes/` or `fixlinks.jsonl` data
+/// bootstraps a lock before reading so concurrent writers cannot race it;
+/// markerless non-canonical fixtures remain read-only and file-free. Readers
+/// refuse interrupted transactions without modifying data.
 pub(crate) struct ArchiveLock {
     _file: Option<std::fs::File>,
+}
+
+fn validate_archive_root(dir: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err("archive root must be a real directory".to_owned())
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+        _ => Ok(()),
+    }
 }
 
 fn validate_archive_layout(dir: &Path) -> Result<(), String> {
@@ -134,12 +146,19 @@ fn validate_archive_layout(dir: &Path) -> Result<(), String> {
 }
 
 pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, String> {
+    validate_archive_root(dir)?;
     // Check before creating a lock so a frozen archive remains byte-for-byte
     // untouched when it has never been opened by this process.
     if exclusive {
         retention::ensure_not_frozen(dir)?;
     } else if retention::is_frozen(dir)? {
         validate_archive_layout(dir)?;
+        if retention::has_pending_transaction(dir) {
+            return Err(
+                "archive has an interrupted prune; run cause prune --apply to recover before reading"
+                    .to_owned(),
+            );
+        }
         return Ok(ArchiveLock { _file: None });
     }
     if exclusive {
@@ -175,18 +194,14 @@ pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, S
             validate_archive_layout(dir)?;
             let canonical = dir.join("causes").exists() || dir.join("fixlinks.jsonl").exists();
             if retention::has_pending_transaction(dir) || canonical {
-                let _bootstrap = lock_archive(dir, true)?;
-                drop(_bootstrap);
+                let bootstrap = lock_archive(dir, true)?;
+                drop(bootstrap);
                 return lock_archive(dir, false);
             }
             return Ok(ArchiveLock { _file: None });
         }
         Err(error) if !exclusive && error.kind() == std::io::ErrorKind::PermissionDenied => {
-            if retention::has_pending_transaction(dir) {
-                return Err(error.to_string());
-            }
-            validate_archive_layout(dir)?;
-            return Ok(ArchiveLock { _file: None });
+            return Err(error.to_string());
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -215,10 +230,11 @@ pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, S
     validate_archive_layout(dir)?;
     if exclusive {
         retention::recover_pending_transaction(dir)?;
-    } else {
-        if retention::has_pending_transaction(dir) {
-            return Err("archive has an interrupted prune; run cause prune --apply to recover before reading".to_owned());
-        }
+    } else if retention::has_pending_transaction(dir) {
+        return Err(
+            "archive has an interrupted prune; run cause prune --apply to recover before reading"
+                .to_owned(),
+        );
     }
     Ok(ArchiveLock { _file: Some(lock) })
 }

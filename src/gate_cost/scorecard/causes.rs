@@ -270,6 +270,84 @@ pub fn gather(
     read
 }
 
+fn read_archive_file(
+    path: &Path,
+    repo: &str,
+    read: &mut CausesRead,
+    bytes: &mut u64,
+    lines: &mut usize,
+) -> bool {
+    let Ok(file_bytes) = path.metadata().map(|metadata| metadata.len()) else {
+        read.archive_malformed += 1;
+        return false;
+    };
+    if file_bytes > MAX_ARCHIVE_BYTES.saturating_sub(*bytes) {
+        read.archive_truncated = true;
+        return true;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        read.archive_malformed += 1;
+        return false;
+    };
+    let remaining = MAX_ARCHIVE_BYTES.saturating_sub(*bytes);
+    let mut reader = std::io::BufReader::new(file.take(remaining.saturating_add(1)));
+    let mut file_bytes = 0u64;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let Ok(count) = reader.read_line(&mut line) else {
+            read.archive_malformed += 1;
+            break;
+        };
+        if count == 0 {
+            break;
+        }
+        file_bytes = file_bytes.saturating_add(count as u64);
+        if file_bytes > remaining {
+            read.archive_truncated = true;
+            return true;
+        }
+        *bytes = bytes.saturating_add(count as u64);
+        *lines += 1;
+        if *bytes > MAX_ARCHIVE_BYTES || *lines > MAX_ARCHIVE_LINES {
+            read.archive_truncated = true;
+            return true;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(cause) = serde_json::from_str::<CiCause>(&line) else {
+            read.archive_malformed += 1;
+            continue;
+        };
+        read.archive_rows += 1;
+        if cause.schema != crate::diagnose::cause::SCHEMA
+            || cause.repo != repo
+            || cause_key(&cause).is_none()
+        {
+            read.archive_malformed += 1;
+            continue;
+        }
+        let Some(key) = cause_key(&cause) else {
+            continue;
+        };
+        if read.ambiguous.contains(&key.base) {
+            read.archive_duplicates += 1;
+            continue;
+        }
+        if let Some(existing) = read.by_base.remove(&key.base) {
+            read.by_case.remove(&existing);
+            read.ambiguous.insert(key.base);
+            read.archive_duplicates += 1;
+            continue;
+        }
+        read.by_base.insert(key.base.clone(), key.clone());
+        read.by_case.insert(key.clone(), cause.clone());
+        read.by_job.insert(key.base.job_id, cause);
+    }
+    false
+}
+
 /// Read a bounded append-only `cause` archive for one repository.
 ///
 /// Rows without a complete `(repo, run_id, job_id)` identity, rows for another
@@ -308,73 +386,8 @@ pub fn archive(dir: &Path, repo: &str) -> Result<CausesRead, String> {
     let mut bytes = 0u64;
     let mut lines = 0usize;
     for path in files {
-        let Ok(file_bytes) = path.metadata().map(|metadata| metadata.len()) else {
-            read.archive_malformed += 1;
-            continue;
-        };
-        if file_bytes > MAX_ARCHIVE_BYTES.saturating_sub(bytes) {
-            read.archive_truncated = true;
+        if read_archive_file(&path, repo, &mut read, &mut bytes, &mut lines) {
             return Ok(read);
-        }
-        let Ok(file) = std::fs::File::open(&path) else {
-            read.archive_malformed += 1;
-            continue;
-        };
-        let remaining = MAX_ARCHIVE_BYTES.saturating_sub(bytes);
-        let mut reader = std::io::BufReader::new(file.take(remaining.saturating_add(1)));
-        let mut file_bytes = 0u64;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let Ok(count) = reader.read_line(&mut line) else {
-                read.archive_malformed += 1;
-                break;
-            };
-            if count == 0 {
-                break;
-            }
-            file_bytes = file_bytes.saturating_add(count as u64);
-            if file_bytes > remaining {
-                read.archive_truncated = true;
-                return Ok(read);
-            }
-            bytes = bytes.saturating_add(count as u64);
-            lines += 1;
-            if bytes > MAX_ARCHIVE_BYTES || lines > MAX_ARCHIVE_LINES {
-                read.archive_truncated = true;
-                return Ok(read);
-            }
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(cause) = serde_json::from_str::<CiCause>(&line) else {
-                read.archive_malformed += 1;
-                continue;
-            };
-            read.archive_rows += 1;
-            if cause.schema != crate::diagnose::cause::SCHEMA
-                || cause.repo != repo
-                || cause_key(&cause).is_none()
-            {
-                read.archive_malformed += 1;
-                continue;
-            }
-            let Some(key) = cause_key(&cause) else {
-                continue;
-            };
-            if read.ambiguous.contains(&key.base) {
-                read.archive_duplicates += 1;
-                continue;
-            }
-            if let Some(existing) = read.by_base.remove(&key.base) {
-                read.by_case.remove(&existing);
-                read.ambiguous.insert(key.base);
-                read.archive_duplicates += 1;
-                continue;
-            }
-            read.by_base.insert(key.base.clone(), key.clone());
-            read.by_case.insert(key.clone(), cause.clone());
-            read.by_job.insert(key.base.job_id, cause);
         }
     }
     read.unreadable

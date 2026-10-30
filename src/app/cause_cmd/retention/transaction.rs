@@ -149,7 +149,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     }
     let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let count = file
             .read(&mut buffer)
@@ -233,7 +233,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .create_new(true)
         .open(&temp)
         .map_err(|error| format!("{}: {error}", temp.display()))?;
-    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(&temp);
         return Err(format!("{}: {error}", temp.display()));
     }
@@ -483,15 +483,14 @@ fn validate_manifest(
                 target.display()
             ));
         }
-        if entry.existed {
-            if let Ok(meta) = fs::symlink_metadata(&target)
-                && (meta.file_type().is_symlink() || !meta.is_file())
-            {
-                return Err(format!(
-                    "{} is not a regular archive file",
-                    target.display()
-                ));
-            }
+        if entry.existed
+            && let Ok(meta) = fs::symlink_metadata(&target)
+            && (meta.file_type().is_symlink() || !meta.is_file())
+        {
+            return Err(format!(
+                "{} is not a regular archive file",
+                target.display()
+            ));
         }
     }
     Ok(())
@@ -666,6 +665,89 @@ pub(crate) fn has_pending_transaction(dir: &Path) -> bool {
     fs::symlink_metadata(transaction_dir(dir)).is_ok()
 }
 
+fn prepare_entries(
+    dir: &Path,
+    tx: &Path,
+    grouped: &BTreeMap<PathBuf, Vec<String>>,
+    target_paths: &BTreeSet<PathBuf>,
+) -> Result<Vec<TransactionEntry>, String> {
+    let mut entries = Vec::new();
+    let mut transaction_bytes = 0u64;
+    for (index, path) in target_paths.iter().enumerate() {
+        let rel = path
+            .strip_prefix(dir)
+            .map_err(|_| format!("archive path escapes {}", dir.display()))?
+            .to_str()
+            .ok_or_else(|| "archive path is not valid UTF-8".to_owned())?
+            .to_owned();
+        let target = validate_archive_target(dir, &rel)?;
+        let existed = fs::symlink_metadata(&target).is_ok();
+        let old_name = format!("old/{index}");
+        let old_sha256 = if existed {
+            let metadata = fs::symlink_metadata(&target).map_err(|error| error.to_string())?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "{} is not a regular archive file",
+                    target.display()
+                ));
+            }
+            let old = tx.join(&old_name);
+            fs::copy(&target, &old).map_err(|error| error.to_string())?;
+            sync_file(&old)?;
+            sync_dir(&tx.join("old"))?;
+            add_transaction_bytes(&mut transaction_bytes, &old)?;
+            Some(sha256_file(&old)?)
+        } else {
+            None
+        };
+        let lines = grouped.get(path).map_or(&[] as &[String], Vec::as_slice);
+        let (new_name, new_sha256) = if lines.is_empty() {
+            (None, None)
+        } else {
+            let name = format!("new/{index}");
+            let digest = stage_file(&tx.join(&name), lines)?;
+            add_transaction_bytes(&mut transaction_bytes, &tx.join(&name))?;
+            (Some(name), Some(digest))
+        };
+        entries.push(TransactionEntry {
+            rel,
+            old: old_name,
+            old_sha256,
+            new: new_name,
+            new_sha256,
+            existed,
+        });
+    }
+    Ok(entries)
+}
+
+fn install_entries(dir: &Path, tx: &Path, entries: &[TransactionEntry]) -> Result<(), String> {
+    for entry in entries {
+        let target = validate_archive_target(dir, &entry.rel)?;
+        if let Ok(meta) = fs::symlink_metadata(&target) {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(format!("unsafe archive target {}", target.display()));
+            }
+            fs::remove_file(&target).map_err(|error| error.to_string())?;
+        }
+        if let Some(new) = &entry.new {
+            let staged = tx.join(new);
+            // Keep the staged bytes in the transaction. A second crash during
+            // rollback can then still validate the manifest and distinguish
+            // the old target from the intended replacement.
+            let expected = entry
+                .new_sha256
+                .as_deref()
+                .ok_or_else(|| "transaction entry lacks staged checksum".to_owned())?;
+            install_staged(&staged, &target, expected, dir)?;
+        }
+        if let Some(parent) = target.parent() {
+            sync_dir(parent)?;
+        }
+    }
+    sync_dir(dir)
+}
+
 pub(crate) fn apply_transaction(
     dir: &Path,
     grouped: &BTreeMap<PathBuf, Vec<String>>,
@@ -698,55 +780,9 @@ pub(crate) fn apply_transaction(
     fs::create_dir(tx.join("old")).map_err(|error| error.to_string())?;
     fs::create_dir(tx.join("new")).map_err(|error| error.to_string())?;
     sync_dir(&tx)?;
-    let mut entries = Vec::new();
-    let mut transaction_bytes = 0u64;
     let mut prepared = false;
     let result = (|| {
-        for (index, path) in target_paths.iter().enumerate() {
-            let rel = path
-                .strip_prefix(dir)
-                .map_err(|_| format!("archive path escapes {}", dir.display()))?
-                .to_str()
-                .ok_or_else(|| "archive path is not valid UTF-8".to_owned())?
-                .to_owned();
-            let target = validate_archive_target(dir, &rel)?;
-            let existed = fs::symlink_metadata(&target).is_ok();
-            let old_name = format!("old/{index}");
-            let old_sha256 = if existed {
-                let metadata = fs::symlink_metadata(&target).map_err(|error| error.to_string())?;
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    return Err(format!(
-                        "{} is not a regular archive file",
-                        target.display()
-                    ));
-                }
-                let old = tx.join(&old_name);
-                fs::copy(&target, &old).map_err(|error| error.to_string())?;
-                sync_file(&old)?;
-                sync_dir(&tx.join("old"))?;
-                add_transaction_bytes(&mut transaction_bytes, &old)?;
-                Some(sha256_file(&old)?)
-            } else {
-                None
-            };
-            let lines = grouped.get(path).map(Vec::as_slice).unwrap_or(&[]);
-            let (new_name, new_sha256) = if lines.is_empty() {
-                (None, None)
-            } else {
-                let name = format!("new/{index}");
-                let digest = stage_file(&tx.join(&name), lines)?;
-                add_transaction_bytes(&mut transaction_bytes, &tx.join(&name))?;
-                (Some(name), Some(digest))
-            };
-            entries.push(TransactionEntry {
-                rel,
-                old: old_name,
-                old_sha256,
-                new: new_name,
-                new_sha256,
-                existed,
-            });
-        }
+        let entries = prepare_entries(dir, &tx, grouped, target_paths)?;
         let manifest = TransactionManifest {
             schema: TX_SCHEMA.to_owned(),
             state: "prepared".to_owned(),
@@ -763,30 +799,7 @@ pub(crate) fn apply_transaction(
         sync_dir(dir)?;
         prepared = true;
 
-        for entry in &manifest.entries {
-            let target = validate_archive_target(dir, &entry.rel)?;
-            if let Ok(meta) = fs::symlink_metadata(&target) {
-                if meta.file_type().is_symlink() || !meta.is_file() {
-                    return Err(format!("unsafe archive target {}", target.display()));
-                }
-                fs::remove_file(&target).map_err(|error| error.to_string())?;
-            }
-            if let Some(new) = &entry.new {
-                let staged = tx.join(new);
-                // Keep the staged bytes in the transaction. A second crash
-                // during rollback can then still validate the manifest and
-                // distinguish the old target from the intended replacement.
-                let expected = entry
-                    .new_sha256
-                    .as_deref()
-                    .ok_or_else(|| "transaction entry lacks staged checksum".to_owned())?;
-                install_staged(&staged, &target, expected, dir)?;
-            }
-            if let Some(parent) = target.parent() {
-                sync_dir(parent)?;
-            }
-        }
-        sync_dir(dir)?;
+        install_entries(dir, &tx, &manifest.entries)?;
         let mut hasher = Sha256::new();
         hasher.update(&manifest_bytes);
         let receipt = CommitReceipt {

@@ -587,6 +587,84 @@ fn plan_rows(
     ))
 }
 
+fn unresolved_rows(dir: &Path, causes: &[Row], links: &[Row]) -> Vec<UnresolvedRow> {
+    let keys: BTreeSet<_> = causes.iter().filter_map(|row| row.key.as_ref()).collect();
+    let ids: BTreeSet<_> = causes.iter().filter_map(|row| row.id.as_deref()).collect();
+    let mut unresolved = Vec::new();
+    for row in causes {
+        let reason = if row.key.is_none() {
+            Some("unkeyed_cause")
+        } else if row
+            .supersedes
+            .as_deref()
+            .is_some_and(|id| !ids.contains(id))
+        {
+            Some("unresolved_supersedes")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            unresolved.push(UnresolvedRow {
+                file: row
+                    .path
+                    .strip_prefix(dir)
+                    .unwrap_or(&row.path)
+                    .display()
+                    .to_string(),
+                line: row.line_number,
+                reason,
+            });
+        }
+    }
+    for row in links {
+        if row.key.as_ref().is_none_or(|key| !keys.contains(key)) {
+            unresolved.push(UnresolvedRow {
+                file: "fixlinks.jsonl".to_owned(),
+                line: row.line_number,
+                reason: "unmatched_fixlink",
+            });
+        }
+    }
+    unresolved
+}
+
+fn apply_prune_rows(
+    dir: &Path,
+    args: &CausePruneArgs,
+    causes: &[Row],
+    links: &[Row],
+    keep_causes: &[bool],
+    keep_links: &[bool],
+) -> Result<(), CliFailure> {
+    if args.initialize {
+        initialize_archive_marker(dir).map_err(|error| CliFailure::new(2, error))?;
+    }
+    let mut grouped: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    for (row, keep) in causes.iter().zip(keep_causes) {
+        if *keep {
+            grouped
+                .entry(row.path.clone())
+                .or_default()
+                .push(row.line.clone());
+        }
+    }
+    let mut target_paths = causes
+        .iter()
+        .map(|row| row.path.clone())
+        .collect::<BTreeSet<_>>();
+    let fix_path = dir.join("fixlinks.jsonl");
+    let retained_link_lines = links
+        .iter()
+        .zip(keep_links)
+        .filter_map(|(row, keep)| keep.then_some(row.line.clone()))
+        .collect::<Vec<_>>();
+    if fix_path.exists() || !retained_link_lines.is_empty() {
+        target_paths.insert(fix_path.clone());
+        grouped.insert(fix_path, retained_link_lines);
+    }
+    apply_transaction(dir, &grouped, &target_paths).map_err(|error| CliFailure::new(1, error))
+}
+
 fn prune(args: &CausePruneArgs) -> Result<Report, CliFailure> {
     if args.retention_days <= 0
         || args.retention_days > MAX_RETENTION_DAYS
@@ -632,73 +710,10 @@ fn prune(args: &CausePruneArgs) -> Result<Report, CliFailure> {
     let (keep_causes, keep_links, unresolved_fixlinks, unkeyed_causes, size_cap_overrode_age) =
         plan_rows(&causes, &links, cutoff, args.max_bytes)
             .map_err(|error| CliFailure::new(2, error))?;
-    let keys: BTreeSet<_> = causes.iter().filter_map(|row| row.key.as_ref()).collect();
-    let ids: BTreeSet<_> = causes.iter().filter_map(|row| row.id.as_deref()).collect();
-    let mut unresolved = Vec::new();
-    for row in &causes {
-        let reason = if row.key.is_none() {
-            Some("unkeyed_cause")
-        } else if row
-            .supersedes
-            .as_deref()
-            .is_some_and(|id| !ids.contains(id))
-        {
-            Some("unresolved_supersedes")
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            unresolved.push(UnresolvedRow {
-                file: row
-                    .path
-                    .strip_prefix(&args.dir)
-                    .unwrap_or(&row.path)
-                    .display()
-                    .to_string(),
-                line: row.line_number,
-                reason,
-            });
-        }
-    }
-    for row in &links {
-        if row.key.as_ref().is_none_or(|key| !keys.contains(key)) {
-            unresolved.push(UnresolvedRow {
-                file: "fixlinks.jsonl".to_owned(),
-                line: row.line_number,
-                reason: "unmatched_fixlink",
-            });
-        }
-    }
+    let unresolved = unresolved_rows(&args.dir, &causes, &links);
     let after = retained_bytes(&causes, &keep_causes, &links, &keep_links);
     if args.apply {
-        if args.initialize {
-            initialize_archive_marker(&args.dir).map_err(|error| CliFailure::new(2, error))?;
-        }
-        let mut grouped: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
-        for (row, keep) in causes.iter().zip(&keep_causes) {
-            if *keep {
-                grouped
-                    .entry(row.path.clone())
-                    .or_default()
-                    .push(row.line.clone());
-            }
-        }
-        let mut target_paths = causes
-            .iter()
-            .map(|row| row.path.clone())
-            .collect::<BTreeSet<_>>();
-        let fix_path = args.dir.join("fixlinks.jsonl");
-        let lines = links
-            .iter()
-            .zip(&keep_links)
-            .filter_map(|(row, keep)| keep.then_some(row.line.clone()))
-            .collect::<Vec<_>>();
-        if fix_path.exists() || !lines.is_empty() {
-            target_paths.insert(fix_path.clone());
-            grouped.insert(fix_path, lines);
-        }
-        apply_transaction(&args.dir, &grouped, &target_paths)
-            .map_err(|error| CliFailure::new(1, error))?;
+        apply_prune_rows(&args.dir, args, &causes, &links, &keep_causes, &keep_links)?;
     }
     Ok(Report {
         schema: "shipyard.cause-prune/v1",
