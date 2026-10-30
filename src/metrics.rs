@@ -412,6 +412,9 @@ pub struct StewardshipScorecard {
     /// Observation-only eligible `TartCI` slot-hours in this window. Unknown
     /// samples remain visible and make the denominator partial.
     pub fleet_capacity: FleetCapacityDenominator,
+    /// Safely merged changes per eligible fleet-hour. This is unavailable
+    /// without both durable safe-merge receipts and measured capacity.
+    pub safely_merged_changes_per_eligible_slot_hour: ScorecardCoverage,
     /// Basis of `comparison.verdict`.
     pub basis: &'static str,
     /// Load-independent proxies over this window (project-wide).
@@ -2523,6 +2526,8 @@ impl MetricsStore {
         let now = Utc::now();
         let fleet_capacity =
             self.fleet_capacity_denominator(project, &cutoff, &now.to_rfc3339())?;
+        let safely_merged_changes_per_eligible_slot_hour =
+            safe_merge_rate(safe_merge_count, &fleet_capacity);
         let (proxies, comparison) = proxy_store::scorecard_window(
             &proxy_store::load_samples(&conn, Some(project))?,
             now,
@@ -2621,6 +2626,7 @@ impl MetricsStore {
                 value: None,
             },
             fleet_capacity,
+            safely_merged_changes_per_eligible_slot_hour,
             basis: basis.as_str(),
             proxies,
             comparison,
