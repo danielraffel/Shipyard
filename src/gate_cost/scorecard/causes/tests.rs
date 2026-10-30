@@ -433,3 +433,93 @@ fn a_cached_cause_does_not_count_against_the_budget() {
     assert_eq!(read.unreadable[0].job_id, 42);
     assert_eq!(gh.calls.lock().expect("calls").len(), reads);
 }
+
+fn archive_cause(job_id: u64, run_id: u64, repo: &str) -> Value {
+    json!({
+        "schema": "ci.cause/v1",
+        "repo": repo,
+        "run_id": run_id,
+        "attempt": 1,
+        "job_id": job_id,
+        "job": "macos",
+        "head_sha": "a".repeat(40),
+        "event": "pull_request",
+        "pr": 10_154,
+        "failed_step": "test",
+        "failure_class": "test",
+        "format": "ctest",
+        "signature": VELLUM,
+        "detail": "failed",
+        "evidence": {"log_line": 10, "excerpt": ["failed"]},
+        "fix_hint": null,
+        "confidence": "high",
+        "source": "extractor",
+        "extractor": "test",
+        "named_at": "2026-10-12T21:25:47Z",
+        "supersedes": null,
+        "kind": "test",
+        "location": "test.cpp:1",
+        "step_failed": true,
+        "retrospective": true
+    })
+}
+
+#[test]
+fn archive_joins_exact_identity_and_reports_unjoined_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let causes = dir.path().join("causes");
+    std::fs::create_dir(&causes).expect("causes");
+    let path = causes.join("2026-10.jsonl");
+    let rows = [
+        archive_cause(GATE_JOB, 38_308_868_279, PULP),
+        archive_cause(999, 38_308_868_279, PULP),
+    ];
+    std::fs::write(
+        &path,
+        rows.iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("archive");
+    let read = archive(dir.path(), PULP);
+    assert_eq!(read.source, CauseSource::Archive);
+    assert_eq!(read.archive_rows, 2);
+    let mut cases = cases(&observation());
+    attach(&mut cases, &read);
+    let naming = compute(&cases, &read);
+    assert_eq!(naming.source, "archive");
+    assert_eq!(naming.named, 1);
+    assert_eq!(naming.archive_unjoined, 1);
+    assert_eq!(naming.archive_malformed, 0);
+}
+
+#[test]
+fn archive_duplicates_and_malformed_rows_stay_unreadable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let causes = dir.path().join("causes");
+    std::fs::create_dir(&causes).expect("causes");
+    let path = causes.join("2026-10.jsonl");
+    let duplicate = archive_cause(GATE_JOB, 38_308_868_279, PULP);
+    let mut wrong_repo = archive_cause(998, 38_308_868_279, "other/repo");
+    let mut missing_job = archive_cause(997, 38_308_868_279, PULP);
+    missing_job["job_id"] = Value::Null;
+    wrong_repo["repo"] = json!("other/repo");
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n{}\n{}\n{{bad json}}\n",
+            duplicate, duplicate, wrong_repo, missing_job
+        ),
+    )
+    .expect("archive");
+    let read = archive(dir.path(), PULP);
+    assert_eq!(read.archive_rows, 4);
+    assert_eq!(read.archive_duplicates, 1);
+    assert_eq!(read.archive_malformed, 3);
+    let mut cases = cases(&observation());
+    attach(&mut cases, &read);
+    let naming = compute(&cases, &read);
+    assert_eq!(naming.named, 0, "ambiguous causes must not be joined");
+    assert_eq!(naming.unreadable, 2, "the duplicate job is unreadable");
+}

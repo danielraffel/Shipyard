@@ -32,6 +32,7 @@ pub(super) fn gate_cost_command<W: Write>(
     let scorecard = args.scorecard;
     let flakes = args.flakes;
     let causes = args.causes;
+    let causes_archive = args.causes_archive.clone();
     let causes_max_jobs = args.causes_max_jobs;
     let required_contexts = args.required_contexts.clone();
     let selection_steps = args.selection_steps.clone();
@@ -63,7 +64,11 @@ pub(super) fn gate_cost_command<W: Write>(
             .map_err(|error| CliFailure::new(1, format!("scorecard read failed: {error}")))?;
         let mut report = scorecard::compute(&observation);
         let mut rows = scorecard::cases::cases(&observation);
-        if causes || export_cases.is_some() {
+        if let Some(dir) = causes_archive {
+            let read = scorecard::causes::archive(&dir, &observation.query.repo);
+            scorecard::causes::attach(&mut rows, &read);
+            report.cause_naming = Some(scorecard::causes::compute(&rows, &read));
+        } else if causes || export_cases.is_some() {
             report.cause_naming = Some(read_causes(
                 &reader,
                 &cache,
