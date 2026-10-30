@@ -1579,6 +1579,10 @@ pub(crate) enum CauseCommand {
     /// `causes/YYYY-MM.jsonl` per month of `named_at` under `--dir`. A record whose
     /// id is already archived is skipped; nothing is rewritten.
     Archive(CauseArchiveArgs),
+    /// Preview or apply bounded age/size retention to a local cause archive.
+    /// The default is a dry run; malformed or unclassifiable rows refuse the
+    /// operation rather than being guessed away.
+    Prune(CausePruneArgs),
     /// Keep a labels archive current: read the workflow's completed runs
     /// since `--since`, write a `ci.cause/v1` record for each red job not yet
     /// in `--dir`, and a fix-link for each red that a later run on its pull
@@ -1661,6 +1665,25 @@ pub(crate) struct CauseArchiveArgs {
     /// `cause` is taken). Repeatable.
     #[arg(long = "input", value_name = "FILE", required = true)]
     pub(crate) inputs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CausePruneArgs {
+    /// Cause archive parent (containing causes/ and fixlinks.jsonl).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) dir: PathBuf,
+    /// Keep rows named within this many days. Default: 365.
+    #[arg(long, default_value_t = 365)]
+    pub(crate) retention_days: i64,
+    /// Maximum retained JSONL payload bytes. Default: 64 MiB.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    pub(crate) max_bytes: u64,
+    /// Apply the planned rotation. Without this flag the command is a preview.
+    #[arg(long)]
+    pub(crate) apply: bool,
+    /// Explicitly enroll an existing unmarked archive before applying.
+    #[arg(long, requires = "apply")]
+    pub(crate) initialize: bool,
 }
 
 #[derive(Debug, Args)]

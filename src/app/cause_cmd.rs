@@ -26,6 +26,7 @@ use serde_json::Value;
 mod advice;
 mod audit;
 mod record;
+mod retention;
 
 use super::CliFailure;
 use super::cli::{CauseArchiveArgs, CauseCommand, CauseExtractArgs, CauseRecordArgs};
@@ -87,9 +88,87 @@ pub(super) fn cause_command<W: Write>(
             };
             written.map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
+        CauseCommand::Prune(args) => return retention::command(&args, json, stdout),
         CauseCommand::Audit(args) => return audit::command(&args, json, stdout),
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Hold a managed archive lock for the complete reader or writer operation.
+/// Unmanaged historical corpora can be read without creating files; they cannot
+/// be pruned. Readers refuse interrupted transactions without modifying data.
+pub(crate) struct ArchiveLock {
+    _file: Option<std::fs::File>,
+}
+
+pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, String> {
+    if exclusive {
+        fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    }
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("archive root must be a real directory".to_owned());
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.to_string()),
+        _ => {}
+    }
+    let lock_path = dir.join(".lock");
+    if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+        && !metadata.is_file()
+    {
+        return Err("archive lock must be a regular file".to_owned());
+    }
+    let lock = match OpenOptions::new()
+        .create(exclusive)
+        .truncate(false)
+        .read(true)
+        .write(exclusive)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        Err(error) if !exclusive && error.kind() == std::io::ErrorKind::NotFound => {
+            if retention::has_pending_transaction(dir)
+                || fs::symlink_metadata(dir.join(".shipyard-cause-archive.json")).is_ok()
+            {
+                return Err(
+                    "managed archive lacks its lock; repair the archive before reading".to_owned(),
+                );
+            }
+            return Ok(ArchiveLock { _file: None });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let result = if exclusive {
+            lock.try_lock_exclusive()
+        } else {
+            fs2::FileExt::try_lock_shared(&lock)
+        };
+        match result {
+            Ok(()) => break,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "archive lock unavailable after bounded wait: {error}"
+                ));
+            }
+        }
+    }
+    if exclusive {
+        retention::ensure_not_frozen(dir)?;
+        retention::recover_pending_transaction(dir)?;
+    } else {
+        if retention::has_pending_transaction(dir) {
+            return Err("archive has an interrupted prune; run cause prune --apply to recover before reading".to_owned());
+        }
+    }
+    Ok(ArchiveLock { _file: Some(lock) })
 }
 
 /// `cause record`: one observer pass over the live GitHub reader.
@@ -364,15 +443,9 @@ fn archived_ids(dir: &Path) -> Result<BTreeSet<String>, String> {
 
 /// Append `records` to the archive under `dir`, holding its lock.
 pub(super) fn archive(dir: &Path, lines: &[String]) -> Result<ArchiveReport, String> {
-    fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(".lock"))
-        .map_err(|error| error.to_string())?;
-    lock.lock_exclusive().map_err(|error| error.to_string())?;
+    let _lock = lock_archive(dir, true)?;
     require_archive_parent(dir)?;
+    retention::ensure_archive_marker(dir, false)?;
     fs::create_dir_all(causes_dir(dir)).map_err(|error| error.to_string())?;
     let mut seen = archived_ids(dir)?;
     let mut report = ArchiveReport::default();

@@ -599,6 +599,15 @@ is bound to that job (repo, head, run, attempt, job name) and names the cause
 the scorecard reads from the log, so a forged line changes nothing. Keep records with
 `shipyard cause archive --dir <labels checkout>/data/ci-cause --input <file>`
 (append-only, one file per month under `causes/`, ids never duplicated).
+Use `shipyard cause prune --dir <labels checkout>/data/ci-cause` as a dry-run
+to bound the private archive to 365 days and 64 MiB; add `--apply` only for a
+managed archive whose marker is mutable; use `--initialize` only for an explicit
+enrollment of an existing archive. The apply path locks, stages and checksums
+complete red-attempt evidence groups and recovers interrupted work.
+`--retention-days` and `--max-bytes` adjust the window within safe upper bounds;
+unkeyed causes, unmatched links and unresolved supersedes are preserved or the
+command refuses. Readers never recover or write during a preview.
+Malformed rows refuse rotation, and disabling observation does not delete data.
 
 **A rollup lands on its members' approvals.** On a base with `[train]
 mode = "rollup"`, a `shipyard-train/rollup-*` head with no verdict of its own

@@ -20,7 +20,6 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use fs2::FileExt;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -467,17 +466,12 @@ fn may_hold_red(run: &Value) -> bool {
 /// One pass: causes for new red jobs, then fix-links for reds now green.
 pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<RecordReport, String> {
     fs::create_dir_all(&query.dir).map_err(|error| error.to_string())?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(query.dir.join(".lock"))
-        .map_err(|error| error.to_string())?;
-    lock.lock_exclusive().map_err(|error| error.to_string())?;
+    let _lock = super::lock_archive(&query.dir, true)?;
 
     let mut report = RecordReport::default();
     let mut pulls = BTreeMap::new();
     super::require_archive_parent(&query.dir)?;
+    super::retention::ensure_archive_marker(&query.dir, false)?;
     let archived = archived_causes(&query.dir)?;
     let linked = linked_fixlinks(&query.dir)?;
     let recorded: BTreeSet<(String, u64)> = archived

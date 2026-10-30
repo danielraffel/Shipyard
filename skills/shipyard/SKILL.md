@@ -5358,3 +5358,13 @@ formatting and lint gates; m1 is a fallback, not a universal gate. Local gates
 do not grant merge authority: GitHub CI, branch protection, and the configured
 Shipyard mutation machine remain authoritative.
 
+### Cause archive retention
+
+Use `shipyard cause prune --dir <archive>` to preview a 365-day, 64 MiB
+retention policy. Applying it requires `--apply` and a mutable
+`.shipyard-cause-archive.json` marker. An existing unmarked archive requires the
+explicit `--initialize` enrollment flag. The operation is locked, checksummed
+and recoverable; readers never write during a preview. `--retention-days` and
+`--max-bytes` adjust the limits within their safe bounds. Collection does not
+automatically run pruning.
+
