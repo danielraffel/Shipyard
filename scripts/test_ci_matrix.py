@@ -427,7 +427,7 @@ class CiMatrixTests(unittest.TestCase):
                     names.setdefault(stripped, []).append(path.name)
         duplicated = {name: files for name, files in names.items() if len(files) > 1}
         self.assertEqual(duplicated, {})
-        self.assertIn("name: Test ${{ matrix.name }} [${{ matrix.provider }}]", names)
+        self.assertIn("name: Test ${{ matrix.name }}", names)
         self.assertIn("name: Sandbox ${{ matrix.name }} [${{ matrix.provider }}]", names)
 
     def test_rust_cache_never_runs_the_macos_save_hook(self) -> None:
