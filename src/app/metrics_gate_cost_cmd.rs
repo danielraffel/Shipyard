@@ -32,11 +32,17 @@ pub(super) fn gate_cost_command<W: Write>(
     let scorecard = args.scorecard;
     let flakes = args.flakes;
     let causes = args.causes;
+    let causes_archive = args.causes_archive.clone();
     let causes_max_jobs = args.causes_max_jobs;
     let required_contexts = args.required_contexts.clone();
     let selection_steps = args.selection_steps.clone();
     let export_cases = args.export_cases.clone();
     let query = resolve_query(args, &config, now)?;
+    let archive_causes = causes_archive
+        .as_deref()
+        .map(|dir| scorecard::causes::archive(dir, &query.repo))
+        .transpose()
+        .map_err(|error| CliFailure::new(1, error))?;
     let cache = if no_cache {
         ReadCache::disabled()
     } else {
@@ -63,7 +69,10 @@ pub(super) fn gate_cost_command<W: Write>(
             .map_err(|error| CliFailure::new(1, format!("scorecard read failed: {error}")))?;
         let mut report = scorecard::compute(&observation);
         let mut rows = scorecard::cases::cases(&observation);
-        if causes || export_cases.is_some() {
+        if let Some(read) = archive_causes {
+            scorecard::causes::attach(&mut rows, &read);
+            report.cause_naming = Some(scorecard::causes::compute(&rows, &read));
+        } else if causes || export_cases.is_some() {
             report.cause_naming = Some(read_causes(
                 &reader,
                 &cache,
@@ -95,21 +104,7 @@ pub(super) fn gate_cost_command<W: Write>(
                 .map_err(|error| CliFailure::new(1, format!("flake read failed: {error}")))?;
             report.same_sha_flakes = Some(scorecard::flakes::compute(&query.repo, &read));
         }
-        if json_output {
-            write_pretty_json(stdout, &report)
-                .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        } else {
-            write!(stdout, "{}", scorecard::render(&report))
-                .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            if let Some(flakes) = &report.same_sha_flakes {
-                write!(stdout, "{}", scorecard::flakes::render(flakes))
-                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            }
-            if let Some(naming) = &report.cause_naming {
-                write!(stdout, "{}", scorecard::causes::render(naming))
-                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            }
-        }
+        write_scorecard(stdout, &report, json_output)?;
         return Ok(std::process::ExitCode::SUCCESS);
     }
     let observation = gate_cost::gather_cached(&reader, &query, now, &cache)
@@ -123,6 +118,28 @@ pub(super) fn gate_cost_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+fn write_scorecard<W: Write>(
+    stdout: &mut W,
+    report: &scorecard::ScorecardReport,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    if json_output {
+        write_pretty_json(stdout, report).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else {
+        write!(stdout, "{}", scorecard::render(report))
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        if let Some(flakes) = &report.same_sha_flakes {
+            write!(stdout, "{}", scorecard::flakes::render(flakes))
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+        if let Some(naming) = &report.cause_naming {
+            write!(stdout, "{}", scorecard::causes::render(naming))
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Read the red cases' causes, put them on `rows`, and score them.
@@ -489,6 +506,57 @@ mod tests {
 
     use super::*;
     use crate::gate_cost::{GateCostObservation, compute};
+
+    #[test]
+    fn unavailable_archive_fails_without_output_or_exports() {
+        use crate::app::cli::{Cli, Command, MetricsCommand};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let export = dir.path().join("cases.jsonl");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "metrics",
+            "gate-cost",
+            "--repo",
+            "o/r",
+            "--workflow",
+            "build.yml",
+            "--gate-job",
+            "test",
+            "--scorecard",
+            "--causes-archive",
+            dir.path().to_str().expect("archive path"),
+            "--export-cases",
+            export.to_str().expect("export path"),
+        ]);
+        let Command::Metrics { command } = cli.command else {
+            panic!("metrics command")
+        };
+        let MetricsCommand::GateCost(args) = *command else {
+            panic!("gate-cost command")
+        };
+        let mut output = Vec::new();
+        let error = gate_cost_command(
+            *args,
+            RuntimeMode::Isolated,
+            dir.path(),
+            dir.path(),
+            true,
+            &mut output,
+        )
+        .expect_err("missing archive must fail before GitHub reads");
+        assert!(
+            error.message.contains("cause archive unavailable"),
+            "{}",
+            error.message
+        );
+        assert!(output.is_empty(), "must not print a zero-count report");
+        assert!(!export.exists(), "must not publish an empty export");
+        assert!(
+            !receipt_path(&export).exists(),
+            "must not publish an export receipt"
+        );
+    }
 
     /// The export and its receipt land next to each other, whole, and the
     /// receipt's hash is the file's.

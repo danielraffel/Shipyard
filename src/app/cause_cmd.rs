@@ -7,14 +7,16 @@
 //! read it back. It is also EXP-A3's entry point to C2 (`--format c2`), so the
 //! corpus and Shipyard use one extractor.
 //!
-//! `archive` appends records to `<dir>/YYYY-MM.jsonl` by the month of
+//! `archive` appends records to `<dir>/causes/YYYY-MM.jsonl` by the month of
 //! `named_at`. A record whose id is already in the archive is skipped; no
-//! line is ever rewritten.
+//! line is ever rewritten. The directory passed to `archive` is the parent
+//! containing `causes/` and `fixlinks.jsonl`, the same layout used by the
+//! recorder, advice, and audit commands.
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use fs2::FileExt;
@@ -291,9 +293,65 @@ fn month_file(record: &CiCause) -> String {
     format!("{month}.jsonl")
 }
 
+fn causes_dir(dir: &Path) -> PathBuf {
+    dir.join("causes")
+}
+
+fn legacy_root_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(files),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            && path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == "undated"
+                        || (name.len() == 7
+                            && name.as_bytes()[4] == b'-'
+                            && name
+                                .bytes()
+                                .enumerate()
+                                .all(|(i, b)| i == 4 || b.is_ascii_digit()))
+                })
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn require_archive_parent(dir: &Path) -> Result<(), String> {
+    let legacy = legacy_root_files(dir)?;
+    if !legacy.is_empty() {
+        let files = legacy
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "legacy cause archive files found directly under {} ({files}); use the parent directory if these files are already in causes/; otherwise reconcile them into {}/causes without overwriting existing files before retrying",
+            dir.display(),
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
 fn archived_ids(dir: &Path) -> Result<BTreeSet<String>, String> {
     let mut ids = BTreeSet::new();
-    for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
+    let entries = match fs::read_dir(causes_dir(dir)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
         let path = entry.map_err(|error| error.to_string())?.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
             continue;
@@ -314,6 +372,8 @@ pub(super) fn archive(dir: &Path, lines: &[String]) -> Result<ArchiveReport, Str
         .open(dir.join(".lock"))
         .map_err(|error| error.to_string())?;
     lock.lock_exclusive().map_err(|error| error.to_string())?;
+    require_archive_parent(dir)?;
+    fs::create_dir_all(causes_dir(dir)).map_err(|error| error.to_string())?;
     let mut seen = archived_ids(dir)?;
     let mut report = ArchiveReport::default();
     for line in lines.iter().filter(|line| !line.trim().is_empty()) {
@@ -328,7 +388,7 @@ pub(super) fn archive(dir: &Path, lines: &[String]) -> Result<ArchiveReport, Str
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join(month_file(&record)))
+            .open(causes_dir(dir).join(month_file(&record)))
             .map_err(|error| error.to_string())?;
         let mut bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
         bytes.push(b'\n');
