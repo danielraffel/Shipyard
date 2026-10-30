@@ -53,6 +53,9 @@ class ReleaseConfig:
 
 
 class CommandRunner:
+    def __init__(self, *, ci_mode: bool = False) -> None:
+        self.ci_gh = require_ci_gh() if ci_mode else None
+
     def run(
         self,
         args: list[str],
@@ -64,6 +67,10 @@ class CommandRunner:
         merged_env = os.environ.copy()
         if env:
             merged_env.update(env)
+        if self.ci_gh and args[0] == "gh":
+            args = [self.ci_gh, *args[1:]]
+            # Explicit job identity wins over any inherited CLI authentication.
+            merged_env["GH_TOKEN"] = os.environ["GITHUB_TOKEN"]
         result = subprocess.run(
             args,
             cwd=cwd,
@@ -124,6 +131,16 @@ def ci_prepared_signing_keychain() -> bool:
         os.environ.get("CI") == "true"
         and os.environ.get("SHIPYARD_SIGNING_KEYCHAIN_READY") == "1"
     )
+
+
+def require_ci_gh() -> str:
+    """Use only the Actions job token and the host's native CLI in CI."""
+    if os.environ.get("GITHUB_ACTIONS") != "true" or not os.environ.get("GITHUB_TOKEN"):
+        raise SystemExit("CI publication requires a GitHub Actions job token")
+    native = shutil.which("gh", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+    if not native:
+        raise SystemExit("CI publication requires native gh in a system installation path")
+    return native
 
 
 def require_ghapp() -> str:
@@ -339,30 +356,31 @@ def upload_artifact_and_checksums(
     artifact: Path,
     runner: CommandRunner,
 ) -> Path:
-    ghapp = require_ghapp()
+    publisher = "gh" if config.ci_mode else require_ghapp()
+    replace_flag = "--clobber" if config.ci_mode else "--replace-existing"
     runner.run(
         [
-            ghapp,
+            publisher,
             "release",
             "upload",
             "--repo",
             config.repo,
             config.tag,
             str(artifact),
-            "--replace-existing",
+            replace_flag,
         ]
     )
     checksums = merge_release_checksum(config, artifact, runner)
     runner.run(
         [
-            ghapp,
+            publisher,
             "release",
             "upload",
             "--repo",
             config.repo,
             config.tag,
             str(checksums),
-            "--replace-existing",
+            replace_flag,
         ]
     )
     return checksums
@@ -780,8 +798,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    runner = CommandRunner()
     args = parse_args(argv or sys.argv[1:])
+    runner = CommandRunner(ci_mode=args.ci_mode and (args.upload or args.publish_only))
     if args.defer_publish and not args.upload:
         raise SystemExit("--defer-publish only applies with --upload")
     if not args.publish_only:
