@@ -1,10 +1,14 @@
 import datetime as dt
 import importlib.util
+import io
 import json
+import os
 import subprocess
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location("collect_baseline", Path(__file__).with_name("collect_baseline.py"))
 MOD = importlib.util.module_from_spec(SPEC)
@@ -13,6 +17,73 @@ import baseline_pass_history as history
 
 
 class BaselineScorecardTests(unittest.TestCase):
+    def test_transient_provider_failure_classifier_does_not_retry_validation_errors(self):
+        transient = subprocess.CompletedProcess(
+            ["shipyard"], 1, "", "Get https://api.github.com: dial tcp 1.2.3.4:443: i/o timeout",
+        )
+        validation = subprocess.CompletedProcess(["shipyard"], 1, "", "invalid provider export")
+        self.assertTrue(MOD.transient_provider_failure(transient))
+        self.assertFalse(MOD.transient_provider_failure(validation))
+        self.assertFalse(MOD.transient_provider_failure(subprocess.CompletedProcess(["shipyard"], 0, "", "")))
+
+    def test_transient_provider_failure_classifier_covers_provider_outage_markers(self):
+        for message in (
+            "gh: HTTP 502 Bad Gateway",
+            "HTTP 503 Service Unavailable",
+            "HTTP 504 Gateway Timeout",
+            "HTTP 429: API rate limit exceeded",
+            "GraphQL: API rate limit already exceeded",
+            "ssh: connect to host m5s port 22: Operation timed out",
+            "ssh: Connection closed by remote host",
+            "provider: unexpected EOF",
+            "provider: temporarily unavailable",
+            "provider: deadline exceeded",
+            "provider: rate_limit exceeded",
+            "provider: timeout",
+            "command timed out after 300s: tartci",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(MOD.transient_provider_failure(
+                    subprocess.CompletedProcess(["provider"], 1, "", message)
+                ))
+
+    def test_provider_import_retries_command_timeout(self):
+        calls = []
+
+        def run_attempt(command, **kwargs):
+            calls.append(command)
+            if len(calls) == 1:
+                raise RuntimeError("command timed out after 300s: provider")
+            return subprocess.CompletedProcess(command, 0, '{"imported": 3}', "")
+
+        with mock.patch.object(MOD, "run", side_effect=run_attempt):
+            with mock.patch.object(MOD.time, "sleep") as sleep:
+                result = MOD.run_provider_with_retry(["provider"], retries=2, delay_seconds=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once_with(5)
+
+    def test_provider_retry_configuration_is_bounded_and_finite(self):
+        with self.assertRaises(ValueError):
+            MOD.run_provider_with_retry(["provider"], retries=MOD.MAX_PROVIDER_RETRIES + 1)
+        with self.assertRaises(ValueError):
+            MOD.run_provider_with_retry(["provider"], delay_seconds=float("nan"))
+        with self.assertRaises(ValueError):
+            MOD.run_provider_with_retry(["provider"], delay_seconds=MOD.MAX_PROVIDER_RETRY_DELAY_SECONDS + 1)
+
+    def test_provider_import_retries_transient_failure_with_bounded_backoff(self):
+        results = [
+            subprocess.CompletedProcess(["provider"], 1, "", "dial tcp 1.2.3.4:443: i/o timeout"),
+            subprocess.CompletedProcess(["provider"], 0, '{"imported": 3}', ""),
+        ]
+        calls = []
+        with mock.patch.object(MOD, "run", side_effect=lambda command, **kwargs: calls.append(command) or results.pop(0)):
+            with mock.patch.object(MOD.time, "sleep") as sleep:
+                result = MOD.run_provider_with_retry(["provider"], retries=2, delay_seconds=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once_with(5)
+
     def test_readiness_rejects_nonfinite_instrumentation_and_separates_lane_eligibility(self):
         started = dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc)
         observed = started + dt.timedelta(days=5)
@@ -357,6 +428,53 @@ class CollectorInvocationTests(unittest.TestCase):
             self.assertEqual(receipt["status"], "unavailable")
             self.assertIn("source empty", receipt["reason"])
 
+    def test_collect_allows_missing_merge_receipt_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            conn = __import__("sqlite3").connect(db)
+            conn.executescript("create table runs(id integer primary key, project text, repo text); create table jobs(id integer primary key, run_id integer, started_at text, completed_at text);")
+            conn.commit(); conn.close()
+            shipyard = root / "shipyard"; tartci = root / "tartci"
+            shipyard.write_text("#!/bin/sh\ncase \"$*\" in *merge-receipt*) echo 'unexpected merge receipt import' >&2; exit 1;; *) echo '{\"imported\": 1}' ;; esac\n")
+            tartci.write_text("#!/bin/sh\necho '{\"project\":\"p\",\"repo\":\"o/p\",\"provider\":\"tart\",\"external_id\":\"fixture-1\"}'\n")
+            shipyard.chmod(0o755); tartci.chmod(0o755)
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p", "repo": "o/p",
+                "shipyard": str(shipyard), "tartci": str(tartci), "limit": 1, "since_days": 5,
+                "timeout_seconds": 5, "merge_receipts": root / "missing-receipts.jsonl"})()
+            args.state.write_text("{}")
+            events = MOD.import_organic(args)
+            receipt = next(event for event in events if event.get("source") == "merge-receipt")
+            self.assertEqual(receipt["source"], "merge-receipt")
+            self.assertEqual(receipt["status"], "unavailable")
+            self.assertIn("handoff", receipt["reason"])
+            self.assertEqual(events[-1]["source"], "collection")
+
+    def test_collect_deduplicates_unavailable_event_from_newer_supervisor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
+            args = type("Args", (), {"db": db, "state": root / "state.json", "project": "p",
+                "repo": "o/p", "merge_receipts": root / "missing-receipts.jsonl"})()
+            args.state.write_text("{}")
+            provider_events = [
+                {"source": "github", "imported": 1},
+                {"source": "merge-receipt", "status": "unavailable", "reason": "wrapper"},
+            ]
+            with mock.patch.object(MOD, "_import_organic_after_preflight", return_value=provider_events):
+                events = MOD.import_organic(args)
+            self.assertEqual(sum(event.get("source") == "merge-receipt" for event in events), 1)
+            self.assertEqual(events[-1]["reason"], "wrapper")
+
+    def test_collect_does_not_treat_dangling_merge_receipt_link_as_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            handoff = root / "missing-receipts.jsonl"
+            os.symlink(root / "does-not-exist.jsonl", handoff)
+            args = type("Args", (), {"db": root / "metrics" / "metrics.db", "state": root / "state.json",
+                "project": "p", "repo": "o/p", "merge_receipts": handoff})()
+            args.state.write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "health sidecar is required"):
+                MOD.import_organic(args)
+
     def test_collect_refuses_unknown_provider_counts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); db = root / "metrics" / "metrics.db"; db.parent.mkdir()
@@ -536,6 +654,138 @@ class CollectorInvocationTests(unittest.TestCase):
             path.write_text(json.dumps({"repo": "other/repo"}) + "\n")
             with self.assertRaisesRegex(RuntimeError, "repository other than"):
                 MOD.validate_merge_receipt_scope(path, "owner/repo")
+
+class BaselineProviderRetryIntegrationTests(unittest.TestCase):
+    GITHUB_TIMEOUT = "metrics GitHub observation timed out"
+    TARTCI_TIMEOUT = "ssh: connect to host example port 22: Operation timed out"
+
+    def args(self, root, retries=2):
+        db = root / "metrics" / "metrics.db"
+        db.parent.mkdir()
+        with sqlite3.connect(db) as connection:
+            connection.executescript(
+                "create table runs(id integer primary key, project text, repo text);"
+                "create table jobs(id integer primary key, run_id integer, started_at text, completed_at text);"
+            )
+        return MOD.argparse.Namespace(
+            db=db, state=root / "state.json", project="pulp", repo="o/pulp",
+            shipyard="shipyard", tartci="tartci", limit=1, since_days=5,
+            timeout_seconds=300, provider_retries=retries, provider_retry_delay_seconds=5,
+        )
+
+    def provider_runner(self, failures, calls):
+        def run(command, **kwargs):
+            if command[:3] == ["tartci", "runtime", "export"]:
+                phase = "tartci_export"
+            elif command[3:6] == ["metrics", "import", "github"]:
+                phase = "github"
+            elif command[3:6] == ["metrics", "import", "tartci"]:
+                phase = "tartci_import"
+            else:
+                self.fail(f"unexpected provider command: {command}")
+            calls.append(phase)
+            if failures.get(phase, 0):
+                failures[phase] -= 1
+                error = self.GITHUB_TIMEOUT if phase == "github" else self.TARTCI_TIMEOUT
+                return subprocess.CompletedProcess(command, 1, "", error)
+            if phase == "tartci_export":
+                payload = '{"project":"pulp","repo":"o/pulp","provider":"tart","external_id":"fixture-1"}'
+            else:
+                payload = '{"imported": 1}'
+            return subprocess.CompletedProcess(command, 0, payload, "")
+        return run
+
+    def test_each_provider_timeout_recovers_through_import_organic(self):
+        for provider, expected_calls in (
+            ("github", ["github", "github", "tartci_export", "tartci_import"]),
+            ("tartci_export", ["github", "tartci_export", "tartci_export", "tartci_import"]),
+        ):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                args = self.args(Path(directory))
+                calls = []
+                with mock.patch.object(MOD, "run", side_effect=self.provider_runner({provider: 1}, calls)), \
+                        mock.patch.object(MOD.time, "sleep") as sleep:
+                    events = MOD.import_organic(args)
+                self.assertEqual(calls, expected_calls)
+                sleep.assert_called_once_with(5)
+                self.assertEqual([(e["source"], e["status"], e["imported"]) for e in events[:2]],
+                                 [("github", "completed", 1), ("tartci", "completed", 1)])
+                self.assertEqual(events[-1]["status"], "completed")
+
+    def test_each_provider_exhaustion_records_failed_history_and_exit_one(self):
+        for provider, expected_calls, error in (
+            ("github", ["github"] * 3, "GitHub import failed: " + self.GITHUB_TIMEOUT),
+            ("tartci_export", ["github"] + ["tartci_export"] * 3, "TartCI export failed: " + self.TARTCI_TIMEOUT),
+        ):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                args = self.args(root)
+                history_path = root / "pass-history.json"
+                argv = ["collect_baseline.py", "--db", str(args.db), "--project", args.project,
+                        "--repo", args.repo, "--state", str(args.state), "--collect",
+                        "--pass-history", str(history_path)]
+                calls, stderr, stdout = [], io.StringIO(), io.StringIO()
+                with mock.patch.object(MOD.sys, "argv", argv), \
+                        mock.patch.object(MOD.sys, "stderr", stderr), \
+                        mock.patch.object(MOD.sys, "stdout", stdout), \
+                        mock.patch.object(MOD, "run", side_effect=self.provider_runner({provider: 100}, calls)), \
+                        mock.patch.object(MOD.time, "sleep") as sleep, \
+                        mock.patch.object(MOD, "authoritative_scorecard") as scorecard, \
+                        mock.patch.object(MOD, "update_state") as update_state:
+                    exit_code = MOD.main()
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(calls, expected_calls)
+                self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(10)])
+                scorecard.assert_not_called()
+                update_state.assert_not_called()
+                self.assertFalse(args.state.exists(), "failed pass must not publish successful state")
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("baseline collection failed: " + error, stderr.getvalue())
+                self.assertNotIn("prospective pass history unavailable", stderr.getvalue())
+                observations = json.loads(history_path.read_text())["observations"]
+                self.assertEqual(len(observations), 1)
+                self.assertEqual(observations[0]["status"], "failed")
+                self.assertEqual(observations[0]["error"], error)
+
+    def test_zero_retries_stops_each_provider_after_one_attempt(self):
+        for provider, expected_calls, error in (
+            ("github", ["github"], "GitHub import failed: " + self.GITHUB_TIMEOUT),
+            ("tartci_export", ["github", "tartci_export"], "TartCI export failed: " + self.TARTCI_TIMEOUT),
+        ):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                args = self.args(Path(directory), retries=0)
+                calls = []
+                with mock.patch.object(MOD, "run", side_effect=self.provider_runner({provider: 100}, calls)), \
+                        mock.patch.object(MOD.time, "sleep") as sleep:
+                    with self.assertRaises(RuntimeError) as caught:
+                        MOD.import_organic(args)
+                self.assertEqual(str(caught.exception), error)
+                self.assertEqual(calls, expected_calls)
+                sleep.assert_not_called()
+
+    def test_provider_metadata_does_not_override_a_terminal_error(self):
+        for stdout, stderr in (
+            ('{"timeout_seconds":300}', "invalid export"),
+            ('{"deadline":"2026-10-30T00:00:00Z"}', "authentication failed"),
+            ('{"timeout_seconds":300,"deadline":"configured"}', ""),
+            ("", "invalid export field timeout_seconds or deadline"),
+        ):
+            with self.subTest(stdout=stdout, stderr=stderr):
+                failed = subprocess.CompletedProcess(["provider"], 1, stdout, stderr)
+                self.assertFalse(MOD.transient_provider_failure(failed))
+                with mock.patch.object(MOD, "run", return_value=failed) as run, \
+                        mock.patch.object(MOD.time, "sleep") as sleep:
+                    result = MOD.run_provider_with_retry(["provider"])
+                self.assertIs(result, failed)
+                run.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_stdout_transport_diagnostic_remains_retryable_without_stderr(self):
+        for diagnostic in ("HTTP 503 Service Unavailable", "provider: timeout", "context deadline exceeded"):
+            with self.subTest(diagnostic=diagnostic):
+                result = subprocess.CompletedProcess(["provider"], 1, diagnostic, "")
+                self.assertTrue(MOD.transient_provider_failure(result))
+
 
 if __name__ == "__main__":
     unittest.main()

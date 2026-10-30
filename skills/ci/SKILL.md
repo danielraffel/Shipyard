@@ -12,6 +12,13 @@ identity (`app_id`) when policy distinguishes checks that share a context name.
 If the materialized endpoint omits that identity, retain ambiguous skipped
 attempts so a success from one producer cannot satisfy another producer.
 
+`metrics repeated-work-cost` is read-only accounting for shadow observations
+within its explicit `--since` baseline window. Its `duration_ms` is measured
+runtime from authenticated timing for each distinct superseded queue job, with
+clean, uncertain, cancelled, and unmatched coverage. It never uses survivor
+runtime as savings; never use it to skip validation, alter routing, or authorize
+a merge.
+
 ## Adopting Shipyard, or checking what a repository already has
 
 Before wiring any CI machinery into a repository (a PR gate, a merge queue, a
@@ -84,6 +91,16 @@ refreshing the daemon or clearing token caches: the credential is valid, and
 that remedy belongs to a different fault that merely shares the 403 status code.
 
 ## Metrics authority
+
+`shipyard metrics gate-cost --scorecard --causes-archive DIR` is a bounded,
+read-only historical cause score. It reads JSONL under `DIR/causes/`, requires
+the exact repository/run/positive-attempt/job identity, rejects duplicate or
+malformed rows, and reports archive provenance plus unjoined coverage. It never
+feeds queue, routing, validation, or merge decisions. Live `--causes` remains
+the separate GitHub job-log read.
+Missing or unreadable `DIR/causes/` fails with `cause archive unavailable` before
+GitHub reads or case exports; it never produces a successful zero-count report.
+A readable empty archive remains valid and leaves cases unjoined.
 
 Metrics verdicts (`shipyard metrics compare|watch|trend|scorecard`) default to
 load-independent proxies; wall-clock p50/p90 is load-dependent context. Do not
@@ -584,8 +601,9 @@ record's own `named_at`.
 It prints `::notice title=ci-cause::<record>`, so the job's own log holds its
 `ci.cause/v1` record; the scorecard keeps its `named_at` only when the record
 is bound to that job (repo, head, run, attempt, job name) and names the cause
-the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
-<file>` (append-only, one file per month, ids never duplicated).
+the scorecard reads from the log, so a forged line changes nothing. Keep records with
+`shipyard cause archive --dir <labels checkout>/data/ci-cause --input <file>`
+(append-only, one file per month under `causes/`, ids never duplicated).
 
 **A rollup lands on its members' approvals.** On a base with `[train]
 mode = "rollup"`, a `shipyard-train/rollup-*` head with no verdict of its own
@@ -1151,7 +1169,7 @@ writer custody before mutation.
 | Dispatch only if remote matches HEAD | `shipyard cloud run build --require-sha HEAD --json` |
 | Opt a target into cross-PR reuse | set `reuse_if_paths_unchanged = ["src/backend/**"]` under `[targets.<name>]` |
 | Opt a target into warm-pool reuse | set `warm_keepalive_seconds = 600` under `[targets.<name>]` (see "Warm-pool reuse" below) |
-| Inspect warm-pool entries | `shipyard targets warm status --json` |
+| Inspect warm-pool entries | `shipyard targets warm status --json` (host-pool entries include the selected `member_id` when known) |
 | Drain the warm-pool (force cold-start everywhere) | `shipyard targets warm drain --yes` |
 | Force cold-start for one ship only | `shipyard ship --no-warm` (or `shipyard run --no-warm`) |
 | Global warm-pool kill switch | `SHIPYARD_NO_WARM_POOL=1` in the environment |
@@ -4209,7 +4227,10 @@ waste is not limited to the scorecard window.
 # Repeated-work cost
 
 `shipyard metrics repeated-work-cost` is read-only shadow accounting. Treat
-duration as unavailable until queue-to-metrics provenance is authenticated.
+`duration_ms` as measured superseded-job runtime from the authenticated queue
+timing table within the requested `--since` window. It counts each distinct
+superseded job once; uncertain, cancelled, and unmatched jobs remain coverage
+gaps, and the result never authorizes a queue or merge decision.
 
 
 At the protected merge boundary, Shipyard may produce that receipt only after
