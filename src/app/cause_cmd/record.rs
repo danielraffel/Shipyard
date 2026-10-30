@@ -707,8 +707,8 @@ fn append_causes_and_fixlinks(
         query,
         &run_index,
         &incomplete_reds,
-        &mut pulls,
-        &mut report,
+        pulls,
+        report,
         linked,
         &all_causes,
     )?;

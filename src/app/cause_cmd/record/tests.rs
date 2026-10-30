@@ -1428,24 +1428,16 @@ fn pending_reds_are_counted_by_how_long_ago_they_went_red() {
 
 #[test]
 fn malformed_archived_red_head_is_not_pending_for_fix_linking() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir(dir.path().join("causes")).expect("causes");
-    std::fs::write(
-        dir.path().join("causes/2026-10.jsonl"),
-        json!({
+    let rows = vec![json!({
             "failure_class": "build",
             "repo": "Generous-Corp/pulp",
             "run_id": 100,
             "attempt": 1,
             "head_sha": "short",
             "completed_at": "2026-10-14T10:30:00Z"
-        })
-        .to_string()
-            + "\n",
-    )
-    .expect("archive");
+        })];
 
-    assert!(pending_reds(dir.path(), "2026-10-13T00:00:00Z", &BTreeSet::new()).is_empty());
+    assert!(pending_reds(&rows, "2026-10-13T00:00:00Z", &BTreeSet::new()).is_empty());
 }
 
 #[test]
