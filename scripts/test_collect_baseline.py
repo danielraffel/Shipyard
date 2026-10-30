@@ -24,6 +24,37 @@ class BaselineScorecardTests(unittest.TestCase):
         self.assertFalse(MOD.transient_provider_failure(validation))
         self.assertFalse(MOD.transient_provider_failure(subprocess.CompletedProcess(["shipyard"], 0, "", "")))
 
+    def test_transient_provider_failure_classifier_covers_provider_outage_markers(self):
+        for message in (
+            "gh: HTTP 502 Bad Gateway",
+            "HTTP 503 Service Unavailable",
+            "HTTP 504 Gateway Timeout",
+            "HTTP 429: API rate limit exceeded",
+            "GraphQL: API rate limit already exceeded",
+            "ssh: connect to host m5s port 22: Operation timed out",
+            "command timed out after 300s: tartci",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(MOD.transient_provider_failure(
+                    subprocess.CompletedProcess(["provider"], 1, "", message)
+                ))
+
+    def test_provider_import_retries_command_timeout(self):
+        calls = []
+
+        def run_attempt(command, **kwargs):
+            calls.append(command)
+            if len(calls) == 1:
+                raise RuntimeError("command timed out after 300s: provider")
+            return subprocess.CompletedProcess(command, 0, '{"imported": 3}', "")
+
+        with mock.patch.object(MOD, "run", side_effect=run_attempt):
+            with mock.patch.object(MOD.time, "sleep") as sleep:
+                result = MOD.run_provider_with_retry(["provider"], retries=2, delay_seconds=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once_with(5)
+
     def test_provider_import_retries_transient_failure_with_bounded_backoff(self):
         results = [
             subprocess.CompletedProcess(["provider"], 1, "", "dial tcp 1.2.3.4:443: i/o timeout"),

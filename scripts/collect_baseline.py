@@ -42,11 +42,24 @@ TRANSIENT_PROVIDER_ERROR_MARKERS = (
     "connection reset",
     "connection refused",
     "connection timed out",
+    "operation timed out",
+    "timed out",
+    "i/o timeout",
     "dial tcp",
     "network is unreachable",
     "temporary failure in name resolution",
     "could not resolve host",
     "tls handshake timeout",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "server error",
+    "rate limit",
+    "http 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
 )
 DEFAULT_PROVIDER_RETRIES = 2
 DEFAULT_PROVIDER_RETRY_DELAY_SECONDS = 5.0
@@ -76,12 +89,24 @@ def run_provider_with_retry(command: Sequence[str], *, stdin: str | None = None,
         raise ValueError("provider retries must be non-negative")
     if delay_seconds < 0:
         raise ValueError("provider retry delay must be non-negative")
-    result = run(command, stdin=stdin, timeout=timeout)
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        try:
+            return run(command, stdin=stdin, timeout=timeout)
+        except RuntimeError as exc:
+            # `run` wraps subprocess.TimeoutExpired so callers get a stable
+            # error type. Convert that specific provider timeout back into a
+            # retry-classifiable result; validation and other failures remain
+            # terminal.
+            if "command timed out after" not in str(exc).casefold():
+                raise
+            return subprocess.CompletedProcess(command, 1, "", str(exc))
+
+    result = run_attempt()
     for attempt in range(retries):
         if not transient_provider_failure(result):
             break
         time.sleep(delay_seconds * (2 ** attempt))
-        result = run(command, stdin=stdin, timeout=timeout)
+        result = run_attempt()
     return result
 
 
