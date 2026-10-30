@@ -96,7 +96,7 @@ shipyard cause extract --log FILE --job NAME --notice  # `::notice title=ci-caus
                                              #   bound to the job (repo/head/run/attempt/job) and naming the cause it reads,
                                              #   and dates it by the API time of the step that printed it
 shipyard cause extract --log FILE --format c2  # C2's raw records
-shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/YYYY-MM.jsonl;
+ shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/causes/YYYY-MM.jsonl;
                                              #   ids already archived are skipped, nothing is rewritten
 shipyard cause record --repo OWNER/REPO --workflow FILE --dir DIR [--since TIME] [--base main]
                                              # read-only observer: a cause row per new red job (DIR/causes/YYYY-MM.jsonl)

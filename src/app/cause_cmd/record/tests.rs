@@ -303,6 +303,29 @@ fn a_red_drift_job_gets_one_record_naming_its_generator() {
 }
 
 #[test]
+fn archive_output_is_consumed_by_record_without_duplicate() {
+    let source = tempfile::tempdir().expect("source archive");
+    let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(source.path())).expect("record source cause");
+    let archived =
+        std::fs::read_to_string(source.path().join("causes/2026-10.jsonl")).expect("source cause");
+
+    let dir = tempfile::tempdir().expect("archive");
+    super::super::archive(
+        dir.path(),
+        &archived.lines().map(str::to_owned).collect::<Vec<_>>(),
+    )
+    .expect("archive cause");
+
+    let second = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    let report = record(&gh, &query(dir.path())).expect("record archived cause");
+    assert_eq!((report.causes_written, report.already_recorded), (0, 1));
+    assert_eq!(rows(&dir.path().join("causes/2026-10.jsonl")).len(), 1);
+}
+
+#[test]
 fn a_green_run_writes_nothing_and_reads_no_jobs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut green = red_run();

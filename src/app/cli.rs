@@ -1643,7 +1643,8 @@ pub(crate) struct CauseRecordArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct CauseArchiveArgs {
-    /// Archive directory (for example `causes/` in a private labels checkout).
+    /// Archive parent directory containing `causes/` and `fixlinks.jsonl` (for
+    /// example `data/ci-cause` in a private labels checkout).
     #[arg(long, value_name = "DIR")]
     pub(crate) dir: PathBuf,
     /// JSONL of `ci.cause/v1` records, or of scorecard case rows (their
