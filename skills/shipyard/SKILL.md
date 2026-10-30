@@ -5326,6 +5326,9 @@ has no value. Wasted compute per change counts every failed or cancelled job of
 the merged pull request, earlier pushes included; duplicate receipts for one
 head count once. Waste is matched by PR number, so
 merge-group runs are not counted, and it is not limited to the scorecard window.
+The producer handoff reader matches the legacy `project` key case-insensitively,
+because older metrics rows may preserve repository casing while current export
+normalizes it.
 
 ### Repeated-work cost
 

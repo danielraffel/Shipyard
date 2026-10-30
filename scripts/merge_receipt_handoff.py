@@ -219,7 +219,8 @@ def source_imported_at(state_dir: pathlib.Path, repo: str, base_branch: str) -> 
                 raise RuntimeError("producer merge receipt store has no imported_at column")
             value = connection.execute(
                 "SELECT max(imported_at) FROM merge_receipts "
-                "WHERE lower(trim(repo)) = lower(trim(?1)) AND project = ?2 AND base_branch = ?3",
+                "WHERE lower(trim(repo)) = lower(trim(?1)) "
+                "AND lower(trim(project)) = lower(trim(?2)) AND base_branch = ?3",
                 (repo, repo.rsplit("/", 1)[-1], base_branch),
             ).fetchone()[0]
     except (OSError, sqlite3.Error) as exc:
