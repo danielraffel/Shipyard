@@ -117,6 +117,20 @@ class ReleaseMacosLocalTests(unittest.TestCase):
             ):
                 self.assertEqual(release_macos_local.require_ghapp(), str(wrapper))
 
+    def test_require_ghapp_resolves_path_with_unset_or_empty_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            wrapper = Path(temp) / "ghapp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(0o700)
+            for configured in (None, ""):
+                env = {"PATH": temp}
+                if configured is not None:
+                    env[release_macos_local.GHAPP_ENV] = configured
+                with self.subTest(configured=configured), mock.patch.dict(
+                    os.environ, env, clear=True
+                ):
+                    self.assertEqual(release_macos_local.require_ghapp(), str(wrapper))
+
     def test_require_ghapp_does_not_use_missing_service_home(self) -> None:
         with mock.patch.dict(
             os.environ,
