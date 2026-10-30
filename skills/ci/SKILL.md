@@ -920,7 +920,9 @@ needs `live-smoke`, which runs `scripts/release_live_smoke.py` on the built
 linux-x64 binary: read-only `runner admission-clean` and `runner steward`
 dry-run, `--mode isolated` under a throwaway HOME, against real repositories
 (`vars.RELEASE_SMOKE_REPOS`, default `Generous-Corp/pulp`; token
-`secrets.RELEASE_SMOKE_GH_TOKEN`, else the job token). Any `error` verdict or
+`secrets.RELEASE_SMOKE_GH_TOKEN`, else the job token). Keep this token
+read-only; never route the write-capable release-bot credential to the binary
+under test. Any `error` verdict or
 steward repository error fails the release, as does a lock-held `defer`
 (`observation_in_progress`) or a verdict that does not name the requested
 repository. The job runs with `contents: read` only. v0.302.0-v0.307.0 shipped a census
