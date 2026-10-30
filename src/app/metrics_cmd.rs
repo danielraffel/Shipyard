@@ -405,8 +405,17 @@ pub(super) fn metrics_command<W: Write>(
             })?;
             write_output(stdout, json_output, &summary, || {
                 format!(
-                    "{} repeated-work observations; avoided cost unavailable ({} unjoined)",
-                    summary.observations, summary.unknown_durations
+                    "{} repeated-work observations; avoided survivor runtime: {} ms ({} matched clean, {} uncertain, {} cancelled, {} unmatched; {} distinct survivors; final attempt only={})",
+                    summary.observations,
+                    summary
+                        .duration_ms
+                        .map_or_else(|| "unavailable".to_owned(), |ms| ms.to_string()),
+                    summary.matched_clean,
+                    summary.excluded_uncertain,
+                    summary.excluded_cancelled,
+                    summary.unmatched,
+                    summary.distinct_survivors,
+                    summary.final_attempt_only
                 )
             })?;
         }
@@ -1051,6 +1060,56 @@ mod tests {
             github_jobs_api_path("danielraffel/pulp", 123),
             "/repos/danielraffel/pulp/actions/runs/123/jobs"
         );
+    }
+
+    #[test]
+    fn repeated_work_cost_json_and_human_output_report_survivor_coverage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let timing = crate::metrics::QueueTerminalTiming {
+            queue_job_id: "survivor".to_owned(),
+            queue_identity: "identity".to_owned(),
+            disposition: "clean".to_owned(),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+            total_ms: Some(12),
+        };
+        store
+            .record_queue_terminal(crate::metrics::QUEUE_AUTHORITY_TOKEN, &timing)
+            .expect("queue timing");
+        store
+            .record_repeated_work_shadow(&crate::metrics::RepeatedWorkShadowInput {
+                kind: crate::metrics::RepeatedWorkKind::SupersededExactHead,
+                branch: "main".into(),
+                sha: "head".into(),
+                target_config: "cfg".into(),
+                mode: "normal".into(),
+                job_id: "survivor".into(),
+                superseded_job_id: "old".into(),
+                superseded_sha: "old".into(),
+            })
+            .expect("shadow");
+        let run = |json_output| {
+            let mut output = Vec::new();
+            metrics_command(
+                MetricsCommand::RepeatedWorkCost(crate::app::cli::MetricsRepeatedWorkCostArgs {
+                    limit: 100,
+                }),
+                temp.path(),
+                None,
+                json_output,
+                &mut output,
+            )
+            .expect("repeated work command");
+            String::from_utf8(output).expect("utf8")
+        };
+        let json: Value = serde_json::from_str(&run(true)).expect("json");
+        assert_eq!(json["duration_ms"], 12);
+        assert_eq!(json["matched_clean"], 1);
+        assert_eq!(json["distinct_survivors"], 1);
+        let human = run(false);
+        assert!(human.contains("avoided survivor runtime: 12 ms"), "{human}");
+        assert!(human.contains("final attempt only"), "{human}");
     }
 
     #[test]

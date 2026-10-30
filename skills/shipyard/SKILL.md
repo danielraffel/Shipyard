@@ -9,6 +9,12 @@ Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
 commit-to-pull-requests API, but zero or multiple matches remain unknown.
 
+`metrics repeated-work-cost` exposes read-only avoided survivor runtime from
+the authenticated queue timing table. It counts each distinct survivor once,
+reports clean versus uncertain/cancelled/unmatched coverage, and labels the
+duration as an estimate of represented work. It never turns this evidence into
+a queue or merge decision.
+
 The read-only `queue-digest` surface reports `queue_idle` and emits
 `merge_queue_idle_with_pending_work` for an armed-but-not-enqueued PR, or the
 separate `merge_queue_idle_with_green_unarmed_work` handoff alert for a green

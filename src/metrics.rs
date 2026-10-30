@@ -194,8 +194,9 @@ pub struct RepeatedWorkShadowRow {
     pub superseded_sha: String,
 }
 
-/// Read-only avoided-cost accounting; durations stay unavailable until a
-/// provenance-safe queue-to-metrics linkage exists.
+/// Read-only avoided-cost accounting from shadow observations and authoritative
+/// queue timing. `duration_ms` is avoided survivor runtime, an estimate of the
+/// work represented by a shadow observation, not measured savings.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RepeatedWorkCostSummary {
     pub cost_basis: &'static str,
@@ -205,6 +206,13 @@ pub struct RepeatedWorkCostSummary {
     pub joined_durations: usize,
     pub unknown_durations: usize,
     pub duration_ms: Option<i64>,
+    pub shadow_rows: usize,
+    pub distinct_survivors: usize,
+    pub matched_clean: usize,
+    pub excluded_uncertain: usize,
+    pub excluded_cancelled: usize,
+    pub unmatched: usize,
+    pub final_attempt_only: bool,
 }
 
 /// One grouped timing summary row.
@@ -637,7 +645,14 @@ impl MetricsStore {
         limit: usize,
     ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id FROM repeated_work_shadow ORDER BY id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id")?;
+        Self::repeated_work_survivor_timing_with_conn(&conn, limit)
+    }
+
+    fn repeated_work_survivor_timing_with_conn(
+        conn: &Connection,
+        limit: usize,
+    ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
+        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id")?;
         let mut out = RepeatedWorkSurvivorTiming {
             shadow_rows: 0,
             distinct_survivors: 0,
@@ -1394,8 +1409,7 @@ impl MetricsStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Aggregate shadow observations. Durations remain unavailable until a
-    /// provenance-safe queue-to-metrics linkage exists.
+    /// Aggregate shadow observations and their provenance-safe survivor timing.
     pub fn repeated_work_cost(
         &self,
         limit: usize,
@@ -1413,6 +1427,13 @@ impl MetricsStore {
             joined_durations: 0,
             unknown_durations: 0,
             duration_ms: None,
+            shadow_rows: 0,
+            distinct_survivors: 0,
+            matched_clean: 0,
+            excluded_uncertain: 0,
+            excluded_cancelled: 0,
+            unmatched: 0,
+            final_attempt_only: true,
         };
         for item in ids {
             let (kind, job_id) = item?;
@@ -1422,11 +1443,21 @@ impl MetricsStore {
                 "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
                 _ => {}
             }
-            // Queue ids (`sy-...`) are not SQLite job identities. Without an
-            // authenticated linkage, every duration remains unavailable.
             let _ = job_id;
-            out.unknown_durations += 1;
         }
+        let timing = Self::repeated_work_survivor_timing_with_conn(&conn, limit)?;
+        out.shadow_rows = timing.shadow_rows;
+        out.distinct_survivors = timing.distinct_survivors;
+        out.matched_clean = timing.matched_clean;
+        out.excluded_uncertain = timing.excluded_uncertain;
+        out.excluded_cancelled = timing.excluded_cancelled;
+        out.unmatched = timing.unmatched;
+        out.joined_durations = timing.matched_clean;
+        out.unknown_durations = timing
+            .distinct_survivors
+            .saturating_sub(timing.matched_clean);
+        out.duration_ms = timing.avoided_survivor_ms;
+        out.final_attempt_only = timing.final_attempt_only;
         Ok(out)
     }
 
@@ -5850,6 +5881,16 @@ mod tests {
         assert_eq!(r.excluded_uncertain, 1);
         assert_eq!(r.excluded_cancelled, 1);
         assert_eq!(r.unmatched, 1);
+        let cost = store.repeated_work_cost(100).unwrap();
+        assert_eq!(cost.observations, 5);
+        assert_eq!(cost.shadow_rows, 5);
+        assert_eq!(cost.distinct_survivors, 4);
+        assert_eq!(cost.joined_durations, 1);
+        assert_eq!(cost.unknown_durations, 3);
+        assert_eq!(cost.duration_ms, Some(10));
+        assert_eq!(cost.excluded_uncertain, 1);
+        assert_eq!(cost.excluded_cancelled, 1);
+        assert_eq!(cost.unmatched, 1);
     }
     #[test]
     fn queue_timing_contract_rejects_identity_and_downgrades() {

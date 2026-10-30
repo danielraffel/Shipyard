@@ -819,7 +819,12 @@ terminal refresh updates the existing row only when the phase name matches;
 new phase names append rows under the same correlation ID. No phase duration is
 inferred from a job total.
 
-`metrics repeated-work-cost` is read-only shadow accounting. It reports the
-avoided repeated-work cost basis and preserves duration as unavailable until a
-provenance-safe linkage from queue job IDs to metrics rows exists; it never
-infers cost from numeric-looking IDs.
+`metrics repeated-work-cost` is read-only shadow accounting. It reports
+**avoided survivor runtime**: the final-attempt duration of a distinct survivor
+job, used as a conservative estimate for work represented by superseded or
+duplicate observations. Only clean queue timings count; uncertain, cancelled,
+and unmatched survivors remain visible as coverage counts and are never
+treated as zero. It never infers cost from numeric-looking IDs or changes queue
+authority. In JSON, `joined_durations` and `unknown_durations` count distinct
+survivors, while `observations` and `shadow_rows` preserve the raw shadow-row
+coverage.

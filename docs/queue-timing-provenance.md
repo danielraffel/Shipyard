@@ -52,6 +52,11 @@ If several shadow rows identify one survivor, counting that survivor once is an
 intentional conservative undercount. In a supersession chain, unmatched rows
 for jobs that never ran are expected and remain part of coverage reporting.
 
+The `metrics repeated-work-cost` readout exposes this accounting as
+`duration_ms` (avoided survivor runtime), together with the distinct-survivor and
+excluded/unmatched coverage counts. These fields are observational evidence;
+they do not authorize skipping, cancellation, routing, or merge decisions.
+
 ## Required validation
 
 The implementation must prove migration of an old database, exact identity
