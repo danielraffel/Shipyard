@@ -3,6 +3,62 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03810"></a>
+## [0.381.0] - 2026-10-30
+
+- fix/steward arm live revalidation ([#1059](https://github.com/danielraffel/Shipyard/pull/1059))
+- codex/capacity observation puller 20261030 ([#1050](https://github.com/danielraffel/Shipyard/pull/1050))
+- fix/release smoke token ([#988](https://github.com/danielraffel/Shipyard/pull/988))
+- codex/handoff parent fsync 20261029 ([#1020](https://github.com/danielraffel/Shipyard/pull/1020))
+- codex/state machine b1 docs 20261028 ([#1001](https://github.com/danielraffel/Shipyard/pull/1001))
+
+<a id="v03800"></a>
+## [0.380.0] - 2026-10-30
+
+- codex/metrics auth envelope schema 20261028 ([#998](https://github.com/danielraffel/Shipyard/pull/998))
+
+<a id="v03799"></a>
+## [0.379.9] - 2026-10-30
+
+- codex/observer budget 20261029 ([#1029](https://github.com/danielraffel/Shipyard/pull/1029))
+- codex/baseline state retention 20261030 ([#1048](https://github.com/danielraffel/Shipyard/pull/1048))
+
+<a id="v03798"></a>
+## [0.379.8] - 2026-10-30
+
+- codex/metrics observation integration 20261030 ([#1047](https://github.com/danielraffel/Shipyard/pull/1047))
+
+<a id="v03797"></a>
+## [0.379.7] - 2026-10-30
+
+- codex/route shadow windows fix 20261029 ([#1028](https://github.com/danielraffel/Shipyard/pull/1028))
+
+<a id="v03796"></a>
+## [0.379.6] - 2026-10-30
+
+- fix/reviewer identity binding 20261028 ([#992](https://github.com/danielraffel/Shipyard/pull/992))
+- codex/cause observer launchd 20261030 ([#1043](https://github.com/danielraffel/Shipyard/pull/1043))
+- chore/durable friction recovery ([#1015](https://github.com/danielraffel/Shipyard/pull/1015))
+- fix/queue observer legacy state migration ([#990](https://github.com/danielraffel/Shipyard/pull/990))
+- fix/autonomy contract evidence 20261028 ([#984](https://github.com/danielraffel/Shipyard/pull/984))
+
+<a id="v03793"></a>
+## [0.379.3] - 2026-10-30
+
+- codex/cause readout integration 20261030 ([#1046](https://github.com/danielraffel/Shipyard/pull/1046))
+
+<a id="v03792"></a>
+## [0.379.2] - 2026-10-30
+
+- fix/pr watch parallel screen ([#986](https://github.com/danielraffel/Shipyard/pull/986))
+- docs/readme local first description ([#985](https://github.com/danielraffel/Shipyard/pull/985))
+
+<a id="v03791"></a>
+## [0.379.1] - 2026-10-30
+
+- codex/baseline evidence refresh 20261030 ([#1054](https://github.com/danielraffel/Shipyard/pull/1054))
+- codex/metrics retention index 20261030 ([#1026](https://github.com/danielraffel/Shipyard/pull/1026))
+
 <a id="v03790"></a>
 ## [0.379.0] - 2026-10-30
 
@@ -2742,6 +2798,15 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.381.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.381.0
+[0.380.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.380.0
+[0.379.9]: https://github.com/danielraffel/Shipyard/releases/tag/v0.379.9
+[0.379.8]: https://github.com/danielraffel/Shipyard/releases/tag/v0.379.8
+[0.379.7]: https://github.com/danielraffel/Shipyard/releases/tag/v0.379.7
+[0.379.6]: https://github.com/danielraffel/Shipyard/releases/tag/v0.379.6
+[0.379.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.379.3
+[0.379.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.379.2
+[0.379.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.379.1
 [0.379.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.379.0
 [0.378.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.378.1
 [0.378.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.378.0
