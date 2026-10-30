@@ -100,7 +100,160 @@ fn red_routes() -> Vec<(&'static str, Value)> {
 }
 
 fn rows(path: &Path) -> Vec<Value> {
-    read_jsonl(path)
+    read_jsonl_if_present(path).expect("valid JSONL")
+}
+
+#[test]
+fn malformed_archive_refuses_before_github_or_new_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let causes = dir.path().join("causes");
+    std::fs::create_dir_all(&causes).expect("causes dir");
+    let archive = causes.join("2026-10.jsonl");
+    std::fs::write(
+        &archive,
+        "{\"repo\":\"owner/repo\",\"job_id\":1}\n{not-json}\n",
+    )
+    .expect("archive");
+    let fake = Fake::new(&[]);
+    let gh = |args: &[String]| fake.read(args);
+
+    let error = record(&gh, &query(dir.path())).expect_err("malformed archive must fail closed");
+    assert!(
+        error.contains(&format!("{} line 2", archive.display())),
+        "{error}"
+    );
+    assert!(
+        fake.asked().is_empty(),
+        "archive errors must precede API writes"
+    );
+    assert!(!dir.path().join("fixlinks.jsonl").exists());
+}
+
+#[test]
+fn invalid_cause_archive_shape_refuses_before_github_or_new_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive = dir.path().join("causes/2026-10.jsonl");
+    std::fs::create_dir_all(archive.parent().expect("archive parent")).expect("causes dir");
+    std::fs::write(
+        &archive,
+        "{\"schema\":\"ci.cause/v1\",\"repo\":\"owner/repo\",\"job_id\":\"one\"}\n",
+    )
+    .expect("archive");
+    let fake = Fake::new(&red_routes());
+    let gh = |args: &[String]| fake.read(args);
+
+    let error = record(&gh, &query(dir.path())).expect_err("invalid archive must fail closed");
+    assert!(error.contains("job_id"), "{error}");
+    assert!(
+        fake.asked().is_empty(),
+        "archive errors must precede API writes"
+    );
+    assert!(!dir.path().join("fixlinks.jsonl").exists());
+}
+
+#[test]
+fn invalid_cause_archive_schema_refuses_before_github_or_new_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive = dir.path().join("causes/2026-10.jsonl");
+    std::fs::create_dir_all(archive.parent().expect("archive parent")).expect("causes dir");
+    std::fs::write(
+        &archive,
+        r#"{"schema":"other/v1","repo":"owner/repo","job_id":1}"#,
+    )
+    .expect("archive");
+    let fake = Fake::new(&[]);
+    let gh = |args: &[String]| fake.read(args);
+
+    let error = record(&gh, &query(dir.path())).expect_err("invalid schema must fail closed");
+    assert!(error.contains("schema ci.cause/v1"), "{error}");
+    assert!(
+        fake.asked().is_empty(),
+        "archive errors must precede API writes"
+    );
+    assert!(!dir.path().join("fixlinks.jsonl").exists());
+}
+
+#[test]
+fn unreadable_archive_refuses_before_github_or_new_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive = dir.path().join("causes/2026-10.jsonl");
+    std::fs::create_dir_all(&archive).expect("archive directory");
+    let fake = Fake::new(&[]);
+    let gh = |args: &[String]| fake.read(args);
+
+    let error = record(&gh, &query(dir.path())).expect_err("unreadable archive must fail closed");
+    // Windows and Unix format temporary paths differently (and Windows may
+    // report a directory read as `Access is denied` instead of `Is a
+    // directory`). Keep the assertion tied to the archive entry while making
+    // the diagnostic check portable across both platforms.
+    assert!(error.contains("2026-10.jsonl"), "{error}");
+    assert!(
+        fake.asked().is_empty(),
+        "archive errors must precede API writes"
+    );
+    assert!(!dir.path().join("fixlinks.jsonl").exists());
+}
+
+#[test]
+fn malformed_fixlink_archive_refuses_before_github_or_new_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixlinks = dir.path().join("fixlinks.jsonl");
+    std::fs::write(&fixlinks, "{not-json}\n").expect("fix-links archive");
+    let fake = Fake::new(&red_routes());
+    let gh = |args: &[String]| fake.read(args);
+
+    let error = record(&gh, &query(dir.path())).expect_err("malformed fix-links must fail closed");
+    assert!(
+        error.contains(&format!("{} line 1", fixlinks.display())),
+        "{error}"
+    );
+    assert!(
+        fake.asked().is_empty(),
+        "archive errors must precede API writes"
+    );
+    assert!(!dir.path().join("causes").exists());
+}
+
+#[test]
+fn malformed_fixlink_shape_refuses_before_github_or_new_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixlinks = dir.path().join("fixlinks.jsonl");
+    std::fs::write(
+        &fixlinks,
+        "{\"schema\":\"ci.cause/v1\",\"source\":\"fix-link\",\"repo\":\"owner/repo\"}\n",
+    )
+    .expect("fix-links archive");
+    let fake = Fake::new(&red_routes());
+    let gh = |args: &[String]| fake.read(args);
+
+    let error = record(&gh, &query(dir.path())).expect_err("malformed fix-link must fail closed");
+    assert!(error.contains("red_run_id"), "{error}");
+    assert!(
+        fake.asked().is_empty(),
+        "archive errors must precede API writes"
+    );
+    assert!(!dir.path().join("causes").exists());
+}
+
+#[test]
+fn invalid_fixlink_metadata_refuses_before_github_or_new_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixlinks = dir.path().join("fixlinks.jsonl");
+    std::fs::write(
+        &fixlinks,
+        r#"{"schema":"other/v1","source":"other","repo":"owner/repo","red_run_id":1,"red_attempt":1}"#,
+    )
+    .expect("fix-links archive");
+    let fake = Fake::new(&[]);
+    let gh = |args: &[String]| fake.read(args);
+
+    let error = record(&gh, &query(dir.path())).expect_err("invalid metadata must fail closed");
+    assert!(error.contains("schema ci.cause/v1"), "{error}");
+    assert!(
+        fake.asked().is_empty(),
+        "archive errors must precede API writes"
+    );
+    assert!(!dir.path().join("causes").exists());
 }
 
 #[test]
@@ -146,6 +299,29 @@ fn a_red_drift_job_gets_one_record_naming_its_generator() {
     // A second pass finds it recorded and writes nothing again.
     let again = record(&gh, &query(dir.path())).expect("pass");
     assert_eq!((again.causes_written, again.already_recorded), (0, 1));
+    assert_eq!(rows(&dir.path().join("causes/2026-10.jsonl")).len(), 1);
+}
+
+#[test]
+fn archive_output_is_consumed_by_record_without_duplicate() {
+    let source = tempfile::tempdir().expect("source archive");
+    let first = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| first.read(args);
+    record(&gh, &query(source.path())).expect("record source cause");
+    let archived =
+        std::fs::read_to_string(source.path().join("causes/2026-10.jsonl")).expect("source cause");
+
+    let dir = tempfile::tempdir().expect("archive");
+    super::super::archive(
+        dir.path(),
+        &archived.lines().map(str::to_owned).collect::<Vec<_>>(),
+    )
+    .expect("archive cause");
+
+    let second = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| second.read(args);
+    let report = record(&gh, &query(dir.path())).expect("record archived cause");
+    assert_eq!((report.causes_written, report.already_recorded), (0, 1));
     assert_eq!(rows(&dir.path().join("causes/2026-10.jsonl")).len(), 1);
 }
 
@@ -678,4 +854,19 @@ fn a_record_the_job_printed_names_the_cause_earlier_than_the_pass() {
     assert_eq!(row["named_at"], "2026-10-14T10:30:20Z");
     assert_eq!(row["retrospective"], false);
     assert_eq!(row["completed_at"], "2026-10-14T10:30:00Z");
+}
+
+#[test]
+fn legacy_root_causes_refuse_before_github_reads() {
+    let dir = tempfile::tempdir().expect("archive");
+    std::fs::create_dir(dir.path().join("causes")).expect("canonical directory");
+    let legacy = dir.path().join("2026-10.jsonl");
+    std::fs::write(&legacy, "legacy bytes\n").expect("legacy archive");
+    let fake = Fake::new(&red_routes());
+    let gh = |args: &[String]| fake.read(args);
+    let error = record(&gh, &query(dir.path())).expect_err("legacy archive refused");
+    assert!(error.contains("legacy cause archive files"), "{error}");
+    assert!(fake.asked().is_empty());
+    assert_eq!(std::fs::read_to_string(legacy).unwrap(), "legacy bytes\n");
+    assert!(!dir.path().join("causes/2026-10.jsonl").exists());
 }
