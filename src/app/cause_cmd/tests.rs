@@ -159,8 +159,8 @@ fn the_archive_appends_by_month_and_never_rewrites() {
     let september = record(2, "2026-09-30T23:59:59Z");
     let report = archive(dir.path(), &[october.clone(), september.clone()]).expect("archive");
     assert_eq!(report.appended, 2);
-    let first = std::fs::read(dir.path().join("2026-10.jsonl")).expect("october");
-    assert!(dir.path().join("2026-09.jsonl").exists());
+    let first = std::fs::read(dir.path().join("causes/2026-10.jsonl")).expect("october");
+    assert!(dir.path().join("causes/2026-09.jsonl").exists());
 
     // The same records again, a case row carrying a third, and noise.
     let case_row = serde_json::json!({
@@ -185,7 +185,7 @@ fn the_archive_appends_by_month_and_never_rewrites() {
             without_record: 2,
         }
     );
-    let after = std::fs::read(dir.path().join("2026-10.jsonl")).expect("october");
+    let after = std::fs::read(dir.path().join("causes/2026-10.jsonl")).expect("october");
     assert!(after.starts_with(&first), "earlier lines were rewritten");
     let text = String::from_utf8(after).expect("utf8");
     assert_eq!(text.lines().count(), 2);
@@ -197,7 +197,18 @@ fn an_undated_record_goes_to_its_own_file() {
     let mut value: Value = serde_json::from_str(&record(4, "x")).expect("record");
     value["named_at"] = Value::Null;
     archive(dir.path(), &[value.to_string()]).expect("archive");
-    assert!(dir.path().join("undated.jsonl").exists());
+    assert!(dir.path().join("causes/undated.jsonl").exists());
+}
+
+#[test]
+fn a_legacy_root_archive_is_refused_instead_of_being_ignored() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("2026-10.jsonl"), "not json\n").expect("legacy archive");
+
+    let error = archive(dir.path(), &[record(5, "2026-10-13T12:00:00Z")])
+        .expect_err("legacy root archive must be migrated explicitly");
+    assert!(error.contains("legacy cause archive files"), "{error}");
+    assert!(!dir.path().join("causes/2026-10.jsonl").exists());
 }
 
 #[test]
@@ -238,7 +249,7 @@ fn two_archivers_at_once_lose_and_duplicate_nothing() {
         reports.iter().map(|r| r.already_archived).sum::<usize>(),
         20
     );
-    let text = std::fs::read_to_string(dir.path().join("2026-10.jsonl")).expect("archive");
+    let text = std::fs::read_to_string(dir.path().join("causes/2026-10.jsonl")).expect("archive");
     let ids: Vec<String> = text
         .lines()
         .map(|line| {
@@ -250,4 +261,13 @@ fn two_archivers_at_once_lose_and_duplicate_nothing() {
     let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
     assert_eq!(ids.len(), 40);
     assert_eq!(unique.len(), 40);
+}
+
+#[test]
+fn auxiliary_jsonl_files_do_not_prevent_canonical_archiving() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("fixlinks.jsonl"), "").unwrap();
+    std::fs::write(dir.path().join("outages.jsonl"), "").unwrap();
+    let report = archive(dir.path(), &[record(6, "2026-10-13T12:00:00Z")]).unwrap();
+    assert_eq!(report.appended, 1);
 }
