@@ -53,14 +53,14 @@ pub(crate) struct QueueTimingRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct RepeatedWorkSurvivorTiming {
+pub struct RepeatedWorkSupersededTiming {
     pub shadow_rows: usize,
-    pub distinct_survivors: usize,
+    pub distinct_superseded_jobs: usize,
     pub matched_clean: usize,
     pub excluded_uncertain: usize,
     pub excluded_cancelled: usize,
     pub unmatched: usize,
-    pub avoided_survivor_ms: Option<i64>,
+    pub superseded_runtime_ms: Option<i64>,
     pub final_attempt_only: bool,
 }
 
@@ -213,8 +213,10 @@ pub struct RepeatedWorkShadowRow {
     pub superseded_sha: String,
 }
 
-/// Read-only avoided-cost accounting; durations stay unavailable until a
-/// provenance-safe queue-to-metrics linkage exists.
+/// Read-only repeated-work accounting from shadow observations and
+/// authoritative timing for the superseded queue jobs. `duration_ms` is the
+/// measured runtime of superseded jobs only; it is never inferred from the
+/// surviving job or presented as savings when the superseded job is unmatched.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RepeatedWorkCostSummary {
     pub cost_basis: &'static str,
@@ -224,6 +226,15 @@ pub struct RepeatedWorkCostSummary {
     pub joined_durations: usize,
     pub unknown_durations: usize,
     pub duration_ms: Option<i64>,
+    pub shadow_rows: usize,
+    pub distinct_superseded_jobs: usize,
+    pub matched_clean: usize,
+    pub excluded_uncertain: usize,
+    pub excluded_cancelled: usize,
+    pub unmatched: usize,
+    pub timing_basis: &'static str,
+    pub since_days: i64,
+    pub final_attempt_only: bool,
 }
 
 /// One grouped timing summary row.
@@ -593,6 +604,18 @@ fn queue_timing_rank(s: &str) -> u8 {
     }
 }
 
+fn repeated_work_cutoff(since_days: i64) -> Result<String, Box<dyn std::error::Error>> {
+    if since_days <= 0 {
+        return Err("repeated-work baseline window must be positive".into());
+    }
+    let window = Duration::try_days(since_days)
+        .ok_or("repeated-work baseline window is outside the timestamp range")?;
+    Utc::now()
+        .checked_sub_signed(window)
+        .ok_or_else(|| "repeated-work baseline cutoff is outside the timestamp range".into())
+        .map(|cutoff| cutoff.to_rfc3339())
+}
+
 impl MetricsStore {
     pub(crate) fn record_queue_terminal(
         &self,
@@ -651,39 +674,55 @@ impl MetricsStore {
         Ok(conn.query_row("SELECT queue_job_id, queue_identity, disposition, started_at, completed_at, total_ms FROM queue_timing WHERE queue_job_id=?1", params![queue_job_id], |r| Ok(QueueTimingRow { queue_job_id: r.get(0)?, queue_identity: r.get(1)?, queue_disposition: r.get(2)?, started_at: r.get(3)?, completed_at: r.get(4)?, total_ms: r.get(5)? })).optional()?)
     }
 
-    pub fn repeated_work_survivor_timing(
+    pub fn repeated_work_superseded_timing(
         &self,
         limit: usize,
-    ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
+        since_days: i64,
+    ) -> Result<RepeatedWorkSupersededTiming, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id FROM repeated_work_shadow ORDER BY id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id")?;
-        let mut out = RepeatedWorkSurvivorTiming {
+        let tx = conn.unchecked_transaction()?;
+        let cutoff = repeated_work_cutoff(since_days)?;
+        let timing = Self::repeated_work_superseded_timing_with_conn(&tx, limit, &cutoff)?;
+        tx.commit()?;
+        Ok(timing)
+    }
+
+    fn repeated_work_superseded_timing_with_conn(
+        conn: &Connection,
+        limit: usize,
+        cutoff: &str,
+    ) -> Result<RepeatedWorkSupersededTiming, Box<dyn std::error::Error>> {
+        let mut stmt = conn.prepare("WITH recent AS (SELECT superseded_job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1), superseded AS (SELECT DISTINCT superseded_job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.superseded_job_id, t.disposition, t.total_ms FROM superseded s LEFT JOIN queue_timing t ON t.queue_job_id=s.superseded_job_id AND s.superseded_job_id LIKE 'sy-%' AND instr(s.superseded_job_id, '/') = 0 AND instr(s.superseded_job_id, char(92)) = 0")?;
+        let mut out = RepeatedWorkSupersededTiming {
             shadow_rows: 0,
-            distinct_survivors: 0,
+            distinct_superseded_jobs: 0,
             matched_clean: 0,
             excluded_uncertain: 0,
             excluded_cancelled: 0,
             unmatched: 0,
-            avoided_survivor_ms: None,
+            superseded_runtime_ms: None,
             final_attempt_only: true,
         };
-        let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![i64::try_from(limit).unwrap_or(i64::MAX), cutoff],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )?;
         for row in rows {
             let (count, _, disposition, total) = row?;
             out.shadow_rows = usize::try_from(count).unwrap_or(usize::MAX);
-            out.distinct_survivors += 1;
+            out.distinct_superseded_jobs += 1;
             match disposition.as_deref() {
                 Some("clean") if total.is_some_and(|v| v >= 0) => {
                     out.matched_clean += 1;
-                    out.avoided_survivor_ms = Some(
-                        out.avoided_survivor_ms
+                    out.superseded_runtime_ms = Some(
+                        out.superseded_runtime_ms
                             .unwrap_or(0)
                             .saturating_add(total.unwrap()),
                     );
@@ -693,6 +732,65 @@ impl MetricsStore {
                 _ => out.unmatched += 1,
             }
         }
+        Ok(out)
+    }
+
+    /// Return repeated-work accounting for a positive baseline window.
+    pub fn repeated_work_cost(
+        &self,
+        limit: usize,
+        since_days: i64,
+    ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
+        let cutoff = repeated_work_cutoff(since_days)?;
+        let conn = self.connect()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare("SELECT kind, job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
+        let ids = stmt.query_map(
+            params![i64::try_from(limit).unwrap_or(i64::MAX), &cutoff],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut out = RepeatedWorkCostSummary {
+            cost_basis: "superseded_repeated_work",
+            observations: 0,
+            superseded_exact_head: 0,
+            duplicate_exact_head_config: 0,
+            joined_durations: 0,
+            unknown_durations: 0,
+            duration_ms: None,
+            shadow_rows: 0,
+            distinct_superseded_jobs: 0,
+            matched_clean: 0,
+            excluded_uncertain: 0,
+            excluded_cancelled: 0,
+            unmatched: 0,
+            timing_basis: "superseded_queue_job_runtime",
+            since_days,
+            final_attempt_only: true,
+        };
+        for item in ids {
+            let (kind, _job_id) = item?;
+            out.observations += 1;
+            match kind.as_str() {
+                "superseded_exact_head" => out.superseded_exact_head += 1,
+                "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
+                _ => {}
+            }
+        }
+        let timing = Self::repeated_work_superseded_timing_with_conn(&tx, limit, &cutoff)?;
+        out.shadow_rows = timing.shadow_rows;
+        out.distinct_superseded_jobs = timing.distinct_superseded_jobs;
+        out.matched_clean = timing.matched_clean;
+        out.excluded_uncertain = timing.excluded_uncertain;
+        out.excluded_cancelled = timing.excluded_cancelled;
+        out.unmatched = timing.unmatched;
+        out.joined_durations = timing.matched_clean;
+        out.unknown_durations = timing
+            .distinct_superseded_jobs
+            .saturating_sub(timing.matched_clean);
+        out.duration_ms = timing.superseded_runtime_ms;
+        out.final_attempt_only = timing.final_attempt_only;
+        drop(stmt);
+        tx.commit()?;
         Ok(out)
     }
 
@@ -1620,42 +1718,6 @@ impl MetricsStore {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// Aggregate shadow observations. Durations remain unavailable until a
-    /// provenance-safe queue-to-metrics linkage exists.
-    pub fn repeated_work_cost(
-        &self,
-        limit: usize,
-    ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT kind, job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
-        let ids = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut out = RepeatedWorkCostSummary {
-            cost_basis: "avoided_repeated_work",
-            observations: 0,
-            superseded_exact_head: 0,
-            duplicate_exact_head_config: 0,
-            joined_durations: 0,
-            unknown_durations: 0,
-            duration_ms: None,
-        };
-        for item in ids {
-            let (kind, job_id) = item?;
-            out.observations += 1;
-            match kind.as_str() {
-                "superseded_exact_head" => out.superseded_exact_head += 1,
-                "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
-                _ => {}
-            }
-            // Queue ids (`sy-...`) are not SQLite job identities. Without an
-            // authenticated linkage, every duration remains unavailable.
-            let _ = job_id;
-            out.unknown_durations += 1;
-        }
-        Ok(out)
     }
 
     /// Record one low-friction timing row.
@@ -6087,21 +6149,34 @@ mod tests {
                 sha: "sha".into(),
                 target_config: "cfg".into(),
                 mode: "normal".into(),
-                job_id: id.into(),
-                superseded_job_id: "old".into(),
+                job_id: "sy-survivor".into(),
+                superseded_job_id: id.into(),
                 superseded_sha: "oldsha".into(),
             };
             store.record_repeated_work_shadow(&input).unwrap();
         }
         let conn = Connection::open(store.path()).unwrap();
         conn.execute("INSERT INTO repeated_work_shadow (observed_at,kind,branch,sha,target_config,mode,job_id,superseded_job_id,superseded_sha) VALUES ('now','future_kind','main','sha','cfg','normal','7','old','oldsha')", []).unwrap();
-        let summary = store.repeated_work_cost(100).unwrap();
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &QueueTerminalTiming {
+                    queue_job_id: "42".into(),
+                    queue_identity: "numeric-test".into(),
+                    disposition: "clean".into(),
+                    started_at: Some(Utc::now()),
+                    completed_at: Some(Utc::now()),
+                    total_ms: Some(99),
+                },
+            )
+            .unwrap();
+        let summary = store.repeated_work_cost(100, 14).unwrap();
         assert_eq!(summary.duration_ms, None);
         assert_eq!(summary.joined_durations, 0);
         assert_eq!(summary.unknown_durations, 3);
         assert_eq!(summary.superseded_exact_head, 1);
         assert_eq!(summary.duplicate_exact_head_config, 1);
-        assert_eq!(store.repeated_work_cost(0).unwrap().observations, 0);
+        assert_eq!(store.repeated_work_cost(0, 14).unwrap().observations, 0);
         assert_eq!(
             serde_json::to_value(summary).unwrap()["duration_ms"],
             serde_json::Value::Null
@@ -6201,7 +6276,7 @@ mod tests {
         );
     }
     #[test]
-    fn survivor_timing_counts_distinct_and_excluded_rows() {
+    fn superseded_timing_counts_distinct_and_excluded_rows_in_window() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
         let mk = |id: &str, d: &str, ms| QueueTerminalTiming {
@@ -6213,21 +6288,30 @@ mod tests {
             total_ms: ms,
         };
         store
-            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("clean", "clean", Some(10)))
+            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("sy-clean", "clean", Some(10)))
             .unwrap();
         store
             .record_queue_terminal(
                 QUEUE_AUTHORITY_TOKEN,
-                &mk("uncertain", "uncertain", Some(20)),
+                &mk("sy-uncertain", "uncertain", Some(20)),
             )
             .unwrap();
         store
             .record_queue_terminal(
                 QUEUE_AUTHORITY_TOKEN,
-                &mk("cancel", "cancelled_mid_run", Some(30)),
+                &mk("sy-cancel", "cancelled_mid_run", Some(30)),
             )
             .unwrap();
-        for id in ["clean", "clean", "uncertain", "cancel", "missing"] {
+        for (index, id) in [
+            "sy-clean",
+            "sy-clean",
+            "sy-uncertain",
+            "sy-cancel",
+            "sy-missing",
+        ]
+        .into_iter()
+        .enumerate()
+        {
             store
                 .record_repeated_work_shadow(&RepeatedWorkShadowInput {
                     kind: RepeatedWorkKind::SupersededExactHead,
@@ -6235,20 +6319,38 @@ mod tests {
                     sha: "s".into(),
                     target_config: "t".into(),
                     mode: "m".into(),
-                    job_id: id.into(),
-                    superseded_job_id: "o".into(),
+                    job_id: "sy-survivor".into(),
+                    superseded_job_id: id.into(),
                     superseded_sha: "o".into(),
                 })
                 .unwrap();
+            if index == 4 {
+                let conn = Connection::open(store.path()).unwrap();
+                conn.execute(
+                    "UPDATE repeated_work_shadow SET observed_at='2000-01-01T00:00:00Z' WHERE id=(SELECT max(id) FROM repeated_work_shadow)",
+                    [],
+                )
+                .unwrap();
+            }
         }
-        let r = store.repeated_work_survivor_timing(100).unwrap();
-        assert_eq!(r.shadow_rows, 5);
-        assert_eq!(r.distinct_survivors, 4);
+        let r = store.repeated_work_superseded_timing(100, 14).unwrap();
+        assert_eq!(r.shadow_rows, 4);
+        assert_eq!(r.distinct_superseded_jobs, 3);
         assert_eq!(r.matched_clean, 1);
-        assert_eq!(r.avoided_survivor_ms, Some(10));
+        assert_eq!(r.superseded_runtime_ms, Some(10));
         assert_eq!(r.excluded_uncertain, 1);
         assert_eq!(r.excluded_cancelled, 1);
-        assert_eq!(r.unmatched, 1);
+        assert_eq!(r.unmatched, 0);
+        let cost = store.repeated_work_cost(100, 14).unwrap();
+        assert_eq!(cost.observations, 4);
+        assert_eq!(cost.shadow_rows, 4);
+        assert_eq!(cost.distinct_superseded_jobs, 3);
+        assert_eq!(cost.joined_durations, 1);
+        assert_eq!(cost.unknown_durations, 2);
+        assert_eq!(cost.duration_ms, Some(10));
+        assert_eq!(cost.excluded_uncertain, 1);
+        assert_eq!(cost.excluded_cancelled, 1);
+        assert_eq!(cost.unmatched, 0);
     }
     #[test]
     fn queue_timing_contract_rejects_identity_and_downgrades() {
