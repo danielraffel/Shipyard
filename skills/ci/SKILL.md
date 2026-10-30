@@ -12,6 +12,12 @@ identity (`app_id`) when policy distinguishes checks that share a context name.
 If the materialized endpoint omits that identity, retain ambiguous skipped
 attempts so a success from one producer cannot satisfy another producer.
 
+`metrics repeated-work-cost` is read-only accounting for shadow observations.
+Its `duration_ms` is avoided survivor runtime from authenticated queue timing,
+counted once per distinct survivor and reported with clean, uncertain,
+cancelled, and unmatched coverage. It is an estimate for measurement only;
+never use it to skip validation, alter routing, or authorize a merge.
+
 ## Adopting Shipyard, or checking what a repository already has
 
 Before wiring any CI machinery into a repository (a PR gate, a merge queue, a
