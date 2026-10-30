@@ -5334,6 +5334,10 @@ merge-group runs are not counted, and it is not limited to the scorecard window.
 timing table, bounded by `--since`, counted once per distinct superseded job
 with excluded and unmatched coverage visible. It never changes queue or merge
 authority.
+The baseline window must be positive: `--since 0d` and `--since=-1d`
+exit with invalid-input code 5. Timing joins require the case-sensitive `sy-`
+prefix and no slash or backslash, even when an excluded ID has a timing row.
+Excluded IDs remain observations with unknown duration, never zero runtime.
 
 ### Prospective baseline pass history
 

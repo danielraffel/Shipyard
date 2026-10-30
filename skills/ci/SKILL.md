@@ -4226,6 +4226,10 @@ waste is not limited to the scorecard window.
 timing table within the requested `--since` window. It counts each distinct
 superseded job once; uncertain, cancelled, and unmatched jobs remain coverage
 gaps, and the result never authorizes a queue or merge decision.
+The baseline window must be positive: `--since 0d` and `--since=-1d`
+exit with invalid-input code 5. Timing joins require the case-sensitive `sy-`
+prefix and no slash or backslash, even when an excluded ID has a timing row.
+Excluded IDs remain observations with unknown duration, never zero runtime.
 
 
 At the protected merge boundary, Shipyard may produce that receipt only after

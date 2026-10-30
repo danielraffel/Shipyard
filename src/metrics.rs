@@ -673,7 +673,8 @@ impl MetricsStore {
         limit: usize,
         cutoff: &str,
     ) -> Result<RepeatedWorkSupersededTiming, Box<dyn std::error::Error>> {
-        let mut stmt = conn.prepare("WITH recent AS (SELECT superseded_job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1), superseded AS (SELECT DISTINCT superseded_job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.superseded_job_id, t.disposition, t.total_ms FROM superseded s LEFT JOIN queue_timing t ON t.queue_job_id=s.superseded_job_id AND s.superseded_job_id LIKE 'sy-%' AND instr(s.superseded_job_id, '/') = 0 AND instr(s.superseded_job_id, char(92)) = 0")?;
+        // GLOB preserves the canonical prefix's case; SQLite LIKE folds ASCII.
+        let mut stmt = conn.prepare("WITH recent AS (SELECT superseded_job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1), superseded AS (SELECT DISTINCT superseded_job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.superseded_job_id, t.disposition, t.total_ms FROM superseded s LEFT JOIN queue_timing t ON t.queue_job_id=s.superseded_job_id AND s.superseded_job_id GLOB 'sy-*' AND instr(s.superseded_job_id, '/') = 0 AND instr(s.superseded_job_id, char(92)) = 0")?;
         let mut out = RepeatedWorkSupersededTiming {
             shadow_rows: 0,
             distinct_superseded_jobs: 0,
@@ -5734,6 +5735,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(event, "pull_request");
+    }
+
+    #[test]
+    fn repeated_work_cost_rejects_nonpositive_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        for since_days in [0, -1] {
+            for limit in [0, 100] {
+                let error = store.repeated_work_cost(limit, since_days).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "repeated-work baseline window must be positive"
+                );
+            }
+        }
+        let valid = store.repeated_work_cost(100, 1).unwrap();
+        assert_eq!(valid.observations, 0);
+        assert_eq!(valid.duration_ms, None);
+    }
+
+    #[test]
+    fn repeated_work_cost_only_joins_case_sensitive_queue_ids_without_separators() {
+        // Matching clean timing rows make each rejection exercise the ID guard,
+        // rather than pass because timing was absent.
+        for (id, joins) in [
+            ("sy-a-b", true),
+            ("sy-a/b", false),
+            ("sy-a\\b", false),
+            ("SY-a-b", false),
+            ("Sy-a-b", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = MetricsStore::open(dir.path()).unwrap();
+            store
+                .record_queue_terminal(
+                    QUEUE_AUTHORITY_TOKEN,
+                    &QueueTerminalTiming {
+                        queue_job_id: id.into(),
+                        queue_identity: format!("identity-{id}"),
+                        disposition: "clean".into(),
+                        started_at: Some(Utc::now()),
+                        completed_at: Some(Utc::now()),
+                        total_ms: Some(99),
+                    },
+                )
+                .unwrap();
+            store
+                .record_repeated_work_shadow(&RepeatedWorkShadowInput {
+                    kind: RepeatedWorkKind::SupersededExactHead,
+                    branch: "main".into(),
+                    sha: "head".into(),
+                    target_config: "cfg".into(),
+                    mode: "normal".into(),
+                    job_id: "sy-survivor".into(),
+                    superseded_job_id: id.into(),
+                    superseded_sha: "old".into(),
+                })
+                .unwrap();
+            let summary = store.repeated_work_cost(100, 14).unwrap();
+            assert_eq!(summary.observations, 1, "{id}");
+            assert_eq!(summary.shadow_rows, 1, "{id}");
+            assert_eq!(summary.distinct_superseded_jobs, 1, "{id}");
+            assert_eq!(summary.joined_durations, usize::from(joins), "{id}");
+            assert_eq!(summary.matched_clean, usize::from(joins), "{id}");
+            assert_eq!(summary.unknown_durations, usize::from(!joins), "{id}");
+            assert_eq!(summary.unmatched, usize::from(!joins), "{id}");
+            assert_eq!(summary.duration_ms, joins.then_some(99), "{id}");
+            assert_eq!(summary.timing_basis, "superseded_queue_job_runtime");
+            assert!(summary.final_attempt_only);
+        }
     }
 
     #[test]
