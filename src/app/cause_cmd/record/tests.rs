@@ -1,4 +1,4 @@
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 
 use serde_json::{Value, json};
 
@@ -923,4 +923,42 @@ fn record_releases_archive_lock_during_github_observation() {
         .join()
         .expect("observer thread")
         .expect("record pass");
+}
+
+#[test]
+fn overlapping_record_passes_serialize_the_final_append() {
+    let dir = tempfile::tempdir().expect("archive");
+    super::super::retention::initialize_archive_marker(dir.path()).expect("enroll archive");
+    let guard = super::super::lock_archive(dir.path(), true).expect("lock");
+    drop(guard);
+
+    let fake = Arc::new(Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log()));
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let dir = dir.path().to_path_buf();
+        let fake = Arc::clone(&fake);
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            let reader = move |args: &[String]| {
+                let path = args.last().cloned().unwrap_or_default();
+                if path.contains("runs?status=completed") {
+                    barrier.wait();
+                }
+                fake.read(args)
+            };
+            record(&reader, &query(&dir))
+        }));
+    }
+    for worker in workers {
+        worker
+            .join()
+            .expect("observer thread")
+            .expect("record pass");
+    }
+    assert_eq!(
+        rows(&dir.path().join("causes/2026-10.jsonl")).len(),
+        1,
+        "the final exclusive section must deduplicate overlapping passes"
+    );
 }
