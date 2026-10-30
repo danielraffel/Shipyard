@@ -39,8 +39,6 @@ use crate::landing::{SurfaceOutcome, SurfaceRead, Verdict};
 /// `evaluate` runs the rule and reports, but does not block, so a queue in
 /// that state is reported as present-but-not-enforcing rather than folded in
 /// with an active one.
-const ENFORCEMENT_DISABLED: &str = "disabled";
-
 /// A merge queue's operating parameters, as GitHub reports them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct MergeQueueConfig {
@@ -71,11 +69,23 @@ pub struct MergeQueueConfig {
 
 impl MergeQueueConfig {
     /// Whether this queue blocks merges rather than merely reporting.
+    ///
+    /// `None` means GitHub did not supply an enforcement level (the
+    /// GraphQL effective-queue surface omits it) or supplied an unfamiliar
+    /// value. Callers must keep that state unknown rather than choosing a
+    /// mutating path from it.
     #[must_use]
-    pub fn enforcing(&self) -> bool {
-        self.enforcement
-            .as_deref()
-            .is_none_or(|value| !value.eq_ignore_ascii_case(ENFORCEMENT_DISABLED))
+    pub fn enforcing(&self) -> Option<bool> {
+        match self.enforcement.as_deref() {
+            Some(value) if value.eq_ignore_ascii_case("active") => Some(true),
+            Some(value)
+                if value.eq_ignore_ascii_case("disabled")
+                    || value.eq_ignore_ascii_case("evaluate") =>
+            {
+                Some(false)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -594,13 +604,25 @@ pub fn determine_strict(protection: &Payload, queue: &QueueFinding) -> StrictFin
 pub fn enqueue_guidance(queue: &QueueFinding) -> EnqueueGuidance {
     match &queue.verdict {
         Verdict::Present(config) => {
-            let method = config.merge_method.as_deref().unwrap_or("MERGE");
-            let flag = match method.to_ascii_uppercase().as_str() {
-                "SQUASH" => "--squash",
-                "REBASE" => "--rebase",
-                _ => "--merge",
+            let (method, flag) = match config.merge_method.as_deref() {
+                Some(value) if value.eq_ignore_ascii_case("MERGE") => ("MERGE", "--merge"),
+                Some(value) if value.eq_ignore_ascii_case("SQUASH") => ("SQUASH", "--squash"),
+                Some(value) if value.eq_ignore_ascii_case("REBASE") => ("REBASE", "--rebase"),
+                _ => {
+                    return EnqueueGuidance {
+                        action: "unknown".to_owned(),
+                        command: None,
+                        rationale: "A merge queue was observed but its merge method was not supplied or was unfamiliar; do not name a merge command until GitHub's queue method can be measured.".to_owned(),
+                    };
+                }
             };
-            let enforcing = config.enforcing();
+            let Some(enforcing) = config.enforcing() else {
+                return EnqueueGuidance {
+                    action: "unknown".to_owned(),
+                    command: None,
+                    rationale: "A merge queue was observed but its enforcement level was not supplied or was unfamiliar; do not choose an enqueue or direct merge path until GitHub's queue authority can be measured".to_owned(),
+                };
+            };
             EnqueueGuidance {
                 action: if enforcing { "enqueue" } else { "merge" }.to_owned(),
                 command: Some(if enforcing {

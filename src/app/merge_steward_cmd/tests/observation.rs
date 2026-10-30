@@ -5,7 +5,7 @@ use crate::app::merge_steward_cmd::observation::{
 };
 #[cfg(unix)]
 use crate::app::merge_steward_cmd::observation::{
-    check_runs_for_head, hydrate_preemption_jobs, required_checks,
+    check_runs_for_head, hydrate_census_check_identities, hydrate_preemption_jobs, required_checks,
 };
 
 #[test]
@@ -329,6 +329,32 @@ fn current_head_check_transport_preserves_producer_identity() {
 
 #[cfg(unix)]
 #[test]
+fn open_pr_list_falls_back_to_rest_after_gateway_failure() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"
+case "$*" in
+  *"pr list"*) echo "HTTP 502 Bad Gateway" >&2; exit 1 ;;
+  *"repos/owner/repo/pulls?state=open&base=main&per_page=100&page=1"*)
+    printf '%s' '[{"node_id":"PR_kw","number":42,"draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature"},"mergeable_state":"clean","auto_merge":null,"labels":[{"name":"managed"}]}]' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let prs =
+        pull_requests(&actions, "owner/repo", "main", &BTreeMap::new()).expect("REST fallback");
+    assert_eq!(prs.len(), 1);
+    assert_eq!(prs[0].node_id, "PR_kw");
+    assert_eq!(prs[0].fact.number, 42);
+    assert_eq!(prs[0].fact.head_sha, "a".repeat(40));
+    assert_eq!(prs[0].fact.head_branch, "feature");
+    assert_eq!(prs[0].fact.labels, vec!["managed"]);
+    assert!(prs[0].check_rollup_maybe_truncated);
+}
+
+#[cfg(unix)]
+#[test]
 fn live_pr_revalidation_hydrates_required_check_identity() {
     let temp = tempfile::tempdir().expect("temp");
     let actions = fake_gh(
@@ -582,9 +608,9 @@ fn merge_queue_transport_paginates_beyond_one_hundred_entries() {
         &temp,
         &format!(
             r#"
-if test "$#" -eq 10; then
+    if test "$#" -eq 10; then
   cat '{}'
-elif test "$#" -eq 12 && test "${{11}}" = -F && test "${{12}}" = cursor=cursor-100; then
+    elif test "$#" -eq 12 && test "${{11}}" = -F && test "${{12}}" = cursor=cursor-100; then
   cat '{}'
 else
   echo "unexpected pagination call: $*" >&2
@@ -817,45 +843,162 @@ fn open_pull_request_census_does_not_request_the_check_rollup() {
 }
 
 #[test]
-fn absent_check_rollup_marks_only_managed_pull_requests_for_hydration() {
+fn absent_check_rollup_marks_explicit_and_implicit_managed_pull_requests_for_hydration() {
     let positions = BTreeMap::new();
-    let row = |number: u64, labels: serde_json::Value| {
-        serde_json::json!({
+    let row = |number: u64, branch: &str, author: Option<&str>, labels: serde_json::Value| {
+        let mut row = serde_json::json!({
             "id": format!("PR_{number}"),
             "number": number,
             "isDraft": false,
             "baseRefName": "main",
             "headRefOid": format!("{number:040x}"),
-            "headRefName": format!("feature-{number}"),
+            "headRefName": branch,
             "mergeStateStatus": "CLEAN",
             "autoMergeRequest": null,
             "labels": labels
-        })
+        });
+        if let Some(author) = author {
+            row["author"] = serde_json::json!({"login": author});
+        }
+        row
     };
 
     let managed = parse_pr(
-        &row(1, serde_json::json!([{"name": "shipyard:managed"}])),
+        &row(
+            1,
+            "topic/managed",
+            Some("alice"),
+            serde_json::json!([{"name": "shipyard:managed"}]),
+        ),
         &positions,
     )
     .expect("managed PR");
-    let unmanaged = parse_pr(&row(2, serde_json::json!([])), &positions).expect("unmanaged PR");
+    let implicit = parse_pr(
+        &row(
+            2,
+            "feature/fleet",
+            Some("app/shipyard-local"),
+            serde_json::json!([]),
+        ),
+        &positions,
+    )
+    .expect("implicit fleet PR");
+    let ordinary = parse_pr(
+        &row(3, "feature/human", Some("alice"), serde_json::json!([])),
+        &positions,
+    )
+    .expect("ordinary PR");
+    let foreign_app = parse_pr(
+        &row(
+            4,
+            "feature/foreign-app",
+            Some("app/other-automation"),
+            serde_json::json!([]),
+        ),
+        &positions,
+    )
+    .expect("foreign App PR");
 
     assert!(
         managed.check_rollup_maybe_truncated,
         "a managed PR whose rollup was never observed must be hydrated per head"
     );
     assert!(
-        !unmanaged.check_rollup_maybe_truncated,
-        "an unmanaged PR must not buy a per-head hydration round trip"
+        implicit.check_rollup_maybe_truncated,
+        "an unlabeled fleet PR is implicitly managed and must be hydrated per head"
+    );
+    assert!(
+        !ordinary.check_rollup_maybe_truncated,
+        "an ordinary human PR must not buy a per-head hydration round trip"
+    );
+    assert!(
+        !foreign_app.check_rollup_maybe_truncated,
+        "a non-fleet App must not buy a per-head hydration round trip"
     );
     assert!(managed.fact.checks.is_empty());
+    assert!(implicit.fact.checks.is_empty());
 
     // An observed rollup keeps its existing meaning for the single-PR callers
     // that still request it: complete below the page cap, suspect at it.
-    let mut observed = row(3, serde_json::json!([]));
+    let mut observed = row(5, "feature/observed", Some("alice"), serde_json::json!([]));
     observed["statusCheckRollup"] = serde_json::json!([]);
     let observed = parse_pr(&observed, &positions).expect("observed rollup");
     assert!(!observed.check_rollup_maybe_truncated);
+}
+
+#[cfg(unix)]
+#[test]
+fn census_hydrates_unlabeled_fleet_checks_with_the_required_app_identity() {
+    let temp = tempfile::tempdir().expect("temp");
+    let calls_path = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"/check-runs?per_page=100&page=1"*) printf '%s' '{{"check_runs":[{{"name":"macos","app":{{"id":42}},"status":"completed","conclusion":"success"}}]}}' ;;
+  *"/statuses?per_page=100&page=1"*) printf '%s' '[]' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            calls_path.display()
+        ),
+    );
+    let row = |number: u64, sha: &str, branch: &str, author: &str| {
+        serde_json::json!({
+            "id": format!("PR_{number}"),
+            "number": number,
+            "isDraft": false,
+            "baseRefName": "main",
+            "headRefOid": sha,
+            "headRefName": branch,
+            "author": {"login": author},
+            "mergeStateStatus": "CLEAN",
+            "autoMergeRequest": null,
+            "labels": []
+        })
+    };
+    let mut prs = vec![
+        parse_pr(
+            &row(1, &"a".repeat(40), "feature/fleet", "app/shipyard-local"),
+            &BTreeMap::new(),
+        )
+        .expect("fleet PR"),
+        parse_pr(
+            &row(2, &"b".repeat(40), "feature/human", "alice"),
+            &BTreeMap::new(),
+        )
+        .expect("human PR"),
+        parse_pr(
+            &row(
+                3,
+                &"c".repeat(40),
+                "feature/foreign-app",
+                "app/other-automation",
+            ),
+            &BTreeMap::new(),
+        )
+        .expect("foreign App PR"),
+    ];
+    hydrate_census_check_identities(
+        &actions,
+        "owner/repo",
+        &[RequiredCheck {
+            context: "macos".to_owned(),
+            app_id: Some(42),
+        }],
+        &mut prs,
+    )
+    .expect("census hydration");
+
+    assert_eq!(prs[0].fact.checks.len(), 1);
+    assert_eq!(prs[0].fact.checks[0].app_id, Some(42));
+    assert!(prs[1].fact.checks.is_empty());
+    assert!(prs[2].fact.checks.is_empty());
+    let calls = fs::read_to_string(calls_path).expect("hydration calls");
+    assert!(calls.contains(&format!("commits/{}/check-runs", "a".repeat(40))));
+    assert!(!calls.contains(&format!("commits/{}/check-runs", "b".repeat(40))));
+    assert!(!calls.contains(&format!("commits/{}/check-runs", "c".repeat(40))));
 }
 
 /// The bulk open-PR read must stay within GitHub's per-query node budget no

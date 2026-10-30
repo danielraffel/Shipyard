@@ -937,6 +937,60 @@ fn command_token_cache_is_partitioned_by_expanded_repository() {
 
 #[cfg(unix)]
 #[test]
+fn uncached_command_token_appends_arguments_and_mints_every_time() {
+    let temp = TempDir::new().expect("tempdir");
+    let helper = temp.path().join("scoped-token-helper");
+    let calls = temp.path().join("calls");
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '{{\"token\":\"ghs_scoped\",\"expires_at\":\"2099-01-01T00:00:00Z\"}}\\n'\n",
+            calls.display(),
+        ),
+    );
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "command"
+            token_command = ["{}", "--repo", "{{repo_slug}}"]
+            "#,
+        helper.display()
+    ));
+    let client = GhClient::from_loaded_config(&config)
+        .expect("client")
+        .with_repo_override("owner/one")
+        .expect("repo");
+    let extra = [
+        "--scope-repository".to_owned(),
+        "--permission".to_owned(),
+        "contents=write".to_owned(),
+    ];
+
+    for _ in 0..2 {
+        let (token, expires_at) = client
+            .mint_uncached_command_token(temp.path(), &extra, Duration::from_secs(10))
+            .expect("mint")
+            .expect("command source");
+        assert_eq!(token, "ghs_scoped");
+        assert_eq!(
+            expires_at.map(|time| time.to_rfc3339()).as_deref(),
+            Some("2099-01-01T00:00:00+00:00")
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(calls).expect("calls"),
+        "--repo owner/one --scope-repository --permission contents=write\n".repeat(2)
+    );
+
+    let ambient = GhClient::from_loaded_config(&config_from_toml(""))
+        .expect("ambient client")
+        .mint_uncached_command_token(temp.path(), &extra, Duration::from_secs(10))
+        .expect("ambient");
+    assert!(ambient.is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn explicit_repo_override_resolves_ambiguous_checkout_without_exposing_token() {
     let repo = TempDir::new().expect("tempdir");
     git(repo.path(), &["init", "--quiet", "--initial-branch=main"]);
@@ -1038,6 +1092,47 @@ fn parses_github_remote_urls() {
 fn detects_graphql_rate_limit_text() {
     assert!(is_graphql_rate_limited("GraphQL: API rate limit exceeded"));
     assert!(!is_graphql_rate_limited("REST API rate limit exceeded"));
+}
+
+#[test]
+fn transient_helper_failures_include_github_gateway_statuses() {
+    assert!(helper_failure_is_transient("gh: HTTP 502 Bad Gateway"));
+    assert!(helper_failure_is_transient("gh: HTTP 504 Gateway Timeout"));
+    assert!(!helper_failure_is_transient("HTTP 403 Forbidden"));
+}
+
+#[cfg(unix)]
+#[test]
+fn batched_pr_states_falls_back_to_rest_after_gateway_failure() {
+    let temp = TempDir::new().expect("temp");
+    let fake_gh = temp.path().join("gh");
+    let invocations = temp.path().join("invocations");
+    write_executable(
+        &fake_gh,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = pr ]; then echo 'HTTP 502 Bad Gateway' >&2; exit 1; fi\nprintf '%s' '[{{\"number\":42,\"state\":\"OPEN\"}}]'\n",
+            invocations.display()
+        ),
+    );
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "env"
+            token_env = "PATH"
+            ambient_gh_binary = "{}"
+            "#,
+        fake_gh.display()
+    ));
+    let client = GhClient::from_loaded_config(&config).expect("client");
+
+    let states =
+        pr_states_batched_with_options(Some(&client), "owner/repo", temp.path(), 3, Some(&fake_gh))
+            .expect("REST fallback should resolve states");
+    assert_eq!(states.get(&42).map(String::as_str), Some("OPEN"));
+    assert_eq!(
+        std::fs::read_to_string(invocations).expect("invocations"),
+        "pr list --repo owner/repo --state all --limit 3 --json number,state\napi -X GET repos/owner/repo/pulls?state=all&per_page=100&page=1\n"
+    );
 }
 
 #[test]

@@ -34,6 +34,15 @@ pub(super) fn auth_command<W: Write>(
         AuthCommand::HelperArgv { wrapper, repo } => {
             auth_helper_argv(global_dir, &wrapper, &repo, stdout)?;
         }
+        AuthCommand::GitCredential { action } => {
+            return super::git_credential_cmd::git_credential(
+                &action,
+                global_dir,
+                cwd,
+                std::io::stdin().lock(),
+                stdout,
+            );
+        }
         AuthCommand::Doctor { repo } => {
             auth_doctor(mode, cwd, repo.as_deref(), json_mode, stdout)?;
         }
