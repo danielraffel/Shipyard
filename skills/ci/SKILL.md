@@ -2779,7 +2779,9 @@ open PR heads, use `shipyard queue-observe`. It persists a canonical snapshot,
 emits only initial state or semantic deltas, and backs unchanged polling off
 through 15/30/60/120/300 seconds. The command also reports local mutation
 authority and `HOLD` state, but it never acquires a mutation lease or calls a
-GitHub mutation. Its state file, append-only transition log, and exclusive lock
+GitHub mutation. When a cursor predates the current integrity schema, the live
+observer reboots from a fresh authenticated snapshot rather than trusting
+legacy timestamps. Its state file, append-only transition log, and exclusive lock
 provide a durable handoff boundary for queue-monitor agents. See
 [`docs/queue-observer.md`](../../docs/queue-observer.md).
 
