@@ -1475,34 +1475,97 @@ impl MetricsStore {
         let key = crate::metrics::project_key::ProjectKey::parse(project);
         let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
         let project_filter = crate::metrics::project_key::sql_filter("project", "repo");
-        let safe: Vec<(String, String, i64)> = {
-            let auth_filter = if authenticated_only {
-                " AND EXISTS (
-                    SELECT 1
-                    FROM merge_receipt_handoff_receipts hhr
-                    JOIN merge_receipt_handoffs h ON h.envelope_id = hhr.envelope_id
-                    WHERE hhr.receipt_id = merge_receipts.receipt_id
-                      AND h.repo = merge_receipts.repo
-                      AND h.project = merge_receipts.project
-                      AND h.base_branch = merge_receipts.base_branch
-                )"
-            } else {
-                ""
-            };
-            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND base_branch = ?5 AND julianday(merged_at) >= julianday(?4) AND julianday(merged_at) < julianday(?6){auth_filter}"))?;
-            q.query_map(
-                rusqlite::params![
-                    any,
-                    short,
-                    full,
-                    cutoff,
-                    SCORECARD_BASE_BRANCH,
-                    Utc::now().to_rfc3339()
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?
-            .collect::<Result<_, _>>()?
+        let cutoff = DateTime::parse_from_rfc3339(cutoff)?.with_timezone(&Utc);
+        let now = Utc::now();
+        let auth_filter = if authenticated_only {
+            " AND EXISTS (
+                SELECT 1
+                FROM merge_receipt_handoff_receipts hhr
+                JOIN merge_receipt_handoffs h ON h.envelope_id = hhr.envelope_id
+                WHERE hhr.receipt_id = merge_receipts.receipt_id
+                  AND h.repo = merge_receipts.repo
+                  AND h.project = merge_receipts.project
+                  AND h.base_branch = merge_receipts.base_branch
+            )"
+        } else {
+            ""
         };
+        let mut q = conn.prepare(&format!(
+            "SELECT schema, receipt_id, repo, project, base_branch, pr, head_sha,
+                    validated_head_sha, merge_commit_sha, merged_at, safe_merge,
+                    source, required_checks_json, gate_receipt_sha256, evidence
+               FROM merge_receipts
+              WHERE {project_filter}{auth_filter}"
+        ))?;
+        let rows = q.query_map(rusqlite::params![any, short, full], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, i64>(10)? == 1,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
+            ))
+        })?;
+        let mut safe = Vec::new();
+        for row in rows {
+            let (
+                schema,
+                receipt_id,
+                repo,
+                project,
+                base_branch,
+                pr,
+                head_sha,
+                validated_head_sha,
+                merge_commit_sha,
+                merged_at,
+                safe_merge,
+                source,
+                required_checks_json,
+                gate_receipt_sha256,
+                evidence,
+            ) = row?;
+            let required_checks = serde_json::from_str(&required_checks_json).map_err(|error| {
+                format!("stored merge receipt {receipt_id} has invalid required checks: {error}")
+            })?;
+            let merged_at = DateTime::parse_from_rfc3339(&merged_at)?.with_timezone(&Utc);
+            let receipt = crate::metrics::merge_receipt::MergeReceipt {
+                schema,
+                receipt_id: receipt_id.clone(),
+                repo: repo.clone(),
+                project,
+                base_branch,
+                pr,
+                head_sha,
+                validated_head_sha,
+                merge_commit_sha,
+                merged_at,
+                safe_merge,
+                source,
+                required_checks,
+                gate_receipt_sha256,
+                evidence,
+            };
+            receipt.validate().map_err(|error| {
+                format!("stored merge receipt {receipt_id} is invalid: {error}")
+            })?;
+            if receipt.base_branch == SCORECARD_BASE_BRANCH
+                && receipt.merged_at >= cutoff
+                && receipt.merged_at < now
+            {
+                safe.push((repo, receipt.head_sha, pr));
+            }
+        }
         let mut unique =
             std::collections::BTreeMap::<(String, String), std::collections::BTreeSet<i64>>::new();
         for (repo, head, pr) in safe {
@@ -4779,6 +4842,34 @@ mod tests {
             .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
             .unwrap();
         assert_eq!((total, joined), (1, 0));
+    }
+
+    #[test]
+    fn safe_merge_summary_rejects_malformed_stored_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        store
+            .import_merge_receipts(&[test_receipt(
+                "malformed-merge",
+                "owner/repo",
+                "repo",
+                1,
+                'a',
+            )])
+            .unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_receipts SET validated_head_sha = ?1 WHERE receipt_id = ?2",
+                rusqlite::params![&"b".repeat(40), "malformed-merge"],
+            )
+            .unwrap();
+
+        let error = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .expect_err("malformed stored receipts must fail closed");
+        assert!(error.to_string().contains("validated_head_sha"));
     }
 
     #[test]
