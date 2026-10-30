@@ -612,7 +612,7 @@ fn run_bounded<T: Send>(
 /// The REST list endpoint omits `mergeable_state`; only `GET pulls/{n}`
 /// carries it. Read it for the rows that can still be admitted. A row that
 /// cannot be read keeps no state, which parses as `UNKNOWN` and is refused by
-/// every arming path.
+/// the native arming backstop.
 fn hydrate_rest_merge_states(
     actions: &GitHubActions,
     repo: &str,
@@ -882,10 +882,21 @@ pub(super) fn hydrate_census_check_identities(
 /// pull request.
 ///
 /// `classify_pr` answers queued, draft, invalid-head and conflicting pull
-/// requests before it weighs a single check, so hydrating them costs round
-/// trips that cannot change any outcome or report.
+/// requests before it weighs a required check, so those rows skip hydration.
+/// A row carrying the managed label is the exception: `classify_management`
+/// runs first and reads the handoff commit status from the hydrated checks, so
+/// without them a labelled queued, draft or conflicting row would classify as
+/// `HandoffMissing` and lose its recovery wake, success continuation and run
+/// supersedence.
 fn checks_can_change_decision(pr: &ObservedPr) -> bool {
     let fact = &pr.fact;
+    if fact
+        .labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(super::MANAGED_LABEL))
+    {
+        return true;
+    }
     fact.queue_position.is_none()
         && !fact.draft
         && is_full_sha(&fact.head_sha)

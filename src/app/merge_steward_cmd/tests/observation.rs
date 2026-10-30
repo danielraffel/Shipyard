@@ -483,6 +483,69 @@ esac
     assert!(prs[1].check_rollup_maybe_truncated, "left unobserved");
 }
 
+/// A labelled row is classified by its handoff commit status before the
+/// queued, draft and conflict answers, so it must keep being hydrated.
+#[cfg(unix)]
+#[test]
+fn census_keeps_the_handoff_status_for_labelled_queued_draft_and_dirty_rows() {
+    use crate::merge_steward::{StewardDecision, StewardPolicy, classify_pr};
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"case "$*" in
+  *"/check-runs?per_page=100&page=1"*) printf '%s' '{"check_runs":[]}' ;;
+  *"/statuses?per_page=100&page=1"*) printf '%s' '[{"context":"shipyard/steward-handoff","state":"success","target_url":null,"created_at":"2026-07-26T02:00:00Z"}]' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+    );
+    let row = |number: u64, c: char, draft: bool, state: &str| {
+        serde_json::json!({
+            "id": format!("PR_{number}"), "number": number, "isDraft": draft,
+            "baseRefName": "main", "headRefOid": c.to_string().repeat(40),
+            "headRefName": format!("f{number}"), "author": {"login": "alice"},
+            "mergeStateStatus": state, "autoMergeRequest": null,
+            "labels": [{"name": "shipyard:managed"}]
+        })
+    };
+    let positions = BTreeMap::from([(1, 0)]);
+    let mut prs = [
+        row(1, 'a', false, "CLEAN"),
+        row(2, 'b', true, "CLEAN"),
+        row(3, 'c', false, "DIRTY"),
+    ]
+    .iter()
+    .map(|row| parse_pr(row, &positions).expect("pr"))
+    .collect::<Vec<_>>();
+    hydrate_census_check_identities(&actions, "owner/repo", &[], &mut prs).expect("census");
+    let policy = StewardPolicy {
+        merge_queue: true,
+        native_auto_merge: true,
+        required_checks: Vec::new(),
+        opt_out_label: "shipyard:unmanaged".to_owned(),
+        provenance_blocking_labels: Vec::new(),
+        managed_label: Some(MANAGED_LABEL.to_owned()),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 0,
+    };
+    let decisions = prs
+        .iter()
+        .map(|pr| classify_pr(&pr.fact, &policy, &BTreeMap::new()))
+        .collect::<Vec<_>>();
+    assert!(matches!(decisions[0], StewardDecision::Queued { .. }));
+    assert_eq!(decisions[1], StewardDecision::Draft);
+    assert!(matches!(decisions[2], StewardDecision::NeedsUpdate { .. }));
+    for pr in &prs {
+        assert!(
+            crate::app::merge_steward_cmd::cancellation_revalidation::pull_request_is_managed(
+                pr,
+                MANAGED_LABEL,
+                HANDOFF_CONTEXT
+            )
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn census_fails_closed_when_a_candidates_checks_are_unreadable() {
