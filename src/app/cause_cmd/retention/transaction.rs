@@ -540,7 +540,18 @@ fn copy_restore(old: &Path, target: &Path, dir: &Path) -> Result<(), String> {
     sync_dir(dir)
 }
 
-fn install_staged(staged: &Path, target: &Path, dir: &Path) -> Result<(), String> {
+fn install_staged(
+    staged: &Path,
+    target: &Path,
+    expected_sha256: &str,
+    dir: &Path,
+) -> Result<(), String> {
+    if sha256_file(staged)? != expected_sha256 {
+        return Err(format!(
+            "staged replacement checksum changed {}",
+            staged.display()
+        ));
+    }
     let parent = target
         .parent()
         .ok_or_else(|| "archive target has no parent".to_owned())?;
@@ -553,6 +564,9 @@ fn install_staged(staged: &Path, target: &Path, dir: &Path) -> Result<(), String
     }
     fs::copy(staged, &temp).map_err(|error| error.to_string())?;
     sync_file(&temp)?;
+    if sha256_file(&temp)? != expected_sha256 {
+        return Err(format!("replacement checksum mismatch {}", temp.display()));
+    }
     if let Ok(meta) = fs::symlink_metadata(target) {
         if meta.file_type().is_symlink() || !meta.is_file() {
             return Err(format!("unsafe archive target {}", target.display()));
@@ -758,7 +772,11 @@ pub(crate) fn apply_transaction(
                 // Keep the staged bytes in the transaction. A second crash
                 // during rollback can then still validate the manifest and
                 // distinguish the old target from the intended replacement.
-                install_staged(&staged, &target, dir)?;
+                let expected = entry
+                    .new_sha256
+                    .as_deref()
+                    .ok_or_else(|| "transaction entry lacks staged checksum".to_owned())?;
+                install_staged(&staged, &target, expected, dir)?;
             }
             if let Some(parent) = target.parent() {
                 sync_dir(parent)?;
