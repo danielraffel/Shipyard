@@ -405,11 +405,11 @@ pub(super) fn metrics_command<W: Write>(
             })?;
             write_output(stdout, json_output, &summary, || {
                 format!(
-                    "{} repeated-work observations; avoided survivor runtime: {} ms ({} matched clean, {} uncertain, {} cancelled, {} unmatched; {} distinct survivors; final attempt only={})",
+                    "{} repeated-work observations; avoided survivor runtime: {} ({} matched clean, {} uncertain, {} cancelled, {} unmatched; {} distinct survivors; final attempt only={})",
                     summary.observations,
                     summary
                         .duration_ms
-                        .map_or_else(|| "unavailable".to_owned(), |ms| ms.to_string()),
+                        .map_or_else(|| "unavailable".to_owned(), |ms| format!("{ms} ms")),
                     summary.matched_clean,
                     summary.excluded_uncertain,
                     summary.excluded_cancelled,
