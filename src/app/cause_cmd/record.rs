@@ -412,9 +412,13 @@ fn linked_fixlinks(dir: &Path) -> Result<BTreeSet<(String, u64, u64)>, String> {
                     )
                 })?,
             };
-            Ok((repo.to_owned(), red_run_id, red_attempt))
+            if !super::advice::link_identity_complete(&row) {
+                return Ok(None);
+            }
+            Ok(Some((repo.to_owned(), red_run_id, red_attempt)))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(|rows| rows.into_iter().flatten().collect())
 }
 
 fn append(path: &Path, rows: &[Value]) -> Result<(), String> {

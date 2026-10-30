@@ -1429,13 +1429,13 @@ fn pending_reds_are_counted_by_how_long_ago_they_went_red() {
 #[test]
 fn malformed_archived_red_head_is_not_pending_for_fix_linking() {
     let rows = vec![json!({
-            "failure_class": "build",
-            "repo": "Generous-Corp/pulp",
-            "run_id": 100,
-            "attempt": 1,
-            "head_sha": "short",
-            "completed_at": "2026-10-14T10:30:00Z"
-        })];
+        "failure_class": "build",
+        "repo": "Generous-Corp/pulp",
+        "run_id": 100,
+        "attempt": 1,
+        "head_sha": "short",
+        "completed_at": "2026-10-14T10:30:00Z"
+    })];
 
     assert!(pending_reds(&rows, "2026-10-13T00:00:00Z", &BTreeSet::new()).is_empty());
 }

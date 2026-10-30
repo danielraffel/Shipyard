@@ -394,6 +394,27 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
     }
 }
 
+/// Identity fields required before a producer treats a fix-link as already
+/// recorded. This is intentionally weaker than `valid_fixlink`: an unsafe
+/// but structurally complete row should still be deduplicated, while a row
+/// with malformed run/head identity must be eligible for backfill.
+pub(super) fn link_identity_complete(value: &Value) -> bool {
+    value["schema"] == SCHEMA
+        && value["source"] == "fix-link"
+        && value["repo"].as_str().is_some_and(|repo| !repo.is_empty())
+        && value["red_run_id"].as_u64().is_some_and(|id| id > 0)
+        && value["red_attempt"]
+            .as_u64()
+            .is_some_and(|attempt| attempt > 0)
+        && value["head_sha"].as_str().is_some_and(valid_sha)
+        && value["fix_run_id"].as_u64().is_some_and(|id| id > 0)
+        && value["fix_head_sha"].as_str().is_some_and(valid_sha)
+        && matches!(
+            value["derivation"].as_str(),
+            Some("compare_red_head_to_fix_head" | "rerun_green")
+        )
+}
+
 /// Validate the producer fields that establish when and why a link was made.
 /// A link with valid-looking SHAs but no timestamps or collector rule is not
 /// enough provenance to present as a historical fix.
