@@ -1799,6 +1799,21 @@ targets, or `--target-cwd` when overridden).
 
 ## Runner Metrics
 
+The optional capacity-only observer is `scripts/collect_fleet_capacity.py`;
+see `docs/capacity-observer.md` for its private roster and bounded one-shot
+policy. It fetches without a database lease, then invokes the existing Rust
+capacity importer once. Missing hosts never receive fabricated receipts;
+complete unknown producer documents still require importer validation.
+Compact attempt history has age/byte bounds, source/roster digests, and explicit
+overlap/missing/unconfirmed outcomes. No service installation or scheduling is
+implied. Pass provenance includes the resolved local importer path/hash.
+`SHIPYARD_OBSERVATIONS=off` returns disabled before reads, processes or storage;
+it must not create a successful attempt. Require deployed producer/importer and real timeout/cost evidence
+before an owner approves continuous collection.
+Output-limit failures terminate only the owned child group while pipe callbacks
+continue discarding through EOF; cleanup must preserve the original limit reason
+and close subprocess transports before event-loop shutdown.
+
 Use `shipyard metrics` when an agent needs historical runner timing, queue, and
 health context before recommending a routing, cache, or monitoring change. The
 metrics store is optional and local to Shipyard state; projects do not need
