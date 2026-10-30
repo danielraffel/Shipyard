@@ -271,3 +271,22 @@ fn auxiliary_jsonl_files_do_not_prevent_canonical_archiving() {
     let report = archive(dir.path(), &[record(6, "2026-10-13T12:00:00Z")]).unwrap();
     assert_eq!(report.appended, 1);
 }
+
+#[test]
+fn a_managed_archive_without_its_lock_fails_closed_before_reading() {
+    let dir = tempfile::tempdir().expect("archive");
+    std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
+    std::fs::write(
+        dir.path().join(".shipyard-cause-archive.json"),
+        br#"{"schema":"shipyard.cause-archive/v1","frozen":false}"#,
+    )
+    .expect("archive marker");
+
+    let error = match lock_archive(dir.path(), false) {
+        Ok(_) => panic!("missing managed lock must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("managed archive lacks its lock"), "{error}");
+    assert!(!dir.path().join(".lock").exists());
+}

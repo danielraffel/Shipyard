@@ -114,7 +114,9 @@ and unresolved `supersedes` rows are preserved and listed in JSON output; if the
 size cap cannot retain them, pruning refuses. Malformed or unclassifiable rows
 fail closed and are left untouched. Rotation is separate from collection, so
 disabling observation does not delete data. Readers take a shared lock and
-refuse an interrupted transaction without writing to the archive.
+refuse an interrupted transaction without writing to the archive. A frozen
+archive also refuses `cause record` and `cause archive`; copy it to a mutable
+operational archive before collecting or appending new rows.
 
 For a local integrity check, run `shipyard cause audit --dir DIR`. It reads
 the cause month files and `fixlinks.jsonl`, reports malformed rows, duplicate
