@@ -4253,3 +4253,11 @@ the local formatting and lint gates; m1 is a fallback, not a universal gate.
 These checks are a push safeguard only. GitHub CI, branch protection, and the
 configured Shipyard mutation machine remain the landing authority.
 
+## Authenticated wrapper repository provenance
+
+When a Shipyard GitHub client targets a repository outside its checkout, its
+explicit repository scope must be exported as `GH_REPO=OWNER/REPO` for the
+`ghapp` wrapper. Native `gh api graphql` does not accept a `--repo` argument;
+keep provenance in the client environment rather than appending wrapper-only
+flags to native CLI invocations.
+
