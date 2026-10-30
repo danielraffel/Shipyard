@@ -528,6 +528,71 @@ class BaselineStateRetentionTests(unittest.TestCase):
                 self.update()
         self.assertEqual(self.path.read_bytes(), original)
 
+    def test_cli_invalid_identity_preserves_state_and_history_in_both_modes(self):
+        db = self.path.parent / "metrics/metrics.db"
+        pass_path = self.path.parent / "passes.json"
+        pass_path.write_text("existing history must not be touched")
+        base = ["collect_baseline.py", "--db", str(db), "--project", "pulp",
+                "--repo", "o/pulp", "--state", str(self.path), "--pass-history", str(pass_path)]
+        valid_identity = MOD.state_identity(self.path, "pulp", "o/pulp", db)
+        for identity in (None, [], "invalid", dict(valid_identity, repo="other/pulp")):
+            for collect_flag in ([], ["--collect"]):
+                with self.subTest(identity=identity, collect=bool(collect_flag)):
+                    state = {"started_at": self.started.isoformat(), "observations": [self.row(self.started)]}
+                    if identity is not None:
+                        state["identity"] = identity
+                    original = json.dumps(state)
+                    self.path.write_text(original)
+                    with mock.patch.object(sys, "argv", base + collect_flag), \
+                            mock.patch.object(MOD, "import_organic") as collect, \
+                            mock.patch.object(MOD, "authoritative_scorecard") as scorecard, \
+                            mock.patch.object(MOD, "record_pass_observation", wraps=MOD.record_pass_observation) as record, \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(MOD.main(), 1)
+                    collect.assert_not_called()
+                    scorecard.assert_not_called()
+                    record.assert_not_called()
+                    self.assertEqual(self.path.read_text(), original)
+                    self.assertEqual(pass_path.read_text(), "existing history must not be touched")
+
+    def test_cli_project_repo_mismatch_stops_before_collection_or_history(self):
+        argv = ["collect_baseline.py", "--db", str(self.path.parent / "metrics/metrics.db"),
+                "--project", "other", "--repo", "o/pulp", "--state", str(self.path)]
+        for collect_flag in ([], ["--collect"]):
+            with self.subTest(collect=bool(collect_flag)), mock.patch.object(sys, "argv", argv + collect_flag), \
+                    mock.patch.object(MOD, "import_organic") as collect, \
+                    mock.patch.object(MOD, "authoritative_scorecard") as scorecard, \
+                    mock.patch.object(MOD, "record_pass_observation") as record, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(MOD.main(), 1)
+            collect.assert_not_called()
+            scorecard.assert_not_called()
+            record.assert_not_called()
+            self.assertFalse(self.path.exists())
+
+    def test_provider_failure_after_valid_preflight_records_failed_pass(self):
+        db = self.path.parent / "metrics/metrics.db"
+        pass_path = self.path.parent / "passes.json"
+        state = {"started_at": self.started.isoformat(), "observations": [self.row(self.started)],
+                 "identity": MOD.state_identity(self.path, "pulp", "o/pulp", db)}
+        original = json.dumps(state)
+        self.path.write_text(original)
+        argv = ["collect_baseline.py", "--db", str(db), "--project", "pulp", "--repo", "o/pulp",
+                "--state", str(self.path), "--pass-history", str(pass_path), "--collect"]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(MOD, "import_organic", side_effect=RuntimeError("provider unavailable")) as collect, \
+                mock.patch.object(MOD, "authoritative_scorecard") as scorecard, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(MOD.main(), 1)
+        collect.assert_called_once()
+        scorecard.assert_not_called()
+        self.assertEqual(self.path.read_text(), original)
+        observations = json.loads(pass_path.read_text())["observations"]
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["status"], "failed")
+        self.assertEqual(observations[0]["error"], "provider unavailable")
+        self.assertFalse(observations[0]["completed"])
+
 
 class CollectorInvocationTests(unittest.TestCase):
     def test_project_repo_scope_requires_owner_and_matching_short_name(self):

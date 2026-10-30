@@ -994,6 +994,8 @@ def main() -> int:
     attempt_started_at = dt.datetime.now(dt.timezone.utc)
     try:
         load_status_state(args.state, attempt_started_at, attempt_started_at)
+        validate_project_repo(args.project, args.repo)
+        validate_state_identity(args.state, args.project, args.repo, args.db)
         state_validated = True
         events = import_organic(args) if args.collect else []
         card = authoritative_scorecard(args)

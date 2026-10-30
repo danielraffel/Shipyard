@@ -5356,7 +5356,10 @@ observations by default. `--state-retention-days` and
 `--state-max-observations` accept positive integers to change those limits;
 raise both when retaining a longer, frequent collection history. Every status
 write trims expired/oldest observations after validating existing timestamps,
-including status-only writes. Malformed state refuses replacement. The legacy
+including status-only writes. Malformed state refuses replacement. State
+identity and project/repository scope are checked before any provider
+import or pass-history write in either mode. Provider failures after valid
+preflight still record failed prospective passes. The legacy
 activity/collection counters describe retained observations, as labeled by
 `observation_retention.counter_scope`; they never establish readiness.
 Retention leaves the baseline start and authoritative pass history unchanged.
