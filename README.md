@@ -235,6 +235,14 @@ an observer with `shipyard metrics export merge-receipt --repo <owner/repo>
 only receipts already persisted by Shipyard. It fails without replacing the
 handoff when no receipt exists.
 
+The optional `scripts/collect_baseline.py` collector keeps diagnostic status
+observations for 14 days, capped at 1,024 entries, to bound accumulated
+scorecards and import details. Increase `--state-retention-days` and
+`--state-max-observations` for a longer history. These limits do not change
+readiness, which uses the separate prospective pass history. Omit `--collect`
+to skip this collector's provider imports; this does not disable other
+Shipyard telemetry.
+
 ## This repository uses Shipyard
 
 Shipyard validates itself on macOS, Linux, and Windows. The workflows and
