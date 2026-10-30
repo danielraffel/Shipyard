@@ -3850,6 +3850,13 @@ everything.
 
 ### Log retention operations
 
+Metrics cleanup uses the existing `SHIPYARD_METRICS_RETENTION_DAYS` policy
+(default 90; nonpositive disables pruning, not collection). It also expires
+queue shadow observations and terminal timing, preserving timing referenced by
+retained shadow rows and malformed timestamps. It never prunes merge receipts
+or operational queue/recovery state. Run `shipyard cleanup --apply` to apply;
+this is not automatic scheduling or a hard database-size cap.
+
 Run `shipyard cleanup` first: dry-run is the default and reports each planned
 `compress`/`delete`, every protected active/failure/audit directory, and the
 high/low byte-watermark projection. Apply with `shipyard cleanup --apply` only
@@ -5363,6 +5370,10 @@ normalizes it.
 timing table, bounded by `--since`, counted once per distinct superseded job
 with excluded and unmatched coverage visible. It never changes queue or merge
 authority.
+The baseline window must be positive: `--since 0d` and `--since=-1d`
+exit with invalid-input code 5. Timing joins require the case-sensitive `sy-`
+prefix and no slash or backslash, even when an excluded ID has a timing row.
+Excluded IDs remain observations with unknown duration, never zero runtime.
 
 ### Prospective baseline pass history
 

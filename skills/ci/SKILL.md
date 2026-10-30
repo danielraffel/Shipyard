@@ -7,6 +7,13 @@ description: "Cross-platform CI coordination with Shipyard: validates, ships, ma
 
 ## Required-check producer identity
 
+Metrics cleanup uses the existing `SHIPYARD_METRICS_RETENTION_DAYS` policy
+(default 90; nonpositive disables pruning, not collection). It also expires
+queue shadow observations and terminal timing, preserving timing referenced by
+retained shadow rows and malformed timestamps. It never prunes merge receipts
+or operational queue/recovery state. Run `shipyard cleanup --apply` to apply;
+this is not automatic scheduling or a hard database-size cap.
+
 When CI code consumes required-check materialization, preserve producer
 identity (`app_id`) when policy distinguishes checks that share a context name.
 If the materialized endpoint omits that identity, retain ambiguous skipped
@@ -4239,6 +4246,10 @@ waste is not limited to the scorecard window.
 timing table within the requested `--since` window. It counts each distinct
 superseded job once; uncertain, cancelled, and unmatched jobs remain coverage
 gaps, and the result never authorizes a queue or merge decision.
+The baseline window must be positive: `--since 0d` and `--since=-1d`
+exit with invalid-input code 5. Timing joins require the case-sensitive `sy-`
+prefix and no slash or backslash, even when an excluded ID has a timing row.
+Excluded IDs remain observations with unknown duration, never zero runtime.
 
 
 At the protected merge boundary, Shipyard may produce that receipt only after
