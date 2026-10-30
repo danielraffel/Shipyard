@@ -5321,8 +5321,10 @@ merge-group runs are not counted, and it is not limited to the scorecard window.
 
 ### Repeated-work cost
 
-`shipyard metrics repeated-work-cost` is read-only shadow accounting; duration
-remains unavailable until queue-to-metrics provenance is authenticated.
+`shipyard metrics repeated-work-cost` is read-only shadow accounting. Its
+`duration_ms` is avoided survivor runtime from the authenticated queue timing
+table, counted once per distinct survivor with excluded and unmatched coverage
+visible. It is an estimate only and never changes queue or merge authority.
 
 ### Prospective baseline pass history
 

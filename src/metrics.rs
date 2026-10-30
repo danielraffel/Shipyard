@@ -645,7 +645,10 @@ impl MetricsStore {
         limit: usize,
     ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        Self::repeated_work_survivor_timing_with_conn(&conn, limit)
+        let tx = conn.unchecked_transaction()?;
+        let timing = Self::repeated_work_survivor_timing_with_conn(&tx, limit)?;
+        tx.commit()?;
+        Ok(timing)
     }
 
     fn repeated_work_survivor_timing_with_conn(
@@ -1415,7 +1418,8 @@ impl MetricsStore {
         limit: usize,
     ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT kind, job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare("SELECT kind, job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
         let ids = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -1445,7 +1449,7 @@ impl MetricsStore {
             }
             let _ = job_id;
         }
-        let timing = Self::repeated_work_survivor_timing_with_conn(&conn, limit)?;
+        let timing = Self::repeated_work_survivor_timing_with_conn(&tx, limit)?;
         out.shadow_rows = timing.shadow_rows;
         out.distinct_survivors = timing.distinct_survivors;
         out.matched_clean = timing.matched_clean;
@@ -1458,6 +1462,8 @@ impl MetricsStore {
             .saturating_sub(timing.matched_clean);
         out.duration_ms = timing.avoided_survivor_ms;
         out.final_attempt_only = timing.final_attempt_only;
+        drop(stmt);
+        tx.commit()?;
         Ok(out)
     }
 

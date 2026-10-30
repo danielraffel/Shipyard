@@ -4210,7 +4210,10 @@ waste is not limited to the scorecard window.
 # Repeated-work cost
 
 `shipyard metrics repeated-work-cost` is read-only shadow accounting. Treat
-duration as unavailable until queue-to-metrics provenance is authenticated.
+`duration_ms` as avoided survivor runtime from the authenticated queue timing
+table. It counts each distinct survivor once; uncertain, cancelled, and
+unmatched survivors remain coverage gaps, and the estimate never authorizes a
+queue or merge decision.
 
 
 At the protected merge boundary, Shipyard may produce that receipt only after
