@@ -273,7 +273,7 @@ fn auxiliary_jsonl_files_do_not_prevent_canonical_archiving() {
 }
 
 #[test]
-fn a_managed_archive_without_its_lock_fails_closed_before_reading() {
+fn a_managed_archive_without_its_lock_is_read_without_mutation() {
     let dir = tempfile::tempdir().expect("archive");
     std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
     std::fs::write(
@@ -282,11 +282,7 @@ fn a_managed_archive_without_its_lock_fails_closed_before_reading() {
     )
     .expect("archive marker");
 
-    let Err(error) = lock_archive(dir.path(), false) else {
-        panic!("missing managed lock must fail closed")
-    };
-
-    assert!(error.contains("managed archive lacks its lock"), "{error}");
+    let _reader = lock_archive(dir.path(), false).expect("missing lock must not block readers");
     assert!(!dir.path().join(".lock").exists());
 }
 

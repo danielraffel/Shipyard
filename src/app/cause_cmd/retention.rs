@@ -817,7 +817,7 @@ mod tests {
         };
         let preview = prune(&args).unwrap();
         assert!(preview.dry_run && preview.bytes_after <= 1);
-        assert!(root.path().join(".lock").exists());
+        assert!(!root.path().join(".lock").exists());
         assert!(root.path().join("causes/2025-01.jsonl").exists());
         let args = CausePruneArgs {
             apply: true,

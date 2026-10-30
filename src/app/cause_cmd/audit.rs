@@ -419,9 +419,8 @@ mod tests {
                 .count(),
             2
         );
-        // A lock file may be bootstrapped for a legacy canonical archive;
-        // archive data itself remains unchanged.
-        assert!(fs::read_dir(dir.path()).expect("after").count() >= before);
+        // Readers never create lock files or otherwise mutate a legacy archive.
+        assert_eq!(fs::read_dir(dir.path()).expect("after").count(), before);
     }
 
     #[test]

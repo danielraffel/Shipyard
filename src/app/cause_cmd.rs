@@ -94,11 +94,11 @@ pub(super) fn cause_command<W: Write>(
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// Hold a managed archive lock for the complete reader or writer operation.
-/// A markerless archive with canonical `causes/` or `fixlinks.jsonl` data
-/// bootstraps a lock before reading so concurrent writers cannot race it;
-/// markerless non-canonical fixtures remain read-only and file-free. Readers
-/// refuse interrupted transactions without modifying data.
+/// Hold an archive lock for the complete writer operation, or share an
+/// existing lock for a reader. Readers never create a lock or recover a
+/// transaction: an archive without a lock is read without one when no
+/// transaction is pending, while an interrupted transaction is refused until
+/// a writer recovers it.
 pub(crate) struct ArchiveLock {
     _file: Option<std::fs::File>,
 }
@@ -186,17 +186,12 @@ pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, S
     {
         Ok(lock) => lock,
         Err(error) if !exclusive && error.kind() == std::io::ErrorKind::NotFound => {
-            if fs::symlink_metadata(dir.join(".shipyard-cause-archive.json")).is_ok() {
-                return Err(
-                    "managed archive lacks its lock; repair the archive before reading".to_owned(),
-                );
-            }
             validate_archive_layout(dir)?;
-            let canonical = dir.join("causes").exists() || dir.join("fixlinks.jsonl").exists();
-            if retention::has_pending_transaction(dir) || canonical {
-                let bootstrap = lock_archive(dir, true)?;
-                drop(bootstrap);
-                return lock_archive(dir, false);
+            if retention::has_pending_transaction(dir) {
+                return Err(
+                    "archive has an interrupted prune; run cause prune --apply to recover before reading"
+                        .to_owned(),
+                );
             }
             return Ok(ArchiveLock { _file: None });
         }
