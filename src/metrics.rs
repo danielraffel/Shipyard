@@ -1445,6 +1445,7 @@ impl MetricsStore {
     /// Count safe merged heads on the measured protected branch and the
     /// failed/cancelled compute attached to those exact PR identities in the
     /// scorecard window.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn safe_merge_summary(
         &self,
         project: &str,
