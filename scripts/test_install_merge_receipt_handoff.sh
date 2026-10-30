@@ -27,4 +27,12 @@ PLIST="$HOME/Library/LaunchAgents/com.danielraffel.shipyard.merge-receipt-handof
 grep -q 'bootstrap gui/' "$TMP/launchctl.log"
 grep -q 'owner/repo' "$PLIST"
 grep -q -- '--base-branch' "$PLIST"
+"$ROOT/scripts/install_merge_receipt_handoff.sh" --repo owner/repo --python "$FAKE_PYTHON" \
+  --source-host m3 --source-shipyard /Users/danielraffel/.local/bin/shipyard \
+  --source-state-dir '/Users/danielraffel/Library/Application Support/shipyard' \
+  --interval 900 --install >"$TMP/observer-install"
+grep -q '<string>fetch</string>' "$PLIST"
+grep -q '<string>m3</string>' "$PLIST"
+grep -q '<string>--source-shipyard</string>' "$PLIST"
+if grep -q '<string>export</string>' "$PLIST"; then exit 1; fi
 echo "merge receipt handoff installer checks passed"
