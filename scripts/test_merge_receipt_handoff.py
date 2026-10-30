@@ -8,11 +8,15 @@ import os
 import pathlib
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "merge_receipt_handoff.py"
+sys.path.insert(0, str(ROOT / "scripts"))
+import merge_receipt_handoff as handoff  # noqa: E402
 
 
 def receipt(repo: str = "owner/repo") -> dict[str, object]:
@@ -36,6 +40,31 @@ def receipt(repo: str = "owner/repo") -> dict[str, object]:
 
 
 class MergeReceiptHandoffTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "O_DIRECTORY"), "directory fsync is unavailable")
+    def test_atomic_write_syncs_parent_directory_after_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            path = root / "handoff.jsonl"
+            real_open = handoff.os.open
+            real_close = handoff.os.close
+            real_fsync = handoff.os.fsync
+            opened: list[tuple[object, int]] = []
+            synced: list[int] = []
+
+            def open_wrapper(name: object, flags: int, *args: object) -> int:
+                fd = real_open(name, flags, *args)
+                opened.append((name, fd))
+                return fd
+
+            with mock.patch.object(handoff.os, "open", side_effect=open_wrapper), \
+                 mock.patch.object(handoff.os, "close", side_effect=real_close), \
+                 mock.patch.object(handoff.os, "fsync", side_effect=lambda fd: (synced.append(fd), real_fsync(fd))[1]):
+                handoff.atomic_write(path, "payload\n")
+
+            parent_fds = {fd for name, fd in opened if pathlib.Path(name) == root}
+            self.assertTrue(parent_fds & set(synced))
+            self.assertEqual(path.read_text(), "payload\n")
+
     def health(self, handoff: pathlib.Path, *, now: dt.datetime | None = None, **overrides: object) -> dict[str, object]:
         observed = now or dt.datetime.now(dt.timezone.utc)
         payload = handoff.read_bytes()
