@@ -1391,13 +1391,27 @@ impl MetricsStore {
         &self,
         repo: &str,
     ) -> Result<Vec<crate::metrics::merge_receipt::MergeReceipt>, Box<dyn std::error::Error>> {
+        self.export_merge_receipts_for_branch(repo, SCORECARD_BASE_BRANCH)
+    }
+
+    /// Export validated producer receipts for one exact repository and base
+    /// branch. The default export above is deliberately bound to the branch
+    /// used by the scorecard and handoff contract.
+    pub fn export_merge_receipts_for_branch(
+        &self,
+        repo: &str,
+        base_branch: &str,
+    ) -> Result<Vec<crate::metrics::merge_receipt::MergeReceipt>, Box<dyn std::error::Error>> {
+        if base_branch.trim().is_empty() {
+            return Err("merge receipt export base branch must not be empty".into());
+        }
         let repo = crate::evidence::canonical_repository(repo);
         let conn = self.connect()?;
         let mut statement = conn.prepare(
             "SELECT schema,receipt_id,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence
-             FROM merge_receipts WHERE lower(trim(repo)) = lower(trim(?1)) ORDER BY merged_at, receipt_id",
+             FROM merge_receipts WHERE lower(trim(repo)) = lower(trim(?1)) AND base_branch = ?2 ORDER BY merged_at, receipt_id",
         )?;
-        let rows = statement.query_map([repo], |row| {
+        let rows = statement.query_map(rusqlite::params![repo, base_branch], |row| {
             let required_checks_json: String = row.get(12)?;
             let required_checks = serde_json::from_str(&required_checks_json).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -4804,9 +4818,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(temp.path()).unwrap();
         let first = test_receipt("export-1", "OWNER/REPO", "repo", 1, 'a');
+        let mut release = test_receipt("export-release", "owner/repo", "repo", 3, 'c');
+        release.base_branch = "release".to_owned();
         let other = test_receipt("export-2", "other/repo", "repo", 2, 'd');
         store
-            .import_merge_receipts(&[first.clone(), other])
+            .import_merge_receipts(&[first.clone(), release, other])
             .unwrap();
 
         let exported = store.export_merge_receipts("owner/repo").unwrap();
