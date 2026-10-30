@@ -44,7 +44,8 @@ The scorecard's primary throughput metric,
 `safely_merged_changes_per_eligible_slot_hour`, divides distinct safe merge
 receipt heads by `eligible_slot_hours`. It is unavailable without both durable
 safe merge receipts and positive measured capacity. A partial capacity
-denominator produces a partial result and an explicit upper-bound reason;
+denominator produces a partial result and says the reported rate may be
+overstated;
 unknown capacity is never treated as zero or silently omitted.
 The scorecard binds the numerator to safe merges on the measured protected
 `main` branch, matching the baseline collector's merge-receipt health gate.

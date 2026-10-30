@@ -271,10 +271,13 @@ class BaselineScorecardTests(unittest.TestCase):
         card = {
             "safely_merged_changes": {"status": "available", "value": 2},
             "collector_safe_merge_denominator": {"status": "available", "value": 2},
+            "safely_merged_changes_per_eligible_slot_hour": {"status": "partial", "value": 0.5},
+            "collector_safe_merge_rate": {"status": "partial", "value": 0.5},
             "wasted_compute_per_safely_merged_change": {"status": "partial", "value": 4},
         }
         MOD.force_receipt_metrics_unavailable(card, "handoff is stale")
         for key in ("safely_merged_changes", "collector_safe_merge_denominator",
+                    "safely_merged_changes_per_eligible_slot_hour", "collector_safe_merge_rate",
                     "wasted_compute_per_safely_merged_change"):
             self.assertEqual(card[key]["status"], "unavailable")
             self.assertIsNone(card[key]["value"])

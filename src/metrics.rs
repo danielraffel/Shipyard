@@ -3111,6 +3111,51 @@ fn unavailable_merge_coverage() -> ScorecardCoverage {
 }
 
 #[allow(clippy::cast_precision_loss)]
+fn safe_merge_rate(
+    safe_merge_count: usize,
+    capacity: &FleetCapacityDenominator,
+) -> ScorecardCoverage {
+    let Some(hours) = capacity.eligible_slot_hours.filter(|value| *value > 0.0) else {
+        let reason = if safe_merge_count == 0 {
+            "no durable safe-merge receipt heads or positive eligible fleet-hours"
+        } else if capacity.eligible_slot_hours == Some(0.0) {
+            "eligible fleet-hours are zero; safely merged changes per eligible fleet-hour is undefined"
+        } else {
+            "eligible fleet-hours are unavailable; safely merged changes per eligible fleet-hour is unavailable"
+        };
+        return ScorecardCoverage {
+            status: "unavailable".to_owned(),
+            reason: reason.to_owned(),
+            value: None,
+        };
+    };
+    if safe_merge_count == 0 {
+        return ScorecardCoverage {
+            status: "unavailable".to_owned(),
+            reason: "no durable safe-merge receipt heads in the scorecard window".to_owned(),
+            value: None,
+        };
+    }
+
+    let rate = safe_merge_count as f64 / hours;
+    let partial = capacity.status != "available";
+    let reason = if partial {
+        format!(
+            "{safe_merge_count} distinct safe merge receipt heads / {hours:.6} eligible fleet-hours; denominator is a verified lower bound, so the reported rate may be overstated"
+        )
+    } else {
+        format!(
+            "{safe_merge_count} distinct safe merge receipt heads / {hours:.6} eligible fleet-hours"
+        )
+    };
+    ScorecardCoverage {
+        status: if partial { "partial" } else { "available" }.to_owned(),
+        reason,
+        value: Some(rate),
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
 fn pull_requests_per_day(distinct_pull_requests: usize, since_days: i64) -> f64 {
     distinct_pull_requests as f64 / since_days as f64
 }
@@ -4455,6 +4500,98 @@ mod tests {
         assert_eq!(scorecard.fleet_capacity.verified_samples, 1);
         assert_eq!(scorecard.fleet_capacity.unknown_samples, 1);
         assert!(scorecard.fleet_capacity.eligible_slot_hours.is_some());
+    }
+
+    fn test_capacity_denominator(
+        status: &str,
+        eligible_slot_hours: Option<f64>,
+    ) -> FleetCapacityDenominator {
+        FleetCapacityDenominator {
+            status: status.to_owned(),
+            reason: String::new(),
+            sample_count: 1,
+            verified_samples: usize::from(status == "available"),
+            unknown_samples: usize::from(status == "partial"),
+            host_target_count: 1,
+            eligible_slot_hours,
+        }
+    }
+
+    #[test]
+    fn safe_merge_rate_is_fail_closed_without_capacity_or_receipts() {
+        let no_capacity = safe_merge_rate(2, &test_capacity_denominator("unavailable", None));
+        assert_eq!(no_capacity.status, "unavailable");
+        assert_eq!(no_capacity.value, None);
+
+        let no_receipts = safe_merge_rate(0, &test_capacity_denominator("available", Some(4.0)));
+        assert_eq!(no_receipts.status, "unavailable");
+        assert!(no_receipts.reason.contains("no durable safe-merge"));
+    }
+
+    #[test]
+    fn safe_merge_rate_marks_partial_capacity_as_upper_bound() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("partial", Some(6.0)));
+        assert_eq!(result.status, "partial");
+        assert_eq!(result.value, Some(0.5));
+        assert!(result.reason.contains("lower bound"));
+        assert!(result.reason.contains("may be overstated"));
+    }
+
+    #[test]
+    fn safe_merge_rate_reports_fully_verified_capacity() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("available", Some(6.0)));
+        assert_eq!(result.status, "available");
+        assert_eq!(result.value, Some(0.5));
+        assert!(!result.reason.contains("upper-bound"));
+    }
+
+    #[test]
+    fn safe_merge_rate_rejects_zero_eligible_hours() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("partial", Some(0.0)));
+        assert_eq!(result.status, "unavailable");
+        assert_eq!(result.value, None);
+        assert!(result.reason.contains("zero"));
+    }
+
+    #[test]
+    fn scorecard_reports_safe_merge_rate_from_receipts_and_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 41, "success", 1_000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo = 'danielraffel/Shipyard', sha = ?1 WHERE pr = 41",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        let observed = Utc::now() - Duration::minutes(1);
+        let capacity = test_capacity_sample(observed, "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&capacity).unwrap())
+            .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt(
+                "rate-41",
+                "danielraffel/Shipyard",
+                "shipyard",
+                41,
+                'a',
+            )])
+            .unwrap();
+
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        let rate = &scorecard.safely_merged_changes_per_eligible_slot_hour;
+        assert_eq!(rate.status, "partial");
+        assert!(rate.value.is_some_and(|value| value > 0.0));
+        assert!(rate.reason.contains("eligible fleet-hours"));
+        assert!(rate.reason.contains("may be overstated"));
+        let json = serde_json::to_value(&scorecard).unwrap();
+        assert!(
+            json.get("safely_merged_changes_per_eligible_slot_hour")
+                .and_then(|value| value.get("value"))
+                .and_then(serde_json::Value::as_f64)
+                .is_some()
+        );
     }
 
     #[test]
