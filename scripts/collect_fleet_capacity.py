@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import sys
 import tempfile
@@ -24,6 +25,8 @@ ROSTER_SCHEMA = "shipyard.capacity-roster/v1"
 STATUS_SCHEMA = "shipyard.capacity-observation/v1"
 MAX_HOSTS = 16
 ROSTER_BYTES = 65536
+DEFAULT_HISTORY_BYTES = 32 * 1024 * 1024
+MAX_HISTORY_BYTES = 64 * 1024 * 1024
 # Completeness only. Rust remains the sole digest, schema and capacity validator.
 ENVELOPE = frozenset("schema sample_id observed_at valid_until host_id host_boot_id generation repo target "
                      "profile_sha256 configured_slots eligible_slots free_slots occupied_slots in_flight_slots "
@@ -115,10 +118,26 @@ def read_roster(path):
     return hosts, hashlib.sha256(raw).hexdigest()
 
 
+def importer_identity(executable):
+    resolved = shutil.which(executable)
+    if resolved is None:
+        raise ObservationError("importer_not_found")
+    path = Path(resolved).resolve(strict=True)
+    digest, size = hashlib.sha256(), 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(65536):
+            size += len(chunk)
+            if size > 256 * 1024 * 1024:
+                raise ObservationError("importer_byte_limit")
+            digest.update(chunk)
+    return {"path": str(path), "sha256": digest.hexdigest()}
+
+
 def ssh_command(ssh, host):
     remote = shlex.join([host["tartci"], "fleet", "capacity", "--repo", host["repo"],
                          "--target", host["target"], "--valid-for-seconds", "120", "--json"])
     return [ssh, "-n", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            "-o", "StrictHostKeyChecking=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
             "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=5",
             "-o", "ServerAliveCountMax=1", host["ssh_alias"], remote]
 
@@ -291,9 +310,9 @@ def persist(args, record):
                     raise ObservationError("journal_busy")
                 time.sleep(0.01)
         path = args.output_dir / "attempts.jsonl"
-        previous = bounded_file(path, 16777216) if path.exists() else b""
+        previous = bounded_file(path, MAX_HISTORY_BYTES) if path.exists() else b""
         cutoff = now() - dt.timedelta(days=args.history_days)
-        rows = []
+        rows, age_dropped = [], 0
         for line in previous.splitlines():
             value = strict_json(line)
             if (not isinstance(value, dict) or value.get("schema") != STATUS_SCHEMA
@@ -302,6 +321,8 @@ def persist(args, record):
                 raise ObservationError("invalid_journal")
             if timestamp(value.get("completed_at")) >= cutoff:
                 rows.append(value)
+            else:
+                age_dropped += 1
         # Equality only: generation strings/hashes carry no ordering semantics.
         for host in record["hosts"]:
             if host.get("import") != "accepted":
@@ -314,17 +335,30 @@ def persist(args, record):
                 if match:
                     host["identity_changed"] = any(host[key] != match.get(key) for key in ("generation", "host_boot_id"))
                     break
-        encoded = [encode(row) for row in rows] + [encode(record)]
-        size = sum(map(len, encoded))
-        while len(encoded) > 1 and size > args.history_bytes:
+        encoded = [encode(row) for row in rows]
+        size, byte_dropped = sum(map(len, encoded)), 0
+        while True:
+            record["history_retention"] = {
+                "age_dropped_this_pass": age_dropped, "byte_dropped_this_pass": byte_dropped,
+                "retained_passes": len(encoded) + 1,
+                "oldest_retained_at": rows[byte_dropped]["completed_at"] if encoded else record["completed_at"],
+            }
+            current = encode(record)
+            if size + len(current) <= args.history_bytes:
+                break
+            if not encoded:
+                raise ObservationError("journal_record_too_large")
             size -= len(encoded.pop(0))
-        if size > args.history_bytes:
-            raise ObservationError("journal_record_too_large")
-        atomic_write(path, b"".join(encoded))
+            byte_dropped += 1
+        atomic_write(path, b"".join(encoded) + current)
         atomic_write(args.output_dir / "last-status.json", encode(record))
 
 
 def main(argv=None):
+    if os.environ.get("SHIPYARD_OBSERVATIONS", "").strip().lower() == "off":
+        print(encode({"schema": STATUS_SCHEMA, "status": "disabled", "attempted": False,
+                      "reason": "SHIPYARD_OBSERVATIONS=off"}).decode(), end="")
+        return 0
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--roster", type=Path, required=True)
     parser.add_argument("--state-dir", type=Path, required=True)
@@ -338,21 +372,24 @@ def main(argv=None):
     parser.add_argument("--clock-skew-seconds", type=int, default=5)
     parser.add_argument("--expected-interval-seconds", type=int, default=60)
     parser.add_argument("--history-days", type=int, default=7)
-    parser.add_argument("--history-bytes", type=int, default=1048576)
+    parser.add_argument("--history-bytes", type=int, default=DEFAULT_HISTORY_BYTES)
     args = parser.parse_args(argv)
     if (not math.isfinite(args.deadline_seconds) or not 3 <= args.deadline_seconds <= 55
             or not math.isfinite(args.fetch_seconds) or not 0 < args.fetch_seconds < args.deadline_seconds - 2
             or not 1 <= args.parallel <= MAX_HOSTS or not 1024 <= args.receipt_bytes <= 1048576
             or not 0 <= args.clock_skew_seconds <= 60 or args.expected_interval_seconds < 60
-            or not 1 <= args.history_days <= 36500 or not 65536 <= args.history_bytes <= 16777216):
+            or not 1 <= args.history_days <= 36500 or not 65536 <= args.history_bytes <= MAX_HISTORY_BYTES):
         parser.error("invalid bounded collection policy")
     started, monotonic_start = now(), time.monotonic()
     try:
         hosts, roster_sha = read_roster(args.roster)
+        importer = importer_identity(args.shipyard)
+        args.shipyard = importer["path"]
         args.output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         record = {"schema": STATUS_SCHEMA, "pass_id": uuid.uuid4().hex,
                   "started_at": stamp(started), "roster_sha256": roster_sha,
                   "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                  "importer": importer,
                   "expected_interval_seconds": args.expected_interval_seconds,
                   "policy": {key: getattr(args, key) for key in ("deadline_seconds", "fetch_seconds", "parallel",
                               "receipt_bytes", "clock_skew_seconds", "history_days", "history_bytes")},
