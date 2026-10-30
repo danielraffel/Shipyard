@@ -7,6 +7,7 @@
 - **Collector:** `shipyard metrics gate-cost --json`
 - **Collector source head:** `a130919c116a9d29dec29656f674e822f045c020`
 - **Evidence manifest:** [`2026-10-30-shipyard-baseline-evidence-manifest.json`](2026-10-30-shipyard-baseline-evidence-manifest.json)
+  The manifest records the exact collector command forms and states that raw API response bodies were not retained.
 - **Gate-cost evidence:** [`2026-10-30-shipyard-gate-cost-baseline-7d.json`](2026-10-30-shipyard-gate-cost-baseline-7d.json)
 - **Delivery scorecard:** [`2026-10-30-shipyard-gate-cost-scorecard-7d.json`](2026-10-30-shipyard-gate-cost-scorecard-7d.json)
 - **Repeated-work shadow:** [`2026-10-30-repeated-work-shadow-cost.json`](2026-10-30-repeated-work-shadow-cost.json)
