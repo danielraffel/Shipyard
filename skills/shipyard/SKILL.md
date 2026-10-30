@@ -5,9 +5,22 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+The gate-cost scorecard can read a bounded historical cause archive with
+`--causes-archive DIR`; the report labels that source as archive and keeps
+malformed, duplicate, truncated, and unjoined rows visible. This is advisory
+measurement only and does not authorize queue or merge actions.
+Missing or unreadable `DIR/causes/` exits unsuccessfully with `cause archive
+unavailable`; only a readable empty directory can report zero archived rows.
+
 Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
 commit-to-pull-requests API, but zero or multiple matches remain unknown.
+
+`metrics repeated-work-cost` exposes read-only superseded-job runtime from the
+authenticated queue timing table within its explicit `--since` window. It
+counts each distinct superseded job once, reports clean versus
+uncertain/cancelled/unmatched coverage, and never treats survivor runtime as
+savings. It never turns this evidence into a queue or merge decision.
 
 The read-only `queue-digest` surface reports `queue_idle` and emits
 `merge_queue_idle_with_pending_work` for an armed-but-not-enqueued PR, or the
@@ -1864,9 +1877,10 @@ that needs them and runs `scripts/ci_cause_notices.sh` (a job cannot read its
 own log while it runs, so the records come from the finished logs). `shipyard diagnose
 --annotate plan|post` puts every failing required job's record in the check
 run's `output.text`, and `shipyard cause archive --dir <labels
-checkout>/causes --input <cases.jsonl>` appends records to `YYYY-MM.jsonl`
-files, skipping ids already archived (append-only, so a private corpus never
-loses a line). A job whose
+checkout>/data/ci-cause --input <cases.jsonl>` appends records to
+`causes/YYYY-MM.jsonl` files, skipping ids already archived (append-only, so a
+private corpus never loses a line). A legacy archive with month files directly
+under the parent is refused until it is migrated into `causes/`. A job whose
 log GitHub no longer holds is still judged from its payload. `--causes` reads the same causes without
 exporting and adds "named causes: N/M red cases" with the time to them.
 Each uncached red job costs two API calls, so at most `--causes-max-jobs`
@@ -5315,8 +5329,11 @@ merge-group runs are not counted, and it is not limited to the scorecard window.
 
 ### Repeated-work cost
 
-`shipyard metrics repeated-work-cost` is read-only shadow accounting; duration
-remains unavailable until queue-to-metrics provenance is authenticated.
+`shipyard metrics repeated-work-cost` is read-only shadow accounting. Its
+`duration_ms` is measured superseded-job runtime from the authenticated queue
+timing table, bounded by `--since`, counted once per distinct superseded job
+with excluded and unmatched coverage visible. It never changes queue or merge
+authority.
 
 ### Prospective baseline pass history
 
