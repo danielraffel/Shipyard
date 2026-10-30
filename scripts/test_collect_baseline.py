@@ -363,11 +363,25 @@ class CollectorInvocationTests(unittest.TestCase):
             conn.commit(); conn.close()
             self.assertEqual(MOD.count_jobs(db, "Pulp", "o/pulp"), 1)
             self.assertEqual(MOD.source_activity_dates(db, "Pulp", "o/pulp"), {"2026-10-16"})
+            self.assertEqual(MOD.count_jobs(db, "Pulp", "O/PULP"), 1)
+            self.assertEqual(MOD.source_activity_dates(db, "Pulp", "O/PULP"), {"2026-10-16"})
         payload, excluded = MOD.prepare_tartci_export(
             json.dumps({"project": "Pulp", "repo": "o/pulp", "provider": "tart", "external_id": "job-1"}),
             "o/pulp", "pulp")
         self.assertEqual(excluded, 0)
         self.assertEqual(json.loads(payload)[0]["project"], "Pulp")
+
+        record = {"observed_jobs": 1, "qualified_jobs": 1,
+                  "provenance": "authenticated", "coverage": "complete", "reason": ""}
+        card = {"strata": {"schema": MOD.STRATA_CONTRACT, "repo": "O/PULP",
+                            "unit": "job", "source_head": "a" * 40,
+                            "generated_at": "2026-10-16T12:00:00Z",
+                            "window_since": "2026-10-11T12:00:00Z",
+                            "window_until": "2026-10-16T12:00:00Z",
+                            "strata": {name: dict(record) for name in MOD.PRODUCER_STRATA},
+                            "aggregate": {"observed_jobs": 4, "qualified_jobs": 4}}}
+        self.assertEqual(MOD.consume_authenticated_strata(card, repo="o/pulp")["provenance_status"],
+                         "authenticated_strata_partial")
 
     def test_project_repo_scope_requires_owner_and_matching_short_name(self):
         for project, repo in [("pulp", "pulp"), ("pulp", "/pulp"), ("pulp", "a/b/pulp"), ("other", "o/pulp")]:

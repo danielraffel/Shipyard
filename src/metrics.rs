@@ -1589,10 +1589,7 @@ impl MetricsStore {
             .zip(input.started_at)
             .map(|(queued, started)| (started - queued).num_milliseconds())
             .filter(|value| *value >= 0);
-        if input.provenance_verified
-            && input.provenance.as_deref() == Some("production")
-            && input.provider.is_some()
-        {
+        if input.provenance_verified && input.provenance.as_deref() == Some("production") {
             ensure_authenticated_identity_complete(input)?;
         }
         if let Some(provider) = input.provider.as_deref()
@@ -2478,10 +2475,15 @@ fn ensure_refresh_identity_compatible(
             input.pr.map(|v| v.to_string()),
         ),
     ] {
-        if let (Some(old), Some(new)) = (old, new)
-            && old != new
-        {
-            return Err(format!("existing job identity conflict in {name}").into());
+        if let (Some(old), Some(new)) = (old, new) {
+            let equal = if name == "repo" {
+                old.trim().eq_ignore_ascii_case(new.trim())
+            } else {
+                old == new
+            };
+            if !equal {
+                return Err(format!("existing job identity conflict in {name}").into());
+            }
         }
     }
     Ok(())
@@ -4835,6 +4837,13 @@ mod tests {
                 duration_ms: 100,
                 completed_at: Some(Utc::now()),
                 external_id: Some("test:verified".to_owned()),
+                provider: Some("github".to_owned()),
+                event: Some("pull_request".to_owned()),
+                run_attempt: Some(1),
+                provider_run_id: Some(1),
+                head_sha: Some("a".repeat(40)),
+                sha: Some("a".repeat(40)),
+                repo: Some("owner/shipyard".to_owned()),
                 provenance: Some("production".to_owned()),
                 provenance_verified: true,
                 ..MetricRecordInput::default()
@@ -4843,6 +4852,25 @@ mod tests {
         let verified = store.stewardship_scorecard("shipyard", 1).unwrap();
         assert_eq!(verified.provenance.production, 1);
         assert_eq!(verified.provenance.eligible_samples, 1);
+    }
+
+    #[test]
+    fn verified_production_requires_provider_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let input = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            job: "macos".to_owned(),
+            status: "success".to_owned(),
+            duration_ms: 100,
+            completed_at: Some(Utc::now()),
+            external_id: Some("test:verified".to_owned()),
+            provenance: Some("production".to_owned()),
+            provenance_verified: true,
+            ..MetricRecordInput::default()
+        };
+        let error = store.record_terminal_observation(&input).unwrap_err();
+        assert!(error.to_string().contains("provider identity"));
     }
 
     #[test]
@@ -5355,6 +5383,20 @@ mod tests {
                 Some("production".to_owned()),
             )
         );
+
+        // GitHub repository slugs are case-insensitive. A legacy row written
+        // with mixed casing must still be refresh-compatible with canonical
+        // authenticated input.
+        let mut mixed_case = base.clone();
+        mixed_case.external_id = Some("github:9/3/1".to_owned());
+        mixed_case.provenance = None;
+        mixed_case.provenance_verified = false;
+        mixed_case.repo = Some("OWNER/SHIPYARD".to_owned());
+        store.record_terminal_observation(&mixed_case).unwrap();
+        mixed_case.repo = Some("owner/shipyard".to_owned());
+        mixed_case.provenance = Some("production".to_owned());
+        mixed_case.provenance_verified = true;
+        store.record_terminal_observation(&mixed_case).unwrap();
 
         let mut incomplete = base;
         incomplete.external_id = Some("github:9/2/1".to_owned());
