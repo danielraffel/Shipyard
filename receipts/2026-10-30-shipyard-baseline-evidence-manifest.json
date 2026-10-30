@@ -25,5 +25,48 @@
       "sha256": "0398b9217b780d075069fb40a0bd047d09d221d14e3dd669101803c3b2a9e046"
     }
   ],
-  "interpretation": "Descriptive baseline only. No merge queue or protected required-context denominator was available; repeated-work timing joins were zero, so no optimization promotion claim is supported."
+  "interpretation": "Descriptive baseline only. No merge queue or protected required-context denominator was available; repeated-work timing joins were zero, so no optimization promotion claim is supported.",
+  "collector_commands": [
+    [
+      "shipyard",
+      "metrics",
+      "gate-cost",
+      "--repo",
+      "danielraffel/Shipyard",
+      "--workflow",
+      "ci.yml",
+      "--gate-job",
+      "Test macOS ARM64 [local]",
+      "--base",
+      "main",
+      "--from",
+      "2026-10-23T20:59:22.777525+00:00",
+      "--to",
+      "2026-10-30T20:59:22.777525+00:00",
+      "--json"
+    ],
+    [
+      "shipyard",
+      "metrics",
+      "gate-cost",
+      "--repo",
+      "danielraffel/Shipyard",
+      "--workflow",
+      "ci.yml",
+      "--gate-job",
+      "Test macOS ARM64 [local]",
+      "--base",
+      "main",
+      "--from",
+      "2026-10-23T20:59:22.777525+00:00",
+      "--to",
+      "2026-10-30T20:59:22.777525+00:00",
+      "--scorecard",
+      "--json"
+    ]
+  ],
+  "raw_api_receipts": {
+    "retained": false,
+    "reason": "The collector recorded live read counts but did not export raw API or cache response bodies in this run."
+  }
 }
