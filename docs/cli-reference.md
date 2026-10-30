@@ -533,6 +533,13 @@ it inside that repository's clone.
 `$SHIPYARD_STATE_DIR/metrics/metrics.db` using SQLite. The feature is optional
 and provider-neutral:
 
+`shipyard cleanup` previews retention by default and applies it only with
+`--apply`. Raw metric rows are kept for 90 days by default; set
+`SHIPYARD_METRICS_RETENTION_DAYS` to another non-negative number, or `0` to
+disable pruning. Invalid, negative, or unreasonably large values refuse the
+command. A corrupt or unreadable metrics database fails cleanup closed,
+including dry-run validation, and durable merge receipts are retained.
+
 - `shipyard metrics record` writes one explicit job/step sample.
 - `shipyard run command` writes a best-effort metrics row automatically when it
   stores command evidence.

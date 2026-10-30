@@ -216,6 +216,7 @@ Shipyard stores optional CI timing data in its local SQLite metrics database so
 scorecards can measure queueing, waste, and rework. `shipyard cleanup --apply`
 keeps raw samples for 90 days by default; set
 `SHIPYARD_METRICS_RETENTION_DAYS` to another number, or `0` to disable pruning.
+Invalid, negative, or excessively large values fail cleanup closed.
 Merge receipts are retained as durable provenance. A producer can hand them to
 an observer with `shipyard metrics export merge-receipt --repo <owner/repo>
 --file <handoff.jsonl>`; the export is repository-scoped, atomic, and reads
