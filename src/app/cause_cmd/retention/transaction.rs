@@ -869,6 +869,93 @@ mod tests {
     }
 
     #[test]
+    fn committed_receipt_recovery_preserves_the_published_replacement() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("causes")).unwrap();
+        let target = root.path().join("causes/2026-10.jsonl");
+        fs::write(&target, b"new\n").unwrap();
+        let tx = transaction_dir(root.path());
+        fs::create_dir_all(tx.join("old")).unwrap();
+        fs::create_dir_all(tx.join("new")).unwrap();
+        fs::write(tx.join("old/0"), b"old\n").unwrap();
+        let new_sha256 = sha256_file(&target).unwrap();
+        let manifest = TransactionManifest {
+            schema: TX_SCHEMA.to_owned(),
+            state: "prepared".to_owned(),
+            entries: vec![TransactionEntry {
+                rel: "causes/2026-10.jsonl".to_owned(),
+                old: "old/0".to_owned(),
+                old_sha256: Some(sha256_file(&tx.join("old/0")).unwrap()),
+                new: Some("new/0".to_owned()),
+                new_sha256: Some(new_sha256),
+                existed: true,
+            }],
+        };
+        let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        manifest_bytes.push(b'\n');
+        write_atomic(&tx.join(MANIFEST_NAME), &manifest_bytes).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&manifest_bytes);
+        let receipt = CommitReceipt {
+            schema: COMMIT_SCHEMA.to_owned(),
+            manifest_sha256: hex::encode(hasher.finalize()),
+        };
+        let mut receipt_bytes = serde_json::to_vec(&receipt).unwrap();
+        receipt_bytes.push(b'\n');
+        write_atomic(&tx.join(COMMITTED_NAME), &receipt_bytes).unwrap();
+
+        recover_pending_transaction(root.path()).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"new\n");
+        assert!(!tx.exists());
+    }
+
+    #[test]
+    fn recovery_refuses_an_externally_modified_live_target() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("causes")).unwrap();
+        let target = root.path().join("causes/2026-10.jsonl");
+        fs::write(&target, b"external\n").unwrap();
+        let tx = transaction_dir(root.path());
+        fs::create_dir_all(tx.join("old")).unwrap();
+        fs::create_dir_all(tx.join("new")).unwrap();
+        fs::write(tx.join("old/0"), b"old\n").unwrap();
+        fs::write(tx.join("new/0"), b"new\n").unwrap();
+        let manifest = TransactionManifest {
+            schema: TX_SCHEMA.to_owned(),
+            state: "prepared".to_owned(),
+            entries: vec![TransactionEntry {
+                rel: "causes/2026-10.jsonl".to_owned(),
+                old: "old/0".to_owned(),
+                old_sha256: Some(sha256_file(&tx.join("old/0")).unwrap()),
+                new: Some("new/0".to_owned()),
+                new_sha256: Some(sha256_file(&tx.join("new/0")).unwrap()),
+                existed: true,
+            }],
+        };
+        let mut bytes = serde_json::to_vec(&manifest).unwrap();
+        bytes.push(b'\n');
+        write_atomic(&tx.join(MANIFEST_NAME), &bytes).unwrap();
+
+        let error = recover_pending_transaction(root.path()).unwrap_err();
+
+        assert!(error.contains("changed outside transaction"), "{error}");
+        assert_eq!(fs::read(&target).unwrap(), b"external\n");
+        assert!(tx.exists());
+    }
+
+    #[test]
+    fn apply_rejects_more_targets_than_the_transaction_entry_cap() {
+        let root = tempdir().unwrap();
+        let targets: BTreeSet<PathBuf> = (0..=MAX_ENTRIES)
+            .map(|index| root.path().join(format!("causes/{index}.jsonl")))
+            .collect();
+        let error = apply_transaction(root.path(), &BTreeMap::new(), &targets).unwrap_err();
+        assert!(error.contains("maximum"), "{error}");
+        assert!(!transaction_dir(root.path()).exists());
+    }
+
+    #[test]
     fn recovery_rejects_manifest_target_outside_archive() {
         let root = tempdir().unwrap();
         let tx = transaction_dir(root.path());

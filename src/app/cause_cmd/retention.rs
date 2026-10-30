@@ -931,6 +931,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn supersedes_groups_are_pinned_even_when_the_size_cap_would_drop_them() {
+        let now = Utc::now();
+        let old_key = RedKey {
+            repo: "o/r".to_owned(),
+            run_id: 7,
+            attempt: 1,
+        };
+        let replacement_key = RedKey {
+            repo: "o/r".to_owned(),
+            run_id: 8,
+            attempt: 1,
+        };
+        let causes = vec![
+            Row {
+                path: PathBuf::from("causes/2025-01.jsonl"),
+                line: "old\n".to_owned(),
+                at: now - Duration::days(400),
+                key: Some(old_key),
+                id: Some("old".to_owned()),
+                supersedes: None,
+                line_number: 1,
+            },
+            Row {
+                path: PathBuf::from("causes/2025-02.jsonl"),
+                line: "replacement\n".to_owned(),
+                at: now - Duration::days(300),
+                key: Some(replacement_key),
+                id: Some("replacement".to_owned()),
+                supersedes: Some("old".to_owned()),
+                line_number: 1,
+            },
+        ];
+        let error = plan_rows(&causes, &[], now - Duration::days(1), 1).unwrap_err();
+
+        assert!(error.contains("supersedes-linked evidence"), "{error}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_archive_entries_fail_closed() {
