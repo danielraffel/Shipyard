@@ -75,7 +75,7 @@ shipyard cause extract --log "$RUNNER_TEMP/test.log" --job "<the job's display n
 shipyard cause extract --log job.log --format c2
 
 # Append records to an archive, one file per month of named_at.
-shipyard cause archive --dir causes/ --input records.jsonl
+shipyard cause archive --dir data/ci-cause --input records.jsonl
 
 # One observer pass over a workflow's recent runs.
 shipyard cause record --repo OWNER/REPO --workflow build.yml --dir data/ci-cause
@@ -92,7 +92,13 @@ match the display name is not trusted by the scorecard. It never fails the
 step it runs in; only a missing or unreadable log exits non-zero.
 
 `cause archive` is append-only. A record whose id is already archived is
-skipped, and nothing is rewritten.
+skipped, and nothing is rewritten. `--dir` is the archive parent: cause month
+files live under `causes/`, with `fixlinks.jsonl` in the parent. All archive
+commands refuse legacy `YYYY-MM.jsonl` or `undated.jsonl` files directly under
+`--dir`. If the old directory is already named `causes/`, pass its parent.
+Otherwise, reconcile the month files into `causes/` before retrying: retain all
+rows and never overwrite an existing destination file. No command moves or
+rewrites legacy files automatically.
 
 For a local integrity check, run `shipyard cause audit --dir DIR`. It reads
 the cause month files and `fixlinks.jsonl`, reports malformed rows, invalid

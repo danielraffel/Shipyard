@@ -1544,6 +1544,16 @@ pub(crate) struct MetricsGateCostArgs {
     /// yields is cached, never the log.
     #[arg(long, requires = "scorecard")]
     pub(crate) causes: bool,
+    /// Name causes from a local `cause record` archive instead of reading
+    /// GitHub job logs. The archive is bounded and joined by exact repo/run/job
+    /// identity; ambiguous rows stay unreadable.
+    #[arg(
+        long = "causes-archive",
+        value_name = "DIR",
+        requires = "scorecard",
+        conflicts_with = "causes"
+    )]
+    pub(crate) causes_archive: Option<PathBuf>,
     /// Most red jobs whose job and log `--causes` (or `--export-cases`)
     /// fetches in one run, newest first; each costs two GitHub API calls. A
     /// job whose cause is cached does not count. Jobs over the budget count
@@ -1566,7 +1576,7 @@ pub(crate) enum CauseCommand {
     /// only a missing or unreadable log exits non-zero.
     Extract(CauseExtractArgs),
     /// Append `ci.cause/v1` records to an append-only archive: one
-    /// `YYYY-MM.jsonl` per month of `named_at` under `--dir`. A record whose
+    /// `causes/YYYY-MM.jsonl` per month of `named_at` under `--dir`. A record whose
     /// id is already archived is skipped; nothing is rewritten.
     Archive(CauseArchiveArgs),
     /// Keep a labels archive current: read the workflow's completed runs
@@ -1643,7 +1653,8 @@ pub(crate) struct CauseRecordArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct CauseArchiveArgs {
-    /// Archive directory (for example `causes/` in a private labels checkout).
+    /// Archive parent directory containing `causes/` and `fixlinks.jsonl` (for
+    /// example `data/ci-cause` in a private labels checkout).
     #[arg(long, value_name = "DIR")]
     pub(crate) dir: PathBuf,
     /// JSONL of `ci.cause/v1` records, or of scorecard case rows (their
@@ -2195,6 +2206,9 @@ pub(crate) struct MetricsRepeatedWorkCostArgs {
     /// Maximum shadow observations to include.
     #[arg(long, default_value_t = 1000)]
     pub(crate) limit: usize,
+    /// Baseline window for shadow observations, for example `14d`.
+    #[arg(long = "since", default_value = "14d")]
+    pub(crate) since: String,
 }
 
 #[derive(Debug, Args)]
@@ -4322,6 +4336,48 @@ mod tests {
             ])
             .is_err(),
             "--since and --from conflict"
+        );
+    }
+
+    #[test]
+    fn metrics_gate_cost_parses_archive_cause_source() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "metrics",
+            "gate-cost",
+            "--repo",
+            "o/r",
+            "--workflow",
+            "build.yml",
+            "--gate-job",
+            "macos",
+            "--scorecard",
+            "--causes-archive",
+            "/var/lib/shipyard/causes",
+        ])
+        .expect("archive scorecard");
+        let Command::Metrics { command } = cli.command else {
+            panic!("expected metrics command");
+        };
+        let super::MetricsCommand::GateCost(args) = *command else {
+            panic!("expected metrics gate-cost command");
+        };
+        assert_eq!(
+            args.causes_archive.as_deref(),
+            Some(std::path::Path::new("/var/lib/shipyard/causes"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "metrics",
+                "gate-cost",
+                "--scorecard",
+                "--causes",
+                "--causes-archive",
+                "/tmp/archive",
+            ])
+            .is_err(),
+            "live and archive causes must be explicit"
         );
     }
 

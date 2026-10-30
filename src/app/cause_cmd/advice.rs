@@ -186,6 +186,7 @@ fn advise(
     args: &CauseAdviseArgs,
     windows: &[Window],
 ) -> Result<(Vec<Candidate>, usize), CliFailure> {
+    super::require_archive_parent(&args.dir).map_err(|error| CliFailure::new(2, error))?;
     let rows = read_causes(&args.dir.join("causes"))?;
     let fixlinks = read_fixlinks(&args.dir.join("fixlinks.jsonl"))?;
     let needle = tokens(&args.query);
@@ -472,6 +473,18 @@ mod tests {
             limit: 5,
         }
     }
+    #[test]
+    fn legacy_root_causes_are_not_ignored_by_advice() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(dir.path().join("2026-10.jsonl"), row(&"b".repeat(40), 8)).unwrap();
+        let Err(error) = advise(&args(dir.path()), &[]) else {
+            panic!("legacy archive must be refused");
+        };
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("legacy cause archive files"));
+    }
+
     fn row(sha: &str, pr: u64) -> String {
         serde_json::json!({"schema":SCHEMA,"repo":"o/r","head_sha":sha,"pr":pr,"run_id":1,"attempt":1,"job_id":2,"job":"linux","signature":"compile failure","failure_class":"build","confidence":"high","named_at":"2026-10-13T00:00:00Z","completed_at":"2026-10-13T00:00:00Z"}).to_string()
     }
