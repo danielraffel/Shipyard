@@ -17,3 +17,25 @@ impl AutomaticObservations {
         self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AutomaticObservations;
+
+    #[test]
+    fn optional_observations_disable_only_explicit_trimmed_off() {
+        for value in ["off", "OFF", "  oFf\t"] {
+            assert!(!AutomaticObservations::from_value(Some(value)).enabled());
+        }
+        for value in [
+            None,
+            Some(""),
+            Some("on"),
+            Some("false"),
+            Some("0"),
+            Some("typo"),
+        ] {
+            assert!(AutomaticObservations::from_value(value).enabled());
+        }
+    }
+}

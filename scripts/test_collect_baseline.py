@@ -281,6 +281,47 @@ class BaselineScorecardTests(unittest.TestCase):
                 MOD.validate_state_identity(path, "demo", "o/r", db)
 
 
+class AutomaticObservationControlTests(unittest.TestCase):
+    def test_off_preserves_files_and_skips_providers_with_enabled_control(self):
+        for value in ["off", "  OfF\t", None]:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                db = root / "metrics" / "metrics.db"
+                db.parent.mkdir()
+                state = root / "status.json"
+                history_path = root / "history.json"
+                markdown = root / "status.md"
+                for path in [db, state, history_path, markdown]:
+                    path.write_text("existing evidence must remain unchanged")
+                originals = {path: path.read_bytes() for path in [db, state, history_path, markdown]}
+                called = root / "provider-called"
+                provider = root / "provider"
+                provider.write_text(
+                    "#!%s\nimport pathlib,sys\npathlib.Path(%r).touch()\nsys.exit(3)\n"
+                    % (os.sys.executable, str(called))
+                )
+                provider.chmod(0o755)
+                env = os.environ.copy()
+                env.pop("SHIPYARD_OBSERVATIONS", None)
+                if value is not None:
+                    env["SHIPYARD_OBSERVATIONS"] = value
+                result = subprocess.run([
+                    os.sys.executable, str(Path(MOD.__file__)), "--collect",
+                    "--db", str(db), "--project", "pulp", "--repo", "o/pulp",
+                    "--state", str(state), "--pass-history", str(history_path),
+                    "--status-markdown", str(markdown), "--shipyard", str(provider),
+                    "--tartci", str(provider),
+                ], env=env, capture_output=True, text=True, check=False)
+                if value is not None:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(called.exists())
+                    self.assertIn("collection disabled", result.stderr)
+                    self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertTrue(called.exists(), result.stderr)
+
+
 class CollectorInvocationTests(unittest.TestCase):
     def test_project_repo_scope_requires_owner_and_matching_short_name(self):
         for project, repo in [("pulp", "pulp"), ("pulp", "/pulp"), ("pulp", "a/b/pulp"), ("other", "o/pulp")]:

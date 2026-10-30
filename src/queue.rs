@@ -1861,6 +1861,53 @@ mod tests {
     }
 
     #[test]
+    fn optional_observations_preserve_queue_admission_completion_and_manifest() {
+        for value in [None, Some(" off ")] {
+            let policy = crate::observations::AutomaticObservations::from_value(value);
+            let temp = queue_dir();
+            let mut queue = Queue::new_with_observations(temp.path(), policy).unwrap();
+            let first = queue.enqueue(job("feature", "old", &["mac"])).unwrap();
+            let second = queue.enqueue(job("feature", "new", &["mac"])).unwrap();
+            assert_eq!(
+                queue.get(&first.id).unwrap().unwrap().status,
+                JobStatus::Cancelled
+            );
+            assert_eq!(queue.pending_count().unwrap(), 1);
+            let running = second.start().unwrap();
+            queue.update(&running).unwrap();
+            let completed = running
+                .with_result(TargetResult::new(
+                    "mac",
+                    "macos",
+                    TargetStatus::Pass,
+                    "local",
+                ))
+                .complete()
+                .unwrap();
+            queue.update(&completed).unwrap();
+            assert_eq!(queue.get(&completed.id).unwrap(), Some(completed.clone()));
+            let manifest = crate::log_retention::read_terminal_manifest(
+                &temp.path().join("logs").join(&completed.id),
+            )
+            .expect("required terminal evidence");
+            assert!(!manifest.failed);
+            assert_eq!(temp.path().join("metrics").exists(), policy.enabled());
+            if policy.enabled() {
+                let store = MetricsStore::open(temp.path()).unwrap();
+                assert_eq!(store.repeated_work_shadow(10).unwrap().len(), 1);
+                assert_eq!(
+                    store
+                        .read_queue_timing(&completed.id)
+                        .unwrap()
+                        .unwrap()
+                        .queue_disposition,
+                    "clean"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn enqueue_and_retrieve_job() {
         let temp = queue_dir();
         let mut queue = Queue::new(temp.path()).expect("queue");

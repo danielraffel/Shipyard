@@ -416,6 +416,34 @@ mod tests {
     }
 
     #[test]
+    fn optional_observations_stop_scheduled_import_before_requests_or_checkpoint() {
+        for value in [Some("OFF"), None] {
+            let policy = crate::observations::AutomaticObservations::from_value(value);
+            let state = tempfile::tempdir().unwrap();
+            let config = enabled(&["Generous-Corp/pulp"]);
+            let mut calls = Vec::new();
+            let pass = run_pass_with_observations(
+                &config,
+                state.path(),
+                &[],
+                at("2026-09-30T12:00:00Z"),
+                &mut fake_gh(&mut calls),
+                policy,
+            );
+            assert_eq!(pass.enabled, policy.enabled());
+            assert_eq!(state.path().join("metrics").exists(), policy.enabled());
+            assert_eq!(schedule_path(state.path()).exists(), policy.enabled());
+            if policy.enabled() {
+                assert_eq!(calls.len(), 2);
+                assert_eq!(pass.repos[0].imported, Some(1));
+            } else {
+                assert!(calls.is_empty());
+                assert_eq!(pass, ImportPass::default());
+            }
+        }
+    }
+
+    #[test]
     fn daemon_pass_without_config_is_disabled() {
         let global = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();

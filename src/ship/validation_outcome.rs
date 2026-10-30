@@ -55,7 +55,6 @@ pub(super) fn persist_recovered_outcomes(
 }
 
 /// Persist the kind-specific durable outcome for one terminal queue job.
-#[allow(clippy::manual_inspect, clippy::semicolon_if_nothing_returned)]
 pub(crate) fn persist_terminal_outcome(
     job: &Job,
     state_dir: &Path,
@@ -67,6 +66,7 @@ pub(crate) fn persist_terminal_outcome(
     )
 }
 
+#[allow(clippy::manual_inspect, clippy::semicolon_if_nothing_returned)]
 fn persist_terminal_outcome_with_observations(
     job: &Job,
     state_dir: &Path,
@@ -391,6 +391,19 @@ mod tests {
 
     #[test]
     fn recovered_terminal_ship_outcome_rebuilds_immutable_validation_proof() {
+        assert_recovered_outcome(crate::observations::AutomaticObservations::from_value(None));
+    }
+
+    #[test]
+    fn optional_observations_preserve_recovered_outcome_and_validation_proof() {
+        for value in [None, Some("off")] {
+            assert_recovered_outcome(crate::observations::AutomaticObservations::from_value(
+                value,
+            ));
+        }
+    }
+
+    fn assert_recovered_outcome(observations: crate::observations::AutomaticObservations) {
         let temp = tempfile::tempdir().expect("tempdir");
         let state_dir = temp.path().join("state");
         let request = ShipExecutionRequest {
@@ -440,8 +453,24 @@ mod tests {
             .save(&changed_policy)
             .expect("save changed policy state");
 
-        persist_terminal_outcome(&job, &state_dir)
+        // The fixture's initial queue transition may have written timing;
+        // isolate the recovered-outcome writer without changing queue state.
+        let metrics_db = state_dir.join("metrics/metrics.db");
+        if metrics_db.exists() {
+            std::fs::remove_file(&metrics_db).unwrap();
+        }
+        persist_terminal_outcome_with_observations(&job, &state_dir, observations)
             .expect("supervisor recovery persists immutable proof");
+        assert_eq!(metrics_db.exists(), observations.enabled());
+        if observations.enabled() {
+            assert!(
+                MetricsStore::open(&state_dir)
+                    .unwrap()
+                    .read_queue_timing(&job.id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
         let manifest = read_terminal_manifest(&log_dir).expect("recovered terminal manifest");
         assert!(!manifest.failed);
 
