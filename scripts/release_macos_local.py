@@ -194,18 +194,30 @@ def require_arm64(arch: str) -> None:
         )
 
 
-def expected_release_assets(artifact_prefix: str) -> tuple[str, ...]:
+def expected_release_assets(
+    artifact_prefix: str, focus: str | None = None
+) -> tuple[str, ...]:
+    """Assets a release must carry before it is published.
+
+    `focus` follows the CI_PLATFORM_FOCUS repo variable (read from the
+    environment when not given): `macos` (default) expects macOS and
+    linux-x64; `all` also expects linux-arm64 and windows-x64.
+    """
     companion = package_release.COMPANION_BIN_NAME
-    return (
+    focus = (focus or os.environ.get("CI_PLATFORM_FOCUS") or "macos").lower()
+    assets = [
         f"{artifact_prefix}-linux-x64",
         f"{companion}-linux-x64",
-        f"{artifact_prefix}-linux-arm64",
-        f"{companion}-linux-arm64",
-        f"{artifact_prefix}-windows-x64.exe",
-        f"{companion}-windows-x64.exe",
-        f"{artifact_prefix}-macos-arm64.dmg",
-        "checksums.sha256",
-    )
+    ]
+    if focus == "all":
+        assets += [
+            f"{artifact_prefix}-linux-arm64",
+            f"{companion}-linux-arm64",
+            f"{artifact_prefix}-windows-x64.exe",
+            f"{companion}-windows-x64.exe",
+        ]
+    assets += [f"{artifact_prefix}-macos-arm64.dmg", "checksums.sha256"]
+    return tuple(assets)
 
 
 def package_signed_dmg(config: ReleaseConfig) -> Path:

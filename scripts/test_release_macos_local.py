@@ -14,7 +14,7 @@ import release_macos_local
 
 
 def complete_release_assets() -> list[str]:
-    return list(release_macos_local.expected_release_assets("shipyard"))
+    return list(release_macos_local.expected_release_assets("shipyard", "all"))
 
 
 class FakeRunner(release_macos_local.CommandRunner):
@@ -76,14 +76,34 @@ class FakeRunner(release_macos_local.CommandRunner):
 
 
 class ReleaseMacosLocalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests exercise the full asset set; the focus switch has its own test.
+        patcher = mock.patch.dict(os.environ, {"CI_PLATFORM_FOCUS": "all"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_shell_wrapper_matches_mainline_entrypoint(self) -> None:
         wrapper = release_macos_local.ROOT / "scripts" / "release-macos-local.sh"
         content = wrapper.read_text(encoding="utf-8")
         self.assertIn("release_macos_local.py", content)
         self.assertTrue(os.access(wrapper, os.X_OK))
 
+    def test_macos_focus_expects_macos_and_linux_x64_only(self) -> None:
+        for focus in (None, "macos"):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                assets = release_macos_local.expected_release_assets("shipyard", focus)
+            self.assertIn("shipyard-macos-arm64.dmg", assets)
+            self.assertIn("shipyard-workstream-provider-linux-x64", assets)
+            self.assertIn("checksums.sha256", assets)
+            self.assertFalse([a for a in assets if "windows" in a or "linux-arm64" in a])
+        with mock.patch.dict(os.environ, {"CI_PLATFORM_FOCUS": "all"}):
+            self.assertIn(
+                "shipyard-windows-x64.exe",
+                release_macos_local.expected_release_assets("shipyard"),
+            )
+
     def test_expected_release_assets_include_every_binary_and_checksums(self) -> None:
-        assets = release_macos_local.expected_release_assets("shipyard")
+        assets = release_macos_local.expected_release_assets("shipyard", "all")
         self.assertIn("shipyard-macos-arm64.dmg", assets)
         self.assertIn("shipyard-workstream-provider-linux-x64", assets)
         self.assertIn("shipyard-workstream-provider-linux-arm64", assets)

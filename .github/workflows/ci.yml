@@ -11,6 +11,11 @@ on:
     types: [checks_requested]
   workflow_dispatch:
     inputs:
+      platform_focus:
+        description: "macos or all (empty = repo variable CI_PLATFORM_FOCUS, default macos)"
+        required: false
+        default: ""
+        type: string
       runner_provider:
         description: Runner provider for CI jobs
         required: false
@@ -51,6 +56,7 @@ jobs:
       matrix_json: ${{ steps.resolve.outputs.matrix_json }}
       linux_runs_on_json: ${{ steps.resolve.outputs.linux_runs_on_json }}
       linux_provider: ${{ steps.resolve.outputs.linux_provider }}
+      platform_focus: ${{ steps.resolve.outputs.platform_focus }}
     steps:
       - uses: actions/checkout@v5
 
@@ -58,6 +64,9 @@ jobs:
         env:
           # With GITHUB_EVENT_NAME and GITHUB_REPOSITORY, a fork PR skips self-hosted legs.
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          # macos (default): only the macOS ARM64 test leg. Set the repo
+          # variable CI_PLATFORM_FOCUS=all to resume Linux, Windows and coverage.
+          PLATFORM_FOCUS: ${{ inputs.platform_focus || vars.CI_PLATFORM_FOCUS || 'macos' }}
           REQUESTED_PROVIDER: ${{ github.event_name == 'merge_group' && 'github-hosted' || inputs.runner_provider || vars.DEFAULT_RUNNER_PROVIDER || 'github-hosted' }}
           EXPLICIT_LINUX_RUNNER_SELECTOR_JSON: ${{ inputs.linux_runner_selector_json || '' }}
           EXPLICIT_MACOS_ARM64_RUNNER_SELECTOR_JSON: ${{ inputs.macos_arm64_runner_selector_json || '' }}
@@ -133,7 +142,7 @@ jobs:
   coverage:
     needs: resolve-runners
     name: Coverage >= 75% [${{ needs.resolve-runners.outputs.linux_provider }}]
-    if: needs.resolve-runners.outputs.linux_provider != 'skipped'
+    if: needs.resolve-runners.outputs.platform_focus == 'all' && needs.resolve-runners.outputs.linux_provider != 'skipped'
     runs-on: ${{ fromJSON(needs.resolve-runners.outputs.linux_runs_on_json) }}
     steps:
       - uses: actions/checkout@v5

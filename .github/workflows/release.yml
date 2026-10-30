@@ -29,6 +29,11 @@ on:
         required: false
         default: ""
         type: string
+      platform_focus:
+        description: "Platforms to build (empty = repo variable CI_PLATFORM_FOCUS, default macos = macos-arm64 + linux-x64)"
+        required: false
+        default: ""
+        type: string
       windows_runner_selector_json:
         description: Optional JSON string/array for Windows runs-on
         required: false
@@ -61,6 +66,7 @@ jobs:
 
       - id: resolve
         env:
+          PLATFORM_FOCUS: ${{ inputs.platform_focus || vars.CI_PLATFORM_FOCUS || 'macos' }}
           REQUESTED_PROVIDER: ${{ inputs.runner_provider || vars.DEFAULT_RUNNER_PROVIDER || 'github-hosted' }}
           EXPLICIT_LINUX_RUNNER_SELECTOR_JSON: ${{ inputs.linux_runner_selector_json || '' }}
           EXPLICIT_LINUX_ARM64_RUNNER_SELECTOR_JSON: ${{ inputs.linux_arm64_runner_selector_json || '' }}
