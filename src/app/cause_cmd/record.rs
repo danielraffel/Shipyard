@@ -287,28 +287,125 @@ fn percent_encode(text: &str) -> String {
         .collect()
 }
 
-fn read_jsonl(path: &Path) -> Vec<Value> {
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
+fn parse_jsonl(path: &Path, text: &str) -> Result<Vec<Value>, String> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(line_number, line)| {
+            serde_json::from_str(line)
+                .map_err(|error| format!("{} line {}: {error}", path.display(), line_number + 1))
+        })
         .collect()
 }
 
+fn read_jsonl(path: &Path) -> Result<Vec<Value>, String> {
+    let text = fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    parse_jsonl(path, &text)
+}
+
+fn read_jsonl_if_present(path: &Path) -> Result<Vec<Value>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => parse_jsonl(path, &text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
 /// Every cause row in the archive.
-fn archived_causes(dir: &Path) -> Vec<Value> {
+fn archived_causes(dir: &Path) -> Result<Vec<Value>, String> {
     let mut rows = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir.join("causes")) {
-        let mut paths: Vec<_> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
-        paths.sort();
-        for path in paths
-            .into_iter()
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-        {
-            rows.extend(read_jsonl(&path));
+    let causes_dir = dir.join("causes");
+    let entries = match fs::read_dir(&causes_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(rows),
+        Err(error) => return Err(format!("{}: {error}", causes_dir.display())),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("{}: {error}", causes_dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            paths.push(path);
         }
     }
-    rows
+    paths.sort();
+    for path in paths {
+        let parsed = read_jsonl(&path)?;
+        for (index, row) in parsed.iter().enumerate() {
+            if row["schema"] != cause::SCHEMA {
+                return Err(format!(
+                    "{} row {}: cause archive row must have schema {}",
+                    path.display(),
+                    index + 1,
+                    cause::SCHEMA
+                ));
+            }
+            let job_id_valid = match row.get("job_id") {
+                None | Some(Value::Null) => true,
+                Some(value) => value.as_u64().is_some(),
+            };
+            if row["repo"].as_str().is_none() || !job_id_valid {
+                return Err(format!(
+                    "{} row {}: cause archive row must contain string repo and, when present, integer job_id",
+                    path.display(),
+                    index + 1
+                ));
+            }
+            serde_json::from_value::<cause::CiCause>(row.clone()).map_err(|error| {
+                format!(
+                    "{} row {}: invalid {} cause archive row: {error}",
+                    path.display(),
+                    index + 1,
+                    cause::SCHEMA
+                )
+            })?;
+        }
+        rows.extend(parsed);
+    }
+    Ok(rows)
+}
+
+fn linked_fixlinks(dir: &Path) -> Result<BTreeSet<(String, u64, u64)>, String> {
+    let path = dir.join("fixlinks.jsonl");
+    read_jsonl_if_present(&path)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            if row["schema"] != cause::SCHEMA || row["source"] != "fix-link" {
+                return Err(format!(
+                    "{} row {}: fix-link row must have schema {} and source fix-link",
+                    path.display(),
+                    index + 1,
+                    cause::SCHEMA
+                ));
+            }
+            let repo = row["repo"].as_str().ok_or_else(|| {
+                format!(
+                    "{} row {}: fix-link row must contain string repo",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+            let red_run_id = row["red_run_id"].as_u64().ok_or_else(|| {
+                format!(
+                    "{} row {}: fix-link row must contain integer red_run_id",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+            let red_attempt = match row.get("red_attempt") {
+                None => 1,
+                Some(value) => value.as_u64().ok_or_else(|| {
+                    format!(
+                        "{} row {}: fix-link red_attempt must be an integer",
+                        path.display(),
+                        index + 1
+                    )
+                })?,
+            };
+            Ok((repo.to_owned(), red_run_id, red_attempt))
+        })
+        .collect()
 }
 
 fn append(path: &Path, rows: &[Value]) -> Result<(), String> {
@@ -380,7 +477,9 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
 
     let mut report = RecordReport::default();
     let mut pulls = BTreeMap::new();
-    let archived = archived_causes(&query.dir);
+    super::require_archive_parent(&query.dir)?;
+    let archived = archived_causes(&query.dir)?;
+    let linked = linked_fixlinks(&query.dir)?;
     let recorded: BTreeSet<(String, u64)> = archived
         .iter()
         .filter_map(|row| Some((row["repo"].as_str()?.to_owned(), row["job_id"].as_u64()?)))
@@ -453,16 +552,43 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
             report.causes_written += 1;
         }
     }
-    for (month, rows) in &by_month {
+    report.fixlinks_written = append_causes_and_fixlinks(
+        gh,
+        query,
+        &run_index,
+        &mut pulls,
+        &mut report,
+        &linked,
+        &archived,
+        &by_month,
+    )?;
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)] // Keep archive append and link discovery in one ordered pass.
+fn append_causes_and_fixlinks(
+    gh: &SyncGhReader<'_>,
+    query: &RecordQuery,
+    run_index: &BTreeMap<u64, Value>,
+    pulls: &mut BTreeMap<String, Vec<Value>>,
+    report: &mut RecordReport,
+    linked: &BTreeSet<(String, u64, u64)>,
+    archived: &[Value],
+    by_month: &BTreeMap<String, Vec<Value>>,
+) -> Result<usize, String> {
+    for (month, rows) in by_month {
         append(
             &query.dir.join("causes").join(format!("{month}.jsonl")),
             rows,
         )?;
     }
-    let fixlinks = fixlinks(gh, query, &run_index, &mut pulls, &mut report)?;
+    let mut all_causes = archived.to_vec();
+    for rows in by_month.values() {
+        all_causes.extend(rows.iter().cloned());
+    }
+    let fixlinks = fixlinks(gh, query, run_index, pulls, report, linked, &all_causes)?;
     append(&query.dir.join("fixlinks.jsonl"), &fixlinks)?;
-    report.fixlinks_written = fixlinks.len();
-    Ok(report)
+    Ok(fixlinks.len())
 }
 
 /// The cause row of one failed job, or `None` when its payload says it did
@@ -536,9 +662,9 @@ struct Red {
     branch: String,
 }
 
-fn pending_reds(dir: &Path, since: &str, linked: &BTreeSet<(String, u64, u64)>) -> Vec<Red> {
+fn pending_reds(rows: &[Value], since: &str, linked: &BTreeSet<(String, u64, u64)>) -> Vec<Red> {
     let mut reds: BTreeMap<(String, u64, u64), Red> = BTreeMap::new();
-    for row in archived_causes(dir) {
+    for row in rows {
         if row["failure_class"] == "cancelled" {
             continue; // a cancel is not a red that a push fixes
         }
@@ -944,20 +1070,12 @@ fn fixlinks(
     run_index: &BTreeMap<u64, Value>,
     pulls: &mut BTreeMap<String, Vec<Value>>,
     report: &mut RecordReport,
+    linked: &BTreeSet<(String, u64, u64)>,
+    causes: &[Value],
 ) -> Result<Vec<Value>, String> {
-    let linked: BTreeSet<(String, u64, u64)> = read_jsonl(&query.dir.join("fixlinks.jsonl"))
-        .iter()
-        .filter_map(|row| {
-            Some((
-                row["repo"].as_str()?.to_owned(),
-                row["red_run_id"].as_u64()?,
-                row["red_attempt"].as_u64().unwrap_or(1),
-            ))
-        })
-        .collect();
     let mut greens: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     let mut out = Vec::new();
-    for red in pending_reds(&query.dir, &query.since, &linked) {
+    for red in pending_reds(causes, &query.since, linked) {
         if red.repo != query.repo {
             continue;
         }

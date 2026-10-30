@@ -141,6 +141,16 @@ real ship-state write from overlapping that audit.
 | `phase`              | Additive validation-phase tag (setup/configure/build/test, default `None`), same source as `last_heartbeat_at`. |
 | `required`           | Lane policy **at dispatch time**, snapshotted in `DispatchedRun.required` by add-lane (cli.py:2357) and by `_update_ship_state_from_job` (cli.py:4593). `from_dict` defaults to `True` for legacy files written before #87. `_ship_terminal_verdict` reads this persisted value (cli.py:3809) to decide which failures tolerate. |
 
+### Warm-pool member attribution
+
+When a successful host-pool run is retained for warm reuse, the pool entry
+records the selected member from the dispatch result's structural
+`host_pool_member_id` field. The backend display label may carry `-failover` or
+`-exhausted` suffixes and is not parsed for attribution. The optional
+`member_id` is preserved for older entries and is reported by
+`shipyard targets warm status --json` when known; it does not alter warm-pool
+eligibility or routing.
+
 ## State diagram (textual)
 
 ```

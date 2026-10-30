@@ -30,6 +30,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("--ci-mode", text)
         self.assertIn("CI_MACOS_SIGNING_ENABLED == 'true'", text)
 
+    def test_macos_job_auth_is_checked_before_expensive_work(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        job = text.split("  sign-and-upload-macos:", 1)[1]
+        config, steps = job.split("    steps:", 1)
+        self.assertNotIn("SHIPYARD_GHAPP_PATH", job)
+        self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", steps)
+        self.assertLess(steps.index("from release_macos_local import require_ci_gh"),
+                        steps.index("- name: Install Rust"))
+        self.assertLess(steps.index("from release_macos_local import require_ci_gh"),
+                        steps.index("- name: Import Developer ID signing identity"))
+
     def test_release_is_gated_on_the_live_github_smoke(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("  live-smoke:\n    needs: build\n", text)
