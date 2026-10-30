@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Native merge queue. A merge_group run has no inputs and must not read
+  # vars.DEFAULT_RUNNER_PROVIDER, so it resolves to GitHub-hosted runners.
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
     inputs:
       runner_provider:
@@ -54,7 +58,7 @@ jobs:
         env:
           # With GITHUB_EVENT_NAME and GITHUB_REPOSITORY, a fork PR skips self-hosted legs.
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          REQUESTED_PROVIDER: ${{ inputs.runner_provider || vars.DEFAULT_RUNNER_PROVIDER || 'github-hosted' }}
+          REQUESTED_PROVIDER: ${{ github.event_name == 'merge_group' && 'github-hosted' || inputs.runner_provider || vars.DEFAULT_RUNNER_PROVIDER || 'github-hosted' }}
           EXPLICIT_LINUX_RUNNER_SELECTOR_JSON: ${{ inputs.linux_runner_selector_json || '' }}
           EXPLICIT_MACOS_ARM64_RUNNER_SELECTOR_JSON: ${{ inputs.macos_arm64_runner_selector_json || '' }}
           EXPLICIT_WINDOWS_RUNNER_SELECTOR_JSON: ${{ inputs.windows_runner_selector_json || '' }}
