@@ -812,7 +812,7 @@ impl MetricsStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let ids = {
                 let mut statement =
-                    tx.prepare("SELECT id FROM runs WHERE ts < ?1 ORDER BY id LIMIT 250")?;
+                    tx.prepare("SELECT id FROM runs WHERE ts < ?1 ORDER BY ts, id LIMIT 250")?;
                 statement
                     .query_map([&cutoff], |row| row.get::<_, i64>(0))?
                     .collect::<Result<Vec<_>, _>>()?
@@ -925,6 +925,12 @@ impl MetricsStore {
               cache_hit INTEGER,
               artifact_path TEXT
             );
+            CREATE INDEX IF NOT EXISTS metrics_runs_retention
+              ON runs(ts, id);
+            CREATE INDEX IF NOT EXISTS metrics_jobs_run_id
+              ON jobs(run_id);
+            CREATE INDEX IF NOT EXISTS metrics_steps_job_id
+              ON steps(job_id);
             CREATE TABLE IF NOT EXISTS merge_receipts (
               receipt_id TEXT PRIMARY KEY,
               schema TEXT NOT NULL,
@@ -5996,6 +6002,100 @@ mod tests {
     }
 
     #[test]
+    fn retention_indexes_are_idempotent_and_drive_cleanup_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let expected = [
+            "metrics_jobs_run_id",
+            "metrics_runs_retention",
+            "metrics_steps_job_id",
+        ];
+        let index_names = |store: &MetricsStore| {
+            let conn = store.connect().unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND name LIKE 'metrics_%'
+                     ORDER BY name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(index_names(&store), expected);
+
+        {
+            let conn = store.connect().unwrap();
+            conn.execute("DROP INDEX metrics_runs_retention", [])
+                .unwrap();
+            conn.execute("DROP INDEX metrics_jobs_run_id", []).unwrap();
+            conn.execute("DROP INDEX metrics_steps_job_id", []).unwrap();
+        }
+        store.migrate().unwrap();
+        assert_eq!(index_names(&store), expected);
+
+        let mut conn = store.connect().unwrap();
+        let transaction = conn.transaction().unwrap();
+        for id in 1..=4_000_i64 {
+            let timestamp = if id <= 2_000 {
+                "2020-01-01T00:00:00Z"
+            } else {
+                "2030-01-01T00:00:00Z"
+            };
+            transaction
+                .execute(
+                    "INSERT INTO runs (id, ts, project, status)
+                     VALUES (?1, ?2, 'pulp', 'success')",
+                    params![id, timestamp],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO jobs (id, run_id, job, status)
+                     VALUES (?1, ?1, 'job', 'success')",
+                    params![id],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO steps (id, job_id, step, duration_ms, status)
+                     VALUES (?1, ?1, 'build', 1, 'success')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let plan_detail = |query: &str, parameter: &str| {
+            conn.query_row(&format!("EXPLAIN QUERY PLAN {query}"), [parameter], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+        };
+        let runs_plan = plan_detail(
+            "SELECT id FROM runs WHERE ts < ?1 ORDER BY ts, id LIMIT 250",
+            "2025-01-01T00:00:00Z",
+        );
+        let jobs_plan = plan_detail("SELECT id FROM jobs WHERE run_id = ?1", "1");
+        let steps_plan = plan_detail("SELECT id FROM steps WHERE job_id = ?1", "1");
+        assert!(
+            runs_plan.contains("SEARCH runs USING COVERING INDEX metrics_runs_retention"),
+            "unexpected runs plan: {runs_plan}"
+        );
+        assert!(
+            jobs_plan.contains("SEARCH jobs USING COVERING INDEX metrics_jobs_run_id"),
+            "unexpected jobs plan: {jobs_plan}"
+        );
+        assert!(
+            steps_plan.contains("SEARCH steps USING COVERING INDEX metrics_steps_job_id"),
+            "unexpected steps plan: {steps_plan}"
+        );
+    }
+
+    #[test]
     fn metrics_retention_prunes_raw_samples_but_keeps_receipts() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
@@ -6016,6 +6116,77 @@ mod tests {
             conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn metrics_retention_prunes_multiple_batches_and_preserves_live_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        for pr in 1..=300 {
+            insert_scorecard_sample_at(
+                &store,
+                "pulp",
+                pr,
+                "success",
+                10,
+                0,
+                false,
+                old.to_rfc3339(),
+            );
+        }
+        insert_scorecard_sample(&store, "pulp", 301, "success", 10, 0, false);
+
+        let old_capacity = test_capacity_sample(old, "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&old_capacity).unwrap())
+            .unwrap();
+        let cutoff = Utc::now() - Duration::days(90);
+        let overlapping_capacity =
+            test_capacity_sample(cutoff - Duration::minutes(1), "m5", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&overlapping_capacity).unwrap())
+            .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt(
+                "retention-kept",
+                "owner/repo",
+                "repo",
+                301,
+                'a',
+            )])
+            .unwrap();
+
+        assert_eq!(store.prune_older_than(90).unwrap(), 301);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM steps", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| row
+                .get::<_, i64>(0),)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM merge_receipts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
         );
     }
 
