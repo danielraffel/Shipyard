@@ -579,8 +579,9 @@ record's own `named_at`.
 It prints `::notice title=ci-cause::<record>`, so the job's own log holds its
 `ci.cause/v1` record; the scorecard keeps its `named_at` only when the record
 is bound to that job (repo, head, run, attempt, job name) and names the cause
-the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
-<file>` (append-only, one file per month, ids never duplicated).
+the scorecard reads from the log, so a forged line changes nothing. Keep records with
+`shipyard cause archive --dir <labels checkout>/data/ci-cause --input <file>`
+(append-only, one file per month under `causes/`, ids never duplicated).
 
 **A rollup lands on its members' approvals.** On a base with `[train]
 mode = "rollup"`, a `shipyard-train/rollup-*` head with no verdict of its own
