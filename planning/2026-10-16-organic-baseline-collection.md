@@ -78,6 +78,14 @@ repository, and atomically replaces the handoff file when at least one receipt
 exists. An empty export fails without replacing the previous handoff. It never
 asks GitHub for merge state or creates a receipt.
 
+When the producer and observer are different fleet hosts, run the observer's
+`merge_receipt_handoff.py fetch --source-host <producer>` command. It invokes
+the same local export over the managed SSH alias, transfers the exact payload
+and producer freshness metadata, then validates both before replacing the
+observer handoff. A transport, source, or validation failure leaves the prior
+payload in place and marks health unavailable; it never manufactures a
+receipt.
+
 The command writes an append-only observation history and reports continuous
 elapsed 24-hour days, required activity strata, organic sample counts, and the
 safe-merge denominator. The baseline cannot exit while normal PR, merge-group,

@@ -3,11 +3,8 @@
 <plist version="1.0"><dict>
 <key>Label</key><string>com.danielraffel.shipyard.merge-receipt-handoff</string>
 <key>ProgramArguments</key><array>
-<string>@PYTHON@</string><string>@SCRIPT@</string><string>export</string>
-<string>--shipyard</string><string>@SHIPYARD@</string><string>--state-dir</string><string>@STATE_DIR@</string>
-<string>--repo</string><string>@REPO@</string><string>--file</string><string>@FILE@</string>
-<string>--base-branch</string><string>@BASE_BRANCH@</string>
-<string>--health-file</string><string>@HEALTH_FILE@</string>
+<string>@PYTHON@</string><string>@SCRIPT@</string>
+@MODE_ARGS@
 </array>
 <key>WorkingDirectory</key><string>@HOME@</string>
 <key>RunAtLoad</key><true/><key>StartInterval</key><integer>@INTERVAL@</integer>

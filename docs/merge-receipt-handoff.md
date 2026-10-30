@@ -34,6 +34,33 @@ directory before loading launchd, so the job does not depend on the checkout
 that installed it. It requires an explicit repository and absolute paths; it
 does not copy credentials or alter queue/merge authorization.
 
+## Remote producer and observer
+
+When the protected merge database lives on another fleet host, the observer
+can fetch the producer export through the managed SSH alias. Run this on the
+observer (for example, m1):
+
+```sh
+python3 scripts/merge_receipt_handoff.py fetch \
+  --source-host m3 \
+  --source-shipyard /Users/danielraffel/.local/bin/shipyard \
+  --source-state-dir '/Users/danielraffel/Library/Application Support/shipyard' \
+  --repo Generous-Corp/pulp \
+  --base-branch main \
+  --file '/Users/danielraffel/Library/Application Support/shipyard/merge-receipts.jsonl' \
+  --health-file '/Users/danielraffel/Library/Application Support/shipyard/merge-receipts.health.json'
+```
+
+`fetch` runs the existing repository-scoped export on the named producer host,
+reads the producer's authenticated `imported_at` timestamp from its local
+read-only metrics database, and transfers one validated JSON envelope over
+SSH. The observer validates every receipt, producer identity, timestamp,
+repository, and base branch before atomically replacing its local handoff.
+Transport or validation failure writes an `error` health sidecar and preserves
+the previous payload. It never calls GitHub, creates a receipt, changes queue
+state, or authorizes a merge. The source executable and state paths must be
+absolute; the host is a plain managed SSH alias.
+
 A monitoring agent can fail closed when the producer stops exporting:
 
 ```sh
