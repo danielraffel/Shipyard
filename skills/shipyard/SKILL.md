@@ -5350,6 +5350,18 @@ diagnostic remains retryable;
 authentication, schema, malformed-data, and receipt-handoff failures stay
 terminal. Use `--provider-retries` and
 `--provider-retry-delay-seconds` only to tune that explicit bounded policy.
+
+The separate baseline status file retains at most 14 days and 1,024 diagnostic
+observations by default. `--state-retention-days` and
+`--state-max-observations` accept positive integers to change those limits;
+raise both when retaining a longer, frequent collection history. Every status
+write trims expired/oldest observations after validating existing timestamps,
+including status-only writes. Malformed state refuses replacement. The legacy
+activity/collection counters describe retained observations, as labeled by
+`observation_retention.counter_scope`; they never establish readiness.
+Retention leaves the baseline start and authoritative pass history unchanged.
+Omitting `--collect` skips this collector's provider imports, not all built-in
+Shipyard telemetry.
 # Local Rust gate placement
 
 The pre-push hook selects the repository-pinned Rust channel on the current
