@@ -2,15 +2,27 @@
 
 [![CI](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml/badge.svg)](https://github.com/danielraffel/Shipyard/actions/workflows/ci.yml)
 
+**Local-first engineering orchestration and governance for coding agents.**
+Shipyard coordinates builds and tests, records review and merge gates, and
+supports bounded recovery across local machines, SSH-reachable VMs, and cloud
+runners. GitHub remains authoritative for pull requests and merge order.
+
 Shipyard and [TartCI](https://github.com/danielraffel/tartci) solve different
 parts of CI:
 
 - **Shipyard coordinates the work.** It sends an exact commit to the targets
   you choose, records the results, watches pull requests, and hands a verified
   head to GitHub for landing.
-- **TartCI runs the work in disposable VMs.** It turns Apple Silicon Macs into
-  GitHub Actions capacity by booting clean macOS, Linux, or Windows VMs for
-  jobs and removing them afterward.
+- **TartCI runs the work in disposable VMs.** For teams using Tart on Apple
+  Silicon, it turns their Macs into GitHub Actions capacity with clean macOS,
+  Linux, and Windows VM lanes that are removed after each job.
+
+Tart provides the VM runtime; it does not by itself schedule GitHub jobs or
+manage their runner lifecycle. TartCI adds that CI pool around it: managed
+images, capacity leases, ephemeral runner registration, job cleanup, and
+metrics.
+On a managed fleet, TartCI is the supported pool path; Orchard is retired and
+should be disabled so two schedulers do not claim the same jobs or capacity.
 
 Use Shipyard without TartCI for local, SSH, or hosted checks. Add TartCI when
 those checks need isolated Mac VM capacity. GitHub remains the authority for
@@ -25,7 +37,8 @@ Use Shipyard if you:
 - want a pull request to land only after the exact head passes every required
   platform;
 - run local Macs or private VMs alongside GitHub-hosted runners;
-- want unattended monitoring that records a clear reason when it must stop.
+- want monitoring that can run unattended and records a specific reason when
+  progress cannot continue.
 
 Shipyard is useful for people and coding tools. It does not choose what your
 product should do or edit code on its own.
