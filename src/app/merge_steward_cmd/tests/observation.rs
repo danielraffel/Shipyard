@@ -327,30 +327,195 @@ fn current_head_check_transport_preserves_producer_identity() {
     assert_eq!(checks[0].app_id, Some(42));
 }
 
+/// The REST list endpoint carries no `mergeable_state`; only `pulls/{n}` does.
+/// Rows below follow that real shape.
+#[cfg(unix)]
+const REST_LIST_ROWS: &str = r#"[
+{"node_id":"PR_ready","number":42,"draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature"},"auto_merge":null,"labels":[{"name":"managed"}]},
+{"node_id":"PR_draft","number":43,"draft":true,"base":{"ref":"main"},"head":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ref":"draft"},"auto_merge":null,"labels":[]},
+{"node_id":"PR_queued","number":44,"draft":false,"base":{"ref":"main"},"head":{"sha":"cccccccccccccccccccccccccccccccccccccccc","ref":"queued"},"auto_merge":null,"labels":[]}
+]"#;
+
 #[cfg(unix)]
 #[test]
 fn open_pr_list_falls_back_to_rest_after_gateway_failure() {
     let temp = tempfile::tempdir().expect("temp");
+    let calls_path = temp.path().join("calls");
     let actions = fake_gh(
         &temp,
-        r#"
+        &format!(
+            r#"printf '%s\n' "$*" >> '{calls}'
 case "$*" in
   *"pr list"*) echo "HTTP 502 Bad Gateway" >&2; exit 1 ;;
   *"repos/owner/repo/pulls?state=open&base=main&per_page=100&page=1"*)
-    printf '%s' '[{"node_id":"PR_kw","number":42,"draft":false,"base":{"ref":"main"},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature"},"mergeable_state":"clean","auto_merge":null,"labels":[{"name":"managed"}]}]' ;;
+    printf '%s' '{rows}' ;;
+  *"repos/owner/repo/pulls/42") printf '%s' '{{"number":42,"mergeable_state":"clean","head":{{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#,
+            calls = calls_path.display(),
+            rows = REST_LIST_ROWS.replace('\n', ""),
+        ),
     );
-    let prs =
-        pull_requests(&actions, "owner/repo", "main", &BTreeMap::new()).expect("REST fallback");
-    assert_eq!(prs.len(), 1);
-    assert_eq!(prs[0].node_id, "PR_kw");
+    let positions = BTreeMap::from([(44, 0)]);
+    let prs = pull_requests(&actions, "owner/repo", "main", &positions).expect("REST fallback");
+    assert_eq!(prs.len(), 3);
+    assert_eq!(prs[0].node_id, "PR_ready");
     assert_eq!(prs[0].fact.number, 42);
     assert_eq!(prs[0].fact.head_sha, "a".repeat(40));
     assert_eq!(prs[0].fact.head_branch, "feature");
     assert_eq!(prs[0].fact.labels, vec!["managed"]);
     assert!(prs[0].check_rollup_maybe_truncated);
+    // The candidate's state comes from `pulls/{n}` and is arm-ready.
+    assert!(crate::auto_arm::merge_state_is_arm_ready(
+        &prs[0].fact.merge_state
+    ));
+    // Only the candidate is hydrated: not the draft, not the queued PR.
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    assert!(calls.contains("repos/owner/repo/pulls/42"));
+    assert!(!calls.contains("repos/owner/repo/pulls/43"));
+    assert!(!calls.contains("repos/owner/repo/pulls/44"));
+    assert!(!crate::auto_arm::merge_state_is_arm_ready(
+        &prs[1].fact.merge_state
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn rest_fallback_refuses_a_candidate_whose_merge_state_is_unreadable() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"case "$*" in
+  *"pr list"*) echo "HTTP 502 Bad Gateway" >&2; exit 1 ;;
+  *"repos/owner/repo/pulls?state=open"*) printf '%s' '{rows}' ;;
+  *"repos/owner/repo/pulls/42") echo "HTTP 500" >&2; exit 1 ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            rows = REST_LIST_ROWS,
+        ),
+    );
+    let prs = pull_requests(&actions, "owner/repo", "main", &BTreeMap::from([(44, 0)]))
+        .expect("an unreadable state degrades to UNKNOWN, not a partial success");
+    assert_eq!(prs[0].fact.merge_state, "UNKNOWN");
+    assert!(!crate::auto_arm::merge_state_is_arm_ready(
+        &prs[0].fact.merge_state
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn rest_fallback_refuses_a_candidate_whose_head_moved_before_the_state_read() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"case "$*" in
+  *"pr list"*) echo "HTTP 502 Bad Gateway" >&2; exit 1 ;;
+  *"repos/owner/repo/pulls?state=open"*) printf '%s' '{rows}' ;;
+  *"repos/owner/repo/pulls/42") printf '%s' '{{"mergeable_state":"clean","head":{{"sha":"dddddddddddddddddddddddddddddddddddddddd"}}}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            rows = REST_LIST_ROWS,
+        ),
+    );
+    let prs =
+        pull_requests(&actions, "owner/repo", "main", &BTreeMap::from([(44, 0)])).expect("census");
+    assert_eq!(prs[0].fact.merge_state, "UNKNOWN");
+}
+
+#[cfg(unix)]
+#[test]
+fn census_does_not_hydrate_drafts_conflicts_or_queued_pull_requests() {
+    let temp = tempfile::tempdir().expect("temp");
+    let calls_path = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"/check-runs?per_page=100&page=1"*) printf '%s' '{{"check_runs":[]}}' ;;
+  *"/statuses?per_page=100&page=1"*) printf '%s' '[]' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            calls_path.display()
+        ),
+    );
+    let sha = |c: char| c.to_string().repeat(40);
+    let row = |number: u64, c: char, draft: bool, state: &str| {
+        serde_json::json!({
+            "id": format!("PR_{number}"), "number": number, "isDraft": draft,
+            "baseRefName": "main", "headRefOid": sha(c), "headRefName": format!("f{number}"),
+            "author": {"login": "app/shipyard-local"}, "mergeStateStatus": state,
+            "autoMergeRequest": null, "labels": []
+        })
+    };
+    let positions = BTreeMap::from([(5, 0)]);
+    let mut prs = [
+        row(1, 'a', false, "CLEAN"),
+        row(2, 'b', true, "CLEAN"),
+        row(3, 'c', false, "DIRTY"),
+        row(4, 'd', false, "CONFLICTING"),
+        row(5, 'e', false, "CLEAN"),
+        row(6, 'f', false, "BLOCKED"),
+    ]
+    .iter()
+    .map(|row| parse_pr(row, &positions).expect("pr"))
+    .collect::<Vec<_>>();
+    hydrate_census_check_identities(&actions, "owner/repo", &[], &mut prs).expect("census");
+    let calls = fs::read_to_string(calls_path).expect("calls");
+    for hydrated in ['a', 'f'] {
+        assert!(calls.contains(&format!("commits/{}/check-runs", sha(hydrated))));
+    }
+    for skipped in ['b', 'c', 'd', 'e'] {
+        assert!(
+            !calls.contains(&sha(skipped)),
+            "{skipped} must not be hydrated"
+        );
+    }
+    assert_eq!(
+        calls.lines().count(),
+        4,
+        "two hydrated heads, two reads each"
+    );
+    assert!(!prs[0].check_rollup_maybe_truncated);
+    assert!(prs[1].check_rollup_maybe_truncated, "left unobserved");
+}
+
+#[cfg(unix)]
+#[test]
+fn census_fails_closed_when_a_candidates_checks_are_unreadable() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(
+        &temp,
+        r#"case "$*" in
+  *"commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs"*) echo "HTTP 500" >&2; exit 1 ;;
+  *"/check-runs"*) printf '%s' '{"check_runs":[]}' ;;
+  *"/statuses"*) printf '%s' '[]' ;;
+  *) exit 2 ;;
+esac
+"#,
+    );
+    let row = |number: u64, c: char| {
+        serde_json::json!({
+            "id": format!("PR_{number}"), "number": number, "isDraft": false,
+            "baseRefName": "main", "headRefOid": c.to_string().repeat(40),
+            "headRefName": "f", "author": {"login": "app/shipyard-local"},
+            "mergeStateStatus": "CLEAN", "autoMergeRequest": null, "labels": []
+        })
+    };
+    let mut prs = ['a', 'b', 'c']
+        .iter()
+        .zip(1..)
+        .map(|(c, n)| parse_pr(&row(n, *c), &BTreeMap::new()).expect("pr"))
+        .collect::<Vec<_>>();
+    let error = hydrate_census_check_identities(&actions, "owner/repo", &[], &mut prs)
+        .expect_err("an unreadable candidate must fail the observation");
+    assert!(error.contains("current-head check identities"), "{error}");
 }
 
 #[cfg(unix)]
