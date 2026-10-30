@@ -835,6 +835,7 @@ class CollectorInvocationTests(unittest.TestCase):
                 status="fresh", exported_at=dt.datetime.now(dt.timezone.utc), receipts=[value], payload=payload,
                 source_imported_at=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
                 stale_after_seconds=7200,
+                source_host="m3",
                 producer={"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64})
             generated["unexpected"] = True
             health.write_text(json.dumps(generated))
@@ -845,6 +846,11 @@ class CollectorInvocationTests(unittest.TestCase):
             health.write_text(json.dumps(generated))
             with self.assertRaisesRegex(RuntimeError, "base branch"):
                 MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+            generated["base_branch"] = "main"
+            health.write_text(json.dumps(generated))
+            MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h", expected_source_host="m3")
+            with self.assertRaisesRegex(RuntimeError, "expected m1"):
+                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h", expected_source_host="m1")
 
     def test_import_uses_immutable_validated_handoff_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

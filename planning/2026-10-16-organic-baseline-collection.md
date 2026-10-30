@@ -13,6 +13,7 @@ python3 scripts/collect_baseline.py \
   --tartci-host m5s \
   --merge-receipts "$SHIPYARD_STATE_DIR/merge-receipts.jsonl" \
   --merge-receipt-health "$SHIPYARD_STATE_DIR/merge-receipts.health.json" \
+  --merge-receipt-source-host m3 \
   --collect
 ```
 
@@ -22,7 +23,8 @@ TartCI but excluded from Shipyard's joinable baseline with an explicit count;
 they cannot contribute to safely merged throughput or wasted-compute metrics.
 
 On the observation controller, install the supervised hourly schedule with
-`scripts/install_baseline_collector.sh --install`. The installer is dry-run by
+`scripts/install_baseline_collector.sh --merge-receipt-source-host m3 --install`.
+The installer is dry-run by
 default, validates the collector, handoff checker, wrapper, and
 `baseline_pass_history.py` dependency before loading launchd, and copies them
 into the managed Shipyard state directory (`~/Library/Application
@@ -69,8 +71,8 @@ shipyard --state-dir "$PRODUCER_STATE_DIR" metrics export merge-receipt \
 ```
 
 Its health sidecar is checked with `python3 scripts/merge_receipt_handoff.py
-check ... --stale-after 2h`; a stale, malformed, failed, or empty handoff is
-unavailable, never zero.
+check ... --expect-source-host m3 --stale-after 2h`; a stale, malformed,
+failed, wrong-host, or empty handoff is unavailable, never zero.
 
 The observer then passes that file as `--merge-receipts`. The export reads only
 validated receipts already persisted by Shipyard, scopes them to the exact

@@ -614,6 +614,19 @@ def check(args: argparse.Namespace) -> int:
                 validate_source_host(health["source_host"])
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
+        expected_source_host = getattr(args, "expect_source_host", None)
+        if expected_source_host is not None:
+            try:
+                expected_source_host = validate_source_host(expected_source_host)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
+            recorded_source_host = health.get("source_host")
+            if not isinstance(recorded_source_host, str):
+                raise RuntimeError("health sidecar is missing source_host provenance")
+            if recorded_source_host.casefold() != expected_source_host.casefold():
+                raise RuntimeError(
+                    f"health sidecar source_host is {recorded_source_host}, expected {expected_source_host}"
+                )
         if health.get("freshness_basis") != FRESHNESS_BASIS:
             raise RuntimeError("health sidecar has an unsupported freshness basis")
         expected_base = health.get("base_branch")
@@ -697,6 +710,8 @@ def parser() -> argparse.ArgumentParser:
     check_parser.add_argument("--base-branch", default=DEFAULT_BASE_BRANCH)
     check_parser.add_argument("--health-file", type=pathlib.Path, required=True)
     check_parser.add_argument("--stale-after", default="2h")
+    check_parser.add_argument("--expect-source-host",
+                              help="require health provenance from this managed fleet host")
     check_parser.set_defaults(handler=check)
     return root
 

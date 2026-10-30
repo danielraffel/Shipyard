@@ -81,12 +81,17 @@ python3 scripts/merge_receipt_handoff.py check \
   --file "$HOME/Library/Application Support/shipyard/merge-receipts.jsonl" \
   --repo Generous-Corp/pulp \
   --base-branch main \
+  --expect-source-host m3 \
   --health-file "$HOME/Library/Application Support/shipyard/merge-receipts.health.json" \
   --stale-after 2h
 ```
 
 `check` exits `0` for a valid, recent handoff and `3` for a missing,
 malformed, failed, empty, stale, tampered, duplicate, or conflicting handoff.
+When the observer has a configured producer, pass
+`--expect-source-host <producer>`; a fresh handoff from another host or a
+legacy sidecar without source provenance is rejected. Leave it unset for a
+local producer export or during a compatibility rollout.
 The baseline collector requires and verifies this sidecar when
 `--merge-receipt-health` is supplied, preserving an unavailable denominator
 instead of importing stale data. This status is observational only;

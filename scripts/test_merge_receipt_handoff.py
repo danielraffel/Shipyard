@@ -371,6 +371,27 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             self.assertEqual(result.returncode, 3)
             self.assertIn("plain fleet host", json.loads(result.stdout)["error"])
 
+    def test_check_enforces_expected_source_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            handoff = root / "handoff.jsonl"
+            health = root / "handoff.health.json"
+            handoff.write_text(json.dumps(receipt()) + "\n")
+            health.write_text(json.dumps(self.health(handoff, source_host="m3")))
+            good = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo",
+                               "--health-file", str(health), "--stale-after", "2h",
+                               "--expect-source-host", "m3")
+            self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
+            wrong = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo",
+                                "--health-file", str(health), "--stale-after", "2h",
+                                "--expect-source-host", "m1")
+            self.assertEqual(wrong.returncode, 3)
+            self.assertIn("expected m1", json.loads(wrong.stdout)["error"])
+            local = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo",
+                                "--health-file", str(health), "--stale-after", "2h",
+                                "--expect-source-host", "local")
+            self.assertEqual(local.returncode, 3)
+
     def test_check_rejects_duplicate_and_conflicting_records(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
