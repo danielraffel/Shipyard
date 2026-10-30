@@ -38,6 +38,11 @@ pub(super) fn gate_cost_command<W: Write>(
     let selection_steps = args.selection_steps.clone();
     let export_cases = args.export_cases.clone();
     let query = resolve_query(args, &config, now)?;
+    let archive_causes = causes_archive
+        .as_deref()
+        .map(|dir| scorecard::causes::archive(dir, &query.repo))
+        .transpose()
+        .map_err(|error| CliFailure::new(1, error))?;
     let cache = if no_cache {
         ReadCache::disabled()
     } else {
@@ -64,8 +69,7 @@ pub(super) fn gate_cost_command<W: Write>(
             .map_err(|error| CliFailure::new(1, format!("scorecard read failed: {error}")))?;
         let mut report = scorecard::compute(&observation);
         let mut rows = scorecard::cases::cases(&observation);
-        if let Some(dir) = causes_archive {
-            let read = scorecard::causes::archive(&dir, &observation.query.repo);
+        if let Some(read) = archive_causes {
             scorecard::causes::attach(&mut rows, &read);
             report.cause_naming = Some(scorecard::causes::compute(&rows, &read));
         } else if causes || export_cases.is_some() {
@@ -502,6 +506,57 @@ mod tests {
 
     use super::*;
     use crate::gate_cost::{GateCostObservation, compute};
+
+    #[test]
+    fn unavailable_archive_fails_without_output_or_exports() {
+        use crate::app::cli::{Cli, Command, MetricsCommand};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let export = dir.path().join("cases.jsonl");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "metrics",
+            "gate-cost",
+            "--repo",
+            "o/r",
+            "--workflow",
+            "build.yml",
+            "--gate-job",
+            "test",
+            "--scorecard",
+            "--causes-archive",
+            dir.path().to_str().expect("archive path"),
+            "--export-cases",
+            export.to_str().expect("export path"),
+        ]);
+        let Command::Metrics { command } = cli.command else {
+            panic!("metrics command")
+        };
+        let MetricsCommand::GateCost(args) = *command else {
+            panic!("gate-cost command")
+        };
+        let mut output = Vec::new();
+        let error = gate_cost_command(
+            *args,
+            RuntimeMode::Isolated,
+            dir.path(),
+            dir.path(),
+            true,
+            &mut output,
+        )
+        .expect_err("missing archive must fail before GitHub reads");
+        assert!(
+            error.message.contains("cause archive unavailable"),
+            "{}",
+            error.message
+        );
+        assert!(output.is_empty(), "must not print a zero-count report");
+        assert!(!export.exists(), "must not publish an empty export");
+        assert!(
+            !receipt_path(&export).exists(),
+            "must not publish an export receipt"
+        );
+    }
 
     /// The export and its receipt land next to each other, whole, and the
     /// receipt's hash is the file's.

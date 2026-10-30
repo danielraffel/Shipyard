@@ -277,18 +277,24 @@ pub fn gather(
 /// The run attempt is part of the archived record; the job id is the provider's
 /// attempt identity, and any second row for the same `(repo, run, job)` is
 /// rejected rather than guessed by timestamp or file order.
-#[must_use]
-pub fn archive(dir: &Path, repo: &str) -> CausesRead {
+/// A missing or unreadable archive directory is an error, not an empty archive.
+pub fn archive(dir: &Path, repo: &str) -> Result<CausesRead, String> {
     let mut read = CausesRead {
         source: CauseSource::Archive,
         ..CausesRead::default()
     };
     let causes_dir = dir.join("causes");
-    let Ok(entries) = std::fs::read_dir(&causes_dir) else {
-        return read;
+    let unavailable = |error| {
+        format!(
+            "cause archive unavailable at {}: {error}",
+            causes_dir.display()
+        )
     };
+    let entries = std::fs::read_dir(&causes_dir).map_err(unavailable)?;
     let mut files: Vec<_> = entries
-        .filter_map(Result::ok)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(unavailable)?
+        .into_iter()
         .map(|entry| entry.path())
         .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
@@ -302,7 +308,7 @@ pub fn archive(dir: &Path, repo: &str) -> CausesRead {
         };
         if file_bytes > MAX_ARCHIVE_BYTES.saturating_sub(bytes) {
             read.archive_truncated = true;
-            return read;
+            return Ok(read);
         }
         let Ok(file) = std::fs::File::open(&path) else {
             read.archive_malformed += 1;
@@ -324,13 +330,13 @@ pub fn archive(dir: &Path, repo: &str) -> CausesRead {
             file_bytes = file_bytes.saturating_add(count as u64);
             if file_bytes > remaining {
                 read.archive_truncated = true;
-                return read;
+                return Ok(read);
             }
             bytes = bytes.saturating_add(count as u64);
             lines += 1;
             if bytes > MAX_ARCHIVE_BYTES || lines > MAX_ARCHIVE_LINES {
                 read.archive_truncated = true;
-                return read;
+                return Ok(read);
             }
             if line.trim().is_empty() {
                 continue;
@@ -370,7 +376,7 @@ pub fn archive(dir: &Path, repo: &str) -> CausesRead {
             job_id: key.job_id,
             reason: "ambiguous duplicate archive identity".to_owned(),
         }));
-    read
+    Ok(read)
 }
 
 /// Put each read cause on its case: `cause` and `evidence` are set, and both
