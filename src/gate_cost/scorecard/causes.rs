@@ -20,6 +20,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::io::{BufRead, Read};
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -34,6 +36,12 @@ use crate::diagnose::cause::{self, CiCause, Place};
 pub const DEFAULT_MAX_JOBS: usize = 200;
 /// Why a job over that budget was not read.
 pub const OVER_BUDGET: &str = "skipped: over the --causes-max-jobs budget";
+/// Archive reads are deliberately bounded: this report must never turn a
+/// local labels directory into an unbounded memory or disk operation.
+/// Maximum bytes scanned across all archive files.
+pub const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum non-empty and empty lines scanned across all archive files.
+pub const MAX_ARCHIVE_LINES: usize = 500_000;
 /// Cache key version: bump when a cause's shape or meaning changes.
 const EXTRACT_VERSION: u32 = 7;
 
@@ -57,6 +65,77 @@ pub struct CausesRead {
     pub budget: usize,
     /// Uncached jobs left unread because the budget ran out.
     pub skipped_for_budget: usize,
+    /// Whether causes came from GitHub job/log reads or a local archive.
+    pub source: CauseSource,
+    /// Exact archive identity (repo, workflow run, job).  A job id is not
+    /// accepted by itself for archive joins.
+    by_case: BTreeMap<CauseKey, CiCause>,
+    /// One indexed attempt per base identity, to keep duplicate detection
+    /// linear even for a large archive.
+    by_base: BTreeMap<BaseKey, CauseKey>,
+    /// Archive `(repo, run, job)` identities with more than one attempt/row.
+    /// They are intentionally
+    /// unreadable rather than resolved by file order.
+    ambiguous: BTreeSet<BaseKey>,
+    /// Archive accounting, retained for the scorecard's coverage readout.
+    pub archive_rows: usize,
+    /// Parseable archive rows that were malformed or lacked identity.
+    pub archive_malformed: usize,
+    /// Archive rows rejected because their identity was duplicated.
+    pub archive_duplicates: usize,
+    /// Whether the bounded archive scan stopped before EOF.
+    pub archive_truncated: bool,
+}
+
+/// Provenance of cause naming in a scorecard report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CauseSource {
+    #[default]
+    /// Causes were extracted from GitHub jobs and logs during this run.
+    Live,
+    /// Causes were read from a local append-only archive.
+    Archive,
+}
+
+impl CauseSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Archive => "archive",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BaseKey {
+    repo: String,
+    run_id: u64,
+    job_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CauseKey {
+    base: BaseKey,
+    attempt: u64,
+}
+
+fn cause_key(cause: &CiCause) -> Option<CauseKey> {
+    Some(CauseKey {
+        base: BaseKey {
+            repo: cause.repo.clone(),
+            run_id: cause.run_id?,
+            job_id: cause.job_id?,
+        },
+        attempt: cause.attempt.filter(|attempt| *attempt > 0)?,
+    })
+}
+
+fn case_key(row: &Case) -> Option<BaseKey> {
+    Some(BaseKey {
+        repo: row.repo.clone(),
+        run_id: row.run_id?,
+        job_id: row.job_id?,
+    })
 }
 
 /// The jobs of every red case the scorecard read: red required checks on
@@ -153,12 +232,16 @@ pub fn gather(
 ) -> CausesRead {
     let mut read = CausesRead {
         budget: max_jobs,
+        source: CauseSource::Live,
         ..CausesRead::default()
     };
     let mut uncached = Vec::new();
     for &id in jobs {
         match cached(cache, repo, id) {
             Some(cause) => {
+                if let Some(key) = cause_key(&cause) {
+                    read.by_case.insert(key, cause.clone());
+                }
                 read.by_job.insert(id, cause);
             }
             None => uncached.push(id),
@@ -170,6 +253,9 @@ pub fn gather(
     for (id, result) in uncached.into_iter().zip(results) {
         match result {
             Ok(cause) => {
+                if let Some(key) = cause_key(&cause) {
+                    read.by_case.insert(key, cause.clone());
+                }
                 read.by_job.insert(id, cause);
             }
             Err(reason) => read.unreadable.push(Unreadable { job_id: id, reason }),
@@ -184,12 +270,133 @@ pub fn gather(
     read
 }
 
+/// Read a bounded append-only `cause` archive for one repository.
+///
+/// Rows without a complete `(repo, run_id, job_id)` identity, rows for another
+/// repository, malformed JSON, and duplicate identities remain unreadable.
+/// The run attempt is part of the archived record; the job id is the provider's
+/// attempt identity, and any second row for the same `(repo, run, job)` is
+/// rejected rather than guessed by timestamp or file order.
+/// A missing or unreadable archive directory is an error, not an empty archive.
+pub fn archive(dir: &Path, repo: &str) -> Result<CausesRead, String> {
+    let mut read = CausesRead {
+        source: CauseSource::Archive,
+        ..CausesRead::default()
+    };
+    let causes_dir = dir.join("causes");
+    let unavailable = |error| {
+        format!(
+            "cause archive unavailable at {}: {error}",
+            causes_dir.display()
+        )
+    };
+    let entries = std::fs::read_dir(&causes_dir).map_err(unavailable)?;
+    let mut files: Vec<_> = entries
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(unavailable)?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    files.sort();
+    let mut bytes = 0u64;
+    let mut lines = 0usize;
+    for path in files {
+        let Ok(file_bytes) = path.metadata().map(|metadata| metadata.len()) else {
+            read.archive_malformed += 1;
+            continue;
+        };
+        if file_bytes > MAX_ARCHIVE_BYTES.saturating_sub(bytes) {
+            read.archive_truncated = true;
+            return Ok(read);
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            read.archive_malformed += 1;
+            continue;
+        };
+        let remaining = MAX_ARCHIVE_BYTES.saturating_sub(bytes);
+        let mut reader = std::io::BufReader::new(file.take(remaining.saturating_add(1)));
+        let mut file_bytes = 0u64;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let Ok(count) = reader.read_line(&mut line) else {
+                read.archive_malformed += 1;
+                break;
+            };
+            if count == 0 {
+                break;
+            }
+            file_bytes = file_bytes.saturating_add(count as u64);
+            if file_bytes > remaining {
+                read.archive_truncated = true;
+                return Ok(read);
+            }
+            bytes = bytes.saturating_add(count as u64);
+            lines += 1;
+            if bytes > MAX_ARCHIVE_BYTES || lines > MAX_ARCHIVE_LINES {
+                read.archive_truncated = true;
+                return Ok(read);
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(cause) = serde_json::from_str::<CiCause>(&line) else {
+                read.archive_malformed += 1;
+                continue;
+            };
+            read.archive_rows += 1;
+            if cause.schema != crate::diagnose::cause::SCHEMA
+                || cause.repo != repo
+                || cause_key(&cause).is_none()
+            {
+                read.archive_malformed += 1;
+                continue;
+            }
+            let Some(key) = cause_key(&cause) else {
+                continue;
+            };
+            if read.ambiguous.contains(&key.base) {
+                read.archive_duplicates += 1;
+                continue;
+            }
+            if let Some(existing) = read.by_base.remove(&key.base) {
+                read.by_case.remove(&existing);
+                read.ambiguous.insert(key.base);
+                read.archive_duplicates += 1;
+                continue;
+            }
+            read.by_base.insert(key.base.clone(), key.clone());
+            read.by_case.insert(key.clone(), cause.clone());
+            read.by_job.insert(key.base.job_id, cause);
+        }
+    }
+    read.unreadable
+        .extend(read.ambiguous.iter().map(|key| Unreadable {
+            job_id: key.job_id,
+            reason: "ambiguous duplicate archive identity".to_owned(),
+        }));
+    Ok(read)
+}
+
 /// Put each read cause on its case: `cause` and `evidence` are set, and both
 /// fields leave the row's `unread` list. An unreadable or unrequested job
 /// remains explicitly unread rather than looking like a known empty cause.
 pub fn attach(rows: &mut [Case], read: &CausesRead) {
     for row in rows {
-        let Some(cause) = row.job_id.and_then(|id| read.by_job.get(&id)) else {
+        let cause = match read.source {
+            CauseSource::Archive => case_key(row).and_then(|base| {
+                if read.ambiguous.contains(&base) {
+                    return None;
+                }
+                read.by_case
+                    .iter()
+                    .find(|(key, _)| key.base == base)
+                    .map(|(_, cause)| cause)
+            }),
+            CauseSource::Live => row.job_id.and_then(|id| read.by_job.get(&id)),
+        };
+        let Some(cause) = cause else {
             continue;
         };
         let mut cause = cause.clone();
@@ -205,6 +412,8 @@ pub fn attach(rows: &mut [Case], read: &CausesRead) {
 /// How many red cases have a named cause, and how fast.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CauseNaming {
+    /// `live` for GitHub job/log extraction, `archive` for historical labels.
+    pub source: String,
     /// Red cases: red required checks and failed merge-group gates.
     pub reds: usize,
     /// Of those, cases with no job to read (a status context, or a check
@@ -233,6 +442,16 @@ pub struct CauseNaming {
     /// Red jobs left unread because the budget ran out; counted in
     /// `unreadable`, never as a cause.
     pub skipped_for_budget: usize,
+    /// Valid archive rows that did not join any scorecard case.
+    pub archive_unjoined: usize,
+    /// Parseable rows observed in the archive.
+    pub archive_rows: usize,
+    /// Malformed or identity-incomplete archive rows.
+    pub archive_malformed: usize,
+    /// Duplicate archive identities.
+    pub archive_duplicates: usize,
+    /// Whether the archive scan hit its byte or line bound.
+    pub archive_truncated: bool,
 }
 
 fn minutes_between(from: &str, to: &str) -> Option<f64> {
@@ -251,6 +470,7 @@ pub fn compute(rows: &[Case], read: &CausesRead) -> CauseNaming {
         .collect();
     let mut naming = CauseNaming {
         reds: reds.len(),
+        source: read.source.as_str().to_owned(),
         without_job: reds.iter().filter(|row| row.job_id.is_none()).count(),
         unreadable: 0,
         named: 0,
@@ -263,7 +483,20 @@ pub fn compute(rows: &[Case], read: &CausesRead) -> CauseNaming {
         retrospective: true,
         budget: read.budget,
         skipped_for_budget: read.skipped_for_budget,
+        archive_unjoined: 0,
+        archive_rows: read.archive_rows,
+        archive_malformed: read.archive_malformed,
+        archive_duplicates: read.archive_duplicates,
+        archive_truncated: read.archive_truncated,
     };
+    if read.source == CauseSource::Archive {
+        let joined: BTreeSet<_> = reds.iter().filter_map(|row| case_key(row)).collect();
+        naming.archive_unjoined = read
+            .by_case
+            .keys()
+            .filter(|key| !joined.contains(&key.base))
+            .count();
+    }
     let mut minutes = Vec::new();
     for row in &reds {
         let Some(cause) = &row.cause else {
@@ -315,17 +548,33 @@ pub fn render(naming: &CauseNaming) -> String {
         || "n/a".to_owned(),
         |share| format!("{:.0}%", share * 100.0),
     );
-    let _ = writeln!(
-        out,
-        "named causes: {}/{} red cases ({share}); {} without a job, {} unreadable \
-         ({} skipped over the --causes-max-jobs budget of {})",
-        naming.named,
-        naming.reds,
-        naming.without_job,
-        naming.unreadable,
-        naming.skipped_for_budget,
-        naming.budget
-    );
+    if naming.source == "archive" {
+        let _ = writeln!(
+            out,
+            "named causes (archive): {}/{} red cases ({share}); {} without a job, {} unreadable; \
+             {} valid rows unjoined, {} malformed, {} duplicate, truncated={}",
+            naming.named,
+            naming.reds,
+            naming.without_job,
+            naming.unreadable,
+            naming.archive_unjoined,
+            naming.archive_malformed,
+            naming.archive_duplicates,
+            naming.archive_truncated
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "named causes: {}/{} red cases ({share}); {} without a job, {} unreadable \
+             ({} skipped over the --causes-max-jobs budget of {})",
+            naming.named,
+            naming.reds,
+            naming.without_job,
+            naming.unreadable,
+            naming.skipped_for_budget,
+            naming.budget
+        );
+    }
     let confidence: Vec<String> = naming
         .by_confidence
         .iter()
