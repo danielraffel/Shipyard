@@ -1095,6 +1095,47 @@ fn detects_graphql_rate_limit_text() {
 }
 
 #[test]
+fn transient_helper_failures_include_github_gateway_statuses() {
+    assert!(helper_failure_is_transient("gh: HTTP 502 Bad Gateway"));
+    assert!(helper_failure_is_transient("gh: HTTP 504 Gateway Timeout"));
+    assert!(!helper_failure_is_transient("HTTP 403 Forbidden"));
+}
+
+#[cfg(unix)]
+#[test]
+fn batched_pr_states_falls_back_to_rest_after_gateway_failure() {
+    let temp = TempDir::new().expect("temp");
+    let fake_gh = temp.path().join("gh");
+    let invocations = temp.path().join("invocations");
+    write_executable(
+        &fake_gh,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = pr ]; then echo 'HTTP 502 Bad Gateway' >&2; exit 1; fi\nprintf '%s' '[{{\"number\":42,\"state\":\"OPEN\"}}]'\n",
+            invocations.display()
+        ),
+    );
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "env"
+            token_env = "PATH"
+            ambient_gh_binary = "{}"
+            "#,
+        fake_gh.display()
+    ));
+    let client = GhClient::from_loaded_config(&config).expect("client");
+
+    let states =
+        pr_states_batched_with_options(Some(&client), "owner/repo", temp.path(), 3, Some(&fake_gh))
+            .expect("REST fallback should resolve states");
+    assert_eq!(states.get(&42).map(String::as_str), Some("OPEN"));
+    assert_eq!(
+        std::fs::read_to_string(invocations).expect("invocations"),
+        "pr list --repo owner/repo --state all --limit 3 --json number,state\napi -X GET repos/owner/repo/pulls?state=all&per_page=100&page=1\n"
+    );
+}
+
+#[test]
 fn authenticated_git_command_uses_environment_credential_helper() {
     let cwd = TempDir::new().expect("tempdir");
     let command = GhClient::ambient()
