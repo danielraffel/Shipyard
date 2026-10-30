@@ -42,19 +42,27 @@ TRANSIENT_PROVIDER_ERROR_MARKERS = (
     "connection reset",
     "connection refused",
     "connection timed out",
+    "connection closed",
     "operation timed out",
     "timed out",
     "i/o timeout",
+    "timeout",
     "dial tcp",
+    "deadline",
+    "deadline exceeded",
     "network is unreachable",
     "temporary failure in name resolution",
     "could not resolve host",
     "tls handshake timeout",
+    "temporarily unavailable",
     "service unavailable",
     "bad gateway",
     "gateway timeout",
     "server error",
     "rate limit",
+    "rate_limit",
+    "secondary rate",
+    "unexpected eof",
     "http 429",
     "http 500",
     "http 502",
@@ -63,6 +71,8 @@ TRANSIENT_PROVIDER_ERROR_MARKERS = (
 )
 DEFAULT_PROVIDER_RETRIES = 2
 DEFAULT_PROVIDER_RETRY_DELAY_SECONDS = 5.0
+MAX_PROVIDER_RETRIES = 5
+MAX_PROVIDER_RETRY_DELAY_SECONDS = 300.0
 
 
 def run(command: Sequence[str], *, stdin: str | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -85,10 +95,13 @@ def run_provider_with_retry(command: Sequence[str], *, stdin: str | None = None,
                             delay_seconds: float = DEFAULT_PROVIDER_RETRY_DELAY_SECONDS
                             ) -> subprocess.CompletedProcess[str]:
     """Retry only recognized provider transport failures."""
-    if retries < 0:
-        raise ValueError("provider retries must be non-negative")
-    if delay_seconds < 0:
-        raise ValueError("provider retry delay must be non-negative")
+    if retries < 0 or retries > MAX_PROVIDER_RETRIES:
+        raise ValueError(f"provider retries must be between 0 and {MAX_PROVIDER_RETRIES}")
+    if not math.isfinite(delay_seconds) or not 0 <= delay_seconds <= MAX_PROVIDER_RETRY_DELAY_SECONDS:
+        raise ValueError(
+            "provider retry delay must be finite and between "
+            f"0 and {MAX_PROVIDER_RETRY_DELAY_SECONDS} seconds"
+        )
     def run_attempt() -> subprocess.CompletedProcess[str]:
         try:
             return run(command, stdin=stdin, timeout=timeout)
@@ -868,10 +881,13 @@ def main() -> int:
     args = parser.parse_args()
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
-    if args.provider_retries < 0:
-        parser.error("--provider-retries must be non-negative")
-    if args.provider_retry_delay_seconds < 0:
-        parser.error("--provider-retry-delay-seconds must be non-negative")
+    if not 0 <= args.provider_retries <= MAX_PROVIDER_RETRIES:
+        parser.error(f"--provider-retries must be between 0 and {MAX_PROVIDER_RETRIES}")
+    if not math.isfinite(args.provider_retry_delay_seconds) or not 0 <= args.provider_retry_delay_seconds <= MAX_PROVIDER_RETRY_DELAY_SECONDS:
+        parser.error(
+            "--provider-retry-delay-seconds must be finite and between "
+            f"0 and {MAX_PROVIDER_RETRY_DELAY_SECONDS} seconds"
+        )
     if args.expected_interval_secs <= 0:
         parser.error("--expected-interval-secs must be positive")
     if args.cadence_slack_secs < 0:

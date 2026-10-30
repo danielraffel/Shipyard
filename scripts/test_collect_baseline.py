@@ -32,6 +32,12 @@ class BaselineScorecardTests(unittest.TestCase):
             "HTTP 429: API rate limit exceeded",
             "GraphQL: API rate limit already exceeded",
             "ssh: connect to host m5s port 22: Operation timed out",
+            "ssh: Connection closed by remote host",
+            "provider: unexpected EOF",
+            "provider: temporarily unavailable",
+            "provider: deadline exceeded",
+            "provider: rate_limit exceeded",
+            "provider: timeout",
             "command timed out after 300s: tartci",
         ):
             with self.subTest(message=message):
@@ -54,6 +60,14 @@ class BaselineScorecardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(len(calls), 2)
         sleep.assert_called_once_with(5)
+
+    def test_provider_retry_configuration_is_bounded_and_finite(self):
+        with self.assertRaises(ValueError):
+            MOD.run_provider_with_retry(["provider"], retries=MOD.MAX_PROVIDER_RETRIES + 1)
+        with self.assertRaises(ValueError):
+            MOD.run_provider_with_retry(["provider"], delay_seconds=float("nan"))
+        with self.assertRaises(ValueError):
+            MOD.run_provider_with_retry(["provider"], delay_seconds=MOD.MAX_PROVIDER_RETRY_DELAY_SECONDS + 1)
 
     def test_provider_import_retries_transient_failure_with_bounded_backoff(self):
         results = [
