@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::path::Path;
 
 use serde::Serialize;
@@ -296,11 +296,21 @@ pub fn archive(dir: &Path, repo: &str) -> CausesRead {
     let mut bytes = 0u64;
     let mut lines = 0usize;
     for path in files {
+        let Ok(file_bytes) = path.metadata().map(|metadata| metadata.len()) else {
+            read.archive_malformed += 1;
+            continue;
+        };
+        if file_bytes > MAX_ARCHIVE_BYTES.saturating_sub(bytes) {
+            read.archive_truncated = true;
+            return read;
+        }
         let Ok(file) = std::fs::File::open(&path) else {
             read.archive_malformed += 1;
             continue;
         };
-        let mut reader = std::io::BufReader::new(file);
+        let remaining = MAX_ARCHIVE_BYTES.saturating_sub(bytes);
+        let mut reader = std::io::BufReader::new(file.take(remaining.saturating_add(1)));
+        let mut file_bytes = 0u64;
         let mut line = String::new();
         loop {
             line.clear();
@@ -310,6 +320,11 @@ pub fn archive(dir: &Path, repo: &str) -> CausesRead {
             };
             if count == 0 {
                 break;
+            }
+            file_bytes = file_bytes.saturating_add(count as u64);
+            if file_bytes > remaining {
+                read.archive_truncated = true;
+                return read;
             }
             bytes = bytes.saturating_add(count as u64);
             lines += 1;
@@ -325,7 +340,10 @@ pub fn archive(dir: &Path, repo: &str) -> CausesRead {
                 continue;
             };
             read.archive_rows += 1;
-            if cause.repo != repo || cause_key(&cause).is_none() {
+            if cause.schema != crate::diagnose::cause::SCHEMA
+                || cause.repo != repo
+                || cause_key(&cause).is_none()
+            {
                 read.archive_malformed += 1;
                 continue;
             }

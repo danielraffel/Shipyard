@@ -520,3 +520,33 @@ fn archive_duplicates_and_malformed_rows_stay_unreadable() {
     assert_eq!(naming.named, 0, "ambiguous causes must not be joined");
     assert_eq!(naming.unreadable, 2, "the duplicate job is unreadable");
 }
+
+#[test]
+fn archive_rejects_non_v1_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_dir = dir.path().join("causes");
+    std::fs::create_dir(&archive_dir).expect("archive dir");
+    let path = archive_dir.join("2026-10.jsonl");
+    let mut row = archive_cause(GATE_JOB, 38_308_868_279, PULP);
+    row["schema"] = json!("other/v1");
+    std::fs::write(&path, format!("{row}\n")).expect("archive");
+
+    let read = archive(dir.path(), PULP);
+    assert_eq!(read.archive_rows, 1);
+    assert_eq!(read.archive_malformed, 1);
+    assert!(read.by_job.is_empty());
+}
+
+#[test]
+fn archive_rejects_oversized_files_before_reading() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_dir = dir.path().join("causes");
+    std::fs::create_dir(&archive_dir).expect("archive dir");
+    let path = archive_dir.join("2026-10.jsonl");
+    let file = std::fs::File::create(&path).expect("archive");
+    file.set_len(MAX_ARCHIVE_BYTES + 1).expect("sparse archive");
+
+    let read = archive(dir.path(), PULP);
+    assert!(read.archive_truncated);
+    assert_eq!(read.archive_rows, 0);
+}
