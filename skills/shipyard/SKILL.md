@@ -1777,6 +1777,9 @@ implied. Pass provenance includes the resolved local importer path/hash.
 `SHIPYARD_OBSERVATIONS=off` returns disabled before reads, processes or storage;
 it must not create a successful attempt. Require deployed producer/importer and real timeout/cost evidence
 before an owner approves continuous collection.
+Output-limit failures terminate only the owned child group while pipe callbacks
+continue discarding through EOF; cleanup must preserve the original limit reason
+and close subprocess transports before event-loop shutdown.
 
 Use `shipyard metrics` when an agent needs historical runner timing, queue, and
 health context before recommending a routing, cache, or monitoring change. The

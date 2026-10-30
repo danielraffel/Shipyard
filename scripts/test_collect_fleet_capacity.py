@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import fcntl
+import gc
 import hashlib
 import io
 import json
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+import warnings
 from unittest import mock
 
 import collect_fleet_capacity as collector
@@ -306,6 +308,40 @@ class CapacityJournalTests(unittest.TestCase):
 
 
 class CapacityProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_oversize_pipes_keep_primary_reason_and_close_transports(self):
+        loop = asyncio.get_running_loop()
+        exceptions, protocols = [], []
+        previous_handler = loop.get_exception_handler()
+        original_protocol = collector.CaptureProtocol
+
+        def capture(*args):
+            protocol = original_protocol(*args)
+            protocols.append(protocol)
+            return protocol
+
+        loop.set_exception_handler(lambda _loop, context: exceptions.append(context))
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                with mock.patch.object(collector, "CaptureProtocol", side_effect=capture):
+                    for fd in (1, 2):
+                        for linger in (0, 10):
+                            with self.subTest(fd=fd, linger=linger):
+                                code = f"import os,time; os.write({fd}, b'x' * 2000000); time.sleep({linger})"
+                                with self.assertRaisesRegex(collector.ObservationError, "^output_byte_limit$"):
+                                    await collector.command([sys.executable, "-c", code], time.monotonic() + 3, 1024)
+                                protocol = protocols[-1]
+                                self.assertTrue(protocol.closed.done())
+                                self.assertTrue(protocol.transport.is_closing())
+                                self.assertLessEqual(len(protocol.stdout), 1024)
+                protocols.clear()
+                gc.collect()
+                await asyncio.sleep(0)
+            self.assertFalse([item for item in caught if issubclass(item.category, ResourceWarning)], caught)
+            self.assertEqual(exceptions, [])
+        finally:
+            loop.set_exception_handler(previous_handler)
+
     async def test_timeout_kills_only_its_owned_process_group(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "orphan-marker"

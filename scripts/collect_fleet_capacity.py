@@ -142,59 +142,79 @@ def ssh_command(ssh, host):
             "-o", "ServerAliveCountMax=1", host["ssh_alias"], remote]
 
 
-async def bounded_read(stream, limit):
-    chunks, size = [], 0
-    while True:
-        chunk = await stream.read(min(16384, limit + 1 - size))
-        if not chunk:
-            return b"".join(chunks)
-        size += len(chunk)
-        if size > limit:
-            raise ObservationError("output_byte_limit")
-        chunks.append(chunk)
+class CaptureProtocol(asyncio.SubprocessProtocol):
+    """Consume pipes through EOF without leaving a paused StreamReader behind."""
+    def __init__(self, loop, limit, stdin):
+        self.closed = loop.create_future()
+        self.limits = {1: limit, 2: 16384}
+        self.sizes = {1: 0, 2: 0}
+        self.stdout = bytearray()
+        self.input = stdin
+        self.failure = None
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+        if self.input is not None:
+            pipe = transport.get_pipe_transport(0)
+            pipe.write(self.input)
+            pipe.write_eof()
+
+    def stop(self):
+        # subprocess_exec starts a new session for precisely this child tree.
+        try:
+            os.killpg(self.transport.get_pid(), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def pipe_data_received(self, fd, data):
+        self.sizes[fd] += len(data)
+        if self.sizes[fd] > self.limits[fd]:
+            if self.failure is None:
+                self.failure = "output_byte_limit"
+                self.stop()
+        elif fd == 1 and self.failure is None:
+            self.stdout.extend(data)
+        # After overflow, continue consuming/discarding until EOF. Cancelling a
+        # reader here can leave a full pipe preventing subprocess wait completion.
+
+    def connection_lost(self, exc):
+        if exc is not None and self.failure is None:
+            self.failure = "pipe_error"
+        if not self.closed.done():
+            self.closed.set_result(None)
 
 
 async def command(argv, deadline, output_bytes, stdin=None):
     if time.monotonic() >= deadline:
         raise ObservationError("deadline")
+    loop = asyncio.get_running_loop()
+    protocol = CaptureProtocol(loop, output_bytes, stdin)
     try:
-        process = await asyncio.create_subprocess_exec(
-            *argv, stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+        transport, _ = await loop.subprocess_exec(
+            lambda: protocol, *argv,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True)
     except OSError as exc:
         raise ObservationError("spawn_failed") from exc
 
-    async def send():
-        if stdin is not None:
-            try:
-                process.stdin.write(stdin)
-                await process.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            finally:
-                process.stdin.close()
-
-    tasks = [asyncio.create_task(bounded_read(process.stdout, output_bytes)),
-             asyncio.create_task(bounded_read(process.stderr, 16384)),
-             asyncio.create_task(send()), asyncio.create_task(process.wait())]
     try:
-        result = await asyncio.wait_for(asyncio.gather(*tasks), max(0.001, deadline - time.monotonic()))
-        return result[3], result[0]
+        await asyncio.wait_for(asyncio.shield(protocol.closed), max(0.001, deadline - time.monotonic()))
+        if protocol.failure:
+            raise ObservationError(protocol.failure)
+        return transport.get_returncode(), bytes(protocol.stdout)
     except asyncio.TimeoutError as exc:
-        raise ObservationError("deadline") from exc
+        raise ObservationError(protocol.failure or "deadline") from exc
     finally:
-        # This session/group was created by this call. Never signal inherited groups.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        try:
-            await asyncio.wait_for(process.wait(), 0.5)
-        except asyncio.TimeoutError as exc:
-            raise ObservationError("cleanup_timeout") from exc
+        if not protocol.closed.done():
+            protocol.stop()
+            try:
+                await asyncio.wait_for(asyncio.shield(protocol.closed), 0.5)
+            except asyncio.TimeoutError:
+                # Close all owned pipe transports even if the OS has not yet
+                # reaped a killed child; preserve the primary failure reason.
+                pass
+        transport.close()
 
 
 def receipt_envelope(payload, code, host, checked, skew):
