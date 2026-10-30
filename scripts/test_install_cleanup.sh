@@ -40,15 +40,44 @@ test -f "$PLIST"
 ! grep -q '@[A-Z_]*@' "$PLIST"
 grep -q 'bootstrap gui/' "$HOME_DIR/launchctl.log"
 grep -q "$HOME_DIR/Library/Application Support/shipyard/cleanup/run_cleanup.sh" "$PLIST"
-grep -q '<key>RunAtLoad</key>' "$PLIST"
 python3 - "$PLIST" <<'PY'
 import sys
 text = open(sys.argv[1], encoding="utf-8").read()
-assert '<key>RunAtLoad</key>\n    <true/>' in text
+assert '<key>RunAtLoad</key>' not in text
+assert '<key>StartInterval</key>' in text
 PY
 grep -q -- '--owned-only' "$HOME_DIR/Library/Application Support/shipyard/cleanup/run_cleanup.sh"
 grep -q 'preview=cleanup exit=1' "$HOME_DIR/install"
 grep -q 'preview=validation-tmp exit=0 count=0 bytes=0' "$HOME_DIR/install"
+
+OLD_PLIST_SHA="$(shasum -a 256 "$PLIST" | awk '{print $1}')"
+OLD_WRAPPER_SHA="$(shasum -a 256 "$HOME_DIR/Library/Application Support/shipyard/cleanup/run_cleanup.sh" | awk '{print $1}')"
+FAIL_TOOLS="$HOME_DIR/fail-tools"
+mkdir -p "$FAIL_TOOLS"
+cat >"$FAIL_TOOLS/plutil" <<'SH'
+#!/bin/sh
+exit 0
+SH
+cat >"$FAIL_TOOLS/launchctl" <<'SH'
+#!/bin/sh
+if [ "$1" = print ]; then
+  exit 1
+fi
+if [ "$1" = bootstrap ]; then
+  exit 1
+fi
+exit 0
+SH
+chmod +x "$FAIL_TOOLS/plutil" "$FAIL_TOOLS/launchctl"
+set +e
+HOME="$HOME_DIR" SHIPYARD_PLUTIL_BIN="$FAIL_TOOLS/plutil" \
+  SHIPYARD_LAUNCHCTL_BIN="$FAIL_TOOLS/launchctl" \
+  "$INSTALLER" --shipyard "$HOME_DIR/fake-shipyard" --install >"$HOME_DIR/failed-install" 2>&1
+failed_install_exit=$?
+set -e
+[ "$failed_install_exit" -eq 1 ]
+[ "$OLD_PLIST_SHA" = "$(shasum -a 256 "$PLIST" | awk '{print $1}')" ]
+[ "$OLD_WRAPPER_SHA" = "$(shasum -a 256 "$HOME_DIR/Library/Application Support/shipyard/cleanup/run_cleanup.sh" | awk '{print $1}')" ]
 
 RECEIPT="$HOME_DIR/receipt.json"
 set +e
