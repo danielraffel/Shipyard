@@ -3824,6 +3824,13 @@ everything.
 
 ### Log retention operations
 
+Metrics cleanup uses the existing `SHIPYARD_METRICS_RETENTION_DAYS` policy
+(default 90; nonpositive disables pruning, not collection). It also expires
+queue shadow observations and terminal timing, preserving timing referenced by
+retained shadow rows and malformed timestamps. It never prunes merge receipts
+or operational queue/recovery state. Run `shipyard cleanup --apply` to apply;
+this is not automatic scheduling or a hard database-size cap.
+
 Run `shipyard cleanup` first: dry-run is the default and reports each planned
 `compress`/`delete`, every protected active/failure/audit directory, and the
 high/low byte-watermark projection. Apply with `shipyard cleanup --apply` only

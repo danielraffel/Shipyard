@@ -794,9 +794,11 @@ impl MetricsStore {
         &self.path
     }
 
-    /// Delete raw run, job, step, and fleet-capacity samples older than
-    /// `retention_days`. Merge receipts are retained because they are durable
-    /// provenance.
+    /// Delete expired raw runs (including jobs/steps), fleet-capacity samples,
+    /// and queue observations. Return the number of runs, capacity samples,
+    /// shadow observations, and timing rows removed, excluding child jobs/steps.
+    /// Retained shadow observations keep their timing joins; merge receipts and
+    /// operational queue/recovery state are not pruned.
     pub fn prune_older_than(
         &self,
         retention_days: i64,
@@ -805,7 +807,12 @@ impl MetricsStore {
             return Ok(0);
         }
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
-        let cutoff = (Utc::now() - Duration::days(retention_days)).to_rfc3339();
+        let window = Duration::try_days(retention_days)
+            .ok_or("metrics retention is outside the timestamp range")?;
+        let cutoff_time = Utc::now()
+            .checked_sub_signed(window)
+            .ok_or("metrics retention cutoff is outside the timestamp range")?;
+        let cutoff = cutoff_time.to_rfc3339();
         let mut deleted = 0;
         loop {
             let mut conn = self.connect()?;
@@ -838,6 +845,67 @@ impl MetricsStore {
             "DELETE FROM fleet_capacity_samples WHERE valid_until < ?1",
             [&cutoff],
         )?;
+        deleted += self.prune_queue_observations(cutoff_time)?;
+        Ok(deleted)
+    }
+
+    fn prune_queue_observations(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut conn = self.connect()?;
+        conn.busy_timeout(StdDuration::from_millis(250))?;
+        let mut deleted = 0;
+        // These are observation tables, never the queue/recovery authority.
+        // Expire shadow rows first so all remaining references protect timing.
+        for (table, timestamp, guard) in [
+            ("repeated_work_shadow", "observed_at", ""),
+            (
+                "queue_timing",
+                "recorded_at",
+                " AND NOT EXISTS (SELECT 1 FROM repeated_work_shadow s
+                    WHERE s.superseded_job_id = queue_timing.queue_job_id)",
+            ),
+        ] {
+            let last: i64 = conn.query_row(
+                &format!("SELECT COALESCE(MAX(rowid), 0) FROM {table}"),
+                [],
+                |row| row.get(0),
+            )?;
+            let mut cursor = 0_i64;
+            while cursor < last {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let rows = {
+                    let mut statement = tx.prepare(&format!(
+                        "SELECT rowid, {timestamp} FROM {table}
+                         WHERE rowid > ?1 AND rowid <= ?2 ORDER BY rowid LIMIT 250"
+                    ))?;
+                    statement
+                        .query_map(params![cursor, last], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                if rows.is_empty() {
+                    break;
+                }
+                for (id, timestamp) in rows {
+                    cursor = id;
+                    // Strict parsing preserves malformed values and compares
+                    // RFC3339 offsets correctly. Rowid paging bounds each lock
+                    // and the initial high-water mark bounds concurrent growth.
+                    if DateTime::parse_from_rfc3339(&timestamp)
+                        .is_ok_and(|observed| observed < cutoff)
+                    {
+                        deleted += tx.execute(
+                            &format!("DELETE FROM {table} WHERE rowid = ?1{guard}"),
+                            [id],
+                        )?;
+                    }
+                }
+                tx.commit()?;
+            }
+        }
         Ok(deleted)
     }
 
@@ -991,6 +1059,8 @@ impl MetricsStore {
             );
             CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
               ON repeated_work_shadow(observed_at DESC);
+            CREATE INDEX IF NOT EXISTS repeated_work_shadow_superseded_job
+              ON repeated_work_shadow(superseded_job_id);
             ",
         )?;
         add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
@@ -2758,7 +2828,9 @@ fn migrate_repeated_work_shadow(conn: &Connection) -> Result<(), rusqlite::Error
            superseded_sha TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
-           ON repeated_work_shadow(observed_at DESC);",
+           ON repeated_work_shadow(observed_at DESC);
+         CREATE INDEX IF NOT EXISTS repeated_work_shadow_superseded_job
+           ON repeated_work_shadow(superseded_job_id);",
     )
 }
 
@@ -6066,11 +6138,194 @@ mod tests {
         );
     }
 
+    fn retention_shadow(conn: &Connection, timestamp: &str, superseded: &str) {
+        conn.execute(
+            "INSERT INTO repeated_work_shadow
+             (observed_at, kind, branch, sha, target_config, mode, job_id,
+              superseded_job_id, superseded_sha)
+             VALUES (?1, 'superseded_exact_head', 'main', 'new', 'cfg', 'normal',
+                     'sy-new', ?2, 'old')",
+            params![timestamp, superseded],
+        )
+        .unwrap();
+    }
+
+    fn retention_timing(conn: &Connection, id: &str, timestamp: &str, disposition: &str) {
+        conn.execute(
+            "INSERT INTO queue_timing
+             (queue_job_id, queue_identity, disposition, recorded_at, total_ms)
+             VALUES (?1, 'identity', ?2, ?3, ?4)",
+            params![
+                id,
+                disposition,
+                timestamp,
+                (disposition == "clean").then_some(10)
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metrics_retention_prunes_observations_across_batches_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        for i in 0..501 {
+            let id = format!("sy-old-{i}");
+            retention_shadow(&conn, "2000-01-01T00:00:00Z", &id);
+            retention_timing(
+                &conn,
+                &id,
+                "2000-01-01T00:00:00Z",
+                ["clean", "cancelled_mid_run", "uncertain"][i % 3],
+            );
+        }
+        retention_shadow(&conn, &Utc::now().to_rfc3339(), "sy-fresh");
+        retention_timing(&conn, "sy-fresh", &Utc::now().to_rfc3339(), "clean");
+        retention_timing(
+            &conn,
+            "sy-fresh-unreferenced",
+            &Utc::now().to_rfc3339(),
+            "uncertain",
+        );
+        assert_eq!(store.prune_older_than(90).unwrap(), 1002);
+        assert_eq!(store.repeated_work_shadow(1000).unwrap().len(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM queue_timing", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_preserves_recent_shadow_timing_join_until_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        retention_timing(&conn, "sy-old", "2000-01-01T00:00:00Z", "clean");
+        retention_shadow(&conn, &Utc::now().to_rfc3339(), "sy-old");
+        let before = store.repeated_work_superseded_timing(10, 90).unwrap();
+        assert_eq!(before.matched_clean, 1);
+        assert_eq!(before.superseded_runtime_ms, Some(10));
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+        assert_eq!(
+            store.repeated_work_superseded_timing(10, 90).unwrap(),
+            before
+        );
+        conn.execute(
+            "UPDATE repeated_work_shadow SET observed_at='2000-01-01T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 2);
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_preserves_malformed_dates_and_compares_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        let cutoff = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for timestamp in ["invalid", "2000", "2000-02-30T00:00:00Z"] {
+            retention_shadow(&conn, timestamp, "sy-protected");
+            retention_timing(&conn, timestamp, timestamp, "uncertain");
+        }
+        retention_timing(&conn, "sy-protected", "2000-01-01T00:00:00Z", "clean");
+        for (id, timestamp) in [
+            ("sy-equal", "2025-12-31T19:00:00-05:00"),
+            ("sy-future", "2025-12-31T23:00:00-02:00"),
+            ("sy-expired", "2026-01-01T01:00:00+02:00"),
+        ] {
+            retention_shadow(&conn, timestamp, id);
+            retention_timing(&conn, id, timestamp, "clean");
+        }
+        assert_eq!(store.prune_queue_observations(cutoff).unwrap(), 2);
+        assert_eq!(store.repeated_work_shadow(20).unwrap().len(), 5);
+        for id in [
+            "sy-equal",
+            "sy-future",
+            "sy-protected",
+            "invalid",
+            "2000",
+            "2000-02-30T00:00:00Z",
+        ] {
+            assert!(store.read_queue_timing(id).unwrap().is_some(), "{id}");
+        }
+        assert_eq!(store.prune_queue_observations(cutoff).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_migrates_shadow_only_store() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("metrics")).unwrap();
+        let conn = Connection::open(dir.path().join("metrics/metrics.db")).unwrap();
+        migrate_repeated_work_shadow(&conn).unwrap();
+        retention_shadow(&conn, "2000-01-01T00:00:00Z", "sy-old");
+        for reopen in [false, true] {
+            if reopen {
+                MetricsStore::open(dir.path()).unwrap();
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                     AND name='repeated_work_shadow_superseded_job'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+        }
+        let store = MetricsStore::open(dir.path()).unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 1);
+    }
+
+    #[test]
+    fn metrics_retention_disabled_or_extreme_window_does_not_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        retention_shadow(&store.connect().unwrap(), "2000-01-01T00:00:00Z", "sy-old");
+        assert_eq!(store.prune_older_than(0).unwrap(), 0);
+        assert_eq!(store.prune_older_than(-1).unwrap(), 0);
+        assert!(store.prune_older_than(i64::MAX).is_err());
+        assert_eq!(store.repeated_work_shadow(10).unwrap().len(), 1);
+    }
+
     #[test]
     fn metrics_retention_prunes_raw_samples_but_keeps_receipts() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
         let old = Utc::now() - Duration::days(120);
+        let mut receipt = test_receipt("retained", "o/pulp", "pulp", 42, 'a');
+        receipt.merged_at = old;
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .unwrap();
+        let ships = crate::ship_state::ShipStateStore::new(dir.path().join("ship")).unwrap();
+        let mut open =
+            crate::ship_state::ShipState::new(43, "o/pulp", "feature", "main", "head", "policy");
+        open.updated_at = old;
+        ships.save(&open).unwrap();
+        let mut queue = crate::queue::Queue::new(dir.path()).unwrap();
+        let mut pending = crate::job::Job::create(
+            "head",
+            "feature",
+            vec!["test".into()],
+            crate::job::ValidationMode::Full,
+            crate::job::Priority::Normal,
+        );
+        pending.created_at = old;
+        queue.enqueue(pending.clone()).unwrap();
+        let recovery = dir.path().join("queue/recovery/retained.json");
+        fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        let recovery_bytes = b"opaque recovery authority must remain byte-identical";
+        fs::write(&recovery, recovery_bytes).unwrap();
+        retention_shadow(&store.connect().unwrap(), "2000-01-01T00:00:00Z", "sy-old");
         store
             .record(&MetricRecordInput {
                 project: "pulp".into(),
@@ -6081,7 +6336,15 @@ mod tests {
                 ..MetricRecordInput::default()
             })
             .unwrap();
-        assert_eq!(store.prune_older_than(90).unwrap(), 1);
+        assert_eq!(store.prune_older_than(90).unwrap(), 2);
+        assert_eq!(
+            store.export_merge_receipts("o/pulp").unwrap(),
+            vec![receipt]
+        );
+        assert_eq!(ships.get_scoped("o/pulp", 43).unwrap().updated_at, old);
+        assert_eq!(queue.get(&pending.id).unwrap(), Some(pending));
+        assert_eq!(fs::read(&recovery).unwrap(), recovery_bytes);
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
         let conn = store.connect().unwrap();
         assert_eq!(
             conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
