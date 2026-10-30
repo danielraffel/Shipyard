@@ -175,6 +175,13 @@ DMG to mount and launch both binaries, the full Linux/Windows/macOS asset set
 and checksum entries to be visible, and the public installer E2E to pass. Any
 failure re-drafts the release, including one that was already public.
 
+CI publication uses only the job-scoped `GITHUB_TOKEN` and native `gh` from a
+system installation path. It requires `GITHUB_ACTIONS=true`, pins the CLI path
+for the invocation, and overrides ambient `GH_TOKEN`. Do not install persistent
+release App credentials in the shared `ci` account: it also runs PR jobs.
+Local releases continue to require the managed `ghapp` wrapper; CI authentication
+is not a fallback for local-agent publication.
+
 Required CI secret names:
 
 | Secret | What |
