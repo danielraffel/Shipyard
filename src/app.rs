@@ -36,6 +36,7 @@ mod execution_worker_cmd;
 pub mod fleet_escalation_cmd;
 mod fleet_status_cmd;
 mod fleet_update_cmd;
+mod git_credential_cmd;
 mod governance_cmd;
 mod guards_cmd;
 mod init_cmd;
@@ -3215,6 +3216,40 @@ mod tests {
         assert_eq!(value["entries"][0]["target"], "linux");
         assert_eq!(value["entries"][0]["host"], "runner");
         assert_eq!(value["entries"][0]["sha"], "abc123456789");
+    }
+
+    #[test]
+    fn targets_warm_status_json_reports_host_pool_member() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        pool.save_entries(&[PoolEntry::new(
+            "mac",
+            "local",
+            "host-pool",
+            "/repo",
+            "abc123456789",
+            2_000_000_000.0,
+            1_999_999_000.0,
+        )
+        .with_member_id("studio-a")])
+            .expect("save pool");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "targets",
+            "warm",
+            "status",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["entries"][0]["member_id"], "studio-a");
     }
 
     #[test]

@@ -15,6 +15,13 @@ use crate::merge_steward::StewardDecision;
 #[cfg(unix)]
 use crate::merge_steward::{CapacityPreemptionPolicy, RequiredCheck};
 
+/// The authority stand-in for tests that do not exercise the HOLD gate.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // Matches the gate's signature.
+fn no_authority_needed() -> Result<(), super::ArmAuthorityRefusal> {
+    Ok(())
+}
+
 /// A `gh` stand-in: one shell script that answers the queue-state read and the
 /// arm mutation by matching on its own argv, and appends every call to a log.
 #[cfg(unix)]
@@ -166,6 +173,7 @@ fn a_pr_the_steward_will_enqueue_is_never_armed_by_the_backstop() {
         &report(StewardDecision::ArmMergeQueue),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(!unhealthy);
     assert!(status.results.is_empty(), "{status:?}");
@@ -191,6 +199,7 @@ fn an_unmanaged_green_unarmed_pr_is_armed_with_merge() {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(!unhealthy, "{status:?}");
     assert_eq!(status.results.len(), 1);
@@ -230,6 +239,7 @@ fn the_backstop_never_arms_a_deferred_head() {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(!unhealthy, "{status:?}");
     assert_eq!(status.results[0].outcome, "skipped");
@@ -258,6 +268,7 @@ fn without_apply_the_backstop_reports_would_arm_and_mutates_nothing() {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         false,
+        no_authority_needed,
     );
     assert!(!unhealthy);
     assert_eq!(status.results[0].outcome, "would_arm");
@@ -288,6 +299,7 @@ fn a_candidate_the_queue_ejected_on_this_head_is_confirmed_and_refused() {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(!unhealthy, "an ejection is a normal outcome: {status:?}");
     assert_eq!(status.results[0].outcome, "skipped");
@@ -311,6 +323,7 @@ fn a_draft_is_filtered_before_any_github_read() {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(status.results.is_empty());
     assert!(!log.exists(), "read GitHub for a draft");
@@ -333,6 +346,7 @@ fn a_pr_whose_required_checks_are_failing_is_filtered_before_any_github_read() {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(status.results.is_empty(), "{status:?}");
     assert!(!log.exists(), "read GitHub for a BLOCKED PR");
@@ -354,6 +368,7 @@ fn an_already_armed_pr_is_filtered_so_repeated_passes_are_idempotent() {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(status.results.is_empty(), "{status:?}");
     assert!(!log.exists(), "read GitHub for an already-armed PR");
@@ -375,6 +390,7 @@ fn the_opt_out_label_excludes_a_pr_from_the_backstop() {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(status.results.is_empty(), "{status:?}");
     assert!(!log.exists());
@@ -393,6 +409,7 @@ fn a_repo_without_native_auto_merge_declines_the_whole_pass() {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(!unhealthy);
     assert!(status.policy.contains("does not allow native auto-merge"));
@@ -427,6 +444,7 @@ esac"#,
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(unhealthy, "{status:?}");
     assert_eq!(status.results[0].outcome, "skipped");
@@ -471,6 +489,7 @@ esac"#,
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(
         !unhealthy,
@@ -533,6 +552,7 @@ fn the_backstop_leaves_an_unapproved_head_disarmed() {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(!unhealthy, "{status:?}");
     assert_eq!(status.results[0].outcome, "skipped");
@@ -569,6 +589,7 @@ fn the_backstop_arms_a_head_with_an_approving_review() {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(!unhealthy, "{status:?}");
     assert_eq!(status.results[0].outcome, "armed", "{status:?}");
@@ -685,6 +706,7 @@ fn run_backstop_on_8678(actions: &GitHubActions) -> super::NativeArmResult {
         &report(StewardDecision::Unmanaged),
         "shipyard:no-auto-merge",
         true,
+        no_authority_needed,
     );
     assert!(!unhealthy, "{status:?}");
     status.results[0].clone()
@@ -826,4 +848,144 @@ fn an_arrival_the_window_cannot_place_refuses_the_rearm() {
     // Control: the same verdict with the arrival placed before the last arm.
     let placed = timeline_8678(Some("2026-09-22T23:20:00Z"), &[]);
     assert!(super::armed_since_arrival(allowed, &placed, head).allowed);
+}
+
+// ---------------------------------------------------------------------------
+// Arming is a merge-queue mutation: HOLD and machine authority stop it
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn a_refused_authority_arms_nothing_and_reads_nothing_more() {
+    for failed in [false, true] {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls.log");
+        let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
+        let observation = observation(pr_row(&serde_json::json!({})), true);
+        let (status, unhealthy) = apply_native_arm_backstop(
+            &actions,
+            &observation,
+            &report(StewardDecision::Unmanaged),
+            "shipyard:no-auto-merge",
+            true,
+            || {
+                Err::<(), _>(super::ArmAuthorityRefusal {
+                    reason: "held: test".to_owned(),
+                    failed,
+                })
+            },
+        );
+        // A deliberate HOLD is healthy; a missing authority is not.
+        assert_eq!(unhealthy, failed, "{status:?}");
+        assert_eq!(status.policy, "held: test");
+        assert!(status.results.is_empty(), "{status:?}");
+        assert!(!log.exists(), "the backstop reached GitHub past a refusal");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_mode_and_an_empty_pass_never_take_the_authority() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
+    let observation = observation(pr_row(&serde_json::json!({})), true);
+    let mut asked = false;
+    let (status, _) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &report(StewardDecision::Unmanaged),
+        "shipyard:no-auto-merge",
+        false,
+        || {
+            asked = true;
+            no_authority_needed()
+        },
+    );
+    assert_eq!(status.results[0].outcome, "would_arm", "{status:?}");
+    let (status, _) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &report(StewardDecision::ArmMergeQueue),
+        "shipyard:no-auto-merge",
+        true,
+        || {
+            asked = true;
+            no_authority_needed()
+        },
+    );
+    assert!(status.policy.contains("no candidates"), "{status:?}");
+    assert!(!asked, "the control lock was taken with nothing to arm");
+}
+
+#[test]
+fn the_central_hold_refuses_arming_without_failing_the_pass() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = crate::app::merge_steward_cmd::tests::mutation_control(&temp, "studio", "studio");
+    crate::merge_queue_control::hold(&control.state_dir, "operator pause").expect("hold");
+    let refusal =
+        super::arming_authority(&control, "owner/repo", "main").expect_err("a HOLD refuses arming");
+    assert!(!refusal.failed, "{refusal:?}");
+    assert!(refusal.reason.starts_with("held:"), "{refusal:?}");
+    // Control on the same instrument: released, the authority is granted.
+    crate::merge_queue_control::resume(&control.state_dir).expect("resume");
+    assert!(super::arming_authority(&control, "owner/repo", "main").is_ok());
+}
+
+#[test]
+fn a_host_without_mutation_authority_fails_the_pass() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = crate::app::merge_steward_cmd::tests::mutation_control(&temp, "studio", "m5");
+    let refusal = super::arming_authority(&control, "owner/repo", "main")
+        .expect_err("a non-authority host refuses arming");
+    assert!(refusal.failed, "{refusal:?}");
+    assert!(
+        refusal.reason.contains("no merge-queue mutation authority"),
+        "{refusal:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_machine_policy_refuses_at_the_production_arm_call_site() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = crate::app::merge_steward_cmd::tests::mutation_control(&temp, "studio", "studio");
+    // Keep the path present but unreadable as a regular config file. This
+    // exercises the same `arming_authority` closure passed by the steward's
+    // production arm path, rather than testing the preflight helper in
+    // isolation.
+    std::fs::remove_file(control.global_dir.join("config.toml")).expect("remove policy");
+    std::fs::create_dir(control.global_dir.join("config.toml"))
+        .expect("replace policy with directory");
+
+    let log = temp.path().join("calls.log");
+    let actions = fake_gh(&temp, &never_armed_then_arms(&log.display().to_string()));
+    let observation = observation(pr_row(&serde_json::json!({})), true);
+    let (status, unhealthy) = apply_native_arm_backstop(
+        &actions,
+        &observation,
+        &report(StewardDecision::Unmanaged),
+        "shipyard:no-auto-merge",
+        true,
+        || super::arming_authority(&control, "owner/repo", "main"),
+    );
+
+    assert!(
+        unhealthy,
+        "an unreadable policy is a real failure: {status:?}"
+    );
+    assert!(
+        status.results.is_empty(),
+        "the refusal must precede candidate mutation: {status:?}"
+    );
+    assert!(
+        status
+            .policy
+            .contains("failed to load merge-queue mutation policy"),
+        "{status:?}"
+    );
+    assert!(
+        !log.exists(),
+        "the backstop reached GitHub past the policy refusal"
+    );
 }

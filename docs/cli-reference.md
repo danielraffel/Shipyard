@@ -43,7 +43,7 @@ shipyard dependency pulp update           # qualify latest/stable/fixed and open
 shipyard dependency pulp verify           # fresh, cache-bypassing CI verification
 
 # Understand how a repo lands work (read-only)
-shipyard landing                             # merge queue, strict, enqueue, check placement, backlog, base tip health (HEALTHY/RED/PENDING/UNPROVEN from the tip's merge_group required jobs)
+shipyard landing                             # merge queue, strict, enqueue, batching strategy, check placement, backlog, base tip health (HEALTHY/RED/PENDING/UNPROVEN from the tip's merge_group required jobs)
 shipyard landing --repo OWNER/REPO --base main
 shipyard --json landing                      # machine-readable; exit 9 when any headline field is UNKNOWN
 shipyard landing --pr 123                    # one PR. First line: the VERDICT to quote, RED / PENDING / GREEN / UNKNOWN on the
@@ -96,7 +96,7 @@ shipyard cause extract --log FILE --job NAME --notice  # `::notice title=ci-caus
                                              #   bound to the job (repo/head/run/attempt/job) and naming the cause it reads,
                                              #   and dates it by the API time of the step that printed it
 shipyard cause extract --log FILE --format c2  # C2's raw records
-shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/YYYY-MM.jsonl;
+shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/causes/YYYY-MM.jsonl;
                                              #   ids already archived are skipped, nothing is rewritten
 shipyard cause record --repo OWNER/REPO --workflow FILE --dir DIR [--since TIME] [--base main]
                                              # read-only observer: a cause row per new red job (DIR/causes/YYYY-MM.jsonl)
@@ -183,7 +183,7 @@ shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics export merge-receipt --repo Generous-Corp/pulp --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
 shipyard metrics summary --project pulp --json
-shipyard metrics repeated-work-cost --limit 1000 --json
+shipyard metrics repeated-work-cost --since 14d --limit 1000 --json
 shipyard metrics summary --project pulp --group-by host --json   # fold ephemeral runners into their host
 shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
@@ -540,6 +540,9 @@ and provider-neutral:
   through `gh api`.
 - `shipyard metrics import tartci` imports JSON/JSONL from
   `tartci runtime export` when a project uses tartci VM lanes.
+- `shipyard metrics import fleet-capacity --file <path>` imports validated
+  `tartci.fleet-capacity/v1` observation receipts; see
+  [`fleet-capacity-contract.md`](fleet-capacity-contract.md).
 - `shipyard metrics import merge-receipt --file <path>` imports validated `shipyard-merge-receipt/v1` JSON/JSONL; invalid or unavailable provenance stays fail-closed.
 - `shipyard metrics export merge-receipt --repo <owner/repo> --file <path>` writes the
   producer's already-validated receipts for exactly that repository as an atomic
@@ -816,7 +819,11 @@ terminal refresh updates the existing row only when the phase name matches;
 new phase names append rows under the same correlation ID. No phase duration is
 inferred from a job total.
 
-`metrics repeated-work-cost` is read-only shadow accounting. It reports the
-avoided repeated-work cost basis and preserves duration as unavailable until a
-provenance-safe linkage from queue job IDs to metrics rows exists; it never
-infers cost from numeric-looking IDs.
+`metrics repeated-work-cost` is read-only shadow accounting bounded by
+`--since` (default `14d`). It reports measured runtime from distinct
+**superseded queue jobs**, never the surviving job: only clean queue timings
+count. Uncertain, cancelled, and unmatched superseded jobs remain visible as
+coverage counts and are never treated as zero. It never infers cost from
+numeric-looking IDs or changes queue authority. In JSON, `joined_durations` and
+`unknown_durations` count distinct superseded jobs, while `observations` and
+`shadow_rows` preserve raw shadow-row coverage.

@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+pub mod fleet_capacity;
 pub mod freshness;
 pub mod github_import;
 pub mod import_schedule;
@@ -13,7 +14,7 @@ mod proxy_store;
 // and samples with missing or invalid durations, respectively.
 type SafeMergeSummary = (usize, usize, i64, usize, usize);
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
@@ -51,14 +52,14 @@ pub(crate) struct QueueTimingRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct RepeatedWorkSurvivorTiming {
+pub struct RepeatedWorkSupersededTiming {
     pub shadow_rows: usize,
-    pub distinct_survivors: usize,
+    pub distinct_superseded_jobs: usize,
     pub matched_clean: usize,
     pub excluded_uncertain: usize,
     pub excluded_cancelled: usize,
     pub unmatched: usize,
-    pub avoided_survivor_ms: Option<i64>,
+    pub superseded_runtime_ms: Option<i64>,
     pub final_attempt_only: bool,
 }
 
@@ -193,8 +194,10 @@ pub struct RepeatedWorkShadowRow {
     pub superseded_sha: String,
 }
 
-/// Read-only avoided-cost accounting; durations stay unavailable until a
-/// provenance-safe queue-to-metrics linkage exists.
+/// Read-only repeated-work accounting from shadow observations and
+/// authoritative timing for the superseded queue jobs. `duration_ms` is the
+/// measured runtime of superseded jobs only; it is never inferred from the
+/// surviving job or presented as savings when the superseded job is unmatched.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RepeatedWorkCostSummary {
     pub cost_basis: &'static str,
@@ -204,6 +207,15 @@ pub struct RepeatedWorkCostSummary {
     pub joined_durations: usize,
     pub unknown_durations: usize,
     pub duration_ms: Option<i64>,
+    pub shadow_rows: usize,
+    pub distinct_superseded_jobs: usize,
+    pub matched_clean: usize,
+    pub excluded_uncertain: usize,
+    pub excluded_cancelled: usize,
+    pub unmatched: usize,
+    pub timing_basis: &'static str,
+    pub since_days: i64,
+    pub final_attempt_only: bool,
 }
 
 /// One grouped timing summary row.
@@ -374,6 +386,9 @@ pub struct StewardshipScorecard {
     pub cache_hit_rate: Option<f64>,
     pub submit_to_receipt: ScorecardCoverage,
     pub model_token_use: ScorecardCoverage,
+    /// Observation-only eligible `TartCI` slot-hours in this window. Unknown
+    /// samples remain visible and make the denominator partial.
+    pub fleet_capacity: FleetCapacityDenominator,
     /// Basis of `comparison.verdict`.
     pub basis: &'static str,
     /// Load-independent proxies over this window (project-wide).
@@ -387,6 +402,17 @@ pub struct StewardshipScorecard {
     pub provenance: ScorecardProvenance,
     #[serde(skip_serializing)]
     pub strata: ScorecardStrata,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FleetCapacityDenominator {
+    pub status: String,
+    pub reason: String,
+    pub sample_count: usize,
+    pub verified_samples: usize,
+    pub unknown_samples: usize,
+    pub host_target_count: usize,
+    pub eligible_slot_hours: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -559,6 +585,18 @@ fn queue_timing_rank(s: &str) -> u8 {
     }
 }
 
+fn repeated_work_cutoff(since_days: i64) -> Result<String, Box<dyn std::error::Error>> {
+    if since_days <= 0 {
+        return Err("repeated-work baseline window must be positive".into());
+    }
+    let window = Duration::try_days(since_days)
+        .ok_or("repeated-work baseline window is outside the timestamp range")?;
+    Utc::now()
+        .checked_sub_signed(window)
+        .ok_or_else(|| "repeated-work baseline cutoff is outside the timestamp range".into())
+        .map(|cutoff| cutoff.to_rfc3339())
+}
+
 impl MetricsStore {
     pub(crate) fn record_queue_terminal(
         &self,
@@ -617,39 +655,55 @@ impl MetricsStore {
         Ok(conn.query_row("SELECT queue_job_id, queue_identity, disposition, started_at, completed_at, total_ms FROM queue_timing WHERE queue_job_id=?1", params![queue_job_id], |r| Ok(QueueTimingRow { queue_job_id: r.get(0)?, queue_identity: r.get(1)?, queue_disposition: r.get(2)?, started_at: r.get(3)?, completed_at: r.get(4)?, total_ms: r.get(5)? })).optional()?)
     }
 
-    pub fn repeated_work_survivor_timing(
+    pub fn repeated_work_superseded_timing(
         &self,
         limit: usize,
-    ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
+        since_days: i64,
+    ) -> Result<RepeatedWorkSupersededTiming, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id FROM repeated_work_shadow ORDER BY id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id")?;
-        let mut out = RepeatedWorkSurvivorTiming {
+        let tx = conn.unchecked_transaction()?;
+        let cutoff = repeated_work_cutoff(since_days)?;
+        let timing = Self::repeated_work_superseded_timing_with_conn(&tx, limit, &cutoff)?;
+        tx.commit()?;
+        Ok(timing)
+    }
+
+    fn repeated_work_superseded_timing_with_conn(
+        conn: &Connection,
+        limit: usize,
+        cutoff: &str,
+    ) -> Result<RepeatedWorkSupersededTiming, Box<dyn std::error::Error>> {
+        let mut stmt = conn.prepare("WITH recent AS (SELECT superseded_job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1), superseded AS (SELECT DISTINCT superseded_job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.superseded_job_id, t.disposition, t.total_ms FROM superseded s LEFT JOIN queue_timing t ON t.queue_job_id=s.superseded_job_id AND s.superseded_job_id LIKE 'sy-%' AND instr(s.superseded_job_id, '/') = 0 AND instr(s.superseded_job_id, char(92)) = 0")?;
+        let mut out = RepeatedWorkSupersededTiming {
             shadow_rows: 0,
-            distinct_survivors: 0,
+            distinct_superseded_jobs: 0,
             matched_clean: 0,
             excluded_uncertain: 0,
             excluded_cancelled: 0,
             unmatched: 0,
-            avoided_survivor_ms: None,
+            superseded_runtime_ms: None,
             final_attempt_only: true,
         };
-        let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![i64::try_from(limit).unwrap_or(i64::MAX), cutoff],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )?;
         for row in rows {
             let (count, _, disposition, total) = row?;
             out.shadow_rows = usize::try_from(count).unwrap_or(usize::MAX);
-            out.distinct_survivors += 1;
+            out.distinct_superseded_jobs += 1;
             match disposition.as_deref() {
                 Some("clean") if total.is_some_and(|v| v >= 0) => {
                     out.matched_clean += 1;
-                    out.avoided_survivor_ms = Some(
-                        out.avoided_survivor_ms
+                    out.superseded_runtime_ms = Some(
+                        out.superseded_runtime_ms
                             .unwrap_or(0)
                             .saturating_add(total.unwrap()),
                     );
@@ -659,6 +713,65 @@ impl MetricsStore {
                 _ => out.unmatched += 1,
             }
         }
+        Ok(out)
+    }
+
+    /// Return repeated-work accounting for a positive baseline window.
+    pub fn repeated_work_cost(
+        &self,
+        limit: usize,
+        since_days: i64,
+    ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
+        let cutoff = repeated_work_cutoff(since_days)?;
+        let conn = self.connect()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare("SELECT kind, job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
+        let ids = stmt.query_map(
+            params![i64::try_from(limit).unwrap_or(i64::MAX), &cutoff],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut out = RepeatedWorkCostSummary {
+            cost_basis: "superseded_repeated_work",
+            observations: 0,
+            superseded_exact_head: 0,
+            duplicate_exact_head_config: 0,
+            joined_durations: 0,
+            unknown_durations: 0,
+            duration_ms: None,
+            shadow_rows: 0,
+            distinct_superseded_jobs: 0,
+            matched_clean: 0,
+            excluded_uncertain: 0,
+            excluded_cancelled: 0,
+            unmatched: 0,
+            timing_basis: "superseded_queue_job_runtime",
+            since_days,
+            final_attempt_only: true,
+        };
+        for item in ids {
+            let (kind, _job_id) = item?;
+            out.observations += 1;
+            match kind.as_str() {
+                "superseded_exact_head" => out.superseded_exact_head += 1,
+                "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
+                _ => {}
+            }
+        }
+        let timing = Self::repeated_work_superseded_timing_with_conn(&tx, limit, &cutoff)?;
+        out.shadow_rows = timing.shadow_rows;
+        out.distinct_superseded_jobs = timing.distinct_superseded_jobs;
+        out.matched_clean = timing.matched_clean;
+        out.excluded_uncertain = timing.excluded_uncertain;
+        out.excluded_cancelled = timing.excluded_cancelled;
+        out.unmatched = timing.unmatched;
+        out.joined_durations = timing.matched_clean;
+        out.unknown_durations = timing
+            .distinct_superseded_jobs
+            .saturating_sub(timing.matched_clean);
+        out.duration_ms = timing.superseded_runtime_ms;
+        out.final_attempt_only = timing.final_attempt_only;
+        drop(stmt);
+        tx.commit()?;
         Ok(out)
     }
 
@@ -680,8 +793,9 @@ impl MetricsStore {
         &self.path
     }
 
-    /// Delete raw run, job, and step samples older than `retention_days`.
-    /// Merge receipts are retained because they are durable provenance.
+    /// Delete raw run, job, step, and fleet-capacity samples older than
+    /// `retention_days`. Merge receipts are retained because they are durable
+    /// provenance.
     pub fn prune_older_than(
         &self,
         retention_days: i64,
@@ -718,6 +832,11 @@ impl MetricsStore {
             tx.commit()?;
             deleted += ids.len();
         }
+        let conn = self.connect()?;
+        deleted += conn.execute(
+            "DELETE FROM fleet_capacity_samples WHERE valid_until < ?1",
+            [&cutoff],
+        )?;
         Ok(deleted)
     }
 
@@ -826,6 +945,37 @@ impl MetricsStore {
             );
             CREATE INDEX IF NOT EXISTS merge_receipts_project_merged
               ON merge_receipts(project, merged_at);
+            CREATE TABLE IF NOT EXISTS fleet_capacity_samples (
+              sample_id TEXT PRIMARY KEY,
+              schema TEXT NOT NULL,
+              observed_at TEXT NOT NULL,
+              valid_until TEXT NOT NULL,
+              host_id TEXT NOT NULL,
+              host_boot_id TEXT NOT NULL,
+              generation TEXT NOT NULL,
+              repo TEXT NOT NULL,
+              target TEXT NOT NULL,
+              profile_sha256 TEXT NOT NULL,
+              configured_slots INTEGER NOT NULL,
+              eligible_slots INTEGER,
+              free_slots INTEGER,
+              occupied_slots INTEGER,
+              in_flight_slots INTEGER,
+              unknown_slots INTEGER NOT NULL,
+              pool_state TEXT NOT NULL,
+              source TEXT NOT NULL,
+              auth_method TEXT NOT NULL,
+              verification TEXT NOT NULL,
+              evidence_json TEXT NOT NULL,
+              evidence_sha256 TEXT NOT NULL,
+              census_sha256 TEXT NOT NULL,
+              reason TEXT,
+              imported_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS fleet_capacity_repo_observed
+              ON fleet_capacity_samples(repo, observed_at);
+            CREATE INDEX IF NOT EXISTS fleet_capacity_valid_until
+              ON fleet_capacity_samples(valid_until);
             CREATE TABLE IF NOT EXISTS repeated_work_shadow (
               id INTEGER PRIMARY KEY,
               observed_at TEXT NOT NULL,
@@ -846,6 +996,7 @@ impl MetricsStore {
         add_column_if_missing(&conn, "jobs", "labels_json", "TEXT")?;
         add_column_if_missing(&conn, "jobs", "correlation_id", "TEXT")?;
         add_column_if_missing(&conn, "runs", "event", "TEXT")?;
+        add_column_if_missing(&conn, "fleet_capacity_samples", "evidence_json", "TEXT")?;
         add_column_if_missing(&conn, "runs", "provider_run_id", "INTEGER")?;
         add_column_if_missing(&conn, "runs", "run_attempt", "INTEGER")?;
         add_column_if_missing(&conn, "runs", "head_sha", "TEXT")?;
@@ -1072,6 +1223,178 @@ impl MetricsStore {
         Ok((total, joined, wasted, samples, duration_gaps))
     }
 
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    fn fleet_capacity_denominator(
+        &self,
+        project: &str,
+        cutoff: &str,
+        until: &str,
+    ) -> Result<FleetCapacityDenominator, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        let key = crate::metrics::project_key::ProjectKey::parse(project);
+        let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
+        let project_filter = crate::metrics::project_key::sql_filter("repo", "repo");
+        let mut statement = conn.prepare(&format!(
+            "SELECT repo, observed_at, valid_until, sample_id, host_id, target, verification, eligible_slots
+               FROM fleet_capacity_samples
+              WHERE {project_filter} AND valid_until > ?4 AND observed_at < ?5
+              ORDER BY repo, host_id, target, observed_at"
+        ))?;
+        let rows = statement.query_map(params![any, short, full, cutoff, until], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+            ))
+        })?;
+        let mut samples = Vec::new();
+        for row in rows {
+            let (repo, observed, valid_until, sample_id, host, target, verification, eligible) =
+                row?;
+            let observed = DateTime::parse_from_rfc3339(&observed)?.with_timezone(&Utc);
+            let valid_until = DateTime::parse_from_rfc3339(&valid_until)?.with_timezone(&Utc);
+            samples.push((
+                repo,
+                observed,
+                valid_until,
+                sample_id,
+                host,
+                target,
+                verification,
+                eligible,
+            ));
+        }
+        let sample_count = samples.len();
+        let verified_samples = samples
+            .iter()
+            .filter(|(_, _, _, _, _, _, verification, _)| verification == "verified")
+            .count();
+        let unknown_samples = sample_count.saturating_sub(verified_samples);
+        let mut groups: BTreeMap<
+            (String, String, String),
+            Vec<(
+                DateTime<Utc>,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                String,
+                String,
+                Option<i64>,
+            )>,
+        > = BTreeMap::new();
+        let window_start = DateTime::parse_from_rfc3339(cutoff)?.with_timezone(&Utc);
+        let window_end = DateTime::parse_from_rfc3339(until)?.with_timezone(&Utc);
+        let mut hosts = BTreeSet::new();
+        for (repo, observed, valid_until, sample_id, host, target, verification, eligible) in
+            samples
+        {
+            hosts.insert((repo.clone(), host.clone(), target.clone()));
+            let start = observed.max(window_start);
+            let end = valid_until.min(window_end);
+            if end > start {
+                groups.entry((repo, host, target)).or_default().push((
+                    start,
+                    end,
+                    observed,
+                    sample_id,
+                    verification,
+                    eligible,
+                ));
+            }
+        }
+        let mut eligible_slot_seconds = 0_i64;
+        let mut coverage_gap = false;
+        for intervals in groups.values() {
+            // Sweep interval boundaries once instead of scanning every interval
+            // for every segment. Unknown observations win equal-timestamp ties.
+            let mut events: BTreeMap<DateTime<Utc>, Vec<(bool, usize)>> = BTreeMap::new();
+            let mut keys = Vec::with_capacity(intervals.len());
+            for (index, (start, end, observed, sample_id, verification, _)) in
+                intervals.iter().enumerate()
+            {
+                events.entry(*start).or_default().push((true, index));
+                events.entry(*end).or_default().push((false, index));
+                keys.push((
+                    *observed,
+                    *verification == "unknown",
+                    sample_id.clone(),
+                    index,
+                ));
+            }
+            let mut active = std::collections::BTreeSet::new();
+            let mut previous = None;
+            let mut covered_until = window_start;
+            for (time, changes) in events {
+                if let Some(start) = previous
+                    && time > start
+                    && let Some((_, _, _, index)) = active.iter().next_back()
+                {
+                    let (_, _, _, _, verification, slots) = &intervals[*index];
+                    let slots: i64 = (verification == "verified")
+                        .then_some(*slots)
+                        .flatten()
+                        .filter(|slots| *slots >= 0)
+                        .unwrap_or(0);
+                    eligible_slot_seconds = eligible_slot_seconds
+                        .saturating_add(slots.saturating_mul((time - start).num_seconds().max(0)));
+                    if start > covered_until {
+                        coverage_gap = true;
+                    }
+                    covered_until = time;
+                }
+                for (is_start, index) in changes {
+                    if is_start {
+                        active.insert(keys[index].clone());
+                    } else {
+                        active.remove(&keys[index]);
+                    }
+                }
+                previous = Some(time);
+            }
+            if covered_until < window_end {
+                coverage_gap = true;
+            }
+        }
+        let status = if sample_count == 0 {
+            "unavailable"
+        } else if unknown_samples > 0 || coverage_gap {
+            "partial"
+        } else {
+            "available"
+        };
+        let reason = if sample_count == 0 {
+            "no fleet-capacity samples overlap the scorecard window".to_owned()
+        } else if unknown_samples > 0 || coverage_gap {
+            let mut reasons = Vec::new();
+            if unknown_samples > 0 {
+                reasons.push(format!(
+                    "{verified_samples} verified and {unknown_samples} unknown fleet-capacity samples; denominator is a lower bound"
+                ));
+            }
+            if coverage_gap {
+                reasons.push("capacity coverage has gaps in the scorecard window".to_owned());
+            }
+            reasons.join("; ")
+        } else {
+            format!("{verified_samples} verified fleet-capacity samples")
+        };
+        Ok(FleetCapacityDenominator {
+            status: status.to_owned(),
+            reason,
+            sample_count,
+            verified_samples,
+            unknown_samples,
+            host_target_count: hosts.len(),
+            #[allow(clippy::cast_precision_loss)]
+            eligible_slot_hours: (verified_samples > 0)
+                .then_some(eligible_slot_seconds as f64 / 3600.0),
+        })
+    }
+
     /// Record a queue repeated-work observation without affecting queue
     /// admission, dispatch, or required-check authority.
     pub fn record_repeated_work_shadow(
@@ -1167,42 +1490,6 @@ impl MetricsStore {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// Aggregate shadow observations. Durations remain unavailable until a
-    /// provenance-safe queue-to-metrics linkage exists.
-    pub fn repeated_work_cost(
-        &self,
-        limit: usize,
-    ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT kind, job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
-        let ids = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut out = RepeatedWorkCostSummary {
-            cost_basis: "avoided_repeated_work",
-            observations: 0,
-            superseded_exact_head: 0,
-            duplicate_exact_head_config: 0,
-            joined_durations: 0,
-            unknown_durations: 0,
-            duration_ms: None,
-        };
-        for item in ids {
-            let (kind, job_id) = item?;
-            out.observations += 1;
-            match kind.as_str() {
-                "superseded_exact_head" => out.superseded_exact_head += 1,
-                "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
-                _ => {}
-            }
-            // Queue ids (`sy-...`) are not SQLite job identities. Without an
-            // authenticated linkage, every duration remains unavailable.
-            let _ = job_id;
-            out.unknown_durations += 1;
-        }
-        Ok(out)
     }
 
     /// Record one low-friction timing row.
@@ -1404,6 +1691,55 @@ impl MetricsStore {
                 imported += 1;
             }
         }
+        Ok(imported)
+    }
+
+    /// Import validated `TartCI` fleet-capacity observations atomically.
+    pub fn import_fleet_capacity(&self, text: &str) -> Result<usize, Box<dyn std::error::Error>> {
+        let samples = crate::metrics::fleet_capacity::parse_reader(text.as_bytes())?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut imported = 0;
+        for sample in samples {
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO fleet_capacity_samples
+                 (sample_id,schema,observed_at,valid_until,host_id,host_boot_id,generation,
+                  repo,target,profile_sha256,configured_slots,eligible_slots,free_slots,
+                  occupied_slots,in_flight_slots,unknown_slots,pool_state,source,auth_method,
+                 verification,evidence_json,evidence_sha256,census_sha256,reason,imported_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+                params![
+                    sample.sample_id,
+                    sample.schema,
+                    sample.observed_at.to_rfc3339(),
+                    sample.valid_until.to_rfc3339(),
+                    sample.host_id,
+                    sample.host_boot_id,
+                    sample.generation,
+                    sample.repo,
+                    sample.target,
+                    sample.profile_sha256,
+                    sample.configured_slots,
+                    sample.eligible_slots,
+                    sample.free_slots,
+                    sample.occupied_slots,
+                    sample.in_flight_slots,
+                    sample.unknown_slots,
+                    sample.pool_state,
+                    sample.source,
+                    sample.auth_method,
+                    sample.verification,
+                    serde_json::to_string(&sample.evidence)?,
+                    sample.evidence_sha256,
+                    sample.census_sha256,
+                    sample.reason,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            imported += changed;
+        }
+        tx.commit()?;
         Ok(imported)
     }
 
@@ -1792,6 +2128,8 @@ impl MetricsStore {
             wasted_duration_gaps,
         ) = self.safe_merge_summary(project, &cutoff)?;
         let now = Utc::now();
+        let fleet_capacity =
+            self.fleet_capacity_denominator(project, &cutoff, &now.to_rfc3339())?;
         let (proxies, comparison) = proxy_store::scorecard_window(
             &proxy_store::load_samples(&conn, Some(project))?,
             now,
@@ -1889,6 +2227,7 @@ impl MetricsStore {
                 reason: "job metrics do not store model call or token counters".to_owned(),
                 value: None,
             },
+            fleet_capacity,
             basis: basis.as_str(),
             proxies,
             comparison,
@@ -3589,6 +3928,137 @@ mod tests {
         }
     }
 
+    fn test_capacity_sample(
+        observed_at: DateTime<Utc>,
+        host: &str,
+        verification: &str,
+    ) -> crate::metrics::fleet_capacity::FleetCapacitySample {
+        let mut sample = crate::metrics::fleet_capacity::FleetCapacitySample {
+            schema: crate::metrics::fleet_capacity::SCHEMA.to_owned(),
+            sample_id: String::new(),
+            observed_at,
+            valid_until: observed_at + Duration::minutes(2),
+            host_id: host.to_owned(),
+            host_boot_id: format!("boot-{host}"),
+            generation: "gen-1".to_owned(),
+            repo: "danielraffel/Shipyard".to_owned(),
+            target: "macos".to_owned(),
+            profile_sha256: "a".repeat(64),
+            configured_slots: 3,
+            eligible_slots: (verification == "verified").then_some(3),
+            free_slots: (verification == "verified").then_some(1),
+            occupied_slots: (verification == "verified").then_some(1),
+            in_flight_slots: (verification == "verified").then_some(1),
+            unknown_slots: if verification == "verified" { 0 } else { 3 },
+            pool_state: "on".to_owned(),
+            source: "tartci".to_owned(),
+            auth_method: "untrusted_local".to_owned(),
+            verification: verification.to_owned(),
+            evidence: serde_json::json!({
+                "schema": "tartci.gate-supply/v1",
+                "host": host,
+                "repo": "danielraffel/Shipyard",
+                "class": "macos",
+                "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "verdict": "ok",
+                "pool": "on",
+                "free": 1,
+                "occupied": 1,
+                "in_flight": 1,
+                "lanes": [{"state": "free"}, {"state": "occupied"}, {"state": "occupied"}]
+            }),
+            evidence_sha256: String::new(),
+            census_sha256: String::new(),
+            reason: (verification == "unknown").then(|| "stale".to_owned()),
+        };
+        sample.evidence_sha256 = crate::metrics::fleet_capacity::digest_value(&sample.evidence)
+            .expect("capacity evidence digest");
+        let evidence = sample.evidence.as_object().unwrap();
+        let census = [
+            "schema", "host", "repo", "class", "verdict", "pool", "lanes",
+        ]
+        .into_iter()
+        .map(|key| {
+            (
+                key.to_owned(),
+                evidence.get(key).cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect();
+        sample.census_sha256 = crate::metrics::fleet_capacity::digest_value(&Value::Object(census))
+            .expect("capacity census digest");
+        sample.sample_id = crate::metrics::fleet_capacity::canonical_digest(&sample, true)
+            .expect("capacity sample digest");
+        sample
+    }
+
+    #[test]
+    fn fleet_capacity_import_is_idempotent_and_scorecard_denominator_is_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let observed = Utc::now() - Duration::minutes(1);
+        let verified = test_capacity_sample(observed, "m3", "verified");
+        let unknown = test_capacity_sample(observed, "m5", "unknown");
+        let text = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&verified).unwrap(),
+            serde_json::to_string(&unknown).unwrap()
+        );
+        assert_eq!(store.import_fleet_capacity(&text).unwrap(), 2);
+        assert_eq!(store.import_fleet_capacity(&text).unwrap(), 0);
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.status, "partial");
+        assert_eq!(scorecard.fleet_capacity.sample_count, 2);
+        assert_eq!(scorecard.fleet_capacity.verified_samples, 1);
+        assert_eq!(scorecard.fleet_capacity.unknown_samples, 1);
+        assert!(scorecard.fleet_capacity.eligible_slot_hours.is_some());
+    }
+
+    #[test]
+    fn unknown_latest_capacity_observation_suppresses_overlapping_verified_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let now = Utc::now();
+        let verified = test_capacity_sample(now - Duration::minutes(2), "m3", "verified");
+        let unknown = test_capacity_sample(now - Duration::minutes(1), "m3", "unknown");
+        store
+            .import_fleet_capacity(&format!(
+                "{}\n{}\n",
+                serde_json::to_string(&verified).unwrap(),
+                serde_json::to_string(&unknown).unwrap()
+            ))
+            .unwrap();
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.status, "partial");
+        let hours = scorecard
+            .fleet_capacity
+            .eligible_slot_hours
+            .expect("verified interval before unknown interval remains measurable");
+        assert!((hours - (3.0 / 60.0)).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn unknown_equal_timestamp_wins_capacity_reduction_tie() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let observed = Utc::now() - Duration::minutes(1);
+        let verified = test_capacity_sample(observed, "m3", "verified");
+        let unknown = test_capacity_sample(observed, "m3", "unknown");
+        store
+            .import_fleet_capacity(&format!(
+                "{}\n{}\n",
+                serde_json::to_string(&verified).unwrap(),
+                serde_json::to_string(&unknown).unwrap()
+            ))
+            .unwrap();
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.status, "partial");
+        assert_eq!(scorecard.fleet_capacity.eligible_slot_hours, Some(0.0));
+    }
+
     #[test]
     fn merge_receipt_import_is_atomic_and_idempotent() {
         let temp = tempfile::tempdir().unwrap();
@@ -5280,21 +5750,34 @@ mod tests {
                 sha: "sha".into(),
                 target_config: "cfg".into(),
                 mode: "normal".into(),
-                job_id: id.into(),
-                superseded_job_id: "old".into(),
+                job_id: "sy-survivor".into(),
+                superseded_job_id: id.into(),
                 superseded_sha: "oldsha".into(),
             };
             store.record_repeated_work_shadow(&input).unwrap();
         }
         let conn = Connection::open(store.path()).unwrap();
         conn.execute("INSERT INTO repeated_work_shadow (observed_at,kind,branch,sha,target_config,mode,job_id,superseded_job_id,superseded_sha) VALUES ('now','future_kind','main','sha','cfg','normal','7','old','oldsha')", []).unwrap();
-        let summary = store.repeated_work_cost(100).unwrap();
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &QueueTerminalTiming {
+                    queue_job_id: "42".into(),
+                    queue_identity: "numeric-test".into(),
+                    disposition: "clean".into(),
+                    started_at: Some(Utc::now()),
+                    completed_at: Some(Utc::now()),
+                    total_ms: Some(99),
+                },
+            )
+            .unwrap();
+        let summary = store.repeated_work_cost(100, 14).unwrap();
         assert_eq!(summary.duration_ms, None);
         assert_eq!(summary.joined_durations, 0);
         assert_eq!(summary.unknown_durations, 3);
         assert_eq!(summary.superseded_exact_head, 1);
         assert_eq!(summary.duplicate_exact_head_config, 1);
-        assert_eq!(store.repeated_work_cost(0).unwrap().observations, 0);
+        assert_eq!(store.repeated_work_cost(0, 14).unwrap().observations, 0);
         assert_eq!(
             serde_json::to_value(summary).unwrap()["duration_ms"],
             serde_json::Value::Null
@@ -5394,7 +5877,7 @@ mod tests {
         );
     }
     #[test]
-    fn survivor_timing_counts_distinct_and_excluded_rows() {
+    fn superseded_timing_counts_distinct_and_excluded_rows_in_window() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
         let mk = |id: &str, d: &str, ms| QueueTerminalTiming {
@@ -5406,21 +5889,30 @@ mod tests {
             total_ms: ms,
         };
         store
-            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("clean", "clean", Some(10)))
+            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("sy-clean", "clean", Some(10)))
             .unwrap();
         store
             .record_queue_terminal(
                 QUEUE_AUTHORITY_TOKEN,
-                &mk("uncertain", "uncertain", Some(20)),
+                &mk("sy-uncertain", "uncertain", Some(20)),
             )
             .unwrap();
         store
             .record_queue_terminal(
                 QUEUE_AUTHORITY_TOKEN,
-                &mk("cancel", "cancelled_mid_run", Some(30)),
+                &mk("sy-cancel", "cancelled_mid_run", Some(30)),
             )
             .unwrap();
-        for id in ["clean", "clean", "uncertain", "cancel", "missing"] {
+        for (index, id) in [
+            "sy-clean",
+            "sy-clean",
+            "sy-uncertain",
+            "sy-cancel",
+            "sy-missing",
+        ]
+        .into_iter()
+        .enumerate()
+        {
             store
                 .record_repeated_work_shadow(&RepeatedWorkShadowInput {
                     kind: RepeatedWorkKind::SupersededExactHead,
@@ -5428,20 +5920,38 @@ mod tests {
                     sha: "s".into(),
                     target_config: "t".into(),
                     mode: "m".into(),
-                    job_id: id.into(),
-                    superseded_job_id: "o".into(),
+                    job_id: "sy-survivor".into(),
+                    superseded_job_id: id.into(),
                     superseded_sha: "o".into(),
                 })
                 .unwrap();
+            if index == 4 {
+                let conn = Connection::open(store.path()).unwrap();
+                conn.execute(
+                    "UPDATE repeated_work_shadow SET observed_at='2000-01-01T00:00:00Z' WHERE id=(SELECT max(id) FROM repeated_work_shadow)",
+                    [],
+                )
+                .unwrap();
+            }
         }
-        let r = store.repeated_work_survivor_timing(100).unwrap();
-        assert_eq!(r.shadow_rows, 5);
-        assert_eq!(r.distinct_survivors, 4);
+        let r = store.repeated_work_superseded_timing(100, 14).unwrap();
+        assert_eq!(r.shadow_rows, 4);
+        assert_eq!(r.distinct_superseded_jobs, 3);
         assert_eq!(r.matched_clean, 1);
-        assert_eq!(r.avoided_survivor_ms, Some(10));
+        assert_eq!(r.superseded_runtime_ms, Some(10));
         assert_eq!(r.excluded_uncertain, 1);
         assert_eq!(r.excluded_cancelled, 1);
-        assert_eq!(r.unmatched, 1);
+        assert_eq!(r.unmatched, 0);
+        let cost = store.repeated_work_cost(100, 14).unwrap();
+        assert_eq!(cost.observations, 4);
+        assert_eq!(cost.shadow_rows, 4);
+        assert_eq!(cost.distinct_superseded_jobs, 3);
+        assert_eq!(cost.joined_durations, 1);
+        assert_eq!(cost.unknown_durations, 2);
+        assert_eq!(cost.duration_ms, Some(10));
+        assert_eq!(cost.excluded_uncertain, 1);
+        assert_eq!(cost.excluded_cancelled, 1);
+        assert_eq!(cost.unmatched, 0);
     }
     #[test]
     fn queue_timing_contract_rejects_identity_and_downgrades() {
@@ -5507,5 +6017,47 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn metrics_retention_prunes_old_fleet_capacity_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        let sample = test_capacity_sample(old, "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&sample).unwrap())
+            .unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 1);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn metrics_retention_keeps_capacity_interval_overlapping_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let cutoff = Utc::now() - Duration::days(90);
+        let sample = test_capacity_sample(cutoff - Duration::minutes(1), "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&sample).unwrap())
+            .unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let scorecard = store.stewardship_scorecard("Shipyard", 90).unwrap();
+        assert_eq!(scorecard.fleet_capacity.sample_count, 1);
+        assert!(scorecard.fleet_capacity.eligible_slot_hours.is_some());
     }
 }

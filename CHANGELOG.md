@@ -3,6 +3,85 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03781"></a>
+## [0.378.1] - 2026-10-30
+
+- fix/release ghapp path ([#1039](https://github.com/danielraffel/Shipyard/pull/1039))
+- fix(metrics): retry transient baseline provider reads ([#1041](https://github.com/danielraffel/Shipyard/pull/1041))
+
+<a id="v03780"></a>
+## [0.378.0] - 2026-10-30
+
+- metrics: score archived failure causes in gate-cost ([#1045](https://github.com/danielraffel/Shipyard/pull/1045))
+
+<a id="v03770"></a>
+## [0.377.0] - 2026-10-30
+
+- feat(metrics): report superseded-job runtime for repeated work ([#1044](https://github.com/danielraffel/Shipyard/pull/1044))
+
+<a id="v03760"></a>
+## [0.376.0] - 2026-10-30
+
+- codex/cause record archive fail closed 20261029 ([#1040](https://github.com/danielraffel/Shipyard/pull/1040))
+
+<a id="v03740"></a>
+## [0.374.0] - 2026-10-29
+
+- fix(steward): preserve repository provenance for queue reads ([#1035](https://github.com/danielraffel/Shipyard/pull/1035))
+
+<a id="v03730"></a>
+## [0.373.0] - 2026-10-29
+
+- fix(merge-steward): fall back to REST for open PR census ([#1034](https://github.com/danielraffel/Shipyard/pull/1034))
+- test(metrics): align missing receipt event ordering ([#1031](https://github.com/danielraffel/Shipyard/pull/1031))
+- fix/receiptless merged cancel ([#982](https://github.com/danielraffel/Shipyard/pull/982))
+
+<a id="v03720"></a>
+## [0.372.0] - 2026-10-28
+
+- fix/baseline receipt optional 20261026 ([#963](https://github.com/danielraffel/Shipyard/pull/963))
+- codex/warm pool member observability ([#966](https://github.com/danielraffel/Shipyard/pull/966))
+
+<a id="v03710"></a>
+## [0.371.0] - 2026-10-28
+
+- feat/repo aware landing coordinator 20261026 ([#962](https://github.com/danielraffel/Shipyard/pull/962))
+- feat/risk tier report only ([#955](https://github.com/danielraffel/Shipyard/pull/955))
+
+<a id="v03700"></a>
+## [0.370.0] - 2026-10-28
+
+- fix(steward): run the scheduled arming pass from launchd under HOLD ([#952](https://github.com/danielraffel/Shipyard/pull/952))
+
+<a id="v03691"></a>
+## [0.369.1] - 2026-10-28
+
+- fix(wait): preserve required checks across app identities ([#951](https://github.com/danielraffel/Shipyard/pull/951))
+
+<a id="v03690"></a>
+## [0.369.0] - 2026-10-28
+
+- feat(auth): repository-scoped git credential helper ([#957](https://github.com/danielraffel/Shipyard/pull/957))
+- metrics: import TartCI fleet capacity receipts ([#953](https://github.com/danielraffel/Shipyard/pull/953))
+- fix(baseline): keep collecting when receipt handoff is unavailable ([#965](https://github.com/danielraffel/Shipyard/pull/965))
+
+<a id="v03680"></a>
+## [0.368.0] - 2026-10-28
+
+- feat: show fixing push in human cause advice ([#971](https://github.com/danielraffel/Shipyard/pull/971))
+- fix: run pinned Rust gates on capable hosts ([#975](https://github.com/danielraffel/Shipyard/pull/975))
+
+<a id="v03671"></a>
+## [0.367.1] - 2026-10-28
+
+- fix(merge): fail closed on private queue ambiguity ([#972](https://github.com/danielraffel/Shipyard/pull/972))
+
+<a id="v03670"></a>
+## [0.367.0] - 2026-10-28
+
+- fix(steward): hydrate implicit fleet pull request checks ([#979](https://github.com/danielraffel/Shipyard/pull/979))
+- feat(metrics): supervise merge receipt handoff freshness ([#950](https://github.com/danielraffel/Shipyard/pull/950))
+
 <a id="v03664"></a>
 ## [0.366.4] - 2026-10-26
 
@@ -2657,6 +2736,20 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.378.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.378.1
+[0.378.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.378.0
+[0.377.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.377.0
+[0.376.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.376.0
+[0.374.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.374.0
+[0.373.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.373.0
+[0.372.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.372.0
+[0.371.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.371.0
+[0.370.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.370.0
+[0.369.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.369.1
+[0.369.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.369.0
+[0.368.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.368.0
+[0.367.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.367.1
+[0.367.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.367.0
 [0.366.4]: https://github.com/danielraffel/Shipyard/releases/tag/v0.366.4
 [0.366.3]: https://github.com/danielraffel/Shipyard/releases/tag/v0.366.3
 [0.366.2]: https://github.com/danielraffel/Shipyard/releases/tag/v0.366.2

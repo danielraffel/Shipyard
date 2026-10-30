@@ -5,9 +5,22 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+The gate-cost scorecard can read a bounded historical cause archive with
+`--causes-archive DIR`; the report labels that source as archive and keeps
+malformed, duplicate, truncated, and unjoined rows visible. This is advisory
+measurement only and does not authorize queue or merge actions.
+Missing or unreadable `DIR/causes/` exits unsuccessfully with `cause archive
+unavailable`; only a readable empty directory can report zero archived rows.
+
 Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
 commit-to-pull-requests API, but zero or multiple matches remain unknown.
+
+`metrics repeated-work-cost` exposes read-only superseded-job runtime from the
+authenticated queue timing table within its explicit `--since` window. It
+counts each distinct superseded job once, reports clean versus
+uncertain/cancelled/unmatched coverage, and never treats survivor runtime as
+savings. It never turns this evidence into a queue or merge decision.
 
 The read-only `queue-digest` surface reports `queue_idle` and emits
 `merge_queue_idle_with_pending_work` for an armed-but-not-enqueued PR, or the
@@ -1864,9 +1877,10 @@ that needs them and runs `scripts/ci_cause_notices.sh` (a job cannot read its
 own log while it runs, so the records come from the finished logs). `shipyard diagnose
 --annotate plan|post` puts every failing required job's record in the check
 run's `output.text`, and `shipyard cause archive --dir <labels
-checkout>/causes --input <cases.jsonl>` appends records to `YYYY-MM.jsonl`
-files, skipping ids already archived (append-only, so a private corpus never
-loses a line). A job whose
+checkout>/data/ci-cause --input <cases.jsonl>` appends records to
+`causes/YYYY-MM.jsonl` files, skipping ids already archived (append-only, so a
+private corpus never loses a line). A legacy archive with month files directly
+under the parent is refused until it is migrated into `causes/`. A job whose
 log GitHub no longer holds is still judged from its payload. `--causes` reads the same causes without
 exporting and adds "named causes: N/M red cases" with the time to them.
 Each uncached red job costs two API calls, so at most `--causes-max-jobs`
@@ -1998,6 +2012,16 @@ Default behavior is ambient `gh` auth. Configured env or command-helper tokens
 are injected only into child `gh` commands as `GH_TOKEN`; Shipyard must never
 write raw tokens, GitHub App private keys, Keychain items, 1Password sessions,
 or token caches to config, state, logs, or release artifacts.
+
+Agent git over HTTPS uses `shipyard auth git-credential` as the github.com
+credential helper (`useHttpPath = true`). Each `get` mints a fresh App token
+limited to that one repository and to `git_credential.permissions` (default
+`contents=write`; add `workflows=write` to push workflow files). It serves only
+the repositories listed in the machine-global `git_credential.repositories`,
+and on refusal it prints `quit=1`, so git never falls through to a personal
+helper. `shipyard-github-app-token --scope-repository --permission NAME=LEVEL`
+does the mint, refuses any broader token, and never caches it. Setup, checks and
+rollback: `docs/git-credential.md`.
 
 `shipyard update` reads public release metadata, so it works with no auth — but
 unauthenticated GitHub API calls are capped at 60/hr. As of v0.68.0 `update`
@@ -4037,6 +4061,11 @@ on every pull request's head from a workflow, so a repository can require it
 and stop landings that never pass through `ghapp`
 (docs/review-verdict-status.md).
 
+The report-only `risk-tier` status (`scripts/risk_tier.py`,
+docs/risk-tier.md) posts the review tier a pull request would need: Low (CI
+only), Moderate (one review-App approval) or High (two, plus the owner for
+workflows, credentials, signing and new dependencies).
+
 Unlike Shipyard's validated enqueue, these requests deliberately do **not**
 carry `SHIPYARD_INTERNAL_QUEUE_MUTATION`, so the arm guard judges them — an
 arm-on-open request is not bound to a validated head, so its live read is the
@@ -4044,7 +4073,10 @@ only thing between it and re-arming a queued or ejected head. `src/auto_arm.rs`
 refuses every state the guard refuses (a unit test asserts that agreement), and
 `GHAPP_ALLOW_QUEUE_REARM` is never set by Shipyard. The periodic counterpart is
 `shipyard runner steward --arm-unqueued`, which arms only pull requests the
-steward declines to own; see
+steward declines to own. Under `--apply` it takes the central HOLD,
+`mutation_machine` authority and control lock before arming (a HOLD is reported,
+not a failure), and each `--repo` mints its own token, so it runs from launchd's
+`$HOME`. See
 [references/merge-steward.md](references/merge-steward.md).
 
 Branch refreshes are the third guarded mutation, and the only one whose
@@ -5303,8 +5335,11 @@ merge-group runs are not counted, and it is not limited to the scorecard window.
 
 ### Repeated-work cost
 
-`shipyard metrics repeated-work-cost` is read-only shadow accounting; duration
-remains unavailable until queue-to-metrics provenance is authenticated.
+`shipyard metrics repeated-work-cost` is read-only shadow accounting. Its
+`duration_ms` is measured superseded-job runtime from the authenticated queue
+timing table, bounded by `--since`, counted once per distinct superseded job
+with excluded and unmatched coverage visible. It never changes queue or merge
+authority.
 
 ### Prospective baseline pass history
 
@@ -5313,6 +5348,23 @@ atomic sidecar. Readiness requires observed continuity; historical activity
 counts and status-only runs must not be used to manufacture prospective
 coverage. Sidecars are keyed by repository, source identity, cadence, and
 configuration so changing collection policy cannot mix incompatible history.
+Provider reads retry only recognized transport failures with bounded backoff
+(default: two retries, three attempts). stderr takes precedence over stdout;
+configuration fields such as `timeout_seconds` and `deadline` in structured
+output are not transport errors. With no stderr, a recognized stdout transport
+diagnostic remains retryable;
+authentication, schema, malformed-data, and receipt-handoff failures stay
+terminal. Use `--provider-retries` and
+`--provider-retry-delay-seconds` only to tune that explicit bounded policy.
+# Local Rust gate placement
+
+The pre-push hook selects the repository-pinned Rust channel on the current
+host. Any fleet host with that channel plus rustfmt and clippy may run local
+formatting and lint gates; m1 is a fallback, not a universal gate. Local gates
+do not grant merge authority: GitHub CI, branch protection, and the configured
+Shipyard mutation machine remain authoritative.
+
+
 
 ### Durable reviewer handoff
 

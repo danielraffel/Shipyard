@@ -24,6 +24,7 @@ is `UNKNOWN`.
 | merge queue: present/absent, enforcement, grouping strategy, `max_entries_to_merge`, `max_entries_to_build`, `min_entries_to_merge`, merge method, check timeout | `GET /repos/{o}/{r}/rulesets` + per-ruleset detail, corroborated by GraphQL `repository.mergeQueue(branch:)` |
 | strict up-to-date protection, and its consequence | `GET /repos/{o}/{r}/branches/{b}/protection` |
 | how to enqueue, with the exact merge method this repo requires | the queue's own configuration |
+| batching strategy: queue-only, direct-only, rollup-then-enqueue, rollup-then-direct, or unknown | measured queue state plus the repository's `[train]` configuration |
 | where each required check actually executes | a completed job's `runner_name` / `runner_group_name` |
 | open-pull-request backlog by mergeability | GraphQL `pullRequests.mergeStateStatus` |
 | base health: did the base tip pass its required gate | `GET commits/{base}` → `actions/runs?head_sha=<tip>&event=merge_group` → each run's `jobs`, judged on the required contexts' jobs; the detector's `base-poison-signal/v1` annotation is shown beside it |

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
@@ -733,14 +733,44 @@ fn annotate_required_checks(
     // context.  Treat that pair as one materialized producer.  Keep every
     // other conflicting pair intact so a failure or pending attempt still
     // fails closed below instead of being silently replaced by a success.
-    for entries in materialized_by_name.values_mut() {
+    let policy_app_ids_by_context = policy.iter().fold(
+        BTreeMap::<&str, BTreeSet<Option<u64>>>::new(),
+        |mut app_ids, required| {
+            app_ids
+                .entry(required.context.as_str())
+                .or_default()
+                .insert(required.app_id);
+            app_ids
+        },
+    );
+
+    // The materialized endpoint intentionally omits producer identity. When
+    // policy names the same context for more than one producer, a successful
+    // row cannot be assigned to either producer safely: two successes may be
+    // two attempts from one app, while the other app is still pending or
+    // failed. Keep those rows as blockers below and synthesize PENDING for
+    // every policy entry in the ambiguous context.
+    let ambiguous_contexts: BTreeSet<String> = policy_app_ids_by_context
+        .iter()
+        .filter(|(_, app_ids)| app_ids.len() > 1)
+        .map(|(context, _)| (*context).to_owned())
+        .collect();
+
+    for (name, entries) in &mut materialized_by_name {
         let has_success = entries.iter().any(|entry| {
             entry
                 .get("state")
                 .and_then(Value::as_str)
                 .is_some_and(|state| state.eq_ignore_ascii_case("SUCCESS"))
         });
-        if has_success {
+        // `gh pr checks --required` does not expose the producer app id. If
+        // the policy has multiple producers for one context, keeping a
+        // skipped attempt is the only fail-closed choice: a success from one
+        // app must not erase a skipped required check from another app.
+        let has_one_policy_producer = policy_app_ids_by_context
+            .get(name.as_str())
+            .is_none_or(|app_ids| app_ids.len() <= 1);
+        if has_success && has_one_policy_producer {
             entries.retain(|entry| {
                 !entry
                     .get("state")
@@ -751,9 +781,13 @@ fn annotate_required_checks(
     }
 
     for required in policy {
-        let observed = materialized_by_name
-            .get_mut(&required.context)
-            .and_then(Vec::pop);
+        let observed = if ambiguous_contexts.contains(&required.context) {
+            None
+        } else {
+            materialized_by_name
+                .get_mut(&required.context)
+                .and_then(Vec::pop)
+        };
         let state = observed
             .as_ref()
             .and_then(|entry| entry.get("state"))
@@ -2134,6 +2168,99 @@ mod tests {
         assert_eq!(rollup[0]["name"], "macos");
         assert_eq!(rollup[1]["name"], "macos");
         assert_eq!(rollup[1]["isRequired"], true);
+    }
+
+    #[test]
+    fn required_check_annotation_keeps_skipped_attempt_for_distinct_required_apps() {
+        let mut snapshot = serde_json::json!({"statusCheckRollup": []});
+        annotate_required_checks(
+            &mut snapshot,
+            &[
+                RequiredCheck {
+                    context: "shared".to_owned(),
+                    app_id: Some(10),
+                },
+                RequiredCheck {
+                    context: "shared".to_owned(),
+                    app_id: Some(11),
+                },
+            ],
+            &[
+                serde_json::json!({
+                    "name": "shared",
+                    "state": "SKIPPED",
+                    "bucket": "skipping",
+                    "link": "https://github.test/check/old"
+                }),
+                serde_json::json!({
+                    "name": "shared",
+                    "state": "SUCCESS",
+                    "bucket": "pass",
+                    "link": "https://github.test/check/new"
+                }),
+            ],
+        );
+
+        let rollup = snapshot["statusCheckRollup"].as_array().expect("rollup");
+        assert_eq!(rollup.len(), 4);
+        let policy_rows: Vec<&Value> = rollup
+            .iter()
+            .filter(|entry| entry.get("app_id").and_then(Value::as_u64).is_some())
+            .collect();
+        assert_eq!(policy_rows.len(), 2);
+        assert!(policy_rows.iter().all(|entry| entry["state"] == "PENDING"));
+        assert!(rollup.iter().any(|entry| entry["state"] == "SKIPPED"));
+        assert!(rollup.iter().any(|entry| entry["state"] == "SUCCESS"));
+    }
+
+    #[test]
+    fn required_check_annotation_does_not_assign_duplicate_successes_to_distinct_apps() {
+        let mut snapshot = serde_json::json!({"statusCheckRollup": []});
+        annotate_required_checks(
+            &mut snapshot,
+            &[
+                RequiredCheck {
+                    context: "shared".to_owned(),
+                    app_id: Some(10),
+                },
+                RequiredCheck {
+                    context: "shared".to_owned(),
+                    app_id: Some(11),
+                },
+            ],
+            &[
+                serde_json::json!({
+                    "name": "shared",
+                    "state": "SUCCESS",
+                    "bucket": "pass",
+                    "link": "https://github.test/check/one"
+                }),
+                serde_json::json!({
+                    "name": "shared",
+                    "state": "SUCCESS",
+                    "bucket": "pass",
+                    "link": "https://github.test/check/two"
+                }),
+            ],
+        );
+
+        let rollup = snapshot["statusCheckRollup"].as_array().expect("rollup");
+        // Neither app can be credited with an identity-free success. The two
+        // original successes remain as unassigned required blockers, while
+        // both policy entries stay pending.
+        assert_eq!(rollup.len(), 4);
+        let policy_rows: Vec<&Value> = rollup
+            .iter()
+            .filter(|entry| entry.get("app_id").and_then(Value::as_u64).is_some())
+            .collect();
+        assert_eq!(policy_rows.len(), 2);
+        assert!(policy_rows.iter().all(|entry| entry["state"] == "PENDING"));
+        assert!(
+            rollup
+                .iter()
+                .filter(|entry| entry.get("app_id").is_some_and(Value::is_null))
+                .all(|entry| entry["state"] == "SUCCESS")
+        );
     }
 
     #[test]

@@ -2189,6 +2189,90 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn arm_unqueued_apply_obeys_central_hold_before_native_arm() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+printf '%s\\n' "$*" >> '{}'
+case "$*" in
+  *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  *enablePullRequestAutoMerge*) echo "native arm must not run under HOLD" >&2; exit 90 ;;
+  *) printf '%s' '{{}}' ;;
+esac
+"#,
+            log.display()
+        ),
+    );
+    let observation = observation_for(ready_pr(), true);
+    let args = StewardCommandArgs {
+        repos: vec!["owner/repo".to_owned()],
+        base: "main".to_owned(),
+        opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
+        managed_label: MANAGED_LABEL.to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
+        coalesce: false,
+        preempt_capacity: false,
+        max_preemptions_per_head: 1,
+        arm_unqueued: true,
+        wake_owner: false,
+        apply: true,
+        ledger: None,
+    };
+    let mut ledger = StewardLedger::default();
+    let control = mutation_control(&temp, "studio", "studio");
+    let state_root = control.store.path().parent().expect("state root");
+    crate::merge_queue_control::hold(state_root, "incident").expect("hold");
+
+    let (report, failed, _) = apply_repo_plan(
+        &actions,
+        &args,
+        &observation,
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+        0,
+        Some(&control),
+    );
+
+    assert!(!failed, "a central HOLD is a healthy refusal: {report:?}");
+    assert!(
+        report.errors.is_empty(),
+        "HOLD path must have a complete observation: {report:?}"
+    );
+    assert!(
+        report.prs.iter().all(|pr| pr.error.is_none()),
+        "HOLD path must reach the native-arm backstop: {report:?}"
+    );
+    assert!(
+        report
+            .native_auto_merge_backstop
+            .policy
+            .starts_with("held:"),
+        "{report:?}"
+    );
+    assert!(
+        report.native_auto_merge_backstop.results.is_empty(),
+        "a central HOLD must produce no arm result: {report:?}"
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .all(|error| !error.contains("native arm must not run")),
+        "{report:?}"
+    );
+    let calls = fs::read_to_string(log).expect("calls");
+    assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
 fn steward_ambiguous_failure_is_durable_shared_uncertainty() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");

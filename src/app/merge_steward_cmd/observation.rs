@@ -2,7 +2,8 @@ use super::{
     BTreeMap, CapacityPreemptionPolicy, CliFailure, Duration, GitHubActions, Instant,
     MergeQueueSnapshot, ObservedPr, Path, RepoObservation, RequiredCheck, StewardCheck, StewardJob,
     StewardPullRequest, StewardRun, Value, is_admin_protection_denied,
-    is_capacity_preemption_workflow, is_full_sha, is_private_free_entitlement,
+    is_capacity_preemption_workflow, is_full_sha, is_implicitly_managed,
+    is_private_free_entitlement,
 };
 use crate::required_check_policy::{
     classic_required_checks, encode_path_segment as encode_policy_path_segment,
@@ -280,6 +281,10 @@ fn load_merge_queue_snapshot_once(
     base: &str,
     deadline: Option<Instant>,
 ) -> Result<(MergeQueueSnapshot, usize), String> {
+    // `gh api graphql` has no `--repo` flag. Scope the authenticated client
+    // instead so repository-specific token helpers still receive provenance
+    // while the argv remains valid for the native GitHub CLI.
+    let actions = actions.clone().with_repo_override(repo);
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
@@ -305,7 +310,7 @@ fn load_merge_queue_snapshot_once(
         if let Some(cursor) = cursor.as_deref() {
             args.extend(["-F".to_owned(), format!("cursor={cursor}")]);
         }
-        let value = match gh_json_with_deadline(actions, &args, "merge-queue policy", deadline) {
+        let value = match gh_json_with_deadline(&actions, &args, "merge-queue policy", deadline) {
             Ok(value) => value,
             Err(error) if page == 1 && is_private_free_entitlement(&error) => {
                 return Ok((
@@ -506,7 +511,31 @@ pub(super) fn pull_requests(
         "--json".to_owned(),
         OPEN_PR_LIST_FIELDS.to_owned(),
     ];
-    let value = gh_json(actions, &args, "open PR list")?;
+    let value = match gh_json(actions, &args, "open PR list") {
+        Ok(value) => value,
+        Err(error) if transient_open_pr_error(&error) => {
+            let rest_args = vec![
+                "api".to_owned(),
+                format!(
+                    "repos/{repo}/pulls?state=open&base={}&per_page=100&page=1",
+                    encode_path_segment(base)
+                ),
+            ];
+            let rest = gh_json(actions, &rest_args, "open PR REST fallback")?;
+            let rows = rest
+                .as_array()
+                .ok_or_else(|| "open PR REST fallback was not an array".to_owned())?;
+            if rows.len() == 100 {
+                return Err(
+                    "open PR REST fallback reached 100; refusing a possibly partial snapshot"
+                        .to_owned(),
+                );
+            }
+            let rows = rows.iter().map(rest_pull_request_row).collect::<Vec<_>>();
+            Value::Array(rows)
+        }
+        Err(error) => return Err(error),
+    };
     let rows = value
         .as_array()
         .ok_or_else(|| "open PR list was not an array".to_owned())?;
@@ -516,6 +545,79 @@ pub(super) fn pull_requests(
         ));
     }
     rows.iter().map(|row| parse_pr(row, positions)).collect()
+}
+
+fn transient_open_pr_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "bad gateway",
+        "http 502",
+        "http 504",
+        "gateway timeout",
+        "service unavailable",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "connection reset",
+        "timed out",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn rest_pull_request_row(value: &Value) -> Value {
+    let mut row = serde_json::Map::new();
+    row.insert(
+        "id".to_owned(),
+        value
+            .get("node_id")
+            .cloned()
+            .or_else(|| value.get("id").map(|id| Value::String(id.to_string())))
+            .unwrap_or(Value::Null),
+    );
+    row.insert(
+        "number".to_owned(),
+        value.get("number").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "isDraft".to_owned(),
+        value.get("draft").cloned().unwrap_or(Value::Bool(true)),
+    );
+    row.insert(
+        "baseRefName".to_owned(),
+        value.pointer("/base/ref").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "headRefOid".to_owned(),
+        value.pointer("/head/sha").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "headRefName".to_owned(),
+        value.pointer("/head/ref").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "mergeStateStatus".to_owned(),
+        value.get("mergeable_state").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "autoMergeRequest".to_owned(),
+        value.get("auto_merge").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "labels".to_owned(),
+        value
+            .get("labels")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    );
+    // Force the normal REST check/status hydration path below. The marker is
+    // represented by the same 100-entry sentinel used for a truncated GraphQL
+    // rollup, while parse_check ignores the null entries.
+    row.insert(
+        "statusCheckRollup".to_owned(),
+        Value::Array((0..100).map(|_| Value::Null).collect()),
+    );
+    Value::Object(row)
 }
 
 pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<ObservedPr, String> {
@@ -538,58 +640,57 @@ pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<Ob
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let rollup = row.get("statusCheckRollup").and_then(Value::as_array);
+    let checks = rollup.map_or_else(Vec::new, |rollup| {
+        rollup.iter().filter_map(parse_check).collect()
+    });
+    let fact = StewardPullRequest {
+        number,
+        head_sha: row
+            .get("headRefOid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        head_branch: row
+            .get("headRefName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        author: row
+            .get("author")
+            .and_then(|author| author.get("login"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        draft: row.get("isDraft").and_then(Value::as_bool).unwrap_or(true),
+        merge_state: row
+            .get("mergeStateStatus")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN")
+            .to_owned(),
+        auto_merge_active: row
+            .get("autoMergeRequest")
+            .is_some_and(|request| !request.is_null()),
+        queue_position: positions.get(&number).copied(),
+        labels,
+        checks,
+    };
     // A rollup that is present but at the page cap may be incomplete. A rollup
     // that is absent entirely was never observed, which is not the same as a
     // head with no checks -- so it must not be reported as a complete empty set.
-    // Only a managed pull request ever has its checks consulted: every consumer
-    // is gated behind the managed label, so marking just those reconstructs the
-    // full check set for them while leaving the rest free of a per-PR fetch.
+    // Implicitly managed fleet pull requests consult checks just like explicit
+    // handoffs, so they must also be marked for per-head hydration.
     let check_rollup_maybe_truncated = rollup.map_or_else(
         || {
-            labels
+            fact.labels
                 .iter()
                 .any(|label| label.eq_ignore_ascii_case(super::MANAGED_LABEL))
+                || is_implicitly_managed(&fact)
         },
         |checks| checks.len() == 100,
     );
-    let checks = rollup
-        .into_iter()
-        .flatten()
-        .filter_map(parse_check)
-        .collect();
     Ok(ObservedPr {
         node_id,
         owner: observed_owner(row),
-        fact: StewardPullRequest {
-            number,
-            head_sha: row
-                .get("headRefOid")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            head_branch: row
-                .get("headRefName")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            author: row
-                .get("author")
-                .and_then(|author| author.get("login"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            draft: row.get("isDraft").and_then(Value::as_bool).unwrap_or(true),
-            merge_state: row
-                .get("mergeStateStatus")
-                .and_then(Value::as_str)
-                .unwrap_or("UNKNOWN")
-                .to_owned(),
-            auto_merge_active: row
-                .get("autoMergeRequest")
-                .is_some_and(|request| !request.is_null()),
-            queue_position: positions.get(&number).copied(),
-            labels,
-            checks,
-        },
+        fact,
         check_rollup_maybe_truncated,
     })
 }
@@ -736,17 +837,18 @@ fn hydrate_required_check_identities_with_deadline(
 
 /// Whether this pull request's check set can reach a decision.
 ///
-/// Every consumer of `StewardPullRequest::checks` is gated behind the managed
-/// label: an unmanaged pull request is classified `Unmanaged` before its checks
-/// are weighed, and `pull_request_is_managed` conjoins the label with the
-/// handoff status. Hydrating a head whose checks cannot change an outcome costs
-/// a round trip per open pull request, which is the cost that must not scale
-/// with the backlog.
+/// Every consumer of `StewardPullRequest::checks` is gated behind explicit or
+/// implicit management: an ordinary unmanaged pull request is classified
+/// `Unmanaged` before its checks are weighed, while fleet-authored pull
+/// requests are managed before the label handoff is copied. Hydrating a head
+/// whose checks cannot change an outcome costs a round trip per open pull
+/// request, which is the cost that must not scale with the backlog.
 fn checks_are_consulted(pr: &ObservedPr) -> bool {
     pr.fact
         .labels
         .iter()
         .any(|label| label.eq_ignore_ascii_case(super::MANAGED_LABEL))
+        || is_implicitly_managed(&pr.fact)
 }
 
 fn hydrate_complete_head_checks(
