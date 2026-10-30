@@ -5864,18 +5864,18 @@ mod tests {
             total_ms: ms,
         };
         store
-            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("clean", "clean", Some(10)))
+            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("sy-clean", "clean", Some(10)))
             .unwrap();
         store
             .record_queue_terminal(
                 QUEUE_AUTHORITY_TOKEN,
-                &mk("uncertain", "uncertain", Some(20)),
+                &mk("sy-uncertain", "uncertain", Some(20)),
             )
             .unwrap();
         store
             .record_queue_terminal(
                 QUEUE_AUTHORITY_TOKEN,
-                &mk("cancel", "cancelled_mid_run", Some(30)),
+                &mk("sy-cancel", "cancelled_mid_run", Some(30)),
             )
             .unwrap();
         for id in [
