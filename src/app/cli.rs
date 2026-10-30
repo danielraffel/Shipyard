@@ -1544,6 +1544,16 @@ pub(crate) struct MetricsGateCostArgs {
     /// yields is cached, never the log.
     #[arg(long, requires = "scorecard")]
     pub(crate) causes: bool,
+    /// Name causes from a local `cause record` archive instead of reading
+    /// GitHub job logs. The archive is bounded and joined by exact repo/run/job
+    /// identity; ambiguous rows stay unreadable.
+    #[arg(
+        long = "causes-archive",
+        value_name = "DIR",
+        requires = "scorecard",
+        conflicts_with = "causes"
+    )]
+    pub(crate) causes_archive: Option<PathBuf>,
     /// Most red jobs whose job and log `--causes` (or `--export-cases`)
     /// fetches in one run, newest first; each costs two GitHub API calls. A
     /// job whose cause is cached does not count. Jobs over the budget count
@@ -4326,6 +4336,48 @@ mod tests {
             ])
             .is_err(),
             "--since and --from conflict"
+        );
+    }
+
+    #[test]
+    fn metrics_gate_cost_parses_archive_cause_source() {
+        let cli = Cli::try_parse_from([
+            "shipyard",
+            "metrics",
+            "gate-cost",
+            "--repo",
+            "o/r",
+            "--workflow",
+            "build.yml",
+            "--gate-job",
+            "macos",
+            "--scorecard",
+            "--causes-archive",
+            "/var/lib/shipyard/causes",
+        ])
+        .expect("archive scorecard");
+        let Command::Metrics { command } = cli.command else {
+            panic!("expected metrics command");
+        };
+        let super::MetricsCommand::GateCost(args) = *command else {
+            panic!("expected metrics gate-cost command");
+        };
+        assert_eq!(
+            args.causes_archive.as_deref(),
+            Some(std::path::Path::new("/var/lib/shipyard/causes"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "shipyard",
+                "metrics",
+                "gate-cost",
+                "--scorecard",
+                "--causes",
+                "--causes-archive",
+                "/tmp/archive",
+            ])
+            .is_err(),
+            "live and archive causes must be explicit"
         );
     }
 

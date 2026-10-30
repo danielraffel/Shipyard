@@ -5,6 +5,13 @@ description: Shipyard operations guardrails. Use when working in /Users/danielra
 
 # Shipyard
 
+The gate-cost scorecard can read a bounded historical cause archive with
+`--causes-archive DIR`; the report labels that source as archive and keeps
+malformed, duplicate, truncated, and unjoined rows visible. This is advisory
+measurement only and does not authorize queue or merge actions.
+Missing or unreadable `DIR/causes/` exits unsuccessfully with `cause archive
+unavailable`; only a readable empty directory can report zero archived rows.
+
 Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
 commit-to-pull-requests API, but zero or multiple matches remain unknown.

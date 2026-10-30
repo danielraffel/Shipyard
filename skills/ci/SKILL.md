@@ -92,6 +92,16 @@ that remedy belongs to a different fault that merely shares the 403 status code.
 
 ## Metrics authority
 
+`shipyard metrics gate-cost --scorecard --causes-archive DIR` is a bounded,
+read-only historical cause score. It reads JSONL under `DIR/causes/`, requires
+the exact repository/run/positive-attempt/job identity, rejects duplicate or
+malformed rows, and reports archive provenance plus unjoined coverage. It never
+feeds queue, routing, validation, or merge decisions. Live `--causes` remains
+the separate GitHub job-log read.
+Missing or unreadable `DIR/causes/` fails with `cause archive unavailable` before
+GitHub reads or case exports; it never produces a successful zero-count report.
+A readable empty archive remains valid and leaves cases unjoined.
+
 Metrics verdicts (`shipyard metrics compare|watch|trend|scorecard`) default to
 load-independent proxies; wall-clock p50/p90 is load-dependent context. Do not
 call a CI change faster or slower from wall time alone; `--basis wall-time`
