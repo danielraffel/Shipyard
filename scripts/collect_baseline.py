@@ -19,6 +19,7 @@ import subprocess
 import sqlite3
 import tempfile
 import sys
+import time
 from contextlib import contextmanager
 from typing import Any, Sequence
 
@@ -37,6 +38,39 @@ from baseline_pass_history import (
 REQUIRED_STRATA = ("normal_pr", "merge_group", "rerun", "outage", "concurrent_agents")
 STRATA_CONTRACT = "shipyard-metrics-strata/v1"
 PRODUCER_STRATA = ("normal_pr", "merge_group", "rerun", "unclassified")
+TRANSIENT_PROVIDER_ERROR_MARKERS = (
+    "connection reset",
+    "connection refused",
+    "connection timed out",
+    "connection closed",
+    "operation timed out",
+    "timed out",
+    "i/o timeout",
+    "dial tcp",
+    "deadline exceeded",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "could not resolve host",
+    "tls handshake timeout",
+    "temporarily unavailable",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "server error",
+    "rate limit",
+    "rate_limit",
+    "secondary rate",
+    "unexpected eof",
+    "http 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+)
+DEFAULT_PROVIDER_RETRIES = 2
+DEFAULT_PROVIDER_RETRY_DELAY_SECONDS = 5.0
+MAX_PROVIDER_RETRIES = 5
+MAX_PROVIDER_RETRY_DELAY_SECONDS = 300.0
 
 
 def run(command: Sequence[str], *, stdin: str | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -44,6 +78,52 @@ def run(command: Sequence[str], *, stdin: str | None = None, timeout: int = 300)
         return subprocess.run(command, input=stdin, text=True, capture_output=True, check=False, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"command timed out after {timeout}s: {command[0]}") from exc
+
+
+def transient_provider_failure(result: subprocess.CompletedProcess[str]) -> bool:
+    """Recognize transport failures that are safe to retry with bounded backoff."""
+    if result.returncode == 0:
+        return False
+    # stderr is the error channel; stdout may be structured provider data
+    # containing fields such as timeout_seconds or deadline. Only fall back
+    # to stdout when the provider emitted no stderr diagnostic.
+    text = ((result.stderr or "").strip() or (result.stdout or "").strip()).casefold()
+    return any(marker in text for marker in TRANSIENT_PROVIDER_ERROR_MARKERS) or bool(
+        re.search(r"(?:^|:\s*)timeout[.!]?\s*$", text)
+    )
+
+
+def run_provider_with_retry(command: Sequence[str], *, stdin: str | None = None,
+                            timeout: int = 300, retries: int = DEFAULT_PROVIDER_RETRIES,
+                            delay_seconds: float = DEFAULT_PROVIDER_RETRY_DELAY_SECONDS
+                            ) -> subprocess.CompletedProcess[str]:
+    """Retry only recognized provider transport failures."""
+    if retries < 0 or retries > MAX_PROVIDER_RETRIES:
+        raise ValueError(f"provider retries must be between 0 and {MAX_PROVIDER_RETRIES}")
+    if not math.isfinite(delay_seconds) or not 0 <= delay_seconds <= MAX_PROVIDER_RETRY_DELAY_SECONDS:
+        raise ValueError(
+            "provider retry delay must be finite and between "
+            f"0 and {MAX_PROVIDER_RETRY_DELAY_SECONDS} seconds"
+        )
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        try:
+            return run(command, stdin=stdin, timeout=timeout)
+        except RuntimeError as exc:
+            # `run` wraps subprocess.TimeoutExpired so callers get a stable
+            # error type. Convert that specific provider timeout back into a
+            # retry-classifiable result; validation and other failures remain
+            # terminal.
+            if "command timed out after" not in str(exc).casefold():
+                raise
+            return subprocess.CompletedProcess(command, 1, "", str(exc))
+
+    result = run_attempt()
+    for attempt in range(retries):
+        if not transient_provider_failure(result):
+            break
+        time.sleep(delay_seconds * (2 ** attempt))
+        result = run_attempt()
+    return result
 
 
 def state_identity(path: pathlib.Path, project: str, repo: str, db: pathlib.Path) -> dict[str, str]:
@@ -81,6 +161,25 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     merge_receipts = getattr(args, "merge_receipts", None)
     if merge_receipts is not None:
         receipt_path = pathlib.Path(merge_receipts).expanduser()
+        # The producer handoff is optional until Shipyard has emitted its first
+        # authenticated merge receipt.  An absent handoff must leave the
+        # safe-merge denominator unavailable while allowing the provider
+        # baseline to advance.  A present handoff still requires the health
+        # sidecar and all fail-closed validation below.
+        try:
+            os.lstat(receipt_path)
+        except FileNotFoundError:
+            events = _import_organic_after_preflight(args, state_dir, None)
+            # A newer supervisor may already record the unavailable handoff
+            # while collecting the provider rows.  Keep the older direct
+            # invocation compatible without emitting a duplicate event when
+            # both versions are combined during a staged rollout.
+            if not any(event.get("source") == "merge-receipt" for event in events):
+                events.append({"source": "merge-receipt", "status": "unavailable",
+                               "reason": "producer handoff not present"})
+            return events
+        except OSError as exc:
+            raise RuntimeError(f"merge receipt handoff is unreadable: {exc}") from exc
         health_path = getattr(args, "merge_receipt_health", None)
         if health_path is None:
             raise RuntimeError("merge receipt health sidecar is required with --merge-receipts")
@@ -115,15 +214,22 @@ def immutable_handoff_snapshot(path: pathlib.Path, payload: bytes):
 def _import_organic_after_preflight(args: argparse.Namespace, state_dir: str,
                                     receipt_snapshot: pathlib.Path | None) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
-    merge_receipts = getattr(args, "merge_receipts", None)
     receipt_path = receipt_snapshot
     before = count_jobs(args.db, args.project, args.repo)
-    github = run([args.shipyard, "--state-dir", state_dir, "metrics", "import", "github", "--repo", args.repo,
-                  "--project", args.project, "--limit", str(args.limit), "--json"], timeout=args.timeout_seconds)
+    retries = getattr(args, "provider_retries", DEFAULT_PROVIDER_RETRIES)
+    delay_seconds = getattr(args, "provider_retry_delay_seconds", DEFAULT_PROVIDER_RETRY_DELAY_SECONDS)
+    github = run_provider_with_retry(
+        [args.shipyard, "--state-dir", state_dir, "metrics", "import", "github", "--repo", args.repo,
+         "--project", args.project, "--limit", str(args.limit), "--json"],
+        timeout=args.timeout_seconds, retries=retries, delay_seconds=delay_seconds,
+    )
     if github.returncode:
         raise RuntimeError(f"GitHub import failed: {github.stderr.strip()}")
     events.append(summarize_import("github", github.stdout))
-    tartci = run(tartci_export_command(args), timeout=args.timeout_seconds)
+    tartci = run_provider_with_retry(
+        tartci_export_command(args), timeout=args.timeout_seconds,
+        retries=retries, delay_seconds=delay_seconds,
+    )
     if tartci.returncode:
         raise RuntimeError(f"TartCI export failed: {tartci.stderr.strip()}")
     normalized, excluded = prepare_tartci_export(tartci.stdout, args.repo, args.project)
@@ -135,7 +241,7 @@ def _import_organic_after_preflight(args: argparse.Namespace, state_dir: str,
         tartci_event["excluded_unjoinable"] = excluded
         tartci_event["exclusion_reason"] = "missing external_id cannot be joined to a GitHub job"
     events.append(tartci_event)
-    if merge_receipts is not None:
+    if receipt_path is not None:
         imported_receipts = run([
             args.shipyard, "--state-dir", state_dir, "metrics", "import", "merge-receipt",
             "--file", str(receipt_path), "--json",
@@ -147,6 +253,10 @@ def _import_organic_after_preflight(args: argparse.Namespace, state_dir: str,
         if not isinstance(imported_count, int) or isinstance(imported_count, bool) or imported_count < 0:
             raise RuntimeError("merge receipt import count unavailable; refusing to record a successful pass")
         events.append(receipt_event)
+    else:
+        events.append({"source": "merge-receipt", "status": "unavailable",
+                       "reason": getattr(args, "merge_receipt_unavailable_reason", None)
+                       or "fresh authenticated producer handoff is unavailable"})
     unknown_imports = [event["source"] for event in events
                        if event.get("source") in {"github", "tartci"}
                        and (not isinstance(event.get("imported"), int)
@@ -541,6 +651,14 @@ def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
                                         reference_at=dt.datetime.now(dt.timezone.utc))
 
 
+def force_receipt_metrics_unavailable(card: dict[str, Any], reason: str) -> None:
+    """Prevent stale local receipts from becoming a current denominator."""
+    unavailable = {"status": "unavailable", "value": None, "reason": reason}
+    card["safely_merged_changes"] = dict(unavailable)
+    card["collector_safe_merge_denominator"] = dict(unavailable)
+    card["wasted_compute_per_safely_merged_change"] = dict(unavailable)
+
+
 def baseline_readiness(card: dict[str, Any], started: dt.datetime,
                        observed_at: dt.datetime,
                        pass_history: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -746,10 +864,17 @@ def main() -> int:
                         help="maximum producer handoff age when --merge-receipt-health is supplied")
     parser.add_argument("--merge-receipt-base-branch", default="main",
                         help="protected base branch bound to producer receipts")
+    parser.add_argument("--merge-receipt-unavailable-reason",
+                        help="explicit reason the authenticated producer handoff was unavailable")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--since-days", type=int, default=5)
     parser.add_argument("--collect", action="store_true", help="run provider imports")
     parser.add_argument("--timeout-seconds", type=int, default=300)
+    parser.add_argument("--provider-retries", type=int, default=DEFAULT_PROVIDER_RETRIES,
+                        help="bounded retries for recognized provider transport failures")
+    parser.add_argument("--provider-retry-delay-seconds", type=float,
+                        default=DEFAULT_PROVIDER_RETRY_DELAY_SECONDS,
+                        help="initial delay before a provider retry; doubles per attempt")
     parser.add_argument("--pass-history", type=pathlib.Path,
                         help="prospective pass history sidecar (defaults beside --state)")
     parser.add_argument("--source-identity", default="shipyard.collect_baseline:v1")
@@ -759,6 +884,13 @@ def main() -> int:
     args = parser.parse_args()
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
+    if not 0 <= args.provider_retries <= MAX_PROVIDER_RETRIES:
+        parser.error(f"--provider-retries must be between 0 and {MAX_PROVIDER_RETRIES}")
+    if not math.isfinite(args.provider_retry_delay_seconds) or not 0 <= args.provider_retry_delay_seconds <= MAX_PROVIDER_RETRY_DELAY_SECONDS:
+        parser.error(
+            "--provider-retry-delay-seconds must be finite and between "
+            f"0 and {MAX_PROVIDER_RETRY_DELAY_SECONDS} seconds"
+        )
     if args.expected_interval_secs <= 0:
         parser.error("--expected-interval-secs must be positive")
     if args.cadence_slack_secs < 0:
@@ -772,6 +904,14 @@ def main() -> int:
     try:
         events = import_organic(args) if args.collect else []
         card = authoritative_scorecard(args)
+        if args.collect:
+            receipt_events = [event for event in events if event.get("source") == "merge-receipt"]
+            unavailable = next((event for event in receipt_events if event.get("status") == "unavailable"), None)
+            if unavailable is not None:
+                force_receipt_metrics_unavailable(
+                    card,
+                    str(unavailable.get("reason") or "fresh authenticated producer handoff is unavailable"),
+                )
         completed_at = dt.datetime.now(dt.timezone.utc)
         if args.collect:
             counts = [event.get("imported") for event in events if event.get("source") in {"github", "tartci"}]

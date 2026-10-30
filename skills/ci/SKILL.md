@@ -5,6 +5,20 @@ description: "Cross-platform CI coordination with Shipyard: validates, ships, ma
 
 # CI Operations with Shipyard
 
+## Required-check producer identity
+
+When CI code consumes required-check materialization, preserve producer
+identity (`app_id`) when policy distinguishes checks that share a context name.
+If the materialized endpoint omits that identity, retain ambiguous skipped
+attempts so a success from one producer cannot satisfy another producer.
+
+`metrics repeated-work-cost` is read-only accounting for shadow observations
+within its explicit `--since` baseline window. Its `duration_ms` is measured
+runtime from authenticated timing for each distinct superseded queue job, with
+clean, uncertain, cancelled, and unmatched coverage. It never uses survivor
+runtime as savings; never use it to skip validation, alter routing, or authorize
+a merge.
+
 ## Adopting Shipyard, or checking what a repository already has
 
 Before wiring any CI machinery into a repository (a PR gate, a merge queue, a
@@ -77,6 +91,16 @@ refreshing the daemon or clearing token caches: the credential is valid, and
 that remedy belongs to a different fault that merely shares the 403 status code.
 
 ## Metrics authority
+
+`shipyard metrics gate-cost --scorecard --causes-archive DIR` is a bounded,
+read-only historical cause score. It reads JSONL under `DIR/causes/`, requires
+the exact repository/run/positive-attempt/job identity, rejects duplicate or
+malformed rows, and reports archive provenance plus unjoined coverage. It never
+feeds queue, routing, validation, or merge decisions. Live `--causes` remains
+the separate GitHub job-log read.
+Missing or unreadable `DIR/causes/` fails with `cause archive unavailable` before
+GitHub reads or case exports; it never produces a successful zero-count report.
+A readable empty archive remains valid and leaves cases unjoined.
 
 Metrics verdicts (`shipyard metrics compare|watch|trend|scorecard`) default to
 load-independent proxies; wall-clock p50/p90 is load-dependent context. Do not
@@ -346,9 +370,11 @@ Two things not to conclude from it:
 The periodic counterpart for pull requests that slipped through anyway — opened
 by another route, or ejected and left unarmed — is
 `shipyard runner steward --arm-unqueued` (audit-only without `--apply`), with
-`scripts/install_arm_unqueued.sh` to run it on a timer. It acts only on pull
+`scripts/install_arm_unqueued.sh` to run it on a timer (install it only on the
+`[merge_queue].mutation_machine` host; each run is bounded by `/usr/bin/timeout`,
+and `--status` / `--uninstall` inspect or remove it). It acts only on pull
 requests the steward itself declines to own, so it cannot contend with the
-enqueue path. See the shipyard skill's
+enqueue path, and it honours the central HOLD before arming. See the shipyard skill's
 [merge-steward reference](../shipyard/references/merge-steward.md).
 
 ## The unattended carrier: `runner carrier`
@@ -531,6 +557,13 @@ guard's own decision posted on the head; it is report-only until a
 repository requires it. A red `review-verdict` means the guard would refuse
 that head; fix the verdict, not the status.
 
+**The `risk-tier` status says how much review a head would need.**
+`scripts/risk_tier.py` (`.github/workflows/risk-tier.yml`, docs/risk-tier.md)
+classifies a pull request Low, Moderate or High from its paths, dependency
+changes, version bump, size and `risk:*` labels, with path lists from the
+base's `[review.tiers]`. It is report-only: always `success`, never required.
+Run it locally with `python3 scripts/risk_tier.py --repo R --pr N --gh ghapp`.
+
 **Shipyard's own CI names its reds.** When any job in a `ci.yml` run fails,
 the advisory `ci-cause` job reads the failed jobs' finished logs and prints one
 `ci.cause/v1` record per job as a `::notice title=ci-cause::` annotation
@@ -563,8 +596,9 @@ record's own `named_at`.
 It prints `::notice title=ci-cause::<record>`, so the job's own log holds its
 `ci.cause/v1` record; the scorecard keeps its `named_at` only when the record
 is bound to that job (repo, head, run, attempt, job name) and names the cause
-the scorecard reads from the log, so a forged line changes nothing. Keep records with `shipyard cause archive --dir <dir> --input
-<file>` (append-only, one file per month, ids never duplicated).
+the scorecard reads from the log, so a forged line changes nothing. Keep records with
+`shipyard cause archive --dir <labels checkout>/data/ci-cause --input <file>`
+(append-only, one file per month under `causes/`, ids never duplicated).
 
 **A rollup lands on its members' approvals.** On a base with `[train]
 mode = "rollup"`, a `shipyard-train/rollup-*` head with no verdict of its own
@@ -972,6 +1006,7 @@ PRs are gone.
 | Move one PR's waiting jobs to the front | `shipyard queue prioritize --pr <n> --repo OWNER/REPO --apply --json` |
 | Merge on green (cron-safe one-shot) | `shipyard auto-merge <pr>` (0=merged, 1=fail, 2=not-found, 3=in-flight, 10=automatic classic merge refused) |
 | Diagnose RELEASE_BOT_TOKEN | `shipyard release-bot status --json` |
+| Push as the App, scoped to one repo | `shipyard auth git-credential` as the github.com credential helper with `useHttpPath = true` and machine-global `git_credential.repositories` (see `docs/git-credential.md`) |
 | Configure RELEASE_BOT_TOKEN | `shipyard release-bot setup` (guided) |
 | Re-paste token after rotation | `shipyard release-bot setup --paste` |
 | Opt in to post-release docs sync | `shipyard changelog init` then `shipyard release-bot hook install` |
@@ -1129,7 +1164,7 @@ writer custody before mutation.
 | Dispatch only if remote matches HEAD | `shipyard cloud run build --require-sha HEAD --json` |
 | Opt a target into cross-PR reuse | set `reuse_if_paths_unchanged = ["src/backend/**"]` under `[targets.<name>]` |
 | Opt a target into warm-pool reuse | set `warm_keepalive_seconds = 600` under `[targets.<name>]` (see "Warm-pool reuse" below) |
-| Inspect warm-pool entries | `shipyard targets warm status --json` |
+| Inspect warm-pool entries | `shipyard targets warm status --json` (host-pool entries include the selected `member_id` when known) |
 | Drain the warm-pool (force cold-start everywhere) | `shipyard targets warm drain --yes` |
 | Force cold-start for one ship only | `shipyard ship --no-warm` (or `shipyard run --no-warm`) |
 | Global warm-pool kill switch | `SHIPYARD_NO_WARM_POOL=1` in the environment |
@@ -4170,6 +4205,10 @@ the digest rejects a PR URL whose repository path does not match its census.
 Malformed top-level GraphQL errors, required policy values, or label/assignee
 nodes are also fatal; they must not be filtered into an empty result.
 
+### Steward check hydration
+
+The merge steward implicitly manages fleet-authored pull requests before the explicit `shipyard:managed` handoff label is copied. Census observation must therefore hydrate required check identities for those exact heads, while ordinary human pull requests remain excluded from per-PR hydration. Keep this predicate shared with steward classification so green fleet work is not stranded as `waiting_required`.
+
 ### Merge receipt import provenance
 
 The metrics merge-receipt importer is telemetry only. It requires a
@@ -4183,10 +4222,21 @@ waste is not limited to the scorecard window.
 # Repeated-work cost
 
 `shipyard metrics repeated-work-cost` is read-only shadow accounting. Treat
-duration as unavailable until queue-to-metrics provenance is authenticated.
+`duration_ms` as measured superseded-job runtime from the authenticated queue
+timing table within the requested `--since` window. It counts each distinct
+superseded job once; uncertain, cancelled, and unmatched jobs remain coverage
+gaps, and the result never authorizes a queue or merge decision.
 
 
 At the protected merge boundary, Shipyard may produce that receipt only after
 GitHub confirms the exact validated head is merged and supplies a nonzero merge
 commit and merge timestamp. Queue admission or auto-merge activation is not a
 merge receipt; queue supervision must wait for the later merged observation.
+# Local Rust gate placement
+
+Shipyard's pre-push hook selects the repository-pinned Rust channel on the
+current host. Any fleet host with that channel plus rustfmt and clippy may run
+the local formatting and lint gates; m1 is a fallback, not a universal gate.
+These checks are a push safeguard only. GitHub CI, branch protection, and the
+configured Shipyard mutation machine remain the landing authority.
+

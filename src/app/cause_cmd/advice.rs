@@ -1,5 +1,6 @@
 //! Deterministic, read-only historical cause advice.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -86,12 +87,21 @@ pub(super) fn command<W: Write>(
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
-        writeln!(out, "score\tjob\tsignature\tclass\tfix")
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        writeln!(
+            out,
+            "score\tjob\tsignature\tclass\tfix\tfix_head\tfix_derivation"
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
         for c in &result.candidates {
+            let (fix_head, fix_derivation) = c.fix_link.as_ref().map_or(("none", "none"), |link| {
+                (
+                    link["fix_head_sha"].as_str().unwrap_or("unknown"),
+                    link["derivation"].as_str().unwrap_or("unknown"),
+                )
+            });
             writeln!(
                 out,
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 c.match_score,
                 c.cause["job"].as_str().unwrap_or(""),
                 c.cause["signature"].as_str().unwrap_or(""),
@@ -100,7 +110,9 @@ pub(super) fn command<W: Write>(
                     "available"
                 } else {
                     "none"
-                }
+                },
+                fix_head,
+                fix_derivation,
             )
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
@@ -174,6 +186,7 @@ fn advise(
     args: &CauseAdviseArgs,
     windows: &[Window],
 ) -> Result<(Vec<Candidate>, usize), CliFailure> {
+    super::require_archive_parent(&args.dir).map_err(|error| CliFailure::new(2, error))?;
     let rows = read_causes(&args.dir.join("causes"))?;
     let fixlinks = read_fixlinks(&args.dir.join("fixlinks.jsonl"))?;
     let needle = tokens(&args.query);
@@ -226,20 +239,7 @@ fn advise(
             continue;
         }
         out.push(Candidate {
-            fix_link: fixlinks
-                .iter()
-                .find(|f| {
-                    let red_run_id = f["red_run_id"].as_u64();
-                    let cause_run_id = row["run_id"].as_u64();
-                    let red_attempt = f["red_attempt"].as_u64();
-                    let cause_attempt = row["attempt"].as_u64();
-                    f["repo"] == args.repo
-                        && red_run_id.is_some()
-                        && red_run_id == cause_run_id
-                        && red_attempt.is_some()
-                        && red_attempt == cause_attempt
-                })
-                .cloned(),
+            fix_link: matching_fixlink(&fixlinks, &args.repo, &row),
             cause: row,
             match_score: score,
             match_fields: matched,
@@ -266,6 +266,74 @@ fn advise(
     Ok((out, suppressed))
 }
 
+/// Return the useful fix-link for a red run when its derivation is unambiguous.
+/// Duplicate archive rows are harmless; independently derived fixes are not.
+///
+/// A red attempt can legitimately have both a same-head green rerun and a
+/// later green run on a different fixing head. `cause audit` permits that pair
+/// because the rerun is evidence that the original head recovered while the
+/// compare link identifies the push that fixed the underlying failure. Advice
+/// presents the compare link, preserving the actionable fixing push without
+/// discarding either archived record.
+fn matching_fixlink(fixlinks: &[Value], repo: &str, cause: &Value) -> Option<Value> {
+    let cause_run_id = cause["run_id"].as_u64()?;
+    let cause_attempt = cause["attempt"].as_u64()?;
+    let matches: Vec<&Value> = fixlinks
+        .iter()
+        .filter(|fix| {
+            fix["repo"] == repo
+                && fix["head_sha"] == cause["head_sha"]
+                && fix["red_run_id"] == cause_run_id
+                && fix["red_attempt"] == cause_attempt
+        })
+        .collect();
+    let keys: BTreeSet<(String, String)> = matches
+        .iter()
+        .map(|fix| {
+            (
+                fix_identity(fix),
+                fix["derivation"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    if keys.len() == 1 {
+        return matches.first().map(|fix| (*fix).clone());
+    }
+
+    let has_rerun = keys
+        .iter()
+        .any(|(_, derivation)| derivation == "rerun_green");
+    let compare = keys
+        .iter()
+        .filter(|(_, derivation)| derivation == "compare_red_head_to_fix_head")
+        .count();
+    if has_rerun && compare == 1 && keys.len() == 2 {
+        return matches
+            .iter()
+            .find(|fix| fix["derivation"] == "compare_red_head_to_fix_head")
+            .map(|fix| (*fix).clone());
+    }
+
+    None
+}
+
+/// Identity for a validated link's producer evidence. Archive duplicates may
+/// reorder JSON fields, but a different run or evidence must remain a conflict.
+fn fix_identity(fix: &Value) -> String {
+    serde_json::json!({
+        "fix_run_id": fix["fix_run_id"],
+        "fix_head_sha": fix["fix_head_sha"],
+        "derivation": fix["derivation"],
+        "pushed_at": fix["pushed_at"],
+        "files_raw": fix["files_raw"],
+        "files_truncated": fix["files_truncated"],
+        "own_files": fix["own_files"],
+        "own_files_method": fix["own_files_method"],
+        "own_files_truncated": fix["own_files_truncated"],
+    })
+    .to_string()
+}
+
 fn read_fixlinks(path: &Path) -> Result<Vec<Value>, CliFailure> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -274,13 +342,104 @@ fn read_fixlinks(path: &Path) -> Result<Vec<Value>, CliFailure> {
         .map_err(|e| CliFailure::new(2, e.to_string()))?
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
-        .filter(safe)
+        .filter(valid_fixlink)
         .collect();
-    // If an archive contains several links for one red attempt, choose the
-    // same link regardless of append order.
+    // Keep a deterministic order for duplicate links; matching_fixlink
+    // suppresses an ambiguous red attempt with conflicting valid links.
     links.sort_by_cached_key(Value::to_string);
     Ok(links)
 }
+
+/// Only attach fix-links whose producer identity and evidence are complete.
+/// This prevents a copied, malformed, or cross-head row from being presented
+/// as a historical fix for an otherwise matching cause.
+fn valid_fixlink(value: &Value) -> bool {
+    let Some(derivation) = value["derivation"].as_str() else {
+        return false;
+    };
+    if value["schema"] != SCHEMA
+        || value["source"] != "fix-link"
+        || value["repo"].as_str().is_none_or(str::is_empty)
+        || value["red_run_id"].as_u64().is_none_or(|id| id == 0)
+        || value["red_attempt"]
+            .as_u64()
+            .is_none_or(|attempt| attempt == 0)
+        || value["fix_run_id"].as_u64().is_none_or(|id| id == 0)
+        || !value["head_sha"].as_str().is_some_and(valid_sha)
+        || !value["fix_head_sha"].as_str().is_some_and(valid_sha)
+        || !valid_producer_metadata(value)
+        || !safe(value)
+    {
+        return false;
+    }
+    match derivation {
+        "compare_red_head_to_fix_head" => {
+            value["red_run_id"] != value["fix_run_id"]
+                && value["head_sha"] != value["fix_head_sha"]
+                && value["files_raw"]
+                    .as_array()
+                    .is_some_and(|files| files.iter().all(Value::is_string))
+                && value["files_truncated"].as_bool() == Some(false)
+                && valid_own_files_evidence(value)
+        }
+        "rerun_green" => {
+            value["head_sha"] == value["fix_head_sha"]
+                && value["files_raw"].as_array().is_some_and(Vec::is_empty)
+                && value["own_files"].as_array().is_some_and(Vec::is_empty)
+                && value["files_truncated"].as_bool() == Some(false)
+                && value["own_files_truncated"].as_bool() == Some(false)
+                && value["own_files_method"].as_str() == Some("rerun_same_head")
+        }
+        _ => false,
+    }
+}
+
+/// Validate the producer fields that establish when and why a link was made.
+/// A link with valid-looking SHAs but no timestamps or collector rule is not
+/// enough provenance to present as a historical fix.
+fn valid_producer_metadata(value: &Value) -> bool {
+    let Some(red_time) = value["red_time"].as_str() else {
+        return false;
+    };
+    let Some(pushed_at) = value["pushed_at"].as_str() else {
+        return false;
+    };
+    let (Ok(red_time), Ok(pushed_at)) = (
+        DateTime::parse_from_rfc3339(red_time),
+        DateTime::parse_from_rfc3339(pushed_at),
+    ) else {
+        return false;
+    };
+    if pushed_at <= red_time
+        || value["branch"].as_str().is_none_or(str::is_empty)
+        || value["rule"].as_str().is_none_or(str::is_empty)
+        || value["collector"].as_str().is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    let Some(pr) = value.get("pr") else {
+        return false;
+    };
+    pr.is_null() || pr.as_u64().is_some_and(|number| number > 0)
+}
+
+/// Compare-derived links may legitimately have unknown own-file ownership
+/// (`null`), but the producer must state that fact and its method explicitly.
+fn valid_own_files_evidence(value: &Value) -> bool {
+    let own_files = value.get("own_files");
+    let own_files_shape = own_files.is_some_and(|files| {
+        files.is_null()
+            || files
+                .as_array()
+                .is_some_and(|items| items.iter().all(Value::is_string))
+    });
+    let method = value["own_files_method"].as_str();
+    let truncated = value.get("own_files_truncated");
+    own_files_shape
+        && method.is_some_and(|text| !text.is_empty())
+        && truncated.is_some_and(|value| value.is_null() || value.is_boolean())
+}
+
 static SENSITIVE_MARKER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:github_pat_|\bgh[oprsu]_[A-Za-z0-9]{20,}|(?:token|api[_-]?key|secret|password)\s*[:=])")
         .expect("sensitive marker pattern compiles")
@@ -314,6 +473,18 @@ mod tests {
             limit: 5,
         }
     }
+    #[test]
+    fn legacy_root_causes_are_not_ignored_by_advice() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(dir.path().join("2026-10.jsonl"), row(&"b".repeat(40), 8)).unwrap();
+        let Err(error) = advise(&args(dir.path()), &[]) else {
+            panic!("legacy archive must be refused");
+        };
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("legacy cause archive files"));
+    }
+
     fn row(sha: &str, pr: u64) -> String {
         serde_json::json!({"schema":SCHEMA,"repo":"o/r","head_sha":sha,"pr":pr,"run_id":1,"attempt":1,"job_id":2,"job":"linux","signature":"compile failure","failure_class":"build","confidence":"high","named_at":"2026-10-13T00:00:00Z","completed_at":"2026-10-13T00:00:00Z"}).to_string()
     }
@@ -461,10 +632,18 @@ mod tests {
                 cause
             })
             .collect();
-        let links = ["c", "d"].map(|sha| {
+        let links = ["c", "c"].map(|sha| {
             serde_json::json!({
-                "repo": "o/r", "red_run_id": 1, "red_attempt": 1,
+                "schema": SCHEMA, "source": "fix-link", "repo": "o/r",
+                "red_run_id": 1, "red_attempt": 1, "fix_run_id": 2,
+                "head_sha": "b".repeat(40),
                 "fix_head_sha": sha.repeat(40),
+                "derivation": "compare_red_head_to_fix_head",
+                "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+                "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
+                "files_raw": [], "files_truncated": false,
+                "own_files": [], "own_files_method": "first_parent_non_merge_commits",
+                "own_files_truncated": false,
             })
         });
         let mut query = args(dir.path());
@@ -530,5 +709,250 @@ mod tests {
         a.head_sha = "abc".into();
         let mut out = Vec::new();
         assert_eq!(command(&a, true, &mut out).unwrap_err().code, 2);
+    }
+
+    #[test]
+    fn human_output_names_the_fix_head_and_derivation() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"c".repeat(40), 8),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            serde_json::json!({
+                "schema": SCHEMA,
+                "source": "fix-link",
+                "repo": "o/r",
+                "red_run_id": 1,
+                "red_attempt": 1,
+                "fix_run_id": 1,
+                "head_sha": "c".repeat(40),
+                "fix_head_sha": "c".repeat(40),
+                "derivation": "rerun_green",
+                "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+                "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
+                "files_raw": [],
+                "files_truncated": false,
+                "own_files": [],
+                "own_files_truncated": false,
+                "own_files_method": "rerun_same_head"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut query = args(dir.path());
+        query.pr = None;
+        let mut out = Vec::new();
+        command(&query, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("fix\tfix_head\tfix_derivation"));
+        assert!(text.contains(&format!("{}\trerun_green", "c".repeat(40))));
+    }
+
+    #[test]
+    fn malformed_or_conflicting_fixlinks_are_not_attached() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        let malformed = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 2,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "not-a-sha",
+            "derivation": "compare_red_head_to_fix_head",
+            "files_raw": [],
+            "files_truncated": false,
+            "own_files": [],
+            "own_files_method": "first_parent_non_merge_commits",
+            "own_files_truncated": false
+        });
+        let conflicting = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 2,
+            "head_sha": "a".repeat(40),
+            "fix_head_sha": "c".repeat(40),
+            "derivation": "compare_red_head_to_fix_head",
+                "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+                "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
+            "files_raw": [],
+            "files_truncated": false,
+            "own_files": [],
+            "own_files_method": "first_parent_non_merge_commits",
+            "own_files_truncated": false
+        });
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            format!("{malformed}\n{conflicting}\n"),
+        )
+        .unwrap();
+
+        let mut query = args(dir.path());
+        query.pr = None;
+        let candidates = advise(&query, &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn incomplete_compare_provenance_is_not_attached() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        // The identity fields look plausible, but without producer timestamps
+        // this record cannot prove that the green push came after the red.
+        let incomplete = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "pr": 8,
+            "branch": "feat/x",
+            "rule": "test rule",
+            "collector": "test",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 2,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "c".repeat(40),
+            "derivation": "compare_red_head_to_fix_head",
+            "files_raw": ["src/lib.rs"],
+            "files_truncated": false,
+            "own_files": ["src/lib.rs"],
+            "own_files_method": "first_parent_non_merge_commits",
+            "own_files_truncated": false
+        });
+        fs::write(dir.path().join("fixlinks.jsonl"), incomplete.to_string()).unwrap();
+
+        let mut query = args(dir.path());
+        query.pr = None;
+        let candidates = advise(&query, &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn conflicting_valid_fixlinks_are_not_attached() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        let link = |fix_run_id: u64, fix_head_sha: &str| {
+            serde_json::json!({
+                "schema": SCHEMA,
+                "source": "fix-link",
+                "repo": "o/r",
+                "red_run_id": 1,
+                "red_attempt": 1,
+                "fix_run_id": fix_run_id,
+                "head_sha": "b".repeat(40),
+                "fix_head_sha": fix_head_sha.repeat(40),
+                "derivation": "compare_red_head_to_fix_head",
+                "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+                "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
+                "files_raw": [],
+                "files_truncated": false,
+                "own_files": [],
+                "own_files_method": "first_parent_non_merge_commits",
+                "own_files_truncated": false
+            })
+        };
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            format!("{}\n{}\n", link(2, "c"), link(3, "c")),
+        )
+        .unwrap();
+
+        let mut query = args(dir.path());
+        query.pr = None;
+        let candidates = advise(&query, &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].fix_link.is_none());
+    }
+
+    #[test]
+    fn valid_rerun_and_compare_pair_prefers_the_fixing_push() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(
+            dir.path().join("causes/archive.jsonl"),
+            row(&"b".repeat(40), 8),
+        )
+        .unwrap();
+        let rerun = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 1,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "b".repeat(40),
+            "derivation": "rerun_green",
+            "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+            "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
+            "files_raw": [],
+            "files_truncated": false,
+            "own_files": [],
+            "own_files_truncated": false,
+            "own_files_method": "rerun_same_head"
+        });
+        let compare = serde_json::json!({
+            "schema": SCHEMA,
+            "source": "fix-link",
+            "repo": "o/r",
+            "red_run_id": 1,
+            "red_attempt": 1,
+            "fix_run_id": 2,
+            "head_sha": "b".repeat(40),
+            "fix_head_sha": "c".repeat(40),
+            "derivation": "compare_red_head_to_fix_head",
+                "pushed_at": "2026-10-13T01:00:00Z", "red_time": "2026-10-13T00:00:00Z",
+                "pr": 8, "branch": "feat/x", "rule": "test rule", "collector": "test",
+            "files_raw": ["src/lib.rs"],
+            "files_truncated": false,
+            "own_files": ["src/lib.rs"],
+            "own_files_truncated": false,
+            "own_files_method": "first_parent_non_merge_commits"
+        });
+        fs::write(
+            dir.path().join("fixlinks.jsonl"),
+            format!("{rerun}\n{compare}\n"),
+        )
+        .unwrap();
+
+        let mut query = args(dir.path());
+        query.pr = None;
+        let candidates = advise(&query, &[]).unwrap().0;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].fix_link.as_ref().unwrap()["derivation"],
+            "compare_red_head_to_fix_head"
+        );
+        assert_eq!(
+            candidates[0].fix_link.as_ref().unwrap()["fix_head_sha"],
+            "c".repeat(40)
+        );
     }
 }

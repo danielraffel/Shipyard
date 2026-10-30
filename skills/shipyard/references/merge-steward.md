@@ -139,10 +139,46 @@ Candidates are selected from facts the pass already fetched, so selection costs
 no extra request; only a candidate costs one, because a backlog row carries no
 timeline and so cannot tell a never-armed pull request from an ejected one.
 
-The `ghapp` queue-arm guard judges each arm request (Shipyard does not claim its
-internal marker here — see `docs/ghapp-guards.md`). A guard refusal is agreement
+Where review before arm applies (`[auto_merge] arm_requires_head_approval`, or a
+repository in `REVIEW_REQUIRED_REPOS` on a host without a valid opt-out),
+Shipyard itself checks exact-head approval, including a `verdict: HOLD`, before
+every arm, by the same rules the guard uses. The `ghapp`
+queue-arm guard additionally judges each arm request where Shipyard's `gh`
+resolves to the guarded wrapper (Shipyard does not claim its internal marker
+here — see `docs/ghapp-guards.md`). A guard refusal is agreement
 that there is nothing to arm: it is reported, never retried, and
 `GHAPP_ALLOW_QUEUE_REARM` is never set.
+
+Before arming anything under `--apply`, the pass takes the same central HOLD,
+`[merge_queue].mutation_machine` authority and control lock as every other
+merge-queue mutation, and holds them while it arms. A HOLD is reported as
+`held: …` and is not a failure; a host without the authority, a contended lock,
+or an uncertain earlier mutation on that repository and base fails the pass and
+arms nothing. Audit mode and a pass with no candidates never take the lock.
+
+Each `--repo` mints its own token (`{repo_slug}` in `token_command` expands to
+that repository, not to the working directory's remote), so the pass runs from
+any directory, including launchd's `$HOME`.
+
+### Scheduled arming on the queue-authority host
+
+`scripts/install_arm_unqueued.sh` installs this pass as a launchd agent
+(`com.danielraffel.shipyard.arm-unqueued`). It prints a plan by default;
+`--install` rehearses the exact pass in audit mode under the agent's
+environment, refuses to load on a failed rehearsal, then loads the agent.
+Each run is bounded by `/usr/bin/timeout` (default: interval minus 60 seconds),
+because launchd never starts a tick while the previous one is still running.
+
+```bash
+scripts/install_arm_unqueued.sh --repo OWNER/REPO --interval 600 --shipyard "$(command -v shipyard)"  # plan
+scripts/install_arm_unqueued.sh --repo OWNER/REPO --interval 600 --shipyard "$(command -v shipyard)" --install
+scripts/install_arm_unqueued.sh --status      # loaded?, last exit, last 20 log lines
+scripts/install_arm_unqueued.sh --uninstall   # unload and remove the plist; keeps the log
+```
+
+Install it only on the `[merge_queue].mutation_machine` host: anywhere else
+every armed pass fails on authority by design. The log is
+`~/Library/Logs/shipyard-arm-unqueued.log`.
 
 Per-repository results appear under `native_auto_merge_backstop` in the JSON
 report. A repository whose settings could not be read reports
