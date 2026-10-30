@@ -2842,7 +2842,7 @@ fn safe_merge_rate(
     let partial = capacity.status != "available";
     let reason = if partial {
         format!(
-            "{safe_merge_count} distinct safe merge receipt heads / {hours:.6} eligible fleet-hours; denominator is a verified lower bound, so this rate is an upper-bound estimate"
+            "{safe_merge_count} distinct safe merge receipt heads / {hours:.6} eligible fleet-hours; denominator is a verified lower bound, so the reported rate may be overstated"
         )
     } else {
         format!(
@@ -4186,7 +4186,7 @@ mod tests {
         assert_eq!(result.status, "partial");
         assert_eq!(result.value, Some(0.5));
         assert!(result.reason.contains("lower bound"));
-        assert!(result.reason.contains("upper-bound estimate"));
+        assert!(result.reason.contains("may be overstated"));
     }
 
     #[test]
@@ -4236,7 +4236,7 @@ mod tests {
         assert_eq!(rate.status, "partial");
         assert!(rate.value.is_some_and(|value| value > 0.0));
         assert!(rate.reason.contains("eligible fleet-hours"));
-        assert!(rate.reason.contains("upper-bound estimate"));
+        assert!(rate.reason.contains("may be overstated"));
         let json = serde_json::to_value(&scorecard).unwrap();
         assert!(
             json.get("safely_merged_changes_per_eligible_slot_hour")

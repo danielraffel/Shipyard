@@ -669,6 +669,8 @@ def force_receipt_metrics_unavailable(card: dict[str, Any], reason: str) -> None
     unavailable = {"status": "unavailable", "value": None, "reason": reason}
     card["safely_merged_changes"] = dict(unavailable)
     card["collector_safe_merge_denominator"] = dict(unavailable)
+    card["safely_merged_changes_per_eligible_slot_hour"] = dict(unavailable)
+    card["collector_safe_merge_rate"] = dict(unavailable)
     card["wasted_compute_per_safely_merged_change"] = dict(unavailable)
 
 
