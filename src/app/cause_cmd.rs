@@ -214,10 +214,7 @@ pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, S
         };
         match result {
             Ok(()) => break,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    && std::time::Instant::now() < deadline =>
-            {
+            Err(error) if lock_contention(&error) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
             Err(error) => {
@@ -237,6 +234,13 @@ pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, S
         );
     }
     Ok(ArchiveLock { _file: Some(lock) })
+}
+
+fn lock_contention(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        // Windows reports a byte-range lock held by another process as
+        // ERROR_LOCK_VIOLATION (33), which fs2 surfaces as ErrorKind::Other.
+        || error.raw_os_error() == Some(33)
 }
 
 /// `cause record`: one observer pass over the live GitHub reader.

@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -80,9 +80,14 @@ fn sync_dir(_path: &Path) -> Result<(), String> {
 fn safe_relative(path: &str) -> bool {
     let path = Path::new(path);
     !path.is_absolute()
-        && !path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(..)
+                    | std::path::Component::RootDir
+                    | std::path::Component::ParentDir
+            )
+        })
 }
 
 fn valid_archive_relative(path: &str) -> bool {
@@ -182,10 +187,21 @@ fn add_transaction_bytes(total: &mut u64, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn sync_file(path: &Path) -> Result<(), String> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| format!("{}: {error}", path.display()))
+fn copy_and_sync(source: &Path, destination: &Path) -> Result<(), String> {
+    let mut input = File::open(source).map_err(|error| format!("{}: {error}", source.display()))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| format!("{}: {error}", destination.display()))?;
+    io::copy(&mut input, &mut output)
+        .map_err(|error| format!("{}: {error}", destination.display()))?;
+    output
+        .sync_all()
+        .map_err(|error| format!("{}: {error}", destination.display()))?;
+    drop(output);
+    drop(input);
+    Ok(())
 }
 
 fn generated_temp(target: &Path, kind: &str) -> Result<PathBuf, String> {
@@ -262,6 +278,7 @@ fn stage_file(path: &Path, lines: &[String]) -> Result<String, String> {
             .map_err(|error| error.to_string())?;
     }
     file.sync_all().map_err(|error| error.to_string())?;
+    drop(file);
     sync_dir(parent)?;
     sha256_file(path)
 }
@@ -529,8 +546,7 @@ fn copy_restore(old: &Path, target: &Path, dir: &Path) -> Result<(), String> {
         }
         fs::remove_file(&temp).map_err(|error| error.to_string())?;
     }
-    fs::copy(old, &temp).map_err(|error| error.to_string())?;
-    sync_file(&temp)?;
+    copy_and_sync(old, &temp)?;
     if let Ok(meta) = fs::symlink_metadata(target) {
         if meta.file_type().is_symlink() || !meta.is_file() {
             return Err(format!("unsafe archive target {}", target.display()));
@@ -565,8 +581,7 @@ fn install_staged(
         }
         fs::remove_file(&temp).map_err(|error| error.to_string())?;
     }
-    fs::copy(staged, &temp).map_err(|error| error.to_string())?;
-    sync_file(&temp)?;
+    copy_and_sync(staged, &temp)?;
     if sha256_file(&temp)? != expected_sha256 {
         return Err(format!("replacement checksum mismatch {}", temp.display()));
     }
@@ -692,8 +707,7 @@ fn prepare_entries(
                 ));
             }
             let old = tx.join(&old_name);
-            fs::copy(&target, &old).map_err(|error| error.to_string())?;
-            sync_file(&old)?;
+            copy_and_sync(&target, &old)?;
             sync_dir(&tx.join("old"))?;
             add_transaction_bytes(&mut transaction_bytes, &old)?;
             Some(sha256_file(&old)?)
@@ -827,6 +841,11 @@ mod tests {
         assert!(safe_relative("causes/2026-10.jsonl"));
         assert!(!safe_relative("../outside"));
         assert!(!safe_relative("/outside"));
+        #[cfg(windows)]
+        {
+            assert!(!safe_relative(r"\outside"));
+            assert!(!safe_relative(r"C:\outside"));
+        }
     }
 
     #[test]
