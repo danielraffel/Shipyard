@@ -36,6 +36,8 @@ pub(crate) enum MergedPrObservation {
     Unknown,
 }
 
+const REST_PR_PAGE_SIZE: u32 = 100;
+
 /// Minted command-helper tokens, keyed by the expanded helper argv (which
 /// names the App and the repository). One map per process, in memory only:
 /// a daemon that builds a fresh client per call still reuses a token until it
@@ -933,6 +935,8 @@ fn helper_failure_is_transient(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     [
         "bad gateway",
+        "http 502",
+        "http 504",
         "connection aborted",
         "connection closed",
         "connection refused",
@@ -1495,11 +1499,21 @@ pub fn pr_states_batched(
     cwd: &Path,
     limit: u32,
 ) -> Option<HashMap<u64, String>> {
+    pr_states_batched_with_options(client, repo, cwd, limit, None)
+}
+
+fn pr_states_batched_with_options(
+    client: Option<&GhClient>,
+    repo: &str,
+    cwd: &Path,
+    limit: u32,
+    binary_override: Option<&Path>,
+) -> Option<HashMap<u64, String>> {
     let client = client?.clone().with_repo_override(repo).ok()?;
     let mut cmd = client
         .prepare_command_with_auth_timeout(
             cwd,
-            None,
+            binary_override,
             GhSupervision::Supervised,
             GhAuthPolicy::Default,
             PR_LIST_TIMEOUT,
@@ -1517,17 +1531,61 @@ pub fn pr_states_batched(
         "--json",
         "number,state",
     ]);
-    let output = run_helper_with_timeout(&mut cmd, "gh", PR_LIST_TIMEOUT)
-        .ok()
-        .filter(|out| out.status.success())?;
+    let output = run_helper_with_timeout(&mut cmd, "gh", PR_LIST_TIMEOUT).ok()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_graphql_rate_limited(&stderr) || helper_failure_is_transient(&stderr) {
+            return pr_states_batched_rest(&client, repo, cwd, limit, binary_override);
+        }
+        return None;
+    }
     let parsed = serde_json::from_slice::<Value>(&output.stdout).ok()?;
-    let entries = parsed.as_array()?;
+    parse_pr_states(&parsed)
+}
+
+fn parse_pr_states(value: &Value) -> Option<HashMap<u64, String>> {
+    let entries = value.as_array()?;
     let mut states = HashMap::new();
     for entry in entries {
         if let Some(number) = entry.get("number").and_then(Value::as_u64)
             && let Some(state) = entry.get("state").and_then(Value::as_str)
         {
             states.insert(number, state.to_owned());
+        }
+    }
+    Some(states)
+}
+
+fn pr_states_batched_rest(
+    client: &GhClient,
+    repo: &str,
+    cwd: &Path,
+    limit: u32,
+    binary_override: Option<&Path>,
+) -> Option<HashMap<u64, String>> {
+    let page_count = limit.max(1).div_ceil(REST_PR_PAGE_SIZE);
+    let mut states = HashMap::new();
+    for page in 1..=page_count {
+        let mut cmd = client
+            .prepare_command_with_auth_timeout(
+                cwd,
+                binary_override,
+                GhSupervision::Supervised,
+                GhAuthPolicy::Default,
+                PR_LIST_TIMEOUT,
+            )
+            .ok()?;
+        let endpoint =
+            format!("repos/{repo}/pulls?state=all&per_page={REST_PR_PAGE_SIZE}&page={page}");
+        cmd.args(["api", "-X", "GET", &endpoint]);
+        let output = run_helper_with_timeout(&mut cmd, "gh", PR_LIST_TIMEOUT)
+            .ok()
+            .filter(|out| out.status.success())?;
+        let page_states = parse_pr_states(&serde_json::from_slice::<Value>(&output.stdout).ok()?)?;
+        let page_len = page_states.len();
+        states.extend(page_states);
+        if page_len < REST_PR_PAGE_SIZE as usize {
+            break;
         }
     }
     Some(states)
