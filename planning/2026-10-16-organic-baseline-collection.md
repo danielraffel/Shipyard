@@ -31,6 +31,9 @@ into the managed Shipyard state directory (`~/Library/Application
 Support/shipyard`). The launchd job executes that managed copy, so removing or
 replacing the checkout that performed the installation cannot silently break
 future runs. Before each collection the wrapper checks the producer handoff;
+with `--merge-receipt-source-host`, the default handoff and health paths are
+the observer's `merge-receipt-observer/` directory (explicit paths override
+those defaults). Before each collection the wrapper checks the producer handoff;
 when it is fresh and valid, receipt import is enabled. When it is missing,
 empty, stale, or failed, timing and queue proxies still collect and an explicit
 `merge-receipt: unavailable` event records the reason. The scorecard keeps the

@@ -40,6 +40,11 @@ For remote observer mode, pass `--source-host`, `--source-shipyard`, and
 the `merge-receipt-observer` managed directory; the producer exporter retains
 its original label and directory.
 
+The baseline collector installer follows the same rule when
+`--merge-receipt-source-host` is set: its default handoff and health paths are
+under `merge-receipt-observer/`. Pass explicit `--merge-receipts` and
+`--merge-receipt-health` paths when a different layout is intentional.
+
 ## Remote producer and observer
 
 When the protected merge database lives on another fleet host, the observer
