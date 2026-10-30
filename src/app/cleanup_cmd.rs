@@ -332,6 +332,7 @@ fn cleanup_retention(
         crate::writer_domain_lease::acquire_for_protected_path(state_dir)
             .map_err(|error| CliFailure::new(1, error.to_string()))?
     };
+    validate_metrics_retention_preflight(state_dir)?;
     let mut items = Vec::new();
     let mut protected_items = Vec::new();
     reject_log_symlinks(&state_dir.join("logs"))?;
@@ -421,6 +422,16 @@ fn cleanup_retention(
 }
 
 const DEFAULT_METRICS_RETENTION_DAYS: i64 = 90;
+
+fn validate_metrics_retention_preflight(state_dir: &Path) -> Result<(), CliFailure> {
+    let configured_days = std::env::var("SHIPYARD_METRICS_RETENTION_DAYS").ok();
+    let days = parse_metrics_retention_days(configured_days.as_deref())?;
+    if days <= 0 || !state_dir.join("metrics").join("metrics.db").exists() {
+        return Ok(());
+    }
+    MetricsStore::validate_existing(state_dir)
+        .map_err(|error| CliFailure::new(1, format!("metrics retention failed: {error}")))
+}
 
 fn parse_metrics_retention_days(value: Option<&str>) -> Result<i64, CliFailure> {
     let Some(value) = value else {
@@ -1915,6 +1926,7 @@ mod retention_tests {
     use super::*;
     use crate::log_retention::gzip_closed_log;
     use crate::log_retention::{AUDIT_PIN_FILE, TERMINAL_MANIFEST_FILE, TerminalLogManifest};
+    use rusqlite::Connection;
 
     fn write_terminal(dir: &Path, job_id: &str, failed: bool, age_hours: i64) {
         fs::create_dir_all(dir).expect("job dir");
@@ -2494,6 +2506,60 @@ mod retention_tests {
         let error = cleanup_retention(temp.path(), true, LogRetentionPolicy::default())
             .expect_err("dry-run must validate the metrics database");
         assert!(error.message.contains("metrics retention failed"));
+    }
+
+    #[test]
+    fn incompatible_metrics_schema_fails_before_cleanup_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let job = temp.path().join("logs/success");
+        write_terminal(&job, "success", false, 24 * 365);
+        let bundle = temp.path().join("bundles/orphan.bundle");
+        fs::create_dir_all(bundle.parent().expect("bundle parent")).expect("bundles");
+        fs::write(&bundle, "bundle").expect("bundle");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        let connection = Connection::open(metrics_dir.join("metrics.db")).expect("sqlite");
+        connection
+            .execute("CREATE TABLE runs (wrong TEXT)", [])
+            .expect("incompatible schema");
+        drop(connection);
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("incompatible metrics schema must fail closed");
+        assert!(error.message.contains("metrics retention failed"));
+        assert!(
+            bundle.exists(),
+            "bundle must survive metrics preflight failure"
+        );
+        assert!(job.exists(), "logs must survive metrics preflight failure");
+    }
+
+    #[test]
+    fn incompatible_fleet_metrics_schema_fails_before_cleanup_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bundle = temp.path().join("bundles/orphan.bundle");
+        fs::create_dir_all(bundle.parent().expect("bundle parent")).expect("bundles");
+        fs::write(&bundle, "bundle").expect("bundle");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        let connection = Connection::open(metrics_dir.join("metrics.db")).expect("sqlite");
+        connection
+            .execute_batch(
+                "CREATE TABLE runs (id INTEGER, ts TEXT);
+                 CREATE TABLE jobs (id INTEGER, run_id INTEGER);
+                 CREATE TABLE steps (job_id INTEGER);
+                 CREATE TABLE fleet_capacity_samples (wrong TEXT);",
+            )
+            .expect("incompatible fleet schema");
+        drop(connection);
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("incompatible fleet schema must fail closed");
+        assert!(error.message.contains("metrics retention failed"));
+        assert!(
+            bundle.exists(),
+            "bundle must survive metrics preflight failure"
+        );
     }
 
     #[test]

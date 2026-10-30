@@ -705,6 +705,39 @@ impl MetricsStore {
         if result != "ok" {
             return Err(format!("metrics database integrity check failed: {result}").into());
         }
+        for (table, columns) in [
+            ("runs", &["id", "ts"][..]),
+            ("jobs", &["id", "run_id"][..]),
+            ("steps", &["job_id"][..]),
+            (
+                "fleet_capacity_samples",
+                &["sample_id", "valid_until", "repo", "observed_at"][..],
+            ),
+        ] {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if !present {
+                return Err(format!("metrics database missing required table: {table}").into());
+            }
+            for column in columns {
+                let present: bool = conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = ?1"
+                    ),
+                    [column],
+                    |row| row.get(0),
+                )?;
+                if !present {
+                    return Err(format!(
+                        "metrics database table {table} missing required column: {column}"
+                    )
+                    .into());
+                }
+            }
+        }
         Ok(())
     }
 
