@@ -131,6 +131,16 @@ minutes. Treat these as cost proxies only. A safely-merged-change denominator
 requires a durable merge receipt and remains unavailable when the local metrics
 store has only PR/job observations; never substitute distinct PR count.
 
+The optional authenticated merge-receipt handoff uses
+`shipyard-merge-receipt-handoff-auth/v1`. Before an importer accepts it, the
+producer transport must bind the canonical payload digest to the exact
+repository, project, base branch, producer session, route, destination,
+known-host authority, executable, freshness window, and replay state. Imports
+are atomic and idempotent; legacy `shipyard-merge-receipt/v1` rows remain
+visible but do not enter an authenticated denominator. The resulting
+`authenticated_safe_merge_summary` is telemetry only and never authorizes a
+queue, rerun, arm, enqueue, or merge decision.
+
 `shipyard queue-digest --json` exposes `queue_idle` and deterministic `alerts`.
 Treat `merge_queue_idle_with_pending_work` as a supervisor notification for an
 armed-but-not-enqueued PR, and
