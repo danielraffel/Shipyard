@@ -855,3 +855,18 @@ fn a_record_the_job_printed_names_the_cause_earlier_than_the_pass() {
     assert_eq!(row["retrospective"], false);
     assert_eq!(row["completed_at"], "2026-10-14T10:30:00Z");
 }
+
+#[test]
+fn legacy_root_causes_refuse_before_github_reads() {
+    let dir = tempfile::tempdir().expect("archive");
+    std::fs::create_dir(dir.path().join("causes")).expect("canonical directory");
+    let legacy = dir.path().join("2026-10.jsonl");
+    std::fs::write(&legacy, "legacy bytes\n").expect("legacy archive");
+    let fake = Fake::new(&red_routes());
+    let gh = |args: &[String]| fake.read(args);
+    let error = record(&gh, &query(dir.path())).expect_err("legacy archive refused");
+    assert!(error.contains("legacy cause archive files"), "{error}");
+    assert!(fake.asked().is_empty());
+    assert_eq!(std::fs::read_to_string(legacy).unwrap(), "legacy bytes\n");
+    assert!(!dir.path().join("causes/2026-10.jsonl").exists());
+}

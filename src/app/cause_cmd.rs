@@ -307,13 +307,41 @@ fn legacy_root_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     for entry in entries {
         let path = entry.map_err(|error| error.to_string())?.path();
         if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-            && path.file_name().and_then(|name| name.to_str()) != Some("fixlinks.jsonl")
+            && path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == "undated"
+                        || (name.len() == 7
+                            && name.as_bytes()[4] == b'-'
+                            && name
+                                .bytes()
+                                .enumerate()
+                                .all(|(i, b)| i == 4 || b.is_ascii_digit()))
+                })
         {
             files.push(path);
         }
     }
     files.sort();
     Ok(files)
+}
+
+fn require_archive_parent(dir: &Path) -> Result<(), String> {
+    let legacy = legacy_root_files(dir)?;
+    if !legacy.is_empty() {
+        let files = legacy
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "legacy cause archive files found directly under {} ({files}); use the parent directory if these files are already in causes/; otherwise reconcile them into {}/causes without overwriting existing files before retrying",
+            dir.display(),
+            dir.display()
+        ));
+    }
+    Ok(())
 }
 
 fn archived_ids(dir: &Path) -> Result<BTreeSet<String>, String> {
@@ -344,19 +372,7 @@ pub(super) fn archive(dir: &Path, lines: &[String]) -> Result<ArchiveReport, Str
         .open(dir.join(".lock"))
         .map_err(|error| error.to_string())?;
     lock.lock_exclusive().map_err(|error| error.to_string())?;
-    let legacy = legacy_root_files(dir)?;
-    if !legacy.is_empty() {
-        let files = legacy
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "legacy cause archive files found directly under {} ({files}); move cause files into {}/causes before retrying",
-            dir.display(),
-            dir.display()
-        ));
-    }
+    require_archive_parent(dir)?;
     fs::create_dir_all(causes_dir(dir)).map_err(|error| error.to_string())?;
     let mut seen = archived_ids(dir)?;
     let mut report = ArchiveReport::default();

@@ -93,9 +93,12 @@ step it runs in; only a missing or unreadable log exits non-zero.
 
 `cause archive` is append-only. A record whose id is already archived is
 skipped, and nothing is rewritten. `--dir` is the archive parent: cause month
-files live under `causes/`, beside `fixlinks.jsonl`. A legacy archive with
-month files directly under `--dir` is refused until those files are moved into
-`causes/`; it is never silently ignored.
+files live under `causes/`, with `fixlinks.jsonl` in the parent. All archive
+commands refuse legacy `YYYY-MM.jsonl` or `undated.jsonl` files directly under
+`--dir`. If the old directory is already named `causes/`, pass its parent.
+Otherwise, reconcile the month files into `causes/` before retrying: retain all
+rows and never overwrite an existing destination file. No command moves or
+rewrites legacy files automatically.
 
 For a local integrity check, run `shipyard cause audit --dir DIR`. It reads
 the cause month files and `fixlinks.jsonl`, reports malformed rows, duplicate

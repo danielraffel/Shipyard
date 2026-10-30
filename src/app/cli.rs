@@ -1566,7 +1566,7 @@ pub(crate) enum CauseCommand {
     /// only a missing or unreadable log exits non-zero.
     Extract(CauseExtractArgs),
     /// Append `ci.cause/v1` records to an append-only archive: one
-    /// `YYYY-MM.jsonl` per month of `named_at` under `--dir`. A record whose
+    /// `causes/YYYY-MM.jsonl` per month of `named_at` under `--dir`. A record whose
     /// id is already archived is skipped; nothing is rewritten.
     Archive(CauseArchiveArgs),
     /// Keep a labels archive current: read the workflow's completed runs

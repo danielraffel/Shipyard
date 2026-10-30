@@ -477,6 +477,7 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
 
     let mut report = RecordReport::default();
     let mut pulls = BTreeMap::new();
+    super::require_archive_parent(&query.dir)?;
     let archived = archived_causes(&query.dir)?;
     let linked = linked_fixlinks(&query.dir)?;
     let recorded: BTreeSet<(String, u64)> = archived

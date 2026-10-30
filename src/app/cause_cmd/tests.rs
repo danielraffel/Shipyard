@@ -262,3 +262,12 @@ fn two_archivers_at_once_lose_and_duplicate_nothing() {
     assert_eq!(ids.len(), 40);
     assert_eq!(unique.len(), 40);
 }
+
+#[test]
+fn auxiliary_jsonl_files_do_not_prevent_canonical_archiving() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("fixlinks.jsonl"), "").unwrap();
+    std::fs::write(dir.path().join("outages.jsonl"), "").unwrap();
+    let report = archive(dir.path(), &[record(6, "2026-10-13T12:00:00Z")]).unwrap();
+    assert_eq!(report.appended, 1);
+}
