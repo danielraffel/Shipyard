@@ -73,6 +73,7 @@ fn sync_dir(path: &Path) -> Result<(), String> {
 // Windows does not expose a portable directory fsync. File contents are still
 // synced, and rename is the platform's atomic publication primitive.
 #[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
 fn sync_dir(_path: &Path) -> Result<(), String> {
     Ok(())
 }
