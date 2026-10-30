@@ -22,6 +22,15 @@ counts each distinct superseded job once, reports clean versus
 uncertain/cancelled/unmatched coverage, and never treats survivor runtime as
 savings. It never turns this evidence into a queue or merge decision.
 
+The failure-learning observer is intentionally independent of baseline
+collection. On macOS, use `scripts/install_cause_observer.sh` to render a
+per-user launchd job that runs the read-only `shipyard cause record` pass on a
+bounded interval. The installer is dry-run by default; use `--install` only
+after reviewing the rendered plan. Machine-global auth is used by default; a
+checkout with an untracked `.shipyard.local/config.toml` can be selected with
+`--cwd`. The observer writes only its append-only local archive and never
+arms, enqueues, merges, or posts GitHub state.
+
 The read-only `queue-digest` surface reports `queue_idle` and emits
 `merge_queue_idle_with_pending_work` for an armed-but-not-enqueued PR, or the
 separate `merge_queue_idle_with_green_unarmed_work` handoff alert for a green
