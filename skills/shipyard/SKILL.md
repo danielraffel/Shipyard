@@ -11,6 +11,11 @@ malformed, duplicate, truncated, and unjoined rows visible. This is advisory
 measurement only and does not authorize queue or merge actions.
 Missing or unreadable `DIR/causes/` exits unsuccessfully with `cause archive
 unavailable`; only a readable empty directory can report zero archived rows.
+The archive scan keeps its 64 MiB / 500,000-line bounds. Invalid UTF-8 counts
+as one malformed row and does not discard later rows. Otherwise valid rows
+for another repository are excluded as `archive_other_repo`, not malformed;
+`archive_rows` still counts all successfully decoded cause records. Attachment
+uses the exact-identity index, without changing duplicate or attempt policy.
 
 Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
@@ -1842,6 +1847,11 @@ change lands with its fixture and a `c2::VERSION` bump. It began as a port of
 EXP-A3's `c2_extract.py`, which is frozen at version 5 as the reference behind
 EXP-A3's registered results and is not kept in step: do not port rule changes
 to it.
+C2 v8 excludes explicit linker `warning:` diagnostics, including warnings
+mentioning duplicate symbols, missing paths, or undefined references, even
+when the step later fails or is cancelled. Actual linker errors and fatal
+warnings-as-errors diagnostics remain causes; a warning alone is not one.
+The cause-cache version also advances to v8 so old warning causes are reread.
 Records from the step that ended in `##[error]` come first, so a retried
 assertion never outranks the runner dying. A make or ninja failure ranks
 below every runner and compiler record and is `low`: on its own it names the

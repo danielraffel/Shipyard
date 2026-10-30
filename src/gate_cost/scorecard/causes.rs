@@ -43,7 +43,8 @@ pub const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum non-empty and empty lines scanned across all archive files.
 pub const MAX_ARCHIVE_LINES: usize = 500_000;
 /// Cache key version: bump when a cause's shape or meaning changes.
-const EXTRACT_VERSION: u32 = 7;
+// v8 discards cached linker-warning causes after C2 stops naming warnings.
+const EXTRACT_VERSION: u32 = 8;
 
 /// A red job whose cause could not be read, and why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -70,8 +71,8 @@ pub struct CausesRead {
     /// Exact archive identity (repo, workflow run, job).  A job id is not
     /// accepted by itself for archive joins.
     by_case: BTreeMap<CauseKey, CiCause>,
-    /// One indexed attempt per base identity, to keep duplicate detection
-    /// linear even for a large archive.
+    /// One indexed attempt per base identity, for duplicate detection and
+    /// logarithmic case attachment without rescanning the archive.
     by_base: BTreeMap<BaseKey, CauseKey>,
     /// Archive `(repo, run, job)` identities with more than one attempt/row.
     /// They are intentionally
@@ -79,8 +80,10 @@ pub struct CausesRead {
     ambiguous: BTreeSet<BaseKey>,
     /// Archive accounting, retained for the scorecard's coverage readout.
     pub archive_rows: usize,
-    /// Parseable archive rows that were malformed or lacked identity.
+    /// Archive rows that could not be decoded or had invalid schema/identity.
     pub archive_malformed: usize,
+    /// Otherwise valid archive rows excluded because they name another repo.
+    pub archive_other_repo: usize,
     /// Archive rows rejected because their identity was duplicated.
     pub archive_duplicates: usize,
     /// Whether the bounded archive scan stopped before EOF.
@@ -272,12 +275,14 @@ pub fn gather(
 
 /// Read a bounded append-only `cause` archive for one repository.
 ///
-/// Rows without a complete `(repo, run_id, job_id)` identity, rows for another
-/// repository, malformed JSON, and duplicate identities remain unreadable.
+/// Rows without a complete `(repo, run_id, job_id)` identity, malformed JSON,
+/// and duplicate identities remain unreadable. Otherwise valid rows for another
+/// repository are excluded and counted separately from malformed rows.
 /// The run attempt is part of the archived record; the job id is the provider's
 /// attempt identity, and any second row for the same `(repo, run, job)` is
 /// rejected rather than guessed by timestamp or file order.
 /// A missing or unreadable archive directory is an error, not an empty archive.
+#[allow(clippy::too_many_lines)] // Keep the bounded archive scan and its accounting in one order.
 pub fn archive(dir: &Path, repo: &str) -> Result<CausesRead, String> {
     let mut read = CausesRead {
         source: CauseSource::Archive,
@@ -317,10 +322,12 @@ pub fn archive(dir: &Path, repo: &str) -> Result<CausesRead, String> {
         let remaining = MAX_ARCHIVE_BYTES.saturating_sub(bytes);
         let mut reader = std::io::BufReader::new(file.take(remaining.saturating_add(1)));
         let mut file_bytes = 0u64;
-        let mut line = String::new();
+        let mut line = Vec::new();
         loop {
             line.clear();
-            let Ok(count) = reader.read_line(&mut line) else {
+            // Delimit bytes before decoding: invalid UTF-8 is one malformed
+            // row, not an I/O failure that discards the rest of the month.
+            let Ok(count) = reader.read_until(b'\n', &mut line) else {
                 read.archive_malformed += 1;
                 break;
             };
@@ -338,24 +345,30 @@ pub fn archive(dir: &Path, repo: &str) -> Result<CausesRead, String> {
                 read.archive_truncated = true;
                 return Ok(read);
             }
+            let Ok(line) = std::str::from_utf8(&line) else {
+                read.archive_malformed += 1;
+                continue;
+            };
             if line.trim().is_empty() {
                 continue;
             }
-            let Ok(cause) = serde_json::from_str::<CiCause>(&line) else {
+            let Ok(cause) = serde_json::from_str::<CiCause>(line) else {
                 read.archive_malformed += 1;
                 continue;
             };
             read.archive_rows += 1;
-            if cause.schema != crate::diagnose::cause::SCHEMA
-                || cause.repo != repo
-                || cause_key(&cause).is_none()
-            {
+            if cause.schema != crate::diagnose::cause::SCHEMA {
                 read.archive_malformed += 1;
                 continue;
             }
             let Some(key) = cause_key(&cause) else {
+                read.archive_malformed += 1;
                 continue;
             };
+            if cause.repo != repo {
+                read.archive_other_repo += 1;
+                continue;
+            }
             if read.ambiguous.contains(&key.base) {
                 read.archive_duplicates += 1;
                 continue;
@@ -389,10 +402,9 @@ pub fn attach(rows: &mut [Case], read: &CausesRead) {
                 if read.ambiguous.contains(&base) {
                     return None;
                 }
-                read.by_case
-                    .iter()
-                    .find(|(key, _)| key.base == base)
-                    .map(|(_, cause)| cause)
+                read.by_base
+                    .get(&base)
+                    .and_then(|key| read.by_case.get(key))
             }),
             CauseSource::Live => row.job_id.and_then(|id| read.by_job.get(&id)),
         };
@@ -448,6 +460,8 @@ pub struct CauseNaming {
     pub archive_rows: usize,
     /// Malformed or identity-incomplete archive rows.
     pub archive_malformed: usize,
+    /// Otherwise valid rows excluded because they name another repository.
+    pub archive_other_repo: usize,
     /// Duplicate archive identities.
     pub archive_duplicates: usize,
     /// Whether the archive scan hit its byte or line bound.
@@ -486,6 +500,7 @@ pub fn compute(rows: &[Case], read: &CausesRead) -> CauseNaming {
         archive_unjoined: 0,
         archive_rows: read.archive_rows,
         archive_malformed: read.archive_malformed,
+        archive_other_repo: read.archive_other_repo,
         archive_duplicates: read.archive_duplicates,
         archive_truncated: read.archive_truncated,
     };
@@ -552,13 +567,14 @@ pub fn render(naming: &CauseNaming) -> String {
         let _ = writeln!(
             out,
             "named causes (archive): {}/{} red cases ({share}); {} without a job, {} unreadable; \
-             {} valid rows unjoined, {} malformed, {} duplicate, truncated={}",
+             {} valid rows unjoined, {} malformed, {} other repo, {} duplicate, truncated={}",
             naming.named,
             naming.reds,
             naming.without_job,
             naming.unreadable,
             naming.archive_unjoined,
             naming.archive_malformed,
+            naming.archive_other_repo,
             naming.archive_duplicates,
             naming.archive_truncated
         );

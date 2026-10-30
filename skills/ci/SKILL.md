@@ -101,6 +101,11 @@ the separate GitHub job-log read.
 Missing or unreadable `DIR/causes/` fails with `cause archive unavailable` before
 GitHub reads or case exports; it never produces a successful zero-count report.
 A readable empty archive remains valid and leaves cases unjoined.
+The archive scan keeps its 64 MiB / 500,000-line bounds. Invalid UTF-8 counts
+as one malformed row and does not discard later rows. Otherwise valid rows
+for another repository are excluded as `archive_other_repo`, not malformed;
+`archive_rows` still counts all successfully decoded cause records. Attachment
+uses the exact-identity index, without changing duplicate or attempt policy.
 
 Metrics verdicts (`shipyard metrics compare|watch|trend|scorecard`) default to
 load-independent proxies; wall-clock p50/p90 is load-dependent context. Do not
@@ -673,6 +678,11 @@ a checkout of the main branch, never from the pull request's own checkout, where
 `tools/scripts/<name>.py` is the pull request's own script. Nothing in Shipyard
 executes a `fix_hint` and nothing auto-applies one. A `detail` is log text and
 is never a command.
+C2 v8 excludes explicit linker `warning:` diagnostics, including warnings
+mentioning duplicate symbols, missing paths, or undefined references, even
+when the step later fails or is cancelled. Actual linker errors and fatal
+warnings-as-errors diagnostics remain causes; a warning alone is not one.
+The cause-cache version also advances to v8 so old warning causes are reread.
 It outranks the ctest line that ran the check. Since C2 v7 a CMake error is named
 by its call site and its error's first clause (`PulpLinkFloor.cmake:463 string
 sub-command JSON failed parsing ...`), not by the bare command in parentheses,
