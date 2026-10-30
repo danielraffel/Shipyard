@@ -35,8 +35,9 @@ empty, stale, or failed, timing and queue proxies still collect and an explicit
 safe-merge denominator unavailable and never turns it into zero.
 
 Provider reads retry only recognized transport failures (by default, two
-bounded attempts with 5s then 10s backoff). Authentication, schema, malformed
-data, and handoff validation failures remain terminal and record a failed pass;
+retries after the initial attempt: three attempts with 5s then 10s backoff).
+Authentication, schema, malformed data, and handoff validation failures remain
+terminal and record a failed pass;
 the retry cannot manufacture a successful observation or a safe-merge value.
 Override the bounded policy explicitly with `--provider-retries` and
 `--provider-retry-delay-seconds` when diagnosing a host.

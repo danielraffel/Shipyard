@@ -46,9 +46,7 @@ TRANSIENT_PROVIDER_ERROR_MARKERS = (
     "operation timed out",
     "timed out",
     "i/o timeout",
-    "timeout",
     "dial tcp",
-    "deadline",
     "deadline exceeded",
     "network is unreachable",
     "temporary failure in name resolution",
@@ -86,8 +84,13 @@ def transient_provider_failure(result: subprocess.CompletedProcess[str]) -> bool
     """Recognize transport failures that are safe to retry with bounded backoff."""
     if result.returncode == 0:
         return False
-    text = f"{result.stdout or ''}\n{result.stderr or ''}".casefold()
-    return any(marker in text for marker in TRANSIENT_PROVIDER_ERROR_MARKERS)
+    # stderr is the error channel; stdout may be structured provider data
+    # containing fields such as timeout_seconds or deadline. Only fall back
+    # to stdout when the provider emitted no stderr diagnostic.
+    text = ((result.stderr or "").strip() or (result.stdout or "").strip()).casefold()
+    return any(marker in text for marker in TRANSIENT_PROVIDER_ERROR_MARKERS) or bool(
+        re.search(r"(?:^|:\s*)timeout[.!]?\s*$", text)
+    )
 
 
 def run_provider_with_retry(command: Sequence[str], *, stdin: str | None = None,

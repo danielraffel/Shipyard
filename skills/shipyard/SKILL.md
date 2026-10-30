@@ -5325,7 +5325,11 @@ atomic sidecar. Readiness requires observed continuity; historical activity
 counts and status-only runs must not be used to manufacture prospective
 coverage. Sidecars are keyed by repository, source identity, cadence, and
 configuration so changing collection policy cannot mix incompatible history.
-Provider reads retry only recognized transport failures with bounded backoff;
+Provider reads retry only recognized transport failures with bounded backoff
+(default: two retries, three attempts). stderr takes precedence over stdout;
+configuration fields such as `timeout_seconds` and `deadline` in structured
+output are not transport errors. With no stderr, a recognized stdout transport
+diagnostic remains retryable;
 authentication, schema, malformed-data, and receipt-handoff failures stay
 terminal. Use `--provider-retries` and
 `--provider-retry-delay-seconds` only to tune that explicit bounded policy.
