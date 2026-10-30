@@ -2196,6 +2196,9 @@ pub(crate) struct MetricsRepeatedWorkCostArgs {
     /// Maximum shadow observations to include.
     #[arg(long, default_value_t = 1000)]
     pub(crate) limit: usize,
+    /// Baseline window for shadow observations, for example `14d`.
+    #[arg(long = "since", default_value = "14d")]
+    pub(crate) since: String,
 }
 
 #[derive(Debug, Args)]

@@ -9,6 +9,12 @@ Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the
 commit-to-pull-requests API, but zero or multiple matches remain unknown.
 
+`metrics repeated-work-cost` exposes read-only superseded-job runtime from the
+authenticated queue timing table within its explicit `--since` window. It
+counts each distinct superseded job once, reports clean versus
+uncertain/cancelled/unmatched coverage, and never treats survivor runtime as
+savings. It never turns this evidence into a queue or merge decision.
+
 The read-only `queue-digest` surface reports `queue_idle` and emits
 `merge_queue_idle_with_pending_work` for an armed-but-not-enqueued PR, or the
 separate `merge_queue_idle_with_green_unarmed_work` handoff alert for a green
@@ -5316,8 +5322,11 @@ merge-group runs are not counted, and it is not limited to the scorecard window.
 
 ### Repeated-work cost
 
-`shipyard metrics repeated-work-cost` is read-only shadow accounting; duration
-remains unavailable until queue-to-metrics provenance is authenticated.
+`shipyard metrics repeated-work-cost` is read-only shadow accounting. Its
+`duration_ms` is measured superseded-job runtime from the authenticated queue
+timing table, bounded by `--since`, counted once per distinct superseded job
+with excluded and unmatched coverage visible. It never changes queue or merge
+authority.
 
 ### Prospective baseline pass history
 
