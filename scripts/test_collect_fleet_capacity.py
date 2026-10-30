@@ -321,6 +321,12 @@ class CapacityProcessTests(unittest.IsolatedAsyncioTestCase):
 
         loop.set_exception_handler(lambda _loop, context: exceptions.append(context))
         try:
+            # Flush warnings left by earlier helper tests before narrowing the
+            # capture to resources owned by this subprocess exercise.  A
+            # collection after the commands would also collect unrelated
+            # stale SQLite fixtures from the suite and make this test fail on
+            # Python 3.14 for the wrong reason.
+            gc.collect()
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", ResourceWarning)
                 with mock.patch.object(collector, "CaptureProtocol", side_effect=capture):
@@ -335,7 +341,6 @@ class CapacityProcessTests(unittest.IsolatedAsyncioTestCase):
                                 self.assertTrue(protocol.transport.is_closing())
                                 self.assertLessEqual(len(protocol.stdout), 1024)
                 protocols.clear()
-                gc.collect()
                 await asyncio.sleep(0)
             self.assertFalse([item for item in caught if issubclass(item.category, ResourceWarning)], caught)
             self.assertEqual(exceptions, [])
