@@ -735,7 +735,7 @@ fn import_github(
             CliFailure::new(1, format!("GitHub repository binding failed: {error}"))
         })?;
     let auth = client
-        .pin_command_auth(cwd)
+        .pin_command_auth_with_timeout(cwd, GITHUB_METRICS_OBSERVATION_TIMEOUT)
         .map_err(|error| CliFailure::new(1, format!("GitHub auth resolution failed: {error}")))?;
     let provenance = github_import_provenance(&auth);
     let mut gh = |argv: &[String]| gh_json_with_client(&client, cwd, argv);
