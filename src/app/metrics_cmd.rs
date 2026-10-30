@@ -1067,7 +1067,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = MetricsStore::open(temp.path()).expect("store");
         let timing = crate::metrics::QueueTerminalTiming {
-            queue_job_id: "survivor".to_owned(),
+            queue_job_id: "sy-survivor".to_owned(),
             queue_identity: "identity".to_owned(),
             disposition: "clean".to_owned(),
             started_at: Some(Utc::now()),
@@ -1084,7 +1084,7 @@ mod tests {
                 sha: "head".into(),
                 target_config: "cfg".into(),
                 mode: "normal".into(),
-                job_id: "survivor".into(),
+                job_id: "sy-survivor".into(),
                 superseded_job_id: "old".into(),
                 superseded_sha: "old".into(),
             })

@@ -655,7 +655,7 @@ impl MetricsStore {
         conn: &Connection,
         limit: usize,
     ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
-        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id")?;
+        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id AND s.job_id LIKE 'sy-%' AND instr(s.job_id, '/') = 0 AND instr(s.job_id, char(92)) = 0")?;
         let mut out = RepeatedWorkSurvivorTiming {
             shadow_rows: 0,
             distinct_survivors: 0,
@@ -5733,6 +5733,19 @@ mod tests {
         }
         let conn = Connection::open(store.path()).unwrap();
         conn.execute("INSERT INTO repeated_work_shadow (observed_at,kind,branch,sha,target_config,mode,job_id,superseded_job_id,superseded_sha) VALUES ('now','future_kind','main','sha','cfg','normal','7','old','oldsha')", []).unwrap();
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &QueueTerminalTiming {
+                    queue_job_id: "42".into(),
+                    queue_identity: "numeric-test".into(),
+                    disposition: "clean".into(),
+                    started_at: Some(Utc::now()),
+                    completed_at: Some(Utc::now()),
+                    total_ms: Some(99),
+                },
+            )
+            .unwrap();
         let summary = store.repeated_work_cost(100).unwrap();
         assert_eq!(summary.duration_ms, None);
         assert_eq!(summary.joined_durations, 0);
@@ -5865,7 +5878,13 @@ mod tests {
                 &mk("cancel", "cancelled_mid_run", Some(30)),
             )
             .unwrap();
-        for id in ["clean", "clean", "uncertain", "cancel", "missing"] {
+        for id in [
+            "sy-clean",
+            "sy-clean",
+            "sy-uncertain",
+            "sy-cancel",
+            "sy-missing",
+        ] {
             store
                 .record_repeated_work_shadow(&RepeatedWorkShadowInput {
                     kind: RepeatedWorkKind::SupersededExactHead,
