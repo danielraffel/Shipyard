@@ -416,7 +416,8 @@ def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, rep
     if (not isinstance(health_repo, str)
             or health_repo.strip().casefold() != repo.strip().casefold()):
         raise RuntimeError(f"merge receipt health names a repository other than {repo}")
-    if health.get("project") != repo.rsplit("/", 1)[-1]:
+    if (not isinstance(health.get("project"), str)
+            or canonical_project(health["project"]) != canonical_project(repo.rsplit("/", 1)[-1])):
         raise RuntimeError("merge receipt health project is not bound to repository")
     if health.get("base_branch") != base_branch:
         raise RuntimeError(f"merge receipt health base branch is not {base_branch}")

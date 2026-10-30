@@ -478,7 +478,9 @@ class CollectorInvocationTests(unittest.TestCase):
             receipt = next(event for event in events if event.get("source") == "merge-receipt")
             self.assertEqual(receipt["source"], "merge-receipt")
             self.assertEqual(receipt["status"], "unavailable")
-            self.assertIn("handoff", receipt["reason"])
+            self.assertEqual(receipt["reason"], "producer handoff not present")
+            self.assertEqual([event["source"] for event in events],
+                             ["github", "tartci", "merge-receipt", "collection"])
             self.assertEqual(events[-1]["source"], "collection")
 
     def test_collect_deduplicates_unavailable_event_from_newer_supervisor(self):
@@ -495,6 +497,22 @@ class CollectorInvocationTests(unittest.TestCase):
                 events = MOD.import_organic(args)
             self.assertEqual(sum(event.get("source") == "merge-receipt" for event in events), 1)
             self.assertEqual(events[-1]["reason"], "wrapper")
+
+    def test_collect_inserts_missing_receipt_before_collection_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = type("Args", (), {"db": root / "metrics" / "metrics.db", "state": root / "state.json",
+                "project": "p", "repo": "o/p", "merge_receipts": root / "missing.jsonl"})()
+            args.state.write_text("{}")
+            provider_events = [
+                {"source": "github", "imported": 1},
+                {"source": "collection", "status": "completed"},
+            ]
+            with mock.patch.object(MOD, "_import_organic_after_preflight", return_value=provider_events):
+                events = MOD.import_organic(args)
+            self.assertEqual([event["source"] for event in events],
+                             ["github", "merge-receipt", "collection"])
+            self.assertEqual(events[1]["reason"], "producer handoff not present")
 
     def test_collect_does_not_treat_dangling_merge_receipt_link_as_absent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -581,7 +599,7 @@ class CollectorInvocationTests(unittest.TestCase):
             health.write_text(json.dumps(generated))
             handoff.write_text(json.dumps({**value, "evidence": "sha256:tampered"}) + "\n")
             with self.assertRaisesRegex(RuntimeError, "(byte count|digest) does not match"):
-                MOD.validate_merge_receipt_health(health, handoff, "owner/repo", "2h")
+                MOD.validate_merge_receipt_health(health, handoff, "OWNER/REPO", "2h")
 
     def test_merge_receipt_health_rejects_stale_before_import(self):
         with tempfile.TemporaryDirectory() as directory:
