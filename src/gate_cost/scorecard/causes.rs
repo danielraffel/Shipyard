@@ -281,8 +281,8 @@ pub fn gather(
 pub fn archive(dir: &Path, repo: &str) -> Result<CausesRead, String> {
     let _lock = crate::app::lock_cause_archive(dir).map_err(|error| {
         format!(
-            "cause archive lock unavailable at {}: {error}",
-            dir.display()
+            "cause archive unavailable at {}: {error}",
+            dir.join("causes").display()
         )
     })?;
     let mut read = CausesRead {
