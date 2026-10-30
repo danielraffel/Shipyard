@@ -1465,6 +1465,69 @@ fn malformed_green_head_is_not_emitted_as_a_fix_link() {
 }
 
 #[test]
+fn a_success_query_row_without_success_conclusion_is_not_a_fix_link() {
+    let red = Red {
+        repo: "Generous-Corp/pulp".to_owned(),
+        run_id: 100,
+        attempt: 1,
+        jobs: ["macos".to_owned()].into_iter().collect(),
+        head_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        time: "2026-10-14T10:30:00Z".to_owned(),
+        pr: Some(42),
+        branch: "feat/x".to_owned(),
+    };
+    for head_sha in [
+        red.head_sha.clone(),
+        "fedcba9876543210fedcba9876543210fedcba98".to_owned(),
+    ] {
+        let candidate = json!({
+            "id": 200,
+            "head_sha": head_sha,
+            "created_at": "2026-10-14T11:00:00Z",
+            "run_attempt": 1
+        });
+        assert!(fixes_for(&red, &[&candidate], &BTreeMap::new()).is_empty());
+    }
+}
+
+#[test]
+fn malformed_or_truncated_fix_links_are_not_complete_identities() {
+    let complete = json!({
+        "schema": cause::SCHEMA,
+        "source": "fix-link",
+        "repo": "o/r",
+        "red_run_id": 1,
+        "red_attempt": 1,
+        "fix_run_id": 2,
+        "head_sha": "0123456789abcdef0123456789abcdef01234567",
+        "fix_head_sha": "abcdef0123456789abcdef0123456789abcdef01",
+        "derivation": "compare_red_head_to_fix_head",
+        "red_time": "2026-10-13T00:00:00Z",
+        "pushed_at": "2026-10-13T01:00:00Z",
+        "branch": "main",
+        "rule": "test",
+        "collector": "test",
+        "pr": null,
+        "files_raw": ["src/lib.rs"],
+        "files_truncated": false,
+        "own_files": ["src/lib.rs"],
+        "own_files_method": "first_parent",
+        "own_files_truncated": false
+    });
+    assert!(super::super::advice::link_identity_complete(&complete));
+
+    let mut truncated = complete.clone();
+    truncated["files_truncated"] = json!(true);
+    assert!(!super::super::advice::link_identity_complete(&truncated));
+
+    let mut malformed_time = complete;
+    malformed_time["pushed_at"] = json!("not-a-timestamp");
+    assert!(!super::super::advice::link_identity_complete(
+        &malformed_time
+    ));
+}
+
+#[test]
 fn a_record_the_job_printed_names_the_cause_earlier_than_the_pass() {
     // The job ran `cause extract --notice` in a step after its failing one;
     // that step's completion, by GitHub's clock, is when the cause was named.

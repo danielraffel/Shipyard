@@ -394,11 +394,43 @@ pub(super) fn valid_fixlink(value: &Value) -> bool {
     }
 }
 
-/// Identity fields required before a producer treats a fix-link as already
-/// recorded. This is intentionally weaker than `valid_fixlink`: an unsafe
-/// but structurally complete row should still be deduplicated, while a row
-/// with malformed run/head identity must be eligible for backfill.
+/// Identity and evidence fields required before a producer treats a fix-link
+/// as already recorded. This is intentionally weaker than `valid_fixlink`:
+/// an unsafe but structurally complete row should still be deduplicated, while
+/// malformed provenance or truncated evidence remains eligible for backfill.
 pub(super) fn link_identity_complete(value: &Value) -> bool {
+    let metadata_omitted = ["red_time", "pushed_at", "branch", "rule", "collector", "pr"]
+        .iter()
+        .all(|field| value.get(*field).is_none());
+    let metadata_complete = metadata_omitted || valid_producer_metadata(value);
+    let evidence_complete = match value["derivation"].as_str() {
+        Some("compare_red_head_to_fix_head") => {
+            value["files_raw"]
+                .as_array()
+                .is_some_and(|files| files.iter().all(Value::is_string))
+                && value["files_truncated"].as_bool() == Some(false)
+                && value.get("own_files").is_some_and(|files| {
+                    files.is_null()
+                        || files
+                            .as_array()
+                            .is_some_and(|items| items.iter().all(Value::is_string))
+                })
+                && value["own_files_method"]
+                    .as_str()
+                    .is_some_and(|method| !method.is_empty())
+                && value
+                    .get("own_files_truncated")
+                    .is_some_and(|truncated| truncated.is_null() || truncated.is_boolean())
+        }
+        Some("rerun_green") => {
+            value["files_raw"].as_array().is_some_and(Vec::is_empty)
+                && value["own_files"].as_array().is_some_and(Vec::is_empty)
+                && value["files_truncated"].as_bool() == Some(false)
+                && value["own_files_truncated"].as_bool() == Some(false)
+                && value["own_files_method"].as_str() == Some("rerun_same_head")
+        }
+        _ => false,
+    };
     value["schema"] == SCHEMA
         && value["source"] == "fix-link"
         && value["repo"].as_str().is_some_and(|repo| !repo.is_empty())
@@ -413,6 +445,8 @@ pub(super) fn link_identity_complete(value: &Value) -> bool {
             value["derivation"].as_str(),
             Some("compare_red_head_to_fix_head" | "rerun_green")
         )
+        && metadata_complete
+        && evidence_complete
 }
 
 /// Validate the producer fields that establish when and why a link was made.

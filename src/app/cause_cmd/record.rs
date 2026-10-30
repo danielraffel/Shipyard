@@ -976,6 +976,12 @@ fn created(run: &Value) -> String {
     run["created_at"].as_str().unwrap_or_default().to_owned()
 }
 
+fn valid_timestamp(run: &Value, field: &str) -> bool {
+    run[field]
+        .as_str()
+        .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+}
+
 /// Candidate fixes in deterministic time order: a later attempt of the red
 /// run, later green runs on the same head, then later green pushes on another
 /// head. The caller verifies each candidate before accepting the first one.
@@ -1003,6 +1009,7 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
             && run["head_sha"]
                 .as_str()
                 .is_some_and(super::advice::valid_sha)
+            && valid_timestamp(run, "run_started_at")
     }) && let Some(pushed_at) = run["run_started_at"].as_str()
     {
         fixes.push(Fix {
@@ -1014,7 +1021,9 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
     }
     let mut same_head: Vec<Fix> = later
         .iter()
-        .filter(|run| on_red_head(run))
+        .filter(|run| {
+            run["conclusion"] == "success" && valid_timestamp(run, "created_at") && on_red_head(run)
+        })
         .map(|run| Fix {
             head_sha: red.head_sha.clone(),
             run_id: run["id"].as_u64().unwrap_or_default(),
@@ -1027,9 +1036,11 @@ fn fixes_for(red: &Red, later: &[&Value], run_index: &BTreeMap<u64, Value>) -> V
     let mut pushes: Vec<Fix> = later
         .iter()
         .filter(|run| {
-            run["run_attempt"]
-                .as_u64()
-                .is_some_and(|attempt| attempt > 0)
+            run["conclusion"] == "success"
+                && valid_timestamp(run, "created_at")
+                && run["run_attempt"]
+                    .as_u64()
+                    .is_some_and(|attempt| attempt > 0)
                 && run["id"].as_u64().is_some_and(|id| id > 0)
                 && run["head_sha"]
                     .as_str()
@@ -1457,6 +1468,10 @@ fn fixlinks(
             continue;
         };
         let sets = file_sets(gh, query, &red, &fix, &branch)?;
+        if sets.raw_truncated {
+            pending(report, &red, &query.now);
+            continue;
+        }
         out.push(fix_row(&red, &fix, &branch, &sets));
     }
     Ok(out)
