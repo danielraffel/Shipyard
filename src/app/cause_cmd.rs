@@ -101,7 +101,42 @@ pub(crate) struct ArchiveLock {
     _file: Option<std::fs::File>,
 }
 
+fn validate_archive_layout(dir: &Path) -> Result<(), String> {
+    let causes = dir.join("causes");
+    if let Ok(metadata) = fs::symlink_metadata(&causes) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "cause archive causes path must be a real directory: {}",
+                causes.display()
+            ));
+        }
+        for entry in fs::read_dir(&causes).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "cause archive entry must be a regular file: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    let fixlinks = dir.join("fixlinks.jsonl");
+    if let Ok(metadata) = fs::symlink_metadata(&fixlinks)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(format!(
+            "cause archive fixlinks must be a regular file: {}",
+            fixlinks.display()
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, String> {
+    // Check before creating a lock so a frozen archive remains byte-for-byte
+    // untouched when it has never been opened by this process.
+    retention::ensure_not_frozen(dir)?;
     if exclusive {
         fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     }
@@ -127,12 +162,17 @@ pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, S
     {
         Ok(lock) => lock,
         Err(error) if !exclusive && error.kind() == std::io::ErrorKind::NotFound => {
-            if retention::has_pending_transaction(dir)
-                || fs::symlink_metadata(dir.join(".shipyard-cause-archive.json")).is_ok()
-            {
+            if fs::symlink_metadata(dir.join(".shipyard-cause-archive.json")).is_ok() {
                 return Err(
                     "managed archive lacks its lock; repair the archive before reading".to_owned(),
                 );
+            }
+            validate_archive_layout(dir)?;
+            let canonical = dir.join("causes").exists() || dir.join("fixlinks.jsonl").exists();
+            if retention::has_pending_transaction(dir) || canonical {
+                let _bootstrap = lock_archive(dir, true)?;
+                drop(_bootstrap);
+                return lock_archive(dir, false);
             }
             return Ok(ArchiveLock { _file: None });
         }
@@ -160,8 +200,8 @@ pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, S
             }
         }
     }
+    validate_archive_layout(dir)?;
     if exclusive {
-        retention::ensure_not_frozen(dir)?;
         retention::recover_pending_transaction(dir)?;
     } else {
         if retention::has_pending_transaction(dir) {

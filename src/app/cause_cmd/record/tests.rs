@@ -926,6 +926,21 @@ fn record_releases_archive_lock_during_github_observation() {
 }
 
 #[test]
+fn record_recovers_an_interrupted_prune_before_observing_github() {
+    let dir = tempfile::tempdir().expect("archive");
+    super::super::retention::initialize_archive_marker(dir.path()).expect("enroll archive");
+    std::fs::create_dir_all(dir.path().join(".prune-txn/old")).expect("pending transaction");
+    std::fs::create_dir(dir.path().join(".prune-txn/new")).expect("pending transaction");
+
+    let fake = Fake::new(&red_routes()).with_log("jobs/1000/logs", &drift_log());
+    let gh = |args: &[String]| fake.read(args);
+    record(&gh, &query(dir.path())).expect("record pass");
+
+    assert!(!dir.path().join(".prune-txn").exists());
+    assert_eq!(rows(&dir.path().join("causes/2026-10.jsonl")).len(), 1);
+}
+
+#[test]
 fn overlapping_record_passes_serialize_the_final_append() {
     let dir = tempfile::tempdir().expect("archive");
     super::super::retention::initialize_archive_marker(dir.path()).expect("enroll archive");

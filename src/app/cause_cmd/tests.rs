@@ -290,3 +290,23 @@ fn a_managed_archive_without_its_lock_fails_closed_before_reading() {
     assert!(error.contains("managed archive lacks its lock"), "{error}");
     assert!(!dir.path().join(".lock").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn archive_refuses_a_symlinked_causes_directory_without_writing_outside() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("archive");
+    let outside = tempfile::tempdir().expect("outside");
+    std::fs::write(
+        dir.path().join(".shipyard-cause-archive.json"),
+        br#"{"schema":"shipyard.cause-archive/v1","frozen":false}"#,
+    )
+    .expect("archive marker");
+    symlink(outside.path(), dir.path().join("causes")).expect("causes symlink");
+
+    let error = archive(dir.path(), &[record(99, "2026-10-13T12:00:00Z")]).unwrap_err();
+
+    assert!(error.contains("real directory"), "{error}");
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+}

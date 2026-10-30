@@ -22,6 +22,10 @@ const MANIFEST_NAME: &str = "manifest.json";
 const COMMITTED_NAME: &str = "committed";
 const TX_SCHEMA: &str = "shipyard.cause-prune-txn/v2";
 const COMMIT_SCHEMA: &str = "shipyard.cause-prune-commit/v1";
+// Both bounds are intentional: MAX_ENTRIES bounds the number of archive files
+// touched in one pass, while MAX_MANIFEST_BYTES independently bounds the
+// serialized path/checksum metadata. Either limit can refuse a pathological
+// transaction before live bytes are changed.
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_ENTRIES: usize = 1024;
 const MAX_TRANSACTION_FILE_BYTES: u64 = 256 * 1024 * 1024;

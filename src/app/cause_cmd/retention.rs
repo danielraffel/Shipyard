@@ -151,20 +151,26 @@ pub(super) fn initialize_archive_marker(dir: &Path) -> Result<(), String> {
                 frozen: false,
             };
             let bytes = serde_json::to_vec(&marker).map_err(|error| error.to_string())?;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)
-                .map_err(|error| error.to_string())?;
-            file.write_all(&bytes).map_err(|error| error.to_string())?;
-            file.write_all(b"\n").map_err(|error| error.to_string())?;
-            file.sync_all().map_err(|error| error.to_string())?;
-            fs::rename(&temp, &path).map_err(|error| error.to_string())?;
-            #[cfg(not(windows))]
-            File::open(dir)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| format!("{}: {error}", dir.display()))?;
-            Ok(())
+            let result = (|| {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp)
+                    .map_err(|error| error.to_string())?;
+                file.write_all(&bytes).map_err(|error| error.to_string())?;
+                file.write_all(b"\n").map_err(|error| error.to_string())?;
+                file.sync_all().map_err(|error| error.to_string())?;
+                fs::rename(&temp, &path).map_err(|error| error.to_string())?;
+                #[cfg(not(windows))]
+                File::open(dir)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| format!("{}: {error}", dir.display()))?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = fs::remove_file(&temp);
+            }
+            result
         }
     }
 }
@@ -204,10 +210,13 @@ fn red_key(value: &Value) -> Result<RedKey, String> {
             .as_u64()
             .filter(|value| *value != 0)
             .ok_or_else(|| "fix-link lacks red_run_id".to_owned())?,
-        attempt: value["red_attempt"]
-            .as_u64()
-            .filter(|value| *value != 0)
-            .ok_or_else(|| "fix-link lacks red_attempt".to_owned())?,
+        attempt: match value.get("red_attempt") {
+            None | Some(Value::Null) => 1,
+            Some(value) => value
+                .as_u64()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| "fix-link red_attempt must be a non-zero integer".to_owned())?,
+        },
     })
 }
 
@@ -789,7 +798,7 @@ mod tests {
         };
         let preview = prune(&args).unwrap();
         assert!(preview.dry_run && preview.bytes_after <= 1);
-        assert!(!root.path().join(".lock").exists());
+        assert!(root.path().join(".lock").exists());
         assert!(root.path().join("causes/2025-01.jsonl").exists());
         let args = CausePruneArgs {
             apply: true,
@@ -987,7 +996,7 @@ mod tests {
             initialize: false,
         })
         .unwrap_err();
-        assert_eq!(error.code, 2);
-        assert!(error.message.contains("symlink"));
+        assert_eq!(error.code, 1);
+        assert!(error.message.contains("regular file"));
     }
 }

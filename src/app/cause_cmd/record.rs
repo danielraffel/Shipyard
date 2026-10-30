@@ -466,6 +466,13 @@ fn may_hold_red(run: &Value) -> bool {
 /// One pass: causes for new red jobs, then fix-links for reds now green.
 pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<RecordReport, String> {
     fs::create_dir_all(&query.dir).map_err(|error| error.to_string())?;
+    super::require_archive_parent(&query.dir)?;
+    // A pending prune is recoverable writer state, not a reason to abandon a
+    // scheduled collection pass. Recover it before taking the shared snapshot.
+    super::retention::ensure_not_frozen(&query.dir)?;
+    if super::retention::has_pending_transaction(&query.dir) {
+        let _lock = super::lock_archive(&query.dir, true)?;
+    }
     // The GitHub observation pass can take minutes.  Hold only a shared
     // snapshot lock while reading the archive, then release it before any
     // network calls.  The final exclusive section re-reads and deduplicates
