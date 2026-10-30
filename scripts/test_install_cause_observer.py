@@ -89,6 +89,7 @@ class InstallCauseObserverTests(unittest.TestCase):
 
     def test_invalid_path_or_interval_is_refused(self) -> None:
         for args in (("--dir", "relative"), ("--cwd", "relative"), ("--interval", "899"),
+                     ("--cwd", str(self.home / "does-not-exist")),
                      ("--repo", "pulp"), ("--repo", "bad repo"), ("--repo", "/repo"),
                      ("--repo", "owner/"), ("--repo", "owner/repo/extra")):
             with self.subTest(args=args):

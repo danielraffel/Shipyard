@@ -52,6 +52,7 @@ case "$INTERVAL" in ''|*[!0-9]*) echo "--interval must be numeric" >&2; exit 2 ;
 case "$SHIPYARD" in /*) ;; *) echo "--shipyard must be an absolute path (got '$SHIPYARD')" >&2; exit 2 ;; esac
 case "$DIR" in /*) ;; *) echo "--dir must be an absolute path (got '$DIR')" >&2; exit 2 ;; esac
 case "$CWD" in /*) ;; *) echo "--cwd must be an absolute path (got '$CWD')" >&2; exit 2 ;; esac
+[ -d "$CWD" ] || { echo "--cwd must name an existing directory (got '$CWD')" >&2; exit 2; }
 OWNER="${REPO%%/*}"
 NAME="${REPO#*/}"
 [ -n "$OWNER" ] && [ -n "$NAME" ] && [ "$REPO" = "$OWNER/$NAME" ] || {
