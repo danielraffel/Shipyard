@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "shipyard"
-version = "0.379.9"
+version = "0.380.0"
 dependencies = [
  "atomicwrites",
  "base64",
