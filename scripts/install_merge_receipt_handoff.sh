@@ -8,11 +8,12 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$HERE/launchd/com.danielraffel.shipyard.merge-receipt-handoff.plist.template"
+BASE_MANAGED_DIR="$HOME/Library/Application Support/shipyard"
 LABEL="com.danielraffel.shipyard.merge-receipt-handoff"
 PYTHON="$(command -v python3 2>/dev/null || true)"
 SHIPYARD="$(command -v shipyard 2>/dev/null || true)"
 SOURCE_SCRIPT="$HERE/scripts/merge_receipt_handoff.py"
-MANAGED_DIR="$HOME/Library/Application Support/shipyard"
+MANAGED_DIR="$BASE_MANAGED_DIR"
 SCRIPT="$MANAGED_DIR/merge_receipt_handoff.py"
 STATE_DIR="$MANAGED_DIR"
 REPO=""
@@ -24,6 +25,8 @@ SOURCE_HOST=""
 SOURCE_SHIPYARD=""
 SOURCE_STATE_DIR=""
 INSTALL=0
+FILE_EXPLICIT=0
+HEALTH_EXPLICIT=0
 LAUNCHCTL="${SHIPYARD_LAUNCHCTL_BIN:-/bin/launchctl}"
 PLUTIL="${SHIPYARD_PLUTIL_BIN:-/usr/bin/plutil}"
 
@@ -36,7 +39,7 @@ while [ "$#" -gt 0 ]; do
     --python) PYTHON="${2:-}"; shift 2;; --state-dir) STATE_DIR="${2:-}"; shift 2;;
     --source-host) SOURCE_HOST="${2:-}"; shift 2;; --source-shipyard) SOURCE_SHIPYARD="${2:-}"; shift 2;;
     --source-state-dir) SOURCE_STATE_DIR="${2:-}"; shift 2;;
-    --file) FILE="${2:-}"; shift 2;; --health-file) HEALTH_FILE="${2:-}"; shift 2;; --base-branch) BASE_BRANCH="${2:-}"; shift 2;;
+    --file) FILE="${2:-}"; FILE_EXPLICIT=1; shift 2;; --health-file) HEALTH_FILE="${2:-}"; HEALTH_EXPLICIT=1; shift 2;; --base-branch) BASE_BRANCH="${2:-}"; shift 2;;
     --interval) INTERVAL="${2:-}"; shift 2;; --install) INSTALL=1; shift;;
     -h|--help) usage; exit 0;; *) echo "unknown argument: $1" >&2; usage >&2; exit 2;;
   esac
@@ -46,6 +49,17 @@ done
 case "$REPO" in */*/*|/*|*/|*\ *|"") echo "--repo must be OWNER/REPO" >&2; exit 2;; */*) ;; *) echo "--repo must be OWNER/REPO" >&2; exit 2;; esac
 case "$INTERVAL" in ''|*[!0-9]*) echo "--interval must be a positive integer" >&2; exit 2;; esac
 [ "$INTERVAL" -ge 300 ] || { echo "--interval must be at least 300 seconds" >&2; exit 2; }
+if [ -n "$SOURCE_HOST" ]; then
+  LABEL="com.danielraffel.shipyard.merge-receipt-observer"
+  MANAGED_DIR="$BASE_MANAGED_DIR/merge-receipt-observer"
+  STATE_DIR="$MANAGED_DIR"
+  [ "$FILE_EXPLICIT" = 1 ] || FILE="$MANAGED_DIR/merge-receipts.jsonl"
+  [ "$HEALTH_EXPLICIT" = 1 ] || HEALTH_FILE="$MANAGED_DIR/merge-receipts.health.json"
+else
+  LABEL="com.danielraffel.shipyard.merge-receipt-handoff"
+  MANAGED_DIR="$BASE_MANAGED_DIR"
+fi
+SCRIPT="$MANAGED_DIR/merge_receipt_handoff.py"
 case "$PYTHON" in /*) ;; *) echo "--python must be an absolute path" >&2; exit 2;; esac
 if [ -n "$SOURCE_HOST" ]; then
   case "$SOURCE_HOST" in *[!A-Za-z0-9._-]*|'') echo "--source-host must be a plain fleet host name" >&2; exit 2;; esac
@@ -62,7 +76,7 @@ if [ -z "$SOURCE_HOST" ] && [ ! -x "$SHIPYARD" ]; then
 fi
 "$PYTHON" "$SOURCE_SCRIPT" --help >/dev/null
 for path in "$STATE_DIR" "$FILE" "$HEALTH_FILE"; do case "$path" in /*) ;; *) echo "paths must be absolute: $path" >&2; exit 2;; esac; done
-PLIST_DIR="$HOME/Library/LaunchAgents"; PLIST="$PLIST_DIR/$LABEL.plist"; LOG="$HOME/Library/Logs/shipyard-merge-receipt-handoff.log"
+PLIST_DIR="$HOME/Library/LaunchAgents"; PLIST="$PLIST_DIR/$LABEL.plist"; LOG="$HOME/Library/Logs/$LABEL.log"
 MODE_ARGS=""
 xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"; }
 if [ -n "$SOURCE_HOST" ]; then
@@ -77,7 +91,7 @@ mkdir -p "$PLIST_DIR" "$HOME/Library/Logs" "$MANAGED_DIR" "$(dirname "$FILE")" "
 STAGED="$(mktemp "$PLIST_DIR/.$LABEL.XXXXXX")"; STAGED_SCRIPT="$(mktemp "$MANAGED_DIR/.merge_receipt_handoff.py.XXXXXX")"; trap 'rm -f "$STAGED" "$STAGED_SCRIPT"' EXIT
 cp "$SOURCE_SCRIPT" "$STAGED_SCRIPT"; chmod 0755 "$STAGED_SCRIPT"; mv -f "$STAGED_SCRIPT" "$SCRIPT"
 escape() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
-sed -e "s|@PYTHON@|$(escape "$PYTHON")|g" -e "s|@SCRIPT@|$(escape "$SCRIPT")|g" \
+sed -e "s|@LABEL@|$(escape "$LABEL")|g" -e "s|@PYTHON@|$(escape "$PYTHON")|g" -e "s|@SCRIPT@|$(escape "$SCRIPT")|g" \
     -e "s|@MODE_ARGS@|$(escape "$MODE_ARGS")|g" -e "s|@INTERVAL@|$INTERVAL|g" \
     -e "s|@HOME@|$(escape "$HOME")|g" -e "s|@LOG@|$(escape "$LOG")|g" "$TEMPLATE" > "$STAGED"
 if grep -q '@[A-Z_]*@' "$STAGED"; then echo "template left an unrendered placeholder" >&2; exit 1; fi

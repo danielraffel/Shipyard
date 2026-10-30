@@ -79,6 +79,7 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             "receipt_count": 1,
             "handoff_bytes": len(payload), "handoff_sha256": hashlib.sha256(payload).hexdigest(),
             "producer": {"identity": "shipyard", "version": "shipyard 0.366.4", "executable_sha256": "a" * 64},
+            "source_host": "local",
         }
         value.update(overrides)
         return value
@@ -132,6 +133,8 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             "file": root / "observer" / "merge-receipts.jsonl",
             "health_file": root / "observer" / "merge-receipts.health.json",
             "timeout_seconds": 30,
+            "transport_retries": 2,
+            "transport_retry_delay_seconds": 0,
         })()
 
     def test_export_publishes_atomic_health_sidecar(self) -> None:
@@ -148,6 +151,7 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             self.assertEqual(value["schema"], "shipyard-merge-receipt-handoff/v1")
             self.assertEqual(value["status"], "fresh")
             self.assertEqual(value["receipt_count"], 1)
+            self.assertEqual(value["source_host"], "local")
             self.assertEqual(json.loads(handoff.read_text())["repo"], "owner/repo")
 
     def test_export_accepts_legacy_mixed_case_project_rows(self) -> None:
@@ -200,6 +204,7 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             health = json.loads(args.health_file.read_text())
             self.assertEqual(health["status"], "fresh")
             self.assertEqual(health["file"], str(args.file))
+            self.assertEqual(health["source_host"], "m3")
             run.assert_called_once()
             command = run.call_args.args[0]
             self.assertEqual(command[:5], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
@@ -210,6 +215,7 @@ class MergeReceiptHandoffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
             args = self.fetch_args(root)
+            args.transport_retries = 0
             args.file.parent.mkdir(parents=True)
             args.file.write_text("previous\n")
             completed = subprocess.CompletedProcess(["ssh"], 255, "", "connection refused")
@@ -217,7 +223,64 @@ class MergeReceiptHandoffTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "connection refused"):
                     MOD.fetch(args)
             self.assertEqual(args.file.read_text(), "previous\n")
-            self.assertEqual(json.loads(args.health_file.read_text())["status"], "error")
+            health = json.loads(args.health_file.read_text())
+            self.assertEqual(health["status"], "error")
+            self.assertEqual(health["source_host"], "m3")
+
+    def test_fetch_retries_one_transient_ssh_flap_without_error_health(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            payload = (json.dumps(receipt()) + "\n").encode()
+            args = self.fetch_args(root)
+            observed = dt.datetime.now(dt.timezone.utc)
+            flap = subprocess.CompletedProcess(["ssh"], 255, "", "connection refused")
+            success = subprocess.CompletedProcess(
+                ["ssh"], 0, self.remote_envelope(now=observed, payload=payload), ""
+            )
+            with mock.patch.object(MOD.subprocess, "run", side_effect=[flap, success]) as run:
+                with mock.patch.object(MOD.time, "sleep") as sleep:
+                    self.assertEqual(MOD.fetch(args), 0)
+            self.assertEqual(run.call_count, 2)
+            sleep.assert_called_once_with(0)
+            health = json.loads(args.health_file.read_text())
+            self.assertEqual(health["status"], "fresh")
+            self.assertEqual(health["source_host"], "m3")
+
+    def test_remote_helper_rejects_source_store_change_during_export(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            producer = root / "producer"
+            shipyard = producer / "shipyard"
+            database = producer / "state" / "metrics" / "metrics.db"
+            database.parent.mkdir(parents=True)
+            import sqlite3
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE merge_receipts (repo TEXT, project TEXT, base_branch TEXT, imported_at TEXT)")
+                connection.execute("INSERT INTO merge_receipts VALUES (?, ?, ?, ?)",
+                                   ("owner/repo", "repo", "main", "2026-10-26T00:01:00Z"))
+                connection.commit()
+            payload = json.dumps(receipt()).replace("'", "'\\''")
+            db_text = str(database).replace("'", "'\\''")
+            shipyard.write_text("#!/bin/sh\n"
+                                "case \"$*\" in *--version*) echo 'shipyard 0.378.1'; exit 0;; esac\n"
+                                "while [ \"$#\" -gt 0 ]; do if [ \"$1\" = \"--file\" ]; then shift; file=\"$1\"; fi; shift; done\n"
+                                f"printf '%s\\n' '{payload}' > \"$file\"\n"
+                                f"python3 - '{db_text}' <<'PY'\n"
+                                "import sqlite3, sys\n"
+                                "with sqlite3.connect(sys.argv[1]) as c:\n"
+                                " c.execute(\"UPDATE merge_receipts SET imported_at = '2026-10-26T00:02:00Z'\")\n"
+                                " c.commit()\n"
+                                "PY\n")
+            shipyard.chmod(shipyard.stat().st_mode | stat.S_IXUSR)
+            config = {
+                "shipyard": str(shipyard), "state_dir": str(producer / "state"),
+                "repo": "owner/repo", "base_branch": "main", "timeout_seconds": 30,
+            }
+            encoded = __import__("base64").b64encode(json.dumps(config).encode()).decode()
+            result = subprocess.run(["python3", "-", encoded], input=MOD.REMOTE_FETCH_SCRIPT,
+                                    text=True, capture_output=True, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("changed during export", result.stdout)
 
     def test_fetch_rejects_non_fleet_source_host(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -295,6 +358,18 @@ class MergeReceiptHandoffTests(unittest.TestCase):
             result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo", "--health-file", str(health))
             self.assertEqual(result.returncode, 3)
             self.assertEqual(json.loads(result.stdout)["status"], "error")
+
+    def test_check_rejects_invalid_recorded_source_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            handoff = root / "handoff.jsonl"
+            health = root / "handoff.health.json"
+            handoff.write_text(json.dumps(receipt()) + "\n")
+            health.write_text(json.dumps(self.health(handoff, source_host="m3;bad")))
+            result = self.invoke("check", "--file", str(handoff), "--repo", "owner/repo",
+                                 "--health-file", str(health), "--stale-after", "2h")
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("plain fleet host", json.loads(result.stdout)["error"])
 
     def test_check_rejects_duplicate_and_conflicting_records(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

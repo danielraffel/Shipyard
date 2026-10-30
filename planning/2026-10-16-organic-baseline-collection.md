@@ -80,11 +80,15 @@ asks GitHub for merge state or creates a receipt.
 
 When the producer and observer are different fleet hosts, run the observer's
 `merge_receipt_handoff.py fetch --source-host <producer>` command. It invokes
-the same local export over the managed SSH alias, transfers the exact payload
-and producer freshness metadata, then validates both before replacing the
-observer handoff. A transport, source, or validation failure leaves the prior
-payload in place and marks health unavailable; it never manufactures a
-receipt.
+the same local export over the managed SSH alias, checks the producer's
+`imported_at` before and after export, transfers the exact payload and producer
+freshness metadata, then validates both before replacing the observer handoff.
+The health sidecar records the configured source host. Two bounded retries are
+used for transient SSH transport failures, so one flap does not immediately
+turn a previously healthy handoff into an error; exhausted transport, source,
+or validation failure leaves the prior payload in place and marks health
+unavailable. Producer and observer LaunchAgents use separate labels and
+managed directories. The handoff never manufactures a receipt.
 
 The command writes an append-only observation history and reports continuous
 elapsed 24-hour days, required activity strata, organic sample counts, and the

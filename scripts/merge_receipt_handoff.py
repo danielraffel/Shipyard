@@ -20,19 +20,22 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 SCHEMA = "shipyard-merge-receipt-handoff/v1"
 EXIT_STALE = 3
 MAX_FUTURE_SKEW_SECS = 300
 DEFAULT_BASE_BRANCH = "main"
+DEFAULT_TRANSPORT_RETRIES = 2
+DEFAULT_TRANSPORT_RETRY_DELAY_SECONDS = 2.0
 FRESHNESS_BASIS = "handoff_export_and_source_import"
 _REPO = re.compile(r"^[^/\s]+/[^/\s]+$")
 _HOST = re.compile(r"^[A-Za-z0-9._-]+$")
 HEALTH_FIELDS = frozenset({
     "schema", "repo", "project", "base_branch", "file", "status", "checked_at",
     "exported_at", "latest_merged_at", "source_imported_at", "freshness_basis", "stale_after_seconds", "receipt_count",
-    "handoff_bytes", "handoff_sha256", "producer", "error",
+    "handoff_bytes", "handoff_sha256", "producer", "source_host", "error",
 })
 REQUIRED_HEALTH_FIELDS = frozenset({
     "schema", "repo", "project", "base_branch", "file", "status", "checked_at",
@@ -63,7 +66,30 @@ try:
     staged = tempfile.NamedTemporaryFile(prefix="shipyard-merge-receipts-", suffix=".jsonl", delete=False)
     staged_path = pathlib.Path(staged.name)
     staged.close()
+    def read_imported_at():
+        try:
+            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+                columns = {row[1] for row in connection.execute("pragma table_info(merge_receipts)")}
+                if "imported_at" not in columns:
+                    fail("producer merge receipt store has no imported_at column")
+                value = connection.execute(
+                    "SELECT max(imported_at) FROM merge_receipts "
+                    "WHERE lower(trim(repo)) = lower(trim(?1)) AND project = ?2 AND base_branch = ?3",
+                    (repo, repo.rsplit("/", 1)[-1], base_branch)).fetchone()[0]
+        except sqlite3.Error as error:
+            fail(f"producer merge receipt source is unreadable: {error}")
+        if not isinstance(value, str) or not value.strip():
+            fail("producer merge receipt source has no imported_at for repository/base branch")
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                fail("producer source imported_at has no timezone")
+            return parsed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError as error:
+            fail(f"producer source imported_at is invalid: {error}")
+
     try:
+        imported_before = read_imported_at()
         completed = subprocess.run(
             [str(shipyard), "--state-dir", str(state_dir), "metrics", "export",
              "merge-receipt", "--repo", repo, "--file", str(staged_path)],
@@ -74,26 +100,9 @@ try:
         payload = staged_path.read_bytes()
         if not payload:
             fail("producer export was empty")
-        try:
-            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
-                columns = {row[1] for row in connection.execute("pragma table_info(merge_receipts)")}
-                if "imported_at" not in columns:
-                    fail("producer merge receipt store has no imported_at column")
-                imported_at = connection.execute(
-                    "SELECT max(imported_at) FROM merge_receipts "
-                    "WHERE lower(trim(repo)) = lower(trim(?1)) AND project = ?2 AND base_branch = ?3",
-                    (repo, repo.rsplit("/", 1)[-1], base_branch)).fetchone()[0]
-        except sqlite3.Error as error:
-            fail(f"producer merge receipt source is unreadable: {error}")
-        if not isinstance(imported_at, str) or not imported_at.strip():
-            fail("producer merge receipt source has no imported_at for repository/base branch")
-        try:
-            imported = dt.datetime.fromisoformat(imported_at.replace("Z", "+00:00"))
-            if imported.tzinfo is None or imported.utcoffset() is None:
-                fail("producer source imported_at has no timezone")
-            imported_at = imported.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-        except ValueError as error:
-            fail(f"producer source imported_at is invalid: {error}")
+        imported_at = read_imported_at()
+        if imported_at != imported_before:
+            fail("producer merge receipt source changed during export")
         try:
             version_result = subprocess.run([str(shipyard), "--version"], text=True,
                                             capture_output=True, timeout=10, check=False)
@@ -326,6 +335,7 @@ def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
                    stale_after_seconds: int | None = None,
                    receipts: list[dict[str, Any]] | None = None,
                    payload: bytes | None = None, producer: dict[str, str] | None = None,
+                   source_host: str | None = None,
                    error: str | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schema": SCHEMA,
@@ -340,6 +350,7 @@ def health_payload(*, repo: str, file: pathlib.Path, checked_at: dt.datetime,
         "handoff_bytes": len(payload) if payload is not None else None,
         "handoff_sha256": payload_digest(payload) if payload is not None else None,
         "producer": producer or {"identity": "shipyard", "version": "unavailable", "executable_sha256": "unavailable"},
+        "source_host": source_host,
     }
     if exported_at is not None:
         payload["exported_at"] = timestamp(exported_at)
@@ -381,6 +392,39 @@ def validate_source_host(host: str) -> str:
     return host
 
 
+def is_transient_ssh_failure(completed: subprocess.CompletedProcess[str]) -> bool:
+    """Recognize transport failures that are safe to retry without changing state."""
+    if completed.returncode == 255:
+        return True
+    detail = f"{completed.stderr or ''}\n{completed.stdout or ''}".lower()
+    return any(marker in detail for marker in (
+        "connection refused", "connection timed out", "connection reset",
+        "connection closed", "broken pipe", "no route to host", "network is unreachable",
+        "temporary failure", "temporarily unavailable", "kex_exchange_identification",
+    ))
+
+
+def run_remote_fetch(command: list[str], *, input_text: str, timeout: int,
+                     retries: int, retry_delay_seconds: float) -> subprocess.CompletedProcess[str]:
+    """Run SSH with bounded transport retries; producer failures remain terminal."""
+    attempts = retries + 1
+    for attempt in range(attempts):
+        try:
+            completed = subprocess.run(
+                command, input=input_text, text=True, capture_output=True, check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(retry_delay_seconds * (2 ** attempt))
+            continue
+        if completed.returncode == 0 or not is_transient_ssh_failure(completed) or attempt + 1 >= attempts:
+            return completed
+        time.sleep(retry_delay_seconds * (2 ** attempt))
+    raise RuntimeError("remote producer fetch exhausted transport retries")
+
+
 def fetch(args: argparse.Namespace) -> int:
     """Fetch a producer export over SSH without weakening receipt checks."""
     source_host = validate_source_host(args.source_host)
@@ -400,12 +444,14 @@ def fetch(args: argparse.Namespace) -> int:
         "timeout_seconds": args.timeout_seconds,
     }
     encoded = base64.b64encode(json.dumps(config, sort_keys=True).encode("utf-8")).decode("ascii")
+    transport_retries = getattr(args, "transport_retries", DEFAULT_TRANSPORT_RETRIES)
+    retry_delay_seconds = getattr(args, "transport_retry_delay_seconds", DEFAULT_TRANSPORT_RETRY_DELAY_SECONDS)
     try:
-        completed = subprocess.run(
+        completed = run_remote_fetch(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", source_host,
              "/usr/bin/python3", "-", encoded],
-            input=REMOTE_FETCH_SCRIPT, text=True, capture_output=True, check=False,
-            timeout=args.timeout_seconds + 15,
+            input_text=REMOTE_FETCH_SCRIPT, timeout=args.timeout_seconds + 15,
+            retries=transport_retries, retry_delay_seconds=retry_delay_seconds,
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "remote producer fetch failed").strip()
@@ -449,7 +495,8 @@ def fetch(args: argparse.Namespace) -> int:
                                     checked_at=checked, status="fresh", exported_at=exported_at,
                                     source_imported_at=timestamp(imported_at),
                                     stale_after_seconds=stale_after_seconds, receipts=records,
-                                    payload=validated_payload, producer=producer)
+                                    payload=validated_payload, producer=producer,
+                                    source_host=source_host)
             os.replace(staged_path, file)
             write_health(health_file, health)
         finally:
@@ -459,11 +506,13 @@ def fetch(args: argparse.Namespace) -> int:
     except subprocess.TimeoutExpired as exc:
         error = f"remote producer fetch timed out after {args.timeout_seconds}s"
         write_health(health_file, health_payload(repo=args.repo, file=file, base_branch=args.base_branch,
-                                                  checked_at=now(), status="error", error=error))
+                                                  checked_at=now(), status="error", source_host=source_host,
+                                                  error=error))
         raise RuntimeError(error) from exc
     except (OSError, RuntimeError, ValueError, UnicodeDecodeError) as exc:
         write_health(health_file, health_payload(repo=args.repo, file=file, base_branch=args.base_branch,
-                                                  checked_at=now(), status="error", error=str(exc)))
+                                                  checked_at=now(), status="error", source_host=source_host,
+                                                  error=str(exc)))
         raise
 
 
@@ -503,7 +552,7 @@ def export(args: argparse.Namespace) -> int:
                                 exported_at=exported, source_imported_at=imported_at,
                                 stale_after_seconds=stale_after_seconds,
                                 receipts=receipts, payload=payload,
-                                producer=producer)
+                                producer=producer, source_host="local")
         # Validation completed against the staged payload; publish only after
         # both the exact receipt set and producer identity are known-good.
         os.replace(staged_path, file)
@@ -513,7 +562,8 @@ def export(args: argparse.Namespace) -> int:
     except subprocess.TimeoutExpired as exc:
         error = f"export timed out after {args.timeout_seconds}s"
         write_health(health_file, health_payload(repo=args.repo, file=file,
-                                                  checked_at=now(), status="error", error=error))
+                                                  checked_at=now(), status="error", source_host="local",
+                                                  error=error))
         raise RuntimeError(error) from exc
     except (RuntimeError, ValueError) as exc:
         # A non-zero producer command is an observed producer error and gets
@@ -523,7 +573,8 @@ def export(args: argparse.Namespace) -> int:
         # handoff.
         if "completed" in locals() and completed.returncode != 0:
             write_health(health_file, health_payload(repo=args.repo, file=file,
-                                                      checked_at=now(), status="error", error=str(exc)))
+                                                      checked_at=now(), status="error", source_host="local",
+                                                      error=str(exc)))
         raise
     finally:
         staged_path.unlink(missing_ok=True)
@@ -558,6 +609,11 @@ def check(args: argparse.Namespace) -> int:
             raise RuntimeError("health sidecar is bound to a different handoff file")
         if set(health) - HEALTH_FIELDS:
             raise RuntimeError("health sidecar contains unknown fields")
+        if "source_host" in health and health["source_host"] is not None:
+            try:
+                validate_source_host(health["source_host"])
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
         if health.get("freshness_basis") != FRESHNESS_BASIS:
             raise RuntimeError("health sidecar has an unsupported freshness basis")
         expected_base = health.get("base_branch")
@@ -631,6 +687,9 @@ def parser() -> argparse.ArgumentParser:
     fetch_parser.add_argument("--file", type=pathlib.Path, required=True)
     fetch_parser.add_argument("--health-file", type=pathlib.Path, required=True)
     fetch_parser.add_argument("--timeout-seconds", type=int, default=300)
+    fetch_parser.add_argument("--transport-retries", type=int, default=DEFAULT_TRANSPORT_RETRIES)
+    fetch_parser.add_argument("--transport-retry-delay-seconds", type=float,
+                              default=DEFAULT_TRANSPORT_RETRY_DELAY_SECONDS)
     fetch_parser.set_defaults(handler=fetch)
     check_parser = commands.add_parser("check", help="check a handoff and its producer health sidecar")
     check_parser.add_argument("--file", type=pathlib.Path, required=True)
@@ -646,6 +705,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if getattr(args, "timeout_seconds", 1) <= 0:
         parser().error("--timeout-seconds must be positive")
+    if getattr(args, "transport_retries", 0) < 0:
+        parser().error("--transport-retries must not be negative")
+    if getattr(args, "transport_retry_delay_seconds", 0) < 0:
+        parser().error("--transport-retry-delay-seconds must not be negative")
     try:
         return args.handler(args)
     except (OSError, RuntimeError, ValueError) as exc:
