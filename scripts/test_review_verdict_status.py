@@ -174,6 +174,23 @@ class ReviewVerdictStatus(unittest.TestCase):
                                f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
         self.assertEqual(self.judged(signed, config), "success")
 
+    def test_base_signer_identity_binding_is_enforced_by_the_status(self) -> None:
+        config = ('[auto_merge]\n'
+                  'reviewer_signers = ["codex-review"]\n'
+                  '[auto_merge.reviewer_signer_identities]\n'
+                  'codex-review = ["Daniels-Mac-Studio-m3 agent:codex-reviewer"]\n')
+
+        def approve(stamp: str) -> list[dict[str, Any]]:
+            return [self.comment(f"Reviewed.\nreviewer: codex-review\n{stamp}\n"
+                                 f"verdict: APPROVE head:{HEAD}", "2026-10-12T15:00:00Z")]
+
+        good = "<!-- session: Daniels-Mac-Studio-m3/rotating agent: codex-reviewer -->"
+        wrong_host = "<!-- session: Daniels-M5-Studio/rotating agent: codex-reviewer -->"
+        no_agent = "<!-- session: Daniels-Mac-Studio-m3/rotating -->"
+        self.assertEqual(self.judged(approve(good), config), "success")
+        self.assertEqual(self.judged(approve(wrong_host), config), "failure")
+        self.assertEqual(self.judged(approve(no_agent), config), "failure")
+
     def test_tartci_623s_copied_approve_fails_stamped_unattributed_or_unstamped(self) -> None:
         # tartci#623's deciding APPROVE (comment 6321450475) copied
         # infra-review2's signer and session lines under a

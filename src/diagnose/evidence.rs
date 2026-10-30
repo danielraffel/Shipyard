@@ -65,7 +65,7 @@ static RETRY_NAME_TAIL: LazyLock<Regex> = LazyLock::new(|| pattern(r"\s*\.{3,}.*
 static OTHER_FAILURES: LazyLock<[Regex; 4]> = LazyLock::new(|| {
     [
         pattern(r"^test (\S+) \.\.\. FAILED$"),
-        pattern(r"^FAILED (\S+)"),
+        pattern(r"^FAILED ([^\s(]\S*)"),
         pattern(r"^--- FAIL: (\S+)"),
         pattern(r"^(?:ERROR|FAIL): (\S+) \(([\w.]+)\)"),
     ]

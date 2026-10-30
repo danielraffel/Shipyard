@@ -3,6 +3,12 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03790"></a>
+## [0.379.0] - 2026-10-30
+
+- codex/diagnose authenticated log fallback 20261028 ([#1010](https://github.com/danielraffel/Shipyard/pull/1010))
+- codex/source import casefold 20261028 ([#996](https://github.com/danielraffel/Shipyard/pull/996))
+
 <a id="v03781"></a>
 ## [0.378.1] - 2026-10-30
 
@@ -2736,6 +2742,7 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.379.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.379.0
 [0.378.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.378.1
 [0.378.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.378.0
 [0.377.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.377.0

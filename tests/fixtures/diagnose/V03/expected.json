@@ -1,7 +1,7 @@
 {
  "schema": "shipyard.diagnose/v1",
  "verdict": "red",
- "summary": "1 required check(s) failed. Enforce version & skill sync: real, 2 tests, step 'Gate-script fixture tests'",
+ "summary": "1 required check(s) failed. Enforce version & skill sync: real, 1 test, step 'Gate-script fixture tests'",
  "checks": [
   {
    "context": "Enforce version & skill sync",
@@ -31,10 +31,9 @@
    },
    "failing_tests": {
     "names": [
-     "test_the_committed_baseline_matches_the_tree",
-     "(failures=1)"
+     "test_the_committed_baseline_matches_the_tree"
     ],
-    "total": 2,
+    "total": 1,
     "truncated": false
    },
    "passed_on_retry": null,
