@@ -428,13 +428,32 @@ pub(super) fn metrics_command<W: Write>(
             return Ok(exit);
         }
         MetricsCommand::RepeatedWorkCost(args) => {
-            let summary = store.repeated_work_cost(args.limit).map_err(|error| {
-                CliFailure::new(1, format!("metrics repeated-work-cost failed: {error}"))
-            })?;
+            let since_days = parse_days(&args.since)?;
+            if since_days <= 0 {
+                return Err(CliFailure::new(
+                    WAIT_EXIT_INVALID,
+                    "repeated-work baseline window must be positive",
+                ));
+            }
+            let summary = store
+                .repeated_work_cost(args.limit, since_days)
+                .map_err(|error| {
+                    CliFailure::new(1, format!("metrics repeated-work-cost failed: {error}"))
+                })?;
             write_output(stdout, json_output, &summary, || {
                 format!(
-                    "{} repeated-work observations; avoided cost unavailable ({} unjoined)",
-                    summary.observations, summary.unknown_durations
+                    "{} repeated-work observations; superseded runtime: {} ({} matched clean, {} uncertain, {} cancelled, {} unmatched; {} distinct superseded jobs; baseline={}d; final attempt only={})",
+                    summary.observations,
+                    summary
+                        .duration_ms
+                        .map_or_else(|| "unavailable".to_owned(), |ms| format!("{ms} ms")),
+                    summary.matched_clean,
+                    summary.excluded_uncertain,
+                    summary.excluded_cancelled,
+                    summary.unmatched,
+                    summary.distinct_superseded_jobs,
+                    summary.since_days,
+                    summary.final_attempt_only
                 )
             })?;
         }
@@ -1079,6 +1098,59 @@ mod tests {
             github_jobs_api_path("danielraffel/pulp", 123),
             "/repos/danielraffel/pulp/actions/runs/123/jobs"
         );
+    }
+
+    #[test]
+    fn repeated_work_cost_json_and_human_output_report_superseded_coverage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let timing = crate::metrics::QueueTerminalTiming {
+            queue_job_id: "sy-superseded".to_owned(),
+            queue_identity: "identity".to_owned(),
+            disposition: "clean".to_owned(),
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+            total_ms: Some(12),
+        };
+        store
+            .record_queue_terminal(crate::metrics::QUEUE_AUTHORITY_TOKEN, &timing)
+            .expect("queue timing");
+        store
+            .record_repeated_work_shadow(&crate::metrics::RepeatedWorkShadowInput {
+                kind: crate::metrics::RepeatedWorkKind::SupersededExactHead,
+                branch: "main".into(),
+                sha: "head".into(),
+                target_config: "cfg".into(),
+                mode: "normal".into(),
+                job_id: "sy-survivor".into(),
+                superseded_job_id: "sy-superseded".into(),
+                superseded_sha: "old".into(),
+            })
+            .expect("shadow");
+        let run = |json_output| {
+            let mut output = Vec::new();
+            metrics_command(
+                MetricsCommand::RepeatedWorkCost(crate::app::cli::MetricsRepeatedWorkCostArgs {
+                    limit: 100,
+                    since: "14d".into(),
+                }),
+                temp.path(),
+                None,
+                json_output,
+                &mut output,
+            )
+            .expect("repeated work command");
+            String::from_utf8(output).expect("utf8")
+        };
+        let json: Value = serde_json::from_str(&run(true)).expect("json");
+        assert_eq!(json["duration_ms"], 12);
+        assert_eq!(json["matched_clean"], 1);
+        assert_eq!(json["distinct_superseded_jobs"], 1);
+        assert_eq!(json["timing_basis"], "superseded_queue_job_runtime");
+        assert_eq!(json["since_days"], 14);
+        let human = run(false);
+        assert!(human.contains("superseded runtime: 12 ms"), "{human}");
+        assert!(human.contains("final attempt only"), "{human}");
     }
 
     #[test]

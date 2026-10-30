@@ -277,6 +277,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify job-scoped GitHub publication before signing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; sys.path.insert(0, "scripts"); from release_macos_local import require_ci_gh; print(require_ci_gh())'
+
       # The signed build must not read a toolchain or crate sources that an
       # earlier job on a shared runner could have written to ~/.cargo or
       # ~/.rustup. Fresh homes cost a cold toolchain and registry fetch.

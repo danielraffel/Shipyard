@@ -281,6 +281,10 @@ fn load_merge_queue_snapshot_once(
     base: &str,
     deadline: Option<Instant>,
 ) -> Result<(MergeQueueSnapshot, usize), String> {
+    // `gh api graphql` has no `--repo` flag. Scope the authenticated client
+    // instead so repository-specific token helpers still receive provenance
+    // while the argv remains valid for the native GitHub CLI.
+    let actions = actions.clone().with_repo_override(repo);
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| format!("invalid repository slug `{repo}`"))?;
@@ -306,7 +310,7 @@ fn load_merge_queue_snapshot_once(
         if let Some(cursor) = cursor.as_deref() {
             args.extend(["-F".to_owned(), format!("cursor={cursor}")]);
         }
-        let value = match gh_json_with_deadline(actions, &args, "merge-queue policy", deadline) {
+        let value = match gh_json_with_deadline(&actions, &args, "merge-queue policy", deadline) {
             Ok(value) => value,
             Err(error) if page == 1 && is_private_free_entitlement(&error) => {
                 return Ok((
@@ -507,7 +511,31 @@ pub(super) fn pull_requests(
         "--json".to_owned(),
         OPEN_PR_LIST_FIELDS.to_owned(),
     ];
-    let value = gh_json(actions, &args, "open PR list")?;
+    let value = match gh_json(actions, &args, "open PR list") {
+        Ok(value) => value,
+        Err(error) if transient_open_pr_error(&error) => {
+            let rest_args = vec![
+                "api".to_owned(),
+                format!(
+                    "repos/{repo}/pulls?state=open&base={}&per_page=100&page=1",
+                    encode_path_segment(base)
+                ),
+            ];
+            let rest = gh_json(actions, &rest_args, "open PR REST fallback")?;
+            let rows = rest
+                .as_array()
+                .ok_or_else(|| "open PR REST fallback was not an array".to_owned())?;
+            if rows.len() == 100 {
+                return Err(
+                    "open PR REST fallback reached 100; refusing a possibly partial snapshot"
+                        .to_owned(),
+                );
+            }
+            let rows = rows.iter().map(rest_pull_request_row).collect::<Vec<_>>();
+            Value::Array(rows)
+        }
+        Err(error) => return Err(error),
+    };
     let rows = value
         .as_array()
         .ok_or_else(|| "open PR list was not an array".to_owned())?;
@@ -517,6 +545,79 @@ pub(super) fn pull_requests(
         ));
     }
     rows.iter().map(|row| parse_pr(row, positions)).collect()
+}
+
+fn transient_open_pr_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "bad gateway",
+        "http 502",
+        "http 504",
+        "gateway timeout",
+        "service unavailable",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "connection reset",
+        "timed out",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn rest_pull_request_row(value: &Value) -> Value {
+    let mut row = serde_json::Map::new();
+    row.insert(
+        "id".to_owned(),
+        value
+            .get("node_id")
+            .cloned()
+            .or_else(|| value.get("id").map(|id| Value::String(id.to_string())))
+            .unwrap_or(Value::Null),
+    );
+    row.insert(
+        "number".to_owned(),
+        value.get("number").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "isDraft".to_owned(),
+        value.get("draft").cloned().unwrap_or(Value::Bool(true)),
+    );
+    row.insert(
+        "baseRefName".to_owned(),
+        value.pointer("/base/ref").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "headRefOid".to_owned(),
+        value.pointer("/head/sha").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "headRefName".to_owned(),
+        value.pointer("/head/ref").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "mergeStateStatus".to_owned(),
+        value.get("mergeable_state").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "autoMergeRequest".to_owned(),
+        value.get("auto_merge").cloned().unwrap_or(Value::Null),
+    );
+    row.insert(
+        "labels".to_owned(),
+        value
+            .get("labels")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    );
+    // Force the normal REST check/status hydration path below. The marker is
+    // represented by the same 100-entry sentinel used for a truncated GraphQL
+    // rollup, while parse_check ignores the null entries.
+    row.insert(
+        "statusCheckRollup".to_owned(),
+        Value::Array((0..100).map(|_| Value::Null).collect()),
+    );
+    Value::Object(row)
 }
 
 pub(super) fn parse_pr(row: &Value, positions: &BTreeMap<u64, u64>) -> Result<ObservedPr, String> {
