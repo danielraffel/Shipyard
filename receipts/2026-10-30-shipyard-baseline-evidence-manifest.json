@@ -1,0 +1,29 @@
+{
+  "schema": "shipyard-baseline-evidence-manifest/v1",
+  "repository": "danielraffel/Shipyard",
+  "collector": "shipyard metrics gate-cost",
+  "collector_head_sha": "a130919c116a9d29dec29656f674e822f045c020",
+  "window": {
+    "from": "2026-10-23T20:59:22.777525+00:00",
+    "to": "2026-10-30T20:59:22.777525+00:00"
+  },
+  "reads": {
+    "github": 431,
+    "cached": 0
+  },
+  "artifacts": [
+    {
+      "file": "2026-10-30-shipyard-gate-cost-baseline-7d.json",
+      "sha256": "53406e768d11696f18611092d2e7ef0814a4dbb0b9ac9093cb85bd29a5102210"
+    },
+    {
+      "file": "2026-10-30-shipyard-gate-cost-scorecard-7d.json",
+      "sha256": "800ffa0e8cf05e07417f9244bfa9fad8bc441e0a13045f2225f4abd07d27d1a4"
+    },
+    {
+      "file": "2026-10-30-repeated-work-shadow-cost.json",
+      "sha256": "0398b9217b780d075069fb40a0bd047d09d221d14e3dd669101803c3b2a9e046"
+    }
+  ],
+  "interpretation": "Descriptive baseline only. No merge queue or protected required-context denominator was available; repeated-work timing joins were zero, so no optimization promotion claim is supported."
+}
