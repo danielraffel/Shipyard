@@ -207,7 +207,25 @@ pub fn run_pass(
     now: DateTime<Utc>,
     gh_for_repo: &mut RepoGhRunner<'_>,
 ) -> ImportPass {
-    if !config.enabled {
+    run_pass_with_observations(
+        config,
+        state_dir,
+        daemon_repos,
+        now,
+        gh_for_repo,
+        crate::observations::AutomaticObservations::from_env(),
+    )
+}
+
+fn run_pass_with_observations(
+    config: &ImportConfig,
+    state_dir: &Path,
+    daemon_repos: &[String],
+    now: DateTime<Utc>,
+    gh_for_repo: &mut RepoGhRunner<'_>,
+    observations: crate::observations::AutomaticObservations,
+) -> ImportPass {
+    if !observations.enabled() || !config.enabled {
         return ImportPass::default();
     }
     let mut pass = ImportPass {
@@ -305,6 +323,9 @@ pub fn daemon_pass(
     daemon_repos: &[String],
     now: DateTime<Utc>,
 ) -> ImportPass {
+    if !crate::observations::AutomaticObservations::from_env().enabled() {
+        return ImportPass::default();
+    }
     let config = match LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf()) {
         Ok(config) => config,
         Err(error) => {

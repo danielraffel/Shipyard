@@ -60,10 +60,24 @@ pub(crate) fn persist_terminal_outcome(
     job: &Job,
     state_dir: &Path,
 ) -> Result<(), ShipExecutionError> {
+    persist_terminal_outcome_with_observations(
+        job,
+        state_dir,
+        crate::observations::AutomaticObservations::from_env(),
+    )
+}
+
+fn persist_terminal_outcome_with_observations(
+    job: &Job,
+    state_dir: &Path,
+    observations: crate::observations::AutomaticObservations,
+) -> Result<(), ShipExecutionError> {
     let ship_state = ShipStateStore::new(state_dir.join("ship"))
         .map_err(|error| ShipExecutionError::ShipState(error.to_string()))?;
     persist_recovered_outcomes(std::slice::from_ref(job), state_dir, &ship_state).map(|result| {
-        if let Ok(store) = MetricsStore::open(state_dir) {
+        if observations.enabled()
+            && let Ok(store) = MetricsStore::open(state_dir)
+        {
             let mut prior = job.clone();
             prior.status = if job.started_at.is_some() {
                 JobStatus::Running

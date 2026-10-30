@@ -32,6 +32,26 @@ pub(super) fn run_command_evidence<W: Write>(
     json_mode: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
+    run_command_evidence_with_observations(
+        args,
+        config,
+        cwd,
+        runtime_paths,
+        json_mode,
+        stdout,
+        crate::observations::AutomaticObservations::from_env(),
+    )
+}
+
+fn run_command_evidence_with_observations<W: Write>(
+    args: &RunCommandEvidenceArgs,
+    config: &LoadedConfig,
+    cwd: &Path,
+    runtime_paths: &RuntimePaths,
+    json_mode: bool,
+    stdout: &mut W,
+    observations: crate::observations::AutomaticObservations,
+) -> Result<ExitCode, CliFailure> {
     let target = resolve_command_target(config, &args.target)?;
     let command = CommandRequest::for_target(&target, args, cwd)?;
     let name = args.name.as_deref().unwrap_or(&target.name);
@@ -97,7 +117,9 @@ pub(super) fn run_command_evidence<W: Write>(
     store
         .record(&record)
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
-    let _ = record_command_metric(config, runtime_paths, &record);
+    if observations.enabled() {
+        let _ = record_command_metric(config, runtime_paths, &record);
+    }
     emit_run_command_evidence(stdout, &record, json_mode)?;
     Ok(if record.passed() {
         ExitCode::SUCCESS

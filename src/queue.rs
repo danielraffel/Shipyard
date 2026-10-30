@@ -198,14 +198,28 @@ impl From<serde_json::Error> for QueueError {
 #[derive(Debug)]
 pub struct Queue {
     state_dir: PathBuf,
+    observations: crate::observations::AutomaticObservations,
 }
 
 impl Queue {
     /// Open a queue rooted at `state_dir`.
     pub fn new(state_dir: impl Into<PathBuf>) -> io::Result<Self> {
+        Self::new_with_observations(
+            state_dir,
+            crate::observations::AutomaticObservations::from_env(),
+        )
+    }
+
+    fn new_with_observations(
+        state_dir: impl Into<PathBuf>,
+        observations: crate::observations::AutomaticObservations,
+    ) -> io::Result<Self> {
         let state_dir = state_dir.into();
         crate::writer_domain_lease::ensure_protected_dir_all(&state_dir)?;
-        Ok(Self { state_dir })
+        Ok(Self {
+            state_dir,
+            observations,
+        })
     }
 
     /// Queue state directory.
@@ -261,9 +275,14 @@ impl Queue {
     /// target list, and mode.
     pub fn enqueue(&mut self, job: Job) -> QueueResult<Job> {
         let request_store = QueueRequestStore::new(&self.state_dir).ok();
+        let collect_observations = self.observations.enabled();
         let observations = self.with_jobs_locked(|jobs| {
             backfill_pending_workload_scopes(jobs, request_store.as_ref());
-            let observations = repeated_work_observations(jobs, &job);
+            let observations = if collect_observations {
+                repeated_work_observations(jobs, &job)
+            } else {
+                Vec::new()
+            };
             cancel_superseded_pending(jobs, &job);
             jobs.push(job.clone());
             Ok(observations)
@@ -373,7 +392,9 @@ impl Queue {
         } else {
             prior.clone()
         };
-        if let Some(disposition) = classify_queue_terminal(&classification_prior, job) {
+        if self.observations.enabled()
+            && let Some(disposition) = classify_queue_terminal(&classification_prior, job)
+        {
             let disposition = match disposition {
                 QueueTerminalDisposition::Clean => "clean",
                 QueueTerminalDisposition::CancelledMidRun => "cancelled_mid_run",

@@ -18,6 +18,9 @@ def main() -> int:
     parser.add_argument("--merge-receipt-health", required=True)
     parser.add_argument("collector_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if os.environ.get("SHIPYARD_OBSERVATIONS", "").strip().lower() == "off":
+        print("Automatic observation collection disabled by SHIPYARD_OBSERVATIONS=off", file=sys.stderr)
+        return 0
     if args.collector_args[:1] == ["--"]:
         args.collector_args = args.collector_args[1:]
     check = subprocess.run(

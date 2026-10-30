@@ -623,6 +623,10 @@ pub fn record_scheduler_observation_best_effort(
     leases: &[HostPoolLease],
     observed_at: DateTime<Utc>,
 ) {
+    if !crate::observations::AutomaticObservations::from_env().enabled() {
+        return;
+    }
+
     let Some(snapshot) = scheduler_snapshot(job_id, target, leases, observed_at) else {
         return;
     };
@@ -656,6 +660,10 @@ pub fn record_dispatch_observation_best_effort(
     route_attempts: &[RouteAttempt],
     observed_at: DateTime<Utc>,
 ) {
+    if !crate::observations::AutomaticObservations::from_env().enabled() {
+        return;
+    }
+
     let Some(pending) =
         dispatch_observation(state_dir, job_id, target, route_attempts, observed_at)
     else {
@@ -720,6 +728,19 @@ fn observation_sender() -> Option<&'static SyncSender<PendingObservation>> {
 
 /// Persist one queued observation. Runs only on the background writer.
 fn write_pending_observation(pending: PendingObservation) {
+    write_pending_observation_with_policy(
+        pending,
+        crate::observations::AutomaticObservations::from_env(),
+    );
+}
+
+fn write_pending_observation_with_policy(
+    pending: PendingObservation,
+    observations: crate::observations::AutomaticObservations,
+) {
+    if !observations.enabled() {
+        return;
+    }
     let store = RouteShadowReceiptStore::new(pending.state_dir);
     if pending
         .observation

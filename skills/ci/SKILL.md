@@ -5,6 +5,13 @@ description: "Cross-platform CI coordination with Shipyard: validates, ships, ma
 
 # CI Operations with Shipyard
 
+`SHIPYARD_OBSERVATIONS=off` (trimmed, case-insensitive) stops automatic queue
+shadow/timing, command metric copies, route-shadow receipts, daemon GitHub
+imports, and scheduled baseline collection in processes receiving it. Existing
+services need environment rollout/restart. It preserves required evidence,
+merge receipts, explicit metrics imports/record, and historical reporting;
+retention and manual cause/private-corpus collection remain separate.
+
 ## Required-check producer identity
 
 When CI code consumes required-check materialization, preserve producer
