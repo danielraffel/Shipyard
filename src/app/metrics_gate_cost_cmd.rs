@@ -100,21 +100,7 @@ pub(super) fn gate_cost_command<W: Write>(
                 .map_err(|error| CliFailure::new(1, format!("flake read failed: {error}")))?;
             report.same_sha_flakes = Some(scorecard::flakes::compute(&query.repo, &read));
         }
-        if json_output {
-            write_pretty_json(stdout, &report)
-                .map_err(|error| CliFailure::new(1, error.to_string()))?;
-        } else {
-            write!(stdout, "{}", scorecard::render(&report))
-                .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            if let Some(flakes) = &report.same_sha_flakes {
-                write!(stdout, "{}", scorecard::flakes::render(flakes))
-                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            }
-            if let Some(naming) = &report.cause_naming {
-                write!(stdout, "{}", scorecard::causes::render(naming))
-                    .map_err(|error| CliFailure::new(1, error.to_string()))?;
-            }
-        }
+        write_scorecard(stdout, &report, json_output)?;
         return Ok(std::process::ExitCode::SUCCESS);
     }
     let observation = gate_cost::gather_cached(&reader, &query, now, &cache)
@@ -128,6 +114,28 @@ pub(super) fn gate_cost_command<W: Write>(
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+fn write_scorecard<W: Write>(
+    stdout: &mut W,
+    report: &scorecard::ScorecardReport,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    if json_output {
+        write_pretty_json(stdout, report).map_err(|error| CliFailure::new(1, error.to_string()))?;
+    } else {
+        write!(stdout, "{}", scorecard::render(report))
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        if let Some(flakes) = &report.same_sha_flakes {
+            write!(stdout, "{}", scorecard::flakes::render(flakes))
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+        if let Some(naming) = &report.cause_naming {
+            write!(stdout, "{}", scorecard::causes::render(naming))
+                .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Read the red cases' causes, put them on `rows`, and score them.

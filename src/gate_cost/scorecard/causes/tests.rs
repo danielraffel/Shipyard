@@ -467,9 +467,9 @@ fn archive_cause(job_id: u64, run_id: u64, repo: &str) -> Value {
 #[test]
 fn archive_joins_exact_identity_and_reports_unjoined_rows() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let causes = dir.path().join("causes");
-    std::fs::create_dir(&causes).expect("causes");
-    let path = causes.join("2026-10.jsonl");
+    let archive_dir = dir.path().join("causes");
+    std::fs::create_dir(&archive_dir).expect("archive dir");
+    let path = archive_dir.join("2026-10.jsonl");
     let rows = [
         archive_cause(GATE_JOB, 38_308_868_279, PULP),
         archive_cause(999, 38_308_868_279, PULP),
@@ -497,9 +497,9 @@ fn archive_joins_exact_identity_and_reports_unjoined_rows() {
 #[test]
 fn archive_duplicates_and_malformed_rows_stay_unreadable() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let causes = dir.path().join("causes");
-    std::fs::create_dir(&causes).expect("causes");
-    let path = causes.join("2026-10.jsonl");
+    let archive_dir = dir.path().join("causes");
+    std::fs::create_dir(&archive_dir).expect("archive dir");
+    let path = archive_dir.join("2026-10.jsonl");
     let duplicate = archive_cause(GATE_JOB, 38_308_868_279, PULP);
     let mut wrong_repo = archive_cause(998, 38_308_868_279, "other/repo");
     let mut missing_job = archive_cause(997, 38_308_868_279, PULP);
@@ -507,10 +507,7 @@ fn archive_duplicates_and_malformed_rows_stay_unreadable() {
     wrong_repo["repo"] = json!("other/repo");
     std::fs::write(
         &path,
-        format!(
-            "{}\n{}\n{}\n{}\n{{bad json}}\n",
-            duplicate, duplicate, wrong_repo, missing_job
-        ),
+        format!("{duplicate}\n{duplicate}\n{wrong_repo}\n{missing_job}\n{{bad json}}\n"),
     )
     .expect("archive");
     let read = archive(dir.path(), PULP);
