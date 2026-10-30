@@ -12,11 +12,12 @@ identity (`app_id`) when policy distinguishes checks that share a context name.
 If the materialized endpoint omits that identity, retain ambiguous skipped
 attempts so a success from one producer cannot satisfy another producer.
 
-`metrics repeated-work-cost` is read-only accounting for shadow observations.
-Its `duration_ms` is avoided survivor runtime from authenticated queue timing,
-counted once per distinct survivor and reported with clean, uncertain,
-cancelled, and unmatched coverage. It is an estimate for measurement only;
-never use it to skip validation, alter routing, or authorize a merge.
+`metrics repeated-work-cost` is read-only accounting for shadow observations
+within its explicit `--since` baseline window. Its `duration_ms` is measured
+runtime from authenticated timing for each distinct superseded queue job, with
+clean, uncertain, cancelled, and unmatched coverage. It never uses survivor
+runtime as savings; never use it to skip validation, alter routing, or authorize
+a merge.
 
 ## Adopting Shipyard, or checking what a repository already has
 
@@ -4210,10 +4211,10 @@ waste is not limited to the scorecard window.
 # Repeated-work cost
 
 `shipyard metrics repeated-work-cost` is read-only shadow accounting. Treat
-`duration_ms` as avoided survivor runtime from the authenticated queue timing
-table. It counts each distinct survivor once; uncertain, cancelled, and
-unmatched survivors remain coverage gaps, and the estimate never authorizes a
-queue or merge decision.
+`duration_ms` as measured superseded-job runtime from the authenticated queue
+timing table within the requested `--since` window. It counts each distinct
+superseded job once; uncertain, cancelled, and unmatched jobs remain coverage
+gaps, and the result never authorizes a queue or merge decision.
 
 
 At the protected merge boundary, Shipyard may produce that receipt only after

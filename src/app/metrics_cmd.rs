@@ -400,12 +400,21 @@ pub(super) fn metrics_command<W: Write>(
             return Ok(exit);
         }
         MetricsCommand::RepeatedWorkCost(args) => {
-            let summary = store.repeated_work_cost(args.limit).map_err(|error| {
-                CliFailure::new(1, format!("metrics repeated-work-cost failed: {error}"))
-            })?;
+            let since_days = parse_days(&args.since)?;
+            if since_days <= 0 {
+                return Err(CliFailure::new(
+                    WAIT_EXIT_INVALID,
+                    "repeated-work baseline window must be positive",
+                ));
+            }
+            let summary = store
+                .repeated_work_cost(args.limit, since_days)
+                .map_err(|error| {
+                    CliFailure::new(1, format!("metrics repeated-work-cost failed: {error}"))
+                })?;
             write_output(stdout, json_output, &summary, || {
                 format!(
-                    "{} repeated-work observations; avoided survivor runtime: {} ({} matched clean, {} uncertain, {} cancelled, {} unmatched; {} distinct survivors; final attempt only={})",
+                    "{} repeated-work observations; superseded runtime: {} ({} matched clean, {} uncertain, {} cancelled, {} unmatched; {} distinct superseded jobs; baseline={}d; final attempt only={})",
                     summary.observations,
                     summary
                         .duration_ms
@@ -414,7 +423,8 @@ pub(super) fn metrics_command<W: Write>(
                     summary.excluded_uncertain,
                     summary.excluded_cancelled,
                     summary.unmatched,
-                    summary.distinct_survivors,
+                    summary.distinct_superseded_jobs,
+                    summary.since_days,
                     summary.final_attempt_only
                 )
             })?;
@@ -1063,11 +1073,11 @@ mod tests {
     }
 
     #[test]
-    fn repeated_work_cost_json_and_human_output_report_survivor_coverage() {
+    fn repeated_work_cost_json_and_human_output_report_superseded_coverage() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = MetricsStore::open(temp.path()).expect("store");
         let timing = crate::metrics::QueueTerminalTiming {
-            queue_job_id: "sy-survivor".to_owned(),
+            queue_job_id: "sy-superseded".to_owned(),
             queue_identity: "identity".to_owned(),
             disposition: "clean".to_owned(),
             started_at: Some(Utc::now()),
@@ -1085,7 +1095,7 @@ mod tests {
                 target_config: "cfg".into(),
                 mode: "normal".into(),
                 job_id: "sy-survivor".into(),
-                superseded_job_id: "old".into(),
+                superseded_job_id: "sy-superseded".into(),
                 superseded_sha: "old".into(),
             })
             .expect("shadow");
@@ -1094,6 +1104,7 @@ mod tests {
             metrics_command(
                 MetricsCommand::RepeatedWorkCost(crate::app::cli::MetricsRepeatedWorkCostArgs {
                     limit: 100,
+                    since: "14d".into(),
                 }),
                 temp.path(),
                 None,
@@ -1106,9 +1117,11 @@ mod tests {
         let json: Value = serde_json::from_str(&run(true)).expect("json");
         assert_eq!(json["duration_ms"], 12);
         assert_eq!(json["matched_clean"], 1);
-        assert_eq!(json["distinct_survivors"], 1);
+        assert_eq!(json["distinct_superseded_jobs"], 1);
+        assert_eq!(json["timing_basis"], "superseded_queue_job_runtime");
+        assert_eq!(json["since_days"], 14);
         let human = run(false);
-        assert!(human.contains("avoided survivor runtime: 12 ms"), "{human}");
+        assert!(human.contains("superseded runtime: 12 ms"), "{human}");
         assert!(human.contains("final attempt only"), "{human}");
     }
 

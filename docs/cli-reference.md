@@ -183,7 +183,7 @@ shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics export merge-receipt --repo Generous-Corp/pulp --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
 shipyard metrics summary --project pulp --json
-shipyard metrics repeated-work-cost --limit 1000 --json
+shipyard metrics repeated-work-cost --since 14d --limit 1000 --json
 shipyard metrics summary --project pulp --group-by host --json   # fold ephemeral runners into their host
 shipyard metrics scorecard --project pulp --since 30d --json
 shipyard metrics gate-cost --repo Generous-Corp/pulp --workflow build.yml --gate-job macos --since 48h --json
@@ -819,12 +819,11 @@ terminal refresh updates the existing row only when the phase name matches;
 new phase names append rows under the same correlation ID. No phase duration is
 inferred from a job total.
 
-`metrics repeated-work-cost` is read-only shadow accounting. It reports
-**avoided survivor runtime**: the final-attempt duration of a distinct survivor
-job, used as a conservative estimate for work represented by superseded or
-duplicate observations. Only clean queue timings count; uncertain, cancelled,
-and unmatched survivors remain visible as coverage counts and are never
-treated as zero. It never infers cost from numeric-looking IDs or changes queue
-authority. In JSON, `joined_durations` and `unknown_durations` count distinct
-survivors, while `observations` and `shadow_rows` preserve the raw shadow-row
-coverage.
+`metrics repeated-work-cost` is read-only shadow accounting bounded by
+`--since` (default `14d`). It reports measured runtime from distinct
+**superseded queue jobs**, never the surviving job: only clean queue timings
+count. Uncertain, cancelled, and unmatched superseded jobs remain visible as
+coverage counts and are never treated as zero. It never infers cost from
+numeric-looking IDs or changes queue authority. In JSON, `joined_durations` and
+`unknown_durations` count distinct superseded jobs, while `observations` and
+`shadow_rows` preserve raw shadow-row coverage.
