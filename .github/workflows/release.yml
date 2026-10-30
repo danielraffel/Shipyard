@@ -38,8 +38,12 @@ on:
 # Each job grants only what its own steps use; nothing is granted by default.
 permissions: {}
 
+# One group across tags: a running release always finishes (it may be mid-
+# signing on the local Mac), and a newer tag replaces any older release still
+# waiting, so a burst of merges publishes the newest version instead of
+# queueing one signing per merge.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 env:
