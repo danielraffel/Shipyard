@@ -11,6 +11,11 @@ malformed, duplicate, truncated, and unjoined rows visible. This is advisory
 measurement only and does not authorize queue or merge actions.
 Missing or unreadable `DIR/causes/` exits unsuccessfully with `cause archive
 unavailable`; only a readable empty directory can report zero archived rows.
+The archive scan keeps its 64 MiB / 500,000-line bounds. Invalid UTF-8 counts
+as one malformed row and does not discard later rows. Otherwise valid rows
+for another repository are excluded as `archive_other_repo`, not malformed;
+`archive_rows` still counts all successfully decoded cause records. Attachment
+uses the exact-identity index, without changing duplicate or attempt policy.
 
 Metrics imports preserve exact-head safety when GitHub omits a workflow run's
 pull-request list: `pull_request` and `pull_request_target` runs may use the

@@ -101,6 +101,11 @@ the separate GitHub job-log read.
 Missing or unreadable `DIR/causes/` fails with `cause archive unavailable` before
 GitHub reads or case exports; it never produces a successful zero-count report.
 A readable empty archive remains valid and leaves cases unjoined.
+The archive scan keeps its 64 MiB / 500,000-line bounds. Invalid UTF-8 counts
+as one malformed row and does not discard later rows. Otherwise valid rows
+for another repository are excluded as `archive_other_repo`, not malformed;
+`archive_rows` still counts all successfully decoded cause records. Attachment
+uses the exact-identity index, without changing duplicate or attempt policy.
 
 Metrics verdicts (`shipyard metrics compare|watch|trend|scorecard`) default to
 load-independent proxies; wall-clock p50/p90 is load-dependent context. Do not
