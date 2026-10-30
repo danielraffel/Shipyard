@@ -107,6 +107,7 @@ fn read_archive(dir: &Path) -> Result<ArchiveRows, CliFailure> {
             format!("cause archive directory does not exist: {}", dir.display()),
         ));
     }
+    super::require_archive_parent(dir).map_err(|error| CliFailure::new(2, error))?;
     let paths = jsonl_files(dir)?;
     let mut findings = Vec::new();
     let mut causes = Vec::new();
@@ -427,6 +428,18 @@ pub(super) fn command<W: Write>(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn legacy_root_causes_are_not_reported_as_an_empty_clean_archive() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("causes")).unwrap();
+        fs::write(dir.path().join("2026-10.jsonl"), cause(1)).unwrap();
+        let Err(error) = read_archive(dir.path()) else {
+            panic!("legacy archive must be refused");
+        };
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("legacy cause archive files"));
+    }
 
     fn cause(id: u64) -> String {
         serde_json::json!({
