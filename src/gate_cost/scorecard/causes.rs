@@ -282,6 +282,7 @@ pub fn gather(
 /// attempt identity, and any second row for the same `(repo, run, job)` is
 /// rejected rather than guessed by timestamp or file order.
 /// A missing or unreadable archive directory is an error, not an empty archive.
+#[allow(clippy::too_many_lines)] // Keep the bounded archive scan and its accounting in one order.
 pub fn archive(dir: &Path, repo: &str) -> Result<CausesRead, String> {
     let mut read = CausesRead {
         source: CauseSource::Archive,
