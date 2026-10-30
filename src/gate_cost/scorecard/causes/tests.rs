@@ -723,3 +723,66 @@ fn archive_line_bound_counts_blank_and_invalid_rows_across_files() {
     attach(&mut rows, &over);
     assert_eq!(compute(&rows, &over).named, 1);
 }
+
+#[test]
+fn a_v7_cached_linker_warning_is_reparsed_and_the_new_cause_is_cached() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = ReadCache::open(dir.path(), std::time::SystemTime::now());
+    let repo = "example/project";
+    let job = Job {
+        id: 101,
+        name: "build".to_owned(),
+        status: Some("completed".to_owned()),
+        conclusion: Some("cancelled".to_owned()),
+        started_at: Some("2026-10-01T00:00:00Z".to_owned()),
+        ..Job::default()
+    };
+    let place = Place {
+        repo: repo.to_owned(),
+        ..Place::default()
+    };
+    // Recreate the old cache entry without asking the fixed extractor to
+    // misclassify a warning: v7 gave this warning the same cause as an error.
+    let mut old = cause::build(
+        &job,
+        Some("ld: duplicate symbol 'example_symbol' in: a.o b.o"),
+        &place,
+        None,
+        true,
+    )
+    .expect("cancelled job has a cause");
+    assert_eq!(old.failure_class, "build");
+    old.detail = Some("warning: duplicate symbol 'example_symbol' in: a.o b.o".to_owned());
+    let old_key = "case-cause:v7:example/project:101";
+    cache.put(old_key, &serde_json::to_value(&old).expect("cause json"));
+    assert!(
+        cache.get(old_key).is_some(),
+        "stale cache control must exist"
+    );
+
+    let calls = Mutex::new(0);
+    let reader = |args: &[String]| {
+        *calls.lock().expect("calls") += 1;
+        match args.last().map(String::as_str) {
+            Some("repos/example/project/actions/jobs/101") => {
+                Ok(serde_json::to_string(&job).expect("job json"))
+            }
+            Some("repos/example/project/actions/jobs/101/logs") => Ok(
+                "ld: warning: duplicate symbol 'example_symbol' in: a.o b.o\n\
+                 [2/2] Linking CXX executable example\n\
+                 ##[error]The operation was canceled.\n"
+                    .to_owned(),
+            ),
+            _ => Err(format!("unexpected request {args:?}")),
+        }
+    };
+    let jobs = std::iter::once(101).collect();
+    let first = gather(&reader, &cache, repo, &jobs, 1);
+    assert_eq!(*calls.lock().expect("calls"), 2, "v7 must be reread");
+    assert!(first.unreadable.is_empty());
+    assert_ne!(first.by_job[&101].failure_class, "build");
+    assert_ne!(first.by_job[&101].kind, "link_error");
+    let second = gather(&reader, &cache, repo, &jobs, 1);
+    assert_eq!(*calls.lock().expect("calls"), 2, "new cache must be reused");
+    assert_eq!(first, second);
+}

@@ -1842,6 +1842,11 @@ change lands with its fixture and a `c2::VERSION` bump. It began as a port of
 EXP-A3's `c2_extract.py`, which is frozen at version 5 as the reference behind
 EXP-A3's registered results and is not kept in step: do not port rule changes
 to it.
+C2 v8 excludes explicit linker `warning:` diagnostics, including warnings
+mentioning duplicate symbols, missing paths, or undefined references, even
+when the step later fails or is cancelled. Actual linker errors and fatal
+warnings-as-errors diagnostics remain causes; a warning alone is not one.
+The cause-cache version also advances to v8 so old warning causes are reread.
 Records from the step that ended in `##[error]` come first, so a retried
 assertion never outranks the runner dying. A make or ninja failure ranks
 below every runner and compiler record and is `low`: on its own it names the

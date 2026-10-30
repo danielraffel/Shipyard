@@ -678,6 +678,11 @@ a checkout of the main branch, never from the pull request's own checkout, where
 `tools/scripts/<name>.py` is the pull request's own script. Nothing in Shipyard
 executes a `fix_hint` and nothing auto-applies one. A `detail` is log text and
 is never a command.
+C2 v8 excludes explicit linker `warning:` diagnostics, including warnings
+mentioning duplicate symbols, missing paths, or undefined references, even
+when the step later fails or is cancelled. Actual linker errors and fatal
+warnings-as-errors diagnostics remain causes; a warning alone is not one.
+The cause-cache version also advances to v8 so old warning causes are reread.
 It outranks the ctest line that ran the check. Since C2 v7 a CMake error is named
 by its call site and its error's first clause (`PulpLinkFloor.cmake:463 string
 sub-command JSON failed parsing ...`), not by the bare command in parentheses,

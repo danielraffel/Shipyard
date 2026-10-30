@@ -43,7 +43,8 @@ pub const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum non-empty and empty lines scanned across all archive files.
 pub const MAX_ARCHIVE_LINES: usize = 500_000;
 /// Cache key version: bump when a cause's shape or meaning changes.
-const EXTRACT_VERSION: u32 = 7;
+// v8 discards cached linker-warning causes after C2 stops naming warnings.
+const EXTRACT_VERSION: u32 = 8;
 
 /// A red job whose cause could not be read, and why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
