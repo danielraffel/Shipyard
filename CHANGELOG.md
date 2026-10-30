@@ -3,6 +3,17 @@
 All notable changes to Shipyard are documented here. Each entry links
 to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
+<a id="v03781"></a>
+## [0.378.1] - 2026-10-30
+
+- fix/release ghapp path ([#1039](https://github.com/danielraffel/Shipyard/pull/1039))
+- fix(metrics): retry transient baseline provider reads ([#1041](https://github.com/danielraffel/Shipyard/pull/1041))
+
+<a id="v03780"></a>
+## [0.378.0] - 2026-10-30
+
+- metrics: score archived failure causes in gate-cost ([#1045](https://github.com/danielraffel/Shipyard/pull/1045))
+
 <a id="v03770"></a>
 ## [0.377.0] - 2026-10-30
 
@@ -2725,6 +2736,8 @@ to its [GitHub Release](https://github.com/danielraffel/Shipyard/releases).
 
 - feat/shipyard phases 1 4 ([#1](https://github.com/danielraffel/Shipyard/pull/1))
 
+[0.378.1]: https://github.com/danielraffel/Shipyard/releases/tag/v0.378.1
+[0.378.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.378.0
 [0.377.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.377.0
 [0.376.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.376.0
 [0.374.0]: https://github.com/danielraffel/Shipyard/releases/tag/v0.374.0
