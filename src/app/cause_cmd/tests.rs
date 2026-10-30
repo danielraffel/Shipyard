@@ -291,6 +291,21 @@ fn a_managed_archive_without_its_lock_fails_closed_before_reading() {
     assert!(!dir.path().join(".lock").exists());
 }
 
+#[test]
+fn a_frozen_archive_is_readable_without_creating_a_lock() {
+    let dir = tempfile::tempdir().expect("archive");
+    std::fs::create_dir(dir.path().join("causes")).expect("causes directory");
+    std::fs::write(
+        dir.path().join(".shipyard-cause-archive.json"),
+        br#"{"schema":"shipyard.cause-archive/v1","frozen":true}"#,
+    )
+    .expect("archive marker");
+
+    let _reader = lock_archive(dir.path(), false).expect("frozen reader");
+
+    assert!(!dir.path().join(".lock").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn archive_refuses_a_symlinked_causes_directory_without_writing_outside() {

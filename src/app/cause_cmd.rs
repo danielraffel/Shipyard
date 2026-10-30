@@ -136,7 +136,12 @@ fn validate_archive_layout(dir: &Path) -> Result<(), String> {
 pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, String> {
     // Check before creating a lock so a frozen archive remains byte-for-byte
     // untouched when it has never been opened by this process.
-    retention::ensure_not_frozen(dir)?;
+    if exclusive {
+        retention::ensure_not_frozen(dir)?;
+    } else if retention::is_frozen(dir)? {
+        validate_archive_layout(dir)?;
+        return Ok(ArchiveLock { _file: None });
+    }
     if exclusive {
         fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     }
@@ -174,6 +179,13 @@ pub(super) fn lock_archive(dir: &Path, exclusive: bool) -> Result<ArchiveLock, S
                 drop(_bootstrap);
                 return lock_archive(dir, false);
             }
+            return Ok(ArchiveLock { _file: None });
+        }
+        Err(error) if !exclusive && error.kind() == std::io::ErrorKind::PermissionDenied => {
+            if retention::has_pending_transaction(dir) {
+                return Err(error.to_string());
+            }
+            validate_archive_layout(dir)?;
             return Ok(ArchiveLock { _file: None });
         }
         Err(error) => return Err(error.to_string()),

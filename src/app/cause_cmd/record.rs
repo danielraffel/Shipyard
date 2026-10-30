@@ -393,14 +393,17 @@ fn linked_fixlinks(dir: &Path) -> Result<BTreeSet<(String, u64, u64)>, String> {
                 )
             })?;
             let red_attempt = match row.get("red_attempt") {
-                None => 1,
-                Some(value) => value.as_u64().ok_or_else(|| {
-                    format!(
-                        "{} row {}: fix-link red_attempt must be an integer",
-                        path.display(),
-                        index + 1
-                    )
-                })?,
+                None | Some(Value::Null) => 1,
+                Some(value) => value
+                    .as_u64()
+                    .filter(|attempt| *attempt != 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} row {}: fix-link red_attempt must be a non-zero integer",
+                            path.display(),
+                            index + 1
+                        )
+                    })?,
             };
             Ok((repo.to_owned(), red_run_id, red_attempt))
         })
@@ -603,10 +606,14 @@ pub(super) fn record(gh: &SyncGhReader<'_>, query: &RecordQuery) -> Result<Recor
     let mut links_to_append = Vec::new();
     let mut seen_links = final_linked.clone();
     for link in observed_fixlinks {
+        let attempt = match link.get("red_attempt") {
+            None | Some(Value::Null) => Some(1),
+            Some(value) => value.as_u64().filter(|attempt| *attempt != 0),
+        };
         let key = link["repo"]
             .as_str()
             .zip(link["red_run_id"].as_u64())
-            .zip(link["red_attempt"].as_u64().or(Some(1)))
+            .zip(attempt)
             .map(|((repo, run_id), attempt)| (repo.to_owned(), run_id, attempt));
         if let Some(key) = key
             && seen_links.insert(key)

@@ -112,6 +112,10 @@ pub(super) fn ensure_not_frozen(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) fn is_frozen(dir: &Path) -> Result<bool, String> {
+    Ok(read_marker(dir)?.is_some_and(|marker| marker.frozen))
+}
+
 /// Ensure a managed, mutable archive marker exists. Prune requires the marker
 /// so an arbitrary evaluation fixture cannot be mutated by `--apply`.
 pub(super) fn ensure_archive_marker(dir: &Path, require_existing: bool) -> Result<(), String> {
