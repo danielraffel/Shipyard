@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -29,6 +29,13 @@ const GH_TOKEN_ENV: &str = "GH_TOKEN";
 const PR_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
 /// Timeout for one batched repository-wide pull-request listing.
 const PR_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MergedPrObservation {
+    Merged(String),
+    NotMerged,
+    Unknown,
+}
+
 const REST_PR_PAGE_SIZE: u32 = 100;
 
 /// Minted command-helper tokens, keyed by the expanded helper argv (which
@@ -871,10 +878,25 @@ fn run_helper_with_timeout(
             source,
         }
     })?;
-    let status = match process_tree.wait_timeout(timeout) {
+    // Keep execution and descendant teardown under one absolute budget. A
+    // second `Instant::now() + timeout` here would let a wedged kill/reap
+    // consume another full timeout after the provider wait had expired.
+    let deadline = Instant::now() + timeout;
+    #[cfg(unix)]
+    let execution_deadline = {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        deadline
+            .checked_sub(crate::process::DEADLINE_TEARDOWN_BUDGET.min(remaining / 4))
+            .unwrap_or(deadline)
+    };
+    #[cfg(not(unix))]
+    let execution_deadline = deadline;
+    let status = match process_tree
+        .wait_timeout(execution_deadline.saturating_duration_since(Instant::now()))
+    {
         Ok(status) => status,
         Err(source) => {
-            process_tree.terminate();
+            process_tree.terminate_until(deadline);
             return Err(GhPrepareError::HelperStart {
                 program: program.to_owned(),
                 source,
@@ -882,7 +904,7 @@ fn run_helper_with_timeout(
         }
     };
     let Some(status) = status else {
-        process_tree.terminate();
+        process_tree.terminate_until(deadline);
         return Err(GhPrepareError::HelperTimedOut {
             program: program.to_owned(),
             timeout_ms: timeout.as_millis(),
@@ -890,7 +912,7 @@ fn run_helper_with_timeout(
     };
     // A successful helper is a bounded operation, not a daemon launcher.
     // Reap descendants that detached their stdio before the leader exited.
-    process_tree.terminate();
+    process_tree.terminate_until(deadline);
     let read_output = |file: &mut std::fs::File| -> Result<Vec<u8>, GhPrepareError> {
         file.seek(SeekFrom::Start(0))
             .and_then(|_| {
@@ -1348,6 +1370,50 @@ pub fn pr_merged_head_sha(
         None,
         PR_OBSERVATION_TIMEOUT,
     )
+}
+
+fn bounded_pr_observation_timeout(timeout: Duration) -> Duration {
+    timeout.min(PR_OBSERVATION_TIMEOUT)
+}
+
+/// Observe a pull request with a caller-provided timeout while preserving
+/// transport/parse failures as `Unknown` for the daemon cache.
+///
+/// The daemon supervisor uses this form to carry the remaining per-tick
+/// observation budget into the provider lookup. Foreground callers continue
+/// using [`pr_merged_head_sha`] with its fixed provider timeout.
+pub(crate) fn pr_merged_observation_with_timeout(
+    client: Option<&GhClient>,
+    repo: &str,
+    pr: u64,
+    cwd: &Path,
+    snapshot_file: Option<&Path>,
+    timeout: Duration,
+) -> MergedPrObservation {
+    let value = pr_view_state_json(
+        client,
+        repo,
+        pr,
+        cwd,
+        snapshot_file,
+        None,
+        bounded_pr_observation_timeout(timeout),
+    );
+    let Some(value) = value else {
+        return MergedPrObservation::Unknown;
+    };
+    let Some(state) = value.get("state").and_then(Value::as_str) else {
+        return MergedPrObservation::Unknown;
+    };
+    if !state.eq_ignore_ascii_case("merged") {
+        return MergedPrObservation::NotMerged;
+    }
+    value
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .map_or(MergedPrObservation::Unknown, |head| {
+            MergedPrObservation::Merged(head.to_owned())
+        })
 }
 
 /// Read a pull request's lifecycle state (`OPEN` / `CLOSED` / `MERGED`) as
