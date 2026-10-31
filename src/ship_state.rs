@@ -2440,4 +2440,114 @@ mod tests {
                 .is_ok()
         );
     }
+
+    #[test]
+    fn live_lease_refuses_a_second_claim_that_has_the_current_state_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-live-lease".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let owner = |host: &str, session: &str| WorkItemOwner {
+            host: host.to_owned(),
+            session: session.to_owned(),
+            epoch: 0,
+            expires_at: now + chrono::Duration::minutes(5),
+            capability_version: "fleet/v1".to_owned(),
+        };
+        let claimed = store
+            .claim_work_item(&key, owner("m1", "a"), 1, now)
+            .expect("first claim");
+        // The second claimer holds the current state version, so only the
+        // live-lease check can refuse it; the version check would pass.
+        let error = store
+            .claim_work_item(
+                &key,
+                owner("m3", "b"),
+                claimed.state_version,
+                now + chrono::Duration::seconds(1),
+            )
+            .expect_err("a live lease must not be replaced");
+        assert_eq!(error.to_string(), "work item is already claimed");
+        let after = store.get_work_item(&key).expect("read").expect("item");
+        assert_eq!(after.owner.as_ref().expect("owner").session, "a");
+        assert_eq!(after.state_version, claimed.state_version);
+    }
+
+    #[test]
+    fn stale_epoch_checkpoint_is_refused_even_with_the_current_state_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-epoch-current-version".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let first = store
+            .claim_work_item(
+                &key,
+                WorkItemOwner {
+                    host: "m1".to_owned(),
+                    session: "a".to_owned(),
+                    epoch: 0,
+                    expires_at: now,
+                    capability_version: "fleet/v1".to_owned(),
+                },
+                1,
+                now,
+            )
+            .expect("first claim");
+        let first_epoch = first.owner.as_ref().expect("owner").epoch;
+        let second = store
+            .claim_work_item(
+                &key,
+                WorkItemOwner {
+                    host: "m3".to_owned(),
+                    session: "b".to_owned(),
+                    epoch: 0,
+                    expires_at: now + chrono::Duration::minutes(5),
+                    capability_version: "fleet/v1".to_owned(),
+                },
+                first.state_version,
+                now + chrono::Duration::seconds(1),
+            )
+            .expect("reclaim after expiry");
+        assert!(second.owner.as_ref().expect("owner").epoch > first_epoch);
+        let checkpoint = WorkItemCheckpoint {
+            generation: second.generation,
+            head_or_input_digest: "sha256:input".to_owned(),
+            completed_steps: vec!["registered".to_owned()],
+            next_action: "continue".to_owned(),
+            blockers: vec![],
+            remote_receipt: None,
+        };
+        // The stale owner sends the current state version and an unexpired
+        // clock, so the version, expiry and generation checks all pass and
+        // only the epoch fence can refuse the write.
+        let error = store
+            .checkpoint_work_item(
+                &key,
+                first_epoch,
+                checkpoint,
+                second.state_version,
+                now + chrono::Duration::seconds(2),
+            )
+            .expect_err("a stale owner must not write after a reclaim");
+        assert_eq!(error.to_string(), "stale or missing work-item owner epoch");
+        let after = store.get_work_item(&key).expect("read").expect("item");
+        assert!(after.checkpoint.is_none());
+        assert_eq!(after.state_version, second.state_version);
+    }
 }
