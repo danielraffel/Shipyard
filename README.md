@@ -123,7 +123,11 @@ installation.
 - **Works with GitHub's merge queue.** Shipyard validates the head, hands the
   exact SHA to GitHub, and records the queue action.
 - **Explains failures.** `shipyard diagnose` and `shipyard cause` reduce a red
-  job to its failing step and a few useful evidence lines.
+  job to its failing step and a few useful evidence lines. Optional local cause
+  archives preserve diagnostic history; `shipyard cause prune` previews
+  adjustable retention limits. Apply requires a mutable archive marker (or an
+  explicit `--initialize` enrollment) and never guesses through malformed
+  evidence.
 - **Recovers supported stuck work.** Runner watchdogs, PR rescue, queue
   observation, and bounded retries handle routine failures without guessing.
 - **Keeps state across restarts.** A stopped terminal or daemon does not erase

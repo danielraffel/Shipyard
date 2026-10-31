@@ -193,6 +193,7 @@ fn read_archive(dir: &Path) -> Result<ArchiveRows, CliFailure> {
 }
 
 fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
+    let _lock = super::lock_archive(&args.dir, false).map_err(|error| CliFailure::new(1, error))?;
     let ArchiveRows {
         files_scanned,
         causes,
@@ -280,7 +281,7 @@ fn audit(args: &CauseAuditArgs) -> Result<AuditReport, CliFailure> {
     })
 }
 
-fn is_proven_rerun_green(value: &Value) -> bool {
+pub(super) fn is_proven_rerun_green(value: &Value) -> bool {
     let Some(head_sha) = value["head_sha"].as_str() else {
         return false;
     };
@@ -458,6 +459,7 @@ mod tests {
                 .count(),
             2
         );
+        // Readers never create lock files or otherwise mutate a legacy archive.
         assert_eq!(fs::read_dir(dir.path()).expect("after").count(), before);
     }
 
