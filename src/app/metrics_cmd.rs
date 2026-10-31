@@ -613,14 +613,18 @@ pub(super) fn metrics_command<W: Write>(
                 text.push_str(&coverage);
                 let _ = write!(
                     text,
-                    "\n  cost: {:.2} wasted compute minutes ({} failure/cancelled jobs), {:.2} coordination minutes ({} queued jobs), {:.2} rework compute minutes ({} failed attempts), {:.2} coordination+rework minutes; wasted/safely-merged={} ({})",
+                    "\n  cost: {:.2} wasted compute minutes ({} failure/cancelled jobs; {}), {:.2} coordination minutes ({} queued jobs; {}), {:.2} rework compute minutes ({} failed attempts; {}), {:.2} coordination+rework minutes ({}); wasted/safely-merged={} ({})",
                     scorecard.wasted_compute_minutes,
                     scorecard.wasted_compute_samples,
+                    scorecard.wasted_compute_coverage.status,
                     scorecard.coordination_minutes,
                     scorecard.coordination_samples,
+                    scorecard.coordination_coverage.status,
                     scorecard.rework_compute_minutes,
                     scorecard.rework_compute_samples,
+                    scorecard.rework_compute_coverage.status,
                     scorecard.coordination_rework_minutes,
+                    scorecard.coordination_rework_coverage.status,
                     scorecard.wasted_compute_per_safely_merged_change.status,
                     scorecard.wasted_compute_per_safely_merged_change.reason,
                 );
