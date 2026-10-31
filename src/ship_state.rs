@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -10,9 +11,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::evidence::canonical_repository;
+use crate::record_identity::is_valid_repository_slug;
 
 /// Schema version for durable ship-state files.
-pub const SHIP_STATE_SCHEMA_VERSION: u32 = 1;
+pub const SHIP_STATE_SCHEMA_VERSION: u32 = 2;
 
 /// A single dispatched run tracked as part of an in-flight ship.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -71,6 +73,148 @@ pub struct AbandonRecord {
     /// When the abandonment was recorded.
     pub abandoned_at: DateTime<Utc>,
 }
+
+/// Durable ownership claim held by a reviewer for one exact ship head.
+///
+/// The epoch is monotonic within a ship-state record. A reviewer that loses
+/// the claim (or whose deadline expires) cannot publish a late verdict by
+/// reusing an older epoch, even when the PR head itself has not changed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReviewerClaim {
+    /// Exact PR head this reviewer inspected.
+    pub head_sha: String,
+    /// Monotonic claim epoch within the ship-state record.
+    pub epoch: u64,
+    /// Stable reviewer identity.
+    pub reviewer: String,
+    /// Time at which the claim was acquired.
+    pub claimed_at: DateTime<Utc>,
+    /// Exclusive deadline for accepting a verdict from this claim.
+    pub deadline_at: DateTime<Utc>,
+}
+
+impl ReviewerClaim {
+    /// Return the deterministic external identity for this handoff.
+    ///
+    /// A restarted dispatcher uses this key to reconcile an already-created
+    /// check run instead of publishing a duplicate. The key includes the
+    /// canonical repository, PR, exact head, reviewer, and claim epoch; any
+    /// ownership or head change therefore gets a new identity.
+    #[must_use]
+    pub fn receipt_id(&self, repository: &str, pr: u64) -> String {
+        let material = format!(
+            "shipyard-reviewer-claim/v1:{}:{pr}:{}:{}:{}",
+            canonical_repository(repository),
+            self.head_sha,
+            self.epoch,
+            self.reviewer.trim().to_ascii_lowercase(),
+        );
+        format!(
+            "shipyard-reviewer-claim/v1/{:x}",
+            Sha256::digest(material.as_bytes())
+        )
+    }
+}
+
+/// Inputs for an atomic reviewer claim and external receipt publication.
+#[derive(Clone, Copy, Debug)]
+pub struct ReviewerClaimRequest<'a> {
+    /// Repository slug owning the pull request.
+    pub repository: &'a str,
+    /// Pull request number.
+    pub pr: u64,
+    /// Exact current pull request head.
+    pub head_sha: &'a str,
+    /// Stable reviewer identity.
+    pub reviewer: &'a str,
+    /// Claim acquisition time.
+    pub claimed_at: DateTime<Utc>,
+    /// Exclusive claim deadline.
+    pub deadline_at: DateTime<Utc>,
+    /// Trusted current observation time.
+    pub now: DateTime<Utc>,
+}
+
+/// Stable identity for work initiated by an external agent.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+pub struct WorkItemKey {
+    /// Canonical owner/repository slug.
+    pub repository: String,
+    /// Protected base branch.
+    pub base: String,
+    /// Work category, such as repair or review.
+    pub work_kind: String,
+    /// Stable PR, release, or task identifier.
+    pub external_id: String,
+}
+
+/// Fenced owner of a work item. Expiry is a reconciliation signal only;
+/// takeover must advance `epoch` while holding the work-item lock.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkItemOwner {
+    /// Host currently holding the claim.
+    pub host: String,
+    /// Independent agent session identifier.
+    pub session: String,
+    /// Fencing epoch for this claim.
+    pub epoch: u64,
+    /// Lease expiry; expiry alone never authorizes takeover.
+    pub expires_at: DateTime<Utc>,
+    /// Capability contract used by the worker.
+    pub capability_version: String,
+}
+
+/// Context another agent needs to continue without the original filesystem.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkItemCheckpoint {
+    /// Work-item generation this checkpoint describes.
+    pub generation: u64,
+    /// Exact source head or input digest.
+    pub head_or_input_digest: String,
+    /// Steps completed durably.
+    pub completed_steps: Vec<String>,
+    /// Next action for a replacement worker.
+    pub next_action: String,
+    /// Known blockers and dependencies.
+    pub blockers: Vec<String>,
+    /// Remote commit or artifact receipt, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_receipt: Option<String>,
+}
+
+/// Minimal durable work record stored beside existing `ShipState` files.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkItem {
+    /// Work-item schema revision.
+    pub schema_version: u32,
+    /// Stable work identity.
+    pub key: WorkItemKey,
+    /// Generation invalidating stale checkpoints and claims.
+    pub generation: u64,
+    /// CAS version for serialized updates.
+    pub state_version: u64,
+    /// Lifecycle state.
+    pub state: String,
+    /// Protocol revision required by the worker.
+    pub protocol_version: String,
+    /// Fleet capability revision required by the worker.
+    pub capability_version: String,
+    /// Idempotency key for external effects.
+    pub idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Current fenced owner, if claimed.
+    pub owner: Option<WorkItemOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Last durable continuation context.
+    pub checkpoint: Option<WorkItemCheckpoint>,
+    /// Creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Last durable update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Schema revision for work-item records.
+pub const WORK_ITEM_SCHEMA_VERSION: u32 = 1;
 
 /// Durable state for a single in-flight PR ship.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -146,6 +290,12 @@ pub struct ShipState {
     /// sweep. `None` for a normal in-flight or evidence-terminal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abandoned: Option<AbandonRecord>,
+    /// Monotonic reviewer-claim fence for this PR state.
+    #[serde(default)]
+    pub reviewer_claim_epoch: u64,
+    /// Active reviewer claim, if one currently owns this exact head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_reviewer_claim: Option<ReviewerClaim>,
 }
 
 impl ShipState {
@@ -182,6 +332,8 @@ impl ShipState {
             merge_queue_enqueue_succeeded_at: None,
             merge_queue_enqueue_started_at: None,
             abandoned: None,
+            reviewer_claim_epoch: 0,
+            active_reviewer_claim: None,
         }
     }
 
@@ -248,6 +400,124 @@ impl ShipState {
     pub fn is_sha_drift(&self, current_sha: &str) -> bool {
         current_sha != self.head_sha
     }
+
+    /// Claim the current exact head for a reviewer.
+    ///
+    /// Callers must hold the repository-scoped ship-state lock while invoking
+    /// this method and persisting the returned state. A claim for another head
+    /// or a non-forward deadline is rejected without mutation. An unexpired
+    /// active claim remains exclusive; an expired claim is reclaimed with a
+    /// new epoch. `now` is the caller's observation time and prevents a
+    /// future-dated `claimed_at` from bypassing an unexpired claim.
+    pub fn claim_reviewer(
+        &mut self,
+        head_sha: &str,
+        reviewer: impl Into<String>,
+        claimed_at: DateTime<Utc>,
+        deadline_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<ReviewerClaim> {
+        if head_sha != self.head_sha || deadline_at <= claimed_at || claimed_at > now {
+            return None;
+        }
+        match self.active_reviewer_claim.as_ref() {
+            Some(active)
+                if self.schema_version < SHIP_STATE_SCHEMA_VERSION
+                    || active.epoch == 0
+                    || self.reviewer_claim_epoch != active.epoch
+                    || now < active.deadline_at =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        let epoch = self.reviewer_claim_epoch.checked_add(1)?;
+        let claim = ReviewerClaim {
+            head_sha: head_sha.to_owned(),
+            epoch,
+            reviewer: reviewer.into(),
+            claimed_at,
+            deadline_at,
+        };
+        self.schema_version = SHIP_STATE_SCHEMA_VERSION;
+        self.reviewer_claim_epoch = epoch;
+        self.active_reviewer_claim = Some(claim.clone());
+        self.touch();
+        Some(claim)
+    }
+
+    /// Revoke an active reviewer claim when its exact head, epoch, and
+    /// reviewer identity match.
+    ///
+    /// Revocation advances the epoch even though it clears the active claim,
+    /// fencing a late verdict from the revoked reviewer.
+    pub fn revoke_reviewer_claim(&mut self, head_sha: &str, epoch: u64, reviewer: &str) -> bool {
+        if self.schema_version < SHIP_STATE_SCHEMA_VERSION
+            || epoch == 0
+            || self.reviewer_claim_epoch != epoch
+        {
+            return false;
+        }
+        let matches = self.active_reviewer_claim.as_ref().is_some_and(|claim| {
+            claim.head_sha == head_sha
+                && claim.epoch == epoch
+                && claim.reviewer == reviewer
+                && self.head_sha == head_sha
+        });
+        if !matches {
+            return false;
+        }
+        let Some(next_epoch) = self.reviewer_claim_epoch.checked_add(1) else {
+            return false;
+        };
+        self.reviewer_claim_epoch = next_epoch;
+        self.active_reviewer_claim = None;
+        self.touch();
+        true
+    }
+
+    /// Fence all reviewer claims when the validation identity changes.
+    ///
+    /// This is used by explicit head/base adoption. The epoch still advances
+    /// when no claim is active so every validation identity gets a distinct
+    /// authority generation. Returns `false` only after the monotonic fence is
+    /// exhausted, in which case callers must fail closed.
+    pub fn fence_reviewer_claim(&mut self) -> bool {
+        let Some(next_epoch) = self.reviewer_claim_epoch.checked_add(1) else {
+            return false;
+        };
+        self.schema_version = SHIP_STATE_SCHEMA_VERSION;
+        self.reviewer_claim_epoch = next_epoch;
+        self.active_reviewer_claim = None;
+        self.touch();
+        true
+    }
+
+    /// Return whether a reviewer claim may still publish a verdict now.
+    ///
+    /// The claim must name the current exact head, match the active epoch, and
+    /// be observed between its acquisition time and exclusive deadline.
+    #[must_use]
+    pub fn reviewer_claim_is_current(
+        &self,
+        head_sha: &str,
+        epoch: u64,
+        reviewer: &str,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if self.schema_version < SHIP_STATE_SCHEMA_VERSION || epoch == 0 {
+            return false;
+        }
+        self.active_reviewer_claim.as_ref().is_some_and(|claim| {
+            self.head_sha == head_sha
+                && claim.head_sha == head_sha
+                && claim.epoch == epoch
+                && claim.reviewer == reviewer
+                && self.reviewer_claim_epoch == epoch
+                && claim.claimed_at <= now
+                && now < claim.deadline_at
+        })
+    }
 }
 
 /// Report describing what a prune operation removed.
@@ -286,6 +556,152 @@ impl ShipStateStore {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Register an external-agent work item idempotently in the same durable
+    /// state root used by ships. This is observation/intent state only; it
+    /// does not authorize a GitHub mutation.
+    pub fn register_work_item(
+        &self,
+        key: WorkItemKey,
+        protocol_version: impl Into<String>,
+        capability_version: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        now: DateTime<Utc>,
+    ) -> Result<WorkItem, Box<dyn std::error::Error>> {
+        validate_work_item_key(&key)?;
+        let protocol_version = protocol_version.into();
+        let capability_version = capability_version.into();
+        let idempotency_key = idempotency_key.into();
+        let path = self.work_item_path(&key);
+        let lock = self.lock_work_item(&key)?;
+        if let Some(existing) = Self::get_unlocked_work_item(&path)? {
+            if existing.key != key
+                || existing.protocol_version != protocol_version
+                || existing.capability_version != capability_version
+                || existing.idempotency_key != idempotency_key
+            {
+                return Err("work item identity or protocol mismatch".into());
+            }
+            drop(lock);
+            return Ok(existing);
+        }
+        let item = WorkItem {
+            schema_version: WORK_ITEM_SCHEMA_VERSION,
+            key,
+            generation: 1,
+            state_version: 1,
+            state: "planned".to_owned(),
+            protocol_version,
+            capability_version,
+            idempotency_key,
+            owner: None,
+            checkpoint: None,
+            created_at: now,
+            updated_at: now,
+        };
+        Self::persist_work_item_at(&item, &path)?;
+        drop(lock);
+        Ok(item)
+    }
+
+    /// Read a registered work item without treating lock contention as absence.
+    pub fn get_work_item(&self, key: &WorkItemKey) -> io::Result<Option<WorkItem>> {
+        validate_work_item_key(key)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let _lock = self.lock_work_item(key)?;
+        Self::get_unlocked_work_item(&self.work_item_path(key))
+    }
+
+    /// Claim a registered item, advancing its fencing epoch on every new
+    /// owner. A live owner cannot be replaced by lease expiry alone.
+    pub fn claim_work_item(
+        &self,
+        key: &WorkItemKey,
+        mut owner: WorkItemOwner,
+        expected_state_version: u64,
+        now: DateTime<Utc>,
+    ) -> Result<WorkItem, Box<dyn std::error::Error>> {
+        validate_work_item_key(key)?;
+        let path = self.work_item_path(key);
+        let _lock = self.lock_work_item(key)?;
+        let mut item = Self::get_unlocked_work_item(&path)?.ok_or("work item is not registered")?;
+        if item.key != *key {
+            return Err("work item identity mismatch".into());
+        }
+        validate_work_item_schema(&item)?;
+        if item.state_version != expected_state_version {
+            return Err("work item state version conflict".into());
+        }
+        if owner.capability_version != item.capability_version {
+            return Err("work item owner capability mismatch".into());
+        }
+        if let Some(current) = &item.owner {
+            if current.expires_at > now {
+                return Err("work item is already claimed".into());
+            }
+            owner.epoch = current.epoch.saturating_add(1);
+        } else {
+            owner.epoch = item.generation;
+        }
+        item.owner = Some(owner);
+        "claimed".clone_into(&mut item.state);
+        item.state_version = item.state_version.saturating_add(1);
+        item.updated_at = now;
+        Self::persist_work_item_at(&item, &path)?;
+        Ok(item)
+    }
+
+    /// Persist a continuation checkpoint only for the current fenced owner.
+    pub fn checkpoint_work_item(
+        &self,
+        key: &WorkItemKey,
+        epoch: u64,
+        checkpoint: WorkItemCheckpoint,
+        expected_state_version: u64,
+        now: DateTime<Utc>,
+    ) -> Result<WorkItem, Box<dyn std::error::Error>> {
+        validate_work_item_key(key)?;
+        let path = self.work_item_path(key);
+        let _lock = self.lock_work_item(key)?;
+        let mut item = Self::get_unlocked_work_item(&path)?.ok_or("work item is not registered")?;
+        if item.key != *key || item.owner.as_ref().is_none_or(|owner| owner.epoch != epoch) {
+            return Err("stale or missing work-item owner epoch".into());
+        }
+        validate_work_item_schema(&item)?;
+        if item.state_version != expected_state_version {
+            return Err("work item state version conflict".into());
+        }
+        if item
+            .owner
+            .as_ref()
+            .is_some_and(|owner| now >= owner.expires_at)
+        {
+            return Err("work item owner lease has expired".into());
+        }
+        if checkpoint.generation != item.generation {
+            return Err("checkpoint generation is stale".into());
+        }
+        item.checkpoint = Some(checkpoint);
+        "checkpointed".clone_into(&mut item.state);
+        item.state_version = item.state_version.saturating_add(1);
+        item.updated_at = now;
+        Self::persist_work_item_at(&item, &path)?;
+        Ok(item)
+    }
+
+    fn work_item_path(&self, key: &WorkItemKey) -> PathBuf {
+        self.path
+            .join("work-items")
+            .join(format!("{}.json", work_item_digest(key)))
+    }
+
+    fn lock_work_item(&self, key: &WorkItemKey) -> io::Result<ShipStatePrLock> {
+        ShipStatePrLock::acquire(
+            self.path
+                .join("work-items")
+                .join(format!("{}.lock", work_item_digest(key))),
+        )
     }
 
     /// Return the active state path for a PR.
@@ -481,6 +897,88 @@ impl ShipStateStore {
         Ok(())
     }
 
+    /// Claim an exact reviewer head, persist that claim, and invoke a
+    /// publisher while the repository-scoped lock remains held.
+    ///
+    /// The publisher is expected to create the authenticated external receipt
+    /// using the supplied claim. A claim is persisted before publication so a
+    /// process crash cannot lose ownership evidence; if publication returns an
+    /// error, the claim is revoked and that fence is persisted before the
+    /// error is returned. A successful publication intentionally leaves the
+    /// claim active until the normal verdict/expiry path clears it.
+    ///
+    /// This is the storage primitive for a reviewer dispatcher. It does not
+    /// perform GitHub I/O itself, so callers must bind the receipt to the
+    /// supplied exact head and epoch and use authenticated App credentials.
+    pub fn claim_reviewer_and_publish<T, E>(
+        &self,
+        request: ReviewerClaimRequest<'_>,
+        publisher: impl FnOnce(&ReviewerClaim) -> Result<T, E>,
+    ) -> Result<T, Box<dyn std::error::Error>>
+    where
+        E: Display,
+    {
+        let lock = self.lock_pr_scoped(request.repository, request.pr)?;
+        let mut state = self
+            .get_locked_scoped(request.repository, request.pr, &lock)
+            .ok_or_else(|| {
+                format!(
+                    "no active ship state for {} PR #{}",
+                    request.repository, request.pr
+                )
+            })?;
+        let claim = state
+            .claim_reviewer(
+                request.head_sha,
+                request.reviewer,
+                request.claimed_at,
+                request.deadline_at,
+                request.now,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "cannot claim reviewer {} for {} PR #{} at {}",
+                    request.reviewer, request.repository, request.pr, request.head_sha
+                )
+            })?;
+        self.save_scoped_locked(&state, &lock)?;
+
+        match publisher(&claim) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let publish_error = error.to_string();
+                if !state.revoke_reviewer_claim(request.head_sha, claim.epoch, request.reviewer) {
+                    return Err(format!(
+                        "reviewer receipt publication failed ({publish_error}) and claim revocation failed"
+                    )
+                    .into());
+                }
+                self.save_scoped_locked(&state, &lock)?;
+                Err(publish_error.into())
+            }
+        }
+    }
+
+    /// Claim and publish through the authenticated App transport.
+    ///
+    /// This typed entrypoint prevents callers in the reviewer path from
+    /// accidentally supplying an ambient-token or arbitrary HTTP publisher.
+    /// The generic storage primitive remains available for deterministic unit
+    /// tests and non-GitHub integrations.
+    pub fn claim_reviewer_and_publish_app(
+        &self,
+        request: ReviewerClaimRequest<'_>,
+        transport: &mut crate::reviewer_receipt::GhAppCheckRunTransport,
+    ) -> Result<crate::reviewer_receipt::ReviewerReceipt, Box<dyn std::error::Error>> {
+        let repository = request.repository.to_owned();
+        let pr = request.pr;
+        self.claim_reviewer_and_publish(request, |claim| {
+            let receipt_request =
+                crate::reviewer_receipt::request_from_claim(&repository, pr, claim);
+            crate::reviewer_receipt::publish_or_reconcile(transport, &receipt_request)
+        })
+    }
+
     /// Delete an active state file.
     pub fn delete(&self, pr: u64) -> Result<(), std::io::Error> {
         let states = self.states_for_pr(pr);
@@ -498,6 +996,27 @@ impl ShipStateStore {
     pub fn delete_scoped(&self, repository: &str, pr: u64) -> Result<(), std::io::Error> {
         let _lock = self.lock_pr_scoped(repository, pr)?;
         self.delete_scoped_locked(repository, pr)
+    }
+
+    /// Delete an active state only if the exact state observed by the caller
+    /// is still present under the per-PR lock. A cleanup pass can scan state
+    /// outside that lock; this compare-and-delete closes the window where a
+    /// worker updates the file after the scan but before deletion.
+    pub fn delete_scoped_if_matches(
+        &self,
+        repository: &str,
+        pr: u64,
+        expected: &ShipState,
+    ) -> Result<bool, std::io::Error> {
+        let lock = self.lock_pr_scoped(repository, pr)?;
+        let Some(current) = self.get_locked_scoped(repository, pr, &lock) else {
+            return Ok(false);
+        };
+        if current != *expected {
+            return Ok(false);
+        }
+        self.delete_scoped_locked(repository, pr)?;
+        Ok(true)
     }
 
     fn delete_scoped_locked(&self, repository: &str, pr: u64) -> Result<(), std::io::Error> {
@@ -684,9 +1203,14 @@ impl ShipStateStore {
         new_attempt: Option<u32>,
         lock: &ShipStatePrLock,
     ) -> Result<ShipState, Box<dyn std::error::Error>> {
+        let reviewer_claim_epoch = state
+            .reviewer_claim_epoch
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("reviewer claim epoch exhausted"))?;
         let _ = self.archive_scoped_locked(&state.repo, state.pr, lock)?;
         let now = Utc::now();
         Ok(ShipState {
+            schema_version: SHIP_STATE_SCHEMA_VERSION,
             attempt: new_attempt.unwrap_or(state.attempt + 1),
             source_job_id: None,
             dispatched_runs: Vec::new(),
@@ -700,6 +1224,10 @@ impl ShipStateStore {
             // A fresh attempt must not inherit the prior attempt's terminal
             // abandonment marker, or the re-ship would be dead on arrival.
             abandoned: None,
+            // A fresh attempt must fence every claim from the archived
+            // attempt, even when it reuses the same exact head.
+            reviewer_claim_epoch,
+            active_reviewer_claim: None,
             ..state.clone()
         })
     }
@@ -760,6 +1288,23 @@ impl ShipStateStore {
     fn persist_state_at(state: &ShipState, path: &Path) -> io::Result<()> {
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
         crate::durable_file::replace_json(path, state, true)
+    }
+
+    fn persist_work_item_at(item: &WorkItem, path: &Path) -> io::Result<()> {
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(path)?;
+        crate::durable_file::replace_json(path, item, true)
+    }
+
+    fn get_unlocked_work_item(path: &Path) -> io::Result<Option<WorkItem>> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let item = serde_json::from_str(&contents)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        validate_work_item_schema(&item)?;
+        Ok(Some(item))
     }
 
     fn legacy_is_preserved(&self, legacy: &ShipState) -> bool {
@@ -1011,6 +1556,11 @@ pub(crate) fn repository_key(repository: &str) -> String {
     format!("{readable}--{}", hex::encode(digest))
 }
 
+fn work_item_digest(key: &WorkItemKey) -> String {
+    let bytes = serde_json::to_vec(key).expect("work-item key must serialize");
+    hex::encode(Sha256::digest(bytes))
+}
+
 fn collect_json_files(directory: &Path, output: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
@@ -1053,6 +1603,31 @@ pub fn compute_policy_signature(
     hex::encode(&digest[..8])
 }
 
+fn validate_work_item_key(key: &WorkItemKey) -> Result<(), &'static str> {
+    if !is_valid_repository_slug(&key.repository)
+        || key.repository != canonical_repository(&key.repository)
+    {
+        return Err("work item repository must be a canonical owner/repository slug");
+    }
+    for value in [&key.base, &key.work_kind, &key.external_id] {
+        if value.is_empty() || value.chars().any(char::is_control) || value.trim() != value {
+            return Err("work item key fields must be non-empty and whitespace-free");
+        }
+    }
+    Ok(())
+}
+
+fn validate_work_item_schema(item: &WorkItem) -> io::Result<()> {
+    if item.schema_version != WORK_ITEM_SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported work-item schema {}", item.schema_version),
+        ));
+    }
+    validate_work_item_key(&item.key)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 fn default_attempt() -> u32 {
     1
 }
@@ -1090,8 +1665,9 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use super::{
-        AbandonRecord, DispatchedRun, ShipState, ShipStateStore, compute_policy_signature,
-        same_repository,
+        AbandonRecord, DispatchedRun, ReviewerClaim, ReviewerClaimRequest,
+        SHIP_STATE_SCHEMA_VERSION, ShipState, ShipStateStore, WorkItemCheckpoint, WorkItemKey,
+        WorkItemOwner, compute_policy_signature, same_repository,
     };
     use fs2::FileExt;
 
@@ -1290,6 +1866,116 @@ mod tests {
     }
 
     #[test]
+    fn claim_reviewer_and_publish_persists_claim_before_publisher() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let state = sample_state(43, "claim-head");
+        store.save(&state).expect("save");
+        let now = Utc::now();
+        let observed = store
+            .claim_reviewer_and_publish(
+                ReviewerClaimRequest {
+                    repository: &state.repo,
+                    pr: state.pr,
+                    head_sha: &state.head_sha,
+                    reviewer: "pulp-review",
+                    claimed_at: now,
+                    deadline_at: now + Duration::minutes(5),
+                    now,
+                },
+                |claim| {
+                    assert_eq!(claim.head_sha, state.head_sha);
+                    assert_eq!(claim.reviewer, "pulp-review");
+                    assert!(claim.claimed_at <= now && now < claim.deadline_at);
+                    assert_eq!(
+                        claim.receipt_id(&state.repo, state.pr),
+                        claim.receipt_id(&state.repo.to_ascii_uppercase(), state.pr)
+                    );
+                    Ok::<_, String>((claim.epoch, claim.receipt_id(&state.repo, state.pr)))
+                },
+            )
+            .expect("publish");
+        assert_eq!(observed.0, 1);
+        let restarted = ShipStateStore::new(temp.path().join("ship")).expect("reopen store");
+        let persisted = restarted
+            .get_scoped(&state.repo, state.pr)
+            .expect("persisted");
+        assert_eq!(persisted.reviewer_claim_epoch, 1);
+        let claim = persisted.active_reviewer_claim.expect("active claim");
+        assert_eq!(observed.1, claim.receipt_id(&state.repo, state.pr));
+    }
+
+    #[test]
+    fn claim_reviewer_and_publish_revokes_and_fences_on_publish_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let state = sample_state(44, "claim-head");
+        store.save(&state).expect("save");
+        let now = Utc::now();
+        let error = store
+            .claim_reviewer_and_publish(
+                ReviewerClaimRequest {
+                    repository: &state.repo,
+                    pr: state.pr,
+                    head_sha: &state.head_sha,
+                    reviewer: "pulp-review",
+                    claimed_at: now,
+                    deadline_at: now + Duration::minutes(5),
+                    now,
+                },
+                |_claim| Err::<(), _>("check-run refused"),
+            )
+            .expect_err("publication failure");
+        assert_eq!(error.to_string(), "check-run refused");
+        let persisted = store.get_scoped(&state.repo, state.pr).expect("persisted");
+        assert_eq!(persisted.reviewer_claim_epoch, 2);
+        assert!(persisted.active_reviewer_claim.is_none());
+    }
+
+    #[test]
+    fn reviewer_receipt_id_changes_when_epoch_or_head_changes() {
+        let now = Utc::now();
+        let claim = ReviewerClaim {
+            head_sha: "head-a".to_owned(),
+            epoch: 1,
+            reviewer: "pulp-review".to_owned(),
+            claimed_at: now,
+            deadline_at: now + Duration::minutes(5),
+        };
+        let same = claim.receipt_id("Generous-Corp/Pulp", 9);
+        assert_eq!(same, claim.receipt_id("generous-corp/pulp", 9));
+        let mut next_epoch = claim.clone();
+        next_epoch.epoch = 2;
+        assert_ne!(same, next_epoch.receipt_id("generous-corp/pulp", 9));
+        let mut next_head = claim;
+        next_head.head_sha = "head-b".to_owned();
+        assert_ne!(same, next_head.receipt_id("generous-corp/pulp", 9));
+    }
+
+    #[test]
+    fn compare_and_delete_preserves_state_updated_after_cleanup_scan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let observed = sample_state(43, "old-head");
+        store.save(&observed).expect("save observed state");
+
+        let mut current = observed.clone();
+        current.head_sha = "new-head".to_owned();
+        current.touch();
+        store.save(&current).expect("save updated state");
+
+        assert!(
+            !store
+                .delete_scoped_if_matches(&observed.repo, observed.pr, &observed)
+                .expect("compare-and-delete")
+        );
+        assert_eq!(
+            store.get(observed.pr).expect("state remains").head_sha,
+            "new-head"
+        );
+    }
+
+    #[test]
     fn list_active_ignores_corrupt_and_non_integer_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
@@ -1342,6 +2028,10 @@ mod tests {
         state.merge_queue_attempt_started_at = Some(Utc::now());
         state.merge_queue_enqueue_succeeded_at = Some(Utc::now());
         state.merge_queue_enqueue_started_at = Some(Utc::now());
+        let now = Utc::now();
+        let claim = state
+            .claim_reviewer("abc", "reviewer", now, now + Duration::minutes(5), now)
+            .expect("claim current head");
         store.save(&state).expect("save");
 
         let fresh = store
@@ -1354,6 +2044,8 @@ mod tests {
         assert!(fresh.merge_queue_attempt_started_at.is_none());
         assert!(fresh.merge_queue_enqueue_succeeded_at.is_none());
         assert!(fresh.merge_queue_enqueue_started_at.is_none());
+        assert_eq!(fresh.reviewer_claim_epoch, claim.epoch + 1);
+        assert!(fresh.active_reviewer_claim.is_none());
         assert_eq!(store.list_archived().len(), 1);
     }
 
@@ -1395,6 +2087,271 @@ mod tests {
         assert_eq!(state.pr_url, "");
         assert_eq!(state.pr_title, "");
         assert_eq!(state.commit_subject, "");
+        assert_eq!(state.reviewer_claim_epoch, 0);
+        assert!(state.active_reviewer_claim.is_none());
+    }
+
+    #[test]
+    fn schema_v2_claim_fence_preserves_v1_loads_and_rejects_missing_epoch() {
+        let legacy_value = serde_json::json!({
+            "schema_version": 1,
+            "pr": 227,
+            "repo": "danielraffel/pulp",
+            "branch": "feature/test",
+            "base_branch": "main",
+            "head_sha": "legacy-head",
+            "policy_signature": "policy0001",
+            "dispatched_runs": [],
+            "evidence_snapshot": {},
+            "attempt": 1,
+            "created_at": "2026-04-15T10:00:00+00:00",
+            "updated_at": "2026-04-15T10:00:00+00:00"
+        });
+        let legacy: ShipState = serde_json::from_value(legacy_value).expect("v1 state loads");
+        assert_eq!(legacy.schema_version, 1);
+        assert!(!legacy.reviewer_claim_is_current("legacy-head", 1, "reviewer", Utc::now()));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let fresh = sample_state(228, "fresh-head");
+        store.save(&fresh).expect("save v2 state");
+        let saved: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(store.state_path(228)).expect("saved legacy mirror"),
+        )
+        .expect("saved JSON");
+        assert_eq!(saved["schema_version"], SHIP_STATE_SCHEMA_VERSION);
+        assert_eq!(SHIP_STATE_SCHEMA_VERSION, 2);
+
+        let claimed_at = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
+        let mut claimed = fresh;
+        let claim = claimed
+            .claim_reviewer(
+                "fresh-head",
+                "reviewer",
+                claimed_at,
+                claimed_at + Duration::minutes(5),
+                claimed_at,
+            )
+            .expect("claim current v2 head");
+        let mut missing_epoch = serde_json::to_value(&claimed).expect("serialize claimed state");
+        missing_epoch
+            .as_object_mut()
+            .expect("state object")
+            .remove("reviewer_claim_epoch");
+        let malformed: ShipState =
+            serde_json::from_value(missing_epoch).expect("v2 state with omitted field loads");
+        assert_eq!(malformed.schema_version, 2);
+        assert_eq!(malformed.reviewer_claim_epoch, 0);
+        assert!(!malformed.reviewer_claim_is_current(
+            "fresh-head",
+            claim.epoch,
+            "reviewer",
+            claimed_at + Duration::minutes(1)
+        ));
+    }
+
+    #[test]
+    fn claim_reviewer_refuses_a_non_forward_deadline() {
+        let claimed_at = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
+        for deadline_at in [claimed_at, claimed_at - Duration::seconds(1)] {
+            let mut state = sample_state(229, "head-a");
+            assert!(
+                state
+                    .claim_reviewer("head-a", "reviewer", claimed_at, deadline_at, claimed_at)
+                    .is_none(),
+                "deadline {deadline_at} is not after the claim"
+            );
+            assert_eq!(state.reviewer_claim_epoch, 0, "a refusal does not mutate");
+            assert!(state.active_reviewer_claim.is_none());
+        }
+        // Control: one second forward is a valid claim.
+        let mut state = sample_state(229, "head-a");
+        assert!(
+            state
+                .claim_reviewer(
+                    "head-a",
+                    "reviewer",
+                    claimed_at,
+                    claimed_at + Duration::seconds(1),
+                    claimed_at,
+                )
+                .is_some()
+        );
+    }
+
+    /// A state holding an expired claim, which a new reviewer may reclaim
+    /// unless the state is legacy or its epochs disagree.
+    fn state_with_expired_claim(claimed_at: chrono::DateTime<Utc>) -> ShipState {
+        let mut state = sample_state(230, "head-a");
+        state
+            .claim_reviewer(
+                "head-a",
+                "reviewer-a",
+                claimed_at,
+                claimed_at + Duration::minutes(5),
+                claimed_at,
+            )
+            .expect("first claim");
+        state
+    }
+
+    #[test]
+    fn claim_reviewer_refuses_legacy_or_mismatched_epoch_state_with_an_active_claim() {
+        let claimed_at = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
+        let later = claimed_at + Duration::minutes(10);
+        let reclaim = |state: &mut ShipState| {
+            state.claim_reviewer(
+                "head-a",
+                "reviewer-b",
+                later,
+                later + Duration::minutes(5),
+                later,
+            )
+        };
+        // Control: the expired claim is reclaimed with the next epoch.
+        let mut control = state_with_expired_claim(claimed_at);
+        assert_eq!(reclaim(&mut control).expect("reclaim").epoch, 2);
+
+        let mut legacy = state_with_expired_claim(claimed_at);
+        legacy.schema_version = 1;
+        assert!(reclaim(&mut legacy).is_none(), "legacy schema");
+
+        let mut behind = state_with_expired_claim(claimed_at);
+        behind.reviewer_claim_epoch = 0;
+        assert!(
+            reclaim(&mut behind).is_none(),
+            "state epoch behind the claim"
+        );
+
+        let mut ahead = state_with_expired_claim(claimed_at);
+        ahead.reviewer_claim_epoch = 5;
+        assert!(
+            reclaim(&mut ahead).is_none(),
+            "state epoch ahead of the claim"
+        );
+
+        let mut zero = state_with_expired_claim(claimed_at);
+        zero.reviewer_claim_epoch = 0;
+        zero.active_reviewer_claim.as_mut().expect("claim").epoch = 0;
+        assert!(reclaim(&mut zero).is_none(), "a zero-epoch active claim");
+        for refused in [&legacy, &behind, &ahead, &zero] {
+            assert_eq!(
+                refused
+                    .active_reviewer_claim
+                    .as_ref()
+                    .expect("claim kept")
+                    .reviewer,
+                "reviewer-a",
+                "a refusal does not mutate"
+            );
+        }
+    }
+
+    #[test]
+    fn reviewer_claim_fences_timeout_late_verdict_and_stale_epoch() {
+        let claimed_at = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
+        let deadline_at = claimed_at + Duration::minutes(5);
+        let mut state = sample_state(225, "head-a");
+
+        let first = state
+            .claim_reviewer("head-a", "reviewer-a", claimed_at, deadline_at, claimed_at)
+            .expect("current head can be claimed");
+        assert_eq!(first.epoch, 1);
+        assert!(state.reviewer_claim_is_current(
+            "head-a",
+            first.epoch,
+            "reviewer-a",
+            claimed_at + Duration::minutes(1)
+        ));
+        assert!(
+            !state.reviewer_claim_is_current("head-a", first.epoch, "reviewer-a", deadline_at),
+            "a verdict at the exclusive deadline is late"
+        );
+
+        assert!(
+            state
+                .claim_reviewer(
+                    "head-a",
+                    "reviewer-b",
+                    deadline_at - Duration::seconds(1),
+                    deadline_at + Duration::minutes(5),
+                    deadline_at - Duration::seconds(1),
+                )
+                .is_none()
+        );
+        assert!(
+            state
+                .claim_reviewer(
+                    "head-a",
+                    "reviewer-b",
+                    deadline_at + Duration::seconds(1),
+                    deadline_at + Duration::minutes(5),
+                    deadline_at - Duration::seconds(1),
+                )
+                .is_none(),
+            "a future-dated claim cannot bypass an unexpired claim"
+        );
+        let second = state
+            .claim_reviewer(
+                "head-a",
+                "reviewer-b",
+                deadline_at + Duration::seconds(1),
+                deadline_at + Duration::minutes(5),
+                deadline_at + Duration::seconds(1),
+            )
+            .expect("an expired claim can be reclaimed");
+        assert_eq!(second.epoch, 2);
+        assert!(
+            !state.reviewer_claim_is_current("head-a", first.epoch, "reviewer-a", deadline_at),
+            "the replaced reviewer cannot publish a late verdict"
+        );
+        assert!(state.reviewer_claim_is_current(
+            "head-a",
+            second.epoch,
+            "reviewer-b",
+            deadline_at + Duration::minutes(1)
+        ));
+        assert!(!state.reviewer_claim_is_current(
+            "head-a",
+            second.epoch,
+            "reviewer-a",
+            deadline_at + Duration::minutes(1)
+        ));
+        assert!(!state.revoke_reviewer_claim("head-a", first.epoch, "reviewer-a"));
+        assert!(!state.revoke_reviewer_claim("head-a", second.epoch, "reviewer-a"));
+        assert!(state.revoke_reviewer_claim("head-a", second.epoch, "reviewer-b"));
+        assert_eq!(state.reviewer_claim_epoch, 3);
+        assert!(state.active_reviewer_claim.is_none());
+        assert!(!state.reviewer_claim_is_current(
+            "head-a",
+            second.epoch,
+            "reviewer-b",
+            deadline_at + Duration::minutes(1)
+        ));
+    }
+
+    #[test]
+    fn reviewer_claim_rejects_wrong_head_without_mutating_fence() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 27, 12, 0, 0).unwrap();
+        let mut state = sample_state(226, "head-a");
+        assert!(
+            state
+                .claim_reviewer("head-b", "reviewer", now, now + Duration::minutes(5), now)
+                .is_none()
+        );
+        assert!(
+            state
+                .claim_reviewer(
+                    "head-a",
+                    "reviewer",
+                    now + Duration::seconds(1),
+                    now + Duration::minutes(5),
+                    now,
+                )
+                .is_none()
+        );
+        assert_eq!(state.reviewer_claim_epoch, 0);
+        assert!(state.active_reviewer_claim.is_none());
     }
 
     #[test]
@@ -1796,5 +2753,439 @@ mod tests {
             !fresh.is_abandoned(),
             "a fresh attempt must not inherit the abandonment marker"
         );
+    }
+
+    #[test]
+    fn work_item_registration_is_durable_and_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-1".to_owned(),
+        };
+        let now = Utc::now();
+        let first = store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem-1", now)
+            .expect("register");
+        let second = store
+            .register_work_item(
+                key.clone(),
+                "work-item/v1",
+                "fleet/v1",
+                "idem-1",
+                now + chrono::Duration::seconds(1),
+            )
+            .expect("idempotent register");
+        assert_eq!(first, second);
+
+        // A fresh store instance models a controller restart.
+        let restarted = ShipStateStore::new(temp.path().join("ship")).expect("restart");
+        assert_eq!(restarted.get_work_item(&key).expect("load"), Some(first));
+    }
+
+    #[test]
+    fn work_item_registration_rejects_protocol_or_capability_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "review".to_owned(),
+            external_id: "pr-42".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem-42", now)
+            .expect("register");
+        assert!(
+            store
+                .register_work_item(key.clone(), "work-item/v2", "fleet/v1", "idem-42", now)
+                .is_err()
+        );
+        assert!(
+            store
+                .register_work_item(key, "work-item/v1", "fleet/v2", "idem-42", now)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn work_item_registration_rejects_idempotency_drift_and_preserves_corruption() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-idem".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem-a", now)
+            .expect("register");
+        assert!(
+            store
+                .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem-b", now)
+                .is_err()
+        );
+        let path = store.work_item_path(&key);
+        fs::write(&path, b"{not-json").expect("corrupt record");
+        assert!(
+            store
+                .register_work_item(key, "work-item/v1", "fleet/v1", "idem-a", now)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(path).expect("record remains"),
+            "{not-json"
+        );
+    }
+
+    #[test]
+    fn work_item_rejects_noncanonical_keys_and_unknown_schema() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let invalid = WorkItemKey {
+            repository: "Owner/Repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task".to_owned(),
+        };
+        assert!(
+            store
+                .register_work_item(invalid, "work-item/v1", "fleet/v1", "idem", Utc::now())
+                .is_err()
+        );
+
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-schema".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let path = store.work_item_path(&key);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("record")).expect("json");
+        value["schema_version"] = serde_json::json!(99);
+        fs::write(&path, serde_json::to_vec(&value).expect("json")).expect("unsupported schema");
+        let error = store
+            .get_work_item(&key)
+            .expect_err("unknown schema must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn work_item_claim_requires_matching_capability_and_cas_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "review".to_owned(),
+            external_id: "task-cap".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let owner = WorkItemOwner {
+            host: "m3".to_owned(),
+            session: "session".to_owned(),
+            epoch: 0,
+            expires_at: now + chrono::Duration::minutes(5),
+            capability_version: "fleet/old".to_owned(),
+        };
+        assert!(store.claim_work_item(&key, owner.clone(), 1, now).is_err());
+        assert!(
+            store
+                .claim_work_item(
+                    &key,
+                    WorkItemOwner {
+                        capability_version: "fleet/v1".to_owned(),
+                        ..owner
+                    },
+                    2,
+                    now
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expired_owner_cannot_checkpoint_until_reclaimed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-expiry".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let claimed = store
+            .claim_work_item(
+                &key,
+                WorkItemOwner {
+                    host: "m3".to_owned(),
+                    session: "session".to_owned(),
+                    epoch: 0,
+                    expires_at: now + chrono::Duration::seconds(1),
+                    capability_version: "fleet/v1".to_owned(),
+                },
+                1,
+                now,
+            )
+            .expect("claim");
+        let checkpoint = WorkItemCheckpoint {
+            generation: claimed.generation,
+            head_or_input_digest: "sha256:input".to_owned(),
+            completed_steps: vec!["registered".to_owned()],
+            next_action: "continue".to_owned(),
+            blockers: vec![],
+            remote_receipt: None,
+        };
+        assert!(
+            store
+                .checkpoint_work_item(
+                    &key,
+                    claimed.owner.expect("owner").epoch,
+                    checkpoint,
+                    claimed.state_version,
+                    now + chrono::Duration::seconds(2),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn concurrent_claims_allow_only_one_expected_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("ship");
+        let store = ShipStateStore::new(root.clone()).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "review".to_owned(),
+            external_id: "task-race".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for session in ["a", "b"] {
+            let store = ShipStateStore::new(root.clone()).expect("store");
+            let key = key.clone();
+            let barrier = Arc::clone(&barrier);
+            let session = session.to_owned();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                store
+                    .claim_work_item(
+                        &key,
+                        WorkItemOwner {
+                            host: "m3".to_owned(),
+                            session,
+                            epoch: 0,
+                            expires_at: now + chrono::Duration::minutes(5),
+                            capability_version: "fleet/v1".to_owned(),
+                        },
+                        1,
+                        now,
+                    )
+                    .is_ok()
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("claim thread"))
+            .collect();
+        assert_eq!(results.iter().filter(|result| **result).count(), 1);
+        assert_eq!(results.iter().filter(|result| !**result).count(), 1);
+    }
+
+    #[test]
+    fn work_item_checkpoint_rejects_stale_owner_after_reclaim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-epoch".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let first = store
+            .claim_work_item(
+                &key,
+                WorkItemOwner {
+                    host: "m1".to_owned(),
+                    session: "a".to_owned(),
+                    epoch: 0,
+                    expires_at: now,
+                    capability_version: "fleet/v1".to_owned(),
+                },
+                1,
+                now,
+            )
+            .expect("first claim");
+        let first_epoch = first.owner.as_ref().expect("owner").epoch;
+        let second = store
+            .claim_work_item(
+                &key,
+                WorkItemOwner {
+                    host: "m3".to_owned(),
+                    session: "b".to_owned(),
+                    epoch: 0,
+                    expires_at: now + chrono::Duration::minutes(5),
+                    capability_version: "fleet/v1".to_owned(),
+                },
+                2,
+                now + chrono::Duration::seconds(1),
+            )
+            .expect("reclaim after expiry");
+        let second_epoch = second.owner.as_ref().expect("owner").epoch;
+        assert!(second_epoch > first_epoch);
+        let checkpoint = WorkItemCheckpoint {
+            generation: second.generation,
+            head_or_input_digest: "sha256:input".to_owned(),
+            completed_steps: vec!["registered".to_owned()],
+            next_action: "continue".to_owned(),
+            blockers: vec![],
+            remote_receipt: None,
+        };
+        assert!(
+            store
+                .checkpoint_work_item(&key, first_epoch, checkpoint.clone(), 2, now)
+                .is_err()
+        );
+        assert!(
+            store
+                .checkpoint_work_item(&key, second_epoch, checkpoint, 3, now)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn live_lease_refuses_a_second_claim_that_has_the_current_state_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-live-lease".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let owner = |host: &str, session: &str| WorkItemOwner {
+            host: host.to_owned(),
+            session: session.to_owned(),
+            epoch: 0,
+            expires_at: now + chrono::Duration::minutes(5),
+            capability_version: "fleet/v1".to_owned(),
+        };
+        let claimed = store
+            .claim_work_item(&key, owner("m1", "a"), 1, now)
+            .expect("first claim");
+        // The second claimer holds the current state version, so only the
+        // live-lease check can refuse it; the version check would pass.
+        let error = store
+            .claim_work_item(
+                &key,
+                owner("m3", "b"),
+                claimed.state_version,
+                now + chrono::Duration::seconds(1),
+            )
+            .expect_err("a live lease must not be replaced");
+        assert_eq!(error.to_string(), "work item is already claimed");
+        let after = store.get_work_item(&key).expect("read").expect("item");
+        assert_eq!(after.owner.as_ref().expect("owner").session, "a");
+        assert_eq!(after.state_version, claimed.state_version);
+    }
+
+    #[test]
+    fn stale_epoch_checkpoint_is_refused_even_with_the_current_state_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = ShipStateStore::new(temp.path().join("ship")).expect("store");
+        let key = WorkItemKey {
+            repository: "owner/repo".to_owned(),
+            base: "main".to_owned(),
+            work_kind: "repair".to_owned(),
+            external_id: "task-epoch-current-version".to_owned(),
+        };
+        let now = Utc::now();
+        store
+            .register_work_item(key.clone(), "work-item/v1", "fleet/v1", "idem", now)
+            .expect("register");
+        let first = store
+            .claim_work_item(
+                &key,
+                WorkItemOwner {
+                    host: "m1".to_owned(),
+                    session: "a".to_owned(),
+                    epoch: 0,
+                    expires_at: now,
+                    capability_version: "fleet/v1".to_owned(),
+                },
+                1,
+                now,
+            )
+            .expect("first claim");
+        let first_epoch = first.owner.as_ref().expect("owner").epoch;
+        let second = store
+            .claim_work_item(
+                &key,
+                WorkItemOwner {
+                    host: "m3".to_owned(),
+                    session: "b".to_owned(),
+                    epoch: 0,
+                    expires_at: now + chrono::Duration::minutes(5),
+                    capability_version: "fleet/v1".to_owned(),
+                },
+                first.state_version,
+                now + chrono::Duration::seconds(1),
+            )
+            .expect("reclaim after expiry");
+        assert!(second.owner.as_ref().expect("owner").epoch > first_epoch);
+        let checkpoint = WorkItemCheckpoint {
+            generation: second.generation,
+            head_or_input_digest: "sha256:input".to_owned(),
+            completed_steps: vec!["registered".to_owned()],
+            next_action: "continue".to_owned(),
+            blockers: vec![],
+            remote_receipt: None,
+        };
+        // The stale owner sends the current state version and an unexpired
+        // clock, so the version, expiry and generation checks all pass and
+        // only the epoch fence can refuse the write.
+        let error = store
+            .checkpoint_work_item(
+                &key,
+                first_epoch,
+                checkpoint,
+                second.state_version,
+                now + chrono::Duration::seconds(2),
+            )
+            .expect_err("a stale owner must not write after a reclaim");
+        assert_eq!(error.to_string(), "stale or missing work-item owner epoch");
+        let after = store.get_work_item(&key).expect("read").expect("item");
+        assert!(after.checkpoint.is_none());
+        assert_eq!(after.state_version, second.state_version);
     }
 }

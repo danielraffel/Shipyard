@@ -551,7 +551,7 @@ SHIPYARD_INSTALL_DIR="${HOME}/mytools/bin" bash install.sh
 | OS | Architecture | Release assets |
 |----|-------------|--------|
 | macOS | Apple Silicon (ARM64) | `shipyard-macos-arm64.dmg` (contains both binaries) |
-| Windows | x64 | `shipyard-windows-x64.exe`, `shipyard-workstream-provider-windows-x64.exe` |
+| Windows | x64 | `shipyard-windows-x64.exe`, `shipyard-workstream-provider-windows-x64.exe` (only in releases built with `CI_PLATFORM_FOCUS=all`) |
 | Linux | x64 | `shipyard-linux-x64`, `shipyard-workstream-provider-linux-x64` |
 | Linux | ARM64 | `shipyard-linux-arm64`, `shipyard-workstream-provider-linux-arm64` |
 
@@ -597,12 +597,50 @@ ln -sf ~/.local/bin/shipyard ~/.local/bin/sy
 Only do this intentionally: Claude Code, Codex, the macOS GUI, and
 project pinners all treat `~/.local/bin/shipyard` as canonical.
 
-## Optional dependencies
+## Requirements and optional tools
 
-You don't need everything — just what matches your setup. See the
-[main README requirements table](../README.md#requirements) for
-details.
-# Rust toolchain for local gates
+You don't need everything, just what matches your setup:
+
+| Tool | Needed for |
+| --- | --- |
+| [Git](https://git-scm.com/) | Every project |
+| [GitHub CLI](https://cli.github.com/) | Pull requests and GitHub Actions |
+| [SSH](https://www.openssh.com/) | Remote targets |
+| [Namespace CLI](https://namespace.so/docs/reference/cli/installation) | Optional Namespace runner visibility |
+| [TartCI](https://github.com/danielraffel/tartci) | Optional disposable Apple Silicon VMs |
+
+Run `shipyard doctor` to check the tools and credentials for the current
+configuration.
+
+### Metrics, observations and retention
+
+Set `SHIPYARD_OBSERVATIONS=off` in the producing process to stop automatic
+metrics, route-shadow and baseline collection; existing services need the new
+environment and a restart. Required evidence and explicit imports remain available.
+Retention controls deletion separately; see [collection scope](log-retention.md#automatic-observation-collection).
+
+Shipyard stores optional CI timing data in its local SQLite metrics database so
+scorecards can measure queueing, waste, and rework. `shipyard cleanup --apply`
+keeps raw samples for 90 days by default; set
+`SHIPYARD_METRICS_RETENTION_DAYS` to another number, or `0` to disable pruning.
+Invalid, negative, or excessively large values fail cleanup closed.
+Merge receipts are retained as durable provenance. A producer can hand them to
+an observer with `shipyard metrics export merge-receipt --repo <owner/repo>
+--file <handoff.jsonl>`; the export is repository-scoped, atomic, and reads
+only receipts already persisted by Shipyard. It fails without replacing the
+handoff when no receipt exists. A governed transport can instead use
+`--stdout`; that mode emits only canonical JSONL receipt records and writes no
+summary to stdout.
+
+The optional `scripts/collect_baseline.py` collector keeps diagnostic status
+observations for 14 days, capped at 1,024 entries, to bound accumulated
+scorecards and import details. Increase `--state-retention-days` and
+`--state-max-observations` for a longer history. These limits do not change
+readiness, which uses the separate prospective pass history. Omit `--collect`
+to skip this collector's provider imports; this does not disable other
+Shipyard telemetry.
+
+### Rust toolchain for local gates
 
 Shipyard reads [`rust-toolchain.toml`](../rust-toolchain.toml) for the exact
 compiler and components used by CI and the pre-push hook. On a new host, run

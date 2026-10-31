@@ -91,6 +91,7 @@ fn required(reviewers: &[&str]) -> ApprovalPolicy {
         any_reviewer_but_author: false,
         human_reviewer_logins: Vec::new(),
         signers: None,
+        signer_identities: std::collections::BTreeMap::new(),
         rebase_carry: false,
         signer_source: super::SignerSource::Host,
         carry_excluded: None,
@@ -604,6 +605,7 @@ fn the_policy_is_read_from_the_auto_merge_table() {
             any_reviewer_but_author: false,
             human_reviewer_logins: Vec::new(),
             signers: None,
+            signer_identities: std::collections::BTreeMap::new(),
             rebase_carry: false,
             signer_source: super::SignerSource::Host,
             carry_excluded: None,
@@ -750,6 +752,166 @@ fn a_config_that_sets_the_key_decides_over_the_default() {
         let marker = [fleet("2026-10-12T01:00:00Z", &format!("reviewed: {HEAD}"))];
         assert!(!allows(&policy, &marker, None));
     }
+}
+
+/// The message `GitHubError::command_failed` builds for a failed `gh` call:
+/// the arguments, which name the repository, path and ref, then the status,
+/// then stderr.
+fn command_failed(args: &str, stderr: &str) -> String {
+    format!("gh {args} failed with status 1: {stderr}")
+}
+
+fn config_args(repo: &str, base: &str) -> String {
+    format!(
+        "api -H Accept: application/vnd.github.raw+json repos/{repo}/contents/.shipyard/config.toml?ref={base}"
+    )
+}
+
+type StrictReader = dyn Fn(&[String]) -> Result<String, String>;
+
+/// A `gh` stand-in for the strict read: the config answers `config`, the
+/// branch reads back as `base`, and the `.shipyard` directory is absent.
+fn strict_reader(config: impl Fn(&str) -> String) -> impl Fn(&[String]) -> Result<String, String> {
+    move |argv: &[String]| {
+        let joined = argv.join(" ");
+        if joined.contains("contents/.shipyard/config.toml") {
+            Err(config(&joined))
+        } else if joined.contains("/branches/") {
+            Ok("main\n".to_owned())
+        } else if joined.contains("contents/.shipyard?ref=") {
+            Err(command_failed(&joined, "gh: Not Found (HTTP 404)"))
+        } else {
+            Err(format!("unexpected: {joined}"))
+        }
+    }
+}
+
+/// A clean, confirmed 404 is positive evidence that the base has no config;
+/// anything else is an unread config. The classification reads only the
+/// stderr `gh` printed, never the arguments it was given.
+#[test]
+fn the_required_read_types_absence_apart_from_an_unreadable_config() {
+    super::with_host_review_default(false, || {
+        let absent = strict_reader(|args| command_failed(args, "gh: Not Found (HTTP 404)"));
+        assert!(matches!(
+            super::read_policy_required(&absent, "owner/repo", "main"),
+            Err(super::PolicyReadError::Absent(_))
+        ));
+        let cases: [(&str, Box<StrictReader>); 3] = [
+            (
+                "a 502 on a repository and ref named 404",
+                Box::new(strict_reader(|_| {
+                    command_failed(
+                        &config_args("owner/404-tools", "rel-404"),
+                        "HTTP 502: Bad Gateway (https://api.github.com/repos/owner/404-tools)",
+                    )
+                })),
+            ),
+            (
+                "a token-mint 404",
+                Box::new(strict_reader(|args| {
+                    command_failed(
+                        args,
+                        "ghapp: could not mint an installation token\ngh: Not Found (HTTP 404)",
+                    )
+                })),
+            ),
+            (
+                "a 404 without gh's not-found line",
+                Box::new(strict_reader(|args| {
+                    command_failed(args, "HTTP 404: Not Found")
+                })),
+            ),
+        ];
+        for (shape, reader) in &cases {
+            assert!(
+                matches!(
+                    super::read_policy_required(reader.as_ref(), "owner/404-tools", "main"),
+                    Err(super::PolicyReadError::Unreadable(_))
+                ),
+                "{shape}"
+            );
+        }
+        let garbled = |_: &[String]| -> Result<String, String> { Ok("not = [toml".to_owned()) };
+        assert!(matches!(
+            super::read_policy_required(&garbled, "owner/repo", "main"),
+            Err(super::PolicyReadError::Unreadable(_))
+        ));
+    });
+}
+
+/// A clean 404 counts as absence only when a second, independent read agrees.
+#[test]
+fn absence_needs_a_confirming_read() {
+    let not_found = |args: &str| command_failed(args, "gh: Not Found (HTTP 404)");
+    super::with_host_review_default(false, || {
+        let branch_unreadable = |argv: &[String]| -> Result<String, String> {
+            let joined = argv.join(" ");
+            if joined.contains("/branches/") {
+                Err(command_failed(&joined, "HTTP 502: Bad Gateway"))
+            } else {
+                Err(not_found(&joined))
+            }
+        };
+        let lists_config = |argv: &[String]| -> Result<String, String> {
+            let joined = argv.join(" ");
+            if joined.contains("/branches/") {
+                Ok("main\n".to_owned())
+            } else if joined.contains("contents/.shipyard?ref=") {
+                Ok("config.toml\n".to_owned())
+            } else {
+                Err(not_found(&joined))
+            }
+        };
+        let other_files = |argv: &[String]| -> Result<String, String> {
+            let joined = argv.join(" ");
+            if joined.contains("/branches/") {
+                Ok("main\n".to_owned())
+            } else if joined.contains("contents/.shipyard?ref=") {
+                Ok("signers.toml\n".to_owned())
+            } else {
+                Err(not_found(&joined))
+            }
+        };
+        for (shape, reader) in [
+            ("branch unreadable", &branch_unreadable as super::RunGh<'_>),
+            ("directory lists config.toml", &lists_config),
+        ] {
+            assert!(
+                matches!(
+                    super::read_policy_required(reader, "owner/repo", "main"),
+                    Err(super::PolicyReadError::Unreadable(_))
+                ),
+                "{shape}"
+            );
+        }
+        assert!(matches!(
+            super::read_policy_required(&other_files, "owner/repo", "main"),
+            Err(super::PolicyReadError::Absent(_))
+        ));
+    });
+}
+
+#[test]
+fn the_http_status_is_read_from_stderr_only() {
+    assert_eq!(
+        super::gh_error_http_status(&command_failed(
+            &config_args("owner/repo-404", "404"),
+            "HTTP 502: Bad Gateway"
+        )),
+        Some(502)
+    );
+    assert_eq!(
+        super::gh_error_http_status(&command_failed(
+            &config_args("o/r", "main"),
+            "gh: Not Found (HTTP 404)"
+        )),
+        Some(404)
+    );
+    assert_eq!(
+        super::gh_error_http_status(&command_failed(&config_args("o/r404", "404"), "timeout")),
+        None
+    );
 }
 
 #[test]
@@ -1538,7 +1700,8 @@ fn a_hold_after_the_approve_refuses_by_default() {
         ),
     ];
     assert!(!allows(&policy, &comments, None));
-    // Control: the same pair the other way round approves.
+    // The same pair the other way round refuses too: a HOLD is final for its
+    // head, so a later APPROVE of the same head does not outrank it.
     let reversed = [
         fleet(
             "2026-10-12T01:00:00Z",
@@ -1549,7 +1712,238 @@ fn a_hold_after_the_approve_refuses_by_default() {
             &format!("verdict: APPROVE head:{HEAD}"),
         ),
     ];
-    assert!(allows(&policy, &reversed, None));
+    assert!(!allows(&policy, &reversed, None));
+}
+
+// ---------------------------------------------------------------------------
+// A HOLD makes its head un-approvable (pulp#11117 / pulp#11311, 2026-10-31)
+// ---------------------------------------------------------------------------
+
+/// The incident's signers: the standing reviewer and a second allowlisted one.
+fn pulp_signed() -> ApprovalPolicy {
+    let mut policy = by_default("Generous-Corp/pulp");
+    policy.signers = Some(vec!["pulp-review".to_owned(), "infra-review2".to_owned()]);
+    policy
+}
+
+/// A signed fleet-App verdict comment with an id, from `session`.
+fn signed_verdict(
+    id: u64,
+    at: &str,
+    signer: &str,
+    session: &str,
+    verdict: &str,
+    head: &str,
+) -> Value {
+    let mut comment = fleet(
+        at,
+        &format!(
+            "Review.\nreviewer: {signer}\n<!-- session: Daniels-Mac-Studio-m3/{session} -->\n\
+             verdict: {verdict} head:{head}"
+        ),
+    );
+    comment["id"] = json!(id);
+    comment
+}
+
+/// pulp#11117: the interactive `pulp-review` session HOLDs a head; 40 minutes
+/// later a scheduled reviewer session signed `pulp-review` APPROVEs the same
+/// unchanged head without addressing the HOLD. The head stays held.
+#[test]
+fn a_hold_then_a_later_approve_of_the_same_head_is_not_approved() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(
+            1,
+            "2026-10-31T14:40:00Z",
+            "pulp-review",
+            "737146e7-interactive",
+            "HOLD",
+            HEAD,
+        ),
+        signed_verdict(
+            2,
+            "2026-10-31T15:21:00Z",
+            "pulp-review",
+            "fleet-pass-reviewer-1",
+            "APPROVE",
+            HEAD,
+        ),
+    ];
+    super::with_host_sessions(None, || {
+        // Control: the APPROVE alone counts, so the refusal below is the HOLD's.
+        assert!(allows(&policy, &comments[1..], None));
+        assert!(!allows(&policy, &comments, None));
+        assert_eq!(
+            super::verdict_audit_events(HEAD, &[], &comments, &policy, None),
+            vec![
+                "excluded_approval:head held by pulp-review at comment 1".to_owned(),
+                "head_held:held by pulp-review at comment 1".to_owned()
+            ]
+        );
+    });
+}
+
+#[test]
+fn an_approve_then_a_later_hold_of_the_same_head_is_not_approved() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(
+            1,
+            "2026-10-31T14:00:00Z",
+            "pulp-review",
+            "a",
+            "APPROVE",
+            HEAD,
+        ),
+        signed_verdict(2, "2026-10-31T15:00:00Z", "pulp-review", "a", "HOLD", HEAD),
+    ];
+    super::with_host_sessions(None, || assert!(!allows(&policy, &comments, None)));
+}
+
+#[test]
+fn a_hold_on_an_old_head_does_not_block_an_approve_of_the_new_head() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(1, "2026-10-31T14:00:00Z", "pulp-review", "a", "HOLD", OTHER),
+        signed_verdict(
+            2,
+            "2026-10-31T15:00:00Z",
+            "pulp-review",
+            "b",
+            "APPROVE",
+            HEAD,
+        ),
+    ];
+    super::with_host_sessions(None, || {
+        assert!(allows(&policy, &comments, None));
+        assert!(
+            !super::verdict_audit_events(HEAD, &[], &comments, &policy, None)
+                .iter()
+                .any(|event| event.starts_with("excluded_approval:"))
+        );
+    });
+}
+
+#[test]
+fn a_hold_from_a_login_that_does_not_count_is_ignored() {
+    let policy = pulp_signed();
+    let mut drive_by = person("drive-by", "NONE", &format!("verdict: HOLD head:{HEAD}"));
+    drive_by["at"] = json!("2026-10-31T14:00:00Z");
+    let comments = [
+        drive_by,
+        signed_verdict(
+            2,
+            "2026-10-31T15:00:00Z",
+            "pulp-review",
+            "b",
+            "APPROVE",
+            HEAD,
+        ),
+    ];
+    super::with_host_sessions(None, || {
+        assert!(allows(&policy, &comments, None));
+        assert!(super::verdict_audit_events(HEAD, &[], &comments, &policy, None).is_empty());
+    });
+}
+
+#[test]
+fn one_signers_hold_is_not_outranked_by_another_signers_later_approve() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(
+            7,
+            "2026-10-31T14:00:00Z",
+            "infra-review2",
+            "a",
+            "HOLD",
+            HEAD,
+        ),
+        signed_verdict(
+            8,
+            "2026-10-31T15:00:00Z",
+            "pulp-review",
+            "b",
+            "APPROVE",
+            HEAD,
+        ),
+    ];
+    super::with_host_sessions(None, || {
+        assert!(!allows(&policy, &comments, None));
+        assert_eq!(
+            super::verdict_audit_events(HEAD, &[], &comments, &policy, None),
+            vec![
+                "excluded_approval:head held by infra-review2 at comment 7".to_owned(),
+                "head_held:held by infra-review2 at comment 7".to_owned()
+            ]
+        );
+    });
+}
+
+#[test]
+fn a_changes_requested_review_is_not_outranked_by_a_later_approved_review() {
+    let policy = required(&["shipyard-review[bot]"]);
+    let mut hold = review(
+        "shipyard-review[bot]",
+        "Bot",
+        "CHANGES_REQUESTED",
+        HEAD,
+        "2026-10-31T14:00:00Z",
+    );
+    hold["id"] = json!(55);
+    let approve = review(
+        "shipyard-review[bot]",
+        "Bot",
+        "APPROVED",
+        HEAD,
+        "2026-10-31T15:00:00Z",
+    );
+    let reviews = [hold, approve.clone()];
+    assert!(decide(&policy, HEAD, &[approve], &[], &empty_queue(HEAD)).allows());
+    assert!(!decide(&policy, HEAD, &reviews, &[], &empty_queue(HEAD)).allows());
+    assert_eq!(
+        super::verdict_audit_events(HEAD, &reviews, &[], &policy, None),
+        vec![
+            "excluded_approval:head held by shipyard-review[bot] at review 55".to_owned(),
+            "head_held:held by shipyard-review[bot] at review 55".to_owned()
+        ]
+    );
+}
+
+/// A held head's later APPROVE does not carry to a merge-only update either:
+/// the carry is refused before anything is read from GitHub.
+#[test]
+fn an_approval_of_a_held_head_does_not_carry() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(1, "2026-10-31T14:00:00Z", "pulp-review", "a", "HOLD", OTHER),
+        signed_verdict(
+            2,
+            "2026-10-31T15:00:00Z",
+            "pulp-review",
+            "b",
+            "APPROVE",
+            OTHER,
+        ),
+    ];
+    let input = super::CarryInput {
+        repo: "Generous-Corp/pulp",
+        pr: 11117,
+        head: HEAD,
+        reviews: &[],
+        comments: &comments,
+        policy: &policy,
+        author: None,
+    };
+    let gh = |args: &[String]| -> Result<String, String> {
+        panic!("a held head must not reach a carry read: {args:?}")
+    };
+    let gate = HeadGate::NotApproved {
+        head: HEAD.to_owned(),
+    };
+    super::with_host_sessions(None, || {
+        assert_eq!(super::with_carry(&gh, &input, gate.clone()), gate);
+    });
 }
 
 #[test]
@@ -2746,6 +3140,39 @@ fn only_the_repository_side_rule_requires_a_stamp() {
             Some("it has no `ghapp` session stamp")
         );
     });
+}
+
+#[test]
+fn a_base_signer_identity_binding_rejects_wrong_host_or_agent() {
+    let table: toml::Table = "[auto_merge]\nreviewer_signers = [\"codex-review\"]\n\
+         [auto_merge.reviewer_signer_identities]\n\
+         codex-review = [\"Daniels-Mac-Studio-m3 agent:codex-reviewer\"]\n"
+        .parse()
+        .expect("toml");
+    let mut policy = ApprovalPolicy::from_table(&table);
+    policy.signer_source = super::SignerSource::Base;
+    let head = "a".repeat(40);
+    for (stamp, allowed) in [
+        (
+            "<!-- session: Daniels-Mac-Studio-m3/rotating agent: codex-reviewer -->",
+            true,
+        ),
+        (
+            "<!-- session: Daniels-M5-Studio/rotating agent: codex-reviewer -->",
+            false,
+        ),
+        ("<!-- session: Daniels-Mac-Studio-m3/rotating -->", false),
+    ] {
+        let comment = fleet(
+            "2026-10-18T23:33:31Z",
+            &format!("reviewer: codex-review\n{stamp}\nverdict: APPROVE head:{head}"),
+        );
+        assert_eq!(
+            super::app_approval_refusal(&comment, &policy).is_none(),
+            allowed,
+            "{stamp}"
+        );
+    }
 }
 
 /// Every line boundary Python's `str.splitlines` knows ends a verdict line

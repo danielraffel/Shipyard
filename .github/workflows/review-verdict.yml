@@ -1,6 +1,8 @@
 # Posts the `review-verdict` commit status on a pull request's head: the
 # server-side twin of queue-arm-guard's review-before-arm rule (see
-# docs/review-verdict-status.md). Report-only until branch protection lists it.
+# docs/review-verdict-status.md). The job is also the `review-verdict` check
+# run, and it fails unless the head is allowed, so a required check cannot be
+# green on a refused head.
 #
 # Every trigger here runs the default branch's definition of this file:
 # pull_request_target and issue_comment always do, and a review reaches it
@@ -21,6 +23,8 @@ permissions:
   contents: read
   pull-requests: read
   statuses: write
+  # Re-runs the head's own run when a comment or review changes the verdict.
+  actions: write
 
 # One group per pull request on every path, so a review's run and a comment's
 # run on the same pull request queue behind each other instead of racing; a

@@ -19,6 +19,7 @@ import subprocess
 import sqlite3
 import tempfile
 import sys
+import time
 from contextlib import contextmanager
 from typing import Any, Sequence
 
@@ -37,6 +38,51 @@ from baseline_pass_history import (
 REQUIRED_STRATA = ("normal_pr", "merge_group", "rerun", "outage", "concurrent_agents")
 STRATA_CONTRACT = "shipyard-metrics-strata/v1"
 PRODUCER_STRATA = ("normal_pr", "merge_group", "rerun", "unclassified")
+TRANSIENT_PROVIDER_ERROR_MARKERS = (
+    "connection reset",
+    "connection refused",
+    "connection timed out",
+    "connection closed",
+    "operation timed out",
+    "timed out",
+    "i/o timeout",
+    "dial tcp",
+    "deadline exceeded",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "could not resolve host",
+    "tls handshake timeout",
+    "temporarily unavailable",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "server error",
+    "rate limit",
+    "rate_limit",
+    "secondary rate",
+    "unexpected eof",
+    "http 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+)
+DEFAULT_PROVIDER_RETRIES = 2
+DEFAULT_PROVIDER_RETRY_DELAY_SECONDS = 5.0
+MAX_PROVIDER_RETRIES = 5
+MAX_PROVIDER_RETRY_DELAY_SECONDS = 300.0
+DEFAULT_STATE_RETENTION_DAYS = 14
+DEFAULT_STATE_MAX_OBSERVATIONS = 1024
+
+
+def canonical_project(project: str) -> str:
+    """Return the case-insensitive short project key used by metrics storage."""
+    return project.strip().casefold()
+
+
+def canonical_repo(repo: str) -> str:
+    """Return the case-insensitive GitHub owner/repository identity."""
+    return repo.strip().casefold()
 
 
 def run(command: Sequence[str], *, stdin: str | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -46,13 +92,60 @@ def run(command: Sequence[str], *, stdin: str | None = None, timeout: int = 300)
         raise RuntimeError(f"command timed out after {timeout}s: {command[0]}") from exc
 
 
+def transient_provider_failure(result: subprocess.CompletedProcess[str]) -> bool:
+    """Recognize transport failures that are safe to retry with bounded backoff."""
+    if result.returncode == 0:
+        return False
+    # stderr is the error channel; stdout may be structured provider data
+    # containing fields such as timeout_seconds or deadline. Only fall back
+    # to stdout when the provider emitted no stderr diagnostic.
+    text = ((result.stderr or "").strip() or (result.stdout or "").strip()).casefold()
+    return any(marker in text for marker in TRANSIENT_PROVIDER_ERROR_MARKERS) or bool(
+        re.search(r"(?:^|:\s*)timeout[.!]?\s*$", text)
+    )
+
+
+def run_provider_with_retry(command: Sequence[str], *, stdin: str | None = None,
+                            timeout: int = 300, retries: int = DEFAULT_PROVIDER_RETRIES,
+                            delay_seconds: float = DEFAULT_PROVIDER_RETRY_DELAY_SECONDS
+                            ) -> subprocess.CompletedProcess[str]:
+    """Retry only recognized provider transport failures."""
+    if retries < 0 or retries > MAX_PROVIDER_RETRIES:
+        raise ValueError(f"provider retries must be between 0 and {MAX_PROVIDER_RETRIES}")
+    if not math.isfinite(delay_seconds) or not 0 <= delay_seconds <= MAX_PROVIDER_RETRY_DELAY_SECONDS:
+        raise ValueError(
+            "provider retry delay must be finite and between "
+            f"0 and {MAX_PROVIDER_RETRY_DELAY_SECONDS} seconds"
+        )
+    def run_attempt() -> subprocess.CompletedProcess[str]:
+        try:
+            return run(command, stdin=stdin, timeout=timeout)
+        except RuntimeError as exc:
+            # `run` wraps subprocess.TimeoutExpired so callers get a stable
+            # error type. Convert that specific provider timeout back into a
+            # retry-classifiable result; validation and other failures remain
+            # terminal.
+            if "command timed out after" not in str(exc).casefold():
+                raise
+            return subprocess.CompletedProcess(command, 1, "", str(exc))
+
+    result = run_attempt()
+    for attempt in range(retries):
+        if not transient_provider_failure(result):
+            break
+        time.sleep(delay_seconds * (2 ** attempt))
+        result = run_attempt()
+    return result
+
+
 def state_identity(path: pathlib.Path, project: str, repo: str, db: pathlib.Path) -> dict[str, str]:
-    return {"project": project, "repo": repo, "database": str(db.expanduser().resolve(strict=False))}
+    return {"project": canonical_project(project), "repo": canonical_repo(repo),
+            "database": str(db.expanduser().resolve(strict=False))}
 
 
 def validate_project_repo(project: str, repo: str) -> None:
-    parts = repo.split("/")
-    if len(parts) != 2 or not all(parts) or project.casefold() != parts[1].casefold():
+    parts = canonical_repo(repo).split("/")
+    if len(parts) != 2 or not all(parts) or canonical_project(project) != parts[1].casefold():
         raise ValueError("--project must be the repository short name for exact scorecard scoping")
 
 
@@ -64,17 +157,30 @@ def validate_state_identity(path: pathlib.Path, project: str, repo: str, db: pat
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"baseline state is unreadable: {exc}") from exc
     expected = state_identity(path, project, repo, db)
+    if not isinstance(state, dict):
+        raise ValueError("baseline state must be an object")
     stored = state.get("identity")
     if stored is None:
         if state.get("observations"):
             raise RuntimeError("baseline state has observations but no identity; refusing cross-project reuse")
         return
-    if any(stored.get(key) != value for key, value in expected.items()):
+    mismatched = []
+    if not isinstance(stored, dict):
+        mismatched.append("identity")
+    else:
+        for key, value in expected.items():
+            actual = stored.get(key)
+            if key == "repo" and isinstance(actual, str):
+                actual = canonical_repo(actual)
+            if actual != value:
+                mismatched.append(key)
+    if mismatched:
         raise RuntimeError(f"baseline state identity mismatch: stored={stored!r} requested={expected!r}")
 
 
 def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
+    args.project = canonical_project(args.project)
     validate_project_repo(args.project, args.repo)
     validate_state_identity(args.state, args.project, args.repo, args.db)
     state_dir = str(validate_state_layout(args.db))
@@ -90,13 +196,28 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
             os.lstat(receipt_path)
         except FileNotFoundError:
             events = _import_organic_after_preflight(args, state_dir, None)
-            # A newer supervisor may already record the unavailable handoff
-            # while collecting the provider rows.  Keep the older direct
-            # invocation compatible without emitting a duplicate event when
-            # both versions are combined during a staged rollout.
-            if not any(event.get("source") == "merge-receipt" for event in events):
-                events.append({"source": "merge-receipt", "status": "unavailable",
-                               "reason": "producer handoff not present"})
+            # The provider helper also records an unavailable denominator for
+            # direct callers. Replace only its generic event with the more
+            # precise missing-handoff reason in place, keeping the collection
+            # event last. A newer supervisor may already have a more specific
+            # reason; preserve it.
+            receipt_events = [event for event in events if event.get("source") == "merge-receipt"]
+            generic = next((event for event in receipt_events
+                            if event.get("reason") == "fresh authenticated producer handoff is unavailable"), None)
+            if generic is not None and len(receipt_events) == 1:
+                events[events.index(generic)] = {
+                    "source": "merge-receipt", "status": "unavailable",
+                    "reason": "producer handoff not present"}
+            elif not receipt_events:
+                collection_index = next((index for index, event in enumerate(events)
+                                          if event.get("source") == "collection"), len(events))
+                events.insert(collection_index, {"source": "merge-receipt", "status": "unavailable",
+                                                 "reason": "producer handoff not present"})
+            else:
+                newest = max(i for i, event in enumerate(events)
+                             if event.get("source") == "merge-receipt")
+                events = [event for i, event in enumerate(events)
+                          if event.get("source") != "merge-receipt" or i == newest]
             return events
         except OSError as exc:
             raise RuntimeError(f"merge receipt handoff is unreadable: {exc}") from exc
@@ -107,6 +228,7 @@ def import_organic(args: argparse.Namespace) -> list[dict[str, Any]]:
             pathlib.Path(health_path).expanduser(), receipt_path, args.repo,
             getattr(args, "merge_receipt_stale_after", "2h"),
             getattr(args, "merge_receipt_base_branch", "main"),
+            getattr(args, "merge_receipt_source_host", None),
         )
         with immutable_handoff_snapshot(receipt_path, handoff_payload) as snapshot:
             return _import_organic_after_preflight(args, state_dir, snapshot)
@@ -136,12 +258,20 @@ def _import_organic_after_preflight(args: argparse.Namespace, state_dir: str,
     events: list[dict[str, Any]] = []
     receipt_path = receipt_snapshot
     before = count_jobs(args.db, args.project, args.repo)
-    github = run([args.shipyard, "--state-dir", state_dir, "metrics", "import", "github", "--repo", args.repo,
-                  "--project", args.project, "--limit", str(args.limit), "--json"], timeout=args.timeout_seconds)
+    retries = getattr(args, "provider_retries", DEFAULT_PROVIDER_RETRIES)
+    delay_seconds = getattr(args, "provider_retry_delay_seconds", DEFAULT_PROVIDER_RETRY_DELAY_SECONDS)
+    github = run_provider_with_retry(
+        [args.shipyard, "--state-dir", state_dir, "metrics", "import", "github", "--repo", args.repo,
+         "--project", args.project, "--limit", str(args.limit), "--json"],
+        timeout=args.timeout_seconds, retries=retries, delay_seconds=delay_seconds,
+    )
     if github.returncode:
         raise RuntimeError(f"GitHub import failed: {github.stderr.strip()}")
     events.append(summarize_import("github", github.stdout))
-    tartci = run(tartci_export_command(args), timeout=args.timeout_seconds)
+    tartci = run_provider_with_retry(
+        tartci_export_command(args), timeout=args.timeout_seconds,
+        retries=retries, delay_seconds=delay_seconds,
+    )
     if tartci.returncode:
         raise RuntimeError(f"TartCI export failed: {tartci.stderr.strip()}")
     normalized, excluded = prepare_tartci_export(tartci.stdout, args.repo, args.project)
@@ -194,7 +324,8 @@ def count_jobs(db: pathlib.Path, project: str, repo: str) -> int | None:
     try:
         with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
             return int(connection.execute("""select count(*) from jobs j join runs r on r.id=j.run_id
-                where r.project=? and r.repo=?""", (project, repo)).fetchone()[0])
+                where lower(r.project)=? and lower(r.repo)=?""",
+                (canonical_project(project), canonical_repo(repo))).fetchone()[0])
     except sqlite3.Error:
         return None
 
@@ -211,7 +342,8 @@ def source_activity_dates(db: pathlib.Path, project: str, repo: str) -> set[str]
             timestamp_sql = "coalesce(" + ",".join("j." + name for name in timestamps) + ")"
             rows = connection.execute(
                 f"select {timestamp_sql} from jobs j join runs r on r.id=j.run_id "
-                "where r.project=? and r.repo=?", (project, repo))
+                "where lower(r.project)=? and lower(r.repo)=?",
+                (canonical_project(project), canonical_repo(repo)))
             dates = set()
             for (value,) in rows:
                 if isinstance(value, str):
@@ -252,7 +384,12 @@ def prepare_tartci_export(text: str, repo: str, project: str) -> tuple[str, int]
     A malformed record, wrong project, or invalid provider remains fatal.
     """
     records = _tartci_records(text)
-    invalid = [record for record in records if record.get("repo") != repo or record.get("project") != project
+    expected_project = canonical_project(project)
+    expected_repo = canonical_repo(repo)
+    invalid = [record for record in records if not isinstance(record.get("repo"), str)
+               or canonical_repo(record["repo"]) != expected_repo
+               or not isinstance(record.get("project"), str)
+               or canonical_project(record["project"]) != expected_project
                or not isinstance(record.get("provider"), str) or not record["provider"].strip()
                or ("external_id" in record and not isinstance(record.get("external_id"), str))]
     if invalid:
@@ -268,7 +405,8 @@ def prepare_tartci_export(text: str, repo: str, project: str) -> tuple[str, int]
 
 
 def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, repo: str,
-                                  stale_after: str, base_branch: str = "main") -> tuple[dict[str, Any], bytes]:
+                                  stale_after: str, base_branch: str = "main",
+                                  expected_source_host: str | None = None) -> tuple[dict[str, Any], bytes]:
     """Require a producer health sidecar before importing its handoff."""
     if receipt_handoff is None:
         raise RuntimeError("merge receipt health validation is unavailable")
@@ -291,12 +429,30 @@ def validate_merge_receipt_health(path: pathlib.Path, handoff: pathlib.Path, rep
     if (not isinstance(health_repo, str)
             or health_repo.strip().casefold() != repo.strip().casefold()):
         raise RuntimeError(f"merge receipt health names a repository other than {repo}")
-    if health.get("project") != repo.rsplit("/", 1)[-1]:
+    if (not isinstance(health.get("project"), str)
+            or canonical_project(health["project"]) != canonical_project(repo.rsplit("/", 1)[-1])):
         raise RuntimeError("merge receipt health project is not bound to repository")
     if health.get("base_branch") != base_branch:
         raise RuntimeError(f"merge receipt health base branch is not {base_branch}")
     if health.get("freshness_basis") != receipt_handoff.FRESHNESS_BASIS:
         raise RuntimeError("merge receipt health has an unsupported freshness basis")
+    recorded_source_host = health.get("source_host")
+    if recorded_source_host is not None:
+        try:
+            receipt_handoff.validate_source_host(recorded_source_host)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+    if expected_source_host is not None:
+        try:
+            receipt_handoff.validate_source_host(expected_source_host)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if not isinstance(recorded_source_host, str):
+            raise RuntimeError("merge receipt health is missing source_host provenance")
+        if recorded_source_host.casefold() != expected_source_host.casefold():
+            raise RuntimeError(
+                f"merge receipt health source_host is {recorded_source_host}, expected {expected_source_host}"
+            )
     recorded_file = health.get("file")
     if not isinstance(recorded_file, str) or pathlib.Path(recorded_file).resolve() != handoff.resolve():
         raise RuntimeError("merge receipt health is bound to a different handoff file")
@@ -376,7 +532,12 @@ def validate_merge_receipt_scope(path: pathlib.Path, repo: str) -> None:
 def validate_tartci_export(text: str, repo: str, project: str) -> None:
     """Strict compatibility validator retained for callers and tests."""
     records = _tartci_records(text)
-    missing = [record for record in records if record.get("repo") != repo or record.get("project") != project
+    expected_repo = canonical_repo(repo)
+    expected_project = canonical_project(project)
+    missing = [record for record in records if not isinstance(record.get("repo"), str)
+               or canonical_repo(record["repo"]) != expected_repo
+               or not isinstance(record.get("project"), str)
+               or canonical_project(record["project"]) != expected_project
                or not isinstance(record.get("provider"), str) or not record["provider"].strip()
                or not isinstance(record.get("external_id"), str) or not record["external_id"].strip()]
     if missing:
@@ -426,7 +587,8 @@ def consume_authenticated_strata(card: dict[str, Any], *, repo: str | None = Non
         card["missing_strata"] = list(REQUIRED_STRATA)
         card["provenance_status"] = "unverified_organic_input"
         return card
-    if repo is not None and payload.get("repo") != repo:
+    if repo is not None and (not isinstance(payload.get("repo"), str)
+                            or canonical_repo(payload["repo"]) != canonical_repo(repo)):
         card["strata"] = unavailable
         card["missing_strata"] = list(REQUIRED_STRATA)
         card["provenance_status"] = "unverified_organic_input"
@@ -537,6 +699,12 @@ def validate_state_layout(db: pathlib.Path) -> pathlib.Path:
     return state_dir
 
 
+def coverage_value_text(coverage: Any) -> str:
+    """Render an optional scorecard value without turning unavailable into None."""
+    value = coverage.get("value") if isinstance(coverage, dict) else None
+    return "n/a" if value is None else str(value)
+
+
 def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
     validate_project_repo(args.project, args.repo)
     state_dir = validate_state_layout(args.db)
@@ -558,6 +726,13 @@ def authoritative_scorecard(args: argparse.Namespace) -> dict[str, Any]:
             "reason": "scorecard did not report a safe-merge denominator",
         }
     )
+    safe_merge_rate = card.get("safely_merged_changes_per_eligible_slot_hour")
+    card["collector_safe_merge_rate"] = (
+        dict(safe_merge_rate) if isinstance(safe_merge_rate, dict) else {
+            "status": "unavailable", "value": None,
+            "reason": "scorecard did not report a safe-merge rate",
+        }
+    )
     card.pop("database", None)
     return consume_authenticated_strata(card, repo=args.repo, since_days=args.since_days,
                                         reference_at=dt.datetime.now(dt.timezone.utc))
@@ -568,6 +743,8 @@ def force_receipt_metrics_unavailable(card: dict[str, Any], reason: str) -> None
     unavailable = {"status": "unavailable", "value": None, "reason": reason}
     card["safely_merged_changes"] = dict(unavailable)
     card["collector_safe_merge_denominator"] = dict(unavailable)
+    card["safely_merged_changes_per_eligible_slot_hour"] = dict(unavailable)
+    card["collector_safe_merge_rate"] = dict(unavailable)
     card["wasted_compute_per_safely_merged_change"] = dict(unavailable)
 
 
@@ -615,6 +792,37 @@ def baseline_readiness(card: dict[str, Any], started: dt.datetime,
             or instrumentation.get("continuous_days") < 5:
         reasons.append({"status": "unavailable", "reason": "continuous instrumentation coverage is unavailable"})
 
+    safe_merge = card.get("collector_safe_merge_denominator")
+    if not isinstance(safe_merge, dict) or safe_merge.get("status") != "available" \
+            or isinstance(safe_merge.get("value"), bool) \
+            or not isinstance(safe_merge.get("value"), (int, float)) \
+            or not math.isfinite(float(safe_merge.get("value", float("nan")))) \
+            or safe_merge.get("value") < 0:
+        reasons.append({
+            "status": "unavailable",
+            "reason": "authenticated safe-merge denominator is unavailable",
+        })
+    capacity = card.get("fleet_capacity")
+    if not isinstance(capacity, dict):
+        reasons.append({"status": "unavailable", "reason": "fleet-capacity freshness is unavailable"})
+    elif capacity.get("freshness_status") != "fresh":
+        detail = capacity.get("freshness_reason")
+        reason = "fleet-capacity evidence is not fresh"
+        if isinstance(detail, str) and detail.strip():
+            reason = f"{reason}: {detail}"
+        reasons.append({"status": "unavailable", "reason": reason})
+    else:
+        eligible_hours = capacity.get("eligible_slot_hours")
+        if capacity.get("status") != "available" or (
+                isinstance(eligible_hours, bool)
+                or not isinstance(eligible_hours, (int, float))
+                or not math.isfinite(float(eligible_hours))
+                or eligible_hours <= 0):
+            reasons.append({
+                "status": "unavailable",
+                "reason": "fleet-capacity usable verified denominator is unavailable",
+            })
+
     eligibility_reasons: list[dict[str, str]] = []
     for field, minimum, label in (("important_lanes", 30, "important lane"),
                                   ("host_generations", 10, "host generation")):
@@ -653,16 +861,90 @@ def baseline_readiness(card: dict[str, Any], started: dt.datetime,
             "reasons": reasons, "optimization_reasons": eligibility_reasons}
 
 
+def status_timestamp(value: Any, field: str) -> dt.datetime:
+    if isinstance(value, str):
+        value = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if not isinstance(value, dt.datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field} must be a timezone-aware timestamp")
+    try:
+        return value.astimezone(dt.timezone.utc)
+    except OverflowError as exc:
+        raise ValueError(f"{field} is outside the UTC timestamp range") from exc
+
+
+def status_retention_cutoff(observed_at: dt.datetime, days: int, count: int) -> dt.datetime:
+    for name, value in (("state retention days", days), ("state max observations", count)):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    try:
+        return observed_at - dt.timedelta(days=days)
+    except OverflowError as exc:
+        raise ValueError("state retention days exceeds the timestamp range") from exc
+
+
+def validate_status_observations(observations: Any, started: dt.datetime,
+                                 observed_at: dt.datetime) -> None:
+    if not isinstance(observations, list):
+        raise ValueError("baseline observations must be a list")
+    for item in observations:
+        if not isinstance(item, dict):
+            raise ValueError("baseline observation must be an object")
+        at = status_timestamp(item.get("at"), "observation at")
+        if not started <= at <= observed_at:
+            raise ValueError("observation timestamp is outside the baseline interval")
+        dates = item.get("source_activity_dates", [])
+        if not isinstance(dates, list):
+            raise ValueError("source activity dates must be a list")
+        for value in dates:
+            if not isinstance(value, str) or dt.date.fromisoformat(value).isoformat() != value:
+                raise ValueError("source activity date must be an ISO date")
+        if "events" in item and (not isinstance(item["events"], list)
+                                 or any(not isinstance(event, dict) for event in item["events"])):
+            raise ValueError("observation events must be a list of objects")
+        if "scorecard" in item and not isinstance(item["scorecard"], dict):
+            raise ValueError("observation scorecard must be an object")
+
+
+def load_status_state(path: pathlib.Path, started: dt.datetime,
+                      observed_at: dt.datetime) -> tuple[dict[str, Any], dt.datetime]:
+    state = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(state, dict):
+        raise ValueError("baseline state must be an object")
+    if state.get("observations") and "started_at" not in state:
+        raise ValueError("baseline observations have no start timestamp")
+    baseline_started = status_timestamp(state.get("started_at", started), "started_at")
+    if baseline_started > observed_at:
+        raise ValueError("baseline start is after the observation")
+    if "last_observed_at" in state:
+        last = status_timestamp(state["last_observed_at"], "last_observed_at")
+        if not baseline_started <= last <= observed_at:
+            raise ValueError("last observation is outside the baseline interval")
+    state.setdefault("started_at", baseline_started.isoformat())
+    state.setdefault("observations", [])
+    # Validate expired rows too: retention must not silently repair corrupt state.
+    validate_status_observations(state["observations"], baseline_started, observed_at)
+    return state, baseline_started
+
+
+def readiness_gate_exit(readiness: dict[str, Any], require_ready: bool) -> int:
+    """Return the opt-in gate exit code without changing collection semantics."""
+    if require_ready and readiness.get("optimization_eligible") is not True:
+        return 3
+    return 0
+
+
 def update_state(path: pathlib.Path, project: str, started: dt.datetime,
                  card: dict[str, Any], events: list[dict[str, Any]],
                  observed_at: dt.datetime | None = None, repo: str | None = None,
                  db: pathlib.Path | None = None,
                  pass_history: dict[str, Any] | None = None,
-                 record_observation: bool = True) -> dict[str, Any]:
-    state = json.loads(path.read_text()) if path.exists() else {}
-    state.setdefault("started_at", started.isoformat())
-    state.setdefault("observations", [])
-    observed_at = observed_at or dt.datetime.now(dt.timezone.utc)
+                 record_observation: bool = True,
+                 state_retention_days: int = DEFAULT_STATE_RETENTION_DAYS,
+                 state_max_observations: int = DEFAULT_STATE_MAX_OBSERVATIONS) -> dict[str, Any]:
+    observed_at = status_timestamp(dt.datetime.now(dt.timezone.utc) if observed_at is None else observed_at,
+                                  "observed_at")
+    cutoff = status_retention_cutoff(observed_at, state_retention_days, state_max_observations)
+    state, baseline_started = load_status_state(path, started, observed_at)
     if repo is not None and db is not None:
         validate_state_identity(path, project, repo, db)
         state["identity"] = state_identity(path, project, repo, db)
@@ -674,18 +956,26 @@ def update_state(path: pathlib.Path, project: str, started: dt.datetime,
     activity_dates = set()
     for event in events:
         activity_dates.update(value for value in event.get("source_activity_dates", []) if isinstance(value, str))
-    baseline_started = dt.datetime.fromisoformat(state["started_at"].replace("Z", "+00:00"))
     baseline_start = baseline_started.date()
     has_activity = imported or bool(activity_dates)
     if has_activity and record_observation:
         state["observations"].append({"at": state["last_observed_at"], "events": events,
                                        "source_activity_dates": sorted(activity_dates), "scorecard": card})
+    validate_status_observations(state["observations"], baseline_started, observed_at)
+    state["observations"] = sorted(
+        (item for item in state["observations"] if status_timestamp(item["at"], "observation at") >= cutoff),
+        key=lambda item: status_timestamp(item["at"], "observation at"),
+    )[-state_max_observations:]
+    state["observation_retention"] = {
+        "days": state_retention_days, "max_observations": state_max_observations,
+        "cutoff": cutoff.isoformat(), "counter_scope": "retained_observations",
+    }
     observed_days = {value for item in state["observations"] for value in item.get("source_activity_dates", [])
                      if value >= baseline_start.isoformat()}
-    collection_days = {item["at"][:10] for item in state["observations"]}
+    collection_days = {status_timestamp(item["at"], "observation at").date() for item in state["observations"]}
     state["collection_days_observed"] = len(collection_days)
     state["source_activity_days_observed"] = len(observed_days)
-    # Retain legacy keys as telemetry aliases; readiness no longer uses them.
+    # These legacy counters now cover retained observations only, never readiness.
     state["collection_weekday_days"] = state["collection_days_observed"]
     state["weekday_days_observed"] = state["source_activity_days_observed"]
     state["baseline_readiness"] = baseline_readiness(card, baseline_started, observed_at,
@@ -762,6 +1052,10 @@ def main() -> int:
     parser.add_argument("--project", required=True)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--state", type=pathlib.Path, required=True)
+    parser.add_argument("--state-retention-days", type=int, default=DEFAULT_STATE_RETENTION_DAYS,
+                        help="retain status observations for this many days (default: 14; telemetry only)")
+    parser.add_argument("--state-max-observations", type=int, default=DEFAULT_STATE_MAX_OBSERVATIONS,
+                        help="maximum retained status observations (default: 1024; telemetry only)")
     parser.add_argument("--status-markdown", type=pathlib.Path)
     parser.add_argument("--shipyard", default="shipyard")
     parser.add_argument("--tartci", default="tartci")
@@ -776,12 +1070,21 @@ def main() -> int:
                         help="maximum producer handoff age when --merge-receipt-health is supplied")
     parser.add_argument("--merge-receipt-base-branch", default="main",
                         help="protected base branch bound to producer receipts")
+    parser.add_argument("--merge-receipt-source-host",
+                        help="expected managed fleet host that produced the receipt handoff")
     parser.add_argument("--merge-receipt-unavailable-reason",
                         help="explicit reason the authenticated producer handoff was unavailable")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--since-days", type=int, default=5)
     parser.add_argument("--collect", action="store_true", help="run provider imports")
+    parser.add_argument("--require-ready", action="store_true",
+                        help="exit 3 after writing state unless the baseline is optimization-eligible")
     parser.add_argument("--timeout-seconds", type=int, default=300)
+    parser.add_argument("--provider-retries", type=int, default=DEFAULT_PROVIDER_RETRIES,
+                        help="bounded retries for recognized provider transport failures")
+    parser.add_argument("--provider-retry-delay-seconds", type=float,
+                        default=DEFAULT_PROVIDER_RETRY_DELAY_SECONDS,
+                        help="initial delay before a provider retry; doubles per attempt")
     parser.add_argument("--pass-history", type=pathlib.Path,
                         help="prospective pass history sidecar (defaults beside --state)")
     parser.add_argument("--source-identity", default="shipyard.collect_baseline:v1")
@@ -789,19 +1092,41 @@ def main() -> int:
     parser.add_argument("--expected-interval-secs", type=int, default=3600)
     parser.add_argument("--cadence-slack-secs", type=int, default=300)
     args = parser.parse_args()
+    if args.collect and os.environ.get("SHIPYARD_OBSERVATIONS", "").strip().lower() == "off":
+        print("Automatic observation collection disabled by SHIPYARD_OBSERVATIONS=off", file=sys.stderr)
+        return 0
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
+    if not 0 <= args.provider_retries <= MAX_PROVIDER_RETRIES:
+        parser.error(f"--provider-retries must be between 0 and {MAX_PROVIDER_RETRIES}")
+    if not math.isfinite(args.provider_retry_delay_seconds) or not 0 <= args.provider_retry_delay_seconds <= MAX_PROVIDER_RETRY_DELAY_SECONDS:
+        parser.error(
+            "--provider-retry-delay-seconds must be finite and between "
+            f"0 and {MAX_PROVIDER_RETRY_DELAY_SECONDS} seconds"
+        )
     if args.expected_interval_secs <= 0:
         parser.error("--expected-interval-secs must be positive")
     if args.cadence_slack_secs < 0:
         parser.error("--cadence-slack-secs must be non-negative")
+    try:
+        status_retention_cutoff(dt.datetime.now(dt.timezone.utc),
+                                args.state_retention_days, args.state_max_observations)
+    except ValueError as exc:
+        parser.error(str(exc))
     args.pass_history_path = args.pass_history or default_pass_history_path(args)
+    retention = {"state_retention_days": args.state_retention_days,
+                 "state_max_observations": args.state_max_observations}
 
     events: list[dict[str, Any]] = []
     pass_report: dict[str, Any] | None = None
     pass_recorded = False
+    state_validated = False
     attempt_started_at = dt.datetime.now(dt.timezone.utc)
     try:
+        load_status_state(args.state, attempt_started_at, attempt_started_at)
+        validate_project_repo(args.project, args.repo)
+        validate_state_identity(args.state, args.project, args.repo, args.db)
+        state_validated = True
         events = import_organic(args) if args.collect else []
         card = authoritative_scorecard(args)
         if args.collect:
@@ -819,7 +1144,7 @@ def main() -> int:
             for event in events:
                 event.setdefault("attempt_started_at", attempt_started_at.isoformat())
             state = update_state(args.state, args.project, attempt_started_at, card, events,
-                                 observed_at=completed_at, repo=args.repo, db=args.db)
+                                 observed_at=completed_at, repo=args.repo, db=args.db, **retention)
             try:
                 pass_report = record_pass_observation(args, "success", completed_at, imported_count=imported_count)
                 pass_recorded = True
@@ -827,43 +1152,48 @@ def main() -> int:
                 pass_report = {"status": "unavailable", "reasons": [{"status": "unavailable", "reason": f"prospective pass history unavailable: {history_error}"}]}
             state = update_state(args.state, args.project, attempt_started_at, card, events,
                                  observed_at=completed_at, repo=args.repo, db=args.db,
-                                 pass_history=pass_report, record_observation=False)
+                                 pass_history=pass_report, record_observation=False, **retention)
         else:
             prior_state = json.loads(args.state.read_text()) if args.state.exists() else {}
             pass_report = prior_state.get("pass_history")
             if not isinstance(pass_report, dict):
                 pass_report = {"status": "unavailable", "reasons": [{"status": "unavailable", "reason": "prospective pass history unavailable"}]}
             state = update_state(args.state, args.project, completed_at, card, events, observed_at=completed_at,
-                                 repo=args.repo, db=args.db, pass_history=pass_report)
+                                 repo=args.repo, db=args.db, pass_history=pass_report, **retention)
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired) as exc:
-        if args.collect and not pass_recorded:
+        if args.collect and state_validated and not pass_recorded:
             try:
                 record_pass_observation(args, "failed", dt.datetime.now(dt.timezone.utc), error=str(exc))
             except (OSError, HistoryValidationError, ValueError, TypeError) as history_error:
                 print(f"prospective pass history unavailable: {history_error}", file=sys.stderr)
         print(f"baseline collection failed: {exc}", file=sys.stderr)
         return 1
+    gate_exit = readiness_gate_exit(state.get("baseline_readiness", {}), args.require_ready)
     output = {"project": args.project, "database": "configured metrics store", "scorecard": card,
               "baseline": {"source_activity_days_observed": state["source_activity_days_observed"],
                            "collection_days_observed": state.get("collection_days_observed", 0),
+                           "observation_retention": state["observation_retention"],
                            "readiness": state.get("baseline_readiness", {"status": "unavailable"}),
-                           "exit": state["baseline_exit"]}, "events": events}
+                           "exit": state["baseline_exit"],
+                           "required": args.require_ready,
+                           "gate_exit": gate_exit}, "events": events}
     if args.status_markdown:
         args.status_markdown.write_text(
             "# Organic baseline status\n\n"
             f"- Project: `{args.project}`\n- Observed: `{state['last_observed_at']}`\n"
-            f"- Source activity dates observed: **{state['source_activity_days_observed']}** (telemetry only)\n"
+            f"- Source activity dates in retained observations: **{state['source_activity_days_observed']}** (telemetry only)\n"
             f"- Continuous elapsed days: **{state['baseline_readiness'].get('elapsed_days', 0):.2f}** (exit requires five with active instrumentation)\n"
             f"- Prospective pass history: **{state.get('pass_history', {}).get('continuous_elapsed_days', 0):.2f}** days; trailing interval unobserved: **{state.get('pass_history', {}).get('trailing_interval_unobserved', 'unavailable')}**\n"
             f"- Baseline report complete: **{'yes' if state['baseline_readiness'].get('report_complete') else 'no'}**\n"
             f"- Optimization eligibility: **{'yes' if state['baseline_readiness'].get('optimization_eligible') else 'no'}**\n"
             f"- Safely merged denominator: **{card.get('collector_safe_merge_denominator', {}).get('status', 'unavailable')}**\n"
+            f"- Safely merged changes per eligible slot-hour: **{card.get('collector_safe_merge_rate', {}).get('status', 'unavailable')}** ({coverage_value_text(card.get('collector_safe_merge_rate'))})\n"
             f"- Provenance: **{card.get('provenance_status', 'unverified_organic_input')}**.\n"
             f"- Strata: **{len(REQUIRED_STRATA) - len(card.get('missing_strata', REQUIRED_STRATA))}/{len(REQUIRED_STRATA)} sufficient**; authenticated producer records only.\n\n"
             "Synthetic provenance, unavailable phases, and merge denominators are not imputed.\n"
         )
     print(json.dumps(output, indent=2, sort_keys=True))
-    return 0
+    return gate_exit
 
 
 if __name__ == "__main__":

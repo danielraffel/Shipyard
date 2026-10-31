@@ -79,6 +79,7 @@ pub(super) fn apply_repo_plan(
     let policy = StewardPolicy {
         merge_queue: observation.merge_queue,
         native_auto_merge: observation.allow_auto_merge,
+        approval_context: args.approval_context.clone(),
         required_checks: observation.required_checks.clone(),
         opt_out_label: args.opt_out_label.clone(),
         provenance_blocking_labels: args.provenance_blocking_labels.clone(),
@@ -218,16 +219,13 @@ pub(super) fn apply_repo_plan(
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,
             merge_queue: observation.merge_queue,
-            merge_path: if observation.merge_queue {
-                "native_queue_exact_head".to_owned()
-            } else {
-                "direct_merge_refused_server_enforcement_required".to_owned()
-            },
+            merge_path: policy.merge_path().to_owned(),
             required_contexts: observation
                 .required_checks
                 .iter()
                 .map(RequiredCheck::label)
                 .collect(),
+            blocked_summary: super::blocked_on::summarize(&reports, Utc::now()),
             prs: reports,
             cancellations,
             native_auto_merge_backstop: native_arm_status,
@@ -269,17 +267,55 @@ pub(super) fn apply_pr_plans(
         observation,
         ledger_path,
         mutation_control,
+        approval_blockers: std::cell::RefCell::default(),
     });
-    let reports = observation
+    let mut sweep_pass = super::unapproved_admission::SweepPass::new(args.unapproved_dequeue);
+    if args.apply {
+        super::unapproved_admission::prune(ledger, observation);
+    }
+    let mut reports = observation
         .prs
         .iter()
         .map(|pr| {
             let attempts = attempts_for(ledger, &observation.repo, &pr.fact);
             let decision = classify_pr(&pr.fact, policy, &attempts);
-            if let Some(report) =
+            // Every open PR on the base, owned or not, on every merge path:
+            // an arm or queue entry whose current head the approval gate does
+            // not admit is withdrawn before anything else acts on it. See
+            // `unapproved_admission`.
+            let (stale_mutation, stale_error) =
+                if super::unapproved_admission::applies(pr, &decision) {
+                    super::unapproved_admission::sweep(
+                        actions,
+                        observation,
+                        mutation_context.as_ref(),
+                        args.apply,
+                        pr,
+                        &decision,
+                        &mut sweep_pass,
+                        ledger,
+                    )
+                } else {
+                    (None, None)
+                };
+            unhealthy |= stale_error.is_some();
+            let fold = |mutation: Option<String>, error: Option<String>| {
+                (
+                    match (stale_mutation.clone(), mutation) {
+                        (Some(stale), Some(next)) => Some(format!("{stale},{next}")),
+                        (stale, next) => stale.or(next),
+                    },
+                    match (stale_error.clone(), error) {
+                        (Some(stale), Some(next)) => Some(format!("{stale}; {next}")),
+                        (stale, next) => stale.or(next),
+                    },
+                )
+            };
+            if let Some(mut report) =
                 provenance_blocked_report(mutation_context.as_ref(), pr, policy, &decision, ledger)
             {
                 unhealthy |= report.error.is_some();
+                (report.mutation, report.error) = fold(report.mutation, report.error);
                 return report;
             }
             let (mut mutation, mut error) = (None, None);
@@ -349,6 +385,28 @@ pub(super) fn apply_pr_plans(
                     }
                 }
             }
+            if args.apply
+                && error.is_none()
+                && pr.fact.auto_merge_active
+                && super::exact_head_merge::owns_for_disarm(&decision)
+            {
+                // An armed request survives a later push by anyone with
+                // write access, and the steward admits an owned head itself,
+                // so none is left armed on an owned PR on any base, approved
+                // or not. See `exact_head_merge`.
+                if let Some(context) = mutation_context.as_ref() {
+                    let (disarm_mutation, disarm_error) =
+                        super::exact_head_merge::disarm_owned_auto_merge(context, pr, ledger);
+                    if let Some(disarm_mutation) = disarm_mutation {
+                        mutation = Some(mutation.map_or(disarm_mutation.clone(), |prior| {
+                            format!("{prior},{disarm_mutation}")
+                        }));
+                    }
+                    error = disarm_error;
+                } else {
+                    error = Some("auto-merge disarm requires mutation control".to_owned());
+                }
+            }
             if args.apply && error.is_none() {
                 if let Some(context) = mutation_context.as_ref() {
                     let (pr_mutation, pr_error) = mutate_pr_with_recovery(
@@ -370,15 +428,29 @@ pub(super) fn apply_pr_plans(
                 }
             }
             unhealthy |= error.is_some();
+            let (mutation, error) = fold(mutation, error);
             PrReport {
                 number: pr.fact.number,
                 head_sha: pr.fact.head_sha.clone(),
                 decision,
                 mutation,
                 error,
+                blocked: super::blocked_on::Stall::default(),
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let approval_blockers = mutation_context
+        .map(|context| context.approval_blockers.take())
+        .unwrap_or_default();
+    super::blocked_on::annotate(
+        actions,
+        observation,
+        policy,
+        ledger,
+        &approval_blockers,
+        !args.apply,
+        &mut reports,
+    );
     (reports, unhealthy)
 }
 
@@ -401,6 +473,7 @@ fn provenance_blocked_report(
         decision: decision.clone(),
         mutation,
         error,
+        blocked: super::blocked_on::Stall::default(),
     })
 }
 

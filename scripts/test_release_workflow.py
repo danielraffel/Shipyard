@@ -22,6 +22,15 @@ CHECKOUT = "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0"
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_release_runs_one_at_a_time_and_newest_supersedes_pending(self) -> None:
+        import yaml
+
+        workflow = yaml.safe_load(RELEASE_WORKFLOW.read_text(encoding="utf-8"))
+        concurrency = workflow.get("concurrency") or {}
+        self.assertEqual(concurrency.get("group"), "release")
+        # A running release must never be cancelled mid-signing.
+        self.assertIs(concurrency.get("cancel-in-progress"), False)
+
     def test_release_workflow_keeps_macos_local_signing_gate(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("draft: true", text)
@@ -30,10 +39,27 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("--ci-mode", text)
         self.assertIn("CI_MACOS_SIGNING_ENABLED == 'true'", text)
 
+    def test_macos_job_auth_is_checked_before_expensive_work(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        job = text.split("  sign-and-upload-macos:", 1)[1]
+        config, steps = job.split("    steps:", 1)
+        self.assertNotIn("SHIPYARD_GHAPP_PATH", job)
+        self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", steps)
+        self.assertLess(steps.index("from release_macos_local import require_ci_gh"),
+                        steps.index("- name: Install Rust (attempt 1)"))
+        self.assertLess(steps.index("from release_macos_local import require_ci_gh"),
+                        steps.index("- name: Import Developer ID signing identity"))
+
     def test_release_is_gated_on_the_live_github_smoke(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("  live-smoke:\n    needs: build\n", text)
         self.assertIn("  release:\n    needs: [build, live-smoke]\n", text)
+        self.assertIn("if: always() && startsWith(github.ref, 'refs/tags/v')", text)
+        release = text.split("  release:\n", 1)[1].split("\n  sign-and-upload-macos:", 1)[0]
+        self.assertIn("name: Require verified build and live smoke", release)
+        self.assertIn('BUILD_RESULT: ${{ needs.build.result }}', release)
+        self.assertIn('LIVE_SMOKE_RESULT: ${{ needs.live-smoke.result }}', release)
+        self.assertIn('release withheld: build=$BUILD_RESULT live-smoke=$LIVE_SMOKE_RESULT', release)
         self.assertIn("scripts/release_live_smoke.py --binary", text)
         self.assertIn("name: release-linux-x64", text)
         self.assertIn("Generous-Corp/pulp", text)
@@ -42,6 +68,26 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", live)
         self.assertIn("    permissions:\n      contents: read\n", live)
         self.assertNotIn("write", live.split("steps:", 1)[0])
+
+    def test_macos_publication_retries_with_the_release_gate(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        signing = text.split("  sign-and-upload-macos:\n", 1)[1]
+        self.assertIn(
+            "if: always() && startsWith(github.ref, 'refs/tags/v') && "
+            "vars.CI_MACOS_SIGNING_ENABLED == 'true'",
+            signing,
+        )
+        self.assertIn("name: Require published non-macOS release gate", signing)
+        self.assertIn('RELEASE_RESULT: ${{ needs.release.result }}', signing)
+        self.assertIn('macOS publication withheld: release=$RELEASE_RESULT', signing)
+
+    def test_live_smoke_prefers_a_dedicated_read_token(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "secrets.RELEASE_SMOKE_GH_TOKEN || github.token",
+            text,
+        )
+        self.assertNotIn("secrets.RELEASE_BOT_TOKEN", text)
 
     def test_release_workflow_uses_current_ci_signing_secret_names_only(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -92,6 +138,15 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertIn('--companion-binary "${{ matrix.companion_binary }}"', text)
         self.assertIn("target/release/shipyard-workstream-provider --version", text)
+
+    def test_release_workflow_binds_and_verifies_artifact_identity(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("scripts/release_artifact_manifest.py write", text)
+        self.assertIn("steps.upload_artifact.outputs.artifact-id", text)
+        self.assertIn("steps.upload_artifact.outputs.artifact-digest", text)
+        self.assertIn("scripts/release_artifact_manifest.py aggregate", text)
+        self.assertIn("shipyard-release-manifest.json", text)
+        self.assertIn("! -name release-manifest.json", text)
 
     def test_release_workflow_attests_every_executable_release_asset(self) -> None:
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -206,7 +261,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         names = [step.split("\n", 1)[0] for step in steps]
         isolate = names.index("name: Isolate the build from shared Rust homes")
         # Before the toolchain install and every cargo invocation.
-        self.assertLess(isolate, names.index("name: Install Rust"))
+        self.assertLess(isolate, names.index("name: Install Rust (attempt 1)"))
         self.assertLess(isolate, next(
             index for index, step in enumerate(steps)
             if "scripts/release-macos-local.sh" in step
@@ -274,6 +329,33 @@ class ReleaseWorkflowTests(unittest.TestCase):
                         continue
                     if in_run or stripped.startswith(("run: ", "- run: ")):
                         self.assertNotRegex(line, r"\$\{\{\s*inputs\.", line)
+
+    def test_macos_job_retries_rust_install_and_restore_tolerates_unprepared_keychain(self) -> None:
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        job = text.split("  sign-and-upload-macos:", 1)[1]
+        for n in (1, 2, 3):
+            self.assertIn(f"name: Install Rust (attempt {n})", job)
+        self.assertIn("steps.rust_2.outcome == 'failure'", job)
+        restore = job.split("name: Restore user keychains", 1)[1]
+        self.assertLess(restore.index('[ ! -e "$KEYCHAIN_STATE" ]'),
+                        restore.index("ci_macos_signing_keychain.py restore"))
+
+    def test_heal_is_its_own_workflow_and_auto_release_is_untouched(self) -> None:
+        import yaml
+
+        auto = AUTO_RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("schedule", auto)
+        self.assertNotIn("heal", auto)
+        self.assertNotIn("github.event_name", auto)
+        workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release-heal.yml").read_text(encoding="utf-8"))
+        triggers = workflow.get(True) or workflow.get("on")
+        self.assertEqual(set(triggers), {"push", "schedule", "workflow_dispatch"})
+        self.assertEqual(workflow["concurrency"], {"group": "release-heal", "cancel-in-progress": False})
+        self.assertEqual(workflow["permissions"], {})
+        heal = workflow["jobs"]["heal"]
+        self.assertEqual(heal["permissions"], {"actions": "write", "contents": "write"})
+        run_steps = [s["run"] for s in heal["steps"] if "run" in s]
+        self.assertIn("python3 scripts/release_draft_heal.py", run_steps)
 
     def test_auto_release_workflow_supports_doctor_release_chain(self) -> None:
         text = AUTO_RELEASE_WORKFLOW.read_text(encoding="utf-8")

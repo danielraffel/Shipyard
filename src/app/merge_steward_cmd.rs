@@ -51,7 +51,14 @@ pub(super) struct StewardCommandArgs {
     /// Also arm GitHub-native auto-merge on green, unqueued, unarmed pull
     /// requests the steward declines to own. See `native_arm`.
     pub(super) arm_unqueued: bool,
+    /// Required check that reports exact-head approval; with it required
+    /// and no merge queue, owned PRs are admitted by exact-head auto-merge.
+    pub(super) approval_context: String,
     pub(super) wake_owner: bool,
+    /// `[merge_steward] unapproved_dequeue`: whether the sweep removes
+    /// unapproved queue entries or only reports them. Read from the
+    /// machine-global config by [`steward_command`].
+    pub(super) unapproved_dequeue: unapproved_admission::DequeueMode,
     pub(super) apply: bool,
     pub(super) ledger: Option<PathBuf>,
 }
@@ -102,6 +109,9 @@ struct PrReport {
     decision: StewardDecision,
     mutation: Option<String>,
     error: Option<String>,
+    /// Why this pull request is not merging, and since when.
+    #[serde(flatten)]
+    blocked: blocked_on::Stall,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -121,6 +131,8 @@ struct RepoReport {
     merge_path: String,
     required_contexts: Vec<String>,
     prs: Vec<PrReport>,
+    /// Counts by `blocked_on` token and the oldest blocked pull requests.
+    blocked_summary: blocked_on::BlockedSummary,
     cancellations: Vec<CancellationReport>,
     stale_pr_run_wedge: StalePrRunWedgeRepoStatus,
     native_auto_merge_backstop: native_arm::NativeArmRepoStatus,
@@ -161,6 +173,19 @@ struct StewardLedger {
     audit: Vec<LedgerAudit>,
     #[serde(default)]
     wake_records: BTreeMap<String, String>,
+    /// Consecutive passes on which a queued head's approval, live state or
+    /// policy was unreadable, keyed `repo#pr:head`. See `unapproved_admission`.
+    #[serde(default)]
+    dequeue_unreadable: BTreeMap<String, u32>,
+    /// Superseded by `steward_removals`; read so an older ledger still
+    /// loads, and pruned.
+    #[serde(default)]
+    steward_dequeues: BTreeMap<String, u32>,
+    /// When the steward itself removed each head from the queue, keyed
+    /// `repo#pr:head` (RFC 3339); exactly those removals do not count toward
+    /// the head's ejection cap.
+    #[serde(default)]
+    steward_removals: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -377,7 +402,14 @@ struct MutationApplyContext<'a> {
     observation: &'a RepoObservation,
     ledger_path: &'a Path,
     mutation_control: &'a MutationControl,
+    /// Every exact-head approval verdict this pass read, by PR number: the
+    /// head it judged and, when refused, why. The report's `blocked_on` reads
+    /// it instead of asking GitHub again.
+    approval_blockers: std::cell::RefCell<ApprovalBlockers>,
 }
+
+/// Exact-head approval gate reads made during one pass, by PR number.
+type ApprovalBlockers = BTreeMap<u64, blocked_on::GateRecord>;
 
 struct CapacityApplyContext<'a> {
     actions: &'a GitHubActions,
@@ -1071,7 +1103,10 @@ pub(super) fn steward_command<W: Write>(
     json_output: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let (normalized_args, repos) = normalized_steward_args(args, cwd)?;
+    let (mut normalized_args, repos) = normalized_steward_args(args, cwd)?;
+    normalized_args.unapproved_dequeue =
+        unapproved_admission::DequeueMode::from_machine_global(&runtime_paths.global_dir)
+            .map_err(|error| CliFailure::new(2, error))?;
     let args = &normalized_args;
     let ledger_path = args
         .ledger
@@ -1203,6 +1238,7 @@ fn unreadable_repo_report(
         merge_path: "unreadable".to_owned(),
         required_contexts: Vec::new(),
         prs: Vec::new(),
+        blocked_summary: blocked_on::BlockedSummary::default(),
         cancellations: Vec::new(),
         stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, repo),
         native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
@@ -1275,6 +1311,7 @@ fn append_unmatched_recovery_errors(
             merge_path: "pending_cancellation_recovery".to_owned(),
             required_contexts: Vec::new(),
             prs: Vec::new(),
+            blocked_summary: blocked_on::BlockedSummary::default(),
             cancellations,
             stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, &repo),
             native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
@@ -1307,6 +1344,7 @@ fn persist_final_ledger(
             merge_path: "unreadable".to_owned(),
             required_contexts: Vec::new(),
             prs: Vec::new(),
+            blocked_summary: blocked_on::BlockedSummary::default(),
             cancellations: Vec::new(),
             stale_pr_run_wedge: stale_pr_wedge::repo_status(None, Vec::new(), ledger, "steward"),
             native_auto_merge_backstop: native_arm::NativeArmRepoStatus::default(),
@@ -1376,11 +1414,13 @@ fn acquire_ledger_lock(path: &Path) -> Result<crate::file_lock::LockedFile, CliF
     })
 }
 
+mod blocked_on;
 mod cancellation;
 mod cancellation_recovery;
 mod cancellation_revalidation;
 mod cancellation_terminalization;
 mod capacity_cancellation;
+mod exact_head_merge;
 mod ledger;
 mod native_arm;
 mod observation;
@@ -1391,6 +1431,8 @@ mod render;
 mod resume_record;
 mod terminal_handoff;
 pub(super) mod train;
+mod unapproved_admission;
+pub(super) use unapproved_admission::DequeueMode;
 
 use cancellation::{
     apply_repo_plan, cancellation_reason_label, queue_front_head, timestamp_old_enough,
@@ -1417,6 +1459,19 @@ use capacity_cancellation::{
     mark_cancellation_skipped, persist_capacity_evidence,
 };
 use ledger::{attempt_key, check_attempt_key, load_ledger, record_audit, save_ledger};
+/// How `repo`'s `base` admits an approved head, for `shipyard pr`'s next-steps
+/// block. Read-only.
+pub(super) fn observe_next_steps(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+) -> crate::pr_next_steps::NextSteps {
+    match observation::admission_policy(actions, repo, base) {
+        Ok(policy) => crate::pr_next_steps::NextSteps::from_policy(&policy),
+        Err(error) => crate::pr_next_steps::NextSteps::unavailable(error),
+    }
+}
+
 use observation::{
     active_runs, complete_checks_for_head, fetch_run_jobs, fetch_run_jobs_before, gh_json,
     gh_json_before, gh_json_timeout, hydrate_census_check_identities,
