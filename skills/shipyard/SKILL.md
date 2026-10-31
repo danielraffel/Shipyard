@@ -3497,7 +3497,7 @@ It observes by default; `--apply` enables exact-head guarded queue admission,
 reruns, and narrowly policy-scoped capacity-preemption mutations. Client-side
 REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
-queue or manual merge instead. A base with no merge queue (GitHub offers
+queue or the server-enforced exact-head merge below. A base with no merge queue (GitHub offers
 queues only to organization-owned repositories) reports
 `merge_path: server_enforced_exact_head_merge` when GitHub requires a check set
 that includes the approval context (`--approval-context`, default
@@ -3514,9 +3514,9 @@ request on an owned PR is disarmed (`auto_merge_disabled:<sha>`) on every
 `--apply` pass, approved or not. The org-queue path never takes this merge.
 The bound rule is satisfied only by a check run carrying that app id (the
 canonical `review-verdict` job, github-actions 15368); an app-less status of
-the same name never satisfies it. Because that job succeeds whenever it posts a
-verdict, the newest same-named commit status must also be `success` when one
-exists: a refusing status makes the head `required_failed`
+the same name never satisfies it. The canonical job fails unless the head is
+allowed, and the steward also requires the newest same-named commit status to
+be `success` when one exists: a refusing status makes the head `required_failed`
 (`review-verdict (commit status)`). `--arm-unqueued` reports `not applicable`
 on any base without a merge queue and arms nothing there.
 Apply mode is restricted by central mutation

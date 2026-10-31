@@ -31,9 +31,11 @@ owner only acts on evidence about the exact commit in front of it.
   merge itself. Nothing here works around it.
 - **Shipyard's steward** (`shipyard runner steward --apply`) is the only
   thing that admits work. It reads every open pull request. For each one
-  whose current head has an approving verdict and green required checks, it
-  either adds it to the merge queue or merges that exact head. It re-reads the
-  approval immediately before acting, and does nothing if anything is unclear.
+  that has been handed to it (or was opened by the fleet App) and whose
+  current head has an approving verdict and green required checks, it either
+  adds it to the merge queue or merges that exact head. It checks the approval
+  first, then re-reads the pull request live immediately before acting, and
+  does nothing if anything is unclear.
 - **TartCI** turns Apple Silicon Macs into GitHub Actions capacity. Each job
   gets a fresh macOS, Linux, or Windows VM that is thrown away afterwards, with
   build caches kept warm on the host and a budget so CI doesn't starve the
@@ -81,8 +83,16 @@ For the no-queue path to be safe, the branch ruleset has to require your CI and
 a `review-verdict` check, and **both must be bound to the app that produces
 them** (for GitHub Actions, integration id `15368`). Otherwise anyone who can
 post a commit status could satisfy the requirement. The `review-verdict` job
-must also *fail* when the verdict is a refusal. A job that posts a refusal and
-still exits green would pass a held head.
+fails unless the head is allowed, so a held or unapproved head cannot be green.
+The steward reports this path as `server_enforced_exact_head_merge`. It merges
+only a head that GitHub reports `CLEAN`, with every required check green and an
+approval it has itself confirmed. On any base that has no queue and no
+app-bound approval rule, the steward refuses to merge at all
+(`direct_merge_refused_server_enforcement_required`). It never arms GitHub's
+native auto-merge on a base without a queue, because an armed request survives
+a later push, and it turns off any such request it finds on a pull request it
+owns. The approval check name is `--approval-context` (default
+`review-verdict`).
 
 ## Setting it up
 
@@ -91,8 +101,10 @@ still exits green would pass a held head.
    plus `review-verdict`, both bound to the GitHub Actions app.
 2. **Pick one machine to run the steward on a timer.** It needs only the
    repository's `.shipyard/` config, so a sparse clone is enough:
-   `shipyard runner steward --repo OWNER/REPO --base main --arm-unqueued --apply`.
-   Run one writer per repository, never two.
+   `shipyard runner steward --repo OWNER/REPO --base main --apply`. Leave out
+   `--arm-unqueued`: it arms native auto-merge for pull requests the steward
+   does not own, only on a base with a merge queue, and reports "not applicable"
+   on a base without one. Run one writer per repository, never two.
 3. **Give CI somewhere to run.** Install TartCI on the Macs you want in the
    pool, label your jobs for it, and keep GitHub-hosted runners as overflow or
    for platforms you don't host.

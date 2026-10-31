@@ -4267,6 +4267,8 @@ nodes are also fatal; they must not be filtered into an empty result.
 
 The merge steward implicitly manages fleet-authored pull requests before the explicit `shipyard:managed` handoff label is copied. Census observation must therefore hydrate required check identities for those exact heads, while ordinary human pull requests remain excluded from per-PR hydration. Keep this predicate shared with steward classification so green fleet work is not stranded as `waiting_required`.
 
+Hydration is also lazy: drafts, queued rows and `DIRTY`/`CONFLICTING` rows are skipped because classification answers them before it weighs a required check, except rows carrying the managed label, whose handoff status lives in the hydrated checks. Candidates are read four at a time, and an unreadable candidate still fails the observation. The REST fallback for the open-PR list reads `mergeable_state` from `pulls/{n}` for non-draft, non-queued candidates, bound to the listed head; a row it cannot read stays `UNKNOWN` and is never armed. Before a mutation, the live single-PR revalidation reads the same fields as the census (including `author`), and exact-head approval is checked before that live read.
+
 ### Merge receipt import provenance
 
 The metrics merge-receipt importer is telemetry only. It requires a

@@ -30,7 +30,7 @@ on:
         default: ""
         type: string
       platform_focus:
-        description: "Platforms to build (empty = repo variable CI_PLATFORM_FOCUS, default macos = macos-arm64 + linux-x64)"
+        description: "Platforms to build (empty = repo variable CI_PLATFORM_FOCUS, default macos = macos-arm64 + linux-x64 + linux-arm64)"
         required: false
         default: ""
         type: string
