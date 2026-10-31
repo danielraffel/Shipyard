@@ -37,7 +37,7 @@ owner only acts on evidence about the exact commit in front of it.
 - **TartCI** turns Apple Silicon Macs into GitHub Actions capacity. Each job
   gets a fresh macOS, Linux, or Windows VM that is thrown away afterwards, with
   build caches kept warm on the host and a budget so CI doesn't starve the
-  machine. [Tart](https://tart.run) provides the VMs; TartCI schedules them.
+  machine. [Tart](https://github.com/openai/tart) provides the VMs; TartCI schedules them.
 - **GitHub-hosted runners** cover whatever you'd rather not run yourself, or
   run when your Macs are busy. Shipyard doesn't care where a check ran, only
   that it passed on the exact head.
