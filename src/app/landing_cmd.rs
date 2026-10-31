@@ -17,6 +17,8 @@
 use std::io::Write;
 use std::path::Path;
 
+use serde_json::Value;
+
 use super::CliFailure;
 use crate::config::LoadedConfig;
 use crate::gate_cost::ReadCache;
@@ -24,6 +26,205 @@ use crate::identity::RuntimeMode;
 use crate::landability::gate;
 use crate::landing::gather::{DEFAULT_MAX_JOB_READS, DEFAULT_RUN_SAMPLE, GatherOptions};
 use crate::landing::{EXIT_LANDING_UNKNOWN, gather, pr_state, render};
+
+struct RepositoryTrainConfigError {
+    surface: crate::landing::SurfaceRead,
+    message: String,
+    api_calls: u32,
+}
+
+fn repository_train_query(repo: &str, base: &str) -> String {
+    format!(
+        "repos/{repo}/contents/.shipyard/config.toml?ref={}",
+        crate::required_check_policy::encode_path_segment(base)
+    )
+}
+
+/// Determine whether the exact config path is absent from a complete tree
+/// response. A successful repository metadata read is not enough: an App can
+/// read metadata while lacking Contents permission, and a contents 404 would
+/// then be indistinguishable from an absent file.
+fn config_path_in_tree(raw: &str) -> Result<bool, String> {
+    let payload: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("the base tree response is not valid JSON: {error}"))?;
+    match payload.get("truncated").and_then(Value::as_bool) {
+        Some(false) => {}
+        Some(true) => {
+            return Err(
+                "the base tree response was truncated; config absence cannot be proven".to_owned(),
+            );
+        }
+        None => {
+            return Err(
+                "the base tree response did not state whether it was truncated; config absence cannot be proven".to_owned(),
+            );
+        }
+    }
+    let tree = payload
+        .get("tree")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "the base tree response did not contain a complete tree".to_owned())?;
+    Ok(tree
+        .iter()
+        .any(|entry| entry.get("path").and_then(Value::as_str) == Some(".shipyard/config.toml")))
+}
+
+fn verify_config_absent(
+    actions: &crate::cloud::GitHubActions,
+    repo: &str,
+    base: &str,
+    contents_error: &str,
+    surface_query: &str,
+) -> Result<(crate::rollup::Config, crate::landing::SurfaceRead, u32), RepositoryTrainConfigError> {
+    let tree_query = format!(
+        "repos/{repo}/git/trees/{}?recursive=1",
+        crate::required_check_policy::encode_path_segment(base)
+    );
+    let verified_query = format!("{surface_query} (404); GET /{tree_query}");
+    let probe = actions.run_gh(&["api".to_owned(), tree_query.clone()]);
+    match probe {
+        Ok(raw_tree) => match config_path_in_tree(&raw_tree) {
+            Ok(true) => Err(RepositoryTrainConfigError {
+                surface: crate::landing::SurfaceRead {
+                    surface: "repository_train_config".to_owned(),
+                    query: verified_query,
+                    outcome: crate::landing::SurfaceOutcome::Unreadable {
+                        boundary: crate::fleet_service::Boundary::Permission,
+                        detail: format!(
+                            ".shipyard/config.toml on {repo}@{base} returned 404, but the base tree contains that path"
+                        ),
+                    },
+                },
+                message: format!(
+                    ".shipyard/config.toml on {repo}@{base} could not be read: the contents request returned {contents_error}, but the base tree contains that path"
+                ),
+                api_calls: 2,
+            }),
+            Ok(false) => Ok((
+                crate::rollup::Config::default(),
+                crate::landing::SurfaceRead {
+                    surface: "repository_train_config".to_owned(),
+                    query: verified_query,
+                    outcome: crate::landing::SurfaceOutcome::Absent {
+                        detail: "the complete base tree was readable and did not contain .shipyard/config.toml; train defaults apply".to_owned(),
+                    },
+                },
+                2,
+            )),
+            Err(tree_error) => Err(RepositoryTrainConfigError {
+                surface: crate::landing::SurfaceRead {
+                    surface: "repository_train_config".to_owned(),
+                    query: verified_query,
+                    outcome: crate::landing::SurfaceOutcome::Unreadable {
+                        boundary: crate::fleet_service::Boundary::Parse,
+                        detail: format!(
+                            ".shipyard/config.toml on {repo}@{base} could not be proven absent: {tree_error}"
+                        ),
+                    },
+                },
+                message: format!(
+                    ".shipyard/config.toml on {repo}@{base} could not be proven absent: the contents request returned {contents_error}, and the base tree response was unusable: {tree_error}"
+                ),
+                api_calls: 2,
+            }),
+        },
+        Err(probe_error) => {
+            let detail = format!(
+                ".shipyard/config.toml on {repo}@{base} could not be proven absent: the contents request returned {contents_error}, and exact-base tree verification failed: {probe_error}"
+            );
+            Err(RepositoryTrainConfigError {
+                surface: crate::landing::SurfaceRead {
+                    surface: "repository_train_config".to_owned(),
+                    query: verified_query,
+                    outcome: crate::landing::SurfaceOutcome::Unreadable {
+                        boundary: crate::landing::gather::classify(
+                            &probe_error.to_string(),
+                        ),
+                        detail: detail.clone(),
+                    },
+                },
+                message: detail,
+                api_calls: 2,
+            })
+        }
+    }
+}
+
+fn repository_train_config(
+    actions: &crate::cloud::GitHubActions,
+    repo: &str,
+    base: &str,
+) -> Result<(crate::rollup::Config, crate::landing::SurfaceRead, u32), RepositoryTrainConfigError> {
+    let query = repository_train_query(repo, base);
+    let surface_query = format!("GET /{query}");
+    let raw = match actions.run_gh(&[
+        "api".to_owned(),
+        "-H".to_owned(),
+        "Accept: application/vnd.github.raw+json".to_owned(),
+        query.clone(),
+    ]) {
+        Ok(raw) => raw,
+        Err(error)
+            if error.to_string().contains("404") || error.to_string().contains("Not Found") =>
+        {
+            return verify_config_absent(actions, repo, base, &error.to_string(), &surface_query);
+        }
+        Err(error) => {
+            let detail = format!(".shipyard/config.toml on {repo}@{base} is unreadable: {error}");
+            return Err(RepositoryTrainConfigError {
+                surface: crate::landing::SurfaceRead {
+                    surface: "repository_train_config".to_owned(),
+                    query: surface_query,
+                    outcome: crate::landing::SurfaceOutcome::Unreadable {
+                        boundary: crate::fleet_service::Boundary::Transport,
+                        detail: detail.clone(),
+                    },
+                },
+                message: detail,
+                api_calls: 1,
+            });
+        }
+    };
+    let table = raw.parse::<toml::Table>().map_err(|error| {
+        let detail = format!(".shipyard/config.toml on {repo}@{base} does not parse: {error}");
+        RepositoryTrainConfigError {
+            surface: crate::landing::SurfaceRead {
+                surface: "repository_train_config".to_owned(),
+                query: surface_query.clone(),
+                outcome: crate::landing::SurfaceOutcome::Unreadable {
+                    boundary: crate::fleet_service::Boundary::Parse,
+                    detail: detail.clone(),
+                },
+            },
+            message: detail,
+            api_calls: 1,
+        }
+    })?;
+    let config = crate::rollup::Config::from_table(&table).map_err(|error| {
+        let detail = format!("[train] in {repo}@{base} is invalid: {error}");
+        RepositoryTrainConfigError {
+            surface: crate::landing::SurfaceRead {
+                surface: "repository_train_config".to_owned(),
+                query: surface_query.clone(),
+                outcome: crate::landing::SurfaceOutcome::Unreadable {
+                    boundary: crate::fleet_service::Boundary::Parse,
+                    detail: detail.clone(),
+                },
+            },
+            message: detail,
+            api_calls: 1,
+        }
+    })?;
+    Ok((
+        config,
+        crate::landing::SurfaceRead {
+            surface: "repository_train_config".to_owned(),
+            query: surface_query,
+            outcome: crate::landing::SurfaceOutcome::Read,
+        },
+        1,
+    ))
+}
 
 /// What the caller asked for, as parsed from the command line.
 pub(super) struct LandingArgs {
@@ -45,6 +246,7 @@ pub(super) struct LandingArgs {
 }
 
 /// Run `shipyard landing`.
+#[allow(clippy::too_many_lines)] // Keep the read-only landing command's evidence order auditable.
 pub(super) fn landing_command<W: Write>(
     mode: RuntimeMode,
     cwd: &Path,
@@ -123,6 +325,25 @@ pub(super) fn landing_command<W: Write>(
         },
     );
 
+    match repository_train_config(&actions, &repo, &base) {
+        Ok((train, surface, api_calls)) => {
+            report.api_calls += api_calls;
+            report.surfaces.push(surface);
+            report.batching =
+                crate::landing::strategy::batching_guidance(&report.merge_queue, &train);
+        }
+        Err(error) => {
+            report.api_calls += error.api_calls;
+            report.surfaces.push(error.surface);
+            report.batching = crate::landing::strategy::BatchingGuidance {
+                action: crate::landing::strategy::BatchingAction::Unknown,
+                command: None,
+                max_members: None,
+                rationale: error.message,
+            };
+        }
+    }
+
     report.opt_in_targets = crate::opt_in_targets::from_config(&config);
 
     if json {
@@ -141,4 +362,41 @@ pub(super) fn landing_command<W: Write>(
         ));
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{config_path_in_tree, repository_train_query};
+
+    #[test]
+    fn repository_train_query_encodes_the_base_ref() {
+        assert_eq!(
+            repository_train_query("owner/repo", "release/1.0?x=y&z"),
+            "repos/owner/repo/contents/.shipyard/config.toml?ref=release%2F1.0%3Fx%3Dy%26z"
+        );
+    }
+
+    #[test]
+    fn complete_tree_proves_config_absent_only_when_path_is_missing() {
+        assert!(
+            !config_path_in_tree(
+                r#"{"truncated":false,"tree":[{"path":"README.md","type":"blob"}]}"#
+            )
+            .expect("tree")
+        );
+        assert!(
+            config_path_in_tree(
+                r#"{"truncated":false,"tree":[{"path":".shipyard/config.toml","type":"blob"}]}"#
+            )
+            .expect("tree")
+        );
+    }
+
+    #[test]
+    fn incomplete_tree_cannot_prove_config_absent() {
+        let error = config_path_in_tree(r#"{"truncated":true,"tree":[]}"#)
+            .expect_err("truncated tree must stay unknown");
+        assert!(error.contains("truncated"), "{error}");
+        assert!(config_path_in_tree(r#"{"truncated":false}"#).is_err());
+    }
 }

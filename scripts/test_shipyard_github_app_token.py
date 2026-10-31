@@ -688,7 +688,7 @@ class GitHubAppTokenHelperTests(unittest.TestCase):
                 code = shipyard_github_app_token.main()
 
         self.assertEqual(code, 0)
-        create_token.assert_called_once_with("https://api.github.com", "jwt", "456")
+        create_token.assert_called_once_with("https://api.github.com", "jwt", "456", None)
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["token"], "ghs_test")
         self.assertEqual(payload["kind"], "github-app-installation")
@@ -765,6 +765,124 @@ class GitHubAppTokenHelperTests(unittest.TestCase):
 
         self.assertEqual(code, 75)
         self.assertIn("sandbox_writer_domain_overlap:", stderr.getvalue())
+
+    def test_scope_request_names_one_repository_and_only_the_given_permissions(self) -> None:
+        scope = shipyard_github_app_token.token_scope(
+            "danielraffel/Shipyard", True, ["contents=write", "workflows=write"]
+        )
+        self.assertEqual(
+            scope,
+            {
+                "repositories": ["Shipyard"],
+                "permissions": {"contents": "write", "workflows": "write"},
+            },
+        )
+        self.assertIsNone(shipyard_github_app_token.token_scope("o/r", False, []))
+
+    def test_scope_request_refuses_malformed_input(self) -> None:
+        for repo, scoped, permissions in (
+            (None, True, ["contents=write"]),
+            ("danielraffel", True, ["contents=write"]),
+            ("o/r/x", True, ["contents=write"]),
+            ("o/r", True, []),
+            ("o/r", True, ["contents"]),
+            ("o/r", True, ["contents=admin"]),
+            ("o/r", True, ["Contents=write"]),
+            ("o/r", True, ["contents=write", "contents=read"]),
+            ("o/r", False, ["contents=write"]),
+        ):
+            with self.subTest(repo=repo, permissions=permissions):
+                with self.assertRaises(shipyard_github_app_token.HelperError):
+                    shipyard_github_app_token.token_scope(repo, scoped, permissions)
+
+    def test_scoped_mint_posts_the_scope_and_refuses_a_broader_token(self) -> None:
+        scope = {"repositories": ["Shipyard"], "permissions": {"contents": "write"}}
+        exact = {
+            "token": "ghs_test",
+            "repositories": [{"name": "Shipyard"}],
+            "permissions": {"contents": "write", "metadata": "read"},
+        }
+        with mock.patch.object(
+            shipyard_github_app_token, "api_post", return_value=exact
+        ) as post:
+            self.assertEqual(
+                shipyard_github_app_token.create_installation_token(
+                    "https://api.github.com", "jwt", "456", scope
+                ),
+                exact,
+            )
+        post.assert_called_once_with(
+            "https://api.github.com",
+            "/app/installations/456/access_tokens",
+            "jwt",
+            scope,
+        )
+        for broader in (
+            {**exact, "repositories": [{"name": "Shipyard"}, {"name": "pulp"}]},
+            {**exact, "repositories": None},
+            {**exact, "permissions": {"contents": "write", "administration": "write"}},
+            {**exact, "permissions": {"contents": "admin"}},
+        ):
+            with self.subTest(broader=broader), mock.patch.object(
+                shipyard_github_app_token, "api_post", return_value=broader
+            ), self.assertRaises(shipyard_github_app_token.HelperError) as ctx:
+                shipyard_github_app_token.create_installation_token(
+                    "https://api.github.com", "jwt", "456", scope
+                )
+            self.assertNotIn("ghs_test", str(ctx.exception))
+
+    def test_unscoped_mint_still_posts_an_empty_body(self) -> None:
+        with mock.patch.object(
+            shipyard_github_app_token, "api_post", return_value={"token": "t"}
+        ) as post:
+            shipyard_github_app_token.create_installation_token(
+                "https://api.github.com", "jwt", "456"
+            )
+        post.assert_called_once_with(
+            "https://api.github.com", "/app/installations/456/access_tokens", "jwt", {}
+        )
+
+    def test_main_never_caches_a_scoped_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            key_path = Path(temp) / "app.pem"
+            key_path.write_text("fake-key", encoding="utf-8")
+            if os.name != "nt":
+                key_path.chmod(0o600)
+            cache = Path(temp) / "cache"
+            argv = [
+                "shipyard-github-app-token",
+                "--app-id", "123",
+                "--installation-id", "456",
+                "--private-key", str(key_path),
+                "--repo", "danielraffel/Shipyard",
+                "--scope-repository",
+                "--permission", "contents=write",
+                "--cache-dir", str(cache),
+            ]
+            stdout = StringIO()
+            with mock.patch("sys.argv", argv), mock.patch.object(
+                shipyard_github_app_token, "build_jwt", return_value="jwt"
+            ), mock.patch.object(
+                shipyard_github_app_token, "resolve_installation_id", return_value="456"
+            ), mock.patch.object(
+                shipyard_github_app_token, "load_cached_token", return_value=None
+            ) as load, mock.patch.object(
+                shipyard_github_app_token, "store_cached_token"
+            ) as store, mock.patch.object(
+                shipyard_github_app_token,
+                "create_installation_token",
+                return_value={"token": "ghs_test", "expires_at": "2026-05-27T20:12:00Z"},
+            ) as create, redirect_stdout(stdout):
+                code = shipyard_github_app_token.main()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["token"], "ghs_test")
+        self.assertIsNone(load.call_args.args[0])
+        self.assertIsNone(store.call_args.args[0])
+        self.assertEqual(
+            create.call_args.args[3],
+            {"repositories": ["Shipyard"], "permissions": {"contents": "write"}},
+        )
 
 
 if __name__ == "__main__":

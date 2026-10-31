@@ -12,6 +12,27 @@ Keep this doc in step with `src/ship_state.rs`, `src/ship.rs`,
 `src/app/watch_cmd.rs`, `src/app/auto_merge_cmd.rs`, and
 `src/app/cloud_cmd.rs`.
 
+## External durable work items
+
+ShipState also persists externally initiated work items under the same durable
+state root (`work-items/`). A work item is identified by its canonical
+repository, pull request, work kind, and release identity. Registration is
+idempotent and records the protocol/capability version and durable intent
+before an agent claims it. Claims advance a fencing epoch; checkpoints include
+the owner and epoch, so a stale session cannot write after another host has
+reclaimed the item. Checkpoints contain resumable context and remain usable
+after the original process, session, or host disappears. This is a persistence
+and fencing primitive, not autonomous takeover: cross-host reconciliation and
+privileged recovery remain default-off until shared fencing and failure
+injection evidence land.
+
+Work-item reads fail closed on corrupt or unsupported records. Registration
+compares the idempotency key, claims and checkpoints require an expected
+`state_version` and matching capability, and an expired owner cannot checkpoint
+until a fenced reclaim occurs. These checks protect intent from silent
+replacement and lost acknowledgements; they still do not authenticate a host
+or session by themselves.
+
 **Phase B** (transition tests, see below) and **Phase C** (pre-merge
 doc-sync hook, dedicated CI lane) land in follow-up PRs.
 
@@ -70,6 +91,12 @@ but not durable, so a host that loses power or reboots right after a save
 could read back an empty or old state file and drop the PR's episode. Queue
 requests, execution receipts and queue-hold records use the same helper.
 
+Cleanup of aged active ship state is compare-and-delete: after the cleanup
+scan identifies a closed, stale `(repo, PR)` record, it reacquires that
+record's scoped lock and compares the complete state to the scanned snapshot.
+If a worker updated the record while the scan was in progress, the comparison
+fails and the newer evidence remains in place.
+
 ### Writer-domain audit boundary
 
 The per-PR `ShipStatePrLock` remains the semantic concurrency boundary for
@@ -101,10 +128,12 @@ real ship-state write from overlapping that audit.
 | `dispatched_runs`   | List of `DispatchedRun`. Upsert key is `(target, run_id)`, not just `target` — a single target can hold multiple rows if a new run id was issued (e.g. from a peer dispatch under the same state). Phase B should either add deduplication logic or document the multi-row invariant. |
 | `evidence_snapshot` | `{target: "pass" | "fail"}` written by `_update_ship_state_from_job` (cli.py:4576). No other values are ever written by the normal path — `"pending"` is accepted by `_ship_terminal_verdict` but never produced. |
 | `attempt`           | Monotonic attempt counter bumped on `--no-resume`; the value is carried into the replacement state so old attempts do not reattach. |
+| `reviewer_claim_epoch` | Monotonic fence for reviewer ownership claims. It advances on claim and revocation, and also when an attempt is replaced, so a late verdict cannot reuse an older claim epoch. Defaults to `0` for legacy state. The fence is effectively per host and per reviewer name: `shipyard reviewer-claim validate` compares this state's epoch with itself, the client guard keys on `SHIPYARD_AGENT_ID`, and a fresh ship-state resets the epoch to `0`, so claims on different hosts do not fence each other. |
+| `active_reviewer_claim` | Optional exact-head `ReviewerClaim` (`head_sha`, `epoch`, `reviewer`, `claimed_at`, `deadline_at`). An unexpired claim remains exclusive; an expired claim may be reclaimed with a new epoch. `ReviewerClaim::receipt_id(repo, pr)` deterministically identifies the external handoff so a restarted dispatcher reconciles an existing check run instead of creating a duplicate. Verdict acceptance requires the current head, matching epoch and reviewer, and an unexpired deadline. Defaults to absent for legacy state. |
 | `pr_url`, `pr_title`, `commit_subject` | Human context. Refreshed by the `ship` resume path (cli.py:2679) on each invocation; NOT refreshed by add-lane's `save` (cli.py:2359) or by `_update_ship_state_from_job`. Test coverage: `ship-state show` after a force-push + `shipyard ship` resume should see updated fields; after a `cloud add-lane` against the same state, should not. |
 | `created_at`        | Attempt-scoped: stable for the life of an attempt.                                  |
 | `updated_at`        | Last `touch()` — bumped after every mutation helper.                                |
-| `schema_version`    | `SCHEMA_VERSION` (currently 1). `from_dict` defaults to `SCHEMA_VERSION` when reading older files that omit it.                                                                 |
+| `schema_version`    | `SCHEMA_VERSION` (currently 2). v1 files remain readable for non-claim state; claim checks require v2 and a consistent epoch. `from_dict` defaults to `SCHEMA_VERSION` when reading files that omit it. |
 
 `DispatchedRun` is the per-dispatch record (not strictly per-target — see
 `dispatched_runs` note above):
@@ -119,6 +148,16 @@ real ship-state write from overlapping that audit.
 | `last_heartbeat_at`  | Additive liveness signal (default `None`) — written by the poller via `_update_ship_state_from_job`, used by `watch` to mark `stale` runs. |
 | `phase`              | Additive validation-phase tag (setup/configure/build/test, default `None`), same source as `last_heartbeat_at`. |
 | `required`           | Lane policy **at dispatch time**, snapshotted in `DispatchedRun.required` by add-lane (cli.py:2357) and by `_update_ship_state_from_job` (cli.py:4593). `from_dict` defaults to `True` for legacy files written before #87. `_ship_terminal_verdict` reads this persisted value (cli.py:3809) to decide which failures tolerate. |
+
+### Warm-pool member attribution
+
+When a successful host-pool run is retained for warm reuse, the pool entry
+records the selected member from the dispatch result's structural
+`host_pool_member_id` field. The backend display label may carry `-failover` or
+`-exhausted` suffixes and is not parsed for attribution. The optional
+`member_id` is preserved for older entries and is reported by
+`shipyard targets warm status --json` when known; it does not alter warm-pool
+eligibility or routing.
 
 ## State diagram (textual)
 
@@ -384,7 +423,7 @@ slipped through anyway is `shipyard runner steward --arm-unqueued`.
 | `shipyard ship-state show`  | `get_scoped(checkout_repo, pr)`; unscoped fallback only when the PR number is unambiguous | None |
 | `shipyard ship-state discard` | `get_scoped(--repo, pr)`, or the only record with that PR number; refuses when several repositories share it (accepts any state, not only MERGED) | `archive_scoped(repo, pr)` (manual tombstone) |
 | `shipyard ship-state prune` | `list_active()`, then each record's PR lifecycle from GitHub, retried under the repository's current name when it was renamed | With `--apply`, `archive_scoped(repo, pr)` for MERGED or CLOSED only; open or unreadable records are kept, and an unreadable row carries the rename check's failure reason |
-| `shipyard cleanup --ship-state` | `prune(active_days=14, archive_days=30, closed_prs=...)` | Queries each active state's recorded repository and deletes aged-out active state only for the matching closed `(repo, PR)`, plus aged archives. Unlinks are unguarded — a failure raises. |
+| `shipyard cleanup --ship-state` | `prune(active_days=14, archive_days=30, closed_prs=...)` | Queries each active state's recorded repository and compare-and-deletes aged-out active state only for the matching closed `(repo, PR)` while holding that record's scoped lock; a changed snapshot is kept. Also removes aged archives. Unlinks are unguarded — a failure raises. |
 | `shipyard runner recovery-worker` | Durable steward recovery requests plus the live exact PR head; trusted machine-global `[merge_steward.recovery_worker]` only | Without `--apply`, no writes and no model launch. With `--apply`, claims at most one request by default and persists a bounded terminal escalation/failure receipt; it never writes ship state or GitHub/queue/merge/release state. |
 
 The daemon's GitHub check-rollup reconciler may heal only dispatched runs whose
@@ -532,7 +571,7 @@ authoritative even when an unrelated hosted check has a similar target name.
 - **To:** `STATE_VERDICT_PASS`, `STATE_VERDICT_FAIL`, or still in flight (`None`)
 - **Computation:** `_ship_terminal_verdict(state)` at cli.py:3790
 - **Externals:** none
-- **⚠ Known bug — Bug B1.** The verdict is computed only from `evidence_snapshot.values()` (cli.py:3806) and `evidence_snapshot.items()` (cli.py:3812). The function does **not** check that every `DispatchedRun.target` has a matching evidence row. A ship that dispatched targets `[macos, ubuntu, windows]` and only persisted evidence for `[macos]` (all "pass") will be reported `STATE_VERDICT_PASS` — and `auto-merge` will proceed to `merge_pr`. This is the single highest-impact silent-failure candidate in the state machine; Phase B must have a dedicated regression test for it.
+- **Bug B1 is fixed.** `ship_terminal_verdict` in `src/watch.rs:131-177` first requires an evidence row for every required dispatched target. A ship that dispatched targets `[macos, ubuntu, windows]` and only persisted evidence for `[macos]` remains in flight (`None`); it cannot reach `STATE_VERDICT_PASS` or the merge path. The exact regression is `verdict_requires_terminal_evidence_for_all_required_targets` in `src/watch.rs`, covered by the current Rust library test suite. The older Python-era line references in this historical audit are retained elsewhere only as provenance; they are not current source locations.
 - **Other failure modes:** none — pure function.
 
 ### T5 — Merge on PASS
@@ -1112,7 +1151,7 @@ will fail the `state-machine` CI lane immediately.
 ## Silent-failure regression tests
 
 1. **Merge success hidden behind cleanup failure.** If `gh pr merge --delete-branch` merges on GitHub but fails while deleting a local branch checked out in another worktree, `auto-merge` must archive ship-state and exit 0 with a cleanup warning, not report `merge-failed`. Covered by `auto_merge_archives_when_merge_error_reports_already_merged`.
-2. **Partial evidence PASS (Bug B1).** Dispatch 3 targets, write evidence for only 1 (all "pass"), compute verdict. Today returns True. *Test:* seed a `ShipState` with `dispatched_runs=[T1, T2, T3]` and `evidence_snapshot={"T1":"pass"}`; `_ship_terminal_verdict(state)` must return `None`, not `True`. Proposed fix: extend the function to require an evidence row for every non-advisory `DispatchedRun.target`.
+2. **Partial evidence PASS (Bug B1).** Dispatch 3 targets, write evidence for only 1 (all "pass"), and compute the verdict. The current Rust implementation returns `None`, not `Some(true)`: `ship_terminal_verdict` requires evidence for every required `DispatchedRun.target`. The regression is covered by `verdict_requires_terminal_evidence_for_all_required_targets` in `src/watch.rs`; keep it as a negative control against premature merge readiness.
 3. **Ship-state tmp-write durability.** `ShipStateStore.save` already uses tmp+`os.replace` (core/ship_state.py:342). *Test:* inject an `os.replace` failure; assert the prior file is byte-identical. (Do NOT couple this test to `queue.json` — `Queue._save` uses a different write pattern on `main`; atomicity for that file lands in PR #105.)
 
 ## Phase B test plan

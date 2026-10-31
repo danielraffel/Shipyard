@@ -52,6 +52,30 @@ fn target_result_serializes_python_shape() {
 }
 
 #[test]
+fn host_pool_member_attribution_is_optional_and_round_trips() {
+    let legacy = serde_json::json!({
+        "target": "mac",
+        "platform": "macos",
+        "status": "pass",
+        "backend": "local"
+    });
+    let legacy_result: TargetResult = serde_json::from_value(legacy).expect("legacy result");
+    assert_eq!(legacy_result.host_pool_member_id, None);
+
+    let mut result = TargetResult::new(
+        "mac",
+        "macos",
+        TargetStatus::Pass,
+        "host-pool:p/worker-a-failover",
+    );
+    result.host_pool_member_id = Some("worker/a".to_owned());
+    let value = result.to_json_value();
+    assert_eq!(value["host_pool_member_id"], "worker/a");
+    let round_trip: TargetResult = serde_json::from_value(value).expect("round trip");
+    assert_eq!(round_trip.host_pool_member_id.as_deref(), Some("worker/a"));
+}
+
+#[test]
 fn job_create_sets_pending_state_and_id_shape() {
     let job = job();
     assert!(job.id.starts_with("sy-"));

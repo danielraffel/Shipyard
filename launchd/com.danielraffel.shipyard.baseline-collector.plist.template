@@ -2,10 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.danielraffel.shipyard.baseline-collector</string>
-<key>ProgramArguments</key><array><string>@PYTHON@</string><string>@COLLECTOR@</string>
+<key>ProgramArguments</key><array><string>@PYTHON@</string><string>@WRAPPER@</string>
+<string>--collector</string><string>@COLLECTOR@</string><string>--handoff-script</string><string>@HANDOFF@</string>
+<string>--repo</string><string>@REPO@</string><string>--base-branch</string><string>@MERGE_RECEIPT_BASE_BRANCH@</string>
+<string>--merge-receipts</string><string>@MERGE_RECEIPTS@</string><string>--merge-receipt-health</string><string>@MERGE_RECEIPT_HEALTH@</string>@MERGE_RECEIPT_SOURCE_HOST_ARGS@<string>--</string>
 <string>--db</string><string>@DB@</string><string>--project</string><string>@PROJECT@</string>
 <string>--repo</string><string>@REPO@</string><string>--state</string><string>@STATE@</string>
-<string>--status-markdown</string><string>@STATUS@</string><string>--merge-receipts</string><string>@MERGE_RECEIPTS@</string><string>--merge-receipt-health</string><string>@MERGE_RECEIPT_HEALTH@</string><string>--merge-receipt-base-branch</string><string>@MERGE_RECEIPT_BASE_BRANCH@</string><string>--tartci-host</string><string>@TARTCI_HOST@</string><string>--collect</string></array>
+<string>--status-markdown</string><string>@STATUS@</string><string>--tartci-host</string><string>@TARTCI_HOST@</string><string>--collect</string></array>
 <key>WorkingDirectory</key><string>@HOME@</string><key>RunAtLoad</key><true/><key>StartInterval</key><integer>@INTERVAL@</integer>
 <key>ProcessType</key><string>Background</string><key>LowPriorityIO</key><true/><key>StandardOutPath</key><string>@LOG@</string><key>StandardErrorPath</key><string>@LOG@</string>
 <key>EnvironmentVariables</key><dict><key>HOME</key><string>@HOME@</string><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:@HOME@/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
