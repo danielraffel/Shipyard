@@ -88,8 +88,8 @@ pub(super) fn mutate_pr_with_recovery(
     }
     let pr = &live_pr;
     match decision {
-        StewardDecision::ArmMergeQueue if policy.native_auto_merge_exact_head() => {
-            super::auto_merge_exact_head::enable_auto_merge_exact_head(context, pr, policy, ledger)
+        StewardDecision::ArmMergeQueue if policy.server_enforced_exact_head_merge() => {
+            super::exact_head_merge::merge_exact_head(context, pr, policy, ledger)
         }
         StewardDecision::ArmMergeQueue => enqueue_pull_request_with_recovery(
             context,

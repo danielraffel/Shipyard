@@ -246,7 +246,7 @@ shipyard runner steward --recover-hosted-setup-eviction-priority --apply
 shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable authority blocker
 shipyard runner steward --arm-unqueued              # audit green, unqueued, UNARMED PRs
 shipyard runner steward --arm-unqueued --apply      # arm native auto-merge on them
-shipyard runner steward --auto-merge-approval-context review-verdict  # no-queue base: exact-head auto-merge only when GitHub requires this check
+shipyard runner steward --approval-context review-verdict  # no-queue base: exact-head merge only when GitHub requires this app-bound check
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-form handoff identifiers

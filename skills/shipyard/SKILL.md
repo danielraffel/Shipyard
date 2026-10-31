@@ -3487,24 +3487,19 @@ REST direct merge is refused because GitHub cannot atomically bind both complete
 check materialization and the validated base revision; use a server-owned merge
 queue or manual merge instead. A base with no merge queue (GitHub offers
 queues only to organization-owned repositories) reports
-`merge_path: native_auto_merge_exact_head` when the repository allows
-auto-merge and GitHub requires a non-empty check set that includes the approval
-context (`--auto-merge-approval-context`, default `review-verdict`). There an
-owned, exact-head-approved PR is armed with `enablePullRequestAutoMerge`
-(`expectedHeadOid` = the approved head, `MERGE`) through the ordinary
-`gh`/`ghapp` path, so the queue-arm guard judges it; pending required checks do
-not hold the arm back, failed ones do. Per-PR mutations are
-`auto_merge_enabled:<sha>`, `auto_merge_already_enabled:<sha>`,
-`auto_merge_disabled_head_moved:<sha>` (an arm from before this head arrived is
-disarmed; re-arm waits for a later pass), `waiting_head_approval`,
-and `merged_exact_head:<sha>`. GitHub will not arm an already-mergeable PR, so
-on this path only an approved head that is `CLEAN` with every required check
-green is merged with `mergePullRequest` (`expectedHeadOid` = the approved head,
-`MERGE`) through the same `gh`/`ghapp` path; the ruleset still makes GitHub
-refuse a head whose approval context or CI has not passed. A clean-status
-answer the steward did not predict reports `auto_merge_refused_clean_status:<sha>`
-and does nothing. The org-queue path never takes this merge. Without the approval
-context the base stays `direct_merge_refused_server_enforcement_required`.
+`merge_path: server_enforced_exact_head_merge` when GitHub requires a check set
+that includes the approval context (`--approval-context`, default
+`review-verdict`) and that rule is bound to an app (`integration_id`); an
+unbound rule leaves the base `direct_merge_refused_server_enforcement_required`.
+There the steward merges an owned head with `mergePullRequest`
+(`expectedHeadOid` = that head, `MERGE`) through the ordinary `gh`/`ghapp` path,
+only when GitHub reports it `CLEAN`, every required check is green, and the
+exact-head approval gate returns `Approved` (`NotRequired` is refused). Per-PR
+mutations are `merged_exact_head:<sha>`, `waiting_head_approval`, and
+`waiting_required`. It never arms native auto-merge on such a base, because an
+armed request survives a later push by anyone with write access; any armed
+request on an owned PR is disarmed (`auto_merge_disabled:<sha>`) on every
+`--apply` pass, approved or not. The org-queue path never takes this merge.
 Apply mode is restricted by central mutation
 authority, durable write-ahead intent, and live revalidation immediately before
 every GitHub write. Transient retry limits are also fenced against GitHub's

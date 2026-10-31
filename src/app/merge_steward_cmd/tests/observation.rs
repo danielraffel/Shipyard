@@ -521,8 +521,7 @@ esac
     let policy = StewardPolicy {
         merge_queue: true,
         native_auto_merge: true,
-        auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-            .to_owned(),
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         required_checks: Vec::new(),
         opt_out_label: "shipyard:unmanaged".to_owned(),
         provenance_blocking_labels: Vec::new(),

@@ -2820,8 +2820,9 @@ pub(super) enum RunnerCommand {
     /// rerun a bounded transient failure, or cancel only queued runs with a
     /// provably superseded PR/merge-group head. Same-head duplicates are never
     /// cancelled. Repositories without a server-owned merge queue are admitted
-    /// by exact-head native auto-merge when GitHub requires the approval
-    /// context; otherwise they are reported as direct-merge refusals.
+    /// by a server-enforced exact-head merge when GitHub requires the
+    /// app-bound approval context; otherwise they are reported as direct-merge
+    /// refusals.
     Steward {
         /// Owner/repo slug. Repeatable; defaults to the current repository.
         #[arg(long)]
@@ -2866,12 +2867,12 @@ pub(super) enum RunnerCommand {
         #[arg(long = "arm-unqueued")]
         arm_unqueued: bool,
         /// Required check that reports exact-head approval. On a base with no
-        /// merge queue, owned pull requests are admitted by GitHub-native
-        /// auto-merge pinned to the approved head only when GitHub requires
-        /// this context and the repository allows auto-merge; otherwise they
-        /// stay refused. Never a direct merge.
-        #[arg(long = "auto-merge-approval-context", default_value = "review-verdict")]
-        auto_merge_approval_context: String,
+        /// merge queue, an owned, approved, CLEAN, all-green head is merged by
+        /// `mergePullRequest` bound to that head only when GitHub requires this
+        /// context from a bound app; otherwise it stays refused. Native
+        /// auto-merge is never armed there, and any armed request is disarmed.
+        #[arg(long = "approval-context", default_value = "review-verdict")]
+        approval_context: String,
         /// Perform the planned mutations. Without this flag, only audit.
         #[arg(long)]
         apply: bool,

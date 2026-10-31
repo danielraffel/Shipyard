@@ -105,8 +105,7 @@ esac
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
-        auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-            .to_owned(),
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         apply: true,
         ledger: None,
@@ -2223,8 +2222,7 @@ esac
         preempt_capacity: false,
         max_preemptions_per_head: 1,
         arm_unqueued: true,
-        auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-            .to_owned(),
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         apply: true,
         ledger: None,
@@ -2364,8 +2362,7 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
-        auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-            .to_owned(),
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         apply: false,
         ledger: None,
@@ -2453,8 +2450,7 @@ esac
             preempt_capacity: false,
             max_preemptions_per_head: 1,
             arm_unqueued: false,
-            auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-                .to_owned(),
+            approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
             wake_owner,
             apply: true,
             ledger: None,
@@ -2802,8 +2798,7 @@ fi
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
-        auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-            .to_owned(),
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         apply: true,
         ledger: None,
@@ -2864,8 +2859,7 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
-        auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-            .to_owned(),
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         apply: false,
         ledger: None,
@@ -2909,8 +2903,7 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         preempt_capacity: false,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
-        auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-            .to_owned(),
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
         apply: false,
         ledger: None,

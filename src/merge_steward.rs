@@ -92,9 +92,9 @@ pub struct StewardPolicy {
     pub native_auto_merge: bool,
     /// Required check that reports exact-head approval on every PR head (for
     /// example `review-verdict`). A repository without a merge queue is
-    /// admitted through exact-head native auto-merge only when GitHub itself
-    /// requires this context; see [`Self::native_auto_merge_exact_head`].
-    pub auto_merge_approval_context: String,
+    /// admitted by an exact-head merge only when GitHub itself requires this
+    /// context from a bound app; see [`Self::server_enforced_exact_head_merge`].
+    pub approval_context: String,
     /// Authoritative required check rules. Empty means mutation is refused
     /// because the observed check set cannot prove complete materialization.
     pub required_checks: Vec<RequiredCheck>,
@@ -117,35 +117,31 @@ pub struct StewardPolicy {
     pub max_transient_reruns: u32,
 }
 
-/// `mergeStateStatus` values on which exact-head auto-merge may be armed in a
-/// repository without a merge queue. `BEHIND` and conflicts need a new head
-/// first, and `UNKNOWN` is not yet a decision.
-const AUTO_MERGE_ARMABLE_STATES: &[&str] = &["BLOCKED", "UNSTABLE", "HAS_HOOKS", "CLEAN"];
-
-/// Default required approval context for exact-head native auto-merge.
-pub const DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT: &str = "review-verdict";
+/// Default required approval context for the server-enforced exact-head merge.
+pub const DEFAULT_APPROVAL_CONTEXT: &str = "review-verdict";
 
 impl StewardPolicy {
-    /// Whether this base is admitted through GitHub-native auto-merge pinned
-    /// to the approved head instead of a merge queue.
+    /// Whether this base admits a pull request by a server-enforced
+    /// exact-head merge instead of a merge queue.
     ///
-    /// Only when there is no merge queue, the repository allows auto-merge,
-    /// and GitHub itself enforces a non-empty required-check set that
-    /// includes the approval context. GitHub then refuses to merge any head
-    /// whose approval check has not passed, so arming (or, for a head that is
-    /// already mergeable, an `expectedHeadOid`-bound merge) cannot grant
-    /// authority branch protection does not already hold. Anything less stays
-    /// refused, with no merge at all.
+    /// Only when there is no merge queue and GitHub itself enforces a
+    /// required-check set that includes the approval context, with that rule
+    /// bound to an app (`integration_id`): an unbound rule is satisfied by any
+    /// actor that can post a status of that name. The steward then merges
+    /// with `mergePullRequest` bound by `expectedHeadOid`, only an approved,
+    /// `CLEAN`, all-green head, and GitHub refuses the merge of any head whose
+    /// approval context or CI has not passed. It never arms auto-merge here:
+    /// an armed request survives a later push by anyone with write access.
+    /// Anything less stays refused, with no merge at all.
     #[must_use]
-    pub fn native_auto_merge_exact_head(&self) -> bool {
-        let context = self.auto_merge_approval_context.trim();
+    pub fn server_enforced_exact_head_merge(&self) -> bool {
+        let context = self.approval_context.trim();
         !self.merge_queue
-            && self.native_auto_merge
             && !context.is_empty()
             && self
                 .required_checks
                 .iter()
-                .any(|check| check.context == context)
+                .any(|check| check.context == context && check.app_id.is_some())
     }
 
     /// Report label for how this base admits a pull request.
@@ -153,8 +149,8 @@ impl StewardPolicy {
     pub fn merge_path(&self) -> &'static str {
         if self.merge_queue {
             "native_queue_exact_head"
-        } else if self.native_auto_merge_exact_head() {
-            "native_auto_merge_exact_head"
+        } else if self.server_enforced_exact_head_merge() {
+            "server_enforced_exact_head_merge"
         } else {
             "direct_merge_refused_server_enforcement_required"
         }
@@ -335,7 +331,6 @@ pub enum DirectMergeRefusal {
 
 /// Classify one PR without performing a mutation.
 #[must_use]
-#[allow(clippy::too_many_lines)] // One ordered decision ladder; splitting it hides the precedence.
 pub fn classify_pr(
     pr: &StewardPullRequest,
     policy: &StewardPolicy,
@@ -413,8 +408,7 @@ pub fn classify_pr(
             failed.push(context);
         }
     }
-    let auto_merge = policy.native_auto_merge_exact_head();
-    if !waiting.is_empty() && !auto_merge {
+    if !waiting.is_empty() {
         waiting.sort();
         waiting.dedup();
         return StewardDecision::WaitingRequired { contexts: waiting };
@@ -429,15 +423,14 @@ pub fn classify_pr(
             run_ids: transient_runs.into_iter().collect(),
         };
     }
-    if auto_merge {
-        return classify_auto_merge_exact_head(&merge_state);
-    }
     if !policy.merge_queue && merge_state != "CLEAN" {
         return StewardDecision::WaitingRequired {
             contexts: vec![format!("github-merge-state:CLEAN (current={merge_state})")],
         };
     }
-    if policy.merge_queue {
+    if policy.merge_queue || policy.server_enforced_exact_head_merge() {
+        // On a no-queue base this is only reached for a `CLEAN`, all-green
+        // head; the exact-head merge re-reads both and the approval gate.
         // The exact-head enqueue mutation is idempotent from the steward's
         // perspective and is stronger evidence than autoMergeRequest: GitHub
         // clears that field once a PR is in the queue, while a stranded native
@@ -446,23 +439,6 @@ pub fn classify_pr(
     } else {
         StewardDecision::DirectMergeRefused {
             reasons: vec![DirectMergeRefusal::ValidatedBaseRevisionNotAtomic],
-        }
-    }
-}
-
-/// Admission on an exact-head native auto-merge base, once no required check
-/// has failed. GitHub enforces every required check, the approval context
-/// included, before an armed auto-merge lands, so a pending check does not
-/// hold the arm back. The exact-head approval gate runs again before the
-/// mutation.
-fn classify_auto_merge_exact_head(merge_state: &str) -> StewardDecision {
-    if AUTO_MERGE_ARMABLE_STATES.contains(&merge_state) {
-        StewardDecision::ArmMergeQueue
-    } else {
-        StewardDecision::WaitingRequired {
-            contexts: vec![format!(
-                "github-merge-state:BLOCKED|CLEAN (current={merge_state})"
-            )],
         }
     }
 }

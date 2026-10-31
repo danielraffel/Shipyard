@@ -1155,8 +1155,7 @@ mod tests {
         let policy = StewardPolicy {
             merge_queue: true,
             native_auto_merge: true,
-            auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-                .to_owned(),
+            approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
             required_checks: vec![
                 RequiredCheck {
                     context: "linux".to_owned(),
@@ -1253,8 +1252,7 @@ mod tests {
         let policy = |checks: Vec<RequiredCheck>, reruns| StewardPolicy {
             merge_queue: true,
             native_auto_merge: true,
-            auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-                .to_owned(),
+            approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
             required_checks: checks,
             opt_out_label: "shipyard:no-auto-merge".to_owned(),
             provenance_blocking_labels: vec!["5·unresolved".to_owned()],

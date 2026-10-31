@@ -140,8 +140,7 @@ fn queue_policy() -> StewardPolicy {
     StewardPolicy {
         merge_queue: true,
         native_auto_merge: true,
-        auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-            .to_owned(),
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         required_checks: vec![RequiredCheck {
             context: "macos".to_owned(),
             app_id: None,
@@ -198,9 +197,9 @@ fn pending_cancellation_record() -> PendingCancellation {
 mod admission;
 #[cfg(unix)]
 mod arm_guard;
-mod auto_merge;
 #[cfg(unix)]
 mod capacity;
+mod exact_head_merge;
 mod mutations;
 mod observation;
 #[cfg(unix)]

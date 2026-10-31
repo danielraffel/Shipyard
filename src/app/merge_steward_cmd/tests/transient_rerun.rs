@@ -102,8 +102,7 @@ esac
             preempt_capacity: true,
             max_preemptions_per_head: 1,
             arm_unqueued: false,
-            auto_merge_approval_context: crate::merge_steward::DEFAULT_AUTO_MERGE_APPROVAL_CONTEXT
-                .to_owned(),
+            approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
             wake_owner: false,
             apply: true,
             ledger: None,

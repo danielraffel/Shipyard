@@ -79,7 +79,7 @@ pub(super) fn apply_repo_plan(
     let policy = StewardPolicy {
         merge_queue: observation.merge_queue,
         native_auto_merge: observation.allow_auto_merge,
-        auto_merge_approval_context: args.auto_merge_approval_context.clone(),
+        approval_context: args.approval_context.clone(),
         required_checks: observation.required_checks.clone(),
         opt_out_label: args.opt_out_label.clone(),
         provenance_blocking_labels: args.provenance_blocking_labels.clone(),
@@ -344,6 +344,28 @@ pub(super) fn apply_pr_plans(
                     } else {
                         error = Some("owner wake requires mutation control".to_owned());
                     }
+                }
+            }
+            if args.apply
+                && error.is_none()
+                && policy.server_enforced_exact_head_merge()
+                && pr.fact.auto_merge_active
+                && super::exact_head_merge::owns_for_disarm(&decision)
+            {
+                // An armed request survives a later push by anyone with
+                // write access, so none is left armed on an owned PR here,
+                // approved or not. See `exact_head_merge`.
+                if let Some(context) = mutation_context.as_ref() {
+                    let (disarm_mutation, disarm_error) =
+                        super::exact_head_merge::disarm_owned_auto_merge(context, pr, ledger);
+                    if let Some(disarm_mutation) = disarm_mutation {
+                        mutation = Some(mutation.map_or(disarm_mutation.clone(), |prior| {
+                            format!("{prior},{disarm_mutation}")
+                        }));
+                    }
+                    error = disarm_error;
+                } else {
+                    error = Some("auto-merge disarm requires mutation control".to_owned());
                 }
             }
             if args.apply && error.is_none() {
