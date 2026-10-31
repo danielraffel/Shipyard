@@ -961,6 +961,14 @@ v0.245.0 published with no attestation after one transient Sigstore TLS error,
 and every host's fleet-update refused it ("no acceptable build-provenance
 attestation"). If a release is stuck as a draft, rerun the failed
 `sign-and-upload-macos` job; do not publish it by hand without an attestation.
+This recovery is automatic: the `heal` job in `auto-release.yml` (every main
+push and every 30 minutes) re-runs the failed jobs of the current version's
+release run once it has been finished for 20 minutes, up to 3 attempts
+(`scripts/release_draft_heal.py`), and fails with the failing step names when
+attempts are exhausted. It never publishes by itself and does nothing unless
+`CI_MACOS_SIGNING_ENABLED=true`. The Rust install in that job retries 3 times
+(a self-hosted runner that cannot reach static.rust-lang.org stranded v0.381.0
+and v0.383.0 as drafts).
 A `sign-and-upload-macos` failure that ends in `OSError: [Errno 30] Read-only
 file system` after "The validate action worked!" is the DMG smoke's detach.
 The image was signed and notarized, but `hdiutil detach` was refused while the

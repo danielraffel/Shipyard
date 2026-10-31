@@ -811,6 +811,12 @@ v0.245.0 published with no attestation after one transient Sigstore TLS error,
 and every host's fleet-update refused it ("no acceptable build-provenance
 attestation"). If a release is stuck as a draft, rerun the failed
 `sign-and-upload-macos` job; do not publish it by hand without an attestation.
+That rerun is automatic: the `heal` job in `auto-release.yml` (main pushes and
+every 30 minutes) re-runs the failed jobs of the current version's release run
+after a 20 minute grace, at most 3 attempts, then fails naming the failing
+steps (`scripts/release_draft_heal.py`). The signing job's Rust install retries
+3 times because the self-hosted runner has lost `static.rust-lang.org` for
+minutes at a time (v0.381.0, v0.383.0).
 The live GitHub smoke uses a dedicated read-only token when configured and
 otherwise the Actions job token; never route the write-capable release-bot
 credential to the binary under test. The smoke remains fail-closed.
