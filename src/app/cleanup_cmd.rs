@@ -332,6 +332,7 @@ fn cleanup_retention(
         crate::writer_domain_lease::acquire_for_protected_path(state_dir)
             .map_err(|error| CliFailure::new(1, error.to_string()))?
     };
+    validate_metrics_retention_preflight(state_dir)?;
     let mut items = Vec::new();
     let mut protected_items = Vec::new();
     reject_log_symlinks(&state_dir.join("logs"))?;
@@ -339,6 +340,11 @@ fn cleanup_retention(
         recover_retirement_quarantines(state_dir, dry_run, &mut items, &mut protected_items)?;
     reject_log_symlinks(&state_dir.join("logs"))?;
     if recovered {
+        // Recovery must not bypass the metrics safety check. A recovered
+        // quarantine is returned early so the restored evidence can remain
+        // protected for a separately previewed cleanup, but an unreadable
+        // metrics store still has to fail closed on this invocation.
+        prune_metrics(state_dir, dry_run, &mut items)?;
         let protected_bytes = protected_items.iter().map(|item| item.size_bytes).sum();
         let log_bytes =
             dir_size(&state_dir.join("logs")) + if dry_run { protected_bytes } else { 0 };
@@ -378,7 +384,7 @@ fn cleanup_retention(
     )?;
     scan_bundles(state_dir, dry_run, &mut items)?;
     scan_evidence(state_dir, dry_run, &mut items)?;
-    prune_metrics(state_dir, dry_run, &mut items);
+    prune_metrics(state_dir, dry_run, &mut items)?;
     if !dry_run {
         apply_cleanup_staging(&staging_candidates)?;
     }
@@ -417,21 +423,66 @@ fn cleanup_retention(
 
 const DEFAULT_METRICS_RETENTION_DAYS: i64 = 90;
 
-fn prune_metrics(state_dir: &Path, dry_run: bool, items: &mut Vec<CleanupItem>) {
-    let days = std::env::var("SHIPYARD_METRICS_RETENTION_DAYS")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(DEFAULT_METRICS_RETENTION_DAYS);
+fn validate_metrics_retention_preflight(state_dir: &Path) -> Result<(), CliFailure> {
+    let configured_days = std::env::var("SHIPYARD_METRICS_RETENTION_DAYS").ok();
+    let days = parse_metrics_retention_days(configured_days.as_deref())?;
+    if days <= 0 || !state_dir.join("metrics").join("metrics.db").exists() {
+        return Ok(());
+    }
+    MetricsStore::validate_existing(state_dir)
+        .map_err(|error| CliFailure::new(1, format!("metrics retention failed: {error}")))
+}
+
+fn parse_metrics_retention_days(value: Option<&str>) -> Result<i64, CliFailure> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_METRICS_RETENTION_DAYS);
+    };
+    let days = value.parse::<i64>().map_err(|_| {
+        CliFailure::new(
+            2,
+            format!(
+                "SHIPYARD_METRICS_RETENTION_DAYS must be a non-negative integer, got {value:?}"
+            ),
+        )
+    })?;
+    if days < 0 {
+        return Err(CliFailure::new(
+            2,
+            "SHIPYARD_METRICS_RETENTION_DAYS must be non-negative",
+        ));
+    }
+    let Some(retention) = Duration::try_days(days) else {
+        return Err(CliFailure::new(
+            2,
+            "SHIPYARD_METRICS_RETENTION_DAYS is too large",
+        ));
+    };
+    if Utc::now().checked_sub_signed(retention).is_none() {
+        return Err(CliFailure::new(
+            2,
+            "SHIPYARD_METRICS_RETENTION_DAYS is outside the supported date range",
+        ));
+    }
+    Ok(days)
+}
+
+fn prune_metrics(
+    state_dir: &Path,
+    dry_run: bool,
+    items: &mut Vec<CleanupItem>,
+) -> Result<(), CliFailure> {
+    let configured_days = std::env::var("SHIPYARD_METRICS_RETENTION_DAYS").ok();
+    let days = parse_metrics_retention_days(configured_days.as_deref())?;
     if days <= 0 {
-        return;
+        return Ok(());
     }
     let path = state_dir.join("metrics").join("metrics.db");
     if !path.exists() {
-        return;
+        return Ok(());
     }
     let size = path.metadata().map_or(0, |metadata| metadata.len());
     let result = if dry_run {
-        Ok(0)
+        MetricsStore::validate_existing(state_dir).map(|()| 0)
     } else {
         MetricsStore::open(state_dir).and_then(|store| store.prune_older_than(days))
     };
@@ -444,7 +495,19 @@ fn prune_metrics(state_dir: &Path, dry_run: bool, items: &mut Vec<CleanupItem>) 
             "delete".to_owned(),
             format!("Pruned {deleted} raw runs and observational rows older than {days} days"),
         ),
-        Err(error) => ("skip".to_owned(), format!("Metrics prune skipped: {error}")),
+        Err(error) => {
+            items.push(CleanupItem {
+                path: path.display().to_string(),
+                kind: "metrics".to_owned(),
+                action: "error".to_owned(),
+                size_bytes: 0,
+                reason: format!("Metrics prune failed: {error}"),
+            });
+            return Err(CliFailure::new(
+                1,
+                format!("metrics retention failed: {error}"),
+            ));
+        }
     };
     items.push(CleanupItem {
         path: path.display().to_string(),
@@ -453,6 +516,7 @@ fn prune_metrics(state_dir: &Path, dry_run: bool, items: &mut Vec<CleanupItem>) 
         size_bytes: if dry_run { size } else { 0 },
         reason,
     });
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1862,6 +1926,7 @@ mod retention_tests {
     use super::*;
     use crate::log_retention::gzip_closed_log;
     use crate::log_retention::{AUDIT_PIN_FILE, TERMINAL_MANIFEST_FILE, TerminalLogManifest};
+    use rusqlite::Connection;
 
     fn write_terminal(dir: &Path, job_id: &str, failed: bool, age_hours: i64) {
         fs::create_dir_all(dir).expect("job dir");
@@ -2415,6 +2480,113 @@ mod retention_tests {
                 .iter()
                 .any(|item| item.category == "restart_recovery")
         );
+    }
+
+    #[test]
+    fn metrics_retention_failure_fails_cleanup_closed() {
+        let temp = tempfile::tempdir().expect("temp");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        fs::write(metrics_dir.join("metrics.db"), b"not a sqlite database")
+            .expect("invalid metrics db");
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("metrics retention failure must fail cleanup");
+        assert!(error.message.contains("metrics retention failed"));
+    }
+
+    #[test]
+    fn metrics_retention_dry_run_validates_existing_database() {
+        let temp = tempfile::tempdir().expect("temp");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        fs::write(metrics_dir.join("metrics.db"), b"not a sqlite database")
+            .expect("invalid metrics db");
+
+        let error = cleanup_retention(temp.path(), true, LogRetentionPolicy::default())
+            .expect_err("dry-run must validate the metrics database");
+        assert!(error.message.contains("metrics retention failed"));
+    }
+
+    #[test]
+    fn incompatible_metrics_schema_fails_before_cleanup_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let job = temp.path().join("logs/success");
+        write_terminal(&job, "success", false, 24 * 365);
+        let bundle = temp.path().join("bundles/orphan.bundle");
+        fs::create_dir_all(bundle.parent().expect("bundle parent")).expect("bundles");
+        fs::write(&bundle, "bundle").expect("bundle");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        let connection = Connection::open(metrics_dir.join("metrics.db")).expect("sqlite");
+        connection
+            .execute("CREATE TABLE runs (wrong TEXT)", [])
+            .expect("incompatible schema");
+        drop(connection);
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("incompatible metrics schema must fail closed");
+        assert!(error.message.contains("metrics retention failed"));
+        assert!(
+            bundle.exists(),
+            "bundle must survive metrics preflight failure"
+        );
+        assert!(job.exists(), "logs must survive metrics preflight failure");
+    }
+
+    #[test]
+    fn incompatible_fleet_metrics_schema_fails_before_cleanup_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bundle = temp.path().join("bundles/orphan.bundle");
+        fs::create_dir_all(bundle.parent().expect("bundle parent")).expect("bundles");
+        fs::write(&bundle, "bundle").expect("bundle");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        let connection = Connection::open(metrics_dir.join("metrics.db")).expect("sqlite");
+        connection
+            .execute_batch(
+                "CREATE TABLE runs (id INTEGER, ts TEXT);
+                 CREATE TABLE jobs (id INTEGER, run_id INTEGER);
+                 CREATE TABLE steps (job_id INTEGER);
+                 CREATE TABLE fleet_capacity_samples (wrong TEXT);",
+            )
+            .expect("incompatible fleet schema");
+        drop(connection);
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("incompatible fleet schema must fail closed");
+        assert!(error.message.contains("metrics retention failed"));
+        assert!(
+            bundle.exists(),
+            "bundle must survive metrics preflight failure"
+        );
+    }
+
+    #[test]
+    fn recovered_quarantine_does_not_bypass_metrics_validation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let quarantine = temp
+            .path()
+            .join("cleanup-staging/.shipyard-retire-interrupted");
+        write_terminal(&quarantine.join("success"), "success", false, 24 * 365);
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        fs::write(metrics_dir.join("metrics.db"), b"not a sqlite database")
+            .expect("invalid metrics db");
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("recovery must not bypass metrics validation");
+        assert!(error.message.contains("metrics retention failed"));
+    }
+
+    #[test]
+    fn metrics_retention_setting_is_explicit_and_bounded() {
+        assert_eq!(parse_metrics_retention_days(None).unwrap(), 90);
+        assert_eq!(parse_metrics_retention_days(Some("0")).unwrap(), 0);
+        assert!(parse_metrics_retention_days(Some("-1")).is_err());
+        assert!(parse_metrics_retention_days(Some("not-a-number")).is_err());
+        assert!(parse_metrics_retention_days(Some("9223372036854775807")).is_err());
+        assert!(parse_metrics_retention_days(Some("100000000")).is_err());
     }
 
     #[test]

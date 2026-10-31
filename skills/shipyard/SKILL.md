@@ -3920,6 +3920,10 @@ evidence is never pressure-deleted. Current Phase 1 rotation is lossless at
 writer reopen boundaries; do not use external `copytruncate` against active
 Shipyard writers. Full continuously-active writer rotation remains Phase 2.
 
+Metrics retention is bounded as well: raw runs and expired fleet-capacity
+samples are deleted in small SQLite transactions, and a metrics-store failure
+fails `cleanup` closed so scheduled receipts cannot report a false success.
+
 ## GraphQL And GitHub App Fallback Behaviour
 
 Raw queue removal is not a queue-steward operation. Install

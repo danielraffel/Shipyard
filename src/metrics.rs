@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -820,6 +820,52 @@ impl MetricsStore {
         &self.path
     }
 
+    /// Validate an existing metrics database without migrating or writing it.
+    /// Cleanup uses this for dry-run validation so an unreadable store cannot
+    /// be reported as a successful rotation plan.
+    pub fn validate_existing(state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let path = state_dir.join("metrics").join("metrics.db");
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let result: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if result != "ok" {
+            return Err(format!("metrics database integrity check failed: {result}").into());
+        }
+        for (table, columns) in [
+            ("runs", &["id", "ts"][..]),
+            ("jobs", &["id", "run_id"][..]),
+            ("steps", &["job_id"][..]),
+            (
+                "fleet_capacity_samples",
+                &["sample_id", "valid_until", "repo", "observed_at"][..],
+            ),
+        ] {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if !present {
+                return Err(format!("metrics database missing required table: {table}").into());
+            }
+            for column in columns {
+                let present: bool = conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = ?1"
+                    ),
+                    [column],
+                    |row| row.get(0),
+                )?;
+                if !present {
+                    return Err(format!(
+                        "metrics database table {table} missing required column: {column}"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Delete expired raw runs (including jobs/steps), fleet-capacity samples,
     /// and queue observations. Return the number of runs, capacity samples,
     /// shadow observations, and timing rows removed, excluding child jobs/steps.
@@ -866,11 +912,26 @@ impl MetricsStore {
             tx.commit()?;
             deleted += ids.len();
         }
-        let conn = self.connect()?;
-        deleted += conn.execute(
-            "DELETE FROM fleet_capacity_samples WHERE valid_until < ?1",
-            [&cutoff],
-        )?;
+        loop {
+            let mut conn = self.connect()?;
+            conn.busy_timeout(std::time::Duration::from_millis(250))?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let removed = tx.execute(
+                "DELETE FROM fleet_capacity_samples
+                 WHERE sample_id IN (
+                   SELECT sample_id FROM fleet_capacity_samples
+                   WHERE valid_until < ?1
+                   ORDER BY valid_until, sample_id
+                   LIMIT 250
+                 )",
+                [&cutoff],
+            )?;
+            tx.commit()?;
+            deleted += removed;
+            if removed == 0 {
+                break;
+            }
+        }
         deleted += self.prune_queue_observations(cutoff_time)?;
         Ok(deleted)
     }
@@ -7255,6 +7316,16 @@ mod tests {
     }
 
     #[test]
+    fn metrics_retention_rejects_period_outside_date_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let error = store
+            .prune_older_than(100_000_000)
+            .expect_err("out-of-range retention must fail closed");
+        assert!(error.to_string().contains("outside the timestamp range"));
+    }
+
+    #[test]
     fn metrics_retention_prunes_old_fleet_capacity_samples() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
@@ -7269,6 +7340,34 @@ mod tests {
             conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn metrics_retention_prunes_capacity_samples_in_bounded_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        let records = (0..501)
+            .map(|index| {
+                serde_json::to_string(&test_capacity_sample(
+                    old - Duration::seconds(i64::from(index)),
+                    &format!("m{index}"),
+                    "verified",
+                ))
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(store.import_fleet_capacity(&records).unwrap(), 501);
+        assert_eq!(store.prune_older_than(90).unwrap(), 501);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
             0
         );
     }

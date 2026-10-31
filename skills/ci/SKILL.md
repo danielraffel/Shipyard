@@ -987,6 +987,11 @@ a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
 a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
 everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
 
+The scheduled metrics retention pass is fail-closed: raw runs and expired
+fleet-capacity samples are deleted in bounded SQLite batches, and an unreadable
+metrics store makes the cleanup command fail so its receipt cannot claim a
+successful rotation.
+
 ## Version-at-land
 
 A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
