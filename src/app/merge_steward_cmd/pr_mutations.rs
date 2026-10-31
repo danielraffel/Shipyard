@@ -122,20 +122,21 @@ pub(super) fn read_head_gate_with_queue_state(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
 ) -> Result<(crate::head_approval::HeadGate, Vec<String>, Value), String> {
-    let run_gh = |argv: &[String]| {
-        context
-            .actions
-            .run_gh(argv)
-            .map_err(|error| error.to_string())
-    };
-    let approval_policy = crate::head_approval::read_policy_required(
-        &run_gh,
-        &context.observation.repo,
-        &context.observation.base,
-    )
-    .map_err(|error| format!("head approval policy unreadable: {error}"))?;
-    let (owner, name) = context
-        .observation
+    read_head_gate_for(context.actions, context.observation, pr)
+}
+
+/// [`read_head_gate_with_queue_state`] from read-only inputs, so an audit
+/// (dry-run) pass can judge a head without mutation control.
+pub(super) fn read_head_gate_for(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    pr: &ObservedPr,
+) -> Result<(crate::head_approval::HeadGate, Vec<String>, Value), String> {
+    let run_gh = |argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string());
+    let approval_policy =
+        crate::head_approval::read_policy_required(&run_gh, &observation.repo, &observation.base)
+            .map_err(|error| format!("head approval policy unreadable: {error}"))?;
+    let (owner, name) = observation
         .repo
         .split_once('/')
         .ok_or_else(|| "invalid repository slug".to_owned())?;
@@ -156,7 +157,7 @@ pub(super) fn read_head_gate_with_queue_state(
         .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
     let (gate, events) = crate::head_approval::evaluate_with_policy_for_author_with_events(
         &run_gh,
-        &context.observation.repo,
+        &observation.repo,
         pr.fact.number,
         &pr.fact.head_sha,
         &approval_policy,

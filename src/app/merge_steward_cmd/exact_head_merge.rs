@@ -27,7 +27,7 @@ use crate::merge_queue_control::MergeQueueMutationGuard;
 
 /// GraphQL document that disarms native auto-merge. Variable: `id`.
 const DISABLE_AUTO_MERGE_MUTATION: &str = "mutation($id:ID!){disablePullRequestAutoMerge(input:\
-     {pullRequestId:$id}){pullRequest{number}}}";
+     {pullRequestId:$id}){pullRequest{number autoMergeRequest{enabledAt}}}}";
 
 /// GraphQL document that merges one exact head. Variables: `id`, `head`.
 const EXACT_HEAD_MERGE_MUTATION: &str = "mutation($id:ID!,$head:GitObjectID!)\
@@ -68,12 +68,22 @@ pub(super) fn owns_for_disarm(decision: &StewardDecision) -> bool {
     )
 }
 
-/// Disarm native auto-merge on `pr` under an already-held guard.
-fn disarm(
+/// Disarm native auto-merge on `pr` under an already-held guard, recording
+/// `audit_action` in the ledger.
+///
+/// The mutation goes through Shipyard's internal queue-mutation path
+/// ([`crate::cloud::GitHubActions::run_gh_internal_queue_mutation`]): the
+/// `ghapp` queue-removal guard judges `disablePullRequestAutoMerge` a queue
+/// removal and refuses it unless it carries the one-shot nonce that path
+/// issues, so a plain `gh` disarm would never reach GitHub behind the
+/// wrapper. Accepted only when GitHub answers with the pull request and no
+/// auto-merge request left on it.
+pub(super) fn disarm_under_guard(
     context: &MutationApplyContext<'_>,
     pr: &ObservedPr,
     ledger: &mut StewardLedger,
-) -> Result<String, String> {
+    audit_action: &str,
+) -> Result<(), String> {
     let args = vec![
         "api".to_owned(),
         "graphql".to_owned(),
@@ -82,17 +92,25 @@ fn disarm(
         "-F".to_owned(),
         format!("id={}", pr.node_id),
     ];
-    let raw = context.actions.run_gh(&args).map_err(|error| {
-        format!(
-            "PR #{} auto-merge could not be disarmed: {error}",
-            pr.fact.number
-        )
-    })?;
+    let raw = context
+        .actions
+        .run_gh_internal_queue_mutation(&args)
+        .map_err(|error| {
+            format!(
+                "PR #{} auto-merge could not be disarmed: {error}",
+                pr.fact.number
+            )
+        })?;
     let accepted = serde_json::from_str::<Value>(&raw).is_ok_and(|value| {
         value.get("errors").is_none()
             && value
                 .pointer("/data/disablePullRequestAutoMerge/pullRequest")
-                .is_some_and(|pull_request| !pull_request.is_null())
+                .is_some_and(|pull_request| {
+                    pull_request.is_object()
+                        && pull_request
+                            .get("autoMergeRequest")
+                            .is_none_or(Value::is_null)
+                })
     });
     if !accepted {
         return Err(format!(
@@ -105,8 +123,24 @@ fn disarm(
         ledger,
         &context.observation.repo,
         &format!("pr:{}:{}", pr.fact.number, pr.fact.head_sha),
-        "disable_auto_merge_server_enforced_base",
+        audit_action,
     );
+    Ok(())
+}
+
+/// Disarm native auto-merge on `pr` on a server-enforced base, under an
+/// already-held guard.
+fn disarm(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    ledger: &mut StewardLedger,
+) -> Result<String, String> {
+    disarm_under_guard(
+        context,
+        pr,
+        ledger,
+        "disable_auto_merge_server_enforced_base",
+    )?;
     Ok(format!("auto_merge_disabled:{}", pr.fact.head_sha))
 }
 

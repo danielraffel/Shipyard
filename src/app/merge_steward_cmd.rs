@@ -1393,6 +1393,7 @@ pub(super) mod queue_drain;
 mod queue_priority_recovery;
 mod render;
 mod resume_record;
+mod stale_auto_merge;
 mod terminal_handoff;
 pub(super) mod train;
 
