@@ -33,6 +33,34 @@ fn pending_verdict_pr_json(head: &str) -> String {
     )
 }
 
+/// Every required check green and GitHub reports `CLEAN`: GitHub would merge
+/// it now, so it cannot be armed.
+fn clean_pr_json(head: &str) -> String {
+    pending_verdict_pr_json(head)
+        .replace(
+            r#""mergeStateStatus":"BLOCKED""#,
+            r#""mergeStateStatus":"CLEAN""#,
+        )
+        .replace(
+            r#""status":"IN_PROGRESS","conclusion":null"#,
+            r#""status":"COMPLETED","conclusion":"SUCCESS","completedAt":"2026-10-30T00:01:00Z""#,
+        )
+}
+
+/// [`script`] serving a `CLEAN`, all-green live PR.
+fn clean_script(log: &Path, comments: &str) -> String {
+    script(log, comments, HEAD, "null", "")
+        .replace(&pending_verdict_pr_json(HEAD), &clean_pr_json(HEAD))
+}
+
+fn clean_pr() -> ObservedPr {
+    parse_pr(
+        &serde_json::from_str(&clean_pr_json(HEAD)).expect("PR json"),
+        &BTreeMap::new(),
+    )
+    .expect("PR")
+}
+
 fn pending_verdict_pr() -> ObservedPr {
     parse_pr(
         &serde_json::from_str(&pending_verdict_pr_json(HEAD)).expect("PR json"),
@@ -64,6 +92,7 @@ printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"contents/.shipyard/config.toml"*) {POLICY_OK} ;;
   *"enablePullRequestAutoMerge"*) printf '%s' '{{"data":{{"enablePullRequestAutoMerge":{{"pullRequest":{{"number":42}}}}}}}}' ;;
+  *"mergePullRequest("*) printf '%s' '{{"data":{{"mergePullRequest":{{"pullRequest":{{"number":42,"merged":true}}}}}}}}' ;;
   *"disablePullRequestAutoMerge"*) printf '%s' '{{"data":{{"disablePullRequestAutoMerge":{{"pullRequest":{{"number":42}}}}}}}}' ;;
   *"enqueuePullRequest"*) echo "a no-queue base must never enqueue" >&2; exit 91 ;;
   *"pulls/42/reviews"*) printf '' ;;
@@ -84,9 +113,16 @@ fn run(
     temp: &tempfile::TempDir,
     body: &str,
 ) -> (Option<String>, Option<String>, String, StewardLedger) {
+    run_with(temp, body, &pending_verdict_pr())
+}
+
+fn run_with(
+    temp: &tempfile::TempDir,
+    body: &str,
+    pr: &ObservedPr,
+) -> (Option<String>, Option<String>, String, StewardLedger) {
     let log = temp.path().join("calls");
     let actions = fake_gh(temp, body);
-    let pr = pending_verdict_pr();
     let observation = no_queue_observation(pr.clone());
     let policy = no_queue_policy(&["macos", "review-verdict"]);
     let mut ledger = StewardLedger::default();
@@ -95,7 +131,7 @@ fn run(
     let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
     let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
     assert_eq!(decision, StewardDecision::ArmMergeQueue);
-    let (mutation, error) = mutate_pr(&context, &pr, &policy, &decision, &mut ledger);
+    let (mutation, error) = mutate_pr(&context, pr, &policy, &decision, &mut ledger);
     let calls = fs::read_to_string(log).unwrap_or_default();
     (mutation, error, calls, ledger)
 }
@@ -214,16 +250,26 @@ fn unapproved_or_held_head_is_never_armed() {
     );
     let earlier = comment(&format!("LGTM\\nreviewed: {MOVED}"));
     for comments in [String::new(), hold, earlier] {
-        let temp = tempfile::tempdir().expect("temp");
-        let log = temp.path().join("calls");
-        let body = script(&log, &comments, HEAD, "null", "");
-        let (mutation, error, calls, _) = run(&temp, &body);
-        assert_eq!(
-            mutation.as_deref(),
-            Some("waiting_head_approval"),
-            "{comments}: {error:?}\n{calls}"
-        );
-        assert!(!calls.contains("AutoMerge("), "{calls}");
+        for clean in [false, true] {
+            let temp = tempfile::tempdir().expect("temp");
+            let log = temp.path().join("calls");
+            let (body, pr) = if clean {
+                (clean_script(&log, &comments), clean_pr())
+            } else {
+                (
+                    script(&log, &comments, HEAD, "null", ""),
+                    pending_verdict_pr(),
+                )
+            };
+            let (mutation, error, calls, _) = run_with(&temp, &body, &pr);
+            assert_eq!(
+                mutation.as_deref(),
+                Some("waiting_head_approval"),
+                "{comments} clean={clean}: {error:?}\n{calls}"
+            );
+            assert!(!calls.contains("AutoMerge("), "{calls}");
+            assert!(!calls.contains("mergePullRequest("), "{calls}");
+        }
     }
 }
 
@@ -294,4 +340,66 @@ fn an_arm_for_this_head_is_left_alone_and_one_for_an_earlier_head_is_disarmed() 
     );
     assert!(calls.contains("disablePullRequestAutoMerge"), "{calls}");
     assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_approved_head_is_merged_with_expected_head_oid() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let body = clean_script(&log, &approved());
+    let (mutation, error, calls, ledger) = run_with(&temp, &body, &clean_pr());
+    assert!(error.is_none(), "{error:?}\n{calls}");
+    assert_eq!(mutation, Some(format!("merged_exact_head:{HEAD}")));
+    let merge = calls
+        .lines()
+        .find(|line| line.contains("mergePullRequest("))
+        .expect("merge call");
+    assert!(merge.contains("expectedHeadOid:$head"), "{merge}");
+    assert!(merge.contains("mergeMethod:MERGE"), "{merge}");
+    assert!(merge.contains(&format!("head={HEAD}")), "{merge}");
+    assert!(!calls.contains("AutoMerge("), "{calls}");
+    assert!(!calls.contains("enqueuePullRequest"), "{calls}");
+    assert!(
+        ledger
+            .audit
+            .iter()
+            .any(|entry| entry.action == "merge_exact_head_clean"
+                && entry.subject == format!("pr:42:{HEAD}"))
+    );
+    let audit = fs::read_to_string(temp.path().join("state/merge_queue/mutations.jsonl"))
+        .expect("mutation audit");
+    assert!(audit.contains("merged_exact_head"), "{audit}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_base_whose_ruleset_lacks_the_approval_context_neither_arms_nor_merges() {
+    for (pr, json) in [
+        (clean_pr(), clean_pr_json(HEAD)),
+        (pending_verdict_pr(), pending_verdict_pr_json(HEAD)),
+    ] {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls");
+        let body = script(&log, &approved(), HEAD, "null", "")
+            .replace(&pending_verdict_pr_json(HEAD), &json);
+        let actions = fake_gh(&temp, &body);
+        let mut observation = no_queue_observation(pr.clone());
+        observation.required_checks = required(&["macos"]);
+        let policy = no_queue_policy(&["macos"]);
+        let mut ledger = StewardLedger::default();
+        let control = mutation_control(&temp, "studio", "studio");
+        let ledger_path = temp.path().join("ledger.json");
+        let context = mutation_apply_context(&actions, &observation, &ledger_path, &control);
+        let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+        assert_ne!(decision, StewardDecision::ArmMergeQueue);
+        let (mutation, error) = mutate_pr(&context, &pr, &policy, &decision, &mut ledger);
+        assert!(
+            mutation.is_none() && error.is_none(),
+            "{mutation:?} {error:?}"
+        );
+        let calls = fs::read_to_string(log).unwrap_or_default();
+        assert!(!calls.contains("AutoMerge("), "{calls}");
+        assert!(!calls.contains("mergePullRequest("), "{calls}");
+    }
 }

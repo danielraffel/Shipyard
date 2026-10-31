@@ -3496,9 +3496,14 @@ owned, exact-head-approved PR is armed with `enablePullRequestAutoMerge`
 not hold the arm back, failed ones do. Per-PR mutations are
 `auto_merge_enabled:<sha>`, `auto_merge_already_enabled:<sha>`,
 `auto_merge_disabled_head_moved:<sha>` (an arm from before this head arrived is
-disarmed; re-arm waits for a later pass), `waiting_head_approval`, and
-`auto_merge_refused_clean_status:<sha>`: GitHub will not arm an already-mergeable
-PR, and the steward never falls back to a direct merge. Without the approval
+disarmed; re-arm waits for a later pass), `waiting_head_approval`,
+and `merged_exact_head:<sha>`. GitHub will not arm an already-mergeable PR, so
+on this path only an approved head that is `CLEAN` with every required check
+green is merged with `mergePullRequest` (`expectedHeadOid` = the approved head,
+`MERGE`) through the same `gh`/`ghapp` path; the ruleset still makes GitHub
+refuse a head whose approval context or CI has not passed. A clean-status
+answer the steward did not predict reports `auto_merge_refused_clean_status:<sha>`
+and does nothing. The org-queue path never takes this merge. Without the approval
 context the base stays `direct_merge_refused_server_enforcement_required`.
 Apply mode is restricted by central mutation
 authority, durable write-ahead intent, and live revalidation immediately before

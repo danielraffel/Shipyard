@@ -12,7 +12,11 @@
 //!
 //! The steward still runs its own exact-head approval gate first, and the
 //! arm goes through the ordinary `gh` path, so the `ghapp` queue-arm guard
-//! judges it too. There is never a client-side direct merge.
+//! judges it too. A head that is already mergeable cannot be armed, so on
+//! this path only it is merged with `mergePullRequest` bound by
+//! `expectedHeadOid`; the ruleset still makes GitHub refuse any head whose
+//! approval context or CI has not passed. A base without the required
+//! approval context, and the org-queue path, never take this merge.
 
 use super::{
     MutationApplyContext, ObservedPr, StewardLedger, StewardPolicy, Value,
@@ -87,9 +91,12 @@ fn finish(
 /// * `auto_merge_disabled_head_moved:<sha>` — an arm left over from an
 ///   earlier head was disarmed; the next pass re-arms after approval.
 /// * `auto_merge_enabled:<sha>` — armed with `expectedHeadOid` = `<sha>`.
-/// * `auto_merge_refused_clean_status:<sha>` — GitHub would not arm an
-///   already-mergeable pull request; it is left for a person, never merged
-///   directly.
+/// * `merged_exact_head:<sha>` — the head was already mergeable (`CLEAN`,
+///   every required check green), so it was merged with `mergePullRequest`
+///   bound by `expectedHeadOid`; GitHub will not arm auto-merge on it.
+/// * `auto_merge_refused_clean_status:<sha>` — GitHub reported clean status
+///   even though the steward did not see the head as mergeable; nothing is
+///   merged on that answer.
 #[allow(clippy::too_many_lines)] // One guarded transaction keeps the gate, the read and the arm adjacent.
 pub(super) fn enable_auto_merge_exact_head(
     context: &MutationApplyContext<'_>,
@@ -234,8 +241,8 @@ pub(super) fn enable_auto_merge_exact_head(
     }
     // Final live read under the guard: same head, same queue capability, and
     // still an arm candidate on GitHub's current facts.
-    match final_enqueue_revalidation(context, pr, policy, ledger) {
-        Ok(Some(_)) => {}
+    let live = match final_enqueue_revalidation(context, pr, policy, ledger) {
+        Ok(Some(live)) => live,
         Ok(None) => {
             return finish(
                 guard,
@@ -245,6 +252,16 @@ pub(super) fn enable_auto_merge_exact_head(
             );
         }
         Err(error) => return finish(guard, "final_live_revalidation_failed", None, Some(error)),
+    };
+    if live.fact.merge_state.eq_ignore_ascii_case("CLEAN")
+        && crate::merge_steward::required_checks_all_succeeded(&live.fact, policy)
+    {
+        // GitHub will not arm auto-merge on a pull request it could merge
+        // now. On this path only, merge the approved head directly: the
+        // mutation is bound to it by `expectedHeadOid`, and the base's
+        // ruleset still requires the approval context and CI, so GitHub
+        // refuses the merge of any head those have not passed.
+        return merge_exact_head(context, pr, &head, ledger, guard);
     }
     // Deliberately the ordinary `run_gh`: the `ghapp` queue-arm guard judges
     // this arm, and its refusals are honoured, never overridden.
@@ -275,8 +292,9 @@ pub(super) fn enable_auto_merge_exact_head(
                     "refused_clean_status",
                     Some(format!("auto_merge_refused_clean_status:{head}")),
                     Some(format!(
-                        "PR #{} head {} is approved and already mergeable, so GitHub will not \
-                         arm auto-merge on it; the steward never merges directly ({detail})",
+                        "PR #{} head {} was not seen as mergeable but GitHub reports clean \
+                         status, so nothing was armed or merged; the next pass re-reads it \
+                         ({detail})",
                         pr.fact.number,
                         short(&head)
                     )),
@@ -304,6 +322,79 @@ pub(super) fn enable_auto_merge_exact_head(
                 )
             } else {
                 finish(guard, "arm_failed", None, Some(message))
+            }
+        }
+    }
+}
+
+/// GraphQL document that merges one exact head. Variables: `id`, `head`.
+const EXACT_HEAD_MERGE_MUTATION: &str = "mutation($id:ID!,$head:GitObjectID!)\
+     {mergePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head,mergeMethod:MERGE})\
+     {pullRequest{number merged}}}";
+
+/// Merge an approved, already-mergeable head on an exact-head auto-merge
+/// base, through the ordinary `gh` path so the `ghapp` merge guard judges it.
+fn merge_exact_head(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+    head: &str,
+    ledger: &mut StewardLedger,
+    guard: crate::merge_queue_control::MergeQueueMutationGuard,
+) -> (Option<String>, Option<String>) {
+    let args = vec![
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={EXACT_HEAD_MERGE_MUTATION}"),
+        "-F".to_owned(),
+        format!("id={}", pr.node_id),
+        "-f".to_owned(),
+        format!("head={head}"),
+    ];
+    match context.actions.run_gh(&args) {
+        Ok(raw)
+            if serde_json::from_str::<Value>(&raw).is_ok_and(|value| {
+                value.get("errors").is_none()
+                    && value
+                        .pointer("/data/mergePullRequest/pullRequest/merged")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            }) =>
+        {
+            record_audit(
+                ledger,
+                &context.observation.repo,
+                &format!("pr:{}:{head}", pr.fact.number),
+                "merge_exact_head_clean",
+            );
+            finish(
+                guard,
+                "merged_exact_head",
+                Some(format!("merged_exact_head:{head}")),
+                None,
+            )
+        }
+        Ok(raw) => finish(
+            guard,
+            "rejected",
+            None,
+            Some(format!(
+                "PR #{} exact-head merge was not accepted: {}",
+                pr.fact.number,
+                first_graphql_error(&raw).unwrap_or_else(|| "no errors reported".to_owned())
+            )),
+        ),
+        Err(error) => {
+            let message = error.to_string();
+            if crate::queue_arm_gate::is_refusal(&message) {
+                finish(
+                    guard,
+                    "refused_by_merge_guard",
+                    Some("waiting_head_approval".to_owned()),
+                    Some(message),
+                )
+            } else {
+                finish(guard, "merge_failed", None, Some(message))
             }
         }
     }

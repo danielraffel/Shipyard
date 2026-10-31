@@ -132,9 +132,10 @@ impl StewardPolicy {
     /// Only when there is no merge queue, the repository allows auto-merge,
     /// and GitHub itself enforces a non-empty required-check set that
     /// includes the approval context. GitHub then refuses to merge any head
-    /// whose approval check has not passed, so arming cannot grant authority
-    /// branch protection does not already hold. Anything less stays refused;
-    /// there is never a client-side direct merge.
+    /// whose approval check has not passed, so arming (or, for a head that is
+    /// already mergeable, an `expectedHeadOid`-bound merge) cannot grant
+    /// authority branch protection does not already hold. Anything less stays
+    /// refused, with no merge at all.
     #[must_use]
     pub fn native_auto_merge_exact_head(&self) -> bool {
         let context = self.auto_merge_approval_context.trim();
@@ -569,6 +570,28 @@ pub fn has_successful_status(pr: &StewardPullRequest, context: &str) -> bool {
                 .as_deref()
                 .is_some_and(|value| value.eq_ignore_ascii_case("SUCCESS"))
     })
+}
+
+/// Whether every required check has a successful terminal conclusion on the
+/// observed head. Missing, pending, failed and transient checks all answer
+/// `false`.
+#[must_use]
+pub fn required_checks_all_succeeded(pr: &StewardPullRequest, policy: &StewardPolicy) -> bool {
+    !policy.required_checks.is_empty()
+        && selected_checks(pr, policy).iter().all(|(_, check)| {
+            check.is_some_and(|check| {
+                check.status.eq_ignore_ascii_case("COMPLETED")
+                    && matches!(
+                        check
+                            .conclusion
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_ascii_uppercase()
+                            .as_str(),
+                        "SUCCESS" | "NEUTRAL" | "SKIPPED"
+                    )
+            })
+        })
 }
 
 fn selected_checks<'a>(
