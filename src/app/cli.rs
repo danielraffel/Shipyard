@@ -515,6 +515,13 @@ pub(super) enum Command {
         #[arg(long)]
         no_rebase_carry: bool,
     },
+    /// Record or reconcile reviewer-dispatch liveness receipts.
+    #[command(name = "reviewer-dispatch")]
+    ReviewerDispatch {
+        /// Reviewer-dispatch receipt operation.
+        #[command(subcommand)]
+        command: ReviewerDispatchCommand,
+    },
     /// Acquire, validate, or revoke a durable reviewer claim for one exact
     /// pull-request head. Claim acquisition publishes the configured
     /// `shipyard-reviewer-claim/v1` check-run receipt through the App client.
@@ -1065,6 +1072,85 @@ pub(super) enum ReviewerClaimCommand {
         #[arg(long, default_value = crate::reviewer_receipt::REVIEWER_CLAIM_CHECK_NAME)]
         check_name: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ReviewerDispatchCommand {
+    /// Append one authenticated launcher attempt to the receipt store.
+    Record(ReviewerDispatchRecordArgs),
+    /// Reconcile the latest attempt with an authenticated head and verdict read.
+    Observe(ReviewerDispatchObserveArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReviewerDispatchRecordArgs {
+    /// Canonical OWNER/REPO identity.
+    #[arg(long)]
+    pub(crate) repo: String,
+    /// Pull request number.
+    #[arg(long)]
+    pub(crate) pr: u64,
+    /// Full exact pull-request head SHA.
+    #[arg(long)]
+    pub(crate) head: String,
+    /// Reviewer identity requested by the caller.
+    #[arg(long)]
+    pub(crate) reviewer: String,
+    /// Distinct attempt identifier.
+    #[arg(long)]
+    pub(crate) attempt_id: String,
+    /// One-based attempt number.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) attempt: u32,
+    /// Authenticated launcher identity.
+    #[arg(long)]
+    pub(crate) launcher_identity: String,
+    /// Authenticated reviewer-session identifier, when started.
+    #[arg(long)]
+    pub(crate) session_id: Option<String>,
+    /// Stable upstream dispatch/request identifier.
+    #[arg(long)]
+    pub(crate) dispatch_id: String,
+    /// RFC 3339 attempt start time.
+    #[arg(long)]
+    pub(crate) started_at: String,
+    /// RFC 3339 deadline.
+    #[arg(long)]
+    pub(crate) deadline_at: String,
+    /// Launcher result: requested, started, or failed.
+    #[arg(long)]
+    pub(crate) result: String,
+    /// Failure detail, required when result is failed.
+    #[arg(long)]
+    pub(crate) error: Option<String>,
+    /// JSONL receipt store. Defaults to the machine state directory.
+    #[arg(long)]
+    pub(crate) store: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReviewerDispatchObserveArgs {
+    /// Canonical OWNER/REPO identity.
+    #[arg(long)]
+    pub(crate) repo: String,
+    /// Pull request number.
+    #[arg(long)]
+    pub(crate) pr: u64,
+    /// Reviewer identity to observe.
+    #[arg(long)]
+    pub(crate) reviewer: String,
+    /// Current authenticated exact pull-request head.
+    #[arg(long)]
+    pub(crate) head: String,
+    /// RFC 3339 observation time. Defaults to now.
+    #[arg(long)]
+    pub(crate) now: Option<String>,
+    /// Maximum number of retries after the first attempt.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(..=1))]
+    pub(crate) max_retries: u32,
+    /// JSONL receipt store. Defaults to the machine state directory.
+    #[arg(long)]
+    pub(crate) store: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
