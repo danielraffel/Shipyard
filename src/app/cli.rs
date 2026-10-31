@@ -1319,6 +1319,9 @@ pub(crate) enum MetricsCommand {
     /// `queue_wait_per_job_ahead_ms` = median of wait / (1 + jobs of the same
     /// lane queued earlier and still waiting).
     /// `cache_hit_rate` = jobs whose every reported step hit / jobs reporting.
+    /// `--before` bounds the earlier side to [split-before, split), while
+    /// `--after` bounds the later side to [split, split+after); neither moves
+    /// the `--split-days-ago` point. Both intervals are half-open.
     #[command(verbatim_doc_comment)]
     Compare(MetricsCompareArgs),
     /// Show recent rows plus each job class's earlier-half vs later-half
@@ -2312,10 +2315,10 @@ pub(crate) struct MetricsCompareArgs {
     /// Optional lane key for agent context.
     #[arg(long)]
     pub(crate) lane: Option<String>,
-    /// Before window, for example `7d`.
+    /// Limit the before side to this window ending at the split, for example `7d`.
     #[arg(long)]
     pub(crate) before: Option<String>,
-    /// After window, for example `7d`.
+    /// Limit the after side to this window starting at the split, for example `7d`.
     #[arg(long)]
     pub(crate) after: Option<String>,
     /// Split point in days ago. Older rows are before; newer rows are after.

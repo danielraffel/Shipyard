@@ -203,6 +203,14 @@ shipyard metrics compare --project pulp --lane windows-arm64 --before 7d --after
 shipyard metrics compare --project pulp --basis wall-time --json   # duration verdict (load-dependent)
 shipyard metrics trend --project pulp --since 14d --json
 
+`metrics compare` splits at `now - --split-days-ago`. `--before` bounds the earlier
+side to `[split-before, split)` and `--after` independently bounds the later
+side to `[split, split+after)`; neither flag moves the split. Both intervals
+are half-open, so a sample exactly at the split belongs to the after side and
+a sample exactly at an explicit window end is excluded. Windows that cannot
+be represented by the timestamp range produce no findings instead of
+panicking.
+
 # Manage
 shipyard bump <id> high        # reprioritize a pending job
 shipyard cancel <id>           # cancel a job

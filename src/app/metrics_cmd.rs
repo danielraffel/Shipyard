@@ -488,15 +488,16 @@ pub(super) fn metrics_command<W: Write>(
         }
         MetricsCommand::Compare(args) => {
             let _lane = args.lane.as_deref();
-            let _before_days = args.before.as_deref().map(parse_days).transpose()?;
-            let split_days_ago = args
-                .after
-                .as_deref()
-                .map(parse_days)
-                .transpose()?
-                .unwrap_or(args.split_days_ago);
+            let before_days = parse_compare_window(args.before.as_deref())?;
+            let after_days = parse_compare_window(args.after.as_deref())?;
             let findings = store
-                .compare(&args.project, split_days_ago, args.basis.into())
+                .compare_with_windows(
+                    &args.project,
+                    args.split_days_ago,
+                    before_days,
+                    after_days,
+                    args.basis.into(),
+                )
                 .map_err(|error| CliFailure::new(1, format!("metrics compare failed: {error}")))?;
             write_findings(
                 stdout,
@@ -770,6 +771,20 @@ fn parse_days(value: &str) -> Result<i64, CliFailure> {
             format!("invalid day window {value:?}; use a number or Nd, for example 14d"),
         )
     })
+}
+
+fn parse_compare_window(value: Option<&str>) -> Result<Option<i64>, CliFailure> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let days = parse_days(value)?;
+    if days <= 0 {
+        return Err(CliFailure::new(
+            WAIT_EXIT_INVALID,
+            format!("compare window must be positive, got {value:?}"),
+        ));
+    }
+    Ok(Some(days))
 }
 
 fn import_tartci(
@@ -1216,6 +1231,14 @@ mod tests {
             stale_after: None,
             fail_on_stale: false,
         }
+    }
+
+    #[test]
+    fn compare_window_parser_rejects_non_positive_values() {
+        assert_eq!(parse_compare_window(Some("7d")).unwrap(), Some(7));
+        assert!(parse_compare_window(Some("0d")).is_err());
+        assert!(parse_compare_window(Some("-1d")).is_err());
+        assert_eq!(parse_compare_window(None).unwrap(), None);
     }
 
     #[test]
