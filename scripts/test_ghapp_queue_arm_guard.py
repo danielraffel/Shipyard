@@ -3977,6 +3977,27 @@ class ReviewIdentity(unittest.TestCase):
         self.assertTrue(guard.review_verdict(head, "shipyard-local[bot]", [comment], [],
                                              self.policy())[0])
 
+    def test_base_signer_identity_binding_accepts_only_the_stamped_host_and_agent(self) -> None:
+        config = ('[auto_merge]\n'
+                  'reviewer_signers = ["codex-review"]\n'
+                  '[auto_merge.reviewer_signer_identities]\n'
+                  'codex-review = ["Daniels-Mac-Studio-m3 agent:codex-reviewer"]\n')
+        policy = guard.review_policy(config, "Generous-Corp/pulp", True)
+        policy["sessions"] = None  # identity binding is repository-side, not host-local
+        stamp = "<!-- session: Daniels-Mac-Studio-m3/rotating-session agent: codex-reviewer -->"
+        good = self.comment("shipyard-local[bot]", f"reviewer: codex-review\n{stamp}\n"
+                            f"verdict: APPROVE head:{self.HEAD}")
+        self.assertTrue(guard.review_verdict(self.HEAD, "danielraffel", [good], [], policy)[0])
+        for wrong in (
+            "<!-- session: Daniels-M5-Studio/rotating-session agent: codex-reviewer -->",
+            "<!-- session: Daniels-Mac-Studio-m3/rotating-session agent: other-agent -->",
+            "<!-- session: Daniels-Mac-Studio-m3/rotating-session -->",
+        ):
+            bad = self.comment("shipyard-local[bot]", f"reviewer: codex-review\n{wrong}\n"
+                               f"verdict: APPROVE head:{self.HEAD}")
+            self.assertFalse(guard.review_verdict(self.HEAD, "danielraffel", [bad], [], policy)[0],
+                             wrong)
+
     def test_the_base_config_names_signers_before_the_host_file(self) -> None:
         with tempfile.TemporaryDirectory() as scratch, \
                 mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": scratch}):

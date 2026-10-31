@@ -98,6 +98,11 @@ shipyard cause extract --log FILE --job NAME --notice  # `::notice title=ci-caus
 shipyard cause extract --log FILE --format c2  # C2's raw records
 shipyard cause archive --dir DIR --input F   # append records (or scorecard case rows' `cause`) to DIR/causes/YYYY-MM.jsonl;
                                              #   ids already archived are skipped, nothing is rewritten
+shipyard cause prune --dir DIR               # preview bounded archive retention (365 days, 64 MiB)
+shipyard cause prune --dir DIR --apply       # apply only to a managed, mutable archive
+                                             #   (max 36,500 days / 128 MiB; unresolved evidence is preserved)
+shipyard cause prune --dir DIR --apply --initialize
+                                             # explicitly enroll an existing unmarked archive
 shipyard cause record --repo OWNER/REPO --workflow FILE --dir DIR [--since TIME] [--base main]
                                              # read-only observer: a cause row per new red job (DIR/causes/YYYY-MM.jsonl)
                                              #   and a fix-link once its PR or branch goes green (DIR/fixlinks.jsonl);
@@ -182,6 +187,7 @@ shipyard metrics record --project pulp --job linux-arm64 --step compile --durati
 shipyard metrics import github --repo Generous-Corp/pulp --workflow build.yml --limit 10
 tartci runtime export --repo Generous-Corp/pulp | shipyard metrics import tartci
 shipyard metrics export merge-receipt --repo Generous-Corp/pulp --file "$SHIPYARD_HANDOFF_DIR/merge-receipts.jsonl"
+shipyard metrics export merge-receipt --repo Generous-Corp/pulp --stdout  # canonical JSONL only; for a governed transport
 shipyard metrics summary --project pulp --json
 shipyard metrics repeated-work-cost --since 14d --limit 1000 --json
 shipyard metrics summary --project pulp --group-by host --json   # fold ephemeral runners into their host
@@ -246,6 +252,7 @@ shipyard runner steward --recover-hosted-setup-eviction-priority --apply
 shipyard runner steward --provenance-blocking-label 5·unresolved # repeatable authority blocker
 shipyard runner steward --arm-unqueued              # audit green, unqueued, UNARMED PRs
 shipyard runner steward --arm-unqueued --apply      # arm native auto-merge on them
+shipyard runner steward --approval-context review-verdict  # no-queue base: exact-head merge only when GitHub requires this app-bound check
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --apply
 shipyard runner steward-handoff --repo OWNER/REPO --pr 123 --head "$SHA" --workstream-id GEN-7 --context-url https://linear.app/... --agent-provider codex --agent-session-id NEW_SESSION --transfer-agent-owner --apply
 shipyard pr --workstream-id GEN-7 --context-url https://linear.app/...   # free-form handoff identifiers
@@ -533,6 +540,13 @@ it inside that repository's clone.
 `$SHIPYARD_STATE_DIR/metrics/metrics.db` using SQLite. The feature is optional
 and provider-neutral:
 
+`shipyard cleanup` previews retention by default and applies it only with
+`--apply`. Raw metric rows are kept for 90 days by default; set
+`SHIPYARD_METRICS_RETENTION_DAYS` to another non-negative number, or `0` to
+disable pruning. Invalid, negative, or unreasonably large values refuse the
+command. A corrupt or unreadable metrics database fails cleanup closed,
+including dry-run validation, and durable merge receipts are retained.
+
 - `shipyard metrics record` writes one explicit job/step sample.
 - `shipyard run command` writes a best-effort metrics row automatically when it
   stores command evidence.
@@ -549,7 +563,9 @@ and provider-neutral:
   JSONL handoff. It reads only the local `merge_receipts` store; it never queries
   GitHub or manufactures receipts. An empty export fails closed without
   replacing the destination, so the downstream cannot record a false
-  successful handoff.
+  successful handoff. `--stdout` is the stream form: it is mutually exclusive
+  with `--file` and emits only canonical JSONL receipt records, with no summary
+  mixed into stdout. It cannot be combined with `--json`.
 - `scripts/merge_receipt_handoff.py export ...` supervises that producer export
   and writes an atomic `shipyard-merge-receipt-handoff/v1` health sidecar;
   `... check --repo <owner/repo> --base-branch main --stale-after 2h` exits `3` for a missing, malformed, failed,

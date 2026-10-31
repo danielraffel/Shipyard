@@ -189,15 +189,23 @@ fn write_merge_receipts_jsonl(
         .unwrap_or(Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
-    for receipt in receipts {
-        let line = serde_json::to_string(receipt)
-            .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
-        writeln!(temporary, "{line}")
-            .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
-    }
+    write_merge_receipts_jsonl_to(&mut temporary, receipts)?;
     temporary.persist(path).map_err(|error| {
         CliFailure::new(1, format!("merge receipt export failed: {}", error.error))
     })?;
+    Ok(())
+}
+
+fn write_merge_receipts_jsonl_to<W: Write>(
+    output: &mut W,
+    receipts: &[crate::metrics::merge_receipt::MergeReceipt],
+) -> Result<(), CliFailure> {
+    for receipt in receipts {
+        let line = serde_json::to_string(receipt)
+            .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
+        writeln!(output, "{line}")
+            .map_err(|error| CliFailure::new(1, format!("merge receipt export failed: {error}")))?;
+    }
     Ok(())
 }
 
@@ -333,7 +341,17 @@ pub(super) fn metrics_command<W: Write>(
             }
         },
         MetricsCommand::Export { source } => match source {
-            MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs { repo, file }) => {
+            MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
+                repo,
+                file,
+                stdout: stream,
+            }) => {
+                if stream && json_output {
+                    return Err(CliFailure::new(
+                        2,
+                        "merge receipt export failed: --json cannot be combined with --stdout",
+                    ));
+                }
                 let receipts = store.export_merge_receipts(&repo).map_err(|error| {
                     CliFailure::new(1, format!("merge receipt export failed: {error}"))
                 })?;
@@ -343,6 +361,16 @@ pub(super) fn metrics_command<W: Write>(
                         format!("merge receipt export failed: no receipts for {repo}"),
                     ));
                 }
+                if stream {
+                    write_merge_receipts_jsonl_to(stdout, &receipts)?;
+                    return Ok(std::process::ExitCode::SUCCESS);
+                }
+                let file = file.ok_or_else(|| {
+                    CliFailure::new(
+                        2,
+                        "merge receipt export failed: --file or --stdout is required",
+                    )
+                })?;
                 let destination = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
                 let store_path = std::fs::canonicalize(store.path())
                     .unwrap_or_else(|_| store.path().to_path_buf());
@@ -1094,6 +1122,38 @@ mod tests {
     }
 
     #[test]
+    fn repeated_work_cost_rejects_nonpositive_windows_without_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for since in ["0d", "-1d"] {
+            for json_output in [false, true] {
+                let mut output = Vec::new();
+                let error = metrics_command(
+                    MetricsCommand::RepeatedWorkCost(
+                        crate::app::cli::MetricsRepeatedWorkCostArgs {
+                            limit: 100,
+                            since: since.into(),
+                        },
+                    ),
+                    temp.path(),
+                    None,
+                    json_output,
+                    &mut output,
+                )
+                .expect_err("nonpositive baseline window must fail");
+                assert_eq!(error.code, WAIT_EXIT_INVALID, "{since}");
+                assert_eq!(
+                    error.message(),
+                    "repeated-work baseline window must be positive"
+                );
+                assert!(
+                    output.is_empty(),
+                    "invalid window emitted a report: {since}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn repeated_work_cost_json_and_human_output_report_superseded_coverage() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = MetricsStore::open(temp.path()).expect("store");
@@ -1324,7 +1384,8 @@ mod tests {
             MetricsCommand::Export {
                 source: MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
                     repo: "owner/repo".to_owned(),
-                    file: destination.clone(),
+                    file: Some(destination.clone()),
+                    stdout: false,
                 }),
             },
             temp.path(),
@@ -1344,6 +1405,74 @@ mod tests {
     }
 
     #[test]
+    fn merge_receipt_export_stdout_contains_only_canonical_jsonl() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        let receipt = crate::metrics::merge_receipt::MergeReceipt {
+            schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
+            receipt_id: "export-stdout".to_owned(),
+            repo: "owner/repo".to_owned(),
+            project: "repo".to_owned(),
+            base_branch: "main".to_owned(),
+            pr: 1,
+            head_sha: "a".repeat(40),
+            validated_head_sha: "a".repeat(40),
+            merge_commit_sha: "b".repeat(40),
+            merged_at: Utc::now(),
+            safe_merge: true,
+            source: "shipyard".to_owned(),
+            required_checks: vec!["linux".to_owned()],
+            gate_receipt_sha256: "c".repeat(64),
+            evidence: "sha256:export-stdout".to_owned(),
+        };
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .expect("receipt");
+
+        let mut output = Vec::new();
+        metrics_command(
+            MetricsCommand::Export {
+                source: MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
+                    repo: "owner/repo".to_owned(),
+                    file: None,
+                    stdout: true,
+                }),
+            },
+            temp.path(),
+            None,
+            false,
+            &mut output,
+        )
+        .expect("stream export");
+
+        let text = String::from_utf8(output).expect("UTF-8 JSONL");
+        assert_eq!(text.lines().count(), 1);
+        let exported: Value = serde_json::from_str(text.trim()).expect("receipt JSON");
+        assert_eq!(exported["receipt_id"], "export-stdout");
+        assert!(
+            exported.get("exported").is_none(),
+            "summary leaked to stdout"
+        );
+
+        let mut json_output = Vec::new();
+        let error = metrics_command(
+            MetricsCommand::Export {
+                source: MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
+                    repo: "owner/repo".to_owned(),
+                    file: None,
+                    stdout: true,
+                }),
+            },
+            temp.path(),
+            None,
+            true,
+            &mut json_output,
+        )
+        .expect_err("stream mode must not mix structured summary output");
+        assert_eq!(error.code, 2);
+    }
+
+    #[test]
     fn merge_receipt_export_refuses_empty_or_database_destinations() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = MetricsStore::open(temp.path()).expect("store");
@@ -1354,7 +1483,8 @@ mod tests {
                 MetricsCommand::Export {
                     source: MetricsExportCommand::MergeReceipt(MetricsExportMergeReceiptArgs {
                         repo: repo.to_owned(),
-                        file,
+                        file: Some(file),
+                        stdout: false,
                     }),
                 },
                 temp.path(),

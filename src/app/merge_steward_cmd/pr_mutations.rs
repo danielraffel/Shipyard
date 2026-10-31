@@ -41,6 +41,21 @@ pub(super) fn mutate_pr_with_recovery(
     ) {
         return (None, None);
     }
+    // Cheap, fail-open-to-the-full-path pre-filter: an arm candidate whose
+    // census head has no exact-head approval is refused here, before the
+    // merge-queue snapshot and the full PR/check re-read. Only a definitive
+    // "not approved" short-circuits; any read error falls through, and
+    // `enqueue_pull_request_with_recovery` re-evaluates the gate on the live
+    // head, so a moved head or a late HOLD is still refused fail-closed.
+    if matches!(decision, StewardDecision::ArmMergeQueue)
+        && let Ok((gate, _events)) = read_head_gate(context, pr)
+        && !gate.allows()
+    {
+        return (
+            Some("waiting_head_approval".to_owned()),
+            Some(gate.explain()),
+        );
+    }
     let queue_positions = match merge_queue_snapshot(
         context.actions,
         &context.observation.repo,
@@ -73,6 +88,9 @@ pub(super) fn mutate_pr_with_recovery(
     }
     let pr = &live_pr;
     match decision {
+        StewardDecision::ArmMergeQueue if policy.server_enforced_exact_head_merge() => {
+            super::exact_head_merge::merge_exact_head(context, pr, policy, ledger)
+        }
         StewardDecision::ArmMergeQueue => enqueue_pull_request_with_recovery(
             context,
             pr,
@@ -85,6 +103,68 @@ pub(super) fn mutate_pr_with_recovery(
         }
         _ => (None, None),
     }
+}
+
+/// Read the exact-head approval gate for `pr`'s census head: reviewer policy,
+/// live merge-queue observation, then the review/comment evaluation. Errors
+/// carry the full operator-facing message.
+fn read_head_gate(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+) -> Result<(crate::head_approval::HeadGate, Vec<String>), String> {
+    read_head_gate_with_queue_state(context, pr).map(|(gate, events, _queue)| (gate, events))
+}
+
+/// [`read_head_gate`], also returning the live queue-state response it read
+/// (`PR_QUEUE_STATE_QUERY`), so a caller can bind a mutation to the same
+/// observation the gate was evaluated against.
+pub(super) fn read_head_gate_with_queue_state(
+    context: &MutationApplyContext<'_>,
+    pr: &ObservedPr,
+) -> Result<(crate::head_approval::HeadGate, Vec<String>, Value), String> {
+    let run_gh = |argv: &[String]| {
+        context
+            .actions
+            .run_gh(argv)
+            .map_err(|error| error.to_string())
+    };
+    let approval_policy = crate::head_approval::read_policy_required(
+        &run_gh,
+        &context.observation.repo,
+        &context.observation.base,
+    )
+    .map_err(|error| format!("head approval policy unreadable: {error}"))?;
+    let (owner, name) = context
+        .observation
+        .repo
+        .split_once('/')
+        .ok_or_else(|| "invalid repository slug".to_owned())?;
+    let raw = run_gh(&[
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={}", crate::pr_queue_state::PR_QUEUE_STATE_QUERY),
+        "-F".to_owned(),
+        format!("owner={owner}"),
+        "-F".to_owned(),
+        format!("name={name}"),
+        "-F".to_owned(),
+        format!("number={}", pr.fact.number),
+    ])
+    .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
+    let queue = serde_json::from_str::<Value>(&raw)
+        .map_err(|error| format!("merge-queue observation unreadable: {error}"))?;
+    let (gate, events) = crate::head_approval::evaluate_with_policy_for_author_with_events(
+        &run_gh,
+        &context.observation.repo,
+        pr.fact.number,
+        &pr.fact.head_sha,
+        &approval_policy,
+        &queue,
+        pr.fact.author.as_deref(),
+    )
+    .map_err(|error| format!("head approval unreadable: {error}"))?;
+    Ok((gate, events, queue))
 }
 
 #[cfg(all(test, unix))]
@@ -115,63 +195,11 @@ fn enqueue_pull_request_with_recovery(
             .run_gh(argv)
             .map_err(|error| error.to_string())
     };
-    let approval_policy = match crate::head_approval::read_policy_required(
-        &run_gh,
-        &context.observation.repo,
-        &context.observation.base,
-    ) {
-        Ok(policy) => policy,
-        Err(error) => {
-            return (
-                None,
-                Some(format!("head approval policy unreadable: {error}")),
-            );
-        }
-    };
     let mut approval_comment_id = None;
     let mut approval_app_id = None;
     let verdict_audit_events;
     {
-        let Some((owner, name)) = context.observation.repo.split_once('/') else {
-            return (None, Some("invalid repository slug".to_owned()));
-        };
-        let queue = match run_gh(&[
-            "api".to_owned(),
-            "graphql".to_owned(),
-            "-f".to_owned(),
-            format!("query={}", crate::pr_queue_state::PR_QUEUE_STATE_QUERY),
-            "-F".to_owned(),
-            format!("owner={owner}"),
-            "-F".to_owned(),
-            format!("name={name}"),
-            "-F".to_owned(),
-            format!("number={}", pr.fact.number),
-        ]) {
-            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
-                Ok(queue) => queue,
-                Err(error) => {
-                    return (
-                        None,
-                        Some(format!("merge-queue observation unreadable: {error}")),
-                    );
-                }
-            },
-            Err(error) => {
-                return (
-                    None,
-                    Some(format!("merge-queue observation unreadable: {error}")),
-                );
-            }
-        };
-        match crate::head_approval::evaluate_with_policy_for_author_with_events(
-            &run_gh,
-            &context.observation.repo,
-            pr.fact.number,
-            &pr.fact.head_sha,
-            &approval_policy,
-            &queue,
-            pr.fact.author.as_deref(),
-        ) {
+        match read_head_gate(context, pr) {
             Ok((crate::head_approval::HeadGate::Approved { approval }, events)) => {
                 verdict_audit_events = events;
                 approval_comment_id = approval.comment_id();
@@ -186,7 +214,7 @@ fn enqueue_pull_request_with_recovery(
                     Some(gate.explain()),
                 );
             }
-            Err(error) => return (None, Some(format!("head approval unreadable: {error}"))),
+            Err(error) => return (None, Some(error)),
         }
         // The enqueue below goes past the `ghapp` arm guard, so the steward
         // applies the guard's deferred-tier rule itself.
@@ -738,7 +766,7 @@ fn same_head_enqueue_refusal(
     })
 }
 
-fn final_enqueue_revalidation(
+pub(super) fn final_enqueue_revalidation(
     context: &MutationApplyContext<'_>,
     observed: &ObservedPr,
     policy: &StewardPolicy,
