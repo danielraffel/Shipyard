@@ -16,6 +16,7 @@ def main() -> int:
     parser.add_argument("--base-branch", default="main")
     parser.add_argument("--merge-receipts", required=True)
     parser.add_argument("--merge-receipt-health", required=True)
+    parser.add_argument("--merge-receipt-source-host")
     parser.add_argument("collector_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if os.environ.get("SHIPYARD_OBSERVATIONS", "").strip().lower() == "off":
@@ -23,10 +24,15 @@ def main() -> int:
         return 0
     if args.collector_args[:1] == ["--"]:
         args.collector_args = args.collector_args[1:]
+    check_command = [
+        sys.executable, args.handoff_script, "check", "--file", args.merge_receipts,
+        "--repo", args.repo, "--base-branch", args.base_branch,
+        "--health-file", args.merge_receipt_health, "--stale-after", "2h",
+    ]
+    if args.merge_receipt_source_host:
+        check_command.extend(["--expect-source-host", args.merge_receipt_source_host])
     check = subprocess.run(
-        [sys.executable, args.handoff_script, "check", "--file", args.merge_receipts,
-         "--repo", args.repo, "--base-branch", args.base_branch,
-         "--health-file", args.merge_receipt_health, "--stale-after", "2h"],
+        check_command,
         capture_output=True, text=True, check=False,
     )
     collector_args = list(args.collector_args)
@@ -36,6 +42,8 @@ def main() -> int:
             "--merge-receipt-health", args.merge_receipt_health,
             "--merge-receipt-base-branch", args.base_branch,
         ])
+        if args.merge_receipt_source_host:
+            collector_args.extend(["--merge-receipt-source-host", args.merge_receipt_source_host])
     else:
         detail = (check.stderr or check.stdout or "handoff validation failed").strip()
         collector_args.extend(["--merge-receipt-unavailable-reason", " ".join(detail.split())[:500]])

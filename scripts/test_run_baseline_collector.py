@@ -35,6 +35,7 @@ class WrapperTests(unittest.TestCase):
                  "--handoff-script", str(handoff), "--repo", "owner/repo",
                  "--merge-receipts", str(root / "receipts.jsonl"),
                  "--merge-receipt-health", str(root / "receipts.health.json"),
+                 "--merge-receipt-source-host", "m3",
                  "--", "--db", "metrics.db"], check=False, env=env, capture_output=True, text=True,
             )
             self.assertEqual(result.returncode, 0)
@@ -61,6 +62,8 @@ class WrapperTests(unittest.TestCase):
         args = self._run(0)
         self.assertIn("--merge-receipts", args)
         self.assertIn("--merge-receipt-health", args)
+        self.assertIn("--merge-receipt-source-host", args)
+        self.assertIn("m3", args)
         self.assertNotIn("--merge-receipt-unavailable-reason", args)
 
 

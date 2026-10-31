@@ -125,6 +125,7 @@ pub(super) fn cleanup_command<W: Write>(
 pub(super) fn validation_tmp_cleanup<W: Write>(
     mode: CleanupMode,
     older_than_hours: u64,
+    include_unowned: bool,
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
@@ -132,7 +133,7 @@ pub(super) fn validation_tmp_cleanup<W: Write>(
     let base = validation_tmp::default_base();
     let policy = ReclaimPolicy {
         min_age: std::time::Duration::from_hours(older_than_hours),
-        include_unowned: true,
+        include_unowned,
     };
     let candidates =
         validation_tmp::plan(&base, std::time::SystemTime::now(), policy, &SystemLiveness);
@@ -149,6 +150,10 @@ pub(super) fn validation_tmp_cleanup<W: Write>(
         data.insert(
             "older_than_hours".to_owned(),
             serde_json::json!(older_than_hours),
+        );
+        data.insert(
+            "include_unowned".to_owned(),
+            serde_json::json!(include_unowned),
         );
         data.insert("candidates".to_owned(), serde_json::json!(candidates));
         data.insert(
@@ -318,6 +323,69 @@ struct ShipStateCleanupReport {
     note: Option<String>,
 }
 
+/// Scoped writer-domain lease for one cleanup mutation outside the log
+/// retirement path. These mutations never hold the queue lock, so taking the
+/// lease here cannot invert the queue-lock-before-lease order.
+fn mutation_lease(
+    state_dir: &Path,
+    dry_run: bool,
+    phase: &'static str,
+) -> Result<Option<crate::writer_domain_lease::ProductionWriterDomainLease>, CliFailure> {
+    if dry_run {
+        return Ok(None);
+    }
+    let lease = crate::writer_domain_lease::acquire_for_protected_path(state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    mutation_probe::record(phase, state_dir);
+    Ok(lease)
+}
+
+#[cfg(test)]
+mod mutation_probe {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    use fs2::FileExt;
+
+    pub(super) struct Observation {
+        pub(super) phase: &'static str,
+        pub(super) lease_depth: usize,
+        pub(super) queue_lock_free: bool,
+    }
+
+    thread_local! {
+        pub(super) static OBSERVATIONS: RefCell<Vec<Observation>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Runs at the moment a mutation starts: records the writer-domain lease
+    /// depth and whether the queue state lock is free of this thread.
+    pub(super) fn record(phase: &'static str, state_dir: &Path) {
+        let queue_lock_free =
+            std::fs::File::open(state_dir.join("queue.state.lock")).map_or(true, |file| {
+                let free = file.try_lock_exclusive().is_ok();
+                if free {
+                    let _ = FileExt::unlock(&file);
+                }
+                free
+            });
+        let lease_depth = crate::writer_domain_lease::thread_lease_depth();
+        OBSERVATIONS.with(|observations| {
+            observations.borrow_mut().push(Observation {
+                phase,
+                lease_depth,
+                queue_lock_free,
+            });
+        });
+    }
+}
+
+#[cfg(not(test))]
+mod mutation_probe {
+    use std::path::Path;
+
+    pub(super) fn record(_phase: &'static str, _state_dir: &Path) {}
+}
+
 fn cleanup_retention(
     state_dir: &Path,
     dry_run: bool,
@@ -326,12 +394,10 @@ fn cleanup_retention(
     let _cleanup_guard = (!dry_run)
         .then(|| acquire_cleanup_lock(state_dir))
         .transpose()?;
-    let _writer_domain = if dry_run {
-        None
-    } else {
-        crate::writer_domain_lease::acquire_for_protected_path(state_dir)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?
-    };
+    // No whole-run writer-domain lease: the queue lock must be taken before the
+    // lease, and the per-candidate log mutations take the queue lock. Each
+    // non-log mutation below takes its own scoped lease instead.
+    validate_metrics_retention_preflight(state_dir)?;
     let mut items = Vec::new();
     let mut protected_items = Vec::new();
     reject_log_symlinks(&state_dir.join("logs"))?;
@@ -339,6 +405,11 @@ fn cleanup_retention(
         recover_retirement_quarantines(state_dir, dry_run, &mut items, &mut protected_items)?;
     reject_log_symlinks(&state_dir.join("logs"))?;
     if recovered {
+        // Recovery must not bypass the metrics safety check. A recovered
+        // quarantine is returned early so the restored evidence can remain
+        // protected for a separately previewed cleanup, but an unreadable
+        // metrics store still has to fail closed on this invocation.
+        prune_metrics(state_dir, dry_run, &mut items)?;
         let protected_bytes = protected_items.iter().map(|item| item.size_bytes).sum();
         let log_bytes =
             dir_size(&state_dir.join("logs")) + if dry_run { protected_bytes } else { 0 };
@@ -378,8 +449,9 @@ fn cleanup_retention(
     )?;
     scan_bundles(state_dir, dry_run, &mut items)?;
     scan_evidence(state_dir, dry_run, &mut items)?;
-    prune_metrics(state_dir, dry_run, &mut items);
+    prune_metrics(state_dir, dry_run, &mut items)?;
     if !dry_run {
+        let _writer_domain = mutation_lease(state_dir, dry_run, "apply_cleanup_staging")?;
         apply_cleanup_staging(&staging_candidates)?;
     }
     let total_bytes = items.iter().map(|item| item.size_bytes).sum();
@@ -417,21 +489,66 @@ fn cleanup_retention(
 
 const DEFAULT_METRICS_RETENTION_DAYS: i64 = 90;
 
-fn prune_metrics(state_dir: &Path, dry_run: bool, items: &mut Vec<CleanupItem>) {
-    let days = std::env::var("SHIPYARD_METRICS_RETENTION_DAYS")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(DEFAULT_METRICS_RETENTION_DAYS);
+fn validate_metrics_retention_preflight(state_dir: &Path) -> Result<(), CliFailure> {
+    let configured_days = std::env::var("SHIPYARD_METRICS_RETENTION_DAYS").ok();
+    let days = parse_metrics_retention_days(configured_days.as_deref())?;
+    if days <= 0 || !state_dir.join("metrics").join("metrics.db").exists() {
+        return Ok(());
+    }
+    MetricsStore::validate_existing(state_dir)
+        .map_err(|error| CliFailure::new(1, format!("metrics retention failed: {error}")))
+}
+
+fn parse_metrics_retention_days(value: Option<&str>) -> Result<i64, CliFailure> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_METRICS_RETENTION_DAYS);
+    };
+    let days = value.parse::<i64>().map_err(|_| {
+        CliFailure::new(
+            2,
+            format!(
+                "SHIPYARD_METRICS_RETENTION_DAYS must be a non-negative integer, got {value:?}"
+            ),
+        )
+    })?;
+    if days < 0 {
+        return Err(CliFailure::new(
+            2,
+            "SHIPYARD_METRICS_RETENTION_DAYS must be non-negative",
+        ));
+    }
+    let Some(retention) = Duration::try_days(days) else {
+        return Err(CliFailure::new(
+            2,
+            "SHIPYARD_METRICS_RETENTION_DAYS is too large",
+        ));
+    };
+    if Utc::now().checked_sub_signed(retention).is_none() {
+        return Err(CliFailure::new(
+            2,
+            "SHIPYARD_METRICS_RETENTION_DAYS is outside the supported date range",
+        ));
+    }
+    Ok(days)
+}
+
+fn prune_metrics(
+    state_dir: &Path,
+    dry_run: bool,
+    items: &mut Vec<CleanupItem>,
+) -> Result<(), CliFailure> {
+    let configured_days = std::env::var("SHIPYARD_METRICS_RETENTION_DAYS").ok();
+    let days = parse_metrics_retention_days(configured_days.as_deref())?;
     if days <= 0 {
-        return;
+        return Ok(());
     }
     let path = state_dir.join("metrics").join("metrics.db");
     if !path.exists() {
-        return;
+        return Ok(());
     }
     let size = path.metadata().map_or(0, |metadata| metadata.len());
     let result = if dry_run {
-        Ok(0)
+        MetricsStore::validate_existing(state_dir).map(|()| 0)
     } else {
         MetricsStore::open(state_dir).and_then(|store| store.prune_older_than(days))
     };
@@ -444,7 +561,19 @@ fn prune_metrics(state_dir: &Path, dry_run: bool, items: &mut Vec<CleanupItem>) 
             "delete".to_owned(),
             format!("Pruned {deleted} raw runs and observational rows older than {days} days"),
         ),
-        Err(error) => ("skip".to_owned(), format!("Metrics prune skipped: {error}")),
+        Err(error) => {
+            items.push(CleanupItem {
+                path: path.display().to_string(),
+                kind: "metrics".to_owned(),
+                action: "error".to_owned(),
+                size_bytes: 0,
+                reason: format!("Metrics prune failed: {error}"),
+            });
+            return Err(CliFailure::new(
+                1,
+                format!("metrics retention failed: {error}"),
+            ));
+        }
     };
     items.push(CleanupItem {
         path: path.display().to_string(),
@@ -453,6 +582,7 @@ fn prune_metrics(state_dir: &Path, dry_run: bool, items: &mut Vec<CleanupItem>) 
         size_bytes: if dry_run { size } else { 0 },
         reason,
     });
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -497,7 +627,7 @@ fn recover_retirement_quarantines(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| CliFailure::new(1, error.to_string()))?;
         if children.is_empty() {
-            remove_empty_retirement_quarantine(&entry.path(), dry_run, items)?;
+            remove_empty_retirement_quarantine(state_dir, &entry.path(), dry_run, items)?;
             continue;
         }
         if children.len() != 1 {
@@ -543,6 +673,7 @@ fn recover_retirement_quarantines(
                 .to_owned(),
         });
         if !dry_run {
+            let _writer_domain = mutation_lease(state_dir, dry_run, "recover_quarantine")?;
             if path_identity(&child.path()) != Some(child_identity) {
                 return Err(CliFailure::new(
                     1,
@@ -565,6 +696,7 @@ fn recover_retirement_quarantines(
 }
 
 fn remove_empty_retirement_quarantine(
+    state_dir: &Path,
     path: &Path,
     dry_run: bool,
     items: &mut Vec<CleanupItem>,
@@ -577,6 +709,7 @@ fn remove_empty_retirement_quarantine(
         reason: "empty completed retirement quarantine".to_owned(),
     });
     if !dry_run {
+        let _writer_domain = mutation_lease(state_dir, dry_run, "remove_empty_quarantine")?;
         fs::remove_dir(path).map_err(|error| CliFailure::new(1, error.to_string()))?;
         sync_parent_directory(path).map_err(|error| CliFailure::new(1, error.to_string()))?;
     }
@@ -1086,8 +1219,16 @@ fn with_log_mutation_guard<T>(
     queue_lock_held: bool,
     mutation: impl FnOnce() -> std::io::Result<T>,
 ) -> Result<T, CliFailure> {
+    // Both production callers run without the queue lock held; the branch below
+    // exists for callers that already own it and must not retake it.
     if queue_lock_held {
         recheck_mutation_boundary(candidate)?;
+        let state_dir = candidate
+            .logs_root
+            .parent()
+            .ok_or_else(|| CliFailure::new(1, "invalid log staging boundary"))?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(state_dir)
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return mutation().map_err(|error| CliFailure::new(1, error.to_string()));
     }
     let Some(state_dir) = candidate.path.parent().and_then(Path::parent) else {
@@ -1098,6 +1239,8 @@ fn with_log_mutation_guard<T>(
         .lock_for_log_cleanup()
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     recheck_mutation_boundary(candidate)?;
+    let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(state_dir)
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
     mutation().map_err(|error| CliFailure::new(1, error.to_string()))
 }
 
@@ -1195,6 +1338,7 @@ fn scan_bundles(
             reason: "Orphaned git bundle".to_owned(),
         });
         if !dry_run {
+            let _writer_domain = mutation_lease(state_dir, dry_run, "scan_bundles")?;
             fs::remove_file(&path).map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
     }
@@ -1241,6 +1385,7 @@ fn scan_evidence(
             reason: reason.to_owned(),
         });
         if !dry_run {
+            let _writer_domain = mutation_lease(state_dir, dry_run, "scan_evidence")?;
             fs::remove_file(&path).map_err(|error| CliFailure::new(1, error.to_string()))?;
         }
     }
@@ -1276,10 +1421,10 @@ fn cleanup_ship_state(
             .iter()
             .any(|(repo, pr)| repo.eq_ignore_ascii_case(&state.repo) && *pr == state.pr)
             && state.updated_at <= active_cutoff
+            && store
+                .delete_scoped_if_matches(&state.repo, state.pr, &state)
+                .map_err(|error| CliFailure::new(1, error.to_string()))?
         {
-            store
-                .delete_scoped(&state.repo, state.pr)
-                .map_err(|error| CliFailure::new(1, error.to_string()))?;
             deleted_active.push(state.pr);
         }
     }
@@ -1517,8 +1662,8 @@ fn load_queue_job_retention(
         )
     })?;
     let mut parsed = BTreeMap::new();
-    for job in jobs {
-        let (id, state) = parse_queue_log_state(job, queue_file)?;
+    for (index, job) in jobs.iter().enumerate() {
+        let (id, state) = parse_queue_log_state(job, queue_file, index)?;
         if parsed.insert(id, state).is_some() {
             return Err(CliFailure::new(
                 1,
@@ -1535,6 +1680,7 @@ fn load_queue_job_retention(
 fn parse_queue_log_state(
     job: &Value,
     queue_file: &Path,
+    index: usize,
 ) -> Result<(String, QueueLogState), CliFailure> {
     let id = job
         .get("id")
@@ -1607,8 +1753,10 @@ fn parse_queue_log_state(
         return Err(CliFailure::new(
             1,
             format!(
-                "refusing log cleanup because queue state {} contains a malformed terminal job",
-                queue_file.display()
+                "refusing log cleanup because queue state {} contains malformed terminal job {} (array index {})",
+                queue_file.display(),
+                id,
+                index
             ),
         ));
     }
@@ -1862,6 +2010,7 @@ mod retention_tests {
     use super::*;
     use crate::log_retention::gzip_closed_log;
     use crate::log_retention::{AUDIT_PIN_FILE, TERMINAL_MANIFEST_FILE, TerminalLogManifest};
+    use rusqlite::Connection;
 
     fn write_terminal(dir: &Path, job_id: &str, failed: bool, age_hours: i64) {
         fs::create_dir_all(dir).expect("job dir");
@@ -2070,6 +2219,97 @@ mod retention_tests {
         )
         .expect("second apply");
         assert!(!job.join("target.log").exists());
+    }
+
+    fn protected_state_dir() -> tempfile::TempDir {
+        let root =
+            crate::paths::RuntimePaths::current(crate::identity::RuntimeMode::Shipyard).state_dir;
+        fs::create_dir_all(&root).expect("protected state root");
+        tempfile::tempdir_in(root).expect("protected temp state")
+    }
+
+    fn observed_phases() -> Vec<(&'static str, usize, bool)> {
+        mutation_probe::OBSERVATIONS.with(|observations| {
+            observations
+                .borrow_mut()
+                .drain(..)
+                .map(|o| (o.phase, o.lease_depth, o.queue_lock_free))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn non_log_mutations_hold_a_real_writer_lease_without_the_queue_lock() {
+        // Recovery phases: restore a quarantined job and drop an empty quarantine.
+        let recovery = protected_state_dir();
+        let staging = recovery.path().join("cleanup-staging");
+        write_terminal(
+            &staging.join(".shipyard-retire-a/success"),
+            "success",
+            false,
+            24 * 365,
+        );
+        fs::create_dir_all(staging.join(".shipyard-retire-b")).expect("empty quarantine");
+        observed_phases();
+        cleanup_retention(recovery.path(), false, LogRetentionPolicy::default())
+            .expect("recovery apply");
+        let recovered = observed_phases();
+
+        // Scan phases: bundle, evidence, and abandoned staging file.
+        let scan = protected_state_dir();
+        fs::create_dir_all(scan.path().join("bundles")).expect("bundles");
+        fs::write(scan.path().join("bundles/x.bundle"), "b").expect("bundle");
+        fs::create_dir_all(scan.path().join("evidence")).expect("evidence");
+        fs::write(scan.path().join("evidence/e.json"), "{}").expect("evidence file");
+        fs::create_dir_all(scan.path().join("cleanup-staging")).expect("staging");
+        fs::write(scan.path().join("cleanup-staging/abandoned.tmp"), "p").expect("tmp");
+        cleanup_retention(scan.path(), false, LogRetentionPolicy::default()).expect("scan apply");
+        let scanned = observed_phases();
+
+        for expected in [
+            "recover_quarantine",
+            "remove_empty_quarantine",
+            "scan_bundles",
+            "scan_evidence",
+            "apply_cleanup_staging",
+        ] {
+            let hit = recovered
+                .iter()
+                .chain(scanned.iter())
+                .find(|(phase, _, _)| *phase == expected)
+                .unwrap_or_else(|| panic!("mutation phase {expected} never ran under a lease"));
+            assert!(hit.1 > 0, "{expected} ran without a writer-domain lease");
+            assert!(hit.2, "{expected} held the queue lock while leased");
+        }
+        assert!(
+            !recovery
+                .path()
+                .join("cleanup-staging/.shipyard-retire-a")
+                .exists()
+        );
+        assert!(!scan.path().join("bundles/x.bundle").exists());
+        assert!(!scan.path().join("evidence/e.json").exists());
+    }
+
+    #[test]
+    fn cleanup_dry_run_takes_no_writer_lease() {
+        let temp = protected_state_dir();
+        fs::create_dir_all(temp.path().join("bundles")).expect("bundles");
+        fs::write(temp.path().join("bundles/x.bundle"), "b").expect("bundle");
+        observed_phases();
+        cleanup_retention(temp.path(), true, LogRetentionPolicy::default()).expect("dry run");
+        assert!(observed_phases().is_empty());
+        assert!(temp.path().join("bundles/x.bundle").exists());
+    }
+
+    #[test]
+    fn cleanup_apply_orders_queue_lock_before_writer_domain() {
+        let temp = tempfile::tempdir().expect("temp");
+        let job = temp.path().join("logs/success");
+        write_terminal(&job, "success", false, 2);
+        cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect("cleanup apply");
+        assert!(job.join("target.log.gz").is_file());
     }
 
     #[test]
@@ -2415,6 +2655,113 @@ mod retention_tests {
                 .iter()
                 .any(|item| item.category == "restart_recovery")
         );
+    }
+
+    #[test]
+    fn metrics_retention_failure_fails_cleanup_closed() {
+        let temp = tempfile::tempdir().expect("temp");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        fs::write(metrics_dir.join("metrics.db"), b"not a sqlite database")
+            .expect("invalid metrics db");
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("metrics retention failure must fail cleanup");
+        assert!(error.message.contains("metrics retention failed"));
+    }
+
+    #[test]
+    fn metrics_retention_dry_run_validates_existing_database() {
+        let temp = tempfile::tempdir().expect("temp");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        fs::write(metrics_dir.join("metrics.db"), b"not a sqlite database")
+            .expect("invalid metrics db");
+
+        let error = cleanup_retention(temp.path(), true, LogRetentionPolicy::default())
+            .expect_err("dry-run must validate the metrics database");
+        assert!(error.message.contains("metrics retention failed"));
+    }
+
+    #[test]
+    fn incompatible_metrics_schema_fails_before_cleanup_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let job = temp.path().join("logs/success");
+        write_terminal(&job, "success", false, 24 * 365);
+        let bundle = temp.path().join("bundles/orphan.bundle");
+        fs::create_dir_all(bundle.parent().expect("bundle parent")).expect("bundles");
+        fs::write(&bundle, "bundle").expect("bundle");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        let connection = Connection::open(metrics_dir.join("metrics.db")).expect("sqlite");
+        connection
+            .execute("CREATE TABLE runs (wrong TEXT)", [])
+            .expect("incompatible schema");
+        drop(connection);
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("incompatible metrics schema must fail closed");
+        assert!(error.message.contains("metrics retention failed"));
+        assert!(
+            bundle.exists(),
+            "bundle must survive metrics preflight failure"
+        );
+        assert!(job.exists(), "logs must survive metrics preflight failure");
+    }
+
+    #[test]
+    fn incompatible_fleet_metrics_schema_fails_before_cleanup_mutation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let bundle = temp.path().join("bundles/orphan.bundle");
+        fs::create_dir_all(bundle.parent().expect("bundle parent")).expect("bundles");
+        fs::write(&bundle, "bundle").expect("bundle");
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        let connection = Connection::open(metrics_dir.join("metrics.db")).expect("sqlite");
+        connection
+            .execute_batch(
+                "CREATE TABLE runs (id INTEGER, ts TEXT);
+                 CREATE TABLE jobs (id INTEGER, run_id INTEGER);
+                 CREATE TABLE steps (job_id INTEGER);
+                 CREATE TABLE fleet_capacity_samples (wrong TEXT);",
+            )
+            .expect("incompatible fleet schema");
+        drop(connection);
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("incompatible fleet schema must fail closed");
+        assert!(error.message.contains("metrics retention failed"));
+        assert!(
+            bundle.exists(),
+            "bundle must survive metrics preflight failure"
+        );
+    }
+
+    #[test]
+    fn recovered_quarantine_does_not_bypass_metrics_validation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let quarantine = temp
+            .path()
+            .join("cleanup-staging/.shipyard-retire-interrupted");
+        write_terminal(&quarantine.join("success"), "success", false, 24 * 365);
+        let metrics_dir = temp.path().join("metrics");
+        fs::create_dir_all(&metrics_dir).expect("metrics dir");
+        fs::write(metrics_dir.join("metrics.db"), b"not a sqlite database")
+            .expect("invalid metrics db");
+
+        let error = cleanup_retention(temp.path(), false, LogRetentionPolicy::default())
+            .expect_err("recovery must not bypass metrics validation");
+        assert!(error.message.contains("metrics retention failed"));
+    }
+
+    #[test]
+    fn metrics_retention_setting_is_explicit_and_bounded() {
+        assert_eq!(parse_metrics_retention_days(None).unwrap(), 90);
+        assert_eq!(parse_metrics_retention_days(Some("0")).unwrap(), 0);
+        assert!(parse_metrics_retention_days(Some("-1")).is_err());
+        assert!(parse_metrics_retention_days(Some("not-a-number")).is_err());
+        assert!(parse_metrics_retention_days(Some("9223372036854775807")).is_err());
+        assert!(parse_metrics_retention_days(Some("100000000")).is_err());
     }
 
     #[test]
