@@ -132,7 +132,11 @@ impl GateRecord {
         let report = crate::pr_queue_state::explain_pr_queue_state(queue);
         let ejection = match crate::pr_queue_state::internal_enqueue_verdict(&report, head) {
             crate::pr_queue_state::InternalEnqueueVerdict::RefuseEjectedSameHead { reason, at } => {
-                Some(SameHeadEjection { reason, at })
+                Some(SameHeadEjection {
+                    reason,
+                    at,
+                    retry: None,
+                })
             }
             _ => None,
         };
@@ -151,6 +155,30 @@ pub(super) struct SameHeadEjection {
     pub reason: String,
     /// When the removal happened.
     pub at: Option<String>,
+    /// The one not-head's-fault retry verdict, when it was assessed
+    /// ([`crate::environment_requeue::assess`]).
+    pub retry: Option<SameHeadRetry>,
+}
+
+/// Whether an ejected head gets its one automatic re-enqueue, and why.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SameHeadRetry {
+    /// The re-enqueue is allowed.
+    pub allowed: bool,
+    /// The classifier's reason: the failing job, its attribution, and
+    /// whether the head's retry has been spent.
+    pub detail: String,
+}
+
+impl SameHeadRetry {
+    /// The steward's reading of one classifier verdict.
+    #[must_use]
+    pub fn from_verdict(verdict: &crate::environment_requeue::EnvironmentRequeue) -> Self {
+        Self {
+            allowed: verdict.allowed,
+            detail: verdict.reason.clone(),
+        }
+    }
 }
 
 /// What the pass knows about one row.
@@ -299,14 +327,25 @@ fn arm_candidate(facts: &RowFacts<'_>, policy: &StewardPolicy) -> (Stall, SinceH
         .unwrap_or_default();
     // The queue's own verdict on this exact head outranks the approval: a
     // dry run and an apply pass both read it from the gate's queue state.
-    if let Some(ejection) = facts.ejection {
-        return ejected(&ejection.reason, ejection.at.clone(), green_since());
+    // A head the classifier clears for its one retry is an ordinary
+    // admission candidate; every other ejection names the classifier's
+    // reason (the failing job, and whether the retry is spent).
+    if let Some(ejection) = facts
+        .ejection
+        .filter(|ejection| !ejection.retry.as_ref().is_some_and(|retry| retry.allowed))
+    {
+        return ejected(
+            &ejection.reason,
+            ejection.at.clone(),
+            green_since(),
+            ejection.retry.as_ref().map(|retry| retry.detail.clone()),
+        );
     }
     if let Some(cause) = parts
         .iter()
         .find_map(|part| part.strip_prefix("skipped_ejected_same_head:"))
     {
-        return ejected(cause, None, green_since());
+        return ejected(cause, None, green_since(), None);
     }
     if parts.contains(&"waiting_head_approval")
         || (facts.mutation.is_none() && facts.error.is_none())
@@ -362,11 +401,16 @@ fn admitted(mutation: Option<&str>) -> bool {
     })
 }
 
-fn ejected(cause: &str, at: Option<String>, green_since: Option<String>) -> (Stall, SinceHint) {
+fn ejected(
+    cause: &str,
+    at: Option<String>,
+    green_since: Option<String>,
+    detail: Option<String>,
+) -> (Stall, SinceHint) {
     let token = format!("ejected_same_head:{cause}");
     match at {
-        Some(at) => dated(token, Some(at), "queue_removed", None),
-        None => green(token, green_since, None),
+        Some(at) => dated(token, Some(at), "queue_removed", detail),
+        None => green(token, green_since, detail),
     }
 }
 
@@ -695,10 +739,17 @@ pub(super) fn annotate(
             && let Ok((_, queue, blocker)) =
                 super::pr_mutations::read_head_gate_for_report(actions, observation, pr, ledger)
         {
-            dry_run_blockers.insert(
-                report.number,
-                GateRecord::new(&pr.fact.head_sha, blocker, &queue),
-            );
+            let mut record = GateRecord::new(&pr.fact.head_sha, blocker, &queue);
+            if let Some(ejection) = record.ejection.as_mut() {
+                ejection.retry = super::pr_mutations::same_head_retry_verdict(
+                    actions,
+                    observation,
+                    &crate::pr_queue_state::explain_pr_queue_state(&queue),
+                )
+                .as_ref()
+                .map(SameHeadRetry::from_verdict);
+            }
+            dry_run_blockers.insert(report.number, record);
         }
         let record = blockers
             .get(&report.number)

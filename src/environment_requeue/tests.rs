@@ -670,3 +670,206 @@ fn a_failing_required_commit_status_refuses() {
         verdict.reason
     );
 }
+
+// ---- Not-head-caused retry: a head ejected once whose failure is placed away
+// from it gets one re-enqueue; a head-caused, unplaceable, or second ejection
+// does not.
+
+const HEAD_8678: &str = "f0fb2fb38ef5c900efad7ea0630906f081db53a9";
+
+/// The test-failure log shape: a failing step with no environment signature.
+const TEST_FAILURE_LOG: &str = "\
+2026-10-09T23:10:00.0000000Z ##[group]Run ctest
+2026-10-09T23:10:00.0000000Z ctest
+2026-10-09T23:10:00.0000000Z ##[endgroup]
+2026-10-09T23:30:00.0000000Z 1/2 Test #4: dylib-reproducibility ....***Failed
+2026-10-09T23:30:01.0000000Z ##[error]Process completed with exit code 8.
+";
+
+fn test_failure_job() -> Value {
+    json!({
+        "id": 7, "status": "completed", "conclusion": "failure",
+        "created_at": "2026-10-09T23:00:00Z", "completed_at": "2026-10-09T23:30:01Z",
+        "runner_name": "studio-pulp-gate-01",
+        "steps": [{"name": "Test", "conclusion": "failure", "started_at": "2026-10-09T23:10:00Z"}]
+    })
+}
+
+/// Answer the base-tip and head lookups for `macos`: `None` is no completed
+/// run, `Some(conclusion)` one completed run.
+fn compare(
+    answers: &mut HashMap<String, Result<String, String>>,
+    on_base: Option<&str>,
+    on_head: Option<&str>,
+) {
+    for (reference, conclusion) in [("main", on_base), (HEAD_8678, on_head)] {
+        let runs = conclusion.map_or_else(Vec::new, |conclusion| {
+            vec![json!({"id": 9, "name": "macos", "status": "completed", "conclusion": conclusion})]
+        });
+        answers.insert(
+            format!("repos/{REPO}/commits/{reference}/check-runs?check_name=macos&per_page=100"),
+            Ok(json!({"total_count": runs.len(), "check_runs": runs}).to_string()),
+        );
+        answers.insert(
+            format!("repos/{REPO}/commits/{reference}/status"),
+            Ok(json!({"statuses": []}).to_string()),
+        );
+    }
+}
+
+fn flake_group(
+    on_base: Option<&str>,
+    on_head: Option<&str>,
+) -> HashMap<String, Result<String, String>> {
+    let mut answers = interrupted_group("failure", &test_failure_job(), TEST_FAILURE_LOG);
+    compare(&mut answers, on_base, on_head);
+    answers
+}
+
+fn only_cause(verdict: &EnvironmentRequeue) -> &FailureAttribution {
+    assert_eq!(verdict.attribution.len(), 1, "{verdict:?}");
+    &verdict.attribution[0].attribution
+}
+
+#[test]
+fn a_runner_conclusion_ejected_once_gets_one_retry() {
+    for conclusion in INFRA_CONCLUSIONS {
+        // No base or head lookup is answered: the conclusion alone places it.
+        let verdict = assess_group(&interrupted_group(conclusion, &test_failure_job(), ""), 1);
+        assert!(verdict.allowed, "{conclusion}: {}", verdict.reason);
+        assert_eq!(verdict.class, Some(RequeueClass::NotHeadCaused));
+        assert!(
+            matches!(only_cause(&verdict), FailureAttribution::Infra(detail) if detail.contains(conclusion)),
+            "{verdict:?}"
+        );
+    }
+}
+
+#[test]
+fn a_lost_runner_annotation_ejected_once_gets_one_retry() {
+    let mut job = test_failure_job();
+    job["steps"] = json!([]);
+    let mut answers = interrupted_group("failure", &job, "");
+    answers.insert(
+        format!("repos/{REPO}/check-runs/7/annotations"),
+        Ok(json!([{"annotation_level": "failure", "message":
+            "The self-hosted runner: studio-pulp-gate-01 lost communication with the server."}])
+        .to_string()),
+    );
+    let verdict = assess_group(&answers, 1);
+    assert!(verdict.allowed, "{}", verdict.reason);
+    assert!(matches!(only_cause(&verdict), FailureAttribution::Infra(_)));
+    // Control: the same job without the annotation is unplaced.
+    let bare = assess_group(&interrupted_group("failure", &job, ""), 1);
+    assert!(!bare.allowed, "{}", bare.reason);
+}
+
+#[test]
+fn a_check_that_passed_on_the_head_gets_one_retry_and_only_one() {
+    let verdict = assess_group(&flake_group(Some("success"), Some("success")), 1);
+    assert!(verdict.allowed, "{}", verdict.reason);
+    assert_eq!(verdict.class, Some(RequeueClass::NotHeadCaused));
+    assert!(matches!(
+        only_cause(&verdict),
+        FailureAttribution::PassedOnHead(_)
+    ));
+    // The signature reading still says what it saw.
+    assert_eq!(verdict.evidence[0].reading, StepReading::NoSignature);
+    // The second ejection of the same head: spent, reported with the job.
+    let second = assess_group(&flake_group(Some("success"), Some("success")), 2);
+    assert!(!second.allowed, "{}", second.reason);
+    assert!(
+        second.reason.contains("has been spent"),
+        "{}",
+        second.reason
+    );
+    assert!(second.reason.contains("macos / Test"), "{}", second.reason);
+    assert!(second.attribution.is_empty());
+}
+
+#[test]
+fn a_check_also_failing_on_the_base_tip_gets_one_retry() {
+    let verdict = assess_group(&flake_group(Some("failure"), None), 1);
+    assert!(verdict.allowed, "{}", verdict.reason);
+    assert!(matches!(
+        only_cause(&verdict),
+        FailureAttribution::FailsOnBase(_)
+    ));
+}
+
+#[test]
+fn a_check_that_passed_on_the_base_and_not_on_the_head_is_head_caused() {
+    for on_head in [Some("failure"), None] {
+        let verdict = assess_group(&flake_group(Some("success"), on_head), 1);
+        assert!(!verdict.allowed, "{}", verdict.reason);
+        assert_eq!(verdict.class, None);
+        assert!(matches!(
+            only_cause(&verdict),
+            FailureAttribution::HeadCaused(_)
+        ));
+        assert!(
+            verdict.reason.contains("`macos` head-caused"),
+            "{}",
+            verdict.reason
+        );
+    }
+}
+
+#[test]
+fn a_check_nothing_can_place_is_not_retried() {
+    // No completed run on the base tip or the head.
+    let verdict = assess_group(&flake_group(None, None), 1);
+    assert!(!verdict.allowed, "{}", verdict.reason);
+    assert!(matches!(
+        only_cause(&verdict),
+        FailureAttribution::Unknown(_)
+    ));
+    assert!(
+        verdict.reason.contains("`macos` unknown"),
+        "{}",
+        verdict.reason
+    );
+    // Unreadable lookups are unknown too, never permission.
+    let unread = assess_group(
+        &interrupted_group("failure", &test_failure_job(), TEST_FAILURE_LOG),
+        1,
+    );
+    assert!(!unread.allowed, "{}", unread.reason);
+    assert!(
+        matches!(only_cause(&unread), FailureAttribution::Unknown(detail) if detail.contains("unreadable"))
+    );
+}
+
+#[test]
+fn one_head_caused_check_refuses_even_beside_a_runner_failure() {
+    let mut answers = flake_group(Some("success"), Some("failure"));
+    let checks = fixture("merge_group_required_checks_real.json");
+    answers.insert(
+        format!("repos/{REPO}/rules/branches/main"),
+        Ok(checks["rules_branches_main"].to_string()),
+    );
+    answers.insert(
+        format!("repos/{REPO}/branches/main/protection/required_status_checks"),
+        Ok(json!({"contexts": ["macos", "linux"]}).to_string()),
+    );
+    answers.insert(
+        format!("repos/{REPO}/commits/{GROUP}/check-runs?per_page=100"),
+        Ok(json!({"total_count": 2, "check_runs": [
+            {"id": 7, "name": "macos", "status": "completed", "conclusion": "failure",
+             "app": {"slug": "github-actions"}},
+            {"id": 8, "name": "linux", "status": "completed", "conclusion": "timed_out",
+             "app": {"slug": "github-actions"}}
+        ]})
+        .to_string()),
+    );
+    let verdict = assess_group(&answers, 1);
+    assert!(!verdict.allowed, "{}", verdict.reason);
+    assert_eq!(verdict.attribution.len(), 2);
+    assert!(
+        verdict
+            .attribution
+            .iter()
+            .any(|check| check.check == "linux"
+                && matches!(check.attribution, FailureAttribution::Infra(_)))
+    );
+}

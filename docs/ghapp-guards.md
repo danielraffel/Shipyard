@@ -798,6 +798,16 @@ Then, for a same-head `failed_checks` ejection only, the guard (and
 | every failing required check on the merge-group commit is a GitHub Actions job concluded `failure` (or `cancelled` and starved, below), and no required commit status failed | a `timed_out` job or a status has no log that could prove anything |
 | every failing step of each such job (jobs API `conclusion == failure`) printed an environment signature within 60 output lines of that step's first `##[error]` | positive evidence at the failure, not anywhere in a long log |
 
+The Rust classifier adds a third, narrower allowance that this guard does
+not mirror: on a head's **first** ejection, when no signature explains the
+failure but every failing required check is attributed away from the head (a
+`timed_out` / `startup_failure` / `stale` conclusion or a lost-runner
+annotation, the same check failing on the base tip, or the same check having
+passed on the head), the merge steward, `shipyard landing` and `ship`'s
+arm-on-open allow one same-head re-enqueue (`class: not_head_caused`). A
+manual `ghapp` arm of such a head is still refused here; the steward's enqueue
+is internal and applies the verdict itself.
+
 The signatures are the network-transport spellings shared with Shipyard's infra
 classifier (`Could not resolve host`, `Network is unreachable`, `No route to
 host`, `Connection reset by peer`) plus `ENOTFOUND`, `getaddrinfo`,

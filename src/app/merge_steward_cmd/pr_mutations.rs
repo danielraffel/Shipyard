@@ -960,12 +960,55 @@ fn same_head_enqueue_refusal(
     }
     Some(match verdict {
         crate::pr_queue_state::InternalEnqueueVerdict::RefuseEjectedSameHead { reason, .. } => {
+            // The one bounded retry of a head whose merge-group failure is
+            // not its own fault: the same classifier the native-arm backstop
+            // and `shipyard ship` consult, read live from this queue answer.
+            // The approval gate was already read live for this head above.
+            let retry = same_head_retry_verdict(context.actions, context.observation, &report)
+                .as_ref()
+                .map(super::blocked_on::SameHeadRetry::from_verdict);
+            if let Some(ejection) = context
+                .approval_blockers
+                .borrow_mut()
+                .get_mut(&pr.fact.number)
+                .filter(|record| record.head.eq_ignore_ascii_case(&pr.fact.head_sha))
+                .and_then(|record| record.ejection.as_mut())
+            {
+                ejection.retry.clone_from(&retry);
+            }
+            if retry.is_some_and(|retry| retry.allowed) {
+                return None;
+            }
             Ok(format!("skipped_ejected_same_head:{reason}"))
         }
         other => Err(other
             .refusal(pr.fact.number, &pr.fact.head_sha)
             .unwrap_or_else(|| "merge-queue state refused enqueue".to_owned())),
     })
+}
+
+/// The classifier's verdict on one same-head `failed_checks` ejection
+/// ([`crate::environment_requeue::assess`]), under the base branch's own
+/// opt-in. `None` when the report is not such an ejection. An unreadable
+/// opt-in refuses, with its reason, rather than retrying blind.
+pub(super) fn same_head_retry_verdict(
+    actions: &GitHubActions,
+    observation: &RepoObservation,
+    report: &crate::pr_queue_state::PrQueueReport,
+) -> Option<crate::environment_requeue::EnvironmentRequeue> {
+    if !crate::environment_requeue::applies(report) {
+        return None;
+    }
+    let run_gh = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
+    match crate::environment_requeue::read_opt_in(&run_gh, &observation.repo, &observation.base) {
+        Ok(opted_in) => {
+            crate::environment_requeue::assess(&run_gh, &observation.repo, report, opted_in)
+        }
+        Err(detail) => Some(crate::environment_requeue::EnvironmentRequeue::refused(
+            format!("the re-enqueue policy is unreadable, so the head is not retried: {detail}"),
+            None,
+        )),
+    }
 }
 
 pub(super) fn final_enqueue_revalidation(

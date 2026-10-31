@@ -49,6 +49,20 @@
 //! ordinary refusal applies. The worst a wrong allowance can cost is the one
 //! batch the retry joins.
 //!
+//! ## Not the head's fault
+//!
+//! When no network or interruption signature explains the ejection, a head
+//! the queue ejected **once** still gets one retry when every failing required
+//! check is positively attributed away from it ([`FailureAttribution`]): the
+//! check ended in a runner conclusion ([`INFRA_CONCLUSIONS`]) or its
+//! annotations say the runner was lost ([`RUNNER_LOST_ANNOTATIONS`]); or the
+//! same check is failing on the base branch tip too; or the same check passed
+//! on the pull request's own head. A check that passed on the base tip, failed
+//! on the merge group and did not pass on the head is the head's fault, and a
+//! check none of those reads can place is unknown; either refuses. This is the
+//! [`RequeueClass::NotHeadCaused`] allowance: one per head, counted like a
+//! network retry, so a head ejected twice is left for repair.
+//!
 //! ## Opt-in
 //!
 //! Off unless the repository sets `queue.environment_requeue.enabled = true`
@@ -131,6 +145,23 @@ pub const INTERRUPTION_REARM_LIMIT: u32 = 2;
 /// Output lines before (and including) a failing step's first `##[error]`
 /// that may carry the signature.
 pub const FAILURE_PROXIMITY_LINES: usize = 60;
+
+/// Check-run conclusions a runner produces, not a diff: the job ran out of
+/// time, never started, or GitHub gave up on it. `cancelled` is deliberately
+/// absent: a short or superseded cancel says nothing on its own (see
+/// [`starved_job`]), so a cancelled check is placed by comparison instead.
+pub const INFRA_CONCLUSIONS: [&str; 3] = ["timed_out", "startup_failure", "stale"];
+
+/// Check-run annotation text GitHub writes when the runner, not the job,
+/// failed: a hosted or self-hosted runner that went away mid-job.
+pub const RUNNER_LOST_ANNOTATIONS: [&str; 3] = [
+    "The runner has received a shutdown signal",
+    "lost communication with the server",
+    "The hosted runner encountered an error",
+];
+
+/// Conclusions that count as the base tip failing the same check.
+const FAILING_CONCLUSIONS: [&str; 4] = ["failure", "timed_out", "startup_failure", "error"];
 
 const RUN_GROUP: &str = "##[group]Run ";
 const END_GROUP: &str = "##[endgroup]";
@@ -381,6 +412,11 @@ pub struct EnvironmentRequeue {
     pub merge_group_commit: Option<String>,
     /// Per failing step of each failing required check, what its log says.
     pub evidence: Vec<StepEvidence>,
+    /// Per failing required check, whether it is the head's fault. Filled
+    /// only when the signatures above did not explain the ejection and the
+    /// head has not been ejected before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attribution: Vec<CheckAttribution>,
 }
 
 /// What kind of ejection an allowed verdict answers.
@@ -393,6 +429,69 @@ pub enum RequeueClass {
     /// runner, or an upload that stalled after its work passed) and every
     /// other one failed on the network.
     Interruption,
+    /// No signature explained the ejection, but every failing required
+    /// check is attributed away from the head ([`FailureAttribution`]).
+    /// First ejection only.
+    NotHeadCaused,
+}
+
+/// Why one failing required check on the merge group is, or is not, the
+/// head's fault.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "cause", content = "detail", rename_all = "snake_case")]
+pub enum FailureAttribution {
+    /// A runner or network failure: an [`INFRA_CONCLUSIONS`] conclusion, a
+    /// [`RUNNER_LOST_ANNOTATIONS`] annotation, or every failing step carried
+    /// an environment or interruption signature.
+    Infra(String),
+    /// The same check is failing on the base branch tip.
+    FailsOnBase(String),
+    /// The same check passed on the pull request's own head.
+    PassedOnHead(String),
+    /// The check passed on the base tip, failed on the merge group, and did
+    /// not pass on the head.
+    HeadCaused(String),
+    /// None of the reads could place it.
+    Unknown(String),
+}
+
+impl FailureAttribution {
+    /// Whether this attribution clears the head.
+    #[must_use]
+    pub fn clears_head(&self) -> bool {
+        matches!(
+            self,
+            Self::Infra(_) | Self::FailsOnBase(_) | Self::PassedOnHead(_)
+        )
+    }
+
+    fn label(&self) -> (&'static str, &str) {
+        match self {
+            Self::Infra(detail) => ("infra", detail),
+            Self::FailsOnBase(detail) => ("fails on base", detail),
+            Self::PassedOnHead(detail) => ("passed on head", detail),
+            Self::HeadCaused(detail) => ("head-caused", detail),
+            Self::Unknown(detail) => ("unknown", detail),
+        }
+    }
+}
+
+/// One failing required check and its [`FailureAttribution`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CheckAttribution {
+    /// The required check name.
+    pub check: String,
+    /// Whether it is the head's fault, and why.
+    pub attribution: FailureAttribution,
+}
+
+impl CheckAttribution {
+    /// One line for a human.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let (label, detail) = self.attribution.label();
+        format!("`{}` {label}: {detail}", self.check)
+    }
 }
 
 impl EnvironmentRequeue {
@@ -403,6 +502,12 @@ impl EnvironmentRequeue {
         self.allowed && self.class == Some(RequeueClass::Interruption)
     }
 
+    /// A refusal with no evidence read.
+    #[must_use]
+    pub fn refused(reason: impl Into<String>, merge_group_commit: Option<String>) -> Self {
+        Self::refuse(reason, merge_group_commit)
+    }
+
     fn refuse(reason: impl Into<String>, merge_group_commit: Option<String>) -> Self {
         Self {
             allowed: false,
@@ -410,6 +515,7 @@ impl EnvironmentRequeue {
             reason: reason.into(),
             merge_group_commit,
             evidence: Vec::new(),
+            attribution: Vec::new(),
         }
     }
 }
@@ -727,7 +833,57 @@ fn assess_merge_group(
         ));
     }
     let mut evidence = Vec::new();
-    for check in &failed {
+    let signatures = read_signatures(run_gh, repo, &failed, &mut evidence)
+        .map(|()| verdict_from_evidence(sha, report.ejections_of_current_head, evidence.clone()));
+    if matches!(&signatures, Ok(verdict) if verdict.allowed) {
+        return signatures;
+    }
+    // The one not-head-caused retry belongs to a head's first ejection; a
+    // second ejection keeps the signature verdict, which says it is spent.
+    let Some(head) = report
+        .head_oid
+        .as_deref()
+        .filter(|_| report.ejections_of_current_head == 1)
+    else {
+        if report.ejections_of_current_head <= 1 {
+            return signatures;
+        }
+        let spent = |reason: String| {
+            format!("{reason}; the one not-head-caused retry this head is allowed has been spent")
+        };
+        return match signatures {
+            Ok(mut verdict) if !verdict.allowed => {
+                verdict.reason = spent(verdict.reason);
+                Ok(verdict)
+            }
+            Err(detail) => Err(spent(detail)),
+            allowed => allowed,
+        };
+    };
+    let attribution = failed
+        .iter()
+        .map(|check| CheckAttribution {
+            check: check.name.clone(),
+            attribution: attribute(run_gh, repo, base, head, check, &evidence),
+        })
+        .collect::<Vec<_>>();
+    Ok(verdict_from_attribution(
+        sha,
+        signatures,
+        evidence,
+        attribution,
+    ))
+}
+
+/// Read every failing required check's signature evidence into `evidence`,
+/// stopping at the first check that cannot be read as a signature.
+fn read_signatures(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    failed: &[FailedCheck],
+    evidence: &mut Vec<StepEvidence>,
+) -> Result<(), String> {
+    for check in failed {
         let Some(job_id) = check.id.filter(|_| check.actions_job) else {
             return Err(format!(
                 "required check `{}` ({}) is not a GitHub Actions job, so it has no log to read",
@@ -758,11 +914,217 @@ fn assess_merge_group(
         }
         evidence.extend(read_job(run_gh, repo, &check.name, job_id)?);
     }
-    Ok(verdict_from_evidence(
-        sha,
-        report.ejections_of_current_head,
-        evidence,
+    Ok(())
+}
+
+/// Whether one failing required check is the head's fault. Positive evidence
+/// only: anything unread is [`FailureAttribution::Unknown`].
+fn attribute(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    head: &str,
+    check: &FailedCheck,
+    evidence: &[StepEvidence],
+) -> FailureAttribution {
+    let steps = evidence
+        .iter()
+        .filter(|step| step.check == check.name)
+        .collect::<Vec<_>>();
+    if !steps.is_empty()
+        && steps.iter().all(|step| {
+            matches!(
+                step.reading,
+                StepReading::Environment(_) | StepReading::Interruption(_)
+            )
+        })
+    {
+        return FailureAttribution::Infra(
+            steps
+                .iter()
+                .map(|step| step.render())
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
+    if INFRA_CONCLUSIONS.contains(&check.conclusion.as_str()) {
+        return FailureAttribution::Infra(format!(
+            "concluded `{}` on the merge group",
+            check.conclusion
+        ));
+    }
+    if let Some(job_id) = check.id.filter(|_| check.actions_job)
+        && let Ok(annotations) = api_json(
+            run_gh,
+            &format!("repos/{repo}/check-runs/{job_id}/annotations"),
+        )
+        && let Some(message) = runner_lost(&annotations)
+    {
+        return FailureAttribution::Infra(format!("[job {job_id}] {message}"));
+    }
+    let on_base = latest_conclusion(run_gh, repo, base, &check.name);
+    if let Ok(Some(conclusion)) = &on_base
+        && FAILING_CONCLUSIONS.contains(&conclusion.as_str())
+    {
+        return FailureAttribution::FailsOnBase(format!("also `{conclusion}` on the `{base}` tip"));
+    }
+    let on_head = latest_conclusion(run_gh, repo, head, &check.name);
+    if matches!(&on_head, Ok(Some(conclusion)) if conclusion == "success") {
+        return FailureAttribution::PassedOnHead(format!(
+            "passed on head {}, `{}` on the merge group",
+            short(head),
+            check.conclusion
+        ));
+    }
+    let describe = |read: &Result<Option<String>, String>| match read {
+        Ok(Some(conclusion)) => format!("`{conclusion}`"),
+        Ok(None) => "no completed run".to_owned(),
+        Err(error) => format!("unreadable ({error})"),
+    };
+    if matches!(&on_base, Ok(Some(conclusion)) if conclusion == "success") {
+        return FailureAttribution::HeadCaused(format!(
+            "passed on the `{base}` tip, `{}` on the merge group, {} on head {}",
+            check.conclusion,
+            describe(&on_head),
+            short(head)
+        ));
+    }
+    FailureAttribution::Unknown(format!(
+        "`{}` on the merge group; {} on the `{base}` tip, {} on head {}",
+        check.conclusion,
+        describe(&on_base),
+        describe(&on_head),
+        short(head)
     ))
+}
+
+/// The first [`RUNNER_LOST_ANNOTATIONS`] annotation message.
+fn runner_lost(annotations: &Value) -> Option<String> {
+    annotations
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|annotation| annotation.get("message").and_then(Value::as_str))
+        .find(|message| {
+            RUNNER_LOST_ANNOTATIONS
+                .iter()
+                .any(|text| message.contains(text))
+        })
+        .map(|message| message.trim().chars().take(240).collect())
+}
+
+/// The newest completed conclusion of check `name` on `reference` (a branch
+/// or a commit), from check runs, else from commit statuses. `None` when
+/// neither has a completed result.
+fn latest_conclusion(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    reference: &str,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let runs = api_json(
+        run_gh,
+        &format!(
+            "repos/{repo}/commits/{reference}/check-runs?check_name={}&per_page=100",
+            percent_encode(name)
+        ),
+    )?;
+    let newest = runs
+        .get("check_runs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|run| {
+            run.get("name").and_then(Value::as_str) == Some(name)
+                && run.get("status").and_then(Value::as_str) == Some("completed")
+        })
+        .max_by_key(|run| run.get("id").and_then(Value::as_u64).unwrap_or(0));
+    if let Some(run) = newest {
+        return Ok(run
+            .get("conclusion")
+            .and_then(Value::as_str)
+            .map(str::to_owned));
+    }
+    let statuses = api_json(run_gh, &format!("repos/{repo}/commits/{reference}/status"))?;
+    Ok(statuses
+        .get("statuses")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|status| status.get("context").and_then(Value::as_str) == Some(name))
+        .and_then(|status| status.get("state").and_then(Value::as_str))
+        .filter(|state| *state != "pending")
+        .map(str::to_owned))
+}
+
+/// Percent-encode a query value (check names carry spaces and slashes).
+fn percent_encode(value: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            write!(out, "%{byte:02X}").expect("write to String");
+        }
+    }
+    out
+}
+
+/// The verdict once the signature reading refused and every failing required
+/// check was attributed: allowed only when every attribution clears the head.
+fn verdict_from_attribution(
+    sha: &str,
+    signatures: Result<EnvironmentRequeue, String>,
+    evidence: Vec<StepEvidence>,
+    attribution: Vec<CheckAttribution>,
+) -> EnvironmentRequeue {
+    let commit = Some(sha.to_owned());
+    let signature_reason = match signatures {
+        Ok(verdict) => verdict.reason,
+        Err(detail) => detail,
+    };
+    let blocking = attribution
+        .iter()
+        .filter(|check| !check.attribution.clears_head())
+        .map(CheckAttribution::render)
+        .collect::<Vec<_>>();
+    if attribution.is_empty() || !blocking.is_empty() {
+        return EnvironmentRequeue {
+            allowed: false,
+            class: None,
+            reason: format!(
+                "{signature_reason}; not retried, because a failing required check on \
+                 merge-group commit {} is not cleared of the head: {}",
+                short(sha),
+                if blocking.is_empty() {
+                    "none was attributed".to_owned()
+                } else {
+                    blocking.join("; ")
+                }
+            ),
+            merge_group_commit: commit,
+            evidence,
+            attribution,
+        };
+    }
+    EnvironmentRequeue {
+        allowed: true,
+        class: Some(RequeueClass::NotHeadCaused),
+        reason: format!(
+            "no failing required check on merge-group commit {} is the head's fault ({}), and \
+             this is the head's first ejection, so it gets its one retry",
+            short(sha),
+            attribution
+                .iter()
+                .map(CheckAttribution::render)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        merge_group_commit: commit,
+        evidence,
+        attribution,
+    }
 }
 
 /// The verdict once every failing required check's evidence is read: refused
@@ -796,6 +1158,7 @@ fn verdict_from_evidence(
             ),
             merge_group_commit: commit,
             evidence,
+            attribution: Vec::new(),
         };
     }
     let interrupted = evidence
@@ -813,6 +1176,7 @@ fn verdict_from_evidence(
             ),
             merge_group_commit: commit,
             evidence,
+            attribution: Vec::new(),
         }
     } else if ejections == 1 {
         EnvironmentRequeue {
@@ -825,6 +1189,7 @@ fn verdict_from_evidence(
             ),
             merge_group_commit: commit,
             evidence,
+            attribution: Vec::new(),
         }
     } else {
         EnvironmentRequeue {
@@ -836,6 +1201,7 @@ fn verdict_from_evidence(
             ),
             merge_group_commit: commit,
             evidence,
+            attribution: Vec::new(),
         }
     }
 }

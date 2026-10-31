@@ -201,6 +201,8 @@ mod arm_guard;
 mod blocked_on;
 #[cfg(unix)]
 mod capacity;
+#[cfg(unix)]
+mod ejected_retry;
 mod exact_head_merge;
 mod mutations;
 mod observation;
