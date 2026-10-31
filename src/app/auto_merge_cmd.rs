@@ -2657,29 +2657,18 @@ fn repository_requires_merge_queue(
         .map_err(|error| format!("failed to inspect evaluated branch rules: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return match merge_queue_requirement_from_observations(&queue_body, Err(&stderr)).map_err(
-            |error| {
+        let requirement = merge_queue_requirement_from_observations(&queue_body, Err(&stderr))
+            .map_err(|error| {
                 format!(
                     "failed to inspect evaluated branch rules for {repo}:{base_branch}: {error}"
                 )
-            },
-        )? {
-            MergeQueueRequirement::Required => Ok(true),
-            MergeQueueRequirement::Classic => Ok(false),
-            MergeQueueRequirement::PrivateFreeClassicFallback => {
-                let _ = crate::writer_domain_lease::write_stderr(format_args!(
-                    "shipyard: evaluated branch rules are unavailable on this private-free repository; the authoritative mergeQueue query returned null, so classifying the branch as classic before refusing automatic direct merge"
-                ));
-                Ok(false)
-            }
-        };
+            })?;
+        return merge_queue_requirement_for_merge(requirement, repo, base_branch);
     }
     let body: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("evaluated branch rules returned invalid JSON: {error}"))?;
-    Ok(matches!(
-        merge_queue_requirement_from_observations(&queue_body, Ok(&body))?,
-        MergeQueueRequirement::Required
-    ))
+    let requirement = merge_queue_requirement_from_observations(&queue_body, Ok(&body))?;
+    merge_queue_requirement_for_merge(requirement, repo, base_branch)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2687,6 +2676,26 @@ enum MergeQueueRequirement {
     Required,
     Classic,
     PrivateFreeClassicFallback,
+}
+
+/// Decide whether the built-in merge may proceed with the observed governance.
+///
+/// A private-free entitlement error is not evidence that the branch is classic:
+/// GitHub withheld the rules response, while the queue probe returned null. Treat
+/// that ambiguity as a refusal so the caller cannot fall through to a direct
+/// merge outside the queue.
+fn merge_queue_requirement_for_merge(
+    requirement: MergeQueueRequirement,
+    repo: &str,
+    base_branch: &str,
+) -> Result<bool, String> {
+    match requirement {
+        MergeQueueRequirement::Required => Ok(true),
+        MergeQueueRequirement::Classic => Ok(false),
+        MergeQueueRequirement::PrivateFreeClassicFallback => Err(format!(
+            "cannot determine whether {repo}:{base_branch} requires a merge queue: GitHub withheld evaluated branch rules on a private-free repository; refusing direct merge"
+        )),
+    }
 }
 
 fn merge_queue_requirement_from_observations(
@@ -4103,6 +4112,60 @@ mod tests {
         assert!(
             merge_queue_requirement_from_observations(&queue_null, Ok(&malformed_rules)).is_err()
         );
+    }
+
+    #[test]
+    fn private_free_fallback_refuses_direct_merge() {
+        let error = merge_queue_requirement_for_merge(
+            MergeQueueRequirement::PrivateFreeClassicFallback,
+            "owner/repo",
+            "main",
+        )
+        .expect_err("governance ambiguity must never select direct merge");
+        assert!(error.contains("refusing direct merge"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_probe_refuses_private_free_rules_ambiguity_before_direct_merge() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // The auth layer intentionally rejects scripts as configured binaries.
+        // Use the native Python interpreter as the binary and place its script
+        // at argv[1] (`api`) in the test cwd, so this exercises the real
+        // repository probe without weakening that production guard.
+        std::fs::write(
+            temp.path().join("api"),
+            r#"import json, sys
+args = " ".join(sys.argv[1:])
+if "graphql" in args:
+    print(json.dumps({"data": {"repository": {"mergeQueue": None}}}))
+elif "rules/branches/main" in args:
+    print("gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)", file=sys.stderr)
+    raise SystemExit(1)
+else:
+    print(f"unexpected gh call: {args}", file=sys.stderr)
+    raise SystemExit(3)
+"#,
+        )
+        .expect("fake gh script");
+        let config = crate::config::LoadedConfig {
+            data: format!(
+                "[github.auth]\nambient_gh_binary = {}\n",
+                toml::Value::String("/usr/bin/python3".to_owned())
+            )
+            .parse::<toml::Table>()
+            .expect("config TOML"),
+            global_dir: temp.path().to_path_buf(),
+            project_dir: None,
+            local_dir: None,
+            local_overlay_source: crate::config::LocalOverlaySource::None,
+        };
+        let client = GhClient::from_loaded_config(&config).expect("configured fake gh");
+        let error = crate::gh::allow_bare_gh_for_test(|| {
+            repository_requires_merge_queue(&client, temp.path(), "owner/repo", "main")
+        })
+        .expect_err("rules ambiguity must refuse the direct path");
+        assert!(error.contains("refusing direct merge"), "{error}");
     }
 
     #[test]

@@ -1,0 +1,50 @@
+{
+  "auth_method": "untrusted_local",
+  "census_sha256": "2a559fcb9de15abffcfb2d183c898070dae13e61d17da2f48294f30832fd41c8",
+  "configured_slots": 3,
+  "eligible_slots": 3,
+  "evidence": {
+    "class": "macos",
+    "free": 1,
+    "host": "m3",
+    "in_flight": 1,
+    "label": "café",
+    "lanes": [
+      {
+        "state": "free"
+      },
+      {
+        "state": "occupied"
+      },
+      {
+        "state": "occupied"
+      }
+    ],
+    "large": 9007199254740993,
+    "occupied": 1,
+    "pool": "on",
+    "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "repo": "Generous-Corp/Shipyard",
+    "schema": "tartci.gate-supply/v1",
+    "threshold": 1e-06,
+    "verdict": "ok"
+  },
+  "evidence_sha256": "e2b8c1aa2a214921240827c7c03c5df75aacd620af33b0e4d3411fc44caae86e",
+  "free_slots": 1,
+  "generation": "gen-42",
+  "host_boot_id": "boot-m3-2026",
+  "host_id": "m3",
+  "in_flight_slots": 1,
+  "observed_at": "2026-10-25T00:00:00Z",
+  "occupied_slots": 1,
+  "pool_state": "on",
+  "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "repo": "Generous-Corp/Shipyard",
+  "sample_id": "7a58f1d56971e5c20aa6c82277bfc9acea35739da2a8cdc4b52ad75a8a55c54b",
+  "schema": "tartci.fleet-capacity/v1",
+  "source": "tartci",
+  "target": "macos",
+  "unknown_slots": 0,
+  "valid_until": "2026-10-25T00:02:00Z",
+  "verification": "verified"
+}

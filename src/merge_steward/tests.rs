@@ -31,6 +31,7 @@ fn queue_policy() -> StewardPolicy {
     StewardPolicy {
         merge_queue: true,
         native_auto_merge: true,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         required_checks: vec![RequiredCheck {
             context: "required".to_owned(),
             app_id: None,
@@ -109,6 +110,21 @@ fn fleet_management_uses_author_and_branch_quadrants() {
     dependabot.author = Some("app/dependabot".to_owned());
     assert_eq!(
         classify_pr(&dependabot, &policy, &BTreeMap::new()),
+        StewardDecision::Unmanaged
+    );
+
+    let mut foreign_app = green_pr();
+    foreign_app.head_branch = "feature/fleet".to_owned();
+    foreign_app.author = Some("app/other-automation".to_owned());
+    assert_eq!(
+        classify_pr(&foreign_app, &policy, &BTreeMap::new()),
+        StewardDecision::Unmanaged
+    );
+
+    let mut foreign_bot = foreign_app;
+    foreign_bot.author = Some("other-automation[bot]".to_owned());
+    assert_eq!(
+        classify_pr(&foreign_bot, &policy, &BTreeMap::new()),
         StewardDecision::Unmanaged
     );
 }

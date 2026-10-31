@@ -1,10 +1,13 @@
 #![allow(missing_docs)]
 
+pub mod fleet_capacity;
 pub mod freshness;
 pub mod github_import;
+pub mod github_merge_receipts;
 pub mod import_schedule;
 pub mod job_name;
 pub mod merge_receipt;
+pub mod merge_receipt_handoff;
 pub mod project_key;
 pub mod proxy;
 mod proxy_store;
@@ -13,13 +16,17 @@ mod proxy_store;
 // and samples with missing or invalid durations, respectively.
 type SafeMergeSummary = (usize, usize, i64, usize, usize);
 
-use std::collections::BTreeMap;
+/// The baseline throughput stream is the protected default branch. The
+/// collector's merge-receipt health gate is bound to this same branch.
+const SCORECARD_BASE_BRANCH: &str = "main";
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -51,14 +58,14 @@ pub(crate) struct QueueTimingRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct RepeatedWorkSurvivorTiming {
+pub struct RepeatedWorkSupersededTiming {
     pub shadow_rows: usize,
-    pub distinct_survivors: usize,
+    pub distinct_superseded_jobs: usize,
     pub matched_clean: usize,
     pub excluded_uncertain: usize,
     pub excluded_cancelled: usize,
     pub unmatched: usize,
-    pub avoided_survivor_ms: Option<i64>,
+    pub superseded_runtime_ms: Option<i64>,
     pub final_attempt_only: bool,
 }
 
@@ -83,6 +90,24 @@ struct ExistingMergeReceipt {
     required_checks_json: String,
     gate_receipt_sha256: String,
     evidence: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // The durable handoff row is consumed by the staged authenticated importer surface.
+struct ExistingMergeReceiptHandoff {
+    schema: String,
+    repo: String,
+    project: String,
+    base_branch: String,
+    payload_sha256: String,
+    producer_host_id: String,
+    producer_session_generation: i64,
+    route: String,
+    destination: String,
+    known_hosts_sha256: String,
+    executable_sha256: String,
+    issued_at: String,
+    expires_at: String,
 }
 
 /// Input for a low-friction `shipyard metrics record` call.
@@ -193,8 +218,10 @@ pub struct RepeatedWorkShadowRow {
     pub superseded_sha: String,
 }
 
-/// Read-only avoided-cost accounting; durations stay unavailable until a
-/// provenance-safe queue-to-metrics linkage exists.
+/// Read-only repeated-work accounting from shadow observations and
+/// authoritative timing for the superseded queue jobs. `duration_ms` is the
+/// measured runtime of superseded jobs only; it is never inferred from the
+/// surviving job or presented as savings when the superseded job is unmatched.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RepeatedWorkCostSummary {
     pub cost_basis: &'static str,
@@ -204,6 +231,15 @@ pub struct RepeatedWorkCostSummary {
     pub joined_durations: usize,
     pub unknown_durations: usize,
     pub duration_ms: Option<i64>,
+    pub shadow_rows: usize,
+    pub distinct_superseded_jobs: usize,
+    pub matched_clean: usize,
+    pub excluded_uncertain: usize,
+    pub excluded_cancelled: usize,
+    pub unmatched: usize,
+    pub timing_basis: &'static str,
+    pub since_days: i64,
+    pub final_attempt_only: bool,
 }
 
 /// One grouped timing summary row.
@@ -346,19 +382,32 @@ pub struct StewardshipScorecard {
     /// Number of failed or cancelled jobs contributing to
     /// [`Self::wasted_compute_minutes`].
     pub wasted_compute_samples: usize,
+    /// Coverage of measured duration across failed or cancelled jobs.
+    pub wasted_compute_coverage: ScorecardCoverage,
     /// Queue wait minutes with an authoritative queued timestamp.
     /// This is the coordination-cost proxy.
     pub coordination_minutes: f64,
     /// Number of jobs contributing to [`Self::coordination_minutes`].
     pub coordination_samples: usize,
+    /// Coverage of authoritative queue timing across completed job samples.
+    /// This keeps a queue-wait total from being mistaken for a complete
+    /// coordination-cost measurement when some jobs have no queued timestamp.
+    pub coordination_coverage: ScorecardCoverage,
     /// Failed-attempt compute minutes. Cancellations are kept in
     /// `wasted_compute_minutes` but are not called rework without evidence
     /// that a replacement attempt ran.
     pub rework_compute_minutes: f64,
     /// Number of failed attempts contributing to rework compute.
     pub rework_compute_samples: usize,
+    /// Coverage of measured duration across failed attempts. Failed attempts
+    /// without a valid duration remain visible in the denominator and keep
+    /// this metric partial or unavailable.
+    pub rework_compute_coverage: ScorecardCoverage,
     /// Sum of measured queue and failed-attempt compute minutes.
     pub coordination_rework_minutes: f64,
+    /// Combined coverage for the queue-wait and failed-attempt components.
+    /// The aggregate is partial when either component is incomplete.
+    pub coordination_rework_coverage: ScorecardCoverage,
     /// Merge receipts are not currently part of the local metrics schema.
     /// Keep this explicit instead of dividing by distinct PRs and calling
     /// those changes safely merged.
@@ -374,6 +423,12 @@ pub struct StewardshipScorecard {
     pub cache_hit_rate: Option<f64>,
     pub submit_to_receipt: ScorecardCoverage,
     pub model_token_use: ScorecardCoverage,
+    /// Observation-only eligible `TartCI` slot-hours in this window. Unknown
+    /// samples remain visible and make the denominator partial.
+    pub fleet_capacity: FleetCapacityDenominator,
+    /// Safely merged changes per eligible fleet-hour. This is unavailable
+    /// without both durable safe-merge receipts and measured capacity.
+    pub safely_merged_changes_per_eligible_slot_hour: ScorecardCoverage,
     /// Basis of `comparison.verdict`.
     pub basis: &'static str,
     /// Load-independent proxies over this window (project-wide).
@@ -387,6 +442,22 @@ pub struct StewardshipScorecard {
     pub provenance: ScorecardProvenance,
     #[serde(skip_serializing)]
     pub strata: ScorecardStrata,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FleetCapacityDenominator {
+    pub status: String,
+    pub reason: String,
+    /// Currentness of the newest producer validity interval. This is separate
+    /// from `status`, which describes historical window coverage.
+    pub freshness_status: String,
+    pub latest_valid_until: Option<DateTime<Utc>>,
+    pub freshness_reason: String,
+    pub sample_count: usize,
+    pub verified_samples: usize,
+    pub unknown_samples: usize,
+    pub host_target_count: usize,
+    pub eligible_slot_hours: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -559,6 +630,18 @@ fn queue_timing_rank(s: &str) -> u8 {
     }
 }
 
+fn repeated_work_cutoff(since_days: i64) -> Result<String, Box<dyn std::error::Error>> {
+    if since_days <= 0 {
+        return Err("repeated-work baseline window must be positive".into());
+    }
+    let window = Duration::try_days(since_days)
+        .ok_or("repeated-work baseline window is outside the timestamp range")?;
+    Utc::now()
+        .checked_sub_signed(window)
+        .ok_or_else(|| "repeated-work baseline cutoff is outside the timestamp range".into())
+        .map(|cutoff| cutoff.to_rfc3339())
+}
+
 impl MetricsStore {
     pub(crate) fn record_queue_terminal(
         &self,
@@ -617,39 +700,56 @@ impl MetricsStore {
         Ok(conn.query_row("SELECT queue_job_id, queue_identity, disposition, started_at, completed_at, total_ms FROM queue_timing WHERE queue_job_id=?1", params![queue_job_id], |r| Ok(QueueTimingRow { queue_job_id: r.get(0)?, queue_identity: r.get(1)?, queue_disposition: r.get(2)?, started_at: r.get(3)?, completed_at: r.get(4)?, total_ms: r.get(5)? })).optional()?)
     }
 
-    pub fn repeated_work_survivor_timing(
+    pub fn repeated_work_superseded_timing(
         &self,
         limit: usize,
-    ) -> Result<RepeatedWorkSurvivorTiming, Box<dyn std::error::Error>> {
+        since_days: i64,
+    ) -> Result<RepeatedWorkSupersededTiming, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("WITH recent AS (SELECT job_id FROM repeated_work_shadow ORDER BY id DESC LIMIT ?1), survivors AS (SELECT DISTINCT job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.job_id, t.disposition, t.total_ms FROM survivors s LEFT JOIN queue_timing t ON t.queue_job_id=s.job_id")?;
-        let mut out = RepeatedWorkSurvivorTiming {
+        let tx = conn.unchecked_transaction()?;
+        let cutoff = repeated_work_cutoff(since_days)?;
+        let timing = Self::repeated_work_superseded_timing_with_conn(&tx, limit, &cutoff)?;
+        tx.commit()?;
+        Ok(timing)
+    }
+
+    fn repeated_work_superseded_timing_with_conn(
+        conn: &Connection,
+        limit: usize,
+        cutoff: &str,
+    ) -> Result<RepeatedWorkSupersededTiming, Box<dyn std::error::Error>> {
+        // GLOB preserves the canonical prefix's case; SQLite LIKE folds ASCII.
+        let mut stmt = conn.prepare("WITH recent AS (SELECT superseded_job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1), superseded AS (SELECT DISTINCT superseded_job_id FROM recent) SELECT (SELECT COUNT(*) FROM recent), s.superseded_job_id, t.disposition, t.total_ms FROM superseded s LEFT JOIN queue_timing t ON t.queue_job_id=s.superseded_job_id AND s.superseded_job_id GLOB 'sy-*' AND instr(s.superseded_job_id, '/') = 0 AND instr(s.superseded_job_id, char(92)) = 0")?;
+        let mut out = RepeatedWorkSupersededTiming {
             shadow_rows: 0,
-            distinct_survivors: 0,
+            distinct_superseded_jobs: 0,
             matched_clean: 0,
             excluded_uncertain: 0,
             excluded_cancelled: 0,
             unmatched: 0,
-            avoided_survivor_ms: None,
+            superseded_runtime_ms: None,
             final_attempt_only: true,
         };
-        let rows = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![i64::try_from(limit).unwrap_or(i64::MAX), cutoff],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )?;
         for row in rows {
             let (count, _, disposition, total) = row?;
             out.shadow_rows = usize::try_from(count).unwrap_or(usize::MAX);
-            out.distinct_survivors += 1;
+            out.distinct_superseded_jobs += 1;
             match disposition.as_deref() {
                 Some("clean") if total.is_some_and(|v| v >= 0) => {
                     out.matched_clean += 1;
-                    out.avoided_survivor_ms = Some(
-                        out.avoided_survivor_ms
+                    out.superseded_runtime_ms = Some(
+                        out.superseded_runtime_ms
                             .unwrap_or(0)
                             .saturating_add(total.unwrap()),
                     );
@@ -659,6 +759,65 @@ impl MetricsStore {
                 _ => out.unmatched += 1,
             }
         }
+        Ok(out)
+    }
+
+    /// Return repeated-work accounting for a positive baseline window.
+    pub fn repeated_work_cost(
+        &self,
+        limit: usize,
+        since_days: i64,
+    ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
+        let cutoff = repeated_work_cutoff(since_days)?;
+        let conn = self.connect()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare("SELECT kind, job_id FROM repeated_work_shadow WHERE observed_at >= ?2 ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
+        let ids = stmt.query_map(
+            params![i64::try_from(limit).unwrap_or(i64::MAX), &cutoff],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut out = RepeatedWorkCostSummary {
+            cost_basis: "superseded_repeated_work",
+            observations: 0,
+            superseded_exact_head: 0,
+            duplicate_exact_head_config: 0,
+            joined_durations: 0,
+            unknown_durations: 0,
+            duration_ms: None,
+            shadow_rows: 0,
+            distinct_superseded_jobs: 0,
+            matched_clean: 0,
+            excluded_uncertain: 0,
+            excluded_cancelled: 0,
+            unmatched: 0,
+            timing_basis: "superseded_queue_job_runtime",
+            since_days,
+            final_attempt_only: true,
+        };
+        for item in ids {
+            let (kind, _job_id) = item?;
+            out.observations += 1;
+            match kind.as_str() {
+                "superseded_exact_head" => out.superseded_exact_head += 1,
+                "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
+                _ => {}
+            }
+        }
+        let timing = Self::repeated_work_superseded_timing_with_conn(&tx, limit, &cutoff)?;
+        out.shadow_rows = timing.shadow_rows;
+        out.distinct_superseded_jobs = timing.distinct_superseded_jobs;
+        out.matched_clean = timing.matched_clean;
+        out.excluded_uncertain = timing.excluded_uncertain;
+        out.excluded_cancelled = timing.excluded_cancelled;
+        out.unmatched = timing.unmatched;
+        out.joined_durations = timing.matched_clean;
+        out.unknown_durations = timing
+            .distinct_superseded_jobs
+            .saturating_sub(timing.matched_clean);
+        out.duration_ms = timing.superseded_runtime_ms;
+        out.final_attempt_only = timing.final_attempt_only;
+        drop(stmt);
+        tx.commit()?;
         Ok(out)
     }
 
@@ -680,8 +839,57 @@ impl MetricsStore {
         &self.path
     }
 
-    /// Delete raw run, job, and step samples older than `retention_days`.
-    /// Merge receipts are retained because they are durable provenance.
+    /// Validate an existing metrics database without migrating or writing it.
+    /// Cleanup uses this for dry-run validation so an unreadable store cannot
+    /// be reported as a successful rotation plan.
+    pub fn validate_existing(state_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let path = state_dir.join("metrics").join("metrics.db");
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let result: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if result != "ok" {
+            return Err(format!("metrics database integrity check failed: {result}").into());
+        }
+        for (table, columns) in [
+            ("runs", &["id", "ts"][..]),
+            ("jobs", &["id", "run_id"][..]),
+            ("steps", &["job_id"][..]),
+            (
+                "fleet_capacity_samples",
+                &["sample_id", "valid_until", "repo", "observed_at"][..],
+            ),
+        ] {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if !present {
+                return Err(format!("metrics database missing required table: {table}").into());
+            }
+            for column in columns {
+                let present: bool = conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = ?1"
+                    ),
+                    [column],
+                    |row| row.get(0),
+                )?;
+                if !present {
+                    return Err(format!(
+                        "metrics database table {table} missing required column: {column}"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete expired raw runs (including jobs/steps), fleet-capacity samples,
+    /// and queue observations. Return the number of runs, capacity samples,
+    /// shadow observations, and timing rows removed, excluding child jobs/steps.
+    /// Retained shadow observations keep their timing joins; merge receipts and
+    /// operational queue/recovery state are not pruned.
     pub fn prune_older_than(
         &self,
         retention_days: i64,
@@ -690,7 +898,12 @@ impl MetricsStore {
             return Ok(0);
         }
         let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
-        let cutoff = (Utc::now() - Duration::days(retention_days)).to_rfc3339();
+        let window = Duration::try_days(retention_days)
+            .ok_or("metrics retention is outside the timestamp range")?;
+        let cutoff_time = Utc::now()
+            .checked_sub_signed(window)
+            .ok_or("metrics retention cutoff is outside the timestamp range")?;
+        let cutoff = cutoff_time.to_rfc3339();
         let mut deleted = 0;
         loop {
             let mut conn = self.connect()?;
@@ -698,7 +911,7 @@ impl MetricsStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let ids = {
                 let mut statement =
-                    tx.prepare("SELECT id FROM runs WHERE ts < ?1 ORDER BY id LIMIT 250")?;
+                    tx.prepare("SELECT id FROM runs WHERE ts < ?1 ORDER BY ts, id LIMIT 250")?;
                 statement
                     .query_map([&cutoff], |row| row.get::<_, i64>(0))?
                     .collect::<Result<Vec<_>, _>>()?
@@ -717,6 +930,87 @@ impl MetricsStore {
             }
             tx.commit()?;
             deleted += ids.len();
+        }
+        loop {
+            let mut conn = self.connect()?;
+            conn.busy_timeout(std::time::Duration::from_millis(250))?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let removed = tx.execute(
+                "DELETE FROM fleet_capacity_samples
+                 WHERE sample_id IN (
+                   SELECT sample_id FROM fleet_capacity_samples
+                   WHERE valid_until < ?1
+                   ORDER BY valid_until, sample_id
+                   LIMIT 250
+                 )",
+                [&cutoff],
+            )?;
+            tx.commit()?;
+            deleted += removed;
+            if removed == 0 {
+                break;
+            }
+        }
+        deleted += self.prune_queue_observations(cutoff_time)?;
+        Ok(deleted)
+    }
+
+    fn prune_queue_observations(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut conn = self.connect()?;
+        conn.busy_timeout(StdDuration::from_millis(250))?;
+        let mut deleted = 0;
+        // These are observation tables, never the queue/recovery authority.
+        // Expire shadow rows first so all remaining references protect timing.
+        for (table, timestamp, guard) in [
+            ("repeated_work_shadow", "observed_at", ""),
+            (
+                "queue_timing",
+                "recorded_at",
+                " AND NOT EXISTS (SELECT 1 FROM repeated_work_shadow s
+                    WHERE s.superseded_job_id = queue_timing.queue_job_id)",
+            ),
+        ] {
+            let last: i64 = conn.query_row(
+                &format!("SELECT COALESCE(MAX(rowid), 0) FROM {table}"),
+                [],
+                |row| row.get(0),
+            )?;
+            let mut cursor = 0_i64;
+            while cursor < last {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let rows = {
+                    let mut statement = tx.prepare(&format!(
+                        "SELECT rowid, {timestamp} FROM {table}
+                         WHERE rowid > ?1 AND rowid <= ?2 ORDER BY rowid LIMIT 250"
+                    ))?;
+                    statement
+                        .query_map(params![cursor, last], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                if rows.is_empty() {
+                    break;
+                }
+                for (id, timestamp) in rows {
+                    cursor = id;
+                    // Strict parsing preserves malformed values and compares
+                    // RFC3339 offsets correctly. Rowid paging bounds each lock
+                    // and the initial high-water mark bounds concurrent growth.
+                    if DateTime::parse_from_rfc3339(&timestamp)
+                        .is_ok_and(|observed| observed < cutoff)
+                    {
+                        deleted += tx.execute(
+                            &format!("DELETE FROM {table} WHERE rowid = ?1{guard}"),
+                            [id],
+                        )?;
+                    }
+                }
+                tx.commit()?;
+            }
         }
         Ok(deleted)
     }
@@ -806,6 +1100,17 @@ impl MetricsStore {
               cache_hit INTEGER,
               artifact_path TEXT
             );
+            CREATE INDEX IF NOT EXISTS metrics_runs_retention
+              ON runs(ts, id);
+            CREATE INDEX IF NOT EXISTS metrics_jobs_run_id
+              ON jobs(run_id);
+            CREATE INDEX IF NOT EXISTS metrics_steps_job_id
+              ON steps(job_id);
+            -- Freshness classifies each job by whether it has a github_job
+            -- step. Keep that existence probe bounded as the metrics store
+            -- grows; without this index a scorecard scans steps once per job.
+            CREATE INDEX IF NOT EXISTS steps_job_step
+              ON steps(job_id, step);
             CREATE TABLE IF NOT EXISTS merge_receipts (
               receipt_id TEXT PRIMARY KEY,
               schema TEXT NOT NULL,
@@ -826,6 +1131,71 @@ impl MetricsStore {
             );
             CREATE INDEX IF NOT EXISTS merge_receipts_project_merged
               ON merge_receipts(project, merged_at);
+            CREATE TABLE IF NOT EXISTS merge_receipt_handoffs (
+              envelope_id TEXT PRIMARY KEY,
+              schema TEXT NOT NULL,
+              repo TEXT NOT NULL,
+              project TEXT NOT NULL,
+              base_branch TEXT NOT NULL,
+              payload_sha256 TEXT NOT NULL,
+              producer_host_id TEXT NOT NULL,
+              producer_session_generation INTEGER NOT NULL,
+              route TEXT NOT NULL,
+              destination TEXT NOT NULL,
+              known_hosts_sha256 TEXT NOT NULL,
+              executable_sha256 TEXT NOT NULL,
+              issued_at TEXT NOT NULL,
+              expires_at TEXT NOT NULL,
+              imported_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS merge_receipt_handoff_receipts (
+              envelope_id TEXT NOT NULL REFERENCES merge_receipt_handoffs(envelope_id),
+              receipt_id TEXT NOT NULL,
+              receipt_sha256 TEXT NOT NULL,
+              PRIMARY KEY(envelope_id, receipt_id)
+            );
+            CREATE INDEX IF NOT EXISTS merge_receipt_handoff_receipts_receipt
+              ON merge_receipt_handoff_receipts(receipt_id);
+            CREATE TRIGGER IF NOT EXISTS merge_receipt_authenticated_immutable
+              BEFORE UPDATE ON merge_receipts
+              WHEN EXISTS (
+                SELECT 1 FROM merge_receipt_handoff_receipts
+                WHERE receipt_id = OLD.receipt_id
+              )
+            BEGIN
+              SELECT RAISE(ABORT, 'authenticated merge receipt is immutable');
+            END;
+            CREATE TABLE IF NOT EXISTS fleet_capacity_samples (
+              sample_id TEXT PRIMARY KEY,
+              schema TEXT NOT NULL,
+              observed_at TEXT NOT NULL,
+              valid_until TEXT NOT NULL,
+              host_id TEXT NOT NULL,
+              host_boot_id TEXT NOT NULL,
+              generation TEXT NOT NULL,
+              repo TEXT NOT NULL,
+              target TEXT NOT NULL,
+              profile_sha256 TEXT NOT NULL,
+              configured_slots INTEGER NOT NULL,
+              eligible_slots INTEGER,
+              free_slots INTEGER,
+              occupied_slots INTEGER,
+              in_flight_slots INTEGER,
+              unknown_slots INTEGER NOT NULL,
+              pool_state TEXT NOT NULL,
+              source TEXT NOT NULL,
+              auth_method TEXT NOT NULL,
+              verification TEXT NOT NULL,
+              evidence_json TEXT NOT NULL,
+              evidence_sha256 TEXT NOT NULL,
+              census_sha256 TEXT NOT NULL,
+              reason TEXT,
+              imported_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS fleet_capacity_repo_observed
+              ON fleet_capacity_samples(repo, observed_at);
+            CREATE INDEX IF NOT EXISTS fleet_capacity_valid_until
+              ON fleet_capacity_samples(valid_until);
             CREATE TABLE IF NOT EXISTS repeated_work_shadow (
               id INTEGER PRIMARY KEY,
               observed_at TEXT NOT NULL,
@@ -840,12 +1210,15 @@ impl MetricsStore {
             );
             CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
               ON repeated_work_shadow(observed_at DESC);
+            CREATE INDEX IF NOT EXISTS repeated_work_shadow_superseded_job
+              ON repeated_work_shadow(superseded_job_id);
             ",
         )?;
         add_column_if_missing(&conn, "jobs", "runner_assigned", "INTEGER")?;
         add_column_if_missing(&conn, "jobs", "labels_json", "TEXT")?;
         add_column_if_missing(&conn, "jobs", "correlation_id", "TEXT")?;
         add_column_if_missing(&conn, "runs", "event", "TEXT")?;
+        add_column_if_missing(&conn, "fleet_capacity_samples", "evidence_json", "TEXT")?;
         add_column_if_missing(&conn, "runs", "provider_run_id", "INTEGER")?;
         add_column_if_missing(&conn, "runs", "run_attempt", "INTEGER")?;
         add_column_if_missing(&conn, "runs", "head_sha", "TEXT")?;
@@ -882,7 +1255,91 @@ impl MetricsStore {
     }
 
     /// Import validated merge receipts atomically. Duplicate receipt IDs are
-    /// idempotent only when the payload is byte-for-byte equivalent.
+    /// idempotent when the payload is equivalent after ownership-key
+    /// canonicalization, preserving compatibility with legacy mixed-case rows.
+    fn insert_merge_receipt_tx(
+        tx: &rusqlite::Transaction<'_>,
+        receipt: &crate::metrics::merge_receipt::MergeReceipt,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        receipt
+            .validate()
+            .map_err(|e| format!("invalid merge receipt: {e}"))?;
+        // Repository and project are durable ownership keys. Normalize them
+        // before both conflict checks and storage so case/outer whitespace
+        // cannot create a second identity for one PR.
+        let repo = crate::evidence::canonical_repository(&receipt.repo);
+        let project_input = crate::evidence::canonical_repository(&receipt.project);
+        let (project, _) =
+            crate::metrics::project_key::normalize_for_write(&project_input, Some(&repo));
+        let existing: Option<ExistingMergeReceipt> = tx.query_row(
+            "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
+            [&receipt.receipt_id],
+            |row| {
+                let existing_repo: String = row.get(1)?;
+                let existing_repo = crate::evidence::canonical_repository(&existing_repo);
+                let existing_project_raw: String = row.get(2)?;
+                let (existing_project, _) = crate::metrics::project_key::normalize_for_write(
+                    &existing_project_raw,
+                    Some(&existing_repo),
+                );
+                Ok(ExistingMergeReceipt {
+                    schema: row.get(0)?,
+                    repo: existing_repo,
+                    project: existing_project,
+                    base_branch: row.get(3)?,
+                    pr: row.get(4)?,
+                    head_sha: row.get(5)?,
+                    validated_head_sha: row.get(6)?,
+                    merge_commit_sha: row.get(7)?,
+                    merged_at: row.get(8)?,
+                    source: row.get(9)?,
+                    required_checks_json: row.get(10)?,
+                    gate_receipt_sha256: row.get(11)?,
+                    evidence: row.get(12)?,
+                })
+            },
+        ).optional()?;
+        if let Some(existing) = existing {
+            let incoming = ExistingMergeReceipt {
+                schema: receipt.schema.clone(),
+                repo: repo.clone(),
+                project: project.clone(),
+                base_branch: receipt.base_branch.clone(),
+                pr: receipt.pr,
+                head_sha: receipt.head_sha.clone(),
+                validated_head_sha: receipt.validated_head_sha.clone(),
+                merge_commit_sha: receipt.merge_commit_sha.clone(),
+                merged_at: receipt.merged_at.to_rfc3339(),
+                source: receipt.source.clone(),
+                required_checks_json: serde_json::to_string(&receipt.required_checks)?,
+                gate_receipt_sha256: receipt.gate_receipt_sha256.clone(),
+                evidence: receipt.evidence.clone(),
+            };
+            if existing != incoming {
+                return Err(format!(
+                    "merge receipt {} conflicts with existing payload",
+                    receipt.receipt_id
+                )
+                .into());
+            }
+            return Ok(false);
+        }
+        let semantic_conflict: Option<String> = tx.query_row(
+            "SELECT receipt_id FROM merge_receipts WHERE lower(trim(repo)) = ?1 AND pr = ?2 AND receipt_id <> ?3 AND (lower(trim(project)) <> ?4 OR base_branch <> ?5 OR head_sha <> ?6 OR merge_commit_sha <> ?7)",
+            rusqlite::params![repo, receipt.pr, receipt.receipt_id, project, receipt.base_branch, receipt.head_sha, receipt.merge_commit_sha],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(other) = semantic_conflict {
+            return Err(format!(
+                "merge receipt {} conflicts with semantic receipt {other}",
+                receipt.receipt_id
+            )
+            .into());
+        }
+        tx.execute("INSERT INTO merge_receipts (receipt_id,schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,?15)", rusqlite::params![receipt.receipt_id, receipt.schema, repo, project, receipt.base_branch, receipt.pr, receipt.head_sha, receipt.validated_head_sha, receipt.merge_commit_sha, receipt.merged_at.to_rfc3339(), receipt.source, serde_json::to_string(&receipt.required_checks)?, receipt.gate_receipt_sha256, receipt.evidence, Utc::now().to_rfc3339()])?;
+        Ok(true)
+    }
+
     pub fn import_merge_receipts(
         &self,
         receipts: &[crate::metrics::merge_receipt::MergeReceipt],
@@ -892,64 +1349,141 @@ impl MetricsStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut imported = 0;
         for receipt in receipts {
-            receipt
-                .validate()
-                .map_err(|e| format!("invalid merge receipt: {e}"))?;
-            // Repository and project are durable ownership keys. Normalize
-            // them before both conflict checks and storage so case/outer
-            // whitespace cannot create a second identity for one PR.
-            let repo = crate::evidence::canonical_repository(&receipt.repo);
-            let project_input = crate::evidence::canonical_repository(&receipt.project);
-            let (project, _) =
-                crate::metrics::project_key::normalize_for_write(&project_input, Some(&repo));
-            let existing: Option<ExistingMergeReceipt> = tx.query_row(
-                "SELECT schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,source,required_checks_json,gate_receipt_sha256,evidence FROM merge_receipts WHERE receipt_id = ?1",
-                [&receipt.receipt_id],
-                |row| Ok(ExistingMergeReceipt {
-                    schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?, pr: row.get(4)?,
-                    head_sha: row.get(5)?, validated_head_sha: row.get(6)?, merge_commit_sha: row.get(7)?, merged_at: row.get(8)?,
-                    source: row.get(9)?, required_checks_json: row.get(10)?, gate_receipt_sha256: row.get(11)?, evidence: row.get(12)?,
+            imported += usize::from(Self::insert_merge_receipt_tx(&tx, receipt)?);
+        }
+        tx.commit()?;
+        Ok(imported)
+    }
+
+    /// Import one authenticated handoff atomically with its provenance links.
+    /// Legacy v1 imports remain valid but do not acquire provenance merely by
+    /// being present in `merge_receipts`.
+    #[allow(dead_code)] // Transport/CLI wiring lands separately; keep this atomic persistence API ready.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn import_authenticated_merge_receipt_handoff(
+        &self,
+        envelope: &crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope,
+        context: &crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        use crate::metrics::merge_receipt_handoff::{HandoffError, digest_receipt};
+
+        // Validate all envelope-level invariants and the trusted transport
+        // fence before taking the writer lease or opening a write transaction.
+        envelope
+            .validate()
+            .map_err(|error| format!("invalid authenticated handoff: {error}"))?;
+        // A fresh envelope must pass the full trusted-fence check before any
+        // write. An exact envelope already persisted may be replayed after its
+        // expiry so periodic exports remain idempotent; the durable identity
+        // comparison below is the only freshness exception.
+        let verification_error = envelope.verify(context).err();
+        let stale_replay = matches!(verification_error.as_ref(), Some(HandoffError::Stale));
+        if let Some(error) = verification_error
+            && !stale_replay
+        {
+            return Err(format!("authenticated handoff verification failed: {error}").into());
+        }
+
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let mut conn = self.connect()?;
+        let repository = crate::evidence::canonical_repository(&envelope.repository);
+        let project_input = crate::evidence::canonical_repository(&envelope.project);
+        if project_input.contains('/') && project_input != repository {
+            return Err("authenticated handoff project is not bound to repository".into());
+        }
+        let (project, _) =
+            crate::metrics::project_key::normalize_for_write(&project_input, Some(&repository));
+        let route = serde_json::to_string(&envelope.route)?;
+        let incoming = ExistingMergeReceiptHandoff {
+            schema: envelope.schema.clone(),
+            repo: repository.clone(),
+            project: project.clone(),
+            base_branch: envelope.base_branch.clone(),
+            payload_sha256: envelope.payload_sha256.as_str().to_owned(),
+            producer_host_id: envelope.producer_host_id.clone(),
+            producer_session_generation: i64::try_from(envelope.producer_session_generation)
+                .map_err(|_| HandoffError::Invalid("session generation"))?,
+            route: route.clone(),
+            destination: envelope.destination.clone(),
+            known_hosts_sha256: envelope.known_hosts_sha256.as_str().to_owned(),
+            executable_sha256: envelope.executable_sha256.as_str().to_owned(),
+            issued_at: envelope.issued_at.to_rfc3339(),
+            expires_at: envelope.expires_at.to_rfc3339(),
+        };
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<ExistingMergeReceiptHandoff> = tx
+            .query_row(
+                "SELECT schema,repo,project,base_branch,payload_sha256,producer_host_id,producer_session_generation,route,destination,known_hosts_sha256,executable_sha256,issued_at,expires_at FROM merge_receipt_handoffs WHERE envelope_id=?1",
+                [&envelope.envelope_id],
+                |row| Ok(ExistingMergeReceiptHandoff {
+                    schema: row.get(0)?, repo: row.get(1)?, project: row.get(2)?, base_branch: row.get(3)?,
+                    payload_sha256: row.get(4)?, producer_host_id: row.get(5)?, producer_session_generation: row.get(6)?,
+                    route: row.get(7)?, destination: row.get(8)?, known_hosts_sha256: row.get(9)?, executable_sha256: row.get(10)?,
+                    issued_at: row.get(11)?, expires_at: row.get(12)?,
                 }),
-            ).optional()?;
-            if let Some(existing) = existing {
-                let incoming = ExistingMergeReceipt {
-                    schema: receipt.schema.clone(),
-                    repo: repo.clone(),
-                    project: project.clone(),
-                    base_branch: receipt.base_branch.clone(),
-                    pr: receipt.pr,
-                    head_sha: receipt.head_sha.clone(),
-                    validated_head_sha: receipt.validated_head_sha.clone(),
-                    merge_commit_sha: receipt.merge_commit_sha.clone(),
-                    merged_at: receipt.merged_at.to_rfc3339(),
-                    source: receipt.source.clone(),
-                    required_checks_json: serde_json::to_string(&receipt.required_checks)?,
-                    gate_receipt_sha256: receipt.gate_receipt_sha256.clone(),
-                    evidence: receipt.evidence.clone(),
-                };
-                if existing != incoming {
-                    return Err(format!(
-                        "merge receipt {} conflicts with existing payload",
-                        receipt.receipt_id
-                    )
-                    .into());
-                }
-                continue;
-            }
-            let semantic_conflict: Option<String> = tx.query_row(
-                "SELECT receipt_id FROM merge_receipts WHERE lower(trim(repo)) = ?1 AND pr = ?2 AND receipt_id <> ?3 AND (lower(trim(project)) <> ?4 OR base_branch <> ?5 OR head_sha <> ?6 OR merge_commit_sha <> ?7)",
-                rusqlite::params![repo, receipt.pr, receipt.receipt_id, project, receipt.base_branch, receipt.head_sha, receipt.merge_commit_sha],
+            )
+            .optional()?;
+        let had_existing = existing.is_some();
+        if let Some(existing) = existing.as_ref()
+            && existing != &incoming
+        {
+            return Err(format!(
+                "authenticated handoff {} conflicts with existing envelope",
+                envelope.envelope_id
+            )
+            .into());
+        }
+        if stale_replay && existing.as_ref() != Some(&incoming) {
+            return Err(format!(
+                "authenticated handoff verification failed: {}",
+                HandoffError::Stale
+            )
+            .into());
+        }
+
+        if !had_existing {
+            tx.execute(
+                "INSERT INTO merge_receipt_handoffs (envelope_id,schema,repo,project,base_branch,payload_sha256,producer_host_id,producer_session_generation,route,destination,known_hosts_sha256,executable_sha256,issued_at,expires_at,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![
+                    envelope.envelope_id,
+                    envelope.schema,
+                    repository,
+                    project,
+                    envelope.base_branch,
+                    envelope.payload_sha256.as_str(),
+                    envelope.producer_host_id,
+                    incoming.producer_session_generation,
+                    route,
+                    envelope.destination,
+                    envelope.known_hosts_sha256.as_str(),
+                    envelope.executable_sha256.as_str(),
+                    envelope.issued_at.to_rfc3339(),
+                    envelope.expires_at.to_rfc3339(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+        let mut imported = 0;
+        for receipt in &envelope.receipts {
+            imported += usize::from(Self::insert_merge_receipt_tx(&tx, receipt)?);
+            let receipt_sha256 = digest_receipt(receipt)
+                .map_err(|error| format!("authenticated receipt digest failed: {error}"))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO merge_receipt_handoff_receipts (envelope_id,receipt_id,receipt_sha256) VALUES (?1,?2,?3)",
+                params![envelope.envelope_id, receipt.receipt_id, receipt_sha256.as_str()],
+            )?;
+            let stored: String = tx.query_row(
+                "SELECT receipt_sha256 FROM merge_receipt_handoff_receipts WHERE envelope_id=?1 AND receipt_id=?2",
+                params![envelope.envelope_id, receipt.receipt_id],
                 |row| row.get(0),
-            ).optional()?;
-            if let Some(other) = semantic_conflict {
+            )?;
+            if stored != receipt_sha256.as_str() {
                 return Err(format!(
-                    "merge receipt {} conflicts with semantic receipt {other}",
-                    receipt.receipt_id
+                    "authenticated handoff {} conflicts with receipt provenance",
+                    envelope.envelope_id
                 )
                 .into());
             }
-            tx.execute("INSERT INTO merge_receipts (receipt_id,schema,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence,imported_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,?15)", rusqlite::params![receipt.receipt_id, receipt.schema, repo, project, receipt.base_branch, receipt.pr, receipt.head_sha, receipt.validated_head_sha, receipt.merge_commit_sha, receipt.merged_at.to_rfc3339(), receipt.source, serde_json::to_string(&receipt.required_checks)?, receipt.gate_receipt_sha256, receipt.evidence, Utc::now().to_rfc3339()])?;
-            imported += 1;
         }
         tx.commit()?;
         Ok(imported)
@@ -962,13 +1496,27 @@ impl MetricsStore {
         &self,
         repo: &str,
     ) -> Result<Vec<crate::metrics::merge_receipt::MergeReceipt>, Box<dyn std::error::Error>> {
+        self.export_merge_receipts_for_branch(repo, SCORECARD_BASE_BRANCH)
+    }
+
+    /// Export validated producer receipts for one exact repository and base
+    /// branch. The default export above is deliberately bound to the branch
+    /// used by the scorecard and handoff contract.
+    pub fn export_merge_receipts_for_branch(
+        &self,
+        repo: &str,
+        base_branch: &str,
+    ) -> Result<Vec<crate::metrics::merge_receipt::MergeReceipt>, Box<dyn std::error::Error>> {
+        if base_branch.trim().is_empty() {
+            return Err("merge receipt export base branch must not be empty".into());
+        }
         let repo = crate::evidence::canonical_repository(repo);
         let conn = self.connect()?;
         let mut statement = conn.prepare(
             "SELECT schema,receipt_id,repo,project,base_branch,pr,head_sha,validated_head_sha,merge_commit_sha,merged_at,safe_merge,source,required_checks_json,gate_receipt_sha256,evidence
-             FROM merge_receipts WHERE lower(trim(repo)) = lower(trim(?1)) ORDER BY merged_at, receipt_id",
+             FROM merge_receipts WHERE lower(trim(repo)) = lower(trim(?1)) AND base_branch = ?2 ORDER BY merged_at, receipt_id",
         )?;
-        let rows = statement.query_map([repo], |row| {
+        let rows = statement.query_map(rusqlite::params![repo, base_branch], |row| {
             let required_checks_json: String = row.get(12)?;
             let required_checks = serde_json::from_str(&required_checks_json).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -1016,48 +1564,170 @@ impl MetricsStore {
         Ok(receipts)
     }
 
-    /// Count safe merged heads and the failed/cancelled compute attached to
-    /// those exact PR identities in the scorecard window.
+    /// Count safe merged heads on the measured protected branch and the
+    /// failed/cancelled compute attached to those exact PR identities in the
+    /// scorecard window.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn safe_merge_summary(
         &self,
         project: &str,
         cutoff: &str,
     ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
+        self.safe_merge_summary_filtered(project, cutoff, false)
+    }
+
+    /// Count only safe merges joined to an authenticated handoff envelope.
+    /// Legacy v1 rows remain queryable through `safe_merge_summary` but are
+    /// excluded from this opt-in denominator until provenance is attached.
+    #[allow(dead_code)] // Callers opt into authenticated denominators when transport wiring is enabled.
+    pub(crate) fn authenticated_safe_merge_summary(
+        &self,
+        project: &str,
+        cutoff: &str,
+    ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
+        self.safe_merge_summary_filtered(project, cutoff, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn safe_merge_summary_filtered(
+        &self,
+        project: &str,
+        cutoff: &str,
+        authenticated_only: bool,
+    ) -> Result<SafeMergeSummary, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
         let key = crate::metrics::project_key::ProjectKey::parse(project);
         let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
         let project_filter = crate::metrics::project_key::sql_filter("project", "repo");
-        let safe: Vec<(String, String, i64)> = {
-            let mut q = conn.prepare(&format!("SELECT repo, head_sha, pr FROM merge_receipts WHERE {project_filter} AND safe_merge = 1 AND required_checks_json <> '[]' AND length(gate_receipt_sha256) = 64 AND julianday(merged_at) >= julianday(?4)"))?;
-            q.query_map(rusqlite::params![any, short, full, cutoff], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<Result<_, _>>()?
+        let cutoff = DateTime::parse_from_rfc3339(cutoff)?.with_timezone(&Utc);
+        let now = Utc::now();
+        let auth_filter = if authenticated_only {
+            " AND EXISTS (
+                SELECT 1
+                FROM merge_receipt_handoff_receipts hhr
+                JOIN merge_receipt_handoffs h ON h.envelope_id = hhr.envelope_id
+                WHERE hhr.receipt_id = merge_receipts.receipt_id
+                  AND h.repo = merge_receipts.repo
+                  AND h.project = merge_receipts.project
+                  AND h.base_branch = merge_receipts.base_branch
+            )"
+        } else {
+            ""
         };
-        let unique = safe.into_iter().collect::<std::collections::BTreeSet<_>>();
+        let mut q = conn.prepare(&format!(
+            "SELECT schema, receipt_id, repo, project, base_branch, pr, head_sha,
+                    validated_head_sha, merge_commit_sha, merged_at, safe_merge,
+                    source, required_checks_json, gate_receipt_sha256, evidence
+               FROM merge_receipts
+              WHERE {project_filter}{auth_filter}"
+        ))?;
+        let rows = q.query_map(rusqlite::params![any, short, full], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, i64>(10)? == 1,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
+            ))
+        })?;
+        let mut safe = Vec::new();
+        for row in rows {
+            let (
+                schema,
+                receipt_id,
+                repo,
+                project,
+                base_branch,
+                pr,
+                head_sha,
+                validated_head_sha,
+                merge_commit_sha,
+                merged_at,
+                safe_merge,
+                source,
+                required_checks_json,
+                gate_receipt_sha256,
+                evidence,
+            ) = row?;
+            let required_checks = serde_json::from_str(&required_checks_json).map_err(|error| {
+                format!("stored merge receipt {receipt_id} has invalid required checks: {error}")
+            })?;
+            let merged_at = DateTime::parse_from_rfc3339(&merged_at)?.with_timezone(&Utc);
+            let receipt = crate::metrics::merge_receipt::MergeReceipt {
+                schema,
+                receipt_id: receipt_id.clone(),
+                repo: repo.clone(),
+                project,
+                base_branch,
+                pr,
+                head_sha,
+                validated_head_sha,
+                merge_commit_sha,
+                merged_at,
+                safe_merge,
+                source,
+                required_checks,
+                gate_receipt_sha256,
+                evidence,
+            };
+            receipt.validate().map_err(|error| {
+                format!("stored merge receipt {receipt_id} is invalid: {error}")
+            })?;
+            if receipt.base_branch == SCORECARD_BASE_BRANCH
+                && receipt.merged_at >= cutoff
+                && receipt.merged_at < now
+            {
+                safe.push((repo, receipt.head_sha, pr));
+            }
+        }
+        let mut unique =
+            std::collections::BTreeMap::<(String, String), std::collections::BTreeSet<i64>>::new();
+        for (repo, head, pr) in safe {
+            unique.entry((repo, head)).or_default().insert(pr);
+        }
         let total = unique.len();
         let mut joined = 0_usize;
         let mut wasted = 0_i64;
         let mut samples = 0_usize;
         let mut duration_gaps = 0_usize;
-        for (repo, head, pr) in unique {
-            let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND run.sha = ?2 AND run.pr = ?3 AND job.completed_at IS NOT NULL")?;
-            let mut matched = false;
-            let mut invalid_duration = false;
-            for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
-            })? {
-                let (_, ms) = row?;
-                if ms.is_none_or(|v| v < 0) {
-                    // A completed row with NULL/negative duration cannot
-                    // substantiate a cost join. Keep the merge unjoined so
-                    // the scorecard cannot report a zero-cost claim.
-                    invalid_duration = true;
-                    continue;
+        for ((repo, head), prs) in unique {
+            let mut q = conn.prepare("SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id WHERE lower(trim(run.repo)) = ?1 AND (run.head_sha = ?2 OR run.sha = ?2) AND run.pr = ?3 AND run.provenance = 'production' AND run.provenance_verified = 1 AND job.completed_at IS NOT NULL")?;
+            let mut matched_pr = None;
+            for pr in prs {
+                let mut pr_matched = false;
+                let mut pr_invalid_duration = false;
+                for row in q.query_map(rusqlite::params![repo, head, pr], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+                })? {
+                    let (status, ms) = row?;
+                    if status == "skipped" {
+                        continue;
+                    }
+                    if ms.is_none_or(|v| v < 0) {
+                        // A completed row with NULL/negative duration cannot
+                        // substantiate a cost join. Keep the merge unjoined so
+                        // the scorecard cannot report a zero-cost claim.
+                        pr_invalid_duration = true;
+                        continue;
+                    }
+                    pr_matched = true;
                 }
-                matched = true;
+                if pr_matched && !pr_invalid_duration {
+                    matched_pr = Some(pr);
+                    break;
+                }
             }
-            if matched && !invalid_duration {
+            if let Some(pr) = matched_pr {
                 // The merged head proved the join; the change's waste is every
                 // failed or cancelled job of its pull request, earlier pushes
                 // included, not only the jobs on the head that merged.
@@ -1070,6 +1740,247 @@ impl MetricsStore {
             }
         }
         Ok((total, joined, wasted, samples, duration_gaps))
+    }
+
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    fn fleet_capacity_denominator(
+        &self,
+        project: &str,
+        cutoff: &str,
+        check_time: &str,
+    ) -> Result<FleetCapacityDenominator, Box<dyn std::error::Error>> {
+        let conn = self.connect()?;
+        let key = crate::metrics::project_key::ProjectKey::parse(project);
+        let (any, short, full) = crate::metrics::project_key::sql_params(key.as_ref());
+        let project_filter = crate::metrics::project_key::sql_filter("repo", "repo");
+        let mut statement = conn.prepare(&format!(
+            "SELECT repo, observed_at, valid_until, sample_id, host_id, target, verification, eligible_slots
+               FROM fleet_capacity_samples
+              WHERE {project_filter} AND valid_until > ?4 AND observed_at < ?5
+              ORDER BY repo, host_id, target, observed_at"
+        ))?;
+        let rows = statement.query_map(params![any, short, full, cutoff, check_time], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+            ))
+        })?;
+        let mut samples = Vec::new();
+        for row in rows {
+            let (repo, observed, valid_until, sample_id, host, target, verification, eligible) =
+                row?;
+            let observed = DateTime::parse_from_rfc3339(&observed)?.with_timezone(&Utc);
+            let valid_until = DateTime::parse_from_rfc3339(&valid_until)?.with_timezone(&Utc);
+            samples.push((
+                repo,
+                observed,
+                valid_until,
+                sample_id,
+                host,
+                target,
+                verification,
+                eligible,
+            ));
+        }
+        let sample_count = samples.len();
+        let check_time = DateTime::parse_from_rfc3339(check_time)?.with_timezone(&Utc);
+        // Freshness is about the evidence that is current at the scorecard
+        // boundary, not the longest validity interval anywhere in the
+        // historical window.  Keep a per host/target latest observation so a
+        // current unknown result cannot inherit an older verified interval.
+        let mut current_observations: BTreeMap<
+            (String, String, String),
+            (DateTime<Utc>, DateTime<Utc>, String, Option<i64>),
+        > = BTreeMap::new();
+        for (repo, observed, valid_until, _, host, target, verification, eligible) in &samples {
+            if *observed > check_time || *valid_until <= check_time {
+                continue;
+            }
+            let key = (repo.clone(), host.clone(), target.clone());
+            let candidate = (*observed, *valid_until, verification.clone(), *eligible);
+            let replace = current_observations.get(&key).is_none_or(|existing| {
+                candidate.0 > existing.0
+                    || (candidate.0 == existing.0
+                        && (candidate.2 == "unknown")
+                        && (existing.2 != "unknown"))
+            });
+            if replace {
+                current_observations.insert(key, candidate);
+            }
+        }
+        let current_verified_positive =
+            current_observations
+                .values()
+                .any(|(_, _, verification, eligible)| {
+                    verification == "verified" && eligible.is_some_and(|slots| slots > 0)
+                });
+        let current_latest_valid_until = current_observations
+            .values()
+            .filter(|(_, _, verification, eligible)| {
+                verification == "verified" && eligible.is_some_and(|slots| slots > 0)
+            })
+            .map(|(_, valid_until, _, _)| *valid_until)
+            .max();
+        let latest_verified_valid_until = samples
+            .iter()
+            .filter(|(_, _, _, _, _, _, verification, eligible)| {
+                verification == "verified" && eligible.is_some_and(|slots| slots > 0)
+            })
+            .map(|(_, _, valid_until, _, _, _, _, _)| *valid_until)
+            .max();
+        let verified_samples = samples
+            .iter()
+            .filter(|(_, _, _, _, _, _, verification, _)| verification == "verified")
+            .count();
+        let unknown_samples = sample_count.saturating_sub(verified_samples);
+        let mut groups: BTreeMap<
+            (String, String, String),
+            Vec<(
+                DateTime<Utc>,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                String,
+                String,
+                Option<i64>,
+            )>,
+        > = BTreeMap::new();
+        let window_start = DateTime::parse_from_rfc3339(cutoff)?.with_timezone(&Utc);
+        let mut hosts = BTreeSet::new();
+        for (repo, observed, valid_until, sample_id, host, target, verification, eligible) in
+            samples
+        {
+            hosts.insert((repo.clone(), host.clone(), target.clone()));
+            let start = observed.max(window_start);
+            let end = valid_until.min(check_time);
+            if end > start {
+                groups.entry((repo, host, target)).or_default().push((
+                    start,
+                    end,
+                    observed,
+                    sample_id,
+                    verification,
+                    eligible,
+                ));
+            }
+        }
+        let mut eligible_slot_seconds = 0_i64;
+        let mut coverage_gap = false;
+        for intervals in groups.values() {
+            // Sweep interval boundaries once instead of scanning every interval
+            // for every segment. Unknown observations win equal-timestamp ties.
+            let mut events: BTreeMap<DateTime<Utc>, Vec<(bool, usize)>> = BTreeMap::new();
+            let mut keys = Vec::with_capacity(intervals.len());
+            for (index, (start, end, observed, sample_id, verification, _)) in
+                intervals.iter().enumerate()
+            {
+                events.entry(*start).or_default().push((true, index));
+                events.entry(*end).or_default().push((false, index));
+                keys.push((
+                    *observed,
+                    *verification == "unknown",
+                    sample_id.clone(),
+                    index,
+                ));
+            }
+            let mut active = std::collections::BTreeSet::new();
+            let mut previous = None;
+            let mut covered_until = window_start;
+            for (time, changes) in events {
+                if let Some(start) = previous
+                    && time > start
+                    && let Some((_, _, _, index)) = active.iter().next_back()
+                {
+                    let (_, _, _, _, verification, slots) = &intervals[*index];
+                    let slots: i64 = (verification == "verified")
+                        .then_some(*slots)
+                        .flatten()
+                        .filter(|slots| *slots >= 0)
+                        .unwrap_or(0);
+                    eligible_slot_seconds = eligible_slot_seconds
+                        .saturating_add(slots.saturating_mul((time - start).num_seconds().max(0)));
+                    if start > covered_until {
+                        coverage_gap = true;
+                    }
+                    covered_until = time;
+                }
+                for (is_start, index) in changes {
+                    if is_start {
+                        active.insert(keys[index].clone());
+                    } else {
+                        active.remove(&keys[index]);
+                    }
+                }
+                previous = Some(time);
+            }
+            if covered_until < check_time {
+                coverage_gap = true;
+            }
+        }
+        let status = if sample_count == 0 {
+            "unavailable"
+        } else if unknown_samples > 0 || coverage_gap {
+            "partial"
+        } else {
+            "available"
+        };
+        let reason = if sample_count == 0 {
+            "no fleet-capacity samples overlap the scorecard window".to_owned()
+        } else if unknown_samples > 0 || coverage_gap {
+            let mut reasons = Vec::new();
+            if unknown_samples > 0 {
+                reasons.push(format!(
+                    "{verified_samples} verified and {unknown_samples} unknown fleet-capacity samples; denominator is a lower bound"
+                ));
+            }
+            if coverage_gap {
+                reasons.push("capacity coverage has gaps in the scorecard window".to_owned());
+            }
+            reasons.join("; ")
+        } else {
+            format!("{verified_samples} verified fleet-capacity samples")
+        };
+        let usable_verified_capacity = verified_samples > 0 && eligible_slot_seconds > 0;
+        let (freshness_status, freshness_reason, latest_valid_until) = if current_observations
+            .is_empty()
+        {
+            // No current observation means historical coverage may still
+            // be measurable, but it cannot be fresh.  Preserve the
+            // verified interval for an honest stale explanation.
+            let (status, reason) = fleet_capacity_freshness(
+                latest_verified_valid_until,
+                check_time,
+                usable_verified_capacity,
+            );
+            (status, reason, latest_verified_valid_until)
+        } else {
+            let freshness_valid_until = current_latest_valid_until.or(latest_verified_valid_until);
+            let (status, reason) = fleet_capacity_freshness(
+                freshness_valid_until,
+                check_time,
+                current_verified_positive,
+            );
+            (status, reason, freshness_valid_until)
+        };
+        Ok(FleetCapacityDenominator {
+            status: status.to_owned(),
+            reason,
+            freshness_status: freshness_status.to_owned(),
+            latest_valid_until,
+            freshness_reason,
+            sample_count,
+            verified_samples,
+            unknown_samples,
+            host_target_count: hosts.len(),
+            #[allow(clippy::cast_precision_loss)]
+            eligible_slot_hours: (verified_samples > 0)
+                .then_some(eligible_slot_seconds as f64 / 3600.0),
+        })
     }
 
     /// Record a queue repeated-work observation without affecting queue
@@ -1169,42 +2080,6 @@ impl MetricsStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Aggregate shadow observations. Durations remain unavailable until a
-    /// provenance-safe queue-to-metrics linkage exists.
-    pub fn repeated_work_cost(
-        &self,
-        limit: usize,
-    ) -> Result<RepeatedWorkCostSummary, Box<dyn std::error::Error>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT kind, job_id FROM repeated_work_shadow ORDER BY observed_at DESC, id DESC LIMIT ?1")?;
-        let ids = stmt.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut out = RepeatedWorkCostSummary {
-            cost_basis: "avoided_repeated_work",
-            observations: 0,
-            superseded_exact_head: 0,
-            duplicate_exact_head_config: 0,
-            joined_durations: 0,
-            unknown_durations: 0,
-            duration_ms: None,
-        };
-        for item in ids {
-            let (kind, job_id) = item?;
-            out.observations += 1;
-            match kind.as_str() {
-                "superseded_exact_head" => out.superseded_exact_head += 1,
-                "duplicate_exact_head_config" => out.duplicate_exact_head_config += 1,
-                _ => {}
-            }
-            // Queue ids (`sy-...`) are not SQLite job identities. Without an
-            // authenticated linkage, every duration remains unavailable.
-            let _ = job_id;
-            out.unknown_durations += 1;
-        }
-        Ok(out)
-    }
-
     /// Record one low-friction timing row.
     pub fn record(&self, input: &MetricRecordInput) -> Result<i64, Box<dyn std::error::Error>> {
         self.record_with_refresh(input, false)
@@ -1284,6 +2159,9 @@ impl MetricsStore {
             .zip(input.started_at)
             .map(|(queued, started)| (started - queued).num_milliseconds())
             .filter(|value| *value >= 0);
+        if input.provenance_verified && input.provenance.as_deref() == Some("production") {
+            ensure_authenticated_identity_complete(input)?;
+        }
         if let Some(provider) = input.provider.as_deref()
             && let Some(existing) =
                 existing_job_id(conn, provider, input.external_id.as_deref())?.or(
@@ -1404,6 +2282,55 @@ impl MetricsStore {
                 imported += 1;
             }
         }
+        Ok(imported)
+    }
+
+    /// Import validated `TartCI` fleet-capacity observations atomically.
+    pub fn import_fleet_capacity(&self, text: &str) -> Result<usize, Box<dyn std::error::Error>> {
+        let samples = crate::metrics::fleet_capacity::parse_reader(text.as_bytes())?;
+        let _writer_domain = crate::writer_domain_lease::acquire_for_protected_path(&self.path)?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut imported = 0;
+        for sample in samples {
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO fleet_capacity_samples
+                 (sample_id,schema,observed_at,valid_until,host_id,host_boot_id,generation,
+                  repo,target,profile_sha256,configured_slots,eligible_slots,free_slots,
+                  occupied_slots,in_flight_slots,unknown_slots,pool_state,source,auth_method,
+                 verification,evidence_json,evidence_sha256,census_sha256,reason,imported_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+                params![
+                    sample.sample_id,
+                    sample.schema,
+                    sample.observed_at.to_rfc3339(),
+                    sample.valid_until.to_rfc3339(),
+                    sample.host_id,
+                    sample.host_boot_id,
+                    sample.generation,
+                    sample.repo,
+                    sample.target,
+                    sample.profile_sha256,
+                    sample.configured_slots,
+                    sample.eligible_slots,
+                    sample.free_slots,
+                    sample.occupied_slots,
+                    sample.in_flight_slots,
+                    sample.unknown_slots,
+                    sample.pool_state,
+                    sample.source,
+                    sample.auth_method,
+                    sample.verification,
+                    serde_json::to_string(&sample.evidence)?,
+                    sample.evidence_sha256,
+                    sample.census_sha256,
+                    sample.reason,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            imported += changed;
+        }
+        tx.commit()?;
         Ok(imported)
     }
 
@@ -1651,16 +2578,37 @@ impl MetricsStore {
         split_days_ago: i64,
         basis: proxy::Basis,
     ) -> Result<Vec<MetricsFinding>, Box<dyn std::error::Error>> {
+        self.compare_with_windows(project, split_days_ago, None, None, basis)
+    }
+
+    /// Compare before/after windows with optional bounded sides.
+    pub fn compare_with_windows(
+        &self,
+        project: &str,
+        split_days_ago: i64,
+        before_days: Option<i64>,
+        after_days: Option<i64>,
+        basis: proxy::Basis,
+    ) -> Result<Vec<MetricsFinding>, Box<dyn std::error::Error>> {
         let conn = self.connect()?;
+        let now = Utc::now();
         if basis == proxy::Basis::WallTime {
             let rows = load_summary_inputs(&conn, Some(project))?;
-            return Ok(compare_findings(rows, split_days_ago));
+            return Ok(compare_findings(
+                rows,
+                split_days_ago,
+                before_days,
+                after_days,
+                now,
+            ));
         }
         let samples = proxy_store::load_samples(&conn, Some(project))?;
         Ok(proxy_store::compare_findings(
             &samples,
             split_days_ago,
-            Utc::now(),
+            before_days,
+            after_days,
+            now,
         ))
     }
 
@@ -1727,6 +2675,10 @@ impl MetricsStore {
                     && (proxy::is_failure(status) || proxy::is_cancelled(status))
             })
             .count();
+        let wasted_candidates = samples
+            .iter()
+            .filter(|(status, _, _, _, _)| proxy::is_failure(status) || proxy::is_cancelled(status))
+            .count();
         let wasted_compute_ms = samples
             .iter()
             .filter(|(status, _, _, _, _)| proxy::is_failure(status) || proxy::is_cancelled(status))
@@ -1750,6 +2702,25 @@ impl MetricsStore {
             .filter_map(|(_, _, queue, _, _)| *queue)
             .filter(|value| *value >= 0)
             .fold(0_i64, i64::saturating_add);
+        let coordination_coverage = coverage_for_samples(
+            queues.len(),
+            samples.len(),
+            "completed job samples include authoritative queue timing",
+        );
+        let rework_coverage = coverage_for_failures(
+            rework_samples,
+            failed_jobs,
+            samples.len(),
+            "failed attempts include measured duration",
+        );
+        let wasted_coverage = coverage_for_failures(
+            wasted_samples,
+            wasted_candidates,
+            samples.len(),
+            "failed/cancelled jobs include measured duration",
+        );
+        let coordination_rework_coverage =
+            combine_cost_coverage(&coordination_coverage, &rework_coverage);
         let distinct_pull_requests = samples
             .iter()
             .filter_map(|(_, _, _, repo, pr)| Some((repo.as_deref()?, (*pr)?)))
@@ -1792,6 +2763,10 @@ impl MetricsStore {
             wasted_duration_gaps,
         ) = self.safe_merge_summary(project, &cutoff)?;
         let now = Utc::now();
+        let fleet_capacity =
+            self.fleet_capacity_denominator(project, &cutoff, &now.to_rfc3339())?;
+        let safely_merged_changes_per_eligible_slot_hour =
+            safe_merge_rate(safe_merge_count, &fleet_capacity);
         let (proxies, comparison) = proxy_store::scorecard_window(
             &proxy_store::load_samples(&conn, Some(project))?,
             now,
@@ -1818,13 +2793,17 @@ impl MetricsStore {
             queue_p90_ms: percentile(&queues, 90),
             wasted_compute_minutes: millis_to_minutes(wasted_compute_ms),
             wasted_compute_samples: wasted_samples,
+            wasted_compute_coverage: wasted_coverage,
             coordination_minutes: millis_to_minutes(coordination_ms),
             coordination_samples: queues.len(),
+            coordination_coverage,
             rework_compute_minutes: millis_to_minutes(rework_compute_ms),
             rework_compute_samples: rework_samples,
+            rework_compute_coverage: rework_coverage,
             coordination_rework_minutes: millis_to_minutes(
                 rework_compute_ms.saturating_add(coordination_ms),
             ),
+            coordination_rework_coverage,
             safely_merged_changes: ScorecardCoverage {
                 status: if joined_merge_count == 0 {
                     "unavailable"
@@ -1889,6 +2868,8 @@ impl MetricsStore {
                 reason: "job metrics do not store model call or token counters".to_owned(),
                 value: None,
             },
+            fleet_capacity,
+            safely_merged_changes_per_eligible_slot_hour,
             basis: basis.as_str(),
             proxies,
             comparison,
@@ -2061,15 +3042,37 @@ impl MetricsStore {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn ensure_refresh_identity_compatible(
     conn: &Connection,
     job_id: i64,
     input: &MetricRecordInput,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stored: (Option<String>, Option<i64>, Option<i64>, Option<String>) = conn.query_row(
-        "SELECT event, run_attempt, provider_run_id, head_sha FROM runs WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
+    let stored: (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    ) = conn.query_row(
+        "SELECT event, run_attempt, provider_run_id, head_sha, sha, repo, branch, pr
+           FROM runs WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
         [job_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
     )?;
     for (name, old, new) in [
         ("event", stored.0, input.event.clone()),
@@ -2084,12 +3087,66 @@ fn ensure_refresh_identity_compatible(
             input.provider_run_id.map(|v| v.to_string()),
         ),
         ("head_sha", stored.3, input.head_sha.clone()),
+        ("sha", stored.4, input.sha.clone()),
+        ("repo", stored.5, input.repo.clone()),
+        ("branch", stored.6, input.branch.clone()),
+        (
+            "pr",
+            stored.7.map(|v| v.to_string()),
+            input.pr.map(|v| v.to_string()),
+        ),
     ] {
-        if let (Some(old), Some(new)) = (old, new)
-            && old != new
-        {
-            return Err(format!("existing job identity conflict in {name}").into());
+        if let (Some(old), Some(new)) = (old, new) {
+            let equal = if name == "repo" {
+                old.trim().eq_ignore_ascii_case(new.trim())
+            } else {
+                old == new
+            };
+            if !equal {
+                return Err(format!("existing job identity conflict in {name}").into());
+            }
         }
+    }
+    Ok(())
+}
+
+fn ensure_authenticated_identity_complete(
+    input: &MetricRecordInput,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let provenance = input.provenance.as_deref();
+    if !matches!(provenance, Some("production" | "synthetic")) {
+        return Err("verified metrics provenance requires production or synthetic label".into());
+    }
+    if input
+        .external_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("verified metrics provenance requires provider external identity".into());
+    }
+    if input
+        .provider
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("verified metrics provenance requires provider identity".into());
+    }
+    if input
+        .repo
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("verified metrics provenance requires repository identity".into());
+    }
+    if input.event.as_deref().is_none_or(str::is_empty)
+        || input.run_attempt.is_none_or(|value| value <= 0)
+        || input.provider_run_id.is_none_or(|value| value <= 0)
+        || input
+            .head_sha
+            .as_deref()
+            .is_none_or(|value| !is_exact_sha(value))
+    {
+        return Err("verified metrics provenance requires complete run identity".into());
     }
     Ok(())
 }
@@ -2347,7 +3404,9 @@ fn pull_request_waste(
 ) -> Result<(i64, usize, usize), rusqlite::Error> {
     let mut q = conn.prepare(
         "SELECT job.status, job.total_ms FROM jobs job JOIN runs run ON run.id = job.run_id \
-         WHERE lower(trim(run.repo)) = ?1 AND run.pr = ?2 AND job.completed_at IS NOT NULL",
+         WHERE lower(trim(run.repo)) = ?1 AND run.pr = ?2 \
+           AND run.provenance = 'production' AND run.provenance_verified = 1
+           AND job.completed_at IS NOT NULL",
     )?;
     let mut wasted = 0_i64;
     let mut samples = 0_usize;
@@ -2378,6 +3437,81 @@ fn unavailable_merge_coverage() -> ScorecardCoverage {
     }
 }
 
+fn fleet_capacity_freshness(
+    latest_valid_until: Option<DateTime<Utc>>,
+    check_time: DateTime<Utc>,
+    usable_verified_capacity: bool,
+) -> (&'static str, String) {
+    let Some(valid_until) = latest_valid_until else {
+        return (
+            "unavailable",
+            "no fleet-capacity validity interval is available".to_owned(),
+        );
+    };
+    if !usable_verified_capacity {
+        return (
+            "unavailable",
+            "current fleet-capacity evidence has no verified eligible slot-hours".to_owned(),
+        );
+    }
+    if valid_until > check_time {
+        (
+            "fresh",
+            format!("latest fleet-capacity evidence is valid until {valid_until}"),
+        )
+    } else {
+        (
+            "stale",
+            format!("latest fleet-capacity evidence expired at {valid_until}"),
+        )
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn safe_merge_rate(
+    safe_merge_count: usize,
+    capacity: &FleetCapacityDenominator,
+) -> ScorecardCoverage {
+    let Some(hours) = capacity.eligible_slot_hours.filter(|value| *value > 0.0) else {
+        let reason = if safe_merge_count == 0 {
+            "no durable safe-merge receipt heads or positive eligible fleet-hours"
+        } else if capacity.eligible_slot_hours == Some(0.0) {
+            "eligible fleet-hours are zero; safely merged changes per eligible fleet-hour is undefined"
+        } else {
+            "eligible fleet-hours are unavailable; safely merged changes per eligible fleet-hour is unavailable"
+        };
+        return ScorecardCoverage {
+            status: "unavailable".to_owned(),
+            reason: reason.to_owned(),
+            value: None,
+        };
+    };
+    if safe_merge_count == 0 {
+        return ScorecardCoverage {
+            status: "unavailable".to_owned(),
+            reason: "no durable safe-merge receipt heads in the scorecard window".to_owned(),
+            value: None,
+        };
+    }
+
+    let rate = safe_merge_count as f64 / hours;
+    let partial = capacity.status != "available";
+    let reason = if partial {
+        format!(
+            "{safe_merge_count} distinct safe merge receipt heads / {hours:.6} eligible fleet-hours; denominator is a verified lower bound, so the reported rate may be overstated"
+        )
+    } else {
+        format!(
+            "{safe_merge_count} distinct safe merge receipt heads / {hours:.6} eligible fleet-hours"
+        )
+    };
+    ScorecardCoverage {
+        status: if partial { "partial" } else { "available" }.to_owned(),
+        reason,
+        value: Some(rate),
+    }
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn pull_requests_per_day(distinct_pull_requests: usize, since_days: i64) -> f64 {
     distinct_pull_requests as f64 / since_days as f64
@@ -2403,6 +3537,47 @@ fn coverage_for_samples(measured: usize, total: usize, description: &str) -> Sco
     }
 }
 
+/// Coverage of a measurement taken over failed attempts only. When the window
+/// holds completed samples but none failed, the zero-cost proxy is a complete
+/// measurement rather than a missing one; with no samples at all it stays
+/// unavailable.
+fn coverage_for_failures(
+    measured: usize,
+    failures: usize,
+    completed_samples: usize,
+    description: &str,
+) -> ScorecardCoverage {
+    if failures == 0 && completed_samples > 0 {
+        return ScorecardCoverage {
+            status: "available".to_owned(),
+            reason: format!("no failed attempts among {completed_samples} completed job samples"),
+            value: None,
+        };
+    }
+    coverage_for_samples(measured, failures, description)
+}
+
+fn combine_cost_coverage(
+    coordination: &ScorecardCoverage,
+    rework: &ScorecardCoverage,
+) -> ScorecardCoverage {
+    let status = if coordination.status == "available" && rework.status == "available" {
+        "available"
+    } else if coordination.status == "unavailable" && rework.status == "unavailable" {
+        "unavailable"
+    } else {
+        "partial"
+    };
+    ScorecardCoverage {
+        status: status.to_owned(),
+        reason: format!(
+            "coordination timing: {}; rework timing: {}",
+            coordination.reason, rework.reason
+        ),
+        value: None,
+    }
+}
+
 fn migrate_repeated_work_shadow(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS repeated_work_shadow (
@@ -2418,7 +3593,9 @@ fn migrate_repeated_work_shadow(conn: &Connection) -> Result<(), rusqlite::Error
            superseded_sha TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS repeated_work_shadow_observed_at
-           ON repeated_work_shadow(observed_at DESC);",
+           ON repeated_work_shadow(observed_at DESC);
+         CREATE INDEX IF NOT EXISTS repeated_work_shadow_superseded_job
+           ON repeated_work_shadow(superseded_job_id);",
     )
 }
 
@@ -2648,6 +3825,9 @@ fn refresh_existing_job(
     let started_at = started_at.to_rfc3339();
     let completed_at = completed_at.to_rfc3339();
     let step = input.step.as_deref().unwrap_or("total");
+    let authenticated_rebind = input.provenance_verified
+        && input.provenance.as_deref() == Some("production")
+        && input.provider.is_some();
     conn.execute(
         "UPDATE jobs
             SET queued_at = COALESCE(?2, queued_at), started_at = ?3, completed_at = ?4, run_ms = ?5, total_ms = ?5,
@@ -2681,13 +3861,17 @@ fn refresh_existing_job(
     )?;
     conn.execute(
         "UPDATE runs
-            SET ts = ?2, project = ?3, repo = COALESCE(?4, repo),
-                branch = COALESCE(?5, branch), sha = COALESCE(?6, sha),
+            SET ts = ?2, project = ?3,
+                repo = CASE WHEN ?18 THEN ?4 ELSE COALESCE(?4, repo) END,
+                branch = COALESCE(?5, branch),
+                sha = CASE WHEN ?18 THEN ?6 ELSE COALESCE(?6, sha) END,
                 pr = COALESCE(?7, pr), workflow = COALESCE(?8, workflow),
                 profile = COALESCE(?9, profile),
                 routing_decision = COALESCE(?10, routing_decision), status = ?11,
-                event = COALESCE(event, ?12), provider_run_id = COALESCE(provider_run_id, ?13),
-                run_attempt = COALESCE(run_attempt, ?14), head_sha = COALESCE(head_sha, ?15),
+                event = CASE WHEN ?18 THEN ?12 ELSE COALESCE(event, ?12) END,
+                provider_run_id = CASE WHEN ?18 THEN ?13 ELSE COALESCE(provider_run_id, ?13) END,
+                run_attempt = CASE WHEN ?18 THEN ?14 ELSE COALESCE(run_attempt, ?14) END,
+                head_sha = CASE WHEN ?18 THEN ?15 ELSE COALESCE(head_sha, ?15) END,
                 provenance = CASE WHEN ?17 AND ?16 IS NOT NULL THEN ?16 ELSE provenance END,
                 provenance_verified = MAX(provenance_verified, (?17 AND ?16 IS NOT NULL))
           WHERE id = (SELECT run_id FROM jobs WHERE id = ?1)",
@@ -2709,6 +3893,7 @@ fn refresh_existing_job(
             input.head_sha,
             input.provenance,
             input.provenance_verified,
+            authenticated_rebind,
         ],
     )?;
     let updated_steps = conn.execute(
@@ -3278,8 +4463,18 @@ fn advise_findings(rows: Vec<SummaryInput>) -> Vec<MetricsFinding> {
     findings
 }
 
-fn compare_findings(rows: Vec<SummaryInput>, split_days_ago: i64) -> Vec<MetricsFinding> {
-    let split = Utc::now() - Duration::days(split_days_ago.max(1));
+fn compare_findings(
+    rows: Vec<SummaryInput>,
+    split_days_ago: i64,
+    before_days: Option<i64>,
+    after_days: Option<i64>,
+    now: DateTime<Utc>,
+) -> Vec<MetricsFinding> {
+    let Some((before_start, split, after_end)) =
+        compare_window_bounds(split_days_ago, before_days, after_days, now)
+    else {
+        return Vec::new();
+    };
     let mut groups: BTreeMap<String, (Vec<i64>, Vec<i64>)> = BTreeMap::new();
     for row in rows {
         if !(row.status == "pass" || row.status == "success") {
@@ -3292,9 +4487,9 @@ fn compare_findings(rows: Vec<SummaryInput>, split_days_ago: i64) -> Vec<Metrics
             continue;
         };
         let lane = format!("{}/{}/{}", row.target, row.backend, row.host);
-        if completed_at < split {
+        if completed_at >= before_start && completed_at < split {
             groups.entry(lane).or_default().0.push(total_ms);
-        } else {
+        } else if completed_at >= split && completed_at < after_end {
             groups.entry(lane).or_default().1.push(total_ms);
         }
     }
@@ -3333,6 +4528,35 @@ fn compare_findings(rows: Vec<SummaryInput>, split_days_ago: i64) -> Vec<Metrics
         });
     }
     findings
+}
+
+/// Return the half-open bounds used by both proxy and wall-time comparisons.
+///
+/// Extremely large public-API windows must not panic while constructing a
+/// `chrono::Duration` or moving a timestamp. Saturating the optional side
+/// keeps a valid split useful; an unrepresentable split yields no findings.
+pub(super) fn compare_window_bounds(
+    split_days_ago: i64,
+    before_days: Option<i64>,
+    after_days: Option<i64>,
+    now: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> {
+    let split = now.checked_sub_signed(Duration::try_days(split_days_ago.max(1))?)?;
+    let before_start = match before_days {
+        Some(days) => Duration::try_days(days.max(1))
+            .and_then(|duration| split.checked_sub_signed(duration))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC),
+        None => DateTime::<Utc>::MIN_UTC,
+    };
+    let after_end = match after_days {
+        Some(days) => Duration::try_days(days.max(1))
+            .and_then(|duration| split.checked_add_signed(duration))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC),
+        None => now
+            .checked_add_signed(Duration::seconds(1))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC),
+    };
+    Some((before_start, split, after_end))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -3542,6 +4766,42 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn metrics_migration_indexes_freshness_step_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = Connection::open(store.path()).unwrap();
+        let present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'steps_job_step'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1);
+        let mut plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT 1 FROM jobs
+                 WHERE EXISTS (SELECT 1 FROM steps
+                               WHERE steps.job_id = jobs.id
+                                 AND steps.step = 'github_job')",
+            )
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("steps_job_step")),
+            "freshness probe plan did not use steps_job_step: {details:?}"
+        );
+    }
+
     fn insert_scorecard_sample(
         store: &MetricsStore,
         project: &str,
@@ -3589,6 +4849,433 @@ mod tests {
         }
     }
 
+    /// Marks a PR's runs as verified production without touching `sha` or
+    /// `head_sha`, for tests whose point is how the two heads differ.
+    fn mark_production_runs_keeping_heads(store: &MetricsStore, pr: i64) {
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET provenance='production', provenance_verified=1,
+                    event='pull_request', provider_run_id=?1, run_attempt=1
+                 WHERE pr=?1",
+                [pr],
+            )
+            .unwrap();
+    }
+
+    fn mark_production_runs(store: &MetricsStore, pr: i64) {
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET provenance='production', provenance_verified=1,
+                    event='pull_request', provider_run_id=?1, run_attempt=1, head_sha=sha
+                 WHERE pr=?1",
+                [pr],
+            )
+            .unwrap();
+    }
+
+    fn test_authenticated_envelope(
+        envelope_id: &str,
+        repository: &str,
+        project: &str,
+        receipts: Vec<crate::metrics::merge_receipt::MergeReceipt>,
+    ) -> crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
+        let payload_sha256 =
+            crate::metrics::merge_receipt_handoff::digest_receipts(&receipts).unwrap();
+        crate::metrics::merge_receipt_handoff::AuthenticatedHandoffEnvelope {
+            schema: crate::metrics::merge_receipt_handoff::SCHEMA.to_owned(),
+            envelope_id: envelope_id.to_owned(),
+            repository: repository.to_owned(),
+            project: project.to_owned(),
+            base_branch: "main".to_owned(),
+            payload_sha256,
+            receipts,
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            issued_at: "2026-10-28T00:00:00Z".parse().unwrap(),
+            expires_at: "2026-10-28T00:10:00Z".parse().unwrap(),
+        }
+    }
+
+    fn test_authenticated_context(
+        repository: &str,
+        project: &str,
+    ) -> crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
+        crate::metrics::merge_receipt_handoff::AuthenticatedProducerContext {
+            repository: repository.to_owned(),
+            project: project.to_owned(),
+            base_branch: "main".to_owned(),
+            producer_host_id: "m1".to_owned(),
+            producer_session_generation: 7,
+            route: crate::parallel_proof_canary::CanaryRoute::Lan,
+            destination: "shipyard@m1.local".to_owned(),
+            known_hosts_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"known-hosts"),
+            executable_sha256: crate::parallel_proof::Sha256Digest::of_bytes(b"shipyard"),
+            now: "2026-10-28T00:05:00Z".parse().unwrap(),
+            max_age: Duration::minutes(15),
+            max_future_skew: Duration::minutes(2),
+        }
+    }
+
+    fn test_capacity_sample(
+        observed_at: DateTime<Utc>,
+        host: &str,
+        verification: &str,
+    ) -> crate::metrics::fleet_capacity::FleetCapacitySample {
+        let mut sample = crate::metrics::fleet_capacity::FleetCapacitySample {
+            schema: crate::metrics::fleet_capacity::SCHEMA.to_owned(),
+            sample_id: String::new(),
+            observed_at,
+            valid_until: observed_at + Duration::minutes(2),
+            host_id: host.to_owned(),
+            host_boot_id: format!("boot-{host}"),
+            generation: "gen-1".to_owned(),
+            repo: "danielraffel/Shipyard".to_owned(),
+            target: "macos".to_owned(),
+            profile_sha256: "a".repeat(64),
+            configured_slots: 3,
+            eligible_slots: (verification == "verified").then_some(3),
+            free_slots: (verification == "verified").then_some(1),
+            occupied_slots: (verification == "verified").then_some(1),
+            in_flight_slots: (verification == "verified").then_some(1),
+            unknown_slots: if verification == "verified" { 0 } else { 3 },
+            pool_state: "on".to_owned(),
+            source: "tartci".to_owned(),
+            auth_method: "untrusted_local".to_owned(),
+            verification: verification.to_owned(),
+            evidence: serde_json::json!({
+                "schema": "tartci.gate-supply/v1",
+                "host": host,
+                "repo": "danielraffel/Shipyard",
+                "class": "macos",
+                "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "verdict": "ok",
+                "pool": "on",
+                "free": 1,
+                "occupied": 1,
+                "in_flight": 1,
+                "lanes": [{"state": "free"}, {"state": "occupied"}, {"state": "occupied"}]
+            }),
+            evidence_sha256: String::new(),
+            census_sha256: String::new(),
+            reason: (verification == "unknown").then(|| "stale".to_owned()),
+        };
+        sample.evidence_sha256 = crate::metrics::fleet_capacity::digest_value(&sample.evidence)
+            .expect("capacity evidence digest");
+        let evidence = sample.evidence.as_object().unwrap();
+        let census = [
+            "schema", "host", "repo", "class", "verdict", "pool", "lanes",
+        ]
+        .into_iter()
+        .map(|key| {
+            (
+                key.to_owned(),
+                evidence.get(key).cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect();
+        sample.census_sha256 = crate::metrics::fleet_capacity::digest_value(&Value::Object(census))
+            .expect("capacity census digest");
+        sample.sample_id = crate::metrics::fleet_capacity::canonical_digest(&sample, true)
+            .expect("capacity sample digest");
+        sample
+    }
+
+    #[test]
+    fn wall_time_compare_uses_the_same_half_open_windows() {
+        let now = Utc::now();
+        let row = |days_ago: i64| SummaryInput {
+            project: "p".to_owned(),
+            target: "macos".to_owned(),
+            backend: "local".to_owned(),
+            host: "m3".to_owned(),
+            provider: "tart".to_owned(),
+            status: "success".to_owned(),
+            total_ms: Some(60_000),
+            completed_at: Some(now - Duration::days(days_ago)),
+            repo: None,
+            labels: Vec::new(),
+        };
+        let findings = compare_findings(vec![row(9), row(7), row(5)], 7, Some(2), Some(2), now);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].sample_count, 2);
+    }
+
+    #[test]
+    fn wall_time_compare_rejects_unrepresentable_public_window_without_panicking() {
+        assert!(
+            compare_findings(
+                Vec::new(),
+                i64::MAX,
+                Some(i64::MAX),
+                Some(i64::MAX),
+                Utc::now(),
+            )
+            .is_empty()
+        );
+        let (before_start, split, after_end) =
+            compare_window_bounds(1, Some(i64::MAX), Some(i64::MAX), Utc::now())
+                .expect("representable split");
+        assert_eq!(before_start, DateTime::<Utc>::MIN_UTC);
+        assert_eq!(after_end, DateTime::<Utc>::MAX_UTC);
+        assert!(before_start < split && split < after_end);
+    }
+
+    #[test]
+    fn fleet_capacity_import_is_idempotent_and_scorecard_denominator_is_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let observed = Utc::now() - Duration::minutes(1);
+        let verified = test_capacity_sample(observed, "m3", "verified");
+        let unknown = test_capacity_sample(observed, "m5", "unknown");
+        let text = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&verified).unwrap(),
+            serde_json::to_string(&unknown).unwrap()
+        );
+        assert_eq!(store.import_fleet_capacity(&text).unwrap(), 2);
+        assert_eq!(store.import_fleet_capacity(&text).unwrap(), 0);
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.status, "partial");
+        assert_eq!(scorecard.fleet_capacity.sample_count, 2);
+        assert_eq!(scorecard.fleet_capacity.verified_samples, 1);
+        assert_eq!(scorecard.fleet_capacity.unknown_samples, 1);
+        assert_eq!(scorecard.fleet_capacity.freshness_status, "fresh");
+        assert!(scorecard.fleet_capacity.latest_valid_until.is_some());
+        assert!(scorecard.fleet_capacity.eligible_slot_hours.is_some());
+    }
+
+    fn test_capacity_denominator(
+        status: &str,
+        eligible_slot_hours: Option<f64>,
+    ) -> FleetCapacityDenominator {
+        FleetCapacityDenominator {
+            status: status.to_owned(),
+            reason: String::new(),
+            sample_count: 1,
+            verified_samples: usize::from(status == "available"),
+            unknown_samples: usize::from(status == "partial"),
+            host_target_count: 1,
+            eligible_slot_hours,
+            freshness_status: "fresh".to_owned(),
+            freshness_reason: String::new(),
+            latest_valid_until: None,
+        }
+    }
+
+    #[test]
+    fn safe_merge_rate_is_fail_closed_without_capacity_or_receipts() {
+        let no_capacity = safe_merge_rate(2, &test_capacity_denominator("unavailable", None));
+        assert_eq!(no_capacity.status, "unavailable");
+        assert_eq!(no_capacity.value, None);
+
+        let no_receipts = safe_merge_rate(0, &test_capacity_denominator("available", Some(4.0)));
+        assert_eq!(no_receipts.status, "unavailable");
+        assert!(no_receipts.reason.contains("no durable safe-merge"));
+    }
+
+    #[test]
+    fn safe_merge_rate_marks_partial_capacity_as_upper_bound() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("partial", Some(6.0)));
+        assert_eq!(result.status, "partial");
+        assert_eq!(result.value, Some(0.5));
+        assert!(result.reason.contains("lower bound"));
+        assert!(result.reason.contains("may be overstated"));
+    }
+
+    #[test]
+    fn safe_merge_rate_reports_fully_verified_capacity() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("available", Some(6.0)));
+        assert_eq!(result.status, "available");
+        assert_eq!(result.value, Some(0.5));
+        assert!(!result.reason.contains("upper-bound"));
+    }
+
+    #[test]
+    fn safe_merge_rate_rejects_zero_eligible_hours() {
+        let result = safe_merge_rate(3, &test_capacity_denominator("partial", Some(0.0)));
+        assert_eq!(result.status, "unavailable");
+        assert_eq!(result.value, None);
+        assert!(result.reason.contains("zero"));
+    }
+
+    #[test]
+    fn scorecard_reports_safe_merge_rate_from_receipts_and_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 41, "success", 1_000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo = 'danielraffel/Shipyard', sha = ?1 WHERE pr = 41",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        let observed = Utc::now() - Duration::minutes(1);
+        let capacity = test_capacity_sample(observed, "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&capacity).unwrap())
+            .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt(
+                "rate-41",
+                "danielraffel/Shipyard",
+                "shipyard",
+                41,
+                'a',
+            )])
+            .unwrap();
+
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        let rate = &scorecard.safely_merged_changes_per_eligible_slot_hour;
+        assert_eq!(rate.status, "partial");
+        assert!(rate.value.is_some_and(|value| value > 0.0));
+        assert!(rate.reason.contains("eligible fleet-hours"));
+        assert!(rate.reason.contains("may be overstated"));
+        let json = serde_json::to_value(&scorecard).unwrap();
+        assert!(
+            json.get("safely_merged_changes_per_eligible_slot_hour")
+                .and_then(|value| value.get("value"))
+                .and_then(serde_json::Value::as_f64)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn expired_capacity_evidence_is_marked_stale_without_erasing_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let expired = test_capacity_sample(Utc::now() - Duration::hours(2), "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&expired).unwrap())
+            .unwrap();
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.freshness_status, "stale");
+        assert!(
+            scorecard
+                .fleet_capacity
+                .freshness_reason
+                .contains("expired at")
+        );
+        assert_eq!(scorecard.fleet_capacity.sample_count, 1);
+    }
+
+    #[test]
+    fn no_capacity_evidence_is_explicitly_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.freshness_status, "unavailable");
+        assert_eq!(scorecard.fleet_capacity.latest_valid_until, None);
+    }
+
+    #[test]
+    fn fleet_capacity_freshness_requires_usable_verified_capacity_and_strictly_future_validity() {
+        let check_time: DateTime<Utc> = "2026-10-27T12:00:00Z".parse().unwrap();
+        let equal: DateTime<Utc> = "2026-10-27T12:00:00Z".parse().unwrap();
+        let future: DateTime<Utc> = "2026-10-27T12:00:01Z".parse().unwrap();
+
+        let (status, reason) = fleet_capacity_freshness(Some(equal), check_time, true);
+        assert_eq!(status, "stale");
+        assert!(reason.contains("expired at"));
+
+        let (status, _) = fleet_capacity_freshness(Some(future), check_time, true);
+        assert_eq!(status, "fresh");
+
+        let (status, reason) = fleet_capacity_freshness(Some(future), check_time, false);
+        assert_eq!(status, "unavailable");
+        assert!(reason.contains("no verified eligible slot-hours"));
+    }
+
+    #[test]
+    fn unknown_latest_capacity_observation_suppresses_overlapping_verified_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let now = Utc::now();
+        let verified = test_capacity_sample(now - Duration::minutes(2), "m3", "verified");
+        let unknown = test_capacity_sample(now - Duration::seconds(10), "m3", "unknown");
+        store
+            .import_fleet_capacity(&format!(
+                "{}\n{}\n",
+                serde_json::to_string(&verified).unwrap(),
+                serde_json::to_string(&unknown).unwrap()
+            ))
+            .unwrap();
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.status, "partial");
+        assert_eq!(scorecard.fleet_capacity.freshness_status, "unavailable");
+        assert!(
+            scorecard
+                .fleet_capacity
+                .freshness_reason
+                .contains("no verified eligible slot-hours"),
+            "{}",
+            scorecard.fleet_capacity.freshness_reason
+        );
+        let hours = scorecard
+            .fleet_capacity
+            .eligible_slot_hours
+            .expect("verified interval before unknown interval remains measurable");
+        assert!((hours - (5.5 / 60.0)).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn current_unknown_capacity_cannot_inherit_expired_verified_freshness() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let now = Utc::now();
+        let expired = test_capacity_sample(now - Duration::hours(2), "m3", "verified");
+        let unknown = test_capacity_sample(now - Duration::seconds(10), "m3", "unknown");
+        store
+            .import_fleet_capacity(&format!(
+                "{}\n{}\n",
+                serde_json::to_string(&expired).unwrap(),
+                serde_json::to_string(&unknown).unwrap()
+            ))
+            .unwrap();
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.freshness_status, "unavailable");
+        assert!(
+            scorecard
+                .fleet_capacity
+                .freshness_reason
+                .contains("no verified eligible slot-hours"),
+            "{}",
+            scorecard.fleet_capacity.freshness_reason
+        );
+    }
+
+    #[test]
+    fn unknown_equal_timestamp_wins_capacity_reduction_tie() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let observed = Utc::now() - Duration::minutes(1);
+        let verified = test_capacity_sample(observed, "m3", "verified");
+        let unknown = test_capacity_sample(observed, "m3", "unknown");
+        store
+            .import_fleet_capacity(&format!(
+                "{}\n{}\n",
+                serde_json::to_string(&verified).unwrap(),
+                serde_json::to_string(&unknown).unwrap()
+            ))
+            .unwrap();
+        let scorecard = store.stewardship_scorecard("Shipyard", 1).unwrap();
+        assert_eq!(scorecard.fleet_capacity.status, "partial");
+        assert_eq!(scorecard.fleet_capacity.eligible_slot_hours, Some(0.0));
+    }
+
     #[test]
     fn merge_receipt_import_is_atomic_and_idempotent() {
         let temp = tempfile::tempdir().unwrap();
@@ -3621,13 +5308,166 @@ mod tests {
     }
 
     #[test]
+    fn merge_receipt_reimport_accepts_legacy_mixed_case_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let receipt = test_receipt("legacy-project-case", "owner/repo", "repo", 1, 'a');
+        assert_eq!(
+            store
+                .import_merge_receipts(std::slice::from_ref(&receipt))
+                .unwrap(),
+            1
+        );
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_receipts SET repo = 'OWNER/REPO', project = 'REPO' WHERE receipt_id = 'legacy-project-case'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .import_merge_receipts(std::slice::from_ref(&receipt))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn authenticated_handoff_persists_fence_and_is_replay_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let repository = "owner/repo";
+        let receipts = vec![
+            test_receipt("auth-1", repository, "owner/repo", 1, 'a'),
+            test_receipt("auth-2", repository, "owner/repo", 2, 'b'),
+        ];
+        let envelope =
+            test_authenticated_envelope("auth-envelope-1", repository, "owner/repo", receipts);
+        let context = test_authenticated_context(repository, "owner/repo");
+        assert_eq!(
+            store
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
+                .unwrap(),
+            0
+        );
+        let mut expired_context = context.clone();
+        expired_context.now = "2026-10-28T01:00:00Z".parse().unwrap();
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &expired_context)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            2
+        );
+        let conn = store.connect().unwrap();
+        let counts: (i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM merge_receipt_handoffs), (SELECT count(*) FROM merge_receipt_handoff_receipts), (SELECT count(*) FROM merge_receipts), (SELECT project FROM merge_receipt_handoffs WHERE envelope_id='auth-envelope-1')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 2, 2, "repo".to_owned()));
+        assert!(
+            conn.execute(
+                "UPDATE merge_receipts SET safe_merge=0 WHERE receipt_id='auth-1'",
+                [],
+            )
+            .is_err()
+        );
+        conn.execute(
+            "UPDATE merge_receipt_handoffs SET project='other' WHERE envelope_id='auth-envelope-1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .authenticated_safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            0
+        );
+        conn.execute(
+            "UPDATE merge_receipt_handoffs SET project='repo' WHERE envelope_id='auth-envelope-1'",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn authenticated_handoff_attaches_to_legacy_rows_and_rejects_conflicts_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let repository = "owner/repo";
+        let receipt = test_receipt("auth-legacy", repository, "repo", 1, 'a');
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .unwrap();
+        let envelope = test_authenticated_envelope(
+            "auth-envelope-legacy",
+            repository,
+            "repo",
+            vec![receipt.clone()],
+        );
+        let context = test_authenticated_context(repository, "repo");
+        assert_eq!(
+            store
+                .import_authenticated_merge_receipt_handoff(&envelope, &context)
+                .unwrap(),
+            0
+        );
+        let mut conflicting = envelope.clone();
+        conflicting.envelope_id = "auth-envelope-conflict".to_owned();
+        conflicting.receipts[0].evidence = "sha256:changed".to_owned();
+        conflicting.payload_sha256 =
+            crate::metrics::merge_receipt_handoff::digest_receipts(&conflicting.receipts).unwrap();
+        assert!(
+            store
+                .import_authenticated_merge_receipt_handoff(&conflicting, &context)
+                .is_err()
+        );
+        let conn = store.connect().unwrap();
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM merge_receipt_handoffs), (SELECT count(*) FROM merge_receipt_handoff_receipts)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1));
+    }
+
+    #[test]
     fn merge_receipt_export_filters_exact_repository_and_round_trips() {
         let temp = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(temp.path()).unwrap();
         let first = test_receipt("export-1", "OWNER/REPO", "repo", 1, 'a');
+        let mut release = test_receipt("export-release", "owner/repo", "repo", 3, 'c');
+        release.base_branch = "release".to_owned();
         let other = test_receipt("export-2", "other/repo", "repo", 2, 'd');
         store
-            .import_merge_receipts(&[first.clone(), other])
+            .import_merge_receipts(&[first.clone(), release, other])
             .unwrap();
 
         let exported = store.export_merge_receipts("owner/repo").unwrap();
@@ -3692,6 +5532,7 @@ mod tests {
             [&"a".repeat(40)],
         )
         .unwrap();
+        mark_production_runs(&store, 10);
         let mut inside = test_receipt("window-in", "OWNER/REPO", "repo", 10, 'a');
         inside.merged_at = Utc::now();
         let mut old = test_receipt("window-old", "owner/repo", "repo", 11, 'd');
@@ -3726,6 +5567,46 @@ mod tests {
     }
 
     #[test]
+    fn safe_merge_summary_joins_authoritative_head_sha_when_legacy_sha_is_null() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 12, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=NULL, head_sha=?1 WHERE pr=12",
+            [&"b".repeat(40)],
+        )
+        .unwrap();
+        mark_production_runs_keeping_heads(&store, 12);
+        let receipt = test_receipt("head-only", "owner/repo", "repo", 12, 'b');
+        store.import_merge_receipts(&[receipt]).unwrap();
+        let (total, joined, _, samples, gaps) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((total, joined, samples, gaps), (1, 1, 1, 0));
+    }
+
+    #[test]
+    fn safe_merge_summary_keeps_legacy_sha_matches_when_both_heads_differ() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 13, "failure", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=?1, head_sha=?2 WHERE pr=13",
+            [&"c".repeat(40), &"d".repeat(40)],
+        )
+        .unwrap();
+        mark_production_runs_keeping_heads(&store, 13);
+        let receipt = test_receipt("legacy-head", "owner/repo", "repo", 13, 'c');
+        store.import_merge_receipts(&[receipt]).unwrap();
+        let (_, joined, _, samples, gaps) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((joined, samples, gaps), (1, 1, 0));
+    }
+
+    #[test]
     fn duplicate_receipts_for_one_head_count_once() {
         let temp = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(temp.path()).unwrap();
@@ -3738,6 +5619,7 @@ mod tests {
                 [&"a".repeat(40)],
             )
             .unwrap();
+        mark_production_runs(&store, 30);
         let first = test_receipt("dup-1", "owner/repo", "repo", 30, 'a');
         let mut second = first.clone();
         second.receipt_id = "dup-2".into();
@@ -3752,6 +5634,90 @@ mod tests {
         );
         let scorecard = store.stewardship_scorecard("repo", 2).unwrap();
         assert_eq!(scorecard.safely_merged_changes.value, Some(1.0));
+    }
+
+    #[test]
+    fn safe_merge_rate_deduplicates_one_head_across_pr_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 30, "success", 1_000, 0, false);
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET repo='owner/repo', sha=?1 WHERE pr=30",
+                [&"a".repeat(40)],
+            )
+            .unwrap();
+        mark_production_runs(&store, 30);
+        let first = test_receipt("head-pr-30", "owner/repo", "repo", 30, 'a');
+        let mut second = first.clone();
+        second.receipt_id = "head-pr-31".into();
+        second.pr = 31;
+        store.import_merge_receipts(&[first, second]).unwrap();
+        let (total, joined, _, _, _) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((total, joined), (1, 1));
+    }
+
+    #[test]
+    fn safe_merge_summary_excludes_future_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let mut future = test_receipt("future-merge", "owner/repo", "repo", 1, 'a');
+        future.merged_at = Utc::now() + Duration::hours(1);
+        store.import_merge_receipts(&[future]).unwrap();
+        assert_eq!(
+            store
+                .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .0,
+            0
+        );
+    }
+
+    #[test]
+    fn safe_merge_summary_counts_only_the_measured_main_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        let main = test_receipt("main-merge", "owner/repo", "repo", 1, 'a');
+        let mut release = test_receipt("release-merge", "owner/repo", "repo", 2, 'd');
+        release.base_branch = "release".to_owned();
+        store.import_merge_receipts(&[main, release]).unwrap();
+
+        let (total, joined, _, _, _) = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!((total, joined), (1, 0));
+    }
+
+    #[test]
+    fn safe_merge_summary_rejects_malformed_stored_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        store
+            .import_merge_receipts(&[test_receipt(
+                "malformed-merge",
+                "owner/repo",
+                "repo",
+                1,
+                'a',
+            )])
+            .unwrap();
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE merge_receipts SET validated_head_sha = ?1 WHERE receipt_id = ?2",
+                rusqlite::params![&"b".repeat(40), "malformed-merge"],
+            )
+            .unwrap();
+
+        let error = store
+            .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+            .expect_err("malformed stored receipts must fail closed");
+        assert!(error.to_string().contains("validated_head_sha"));
     }
 
     #[test]
@@ -3774,6 +5740,7 @@ mod tests {
             [&"a".repeat(40)],
         )
         .unwrap();
+        mark_production_runs(&store, 31);
         // Control: another pull request's failure never counts.
         insert_scorecard_sample(&store, "repo", 32, "failure", 9000, 0, false);
         conn.execute("UPDATE runs SET repo='owner/repo' WHERE pr=32", [])
@@ -3821,6 +5788,7 @@ mod tests {
             [&"a".repeat(40)],
         )
         .unwrap();
+        mark_production_runs(&store, 34);
         conn.execute(
             "UPDATE jobs SET total_ms = NULL WHERE job = 'job-34-5000'",
             [],
@@ -3884,6 +5852,7 @@ mod tests {
             [&"a".repeat(40)],
         )
         .unwrap();
+        mark_production_runs(&store, 34);
         store
             .import_merge_receipts(&[test_receipt("pr-34", "owner/repo", "repo", 34, 'a')])
             .unwrap();
@@ -4215,6 +6184,13 @@ mod tests {
                 duration_ms: 100,
                 completed_at: Some(Utc::now()),
                 external_id: Some("test:verified".to_owned()),
+                provider: Some("github".to_owned()),
+                event: Some("pull_request".to_owned()),
+                run_attempt: Some(1),
+                provider_run_id: Some(1),
+                head_sha: Some("a".repeat(40)),
+                sha: Some("a".repeat(40)),
+                repo: Some("owner/shipyard".to_owned()),
                 provenance: Some("production".to_owned()),
                 provenance_verified: true,
                 ..MetricRecordInput::default()
@@ -4223,6 +6199,25 @@ mod tests {
         let verified = store.stewardship_scorecard("shipyard", 1).unwrap();
         assert_eq!(verified.provenance.production, 1);
         assert_eq!(verified.provenance.eligible_samples, 1);
+    }
+
+    #[test]
+    fn verified_production_requires_provider_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let input = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            job: "macos".to_owned(),
+            status: "success".to_owned(),
+            duration_ms: 100,
+            completed_at: Some(Utc::now()),
+            external_id: Some("test:verified".to_owned()),
+            provenance: Some("production".to_owned()),
+            provenance_verified: true,
+            ..MetricRecordInput::default()
+        };
+        let error = store.record_terminal_observation(&input).unwrap_err();
+        assert!(error.to_string().contains("provider identity"));
     }
 
     #[test]
@@ -4403,6 +6398,8 @@ mod tests {
                 pr: Some(10),
                 provider_run_id: Some(2),
                 head_sha: Some("b".repeat(40)),
+                provenance: None,
+                provenance_verified: false,
                 ..bound
             })
             .unwrap();
@@ -4466,6 +6463,7 @@ mod tests {
                 status: "success".into(),
                 completed_at: Some(Utc::now()),
                 duration_ms: 100,
+                external_id: Some("github:1/1/1".into()),
                 event: Some("pull_request".into()),
                 run_attempt: Some(1),
                 provider_run_id: Some(1),
@@ -4621,12 +6619,19 @@ mod tests {
         let store = MetricsStore::open(dir.path()).unwrap();
         let mut input = MetricRecordInput {
             project: "shipyard".to_owned(),
+            repo: Some("owner/shipyard".to_owned()),
             job: "macos".to_owned(),
             status: "success".to_owned(),
             duration_ms: 100,
             completed_at: Some(Utc::now()),
             external_id: Some("github:8/1/1".to_owned()),
             provider: Some("github".to_owned()),
+            event: Some("pull_request".to_owned()),
+            run_attempt: Some(1),
+            pr: Some(8),
+            provider_run_id: Some(1),
+            sha: Some("a".repeat(40)),
+            head_sha: Some("a".repeat(40)),
             provenance: Some("production".to_owned()),
             ..MetricRecordInput::default()
         };
@@ -4635,17 +6640,146 @@ mod tests {
         input.provenance_verified = true;
         store.record_terminal_observation(&input).unwrap();
         input.external_id = Some("github:8/2/1".to_owned());
+        input.provider_run_id = Some(2);
+        input.sha = Some("b".repeat(40));
+        input.head_sha = Some("b".repeat(40));
         input.provenance = Some("production".to_owned());
         input.provenance_verified = false;
         store.record_terminal_observation(&input).unwrap();
         input.provenance = None;
         input.provenance_verified = true;
-        store.record_terminal_observation(&input).unwrap();
+        assert!(store.record_terminal_observation(&input).is_ok());
         let scorecard = store.stewardship_scorecard("shipyard", 1).unwrap();
         assert_eq!(scorecard.provenance.production, 0);
         assert_eq!(scorecard.provenance.synthetic, 1);
         assert_eq!(scorecard.provenance.unknown, 1);
         assert_eq!(scorecard.provenance.eligible_samples, 0);
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn verified_refresh_requires_complete_identity_and_rejects_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let base = MetricRecordInput {
+            project: "shipyard".to_owned(),
+            repo: Some("owner/shipyard".to_owned()),
+            job: "macos".to_owned(),
+            status: "success".to_owned(),
+            duration_ms: 100,
+            completed_at: Some(Utc::now()),
+            provider: Some("github".to_owned()),
+            external_id: Some("github:9/1/1".to_owned()),
+            event: Some("pull_request".to_owned()),
+            run_attempt: Some(1),
+            pr: Some(9),
+            provider_run_id: Some(1),
+            sha: Some("a".repeat(40)),
+            head_sha: Some("a".repeat(40)),
+            provenance: Some("production".to_owned()),
+            provenance_verified: true,
+            ..MetricRecordInput::default()
+        };
+        let mut legacy = base.clone();
+        legacy.provenance = None;
+        legacy.provenance_verified = false;
+        store.record_terminal_observation(&legacy).unwrap();
+
+        let mut conflicting = base.clone();
+        conflicting.sha = Some("b".repeat(40));
+        conflicting.head_sha = Some("b".repeat(40));
+        assert!(store.record_terminal_observation(&conflicting).is_err());
+
+        let mut incomplete_legacy = base.clone();
+        incomplete_legacy.external_id = Some("github:9/2/1".to_owned());
+        incomplete_legacy.event = None;
+        incomplete_legacy.run_attempt = None;
+        incomplete_legacy.provider_run_id = None;
+        incomplete_legacy.head_sha = None;
+        incomplete_legacy.sha = None;
+        incomplete_legacy.provenance = None;
+        incomplete_legacy.provenance_verified = false;
+        store
+            .record_terminal_observation(&incomplete_legacy)
+            .unwrap();
+        let mut rebound = incomplete_legacy;
+        rebound.event = Some("pull_request".to_owned());
+        rebound.run_attempt = Some(1);
+        rebound.provider_run_id = Some(2);
+        rebound.head_sha = Some("c".repeat(40));
+        rebound.sha = Some("c".repeat(40));
+        rebound.provenance = Some("production".to_owned());
+        rebound.provenance_verified = true;
+        store.record_terminal_observation(&rebound).unwrap();
+        let conn = store.connect().unwrap();
+        let identity: (Option<String>, Option<i64>, Option<i64>, Option<String>, Option<String>) =
+            conn.query_row(
+                "SELECT event, run_attempt, provider_run_id, head_sha, provenance
+                   FROM runs WHERE id = (SELECT run_id FROM jobs WHERE external_id = 'github:9/2/1')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            identity,
+            (
+                Some("pull_request".to_owned()),
+                Some(1),
+                Some(2),
+                Some("c".repeat(40)),
+                Some("production".to_owned()),
+            )
+        );
+
+        // GitHub repository slugs are case-insensitive. A legacy row written
+        // with mixed casing must still be refresh-compatible with canonical
+        // authenticated input.
+        let mut mixed_case = base.clone();
+        mixed_case.external_id = Some("github:9/3/1".to_owned());
+        mixed_case.provenance = None;
+        mixed_case.provenance_verified = false;
+        mixed_case.repo = Some("OWNER/SHIPYARD".to_owned());
+        store.record_terminal_observation(&mixed_case).unwrap();
+        mixed_case.repo = Some("owner/shipyard".to_owned());
+        mixed_case.provenance = Some("production".to_owned());
+        mixed_case.provenance_verified = true;
+        store.record_terminal_observation(&mixed_case).unwrap();
+
+        let mut incomplete = base;
+        incomplete.external_id = Some("github:9/2/1".to_owned());
+        incomplete.head_sha = None;
+        assert!(store.record_terminal_observation(&incomplete).is_err());
+    }
+
+    #[test]
+    fn safe_merge_summary_excludes_unverified_compute() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(temp.path()).unwrap();
+        insert_scorecard_sample(&store, "repo", 35, "success", 1000, 0, false);
+        let conn = store.connect().unwrap();
+        conn.execute(
+            "UPDATE runs SET repo='owner/repo', sha=?1 WHERE pr=35",
+            [&"a".repeat(40)],
+        )
+        .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt("pr-35", "owner/repo", "repo", 35, 'a')])
+            .unwrap();
+        assert_eq!(
+            store
+                .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .1,
+            0
+        );
+        mark_production_runs(&store, 35);
+        assert_eq!(
+            store
+                .safe_merge_summary("repo", "1970-01-01T00:00:00Z")
+                .unwrap()
+                .1,
+            1
+        );
     }
 
     #[test]
@@ -4680,8 +6814,10 @@ mod tests {
         assert_eq!(scorecard.wasted_compute_samples, 1);
         assert!((scorecard.coordination_minutes - 0.1).abs() < f64::EPSILON);
         assert_eq!(scorecard.coordination_samples, 3);
+        assert_eq!(scorecard.coordination_coverage.status, "available");
         assert!((scorecard.rework_compute_minutes - 2.0).abs() < f64::EPSILON);
         assert_eq!(scorecard.rework_compute_samples, 1);
+        assert_eq!(scorecard.rework_compute_coverage.status, "available");
         assert!((scorecard.coordination_rework_minutes - 2.1).abs() < f64::EPSILON);
         assert_eq!(scorecard.safely_merged_changes.status, "unavailable");
         assert_eq!(
@@ -4709,6 +6845,7 @@ mod tests {
         .expect("repo identity");
         conn.execute("UPDATE runs SET sha = ?1 WHERE pr = 41", [&"a".repeat(40)])
             .expect("head identity");
+        mark_production_runs(&store, 41);
         let receipt = crate::metrics::merge_receipt::MergeReceipt {
             schema: crate::metrics::merge_receipt::SCHEMA.to_owned(),
             receipt_id: "merge-41".to_owned(),
@@ -4872,7 +7009,116 @@ mod tests {
         assert_eq!(scorecard.other_jobs, 3);
         assert_eq!(scorecard.failure_rate, Some(2.0 / 3.0));
         assert_eq!(scorecard.wasted_compute_samples, 3);
+        assert_eq!(scorecard.wasted_compute_coverage.status, "available");
         assert_eq!(scorecard.rework_compute_samples, 2);
+        assert_eq!(scorecard.coordination_coverage.status, "available");
+        assert_eq!(scorecard.rework_compute_coverage.status, "available");
+        assert_eq!(scorecard.coordination_rework_coverage.status, "available");
+    }
+
+    #[test]
+    fn stewardship_scorecard_marks_cost_proxy_gaps_explicitly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "failure", 60_000, 1_000, false);
+        let conn = store.connect().expect("metrics connection");
+        conn.execute(
+            "UPDATE jobs SET total_ms = NULL, queue_ms = NULL WHERE run_id = (SELECT id FROM runs WHERE pr = 41)",
+            [],
+        )
+        .expect("remove timing evidence");
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.coordination_samples, 0);
+        assert_eq!(scorecard.coordination_coverage.status, "unavailable");
+        assert_eq!(scorecard.wasted_compute_coverage.status, "unavailable");
+        assert_eq!(scorecard.rework_compute_samples, 0);
+        assert_eq!(scorecard.rework_compute_coverage.status, "unavailable");
+        assert_eq!(scorecard.coordination_rework_coverage.status, "unavailable");
+        let json = serde_json::to_value(&scorecard).expect("scorecard JSON");
+        for field in [
+            "wasted_compute_coverage",
+            "coordination_coverage",
+            "rework_compute_coverage",
+            "coordination_rework_coverage",
+        ] {
+            assert_eq!(json[field]["status"], "unavailable", "{field}");
+        }
+        assert!(scorecard.coordination_coverage.reason.contains("0 of 1"));
+        assert!(scorecard.rework_compute_coverage.reason.contains("0 of 1"));
+    }
+
+    #[test]
+    fn stewardship_scorecard_marks_partial_cost_proxy_coverage_and_serializes_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "failure", 60_000, 1_000, false);
+        insert_scorecard_sample(&store, "shipyard", 42, "cancelled", 60_000, 1_000, false);
+        let conn = store.connect().expect("metrics connection");
+        conn.execute(
+            "UPDATE jobs SET total_ms = NULL, queue_ms = NULL WHERE run_id = (SELECT id FROM runs WHERE pr = 42)",
+            [],
+        )
+        .expect("remove one timing sample");
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.wasted_compute_coverage.status, "partial");
+        assert_eq!(scorecard.coordination_coverage.status, "partial");
+        assert_eq!(scorecard.rework_compute_coverage.status, "available");
+        assert_eq!(scorecard.coordination_rework_coverage.status, "partial");
+        let json = serde_json::to_value(&scorecard).expect("scorecard JSON");
+        assert_eq!(json["wasted_compute_coverage"]["status"], "partial");
+        assert_eq!(json["coordination_rework_coverage"]["status"], "partial");
+    }
+
+    #[test]
+    fn stewardship_scorecard_reports_complete_cost_proxy_coverage_without_failures() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+        insert_scorecard_sample(&store, "shipyard", 41, "success", 60_000, 1_000, true);
+        insert_scorecard_sample(&store, "shipyard", 42, "success", 90_000, 2_000, false);
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.failed_jobs, 0);
+        // No failed or cancelled attempt means the 0-minute proxies are
+        // complete measurements, not missing ones.
+        assert_eq!(scorecard.wasted_compute_coverage.status, "available");
+        assert_eq!(scorecard.rework_compute_coverage.status, "available");
+        assert_eq!(scorecard.coordination_coverage.status, "available");
+        assert_eq!(scorecard.coordination_rework_coverage.status, "available");
+        assert!(
+            scorecard
+                .rework_compute_coverage
+                .reason
+                .contains("no failed attempts"),
+            "{}",
+            scorecard.rework_compute_coverage.reason
+        );
+    }
+
+    #[test]
+    fn stewardship_scorecard_keeps_cost_proxy_coverage_unavailable_without_samples() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = MetricsStore::open(temp.path()).expect("store");
+
+        let scorecard = store
+            .stewardship_scorecard("shipyard", 2)
+            .expect("scorecard");
+
+        assert_eq!(scorecard.job_samples, 0);
+        assert_eq!(scorecard.wasted_compute_coverage.status, "unavailable");
+        assert_eq!(scorecard.rework_compute_coverage.status, "unavailable");
+        assert_eq!(scorecard.coordination_coverage.status, "unavailable");
+        assert_eq!(scorecard.coordination_rework_coverage.status, "unavailable");
     }
 
     #[test]
@@ -5267,6 +7513,76 @@ mod tests {
     }
 
     #[test]
+    fn repeated_work_cost_rejects_nonpositive_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        for since_days in [0, -1] {
+            for limit in [0, 100] {
+                let error = store.repeated_work_cost(limit, since_days).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "repeated-work baseline window must be positive"
+                );
+            }
+        }
+        let valid = store.repeated_work_cost(100, 1).unwrap();
+        assert_eq!(valid.observations, 0);
+        assert_eq!(valid.duration_ms, None);
+    }
+
+    #[test]
+    fn repeated_work_cost_only_joins_case_sensitive_queue_ids_without_separators() {
+        // Matching clean timing rows make each rejection exercise the ID guard,
+        // rather than pass because timing was absent.
+        for (id, joins) in [
+            ("sy-a-b", true),
+            ("sy-a/b", false),
+            ("sy-a\\b", false),
+            ("SY-a-b", false),
+            ("Sy-a-b", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = MetricsStore::open(dir.path()).unwrap();
+            store
+                .record_queue_terminal(
+                    QUEUE_AUTHORITY_TOKEN,
+                    &QueueTerminalTiming {
+                        queue_job_id: id.into(),
+                        queue_identity: format!("identity-{id}"),
+                        disposition: "clean".into(),
+                        started_at: Some(Utc::now()),
+                        completed_at: Some(Utc::now()),
+                        total_ms: Some(99),
+                    },
+                )
+                .unwrap();
+            store
+                .record_repeated_work_shadow(&RepeatedWorkShadowInput {
+                    kind: RepeatedWorkKind::SupersededExactHead,
+                    branch: "main".into(),
+                    sha: "head".into(),
+                    target_config: "cfg".into(),
+                    mode: "normal".into(),
+                    job_id: "sy-survivor".into(),
+                    superseded_job_id: id.into(),
+                    superseded_sha: "old".into(),
+                })
+                .unwrap();
+            let summary = store.repeated_work_cost(100, 14).unwrap();
+            assert_eq!(summary.observations, 1, "{id}");
+            assert_eq!(summary.shadow_rows, 1, "{id}");
+            assert_eq!(summary.distinct_superseded_jobs, 1, "{id}");
+            assert_eq!(summary.joined_durations, usize::from(joins), "{id}");
+            assert_eq!(summary.matched_clean, usize::from(joins), "{id}");
+            assert_eq!(summary.unknown_durations, usize::from(!joins), "{id}");
+            assert_eq!(summary.unmatched, usize::from(!joins), "{id}");
+            assert_eq!(summary.duration_ms, joins.then_some(99), "{id}");
+            assert_eq!(summary.timing_basis, "superseded_queue_job_runtime");
+            assert!(summary.final_attempt_only);
+        }
+    }
+
+    #[test]
     fn repeated_work_cost_keeps_all_unlinked_ids_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
@@ -5280,21 +7596,34 @@ mod tests {
                 sha: "sha".into(),
                 target_config: "cfg".into(),
                 mode: "normal".into(),
-                job_id: id.into(),
-                superseded_job_id: "old".into(),
+                job_id: "sy-survivor".into(),
+                superseded_job_id: id.into(),
                 superseded_sha: "oldsha".into(),
             };
             store.record_repeated_work_shadow(&input).unwrap();
         }
         let conn = Connection::open(store.path()).unwrap();
         conn.execute("INSERT INTO repeated_work_shadow (observed_at,kind,branch,sha,target_config,mode,job_id,superseded_job_id,superseded_sha) VALUES ('now','future_kind','main','sha','cfg','normal','7','old','oldsha')", []).unwrap();
-        let summary = store.repeated_work_cost(100).unwrap();
+        store
+            .record_queue_terminal(
+                QUEUE_AUTHORITY_TOKEN,
+                &QueueTerminalTiming {
+                    queue_job_id: "42".into(),
+                    queue_identity: "numeric-test".into(),
+                    disposition: "clean".into(),
+                    started_at: Some(Utc::now()),
+                    completed_at: Some(Utc::now()),
+                    total_ms: Some(99),
+                },
+            )
+            .unwrap();
+        let summary = store.repeated_work_cost(100, 14).unwrap();
         assert_eq!(summary.duration_ms, None);
         assert_eq!(summary.joined_durations, 0);
         assert_eq!(summary.unknown_durations, 3);
         assert_eq!(summary.superseded_exact_head, 1);
         assert_eq!(summary.duplicate_exact_head_config, 1);
-        assert_eq!(store.repeated_work_cost(0).unwrap().observations, 0);
+        assert_eq!(store.repeated_work_cost(0, 14).unwrap().observations, 0);
         assert_eq!(
             serde_json::to_value(summary).unwrap()["duration_ms"],
             serde_json::Value::Null
@@ -5394,7 +7723,7 @@ mod tests {
         );
     }
     #[test]
-    fn survivor_timing_counts_distinct_and_excluded_rows() {
+    fn superseded_timing_counts_distinct_and_excluded_rows_in_window() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
         let mk = |id: &str, d: &str, ms| QueueTerminalTiming {
@@ -5406,21 +7735,30 @@ mod tests {
             total_ms: ms,
         };
         store
-            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("clean", "clean", Some(10)))
+            .record_queue_terminal(QUEUE_AUTHORITY_TOKEN, &mk("sy-clean", "clean", Some(10)))
             .unwrap();
         store
             .record_queue_terminal(
                 QUEUE_AUTHORITY_TOKEN,
-                &mk("uncertain", "uncertain", Some(20)),
+                &mk("sy-uncertain", "uncertain", Some(20)),
             )
             .unwrap();
         store
             .record_queue_terminal(
                 QUEUE_AUTHORITY_TOKEN,
-                &mk("cancel", "cancelled_mid_run", Some(30)),
+                &mk("sy-cancel", "cancelled_mid_run", Some(30)),
             )
             .unwrap();
-        for id in ["clean", "clean", "uncertain", "cancel", "missing"] {
+        for (index, id) in [
+            "sy-clean",
+            "sy-clean",
+            "sy-uncertain",
+            "sy-cancel",
+            "sy-missing",
+        ]
+        .into_iter()
+        .enumerate()
+        {
             store
                 .record_repeated_work_shadow(&RepeatedWorkShadowInput {
                     kind: RepeatedWorkKind::SupersededExactHead,
@@ -5428,20 +7766,38 @@ mod tests {
                     sha: "s".into(),
                     target_config: "t".into(),
                     mode: "m".into(),
-                    job_id: id.into(),
-                    superseded_job_id: "o".into(),
+                    job_id: "sy-survivor".into(),
+                    superseded_job_id: id.into(),
                     superseded_sha: "o".into(),
                 })
                 .unwrap();
+            if index == 4 {
+                let conn = Connection::open(store.path()).unwrap();
+                conn.execute(
+                    "UPDATE repeated_work_shadow SET observed_at='2000-01-01T00:00:00Z' WHERE id=(SELECT max(id) FROM repeated_work_shadow)",
+                    [],
+                )
+                .unwrap();
+            }
         }
-        let r = store.repeated_work_survivor_timing(100).unwrap();
-        assert_eq!(r.shadow_rows, 5);
-        assert_eq!(r.distinct_survivors, 4);
+        let r = store.repeated_work_superseded_timing(100, 14).unwrap();
+        assert_eq!(r.shadow_rows, 4);
+        assert_eq!(r.distinct_superseded_jobs, 3);
         assert_eq!(r.matched_clean, 1);
-        assert_eq!(r.avoided_survivor_ms, Some(10));
+        assert_eq!(r.superseded_runtime_ms, Some(10));
         assert_eq!(r.excluded_uncertain, 1);
         assert_eq!(r.excluded_cancelled, 1);
-        assert_eq!(r.unmatched, 1);
+        assert_eq!(r.unmatched, 0);
+        let cost = store.repeated_work_cost(100, 14).unwrap();
+        assert_eq!(cost.observations, 4);
+        assert_eq!(cost.shadow_rows, 4);
+        assert_eq!(cost.distinct_superseded_jobs, 3);
+        assert_eq!(cost.joined_durations, 1);
+        assert_eq!(cost.unknown_durations, 2);
+        assert_eq!(cost.duration_ms, Some(10));
+        assert_eq!(cost.excluded_uncertain, 1);
+        assert_eq!(cost.excluded_cancelled, 1);
+        assert_eq!(cost.unmatched, 0);
     }
     #[test]
     fn queue_timing_contract_rejects_identity_and_downgrades() {
@@ -5485,11 +7841,288 @@ mod tests {
         );
     }
 
+    fn retention_shadow(conn: &Connection, timestamp: &str, superseded: &str) {
+        conn.execute(
+            "INSERT INTO repeated_work_shadow
+             (observed_at, kind, branch, sha, target_config, mode, job_id,
+              superseded_job_id, superseded_sha)
+             VALUES (?1, 'superseded_exact_head', 'main', 'new', 'cfg', 'normal',
+                     'sy-new', ?2, 'old')",
+            params![timestamp, superseded],
+        )
+        .unwrap();
+    }
+
+    fn retention_timing(conn: &Connection, id: &str, timestamp: &str, disposition: &str) {
+        conn.execute(
+            "INSERT INTO queue_timing
+             (queue_job_id, queue_identity, disposition, recorded_at, total_ms)
+             VALUES (?1, 'identity', ?2, ?3, ?4)",
+            params![
+                id,
+                disposition,
+                timestamp,
+                (disposition == "clean").then_some(10)
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metrics_retention_prunes_observations_across_batches_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        for i in 0..501 {
+            let id = format!("sy-old-{i}");
+            retention_shadow(&conn, "2000-01-01T00:00:00Z", &id);
+            retention_timing(
+                &conn,
+                &id,
+                "2000-01-01T00:00:00Z",
+                ["clean", "cancelled_mid_run", "uncertain"][i % 3],
+            );
+        }
+        retention_shadow(&conn, &Utc::now().to_rfc3339(), "sy-fresh");
+        retention_timing(&conn, "sy-fresh", &Utc::now().to_rfc3339(), "clean");
+        retention_timing(
+            &conn,
+            "sy-fresh-unreferenced",
+            &Utc::now().to_rfc3339(),
+            "uncertain",
+        );
+        assert_eq!(store.prune_older_than(90).unwrap(), 1002);
+        assert_eq!(store.repeated_work_shadow(1000).unwrap().len(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM queue_timing", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_preserves_recent_shadow_timing_join_until_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        retention_timing(&conn, "sy-old", "2000-01-01T00:00:00Z", "clean");
+        retention_shadow(&conn, &Utc::now().to_rfc3339(), "sy-old");
+        let before = store.repeated_work_superseded_timing(10, 90).unwrap();
+        assert_eq!(before.matched_clean, 1);
+        assert_eq!(before.superseded_runtime_ms, Some(10));
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+        assert_eq!(
+            store.repeated_work_superseded_timing(10, 90).unwrap(),
+            before
+        );
+        conn.execute(
+            "UPDATE repeated_work_shadow SET observed_at='2000-01-01T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 2);
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_preserves_malformed_dates_and_compares_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let conn = store.connect().unwrap();
+        let cutoff = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for timestamp in ["invalid", "2000", "2000-02-30T00:00:00Z"] {
+            retention_shadow(&conn, timestamp, "sy-protected");
+            retention_timing(&conn, timestamp, timestamp, "uncertain");
+        }
+        retention_timing(&conn, "sy-protected", "2000-01-01T00:00:00Z", "clean");
+        for (id, timestamp) in [
+            ("sy-equal", "2025-12-31T19:00:00-05:00"),
+            ("sy-future", "2025-12-31T23:00:00-02:00"),
+            ("sy-expired", "2026-01-01T01:00:00+02:00"),
+        ] {
+            retention_shadow(&conn, timestamp, id);
+            retention_timing(&conn, id, timestamp, "clean");
+        }
+        assert_eq!(store.prune_queue_observations(cutoff).unwrap(), 2);
+        assert_eq!(store.repeated_work_shadow(20).unwrap().len(), 5);
+        for id in [
+            "sy-equal",
+            "sy-future",
+            "sy-protected",
+            "invalid",
+            "2000",
+            "2000-02-30T00:00:00Z",
+        ] {
+            assert!(store.read_queue_timing(id).unwrap().is_some(), "{id}");
+        }
+        assert_eq!(store.prune_queue_observations(cutoff).unwrap(), 0);
+    }
+
+    #[test]
+    fn metrics_retention_migrates_shadow_only_store() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("metrics")).unwrap();
+        let conn = Connection::open(dir.path().join("metrics/metrics.db")).unwrap();
+        migrate_repeated_work_shadow(&conn).unwrap();
+        retention_shadow(&conn, "2000-01-01T00:00:00Z", "sy-old");
+        for reopen in [false, true] {
+            if reopen {
+                MetricsStore::open(dir.path()).unwrap();
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                     AND name='repeated_work_shadow_superseded_job'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+        }
+        let store = MetricsStore::open(dir.path()).unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 1);
+    }
+
+    #[test]
+    fn metrics_retention_disabled_or_extreme_window_does_not_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        retention_shadow(&store.connect().unwrap(), "2000-01-01T00:00:00Z", "sy-old");
+        assert_eq!(store.prune_older_than(0).unwrap(), 0);
+        assert_eq!(store.prune_older_than(-1).unwrap(), 0);
+        assert!(store.prune_older_than(i64::MAX).is_err());
+        assert_eq!(store.repeated_work_shadow(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retention_indexes_are_idempotent_and_drive_cleanup_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let expected = [
+            "metrics_jobs_run_id",
+            "metrics_runs_retention",
+            "metrics_steps_job_id",
+        ];
+        let index_names = |store: &MetricsStore| {
+            let conn = store.connect().unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND name LIKE 'metrics_%'
+                     ORDER BY name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(index_names(&store), expected);
+
+        {
+            let conn = store.connect().unwrap();
+            conn.execute("DROP INDEX metrics_runs_retention", [])
+                .unwrap();
+            conn.execute("DROP INDEX metrics_jobs_run_id", []).unwrap();
+            conn.execute("DROP INDEX metrics_steps_job_id", []).unwrap();
+        }
+        store.migrate().unwrap();
+        assert_eq!(index_names(&store), expected);
+
+        let mut conn = store.connect().unwrap();
+        let transaction = conn.transaction().unwrap();
+        for id in 1..=4_000_i64 {
+            let timestamp = if id <= 2_000 {
+                "2020-01-01T00:00:00Z"
+            } else {
+                "2030-01-01T00:00:00Z"
+            };
+            transaction
+                .execute(
+                    "INSERT INTO runs (id, ts, project, status)
+                     VALUES (?1, ?2, 'pulp', 'success')",
+                    params![id, timestamp],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO jobs (id, run_id, job, status)
+                     VALUES (?1, ?1, 'job', 'success')",
+                    params![id],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO steps (id, job_id, step, duration_ms, status)
+                     VALUES (?1, ?1, 'build', 1, 'success')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let plan_detail = |query: &str, parameter: &str| {
+            conn.query_row(&format!("EXPLAIN QUERY PLAN {query}"), [parameter], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+        };
+        let runs_plan = plan_detail(
+            "SELECT id FROM runs WHERE ts < ?1 ORDER BY ts, id LIMIT 250",
+            "2025-01-01T00:00:00Z",
+        );
+        let jobs_plan = plan_detail("SELECT id FROM jobs WHERE run_id = ?1", "1");
+        let steps_plan = plan_detail("SELECT id FROM steps WHERE job_id = ?1", "1");
+        assert!(
+            runs_plan.contains("SEARCH runs USING COVERING INDEX metrics_runs_retention"),
+            "unexpected runs plan: {runs_plan}"
+        );
+        assert!(
+            jobs_plan.contains("SEARCH jobs USING COVERING INDEX metrics_jobs_run_id"),
+            "unexpected jobs plan: {jobs_plan}"
+        );
+        assert!(
+            steps_plan.contains("SEARCH steps USING COVERING INDEX metrics_steps_job_id"),
+            "unexpected steps plan: {steps_plan}"
+        );
+    }
+
     #[test]
     fn metrics_retention_prunes_raw_samples_but_keeps_receipts() {
         let dir = tempfile::tempdir().unwrap();
         let store = MetricsStore::open(dir.path()).unwrap();
         let old = Utc::now() - Duration::days(120);
+        let mut receipt = test_receipt("retained", "o/pulp", "pulp", 42, 'a');
+        receipt.merged_at = old;
+        store
+            .import_merge_receipts(std::slice::from_ref(&receipt))
+            .unwrap();
+        let ships = crate::ship_state::ShipStateStore::new(dir.path().join("ship")).unwrap();
+        let mut open =
+            crate::ship_state::ShipState::new(43, "o/pulp", "feature", "main", "head", "policy");
+        open.updated_at = old;
+        ships.save(&open).unwrap();
+        let mut queue = crate::queue::Queue::new(dir.path()).unwrap();
+        let mut pending = crate::job::Job::create(
+            "head",
+            "feature",
+            vec!["test".into()],
+            crate::job::ValidationMode::Full,
+            crate::job::Priority::Normal,
+        );
+        pending.created_at = old;
+        queue.enqueue(pending.clone()).unwrap();
+        let recovery = dir.path().join("queue/recovery/retained.json");
+        fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        let recovery_bytes = b"opaque recovery authority must remain byte-identical";
+        fs::write(&recovery, recovery_bytes).unwrap();
+        retention_shadow(&store.connect().unwrap(), "2000-01-01T00:00:00Z", "sy-old");
         store
             .record(&MetricRecordInput {
                 project: "pulp".into(),
@@ -5500,12 +8133,171 @@ mod tests {
                 ..MetricRecordInput::default()
             })
             .unwrap();
-        assert_eq!(store.prune_older_than(90).unwrap(), 1);
+        assert_eq!(store.prune_older_than(90).unwrap(), 2);
+        assert_eq!(
+            store.export_merge_receipts("o/pulp").unwrap(),
+            vec![receipt]
+        );
+        assert_eq!(ships.get_scoped("o/pulp", 43).unwrap().updated_at, old);
+        assert_eq!(queue.get(&pending.id).unwrap(), Some(pending));
+        assert_eq!(fs::read(&recovery).unwrap(), recovery_bytes);
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
         let conn = store.connect().unwrap();
         assert_eq!(
             conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn metrics_retention_prunes_multiple_batches_and_preserves_live_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        for pr in 1..=300 {
+            insert_scorecard_sample_at(
+                &store,
+                "pulp",
+                pr,
+                "success",
+                10,
+                0,
+                false,
+                old.to_rfc3339(),
+            );
+        }
+        insert_scorecard_sample(&store, "pulp", 301, "success", 10, 0, false);
+
+        let old_capacity = test_capacity_sample(old, "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&old_capacity).unwrap())
+            .unwrap();
+        let cutoff = Utc::now() - Duration::days(90);
+        let overlapping_capacity =
+            test_capacity_sample(cutoff - Duration::minutes(1), "m5", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&overlapping_capacity).unwrap())
+            .unwrap();
+        store
+            .import_merge_receipts(&[test_receipt(
+                "retention-kept",
+                "owner/repo",
+                "repo",
+                301,
+                'a',
+            )])
+            .unwrap();
+
+        assert_eq!(store.prune_older_than(90).unwrap(), 301);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM runs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM steps", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| row
+                .get::<_, i64>(0),)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM merge_receipts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn metrics_retention_rejects_period_outside_date_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let error = store
+            .prune_older_than(100_000_000)
+            .expect_err("out-of-range retention must fail closed");
+        assert!(error.to_string().contains("outside the timestamp range"));
+    }
+
+    #[test]
+    fn metrics_retention_prunes_old_fleet_capacity_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        let sample = test_capacity_sample(old, "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&sample).unwrap())
+            .unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 1);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn metrics_retention_prunes_capacity_samples_in_bounded_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        let old = Utc::now() - Duration::days(120);
+        let records = (0..501)
+            .map(|index| {
+                serde_json::to_string(&test_capacity_sample(
+                    old - Duration::seconds(i64::from(index)),
+                    &format!("m{index}"),
+                    "verified",
+                ))
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(store.import_fleet_capacity(&records).unwrap(), 501);
+        assert_eq!(store.prune_older_than(90).unwrap(), 501);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn metrics_retention_keeps_capacity_interval_overlapping_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetricsStore::open(dir.path()).unwrap();
+        insert_scorecard_sample(&store, "Shipyard", 1, "success", 1000, 0, true);
+        let cutoff = Utc::now() - Duration::days(90);
+        let sample = test_capacity_sample(cutoff - Duration::minutes(1), "m3", "verified");
+        store
+            .import_fleet_capacity(&serde_json::to_string(&sample).unwrap())
+            .unwrap();
+        assert_eq!(store.prune_older_than(90).unwrap(), 0);
+        let conn = store.connect().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM fleet_capacity_samples", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let scorecard = store.stewardship_scorecard("Shipyard", 90).unwrap();
+        assert_eq!(scorecard.fleet_capacity.sample_count, 1);
+        assert!(scorecard.fleet_capacity.eligible_slot_hours.is_some());
     }
 }

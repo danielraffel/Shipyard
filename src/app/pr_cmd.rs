@@ -14,6 +14,7 @@ use crate::gate_scripts::{SKILL_SYNC, VERSION_BUMP, VERSIONING_CONFIG, resolve};
 use crate::gh::{GhAuthPolicy, GhClient, GhSupervision};
 use crate::paths::RuntimePaths;
 use crate::pr_fold;
+use crate::pr_next_steps::NextSteps;
 
 mod fold;
 
@@ -51,6 +52,8 @@ pub(super) struct PrCommandArgs {
     /// Arm GitHub-native auto-merge on the pull request once `ship` knows it.
     /// Cleared by `--no-arm`.
     pub(super) arm_auto_merge: super::cli::ArmRequest,
+    /// `--arm` was passed explicitly (arming is also the default).
+    pub(super) explicit_arm: bool,
     /// Sibling branches whose own commits are carried onto this branch first.
     pub(super) fold: Vec<String>,
     /// Forwarded to `ship`: text appended to the pull request body once.
@@ -312,6 +315,16 @@ pub(super) fn pr_command<W: Write>(
 
     let steward_handoff =
         resolve_steward_handoff(&args, protected_base_auto_handoff(cwd, &args.base));
+    let next_steps = observe_next_steps(config, cwd, &args.base);
+    if args.explicit_arm
+        && let Some(warning) = next_steps.arm_warning()
+    {
+        if json_mode {
+            let _ = crate::writer_domain_lease::write_stderr(format_args!("{warning}"));
+        } else {
+            writeln!(stdout, "{warning}").map_err(|error| CliFailure::new(1, error.to_string()))?;
+        }
+    }
     writeln!(stdout, "▸ Handing off to `shipyard ship`")
         .map_err(|error| CliFailure::new(1, error.to_string()))?;
     ship_command(
@@ -339,6 +352,7 @@ pub(super) fn pr_command<W: Write>(
             arm_auto_merge: args.arm_auto_merge,
             leave_unarmed: args.arm_auto_merge.leaves_unarmed(),
             body_append: args.body_append,
+            next_steps: Some(next_steps),
         },
         config,
         cwd,
@@ -346,6 +360,15 @@ pub(super) fn pr_command<W: Write>(
         json_mode,
         stdout,
     )
+}
+
+/// Read-only: how the base admits an approved head, for the next-steps block.
+fn observe_next_steps(config: &LoadedConfig, cwd: &Path, base: &str) -> NextSteps {
+    let Some(repo) = super::ship_cmd::git_repo_slug(cwd) else {
+        return NextSteps::unavailable("no GitHub origin remote");
+    };
+    let actions = crate::cloud::GitHubActions::from_loaded_config(cwd, config);
+    super::merge_steward_cmd::observe_next_steps(&actions, &repo, base)
 }
 
 /// The steward receipt `shipyard pr` writes, if any. `--no-arm` writes none:
@@ -867,6 +890,7 @@ mod tests {
             steward_handoff_preference: StewardHandoffPreference::ProjectDefault,
             python_command: None,
             arm_auto_merge: crate::app::cli::ArmRequest::Off,
+            explicit_arm: false,
             fold: Vec::new(),
             body_append: None,
         }

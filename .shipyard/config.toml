@@ -55,6 +55,27 @@ workflow_shipyard_version = "checkout"
 name  = "shipyard-release-bot"
 email = "shipyard-release-bot@users.noreply.github.com"
 
+[pr_watch]
+# Keep the daemon read-only: it observes and records flags, with comment
+# delivery, arming, queue changes, and merging disabled by this config.
+# This repository policy makes explicit `shipyard pr-watch scan` usable. The
+# unattended daemon still requires the same block in trusted machine-global
+# config on its scanning host; this file does not grant host authority.
+enabled         = true
+repos           = ["danielraffel/Shipyard"]
+base            = "main"
+workflow        = "ci.yml"
+lookback        = "7d"
+post_comments   = false
+stale_after_minutes = 45
+# Mirrors the main-required-checks ruleset; Linux, Windows and coverage do not
+# run under the default macos platform focus, so naming them would flag every
+# PR as having a never-run required check.
+required_checks = [
+  "Test macOS ARM64",
+  "review-verdict",
+]
+
 [auto_merge]
 human_reviewers = ["danielraffel"]
 # Who may sign the fleet App's `verdict: APPROVE`: an approval posted through

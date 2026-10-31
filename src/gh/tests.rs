@@ -41,6 +41,18 @@ fn env_is_removed(command: &Command, key: &str) -> bool {
 }
 
 #[test]
+fn merged_observation_timeout_never_exceeds_provider_cap() {
+    assert_eq!(
+        bounded_pr_observation_timeout(std::time::Duration::from_secs(60)),
+        PR_OBSERVATION_TIMEOUT
+    );
+    assert_eq!(
+        bounded_pr_observation_timeout(std::time::Duration::from_secs(2)),
+        std::time::Duration::from_secs(2)
+    );
+}
+
+#[test]
 fn missing_config_uses_ambient_auth() {
     let config = config_from_toml("");
     let client = GhClient::from_loaded_config(&config).expect("client");
@@ -284,6 +296,37 @@ fn merged_pr_snapshot_never_invokes_external_github_command() {
     );
 
     assert_eq!(merged.as_deref(), Some("abc123"));
+}
+
+#[test]
+fn merged_observation_missing_state_is_unknown() {
+    let temp = TempDir::new().expect("temp");
+    let snapshot = temp.path().join("missing-state.json");
+    std::fs::write(&snapshot, r#"{"headRefOid":"abc123"}"#).expect("snapshot");
+
+    assert_eq!(
+        pr_merged_observation_with_timeout(
+            None,
+            "owner/repo",
+            42,
+            temp.path(),
+            Some(&snapshot),
+            Duration::from_secs(1),
+        ),
+        MergedPrObservation::Unknown
+    );
+    std::fs::write(&snapshot, r#"{"state":42}"#).expect("non-string state snapshot");
+    assert_eq!(
+        pr_merged_observation_with_timeout(
+            None,
+            "owner/repo",
+            42,
+            temp.path(),
+            Some(&snapshot),
+            Duration::from_secs(1),
+        ),
+        MergedPrObservation::Unknown
+    );
 }
 
 #[cfg(unix)]
@@ -1162,6 +1205,47 @@ fn parses_github_remote_urls() {
 fn detects_graphql_rate_limit_text() {
     assert!(is_graphql_rate_limited("GraphQL: API rate limit exceeded"));
     assert!(!is_graphql_rate_limited("REST API rate limit exceeded"));
+}
+
+#[test]
+fn transient_helper_failures_include_github_gateway_statuses() {
+    assert!(helper_failure_is_transient("gh: HTTP 502 Bad Gateway"));
+    assert!(helper_failure_is_transient("gh: HTTP 504 Gateway Timeout"));
+    assert!(!helper_failure_is_transient("HTTP 403 Forbidden"));
+}
+
+#[cfg(unix)]
+#[test]
+fn batched_pr_states_falls_back_to_rest_after_gateway_failure() {
+    let temp = TempDir::new().expect("temp");
+    let fake_gh = temp.path().join("gh");
+    let invocations = temp.path().join("invocations");
+    write_executable(
+        &fake_gh,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = pr ]; then echo 'HTTP 502 Bad Gateway' >&2; exit 1; fi\nprintf '%s' '[{{\"number\":42,\"state\":\"OPEN\"}}]'\n",
+            invocations.display()
+        ),
+    );
+    let config = config_from_toml(&format!(
+        r#"
+            [github.auth]
+            source = "env"
+            token_env = "PATH"
+            ambient_gh_binary = "{}"
+            "#,
+        fake_gh.display()
+    ));
+    let client = GhClient::from_loaded_config(&config).expect("client");
+
+    let states =
+        pr_states_batched_with_options(Some(&client), "owner/repo", temp.path(), 3, Some(&fake_gh))
+            .expect("REST fallback should resolve states");
+    assert_eq!(states.get(&42).map(String::as_str), Some("OPEN"));
+    assert_eq!(
+        std::fs::read_to_string(invocations).expect("invocations"),
+        "pr list --repo owner/repo --state all --limit 3 --json number,state\napi -X GET repos/owner/repo/pulls?state=all&per_page=100&page=1\n"
+    );
 }
 
 #[test]

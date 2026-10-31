@@ -25,7 +25,11 @@ fn fake_gh(temp: &tempfile::TempDir, body: &str) -> GitHubActions {
     GitHubActions::from_loaded_config(temp.path(), &config).with_gh_binary_for_tests(path)
 }
 
-fn mutation_control(temp: &tempfile::TempDir, authority: &str, machine: &str) -> MutationControl {
+pub(super) fn mutation_control(
+    temp: &tempfile::TempDir,
+    authority: &str,
+    machine: &str,
+) -> MutationControl {
     let global_dir = temp.path().join("global");
     let state_dir = temp.path().join("state");
     fs::create_dir_all(&global_dir).expect("global config");
@@ -56,6 +60,7 @@ fn mutation_apply_context<'a>(
         observation,
         ledger_path,
         mutation_control,
+        approval_blockers: std::cell::RefCell::default(),
     }
 }
 
@@ -136,6 +141,7 @@ fn queue_policy() -> StewardPolicy {
     StewardPolicy {
         merge_queue: true,
         native_auto_merge: true,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         required_checks: vec![RequiredCheck {
             context: "macos".to_owned(),
             app_id: None,
@@ -192,8 +198,10 @@ fn pending_cancellation_record() -> PendingCancellation {
 mod admission;
 #[cfg(unix)]
 mod arm_guard;
+mod blocked_on;
 #[cfg(unix)]
 mod capacity;
+mod exact_head_merge;
 mod mutations;
 mod observation;
 #[cfg(unix)]
@@ -202,3 +210,5 @@ mod recovery;
 mod train_off;
 #[cfg(unix)]
 mod transient_rerun;
+#[cfg(unix)]
+mod unapproved_admission;

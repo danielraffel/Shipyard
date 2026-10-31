@@ -17,6 +17,11 @@ mod base_health_cmd;
 mod branch_cmd;
 mod capacity_cmd;
 mod cause_cmd;
+
+/// Acquire the shared snapshot lock used by the private cause archive.
+pub(crate) fn lock_cause_archive(dir: &Path) -> Result<cause_cmd::ArchiveLock, String> {
+    cause_cmd::lock_archive(dir, false)
+}
 pub(crate) mod changed_surface_cmd;
 mod changed_surface_trial_cmd;
 mod changelog_cmd;
@@ -61,12 +66,14 @@ mod queue_cmd;
 mod queue_digest_cmd;
 mod queue_hold_cmd;
 mod queue_observer_cmd;
+mod queue_quarantine_cmd;
 mod release_bot_cmd;
 mod reroute_cmd;
 mod rescue_cmd;
 mod reuse_cmd;
 mod reuse_rederive;
 mod review_verdict_cmd;
+mod reviewer_claim_cmd;
 mod rollup_cmd;
 mod run_cmd;
 mod runner_cmd;
@@ -127,6 +134,7 @@ use self::queue_cmd::{
 use self::queue_digest_cmd::queue_digest_command;
 use self::queue_hold_cmd::queue_hold_command;
 use self::queue_observer_cmd::{QueueObserverArgs, queue_observer_command};
+use self::queue_quarantine_cmd::queue_quarantine_command;
 use self::release_bot_cmd::release_bot_command;
 use self::rescue_cmd::rescue_command;
 use self::run_cmd::{
@@ -439,6 +447,7 @@ where
         | Command::Logs { .. }
         | Command::Cancel { .. }
         | Command::QueueReconcileOrphan { .. }
+        | Command::QueueQuarantine { .. }
         | Command::Bump { .. }
         | Command::Queue { command: None }
         | Command::Cleanup { .. }) => {
@@ -568,6 +577,16 @@ where
                     rebase_carry: !no_rebase_carry,
                     json: cli.json,
                 },
+                stdout,
+            );
+        }
+        Command::ReviewerClaim { command } => {
+            return reviewer_claim_cmd::reviewer_claim_command(
+                command,
+                cli.mode.into(),
+                &cwd,
+                &runtime_paths.state_dir,
+                cli.json,
                 stdout,
             );
         }
@@ -924,6 +943,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Logs { .. }
         | Command::Cancel { .. }
         | Command::QueueReconcileOrphan { .. }
+        | Command::QueueQuarantine { .. }
         | Command::Bump { .. }
         | Command::Queue { .. }
         | Command::QueueHold { .. }
@@ -942,6 +962,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Landing { .. }
         | Command::Inspect { .. }
         | Command::ReviewVerdict { .. }
+        | Command::ReviewerClaim { .. }
         | Command::Rollup { .. }
         | Command::Who { .. }
         | Command::BaseHealth { .. }
@@ -1127,6 +1148,11 @@ fn handle_state_command<W: Write>(
             json,
             stdout,
         ),
+        Command::QueueQuarantine {
+            job_id,
+            reason,
+            apply,
+        } => queue_quarantine_command(&job_id, &reason, apply, state_dir, json, stdout),
         Command::Bump { job_id, priority } => {
             bump_command(&job_id, priority, state_dir, json, stdout)
         }
@@ -1136,10 +1162,12 @@ fn handle_state_command<W: Write>(
             dry_run,
             apply,
             older_than_hours,
+            owned_only,
             ..
         } => validation_tmp_cleanup(
             CleanupMode::from_flags(dry_run, apply),
             older_than_hours,
+            !owned_only,
             json,
             stdout,
         ),
@@ -1350,6 +1378,7 @@ fn handle_ship_variant<W: Write>(
             arm_auto_merge,
             leave_unarmed: arm_auto_merge.leaves_unarmed(),
             body_append,
+            next_steps: None,
         },
         mode,
         cwd,
@@ -1389,7 +1418,7 @@ fn handle_pr_variant<W: Write>(
         context_url,
         no_steward_handoff,
         no_arm: _,
-        arm: _,
+        arm,
         fold,
         body_append,
     } = command
@@ -1442,6 +1471,7 @@ fn handle_pr_variant<W: Write>(
             },
             python_command: None,
             arm_auto_merge,
+            explicit_arm: arm,
             fold,
             body_append,
         },
@@ -1482,8 +1512,12 @@ fn handle_run_variant<W: Write>(
         unreachable!("run variant required")
     };
     if let Some(RunSubcommand::Command(args)) = subcommand {
-        let config = LoadedConfig::load_from_cwd(mode, cwd)
-            .map_err(|error| CliFailure::new(1, error.to_string()))?;
+        let config = LoadedConfig::load_from_cwd_with_global_dir(
+            mode,
+            cwd,
+            runtime_paths.global_dir.clone(),
+        )
+        .map_err(|error| CliFailure::new(1, error.to_string()))?;
         return run_command_evidence(&args, &config, cwd, runtime_paths, json, stdout);
     }
     handle_run_command(
@@ -1682,8 +1716,9 @@ fn handle_run_command<W: Write>(
     json: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let config = LoadedConfig::load_from_cwd(mode, cwd)
-        .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    let config =
+        LoadedConfig::load_from_cwd_with_global_dir(mode, cwd, runtime_paths.global_dir.clone())
+            .map_err(|error| CliFailure::new(1, error.to_string()))?;
     run_command(args, &config, cwd, runtime_paths, json, stdout)
 }
 
@@ -3204,6 +3239,40 @@ mod tests {
         assert_eq!(value["entries"][0]["target"], "linux");
         assert_eq!(value["entries"][0]["host"], "runner");
         assert_eq!(value["entries"][0]["sha"], "abc123456789");
+    }
+
+    #[test]
+    fn targets_warm_status_json_reports_host_pool_member() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pool = WarmPool::new(temp.path().join("warm_pool.json"));
+        pool.save_entries(&[PoolEntry::new(
+            "mac",
+            "local",
+            "host-pool",
+            "/repo",
+            "abc123456789",
+            2_000_000_000.0,
+            1_999_999_000.0,
+        )
+        .with_member_id("studio-a")])
+            .expect("save pool");
+        let cli = Cli::parse_from([
+            "shipyard",
+            "--json",
+            "--state-dir",
+            temp.path().to_str().expect("temp path"),
+            "targets",
+            "warm",
+            "status",
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(cli, &mut stdout, &mut stderr);
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(stderr.is_empty());
+        let value: Value = serde_json::from_slice(&stdout).expect("json");
+        assert_eq!(value["entries"][0]["member_id"], "studio-a");
     }
 
     #[test]

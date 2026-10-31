@@ -27,7 +27,7 @@ use crate::gh::{GhClient, validate_repo_slug};
 use super::CliFailure;
 
 const DEFAULT_PERMISSIONS: &[&str] = &["contents=write"];
-const MINT_TIMEOUT: Duration = Duration::from_secs(60);
+const MINT_TIMEOUT: Duration = Duration::from_mins(1);
 const MAX_INPUT_BYTES: u64 = 64 * 1024;
 
 /// What `get` hands back to git. The token never reaches a `{:?}`.

@@ -105,7 +105,9 @@ esac
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: true,
         ledger: None,
     };
@@ -2189,6 +2191,92 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn arm_unqueued_apply_obeys_central_hold_before_native_arm() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+printf '%s\\n' "$*" >> '{}'
+case "$*" in
+  *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
+  *"mergeQueue"*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":{{"entries":{{"nodes":[],"pageInfo":{{"hasNextPage":false}}}}}}}}}}}}' ;;
+  *enablePullRequestAutoMerge*) echo "native arm must not run under HOLD" >&2; exit 90 ;;
+  *) printf '%s' '{{}}' ;;
+esac
+"#,
+            log.display()
+        ),
+    );
+    let observation = observation_for(ready_pr(), true);
+    let args = StewardCommandArgs {
+        repos: vec!["owner/repo".to_owned()],
+        base: "main".to_owned(),
+        opt_out_label: "steward:skip".to_owned(),
+        provenance_blocking_labels: default_provenance_blocking_labels(),
+        managed_label: MANAGED_LABEL.to_owned(),
+        handoff_context: HANDOFF_CONTEXT.to_owned(),
+        max_transient_reruns: 1,
+        recover_hosted_setup_eviction_priority: false,
+        coalesce: false,
+        preempt_capacity: false,
+        max_preemptions_per_head: 1,
+        arm_unqueued: true,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
+        wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
+        apply: true,
+        ledger: None,
+    };
+    let mut ledger = StewardLedger::default();
+    let control = mutation_control(&temp, "studio", "studio");
+    let state_root = control.store.path().parent().expect("state root");
+    crate::merge_queue_control::hold(state_root, "incident").expect("hold");
+
+    let (report, failed, _) = apply_repo_plan(
+        &actions,
+        &args,
+        &observation,
+        &temp.path().join("ledger.json"),
+        &mut ledger,
+        0,
+        Some(&control),
+    );
+
+    assert!(!failed, "a central HOLD is a healthy refusal: {report:?}");
+    assert!(
+        report.errors.is_empty(),
+        "HOLD path must have a complete observation: {report:?}"
+    );
+    assert!(
+        report.prs.iter().all(|pr| pr.error.is_none()),
+        "HOLD path must reach the native-arm backstop: {report:?}"
+    );
+    assert!(
+        report
+            .native_auto_merge_backstop
+            .policy
+            .starts_with("held:"),
+        "{report:?}"
+    );
+    assert!(
+        report.native_auto_merge_backstop.results.is_empty(),
+        "a central HOLD must produce no arm result: {report:?}"
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .all(|error| !error.contains("native arm must not run")),
+        "{report:?}"
+    );
+    let calls = fs::read_to_string(log).expect("calls");
+    assert!(!calls.contains("enablePullRequestAutoMerge"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
 fn steward_ambiguous_failure_is_durable_shared_uncertainty() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("calls");
@@ -2276,7 +2364,9 @@ fn steward_dry_run_needs_no_mutation_authority_and_makes_no_remote_write() {
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: false,
         ledger: None,
     };
@@ -2363,7 +2453,9 @@ esac
             preempt_capacity: false,
             max_preemptions_per_head: 1,
             arm_unqueued: false,
+            approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
             wake_owner,
+            unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
             apply: true,
             ledger: None,
         }
@@ -2636,7 +2728,7 @@ fn provenance_blocker_with_opt_out_and_steward_state_makes_no_github_write() {
         r#"
 calls_path=$(dirname "$0")/calls
 queue_query='query=query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}}'
-pr_fields='id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup'
+pr_fields='id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,statusCheckRollup'
 if test "$#" -eq 10 \
   && test "$1" = api \
   && test "$2" = graphql \
@@ -2710,7 +2802,9 @@ fi
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: true,
         ledger: None,
     };
@@ -2739,7 +2833,7 @@ fi
         calls,
         concat!(
             "10:api graphql -f query=query($owner:String!,$name:String!,$branch:String!,$cursor:String){repository(owner:$owner,name:$name){mergeQueue(branch:$branch){entries(first:100,after:$cursor){nodes{position enqueuedAt headCommit{oid} pullRequest{number}} pageInfo{hasNextPage endCursor}}}}} -F owner=owner -F name=repo -F branch=main\n",
-            "7:pr view 42 --repo owner/repo --json id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,statusCheckRollup\n",
+            "7:pr view 42 --repo owner/repo --json id,number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,autoMergeRequest,labels,author,statusCheckRollup\n",
         ),
         "only the ordered fenced revalidation reads are allowed"
     );
@@ -2770,7 +2864,9 @@ fn routing_readiness_hold_does_not_suppress_an_unrelated_pr_in_repo_plan() {
         preempt_capacity: true,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: false,
         ledger: None,
     };
@@ -2813,7 +2909,9 @@ fn disabled_preemption_ignores_preemption_only_observation_errors() {
         preempt_capacity: false,
         max_preemptions_per_head: 1,
         arm_unqueued: false,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
         wake_owner: false,
+        unapproved_dequeue: crate::app::merge_steward_cmd::DequeueMode::Report,
         apply: false,
         ledger: None,
     };
@@ -3272,4 +3370,81 @@ esac
             .expect("uncertainties")
             .is_empty()
     );
+}
+
+/// The live single-pull-request read before an enqueue must carry the same
+/// management evidence as the census. A fleet-authored pull request with no
+/// handoff label is managed only through its author; when the live `pr view`
+/// omitted `author`, every such pull request re-classified as `Unmanaged`
+/// and the steward reported `skipped_after_live_revalidation` for all of
+/// them. The fake emits `author` only when the field is requested, as `gh`
+/// does, and the rollup carries no app identity, as `gh pr view` returns it.
+#[cfg(unix)]
+#[test]
+fn live_revalidation_keeps_implicit_fleet_management_from_the_author() {
+    let temp = tempfile::tempdir().expect("temp");
+    let head = "78fa791906ed0b698fc6d3f96efb45df433ec141";
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+case "$*" in
+  "pr view "*"--json "*author*)
+    printf '%s' '{{"author":{{"is_bot":true,"login":"app/shipyard-local"}},"autoMergeRequest":null,"baseRefName":"main","headRefName":"fix/11248-channel-binding","headRefOid":"{head}","id":"PR_kwDOR7YGt88AAAABLpxIDA","isDraft":false,"labels":[{{"id":"LA_kw","name":"2·m3","description":"","color":"1a7f37"}}],"mergeStateStatus":"CLEAN","number":11270,"state":"OPEN","statusCheckRollup":[{{"__typename":"CheckRun","completedAt":"2026-10-30T20:48:14Z","conclusion":"SKIPPED","detailsUrl":"https://github.com/owner/repo/actions/runs/41126086571/job/124304870454","name":"Vellum trusted freeze","startedAt":"2026-10-30T20:48:14Z","status":"COMPLETED","workflowName":"Vellum"}},{{"__typename":"StatusContext","context":"Vellum trusted freeze","startedAt":"2026-10-30T20:50:27Z","state":"SUCCESS","targetUrl":"https://github.com/owner/repo/actions/runs/41126092850"}},{{"__typename":"CheckRun","completedAt":"2026-10-30T21:40:00Z","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/41126086600/job/124304870500","name":"macos","startedAt":"2026-10-30T21:00:00Z","status":"COMPLETED","workflowName":"Build"}}]}}' ;;
+  "pr view "*)
+    printf '%s' '{{"autoMergeRequest":null,"baseRefName":"main","headRefName":"fix/11248-channel-binding","headRefOid":"{head}","id":"PR_kwDOR7YGt88AAAABLpxIDA","isDraft":false,"labels":[{{"id":"LA_kw","name":"2·m3","description":"","color":"1a7f37"}}],"mergeStateStatus":"CLEAN","number":11270,"state":"OPEN","statusCheckRollup":[{{"__typename":"CheckRun","completedAt":"2026-10-30T20:48:14Z","conclusion":"SKIPPED","detailsUrl":"https://github.com/owner/repo/actions/runs/41126086571/job/124304870454","name":"Vellum trusted freeze","startedAt":"2026-10-30T20:48:14Z","status":"COMPLETED","workflowName":"Vellum"}},{{"__typename":"StatusContext","context":"Vellum trusted freeze","startedAt":"2026-10-30T20:50:27Z","state":"SUCCESS","targetUrl":"https://github.com/owner/repo/actions/runs/41126092850"}},{{"__typename":"CheckRun","completedAt":"2026-10-30T21:40:00Z","conclusion":"SUCCESS","detailsUrl":"https://github.com/owner/repo/actions/runs/41126086600/job/124304870500","name":"macos","startedAt":"2026-10-30T21:00:00Z","status":"COMPLETED","workflowName":"Build"}}]}}' ;;
+  "api repos/owner/repo/commits/{head}/check-runs?per_page=100&page=1")
+    printf '%s' '{{"total_count":2,"check_runs":[{{"name":"Vellum trusted freeze","status":"completed","conclusion":"skipped","started_at":"2026-10-30T20:48:14Z","completed_at":"2026-10-30T20:48:14Z","details_url":"https://github.com/owner/repo/actions/runs/41126086571/job/124304870454","app":{{"id":15368,"slug":"github-actions"}}}},{{"name":"macos","status":"completed","conclusion":"success","started_at":"2026-10-30T21:00:00Z","completed_at":"2026-10-30T21:40:00Z","details_url":"https://github.com/owner/repo/actions/runs/41126086600/job/124304870500","app":{{"id":15368,"slug":"github-actions"}}}}]}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#
+        ),
+    );
+    let policy = StewardPolicy {
+        required_checks: vec![
+            RequiredCheck {
+                context: "macos".to_owned(),
+                app_id: Some(15368),
+            },
+            RequiredCheck {
+                context: "Vellum trusted freeze".to_owned(),
+                app_id: Some(15368),
+            },
+        ],
+        managed_label: Some("shipyard:managed".to_owned()),
+        ..queue_policy()
+    };
+
+    let live = pull_request_with_required_checks(
+        &actions,
+        "owner/repo",
+        11270,
+        "main",
+        &BTreeMap::new(),
+        &policy.required_checks,
+    )
+    .expect("live read")
+    .expect("open on main");
+
+    assert_eq!(live.fact.author.as_deref(), Some("app/shipyard-local"));
+    assert_eq!(
+        classify_pr(&live.fact, &policy, &BTreeMap::new()),
+        StewardDecision::ArmMergeQueue
+    );
+}
+
+/// Every fact the census reads per pull request must also be read by the
+/// live revalidation, or the two classifications can disagree by
+/// construction and a census decision can never survive to its mutation.
+#[test]
+fn live_pull_request_view_reads_every_census_field() {
+    let live = crate::app::merge_steward_cmd::cancellation_revalidation::LIVE_PR_VIEW_FIELDS
+        .split(',')
+        .collect::<BTreeSet<_>>();
+    for field in crate::app::merge_steward_cmd::observation::OPEN_PR_LIST_FIELDS.split(',') {
+        assert!(
+            live.contains(field),
+            "live PR view omits census field `{field}`"
+        );
+    }
 }
