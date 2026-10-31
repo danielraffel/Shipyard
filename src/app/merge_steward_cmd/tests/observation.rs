@@ -1301,3 +1301,78 @@ esac
     assert_eq!(prs[0].fact.author.as_deref(), Some("alice"));
     assert_eq!(prs[1].owner, None, "owner is resolved lazily from PR view");
 }
+
+/// A fake repository answering only the reads `shipyard pr`'s next-steps block
+/// makes: settings, evaluated rules, classic protection, and the merge queue.
+#[cfg(unix)]
+fn next_steps_for(
+    temp: &tempfile::TempDir,
+    queue: &str,
+    rules: &str,
+) -> crate::pr_next_steps::NextSteps {
+    let actions = fake_gh(
+        temp,
+        &format!(
+            r#"
+case "$*" in
+  "api repos/owner/repo") printf '%s' '{{"full_name":"owner/repo","allow_auto_merge":true}}' ;;
+  *"rules/branches/main --paginate --slurp"*) printf '%s' '{rules}' ;;
+  *"branches/main/protection/required_status_checks"*) echo "HTTP 404" >&2; exit 1 ;;
+  "api graphql "*) printf '%s' '{queue}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#
+        ),
+    );
+    observe_next_steps(&actions, "owner/repo", "main")
+}
+
+#[cfg(unix)]
+#[test]
+fn next_steps_reads_a_native_queue_repository() {
+    let temp = tempfile::tempdir().expect("temp");
+    let steps = next_steps_for(
+        &temp,
+        r#"{"data":{"repository":{"mergeQueue":{"entries":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#,
+        r#"[[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"macos"}]}}]]"#,
+    );
+    let lines = steps.lines();
+    assert!(lines[1].contains("enqueues the approved head into the merge queue"));
+    assert_eq!(steps.to_json()["allow_auto_merge"], true);
+    assert_eq!(steps.to_json()["merge_queue"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn next_steps_reads_an_enforced_approval_repository_without_a_queue() {
+    let temp = tempfile::tempdir().expect("temp");
+    let steps = next_steps_for(
+        &temp,
+        r#"{"data":{"repository":{"mergeQueue":null}}}"#,
+        r#"[[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"macos"},{"context":"review-verdict","integration_id":42}]}}]]"#,
+    );
+    assert!(steps.lines()[1].contains("merges the approved head exactly; do not merge"));
+    assert_eq!(steps.to_json()["merge_queue"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn next_steps_reads_a_repository_with_no_automatic_admission() {
+    let temp = tempfile::tempdir().expect("temp");
+    let steps = next_steps_for(
+        &temp,
+        r#"{"data":{"repository":{"mergeQueue":null}}}"#,
+        r#"[[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"macos"}]}}]]"#,
+    );
+    assert!(steps.lines()[1].starts_with("No automatic admission exists"));
+}
+
+#[cfg(unix)]
+#[test]
+fn next_steps_claims_nothing_when_settings_cannot_be_read() {
+    let temp = tempfile::tempdir().expect("temp");
+    let actions = fake_gh(&temp, "echo boom >&2; exit 1");
+    let steps = observe_next_steps(&actions, "owner/repo", "main");
+    assert!(steps.lines()[1].contains("could not be read"));
+    assert!(steps.to_json()["unavailable_reason"].is_string());
+}

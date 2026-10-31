@@ -225,7 +225,7 @@ fn foreground_json_uses_the_final_post_validation_state() {
         post_validation: None,
     };
     let mut output = Vec::new();
-    render_json(&mut output, 7751, &outcome, &state, &[], None).expect("render JSON");
+    render_json(&mut output, 7751, &outcome, &state, &[], None, None).expect("render JSON");
     let value: serde_json::Value = serde_json::from_slice(&output).expect("JSON envelope");
     assert_eq!(
         value
@@ -250,9 +250,33 @@ fn foreground_json_uses_the_final_post_validation_state() {
         head: "a".repeat(40),
         monitoring_transferred: true,
     };
+    let steps = crate::pr_next_steps::NextSteps::unavailable("offline");
     output.clear();
-    render_json(&mut output, 7751, &outcome, &state, &[], Some(&transfer))
-        .expect("render transfer receipt");
+    render_json(&mut output, 7751, &outcome, &state, &[], None, Some(&steps))
+        .expect("render next steps");
+    let value: Value = serde_json::from_slice(&output).expect("JSON envelope");
+    assert_eq!(
+        value.pointer("/next_steps/admission"),
+        Some(&Value::from("unknown"))
+    );
+    assert_eq!(
+        value.pointer("/next_steps/lines/2"),
+        Some(&Value::from(
+            "On a HOLD: merge main (no rebase), fix, push once."
+        ))
+    );
+
+    output.clear();
+    render_json(
+        &mut output,
+        7751,
+        &outcome,
+        &state,
+        &[],
+        Some(&transfer),
+        None,
+    )
+    .expect("render transfer receipt");
     let value: Value = serde_json::from_slice(&output).expect("JSON envelope");
     assert_eq!(
         value.pointer("/steward_handoff/monitoring_transferred"),
@@ -478,4 +502,40 @@ fn no_arm_skips_the_merge_phase_after_green_validation() {
         format!("{:?}", ExitCode::SUCCESS)
     );
     assert!(!ran.exists(), "the merge phase ran under --no-arm");
+}
+
+fn pending_state() -> ShipRenderState {
+    ShipRenderState::GreenPendingMergeReadiness("required checks are still in flight".to_owned())
+}
+
+#[test]
+fn final_human_output_ends_with_the_next_steps_block() {
+    let steps = crate::pr_next_steps::NextSteps::unavailable("offline");
+    let mut out = Vec::new();
+    super::render::render_human(&mut out, 7, &pending_state(), &[], Some(&steps)).expect("render");
+    let text = String::from_utf8(out).expect("utf8");
+    let tail: Vec<&str> = text.lines().rev().take(3).collect();
+    assert_eq!(
+        tail[0],
+        "  On a HOLD: merge main (no rebase), fix, push once."
+    );
+    assert!(tail[1].contains("could not be read"));
+    assert!(tail[2].starts_with("  Next: a reviewer posts an exact-head verdict"));
+}
+
+#[test]
+fn merged_and_failed_validation_print_no_next_steps() {
+    let steps = crate::pr_next_steps::NextSteps::unavailable("offline");
+    for state in [ShipRenderState::Merged, ShipRenderState::ValidationFailed] {
+        let mut out = Vec::new();
+        super::render::render_human(&mut out, 7, &state, &[], Some(&steps)).expect("render");
+        assert!(!String::from_utf8(out).expect("utf8").contains("On a HOLD"));
+    }
+}
+
+#[test]
+fn ship_without_next_steps_prints_none() {
+    let mut out = Vec::new();
+    super::render::render_human(&mut out, 7, &pending_state(), &[], None).expect("render");
+    assert!(!String::from_utf8(out).expect("utf8").contains("On a HOLD"));
 }

@@ -220,6 +220,8 @@ pub mod platform;
 pub mod pr;
 /// Same-session sibling pull requests that could ship as one.
 pub mod pr_fold;
+/// The "what happens next" block `shipyard pr` prints.
+pub mod pr_next_steps;
 /// Classify one pull request's merge-queue state from GraphQL timeline facts.
 pub mod pr_queue_state;
 /// Pull request title/body composition.

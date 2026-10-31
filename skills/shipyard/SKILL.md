@@ -4066,7 +4066,12 @@ the head it judged (`expectedHeadOid`). `--no-arm`
 opts out of every landing that invocation would make: no arm, no steward
 handoff (`shipyard pr --no-arm` writes none), and no post-validation merge
 phase, in the foreground or daemon-owned (`ShipExecutionRequest.leave_unarmed`,
-persisted in the queue envelope). Every arm, enqueue or merge Shipyard does
+persisted in the queue envelope). `shipyard pr` also prints a read-only
+"what happens next" block (`crate::pr_next_steps`, `next_steps` in `--json`)
+derived from the base's live merge settings through `StewardPolicy`: native
+queue, app-bound-approval exact-head merge, no automatic admission, or unknown
+when the settings cannot be read. An explicit `--arm` on a steward-managed base
+prints a warning; the default arming behaviour is unchanged. Every arm, enqueue or merge Shipyard does
 make first runs the bundled `queue-arm-guard` with
 `SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1` (`crate::queue_arm_gate`, called from the
 `GitHubActions` transports and `auto_merge`'s arm and merge commands), so the
