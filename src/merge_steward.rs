@@ -632,7 +632,7 @@ pub(crate) fn selected_required_check<'a>(
     checks: &'a [StewardCheck],
     required: &RequiredCheck,
 ) -> Option<&'a StewardCheck> {
-    checks
+    let selected = checks
         .iter()
         .filter(|check| {
             check.name.eq_ignore_ascii_case(&required.context)
@@ -640,7 +640,45 @@ pub(crate) fn selected_required_check<'a>(
                     .app_id
                     .is_none_or(|app_id| check.app_id == Some(app_id))
         })
-        .max_by_key(|check| check_recency(check))
+        .max_by_key(|check| check_recency(check));
+
+    // GitHub can publish an app-bound Actions check as SKIPPED while the same
+    // workflow run also leaves a successful legacy commit status. The status
+    // is acceptable only as an exact identity match for that skipped run; a
+    // context-only match would let an unrelated producer satisfy an app-bound
+    // branch-protection rule.
+    if required.app_id.is_some()
+        && selected.is_some_and(|check| {
+            check.source == StewardCheckSource::CheckRun
+                && check.status.eq_ignore_ascii_case("COMPLETED")
+                && check
+                    .conclusion
+                    .as_deref()
+                    .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("SKIPPED"))
+        })
+    {
+        let skipped_run_id = selected.and_then(|check| check.run_id);
+        if let Some(skipped_run_id) = skipped_run_id {
+            let matching_status = checks
+                .iter()
+                .filter(|check| {
+                    check.name.eq_ignore_ascii_case(&required.context)
+                        && check.source == StewardCheckSource::StatusContext
+                        && check.status.eq_ignore_ascii_case("COMPLETED")
+                        && check
+                            .conclusion
+                            .as_deref()
+                            .is_some_and(|conclusion| conclusion.eq_ignore_ascii_case("SUCCESS"))
+                        && check.run_id == Some(skipped_run_id)
+                })
+                .max_by_key(|check| check_recency(check));
+            if matching_status.is_some() {
+                return matching_status;
+            }
+        }
+    }
+
+    selected
 }
 
 fn check_recency(check: &StewardCheck) -> (bool, &str, bool) {
