@@ -830,7 +830,12 @@ everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
 A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
 versions. The read-only version gate rejects those edits unless the PR carries
 the explicit release recovery trailer. After merge, `version-at-land.yml` is the
-single writer and assigns the next versions.
+single writer and assigns the next versions. It never pushes to `main` (the
+ruleset requires PR-only checks): it rebuilds the bot-owned
+`release/version-at-land` branch with one cumulative bump commit, keeps a single
+pull request open for it, labels it `shipyard:managed` and posts the exact-head
+`shipyard/steward-handoff` status. That pull request still needs green required
+checks and a reviewer's exact-head APPROVE; the run on its merge is a no-op.
 
 It judges each first-parent change since the last `Version-Bump-Applied` marker
 on its own, then takes the highest level per surface. A
@@ -4162,7 +4167,12 @@ the head it judged (`expectedHeadOid`). `--no-arm`
 opts out of every landing that invocation would make: no arm, no steward
 handoff (`shipyard pr --no-arm` writes none), and no post-validation merge
 phase, in the foreground or daemon-owned (`ShipExecutionRequest.leave_unarmed`,
-persisted in the queue envelope). Every arm, enqueue or merge Shipyard does
+persisted in the queue envelope). `shipyard pr` also prints a read-only
+"what happens next" block (`crate::pr_next_steps`, `next_steps` in `--json`)
+derived from the base's live merge settings through `StewardPolicy`: native
+queue, app-bound-approval exact-head merge, no automatic admission, or unknown
+when the settings cannot be read. An explicit `--arm` on a steward-managed base
+prints a warning; the default arming behaviour is unchanged. Every arm, enqueue or merge Shipyard does
 make first runs the bundled `queue-arm-guard` with
 `SHIPYARD_QUEUE_ARM_REVIEW_ONLY=1` (`crate::queue_arm_gate`, called from the
 `GitHubActions` transports and `auto_merge`'s arm and merge commands), so the
@@ -4254,7 +4264,12 @@ with any non-canonical variant); it has no override:
 `hold-disarms`, `verdict-hold-hook` dequeues or disarms a pull request queued
 or armed at exactly the head a HOLD names, before the HOLD posts, and never
 blocks the HOLD (`docs/ghapp-guards.md`, A HOLD takes its head out of the
-landing path). See `crate::head_approval`. Its count of queue removals per
+landing path). A HOLD is also final for its head: no APPROVE of that head
+counts, from any signer, before or after it (pulp#11117 merged on a held head
+when a second reviewer session approved it later), and no approval carries
+from a held head; the only escape is a new push. Each APPROVE excluded this
+way is reported as `excluded_approval:head held by <signer> at <id>`. See
+`crate::head_approval`. Its count of queue removals per
 head reads only the last 100 timeline events, so a very busy pull request can
 under-count; that errs lenient (an approval is still required), never strict. This matters because Shipyard's own admission path enqueues only
 after it has validated a head, which happens only while a Shipyard process is

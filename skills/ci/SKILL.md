@@ -282,6 +282,18 @@ or merges. `shipyard pr --no-arm` writes no steward handoff (it implies
 handed-off `ship` skips its post-validation merge phase, reporting
 `left unarmed (--no-arm)`, in the foreground and when the daemon owns it.
 
+**`shipyard pr` ends with a "what happens next" block** (three lines under the
+queued/final output; `next_steps` in `--json`, with `admission`,
+`steward_managed`, `lines`, and the observed `merge_queue`, `allow_auto_merge`,
+`required_contexts`). It is read from the base's live merge settings, the same
+facts the steward uses: a native merge queue says the fleet steward enqueues the
+approved head (do not arm or enqueue); no queue but an app-bound approval
+context among the required checks says the steward merges the exact head (do not
+merge); neither says no automatic admission exists; unreadable settings claim
+no path. Every shape ends "On a HOLD: merge main (no rebase), fix, push once."
+It is output only and changes no behaviour; an explicit `--arm` on a
+steward-managed repository also prints a warning line.
+
 **Every Shipyard landing passes `queue-arm-guard`.** Before any request that
 can arm, enqueue or merge (`enablePullRequestAutoMerge`, `enqueuePullRequest`,
 `mergePullRequest`, `gh pr merge`, REST `PUT pulls/<n>/merge`), from `ship`,
@@ -358,7 +370,8 @@ reviewed:<40-hex sha>
 ```
 
 `reviewed:` is an alias for APPROVE. The latest verdict on the current head
-decides. A HOLD on an older head, a quoted (`>`) line, a line above the last,
+decides, except that a HOLD is final: once a counting HOLD names a head, no
+APPROVE of that head (earlier or later, any signer) counts; push a new head. A HOLD on an older head, a quoted (`>`) line, a line above the last,
 and prose that mentions "hold" or "changes requested" never gate. A marker
 posted before the head commit existed does not count. Without an approval the line reads
 `▸ Auto-merge not armed on #N: head … carries no approval …`, and the same check
@@ -1036,7 +1049,12 @@ successful rotation.
 A normal PR does not edit `Cargo.toml`, `Cargo.lock`, or plugin manifest
 versions. The read-only version gate rejects those edits unless the PR carries
 the explicit release recovery trailer. After merge, `version-at-land.yml` is the
-single writer and assigns the next versions.
+single writer and assigns the next versions. It never pushes to `main` (the
+ruleset requires PR-only checks): it rebuilds the bot-owned
+`release/version-at-land` branch with one cumulative bump commit, keeps a single
+pull request open for it, labels it `shipyard:managed` and posts the exact-head
+`shipyard/steward-handoff` status. That pull request still needs green required
+checks and a reviewer's exact-head APPROVE; the run on its merge is a no-op.
 
 ## Stale ship-state records: `discard --repo` and `prune`
 

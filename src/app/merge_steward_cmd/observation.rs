@@ -98,6 +98,40 @@ pub(super) fn observe_repo(
     })
 }
 
+/// The repository facts that decide how a head is admitted, without the
+/// pull-request and run census `observe_repo` also loads.
+pub(super) fn admission_policy(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+) -> Result<crate::merge_steward::StewardPolicy, String> {
+    let settings = gh_json(
+        actions,
+        &["api".to_owned(), format!("repos/{repo}")],
+        "repository settings",
+    )?;
+    let repo = canonical_repo_name(&settings)?;
+    let allow_auto_merge = settings
+        .get("allow_auto_merge")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let evaluated_rules = evaluated_branch_rules(actions, &repo, base)?;
+    let required_checks =
+        required_checks_with_evaluated_rules(actions, &repo, base, &evaluated_rules)?;
+    let (merge_queue, ..) = merge_queue_snapshot(actions, &repo, base)?;
+    Ok(crate::merge_steward::StewardPolicy {
+        merge_queue,
+        native_auto_merge: allow_auto_merge,
+        approval_context: crate::merge_steward::DEFAULT_APPROVAL_CONTEXT.to_owned(),
+        required_checks,
+        opt_out_label: String::new(),
+        provenance_blocking_labels: Vec::new(),
+        managed_label: None,
+        handoff_context: String::new(),
+        max_transient_reruns: 0,
+    })
+}
+
 pub(super) fn canonical_repo_name(settings: &Value) -> Result<String, String> {
     let full_name = settings
         .get("full_name")

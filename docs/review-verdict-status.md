@@ -17,8 +17,9 @@ required check: GitHub then cannot merge a head whose status is not
 `review_gate` with the live head bound, so the status and the guard cannot
 disagree:
 
-- the newest trusted verdict naming the head decides; a HOLD with no readable
-  time always wins;
+- a trusted HOLD naming the head always wins, before or after any APPROVE of
+  the same head (a held head needs a new push); otherwise the newest trusted
+  verdict naming the head decides;
 - `success` only for an APPROVE naming the head (a comment ending
   `verdict: APPROVE head:<sha>` or `reviewed: <sha>`, or an `APPROVED`
   review on it), or one the guard's merge-only carry takes to it;

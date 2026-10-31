@@ -1443,6 +1443,19 @@ use capacity_cancellation::{
     mark_cancellation_skipped, persist_capacity_evidence,
 };
 use ledger::{attempt_key, check_attempt_key, load_ledger, record_audit, save_ledger};
+/// How `repo`'s `base` admits an approved head, for `shipyard pr`'s next-steps
+/// block. Read-only.
+pub(super) fn observe_next_steps(
+    actions: &GitHubActions,
+    repo: &str,
+    base: &str,
+) -> crate::pr_next_steps::NextSteps {
+    match observation::admission_policy(actions, repo, base) {
+        Ok(policy) => crate::pr_next_steps::NextSteps::from_policy(&policy),
+        Err(error) => crate::pr_next_steps::NextSteps::unavailable(error),
+    }
+}
+
 use observation::{
     active_runs, complete_checks_for_head, fetch_run_jobs, fetch_run_jobs_before, gh_json,
     gh_json_before, gh_json_timeout, hydrate_census_check_identities,

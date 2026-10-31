@@ -314,6 +314,19 @@ written, as it always was.
 (`mac: opt-in, not run (GitHub required checks decide)`), so a PR with no
 record reads as delegated rather than as a lane that never started.
 
+## The "what happens next" block is output only
+
+`shipyard pr` derives a "what happens next" block (`pr_next_steps::NextSteps`)
+from the same repository facts the merge steward reads (merge queue,
+`allow_auto_merge`, required contexts, approval context) and hands it to
+`ship_command` through `ShipCommandArgs.next_steps`. `src/app/ship_cmd.rs`
+prints it on every output path a pull request can leave through: the queued
+job, the required-checks delegation, and the final human or `--json` render
+(JSON carries it as `next_steps`, `null` for plain `shipyard ship`). It is
+rendering only. It is not persisted in `ShipState`, adds no state or
+transition, and never changes what `ship` does; when the settings cannot be
+read it claims no admission path rather than guessing one.
+
 ## Arming auto-merge is outside the state machine
 
 Once `resolve_pr_context` has a pull-request number — for `shipyard pr`, a bare
