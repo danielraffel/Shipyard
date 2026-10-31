@@ -95,10 +95,11 @@ pub(super) fn cause_command<W: Write>(
 }
 
 /// Hold an archive lock for the complete writer operation, or share an
-/// existing lock for a reader. Readers never create a lock or recover a
-/// transaction: an archive without a lock is read without one when no
-/// transaction is pending, while an interrupted transaction is refused until
-/// a writer recovers it.
+/// lock for a reader. A reader never recovers a transaction: an interrupted
+/// transaction is refused until a writer recovers it. A reader creates the
+/// lock file only for a managed, non-frozen archive that already holds cause
+/// data; frozen and unmanaged legacy archives are read without a lock and
+/// without any new file.
 pub(crate) struct ArchiveLock {
     _file: Option<std::fs::File>,
 }

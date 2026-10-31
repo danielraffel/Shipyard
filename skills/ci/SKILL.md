@@ -153,6 +153,11 @@ metrics importer resolves those rows only through the exact commit's
 authoritative pull-request API response, and keeps the identity unknown when
 that response is empty or ambiguous.
 
+For a governed receipt transport, `shipyard metrics export merge-receipt
+--repo <owner/repo> --stdout` emits only canonical JSONL records. It is
+mutually exclusive with `--file` and `--json`; keep health or transport status
+on a separate channel so stdout remains machine-readable handoff bytes.
+
 ## Version-only release bumps
 
 The CLI version is part of the CI surface map. Even a release-only
@@ -986,6 +991,11 @@ a sibling `<dir>.owner` (the run's pid). A new run first deletes dirs older than
 [--older-than-hours N]` also handles dirs without an owner file, keeping any that
 a live process (`ps eww`) still has as TMPDIR. A failed process listing keeps
 everything unowned. The cleanup touches nothing but `shipyard-validation-*`.
+
+The scheduled metrics retention pass is fail-closed: raw runs and expired
+fleet-capacity samples are deleted in bounded SQLite batches, and an unreadable
+metrics store makes the cleanup command fail so its receipt cannot claim a
+successful rotation.
 
 ## Version-at-land
 

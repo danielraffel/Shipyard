@@ -114,7 +114,9 @@ and unresolved `supersedes` rows are preserved and listed in JSON output; if the
 size cap cannot retain them, pruning refuses. Malformed or unclassifiable rows
 fail closed and are left untouched. Rotation is separate from collection, so
 disabling observation does not delete data. Readers take a shared lock and
-refuse an interrupted transaction without writing to the archive. A frozen
+refuse an interrupted transaction without recovering it. A reader creates the
+lock file only in a managed, non-frozen archive that already holds cause data;
+frozen and unmanaged legacy archives are read without writing anything. A frozen
 archive also refuses `cause record` and `cause archive`; copy it to a mutable
 operational archive before collecting or appending new rows.
 

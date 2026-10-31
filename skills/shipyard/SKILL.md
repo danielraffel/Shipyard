@@ -27,6 +27,11 @@ counts each distinct superseded job once, reports clean versus
 uncertain/cancelled/unmatched coverage, and never treats survivor runtime as
 savings. It never turns this evidence into a queue or merge decision.
 
+The producer-side merge-receipt export supports an explicit `--stdout` stream
+mode for a governed transport. It emits canonical JSONL receipt records only;
+`--file` remains the atomic handoff mode, and `--stdout` cannot be combined
+with `--file` or `--json`.
+
 The failure-learning observer is intentionally independent of baseline
 collection. On macOS, use `scripts/install_cause_observer.sh` to render a
 per-user launchd job that runs the read-only `shipyard cause record` pass on a
@@ -3929,6 +3934,10 @@ do not raw-`touch` it while cleanup may run. Failure and unclassified legacy
 evidence is never pressure-deleted. Current Phase 1 rotation is lossless at
 writer reopen boundaries; do not use external `copytruncate` against active
 Shipyard writers. Full continuously-active writer rotation remains Phase 2.
+
+Metrics retention is bounded as well: raw runs and expired fleet-capacity
+samples are deleted in small SQLite transactions, and a metrics-store failure
+fails `cleanup` closed so scheduled receipts cannot report a false success.
 
 ## GraphQL And GitHub App Fallback Behaviour
 
