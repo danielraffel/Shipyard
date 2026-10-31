@@ -1,0 +1,18 @@
+{
+  "cost_basis": "superseded_repeated_work",
+  "observations": 21,
+  "superseded_exact_head": 12,
+  "duplicate_exact_head_config": 9,
+  "joined_durations": 0,
+  "unknown_durations": 21,
+  "duration_ms": null,
+  "shadow_rows": 21,
+  "distinct_superseded_jobs": 21,
+  "matched_clean": 0,
+  "excluded_uncertain": 0,
+  "excluded_cancelled": 0,
+  "unmatched": 21,
+  "timing_basis": "superseded_queue_job_runtime",
+  "since_days": 14,
+  "final_attempt_only": true
+}

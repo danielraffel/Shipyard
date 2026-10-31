@@ -171,6 +171,17 @@ def atomic_write(path: pathlib.Path, payload: str) -> None:
     except OSError:
         temporary.unlink(missing_ok=True)
         raise
+    # The file fsync makes the new contents durable; syncing the containing
+    # directory makes the rename durable as well. Some platforms do not
+    # expose O_DIRECTORY, so retain the existing atomic-replace guarantee
+    # there and use the stronger directory barrier where supported.
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if directory_flag:
+        directory_fd = os.open(path.parent, os.O_RDONLY | directory_flag)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 RECEIPT_FIELDS = frozenset({
@@ -294,7 +305,8 @@ def source_imported_at(state_dir: pathlib.Path, repo: str, base_branch: str) -> 
                 raise RuntimeError("producer merge receipt store has no imported_at column")
             value = connection.execute(
                 "SELECT max(imported_at) FROM merge_receipts "
-                "WHERE lower(trim(repo)) = lower(trim(?1)) AND project = ?2 AND base_branch = ?3",
+                "WHERE lower(trim(repo)) = lower(trim(?1)) "
+                "AND lower(trim(project)) = lower(trim(?2)) AND base_branch = ?3",
                 (repo, repo.rsplit("/", 1)[-1], base_branch),
             ).fetchone()[0]
     except (OSError, sqlite3.Error) as exc:

@@ -1073,6 +1073,38 @@ mod tests {
     }
 
     #[test]
+    fn repeated_work_cost_rejects_nonpositive_windows_without_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for since in ["0d", "-1d"] {
+            for json_output in [false, true] {
+                let mut output = Vec::new();
+                let error = metrics_command(
+                    MetricsCommand::RepeatedWorkCost(
+                        crate::app::cli::MetricsRepeatedWorkCostArgs {
+                            limit: 100,
+                            since: since.into(),
+                        },
+                    ),
+                    temp.path(),
+                    None,
+                    json_output,
+                    &mut output,
+                )
+                .expect_err("nonpositive baseline window must fail");
+                assert_eq!(error.code, WAIT_EXIT_INVALID, "{since}");
+                assert_eq!(
+                    error.message(),
+                    "repeated-work baseline window must be positive"
+                );
+                assert!(
+                    output.is_empty(),
+                    "invalid window emitted a report: {since}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn repeated_work_cost_json_and_human_output_report_superseded_coverage() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = MetricsStore::open(temp.path()).expect("store");

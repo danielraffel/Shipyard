@@ -32,11 +32,19 @@ use crate::queue_request::{
     QueuedExecutionKind, QueuedExecutionOutcome, QueuedExecutionOwner, QueuedExecutionRequest,
 };
 use crate::queue_scheduler::{AlreadyMergedCancellation, AlreadyMergedObserver};
+
 use crate::ship::persist_terminal_outcome;
 use crate::worker_process_custody::{
     ProcessLiveness, terminate_child_tree as terminate_owned_child_tree,
 };
 
+/// Absolute deadline for daemon already-merged provider observations.
+///
+/// No provider lookup starts after this 10-second deadline, and each lookup is
+/// capped at `min(remaining, 15s)`. Local git provenance/config/cancellation
+/// I/O remains outside this provider-phase budget.
+pub(crate) const MERGED_OBSERVATION_TICK_BUDGET: StdDuration = StdDuration::from_secs(10);
+const RUNNING_OBSERVATION_RESERVE: StdDuration = StdDuration::from_secs(2);
 const MAX_WORKERS: usize = 1;
 const MAX_METADATA_CONTROLLERS: usize = 4;
 
@@ -175,6 +183,7 @@ pub struct ExecutionSupervisor {
     state_dir: PathBuf,
     children: BTreeMap<String, Child>,
     merge_observers: BTreeMap<PathBuf, (AlreadyMergedObserver, String)>,
+    merge_observer_cwd_cursor: Option<PathBuf>,
     next_queue_absent_recovery: std::time::Instant,
     queue_absent_recovery_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// This host's current boot ([`crate::boot_identity::current`]).
@@ -187,6 +196,8 @@ pub struct ExecutionSupervisor {
     #[cfg(test)]
     crash_after_intent: bool,
 }
+
+type MergedShipJobsByCwd = BTreeMap<PathBuf, Vec<(Job, crate::queue_request::ExecutionProvenance)>>;
 
 struct QueueAbsentRecoveryFlight(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
@@ -212,6 +223,7 @@ impl ExecutionSupervisor {
             state_dir,
             children: BTreeMap::new(),
             merge_observers: BTreeMap::new(),
+            merge_observer_cwd_cursor: None,
             next_queue_absent_recovery: std::time::Instant::now(),
             queue_absent_recovery_in_flight: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
@@ -325,47 +337,36 @@ impl ExecutionSupervisor {
     }
 
     fn observe_merged_ship_jobs(&mut self) -> Result<(), SupervisorError> {
+        let deadline = Instant::now() + MERGED_OBSERVATION_TICK_BUDGET;
         let request_store = QueueRequestStore::new(&self.state_dir)?;
         let mut queue = Queue::new(&self.state_dir)?;
-        let mut jobs_by_cwd =
-            BTreeMap::<PathBuf, Vec<(Job, crate::queue_request::ExecutionProvenance)>>::new();
-        for job in queue
-            .get_all()?
-            .into_iter()
-            .filter(requires_merged_ship_observation)
-        {
-            let Ok(Some(envelope)) = request_store.load(&job.id) else {
-                continue;
-            };
-            if envelope.job_id != job.id || !envelope.is_daemon_admissible() {
-                continue;
-            }
-            let Some(provenance) = envelope.provenance.as_ref() else {
-                continue;
-            };
-            if provenance.config_signature.is_none()
-                || envelope.cwd != provenance.canonical_cwd
-                || provenance.validate(&provenance.canonical_cwd).is_err()
-                || !matches!(envelope.request, QueuedExecutionRequest::Ship(_))
-            {
-                continue;
-            }
-            jobs_by_cwd
-                .entry(provenance.canonical_cwd.clone())
-                .or_default()
-                .push((job, provenance.clone()));
-        }
+        let (jobs_by_cwd, collection_complete) =
+            Self::collect_merged_ship_jobs(&mut queue, &request_store, deadline)?;
         if jobs_by_cwd.is_empty() {
-            self.merge_observers.clear();
+            if collection_complete {
+                self.merge_observers.clear();
+            }
             return Ok(());
         }
 
-        let active_cwds = jobs_by_cwd.keys().cloned().collect::<BTreeSet<_>>();
-        self.merge_observers
-            .retain(|cwd, _| active_cwds.contains(cwd));
+        if collection_complete {
+            let active_cwds = jobs_by_cwd.keys().cloned().collect::<BTreeSet<_>>();
+            self.merge_observers
+                .retain(|cwd, _| active_cwds.contains(cwd));
+        }
+        let mut cwd_entries = jobs_by_cwd.into_iter().collect::<Vec<_>>();
+        if let Some(cursor) = self.merge_observer_cwd_cursor.as_ref()
+            && let Some(index) = cwd_entries.iter().position(|(cwd, _)| cwd > cursor)
+        {
+            cwd_entries.rotate_left(index);
+        }
         let mut pending = Vec::new();
         let mut running = Vec::new();
-        for (cwd, scoped_entries) in jobs_by_cwd {
+        for (cwd, scoped_entries) in cwd_entries {
+            if Instant::now() >= deadline {
+                break;
+            }
+            self.merge_observer_cwd_cursor = Some(cwd.clone());
             let Ok(config) = crate::config::LoadedConfig::load_from_cwd_with_global_dir(
                 self.mode,
                 &cwd,
@@ -373,14 +374,18 @@ impl ExecutionSupervisor {
             ) else {
                 continue;
             };
-            let Some(signature) = scoped_entries.iter().find_map(|(_, provenance)| {
+            let Some(trusted_provenance) = scoped_entries.iter().find_map(|(_, provenance)| {
                 provenance
                     .validate_with_config(&cwd, &config)
                     .ok()
-                    .and_then(|()| provenance.config_signature.clone())
+                    .map(|()| provenance.clone())
             }) else {
                 continue;
             };
+            let signature = trusted_provenance
+                .config_signature
+                .clone()
+                .expect("daemon-admissible provenance has a configuration signature");
             if self
                 .merge_observers
                 .get(&cwd)
@@ -391,21 +396,92 @@ impl ExecutionSupervisor {
                     (AlreadyMergedObserver::from_config(&config), signature),
                 );
             }
-            let (observer, trusted_signature) = self
+            let (observer, _) = self
                 .merge_observers
                 .get_mut(&cwd)
                 .expect("observer inserted for active cwd");
             let scoped_jobs = scoped_entries
                 .into_iter()
-                .filter(|(_, provenance)| {
-                    provenance.config_signature.as_ref() == Some(trusted_signature)
-                })
+                // A CWD can have requests captured at different heads or
+                // tree states. Only the exact provenance that passed the
+                // current checkout/config fence may reach the provider
+                // observer; a shared config signature is insufficient.
+                .filter(|(_, provenance)| provenance == &trusted_provenance)
                 .map(|(job, _)| job)
                 .collect::<Vec<_>>();
-            pending.extend(observer.observe_pending(&scoped_jobs, &request_store, &cwd, None));
-            running.extend(observer.observe_running(&scoped_jobs, &request_store, &cwd, None));
+            pending.extend(
+                observer.observe_pending_until(
+                    &scoped_jobs,
+                    &request_store,
+                    &cwd,
+                    None,
+                    deadline
+                        .checked_sub(RUNNING_OBSERVATION_RESERVE)
+                        .unwrap_or(deadline),
+                ),
+            );
+            running.extend(observer.observe_running_until(
+                &scoped_jobs,
+                &request_store,
+                &cwd,
+                None,
+                deadline,
+            ));
         }
         self.apply_merge_cancellations(pending, running)
+    }
+
+    fn collect_merged_ship_jobs(
+        queue: &mut Queue,
+        request_store: &QueueRequestStore,
+        deadline: Instant,
+    ) -> Result<(MergedShipJobsByCwd, bool), SupervisorError> {
+        let all_jobs = queue.get_all()?;
+        if Instant::now() >= deadline {
+            return Ok((BTreeMap::new(), false));
+        }
+        let mut jobs_by_cwd = MergedShipJobsByCwd::new();
+        let mut complete = true;
+        for job in all_jobs
+            .into_iter()
+            .filter(requires_merged_ship_observation)
+        {
+            if Instant::now() >= deadline {
+                complete = false;
+                break;
+            }
+            let Ok(Some(envelope)) = request_store.load(&job.id) else {
+                continue;
+            };
+            if envelope.job_id != job.id || !envelope.is_daemon_admissible() {
+                continue;
+            }
+            let Some(provenance) = envelope.provenance.as_ref() else {
+                continue;
+            };
+            let QueuedExecutionRequest::Ship(request) = &envelope.request else {
+                continue;
+            };
+            // Keep indexing free of Git/filesystem probes. The per-CWD pass
+            // below validates checkout identity once before any provider
+            // observation; probing once per job made one wedged checkout
+            // consume the entire observer budget and starve every repository.
+            // Bind the durable queue row to the immutable request snapshot as
+            // well, so a mixed or tampered envelope cannot substitute its own
+            // PR head/repository for the job being observed.
+            if provenance.config_signature.is_none()
+                || envelope.cwd != provenance.canonical_cwd
+                || job.sha != request.sha
+                || provenance.repo_slug.as_deref() != Some(request.repo.as_str())
+            {
+                continue;
+            }
+            jobs_by_cwd
+                .entry(provenance.canonical_cwd.clone())
+                .or_default()
+                .push((job, provenance.clone()));
+        }
+        Ok((jobs_by_cwd, complete))
     }
 
     fn apply_merge_cancellations(
