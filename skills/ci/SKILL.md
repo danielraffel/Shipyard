@@ -5,6 +5,20 @@ description: "Cross-platform CI coordination with Shipyard: validates, ships, ma
 
 # CI Operations with Shipyard
 
+## Durable external work
+
+Agents may register CI preparation, repair, review, or release work through
+Shipyard's durable work-item store without being launched or supervised by
+Shipyard. Registration is idempotent; checkpoints must be written before a
+session hands off or exits. Claims carry a fencing epoch and protocol/capability
+version, and stale owners are rejected on checkpoint. A host-loss recovery
+must rediscover the item from shared ShipState and obtain a new fenced claim;
+local files or conversation history are not recovery state. This contract is
+observation-only until the cross-host failure canary proves concurrent
+reconcilers cannot duplicate privileged effects. Work-item records fail closed
+on corruption or schema drift; idempotency keys, capability versions, lease
+expiry, and expected state versions are checked before checkpoint or claim.
+
 `SHIPYARD_OBSERVATIONS=off` (trimmed, case-insensitive) stops automatic queue
 shadow/timing, command metric copies, route-shadow receipts, daemon GitHub
 imports, and scheduled baseline collection in processes receiving it. Existing
